@@ -13,6 +13,8 @@ pub(crate) struct DistributedDsparkChain<'w, 'a> {
     terminal: DistributedDsparkTerminal<'w, 'a>,
     ready: Option<usize>,
     pending: Option<Phase<'a>>,
+    /// A CUDA/replay failure is terminal for this chain.
+    failure: super::DraftFailure,
 }
 impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
     pub fn device(&self) -> Device<'a> { self.chain.device }
@@ -32,9 +34,15 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
         Ok(Self {
             chain: devices[1].own(|| weights.embedded_chain(embedding, requests, weights.chain_bytes(requests)?))?,
             terminal: DistributedDsparkTerminal::new(devices, weights, shards, requests as usize, terminal_bytes)?,
-            ready: None, pending: None,
+            ready: None, pending: None, failure: super::DraftFailure::default(),
         })
     }
+    /// Record a CUDA/replay failure as terminal for this chain.
+    pub(crate) fn note_failure(&mut self, error: &anyhow::Error) { self.failure.record(error); }
+    /// A terminal draft is not a reusable target-only fallback.
+    pub fn require_live(&self) -> Result<()> { self.failure.check("distributed dSpark draft chain") }
+    /// Drop a pending replay so its requests can be released.
+    pub fn cancel_replay(&mut self) { self.cancel(); }
     pub fn width(&self) -> usize { self.chain.width }
     pub fn set_width(&mut self, width: usize) -> Result<()> {
         ensure!(self.pending.is_none(), "distributed draft still pending");

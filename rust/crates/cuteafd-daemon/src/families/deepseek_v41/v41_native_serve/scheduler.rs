@@ -2079,7 +2079,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
             Ok(inputs) => inputs,
             // W64-1: a failed proposal verifies the anchors only while the draft
             // is still live; a terminal draft fails the round.
-            Err(error) => stall::draft_fallback(draft.require_live(lane), &seeds, lane, &error)?,
+            Err(error) => draft.anchor_fallback(lane, &seeds, &error)?,
         }
     } else { seeds.iter().map(|r| vec![r.1]).collect() };
     if let Some(draft) = draft.as_deref_mut() { extend_inputs(draft, active, members, &mut inputs)?; }

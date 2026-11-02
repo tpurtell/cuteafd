@@ -197,8 +197,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     // draft is still live; a terminal draft fails the round.
                     if let Some(draft) = draft.as_deref_mut() { match draft.poll_propose(lane, &drafting) {
                         Ok(proposed) => proposed,
-                        Err(error) => Some((super::stall::draft_fallback(
-                            draft.require_live(lane), &drafting, lane, &error)?, 0)),
+                        Err(error) => Some((draft.anchor_fallback(lane, &drafting, &error)?, 0)),
                     } }
                     else { Some((drafting.iter().map(|r| vec![r.1]).collect(), 0)) }
                 };

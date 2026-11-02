@@ -11,6 +11,25 @@ use std::ffi::c_void;
 mod distributed;
 pub(crate) use distributed::DistributedDsparkChain;
 
+/// A sticky terminal failure for a draft chain. A CUDA or replay error is not
+/// recoverable in-process, so the lane must fail the round instead of falling
+/// back to anchors forever with the error masked.
+#[derive(Default)]
+pub(crate) struct DraftFailure(Option<String>);
+impl DraftFailure {
+    pub(crate) fn record(&mut self, error: &anyhow::Error) {
+        if self.0.is_none() { self.0 = Some(format!("{error:#}")); }
+    }
+    pub(crate) fn check(&self, what: &str) -> Result<()> {
+        match &self.0 {
+            Some(reason) => anyhow::bail!("{what} failed until restart: {reason}"),
+            None => Ok(()),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn is_failed(&self) -> bool { self.0.is_some() }
+}
+
 pub(crate) struct DsparkChain<'weights, 'library> {
     stream: LoadStream<'library>,
     timing: crate::shared::draft::timing::DraftTiming<'library>,
@@ -29,6 +48,8 @@ pub(crate) struct DsparkChain<'weights, 'library> {
     token_count: Option<usize>,
     terminal: Option<DsparkTerminal<'weights, 'library>>,
     ops: V41AttentionOps<'library>,
+    /// A CUDA/replay failure is terminal for this chain.
+    failure: DraftFailure,
 }
 /// Own reservations before the first upload. Errors and unwinding drain before
 /// pinned inputs or cache ring slots may be reused. Successful polls disarm it.
@@ -128,6 +149,7 @@ impl<'library> DsparkWeights<'library> {
             token_count: None,
             terminal: None,
             ops: library.v41_attention_ops_width(self.draft_width)?,
+            failure: DraftFailure::default(),
         })
     }
 }
@@ -506,11 +528,17 @@ impl DsparkChain<'_, '_> {
             .map(|b| f32::from_ne_bytes(b.try_into().unwrap())).collect();
         Ok(Some((tokens, confidence)))
     }
-    #[cfg(test)]
-    pub fn cancel_pending_for_test(&mut self) {
+    /// Record a CUDA/replay failure as terminal for this chain.
+    pub(crate) fn note_failure(&mut self, error: &anyhow::Error) { self.failure.record(error); }
+    /// A terminal draft is not a reusable target-only fallback.
+    pub fn require_live(&self) -> Result<()> { self.failure.check("dSpark draft chain") }
+    /// Drop a pending replay so its requests can be released.
+    pub fn cancel_replay(&mut self) {
         self.pending = None; // guard drains before releasing reads
         self.invalidate();
     }
+    #[cfg(test)]
+    pub fn cancel_pending_for_test(&mut self) { self.cancel_replay(); }
     pub fn output(&self) -> Result<[CuteafdDeviceBuffer; 2]> {
         let requests = self.ready.context("dSpark chain output incomplete")?;
         let mut output = self.stages[2].output_storage();

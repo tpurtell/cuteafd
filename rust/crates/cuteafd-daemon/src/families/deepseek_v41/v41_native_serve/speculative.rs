@@ -17,6 +17,42 @@ static TAIL_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static TAIL_PROPOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TAIL_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TAIL_ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAFT_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One lane round's draft seeds: (request identity, anchor, committed end,
+/// remaining output budget).
+type DraftSeed = (u64, u32, u64, usize);
+
+/// Reset a lane's draft state before a new proposal attempt. A proposal that
+/// fails in its guards must not leave the previous round's width, drafted
+/// request count or confidence trace behind for `select_lengths`/`observe`.
+pub(crate) fn reset_lane_draft(lane: &mut LaneRound, confidence_trace: &mut std::collections::BTreeMap<u64, Vec<f32>>,
+    neural_lengths: &mut std::collections::BTreeMap<u64, usize>, inputs: &[DraftSeed]) {
+    lane.width = 0;
+    lane.drafted_requests = 0;
+    for &(id, _, _, _) in inputs {
+        confidence_trace.remove(&id);
+        neural_lengths.remove(&id);
+    }
+}
+
+/// The anchor-only inputs a failed proposal verifies.
+pub(crate) fn anchor_inputs(seeds: &[DraftSeed]) -> Vec<Vec<u32>> {
+    seeds.iter().map(|seed| vec![seed.1]).collect()
+}
+
+/// Whether a pending proposal still holds request `id` (and so blocks release).
+pub(crate) fn pending_draft_blocks(pending: &[Option<(Vec<DraftSeed>, Instant)>], id: u64) -> bool {
+    pending.iter().flatten().any(|(seeds, _)| seeds.iter().any(|seed| seed.0 == id))
+}
+
+/// Drop lane `lane`'s pending proposal marker; returns whether one was set.
+pub(crate) fn clear_pending_draft(pending: &mut [Option<(Vec<DraftSeed>, Instant)>], lane: usize) -> bool {
+    match pending.get_mut(lane) {
+        Some(slot) if slot.is_some() => { *slot = None; true }
+        _ => false,
+    }
+}
 
 pub(crate) fn policy_snapshot() -> serde_json::Value {
     use std::sync::atomic::Ordering::Relaxed;
@@ -541,15 +577,27 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     ) -> Result<Option<(Vec<Vec<u32>>, u64)>> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(lane < self.chains.len(), "invalid draft lane");
-        if let Some((seeds, started)) = &self.pending[lane] {
-            let started = *started;
-            ensure!(seeds == inputs, "pending draft request inputs changed");
+        if let Some((seeds, started)) = self.pending[lane].take() {
+            if seeds != inputs {
+                // W64-1: the pending proposal no longer matches this round's
+                // inputs. Cancel it and drop the marker so `release()` can free
+                // the requests; the caller then verifies anchors only.
+                self.chains[lane].cancel_replay();
+                if let Some(round) = self.lanes.get_mut(lane) {
+                    reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, inputs);
+                }
+                anyhow::bail!("pending draft request inputs changed");
+            }
             let completed = match self.chains[lane].poll_replay() {
-                Ok(None) => return Ok(None),
+                Ok(None) => { self.pending[lane] = Some((seeds, started)); return Ok(None); },
                 Ok(Some(value)) => value,
-                Err(error) => { self.pending[lane] = None; return Err(error); },
+                Err(error) => {
+                    if let Some(round) = self.lanes.get_mut(lane) {
+                        reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, inputs);
+                    }
+                    return Err(error);
+                },
             };
-            self.pending[lane] = None;
             let (packed, values) = completed;
             let active: Vec<_> = inputs.iter().enumerate()
                 .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
@@ -569,21 +617,21 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         }
         let started = Instant::now();
         ensure!(self.pending[lane].is_none(), "shared draft proposal still pending");
+        // W64-1: reset before the guards so a proposal that fails them cannot
+        // leave the previous round's width/counts/confidence behind.
+        if let Some(round) = self.lanes.get_mut(lane) {
+            reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, inputs);
+        }
         ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
             ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");
             ensure!(anchor < 129280 && remaining > 0, "invalid draft request input");
         }
-        for &(id, _, _, _) in inputs {
-            self.confidence_trace.remove(&id);
-        self.neural_lengths.remove(&id);
-        }
         let active: Vec<_> = inputs.iter().enumerate()
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
         let outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
         if active.is_empty() {
-            self.lanes[lane].width = 0; self.lanes[lane].drafted_requests = 0;
             return Ok(Some((outputs, started.elapsed().as_micros() as u64)));
         }
         let widths: Vec<_> = inputs.iter().map(|&(id, _, end, remaining)|
@@ -621,6 +669,21 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn require_live(&self, lane: usize) -> Result<()> {
         self.chains.get(lane).context("invalid draft lane")?.require_live()
     }
+    /// A failed draft proposal: verify each member's anchor alone, but only
+    /// while the draft is still live. A terminal draft propagates its error so
+    /// the round fails instead of degrading to anchors forever. The lane's
+    /// draft state is reset so the anchor-only round is observed as undrafted.
+    pub fn anchor_fallback(&mut self, lane: usize, seeds: &[DraftSeed], error: &anyhow::Error)
+        -> Result<Vec<Vec<u32>>> {
+        self.require_live(lane)?;
+        if let Some(round) = self.lanes.get_mut(lane) {
+            reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, seeds);
+        }
+        let total = DRAFT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::warn!(lane, requests = seeds.len(), total, error = %format!("{error:#}"),
+            "dSpark draft proposal failed; this lane round verifies anchors only");
+        Ok(anchor_inputs(seeds))
+    }
 }
 impl<'w, 'a> DraftRuntime<'w, 'a> {
     /// Inputs are (request identity, anchor, committed end, remaining output budget).
@@ -630,20 +693,19 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
     ) -> Result<Vec<Vec<u32>>> {
         ensure!(lane < self.lanes.len(), "invalid draft lane");
         ensure!(self.pending.iter().all(Option::is_none), "shared draft proposal still pending");
+        // W64-1: reset before the guards so a proposal that fails them cannot
+        // leave the previous round's width/counts/confidence behind.
+        reset_lane_draft(&mut self.lanes[lane], &mut self.confidence_trace, &mut self.neural_lengths, inputs);
         ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
             ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");
             ensure!(anchor < 129280 && remaining > 0, "invalid draft request input");
         }
-        for &(id, _, _, _) in inputs {
-            self.confidence_trace.remove(&id);
-        self.neural_lengths.remove(&id);
-        }
         let active: Vec<_> = inputs.iter().enumerate()
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
         let mut outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
-        if active.is_empty() { self.lanes[lane].width = 0; self.lanes[lane].drafted_requests = 0; return Ok(outputs); }
+        if active.is_empty() { return Ok(outputs); }
         let widths: Vec<_> = inputs.iter().map(|&(id, _, end, remaining)|
             (id, if end >= 2 { remaining.saturating_sub(1) } else { 0 })).collect();
         let width = self.apply_width(lane, 0, &widths)?;
@@ -651,7 +713,10 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
         let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
         let bindings: [Vec<_>; 3] = std::array::from_fn(|stage| active.iter()
             .map(|(_, (id, _, end, _))| (self.requests[id].leases[stage], *end)).collect());
-        self.chains[0].set_tokens(&tokens)?;
+        if let Err(error) = self.chains[0].set_tokens(&tokens) {
+            self.chains[0].note_failure(&error);
+            return Err(error);
+        }
         let mut rngs: Vec<_> = self.requests.iter_mut().filter_map(|(id, request)|
             active.iter().position(|(_, (active_id, _, _, _))| active_id == id)
                 .map(|index| (index, &mut request.rng))).collect();
@@ -661,9 +726,15 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
         let windows = self.windows.each_ref();
         let bindings = bindings.each_ref().map(|rows| rows.as_slice());
         if !self.chains[0].has_graph(count) {
-            unsafe { self.chains[0].capture(windows, bindings)?; }
+            if let Err(error) = unsafe { self.chains[0].capture(windows, bindings) } {
+                self.chains[0].note_failure(&error);
+                return Err(error);
+            }
         }
-        unsafe { self.chains[0].replay(windows, bindings)?; }
+        if let Err(error) = unsafe { self.chains[0].replay(windows, bindings) } {
+            self.chains[0].note_failure(&error);
+            return Err(error);
+        }
         let buffer = self.chains[0].draft_output()?[0];
         let mut bytes = vec![0; buffer.bytes];
         lib.copy_d2h(&mut bytes, buffer)?;
@@ -738,5 +809,91 @@ mod restored_prefix_tests {
         assert_eq!(tail_outcome(38, 20, 5), (32, 15, 14));
         assert_eq!(tail_outcome(38, 38, 5), (32, 32, 32));
         assert_eq!(tail_outcome(4, 4, 5), (0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod anchor_fallback_tests {
+    use super::*;
+    use crate::families::deepseek_v41::v41_experts::dspark::DraftFailure;
+    use crate::shared::draft::binding::LaneRound;
+    use cuteafd_core::{DraftCandidate, DraftPolicy, PolicySeed};
+
+    fn geometry() -> cuteafd_core::PolicyGeometry { policy::remote_geometry(5) }
+
+    fn seeds(ids: &[u64]) -> Vec<DraftSeed> {
+        ids.iter().enumerate().map(|(i, &id)| (id, 11 + i as u32, 5, 9)).collect()
+    }
+
+    /// A proposal that fails in its guards must not leave the previous round's
+    /// width, drafted-request count or confidence trace behind.
+    #[test]
+    fn reset_lane_draft_clears_the_previous_rounds_state() {
+        let mut lane = LaneRound::new(policy::LAYERS, policy::TOPK);
+        lane.width = 5;
+        lane.drafted_requests = 4;
+        let mut confidence = std::collections::BTreeMap::from([(1u64, vec![0.5f32; 5]), (2, vec![0.1; 5])]);
+        let mut neural = std::collections::BTreeMap::from([(1u64, 3usize), (2, 1)]);
+        reset_lane_draft(&mut lane, &mut confidence, &mut neural, &seeds(&[1, 2]));
+        assert_eq!((lane.width, lane.drafted_requests), (0, 0));
+        assert!(confidence.is_empty() && neural.is_empty());
+    }
+
+    /// The 4-then-2 interleaving: round N-1 drafted four requests, round N has
+    /// two and its proposal fails. Without the reset, `select_lengths` sees two
+    /// candidates against `drafted_requests = 4` and the policy aborts the
+    /// round; with the reset the anchor-only round is consistent and not aborted.
+    #[test]
+    fn a_four_then_two_interleaving_does_not_abort_the_round() {
+        let mut lane = LaneRound::new(policy::LAYERS, policy::TOPK);
+        lane.width = 5;
+        lane.drafted_requests = 4;
+        let mut confidence = std::collections::BTreeMap::new();
+        let mut neural = std::collections::BTreeMap::new();
+        let round = seeds(&[1, 2]);
+        let candidates: Vec<_> = round.iter().map(|&(id, ..)| DraftCandidate { id, confidence: &[] }).collect();
+        let mut policy = DraftPolicy::new(geometry(), PolicySeed::weak(7), false).unwrap();
+        // The stale state aborts: two candidates against four drafted requests.
+        assert!(policy.select_drafted_within(false, &candidates, lane.width, cuteafd_core::V41_VERIFY_ROWS,
+            lane.drafted_requests).is_err(), "the stale state must abort the round");
+        // The fallback reset makes the anchor-only round consistent.
+        reset_lane_draft(&mut lane, &mut confidence, &mut neural, &round);
+        assert!(policy.select_drafted_within(false, &candidates, lane.width, cuteafd_core::V41_VERIFY_ROWS,
+            lane.drafted_requests).is_ok(), "the reset round must not abort");
+    }
+
+    /// A failed proposal clears its pending marker so `release()` can free the
+    /// requests it held.
+    #[test]
+    fn a_failed_proposal_releases_its_requests() {
+        let round = seeds(&[1, 2]);
+        let mut pending: Vec<Option<(Vec<DraftSeed>, Instant)>> = vec![Some((round, Instant::now())), None];
+        assert!(pending_draft_blocks(&pending, 1), "a pending proposal blocks release");
+        assert!(clear_pending_draft(&mut pending, 0));
+        assert!(!pending_draft_blocks(&pending, 1), "the cleared proposal no longer blocks release");
+        assert!(!clear_pending_draft(&mut pending, 0), "clearing an empty lane is a no-op");
+    }
+
+    /// The fallback verifies each member's anchor alone, in input order.
+    #[test]
+    fn the_fallback_verifies_each_anchor_alone() {
+        let round = seeds(&[7, 8, 9]);
+        assert_eq!(anchor_inputs(&round), vec![vec![11], vec![12], vec![13]]);
+    }
+
+    /// A sticky CUDA/replay failure is terminal: `require_live` keeps failing
+    /// until restart instead of falling back to anchors forever, and a later
+    /// error does not replace the first terminal reason.
+    #[test]
+    fn a_sticky_draft_failure_is_terminal() {
+        let mut failure = DraftFailure::default();
+        assert!(failure.check("dSpark draft chain").is_ok());
+        failure.record(&anyhow::anyhow!(
+            "cuteafd_cuda_stream_query returned status 98: invalid device function"));
+        let error = failure.check("dSpark draft chain").unwrap_err();
+        assert!(error.to_string().contains("invalid device function"));
+        failure.record(&anyhow::anyhow!("another error"));
+        assert!(failure.check("dSpark draft chain").unwrap_err().to_string().contains("invalid device function"));
+        assert!(failure.is_failed());
     }
 }
