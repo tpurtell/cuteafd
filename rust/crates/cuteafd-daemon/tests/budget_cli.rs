@@ -362,7 +362,8 @@ fn installed_flash_exlr8_min_max_preserve_worker_budget_and_pending_refusal() {
             assert_eq!(deployment["family"], "glm5_flash");
             assert_eq!(deployment["exlr8"]["manifest"], "k4");
             assert_eq!(deployment["wip_launchable"], false);
-            assert_eq!(deployment["report"]["native_serving_admitted"], false);
+            assert_eq!(deployment["report"]["runtime"], "planned");
+            assert_eq!(deployment["report"]["placement_supported"], false);
             assert_eq!(deployment["spark_ranks"], ranks);
             let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
                 .filter(|device| device["kind"] == "spark").collect::<Vec<_>>();
