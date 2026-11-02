@@ -2266,6 +2266,7 @@ def main():
                         'log-prob rows of both arms for these cases over generated tokens START..END (e.g. code-2,code-5:70-90) '
                         'to <job>/lossless-rows/spec-lossless-rows-*/ with a manifest.json; needs --panels with spec_lossless_set')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
+    parser.add_argument('--sweep-prompts', choices=['shared', 'distinct-v1'], help='--levels workload: identical code prompts per wave, or distinct styles/topics (omitted: existing code with unique nonces)')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
     parser.add_argument('--sweep-tokens', type=int, metavar='N', help='output tokens per --levels decode request '
                         '(default 192); longer runs give profiled waves more decode steps at every width')
@@ -2386,6 +2387,8 @@ def main():
         parser.error('--prefill-repeat needs --prefill-lengths')
     if args.sweep_tokens is not None and not (args.levels and 1 <= args.sweep_tokens <= 8192):
         parser.error('--sweep-tokens needs --levels and 1..8192 tokens')
+    if args.sweep_prompts and not args.levels:
+        parser.error('--sweep-prompts needs --levels')
     levels = None
     if args.levels:
         levels = [int(x) for x in args.levels.split(',') if x.strip()]
@@ -2451,6 +2454,8 @@ def main():
                 card['prefill_repeat'] = True
         if levels:
             card['levels'] = levels
+            if args.sweep_prompts:
+                card['sweep_prompts'] = args.sweep_prompts
             if args.sweep_tokens is not None:
                 card['sweep_tokens'] = args.sweep_tokens
             if args.post_load_c1:
@@ -2585,6 +2590,7 @@ def main():
         (['prefill_repeat'] if args.prefill_repeat else []) + \
         (['prefill_purge'] if any(job['entry'].get('prefill_purge') for job in jobs) else []) + \
         (['sweep_tokens'] if args.sweep_tokens is not None else []) + \
+        (['sweep_prompts'] if args.sweep_prompts else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \
