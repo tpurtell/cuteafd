@@ -312,7 +312,7 @@ impl Family for KimiK3 {
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
     /// Header-native K6 core tensors are served natively; there is no BF16 fallback.
-    fn configure(&mut self, _options: &crate::plan::PlanOptions) -> Result<(), ConfigError> {
+    fn configure(&mut self) -> Result<(), ConfigError> {
         self.core.validate_runtime_groups(&self.cfg).map_err(ConfigError::from_anyhow)
     }
     fn native_serving_admission(&self) -> bool { true }

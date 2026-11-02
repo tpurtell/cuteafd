@@ -49,6 +49,67 @@ fn planner_timings_charge_metadata_once_and_preserve_reports() {
 }
 
 #[test]
+fn report_census_reuses_only_checkpoint_facts_across_options() {
+    let mut tensors = mimo_flash_tensors();
+    tensors.extend([
+        t("model.mtp.layers.0.enorm.weight", "BF16", &[128]),
+        t("visual.unknown.weight", "F16", &[2, 2]),
+        t("audio.unknown.weight", "F16", &[2, 2]),
+        t("unclassified.weight", "BF16", &[2]),
+    ]);
+    let dir = snapshot(mimo_flash_config(), &tensors);
+    for missing in [false, true] {
+        let make_input = || {
+            let mut checkpoint = Checkpoint::open(dir.path()).unwrap();
+            if missing {
+                checkpoint.weight_map.insert("model.mtp.layers.0.missing.weight".into(), "missing-draft.safetensors".into());
+                checkpoint.weight_map.insert("visual.missing.weight".into(), "missing-vision.safetensors".into());
+                checkpoint.missing_shards = vec!["missing-draft.safetensors".into(), "missing-vision.safetensors".into()];
+            }
+            PlanInput::from_checkpoint(checkpoint)
+        };
+        let input = make_input();
+        let mut census_address = None;
+        for (ranks, media, draft, reserve) in [
+            (4, MediaMode::Off, spec::DraftOwnership::None, 1024),
+            (0, MediaMode::Auto, spec::DraftOwnership::NativeMtp, 2048),
+            (3, MediaMode::Rtx(Some(0)), spec::DraftOwnership::None, 4096),
+            (4, MediaMode::Off, spec::DraftOwnership::NativeMtp, 1024),
+        ] {
+            let options = PlanOptions { vision: media, audio: media, draft_ownership: Some(draft),
+                mapped_scale_host_budget_bytes: Some(64 << 30), mapped_scale_preload_bytes: reserve,
+                layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                    host_cache_bytes: Some(0), pool_tokens: Some(4096), prefill_reserve_rows: Some(reserve),
+                    glm5_drafter_disabled: true, glmf_drafter_disabled: true, ..Default::default() }),
+                ..sparks(ranks) };
+            let expected = make_input().plan(&options).unwrap();
+            let actual = input.plan(&options).unwrap();
+            assert_eq!(serde_json::to_vec(&actual).unwrap(), serde_json::to_vec(&expected).unwrap(),
+                "missing={missing} ranks={ranks} media={media:?} draft={draft:?}");
+            assert_eq!(component(&actual, Component::Speculator).bytes == 0, !draft.uses_checkpoint());
+            assert!(!component(&actual, Component::Vision).rejections.is_empty());
+            assert_eq!(component(&actual, Component::Vision).status == Status::Disabled, media == MediaMode::Off);
+            assert_eq!(actual.unclassified, vec!["unclassified.weight"]);
+            let address = input.census.get().unwrap() as *const ReportCensus;
+            assert_eq!(*census_address.get_or_insert(address), address);
+            assert!(input.model.get().is_some() && input.modelopt.get().is_some()
+                && input.module_numerics.get().is_some());
+        }
+    }
+}
+
+#[test]
+fn invalid_option_does_not_initialize_checkpoint_census() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    assert!(input.plan(&PlanOptions { decode_lanes: Some(2), ..Default::default() }).is_err());
+    assert!(input.model.get().is_none() && input.census.get().is_none());
+    let expected = PlanInput::open(dir.path()).unwrap().plan(&sparks(4)).unwrap();
+    let actual = input.plan(&sparks(4)).unwrap();
+    assert_eq!(serde_json::to_vec(&actual).unwrap(), serde_json::to_vec(&expected).unwrap());
+}
+
+#[test]
 fn native_spark_resident_reuses_headers_without_reusing_placement_totals() {
     use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
     for v41 in [true, false] {

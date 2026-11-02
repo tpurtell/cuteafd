@@ -145,7 +145,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let (world, gpu_count, attention, mut resolved_layout) = native_options(selected, options, speculator)?;
     let checkpoint = input.checkpoint();
     let snapshot = &checkpoint.snapshot;
-    let mut report = super::empty_report(checkpoint, options)?;
+    let mut report = super::empty_report(input, options)?;
     super::layout::resolve_prefill(&mut report, &mut resolved_layout, world,
         super::families::glm::GLM5.prefill_limits())?;
     let layout = &resolved_layout;
