@@ -99,15 +99,6 @@ def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
     result = builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model", version="media1",
         arm=arm, probe=probe, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
     assert len(result["windows"]) == 8 and len(result["quick_windows"]) == 2
-    # Pin the original builder's complete legacy body, not two calls to the new path.
-    import ast
-    function = next(n for n in ast.parse(pathlib.Path(builder.__file__).read_text()).body
-                    if isinstance(n, ast.FunctionDef) and n.name == "build_vision_set")
-    function.args.kwonlyargs = function.args.kwonlyargs[:-2]
-    function.args.kw_defaults = function.args.kw_defaults[:-2]
-    del function.body[1]  # The sole new statement dispatches --vision-manifest.
-    assert hashlib.sha256(ast.dump(function, include_attributes=False).encode()).hexdigest() == (
-        "bfc3c3bebc7d46288ef4c83a9bdb862c559f744314e53671f8f0962622a1a1f6")
     assert builder.canonical(result) == builder.canonical(builder.build_vision_set(
         family="mimo_v2", model="model", checkpoint="model", version="media1", arm=arm,
         probe=probe, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64, vision_manifest=None))
@@ -136,6 +127,30 @@ def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
     with pytest.raises(ValueError, match="prepared image"):
         builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model", version="media1",
             arm=arm, probe=missing, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
+
+
+def test_legacy_vision_canonical_bytes_match_pre_manifest_builder(tmp_path):
+    import json
+    data = b"legacy fixture identity"
+    records = [{"id": f"image_{i}", "path": f"image_{i}.png",
+        "sha256": hashlib.sha256(data).hexdigest(), "kind": kind, "question": "Pinned question"}
+        for i, kind in enumerate(["code", "code", "terminal", "terminal", "chart", "chart", "diagram", "diagram"])]
+    for item in records:
+        (tmp_path / item["path"]).write_bytes(data)
+    (tmp_path / "fixtures.json").write_text(json.dumps({"schema": "cuteafd.media.fixtures/1",
+        "fixtures": records, "quick_windows": ["image_0", "image_1"]}, sort_keys=True))
+    def probe(body):
+        return {"probe": {"engine": "fake", "prompt_ids": [1] + [9] * 4 + [2],
+            "generated": [3] * 600, "media": [{"start": 1, "len": 4, "kind": "image",
+                "key": "a" * 64, "grid": [1, 4, 4]}]}, "server": {"model": "model", "family": "mimo_v2"}}
+    arm = {"checkpoint": "model", "head": "bf16", "activations": "bf16", "kv": "bf16",
+        "state": "bf16", "speculation": False, "prefix_cache": False}
+    builder = load_script("fidelity-set")
+    result = builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model",
+        version="legacy-contract", arm=arm, probe=probe, fixtures=tmp_path, tokenizer_sha256="c" * 64)
+    # Captured from c30634ea9's original eight-fixture builder on these exact inputs.
+    assert hashlib.sha256(builder.canonical(result)).hexdigest() == (
+        "ebd3ebeac6d05602032865e0c06a9f9e1cd6c4eb8391a719c8d45d11460ca854")
 
 
 @pytest.fixture
