@@ -47,6 +47,14 @@ fn published_flash_native_facts_match_resident_bridge_and_owned_mla() -> Result<
         .context("CUTEAFD_EXLR8_FLASH_SNAPSHOT required")?);
     let config: Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config)?;
+    let catalog = crate::families::deepseek_v41::v41_catalog::read_official_v41_catalog(&snapshot)?;
+    assert_eq!(catalog.experts.layers, cfg.layers);
+    assert_eq!(catalog.experts.first_layer, 3);
+    assert_eq!(catalog.experts.experts, cfg.experts);
+    assert_eq!(catalog.experts.topk, cfg.topk);
+    assert_eq!(catalog.experts.hidden, cfg.hidden);
+    assert_eq!(catalog.experts.intermediate, cfg.moe_intermediate);
+    assert_eq!((catalog.experts.draft_stages, catalog.experts.draft_experts), (0, 0));
     let metadata = MetadataInput::open(&snapshot, "k4")?;
     let records = DenseRecord::inventory(&snapshot)?;
     let routed = cfg.dense.iter().enumerate().filter_map(|(layer, &dense)| (!dense).then_some(layer)).collect::<Vec<_>>();
