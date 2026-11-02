@@ -157,7 +157,8 @@ fn plan_matrix(column: usize) {
             let page_rows = crate::families::muse_spark::cache::PAGE_ROWS;
             let pool_from_ledger = devices.iter().map(|device| {
                 let fixed: u64 = device.items.iter().filter(|item| item.group != "records").map(|item| item.bytes).sum();
-                (device.capacity_bytes - fixed) / (record_bytes * page_rows) * page_rows
+                let context = crate::placement::ArchContext::for_device("sm_120", device.capacity_bytes).context_bytes;
+                (device.capacity_bytes - context - fixed) / (record_bytes * page_rows) * page_rows
             }).min().unwrap().min(cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
             assert_eq!(memory.pool_tokens, pool_from_ledger, "pool first, derived from the exact ledger");
             if rtx == 2 { assert_eq!(memory.pool_tokens, 2 << 20); }
@@ -348,7 +349,8 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     assert_eq!(fixed(draft_device) - fixed(device), charged);
     let page_rows = crate::families::muse_spark::cache::PAGE_ROWS;
     let page_bytes = (cfg.kv_record_bytes() * cfg.full_layers()) as u64 * page_rows;
-    let available = device.capacity_bytes - fixed(device);
+    let context = crate::placement::ArchContext::for_device("sm_120", device.capacity_bytes).context_bytes;
+    let available = device.capacity_bytes - context - fixed(device);
     assert!(memory.pool_tokens < cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(memory.pool_tokens, available / page_bytes * page_rows);
     let displaced_pages = available / page_bytes - (available - charged) / page_bytes;
