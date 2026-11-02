@@ -28,6 +28,8 @@ pub struct Layout {
     pub capacity: u32,
     pub query_row: u32,
     pub fp8: bool,
+    pub nope_dim: u32,
+    pub query_dim: u32,
 }
 
 impl Layout {
@@ -63,10 +65,12 @@ impl Layout {
 
     fn pointer_contract(self) -> Vec<(&'static str, String, &'static str)> {
         let n = self.heads;
-        let query = if self.query_row == n * 576 {
-            format!("[rows,{n},576]")
+        let dim = self.query_dim;
+        let nope = self.nope_dim;
+        let query = if self.query_row == n * dim {
+            format!("[rows,{n},{dim}]")
         } else {
-            format!("[rows,{n},576] (rows {} apart)", self.query_row)
+            format!("[rows,{n},{dim}] (rows {} apart)", self.query_row)
         };
         let contract: Vec<(&str, String, &str)> = match self.kind {
             Kind::RankPack => vec![
@@ -112,7 +116,7 @@ impl Layout {
                             "bfloat16"
                         },
                         if absorb {
-                            format!("[{n},512,192]")
+                            format!("[{n},512,{nope}]")
                         } else {
                             format!("[{n},256,512]")
                         },
@@ -123,7 +127,7 @@ impl Layout {
                     v.push((
                         "float32",
                         if absorb {
-                            format!("[{n},512,3]")
+                            format!("[{n},512,{}]", nope / 64)
                         } else {
                             format!("[{n},256,8]")
                         },
@@ -147,10 +151,14 @@ impl Layout {
 }
 
 fn layout(spec: &ProgramSpec) -> Result<Layout> {
-    let (name, heads) = if let Some(name) = spec.name.strip_prefix("glm_stage_") {
-        (name, 64)
+    let (name, heads, flash) = if let Some(name) = spec.name.strip_prefix("glm_stage_") {
+        (name, 64, false)
     } else if let Some(name) = spec.name.strip_prefix("glm2_stage_") {
-        (name, 32)
+        (name, 32, false)
+    } else if let Some(name) = spec.name.strip_prefix("glmf_stage_") {
+        (name, 64, true)
+    } else if let Some(name) = spec.name.strip_prefix("glmf2_stage_") {
+        (name, 32, true)
     } else {
         return Err(invalid("unknown stage table"));
     };
@@ -158,9 +166,17 @@ fn layout(spec: &ProgramSpec) -> Result<Layout> {
         .rsplit_once("_m")
         .ok_or_else(|| invalid("missing capacity"))?;
     let capacity: u32 = cap.parse().map_err(|_| invalid("malformed capacity"))?;
-    if !matches!(capacity, 64 | 4096) || spec.capacity_rows != capacity {
+    if !(matches!(capacity, 64 | 4096) || (flash && capacity == 128))
+        || spec.capacity_rows != capacity
+    {
         return Err(invalid("capacity disagrees with stage table"));
     }
+    let name = if flash {
+        name.strip_suffix("_fp8")
+            .ok_or_else(|| invalid("Flash KV requires native FP8"))?
+    } else {
+        name
+    };
     let (name, context) = name
         .strip_suffix("_context")
         .map_or((name, false), |s| (s, true));
@@ -176,7 +192,8 @@ fn layout(spec: &ProgramSpec) -> Result<Layout> {
         _ => return Err(invalid("unknown primitive")),
     };
     let batched = matches!(kind, Kind::Absorb | Kind::Values);
-    if (bf16 && !batched)
+    if (flash && (!batched || bf16 || context))
+        || (bf16 && !batched)
         || (context && (heads != 32 || !matches!(kind, Kind::QueryRope | Kind::Absorb)))
     {
         return Err(invalid("unsupported weight/pitch specialization"));
@@ -185,8 +202,15 @@ fn layout(spec: &ProgramSpec) -> Result<Layout> {
         kind,
         heads,
         capacity,
-        query_row: heads * 576 * if context { 2 } else { 1 },
+        query_row: heads
+            * if flash {
+                512
+            } else {
+                576 * if context { 2 } else { 1 }
+            },
         fp8: batched && !bf16,
+        nope_dim: if flash { 256 } else { 192 },
+        query_dim: if flash { 512 } else { 576 },
     };
     let g = &spec.geometry;
     let stage = match kind {
@@ -201,8 +225,8 @@ fn layout(spec: &ProgramSpec) -> Result<Layout> {
             ("max_rows", capacity),
             ("heads", heads),
             ("index_heads", 32),
-            ("q_lora_rank", 2048),
-            ("record_bytes", 656),
+            ("q_lora_rank", if flash { 1536 } else { 2048 }),
+            ("record_bytes", if flash { 528 } else { 656 }),
             ("page_rows", 64),
             ("query_row", layout.query_row),
         ]
@@ -212,7 +236,7 @@ fn layout(spec: &ProgramSpec) -> Result<Layout> {
         || g["index_norm_eps"].as_f64() != Some(1e-6)
         || g["fp8_weights"].as_bool() != Some(layout.fp8)
         || (layout.fp8
-            && g["mode"].as_str() != Some(if capacity == 64 { "decode" } else { "prefill" }))
+            && g["mode"].as_str() != Some(if capacity <= 128 { "decode" } else { "prefill" }))
         || (!layout.fp8 && !g["mode"].is_null())
         || !spec
             .pointers
@@ -415,6 +439,8 @@ mod tests {
             capacity,
             query_row: heads * 576 * if context { 2 } else { 1 },
             fp8,
+            nope_dim: 192,
+            query_dim: 576,
         };
         let suffix = if context {
             "_context"
@@ -478,6 +504,66 @@ mod tests {
             }
         }
         assert_eq!(count, 32);
+    }
+
+    #[test]
+    fn flash_native_kv_uses_its_own_geometry() {
+        for heads in [32, 64] {
+            for capacity in [64, 128, 4096] {
+                for kind in [Kind::Absorb, Kind::Values] {
+                    let (mut spec, _) = fixture(kind, heads, 64, true, false);
+                    let stage = if kind == Kind::Absorb {
+                        "absorb"
+                    } else {
+                        "values"
+                    };
+                    spec.name = format!(
+                        "{}_stage_{stage}_fp8_m{capacity}",
+                        if heads == 64 { "glmf" } else { "glmf2" }
+                    );
+                    spec.capacity_rows = capacity;
+                    spec.geometry["max_rows"] = json!(capacity);
+                    spec.geometry["q_lora_rank"] = json!(1536);
+                    spec.geometry["record_bytes"] = json!(528);
+                    spec.geometry["query_row"] = json!(heads * 512);
+                    spec.geometry["mode"] =
+                        json!(if capacity <= 128 { "decode" } else { "prefill" });
+                    let l = Layout {
+                        kind,
+                        heads,
+                        capacity,
+                        query_row: heads * 512,
+                        fp8: true,
+                        nope_dim: 256,
+                        query_dim: 512,
+                    };
+                    let pointers: Vec<_> = l.pointers().iter().zip(l.pointer_contract())
+                        .map(|(name,(dtype,shape,role))| json!({"name":name,"dtype":dtype,"shape":shape,"role":role}))
+                        .collect();
+                    let entry =
+                        json!({"pointers":pointers,"scalars":[{"name":"rows","type":"int32"}]});
+                    assert_eq!(validate_entry(&spec, &entry).unwrap(), l);
+                    for (key, value) in [
+                        ("q_lora_rank", json!(2048)),
+                        ("query_row", json!(heads * 576)),
+                        ("record_bytes", json!(656)),
+                        ("fp8_weights", json!(false)),
+                    ] {
+                        let mut bad = spec.clone();
+                        bad.geometry[key] = value;
+                        assert!(validate_entry(&bad, &entry).is_err(), "{key}");
+                    }
+                    if kind == Kind::Absorb {
+                        let mut bad = entry.clone();
+                        bad["pointers"][1]["shape"] = json!(format!("[{heads},512,192]"));
+                        assert!(validate_entry(&spec, &bad).is_err());
+                        let mut bad = entry.clone();
+                        bad["pointers"][2]["shape"] = json!(format!("[{heads},512,3]"));
+                        assert!(validate_entry(&spec, &bad).is_err());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

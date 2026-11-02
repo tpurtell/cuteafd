@@ -192,7 +192,9 @@ def glm_stage_programs(g, decode_rows: int, prefill_rows: int):
 def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
     """Native trellis projection boundaries using the original Flash primitives."""
     from functools import partial
-    from b12x.integration.cuteafd.glmf_split import compile_glmf_kda_core_aot, compile_glmf_stage_aot
+    from b12x.integration.cuteafd.glmf_split import (
+        compile_glmf_kda_core_aot, compile_glmf_stage_aot,
+        compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot)
     out = []
     # Wide decode still selects the narrow stage for batches of at most 64 rows.
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
@@ -208,6 +210,16 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
             params = dict(stage="swiglu", max_rows=rows, inter=inter)
             out.append((f"swiglu_i{inter}_m{rows}", "swiglu_split", params,
                         partial(compile_glmf_stage_aot, g, **params)))
+    # Append native-weight seams without moving or changing the existing entries.
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows, decode=rows in decode_caps)
+        out.append((f"kda_projected_m{rows}", "kda_core", params,
+                    partial(compile_glmf_projected_kda_aot, g, **params)))
+        for stage in ("absorb", "values"):
+            params = dict(stage=stage, max_rows=rows,
+                          mode="decode" if rows in decode_caps else "prefill")
+            out.append((f"{stage}_fp8_m{rows}", "attention_stage", params,
+                        partial(compile_glmf_fp8_stage_aot, g, **params)))
     return out
 
 

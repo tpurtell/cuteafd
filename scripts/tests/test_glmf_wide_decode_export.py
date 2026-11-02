@@ -67,7 +67,7 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
     caps = decode_caps | {prefill_rows}
-    assert len(calls) == len(programs) == 6 * len(caps)
+    assert len(calls) == len(programs) == 9 * len(caps)
     for rows in caps:
         op, params, (module, compiler, args, kwargs) = calls[f"kda_core_m{rows}"]
         assert (op, module, compiler) == ("kda_core", "glmf_split", "compile_glmf_kda_core_aot")
@@ -78,6 +78,16 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
             assert op == "attention_stage"
             assert (module, compiler, args) == ("glmf_split", "compile_glmf_stage_aot", (geometry,))
             assert params == kwargs == {"stage": stage, "max_rows": rows}
+        op, params, (module, compiler, args, kwargs) = calls[f"kda_projected_m{rows}"]
+        assert (op, module, compiler, args) == (
+            "kda_core", "glmf_split", "compile_glmf_projected_kda_aot", (geometry,))
+        assert params == kwargs == {"max_rows": rows, "decode": rows in decode_caps}
+        for stage in ("absorb", "values"):
+            op, params, (module, compiler, args, kwargs) = calls[f"{stage}_fp8_m{rows}"]
+            assert (op, module, compiler, args) == (
+                "attention_stage", "glmf_split", "compile_glmf_fp8_stage_aot", (geometry,))
+            assert params == kwargs == {"stage": stage, "max_rows": rows,
+                                       "mode": "decode" if rows in decode_caps else "prefill"}
         for inter in intermediates:
             op, params, (_, compiler, args, kwargs) = calls[f"swiglu_i{inter}_m{rows}"]
             assert op == "swiglu_split"
@@ -85,12 +95,63 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
             assert params == kwargs == {"stage": "swiglu", "max_rows": rows, "inter": inter}
 
 
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("rows", [1, 17, 64, 129, 4096])
+@pytest.mark.parametrize("chunked", [0, 12345])
+def test_projected_kda_pack_aliases_admitted_body_scratch(heads, rows, chunked):
+    fork = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd"
+    align = lambda n: (n + 1023) // 1024 * 1024
+    d = heads * 128
+    g = types.SimpleNamespace(kda_width=d, kda_in_width=3*d+256+heads)
+    tree = ast.parse((fork / "glmf.py").read_text())
+    scratch = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "kda_scratch_bytes")
+    scratch.body = [n for n in scratch.body if not isinstance(n, ast.ImportFrom)]
+    scope = {"GLMFGeometry": object, "_align": align}
+    exec(compile(ast.Module(body=[scratch], type_ignores=[]), "kda_scratch", "exec"), scope)
+    admitted = scope["kda_scratch_bytes"](g, rows, chunked)
+    body = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Kda")
+    body = next(n for n in body.body if isinstance(n, ast.FunctionDef) and n.name == "body")
+    env = dict(self=types.SimpleNamespace(d=d, p=g.kda_in_width, chunked_bytes=chunked),
+               rows=rows, Int64=int, _align=align, _align_i64=align,
+               scratch=types.SimpleNamespace(toint=lambda: 0))
+    offsets = {"d", "m", "base", "fg_off", "qkv_off", "o_off", "y_off", "qscratch"}
+    for assignment in body.body:
+        if isinstance(assignment, ast.Assign):
+            names = {n.id for target in assignment.targets for n in ast.walk(target) if isinstance(n, ast.Name)}
+            if names & offsets:
+                exec(compile(ast.Module(body=[assignment], type_ignores=[]), "body_offsets", "exec"), env)
+    assert env["qscratch"] == admitted
+    intervals = [(0, rows*g.kda_in_width*2), (env["fg_off"], rows*2*d*2),
+                 (env["qkv_off"], rows*3*d*2), (env["o_off"], rows*d*2),
+                 (env["y_off"], rows*d*2), (env["y_off"]+align(rows*d*2), chunked)]
+    assert all(begin + size <= admitted for begin, size in intervals)
+    assert all(begin + size <= following for (begin, size), (following, _) in zip(intervals, intervals[1:]))
+    shared = ast.parse((fork / "kimi_split.py").read_text())
+    core = next(n for n in shared.body if isinstance(n, ast.ClassDef) and n.name == "_ProjectedKdaCore")
+    call = next(n for n in core.body if isinstance(n, ast.FunctionDef) and n.name == "__call__")
+    pack_env = dict(env, self=types.SimpleNamespace(p=g.kda_in_width),
+                    BFloat16=object, _ptr=lambda dtype, address: address)
+    for assignment in call.body:
+        if isinstance(assignment, ast.Assign):
+            exec(compile(ast.Module(body=[assignment], type_ignores=[]), "pack_offsets", "exec"), pack_env)
+    assert pack_env["base"] == 0 and pack_env["fg"] == env["fg_off"]
+    compiler = next(n for n in shared.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "compile_projected_kda_core_aot")
+    allocation = next(n for n in ast.walk(compiler) if isinstance(n, ast.Call)
+                      and isinstance(n.func, ast.Name) and n.func.id == "compile_program")
+    callback = next(kw.value for kw in allocation.keywords if kw.arg == "scratch")
+    builder = dict(scope, g=g, launch=types.SimpleNamespace(core=types.SimpleNamespace(chunked_bytes=chunked)))
+    assert eval(compile(ast.Expression(callback), "scratch_metadata", "eval"), builder)["scratch"](rows) == admitted
+    assert admitted == (align(rows*g.kda_in_width*2) + align(rows*2*d*2)
+                        + align(rows*3*d*2) + 2*align(rows*d*2) + align(chunked))
+
+
 def test_flash_wide_native_stages_preserve_narrow_catalog(exporter):
     narrow = exporter.glmf_stage_programs(GEOMETRY, 64, 4096)
     wide = exporter.glmf_stage_programs(GEOMETRY, 128, 4096)
     describe = lambda programs: {name: (op, params, thunk()) for name, op, params, thunk in programs}
     narrow, wide = describe(narrow), describe(wide)
-    assert len(narrow) == 12 and len(wide) == 18
+    assert len(narrow) == 18 and len(wide) == 27
     assert {name: wide[name] for name in narrow} == narrow
     assert all(name.endswith("_m128") for name in wide.keys() - narrow.keys())
     assert "g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)" in EXPORTER.read_text()

@@ -19,6 +19,26 @@ pub struct GlmfResidentRank {
     pub weights: u64,
 }
 
+/// Native EXLR8 allocations from the shared planner's already-owned target plans.
+/// Shared experts have separate format-level arenas; MTP never enters these plans.
+pub fn native_resident(selection: &crate::plan::exlr8::dense::DenseSelection, layers: usize,
+    plans: &[crate::plan::exlr8::dense::DensePlan], shared_bytes: &[u64])
+    -> anyhow::Result<Vec<GlmfResidentRank>> {
+    use crate::plan::exlr8::dense::resident_native;
+    anyhow::ensure!(matches!(plans.len(), 1 | 2) && plans.len() == shared_bytes.len(),
+        "Flash native resident owners must match one/two shared expert ranks");
+    plans.iter().zip(shared_bytes).enumerate().map(|(rank, (plan, &shared))| {
+        anyhow::ensure!(plan.world == plans.len() && plan.rank == rank,
+            "Flash native resident plan rank/world mismatch");
+        let mut resident = GlmfResidentRank { embedding: 0, weights: shared };
+        for (group, _, bytes) in resident_native(selection, layers, plan)? {
+            let total = if group == "embedding" { &mut resident.embedding } else { &mut resident.weights };
+            *total = total.checked_add(bytes).ok_or_else(|| anyhow::anyhow!("Flash native resident overflow"))?;
+        }
+        Ok(resident)
+    }).collect()
+}
+
 /// No tensor data is read. FP8 block scales and FP32 auxiliaries are counted as uploaded, not
 /// as the source checkpoint stores them. Routed experts, media and external drafts are separate.
 pub fn resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize, ranks: usize,
@@ -240,6 +260,63 @@ mod tests {
         assert_eq!(owned0[0].weights - owned1[0].weights, owned1[1].weights - owned0[1].weights);
         for (ranks, mode, first) in [(1, Layers, 0), (2, Context, 2), (0, Heads, 0)] {
             assert!(resident_weights_placed(&checkpoint, &cfg, 6, ranks, Default::default(), mode, first).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires published native Flash checkpoint headers; CPU only"]
+    fn published_native_residency_consumes_owned_plans_without_mtp_or_duplicate_vocabulary() {
+        use crate::plan::exlr8::{dense::{DensePlan, DenseRecord, DenseRole, DenseSelection}, residency::{ExpertSet, MetadataInput}};
+        use std::collections::BTreeMap;
+        let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_FLASH_SNAPSHOT").expect("Flash snapshot"));
+        let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json")).unwrap();
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let selection = DenseSelection::from_hf(&config).unwrap();
+        let records = DenseRecord::inventory(&snapshot).unwrap().into_iter().filter(|record|
+            selection.role(&record.tensor, cfg.layers).unwrap() != DenseRole::Excluded).collect::<Vec<_>>();
+        let metadata = MetadataInput::open(&snapshot, "k4").unwrap();
+        let routed = cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect::<Vec<_>>();
+        let costs = crate::plan::exlr8::routed_expert_costs(&metadata, &routed).unwrap();
+        assert_eq!(costs.len(), routed.len());
+        for (&layer, cost) in routed.iter().zip(&costs) {
+            assert_eq!(cost.whole.resident, metadata.plan(layer, 1, 0, ExpertSet::Routed).unwrap().resident_bytes as u64);
+            for rank in 0..2 {
+                assert_eq!(cost.half[rank].resident, metadata.plan(layer, 2, rank, ExpertSet::Routed).unwrap().resident_bytes as u64);
+                assert_eq!(cost.half[rank].staging, 0);
+            }
+            assert!(cost.tp2 && cost.spark_ok);
+        }
+        for invalid in [vec![0], vec![cfg.layers], vec![3, 3], vec![4, 3]] {
+            assert!(crate::plan::exlr8::routed_expert_costs(&metadata, &invalid).is_err());
+            assert!(crate::plan::exlr8::shared_expert_resident(&metadata, &invalid, 1).is_err());
+        }
+        assert!(crate::plan::exlr8::shared_expert_resident(&metadata, &routed, 0).is_err());
+        for world in [1, 2] {
+            // Owner facts come from outside admission. No Flash policy runs here.
+            for owners in [BTreeMap::new(), if world == 2 { cfg.attention.iter().enumerate()
+                .filter(|(_, kind)| **kind == GlmNextAttention::Mla).map(|(layer, _)| (layer, 1)).collect()
+                } else { BTreeMap::new() }] {
+                let plans = (0..world).map(|rank| DensePlan::for_rank_owned(&records, world, rank, &owners).unwrap())
+                    .collect::<Vec<_>>();
+                let layers = cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect::<Vec<_>>();
+                let shared = crate::plan::exlr8::shared_expert_resident(&metadata, &layers, world).unwrap();
+                for (rank, &bytes) in shared.iter().enumerate() {
+                    let expected = layers.iter().map(|&layer|
+                        metadata.plan(layer, world, rank, ExpertSet::Shared).unwrap().resident_bytes as u64).sum::<u64>();
+                    assert_eq!(bytes, expected);
+                }
+                let resident = native_resident(&selection, cfg.layers, &plans, &shared).unwrap();
+                for (rank, result) in resident.iter().enumerate() {
+                    assert_eq!(result.weights + result.embedding, plans[rank].resident_bytes as u64 + shared[rank]);
+                    assert!(!plans[rank].tensors.iter().any(|slice| slice.tensor.contains(&format!("layers.{}.", cfg.layers))));
+                    if rank == 0 { assert!(result.embedding > 0); } else { assert_eq!(result.embedding, 0); }
+                }
+                assert!(native_resident(&selection, cfg.layers, &plans, &[]).is_err());
+                let mut invalid = plans.clone(); invalid[0].rank = world;
+                assert!(native_resident(&selection, cfg.layers, &invalid, &shared).is_err());
+                invalid = plans.clone(); invalid[0].resident_bytes += 1;
+                assert!(native_resident(&selection, cfg.layers, &invalid, &shared).is_err());
+            }
         }
     }
 
