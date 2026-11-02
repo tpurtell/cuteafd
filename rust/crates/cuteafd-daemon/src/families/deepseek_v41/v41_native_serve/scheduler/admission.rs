@@ -8,6 +8,8 @@ pub(super) struct Prepared {
     pub job: NativeRequest,
     pub prompt: Vec<u32>,
     pub images: Vec<cuteafd_loader::V41ImageSpan>,
+    /// A pending-prefix wait is single-use, including for later donors.
+    pub prefix_deferred: bool,
 }
 impl Prepared {
     pub fn new(
@@ -33,6 +35,7 @@ impl Prepared {
             job,
             prompt,
             images,
+            prefix_deferred: false,
         })
     }
 }
