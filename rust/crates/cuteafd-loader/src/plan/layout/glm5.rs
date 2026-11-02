@@ -599,7 +599,7 @@ mod tests {
                 let plan_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: sparks },
                     layout: Some(options.clone()), ..Default::default() };
                 let exl3 = input.plan(&plan_options).unwrap();
-                let mut native = crate::plan::empty_report(input.checkpoint(), &plan_options).unwrap();
+                let mut native = crate::plan::empty_report(&input, &plan_options).unwrap();
                 let mut options = options;
                 let shape = crate::plan::layout::resolve_prefill(&mut native, &mut options, sparks,
                     crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5)).unwrap();
@@ -743,7 +743,7 @@ mod tests {
                     256 + device.capacity_bytes - device.used_bytes() + records - target_records + target_records / 8
                 }).collect();
                 let input = crate::plan::PlanInput::open(dir.path()).unwrap();
-                let report = crate::plan::empty_report(&checkpoint, &crate::plan::PlanOptions {
+                let report = crate::plan::empty_report(&input, &crate::plan::PlanOptions {
                     placement: crate::plan::ExpertPlacement::Sparks { ranks: sparks },
                     attention_placement: Some(if gpus == 2 { crate::placement::AttentionPlacement::Context }
                         else { crate::placement::AttentionPlacement::Heads }), ..Default::default()
