@@ -673,7 +673,8 @@ mod draft_prefix_tests {
             config: testing::glm5_flash_config(2), quantize_config: None,
             weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
         let model = crate::plan::families::glm::GLM5_FLASH.open(&checkpoint)?;
-        let mut report = empty_report(&checkpoint, &PlanOptions::default())?;
+        let input = crate::plan::PlanInput::from_checkpoint(checkpoint);
+        let mut report = empty_report(&input, &PlanOptions::default())?;
         let mut options = LayoutOptions { rtx_bytes: vec![96 << 30], prefill_rows: 2752,
             prefill_unit_rows: Some(2752), prefill_waves: 3, ..Default::default() };
         report.prefill_span_rows = Some(8256);
