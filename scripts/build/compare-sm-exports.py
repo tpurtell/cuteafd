@@ -104,7 +104,9 @@ def dense_geometry_jobs():
              for n in sorted({n for _, n, _ in trellis} - {shape[2] for shape in shapes["TRELLIS_SHAPES"]})]
     glue += ["fp8_row_k4096_n154880_s1", "fp8_row_embedding_k4096_n154880",
              "f32_narrow_pack_n1536_p2048", "f32_narrow_pack_n512_p2048",
-             "bf16_projection_k4096_n32", "bf16_projection_k4096_n288"]
+             "f32_narrow_pack_n128_p288", "f32_narrow_pack_n32_p288",
+             "bf16_projection_k4096_n32", "bf16_projection_k4096_n128",
+             "bf16_projection_k4096_n288"]
     return [(f"exlr8-dense-geometry-{label}", "export_b12x_dsv4_aot.py",
              ["--geometry", "exlr8_dense", "--only", ",".join(names),
               "--dense-trellis-families", "glm,glmf"])

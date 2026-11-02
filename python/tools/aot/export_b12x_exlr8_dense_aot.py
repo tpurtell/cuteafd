@@ -98,11 +98,11 @@ def additional_programs():
         params = dict(features=n, max_rows=4096)
         result.append((f"trellis_output_n{n}", "trellis_output", params,
                        partial(compile_trellis_output_aot, **params)))
-    for width, pitch in ((1536, 2048), (512, 2048)):
+    for width, pitch in ((1536, 2048), (512, 2048), (128, 288), (32, 288)):
         params = dict(width=width, pitch=pitch)
         result.append((f"f32_narrow_pack_n{width}_p{pitch}", "f32_narrow_pack", params,
                        partial(compile_f32_narrow_pack_aot, **params)))
-    for outputs in (32, 288):
+    for outputs in (32, 128, 288):
         params = dict(width=4096, outputs=outputs, output_dtype=torch.float32)
         result.append((f"bf16_projection_k4096_n{outputs}", "bf16_projection",
                        dict(width=4096, outputs=outputs, output_dtype="torch.float32"),
