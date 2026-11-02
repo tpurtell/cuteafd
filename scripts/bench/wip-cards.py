@@ -2290,6 +2290,7 @@ def main():
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--sweep-prompts', choices=['shared', 'distinct-v1'], help='--levels workload: identical code prompts per wave, or distinct styles/topics (omitted: existing code with unique nonces)')
     parser.add_argument('--sweep-c1-contexts', metavar='N,N', help='common C1 prose/code grid at corpus-reference contexts 0,42000,213000 (0 means short); needs --levels 1 --sweep-tokens 512')
+    parser.add_argument('--sweep-c1-styles', metavar='prose,code', help='limit C1 grid to these output styles (default prose,code); useful for a prose-only profile')
     parser.add_argument('--nsys-window', metavar='START:COUNT', help='print console decode-step markers for this per-request step range; needs --probe CARD:console')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
     parser.add_argument('--sweep-tokens', type=int, metavar='N', help='output tokens per --levels decode request '
@@ -2418,6 +2419,11 @@ def main():
         c1_contexts = [int(x) for x in args.sweep_c1_contexts.split(',') if x.strip()]
         if not c1_contexts or len(set(c1_contexts)) != len(c1_contexts) or not set(c1_contexts) <= {0, 42000, 213000} or args.levels != '1' or args.sweep_tokens != 512 or args.post_load_c1:
             parser.error('--sweep-c1-contexts needs distinct 0,42000,213000, --levels 1 --sweep-tokens 512 and no post-load')
+    c1_styles = None
+    if args.sweep_c1_styles:
+        c1_styles = args.sweep_c1_styles.split(',')
+        if c1_contexts is None or not c1_styles or len(set(c1_styles)) != len(c1_styles) or not set(c1_styles) <= {'prose', 'code'}:
+            parser.error('--sweep-c1-styles needs --sweep-c1-contexts and distinct prose/code')
     nsys_window = None
     if args.nsys_window:
         if not re.fullmatch(r'[0-9]+:[1-9][0-9]*', args.nsys_window):
@@ -2488,6 +2494,8 @@ def main():
                 card['prefill_repeat'] = True
         if c1_contexts is not None:
             card['sweep_c1_contexts'] = c1_contexts
+            if c1_styles is not None:
+                card['sweep_c1_styles'] = c1_styles
         if levels:
             card['levels'] = levels
             if args.sweep_prompts:
@@ -2632,6 +2640,7 @@ def main():
         (['sweep_tokens'] if args.sweep_tokens is not None else []) + \
         (['sweep_prompts'] if args.sweep_prompts else []) + \
         (['sweep_c1_contexts'] if c1_contexts is not None else []) + \
+        (['sweep_c1_styles'] if c1_styles is not None else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \

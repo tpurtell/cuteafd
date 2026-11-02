@@ -145,6 +145,8 @@ pub struct Entry {
     /// C1 prose/code grid at fixed corpus-reference contexts (0 means short).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_c1_contexts: Option<Vec<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_c1_styles: Option<Vec<String>>,
     /// `false` runs explicit panels without the server's baseline (basic card
     /// + quick quality); default true. Needs a server build that honours it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -485,6 +487,7 @@ impl Entry {
             sweep_tokens: self.sweep_tokens.or(defaults.sweep_tokens),
             sweep_prompts: self.sweep_prompts.or(defaults.sweep_prompts),
             sweep_c1_contexts: self.sweep_c1_contexts.clone().or_else(|| defaults.sweep_c1_contexts.clone()),
+            sweep_c1_styles: self.sweep_c1_styles.clone().or_else(|| defaults.sweep_c1_styles.clone()),
             baseline: self.baseline.or(defaults.baseline),
             window: self.window.clone().or_else(|| defaults.window.clone()),
             lossless_set: self.lossless_set.clone().or_else(|| defaults.lossless_set.clone()),
@@ -912,6 +915,10 @@ fn save_state(path: &Path, state: &BTreeMap<String, Outcome>) -> Result<()> {
 
 /// `post_load_c1` runs after the widest level; `post_load_repeat` replays the levels C1.
 fn check_post_load(entry: &Entry) -> Result<()> {
+    if let Some(styles) = &entry.sweep_c1_styles {
+        anyhow::ensure!(entry.sweep_c1_contexts.is_some() && !styles.is_empty()
+            && styles.iter().all(|s| s == "prose" || s == "code"), "C1 styles need contexts and prose/code");
+    }
     if let Some(contexts) = &entry.sweep_c1_contexts {
         anyhow::ensure!(!contexts.is_empty() && contexts.iter().all(|n| [0, 42000, 213000].contains(n))
             && entry.levels.as_deref() == Some(&[1]) && entry.sweep_tokens == Some(512)
@@ -1004,11 +1011,11 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_purge={} sweep_tokens={} sweep_prompts={:?} sweep_c1_contexts={:?} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_purge={} sweep_tokens={} sweep_prompts={:?} sweep_c1_contexts={:?} sweep_c1_styles={:?} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.prefill_repeat.unwrap_or(false), e.prefill_purge.is_some(),
-                e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.sweep_prompts.unwrap_or_default(), e.sweep_c1_contexts, e.baseline.unwrap_or(true), e.window.is_some(),
+                e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.sweep_prompts.unwrap_or_default(), e.sweep_c1_contexts, e.sweep_c1_styles, e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), e.fabric.unwrap_or(true),
                 WORKER_STOP, e.set);
         }
@@ -1410,10 +1417,12 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 .map(|hook| move || window_hook("prefill-purge", hook, purge_url, purge_config));
             let prefill = crate::sweep::PrefillOptions { repeat: entry.prefill_repeat.unwrap_or(false),
                 purge: purge.as_ref().map(|purge| purge as &dyn Fn() -> Result<()>) };
+            let styles: Vec<usize> = entry.sweep_c1_styles.as_ref().map_or_else(|| vec![1, 0],
+                |styles| styles.iter().map(|s| usize::from(s == "prose")).collect());
             let sweep = crate::sweep::run_configured(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
                 entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]),
                 &prefill, entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS),
-                entry.sweep_prompts.unwrap_or_default(), entry.sweep_c1_contexts.as_deref().unwrap_or(&[]), open);
+                entry.sweep_prompts.unwrap_or_default(), entry.sweep_c1_contexts.as_deref().unwrap_or(&[]), &styles, open);
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;
             closed?;

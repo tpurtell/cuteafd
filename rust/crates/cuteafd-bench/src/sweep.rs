@@ -363,13 +363,13 @@ pub fn run_selected(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
     post_load_repeat: bool, prefill_lengths: &[u64], prefill_options: &PrefillOptions, fabric: bool, tokens: u64,
     set: PromptSet, on_timed: OnTimed) -> Result<Sweep> {
     run_configured(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths, prefill_options,
-        fabric, tokens, set, &[], on_timed)
+        fabric, tokens, set, &[], &[1, 0], on_timed)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
     post_load_repeat: bool, prefill_lengths: &[u64], prefill_options: &PrefillOptions, fabric: bool, tokens: u64,
-    set: PromptSet, c1_contexts: &[u64], mut on_timed: OnTimed) -> Result<Sweep> {
+    set: PromptSet, c1_contexts: &[u64], c1_styles: &[usize], mut on_timed: OnTimed) -> Result<Sweep> {
     anyhow::ensure!(c1_contexts.is_empty() || (levels == [1] && tokens == 512 && !post_load_c1),
         "C1 contexts require levels=[1], 512 output tokens, and no post-load repeat");
     if !(1..=MAX_TOKENS).contains(&tokens) {
@@ -393,7 +393,8 @@ pub fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_l
     let mut c1_prompts = None;
     for &context in c1_contexts {
         anyhow::ensure!([0, 42_000, 213_000].contains(&context), "C1 context must be 0, 42000 or 213000");
-        for style in [1, 0] {
+        anyhow::ensure!(!c1_styles.is_empty() && c1_styles.iter().all(|s| *s <= 1), "C1 styles are prose/code");
+        for &style in c1_styles {
             sweep.points.push(measure(&client, 1, "c1_context", None, tokens, set,
                 &mut on_timed, Some((context, style)))?.0);
         }

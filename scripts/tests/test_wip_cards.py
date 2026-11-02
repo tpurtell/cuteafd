@@ -1181,10 +1181,11 @@ def test_c1_context_grid_and_decode_markers(entry, tmp_path, monkeypatch):
     state = tmp_path / 'state'
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix',
         '--arm', 'a=b:s', '--state', str(state), '--panels', 'none', '--levels', '1', '--sweep-tokens', '512',
-        '--sweep-c1-contexts', '0,42000,213000', '--nsys-window', '1:2', '--probe', 'v41-min:console', '--dry-run'])
+        '--sweep-c1-contexts', '0,42000,213000', '--sweep-c1-styles', 'prose', '--nsys-window', '1:2', '--probe', 'v41-min:console', '--dry-run'])
     assert cards.main() == 0
     job = json.loads((state / 'plan.json').read_text())['jobs'][0]
     assert job['entry']['sweep_c1_contexts'] == [0, 42000, 213000]
+    assert job['entry']['sweep_c1_styles'] == ['prose']
     assert job['nsys_window'] == [1, 2]
     event = dict(e='round', lane=0, t0=10., t1=11., s={'verify': 900}, req=[[7, 5, 3, 2, 3]])
     steps = {}
