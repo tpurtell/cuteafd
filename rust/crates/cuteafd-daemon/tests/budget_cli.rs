@@ -391,23 +391,41 @@ capture_pending_native_exlr8_deployment(Path(sys.argv[2]))
     }
 }
 
-#[test]
-#[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
-fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_pending() {
+fn installed_flash_exlr8_automatic_tp2_plan(ranks: &str) -> serde_json::Value {
     let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_FLASH_SNAPSHOT")
         .expect("explicit Flash snapshot required"));
     let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
         .expect("explicit current exporter manifest required"));
     assert!(snapshot.join("config.json").is_file() && programs.is_file());
+    let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+        .arg(&snapshot).args(["--deployment", "--rtx", "2", "--spark-ranks", ranks,
+            "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
+            "--workspace-manifest"]).arg(&programs).env_remove("COORDINATOR_GPU_BUDGET_GIB")
+        .output().unwrap();
+    assert!(output.status.success(), "requested ranks={ranks}: {}", String::from_utf8_lossy(&output.stderr));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
+#[should_panic(expected = "https://github.com/tpurtell/cuteafd/issues/776: automatic zero-Spark pool must stop at 2M")]
+fn installed_flash_exlr8_automatic_zero_spark_pool_exact_2m_xfail_776() {
+    let deployment = installed_flash_exlr8_automatic_tp2_plan("0");
+    let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2);
+    for device in devices {
+        // Remove should_panic when #776 lands: an unexpected pass must demand that cleanup.
+        assert_eq!(device["kv_tokens"], 2_097_152,
+            "https://github.com/tpurtell/cuteafd/issues/776: automatic zero-Spark pool must stop at 2M");
+    }
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
+fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_pending() {
     // A requested Spark ceiling must not attach idle workers when all routed layers fit locally.
     for ranks in ["0", "6"] {
-        let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
-            .arg(&snapshot).args(["--deployment", "--rtx", "2", "--spark-ranks", ranks,
-                "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
-                "--workspace-manifest"]).arg(&programs).env_remove("COORDINATOR_GPU_BUDGET_GIB")
-            .output().unwrap();
-        assert!(output.status.success(), "requested ranks={ranks}: {}", String::from_utf8_lossy(&output.stderr));
-        let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let deployment = installed_flash_exlr8_automatic_tp2_plan(ranks);
         assert_eq!(deployment["family"], "glm5_flash");
         assert_eq!(deployment["exlr8"]["manifest"], "k4");
         assert_eq!(deployment["spark_ranks"], 0);
@@ -422,7 +440,8 @@ fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_pending() {
         for (rank, device) in devices.iter().enumerate() {
             assert_eq!(device["kind"], "rtx");
             assert_eq!(device["index"], rank);
-            assert!(device["kv_tokens"].as_u64().unwrap() >= 2_097_152);
+            // Explicit zero-Spark pool policy is covered by the exact-2M xfail above.
+            if ranks == "6" { assert_eq!(device["kv_tokens"], 2_097_152); }
             let items = device["items"].as_array().unwrap();
             let routed = items.iter().find(|item| item["group"] == "TP2 expert layer halves 3..45")
                 .expect("all 42 routed layer halves must be resident on each RTX");
