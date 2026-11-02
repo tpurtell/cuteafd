@@ -1,4 +1,4 @@
-//! Compact Flash index post-stage over native projected rows. Checkpoint weight
+//! Flash index post-stages over native projected rows. Checkpoint weight
 //! formats belong to the caller; normalization, pooling and replay stay unchanged.
 use super::programs::{Program, ProgramSpec, Programs, Scalar};
 use crate::CuteafdDeviceBuffer as Buffer;
@@ -6,9 +6,9 @@ use std::ffi::c_void;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
-    #[error("invalid projected compact index: {0}")]
+    #[error("invalid projected index: {0}")]
     Invalid(&'static str),
-    #[error("projected compact index program: {0}")]
+    #[error("projected index program: {0}")]
     Program(#[from] anyhow::Error),
 }
 type Result<T> = std::result::Result<T, IndexError>;
@@ -257,31 +257,224 @@ impl Layout {
             (b.scratch, self.scratch),
         ];
         let alignments = [16, 16, 8, 8, 4, 4, 16, 16, 16, 16, 16, 16, 16, 16, 16];
-        let device = items[0].0.device_id;
-        if device < 0
-            || items.iter().zip(alignments).any(|((b, n), alignment)| {
-                b.ptr.is_null()
-                    || b.bytes < *n
-                    || b.flags != 0
-                    || b.device_id != device
-                    || b.ptr as usize % alignment != 0
-                    || *n > isize::MAX as usize
-                    || (b.ptr as usize).checked_add(*n).is_none()
-            })
-        {
-            return Err(IndexError::Invalid("buffer extent/alignment/device"));
-        }
-        for i in [9, 10, 11, 12, 13, 14] {
-            let (a, na) = items[i];
-            if items.iter().enumerate().any(|(j, (b, nb))| {
-                i != j
-                    && (a.ptr as usize) < b.ptr as usize + nb
-                    && (b.ptr as usize) < a.ptr as usize + na
-            }) {
-                return Err(IndexError::Invalid("overlapping writable operands"));
-            }
-        }
+        validate_buffers(&items, &alignments, &[9, 10, 11, 12, 13, 14])?;
         Ok(items)
+    }
+}
+
+fn validate_buffers<const N: usize>(
+    items: &[(Buffer, usize); N],
+    alignments: &[usize; N],
+    writable: &[usize],
+) -> Result<()> {
+    let device = items[0].0.device_id;
+    if device < 0
+        || items.iter().zip(alignments).any(|((b, n), alignment)| {
+            b.ptr.is_null()
+                || b.bytes < *n
+                || b.flags != 0
+                || b.device_id != device
+                || b.ptr as usize % alignment != 0
+                || *n > isize::MAX as usize
+                || (b.ptr as usize).checked_add(*n).is_none()
+        })
+    {
+        return Err(IndexError::Invalid("buffer extent/alignment/device"));
+    }
+    for &i in writable {
+        let (a, na) = items[i];
+        if items.iter().enumerate().any(|(j, (b, nb))| {
+            i != j
+                && (a.ptr as usize) < b.ptr as usize + nb
+                && (b.ptr as usize) < a.ptr as usize + na
+        }) {
+            return Err(IndexError::Invalid("overlapping writable operands"));
+        }
+    }
+    Ok(())
+}
+
+const KEY_POINTERS: &[&str] = &[
+    "iq",
+    "kw",
+    "slots",
+    "pool_slots",
+    "k_norm_w",
+    "k_norm_b",
+    "ape",
+    "token_keys",
+    "index_cache",
+    "q_fp8",
+    "head_weights",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeysLayout {
+    pub capacity: usize,
+}
+impl KeysLayout {
+    fn pointer_contract(self) -> [(&'static str, &'static str, &'static str); 11] {
+        [
+            ("bfloat16", "[rows,32,128]", "in"),
+            ("bfloat16", "[rows,288]", "in"),
+            ("int64", "[rows]", "in"),
+            ("int64", "[rows]", "in"),
+            ("bfloat16", "[128]", "in"),
+            ("bfloat16", "[128]", "in"),
+            ("bfloat16", "[4,128]", "in"),
+            ("bfloat16", "[record_slots,256]", "inout"),
+            ("uint8", "[pool_pages,8448]", "inout"),
+            ("float8_e4m3fn", "[rows,32,128]", "out"),
+            ("float32", "[rows,32]", "out"),
+        ]
+    }
+    pub fn token_bytes(self, slots: usize) -> Option<usize> {
+        slots.checked_mul(KEY_ROW_BYTES)
+    }
+    fn from_spec(spec: &ProgramSpec) -> Result<Self> {
+        let suffix = spec
+            .name
+            .strip_prefix("glmf_stage_index_projected_keys_m")
+            .or_else(|| spec.name.strip_prefix("glmf2_stage_index_projected_keys_m"))
+            .ok_or(IndexError::Invalid("unknown token-key table"))?;
+        let capacity = suffix
+            .parse()
+            .map_err(|_| IndexError::Invalid("capacity"))?;
+        let g = &spec.geometry;
+        if !matches!(capacity, 64 | 128 | 4096)
+            || spec.capacity_rows as usize != capacity
+            || [
+                ("hidden", 4096),
+                ("index_heads", HEADS),
+                ("index_head_dim", 128),
+                ("index_kpool", 4),
+                ("page_rows", 64),
+                ("max_rows", capacity),
+                ("token_key_row_bytes", KEY_ROW_BYTES),
+            ]
+            .iter()
+            .any(|&(key, value)| g[key].as_u64() != Some(value as u64))
+            || g["index_norm_eps"].as_f64() != Some(1e-6)
+            || g["projected_inputs"].as_bool() != Some(true)
+            || spec.scalar_kinds != b"i"
+            || !spec.scratch.is_empty()
+            || spec
+                .pointers
+                .iter()
+                .map(String::as_str)
+                .ne(KEY_POINTERS.iter().copied())
+        {
+            return Err(IndexError::Invalid("token-key geometry, arithmetic or ABI"));
+        }
+        Ok(Self { capacity })
+    }
+    fn operands(self, w: Weights, b: KeysBatch) -> Result<[(Buffer, usize); 11]> {
+        if b.rows == 0 || b.rows > self.capacity || b.record_slots == 0 || b.pool_pages == 0 {
+            return Err(IndexError::Invalid("token-key batch geometry"));
+        }
+        let items = [
+            (b.query, b.rows * HEADS * 128 * 2),
+            (b.packed, b.rows * (256 + HEADS) * 2),
+            (b.slots, b.rows * 8),
+            (b.pool_slots, b.rows * 8),
+            (w.norm, 256),
+            (w.bias, 256),
+            (w.ape, 1024),
+            (
+                b.token_keys,
+                self.token_bytes(b.record_slots)
+                    .ok_or(IndexError::Invalid("token-key overflow"))?,
+            ),
+            (
+                b.cache,
+                b.pool_pages
+                    .checked_mul(PAGE_BYTES)
+                    .ok_or(IndexError::Invalid("cache overflow"))?,
+            ),
+            (b.query_fp8, b.rows * HEADS * 128),
+            (b.head_weights, b.rows * HEADS * 4),
+        ];
+        validate_buffers(
+            &items,
+            &[16, 16, 8, 8, 16, 16, 16, 16, 16, 16, 16],
+            &[7, 8, 9, 10],
+        )?;
+        Ok(items)
+    }
+}
+
+pub fn validate_keys_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<KeysLayout> {
+    let layout = KeysLayout::from_spec(spec)?;
+    let scalars = entry["scalars"]
+        .as_array()
+        .ok_or(IndexError::Invalid("scalar metadata"))?;
+    let pointers = entry["pointers"]
+        .as_array()
+        .ok_or(IndexError::Invalid("pointer metadata"))?;
+    if entry["op"] != "index_producer"
+        || scalars.len() != 1
+        || scalars[0]["name"] != "rows"
+        || scalars[0]["type"] != "int32"
+        || pointers.len() != KEY_POINTERS.len()
+        || pointers
+            .iter()
+            .zip(KEY_POINTERS)
+            .zip(layout.pointer_contract())
+            .any(|((p, name), (dtype, shape, role))| {
+                p["name"] != *name
+                    || p["dtype"] != dtype
+                    || p["shape"] != shape
+                    || p["role"] != role
+            })
+    {
+        return Err(IndexError::Invalid("token-key exported ABI"));
+    }
+    Ok(layout)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KeysBatch {
+    pub rows: usize,
+    pub record_slots: usize,
+    pub pool_pages: usize,
+    pub query: Buffer,
+    pub packed: Buffer,
+    pub slots: Buffer,
+    pub pool_slots: Buffer,
+    pub token_keys: Buffer,
+    pub cache: Buffer,
+    pub query_fp8: Buffer,
+    pub head_weights: Buffer,
+}
+pub struct ProjectedKeys<'a> {
+    program: Program<'a>,
+    pub layout: KeysLayout,
+}
+impl<'a> ProjectedKeys<'a> {
+    pub fn bind(programs: &'a Programs<'a>, name: &str) -> Result<Self> {
+        let layout = KeysLayout::from_spec(programs.spec(name)?)?;
+        Ok(Self {
+            program: programs.program(name, KEY_POINTERS)?,
+            layout,
+        })
+    }
+    /// # Safety
+    /// Nonnegative slots must address admitted token records. A completed pool
+    /// reads four contiguous records ending at slots[row], all initialized before
+    /// this launch. Pool slots address admitted pages; negative slots skip writes.
+    /// Retain all buffers and the stream until queued work and graph use complete.
+    pub unsafe fn launch(&self, w: Weights, b: KeysBatch, stream: *mut c_void) -> Result<()> {
+        let items = self.layout.operands(w, b)?;
+        // SAFETY: extents, device and writable aliases are checked; device slot
+        // values and graph/stream lifetimes are the caller's contract.
+        unsafe {
+            self.program.launch(
+                &items.map(|(buffer, _)| buffer.ptr),
+                &[Scalar::I32(b.rows as i32)],
+                stream,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -312,6 +505,119 @@ mod tests {
             json!({"op":"index_producer","pointers":pointers,"scalars":[
             {"name":"rows","type":"int32"},{"name":"spec","type":"int32"}]}),
         )
+    }
+    fn keys_fixture(prefix: &str, capacity: usize) -> (ProgramSpec, serde_json::Value) {
+        let layout = KeysLayout { capacity };
+        let spec = ProgramSpec {
+            name: format!("{prefix}_index_projected_keys_m{capacity}"),
+            capacity_rows: capacity as u32,
+            pointers: KEY_POINTERS.iter().map(|name| name.to_string()).collect(),
+            scalar_kinds: b"i".to_vec(),
+            scratch: Default::default(),
+            geometry: json!({"hidden":4096,"index_heads":32,"index_head_dim":128,"index_kpool":4,
+                "page_rows":64,"max_rows":capacity,"token_key_row_bytes":512,
+                "index_norm_eps":1e-6,"projected_inputs":true}),
+        };
+        let pointers: Vec<_> = KEY_POINTERS.iter().zip(layout.pointer_contract())
+            .map(|(name, (dtype, shape, role))| json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect();
+        (
+            spec,
+            json!({"op":"index_producer","pointers":pointers,"scalars":[{"name":"rows","type":"int32"}]}),
+        )
+    }
+    #[test]
+    fn token_keys_validate_replicated_geometry_and_reject_abi_drift() {
+        for prefix in ["glmf_stage", "glmf2_stage"] {
+            for capacity in [64, 128, 4096] {
+                let (spec, entry) = keys_fixture(prefix, capacity);
+                assert_eq!(
+                    validate_keys_entry(&spec, &entry).unwrap().capacity,
+                    capacity
+                );
+                for (field, value) in [
+                    ("index_heads", json!(16)),
+                    ("index_kpool", json!(8)),
+                    ("token_key_row_bytes", json!(256)),
+                    ("index_norm_eps", json!(1e-5)),
+                    ("projected_inputs", json!(false)),
+                ] {
+                    let mut bad = spec.clone();
+                    bad.geometry[field] = value;
+                    assert!(validate_keys_entry(&bad, &entry).is_err(), "{field}");
+                }
+                let mut bad = spec.clone();
+                bad.pointers.swap(2, 3);
+                assert!(validate_keys_entry(&bad, &entry).is_err());
+                let mut bad = spec.clone();
+                bad.scratch.insert("scratch".into(), 1024);
+                assert!(validate_keys_entry(&bad, &entry).is_err());
+                let mut bad = spec.clone();
+                bad.scalar_kinds.push(b'i');
+                assert!(validate_keys_entry(&bad, &entry).is_err());
+                for (field, value) in [
+                    ("dtype", "float32"),
+                    ("shape", "[record_slots,128]"),
+                    ("role", "in"),
+                ] {
+                    let mut bad = entry.clone();
+                    bad["pointers"][7][field] = json!(value);
+                    assert!(validate_keys_entry(&spec, &bad).is_err(), "{field}");
+                }
+                let mut bad = entry.clone();
+                bad["scalars"][0]["name"] = json!("spec");
+                assert!(validate_keys_entry(&spec, &bad).is_err());
+            }
+        }
+    }
+    #[test]
+    fn token_keys_check_extents_aliases_and_64bit_offsets() {
+        let (weights, compact) = buffers();
+        let mut batch = KeysBatch {
+            rows: 17,
+            record_slots: 128,
+            pool_pages: 4,
+            query: compact.query,
+            packed: compact.packed,
+            slots: compact.positions,
+            pool_slots: compact.pool_slots,
+            token_keys: compact.tails,
+            cache: compact.cache,
+            query_fp8: compact.query_fp8,
+            head_weights: compact.head_weights,
+        };
+        let layout = KeysLayout { capacity: 128 };
+        assert!(layout.operands(weights, batch).is_ok());
+        let mut bad = batch;
+        bad.token_keys.bytes = 1;
+        assert!(layout.operands(weights, bad).is_err());
+        let mut bad = batch;
+        bad.record_slots = usize::MAX;
+        assert!(layout.operands(weights, bad).is_err());
+        let mut bad = batch;
+        bad.pool_pages = usize::MAX;
+        assert!(layout.operands(weights, bad).is_err());
+        let mut bad = batch;
+        bad.rows = 129;
+        assert!(layout.operands(weights, bad).is_err());
+        let mut bad = batch;
+        bad.token_keys.ptr = batch.query.ptr;
+        assert!(layout.operands(weights, bad).is_err());
+        let mut bad = batch;
+        bad.slots.ptr = (batch.slots.ptr as usize + 4) as *mut c_void;
+        assert!(layout.operands(weights, bad).is_err());
+        let mut bad = batch;
+        bad.cache.device_id = 1;
+        assert!(layout.operands(weights, bad).is_err());
+        let mut bad = batch;
+        bad.token_keys.flags = 1;
+        assert!(layout.operands(weights, bad).is_err());
+        batch.record_slots = (i32::MAX as usize / KEY_ROW_BYTES) + 1;
+        batch.token_keys.ptr = 0x10_0000_0000usize as *mut c_void;
+        batch.token_keys.bytes = layout.token_bytes(batch.record_slots).unwrap();
+        assert!(batch.token_keys.bytes > i32::MAX as usize);
+        assert!(layout.operands(weights, batch).is_ok());
+        batch.token_keys.ptr = (usize::MAX - 15) as *mut c_void;
+        assert!(layout.operands(weights, batch).is_err());
     }
     #[test]
     fn tp_capacities_keep_replicated_index_geometry() {
@@ -374,7 +680,9 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             for entry in listing["programs"].as_array().unwrap() {
                 let name = entry["name"].as_str().unwrap();
-                if !name.contains("_index_projected_c_m") {
+                if !name.contains("_index_projected_c_m")
+                    && !name.contains("_index_projected_keys_m")
+                {
                     continue;
                 }
                 let spec = ProgramSpec {
@@ -403,16 +711,22 @@ mod tests {
                         .map(|(k, v)| (k.clone(), v.as_u64().unwrap()))
                         .collect(),
                 };
-                validate_entry(&spec, entry).unwrap_or_else(|e| panic!("{name}: {e}"));
+                if name.contains("_index_projected_keys_m") {
+                    validate_keys_entry(&spec, entry).unwrap_or_else(|e| panic!("{name}: {e}"));
+                } else {
+                    validate_entry(&spec, entry).unwrap_or_else(|e| panic!("{name}: {e}"));
+                }
                 assert!(checked.insert(name.to_owned()), "duplicate stage {name}");
             }
         }
         let expected = ["glmf_stage", "glmf2_stage"]
             .into_iter()
             .flat_map(|prefix| {
-                [64, 128, 4096]
-                    .into_iter()
-                    .map(move |rows| format!("{prefix}_index_projected_c_m{rows}"))
+                ["c", "keys"].into_iter().flat_map(move |kind| {
+                    [64, 128, 4096]
+                        .into_iter()
+                        .map(move |rows| format!("{prefix}_index_projected_{kind}_m{rows}"))
+                })
             })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(checked, expected);

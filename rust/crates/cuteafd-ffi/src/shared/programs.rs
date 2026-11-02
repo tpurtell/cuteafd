@@ -221,6 +221,9 @@ impl<'a> Programs<'a> {
             } else if name.starts_with("glmf_stage_index_projected_c_m")
                 || name.starts_with("glmf2_stage_index_projected_c_m") {
                 super::projected_index::validate_entry(spec, entry)?;
+            } else if name.starts_with("glmf_stage_index_projected_keys_m")
+                || name.starts_with("glmf2_stage_index_projected_keys_m") {
+                super::projected_index::validate_keys_entry(spec, entry)?;
             } else if (name.starts_with("glmf_stage_") || name.starts_with("glmf2_stage_"))
                 && (name.contains("_absorb_fp8_") || name.contains("_values_fp8_")) {
                 ensure!(entry["op"] == "attention_stage", "{name}: expected attention_stage");
