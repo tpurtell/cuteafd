@@ -383,7 +383,7 @@ mod tests {
                     "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
                         "dtype": "f16", "zero_on_create": false},
-                        "state": {"allocation": "state", "bytes": 16, "zero_on_create": true}}});
+                        "state": {"allocation": "state", "bytes": 16, "dtype": "torch.int32", "zero_on_create": true}}});
                 std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&manifest)?)?;
             }
         }

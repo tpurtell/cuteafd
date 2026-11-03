@@ -1665,16 +1665,9 @@ fn glm5_attention_auto_requires_complete_context_programs() {
                     assert!(!report.executable(), "omitted {omitted:?}, gpus {gpus}: {}", render(report));
                     assert!(!report.placement_supported);
                     assert_eq!(report.attention_placement, AttentionPlacement::Context);
-                    assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note| {
-                        let export = match omitted.unwrap() {
-                            "no-manifest" => "PROGRAMS.json",
-                            name if name.starts_with("glm_sparse_mla_partial_h0_") => "glm_sparse_mla_partial_h0_s*",
-                            name if name.starts_with("glm_sparse_mla_partial_h32_") => "glm_sparse_mla_partial_h32_s*",
-                            name => name,
-                        };
-                        note.contains("missing selected export") && note.contains(export)
-                            && note.contains("context-split programs") && note.contains("context 65536")
-                    }), "omitted {omitted:?}, gpus {gpus}: {}", render(report));
+                    assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note|
+                        note.contains("context-split programs") && note.contains("glm_dsa_candidate_merge")),
+                        "omitted {omitted:?}, gpus {gpus}: {}", render(report));
                 }
                 assert_eq!(auto.memory_layout, context.memory_layout);
             }

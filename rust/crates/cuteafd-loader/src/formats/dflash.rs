@@ -1009,7 +1009,7 @@ impl MlaDflashConfig {
         let program = self.program_layout(compiled_context)?;
         let cache = self.cache_layout(capacity.context_slots, compiled_context, cache_format)?;
         let paged_cache = self.paged_cache_layout(capacity.context_slots, compiled_context, target_pool_tokens, cache_format)?;
-        let weights = self.weight_layout(mode)?;
+        let mut weights = self.weight_layout(mode)?;
         let fp8 = mode == GlmDraftRepresentation::Fp8Only;
         let (h, inter, rows, seq) = (self.mla.hidden, self.intermediate,
             capacity.block_rows, capacity.max_batch_sequences);
@@ -1062,6 +1062,10 @@ impl MlaDflashConfig {
                 GlmDraftLinearShape { k: inter as u64, n: h as u64 },
             ];
             if shapes.iter().any(|s| s.k % 128 != 0 || s.n % 16 != 0) { return Err(invalid()); }
+            // The executor concatenates gate/up before packing; source headers
+            // alone undercount this transient when the MLP exceeds FC size.
+            weights.max_load_staging = shapes.iter().map(|s| s.k * s.n * 2)
+                .max().unwrap_or(0).max(weights.max_load_staging);
             let scratch_rows = tap_rows.max(rows);
             let bytes = shapes.iter().flat_map(|s| (0..=fp8_mode).map(move |m|
                 draft_fp8_scratch_bytes(scratch_rows as u64, s.k, s.n, sm_count as u64, m)))
