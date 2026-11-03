@@ -2,7 +2,14 @@
 use super::*;
 use crate::shared::prefill_pipeline::{FfnRoute, PrefillHooks, Unit, run_prefill_units};
 
-/// Normalized terminal rows, consumed in order through one bounded logits buffer.
+pub(super) fn logits_capacity(bytes: usize, vocabulary: usize) -> Result<usize> {
+    let row = vocabulary.checked_mul(std::mem::size_of::<f32>()).filter(|row| *row > 0)
+        .context("invalid logits row size")?;
+    ensure!(bytes >= row && bytes % row == 0, "invalid admitted logits storage");
+    Ok(bytes / row)
+}
+
+/// Normalized terminal rows, consumed in order through the admitted logits buffer.
 fn head_spans(total: usize, wanted: usize, capacity: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
     (total - wanted..total).step_by(capacity).map(move |start| start..(start + capacity).min(total))
 }
@@ -246,9 +253,8 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
                 ensure!(wanted == self.wanted, "device logits must lie in the last unit");
                 self.result = Some(e.device_logits(w, wanted, false));
             } else {
-                // Native K6 scoring consumes decode-sized tiles before reusing the
-                // head scratch and logits staging. Other heads keep their M geometry.
-                let capacity = if matches!(e.weights.head, GlmfHead::K6(_)) { DECODE_ROWS } else { wanted };
+                // Admission determines whether the head uses bounded tiles or its full M geometry.
+                let capacity = logits_capacity(w.logits.buffer.bytes, e.cfg.vocab_size)?;
                 for rows in head_spans(unit.rows.len(), wanted, capacity) {
                     e.logits(w, rows.end, rows.len(), false)?;
                     self.logits.extend(e.download(&w.logits, rows.len() * e.cfg.vocab_size * 4)?
@@ -278,8 +284,8 @@ impl<'a> GlmfEngine<'a> {
             self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
         }
         let total: usize = steps.iter().map(|(t, _)| t.positions.len()).sum();
-        ensure!(!device || !matches!(self.weights.head, GlmfHead::K6(_)) || logit_rows <= DECODE_ROWS,
-            "native K6 device prefill logits exceed admitted rows");
+        let capacity = logits_capacity(work[0].logits.buffer.bytes, self.cfg.vocab_size)?;
+        ensure!(!device || logit_rows <= capacity, "device prefill logits exceed admitted rows");
         ensure!(logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
             "prefill logits exceed admitted rows");
         let mut ranked = Vec::new();
@@ -367,6 +373,37 @@ mod tests {
         }
         assert_eq!(head_spans(4096, 129, 64).collect::<Vec<_>>(),
             vec![3967..4031, 4031..4095, 4095..4096]);
+    }
+
+    #[test]
+    fn scoring_tiles_follow_admitted_logits_storage() -> Result<()> {
+        use cuteafd_loader::families::glm5_flash::GlmNextAttention;
+        let cfg = GlmNextConfig { vocab_size: 154880, hidden: 4096, layers: 2,
+            attention: vec![GlmNextAttention::Kda, GlmNextAttention::Mla], dense: vec![false; 2],
+            dense_intermediate: 12288, experts: 288, topk: 8, moe_intermediate: 2048,
+            routed_scale: 2.5, swiglu_limit: 10.0, rms_norm_eps: 1e-5, hc_mult: 4,
+            kda_heads: 64, kda_head_dim: 128, heads: 64, q_lora_rank: 1536, kv_lora_rank: 512,
+            qk_nope_dim: 256, v_head_dim: 256, index_topk: 2048, index_kpool: 4, eos: vec![] };
+        for rows in [1, 63, 64, 65, 129, 4096] {
+            for full in [false, true] {
+                let shape = GlmfStepShape { lead: true, split: false, tp2_experts: false,
+                    local_experts: true, spark: false, partial_bytes: 2, output_shard: false,
+                    full_prefill_logits: full, table_pages: 32768, table_pool_pages: 8192 };
+                let bytes = glmf_temporary_bytes(&cfg, rows as u64, false, &shape,
+                    GlmfScratch { programs: 0, topk: 0 }).logits as usize;
+                let capacity = logits_capacity(bytes, cfg.vocab_size)?;
+                assert_eq!(capacity, if full { rows } else { rows.min(DECODE_ROWS) });
+                let spans = head_spans(rows, rows, capacity).collect::<Vec<_>>();
+                assert_eq!(spans.len() > 1, bytes < rows * cfg.vocab_size * 4);
+                assert!(spans.iter().all(|span| span.len() * cfg.vocab_size * 4 <= bytes));
+                assert_eq!(spans.into_iter().flatten().collect::<Vec<_>>(), (0..rows).collect::<Vec<_>>());
+            }
+        }
+        assert!(logits_capacity(0, cfg.vocab_size).is_err());
+        assert!(logits_capacity(cfg.vocab_size * 4 + 1, cfg.vocab_size).is_err());
+        assert!(logits_capacity(256, 0).is_err());
+        assert!(logits_capacity(256, usize::MAX).is_err());
+        Ok(())
     }
 
     #[test]

@@ -4409,6 +4409,9 @@ impl<'a> GlmfEngine<'a> {
     /// cores at every row count, or `--target-head exact`'s pedantic GEMM), or the FP8 head
     /// (--fp8-head) in 16-row spans for every row count.
     fn logits(&self, w: &Workspace<'_>, t: usize, logit_rows: usize, _decode: bool) -> Result<()> {
+        ensure!(logit_rows <= t && t <= w.rows, "head input exceeds admitted rows");
+        ensure!(logit_rows <= units::logits_capacity(w.logits.buffer.bytes, self.cfg.vocab_size)?,
+            "head logits exceed admitted storage");
         let h = self.cfg.hidden;
         // SAFETY: rows t - logit_rows.. of the normalized rows lie inside `w.x`.
         let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast::<c_void>();
