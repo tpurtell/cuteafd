@@ -60,6 +60,7 @@ fn plan(
     full: bool,
     native: bool,
     core: bool,
+    shared: Option<&cuteafd_loader::plan::exlr8::ExecutionWorkspace>,
 ) -> Result<ResolvedPlan> {
     let mut contract = Contract::fixed(
         128,
@@ -111,7 +112,7 @@ fn plan(
                 core: core
                     .then(|| core_layout(cfg, shape.rows as usize))
                     .transpose()?,
-                shared_workspace: None,
+                shared_workspace: shared.cloned(),
             }
             .components()?,
         );
@@ -430,6 +431,12 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             fixture.configure_memory(&library, device, 8 << 30)?;
         }
         let programs = library.programs()?;
+        let shared_manifest = crate::shared::experts::exlr8::owner_manifest(cuteafd_ffi::exlr8::KernelFamily::Glm);
+        let shared_layout = core.then(|| cuteafd_loader::plan::exlr8::shared_workspace_layout(
+            &shared_manifest, cuteafd_ffi::exlr8::KernelFamily::Glm)).transpose()?;
+        let shared_path = directory.path().join("shared-PROGRAMS.json");
+        std::fs::write(&shared_path, serde_json::to_vec(&shared_manifest)?)?;
+        let shared_programs;
         // Only metadata and real allocation constructors run; no numerical program launches.
         assert!(programs.spec("glm_index_producer_m64").is_ok());
         library.cuda_set_device(devices[0])?;
@@ -490,7 +497,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                 })
                 .collect::<Result<_>>()?;
         }
-        let expected = plan(&cfg, partitioned, owners, pages, shape, full, native, core)?;
+        let mut expected = plan(&cfg, partitioned, owners, pages, shape, full, native, core, shared_layout.as_ref())?;
         assert!(
             planner::reconcile(&expected, Phase::Warmup, &engine.target_buffer_receipts()?)
                 .is_err()
@@ -498,7 +505,24 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
         *engine.decode_workspace.borrow_mut() = Some(engine.workspace(DECODE_ROWS, true)?);
         let _ = engine.peer_workspaces(true, 1)?;
         engine.ensure_prefill_slots()?;
+        fixture.exlr8_programs(&library, false)?;
+        shared_programs = library.programs()?.with_manifest(&shared_path)?;
         if core {
+            use crate::shared::experts::exlr8::{NativeExperts, NativePlan, shared_residency};
+            use cuteafd_loader::plan::exlr8::residency::WeightLayout;
+            let family = cuteafd_ffi::exlr8::KernelFamily::Glm;
+            for (rank, &physical) in devices.iter().enumerate() {
+                let layouts = (cfg.first_moe_layer..cfg.layers)
+                    .map(|layer| shared_residency(family, layer, 2, rank)).collect::<Vec<_>>();
+                expected.facts.allocations.extend(WeightLayout::from_residencies(
+                    &format!("glm.experts.rank.{rank}.shared"), &layouts.iter().collect::<Vec<_>>(),
+                    WeightArenaTopology::PerLayer, Location::coordinator(rank as u8), Lifetime::RESIDENT)?.allocations);
+                engine.native_experts.push(crate::shared::peer_split::on_device(&library, physical, || {
+                    NativeExperts::load(&library, NativePlan::allocation_fixture(family, layouts,
+                        shared_layout.as_ref().unwrap().bytes))
+                })?);
+            }
+            expected.phases = planner::evaluate(&expected.facts, &expected.budgets)?;
             // Allocate through the production CoreScratch constructor; program binding is not
             // emulated. The retained workspaces expose the actual projection owners and views.
             for rank in 0..2 {
@@ -526,6 +550,16 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                 };
                 let decode = allocate(0)?;
                 let prefill = allocate(1)?;
+                let shared = shared_layout.as_ref().unwrap();
+                let shared_execution = || device.run(|| {
+                    let mut execution = crate::shared::experts::exlr8::Exlr8Execution::new_shared(
+                        &library, &shared_programs, cuteafd_ffi::exlr8::KernelFamily::Glm,
+                        DECODE_ROWS, shared.bytes)?;
+                    execution.seal_graph_storage()?;
+                    Ok(Rc::new(execution))
+                });
+                let shared_decode = shared_execution()?;
+                let shared_prefill = shared_execution()?;
                 let (decode_slot, prefill_slots) = if rank == 0 {
                     (&engine.decode_workspace, &engine.prefill_slots)
                 } else {
@@ -533,11 +567,26 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                     (&peer.decode_workspace, &peer.prefill_slots)
                 };
                 decode_slot.borrow_mut().as_mut().unwrap().core = Some(decode);
+                decode_slot.borrow_mut().as_mut().unwrap().native_shared = Some(shared_decode);
                 for slot in prefill_slots.borrow_mut().iter_mut() {
                     slot.core = Some(prefill.clone());
+                    slot.native_shared = Some(shared_prefill.clone());
                 }
             }
         }
+        if core {
+            engine.native_experts.swap(0, 1);
+            assert!(engine.expert_receipts().is_err(), "shared experts must follow engine rank order");
+            engine.native_experts.swap(0, 1);
+            let peer = engine.native_experts.pop().unwrap();
+            assert!(engine.expert_receipts().is_err(), "shared experts must cover all engine ranks");
+            engine.native_experts.push(peer);
+            engine.cfg.first_moe_layer += 1;
+            assert!(engine.expert_receipts().is_err(), "shared experts must match target layer inventory");
+            engine.cfg.first_moe_layer -= 1;
+        }
+        fixture.finish_ordered_uploads(&library)?;
+        library.release_sync_h2d_staging()?;
         // Emulate the actual warmup metadata writers without launching a numerical kernel.
         for rank in 0..2 {
             let decode = if rank == 0 {
@@ -570,6 +619,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
         let receipts = || -> Result<Vec<Receipt>> {
             let mut actual = engine.target_buffer_receipts()?;
             actual.extend(engine.target_hook_receipts()?);
+            actual.extend(engine.expert_receipts()?);
             Ok(actual)
         };
         let actual = receipts()?;
@@ -601,6 +651,14 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             engine.prefill_slots.borrow_mut()[1].core = Some(replacement);
             assert!(engine.target_hook_receipts().is_err());
             engine.prefill_slots.borrow_mut()[1].core = Some(original);
+            planner::reconcile(&expected, Phase::Warmup, &receipts()?)?;
+            let original = engine.prefill_slots.borrow()[1].native_shared.clone();
+            let replacement = device.run(|| crate::shared::experts::exlr8::Exlr8Execution::new_shared(
+                &library, &shared_programs, cuteafd_ffi::exlr8::KernelFamily::Glm,
+                DECODE_ROWS, shared_layout.as_ref().unwrap().bytes).map(Rc::new))?;
+            engine.prefill_slots.borrow_mut()[1].native_shared = Some(replacement);
+            assert!(engine.target_hook_receipts().is_err(), "shared hook slots must retain identical owners");
+            engine.prefill_slots.borrow_mut()[1].native_shared = original;
             planner::reconcile(&expected, Phase::Warmup, &receipts()?)?;
         }
         let mut wrong = actual.clone();

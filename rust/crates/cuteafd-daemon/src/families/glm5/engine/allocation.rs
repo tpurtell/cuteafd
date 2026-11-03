@@ -139,13 +139,10 @@ impl Census<'_> {
                 }
             }
             if let Some(native) = &w.native_shared {
-                actual.record(
-                    &format!("{kind}.native.shared"),
-                    native.allocation_buffer(),
-                    lifetime,
-                    Category::Workspace,
-                    "GLM target hooks",
-                )?;
+                let physical = self.devices.physical_device(self.rank)?;
+                actual.receipts.extend(native.workspace_receipts(
+                    &format!("{}.{kind}.native.shared", self.prefix),
+                    self.devices.location(physical)?, physical, lifetime)?);
             }
             if let Some(previous) = &shared {
                 ensure!(
@@ -377,6 +374,44 @@ impl GlmEngine<'_> {
         }
         if let Some(context) = &self.context {
             out.extend(context.allocation_receipts(self)?);
+        }
+        Ok(out)
+    }
+
+    /// Native shared weights and the optional routed pair, not complete family admission.
+    pub(crate) fn expert_receipts(&self) -> Result<Vec<Receipt>> {
+        let physical = self.census_physical_devices()?;
+        let devices = CoordinatorDevices::new(&physical)?;
+        ensure!(
+            self.native_experts.is_empty() || self.native_experts.len() == physical.len(),
+            "GLM shared expert rank inventory differs from engine"
+        );
+        let mut out = Vec::new();
+        for (rank, native) in self.native_experts.iter().enumerate() {
+            ensure!(
+                native.layers().eq(self.cfg.first_moe_layer..self.weights.layers.len()),
+                "GLM shared expert layers differ from target inventory"
+            );
+            let receipts = native.weight_receipts(
+                &format!("glm.experts.rank.{rank}.shared"), devices, Lifetime::RESIDENT,
+            )?;
+            ensure!(
+                receipts.iter().all(|r| r.allocation.location == Location::coordinator(rank as u8)),
+                "GLM shared expert owners differ from engine logical rank"
+            );
+            out.extend(receipts);
+        }
+        if let Some(pair) = &self.tp2 {
+            let end = self.cfg.first_moe_layer.checked_add(pair.layers.len())
+                .context("GLM routed inventory overflow")?;
+            ensure!(
+                pair.layers.iter().copied().eq(self.cfg.first_moe_layer..end)
+                    && pair.layers.iter().all(|&layer| {
+                        self.weights.layers.get(layer).is_some_and(|l| !l.dense)
+                    }),
+                "GLM routed expert layers differ from target inventory"
+            );
+            out.extend(pair.allocation_receipts("glm.experts.routed", devices, Lifetime::RESIDENT)?);
         }
         Ok(out)
     }

@@ -39,7 +39,12 @@ fn layouts() -> HookBuffers {
             retained_rows: 448,
             receive_suffix: 7,
         }),
-        shared_workspace: Some(4096),
+        shared_workspace: Some(crate::plan::exlr8::ExecutionWorkspace {
+            ranges: std::array::from_fn(|index| ((index + usize::from(index > 9)) * 256,
+                if index == 9 { 512 } else { 256 })),
+            bytes: 3072, rows: 64, top_k: 1, max_groups: 4, hidden: 128, units: 16,
+            unit_limit: 16, intermediate_bytes: 256, compact: false, unit_tables: false,
+        }),
     }
 }
 
@@ -164,7 +169,12 @@ fn native_hooks_name_physical_owners_and_k6_route_aliases_once() {
             .iter()
             .map(|s| s.bytes().unwrap() as u64)
             .sum::<u64>()
-        + 2 * 4096;
+        + 2 * hooks.shared_workspace.as_ref().unwrap().bytes as u64;
+    for kind in ["decode", "prefill"] {
+        assert_eq!(get(&format!("{kind}.native.shared.arena")).bytes, 3072);
+        assert_eq!(get(&format!("{kind}.native.shared.fc2")).view.as_ref().unwrap().backing,
+            format!("glm.target.gpu.1.{kind}.native.shared.arena"));
+    }
     let budget = Budget {
         id: "physical".into(),
         locations: vec![Location::coordinator(1)],
@@ -208,8 +218,21 @@ fn hook_facts_reject_empty_physical_owners_and_invalid_capacity() {
     hooks.maximum_pages = 0;
     assert!(hooks.components().is_err());
     hooks.maximum_pages = 16;
-    hooks.shared_workspace = Some(0);
-    assert!(hooks.components().is_err());
+    let shared = hooks.shared_workspace.clone().unwrap();
+    for defect in 0..6 {
+        let mut invalid = shared.clone();
+        match defect {
+            0 => invalid.bytes = 0,
+            1 => invalid.compact = true,
+            2 => invalid.unit_tables = true,
+            3 => invalid.top_k = 8,
+            4 => invalid.rows = 128,
+            5 => invalid.ranges[1].0 = 0,
+            _ => unreachable!(),
+        }
+        hooks.shared_workspace = Some(invalid);
+        assert!(hooks.components().is_err(), "shared defect {defect}");
+    }
     hooks.shared_workspace = None;
     hooks.native.as_mut().unwrap()[0].linear.table = 1;
     assert!(hooks.components().is_err());

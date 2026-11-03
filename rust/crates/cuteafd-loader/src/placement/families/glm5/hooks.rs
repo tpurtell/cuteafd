@@ -13,8 +13,8 @@ pub struct HookBuffers {
     pub maximum_pages: u64,
     pub native: Option<[ScratchLayout; 2]>,
     pub core: Option<CoreRankLayout>,
-    /// The selected shared-expert execution arena, retained once per hook.
-    pub shared_workspace: Option<u64>,
+    /// Manifest-derived shared execution owners and bindings, once per hook.
+    pub shared_workspace: Option<crate::plan::exlr8::ExecutionWorkspace>,
 }
 
 struct Builder {
@@ -173,14 +173,19 @@ impl HookBuffers {
                     }
                 }
             }
-            if let Some(bytes) = self.shared_workspace {
-                b.add(
-                    &format!("{kind}.native.shared"),
-                    bytes,
-                    workspace,
-                    Category::Workspace,
-                    None,
-                )?;
+            if let Some(layout) = &self.shared_workspace {
+                if layout.compact || layout.unit_tables || layout.top_k != 1
+                    || layout.rows != cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS {
+                    return Err(Refusal::InvalidFact("GLM shared hook execution geometry".into()));
+                }
+                let allocations = layout.allocations(&format!("{}.{kind}.native.shared", b.prefix),
+                    Location::coordinator(self.device), workspace)
+                    .map_err(|e| Refusal::InvalidFact(format!("GLM shared hook: {e}")))?;
+                for allocation in allocations {
+                    let bytes = allocation.bytes;
+                    b.out.push(Component::allocation(allocation, ByteCurve::fixed(bytes, self.maximum_pages),
+                        false, self.maximum_pages));
+                }
             }
         }
         if let Some(core) = &self.core {

@@ -29,7 +29,7 @@ impl ExecutionVariant {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExecutionWorkspace {
     pub ranges: [(usize, usize); 11],
     pub bytes: usize,
@@ -152,8 +152,8 @@ pub(super) fn program_spec(programs: &Value, name: &str) -> Result<ProgramSpec> 
         geometry: entry["geometry"].clone() })
 }
 
-/// Admit the shared expert from the same validated geometry and arena as runtime.
-pub fn shared_workspace(programs: &Value, family: KernelFamily) -> Result<u64> {
+/// Header-only shared execution layout, including direct graph-visible bindings.
+pub fn shared_workspace_layout(programs: &Value, family: KernelFamily) -> Result<ExecutionWorkspace> {
     let variant = ExecutionVariant::SharedDecode;
     let group_name = variant.group(family);
     let group = program_spec(programs, group_name)?;
@@ -164,8 +164,20 @@ pub fn shared_workspace(programs: &Value, family: KernelFamily) -> Result<u64> {
         "EXLR8 shared grouping hidden differs from compute family");
     let spec = program_spec(programs, variant.program(family, PrefillActivations::A16))?;
     let rows = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
-    Ok(u64::try_from(execution_workspace(&spec, rows, ExpertSet::Shared, variant,
-        family.geometry().units, PrefillActivations::A16)?.bytes)?)
+    let layout = execution_workspace(&spec, rows, ExpertSet::Shared, variant,
+        family.geometry().units, PrefillActivations::A16)?;
+    ensure!(group.geometry["top_k"] == spec.geometry["top_k"]
+        && group.geometry["max_groups"] == spec.geometry["max_groups"]
+        && group.capacity_rows == spec.capacity_rows
+        && cuteafd_ffi::exlr8::group_rows(&group)? == cuteafd_ffi::exlr8::group_rows(&spec)?
+        && group.geometry["input_row_bytes"].as_u64() == Some((layout.ranges[0].1 / rows) as u64),
+        "EXLR8 shared grouping and compute geometry differ");
+    Ok(layout)
+}
+
+/// Admit the shared expert from the same validated geometry and arena as runtime.
+pub fn shared_workspace(programs: &Value, family: KernelFamily) -> Result<u64> {
+    Ok(u64::try_from(shared_workspace_layout(programs, family)?.bytes)?)
 }
 
 /// The stream-serialized TP2 backend owns both decode variants, one prefill
@@ -320,10 +332,16 @@ mod tests {
         for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
             let manifest = shared_entries(family);
             let h = family.geometry().hidden;
+            let layout = shared_workspace_layout(&manifest, family).unwrap();
             let bytes = shared_workspace(&manifest, family).unwrap();
-            assert_eq!(bytes, execution_workspace_layout(64,64,16,h,1,4,
+            let (ranges, expected) = execution_workspace_layout(64,64,16,h,1,4,
                 4*16*2*h.div_ceil(1024)*16*128*4,4*16*16*128*2,4*16*h*4,
-                ExpertSet::Shared).unwrap().1 as u64);
+                ExpertSet::Shared).unwrap();
+            assert_eq!(bytes, expected as u64);
+            assert_eq!(layout.bytes, expected);
+            assert_eq!(layout.ranges, ranges);
+            assert_eq!(layout.allocations("test.shared", crate::placement::planner::Location::coordinator(0),
+                crate::placement::planner::Lifetime::RESIDENT).unwrap().len(), 14);
             for missing in 0..2 {
                 let mut invalid = manifest.clone();
                 invalid["programs"].as_array_mut().unwrap().remove(missing);

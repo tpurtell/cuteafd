@@ -19,7 +19,7 @@ pub mod residency;
 pub mod dense;
 pub mod native;
 mod workspace;
-pub use workspace::{execution_workspace, routed_workspace, shared_workspace, ExecutionVariant, ExecutionWorkspace};
+pub use workspace::{execution_workspace, routed_workspace, shared_workspace, shared_workspace_layout, ExecutionVariant, ExecutionWorkspace};
 
 /// Native selection is distinct from the ordinary GLM launch description.
 #[derive(Debug, Clone, Serialize)]
