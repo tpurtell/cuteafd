@@ -362,7 +362,68 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("cold_rows_identical", u64::from(verdict.cold_identical == Some(true)));
     check.status = verdict.status();
     check.summary = verdict.summary();
+    cache_continuation(run, check, minimum)?;
     Ok(())
+}
+
+/// Exercise a short fresh prefill immediately after a multi-unit prompt. Whole
+/// hits above only decode and cannot catch a leaked prefill staging-reuse flag.
+fn cache_continuation(run: &mut Run<'_>, check: &mut Check, minimum: usize) -> Result<()> {
+    let client = run.client;
+    let text = format!("[{}] Read these notes.\n\n{}", nonce(), corpus(73, CACHE_PROMPT_TOKENS));
+    let seed = probed(client, plain(client, &text, 1), ProbeSpec {
+        no_speculation: true, record_rows: 1, ..ProbeSpec::default() })?;
+    if !cache_coverage(check, "continuation seed", seed.prompt_ids.len(), minimum) { return Ok(()); }
+    let ids = cache_continuation_ids(&seed.prompt_ids)?;
+    let probe = |cold| ProbeSpec { cold, no_speculation: true, prompt_ids: Some(ids.clone()),
+        record_rows: 1, top_k: usize::MAX, ..ProbeSpec::default() };
+    let warm = probed(client, plain(client, "cache continuation", 1), probe(false))?;
+    let cold = probed(client, plain(client, "cache continuation", 1), probe(true))?;
+    let repeat = probed(client, plain(client, "cache continuation", 1), probe(true))?;
+    let fresh = warm.prompt_ids.len().saturating_sub(warm.cached_tokens);
+    let covered = warm.cached_tokens >= minimum && (1..512).contains(&fresh);
+    check.set("continuation_cached_tokens", warm.cached_tokens as u64);
+    check.set("continuation_fresh_tokens", fresh as u64);
+    check.set("continuation_covered", covered);
+    check.set("continuation_vs_cold", continuation_rows(&warm, &cold)?);
+    check.set("continuation_cold_noise", continuation_rows(&cold, &repeat)?);
+    if !covered {
+        check.summary.push_str(" · short fresh continuation path not covered");
+        if check.status == CheckStatus::Pass { check.status = CheckStatus::Info; }
+    }
+    Ok(())
+}
+
+fn cache_continuation_ids(prefix: &[u32]) -> Result<Vec<u32>> {
+    anyhow::ensure!(prefix.len() >= 128, "continuation seed is too short");
+    let mut ids = prefix.to_vec();
+    // Reuse input text ids, not generated output: both arms see the same input.
+    ids.extend_from_slice(&prefix[prefix.len() - 128..prefix.len() - 64]);
+    Ok(ids)
+}
+
+/// KL(cold || warm) from complete vocabulary log-probabilities, not a top-k
+/// approximation. Retain scalar evidence only; three full rows stay local.
+fn continuation_rows(warm: &ProbeRecord, cold: &ProbeRecord) -> Result<Value> {
+    anyhow::ensure!(warm.prompt_ids == cold.prompt_ids, "continuation prompts differ");
+    let at = cold.prompt_ids.len();
+    let a = warm.rows.iter().find(|row| row.position == at).context("warm continuation row missing")?;
+    let b = cold.rows.iter().find(|row| row.position == at).context("cold continuation row missing")?;
+    anyhow::ensure!(a.finite && b.finite && !a.top.is_empty() && a.top.len() == b.top.len(),
+        "continuation rows are incomplete or non-finite");
+    let values: std::collections::HashMap<_, _> = a.top.iter().copied().collect();
+    let mut kl = 0.0;
+    let mut mass = 0.0;
+    for &(token, lp) in &b.top {
+        let q = *values.get(&token).context("continuation vocabularies differ")?;
+        let p = f64::from(lp).exp();
+        mass += p;
+        if p > 0.0 { kl += p * (f64::from(lp) - f64::from(q)); }
+    }
+    anyhow::ensure!((mass - 1.0).abs() < 1e-4 && kl.is_finite(), "continuation row is not a full distribution");
+    Ok(json!({"rows": 1, "vocab": b.top.len(), "kl": kl.max(0.0),
+        "top1": u8::from(a.argmax == b.argmax), "warm_argmax": a.argmax,
+        "cold_argmax": b.argmax, "byte_identical": a.hash == b.hash}))
 }
 
 // Leave room for model/reference tokenizer differences above three 2752-row units.
@@ -863,6 +924,32 @@ pub fn describe(timing: &StreamTiming) -> String {
 mod tests {
     use super::*;
     use crate::report::Check;
+
+    #[test]
+    fn short_continuation_keeps_the_prefix_and_appends_only_input_text_ids() {
+        let prefix: Vec<_> = (0..10240).collect();
+        let ids = cache_continuation_ids(&prefix).unwrap();
+        assert_eq!(&ids[..prefix.len()], &prefix);
+        assert_eq!(&ids[prefix.len()..], &prefix[prefix.len() - 128..prefix.len() - 64]);
+        assert!(cache_continuation_ids(&[1; 127]).is_err());
+    }
+
+    #[test]
+    fn continuation_kl_distinguishes_gross_drift_from_cold_noise() {
+        use cuteafd_api::openai::probe::summarize;
+        let record = |logits: &[f32]| ProbeRecord { prompt_ids: vec![1, 2],
+            rows: vec![summarize(2, logits, usize::MAX, &[])], ..ProbeRecord::default() };
+        let cold = record(&[0.0, 6.0, -4.0]);
+        let noise = continuation_rows(&record(&[0.0001, 6.0, -4.0]), &cold).unwrap();
+        assert_eq!(noise["top1"], 1);
+        assert!(noise["kl"].as_f64().unwrap() < 1e-5);
+        let missing = continuation_rows(&record(&[6.0, 0.0, -4.0]), &cold).unwrap();
+        assert_eq!(missing["top1"], 0);
+        assert!(missing["kl"].as_f64().unwrap() > 5.0);
+        let mut incomplete = cold.clone();
+        incomplete.rows[0].top.truncate(1);
+        assert!(continuation_rows(&incomplete, &cold).is_err());
+    }
 
     #[test]
     fn cache_prompts_cover_three_largest_prefill_units() {
