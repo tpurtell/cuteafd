@@ -532,3 +532,17 @@ def test_no_literal_sixteen_request_admission_bound() -> None:
             if literal.search(text):
                 offenders.append(f"{path.relative_to(ROOT)}:{line}: {text.strip()}")
     assert not offenders, "\n".join(offenders)
+
+
+def test_v41_relaxed_acceptance_policy_reaches_the_final_coordinator_command() -> None:
+    matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
+    entry = next(entry for entry in matrix["entries"] if entry["family"] == "deepseek_v41")
+    selected = {**entry, "set": {**matrix["defaults"]["set"], **entry.get("set", {}),
+        "ALLOW_RELAXED_ACCEPTANCE": "off", "ACCEPTANCE_MIN_MIN_P": "0.9", "ACCEPTANCE_MAX_EPSILON": "0.05"}}
+    current = capture(ROOT, entry["name"], release_entry=selected)
+    coordinators = [parse_run(run["argv"]) for run in current["containers"] if run["host"] == "coordinator"]
+    assert len(coordinators) == 1
+    command = coordinators[0]["command"]
+    for flag, value in [("--allow-relaxed-acceptance", "false"),
+                        ("--acceptance-min-min-p", "0.9"), ("--acceptance-max-epsilon", "0.05")]:
+        assert command[command.index(flag) + 1] == value
