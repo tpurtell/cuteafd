@@ -135,6 +135,8 @@ pub(crate) fn measure(client: &Client, info: &ServerInfo, saved: Option<&Generat
             Some(ProbeSpec { cold: true, pair_exempt: true, prompt_ids: Some(prompt_ids.clone()),
                 record_rows: 1, ..ProbeSpec::default() }))?;
         let probe = chat.probe.context("generated match needs probe generated IDs")?;
+        ensure!(probe.error.is_none() && probe.engine.is_some(), "generated probe failed: {:?}", probe.error);
+        ensure!(probe.cold && probe.cached_tokens == 0, "generated continuation reused prefix cache");
         ensure!(probe.prompt_ids == prompt_ids && !probe.generated.is_empty(), "generated probe prompt/coverage differs");
         cases.push(GeneratedCase { id, prompt_ids, generated: probe.generated });
     }

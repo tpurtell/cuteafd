@@ -431,10 +431,13 @@ mod tests {
                 .map(|(_, value)| value.trim().parse().unwrap())).unwrap();
             let mut body = vec![0; length];
             socket.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["speculative_acceptance"], json!({"mode":"min_p", "min_p":0.3_f32}));
             socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 26\r\nConnection: close\r\n\r\nvision encoder unavailable").unwrap();
         });
-        let client = Client::new(&base, None, Arc::new(AtomicBool::new(false)));
-        let error = client.chat(json!({"messages": []}), None).unwrap_err();
+        let mut client = Client::new(&base, None, Arc::new(AtomicBool::new(false)));
+        client.configuration.speculative_acceptance = cuteafd_core::SpeculativeAcceptance::MinP { min_p: 0.3 };
+        let error = client.chat(json!({"messages": [], "temperature":0}), None).unwrap_err();
         server.join().unwrap();
         let upstream = error.downcast_ref::<UpstreamHttpError>().unwrap();
         assert_eq!(upstream.code, 503);
