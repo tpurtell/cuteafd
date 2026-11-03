@@ -324,7 +324,7 @@ def test_release_union_keeps_both_explicit_checkpoint_families(tmp_path, monkeyp
     entries = []
     for family, tag in [('glm5', 'glm'), ('glm5_flash', 'glmf')]:
         config = tag + '.config'
-        (tmp_path / config).write_text(f'FAMILY={family}\nEXLR8_MANIFEST=other\nSPARK_COUNT=1\nRTX_GPUS=1\n')
+        (tmp_path / config).write_text(f'FAMILY={family}\nMODEL_ID=fixture/{tag}\nEXLR8_MANIFEST=other\nSPARK_COUNT=1\nRTX_GPUS=1\n')
         entries.append(dict(name=tag, family=family, config=config, sparks=['a'], gpus=[0], set={}))
     matrix = tmp_path / 'matrix.json'
     matrix.write_text(json.dumps(dict(entries=entries)))

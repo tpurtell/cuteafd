@@ -120,6 +120,7 @@ def test_exlr8_coordinator_enables_dense_and_both_stage_geometries(tmp_path):
             'set(CUTEAFD_GLM_GEOMETRIES "glm;glm2")',
             f'set(CUTEAFD_ENABLE_GLM_AOT {"ON" if glm else "OFF"})',
             "set(CUTEAFD_ENABLE_EXLR8_AOT ON)",
+            "set(CUTEAFD_EXLR8_FAMILIES glm)",
             "add_custom_target(cuteafd_verify_sparkinfer_source)",
             f'include("{cmake}")',
             'file(WRITE "${CMAKE_BINARY_DIR}/scope.txt" "${CUTEAFD_PROGRAM_GEOMETRY}")',
