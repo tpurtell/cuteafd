@@ -10,7 +10,6 @@ fn family_geometry_uses_nested_flash_config_and_excludes_mtp() -> Result<()> {
     let mut invalid = flash.clone();
     invalid["text_config"]["n_routed_experts"] = serde_json::json!(256);
     assert!(family_geometry(&invalid).is_err());
-    assert!(AdapterPending::Flash.hint().what.contains("adapter is not wired"));
     Ok(())
 }
 

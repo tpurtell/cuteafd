@@ -223,7 +223,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             status: Status::Ready, rejected: 0, rejections: Vec::new() });
     }
     report.snapshot = snapshot.display().to_string();
-    let adapter_ready = family.id() == "glm5";
+    let execution = family.exlr8_execution().check(gpu_count, placement.onboard_layers > 0);
+    let adapter_ready = execution.is_ok();
     report.runtime = Some(if adapter_ready { RuntimeStatus::Serving } else { RuntimeStatus::Planned });
     report.native_serving_admitted = adapter_ready;
     report.placement_supported &= adapter_ready;
@@ -234,7 +235,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     if adapter_ready {
         report.hints.push(super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
             how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() });
-    } else { report.hints.push(native::AdapterPending::Flash.hint()); }
+    } else if let Err(error) = execution { report.hints.push(error.hint()); }
     report.placement = if selected_world == 0 { ExpertPlacement::Local }
         else { ExpertPlacement::Sparks { ranks: selected_world } };
     report.min_spark_ranks = Some(selected_world);
@@ -1335,7 +1336,6 @@ mod tests {
         let (world, _, _, flash) = native_options("k4", &options, "dflash2", "glm5_flash").unwrap();
         assert_eq!(world, 0);
         assert!(flash.force_gpu_embedding && !flash.glmf_drafter_disabled);
-        assert!(native::AdapterPending::Flash.hint().what.contains("not wired"));
     }
 
     #[test]

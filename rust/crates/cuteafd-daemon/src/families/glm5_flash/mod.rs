@@ -2000,12 +2000,19 @@ impl Opened {
             native::Admission::new(args, &self.cfg, layers, 1 + usize::from(split_device.is_some()),
                 attention, index_cache, &manifest)
         }).transpose()?;
-        if native_admission.is_some() && split_device.is_some() {
-            return Err(cuteafd_loader::plan::exlr8::native::AdapterPending::Flash.into());
+        if native_admission.is_some() {
+            use cuteafd_loader::plan::family::Family;
+            cuteafd_loader::plan::families::glm::GLM5_FLASH.exlr8_execution()
+                .check(1 + usize::from(split_device.is_some()), false)?;
         }
         let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
             split_device, automatic_context, prepared_draft.as_ref(), attention, native_admission.as_ref())?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
+        if native_admission.is_some() {
+            use cuteafd_loader::plan::family::Family;
+            cuteafd_loader::plan::families::glm::GLM5_FLASH.exlr8_execution()
+                .check(1 + usize::from(split_device.is_some()), placement.onboard_layers > 0)?;
+        }
         let attention = cuteafd_loader::placement::families::glm5_flash::placed_attention(attention, &placement);
         ensure!(placement.attention_placement == attention.mode,
             "GLM Flash admission placed {} attention, the engine serves {}",

@@ -1001,11 +1001,12 @@ def capture_native_exlr8_launch(snapshot: Path, deployment_path: Path, temporary
         assert int(worker[worker.index("--device-budget-bytes") + 1]) == devices[rank]["worker_budget_bytes"]
 
 
-def capture_pending_native_exlr8_deployment(deployment_path: Path) -> None:
-    """Inspect the actual launcher functions without bypassing pending adapter admission."""
+def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
+    """Inspect actual launcher validation for declared native coordinator worlds."""
     deployment = json.loads(deployment_path.read_text())
     assert deployment["family"] == "glm5_flash"
-    assert not deployment["executable"] and not deployment["wip_launchable"]
+    admitted = deployment["rtx_gpus"] == 1
+    assert deployment["wip_launchable"] == admitted
     source = (ROOT / "scripts/launch/run-family.sh").read_text()
     functions = []
     for name in ("release_spark_worker_budget", "release_validate_deployment"):
@@ -1024,9 +1025,12 @@ release_validate_deployment "$plan" glm5_flash
     devices = [device for device in deployment["memory_layout"]["devices"] if device["kind"] == "spark"]
     assert len(devices) == deployment["spark_ranks"]
     assert {device["worker_budget_bytes"] for device in devices} == {int(result.stdout.strip())}
-    assert result.returncode != 0
-    assert "GLM Flash EXLR8 native execution adapter is not wired" in result.stderr
-    assert "invalid deployment specification" in result.stderr
+    if admitted:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert "EXLR8 native dense execution is unsupported for 2 coordinator GPUs" in result.stderr
+        assert "invalid deployment specification" in result.stderr
 
 
 def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, temporary: Path) -> dict:

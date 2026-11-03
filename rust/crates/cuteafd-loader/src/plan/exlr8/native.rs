@@ -9,18 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 #[path = "native_tests.rs"]
 mod tests;
 
-#[derive(Debug, thiserror::Error)]
-pub enum AdapterPending {
-    #[error("GLM Flash EXLR8 native execution adapter is not wired")]
-    Flash,
-}
-impl AdapterPending {
-    pub fn hint(&self) -> crate::plan::Hint {
-        crate::plan::Hint { what: self.to_string(),
-            how: "Native memory fit is inspectable; serving admission remains disabled until the Flash adapter is wired and gated.".into() }
-    }
-}
-
 pub fn family_geometry(config: &Value) -> Result<(usize, usize, KernelFamily)> {
     let text = config.get("text_config").unwrap_or(config);
     match text["model_type"].as_str() {

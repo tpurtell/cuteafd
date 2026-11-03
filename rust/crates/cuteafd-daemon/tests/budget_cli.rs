@@ -341,7 +341,7 @@ capture_native_exlr8_launch(*map(Path, sys.argv[2:]))
 
 #[test]
 #[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
-fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_pending_refusal() {
+fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_capabilities() {
     let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_FLASH_SNAPSHOT")
         .expect("explicit Flash snapshot required"));
     let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
@@ -362,9 +362,10 @@ fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_pending_
             let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(deployment["family"], "glm5_flash");
             assert_eq!(deployment["exlr8"]["manifest"], "k4");
-            assert_eq!(deployment["wip_launchable"], false);
-            assert_eq!(deployment["report"]["runtime"], "planned");
-            assert_eq!(deployment["report"]["placement_supported"], false);
+            let admitted = gpus == "1";
+            assert_eq!(deployment["wip_launchable"], admitted);
+            assert_eq!(deployment["report"]["runtime"], if admitted { "serving" } else { "planned" });
+            assert_eq!(deployment["report"]["placement_supported"], admitted);
             assert_eq!(deployment["spark_ranks"], ranks);
             let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
                 .filter(|device| device["kind"] == "spark").collect::<Vec<_>>();
@@ -383,8 +384,8 @@ fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_pending_
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
-from test_run_family_dispatch import capture_pending_native_exlr8_deployment
-capture_pending_native_exlr8_deployment(Path(sys.argv[2]))
+from test_run_family_dispatch import capture_native_exlr8_capability_deployment
+capture_native_exlr8_capability_deployment(Path(sys.argv[2]))
 "#]).arg(&root).arg(&path).output().unwrap();
             assert!(python.status.success(), "{name}: {}", String::from_utf8_lossy(&python.stderr));
         }

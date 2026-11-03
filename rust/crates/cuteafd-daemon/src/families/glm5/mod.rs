@@ -1006,6 +1006,11 @@ impl Opened {
             onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
                 else { onboard }, full_prefill_logits: args.full_prefill_logits, context };
         let (placement, working) = glm::solve_working_set(&inputs, serial_workspace, requested)?;
+        if native {
+            use cuteafd_loader::plan::family::Family;
+            cuteafd_loader::plan::families::glm::GLM5.exlr8_execution()
+                .check(devices.len(), placement.onboard_layers > 0)?;
+        }
         ensure!(!native || devices.len() != 2
             || placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context,
             "EXLR8 two-coordinator admission requires context attention programs");
