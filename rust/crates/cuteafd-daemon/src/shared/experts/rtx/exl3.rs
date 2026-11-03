@@ -14,6 +14,7 @@ use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event};
 use anyhow::{bail, ensure, Context, Result};
 use cuteafd_core::{expert_geometry, ExpertGeometry};
 use cuteafd_ffi::CuteafdDeviceBuffer;
+use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Receipt};
 use std::{
     ffi::c_void,
     path::{Path, PathBuf},
@@ -799,6 +800,44 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
     fn workspace_bytes(&self) -> usize {
         self.workspace_bytes
     }
+    fn allocation_receipts(&self, prefix: &str, devices: CoordinatorDevices<'_>,
+        lifetime: Lifetime) -> Result<Vec<Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::Allocation as PlannedAllocation;
+        let physical = self.device.id;
+        let location = super::receipt_location(devices, physical, self.shard)?;
+        let (world, rank) = match self.shard {
+            RtxShard::Whole => (1, 0),
+            RtxShard::Tp2 { rank } => (2, usize::from(rank)),
+        };
+        ensure!(!prefix.is_empty() && !self.layers.is_empty()
+            && self.layers.windows(2).all(|ids| ids[0] < ids[1])
+            && self.rank as usize == rank && self.weights.device.id == physical
+            && self.weights.len() == self.layers.len(), "invalid retained EXL3 rank owner");
+        for (weight, &layer) in self.weights.iter().zip(&self.layers) {
+            ensure!(matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(id) if id == layer)
+                && weight.layout.world == world && weight.layout.rank == rank,
+                "EXL3 retained weight inventory differs from its routed rank");
+        }
+        let executions = self.executions.as_ref().context("uninitialized EXL3 rank")?;
+        ensure!(executions.device.id == physical && !executions.is_empty(),
+            "EXL3 executions have a different device or empty inventory");
+        for execution in executions.iter() {
+            execution.validate_retained_weights(self.weights.get(), physical)?;
+        }
+        let mut receipts = Exl3Weights::weight_receipts(&self.weights, &format!("{prefix}.weights"),
+            location, physical, lifetime)?;
+        receipts.extend(Exl3Execution::workspace_receipts(executions, &format!("{prefix}.execution"),
+            location, physical, lifetime)?);
+        let output = self.output.as_ref().context("uninitialized EXL3 stable output")?;
+        ensure!(output.device.id == physical && output.buffer.device_id == physical
+            && !output.buffer.ptr.is_null() && output.buffer.bytes > 0,
+            "EXL3 stable output has an invalid physical owner");
+        receipts.push(Receipt { allocation: PlannedAllocation::buffer(format!("{prefix}.output"),
+            location, output.buffer.bytes as u64, lifetime, Category::Workspace, "EXL3 stable output"),
+            address: output.buffer.ptr as u64 });
+        Ok(receipts)
+    }
     fn group_rows(&self, rows: usize) -> Result<usize> {
         ensure!(rows <= self.max_rows, "invalid EXL3 TP2 grouping row count");
         let executions = self
@@ -879,8 +918,83 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::shared::experts) mod tests {
     use super::*;
+
+    pub(in crate::shared::experts) fn verify_retained_rtx_receipts<'a>(
+        device: Device<'a>, weights: Rc<Vec<Exl3Weights<'a>>>, executions: Vec<Exl3Execution<'a>>,
+        manifests: &[serde_json::Value],
+    ) -> Result<Vec<Exl3Execution<'a>>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::{Exl3WeightLayout, placement::planner::{self, *},
+            serving_capacity::Exl3WorkspaceLayout};
+        let location = Location::coordinator(0);
+        let lifetime = Lifetime::RESIDENT;
+        let workspace = Exl3WorkspaceLayout::from_manifests(manifests, true)?;
+        let max_rows = 16;
+        let geometry = expert_geometry();
+        let output_bytes = max_rows * geometry.hidden as usize * 4;
+        let mut allocations = Exl3WeightLayout::from_residencies("test.weights",
+            &weights.iter().map(|weight| &weight.layout).collect::<Vec<_>>(),
+            WeightArenaTopology::PerLayer, location, lifetime)?.allocations;
+        allocations.extend(workspace.allocations("test.execution", location, lifetime));
+        allocations.push(planner::Allocation::buffer("test.output", location, output_bytes as u64,
+            lifetime, Category::Workspace, "EXL3 stable output"));
+        let facts = Facts { allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
+        let budgets = vec![Budget { id: "CPU routed backend".into(), locations: vec![location],
+            physical_bytes: 1 << 30, logical_bytes: 1 << 30, headroom: 0,
+            baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
+        let phases = planner::evaluate(&facts, &budgets)?;
+        let plan = ResolvedPlan {
+            request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+                prefill: Pin::Auto, operation: Operation::Serving },
+            decisions: Decisions { attention: vec![], onboard_layers: vec![vec![0]],
+                expert_homes: Default::default(), embedding: None,
+                prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
+            pool_tokens: 64, facts, budgets, phases,
+        };
+        // Reuse the measured fixture contexts and disjoint weight views; never launch
+        // numerical kernels or pretend this synthetic inventory is a full family.
+        let mut backend = Exl3Tp2 {
+            completion: RankCompletion::new(Event::new(device)?), device, rank: 0,
+            shard: RtxShard::Tp2 { rank: 0 }, layers: vec![0], geometry,
+            row_policy: Exl3RowPolicy::Nearest, selection: RtxSelectionPolicy::FirstCapacity,
+            reduction_plan: None, package: PathBuf::new(), max_rows,
+            workspace_bytes: workspace.bytes()? as usize + output_bytes,
+            executions: Some(device.own(|| Ok(executions))?),
+            weights: Rc::new(device.own(|| Ok(weights))?),
+            output: Some(crate::shared::memory::device::Allocation::new(device, output_bytes)?),
+        };
+        let devices = CoordinatorDevices::new(&[1, 0])?;
+        let receipts = (&backend as &dyn RtxExpertLayer).allocation_receipts("test", devices, lifetime)?;
+        planner::reconcile(&plan, Phase::Warmup, &receipts)?;
+        assert!(backend.allocation_receipts("", devices, lifetime).is_err());
+        assert!(backend.allocation_receipts("test", CoordinatorDevices::new(&[0, 1])?, lifetime).is_err());
+        backend.layers[0] = 1;
+        assert!(backend.allocation_receipts("test", devices, lifetime).is_err());
+        backend.layers[0] = 0;
+        let original = backend.output.as_ref().unwrap().buffer;
+        backend.output.as_mut().unwrap().buffer.device_id = 0;
+        assert!(backend.allocation_receipts("test", devices, lifetime).is_err());
+        backend.output.as_mut().unwrap().buffer = original;
+        let owners = receipts.iter().enumerate().filter(|(_, r)| r.allocation.view.is_none())
+            .map(|(index, _)| index).collect::<Vec<_>>();
+        for negative in 0..5 {
+            let mut bad = receipts.clone();
+            match negative {
+                0 => { bad.pop(); },
+                1 => { let mut extra = bad[owners[0]].clone(); extra.allocation.id.push_str(".extra"); bad.push(extra); },
+                2 => bad[owners[0]].allocation.bytes += 1,
+                3 => { bad[owners[0]].allocation.bytes += 1; bad[owners[1]].allocation.bytes -= 1; },
+                4 => bad[owners[0]].allocation.location = Location::coordinator(1),
+                _ => unreachable!(),
+            }
+            assert!(planner::reconcile(&plan, Phase::Warmup, &bad).is_err(), "backend negative {negative}");
+        }
+        planner::reconcile(&plan, Phase::Ready,
+            &backend.allocation_receipts("test", devices, lifetime)?)?;
+        Ok(backend.executions.take().unwrap().into_inner())
+    }
     #[test]
     fn package_activation_matches_exporter_defaults_and_all_native_variants() -> Result<()> {
         let temp = tempfile::tempdir()?;

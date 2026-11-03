@@ -234,13 +234,19 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
         V41Exl3ResidentBuffer { bytes: if descriptor {3*6*2*4} else {16},
             initial_words: if descriptor { vec![0; 3*6*2] } else { vec![] }, name }
     }).collect();
-    let arena = DeviceAllocation::new(&library, 1024)?;
-    let weights = Rc::new(vec![Exl3Weights {
-        buffers: specs.iter().map(|s| WeightBuffer { buffer: CuteafdDeviceBuffer { bytes:s.bytes, ..arena.buffer } }).collect(),
-        _arena: crate::shared::experts::exl3::ArenaOwner::Mount(arena),
-        layout: V41Exl3Residency { layer:V41Exl3Layer::Backbone(0),world:2,rank:1,
-            intermediate_start:1152,experts:6,intermediate:1152,tiers:vec![3,4],projection_counts:vec![[0;3];2],unit_map:None,buffers:specs,loads:vec![] },
-        budget: ExpertLoadBudget { resident_bytes:1024,device_staging_bytes:0,pinned_host_bytes:0,read_scratch_bytes:0 },
+    let layout = V41Exl3Residency { layer:V41Exl3Layer::Backbone(0),world:2,rank:0,
+        intermediate_start:0,experts:6,intermediate:1152,tiers:vec![3,4],projection_counts:vec![[0;3];2],
+        unit_map:None,buffers:specs,loads:vec![] };
+    let (offsets, bytes) = layout.device_arena_layout()?;
+    let arena = DeviceAllocation::new(&library, bytes)?;
+    let buffers = layout.buffers.iter().zip(offsets).map(|(spec, offset)| {
+        // SAFETY: every aligned view lies in this header-derived live arena.
+        let ptr = unsafe { arena.buffer.ptr.cast::<u8>().add(offset).cast() };
+        WeightBuffer { buffer: CuteafdDeviceBuffer { ptr, bytes:spec.bytes.max(16), ..arena.buffer } }
+    }).collect();
+    let weights = Rc::new(vec![Exl3Weights { buffers,
+        _arena: crate::shared::experts::exl3::ArenaOwner::Mount(arena), layout,
+        budget: ExpertLoadBudget { resident_bytes:bytes,device_staging_bytes:0,pinned_host_bytes:0,read_scratch_bytes:0 },
     }]);
     let workspace = Exl3Workspace::new(&library, &[directory.to_owned(), wide_directory])?;
     let mut executions = Vec::new();
@@ -264,6 +270,21 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
     assert!(Exl3Execution::workspace_receipts(&executions, "expert.test", Location::coordinator(0),
         1, Lifetime::RESIDENT).is_err());
     executions[0].workspace_bindings.values_mut().next().unwrap().device_id = original_device;
+    for execution in &executions {
+        execution.validate_retained_weights(&weights, 1)?;
+        assert!(execution.validate_retained_weights(&Rc::new(Vec::new()), 1).is_err());
+    }
+    let mut wrong_owner = Rc::new(Vec::new());
+    std::mem::swap(&mut executions[0]._weights, &mut wrong_owner);
+    assert!(executions[0].validate_retained_weights(&weights, 1).is_err());
+    std::mem::swap(&mut executions[0]._weights, &mut wrong_owner);
+    let original_map = executions[0].layers[0].expert_map;
+    executions[0].layers[0].expert_map.ptr = std::ptr::null_mut();
+    assert!(executions[0].validate_retained_weights(&weights, 1).is_err());
+    executions[0].layers[0].expert_map = original_map;
+    executions = crate::shared::experts::rtx::exl3::tests::verify_retained_rtx_receipts(
+        crate::shared::memory::device::Device { library: &library, id: 1 },
+        weights.clone(), executions, &manifests)?;
     assert_eq!(fixture.events()?.chars().filter(|c| "KRW".contains(*c)).collect::<String>(), "KRWKR",
         "execution must consume the measured handles, never reload");
     // Dropping retained native contexts restores their own device even from a peer.

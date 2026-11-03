@@ -819,6 +819,24 @@ impl<'a> Exl3Execution<'a> {
             + self.wire.as_ref().map_or(0, |b| b.buffer.bytes)
     }
 
+    pub(crate) fn validate_retained_weights(&self, weights: &Rc<Vec<Exl3Weights<'a>>>,
+        physical_device: i32) -> Result<()> {
+        ensure!(Rc::ptr_eq(&self._weights, weights) && self.layers.len() == weights.len()
+            && self.device == physical_device && self.modules.owner.device.id == physical_device,
+            "EXL3 execution does not retain its rank's exact weight owner");
+        for (binding, weight) in self.layers.iter().zip(weights.iter()) {
+            for (actual, expected) in [(binding.expert_map, weight.buffer("global_to_combined")?),
+                (binding.svh, weight.buffer("down_svh")?)] {
+                ensure!(actual.ptr == expected.ptr && actual.bytes == expected.bytes
+                    && actual.device_id == physical_device && expected.device_id == physical_device,
+                    "EXL3 execution weight binding differs from its retained owner");
+            }
+            ensure!(binding.local_experts == weight.layout.experts,
+                "EXL3 execution expert extent differs from its retained owner");
+        }
+        Ok(())
+    }
+
     /// Independent retained-field census; code, weights, routed output and
     /// startup allocation/free history are separate owners.
     pub(crate) fn workspace_receipts(

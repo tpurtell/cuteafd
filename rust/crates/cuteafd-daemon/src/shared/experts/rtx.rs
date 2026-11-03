@@ -14,7 +14,8 @@
 //!   runs the fused all-reduce's two kernels.
 //! - [`routes::RouteIdentity`]: replicated routers are checked byte-for-byte
 //!   at startup, with the broadcast fallback.
-use anyhow::Result;
+use anyhow::{ensure, Result};
+use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location, Receipt};
 use std::ffi::c_void;
 
 pub(crate) mod combine;
@@ -112,6 +113,15 @@ pub(super) fn resident_index(layers: &[usize], layer: usize) -> Result<usize> {
     layers.binary_search(&layer).map_err(|_| anyhow::anyhow!("TP2 layer {layer} not resident in {layers:?}"))
 }
 
+fn receipt_location(devices: CoordinatorDevices<'_>, physical: i32, shard: RtxShard) -> Result<Location> {
+    let rank = devices.logical_rank(physical)?;
+    if let RtxShard::Tp2 { rank: expected } = shard {
+        ensure!(rank == expected, "RTX expert shard differs from its logical coordinator rank");
+        devices.physical_device(1 - expected)?;
+    }
+    Ok(devices.location(physical)?)
+}
+
 /// One rank's routed half of an exact ordered set of backbone layers.
 pub(crate) trait RtxExpertLayer {
     fn shard(&self) -> RtxShard;
@@ -129,6 +139,12 @@ pub(crate) trait RtxExpertLayer {
     /// Exact device bytes of the execution workspace (scratch and the routed
     /// output) for up to `rows` rows; feeds `ExpertCost`.
     fn workspace_bytes(&self) -> usize;
+    /// Actual retained device weights, execution storage and stable output.
+    /// Native code, events, host owners and startup history are reconciled separately.
+    fn allocation_receipts(&self, _prefix: &str, _devices: CoordinatorDevices<'_>,
+        _lifetime: Lifetime) -> Result<Vec<Receipt>> {
+        anyhow::bail!("expert backend does not publish retained allocation receipts")
+    }
     /// Route grouping of the selected live-row package; zero queries the compiled maximum.
     fn group_rows(&self, _rows: usize) -> Result<usize> {
         anyhow::bail!("expert backend does not publish installed grouping metadata")
@@ -181,6 +197,34 @@ pub(crate) trait RtxExpertLayer {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    #[test]
+    fn allocation_receipt_boundary_refuses_unsupported_backends_and_wrong_rank() -> Result<()> {
+        struct Unsupported;
+        impl RtxExpertLayer for Unsupported {
+            fn shard(&self) -> RtxShard { RtxShard::Whole }
+            fn partial(&self) -> PartialDtype { PartialDtype::F32 }
+            fn uses_fp8_input(&self) -> bool { true }
+            fn layers(&self) -> &[usize] { &[3] }
+            fn device(&self) -> i32 { 7 }
+            fn workspace_bytes(&self) -> usize { 0 }
+            fn output(&self) -> *mut c_void { std::ptr::null_mut() }
+            unsafe fn enqueue(&mut self, _: usize, _: usize, _: ExpertInput, _: Routes,
+                _: *mut c_void, _: &mut dyn FnMut()) -> Result<()> { unreachable!() }
+        }
+        let devices = CoordinatorDevices::new(&[7, 3])?;
+        let backend: &dyn RtxExpertLayer = &Unsupported;
+        assert!(backend.allocation_receipts("test", devices, Lifetime::RESIDENT).is_err());
+        assert_eq!(receipt_location(devices, 7, RtxShard::Tp2 { rank: 0 })?, Location::coordinator(0));
+        assert_eq!(receipt_location(devices, 3, RtxShard::Tp2 { rank: 1 })?, Location::coordinator(1));
+        assert_eq!(receipt_location(devices, 3, RtxShard::Whole)?, Location::coordinator(1));
+        for (physical, shard) in [(7, RtxShard::Tp2 { rank: 1 }), (3, RtxShard::Tp2 { rank: 0 }),
+            (3, RtxShard::Tp2 { rank: 2 }), (9, RtxShard::Whole)] {
+            assert!(receipt_location(devices, physical, shard).is_err());
+        }
+        assert!(receipt_location(CoordinatorDevices::new(&[7])?, 7, RtxShard::Tp2 { rank: 0 }).is_err());
+        Ok(())
+    }
 
     #[test]
     fn sparse_inventory_maps_absolute_ids_without_filling_gaps() -> Result<()> {

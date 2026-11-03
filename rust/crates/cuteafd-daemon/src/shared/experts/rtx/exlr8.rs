@@ -5,7 +5,8 @@ use crate::shared::experts::exlr8::{grouped_decode_from_row, view, Exlr8Executio
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event};
 use anyhow::{bail, ensure, Context, Result};
 use cuteafd_ffi::{exlr8::KernelFamily, programs::Programs, CuteafdDeviceBuffer};
-use cuteafd_loader::plan::exlr8::residency::ExpertSet;
+use cuteafd_loader::{placement::planner::{CoordinatorDevices, Lifetime, Receipt},
+    plan::exlr8::residency::ExpertSet};
 use std::{ffi::c_void, rc::Rc};
 
 const DECODE_ROWS: usize = 64;
@@ -175,7 +176,7 @@ mod copy_tests {
                                 assert!(fixture.peer_copy_records(&library)?.is_empty());
                                 assert_eq!(library.release_sync_h2d_staging()?, upload_bytes);
                             } else {
-                                let expert = owner?.execution()?;
+                                let mut expert = owner?.execution()?;
                                 assert_eq!(expert.shard(), native_shard(world, rank)?);
                                 assert_eq!(expert.layers(), &layers);
                                 assert_eq!(expert.device(), physical);
@@ -184,8 +185,23 @@ mod copy_tests {
                                 let topology = if pushed { WeightArenaTopology::SharedRank } else { WeightArenaTopology::PerLayer };
                                 let mut allocations = WeightLayout::from_residencies("test.weights", &layouts.iter().collect::<Vec<_>>(),
                                     topology, location, lifetime)?.allocations;
-                                let mut receipts = Exlr8Weights::weight_receipts(&expert.owner.weights, "test.weights", location, physical, lifetime)?;
-                                for (index, execution) in expert.executions.iter().enumerate() {
+                                let physical_devices = if world == 1 { vec![physical] } else { vec![1, 0] };
+                                let devices = CoordinatorDevices::new(&physical_devices)?;
+                                let mut receipts = (&expert as &dyn RtxExpertLayer).allocation_receipts("test", devices, lifetime)?;
+                                assert!(expert.allocation_receipts("", devices, lifetime).is_err());
+                                assert!(expert.allocation_receipts("test", CoordinatorDevices::new(&[2])?, lifetime).is_err());
+                                if world == 2 {
+                                    assert!(expert.allocation_receipts("test", CoordinatorDevices::new(&[0, 1])?, lifetime).is_err());
+                                }
+                                let original_layer = expert.owner.layers[0];
+                                expert.owner.layers[0] += 1;
+                                assert!(expert.allocation_receipts("test", devices, lifetime).is_err());
+                                expert.owner.layers[0] = original_layer;
+                                let original_device = expert.output.buffer.device_id;
+                                expert.output.buffer.device_id = 2;
+                                assert!(expert.allocation_receipts("test", devices, lifetime).is_err());
+                                expert.output.buffer.device_id = original_device;
+                                for index in 0..expert.executions.len() {
                                     let variant = [ExecutionVariant::DecodeCompact, ExecutionVariant::DecodeGrouped, ExecutionVariant::Prefill][index];
                                     let shape = if index < 2 { DECODE_ROWS } else { rows };
                                     let format = if index < 2 { Exlr8PrefillActivations::A16 } else { activations };
@@ -193,7 +209,6 @@ mod copy_tests {
                                     let layout = execution_workspace(programs.spec(variant.program(family, format))?, shape,
                                         ExpertSet::Routed, variant, unit_limit, format)?;
                                     allocations.extend(layout.allocations(&prefix, location, lifetime)?);
-                                    receipts.extend(execution.workspace_receipts(&prefix, location, physical, lifetime)?);
                                 }
                                 let mut output = planner::Allocation::buffer("test.output", location,
                                     (rows * family.geometry().hidden * 2) as u64, lifetime, Category::Workspace, "EXLR8 stable output");
@@ -202,10 +217,6 @@ mod copy_tests {
                                 allocations.push(staging.clone());
                                 receipts.push(staging_receipt.clone());
                                 let buffer = expert.output.buffer;
-                                let mut actual = planner::Allocation::buffer("test.output", location, buffer.bytes as u64,
-                                    lifetime, Category::Workspace, "EXLR8 stable output");
-                                actual.alignment = 256;
-                                receipts.push(Receipt { allocation: actual, address: buffer.ptr as u64 });
                                 let facts = Facts { allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
                                 let budgets = vec![Budget { id: "CPU constructor".into(), locations: vec![location],
                                     physical_bytes: capacity as u64, logical_bytes: capacity as u64, headroom: 0,
@@ -220,6 +231,20 @@ mod copy_tests {
                                         embedding: None, prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
                                     pool_tokens: 64, facts, budgets, phases };
                                 planner::reconcile(&plan, Phase::Load, &receipts)?;
+                                let owner_indices = receipts.iter().enumerate().filter(|(_, receipt)| receipt.allocation.view.is_none())
+                                    .map(|(index, _)| index).collect::<Vec<_>>();
+                                for negative in 0..5 {
+                                    let mut bad = receipts.clone();
+                                    match negative {
+                                        0 => { bad.pop(); },
+                                        1 => { let mut extra = bad[owner_indices[0]].clone(); extra.allocation.id.push_str(".extra"); bad.push(extra); },
+                                        2 => bad[owner_indices[0]].allocation.bytes += 1,
+                                        3 => { bad[owner_indices[0]].allocation.bytes += 1; bad[owner_indices[1]].allocation.bytes -= 1; },
+                                        4 => bad[owner_indices[0]].allocation.location = Location::coordinator(7),
+                                        _ => unreachable!(),
+                                    }
+                                    assert!(planner::reconcile(&plan, Phase::Load, &bad).is_err(), "backend negative {negative}");
+                                }
                                 let owners = receipts.iter().filter(|receipt| receipt.allocation.view.is_none())
                                     .map(|receipt| (receipt.address as usize, receipt.allocation.bytes as usize)).collect::<BTreeMap<_, _>>();
                                 let live = memory_ledger::allocations().into_iter().filter(|record| record.key.owner == Some(tag.as_str()))
@@ -401,6 +426,42 @@ impl RtxExpertLayer for Exlr8Rtx<'_> {
     fn layers(&self) -> &[usize] { &self.owner.layers }
     fn device(&self) -> i32 { self.owner.device.id }
     fn workspace_bytes(&self) -> usize { self.owner.workspace_bytes }
+    fn allocation_receipts(&self, prefix: &str, devices: CoordinatorDevices<'_>,
+        lifetime: Lifetime) -> Result<Vec<Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::Allocation as PlannedAllocation;
+        let physical = self.owner.device.id;
+        let location = super::receipt_location(devices, physical, self.owner.shard)?;
+        let (world, rank) = match self.owner.shard {
+            RtxShard::Whole => (1, 0),
+            RtxShard::Tp2 { rank } => (2, usize::from(rank)),
+        };
+        ensure!(!prefix.is_empty() && !self.owner.layers.is_empty()
+            && self.owner.layers.windows(2).all(|ids| ids[0] < ids[1])
+            && self.owner.weights.device.id == physical && self.executions.device.id == physical
+            && self.owner.weights.len() == self.owner.layers.len() && !self.executions.is_empty(),
+            "invalid retained EXLR8 rank owner");
+        for (weight, &layer) in self.owner.weights.iter().zip(&self.owner.layers) {
+            ensure!(weight.layout.layer == layer && weight.layout.world == world && weight.layout.rank == rank
+                && weight.layout.set == ExpertSet::Routed,
+                "EXLR8 retained weight inventory differs from its routed rank");
+        }
+        let mut receipts = Exlr8Weights::weight_receipts(&self.owner.weights, &format!("{prefix}.weights"),
+            location, physical, lifetime)?;
+        for (index, execution) in self.executions.iter().enumerate() {
+            receipts.extend(execution.workspace_receipts(&format!("{prefix}.execution.{index}"),
+                location, physical, lifetime)?);
+        }
+        let buffer = self.output.buffer;
+        ensure!(self.output.device.id == physical && buffer.device_id == physical
+            && !buffer.ptr.is_null() && buffer.bytes > 0,
+            "EXLR8 stable output has an invalid physical owner");
+        let mut output = PlannedAllocation::buffer(format!("{prefix}.output"), location,
+            buffer.bytes as u64, lifetime, Category::Workspace, "EXLR8 stable output");
+        output.alignment = 256;
+        receipts.push(Receipt { allocation: output, address: buffer.ptr as u64 });
+        Ok(receipts)
+    }
     fn output(&self) -> *mut c_void { self.output.buffer.ptr }
     fn group_rows(&self, rows: usize) -> Result<usize> {
         ensure!(rows <= self.owner.max_rows, "EXLR8 grouping rows exceed admission");
