@@ -161,6 +161,145 @@ fn retained_wave_storage_matches_independent_contract() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn retained_link_composition_counts_fallback_egress_once() -> Result<()> {
+    const CHILD: &str = "CUTEAFD_LINK_OWNER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["shared::spark_waves::tests::retained_link_composition_counts_fallback_egress_once",
+                "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1").env_remove("CUTEAFD_NATIVE_LIB").status()?;
+        ensure!(status.success(), "link owner fixture child failed");
+        return Ok(());
+    }
+    use crate::shared::spark_intake::{IntakeMode, SparkIntake, link_allocation_receipts, unused_registered_egress};
+    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+    use cuteafd_ffi::{memory_ledger, native_library_lifetime_fixture::Fixture};
+    use cuteafd_loader::placement::{SparkEndpointOwners, SparkIntakeMode, SparkIntakeOwners,
+        SparkLinkOwners, SparkWaveOwners, SparkWaveStaging, planner::{self, *}};
+    use cuteafd_transport::{SparkEndpointSnapshot, SparkEndpointSpan};
+    use std::collections::BTreeMap;
+    cuteafd_core::set_expert_geometry(ExpertGeometry::GLM5)
+        .map_err(|_| anyhow::anyhow!("link fixture requires isolated GLM geometry"))?;
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.quiet_events(&library, true)?;
+    cuteafd_transport::set_verbs_host_native_library_path(fixture.directory().join("liblifetime_fixture.so"))?;
+    let devices = CoordinatorDevices::new(&[1, 0])?;
+    let (ranks, slots, rows, row_bytes, slot_bytes) = (6, 3, 64, 12288, 800_000);
+    for device in [1, 0] { for mode in [IntakeMode::Gpu, IntakeMode::Pinned, IntakeMode::Host] {
+        for topology in 0..3 {
+            library.cuda_set_device(device)?;
+            fixture.configure_memory(&library, device, 128 << 20)?;
+            let tag = format!("link/{device}/{mode:?}/{topology}");
+            let _owner = memory_ledger::owner(&tag);
+            let intake = SparkIntake::with_waves(&library, mode, ranks, rows, row_bytes, slots)?;
+            let peers = (0..ranks).map(|rank| format!("127.0.0.1:{}", 19441 + rank).parse())
+                .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+            let mut transport = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(ranks)?,
+                &peers, rows as u32, Default::default(), 0)?;
+            transport.set_max_waves(slots)?;
+            if topology != 0 { transport.enable_egress(if topology == 1 { slot_bytes } else { 256 })?; }
+            let egress = transport.egress_arenas()?;
+            let registered = topology == 1;
+            let unused = unused_registered_egress(&egress, registered)?;
+            assert_eq!(unused.map(|owner| owner.bytes), (topology == 2).then_some(256 * slots));
+            let arenas = if registered { egress.clone() } else {
+                (0..slots).map(|_| StagingArena::new(slot_bytes)).collect::<Result<Vec<_>>>()?
+            };
+            let pinned = if mode == IntakeMode::Gpu { 0 } else { (1 << ranks) - 1 };
+            let cut = Intake { ranks, row_bytes, ranges: intake.ranges(), geometry: intake.geometry(),
+                landing: ((1 << ranks) - 1) & !pinned, placed: intake.placed(), next_slot: 0 };
+            let controls = allocate_wave_controls(&library, &cut, &transport, &arenas)?;
+            let storage = WaveStorage { library: &library, control: controls.control.buffer, words: controls.words,
+                pull_block: controls.pull_block.as_ref().map(|owner| owner.buffer), pulls: controls.pulls,
+                pinned, arenas: &arenas, arena_alias: &controls.arena_alias, slots, ranks };
+            let geometry = ExpertGeometry::GLM5;
+            let (send, recv) = geometry.compact_wire_bytes(rows as u32, true).unwrap();
+            let span = |bytes: usize| bytes.max(256).div_ceil(64) * 64 * 2;
+            let mut ring_owners = Vec::new();
+            let mut snapshots = Vec::new();
+            for rank in 0..ranks {
+                let send = HostAllocation::new(&library, span(send))?;
+                let recv = HostAllocation::new(&library, span(recv))?;
+                let numeric = |owner: &HostAllocation<'_>| SparkEndpointSpan {
+                    address: owner.buffer.ptr as u64, bytes: owner.buffer.bytes as u64,
+                    device_address: owner.buffer.ptr as u64, device, host_flags: owner.buffer.flags,
+                };
+                snapshots.push(SparkEndpointSnapshot { rank, send: numeric(&send), recv: numeric(&recv) });
+                ring_owners.extend([send, recv]);
+            }
+            let endpoints = snapshots.iter().try_fold(Vec::new(), |mut owners, snapshot| -> Result<_> {
+                owners.extend(snapshot.allocation_receipts("test.link.endpoints", device, devices, Lifetime::TARGET)?);
+                Ok(owners)
+            })?;
+            let receipts = link_allocation_receipts("test.link",
+                intake.allocation_receipts("test.link.intake", devices, Lifetime::TARGET)?,
+                storage.allocation_receipts("test.link.waves", Lifetime::TARGET)?, endpoints, unused, Lifetime::TARGET)?;
+            let spec = SparkLinkOwners {
+                intake: SparkIntakeOwners { gpu: devices.logical_rank(device)?, ranks, rows: rows as u64,
+                    row_bytes: row_bytes as u64, waves: slots, mode: match mode {
+                        IntakeMode::Gpu => SparkIntakeMode::Gpu, IntakeMode::Pinned => SparkIntakeMode::Pinned,
+                        IntakeMode::Host => SparkIntakeMode::Host,
+                    } },
+                waves: SparkWaveOwners { ranks, waves: slots, pinned, staging: if registered {
+                    SparkWaveStaging::Registered { slot_bytes: slot_bytes as u64 }
+                } else { SparkWaveStaging::Standalone { slot_bytes: slot_bytes as u64 } } },
+                endpoints: SparkEndpointOwners { ranks, geometry,
+                    endpoint: SparkEndpoint { capacity: rows as u32, ingress: SparkIngress::Bf16,
+                        ring_depth: None, partial_reply_bytes: None },
+                    rings: SparkRings { max_frame_bytes: 1 << 24, depth: 2, slot_bytes: 256, alignment: 64 } },
+                unused_egress_bytes: (topology == 2).then_some((256 * slots) as u64),
+            };
+            let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET,
+                allocations: spec.allocations("test.link", Lifetime::TARGET)?, deferred: vec![], sequential: vec![], allowances: vec![] };
+            let budgets = vec![Budget { id: "CPU link owners".into(), locations: vec![devices.location(device)?, Location::PINNED],
+                physical_bytes: 512 << 20, logical_bytes: 512 << 20, headroom: 0,
+                baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
+            let phases = planner::evaluate(&facts, &budgets)?;
+            let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+                    prefill: Pin::Auto, operation: Operation::Serving }, decisions: Decisions { attention: vec![],
+                    onboard_layers: vec![], expert_homes: Default::default(), embedding: None,
+                    prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 }, pool_tokens: 64, facts, budgets, phases };
+            // Actual allocation subset; numeric ring snapshots are not real RDMA endpoints.
+            planner::reconcile(&plan, Phase::Ready, &receipts)?;
+            let physical = receipts.iter().filter(|receipt| receipt.allocation.view.is_none())
+                .map(|receipt| (receipt.address as usize, receipt.allocation.bytes as usize)).collect::<BTreeMap<_, _>>();
+            let census = memory_ledger::allocations().into_iter().filter(|owner| owner.key.owner == Some(tag.as_str()))
+                .map(|owner| (owner.address, owner.bytes)).collect::<BTreeMap<_, _>>();
+            assert_eq!(physical, census, "all link backings, including idle egress, appear exactly once");
+            for defect in 0..5 {
+                let mut wrong = receipts.clone();
+                match defect {
+                    0 => { wrong.remove(0); }
+                    1 => { let mut extra = wrong[0].clone(); extra.allocation.id.push_str(".duplicate"); wrong.push(extra); }
+                    2 => wrong[0].allocation.bytes += 1,
+                    3 => { wrong[0].allocation.bytes += 1; wrong[1].allocation.bytes -= 1; }
+                    4 => { let endpoint = wrong.iter_mut().find(|owner| owner.allocation.id.ends_with("rank.0.send")).unwrap();
+                        endpoint.address = storage.control.ptr as u64; }
+                    _ => unreachable!(),
+                }
+                assert!(planner::reconcile(&plan, Phase::Ready, &wrong).is_err());
+            }
+            if topology == 2 {
+                let mut missing = receipts.clone();
+                missing.retain(|owner| !owner.allocation.id.ends_with("unused-egress"));
+                assert!(planner::reconcile(&plan, Phase::Ready, &missing).is_err());
+                let mut wrong = spec; wrong.unused_egress_bytes = None;
+                assert_ne!(wrong.allocations("test.link", Lifetime::TARGET)?, plan.facts.allocations);
+            }
+            let mut wrong = spec; wrong.waves.ranks -= 1;
+            assert!(wrong.allocations("test.link", Lifetime::TARGET).is_err());
+            assert!(spec.components("test.link", Lifetime::TARGET, 0).is_err());
+            drop(ring_owners); drop(controls); drop(arenas); drop(egress); drop(transport); drop(intake);
+            assert!(memory_ledger::allocations().iter().all(|owner| owner.key.owner != Some(tag.as_str())));
+            assert_eq!(library.cuda_memory_info()?, (128 << 20, 128 << 20));
+        }
+    } }
+    Ok(())
+}
+
 /// The "GPU": the control words, written by the engine side of the test as
 /// a stream would (staged after copies, consumed after a reduce) and read by
 /// the worker; the worker publishes `landed` here.

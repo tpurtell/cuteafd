@@ -1582,6 +1582,42 @@ fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
     });
 }
 
+pub(super) fn unused_registered_egress(arenas: &[cuteafd_transport::StagingArena], registered: bool)
+    -> Result<Option<CuteafdHostBuffer>> {
+    if registered || arenas.is_empty() { return Ok(None); }
+    let owner = arenas[0].backing_buffer();
+    let required = cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED | cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_MAPPED;
+    ensure!(!owner.ptr.is_null() && owner.bytes > 0 && owner.flags & required == required
+        && (owner.ptr as usize).checked_add(owner.bytes).is_some(), "invalid unused Spark egress backing");
+    for arena in arenas {
+        let backing = arena.backing_buffer();
+        ensure!(arena.shares_backing(&arenas[0]) && backing.ptr == owner.ptr
+            && backing.bytes == owner.bytes && backing.flags == owner.flags,
+            "registered Spark egress slots do not share their retained backing");
+    }
+    Ok(Some(owner))
+}
+
+pub(super) fn link_allocation_receipts(prefix: &str,
+    mut intake: Vec<cuteafd_loader::placement::planner::Receipt>,
+    waves: Vec<cuteafd_loader::placement::planner::Receipt>,
+    endpoints: Vec<cuteafd_loader::placement::planner::Receipt>,
+    unused_egress: Option<CuteafdHostBuffer>,
+    lifetime: cuteafd_loader::placement::planner::Lifetime)
+    -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+    use cuteafd_core::memory_layout::Category;
+    use cuteafd_loader::placement::planner::{Allocation, Location, Receipt};
+    ensure!(!prefix.is_empty(), "empty Spark link owner prefix");
+    intake.extend(waves);
+    intake.extend(endpoints);
+    if let Some(owner) = unused_egress {
+        intake.push(Receipt { allocation: Allocation::buffer(format!("{prefix}.unused-egress"),
+            Location::PINNED, owner.bytes as u64, lifetime, Category::Staging, "Spark unused registered egress"),
+            address: owner.ptr as u64 });
+    }
+    Ok(intake)
+}
+
 /// A Spark transport and the intake its waves land in (dropped in that order).
 pub(crate) struct SparkLink<'a> {
     intake: std::rc::Rc<SparkIntake<'a>>,
@@ -1598,6 +1634,8 @@ pub(crate) struct SparkLink<'a> {
     transport: Option<SparkExperts>,
     /// Plain native span metadata captured before the transport moves to its worker.
     endpoint_snapshots: Vec<cuteafd_transport::SparkEndpointSnapshot>,
+    /// A transport-owned egress backing not used by standalone wave staging.
+    unused_egress: Option<CuteafdHostBuffer>,
     /// Widest wave staging each slot needs (bytes), sized at bootstrap.
     staging_bytes: usize,
     /// The bootstrap request without its (all-zero) hidden payload, and that
@@ -1680,7 +1718,7 @@ impl<'a> SparkLink<'a> {
         let world = transport.world();
         Ok(Self { intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
             terminal_library: None, terminal_released: false, exchange: None, transport: Some(transport),
-            endpoint_snapshots: Vec::new(), staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity })
+            endpoint_snapshots: Vec::new(), unused_egress: None, staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity })
     }
 
     /// The transport while no exchange runs (setup and teardown only).
@@ -1730,6 +1768,7 @@ impl<'a> SparkLink<'a> {
     /// Starts the exchange worker on the idle transport.
     fn start(&mut self) -> Result<()> {
         self.endpoint_snapshots.clear();
+        self.unused_egress = None;
         let intake = &self.intake;
         intake.release_uploads()?;
         let transport = self.transport.take().context("Spark link has no transport")?;
@@ -1744,6 +1783,10 @@ impl<'a> SparkLink<'a> {
         let bytes = self.staging_bytes.max(256);
         let slots = intake.slots();
         let registered = egress.len() == slots && egress.iter().all(|arena| arena.bytes() >= bytes);
+        let unused_egress = match unused_registered_egress(&egress, registered) {
+            Ok(owner) => owner,
+            Err(error) => { self.transport = Some(transport); return Err(error); }
+        };
         let arenas = if registered { Ok(egress) } else {
             let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
             (0..slots).map(|_| cuteafd_transport::StagingArena::new(bytes)).collect::<Result<Vec<_>>>()
@@ -1770,7 +1813,23 @@ impl<'a> SparkLink<'a> {
         self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
             arenas, self.timing)?);
         self.endpoint_snapshots = endpoint_snapshots;
+        self.unused_egress = unused_egress;
         Ok(())
+    }
+
+    /// Native link storage only; no worker RPC or duplicate landing/egress aliases.
+    pub(crate) fn allocation_receipts(&self, prefix: &str,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+        lifetime: cuteafd_loader::placement::planner::Lifetime)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        let device = crate::shared::memory::device::Device { library: self.intake.library, id: self.device() };
+        device.run(|| {
+            let exchange = self.exchange.as_ref().context("Spark link exchange not started (bootstrap first)")?;
+            let intake = self.intake.allocation_receipts(&format!("{prefix}.intake"), devices, lifetime)?;
+            let waves = exchange.allocation_receipts(&format!("{prefix}.waves"), lifetime)?;
+            let endpoints = self.endpoint_allocation_receipts(&format!("{prefix}.endpoints"), devices, lifetime)?;
+            link_allocation_receipts(prefix, intake, waves, endpoints, self.unused_egress, lifetime)
+        })
     }
 
     /// Endpoint rings only; the worker is never consulted by this census.
@@ -1798,6 +1857,7 @@ impl<'a> SparkLink<'a> {
     /// the consuming streams drained.
     fn stop(&mut self) -> Result<()> {
         self.endpoint_snapshots.clear();
+        self.unused_egress = None;
         if let Some(exchange) = self.exchange.take() {
             let (transport, frames, next) = exchange.stop::<SparkExperts>()?;
             self.intake.keep_frames(frames)?;
@@ -1811,6 +1871,7 @@ impl<'a> SparkLink<'a> {
     /// resets the connections and starts it again.
     pub(crate) fn reset_connections(&mut self) -> Result<()> {
         self.endpoint_snapshots.clear();
+        self.unused_egress = None;
         if let Some(exchange) = self.exchange.take() {
             // A failed exchange already abandoned its waves; a cancelled one
             // gives up the engine's unlanded waves without a failure (the
@@ -1861,6 +1922,7 @@ impl<'a> SparkLink<'a> {
     /// exchange owns the transport once started).
     pub(crate) fn terminal_quiesce(&mut self) -> Result<()> {
         self.endpoint_snapshots.clear();
+        self.unused_egress = None;
         if let Some(exchange) = self.exchange.take() {
             // Teardown may abandon waves; the worker then fails, releases its
             // waits and still hands the transport back.
@@ -2136,6 +2198,23 @@ mod tests {
             assert!(report.error.is_some());
             assert!(report.summary().contains("intake auto: pinned"));
         }
+    }
+
+    #[test]
+    fn shipped_bootstrap_egress_covers_staging_at_every_family_geometry() -> Result<()> {
+        use cuteafd_core::ExpertGeometry as G;
+        for geometry in [G::DEEPSEEK_V4_FLASH, G::DEEPSEEK_V4_PRO, G::DEEPSEEK_V41,
+            G::GLM5, G::GLM5_FLASH, G::MIMO_V2_FLASH, G::MIMO_V26_PRO, G::QWEN4,
+            G::KIMI_K3, G::STEP5, G::MUSE_SPARK, G::MISTRAL_LARGE4] {
+            for rows in [1, 16, 64, 2752, 4096] { for bf16 in [false, true] {
+                let row_bytes = if bf16 { geometry.hidden * 2 } else { geometry.hidden + geometry.hidden / 32 };
+                let staging = crate::shared::experts::staging::RouteStaging::new(
+                    rows, geometry.topk as usize, row_bytes as usize)?;
+                let registered = geometry.compact_wire_bytes(rows as u32, bf16).unwrap().0;
+                assert!(registered >= staging.bytes.max(256), "{geometry:?}, rows={rows}, bf16={bf16}");
+            } }
+        }
+        Ok(())
     }
 
     #[test]

@@ -183,6 +183,51 @@ impl SparkEndpointOwners {
     }
 }
 
+/// Physical coordinator owners of one running link, not Spark worker memory
+/// or a complete family's Ready census.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkLinkOwners {
+    pub intake: SparkIntakeOwners,
+    pub waves: SparkWaveOwners,
+    pub endpoints: SparkEndpointOwners,
+    /// Retained registered backing when staging falls back to standalone slots.
+    pub unused_egress_bytes: Option<u64>,
+}
+
+impl SparkLinkOwners {
+    pub fn allocations(self, prefix: &str, lifetime: super::planner::Lifetime)
+        -> Result<Vec<super::planner::Allocation>, super::planner::Refusal> {
+        use super::planner::{Allocation, Location, Refusal};
+        use cuteafd_core::memory_layout::Category;
+        if prefix.is_empty() || self.intake.ranks != self.waves.ranks
+            || self.intake.ranks != self.endpoints.ranks || self.intake.waves != self.waves.waves
+            || self.unused_egress_bytes.is_some_and(|bytes| bytes == 0
+                || matches!(self.waves.staging, SparkWaveStaging::Registered { .. })) {
+            return Err(Refusal::InvalidFact("inconsistent Spark link owner geometry".into()));
+        }
+        let mut owners = self.intake.allocations(&format!("{prefix}.intake"), lifetime)?;
+        owners.extend(self.waves.allocations(&format!("{prefix}.waves"), lifetime)?);
+        owners.extend(self.endpoints.allocations(&format!("{prefix}.endpoints"), lifetime)?);
+        if let Some(bytes) = self.unused_egress_bytes {
+            owners.push(Allocation::buffer(format!("{prefix}.unused-egress"), Location::PINNED,
+                bytes, lifetime, Category::Staging, "Spark unused registered egress"));
+        }
+        Ok(owners)
+    }
+
+    pub fn components(self, prefix: &str, lifetime: super::planner::Lifetime, maximum_pages: u64)
+        -> Result<Vec<super::planner::Component>, super::planner::Refusal> {
+        use super::planner::{ByteCurve, Component, Refusal};
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("Spark link requires a positive pool domain".into()));
+        }
+        Ok(self.allocations(prefix, lifetime)?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }).collect())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkingSetComponent { Always, RtxExperts, SparkExperts }
 
