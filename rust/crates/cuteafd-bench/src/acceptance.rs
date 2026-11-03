@@ -116,8 +116,9 @@ pub(crate) fn measure(client: &Client, info: &ServerInfo, saved: Option<&Generat
     let fingerprint = crate::server::fingerprint(&exact_info);
     let prompts: Vec<_> = windows.iter().map(|window| {
         ensure!(window.media.is_empty(), "generated match requires text fidelity prompts");
-        let prompt_end = window.roles.iter().position(|role| role == "gen")
-            .context("fidelity window lacks a generated continuation")?;
+        // Context-only anchors continue after the full sealed window; mixed windows
+        // continue from their first generated-token boundary.
+        let prompt_end = window.roles.iter().position(|role| role == "gen").unwrap_or(window.tokens.len());
         ensure!(prompt_end > 0 && prompt_end <= window.tokens.len(), "invalid fidelity prompt boundary");
         Ok((window.id.clone(), window.tokens[..prompt_end].to_vec()))
     }).collect::<Result<_>>()?;
