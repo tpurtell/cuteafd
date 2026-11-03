@@ -739,6 +739,68 @@ mod tests {
         assert_eq!(args.mapped_scale_preload_gib, 0.0);
     }
 
+    /// LD-01: the loop-abort run defaults to 512 (ON by default; the
+    /// upstream-sync divergence is recorded in the slice RESULT).
+    #[test]
+    fn loop_abort_run_defaults_to_512() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command
+            else { panic!("expected native serving"); };
+        assert_eq!(args.loop_abort.loop_abort_run, 512);
+        assert_eq!(args.loop_abort.loop_abort_copies, 8);
+        assert_eq!(args.loop_abort.loop_fast_span, 1024);
+        assert_eq!(args.loop_abort.loop_fast_copies, 8);
+    }
+
+    /// LD-01/N4: `--loop-abort-run 0` disables rule R only; rule F is gated by
+    /// `--loop-fast-span` independently. The full kill switch is both knobs at
+    /// zero. The range is 0..=65536.
+    #[test]
+    fn loop_abort_run_zero_disables_rule_r_only() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "0"].iter())).unwrap().command else {
+            panic!("expected native serving") };
+        assert_eq!(args.loop_abort.loop_abort_run, 0);
+        assert_eq!(args.loop_abort.loop_fast_span, 1024, "rule F stays on");
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "65537"].iter())).is_err());
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-copies", "1"].iter())).is_err());
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-fast-copies", "65"].iter())).is_err());
+    }
+
+    /// LD-01/N4: the full kill switch is both rule knobs at zero.
+    #[test]
+    fn loop_abort_both_rules_zero_is_the_kill_switch() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "0", "--loop-fast-span", "0"].iter()))
+            .unwrap().command else { panic!("expected native serving") };
+        let config = args.loop_abort.config();
+        assert_eq!(config.run, 0);
+        assert_eq!(config.fast_span, 0);
+        let super::Commands::ServeNative(enabled_args) = super::Cli::try_parse_from(base)
+            .unwrap().command else { panic!("expected native serving") };
+        for period in [1, 300] {
+            let detail = cuteafd_api::openai::FinishDetail::default();
+            let mut abort = config.guard(detail.clone(), 1);
+            let mut enabled = enabled_args.loop_abort.config()
+                .guard(cuteafd_api::openai::FinishDetail::default(), 2);
+            let mut enabled_aborted = false;
+            for token in (0..if period == 1 { 2_000 } else { 3_000 }).map(|i| i % period) {
+                assert!(!abort.push(token), "the disabled detector never aborts");
+                if !enabled_aborted { enabled_aborted = enabled.push(token); }
+            }
+            assert!(enabled_aborted, "CLI defaults must abort period {period}");
+            assert_eq!(detail.name(), None);
+        }
+    }
+
     #[test]
     fn engram_warm_is_an_opt_in_native_serve_switch() {
         use clap::Parser;
@@ -1184,6 +1246,9 @@ pub(crate) struct NativeServeArgs {
     /// Output limit and KV decode reservation (`--max-output-tokens`, `--kv-*`).
     #[command(flatten)]
     pub reserve: crate::shared::kv_reserve::ReserveArgs,
+
+    #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
 
     /// Exact global KV/index byte budget (B/MB/GB/MiB/GiB), rounded down to page groups.
     #[arg(long)]

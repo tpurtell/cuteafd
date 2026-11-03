@@ -21,8 +21,24 @@ class FakeTokenizer:
 
 
 @pytest.fixture
-def fake_server():
+def fidelity_corpus(tmp_path):
+    # Keep recipe lengths and hashes independent of changes to live engine sources.
+    files = [f"source_{i}.py" for i in range(10)]
+    for i, name in enumerate(files):
+        (tmp_path / name).write_text(f"# Synthetic module {i}\n" + "value = 1234567890\n" * 384)
+    for name in ("scripts/bench/bench-agentic-session.py", "rust/crates/cuteafd-bench/src/panels/quality.rs"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Fixed recipe provenance fixture\n")
+    assert len(FakeTokenizer().encode("".join((tmp_path / name).read_text() for name in files)).ids) >= 4096
+    return {"root": tmp_path, "files": files}
+
+
+@pytest.fixture
+def fake_server(fidelity_corpus):
     state = {"requests": [], "mode": "good", "generated": 600, "family": "deepseek_v41", "tool_once": False, "called": False, "malformed_remaining": 0}
+
+    state["corpus"] = fidelity_corpus
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -94,7 +110,7 @@ def make(state, **kwargs):
                                       "tokens": list(range(576))},
                       legacy_provenance={"path": "synthetic-test-anchor", "sha256": "b" * 64})
     return builder.build_set(family=state["family"], model="test-model", checkpoint="test-model",
-        version="test1", arm=policy(), tokenizer=FakeTokenizer(), probe=state["client"], **kwargs)
+        version="test1", arm=policy(), tokenizer=FakeTokenizer(), probe=state["client"], **state["corpus"], **kwargs)
 
 
 def test_new_backend_sizes_locally_and_records_reference_snapshot(fake_server):
@@ -110,7 +126,7 @@ def test_new_backend_sizes_locally_and_records_reference_snapshot(fake_server):
             return result
     arm = {**policy(), 'tokenizer_sha256': 'a' * 64, 'config_sha256': 'b' * 64}
     manifest = builder.build_set(family='deepseek_v41', model='test-model', checkpoint='test-model',
-        version='test', arm=arm, tokenizer=FakeTokenizer(), probe=LocalBackend(),
+        version='test', arm=arm, tokenizer=FakeTokenizer(), probe=LocalBackend(), **fake_server['corpus'],
         legacy_reference={'schema': 'cuteafd.fidelity.set/1', 'windows': [
             {'id': 'legacy', 'score_from': 64, 'tokens': list(range(576))}]},
         legacy_provenance={'path': 'legacy.json', 'sha256': 'c' * 64})
@@ -454,11 +470,11 @@ class FakeAPI:
                 "tool_calls": message.get("tool_calls", []), "server": {}}
 
 
-def make_api(probe, recipe):
+def make_api(probe, recipe, corpus):
     return builder.build_set(family="mistral_large4", model="test-model", checkpoint="test-model",
         version="t", arm={"checkpoint": "test-model", "snapshot_revision": "r", "config_sha256": "c",
                           "tokenizer_sha256": "t"},
-        tokenizer=FakeTokenizer(), probe=probe, recipe=recipe,
+        tokenizer=FakeTokenizer(), probe=probe, recipe=recipe, **corpus,
         legacy_reference={"schema": "cuteafd.bench.reference/1", "score_from": 64, "tokens": list(range(576))},
         legacy_provenance={"path": "synthetic-test-anchor", "sha256": "b" * 64})
 
@@ -469,9 +485,9 @@ def test_v1_remains_default_and_unversioned(fake_server):
     assert all("turns" not in w["provenance"] for w in manifest["windows"])
 
 
-def test_v2_continues_tool_turns_in_window_and_versions_the_recipe():
+def test_v2_continues_tool_turns_in_window_and_versions_the_recipe(fidelity_corpus):
     probe = FakeAPI(generated=200, calls=3)
-    manifest = make_api(probe, "v2")
+    manifest = make_api(probe, "v2", fidelity_corpus)
     version = manifest["recipe"]["version"]
     assert version["id"] == "own-text-v2" and len(version["sha256"]) == 64
     for window in manifest["windows"]:
@@ -489,9 +505,9 @@ def test_v2_continues_tool_turns_in_window_and_versions_the_recipe():
     assert any(m["role"] == "tool" and m["content"] != builder.V2_TOOL_UNAVAILABLE for m in a00[-1]["messages"])
 
 
-def test_v2_earlier_turns_stay_generated_only_on_exact_prefix():
+def test_v2_earlier_turns_stay_generated_only_on_exact_prefix(fidelity_corpus):
     probe = FakeAPI(generated=800, calls=2)
-    manifest = make_api(probe, "v2")
+    manifest = make_api(probe, "v2", fidelity_corpus)
     e00 = next(w for w in manifest["windows"] if w["id"] == "e00")
     assert e00["provenance"]["earlier_turns_ctx"] == 0
     # Tool results stay ctx: the gen ids are exactly the generated assistant spans.
@@ -499,9 +515,9 @@ def test_v2_earlier_turns_stay_generated_only_on_exact_prefix():
     assert e00["roles"][e00["score_from"]:].count("gen") >= 400
 
 
-def test_v2_short_answers_get_native_user_turn_context():
+def test_v2_short_answers_get_native_user_turn_context(fidelity_corpus):
     probe = FakeAPI(generated=30, calls=0)
-    manifest = make_api(probe, "v2")
+    manifest = make_api(probe, "v2", fidelity_corpus)
     e00 = next(w for w in manifest["windows"] if w["id"] == "e00")
     padding = e00["provenance"]["trailing_ctx"]
     assert padding > 0
@@ -521,9 +537,9 @@ class ShortFinalAPI(FakeAPI):
         return super().__call__(body)
 
 
-def test_v2_scored_span_ends_at_the_best_turn_and_history_continues():
+def test_v2_scored_span_ends_at_the_best_turn_and_history_continues(fidelity_corpus):
     probe = ShortFinalAPI()
-    manifest = make_api(probe, "v2")
+    manifest = make_api(probe, "v2", fidelity_corpus)
     e00 = next(w for w in manifest["windows"] if w["id"] == "e00")
     p = e00["provenance"]
     assert p["turns_generated"] == 3 and p["scored_end_turn"] == 2 and len(p["turns"]) == 2
@@ -535,9 +551,9 @@ def test_v2_scored_span_ends_at_the_best_turn_and_history_continues():
     assert manifest["recipe"]["version"]["scored_end"].startswith("assistant-turn end")
 
 
-def test_topup_appends_next_b_windows_and_notes_allocation():
+def test_topup_appends_next_b_windows_and_notes_allocation(fidelity_corpus):
     probe = FakeAPI(generated=3000, calls=0)
-    manifest = make_api_topup(probe, 3)
+    manifest = make_api_topup(probe, 3, fidelity_corpus)
     ids = [w["id"] for w in manifest["windows"]]
     assert len(ids) == 67 and ids[ids.index("b11") + 1:ids.index("b11") + 4] == ["b12", "b13", "b14"]
     note = manifest["allocation_note"]
@@ -545,14 +561,14 @@ def test_topup_appends_next_b_windows_and_notes_allocation():
     assert note["added_strata"] == {"8-16K": 3} and note["original_blocks"]["B"] == 12
     assert manifest["recipe"]["blocks"]["B"] == 15 and manifest["recipe"]["windows"] == 67
     with pytest.raises(ValueError, match="recipe v2"):
-        make_api_topup(FakeAPI(), 1, recipe="v1")
+        make_api_topup(FakeAPI(), 1, fidelity_corpus, recipe="v1")
 
 
-def make_api_topup(probe, n, recipe="v2"):
+def make_api_topup(probe, n, corpus, recipe="v2"):
     return builder.build_set(family="muse_spark", model="test-model", checkpoint="test-model",
         version="t", arm={"checkpoint": "test-model", "snapshot_revision": "r", "config_sha256": "c",
                           "tokenizer_sha256": "t"},
-        tokenizer=FakeTokenizer(), probe=probe, recipe=recipe, topup_b=n,
+        tokenizer=FakeTokenizer(), probe=probe, recipe=recipe, topup_b=n, **corpus,
         legacy_reference={"schema": "cuteafd.bench.reference/1", "score_from": 64, "tokens": list(range(576))},
         legacy_provenance={"path": "synthetic-test-anchor", "sha256": "b" * 64})
 
@@ -565,13 +581,13 @@ class HistoryRewritingAPI(FakeAPI):
         return self.renderer.conversation_ids(body, rewritten)
 
 
-def test_v2_trailing_context_falls_back_to_raw_text_when_the_renderer_rewrites_history():
-    manifest = make_api(HistoryRewritingAPI(generated=30, calls=0), "v2")
+def test_v2_trailing_context_falls_back_to_raw_text_when_the_renderer_rewrites_history(fidelity_corpus):
+    manifest = make_api(HistoryRewritingAPI(generated=30, calls=0), "v2", fidelity_corpus)
     e00 = next(w for w in manifest["windows"] if w["id"] == "e00")
     assert e00["provenance"]["trailing_context"].startswith("raw repository text")
     counts = manifest["recipe"]["trailing_context_windows"]
     assert counts["raw repository text (renderer rewrites the scored turn)"] > 0 and counts["native user turn"] == 0
-    native = make_api(FakeAPI(generated=30, calls=0), "v2")
+    native = make_api(FakeAPI(generated=30, calls=0), "v2", fidelity_corpus)
     assert native["recipe"]["trailing_context_windows"]["native user turn"] > 0
     assert native["recipe"]["version"]["sha256"] == manifest["recipe"]["version"]["sha256"]
 
@@ -586,13 +602,13 @@ class JsonModeAPI(FakeAPI):
         return chat
 
 
-def test_v2_drops_provider_json_mode_when_it_breaks_prompt_exactness():
+def test_v2_drops_provider_json_mode_when_it_breaks_prompt_exactness(fidelity_corpus):
     probe = JsonModeAPI(generated=3000, calls=0)
-    manifest = make_api(probe, "v2")
+    manifest = make_api(probe, "v2", fidelity_corpus)
     assert manifest["recipe"]["json_mode_dropped_windows"] == ["d00", "d01", "d02"]
     d00 = next(w for w in manifest["windows"] if w["id"] == "d00")
     assert d00["provenance"]["json_mode"]["provider_prompt_offset"] == 22
     final = [r for r in probe.requests if "Fidelity fixture d00" in r["messages"][0]["content"]][-1]
     assert "response_format" not in final and "Reply in JSON." in final["messages"][-1]["content"]
-    exact = make_api(FakeAPI(generated=3000, calls=0), "v2")
+    exact = make_api(FakeAPI(generated=3000, calls=0), "v2", fidelity_corpus)
     assert exact["recipe"]["json_mode_dropped_windows"] == []

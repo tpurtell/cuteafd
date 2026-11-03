@@ -462,8 +462,13 @@ impl Bench {
 
     /// One remote probe is registered inside the serving process, where the registry lives.
     /// It holds the same exclusive inference slot as a benchmark, including on errors.
-    pub fn probe(self: &Arc<Self>, body: Value, mut spec: cuteafd_api::openai::probe::ProbeSpec) -> anyhow::Result<Value> {
+    pub fn probe_fixture(self: &Arc<Self>, body: Value, mut spec: cuteafd_api::openai::probe::ProbeSpec, cache_exact: bool) -> anyhow::Result<Value> {
         anyhow::ensure!(body.is_object(), "probe body must be a chat object");
+        let fixture = if cache_exact {
+            anyhow::ensure!(serde_json::to_value(&spec)? == serde_json::to_value(cuteafd_api::openai::probe::ProbeSpec::default())?,
+                "cache_exact owns its probe switches; omit spec");
+            Some(crate::baseline::cache_fixture(&body)?)
+        } else { None };
         if spec.dump_rows.is_some() {
             let root = std::env::var_os("CUTEAFD_PROBE_DUMP_ROOT")
                 .ok_or_else(|| anyhow::anyhow!("remote row dumps require CUTEAFD_PROBE_DUMP_ROOT"))?;
@@ -490,8 +495,15 @@ impl Bench {
         let mut client = Client::new(&base, Some(active.token), active.cancel).with_api_key(self.api_key.get().cloned());
         client.discover()?;
         let model = client.model.clone();
-        let chat = client.chat(body, Some(spec))?;
-        let mut value = serde_json::to_value(chat)?;
+        let mut value = if let Some(fixture) = fixture {
+            let info = self.server_info(&model);
+            client.configuration = info.configuration.clone();
+            let started = Instant::now();
+            let mut check = crate::report::Check::new("cache_exact", "Media prefix-cache restore");
+            crate::baseline::cache_exact_fixture(&client, &info, &mut check, Some(&fixture))?;
+            check.seconds = started.elapsed().as_secs_f64();
+            json!({"cache_exact": check})
+        } else { serde_json::to_value(client.chat(body, Some(spec))?)? };
         let context = crate::context::get();
         value["server"] = probe_server(&model, &context);
         Ok(value)

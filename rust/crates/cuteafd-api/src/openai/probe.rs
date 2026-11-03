@@ -320,6 +320,13 @@ pub struct ProbeRecord {
     pub audio: Vec<ProbeAudio>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<serde_json::Value>,
+    /// Native tower work needed by this request (false for memo / whole-prefix hits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded: Option<bool>,
+    /// Sum of native owner encode times, excluding request/queue/poll latency.
+    /// None means the serving path has not reported timing; zero with encoded=false is a hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_ms: Option<f64>,
     pub cached_tokens: usize,
     /// Executed unit count of the final prefill call; unknown unless reported by the engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -393,6 +400,10 @@ impl Probe {
             r.cold = self.spec.cold;
             r.no_speculation = self.spec.no_speculation;
         });
+    }
+
+    pub fn encoding(&self, encoded: bool, encode_ms: f64) {
+        self.with(|r| { r.encoded = Some(encoded); r.encode_ms = Some(encode_ms); });
     }
 
     pub fn prefill_units(&self, units: usize) {
@@ -592,6 +603,20 @@ pub fn registry() -> &'static ProbeRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn encoding_probe_distinguishes_native_work_hits_and_unreported_paths() {
+        let probe = Probe::new(ProbeSpec::default());
+        assert_eq!(probe.record().encode_ms, None);
+        assert_eq!(probe.record().encoded, None);
+        probe.encoding(true, 1.25);
+        let wire = serde_json::to_value(probe.record()).unwrap();
+        assert_eq!(wire["encoded"], true);
+        assert_eq!(wire["encode_ms"], 1.25);
+        probe.encoding(false, 0.0);
+        assert_eq!(probe.record().encoded, Some(false));
+        assert_eq!(probe.record().encode_ms, Some(0.0));
+    }
+
     #[test]
     fn image_probe_serialization_is_unchanged_when_audio_is_empty() {
         use super::*;

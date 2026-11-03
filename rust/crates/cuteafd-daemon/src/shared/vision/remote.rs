@@ -617,7 +617,6 @@ impl EncoderServer {
             timeout,
             move || health.healthy(),
             move |job| {
-                let started = Instant::now();
                 let (grid, rgb8) = job.image_input()?;
                 let ticket = service
                     .submit(NativeJob {
@@ -642,7 +641,7 @@ impl EncoderServer {
                 Ok(EncodeOutput {
                     key: job.key,
                     features: bytes.into(),
-                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    elapsed_ms: ticket.encode_ms(),
                 })
             },
         )
@@ -664,7 +663,6 @@ impl EncoderServer {
             timeout,
             move || health.healthy(),
             move |job| {
-                let started = Instant::now();
                 let cuteafd_engine::media::EncodeInput::Audio { pcm, .. } = &job.input else {
                     return Err(error("audio peer refuses image"));
                 };
@@ -689,7 +687,7 @@ impl EncoderServer {
                 Ok(EncodeOutput {
                     key: job.key,
                     features: bytes.into(),
-                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    elapsed_ms: ticket.encode_ms(),
                 })
             },
         )

@@ -182,7 +182,11 @@ async fn start(State(bench): State<Arc<Bench>>, connect: Option<ConnectInfo<Sock
 #[derive(serde::Deserialize)]
 struct ProbeRequest {
     body: serde_json::Value,
+    #[serde(default)]
     spec: cuteafd_api::openai::probe::ProbeSpec,
+    /// Baseline prompt/turn restore checks with one ordinary media fixture.
+    #[serde(default)]
+    cache_exact: bool,
 }
 
 fn probe_error(error: anyhow::Error) -> Response {
@@ -205,7 +209,7 @@ async fn probe_request(State(bench): State<Arc<Bench>>, connect: Option<ConnectI
     // A running panel's own media probes carry its run token.
     let own = headers.get(BENCH_HEADER).and_then(|v| v.to_str().ok()).is_some_and(|t| bench.accepts_internal(t));
     if !own && !authorized(&bench, peer(connect), &headers) { return forbidden(); }
-    match tokio::task::spawn_blocking(move || bench.probe(request.body, request.spec)).await {
+    match tokio::task::spawn_blocking(move || bench.probe_fixture(request.body, request.spec, request.cache_exact)).await {
         Ok(Ok(chat)) => Json(chat).into_response(),
         Ok(Err(error)) => probe_error(error),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
@@ -557,6 +561,20 @@ mod tests {
     /// A rasterization failure is an error naming the file, never an absent
     /// export: a publisher re-rendering a run's images must be able to tell a
     /// failure from a file the run does not have, or it keeps a stale image.
+    #[test]
+    fn media_cache_probe_accepts_fixture_without_manual_probe_switches() {
+        let request: ProbeRequest = serde_json::from_value(json!({"cache_exact": true,
+            "body": {"messages": [{"role": "user", "content": [{"type": "input_audio",
+                "input_audio": {"data": "AA==", "format": "wav"}}]}]}})).unwrap();
+        assert!(request.cache_exact);
+        assert!(request.spec.prompt_ids.is_none());
+        assert!(!request.spec.cold);
+        assert_eq!(crate::baseline::cache_fixture(&request.body).unwrap()["type"], "input_audio");
+        let legacy: ProbeRequest = serde_json::from_value(json!({"body": {}, "spec": {"record_rows": 2}})).unwrap();
+        assert!(!legacy.cache_exact);
+        assert_eq!(legacy.spec.record_rows, 2);
+    }
+
     #[test]
     fn a_failed_rasterization_is_an_error_not_a_missing_export() {
         let error = rasterize("<svg", "card.png").unwrap_err();

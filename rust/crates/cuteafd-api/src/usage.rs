@@ -61,6 +61,7 @@ pub struct Record {
     pub status: u16,
     pub outcome: String,
     pub stop_reason: Option<String>,
+    pub finish_detail: Option<String>,
     pub error_class: Option<String>,
     pub bytes_in: Option<u64>,
     pub bytes_out: Option<u64>,
@@ -139,6 +140,7 @@ struct Inner {
     served: OnceLock<String>,
     session: OnceLock<(String, String)>,
     stop: OnceLock<String>,
+    finish_detail: OnceLock<crate::openai::FinishDetail>,
     error: OnceLock<String>,
     terminal: AtomicU64,
     retired: OnceLock<f64>,
@@ -183,6 +185,7 @@ impl UsageHandle {
             served: OnceLock::new(),
             session: OnceLock::new(),
             stop: OnceLock::new(),
+            finish_detail: OnceLock::new(),
             error: OnceLock::new(),
             terminal: AtomicU64::new(0),
             retired: OnceLock::new(),
@@ -238,6 +241,10 @@ impl UsageHandle {
     pub fn stop(&self, reason: &str) {
         let _ = self.0.stop.set(reason.to_owned());
         if reason == "cancelled" { self.0.terminal.store(1, Relaxed); }
+    }
+    /// Share the engine's terminal detail across every API protocol and disconnect.
+    pub fn finish_detail(&self, detail: crate::openai::FinishDetail) {
+        let _ = self.0.finish_detail.set(detail);
     }
     pub fn engine_error(&self, class: &str) {
         let _ = self.0.error.set(class.to_owned());
@@ -326,6 +333,9 @@ impl Drop for Inner {
             }
         }
         if let Some(stop) = self.stop.get() { r.stop_reason = Some(stop.clone()); }
+        if let Some(detail) = self.finish_detail.get().and_then(|d| d.name()) {
+            r.finish_detail = Some(detail.into());
+        }
         if let Some(error) = self.error.get() { r.error_class = Some(error.clone()); }
         let optional = |v: &AtomicU64| {
             let n = v.load(Relaxed);
@@ -717,6 +727,28 @@ pub(crate) mod tests {
     pub(crate) fn logging_sink() -> (Arc<Sink>, Arc<LogTape>) {
         let tape = Arc::new(LogTape::default());
         (Arc::new(Sink(Default::default(), Counters::default(), Some(tape.clone()))), tape)
+    }
+
+    #[test]
+    fn finish_detail_is_persisted_and_old_records_still_load() {
+        let (sink, _) = logging_sink();
+        for looped in [false, true] {
+            let detail = crate::openai::FinishDetail::default();
+            let scope = UsageHandle::new(Record::default(), sink.clone());
+            scope.finish_detail(detail.clone());
+            scope.stop("length");
+            if looped { detail.set_repetition(); }
+            scope.finished(200);
+            drop(scope);
+        }
+        let rows = sink.0.lock().unwrap();
+        assert_eq!(rows[0].finish_detail, None);
+        assert_eq!(rows[1].finish_detail.as_deref(), Some("repetition"));
+        let mut old = serde_json::to_value(&rows[0]).unwrap();
+        old.as_object_mut().unwrap().remove("finish_detail");
+        assert!(serde_json::from_value::<Record>(old).unwrap().finish_detail.is_none());
+        let jsonl = serde_json::to_string(&rows[1]).unwrap();
+        assert_eq!(serde_json::from_str::<Record>(&jsonl).unwrap().finish_detail.as_deref(), Some("repetition"));
     }
 
     /// The chat path: one refcount clone per frame; the stream's frames, the

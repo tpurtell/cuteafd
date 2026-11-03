@@ -115,22 +115,6 @@
     },
     {
       "family": "glm5",
-      "checkpoint": "nvidia/GLM-5.3-NVFP4",
-      "5090": {
-        "status": "na",
-        "reason": "doesn't fit"
-      },
-      "1rtx": {
-        "status": "current",
-        "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min"
-      },
-      "2rtx": {
-        "status": "na",
-        "reason": "\u2014"
-      }
-    },
-    {
-      "family": "glm5",
       "checkpoint": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
       "5090": {
         "status": "na",
@@ -175,38 +159,6 @@
       "2rtx": {
         "status": "current",
         "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max"
-      }
-    },
-    {
-      "family": "glm5_flash",
-      "checkpoint": "nvidia/GLM-5.3-Flash-NVFP4",
-      "5090": {
-        "status": "current",
-        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090"
-      },
-      "1rtx": {
-        "status": "current",
-        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min"
-      },
-      "2rtx": {
-        "status": "na",
-        "reason": "\u2014"
-      }
-    },
-    {
-      "family": "glm5_flash",
-      "checkpoint": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
-      "5090": {
-        "status": "current",
-        "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090"
-      },
-      "1rtx": {
-        "status": "current",
-        "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min"
-      },
-      "2rtx": {
-        "status": "na",
-        "reason": "\u2014"
       }
     },
     {
@@ -255,22 +207,6 @@
       "2rtx": {
         "status": "current",
         "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-2rtx-6spark-step5-fp8-max"
-      }
-    },
-    {
-      "family": "step5",
-      "checkpoint": "stepfun-ai/Step-5-Preview-NVFP4",
-      "5090": {
-        "status": "na",
-        "reason": "doesn't fit"
-      },
-      "1rtx": {
-        "status": "current",
-        "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-nvfp4-1rtx-4spark-step5-nvfp4-min"
-      },
-      "2rtx": {
-        "status": "na",
-        "reason": "\u2014"
       }
     },
     {
@@ -436,6 +372,48 @@
       "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090",
       "release": "v3.0.0-rc5",
       "release_note": "Tagged build recorded by the report."
+    },
+    {
+      "name": "glm53-nvfp4-min",
+      "config": "examples/configs/glm53-nvfp4-min.config",
+      "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min",
+      "release": "v4.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "glm53f-nvfp4-min",
+      "config": "examples/configs/glm53-flash-nvfp4-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min",
+      "release": "v4.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "glm53f-nvfp4-5090",
+      "config": "examples/configs/glm53-flash-nvfp4-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090",
+      "release": "v4.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "glm53f-tr3-min",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min",
+      "release": "v4.1.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. Retired in v5 (TJ 2026-11-02)."
+    },
+    {
+      "name": "glm53f-tr3-5090",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090",
+      "release": "v4.1.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. Retired in v5 (TJ 2026-11-02)."
+    },
+    {
+      "name": "step5-nvfp4-min",
+      "config": "examples/configs/step5-nvfp4-min.config",
+      "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-nvfp4-1rtx-4spark-step5-nvfp4-min",
+      "release": "v4.0.0-rc2",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
     }
   ]
 }

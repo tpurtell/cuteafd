@@ -71,6 +71,8 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub prefix: PrefixArgs,
     #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
+    #[command(flatten)]
     pub console: console::ConsoleArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
@@ -142,7 +144,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix, vision, media_cache_bytes,
-            remote));
+            remote, args.loop_abort.config()));
     let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
     let mut profile = profile;
     if let Some((preparer, health)) = media {
@@ -225,7 +227,8 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>,
-    remote: Option<crate::families::glm5_flash::media::RemoteVision>) -> Result<()> {
+    remote: Option<crate::families::glm5_flash::media::RemoteVision>,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     let args = &resolved.args;
     let opened = match open(args) {
         Ok(opened) => opened,
@@ -252,7 +255,7 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
         schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences, policy,
-            ranks, &prefix, args.token_io.token_select, &mut media, expander.as_ref(), || {
+            ranks, &prefix, loop_abort, args.token_io.token_select, &mut media, expander.as_ref(), || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
                 }
@@ -339,6 +342,10 @@ struct Active<'a> {
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
+    /// Loop abort: the per-request guard, built at admission from the live knobs.
+    loop_abort: crate::shared::loop_abort::LoopAbort,
+    /// The last emitted token tripped the loop guard (suppresses turn retention).
+    looped: bool,
 }
 
 /// Stops censor an unjudged continuation, never a disagreeing draft token.
@@ -395,6 +402,7 @@ impl Active<'_> {
         crate::shared::probe::token(&self.job.probe, token);
         self.history.push(token);
         self.generated += 1;
+        self.looped = self.loop_abort.push(token);
         self.buffered += 1;
         // A grammar that accepted one of its stop tokens has ended the request.
         let stop = self.job.stop_token_ids.contains(&token)
@@ -407,7 +415,7 @@ impl Active<'_> {
         }
         let finish = if stop {
             Some(InferenceFinishReason::Stop)
-        } else if self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
+        } else if self.looped || self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
             Some(InferenceFinishReason::Length)
         } else {
             None
@@ -624,7 +632,8 @@ fn draft_seed() -> cuteafd_core::PolicySeed {
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
-    max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs, select: SelectPlacement,
+    max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig, select: SelectPlacement,
     media: &mut MediaAdmission<ml4_media::Prompt, ml4_media::Encoder>,
     expander: Option<&cuteafd_loader::media::MistralSpanExpander>, ready: impl FnOnce()) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
@@ -687,6 +696,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 cuteafd_engine::prefix::AdmissionPoll::Ready(admit) => admit,
                 cuteafd_engine::prefix::AdmissionPoll::Empty => match media.poll(|prompt| prompt.job.events.is_closed()) {
                     MediaPoll::Ready(ready) => {
+                        if let Some(probe) = &ready.job().job.probe {
+                            let (encoded, ms) = ready.encoding();
+                            probe.encoding(encoded, ms);
+                        }
                         let (prompt, request_media) = ready.into_parts();
                         Admit { prompt, media: request_media, constraint: None }
                     }
@@ -986,6 +999,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 };
                 let job_events = p.job.events.clone();
                 let admitted = (|| -> Result<Active<'_>> {
+                    let loop_abort = loop_abort.guard(p.job.finish_detail.clone(), p.id);
                     let mut request = Active {
                         spans: spans.clone(),
                         id: p.id,
@@ -1004,6 +1018,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         }, turn: None,
                         capacity: p.capacity, lease: p.lease, next: 0, generated: 0, buffered: 0, started: Instant::now(),
                         ticket: p.ticket,
+                        loop_abort,
+                        looped: false,
                     };
                     request.next = match (p.first, &logits) {
                         (Some(first), _) => first,
@@ -1093,7 +1109,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 plan_ms = per_step(host[1]), embed_ms = per_step(host[2]), verify_ms = per_step(host[3]),
                 select_ms = per_step(host[4]), update_ms = per_step(host[5]),
                 "host step phases since the last completed request (ms per step)");
-            if let Some(row) = &request.turn {
+            if let Some(row) = request.turn.as_ref().filter(|_| !request.looped) {
                 // The conversation so far: every committed row (the last token is not in it).
                 // Keyed like its prompt: image rows by their image identity.
                 let keys = MediaKeys::new(&request.history, engine.cfg.vocab_size as u32, &request.spans)?;
@@ -1304,7 +1320,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
                     if done {
                         // A normal finish (the client took the last chunk): the row that
                         // produced the last token follows the turn snapshot.
-                        if retain_turn && !probe::cold(&request.job.probe) {
+                        if retain_turn && !request.looped && !probe::cold(&request.job.probe) {
                             request.turn = logits.row_host(&opened.library, offset + j)
                                 .inspect_err(|error| tracing::warn!("turn logits: {error:#}")).ok();
                         }

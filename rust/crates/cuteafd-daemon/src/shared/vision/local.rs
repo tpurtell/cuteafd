@@ -3,7 +3,7 @@
 use super::{normalization_lut, EncodeJob, EncoderService, EncoderTicket};
 use cuteafd_engine::media::{self, EncodeInput, EncodeOutput, EncoderClient, MediaError};
 use cuteafd_loader::media::ProcessorConfig;
-use std::{collections::VecDeque, sync::Arc, time::Instant};
+use std::{collections::VecDeque, sync::Arc};
 
 struct Pending {
     id: media::EncoderTicket,
@@ -12,7 +12,6 @@ struct Pending {
 struct Running {
     pending: Pending,
     ticket: EncoderTicket,
-    started: Instant,
 }
 pub struct LocalEncoder {
     service: EncoderService,
@@ -68,7 +67,6 @@ impl EncoderClient for LocalEncoder {
     fn poll(&mut self, id: media::EncoderTicket) -> Option<Result<EncodeOutput, MediaError>> {
         if self.running.is_none() {
             let pending = self.queue.pop_front()?;
-            let started = Instant::now();
             let output = vec![0; pending.job.tokens * self.width];
             let submitted = match &pending.job.input {
                 EncodeInput::Image { grid, rgb8 } => self.service.submit(EncodeJob {
@@ -78,7 +76,7 @@ impl EncoderClient for LocalEncoder {
                     pcm: pcm.clone(), fp32_scratch: if self.service.audio_geometry().is_some_and(|g| g.is_mimo()) { vec![0.0; output.len()] } else { Vec::new() }, output }),
             };
             match submitted {
-                Ok(ticket) => self.running = Some(Running { pending, ticket, started }),
+                Ok(ticket) => self.running = Some(Running { pending, ticket }),
                 Err(super::VisionError::QueueFull) => {
                     // Cancelled work still drains on the owner. Backpressure is not a failed encode.
                     self.queue.push_front(pending);
@@ -106,7 +104,7 @@ impl EncoderClient for LocalEncoder {
         Some(result.map(|output| EncodeOutput {
             key: running.pending.job.key,
             features: output.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>().into(),
-            elapsed_ms: running.started.elapsed().as_secs_f64() * 1000.0,
+            elapsed_ms: running.ticket.encode_ms(),
         }))
     }
     fn cancel(&mut self, id: media::EncoderTicket) {
@@ -121,6 +119,7 @@ impl EncoderClient for LocalEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     use cuteafd_core::ImageKey;
     use std::sync::{atomic::Ordering, mpsc};
 
@@ -137,6 +136,7 @@ mod tests {
                 assert!(job.fp32_scratch.is_empty());
                 assert_eq!(job.output.len(), job.pcm.len().div_ceil(1920) * 8192);
                 job.output.fill(0x3f80);
+                work.encode_ns.store(1_250_000, Ordering::Release);
                 let _ = work.reply.send(Ok(job.output));
             }
         });
@@ -156,6 +156,7 @@ mod tests {
         loop {
             if let Some(output) = encoder.poll(id) {
                 let output = output.unwrap();
+                assert_eq!(output.elapsed_ms, 1.25, "must use native owner timing, not poll latency");
                 assert_eq!(output.features.len(), 2 * 8192 * 2);
                 assert!(output.features.chunks_exact(2).all(|v| v == [0x80, 0x3f]));
                 break;

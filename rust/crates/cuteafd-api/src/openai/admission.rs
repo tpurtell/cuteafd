@@ -144,11 +144,9 @@ mod tests {
         for _ in 0..3 {
             pending.push(tokio::spawn({let a=admission.clone(); let tx=tx.clone(); async move {a.reserve(tx).await}}));
         }
-        for _ in 0..100 {
-            if admission.waiters.available_permits() == 1 { break; }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(admission.waiters.available_permits(), 1);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while admission.waiters.available_permits() != 1 { tokio::task::yield_now().await; }
+        }).await.expect("three waiters hold a slot");
         assert_eq!(admission.metrics()["http_queue_waiters_peak"], 3);
         for p in &pending { p.abort(); }
         for p in pending { let _ = p.await; }
@@ -165,11 +163,11 @@ mod tests {
         for _ in 0..8 {
             pending.push(tokio::spawn({let a=admission.clone(); let tx=tx.clone(); async move {a.reserve(tx).await}}));
         }
-        for _ in 0..1000 {
-            if admission.waiters.available_permits() == 0 { break; }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(admission.waiters.available_permits(), 0);
+        // Bounded by time, not a yield count: under a loaded test host the
+        // eight spawned waiters can take longer than any fixed number of yields.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while admission.waiters.available_permits() != 0 { tokio::task::yield_now().await; }
+        }).await.expect("all eight waiters hold a slot");
         assert_eq!(admission.metrics()["http_queue_waiters_peak"], 8);
         for p in &pending { p.abort(); }
         for p in pending { let _ = p.await; }

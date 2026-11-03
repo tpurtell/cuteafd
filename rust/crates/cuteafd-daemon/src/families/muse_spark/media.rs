@@ -401,7 +401,7 @@ mod tests {
             input_key: None, fixture: None, image_url: None };
         let run = |span: ProbeMedia| {
             let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![span], ..Default::default() });
-            let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
+            let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(),
                 prompt: String::new(), constraint: None, images: Vec::new(), media: vec![image.clone()], audio: Vec::new(),
                 max_tokens: 8, sampling: Default::default(), stop_token_ids: Vec::new(),
                 events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: Some(probe) };

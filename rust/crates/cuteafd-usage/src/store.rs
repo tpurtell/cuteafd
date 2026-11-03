@@ -228,7 +228,7 @@ tokens_in INTEGER, tokens_cached INTEGER, tokens_out INTEGER, tokens_reasoning I
 draft_proposed INTEGER, draft_accepted INTEGER, rounds INTEGER,
 t_queue_ms REAL, t_admit_ms REAL, t_ttft_ms REAL, t_total_ms REAL, t_retire_ms REAL, prefill_tps REAL, decode_tps REAL,
 concurrency_http INTEGER, concurrency_engine INTEGER, status INTEGER NOT NULL, outcome TEXT NOT NULL,
-stop_reason TEXT, error_class TEXT, bytes_in INTEGER, bytes_out INTEGER, bench INTEGER NOT NULL DEFAULT 0);
+stop_reason TEXT, finish_detail TEXT, error_class TEXT, bytes_in INTEGER, bytes_out INTEGER, bench INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts_ms);
 CREATE INDEX IF NOT EXISTS requests_session ON requests(session_id,ts_ms) WHERE session_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS requests_model ON requests(model_served,ts_ms);
@@ -247,6 +247,15 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL);"
         .any(|name| name == "t_retire_ms");
     if !has_retire {
         c.execute_batch("ALTER TABLE requests ADD COLUMN t_retire_ms REAL;")?;
+    }
+    let has_finish_detail = c
+        .prepare("PRAGMA table_info(requests)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "finish_detail");
+    if !has_finish_detail {
+        c.execute_batch("ALTER TABLE requests ADD COLUMN finish_detail TEXT;")?;
     }
     let has_bench = c
         .prepare("PRAGMA table_info(daily)")?
@@ -530,6 +539,26 @@ mod tests {
             ..Record::default()
         }
     }
+    #[test]
+    fn finish_detail_migrates_and_roundtrips() {
+        let c = Connection::open_in_memory().unwrap();
+        schema(&c).unwrap();
+        c.execute_batch("ALTER TABLE requests DROP COLUMN finish_detail;").unwrap();
+        schema(&c).unwrap();
+        schema(&c).unwrap();
+        let mut old = record(0, 0);
+        old.stop_reason = Some("length".into());
+        insert(&c, &mut old).unwrap();
+        let mut looped = record(1, 1);
+        looped.stop_reason = Some("length".into());
+        looped.finish_detail = Some("repetition".into());
+        insert(&c, &mut looped).unwrap();
+        let rows = read_records(&c).unwrap();
+        assert_eq!(rows[0].finish_detail, None);
+        assert_eq!(rows[1].finish_detail.as_deref(), Some("repetition"));
+        assert_eq!(rows[0].stop_reason, rows[1].stop_reason);
+    }
+
     #[test]
     fn settings_roundtrip_and_age() {
         let dir = tempfile::tempdir().unwrap();

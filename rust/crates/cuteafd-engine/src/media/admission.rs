@@ -17,6 +17,8 @@ pub struct MediaWaiter<T> {
     submit_waited: bool,
     pins: Vec<EmbeddingLease>,
     error: Option<MediaError>,
+    encode_ms: f64,
+    encoded: bool,
 }
 impl<T> MediaWaiter<T> {
     pub fn new(
@@ -55,6 +57,8 @@ impl<T> MediaWaiter<T> {
             submit_waited: false,
             pins: Vec::new(),
             error: None,
+            encode_ms: 0.0,
+            encoded: false,
         })
     }
 }
@@ -64,6 +68,10 @@ pub struct MediaReady<T> {
     waiter: MediaWaiter<T>,
 }
 impl<T> MediaReady<T> {
+    /// Native work awaited by this request, not queue or LM latency.
+    pub fn encoding(&self) -> (bool, f64) {
+        (self.waiter.encoded, self.waiter.encode_ms)
+    }
     pub fn job(&self) -> &T {
         &self.waiter.job
     }
@@ -344,7 +352,7 @@ impl<T, C: EncoderClient> MediaAdmission<T, C> {
                 }
                 let lease = self.cache.complete(key, output.features)?;
                 self.latencies.record(output.elapsed_ms);
-                Ok(lease)
+                Ok((lease, output.elapsed_ms))
             });
             for waiter in &mut self.pending {
                 if waiter.error.is_some() { continue; }
@@ -356,7 +364,9 @@ impl<T, C: EncoderClient> MediaAdmission<T, C> {
                     continue;
                 }
                 match &result {
-                    Ok(lease) => {
+                    Ok((lease, elapsed_ms)) => {
+                        waiter.encoded = true;
+                        waiter.encode_ms += elapsed_ms;
                         if let Err(error) = waiter.media.attach(lease.clone()) {
                             waiter.error = Some(error);
                         }
@@ -657,6 +667,8 @@ mod tests {
         let first = ready(queue.poll(|_| false));
         let second = ready(queue.poll(|_| false));
         assert_eq!(queue.encoder().submitted, 1);
+        assert_eq!(first.encoding(), (true, 1.0));
+        assert_eq!(second.encoding(), (true, 1.0), "coalesced waiter also needed native work");
         assert!(queue.cache.contains(audio_key));
         assert!(!queue.cache.contains(ImageKey(audio_key.0)));
         let mut a = crate::media::MediaChunk::default(); first.media().write_chunk(0, 2, &mut a).unwrap();
@@ -670,11 +682,13 @@ mod tests {
         queue.enqueue(make(3, 2)).unwrap();
         let restored = ready(queue.poll(|_| false));
         assert_eq!(queue.encoder().submitted, 1, "prefix restore needs no embeddings");
+        assert_eq!(restored.encoding(), (false, 0.0));
         let retry = restored.reconcile(0).unwrap_err(); queue.enqueue(retry).unwrap();
         let reencoded = ready(queue.poll(|_| false));
         let mut b = crate::media::MediaChunk::default(); reencoded.media().write_chunk(0, 2, &mut b).unwrap();
         assert_eq!(a.features, b.features);
         assert_eq!(queue.encoder().submitted, 2);
+        assert_eq!(reencoded.encoding(), (true, 1.0));
     }
 
     #[test]

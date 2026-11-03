@@ -415,7 +415,7 @@ def test_glmf_exl3_smoke_and_gate_cards_use_the_published_core_checkpoint() -> N
 
 def test_published_matrix_pins_current_reports() -> None:
     matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
-    assert len(matrix["cells"]) == 21
+    assert len(matrix["cells"]) == 17
     for row in matrix["cells"]:
         # The 5090 column carries our simulated card where the checkpoint fits 32 GB.
         assert row["5090"]["status"] in ("current", "na")
@@ -759,7 +759,7 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
                    for other in v4["entries"]) == 1
     assert not any(name.startswith("qwen38-nvfp4") for name in entries)
     retired = v4["retired"]
-    assert len(retired) == 14
+    assert len(retired) == 20
     assert "glm53-exl3-max" not in {entry["name"] for entry in retired}
     assert {"qwen38-nvfp4-" + size for size in ("min", "max", "5090")} <= {e["name"] for e in retired}
     assert retired == json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]

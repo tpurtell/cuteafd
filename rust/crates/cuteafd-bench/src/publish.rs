@@ -1300,7 +1300,7 @@ mod tests {
         let current = rendered.split_once("\n### Retired").unwrap().0.trim();
         // Once the generated README carries Retired, compare the same main section.
         assert_eq!(current, existing.split_once("\n### Retired").map_or(existing, |(main, _)| main).trim());
-        assert_eq!(matrix.retired.len(), 14);
+        assert_eq!(matrix.retired.len(), 20);
         let retired = rendered.split_once("\n### Retired").unwrap().1;
         assert!(!retired.contains("nearest final release"));
         for entry in &matrix.retired {

@@ -1,0 +1,229 @@
+{
+  "schema": "cuteafd.loop_abort.fidelity_evidence/2",
+  "generated": "2026-11-03T19:53:36.068835+00:00",
+  "detector": {
+    "module": "rust/crates/cuteafd-daemon/src/shared/repeat_guard.rs",
+    "sha256": "cff35b4757a6583c7bb72b0b207d3b66f1f55beb9a43296284990dc1c3714280",
+    "rule_r": {
+      "window": 32,
+      "run": 512,
+      "copies": 8,
+      "min_period": 257,
+      "min_tokens": 2342
+    },
+    "rule_f": {
+      "window": 256,
+      "span": 1024,
+      "copies": 8,
+      "min_tokens": 1025
+    },
+    "max_entries": 65536
+  },
+  "harness": {
+    "path": "rust/crates/cuteafd-daemon/tests/loop-abort-fidelity-harness.py",
+    "sha256": "6caba740113ac16e19cd0384a1bfae75b00dead78cae2500c129d92205a7e6e5"
+  },
+  "fidelity": {
+    "repository": "wrldsuksgo2mars/cuteafd-fidelity",
+    "registry": "rust/crates/cuteafd-bench/src/fidelity_dataset.rs",
+    "registry_sha256": "964f4c16cdaeb5076023a885b118b72f65a6528a994a4af552889bb0b6f3ef49",
+    "configs_run": 15,
+    "configs": [
+      {
+        "config": "deepseek_v41-v2_20261005",
+        "revision": "01a0948a62a478a0a9355dd5b57fe4a49bc6cca0",
+        "windows_sha256": "5580f716306b78201c3a5b029a5a7971bbb0ae9cbbbc8161653f040bbcdaf80b",
+        "transcripts": 53,
+        "tokens": 28820,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 2
+      },
+      {
+        "config": "mimo_v2-v2_20261007_flash_mopd_qkvfixed",
+        "revision": "a8af5c3fecfa31bfbf4d0558362d9ab79451842f",
+        "windows_sha256": "03c88eea572450dbef3dc771160e9ebf48b6c40aef88ba41af5d1a51a106c14e",
+        "transcripts": 53,
+        "tokens": 23713,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 2
+      },
+      {
+        "config": "mimo_v2-v2_20261007_pro_mopd_qkvfixed",
+        "revision": "52e79096f3bab9f70e821d4599512901c6b84f3e",
+        "windows_sha256": "e05705b68c0029e837d31a7d8d31aa07978cad57249c53d81e7f2ee13cbda3a1",
+        "transcripts": 53,
+        "tokens": 29123,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 2
+      },
+      {
+        "config": "glm5_flash-v2_20261005_bf16root",
+        "revision": "a7e7d1b4d82329acebe54ca88dc71d47d0d2056d",
+        "windows_sha256": "1d9866e0b11d8073f9389e822d31f025c0af9a7f1b59a16115457a02251b37d1",
+        "transcripts": 53,
+        "tokens": 25798,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 2
+      },
+      {
+        "config": "qwen4-v2_20261005_fp8",
+        "revision": "3e0ccef6cff461baf39ba838627edd93cb687be4",
+        "windows_sha256": "23096f0f23dd8007d0276d46f1aac50c7f443a57bc7fb50e8675ca41353df993",
+        "transcripts": 53,
+        "tokens": 26199,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 1
+      },
+      {
+        "config": "deepseek_v4-v2_20261005_v4flash",
+        "revision": "de92b14a7dabecd4d5dd4f7c799920842a5c3834",
+        "windows_sha256": "23e8d178a5887fdb4582741772c58b5b9233bbcf05df3f3535fc19c9fbb528c2",
+        "transcripts": 53,
+        "tokens": 29747,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 2
+      },
+      {
+        "config": "glm5-v2_20261006_exl3k4_bf16root",
+        "revision": "581cdf3b5ee5a63dd5a7726b9d33ea16cf105b0d",
+        "windows_sha256": "383519b494ffcf78bbee5eda2afbd51410cd9e1a49319cbc6c5f8442628809f9",
+        "transcripts": 53,
+        "tokens": 26786,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 2
+      },
+      {
+        "config": "deepseek_v4-v2_20261005_v4pro",
+        "revision": "5528730649150b8d8753e052f001f203b36ca12f",
+        "windows_sha256": "f09b804ffd410f5539a23b83f4d8b88ceaf46d6ddd000bdd391d7b4ff442f03e",
+        "transcripts": 53,
+        "tokens": 29816,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 861,
+        "max_shingle_copies": 8
+      },
+      {
+        "config": "qwen35-9b-v1_20261018_own-text-bf16",
+        "revision": "cec5bd5800a814c785d391b62041b7e67c6b21a9",
+        "windows_sha256": "221c7619d27006dc464714af26cad118f55eb16aef1a3e83e5b694e44e49a456",
+        "transcripts": 53,
+        "tokens": 52456,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 790,
+        "max_shingle_copies": 8
+      },
+      {
+        "config": "qwen38-27b-v1_20261018_own-text-bf16",
+        "revision": "8dcac4fd5cf00e2189f798cb18e4a50f0bb6b775",
+        "windows_sha256": "2b7212b3a6f19b566dc6d34db7fb0a09fd28f834e07f8e00cec33e3d6cbd0ab7",
+        "transcripts": 53,
+        "tokens": 24205,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 2
+      },
+      {
+        "config": "step5-v1_20261017_bf16_provisional",
+        "revision": "f9cecb776d4e47f05738369e7e157122f3e0b473",
+        "windows_sha256": "0b89fcc1462d9cbb5adff7959fc6dde69ab7feb45442f476860bb0a28f79210d",
+        "transcripts": 53,
+        "tokens": 25686,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 12,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 1
+      },
+      {
+        "config": "deepseek_v41-v2_20261017_1017",
+        "revision": "9fc394f9b7e847cedb49578072082e9a56ba8e57",
+        "windows_sha256": "47901e4a1b4dae0601e407fc054ca52000a4c0f205f6312335a31e5e2f0cbed6",
+        "transcripts": 53,
+        "tokens": 28820,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 2
+      },
+      {
+        "config": "kimi-k3-v2_20261019_own-text-effort-matched-mxfp4-f32",
+        "revision": "a98e1b9d6b622eec1ccc66fd21b5d48ff11d7c01",
+        "windows_sha256": "36990e1bc6463cbde4ee7f751ef0edcd4bedb0c6f28d266b080bdfa4ed3d099d",
+        "transcripts": 53,
+        "tokens": 29261,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 0,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 3
+      },
+      {
+        "config": "muse-spark-v1_20261031_own-text-bf16",
+        "revision": "d18a3b292cc0a279998123f2ddd16999869bb658",
+        "windows_sha256": "d67060c9904c58644462b7fcfba6a6abc4814915a1dc8a156fd1d0a47d25cee2",
+        "transcripts": 56,
+        "tokens": 35181,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 1,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 3
+      },
+      {
+        "config": "mistral-large4-v1_20261031_own-text-fp8",
+        "revision": "71eb39bd490cfa1af7a32edc94476a35eb475c01",
+        "windows_sha256": "4e733f021a655ab1b26e2caddb8b07a99eddf9edec3521d138f0059106d66b8b",
+        "transcripts": 53,
+        "tokens": 41704,
+        "fires": 0,
+        "rule_r_eligible": 0,
+        "rule_f_eligible": 8,
+        "max_consecutive_seen": 0,
+        "max_shingle_copies": 3
+      }
+    ],
+    "note": "Every registered text config, pinned to fidelity_dataset.rs. Only assistant-generated tokens are fed, with a fresh guard per window. Neither rule can fire inside a 1024-token generation window: Rule R's periodic-stream minimum and Rule F's minimum are derived from the shipped constants. Longer windows are reported as eligible; synthetic boundary tests exercise actual loop detection."
+  },
+  "fixture": {
+    "path": "rust/crates/cuteafd-daemon/src/shared/repeat_guard_fixture.json",
+    "sha256": "36e7a5f317952be1a0f296ade7545ae9a3526da6cfa9a1965dd4b73536eedf01",
+    "streams": {
+      "looped": 12360,
+      "draft_then_write": 5000,
+      "fast_loop": 2220
+    },
+    "validated": true
+  },
+  "corpus_replay": "Dropped: private production inputs are unavailable; no old control metrics retained.",
+  "reproduce": [
+    "python3 -I rust/crates/cuteafd-daemon/tests/loop-abort-fidelity-harness.py --registered <fidelity-cache/repository> --evidence rust/crates/cuteafd-daemon/tests/loop-abort-fidelity-evidence.json"
+  ]
+}

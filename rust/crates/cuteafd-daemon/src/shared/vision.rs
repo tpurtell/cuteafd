@@ -21,7 +21,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
     thread::{self, JoinHandle},
@@ -429,9 +429,12 @@ pub struct EncodeJob {
 }
 pub struct EncoderTicket {
     result: mpsc::Receiver<Result<Vec<u16>>>,
+    encode_ns: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
 }
 impl EncoderTicket {
+    /// Published by the owner before its completed features, excluding queue/poll delays.
+    pub fn encode_ms(&self) -> f64 { self.encode_ns.load(Ordering::Acquire) as f64 / 1_000_000.0 }
     pub fn poll(&self) -> Result<Option<Vec<u16>>> {
         match self.result.try_recv() {
             Ok(result) => result.map(Some),
@@ -455,6 +458,7 @@ enum EncoderJob {
 struct Work {
     job: EncoderJob,
     reply: mpsc::SyncSender<Result<Vec<u16>>>,
+    encode_ns: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
 }
 struct OwnerHealth(Arc<AtomicBool>);
@@ -579,6 +583,7 @@ impl EncoderService {
                     return;
                 }
                 while let Ok(work) = jobs.recv() {
+                    let started = std::time::Instant::now();
                     let result = if work.cancelled.load(Ordering::Acquire) {
                         Err(VisionError::Cancelled)
                     } else {
@@ -600,6 +605,7 @@ impl EncoderService {
                             } else { Ok(output) }
                         })
                     };
+                    work.encode_ns.store(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Release);
                     if let Err(ref error) = result {
                         tracing::debug!(%error, "media job failed");
                     }
@@ -649,9 +655,11 @@ impl EncoderService {
         if !self.healthy() { return Err(VisionError::Unavailable); }
         let (reply, result) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
+        let encode_ns = Arc::new(AtomicU64::new(0));
         let work = Work {
             job,
             reply,
+            encode_ns: encode_ns.clone(),
             cancelled: cancelled.clone(),
         };
         self.queue
@@ -662,7 +670,7 @@ impl EncoderService {
                 mpsc::TrySendError::Full(_) => VisionError::QueueFull,
                 mpsc::TrySendError::Disconnected(_) => VisionError::Unavailable,
             })?;
-        Ok(EncoderTicket { result, cancelled })
+        Ok(EncoderTicket { result, encode_ns, cancelled })
     }
 }
 impl Drop for EncoderService {
@@ -759,7 +767,7 @@ mod tests {
         });
         assert!(matches!(result.recv().unwrap(), Err(VisionError::Native(_))));
         assert!(!healthy.load(Ordering::Acquire));
-        let queued = EncoderTicket { result: queued_result, cancelled: Arc::new(AtomicBool::new(false)) };
+        let queued = EncoderTicket { result: queued_result, encode_ns: Arc::new(AtomicU64::new(0)), cancelled: Arc::new(AtomicBool::new(false)) };
         owner.join().unwrap();
         assert!(matches!(queued.poll(), Err(VisionError::Unavailable)));
 
@@ -1034,6 +1042,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let ticket = EncoderTicket {
             result: recv,
+            encode_ns: Arc::new(AtomicU64::new(0)),
             cancelled: flag.clone(),
         };
         assert!(ticket.poll().unwrap().is_none());

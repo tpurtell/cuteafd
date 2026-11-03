@@ -18,7 +18,7 @@ pub(crate) fn exercise_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     draft: Option<&mut DraftRuntime<'_, 'a, C>>,
 ) -> Result<u32> {
     let (events, _receive) = mpsc::unbounded_channel();
-    let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
+    let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
     super::prefill(lib, runtime, requests, prefill, None, lease, tokens,
         super::PrefillShape { rows: chunk_rows, waves }, &job, draft, &mut || Ok(()))?.select(None)
 }
@@ -33,7 +33,7 @@ pub(crate) fn exercise_cancelled_prefill<'a, P: PrefillTarget<'a>, C: DraftChain
     prefill: &mut PrefillSlots<'a, P>, lease: CacheLease, tokens: &[u32], chunk_rows: usize, waves: usize,
 ) -> anyhow::Error {
     let (events, receive) = mpsc::unbounded_channel();
-    let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
+    let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
     let mut receive = Some(receive);
     match super::prefill::<P, C>(lib, runtime, requests, prefill, None, lease, tokens,
         super::PrefillShape { rows: chunk_rows, waves }, &job, None,

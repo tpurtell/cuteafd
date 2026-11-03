@@ -69,6 +69,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "nvfp4")]
     pub expert_partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat,
     #[command(flatten)] pub prefix: crate::shared::prefix::PrefixArgs,
+    #[command(flatten)] pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
     #[command(flatten)] pub api: crate::shared::api::ApiArgs,
@@ -327,7 +328,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
                 depth: crate::shared::speculation::dflash::DflashConfig::read(snapshot)?.drafts(), fixed: false },
         };
         scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, eos,
-            args.decode_share, &prefix, args.token_io.token_select, &mut media, None,
+            args.decode_share, &prefix, args.loop_abort.config(), args.token_io.token_select, &mut media, None,
             || initialized(api))
     })
 }

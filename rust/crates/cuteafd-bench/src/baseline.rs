@@ -319,22 +319,57 @@ fn compare_rows(a: &ProbeRecord, b: &ProbeRecord) -> (usize, Vec<usize>) {
 /// reported, not gated, because prefill kernels with unordered reductions (Spark FP32 atomics) are
 /// not bit-reproducible run to run, which is a property of the kernels, not of the cache.
 fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
-    if run.setting("prefix-cache-entries").is_some_and(|v| v == "0") {
+    cache_exact_fixture(run.client, run.info, check, None)?;
+    if matches!(check.status, CheckStatus::Pass | CheckStatus::Info | CheckStatus::Fail) {
+        cache_continuation(run, check, cache_minimum_tokens(run.info))?;
+    }
+    Ok(())
+}
+
+/// One ordinary chat image or audio clip, not pre-expanded token ids.
+pub(crate) fn cache_fixture(body: &Value) -> Result<Value> {
+    let messages = body["messages"].as_array().context("cache_exact fixture requires messages")?;
+    anyhow::ensure!(messages.len() == 1 && messages[0]["role"] == "user", "cache_exact needs one user fixture message");
+    let content = messages[0]["content"].as_array().context("cache_exact fixture requires content parts")?;
+    anyhow::ensure!(content.iter().all(|p| matches!(p["type"].as_str(), Some("text" | "image_url" | "input_audio"))),
+        "cache_exact supports text, image_url or input_audio parts");
+    let mut media = content.iter().filter(|p| p["type"] != "text");
+    let fixture = media.next().context("cache_exact needs one image or audio clip")?.clone();
+    anyhow::ensure!(media.next().is_none(), "cache_exact needs exactly one image or audio clip");
+    Ok(fixture)
+}
+
+fn cache_body(client: &Client, text: &str, max_tokens: u64, fixture: Option<&Value>) -> Value {
+    let mut body = plain(client, text, max_tokens);
+    if let Some(fixture) = fixture {
+        body["messages"][0]["content"] = json!([fixture, {"type": "text", "text": text}]);
+    }
+    body
+}
+
+pub(crate) fn cache_exact_fixture(client: &Client, info: &ServerInfo, check: &mut Check, fixture: Option<&Value>) -> Result<()> {
+    cache_exact_with(client, info, check, fixture, |body, spec| probed(client, body, spec))
+}
+
+fn cache_exact_with(client: &Client, info: &ServerInfo, check: &mut Check, fixture: Option<&Value>,
+    mut request: impl FnMut(Value, ProbeSpec) -> Result<ProbeRecord>) -> Result<()> {
+    if info.setting("prefix-cache-entries").is_some_and(|v| v == "0") {
         check.status = CheckStatus::Skipped;
         check.summary = "prefix cache off (--prefix-cache-entries 0)".into();
         return Ok(());
     }
-    let client = run.client;
+    let body = |text: &str, n| cache_body(client, text, n, fixture);
     let rows = |n: usize| ProbeSpec { no_speculation: true, record_rows: n, top_k: 1, ..ProbeSpec::default() };
     // Prompt end: the first request computes and retains, the second restores it whole.
     let (text, turn_text) = cache_prompts();
-    let first = probed(client, plain(client, &text, 2), rows(2))?;
+    let first = request(body(&text, 2), rows(2))?;
     if !honoured(&first) {
         unsupported(check);
         return Ok(());
     }
-    let restored = probed(client, plain(client, &text, 2), rows(2))?;
-    let minimum = cache_minimum_tokens(run.info);
+    if let Some(fixture) = fixture { cache_bound(&first, fixture)?; }
+    let restored = request(body(&text, 2), rows(2))?;
+    let minimum = cache_minimum_tokens(info);
     check.set("prompt_reference_tokens", CACHE_PROMPT_TOKENS as u64);
     check.set("minimum_prompt_tokens", minimum as u64);
     check.set("prompt_tokens", restored.prompt_ids.len() as u64);
@@ -342,16 +377,24 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     // Turn end. Long enough to clear the cache's minimum snapshot size and several units; the
     // answer runs past 25 tokens, so the turn ends at its length limit and the turn snapshot is
     // followed by a decode step.
-    let turn = probed(client, plain(client, &turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
+    let turn = request(body(&turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
+    if let Some(fixture) = fixture { cache_bound(&turn, fixture)?; }
     check.set("turn_prompt_tokens", turn.prompt_ids.len() as u64);
     if !cache_coverage(check, "turn prompt", turn.prompt_ids.len(), minimum) { return Ok(()); }
-    let reference = probed(client, plain(client, &turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
+    let reference = request(body(&turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
     let mut ids = turn.prompt_ids.clone();
     ids.extend(&turn.generated[..turn.generated.len().saturating_sub(1)]);
     // The turn's own generated ids are the prompt, so it is not comparable between arms.
-    let again = probed(client, plain(client, "cache probe", 2),
-        ProbeSpec { prompt_ids: Some(ids), output_dependent: true, ..rows(2) })?;
-    let cold = probed(client, plain(client, &turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
+    let (again_body, again_spec) = cache_replay(client, ids, &turn, fixture, rows(2))?;
+    let again = request(again_body, again_spec)?;
+    let cold = request(body(&turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
+    if let Some(fixture) = fixture {
+        for record in [&restored, &reference, &again, &cold] { cache_bound(record, fixture)?; }
+        check.set("fixture_type", fixture["type"].clone());
+        check.set("encodes", json!([("prompt", &first), ("prompt_restore", &restored), ("turn", &turn),
+            ("turn_prompt_restore", &reference), ("turn_restore", &again), ("cold", &cold)].map(|(phase, r)|
+            json!({"phase": phase, "encoded": r.encoded, "encode_ms": r.encode_ms}))));
+    }
     let verdict = Restores::judge(&first, &restored, &turn, &reference, &again, &cold);
     check.set("prompt_restored", restored.cached_tokens as u64);
     check.set("prompt_rows_compared", verdict.prompt.compared as u64);
@@ -362,7 +405,33 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("cold_rows_identical", u64::from(verdict.cold_identical == Some(true)));
     check.status = verdict.status();
     check.summary = verdict.summary();
-    cache_continuation(run, check, minimum)?;
+    Ok(())
+}
+
+/// Responses strip image URLs and may carry response-only input_key. Restore the
+/// verified source from our original fixture, in the spec only (never duplicated in chat).
+fn cache_replay(client: &Client, ids: Vec<u32>, turn: &ProbeRecord, fixture: Option<&Value>, mut spec: ProbeSpec)
+    -> Result<(Value, ProbeSpec)> {
+    spec.prompt_ids = Some(ids);
+    spec.output_dependent = true;
+    spec.media = turn.media.clone();
+    spec.audio = turn.audio.clone();
+    let mut body = cache_body(client, "cache probe", 2, fixture);
+    if let Some(fixture) = fixture.filter(|f| f["type"] == "image_url") {
+        let source: cuteafd_api::openai::probe::ProbeImageUrl = serde_json::from_value(fixture["image_url"].clone()).context("cache_exact image_url source")?;
+        for span in &mut spec.media {
+            span.image_url = Some(source.clone());
+            span.input_key = None;
+        }
+        body = plain(client, "cache probe", 2);
+    }
+    Ok((body, spec))
+}
+
+fn cache_bound(record: &ProbeRecord, fixture: &Value) -> Result<()> {
+    let image = fixture["type"] == "image_url";
+    anyhow::ensure!(if image { record.media.len() == 1 && record.audio.is_empty() }
+        else { record.audio.len() == 1 && record.media.is_empty() }, "cache_exact fixture was not bound by the engine");
     Ok(())
 }
 
@@ -947,6 +1016,83 @@ pub fn describe(timing: &StreamTiming) -> String {
 mod tests {
     use super::*;
     use crate::report::Check;
+
+    #[test]
+    fn media_cache_fixture_rejects_ambiguous_or_missing_inputs() {
+        for part in [json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}),
+            json!({"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}})] {
+            let body = json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "notes"}, part]}]});
+            assert_eq!(cache_fixture(&body).unwrap(), part);
+            let mut twice = body.clone();
+            twice["messages"][0]["content"].as_array_mut().unwrap().push(part);
+            assert!(cache_fixture(&twice).is_err());
+        }
+        for body in [json!({"messages": []}), json!({"messages": [{"role": "user", "content": "text"}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "video_url"}]}]})] {
+            assert!(cache_fixture(&body).is_err());
+        }
+    }
+
+    #[test]
+    fn media_cache_fixtures_exercise_prompt_and_turn_exactness() {
+        use cuteafd_api::openai::probe::{ProbeAudio, ProbeMedia};
+        use std::sync::{Arc, atomic::AtomicBool};
+        let client = Client::new("http://unused", None, Arc::new(AtomicBool::new(false)));
+        let n = 9000;
+        for image in [true, false] {
+            for corrupt in [None, Some(1), Some(4)] {
+                let fixture = if image { json!({"type": "image_url", "image_url": {"url": "fixture", "detail": "low"}}) }
+                    else { json!({"type": "input_audio", "input_audio": {"data": "fixture", "format": "wav"}}) };
+                let mut index = 0;
+                let mut check = Check::new("cache_exact", "media");
+                cache_exact_with(&client, &ServerInfo::default(), &mut check, Some(&fixture), |body, spec| {
+                    let i = index; index += 1;
+                    if image && i == 4 {
+                        assert_eq!(body["messages"][0]["content"], "cache probe", "expanded image source belongs only in spec");
+                    } else { assert_eq!(body["messages"][0]["content"][0], fixture); }
+                    assert!(spec.no_speculation);
+                    assert_eq!(spec.cold, i == 5);
+                    assert_eq!(spec.output_dependent, i == 4);
+                    assert_eq!(spec.prompt_ids.is_some(), i == 4);
+                    let prompt = if i == 4 { n + TURN_TOKENS - 1 } else { n };
+                    let count = [2, 2, TURN_TOKENS, TURN_TOKENS + 1, 2, 1][i];
+                    assert_eq!(spec.record_rows, count);
+                    let mut record = ProbeRecord { engine: Some("test".into()), prompt_ids: vec![1; prompt],
+                        cached_tokens: if matches!(i, 1 | 3 | 4) { prompt } else { 0 },
+                        generated: (prompt..prompt + count).map(|v| v as u32).collect(),
+                        encoded: Some(i == 0), encode_ms: Some(if i == 0 { 2.5 } else { 0.0 }), ..Default::default() };
+                    if image {
+                        record.media = vec![ProbeMedia { start: 1, len: 2, kind: "image".into(), key: "ab".repeat(32),
+                            grid: [1, 2, 4], identity: None, input_key: None, fixture: None, image_url: None }];
+                    } else {
+                        record.audio = vec![ProbeAudio { start: 1, len: 2, key: "ab".repeat(32), samples: 3840, pcm_sha256: "cd".repeat(32) }];
+                    }
+                    if i == 4 {
+                        assert_eq!(spec.prompt_ids.as_ref().unwrap().len(), prompt);
+                        let mut expected = record.media.clone();
+                        if image { expected[0].image_url = Some(serde_json::from_value(fixture["image_url"].clone()).unwrap()); }
+                        assert_eq!(spec.media, expected);
+                        assert_eq!(spec.audio, record.audio);
+                        spec.validate_media_geometries(cuteafd_core::media::ImageTokenGeometry::MERGED,
+                            cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: 1920 }).unwrap();
+                    }
+                    if image { record.media[0].input_key = Some("ef".repeat(32)); }
+                    for position in prompt..prompt + count {
+                        record.rows.push(cuteafd_api::openai::probe::ProbeRow {
+                            position, hash: if corrupt == Some(i) && position == prompt + 1 { "bad".into() }
+                                else { position.to_string() }, ..Default::default() });
+                    }
+                    Ok(record)
+                }).unwrap();
+                assert_eq!(index, 6);
+                assert_eq!(check.status, if corrupt.is_some() { CheckStatus::Fail } else { CheckStatus::Pass }, "{}", check.summary);
+                assert_eq!(check.metrics["prompt_rows_compared"], 2);
+                assert_eq!(check.metrics["turn_rows_compared"], 2);
+            }
+            assert!(cache_bound(&ProbeRecord::default(), &if image { json!({"type": "image_url"}) }
+                else { json!({"type": "input_audio"}) }).is_err());
+        }
+    }
 
     #[test]
     fn short_continuation_keeps_the_prefix_and_appends_only_input_text_ids() {

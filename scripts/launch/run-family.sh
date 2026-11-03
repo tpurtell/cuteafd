@@ -171,6 +171,10 @@ MAX_OUTPUT_TOKENS
 KV_DECODE_RESERVE_CHUNK
 KV_RESERVE_DRAIN_BUFFER
 KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS
+LOOP_ABORT_RUN
+LOOP_ABORT_COPIES
+LOOP_FAST_SPAN
+LOOP_FAST_COPIES
 THERMAL
 API_KEY_FILE
 ENABLE_BENCH
@@ -502,6 +506,10 @@ MAX_OUTPUT_TOKENS
 KV_DECODE_RESERVE_CHUNK
 KV_RESERVE_DRAIN_BUFFER
 KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS
+LOOP_ABORT_RUN
+LOOP_ABORT_COPIES
+LOOP_FAST_SPAN
+LOOP_FAST_COPIES
 MEMORY_RESERVATION
 MODEL_ID
 MODEL_REVISION
@@ -1490,6 +1498,12 @@ echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
 release_kv_reserve_args v41_kv_args
 args+=("${v41_kv_args[@]}")
+# Loop abort (boot-time only): unset keeps the daemon's shipped defaults.
+for pair in 'LOOP_ABORT_RUN:--loop-abort-run' 'LOOP_ABORT_COPIES:--loop-abort-copies' \
+  'LOOP_FAST_SPAN:--loop-fast-span' 'LOOP_FAST_COPIES:--loop-fast-copies'; do
+  key_name="${pair%%:*}"; flag="${pair#*:}"
+  [[ -z "${!key_name:-}" ]] || args+=("$flag" "${!key_name}")
+done
 [[ -z "${PREFILL_PACKING:-}" ]] || args+=(--prefill-packing "$PREFILL_PACKING")
 [[ -z "$v41_decode_lanes" ]] || args+=(--decode-lanes "$resolved_decode_lanes")
 [[ -z "${V41_PREFILL_WAVES:-}" ]] || args+=(--prefill-waves "$V41_PREFILL_WAVES")
@@ -2025,6 +2039,13 @@ if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
 family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")
+# Loop abort (boot-time only): unset keeps the daemon's shipped defaults.
+for pair in 'LOOP_ABORT_RUN:--loop-abort-run' 'LOOP_ABORT_COPIES:--loop-abort-copies' \
+  'LOOP_FAST_SPAN:--loop-fast-span' 'LOOP_FAST_COPIES:--loop-fast-copies'; do
+  key_name="${pair%%:*}"; flag="${pair#*:}"
+  value="$(get "$key_name")"
+  [[ -z "$value" ]] || family_args+=("$flag" "$value")
+done
 chat_template_mounts=()
 # Vision-only override: no template inference and no changes to text-only prompts.
 # Without it, VISION=auto serves a GLM Flash checkpoint whose own chat template cannot mark images

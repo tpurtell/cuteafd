@@ -279,9 +279,7 @@ workloads are unchanged.
 ## Mistral Large 4
 
 - 2026-11-02 · Custom · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (310–550) + 6× DGX Spark · build ed34ed61ebdd · [report](mistral_large4/2026-11-02-custom-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max-candidate-r1/report.svg)
-  measured on ed34, layers placement, before the #1077 prefill port and the context borrower fix; v5 release cards supersede
 - 2026-11-02 · Custom · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 1× RTX PRO 6000 @ gpu-powerd 455 W (450–600) + 5× DGX Spark · build ed34ed61ebdd · [report](mistral_large4/2026-11-02-custom-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min-candidate-r1/report.svg)
-  measured on ed34, layers placement, before the #1077 prefill port and the context borrower fix; v5 release cards supersede
 
 ## Qwen 3.5 / 3.8 dense
 

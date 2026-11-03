@@ -185,7 +185,8 @@ mod tests {
                 key: "07".repeat(32), grid: [1,4,4], identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(),
                     sha256: "ab".repeat(32) }), image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }],
             ..Default::default() });
-        let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
+        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(),
+            literal_spans: Vec::new(),
             prompt: String::new(), constraint: None, images: Vec::new(), media: vec![image.clone()], audio: Vec::new(),
             max_tokens: 8, sampling: cuteafd_core::TargetSamplingParams::default(), stop_token_ids: Vec::new(),
             events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: Some(probe.clone()) };

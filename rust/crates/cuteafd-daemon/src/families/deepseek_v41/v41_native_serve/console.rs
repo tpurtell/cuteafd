@@ -46,8 +46,14 @@ impl Tally {
             proposal: proposal.tokens, emissions: Vec::new() };
         for (index, input) in inputs.iter().enumerate() {
             tally.verified[index] = input.len().saturating_sub(1) as u8;
-            tally.accepted[index] = accepted_inputs.get(index).map_or(0, |&a| a.saturating_sub(1)) as u8;
             tally.emitted[index] = emissions.get(index).map_or(0, Vec::len) as u8;
+            // A loop abort truncates the round's emissions after the drafts were
+            // accepted, so cap the accepted count at what was actually emitted
+            // (the first emitted token is the target's own, not a draft).
+            tally.accepted[index] = usize::try_from(
+                accepted_inputs.get(index).map_or(0, |&a| a.saturating_sub(1)))
+                .unwrap_or(usize::MAX)
+                .min(usize::from(tally.emitted[index]).saturating_sub(1)) as u8;
         }
         let sum = |values: &[u8]| values.iter().map(|&v| u64::from(v)).sum::<u64>();
         totals::round(sum(&tally.drafted), sum(&tally.verified), sum(&tally.accepted), sum(&tally.emitted));
@@ -224,6 +230,18 @@ mod tests {
             assert_eq!(round.requests.len(), count);
             assert_eq!(round.requests.last().unwrap().emitted, 2);
         }
+    }
+
+    #[test]
+    fn tally_caps_accepted_at_emitted_after_a_loop_abort() {
+        // A loop abort accepts the drafts but truncates the emissions: the
+        // console must not report more accepted tokens than were emitted.
+        let inputs = vec![vec![10, 11, 12, 13, 14]];
+        let proposal = Proposal { drafted: vec![4], tokens: Vec::new() };
+        let tally = Tally::new(proposal, &inputs, &[5], &[vec![11]], None);
+        assert_eq!(&tally.verified[..1], &[4]);
+        assert_eq!(&tally.emitted[..1], &[1]);
+        assert_eq!(&tally.accepted[..1], &[0], "accepted must not exceed emitted - 1");
     }
 
     #[test]

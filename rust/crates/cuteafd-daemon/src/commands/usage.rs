@@ -244,6 +244,34 @@ mod tests {
         }
     }
     #[test]
+    fn export_preserves_loop_abort_finish_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = cuteafd_usage::Store::open(Some(dir.path())).unwrap();
+        let ts_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_millis() as i64;
+        for (rid, detail) in [("normal", None), ("looped", Some("repetition"))] {
+            store.record(Record { rid: rid.into(), ts_ms, stop_reason: Some("length".into()),
+                finish_detail: detail.map(str::to_owned), ..Default::default() });
+        }
+        store.flush().unwrap();
+        let out = dir.path().join("usage.csv");
+        export(ExportArgs { dir: Dir { dir: dir.path().into() }, range: "7d".into(), bench: false,
+            out: Some(out.clone()) }).unwrap();
+        let text = std::fs::read_to_string(out).unwrap();
+        let mut lines = text.lines();
+        let columns = lines.next().unwrap().split(',').collect::<Vec<_>>();
+        let rid = columns.iter().position(|c| *c == "rid").unwrap();
+        let detail = columns.iter().position(|c| *c == "finish_detail").unwrap();
+        let rows = lines.map(|line| {
+            let fields = line.split(',').collect::<Vec<_>>();
+            (fields[rid], fields[detail])
+        }).collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.get("normal"), Some(&""));
+        assert_eq!(rows.get("looped"), Some(&"repetition"));
+    }
+
+    #[test]
     fn export_and_clear_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let store = cuteafd_usage::Store::open(Some(dir.path())).unwrap();

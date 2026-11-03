@@ -129,7 +129,7 @@ fn score(serve: crate::cli::NativeServeArgs, spec: ProbeSpec, dump: &std::path::
     let result = (|| -> Result<()> {
         let (events, mut receive) = tokio::sync::mpsc::unbounded_channel();
         let request = NativeRequest {
-            prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(),
+            prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(),
             constraint: None,
             images: Vec::new(),
             media: Vec::new(),
