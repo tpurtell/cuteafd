@@ -20,12 +20,13 @@ fn retained_wave_storage_matches_independent_contract() -> Result<()> {
     use cuteafd_ffi::{memory_ledger::{self, AllocationAudit, AllocationEvent}, native_library_lifetime_fixture::Fixture};
     use cuteafd_loader::placement::{SparkWaveOwners, SparkWaveStaging, planner::{self, *}};
     use std::collections::BTreeMap;
+    // NativeLibrary::load synchronizes the process geometry into the module.
+    cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::GLM5)
+        .map_err(|_| anyhow::anyhow!("wave fixture requires isolated GLM geometry"))?;
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
     fixture.quiet_events(&library, true)?;
     cuteafd_transport::set_verbs_host_native_library_path(fixture.directory().join("liblifetime_fixture.so"))?;
-    cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::GLM5)
-        .map_err(|_| anyhow::anyhow!("wave fixture requires isolated GLM geometry"))?;
     for device in [1, 0] { for ranks in [1, 6, 8] { for slots in [1, 3, 4] {
         let all = if ranks == 8 { u8::MAX } else { (1u8 << ranks) - 1 };
         let mut masks = vec![0, all, all & 0b1010_1010];
