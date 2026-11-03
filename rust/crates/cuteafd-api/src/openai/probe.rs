@@ -269,6 +269,9 @@ pub struct ProbeRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<serde_json::Value>,
     pub cached_tokens: usize,
+    /// Executed unit count of the final prefill call; unknown unless reported by the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prefill_units: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub states: Vec<ProbeState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -338,6 +341,10 @@ impl Probe {
             r.cold = self.spec.cold;
             r.no_speculation = self.spec.no_speculation;
         });
+    }
+
+    pub fn prefill_units(&self, units: usize) {
+        self.with(|r| r.last_prefill_units = Some(units));
     }
 
     /// Echo verified descriptors only, never the image's data URL.
@@ -585,6 +592,20 @@ mod tests {
         let data = &bytes[8 + header_len..];
         assert_eq!(data.len(), vocab * 4);
         data.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).collect()
+    }
+
+    #[test]
+    fn final_prefill_unit_count_is_unknown_until_reported() {
+        let probe = Probe::new(ProbeSpec::default());
+        assert_eq!(probe.record().last_prefill_units, None);
+        probe.prefill_units(3);
+        assert_eq!(probe.record().last_prefill_units, Some(3));
+        probe.prefill_units(1);
+        let value = serde_json::to_value(probe.record()).unwrap();
+        assert_eq!(value["last_prefill_units"], 1);
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("last_prefill_units");
+        assert_eq!(serde_json::from_value::<ProbeRecord>(legacy).unwrap().last_prefill_units, None);
     }
 
     #[test]

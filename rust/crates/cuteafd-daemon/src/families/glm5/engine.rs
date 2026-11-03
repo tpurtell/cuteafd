@@ -442,6 +442,8 @@ pub(crate) struct GlmEngine<'a> {
     staging_owner: RefCell<[Option<(usize, usize)>; 2]>,
     /// Set by [`Self::context_unit_turn`] for the attention about to run.
     context_reuse: Cell<bool>,
+    /// Probe metadata only: no device synchronization or allocation at dispatch.
+    pub(crate) last_prefill_units: Cell<usize>,
     /// The prefill unit whose attention runs next (its context gather/commit plan).
     context_unit: Cell<usize>,
     /// The one prefill transport: every unit's waves, up to `prefill_lanes`
@@ -565,7 +567,7 @@ impl<'a> GlmEngine<'a> {
             decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
             prefill_lanes, depth,
             staged: Cell::new(library.cuda_event_create_ordering()?),
-            staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
+            staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), last_prefill_units: Cell::new(0), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
@@ -1083,6 +1085,7 @@ impl<'a> GlmEngine<'a> {
         }
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
         let tables = self.prefill_tables(placement, start, t)?;
+        self.last_prefill_units.set(1);
         // Short chunks, callbacks and partial-layer goldens use the same
         // prefill owner as units; the decode link admits decode rows only.
         let logits = if experts.is_some() {
@@ -2123,6 +2126,7 @@ impl<'a> GlmEngine<'a> {
         // `lanes` are the call's units in order; at most `waves` are in flight,
         // unit `u` holding slot `u % waves` on both ranks.
         let waves = depth.waves.min(lanes.len()).max(1);
+        self.last_prefill_units.set(lanes.len());
         ensure!(waves <= link.waves(), "{waves} prefill units in flight exceed the link's {} waves", link.waves());
         let owned = self.slot_workspaces(depth.waves)?;
         let workspaces: Vec<&Workspace<'_>> = owned.iter().take(waves).collect();

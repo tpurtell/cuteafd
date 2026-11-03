@@ -371,9 +371,14 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
 fn cache_continuation(run: &mut Run<'_>, check: &mut Check, minimum: usize) -> Result<()> {
     let client = run.client;
     let text = format!("[{}] Read these notes.\n\n{}", nonce(), corpus(73, CACHE_PROMPT_TOKENS));
-    let seed = probed(client, plain(client, &text, 1), ProbeSpec {
+    let discovery = probed(client, plain(client, &text, 1), ProbeSpec {
         no_speculation: true, record_rows: 1, ..ProbeSpec::default() })?;
-    if !cache_coverage(check, "continuation seed", seed.prompt_ids.len(), minimum) { return Ok(()); }
+    if !cache_coverage(check, "continuation seed", discovery.prompt_ids.len(), minimum) { return Ok(()); }
+    // A suffix has no discovery-prefix hit and ends on exactly three units,
+    // rather than a short last call that clears reuse before the test.
+    let seed_ids = cache_seed_ids(&discovery.prompt_ids, minimum)?;
+    let seed = probed(client, plain(client, "cache continuation seed", 1), ProbeSpec {
+        no_speculation: true, prompt_ids: Some(seed_ids), record_rows: 1, ..ProbeSpec::default() })?;
     let ids = cache_continuation_ids(&seed.prompt_ids)?;
     let probe = |cold| ProbeSpec { cold, no_speculation: true, prompt_ids: Some(ids.clone()),
         record_rows: 1, top_k: usize::MAX, ..ProbeSpec::default() };
@@ -381,7 +386,11 @@ fn cache_continuation(run: &mut Run<'_>, check: &mut Check, minimum: usize) -> R
     let cold = probed(client, plain(client, "cache continuation", 1), probe(true))?;
     let repeat = probed(client, plain(client, "cache continuation", 1), probe(true))?;
     let fresh = warm.prompt_ids.len().saturating_sub(warm.cached_tokens);
-    let covered = warm.cached_tokens >= minimum && (1..512).contains(&fresh);
+    let covered = continuation_covered(&seed, &warm, minimum);
+    check.set("continuation_seed_tokens", seed.prompt_ids.len() as u64);
+    check.set("continuation_seed_cached_tokens", seed.cached_tokens as u64);
+    check.set("continuation_seed_final_units", json!(seed.last_prefill_units));
+    check.set("continuation_final_units", json!(warm.last_prefill_units));
     check.set("continuation_cached_tokens", warm.cached_tokens as u64);
     check.set("continuation_fresh_tokens", fresh as u64);
     check.set("continuation_covered", covered);
@@ -392,6 +401,20 @@ fn cache_continuation(run: &mut Run<'_>, check: &mut Check, minimum: usize) -> R
         if check.status == CheckStatus::Pass { check.status = CheckStatus::Info; }
     }
     Ok(())
+}
+
+fn cache_seed_ids(discovered: &[u32], minimum: usize) -> Result<Vec<u32>> {
+    anyhow::ensure!(minimum >= 128 && discovered.len() > minimum, "seed needs a distinct suffix of at least {minimum} input ids");
+    let suffix = &discovered[discovered.len() - minimum..];
+    anyhow::ensure!(suffix[0] != discovered[0], "seed suffix must start outside the discovery prefix");
+    Ok(suffix.to_vec())
+}
+
+fn continuation_covered(seed: &ProbeRecord, warm: &ProbeRecord, minimum: usize) -> bool {
+    seed.prompt_ids.len() == minimum && seed.cached_tokens == 0
+        && seed.last_prefill_units.is_some_and(|units| units >= 2)
+        && warm.cached_tokens == minimum && warm.prompt_ids.len() == minimum + 64
+        && warm.last_prefill_units == Some(1)
 }
 
 fn cache_continuation_ids(prefix: &[u32]) -> Result<Vec<u32>> {
@@ -932,6 +955,33 @@ mod tests {
         assert_eq!(&ids[..prefix.len()], &prefix);
         assert_eq!(&ids[prefix.len()..], &prefix[prefix.len() - 128..prefix.len() - 64]);
         assert!(cache_continuation_ids(&[1; 127]).is_err());
+    }
+
+    #[test]
+    fn continuation_coverage_requires_actual_multi_unit_final_call_and_fresh_seed() {
+        let discovered: Vec<u32> = (0..9592).collect();
+        let ids = cache_seed_ids(&discovered, 8256).unwrap();
+        assert_eq!(ids.len(), 8256);
+        assert_eq!(ids[0], 1336);
+        assert!(cache_seed_ids(&[1; 9000], 8256).is_err());
+        assert!(cache_seed_ids(&discovered, discovered.len()).is_err());
+        let mut seed = ProbeRecord { prompt_ids: ids, last_prefill_units: Some(3), ..ProbeRecord::default() };
+        let mut warm = ProbeRecord { prompt_ids: cache_continuation_ids(&seed.prompt_ids).unwrap(),
+            cached_tokens: 8256, last_prefill_units: Some(1), ..ProbeRecord::default() };
+        assert!(continuation_covered(&seed, &warm, 8256));
+        for units in [None, Some(0), Some(1)] {
+            seed.last_prefill_units = units;
+            assert!(!continuation_covered(&seed, &warm, 8256));
+        }
+        seed.last_prefill_units = Some(3);
+        seed.cached_tokens = 1;
+        assert!(!continuation_covered(&seed, &warm, 8256));
+        seed.cached_tokens = 0;
+        warm.last_prefill_units = None;
+        assert!(!continuation_covered(&seed, &warm, 8256));
+        warm.last_prefill_units = Some(1);
+        warm.cached_tokens -= 1;
+        assert!(!continuation_covered(&seed, &warm, 8256));
     }
 
     #[test]
