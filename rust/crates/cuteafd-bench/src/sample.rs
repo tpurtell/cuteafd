@@ -22,6 +22,7 @@ pub fn report(failed: bool) -> Report {
     let setting = |name: &str, value: &str, default: Option<&str>, source: &str| Setting { name: name.into(),
         value: Some(value.into()), default: default.map(str::to_string), source: source.into() };
     let configuration = Configuration {
+        speculative_acceptance: Default::default(),
         supports_thinking_off: None,
         snapshot: Some("/mnt/sparknest/hf-home/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa".into()),
         quant: vec![QuantGroup { group: "attention".into(), formats: vec!["fp8_block".into()] },
@@ -66,7 +67,7 @@ pub fn report(failed: bool) -> Report {
         card: BasicCard { thinking: None, decode: vec![rate("code", 187.3), rate("prose", 142.6), rate("json", 201.9)],
             concurrency: [(1, 187.3, 187.3), (4, 640.0, 158.0), (8, 960.0, 118.0), (16, 1280.0, 78.0)]
                 .into_iter().map(|(width, aggregate_tok_s, per_stream_median_tok_s)| ConcurrentRate {
-                    width, aggregate_tok_s, per_stream_median_tok_s, decode_s: 319.0 / per_stream_median_tok_s,
+                    draft_counters: None, width, aggregate_tok_s, per_stream_median_tok_s, decode_s: 319.0 / per_stream_median_tok_s,
                     runs: (0..width).map(|_| ConcurrentTiming { sent_s: 0.0,
                         timing: timing(320, 319.0 / per_stream_median_tok_s) }).collect(), warmup_s: 3.0,
                     prompts: Some(if width == 1 { "code" } else { crate::panels::speed::DISTINCT_PROMPTS }.into()) })

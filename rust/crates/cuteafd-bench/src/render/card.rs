@@ -142,10 +142,11 @@ pub fn card_svg(report: &Report) -> String {
         .collect();
     settings.sort_by_key(|s| chip_priority(s));
     let mut options: Vec<String> = settings.into_iter().map(Setting::chip).collect();
+    options.insert(0, format!("acceptance {}", crate::acceptance::label(c.speculative_acceptance)));
     if let Some(power) = hw.power.as_ref().filter(|power| power.capped()) {
         // Report the longest per-GPU evidence, not a sum of GPU-seconds.
         let capped = power.gpus.iter().map(|gpu| gpu.cap_seconds).fold(0.0, f64::max);
-        options.insert(0, format!("POWER-CAPPED {}", seconds(capped)));
+        options.insert(1, format!("POWER-CAPPED {}", seconds(capped)));
     }
     // Both option rows remain available regardless of fabric health evidence.
     let omitted = |items: &[String]| {
@@ -153,7 +154,7 @@ pub fn card_svg(report: &Report) -> String {
         chips(&mut probe, &t, pad, 572.0, WIDTH - 2.0 * pad, items, t.series[2]) > 46.0
     };
     let total = options.len();
-    while omitted(&options) {
+    while options.len() > 1 && omitted(&options) {
         options.pop();
     }
     if options.len() < total {
@@ -164,6 +165,7 @@ pub fn card_svg(report: &Report) -> String {
                 options = shown;
                 break;
             }
+            if options.len() <= 1 { break; }
             options.pop();
         }
     }
@@ -183,12 +185,66 @@ pub fn card_svg(report: &Report) -> String {
         doc.text(pad, 205.0, Font::new(12.0, t.ink2), &fit(&precision.label(), 12.0, WIDTH - 2.0 * pad));
     }
     let color = t.status(status);
-    let width = (text_width(&badge, 14.0) + 36.0).min(520.0);
+    let width = (text_width(&badge, 14.0) + 36.0).min(WIDTH - 2.0 * pad);
+    let badge_size = (14.0 * (width - 36.0) / text_width(&badge, 14.0).max(1.0)).min(14.0);
     doc.text(pad, HEIGHT - 28.0, Font::new(13.0, t.muted), &fit(&build, 13.0, WIDTH - 2.0 * pad - width - 24.0));
     doc.rect_attrs(WIDTH - pad - width, HEIGHT - 46.0, width, 34.0, 17.0,
         &format!(r#"fill="{}" stroke="{color}" stroke-width="1.5""#, t.panel2));
-    doc.text(WIDTH - pad - width / 2.0, HEIGHT - 24.0, Font::new(14.0, color).anchor(Anchor::Middle).weight(600),
-        &fit(&badge, 14.0, width - 20.0));
+    doc.text(WIDTH - pad - width / 2.0, HEIGHT - 24.0, Font::new(badge_size, color).anchor(Anchor::Middle).weight(600),
+        &badge);
     bodies::watermark(&mut doc, &t);
     doc.finish()
+}
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::*;
+    use cuteafd_core::SpeculativeAcceptance;
+    use crate::report::{Check, CheckStatus};
+
+    #[test]
+    fn exact_min_p_typical_badges_preserve_fidelity_and_cache() {
+        for policy in [SpeculativeAcceptance::Exact, SpeculativeAcceptance::MinP { min_p: 0.3 },
+            SpeculativeAcceptance::Typical { epsilon: 0.1, delta: 1.0 }] {
+            let mut report = crate::sample::report(false);
+            report.server.configuration.speculative_acceptance = policy;
+            let quality = &mut report.baseline.as_mut().unwrap().quality;
+            quality.speculative_acceptance = policy;
+            let mut matched = Check::new("greedy_match", "Greedy match");
+            matched.status = CheckStatus::Info;
+            matched.set("match_rate", 0.978);
+            quality.checks.push(matched);
+            let badge = quality.badge();
+            assert!(badge.contains("KL ") && badge.contains("top-1 ") && badge.contains("exact cache"), "{badge}");
+            match policy {
+                SpeculativeAcceptance::Exact => assert!(badge.contains("lossless spec") && !badge.contains("relaxed:")),
+                _ => {
+                    assert!(badge.contains(&format!("relaxed: {}", crate::acceptance::label(policy))), "{badge}");
+                    assert!(badge.contains("greedy match 97.8%") && !badge.contains("lossless spec"), "{badge}");
+                }
+            }
+            let svg = card_svg(&report);
+            assert!(svg.contains(&badge), "quality badge must not be ellipsized");
+            assert!(svg.contains(&format!("acceptance {}", crate::acceptance::label(policy))));
+            assert!(crate::render::png::png(&svg, 0.25).is_ok());
+        }
+    }
+
+    #[test]
+    fn acceptance_chip_survives_wrapping_before_power_and_other_options() {
+        for policy in [SpeculativeAcceptance::Exact, SpeculativeAcceptance::MinP { min_p: 0.3 },
+            SpeculativeAcceptance::Typical { epsilon: 0.1, delta: 1.0 }] {
+            let mut report = crate::sample::report(false);
+            report.server.configuration.speculative_acceptance = policy;
+            for i in 0..80 {
+                report.server.configuration.settings.push(Setting { name: format!("draft-extra-{i}"),
+                    value: Some("a-long-setting-value-to-fill-the-strip".into()), default: None, source: "test".into() });
+            }
+            let svg = card_svg(&report);
+            let acceptance = svg.find(&format!("acceptance {}", crate::acceptance::label(policy))).unwrap();
+            let option = svg.find("draft-extra-").unwrap();
+            assert!(acceptance < option);
+            assert!(svg.contains("more in report"));
+        }
+    }
 }

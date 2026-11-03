@@ -26,6 +26,12 @@ pub(crate) fn probe_server(model: &str, context: &crate::context::ServerContext)
 /// What a client asks to run.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RunRequest {
+    #[serde(default)]
+    pub speculative_acceptance: cuteafd_core::SpeculativeAcceptance,
+    #[serde(default)]
+    pub save_generated_reference: bool,
+    #[serde(default)]
+    pub generated_reference: Option<crate::acceptance::GeneratedReference>,
     /// A built-in or saved profile name.
     #[serde(default)]
     pub profile: Option<String>,
@@ -66,6 +72,8 @@ pub enum StartError {
     NotReady,
     #[error("the server is stopping ({0})")]
     Stopping(String),
+    #[error("invalid speculative acceptance options: {0}")]
+    InvalidAcceptance(String),
     #[error("invalid lossless set: {0}")]
     InvalidSet(String),
     #[error("invalid context-load options: {0}")]
@@ -489,6 +497,9 @@ impl Bench {
         let _release = Release(self.clone(), active.id.clone());
         let mut client = Client::new(&base, Some(active.token), active.cancel).with_api_key(self.api_key.get().cloned());
         client.discover()?;
+        if let Some(policy) = body.get("speculative_acceptance") {
+            client.configuration.speculative_acceptance = serde_json::from_value(policy.clone())?;
+        }
         let model = client.model.clone();
         let chat = client.chat(body, Some(spec))?;
         let mut value = serde_json::to_value(chat)?;
@@ -499,6 +510,7 @@ impl Bench {
 
     /// Starts a run; returns its id.
     pub fn start(self: &Arc<Self>, request: RunRequest) -> Result<String, StartError> {
+        crate::acceptance::validate(&request).map_err(StartError::InvalidAcceptance)?;
         if let Some(reason) = self.stopping.get() { return Err(StartError::Stopping(reason.clone())); }
         let base = crate::context::loopback().ok_or(StartError::NotReady)?;
         let lossless_set = request.lossless_set.clone().map(|set| set.validated()).transpose()
@@ -543,7 +555,7 @@ impl Bench {
         }
         let report = Arc::new(Mutex::new(Report {
             schema: SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
-            profile: name, plan: plan.clone(), server: ServerInfo::default(), fingerprint: String::new(), baseline: None,
+            profile: name, plan: plan.clone(), server: ServerInfo { configuration: crate::report::Configuration { speculative_acceptance: request.speculative_acceptance, ..Default::default() }, ..Default::default() }, fingerprint: String::new(), baseline: None,
             panels: plan.iter().map(|p| PanelResult { id: p.id.clone(),
                 title: panels::find(&p.id).map_or(p.id.clone(), |panel| panel.title().to_string()),
                 ..PanelResult::default() }).collect(),
@@ -557,7 +569,7 @@ impl Bench {
         // clients), so its console text is allowed until it retires.
         let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, lossless_dump, context_load, fabric);
+            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, lossless_dump, context_load, fabric, request.save_generated_reference, request.generated_reference);
         }).expect("spawn the benchmark thread");
         Ok(id)
     }
@@ -573,7 +585,8 @@ impl Bench {
     fn execute(self: Arc<Self>, active: ActiveRun, base: String, plan: Vec<PlannedPanel>,
         report: Arc<Mutex<Report>>, text: Option<BenchText>, skip_baseline: bool,
         lossless_set: Option<panels::lossless::CaseSet>, lossless_dump: Option<panels::lossless::RowDump>,
-        context_load: panels::context_load::Options, fabric: bool) {
+        context_load: panels::context_load::Options, fabric: bool, save_generated_reference: bool,
+        generated_reference: Option<crate::acceptance::GeneratedReference>) {
         let id = active.id.clone();
         let progress = Progress::default();
         let done = Arc::new(AtomicBool::new(false));
@@ -584,7 +597,7 @@ impl Bench {
                 .spawn(move || bench.tick(&report, &progress, &done, &base, fabric)).ok()
         };
         let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline, lossless_set.as_ref(),
-            lossless_dump.as_ref(), &context_load, fabric);
+            lossless_dump.as_ref(), &context_load, fabric, save_generated_reference, generated_reference.as_ref());
         {
             let mut r = report.lock().expect("report lock");
             r.finished = Some(now_rfc3339());
@@ -632,13 +645,16 @@ impl Bench {
 
     fn run_plan(&self, active: &ActiveRun, base: &str, report: &Arc<Mutex<Report>>, progress: &Progress,
         plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>,
-        lossless_dump: Option<&panels::lossless::RowDump>, context_load: &panels::context_load::Options, fabric: bool)
+        lossless_dump: Option<&panels::lossless::RowDump>, context_load: &panels::context_load::Options, fabric: bool,
+        save_generated_reference: bool, generated_reference: Option<&crate::acceptance::GeneratedReference>)
         -> anyhow::Result<()> {
         let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
+        client.configuration.speculative_acceptance = report.lock().expect("report lock").server.configuration.speculative_acceptance;
         let record = client.discover()?;
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let max_output = record["max_output_tokens"].as_u64().unwrap_or(4096);
-        let info = self.server_info(&client.model);
+        let mut info = self.server_info(&client.model);
+        info.configuration.speculative_acceptance = client.configuration.speculative_acceptance;
         let fingerprint = crate::server::fingerprint(&info);
         let run_mark = client.thermal_mark();
         {
@@ -655,7 +671,7 @@ impl Bench {
         let mut remaining: f64 = estimates.iter().map(|(_, s, n)| s * f64::from(*n)).sum::<f64>()
             + if baseline.is_none() && !skip_baseline { crate::baseline::estimate_s(&rates, &info) } else { 0.0 };
         let total = remaining.max(1.0);
-        let baseline = match baseline {
+        let mut baseline = match baseline {
             Some(mut b) => { b.fabric.clear(); Some(b) },
             // Explicit panels alone: no basic card, no quick quality.
             None if skip_baseline => None,
@@ -674,6 +690,14 @@ impl Bench {
                 Some(b)
             }
         };
+        if save_generated_reference || generated_reference.is_some() {
+            let check = crate::acceptance::measure(&client, &info, generated_reference)?;
+            if let Some(b) = &mut baseline {
+                b.quality.checks.retain(|c| c.id != "greedy_match");
+                b.quality.checks.push(check);
+                b.quality.settle();
+            }
+        }
         {
             let mut r = report.lock().expect("report lock");
             r.fabric.extend(baseline.iter().flat_map(|b| b.fabric.iter().cloned()));
@@ -685,6 +709,14 @@ impl Bench {
         for (index, planned) in plan.iter().enumerate() {
             let Some(panel) = panels::find(&planned.id) else { continue };
             let estimate = panel.estimate_s(&rates, &info);
+            if !matches!(client.configuration.speculative_acceptance, cuteafd_core::SpeculativeAcceptance::Exact)
+                && panel.id() == "spec_lossless_set" {
+                let mut r = report.lock().expect("report lock");
+                r.panels[index].status = PanelStatus::Unsupported;
+                r.panels[index].error = Some("relaxed acceptance".into());
+                remaining -= estimate * f64::from(planned.passes);
+                continue;
+            }
             if let Some(reason) = panel.unavailable(&info) {
                 let mut r = report.lock().expect("report lock");
                 r.panels[index].status = PanelStatus::Unsupported;

@@ -453,6 +453,9 @@ pub struct FabricPort {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Configuration {
+    /// Per-request verifier policy used by this benchmark, not a server launch option.
+    #[serde(default)]
+    pub speculative_acceptance: cuteafd_core::SpeculativeAcceptance,
     /// Renderer capability; absent preserves requests to older servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_thinking_off: Option<bool>,
@@ -744,6 +747,8 @@ pub struct ContentRate {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConcurrentRate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_counters: Option<Value>,
     pub width: usize,
     pub aggregate_tok_s: f64,
     pub per_stream_median_tok_s: f64,
@@ -853,6 +858,8 @@ impl CheckStatus {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Quality {
+    #[serde(default)]
+    pub speculative_acceptance: cuteafd_core::SpeculativeAcceptance,
     /// Fail if any gated check failed; Pass if every gated check that ran passed.
     pub status: CheckStatus,
     pub checks: Vec<Check>,
@@ -902,7 +909,13 @@ impl Quality {
                 _ => {}
             }
         }
-        if let Some(spec) = self.check("spec_lossless") {
+        if !matches!(self.speculative_acceptance, cuteafd_core::SpeculativeAcceptance::Exact) {
+            let mut relaxed = format!("relaxed: {}", crate::acceptance::label(self.speculative_acceptance));
+            if let Some(rate) = self.check("greedy_match").and_then(|c| c.metric("match_rate")) {
+                relaxed.push_str(&format!(" · greedy match {:.1}%", rate * 100.0));
+            }
+            tail.push(relaxed);
+        } else if let Some(spec) = self.check("spec_lossless") {
             match spec.status {
                 CheckStatus::Pass => tail.push("✓ lossless spec".to_string()),
                 CheckStatus::Fail => tail.push("✗ spec diverges".to_string()),

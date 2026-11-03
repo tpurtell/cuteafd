@@ -192,9 +192,9 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     let mark = client.thermal_mark();
     let fabric_mark = client.fabric_mark();
     let tables = mapped_counters(client);
-    let before = c1.and_then(|_| client.decode_counters());
+    let before = client.decode_counters();
     let results = uncached(batch(&prompts.timed))?;
-    let draft_counters = draft_delta(before.as_ref(), c1.and_then(|_| client.decode_counters()).as_ref());
+    let draft_counters = draft_delta(before.as_ref(), client.decode_counters().as_ref());
     let mapped_tables = mapped_interval(&tables, &mapped_counters(client));
     let fabric = client.fabric_since(fabric_mark, &format!("{phase}/c{c}"), true).map(|p| serde_json::json!(p));
     let thermal = client.thermal_since(mark);
@@ -220,7 +220,7 @@ fn context_prompts(context: u64, seed: u64) -> Prompts {
     Prompts { warm: vec![prompt()], timed: vec![prompt()] }
 }
 
-fn draft_delta(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
+pub(crate) fn draft_delta(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
     let delta = |key: &str| after?[key].as_u64()?.checked_sub(before?[key].as_u64()?);
     let rounds = delta("verification_rounds")?;
     let accepted = delta("accepted_drafts")?;

@@ -11,6 +11,9 @@ use std::time::Duration;
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     pub url: String,
+    pub speculative_acceptance: cuteafd_core::SpeculativeAcceptance,
+    pub save_generated_reference: Option<PathBuf>,
+    pub generated_reference: Option<PathBuf>,
     pub profile: Option<String>,
     pub fabric: Option<bool>,
     pub panels: Option<Vec<String>>,
@@ -134,7 +137,12 @@ fn check_context_suffix(report: &mut Report, requested: u64) {
 pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     let base = options.url.trim_end_matches('/').to_string();
     let agent = agent();
-    let mut body = json!({});
+    let mut body = json!({"speculative_acceptance": options.speculative_acceptance,
+        "save_generated_reference": options.save_generated_reference.is_some()});
+    if let Some(path) = &options.generated_reference {
+        let reference: crate::acceptance::GeneratedReference = serde_json::from_slice(&std::fs::read(path)?)?;
+        body["generated_reference"] = json!(reference);
+    }
     if let Some(profile) = &options.profile {
         body["profile"] = json!(profile);
     }
@@ -204,6 +212,12 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
         RunStatus::Done => {}
         RunStatus::Cancelled => bail!("the run was cancelled"),
         _ => bail!("the run ended {:?}: {}", report.status, report.error.clone().unwrap_or_default()),
+    }
+    if let Some(path) = &options.save_generated_reference {
+        let reference = report.baseline.as_ref().and_then(|b| b.quality.check("greedy_match"))
+            .and_then(|c| c.metrics.get("generated_reference")).context("run did not save generated reference")?;
+        std::fs::write(path, serde_json::to_vec_pretty(reference)?)
+            .with_context(|| format!("saving exact generated reference {}", path.display()))?;
     }
     Ok((report, dir))
 }

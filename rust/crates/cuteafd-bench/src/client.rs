@@ -122,6 +122,7 @@ impl Client {
     pub fn media_probe(&self, mut body: Value, spec: Value) -> Result<Value> {
         self.check()?;
         crate::request::validate(&self.configuration, &body)?;
+        body["speculative_acceptance"] = json!(self.configuration.speculative_acceptance);
         body["model"] = json!(self.model);
         body["stream"] = json!(false);
         let mut request = self.agent.post(&format!("{}/v1/bench/probe", self.base))
@@ -242,6 +243,7 @@ impl Client {
     pub fn chat(&self, mut body: Value, probe: Option<ProbeSpec>) -> Result<Chat> {
         self.check()?;
         crate::request::validate(&self.configuration, &body)?;
+        body["speculative_acceptance"] = json!(self.configuration.speculative_acceptance);
         body["model"] = json!(self.model);
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});
@@ -465,6 +467,7 @@ mod tests {
             let request: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(request["body"]["model"], "model");
             assert_eq!(request["body"]["stream"], false);
+            assert_eq!(request["body"]["speculative_acceptance"], json!({"mode":"typical", "epsilon":0.1_f32, "delta":2.0_f32}));
             assert_eq!(request["spec"]["media"][0]["key"], "key");
             drop(reader);
             use std::io::Write;
@@ -472,7 +475,8 @@ mod tests {
         });
         let mut client = Client::new(&format!("http://{address}"), Some("secret".into()), Arc::new(AtomicBool::new(false)));
         client.model = "model".into();
-        client.media_probe(json!({"messages": []}), json!({"media": [{"key":"key"}]})).unwrap();
+        client.configuration.speculative_acceptance = cuteafd_core::SpeculativeAcceptance::Typical { epsilon: 0.1, delta: 2.0 };
+        client.media_probe(json!({"messages": [], "speculative_acceptance":{"mode":"exact"}}), json!({"media": [{"key":"key"}]})).unwrap();
         worker.join().unwrap();
     }
 

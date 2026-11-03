@@ -74,7 +74,7 @@ fn concurrent_rate(results: Vec<common::Timed>, warmup_s: f64, prompts: &str) ->
     ConcurrentRate { width: results.len(), aggregate_tok_s: common::aggregate(&results),
         per_stream_median_tok_s: common::median(&mut per), decode_s: (last - first).max(0.0), warmup_s,
         runs: results.into_iter().map(|r| ConcurrentTiming { sent_s: r.sent, timing: r.chat.timing }).collect(),
-        prompts: Some(prompts.into()) }
+        prompts: Some(prompts.into()), draft_counters: None }
 }
 
 struct Run<'a> {
@@ -145,7 +145,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let mut run = Run {
         client, info, progress, max_context,
         baseline: Baseline { fingerprint: fingerprint.into(), run_id: run_id.into(), created: now_rfc3339(),
-            card: BasicCard { thinking: Some(info.configuration.thinking_label().into()), capacity: Some(capacity), ..BasicCard::default() }, quality: Quality::default(), seconds: 0.0, thermal: None, fabric: vec![] },
+            card: BasicCard { thinking: Some(info.configuration.thinking_label().into()), capacity: Some(capacity), ..BasicCard::default() }, quality: Quality { speculative_acceptance: client.configuration.speculative_acceptance, ..Quality::default() }, seconds: 0.0, thermal: None, fabric: vec![] },
     };
     // Warm-up: first-use workspaces, graphs and tables (untimed), and a two-point
     // fit of tokens per reference token for the prefill case.
@@ -163,14 +163,17 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     for (i, (content, prompt)) in CONTENT.iter().enumerate() {
         run.step(0.04 + 0.08 * i as f64, &format!("C1 decode · {content}"));
         let fabric_mark = client.fabric_mark();
+        let before = client.decode_counters();
         let chat = client.chat(plain(client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
             .with_context(|| format!("{content} decode"))?;
+        let draft_counters = crate::sweep::draft_delta(before.as_ref(), client.decode_counters().as_ref());
         if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/{content}/c1"), true) {
             run.baseline.fabric.push(phase);
         }
         if *content == "code" {
             run.baseline.card.concurrency.push(concurrent_rate(vec![common::Timed { sent: 0.0, chat: chat.clone() }],
                 run.baseline.card.warmup_s.unwrap_or_default(), "code"));
+            run.baseline.card.concurrency.last_mut().unwrap().draft_counters = draft_counters;
         }
         run.baseline.card.decode.push(ContentRate { content: content.to_string(), tok_s: chat.timing.decode_tok_s(),
             runs: vec![chat.timing], acceptance: None });
@@ -187,12 +190,15 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
         let warmup_s = warmup.elapsed().as_secs_f64();
         client.check()?;
         let fabric_mark = client.fabric_mark();
+        let before = client.decode_counters();
         let batch = speed::distinct_batch(client, width, SWEEP_TOKENS, 0).into_iter().collect::<Result<Vec<_>>>()
             .with_context(|| format!("C{width} decode"))?;
+        let draft_counters = crate::sweep::draft_delta(before.as_ref(), client.decode_counters().as_ref());
         if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/distinct/c{width}"), true) {
             run.baseline.fabric.push(phase);
         }
         run.baseline.card.concurrency.push(concurrent_rate(batch, warmup_s, speed::DISTINCT_PROMPTS));
+        run.baseline.card.concurrency.last_mut().unwrap().draft_counters = draft_counters;
         run.publish();
     }
     // 8K prefill: a cold prompt sized from the fit.
@@ -324,7 +330,9 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         check.summary = "prefix cache off (--prefix-cache-entries 0)".into();
         return Ok(());
     }
-    let client = run.client;
+    let mut cache_client = run.client.clone();
+    cache_client.configuration.speculative_acceptance = cuteafd_core::SpeculativeAcceptance::Exact;
+    let client = &cache_client;
     let rows = |n: usize| ProbeSpec { no_speculation: true, record_rows: n, top_k: 1, ..ProbeSpec::default() };
     // Prompt end: the first request computes and retains, the second restores it whole.
     let (text, turn_text) = cache_prompts();
@@ -576,6 +584,11 @@ impl Restores {
 }
 
 fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
+    if !matches!(run.client.configuration.speculative_acceptance, cuteafd_core::SpeculativeAcceptance::Exact) {
+        check.status = CheckStatus::Skipped;
+        check.summary = "relaxed acceptance".into();
+        return Ok(());
+    }
     let Some(speculator) = run.info.configuration.speculator.clone() else {
         check.status = CheckStatus::Skipped;
         check.summary = "no speculator".into();

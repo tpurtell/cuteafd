@@ -211,6 +211,7 @@ pub fn configuration(context: &ServerContext, hardware: &Hardware) -> Configurat
     let settings = context.settings.clone();
     let quant = context.snapshot.as_deref().map(|s| quant(s, hardware.sparks.len())).unwrap_or_default();
     Configuration {
+        speculative_acceptance: Default::default(),
         supports_thinking_off: context.supports_thinking_off,
         snapshot: context.snapshot.as_ref().map(|p| p.display().to_string()),
         quant,
@@ -259,6 +260,7 @@ pub fn fingerprint(info: &ServerInfo) -> String {
         hasher.update(b"\n");
     };
     if !info.configuration.supports_thinking_off() { line("thinking", info.configuration.thinking_label()); }
+    line("speculative_acceptance", &serde_json::to_string(&info.configuration.speculative_acceptance).expect("acceptance serializes"));
     line("prompt_content", crate::text::PROMPT_CONTENT);
     line("model", &info.model);
     line("revision", info.revision.as_deref().unwrap_or(""));

@@ -6,6 +6,7 @@
 //! 503 + Retry-After while it runs, and stores each report in SQLite. The
 //! mandatory baseline (basic card + quick quality) runs once per server
 //! lifetime and configuration fingerprint and is shared by later runs.
+pub mod acceptance;
 pub mod baseline;
 pub mod cli;
 pub mod client;

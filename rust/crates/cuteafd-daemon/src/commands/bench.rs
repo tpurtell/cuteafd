@@ -54,6 +54,21 @@ pub(crate) enum BenchAction {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct RunArgs {
+    /// Per-request greedy verifier policy: exact, min_p, or typical.
+    #[arg(long, default_value = "exact", value_parser = ["exact", "min_p", "typical"])]
+    pub(crate) speculative_acceptance: String,
+    #[arg(long)]
+    pub(crate) acceptance_min_p: Option<f32>,
+    #[arg(long)]
+    pub(crate) acceptance_epsilon: Option<f32>,
+    #[arg(long)]
+    pub(crate) acceptance_delta: Option<f32>,
+    /// Save exact-arm generated token IDs on the fixed quick fidelity prompts.
+    #[arg(long, conflicts_with = "generated_reference")]
+    pub(crate) save_generated_reference: Option<PathBuf>,
+    /// Compare greedy generated IDs to a previously saved exact arm.
+    #[arg(long)]
+    pub(crate) generated_reference: Option<PathBuf>,
     /// The server to benchmark.
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     pub(crate) url: String,
@@ -171,7 +186,8 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
                 None => Vec::new(),
             };
             let lossless_set = run.lossless_set.as_deref().map(cuteafd_bench::panels::lossless::CaseSet::load).transpose()?;
-            let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
+            let speculative_acceptance = cuteafd_bench::acceptance::from_cli(&run.speculative_acceptance, run.acceptance_min_p, run.acceptance_epsilon, run.acceptance_delta).map_err(anyhow::Error::msg)?;
+            let options = cuteafd_bench::cli::RunOptions { speculative_acceptance, save_generated_reference: run.save_generated_reference, generated_reference: run.generated_reference, url: run.url, profile: run.profile, panels: run.panels,
                 passes, baseline: None, fabric: run.fabric, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
                 lossless_set, lossless_dump: run.lossless_dump, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
                 context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)?, context_suffix: run.context_suffix };
