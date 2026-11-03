@@ -194,24 +194,29 @@ impl Fixture {
 
     /// Canonical projection metadata for allocation-only drafter construction; launches refuse.
     pub fn draft_projection_programs<'a>(&self, library: &'a NativeLibrary,
-        shapes: &[(usize, usize)], rows: usize) -> Result<crate::programs::Programs<'a>> {
+        shapes: &[(usize, usize)], rows: usize, mla_programs: &[serde_json::Value])
+        -> Result<crate::programs::Programs<'a>> {
+        anyhow::ensure!(mla_programs.is_empty() || mla_programs.len() == 7,
+            "fixture MLA table must contain its complete seven-program inventory");
         let shapes = shapes.iter().copied().collect::<std::collections::BTreeSet<_>>();
         anyhow::ensure!(!shapes.is_empty() && shapes.len() <= 16, "fixture projection table extent");
         let words = shapes.iter().map(|&(k, n)| Ok([u32::try_from(k)?, u32::try_from(n)?]))
             .collect::<Result<Vec<_>>>()?;
         // SAFETY: the fixture copies these live contiguous pairs before returning.
         unsafe {
-            let configure: Symbol<unsafe extern "C" fn(*const u32, u32) -> i32> =
+            let configure: Symbol<unsafe extern "C" fn(*const u32, u32, i32) -> i32> =
                 library.lib.get(b"fixture_configure_draft_projections")?;
-            anyhow::ensure!(configure(words.as_ptr().cast(), words.len() as u32) == 0,
+            anyhow::ensure!(configure(words.as_ptr().cast(), words.len() as u32,
+                i32::from(!mla_programs.is_empty())) == 0,
                 "configuring CPU draft projection table failed");
         }
-        let entries = shapes.iter().map(|&(k, n)| serde_json::json!({
+        let mut entries = shapes.iter().map(|&(k, n)| serde_json::json!({
             "name":format!("draft_bf16_k{k}_n{n}"), "capacity_rows":rows,
             "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],
             "scratch_bytes_at_capacity":{}, "geometry":{"width":k,"outputs":n,
                 "output_dtype":"torch.bfloat16","reduction":"ordered_k16",
                 "tiles_by_rows":[[16,1,4,16,64,6]]}})).collect::<Vec<_>>();
+        entries.extend_from_slice(mla_programs);
         let manifest = self.directory().join("draft-projections.json");
         fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
         library.programs()?.with_manifest(&manifest)

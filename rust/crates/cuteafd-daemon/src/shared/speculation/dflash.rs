@@ -3659,8 +3659,7 @@ mod checkpoint_header_tests {
         entries.push(serde_json::json!({"name":"fixture_mla_draft_output_m64","capacity_rows":64,
             "geometry":geometry,"scratch_bytes_at_capacity":{"scratch":program.scratch[2]},
             "pointers":pointers[2].iter().map(|p| serde_json::json!({"name":p})).collect::<Vec<_>>()}));
-        let manifest = snapshot.join("PROGRAMS.json");
-        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
+        let cfg = DflashConfig::mla(&native);
         for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
             for cache in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
                 let library = fixture.load()?;
@@ -3671,7 +3670,10 @@ mod checkpoint_header_tests {
                 fixture.configure_memory(&library, device, 8 << 30)?;
                 let physical_devices = [device];
                 let devices = planner::CoordinatorDevices::new(&physical_devices)?;
-                let programs = library.programs()?.with_manifest(&manifest)?;
+                let h = cfg.hidden;
+                let programs = fixture.draft_projection_programs(&library,
+                    &[(h, 2 * cfg.intermediate), (cfg.intermediate, h),
+                        (h * cfg.taps.len(), h), (h, cfg.conv_width()), (h, cfg.rank)], TAP_ROWS, &entries)?;
                 let layout = native.runtime_layout(representation, GlmDraftCapacity::new(2, 2, 8)?,
                     8192, 16384, 1, 2, cache)?;
                 let facts = layout.legacy_mla_facts(0);
@@ -3778,7 +3780,7 @@ mod checkpoint_header_tests {
                     let programs = fixture.draft_projection_programs(&library,
                         &[(h, 2 * cfg.intermediate), (cfg.intermediate, h),
                             (h * cfg.taps.len(), h), (h, cfg.conv_width()), (h, cfg.rank),
-                            (h, cfg.qkv_width()), (h, 2 * cfg.kv_width()), (cfg.heads * cfg.head_dim, h)], TAP_ROWS)?;
+                            (h, cfg.qkv_width()), (h, 2 * cfg.kv_width()), (cfg.heads * cfg.head_dim, h)], TAP_ROWS, &[])?;
                     let audit = AllocationAudit::start();
                     let draft = DflashDrafter::load(&library, &programs, &snapshot, std::fs::read(snapshot.join("model.safetensors"))?,
                         std::ptr::null_mut(), 2, 2, vec![0; 256], false, representation,

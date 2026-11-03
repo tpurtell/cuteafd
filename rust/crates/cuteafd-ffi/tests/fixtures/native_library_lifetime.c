@@ -132,20 +132,22 @@ static int native_vocabulary_programs;
 void fixture_configure_native_vocabulary_programs(void) { native_vocabulary_programs = 1; }
 /* Allocation-only drafter constructors still admit the canonical BF16 ABI. */
 static uint32_t draft_projection_count, draft_projection_shapes[16][2];
-int fixture_configure_draft_projections(const uint32_t *shapes, uint32_t count) {
+static int draft_projection_mla;
+int fixture_configure_draft_projections(const uint32_t *shapes, uint32_t count, int include_mla) {
     if (!shapes || count == 0 || count > 16) return 1;
     memcpy(draft_projection_shapes, shapes, count * sizeof(draft_projection_shapes[0]));
     draft_projection_count = count;
+    draft_projection_mla = include_mla;
     return 0;
 }
 uint32_t cuteafd_dsv4_program_count(void) {
-    return draft_projection_count ? draft_projection_count
+    return draft_projection_count ? draft_projection_count + (draft_projection_mla ? 7 : 0)
         : (native_vocabulary_programs ? 2 : (exlr8_programs ? 8 : (glm_target_programs ? 31 : 7)));
 }
 int cuteafd_dsv4_program_info(uint32_t index, struct fixture_program_info *info) {
     if (index >= cuteafd_dsv4_program_count() || !info) return 1;
     memset(info, 0, sizeof(*info));
-    if (draft_projection_count) {
+    if (index < draft_projection_count) {
         snprintf(info->name, sizeof(info->name), "draft_bf16_k%u_n%u",
             draft_projection_shapes[index][0], draft_projection_shapes[index][1]);
         info->pointers = 3;
@@ -153,6 +155,7 @@ int cuteafd_dsv4_program_info(uint32_t index, struct fixture_program_info *info)
         info->scalar_kinds[0] = 'i';
         return 0;
     }
+    if (draft_projection_count) index -= draft_projection_count;
     if (native_vocabulary_programs) {
         strcpy(info->name, index == 0 ? "exlr8_dense_fp8_row_embedding_k128_n256"
                                      : "exlr8_dense_fp8_row_k128_n256_s1");
