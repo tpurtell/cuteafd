@@ -61,6 +61,11 @@ pub(crate) fn report(stage: &str) -> Value {
     json!({
         "stage": stage,
         "devices": per_device,
+        "host_allocations": {
+            "tracked": snapshot.total(Space::Host, -1),
+            "peak": snapshot.peak.get(&(Space::Host, -1)).copied().unwrap_or(0),
+            "scopes": snapshot.by_scope(Space::Host, -1),
+        },
         "pinned": {
             "tracked": snapshot.total(Space::Pinned, -1),
             "peak": snapshot.peak.get(&(Space::Pinned, -1)).copied().unwrap_or(0),
@@ -93,13 +98,15 @@ pub(crate) fn monitor(stage: &'static str, period: Duration) {
         let mut sequence = 0u64;
         loop {
             let value = report(stage);
-            if value["devices"].as_array().is_none_or(Vec::is_empty) && value["pinned"]["tracked"] == 0 {
+            if value["devices"].as_array().is_none_or(Vec::is_empty)
+                && value["pinned"]["tracked"] == 0 && value["host_allocations"]["tracked"] == 0 {
                 std::thread::sleep(period);
                 continue;
             }
             let signature: Vec<i64> = value["devices"].as_array().into_iter().flatten()
                 .flat_map(|d| [d["used"].as_i64().unwrap_or(0), d["tracked"].as_i64().unwrap_or(0)])
-                .chain([value["pinned"]["tracked"].as_i64().unwrap_or(0)])
+                .chain([value["pinned"]["tracked"].as_i64().unwrap_or(0),
+                    value["host_allocations"]["tracked"].as_i64().unwrap_or(0)])
                 .collect();
             let moved = last.as_ref().is_none_or(|previous| previous.iter().zip(&signature)
                 .any(|(a, b)| (a - b).abs() >= 64 << 20));

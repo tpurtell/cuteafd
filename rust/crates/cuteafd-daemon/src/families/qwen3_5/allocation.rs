@@ -442,10 +442,11 @@ fn startup_history(
             AllocationEvent::Allocated(a) => {
                 let domain = match a.key.space {
                     Space::Device => Domain::Device,
+                    Space::Host => Domain::Host,
                     Space::Pinned => Domain::Pinned,
                     Space::Managed => Domain::Managed,
                 };
-                if domain != Domain::Pinned {
+                if matches!(domain, Domain::Device | Domain::Managed) {
                     ensure!(
                         a.key.device == device,
                         "dense allocation on wrong physical device"

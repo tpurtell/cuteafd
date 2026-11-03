@@ -1,4 +1,4 @@
-//! Process-wide ledger of every device, pinned-host and managed allocation made
+//! Process-wide ledger of every device, host, pinned-host and managed allocation made
 //! through [`crate::NativeLibrary`].
 //!
 //! Callers label allocations without touching each call site: a thread-local
@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Space {
     Device,
+    Host,
     Pinned,
     Managed,
 }
@@ -26,6 +27,7 @@ impl Space {
     pub fn label(self) -> &'static str {
         match self {
             Self::Device => "device",
+            Self::Host => "host",
             Self::Pinned => "pinned",
             Self::Managed => "managed",
         }
@@ -330,7 +332,8 @@ pub struct Snapshot {
 impl Snapshot {
     /// Devices holding any tracked device or managed allocation.
     pub fn devices(&self) -> Vec<i32> {
-        let mut devices: Vec<i32> = self.rows.iter().filter(|r| r.key.space != Space::Pinned && r.key.device >= 0)
+        let mut devices: Vec<i32> = self.rows.iter()
+            .filter(|r| matches!(r.key.space, Space::Device | Space::Managed) && r.key.device >= 0)
             .map(|r| r.key.device).collect();
         devices.sort_unstable();
         devices.dedup();

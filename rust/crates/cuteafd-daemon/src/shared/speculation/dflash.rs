@@ -1000,6 +1000,7 @@ fn draft_owner_events(
                 ensure!(record.key.device == device, "draft owner allocated on wrong physical device");
                 devices.location(record.key.device)?
             }
+            Space::Host => Location::HOST,
             Space::Pinned => Location::PINNED,
             Space::Managed => anyhow::bail!("unexpected managed draft owner"),
         };

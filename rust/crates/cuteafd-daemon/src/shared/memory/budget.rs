@@ -206,7 +206,9 @@ pub(crate) fn admit_host_memory_with_resident_formulas(cache: u64, tables: &[(&s
     -> Result<cuteafd_core::memory_layout::HostLayout> {
     let memory = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let snapshot = cuteafd_ffi::memory_ledger::snapshot();
-    let mut resident = host_resident_items(snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1), formulas);
+    let mut resident = host_resident_items(
+        snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Host, -1),
+        snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1), formulas);
     // One singleton serves every mapped table and GPU owner in this process.
     // Its reusable buffers are lazy, so retain the full future reservation.
     append_table_reactor(&mut resident, usize::from(
@@ -226,12 +228,14 @@ fn append_table_reactor(items: &mut Vec<cuteafd_core::memory_layout::Item>, mapp
     }
 }
 
-fn host_resident_items(pinned: std::collections::BTreeMap<&'static str, usize>, formulas: &[(&str, u64)])
+fn host_resident_items(host: std::collections::BTreeMap<&'static str, usize>,
+    pinned: std::collections::BTreeMap<&'static str, usize>, formulas: &[(&str, u64)])
     -> Vec<cuteafd_core::memory_layout::Item> {
     use cuteafd_core::memory_layout::{Basis, Category, Item};
-    let mut items: Vec<_> = pinned.into_iter()
-        .filter(|(scope, _)| !formulas.iter().any(|&(name, _)| name == *scope))
-        .map(|(scope, bytes)| Item::new(Category::of_scope(scope), scope, "pinned", bytes as u64, Basis::Exact))
+    let mut items: Vec<_> = [(host, "host"), (pinned, "pinned")].into_iter()
+        .flat_map(|(scopes, format)| scopes.into_iter().map(move |(scope, bytes)| (scope, bytes, format)))
+        .filter(|(scope, _, _)| !formulas.iter().any(|&(name, _)| name == *scope))
+        .map(|(scope, bytes, format)| Item::new(Category::of_scope(scope), scope, format, bytes as u64, Basis::Exact))
         .collect();
     items.extend(formulas.iter().map(|&(name, bytes)| Item::new(Category::Staging, name,
         "pinned payload + pageable sort tuples", bytes, Basis::Formula)));
@@ -264,6 +268,26 @@ mod tests {
     use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
 
     #[test]
+    fn ordinary_and_pinned_rings_keep_the_same_combined_host_residency() -> Result<()> {
+        use std::collections::BTreeMap;
+        let ring = "transport/rdma-rings";
+        let old = host_resident_items(BTreeMap::new(), BTreeMap::from([(ring, 1024)]), &[]);
+        let relabelled = host_resident_items(BTreeMap::from([(ring, 768)]), BTreeMap::from([(ring, 256)]), &[]);
+        assert_eq!(relabelled.iter().map(|item| (item.format.as_str(), item.bytes)).collect::<Vec<_>>(),
+            vec![("host", 768), ("pinned", 256)]);
+        let old = host_admission((2 << 30, 1 << 30), old, 4096, &[], 0, 0)?;
+        let new = host_admission((2 << 30, 1 << 30), relabelled, 4096, &[], 0, 0)?;
+        assert_eq!(old.resident_bytes, 1024);
+        assert_eq!((new.resident_bytes, new.deferred_bytes, new.shortfall_bytes),
+            (old.resident_bytes, old.deferred_bytes, old.shortfall_bytes));
+        let formulas = [(ring, 2048)];
+        let replaced = host_resident_items(BTreeMap::from([(ring, 768)]), BTreeMap::from([(ring, 256)]), &formulas);
+        assert_eq!(replaced.len(), 1);
+        assert_eq!((replaced[0].bytes, replaced[0].basis), (2048, Basis::Formula));
+        Ok(())
+    }
+
+    #[test]
     fn reactor_reservation_is_once_per_process_not_per_table() -> Result<()> {
         for count in [0, 1, 2, 8] {
             let mut items = Vec::new();
@@ -283,7 +307,7 @@ mod tests {
                     2752 * 16, depth, 64 * 16, row_bytes)?;
                 let payload = shape.slot_bytes().sum::<usize>() as u64;
                 let workspace = shape.workspace_bytes as u64;
-                let items = host_resident_items(std::collections::BTreeMap::from([
+                let items = host_resident_items(Default::default(), std::collections::BTreeMap::from([
                     ("mapped-table", payload as usize)]), &[]);
                 let demands = [("staging/mapped-table-worker", workspace)];
                 let ledger = host_admission((2 << 30, 1 << 30), items.clone(), 0, &demands, 0, 0)?;
@@ -310,7 +334,7 @@ mod tests {
                 ("v41/engram-prefill", shape.host_slots() * rows * 6337),
                 ("v41/engram-decode", shape.decode_slots() * shape.decode_rows() * 6337),
                 ("unrelated/pinned", 7)]);
-            let items = host_resident_items(pinned, &formulas);
+            let items = host_resident_items(Default::default(), pinned, &formulas);
             assert_eq!(items.len(), 3);
             for &(name, bytes) in &formulas {
                 let entry = items.iter().find(|item| item.group == name).unwrap();

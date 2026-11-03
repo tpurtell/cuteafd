@@ -1027,6 +1027,17 @@ mod tests {
                             anyhow::ensure!(snapshots.len() == 1 && snapshots[0].rank == 0, "endpoint snapshot rank inventory");
                             let snapshot = snapshots[0];
                             let session = client.sessions[0].as_ref().unwrap();
+                            let ledger = cuteafd_ffi::memory_ledger::allocations();
+                            for span in [snapshot.send, snapshot.recv] {
+                                let records = ledger.iter().filter(|record| record.address == span.address as usize)
+                                    .collect::<Vec<_>>();
+                                anyhow::ensure!(records.len() == 1 && records[0].bytes as u64 == span.bytes
+                                    && records[0].key.space == cuteafd_ffi::memory_ledger::Space::Pinned
+                                    && records[0].key.device == -1 && records[0].key.scope == "transport/rdma-rings",
+                                    "native ring ledger differs from retained physical-span census");
+                            }
+                            anyhow::ensure!(!ledger.iter().any(|record| record.address == session.endpoint.info.handle as usize),
+                                "native endpoint handle is not a physical allocation");
                             anyhow::ensure!(snapshot.send == SparkEndpointSpan::from_native(session.endpoint.send_buffer_view()?)?
                                 && snapshot.recv == SparkEndpointSpan::from_native(session.endpoint.recv_buffer_view()?)?,
                                 "snapshot differs from real native allocation views");

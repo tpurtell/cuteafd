@@ -1785,6 +1785,7 @@ pub struct NativeLibrary {
     quarantine_after_failed_drain: AtomicBool,
     sync_h2d_staging: Mutex<SyncH2DStagingBuffer>,
     ordered_h2d_staging: Mutex<std::collections::BTreeMap<(i32, usize, usize), OrderedH2DStaging>>,
+    rdma_rings: Mutex<RdmaRingLedger>,
     rdma_rc_endpoint_try_poll_fn: RdmaRcEndpointTryPollFn,
 }
 
@@ -2170,11 +2171,80 @@ impl Drop for CuteafdNcclComm {
     }
 }
 
-/// RC endpoint send/recv spans are allocated natively (pinned or malloc'd and
-/// registered); the ledger keys them by endpoint handle.
-fn record_rdma_rings(handle: *mut c_void, bytes: usize) {
-    let _scope = memory_ledger::scope("transport/rdma-rings");
-    memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, handle as usize, bytes);
+#[derive(Clone, Copy)]
+struct RdmaRingAllocation {
+    address: usize,
+    bytes: usize,
+    space: memory_ledger::Space,
+}
+
+impl RdmaRingAllocation {
+    fn from_view(view: CuteafdRdmaRcEndpointBufferView) -> Result<Self> {
+        let address = view.host_ptr as usize;
+        anyhow::ensure!(address != 0 && view.bytes > 0 && address.checked_add(view.bytes).is_some(),
+            "RDMA ring view has no valid host allocation span");
+        Ok(Self { address, bytes: view.bytes,
+            space: if view.host_flags & CUTEAFD_HOST_BUFFER_FLAG_PINNED != 0 {
+                memory_ledger::Space::Pinned
+            } else {
+                memory_ledger::Space::Host
+            } })
+    }
+}
+
+/// Handles locate lifecycle metadata only; the ledger keys the two real allocations.
+#[derive(Default)]
+struct RdmaRingLedger {
+    endpoints: std::collections::BTreeMap<usize, [Option<RdmaRingAllocation>; 2]>,
+}
+
+impl RdmaRingLedger {
+    fn capture(&mut self, handle: usize,
+        mut view: impl FnMut(bool) -> (CuteafdRdmaRcEndpointBufferView, Result<()>),
+        destroy: impl FnOnce() -> Result<()>) -> Result<()> {
+        anyhow::ensure!(handle != 0 && !self.endpoints.contains_key(&handle),
+            "RDMA ring capture requires a new live endpoint");
+        let mut spans = [None; 2];
+        let mut failure = None;
+        for (index, receive) in [false, true].into_iter().enumerate() {
+            let (raw, mapped) = view(receive);
+            // Native fills these host fields before fallible CUDA mapping. Even
+            // a mapping error must leave the retained physical bytes accounted.
+            match RdmaRingAllocation::from_view(raw) {
+                Ok(span) => spans[index] = Some(span),
+                Err(error) => { failure.get_or_insert(error); }
+            }
+            if let Err(error) = mapped { failure.get_or_insert(error); }
+        }
+        if let [Some(send), Some(recv)] = spans {
+            if send.address < recv.address + recv.bytes && recv.address < send.address + send.bytes {
+                failure.get_or_insert_with(|| anyhow::anyhow!("RDMA send and recv allocations overlap"));
+            }
+        }
+        let _scope = memory_ledger::scope("transport/rdma-rings");
+        for span in spans.iter().flatten() {
+            memory_ledger::record_alloc(span.space, -1, span.address, span.bytes);
+        }
+        self.endpoints.insert(handle, spans);
+        if let Some(error) = failure {
+            if let Err(cleanup) = self.destroy(handle, destroy) {
+                return Err(cleanup.context(format!("{error:#}; RDMA capture cleanup failed; ring records retained")));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn destroy(&mut self, handle: usize, destroy: impl FnOnce() -> Result<()>) -> Result<()> {
+        destroy()?;
+        // A failed QP destroy retains native registrations and allocations.
+        if let Some(spans) = self.endpoints.remove(&handle) {
+            for span in spans.into_iter().flatten() {
+                memory_ledger::record_free(span.address);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Per-destination pinned source and copy-completion fence. Raw owners are
@@ -2308,6 +2378,7 @@ impl NativeLibrary {
             quarantine_after_failed_drain: AtomicBool::new(false),
             sync_h2d_staging: Mutex::new(SyncH2DStagingBuffer::default()),
             ordered_h2d_staging: Mutex::new(Default::default()),
+            rdma_rings: Mutex::new(RdmaRingLedger::default()),
             rdma_rc_endpoint_try_poll_fn,
         })
     }
@@ -4580,6 +4651,8 @@ impl NativeLibrary {
     ) -> Result<CuteafdRdmaRcEndpointInfo> {
         // SAFETY: the symbol has the declared C ABI; all argument buffers live through the call.
         let create_fn: RdmaRcEndpointCreateOnGidWithBufferFlagsFn = self.cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags()?;
+        let view_fn: RdmaRcEndpointBufferViewFn = self.cuteafd_rdma_rc_endpoint_buffer_view()?;
+        let destroy_fn: RdmaRcEndpointDestroyFn = self.cuteafd_rdma_rc_endpoint_destroy()?;
         let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut info = CuteafdRdmaRcEndpointInfo::default();
         // SAFETY: device_name and info remain valid for the synchronous native call.
@@ -4604,7 +4677,20 @@ impl NativeLibrary {
             "cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags",
             status,
         )?;
-        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
+        self.rdma_rings.lock().unwrap_or_else(|error| error.into_inner()).capture(
+            info.handle as usize,
+            |receive| {
+                let mut view = CuteafdRdmaRcEndpointBufferView::default();
+                // SAFETY: create succeeded; info retains the live endpoint and view is local output.
+                let status = unsafe { view_fn(info.handle, c_int::from(receive), &mut view) };
+                (view, self.status_to_result("cuteafd_rdma_rc_endpoint_buffer_view", status))
+            },
+            || {
+                // SAFETY: failed capture still owns the endpoint returned by create.
+                let status = unsafe { destroy_fn(info.handle) };
+                self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)
+            },
+        )?;
         Ok(info)
     }
 
@@ -4980,9 +5066,11 @@ impl NativeLibrary {
 
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {
         let destroy_fn: RdmaRcEndpointDestroyFn = self.cuteafd_rdma_rc_endpoint_destroy()?;
-        memory_ledger::record_free(handle as usize);
-        let status = unsafe { destroy_fn(handle) };
-        self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)
+        self.rdma_rings.lock().unwrap_or_else(|error| error.into_inner()).destroy(handle as usize, || {
+            // SAFETY: the caller owns the endpoint until the native destroy succeeds.
+            let status = unsafe { destroy_fn(handle) };
+            self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)
+        })
     }
 
     /// Metadata-only symbol check; terminal ownership is unavailable on older
@@ -5863,6 +5951,149 @@ mod tests {
         };
         let library = unsafe { NativeLibrary::load(path)? };
         Ok(library)
+    }
+
+    fn numeric_ring_view(address: usize, bytes: usize, host_flags: u64) -> CuteafdRdmaRcEndpointBufferView {
+        CuteafdRdmaRcEndpointBufferView { host_ptr: address as *mut c_void, bytes, host_flags,
+            ..CuteafdRdmaRcEndpointBufferView::default() }
+    }
+
+    fn ring_events(audit: &memory_ledger::AllocationAudit, addresses: [usize; 2])
+        -> Vec<memory_ledger::AllocationEvent> {
+        audit.events().into_iter().filter(|event| {
+            let record = match event {
+                memory_ledger::AllocationEvent::Allocated(record) | memory_ledger::AllocationEvent::Freed(record) => record,
+            };
+            addresses.contains(&record.address)
+        }).collect()
+    }
+
+    #[test]
+    fn rdma_ring_ledger_tracks_real_spans_and_host_vs_pinned_domains() -> Result<()> {
+        use memory_ledger::{AllocationAudit, AllocationEvent, Space};
+        for (index, flags, expected) in [(0, CUTEAFD_HOST_BUFFER_FLAG_NONE, Space::Host),
+            (1, CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED, Space::Pinned)] {
+            let base = 0x7300_0000_0000usize + index * 0x10000;
+            let addresses = [base, base + 4096];
+            let handle = base + 8192;
+            let audit = AllocationAudit::start();
+            let mut ledger = RdmaRingLedger::default();
+            for _ in 0..2 {
+                ledger.capture(handle, |receive| {
+                    let index = usize::from(receive);
+                    (numeric_ring_view(addresses[index], [128, 384][index], flags), Ok(()))
+                }, || anyhow::bail!("successful capture must not destroy"))?;
+                let records = memory_ledger::allocations();
+                assert!(!records.iter().any(|record| record.address == handle));
+                for (index, address) in addresses.into_iter().enumerate() {
+                    let record = records.iter().find(|record| record.address == address).unwrap();
+                    assert_eq!((record.key.space, record.key.device, record.key.scope, record.bytes),
+                        (expected, -1, "transport/rdma-rings", [128, 384][index]));
+                }
+                ledger.destroy(handle, || {
+                    assert_eq!(memory_ledger::allocations().iter()
+                        .filter(|record| addresses.contains(&record.address)).count(), 2);
+                    Ok(())
+                })?;
+                assert!(ledger.endpoints.is_empty());
+                assert!(!memory_ledger::allocations().iter().any(|record| addresses.contains(&record.address)));
+            }
+            let events = ring_events(&audit, addresses);
+            assert_eq!(events.len(), 8);
+            for cycle in events.chunks_exact(4) {
+                for (index, event) in cycle.iter().enumerate() {
+                    let record = match event {
+                        AllocationEvent::Allocated(record) => { assert!(index < 2); record }
+                        AllocationEvent::Freed(record) => { assert!(index >= 2); record }
+                    };
+                    assert_eq!((record.address, record.bytes, record.key.space),
+                        (addresses[index % 2], [128, 384][index % 2], expected));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rdma_ring_failed_destroy_keeps_both_physical_records_until_success() -> Result<()> {
+        use memory_ledger::{AllocationAudit, AllocationEvent};
+        let addresses = [0x7300_0002_0000usize, 0x7300_0002_1000];
+        let handle = addresses[0] + 8192;
+        let audit = AllocationAudit::start();
+        let mut ledger = RdmaRingLedger::default();
+        ledger.capture(handle, |receive| (numeric_ring_view(addresses[usize::from(receive)], 256,
+            CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED), Ok(())), || Ok(()))?;
+        for _ in 0..2 {
+            assert!(ledger.destroy(handle, || anyhow::bail!("injected QP teardown failure")).is_err());
+            assert!(ledger.endpoints.contains_key(&handle));
+            assert_eq!(memory_ledger::allocations().iter()
+                .filter(|record| addresses.contains(&record.address)).count(), 2);
+            assert_eq!(ring_events(&audit, addresses).len(), 2);
+        }
+        let recapture_called = std::cell::Cell::new(false);
+        assert!(ledger.capture(handle, |_| {
+            recapture_called.set(true);
+            (CuteafdRdmaRcEndpointBufferView::default(), Ok(()))
+        }, || Ok(())).is_err());
+        assert!(!recapture_called.get());
+        ledger.destroy(handle, || Ok(()))?;
+        assert!(ledger.endpoints.is_empty());
+        let events = ring_events(&audit, addresses);
+        assert_eq!(events.len(), 4);
+        assert!(events[..2].iter().all(|event| matches!(event, AllocationEvent::Allocated(_))));
+        assert!(events[2..].iter().all(|event| matches!(event, AllocationEvent::Freed(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn rdma_ring_mapping_error_accounts_host_metadata_through_failed_cleanup() -> Result<()> {
+        use memory_ledger::{AllocationAudit, AllocationEvent, Space};
+        for (arm, cleanup_succeeds) in [false, true].into_iter().enumerate() {
+            for failed_receive in [false, true] {
+                let base = 0x7300_0003_0000usize + (arm * 2 + usize::from(failed_receive)) * 0x10000;
+                let addresses = [base, base + 4096];
+                let handle = base + 8192;
+                let audit = AllocationAudit::start();
+                let mut ledger = RdmaRingLedger::default();
+                let queries = std::cell::Cell::new(0);
+                let result = ledger.capture(handle, |receive| {
+                    queries.set(queries.get() + 1);
+                    // CUDA mapping failed, but the native host fields already describe the owner.
+                    (numeric_ring_view(addresses[usize::from(receive)], 512,
+                        CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED),
+                        if receive == failed_receive { Err(anyhow::anyhow!("injected CUDA mapping failure")) } else { Ok(()) })
+                }, || {
+                    let records = memory_ledger::allocations();
+                    for address in addresses {
+                        let record = records.iter().find(|record| record.address == address).unwrap();
+                        assert_eq!((record.bytes, record.key.space), (512, Space::Pinned));
+                    }
+                    if cleanup_succeeds { Ok(()) } else { anyhow::bail!("injected cleanup destroy failure") }
+                });
+                assert!(format!("{:#}", result.unwrap_err()).contains("injected CUDA mapping failure"));
+                assert_eq!(queries.get(), 2);
+                assert_eq!(ledger.endpoints.contains_key(&handle), !cleanup_succeeds);
+                assert_eq!(ring_events(&audit, addresses).len(), if cleanup_succeeds { 4 } else { 2 });
+                if !cleanup_succeeds { ledger.destroy(handle, || Ok(()))?; }
+                assert!(!memory_ledger::allocations().iter().any(|record| addresses.contains(&record.address)));
+                let events = ring_events(&audit, addresses);
+                assert_eq!(events.len(), 4);
+                assert!(events[..2].iter().all(|event| matches!(event, AllocationEvent::Allocated(_))));
+                assert!(events[2..].iter().all(|event| matches!(event, AllocationEvent::Freed(_))));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rdma_ring_host_span_validation_does_not_require_cuda_mapping() -> Result<()> {
+        let valid = numeric_ring_view(0x1000, 64, CUTEAFD_HOST_BUFFER_FLAG_NONE);
+        assert_eq!(RdmaRingAllocation::from_view(valid)?.space, memory_ledger::Space::Host);
+        for invalid in [numeric_ring_view(0, 64, 0), numeric_ring_view(0x1000, 0, 0),
+            numeric_ring_view(usize::MAX - 1, 64, 0)] {
+            assert!(RdmaRingAllocation::from_view(invalid).is_err());
+        }
+        Ok(())
     }
 
     fn synthetic_device_buffer(address: usize, bytes: usize) -> CuteafdDeviceBuffer {
