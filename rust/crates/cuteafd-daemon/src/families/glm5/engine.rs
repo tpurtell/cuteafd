@@ -1162,6 +1162,9 @@ impl<'a> GlmEngine<'a> {
             }
         }
         let bucket = glm_decode_row_bucket(rows, width)?;
+        tracing::debug!(target: "cuteafd::glm_decode_rows", live_rows = rows, bucket_rows = bucket,
+            table_width = width, ladder = if width > 2048 { "long" } else { "short" },
+            "GLM decode row bucket selected");
         self.pad_rows(&mut tables, bucket);
         let mut padded = tokens.to_vec();
         padded.resize(bucket, 0);
