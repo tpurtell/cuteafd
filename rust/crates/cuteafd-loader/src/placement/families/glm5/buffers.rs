@@ -11,6 +11,49 @@ use cuteafd_core::memory_layout::Category;
 
 const FLOOR: u64 = 256;
 
+/// Prefix-owned storage only. KV pools and the drafter's live windows are
+/// aliases owned by their respective target/draft recipes, not new backings.
+#[derive(Debug, Clone, Copy)]
+pub struct PrefixBuffers {
+    pub device: u8,
+    /// One slot's window payload from the drafter layout; None for GQA/no draft.
+    pub draft_windows: Option<u64>,
+    pub mark_slots: u64,
+}
+
+impl PrefixBuffers {
+    pub fn allocations(self, lifetime: Lifetime) -> Result<Vec<Allocation>, Refusal> {
+        if self.device > 1 {
+            return Err(Refusal::InvalidFact("invalid GLM prefix device".into()));
+        }
+        let prefix = format!("glm.prefix.gpu.{}", self.device);
+        let mut owners = vec![Allocation::buffer(format!("{prefix}.tail-scratch"),
+            Location::coordinator(self.device), FLOOR, lifetime, Category::Prefix, "GLM prefix storage")];
+        if let Some(windows) = self.draft_windows.filter(|_| self.mark_slots > 0) {
+            let mark = if windows == 0 { 0 } else {
+                windows.checked_add(super::DRAFT_MARK_HEADER as u64)
+                    .ok_or(Refusal::Overflow("GLM prefix mark header"))?
+            };
+            let bytes = mul(mark, self.mark_slots)?.max(FLOOR);
+            usize::try_from(bytes).map_err(|_| Refusal::Overflow("GLM prefix marks"))?;
+            owners.push(Allocation::buffer(format!("{prefix}.draft-marks"),
+                Location::coordinator(self.device), bytes, lifetime, Category::Prefix, "GLM prefix storage"));
+        }
+        Ok(owners)
+    }
+
+    pub fn components(self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("GLM prefix requires a positive pool domain".into()));
+        }
+        Ok(self.allocations(Lifetime { first: Phase::Warmup, last: Phase::Growth })?
+            .into_iter().map(|owner| {
+                let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+                Component::allocation(owner, bytes, false, maximum_pages)
+            }).collect())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TargetBuffers {
     pub device: u8,

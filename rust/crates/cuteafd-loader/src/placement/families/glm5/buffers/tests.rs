@@ -79,6 +79,42 @@ fn budgets() -> Vec<Budget> {
 }
 
 #[test]
+fn prefix_backings_charge_tail_and_window_marks_but_no_target_or_draft_aliases() {
+    let life = Lifetime { first: Phase::Warmup, last: Phase::Growth };
+    for device in [0, 1] {
+        for windows in [None, Some(0), Some(1), Some(8192)] {
+            for slots in [0, 1, 3] {
+                let spec = PrefixBuffers { device, draft_windows: windows, mark_slots: slots };
+                let owners = spec.allocations(life).unwrap();
+                assert_eq!(owners.len(), 1 + usize::from(windows.is_some() && slots > 0));
+                assert_eq!(owners[0].id, format!("glm.prefix.gpu.{device}.tail-scratch"));
+                assert_eq!(owners[0].bytes, 256);
+                if let Some(windows) = windows.filter(|_| slots > 0) {
+                    assert_eq!(owners[1].bytes, if windows == 0 {256} else {((windows + 16) * slots).max(256)});
+                    assert_eq!(owners[1].id, format!("glm.prefix.gpu.{device}.draft-marks"));
+                }
+                assert!(owners.iter().all(|a| a.view.is_none() && a.lifetime == life
+                    && a.location == Location::coordinator(device) && a.category == Category::Prefix));
+                let mut contract = Contract::fixed(64, 16, 2, Facts {
+                    phase_order: planner::PhaseOrder::DRAFT_THEN_TARGET, allocations: vec![],
+                    deferred: vec![], sequential: vec![], allowances: vec![] });
+                contract.variables = vec![Variable::Prefill(vec![PrefillShape {rows: 64, waves: 1}]), Variable::Lanes(vec![1])];
+                contract.components = spec.components(16).unwrap();
+                for pages in [1, 8, 16] {
+                    assert_eq!(contract.facts(&[0, 0], pages).unwrap().allocations, owners);
+                }
+                assert!(spec.components(0).is_err());
+            }
+        }
+    }
+    for spec in [
+        PrefixBuffers {device: 2, draft_windows: None, mark_slots: 0},
+        PrefixBuffers {device: 0, draft_windows: Some(u64::MAX), mark_slots: 1},
+        PrefixBuffers {device: 0, draft_windows: Some(1), mark_slots: u64::MAX},
+    ] { assert!(spec.allocations(life).is_err()); }
+}
+
+#[test]
 fn named_target_buffers_match_independent_pool_geometry_and_aliases() {
     for device in [0, 1] {
         let target = target(device);

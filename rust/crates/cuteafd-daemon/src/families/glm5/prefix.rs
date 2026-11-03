@@ -104,12 +104,39 @@ struct DraftMarks<'a> {
     slots: usize,
 }
 
-impl DraftMarks<'_> {
+impl<'a> DraftMarks<'a> {
+    fn new(library: &'a cuteafd_ffi::NativeLibrary, windows: usize, slots: usize) -> Result<Self> {
+        let bytes = draft_mark_bytes(true, windows).checked_mul(slots)
+            .ok_or_else(|| anyhow::anyhow!("draft window marks overflow"))?;
+        Ok(Self { storage: DeviceAllocation::new(library, bytes.max(256))?, windows, slots })
+    }
+
     fn bytes(&self) -> usize { DRAFT_MARK_HEADER + self.windows }
     fn mark(&self, slot: MarkSlot) -> Result<CuteafdDeviceBuffer> {
         anyhow::ensure!((slot.0 as usize) < self.slots, "draft window mark outside the arena");
         view(self.storage.buffer, slot.0 as usize * self.bytes(), self.bytes())
     }
+}
+
+fn prefix_allocation_receipts(
+    scratch: &DeviceAllocation<'_>, marks: Option<&DraftMarks<'_>>,
+    devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+    use cuteafd_core::memory_layout::Category;
+    use cuteafd_loader::placement::planner::{Allocation, Lifetime, Phase, Receipt};
+    let physical = scratch.buffer.device_id;
+    let rank = devices.logical_rank(physical)?;
+    let mut owners = vec![("tail-scratch", scratch.buffer)];
+    if let Some(marks) = marks { owners.push(("draft-marks", marks.storage.buffer)); }
+    owners.into_iter().map(|(name, buffer)| {
+        anyhow::ensure!(buffer.device_id == physical && !buffer.ptr.is_null() && buffer.bytes > 0
+            && (buffer.ptr as usize).checked_add(buffer.bytes).is_some(),
+            "invalid GLM prefix owner {name}");
+        Ok(Receipt { allocation: Allocation::buffer(format!("glm.prefix.gpu.{rank}.{name}"),
+            devices.location(physical)?, u64::try_from(buffer.bytes)?,
+            Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Prefix, "GLM prefix storage"),
+            address: buffer.ptr as u64 })
+    }).collect()
 }
 
 /// The prefix mark of a drafter: its window bytes per mark when its whole warm state is window
@@ -131,13 +158,18 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
         let draft_marks = match engine.drafter.as_ref().filter(|d| d.mla_windows_only()) {
             Some(drafter) if mark_slots > 0 => {
                 let windows = drafter.mla_window_segments(0)?.iter().map(|w| w.bytes).sum::<usize>();
-                let bytes = draft_mark_bytes(true, windows).checked_mul(mark_slots)
-                    .ok_or_else(|| anyhow::anyhow!("draft window marks overflow"))?;
-                Some(DraftMarks { storage: DeviceAllocation::new(engine.library, bytes.max(256))?, windows, slots: mark_slots })
+                Some(DraftMarks::new(engine.library, windows, mark_slots)?)
             }
             _ => None,
         };
         Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)?, copies, draft_marks })
+    }
+
+    /// Prefix-owned backings, not the target pools registered as copy aliases.
+    pub(crate) fn allocation_receipts(&self,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+    ) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        prefix_allocation_receipts(&self.scratch, self.draft_marks.as_ref(), devices)
     }
 
     /// The bytes of one prefix mark: a window-ring drafter's windows, otherwise none.
@@ -603,6 +635,77 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn retained_prefix_backings_match_layout_facts_without_charging_registered_pools() -> Result<()> {
+        use cuteafd_ffi::{memory_ledger, native_library_lifetime_fixture::Fixture};
+        use cuteafd_loader::placement::{families::glm5::buffers::PrefixBuffers, planner::{self, *}};
+        use std::collections::BTreeMap;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.quiet_events(&library, true)?;
+        let mapping = CoordinatorDevices::new(&[1, 0])?;
+        for physical in [1, 0] {
+            library.cuda_set_device(physical)?;
+            fixture.configure_memory(&library, physical, 16 << 20)?;
+            for windows in [None, Some(0), Some(1), Some(8192)] {
+                for slots in [0, 1, 3] {
+                    let tag = format!("glm-prefix/{physical}/{windows:?}/{slots}");
+                    let _owner = memory_ledger::owner(&tag);
+                    let scratch = DeviceAllocation::new(&library, 256)?;
+                    let marks = windows.filter(|_| slots > 0)
+                        .map(|windows| DraftMarks::new(&library, windows, slots)).transpose()?;
+                    let receipts = prefix_allocation_receipts(&scratch, marks.as_ref(), mapping)?;
+                    let life = Lifetime { first: Phase::Warmup, last: Phase::Growth };
+                    let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET,
+                        allocations: PrefixBuffers { device: mapping.logical_rank(physical)?,
+                            draft_windows: windows.map(|n| n as u64), mark_slots: slots as u64 }.allocations(life)?,
+                        deferred: vec![], sequential: vec![], allowances: vec![] };
+                    let budgets = vec![Budget { id: "CPU prefix owners".into(), locations: vec![mapping.location(physical)?],
+                        physical_bytes: 16 << 20, logical_bytes: 16 << 20, headroom: 0,
+                        baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
+                    let phases = planner::evaluate(&facts, &budgets)?;
+                    let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64),
+                            onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving },
+                        decisions: Decisions { attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+                            embedding: None, prefill: PrefillShape {rows: 64, waves: 1}, lanes: 1 },
+                        pool_tokens: 64, facts, budgets, phases };
+                    planner::reconcile(&plan, Phase::Ready, &receipts)?;
+                    let live = memory_ledger::allocations().into_iter().filter(|r| r.key.owner == Some(tag.as_str()))
+                        .map(|r| ((r.key.space, r.key.device, r.address), r.bytes)).collect::<BTreeMap<_, _>>();
+                    let owners = receipts.iter().map(|r| ((memory_ledger::Space::Device, physical, r.address as usize),
+                        r.allocation.bytes as usize)).collect::<BTreeMap<_, _>>();
+                    assert_eq!(owners.len(), receipts.len());
+                    assert_eq!(owners, live);
+                    for defect in 0..5 {
+                        let mut wrong = receipts.clone();
+                        match defect {
+                            0 => {wrong.pop();},
+                            1 => {let mut extra = wrong[0].clone(); extra.allocation.id.push_str(".extra"); wrong.push(extra);},
+                            2 => wrong[0].allocation.bytes += 1,
+                            3 => wrong[0].allocation.location = Location::coordinator(1 - mapping.logical_rank(physical)?),
+                            4 => wrong[0].address = 0,
+                            _ => unreachable!(),
+                        }
+                        assert!(planner::reconcile(&plan, Phase::Ready, &wrong).is_err(), "prefix defect {defect}");
+                    }
+                    if let Some(marks) = &marks {
+                        for slot in 0..slots {
+                            let view = marks.mark(MarkSlot(slot as u32))?;
+                            assert_eq!(view.ptr as usize, marks.storage.buffer.ptr as usize + slot * marks.bytes());
+                        }
+                        assert!(marks.mark(MarkSlot(slots as u32)).is_err());
+                    }
+                    assert!(prefix_allocation_receipts(&scratch, marks.as_ref(), CoordinatorDevices::new(&[1 - physical])?).is_err());
+                    drop(marks); drop(scratch);
+                    assert!(memory_ledger::allocations().iter().all(|r| r.key.owner != Some(tag.as_str())));
+                    assert_eq!(library.cuda_memory_info()?, (16 << 20, 16 << 20));
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "sealed ML4 native library, published checkpoint and five real Spark workers"]

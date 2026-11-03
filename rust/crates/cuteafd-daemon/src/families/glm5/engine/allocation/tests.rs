@@ -646,6 +646,67 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                 .all(|r| r.allocation.location == Location::coordinator(rank as u8)));
         }
         planner::reconcile(&expected, Phase::Warmup, &actual)?;
+        // Independent serving-only admission: the prefix's registered target pools
+        // remain aliases and must not appear as new serving backings.
+        {
+            use crate::shared::{prefix::CudaCopyEngine, token_io::{SelectPlacement, TokenSelector}};
+            use cuteafd_engine::prefix::{PrefixCache, PrefixConfig, PrefixFamily};
+            use planner::serving::{HostPrefixOwners, SelectorOwners, ServingOwners};
+            let physical = engine.census_physical_devices()?;
+            let mapping = CoordinatorDevices::new(&physical)?;
+            let tag = format!("glm-serving/{devices:?}/{partitioned}/{owned}/{waves}/{core}");
+            let _owner = cuteafd_ffi::memory_ledger::owner(&tag);
+            for placement in [SelectPlacement::Host, SelectPlacement::Device] {
+                let family = engine.on(0, || super::super::super::prefix::GlmPrefix::new(&engine, false, 3))?;
+                let mut selector = engine.on(0, || TokenSelector::new(&library, placement, cfg.vocab_size, DECODE_ROWS))?;
+                let copy = CudaCopyEngine::registered(&library, &family.buffers())?;
+                let mut cache = PrefixCache::new(family.layout(), PrefixConfig { entries: 1, mark_slots: 0,
+                    keep_logits: false, min_tokens: 1 }, Some((cuteafd_hostcache::config::Config {
+                        bytes: 2 * (1 << 20) + 17, chunk_bytes: 1 << 20, min_tokens: 1, ..Default::default()
+                    }, copy)))?;
+                let serving = ServingOwners { selector: SelectorOwners { location: Location::coordinator(0),
+                    capacity: DECODE_ROWS, vocab: cfg.vocab_size, device_sampling: placement == SelectPlacement::Device },
+                    prefix: HostPrefixOwners {quota_bytes: 2 * (1 << 20) + 17, chunk_bytes: 1 << 20} };
+                let mut subset = expected.clone();
+                subset.facts.allocations = serving.allocations()?;
+                subset.facts.allocations.extend(cuteafd_loader::placement::families::glm5::buffers::PrefixBuffers {
+                    device: 0, draft_windows: None, mark_slots: 3 }.allocations(ServingOwners::LIFETIME)?);
+                subset.phases = planner::evaluate(&subset.facts, &subset.budgets)?;
+                let early = super::super::super::serve::serving_allocation_receipts(&family, &selector, &mut cache, mapping)?;
+                assert_eq!(planner::reconcile(&subset, Phase::Ready, &early).is_ok(), placement == SelectPlacement::Host);
+                selector.reserve_sampler()?;
+                let receipts = super::super::super::serve::serving_allocation_receipts(&family, &selector, &mut cache, mapping)?;
+                planner::reconcile(&subset, Phase::Ready, &receipts)?;
+                let live = cuteafd_ffi::memory_ledger::allocations().into_iter()
+                    .filter(|r| r.key.owner == Some(tag.as_str()))
+                    .map(|r| ((r.key.space, r.key.device, r.address), r.bytes)).collect::<BTreeMap<_, _>>();
+                let owners = receipts.iter().map(|r| {
+                    let (space, device) = match r.allocation.location {
+                        Location {device: planner::Device::Coordinator(rank), domain: Domain::Device} =>
+                            (cuteafd_ffi::memory_ledger::Space::Device, mapping.physical_device(rank).unwrap()),
+                        Location::PINNED => (cuteafd_ffi::memory_ledger::Space::Pinned, -1),
+                        other => panic!("unexpected serving location {other:?}"),
+                    };
+                    ((space, device, r.address as usize), r.allocation.bytes as usize)
+                }).collect::<BTreeMap<_, _>>();
+                assert_eq!(owners.len(), receipts.len(), "serving backings must be unique");
+                assert_eq!(owners, live, "prefix target aliases must not charge twice");
+                for defect in 0..5 {
+                    let mut wrong = receipts.clone();
+                    match defect {
+                        0 => {wrong.remove(0);},
+                        1 => {let mut extra = wrong[0].clone(); extra.allocation.id.push_str(".extra"); wrong.push(extra);},
+                        2 => wrong[0].allocation.bytes += 1,
+                        3 => {wrong[0].allocation.bytes += 1; wrong[1].allocation.bytes -= 1;},
+                        4 => wrong[0].address = wrong[1].address,
+                        _ => unreachable!(),
+                    }
+                    assert!(planner::reconcile(&subset, Phase::Ready, &wrong).is_err(), "serving defect {defect}");
+                }
+                drop(cache); drop(selector); drop(family);
+                assert!(cuteafd_ffi::memory_ledger::allocations().iter().all(|r| r.key.owner != Some(tag.as_str())));
+            }
+        }
         if core {
             let slots = engine.prefill_slots.borrow();
             let original = slots[0].core.as_ref().unwrap().clone();

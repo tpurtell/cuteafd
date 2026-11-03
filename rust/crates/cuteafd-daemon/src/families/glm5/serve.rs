@@ -499,6 +499,22 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrenc
     Ok((family, cache))
 }
 
+/// Serving-storage subset only; target, draft and Spark owners join separately.
+pub(super) fn serving_allocation_receipts(
+    family: &GlmPrefix<'_, '_>, selector: &TokenSelector<'_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'_>>,
+    devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+    use cuteafd_loader::placement::planner::serving::ServingOwners;
+    let physical = devices.physical_device(0)?;
+    let mut owners = family.allocation_receipts(devices)?;
+    owners.extend(selector.allocation_receipts(devices.location(physical)?, physical, ServingOwners::LIFETIME)?);
+    if let Some(copy) = cache.host_engine_mut() {
+        owners.extend(copy.allocation_receipts("host.prefix", ServingOwners::LIFETIME)?);
+    }
+    Ok(owners)
+}
+
 /// Gives a finished or failed sequence's pages and drafter slot back.
 fn release(family: &GlmPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>, slots: &mut Vec<usize>,
     placement: &GlmPlacement, slot: Option<usize>) {
