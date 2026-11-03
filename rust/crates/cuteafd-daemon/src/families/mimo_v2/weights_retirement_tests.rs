@@ -34,6 +34,121 @@ fn count(events: &str, tag: char) -> usize { events.chars().filter(|&c| c == tag
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn predictor_and_embedding_record_before_commit_and_replay_mount_bytes() -> Result<()> {
+    use crate::shared::{experts::rtx::dense, memory::device::Device,
+        token_io::{EmbedPlacement, EmbedSource, TokenEmbedding}};
+    use std::os::unix::fs::FileExt;
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 1 << 30)?; }
+    let cfg = MimoV2Config::from_hf(&serde_json::json!({
+        "model_type": "mimo_v2", "vocab_size": 256, "hidden_size": 256,
+        "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 1,
+        "swa_num_key_value_heads": 1, "head_dim": 128, "v_head_dim": 128,
+        "rope_theta": 10000.0, "swa_rope_theta": 10000.0, "sliding_window": 128,
+        "intermediate_size": 256, "n_routed_experts": 2, "num_experts_per_tok": 1,
+        "moe_intermediate_size": 256
+    }))?;
+    let p = "model.mtp.layers.0";
+    let mut tensors = vec![
+        ("model.embed_tokens.weight".to_string(), DType::Bf16, vec![256, 256]),
+        ("lm_head.weight".to_string(), DType::Bf16, vec![256, 256]),
+        ("model.norm.weight".to_string(), DType::Bf16, vec![256]),
+    ];
+    for (name, shape) in [
+        ("eh_proj.weight", vec![256, 512]), ("enorm.weight", vec![256]),
+        ("hnorm.weight", vec![256]), ("final_layernorm.weight", vec![256]),
+        ("input_layernorm.weight", vec![256]), ("pre_mlp_layernorm.weight", vec![256]),
+        ("self_attn.o_proj.weight", vec![256, 256]), ("self_attn.attention_sink_bias", vec![2]),
+    ] { tensors.push((format!("{p}.{name}"), DType::Bf16, shape)); }
+    for (name, rows) in [("self_attn.qkv_proj.weight", 512), ("mlp.gate_proj.weight", 256),
+        ("mlp.up_proj.weight", 256), ("mlp.down_proj.weight", 256)] {
+        tensors.push((format!("{p}.{name}"), DType::F8E4M3, vec![rows, 256]));
+        tensors.push((format!("{p}.{name}_scale_inv"), DType::F32, vec![rows / 128, 2]));
+    }
+    let refs = tensors.iter().map(|(n, d, s)| (n.as_str(), d.clone(), s.as_slice())).collect::<Vec<_>>();
+    let checkpoint = checkpoint(&fixture, &refs)?;
+    let path = checkpoint.snapshot.join("weights.bin");
+    let file = std::fs::File::options().write(true).open(&path)?;
+    for tensor in &checkpoint.tensors {
+        let bytes = match tensor.meta.dtype {
+            DType::Bf16 => (0..tensor.meta.byte_length / 2).flat_map(|i|
+                (((0.125 * (1 + i % 7) as f32).to_bits() >> 16) as u16).to_le_bytes()).collect::<Vec<_>>(),
+            DType::F32 => (0..tensor.meta.byte_length / 4).flat_map(|i|
+                (0.25 * (1 + i % 5) as f32).to_le_bytes()).collect(),
+            DType::F8E4M3 => (0..tensor.meta.byte_length).map(|i| 0x20 + (i % 24) as u8).collect(),
+            _ => unreachable!(),
+        };
+        file.write_all_at(&bytes, tensor.meta.byte_offset)?;
+    }
+    let payload = std::fs::read(&path)?;
+    let formats = BTreeMap::from([(format!("{p}.self_attn.o_proj.weight"), MimoProjectionRepresentation::Fp8)]);
+    let mounted_loader = loader(&library, &checkpoint, &formats);
+    let mounted = mounted_loader.mtp_weights(&cfg, 1)?;
+    let digests = |weights: &MtpWeights<'_>| -> Result<BTreeMap<String, String>> {
+        let mut out = BTreeMap::new();
+        for (name, mut buffer) in weights.layer.buffers() {
+            if name == "sinks" { buffer.bytes = 4; }
+            out.insert(name.to_string(), super::super::coordinator_golden_tests::digest(&library, buffer)?);
+        }
+        for (i, extra) in weights.extras.iter().enumerate() {
+            out.insert(format!("extra{i}"), super::super::coordinator_golden_tests::digest(&library, extra.buffer)?);
+        }
+        Ok(out)
+    };
+    let expected = digests(&mounted[0])?;
+    let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight").unwrap();
+    let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, 256)?;
+    let (mounted_embedding, ()) = TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || Ok(()))?;
+    assert_eq!(mounted_embedding.verify_resident()?, 256 * 256 * 2);
+    // Recording must succeed with missing payload bytes, on either target layout.
+    std::fs::write(&path, [])?;
+    for peers in [0, 1] {
+        let load = std::rc::Rc::new(dense::DenseLoad::push(&library));
+        let mut planning = loader(&library, &checkpoint, &formats);
+        planning.peers.truncate(peers);
+        planning.fp8_head = true;
+        planning.dense = load.clone();
+        let empty = planning.mtp_weights(&cfg, 0)?;
+        assert!(empty.is_empty());
+        assert_eq!(load.sink.as_ref().unwrap().take_all().summary(), (0, 0, 0, 0, 0, 0));
+        let error = planning.mtp_weights(&cfg, 2).err().expect("unavailable predictor must refuse before loading");
+        assert!(format!("{error:#}").contains("checkpoint has 1 MTP layers"));
+        assert_eq!(load.sink.as_ref().unwrap().take_all().summary(), (0, 0, 0, 0, 0, 0));
+        let ((embedding, (target, predictors)), mut records) = dense::recording(||
+            planning.with_embedding(&cfg, 0, 1, source.clone(), EmbedPlacement::Gpu))?;
+        records.extend(load.sink.as_ref().unwrap().take_all());
+        assert!(target.1.is_empty() || target.1.iter().all(Vec::is_empty));
+        assert_eq!(predictors.len(), 1);
+        assert!(!predictors[0].layer.split);
+        assert!(predictors[0].layer.buffers().iter().all(|(_, b)| b.device_id == 0));
+        assert!(predictors[0].extras.iter().all(|w| w.buffer.device_id == 0));
+        assert!(records.operands.iter().all(|o| o.device == 0));
+        assert!(records.steps.iter().all(|s| s.device == 0 && s.bytes() <= dense::STEP_BYTES));
+        let names = records.operands.iter().flat_map(|o| o.lands.iter().map(|(rect, _)| rect.name.clone()))
+            .chain(records.steps.iter().flat_map(|s| s.rects.iter().map(|rect| rect.name.clone())))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains("model.embed_tokens.weight"));
+        for (name, _, _) in &tensors {
+            assert!(names.contains(name), "unrecorded operand {name}");
+        }
+        assert!(!records.finishes.is_empty());
+        assert!(!planning.transient.borrow().is_empty(), "scale grids must survive until replay drains");
+        std::fs::write(&path, &payload)?;
+        let sockets = tempfile::tempdir_in(fixture.directory())?;
+        let _committed = crate::shared::experts::rtx::push::tests::receive_pushed(
+            Device { library: &library, id: 0 }, None, &checkpoint.snapshot, sockets.path(), &records, None, 0, 0)?;
+        planning.release_transient();
+        assert_eq!(digests(&predictors[0])?, expected);
+        assert_eq!(embedding.verify_resident()?, 256 * 256 * 2);
+        std::fs::write(&path, [])?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn failed_projection_drain_retains_source_destinations_and_module() -> Result<()> {
     for launch in [0, 1] {
         let fixture = Fixture::build()?;

@@ -97,6 +97,11 @@ pub(crate) struct MimoWeights<'a> {
     pub output_fp8: bool,
 }
 
+pub(crate) struct MtpWeights<'a> {
+    pub layer: MimoLayer<'a>,
+    pub extras: [DeviceAllocation<'a>; 4],
+}
+
 #[derive(Clone)]
 pub(crate) struct MimoLoader<'a> {
     pub library: &'a NativeLibrary,
@@ -805,6 +810,26 @@ impl<'a> MimoLoader<'a> {
     pub fn layer(&self, cfg: &MimoV2Config, layer: usize) -> Result<Vec<MimoLayer<'a>>> {
         self.block(cfg, &format!("model.layers.{layer}"), cfg.attention[layer], cfg.dense[layer],
             "post_attention_layernorm", self.ranks())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn with_embedding(&self, cfg: &MimoV2Config, layers: usize, stages: usize,
+        source: crate::shared::token_io::EmbedSource, placement: crate::shared::token_io::EmbedPlacement)
+        -> Result<(crate::shared::token_io::TokenEmbedding<'a>,
+            ((MimoWeights<'a>, Vec<Vec<MimoLayer<'a>>>), Vec<MtpWeights<'a>>))> {
+        crate::shared::token_io::TokenEmbedding::load(self.library, source, placement, || {
+            let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+            Ok((self.model(cfg, layers)?, self.mtp_weights(cfg, stages)?))
+        })
+    }
+
+    pub fn mtp_weights(&self, cfg: &MimoV2Config, stages: usize) -> Result<Vec<MtpWeights<'a>>> {
+        let available = self.checkpoint.tensor_names()
+            .filter(|name| name.starts_with("model.mtp.layers.") && name.ends_with(".eh_proj.weight"))
+            .count();
+        ensure!(stages <= available, "--mtp {stages} but the checkpoint has {available} MTP layers");
+        (0..stages).map(|k| Ok(MtpWeights { extras: self.mtp_extras(k)?, layer: self.mtp_layer(cfg, k)? }))
+            .collect()
     }
 
     /// MTP layer `k` (`model.mtp.layers.{k}`): an SWA decoder layer with a
