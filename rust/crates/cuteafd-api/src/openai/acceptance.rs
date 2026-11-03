@@ -85,6 +85,7 @@ mod path_tests {
         assert!(error.message.contains("V4.1"));
         assert!(!ModelProfile::new("v4", ModelEncoding::DeepseekV4).relaxed_acceptance_supported);
         let mut constrained = request;
+        constrained["messages"][0]["content"] = json!("return json");
         constrained["response_format"] = json!({"type":"json_object"});
         let error = build(&ModelProfile::default(), NativeLimits::default(), &Default::default(), constrained).err().unwrap();
         assert!(error.message.contains("constrained decoding"), "{}", error.message);
