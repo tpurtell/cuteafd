@@ -1724,9 +1724,10 @@ fn load_pool_reservations_charge_bounds_and_replay_independent_actual_peaks() {
     p.phases = evaluate(&p.facts, &p.budgets).unwrap();
     assert_eq!(p.phases.iter().find(|r| r.phase == Phase::Load).unwrap().owned, 380);
     assert_eq!(p.phases.iter().find(|r| r.phase == Phase::Ready).unwrap().owned, 80);
-    let contract = Contract::fixed(64, 1, 1, p.facts.clone());
-    assert_curve_census(&contract, &p.budgets, &[]);
-    assert_eq!(contract.facts(&[], 1).unwrap(), p.facts);
+    let mut contract = Contract::fixed(64, 1, 1, p.facts.clone());
+    contract.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+    assert_curve_census(&contract, &p.budgets, &[0, 0]);
+    assert_eq!(contract.facts(&[0, 0], 1).unwrap(), p.facts);
     let pool = &p.facts.reservations[0];
     let edge = |id: &str, bytes, address, allocate| OwnerEvent::Reserved {
         reservation: pool.id.clone(), receipt: Receipt {

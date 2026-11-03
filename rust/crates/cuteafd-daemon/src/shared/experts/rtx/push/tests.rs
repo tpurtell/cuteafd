@@ -112,7 +112,7 @@ fn dense_host_geometry_tracks_pools_and_large_quant_tables_without_allocating() 
     assert_eq!(block, 1 << 20);
     assert!(crate::shared::fp8_load_quant::quant_table_bytes(usize::MAX, Layout::Channel).is_err());
     assert!(crate::shared::fp8_load_quant::scale_code_table_bytes(usize::MAX).is_err());
-    assert!(HostStaging { staging_bytes: usize::MAX, largest_step: 2, table_bytes: 1 , scratch_bytes: 0}.bytes().is_err());
+    assert!(HostStaging { staging_bytes: usize::MAX, largest_step: 2, table_bytes: 1, scratch_bytes: 0 }.bytes().is_err());
     Ok(())
 }
 
@@ -223,7 +223,7 @@ fn coordinator_host_admission_adds_dense_pools_and_exl3_validation_for_every_ran
             CoordinatorExpertPlan::whole(vec![catalog.exl3().unwrap().residency(V41Exl3Layer::Backbone(0), 1, 0)?], usize::MAX)
         } else { CoordinatorExpertPlan::new(&catalog, &[0], gpu, usize::MAX) }).collect::<Result<Vec<_>>>()?;
         let owners = plans.iter().map(Some).collect::<Vec<_>>();
-        let dense = vec![HostStaging { staging_bytes: 12 * STEP_BYTES, largest_step: STEP_BYTES, table_bytes: 2 << 20 , scratch_bytes: 0}; gpus];
+        let dense = vec![HostStaging { staging_bytes: 12 * STEP_BYTES, largest_step: STEP_BYTES, table_bytes: 2 << 20, scratch_bytes: 0 }; gpus];
         let validation = plans.iter().map(|p| p.validation.bytes()).sum::<usize>();
         assert!(validation > 0);
         let peak = gpus * (128 * (1 << 20) + 12 * STEP_BYTES + (2 << 20)) + validation;
@@ -246,7 +246,7 @@ fn host_admission_refusal_declines_peers_before_returning_a_typed_planning_error
         assert!(planned_offer(&mut second, Ok(()), Ok(offer))?.is_none());
         Ok(())
     });
-    let planned = CoordinatorExpertPlan::admit_host(&[None], &[HostStaging { staging_bytes: 8 << 20, largest_step: 1 << 20, table_bytes: 1 << 20 , scratch_bytes: 0}],
+    let planned = CoordinatorExpertPlan::admit_host(&[None], &[HostStaging { staging_bytes: 8 << 20, largest_step: 1 << 20, table_bytes: 1 << 20, scratch_bytes: 0 }],
         128, 1 << 20, 128 << 20);
     let offer = planned.as_ref().map(|_| unreachable!("staging must exceed this ring-only budget"))
         .map_err(|error| format!("{error:#}"));
