@@ -1404,8 +1404,8 @@ mod tests {
                             baseline: Baseline::Forecast { occupied: 0, source: "CPU fake DSO".into(), assumed: false } })
                         .collect::<Vec<_>>();
                     let plan = ResolvedPlan { request: Request { context: 256, pool: Pin::Exact(512),
-                        onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving },
-                        decisions: Decisions { attention: vec![], onboard_layers: vec![vec![]],
+                        onboard: Pin::Auto, prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving },
+                        decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![vec![]],
                             expert_homes: Default::default(), embedding: None,
                             prefill: PrefillShape { rows: 4096, waves: 1 }, lanes: 1 }, pool_tokens: 512,
                         phases: planner::evaluate(&facts, &budgets)?, facts, budgets };

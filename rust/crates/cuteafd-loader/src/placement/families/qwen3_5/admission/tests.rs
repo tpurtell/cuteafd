@@ -67,6 +67,7 @@ fn request() -> Request {
         pool: Pin::Exact(262144),
         onboard: Pin::Auto,
         prefill: Pin::Auto,
+        spark_reply_format: None,
         operation: Operation::Serving,
     }
 }
@@ -497,6 +498,7 @@ fn malformed_native_inventory_and_operation_fail_before_admission() {
     assert!(matches!(
         admit(
             Request {
+                spark_reply_format: None,
                 operation: Operation::Scoring,
                 ..request()
             },

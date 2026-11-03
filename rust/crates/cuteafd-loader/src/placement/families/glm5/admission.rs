@@ -7,6 +7,7 @@ use crate::families::glm5::GlmDsaConfig;
 use crate::placement::{LayerMode, planner::*};
 use crate::serving_capacity::glm_graphs::{GlmGraphShape, glm_owned_startup_graphs};
 use crate::placement::inventory::{StartupGraphs, GLM_OWNED_SM120_GRAPH_BYTES};
+use cuteafd_core::SparkReplyFormat;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A condition names a domain value, never a solver variable index. Conditions
@@ -50,6 +51,8 @@ pub struct GlmRecipe<'a> {
     /// The executor's existing attention ownership, unchanged by this port.
     pub attention: Vec<LayerMode>,
     pub gpus: usize,
+    /// Retained links, even when one assignment onboards every target layer.
+    pub spark_links: bool,
     pub prefill: Vec<PrefillShape>,
     pub lanes: Vec<u64>,
     pub embedding: Vec<EmbeddingHome>,
@@ -328,6 +331,9 @@ impl Recipe for GlmRecipe<'_> {
         }
         let mut contract = Contract {
             phase_order: crate::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
+            spark_reply_format: self.spark_links.then(|| SparkReplyFormat::resolve(
+                request.spark_reply_format, cuteafd_core::ExpertGeometry::GLM5.partial_replies(),
+            )),
             page_rows: self.page_tokens,
             maximum_pages: self.maximum_pages,
             gpus: self.gpus,

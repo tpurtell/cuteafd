@@ -213,6 +213,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let request = planner::Request { context: cfg.max_context as u64,
         pool: options.pool_tokens.map_or(planner::Pin::Auto, planner::Pin::Exact), onboard,
         prefill: planner::Pin::Exact(planner::PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }),
+        spark_reply_format: None,
         operation: if options.full_prefill_logits { planner::Operation::Scoring } else { planner::Operation::Serving } };
     let record_bytes = options.dense_qwen_kv.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
     let serving = placement::families::qwen3_5::ServingFacts::new(cfg, &buffers, record_bytes,

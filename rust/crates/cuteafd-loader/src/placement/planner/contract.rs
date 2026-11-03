@@ -242,6 +242,8 @@ impl Component {
 #[derive(Debug, Clone)]
 pub struct Contract {
     pub phase_order: PhaseOrder,
+    /// Family-resolved once, before components price the selected reply storage.
+    pub spark_reply_format: Option<SparkReplyFormat>,
     pub page_rows: u64,
     pub maximum_pages: u64,
     pub gpus: usize,
@@ -288,6 +290,7 @@ impl Contract {
         }));
         Self {
             phase_order: facts.phase_order,
+            spark_reply_format: None,
             page_rows,
             maximum_pages,
             gpus,
@@ -436,6 +439,7 @@ impl Contract {
             expert_homes.entry(layer).or_insert(home);
         }
         Ok(Decisions {
+            spark_reply_format: self.spark_reply_format,
             attention: attention.into_values().collect(),
             onboard_layers,
             expert_homes,

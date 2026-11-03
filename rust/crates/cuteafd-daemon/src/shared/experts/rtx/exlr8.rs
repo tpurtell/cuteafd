@@ -160,8 +160,8 @@ mod copy_tests {
                 let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: allocations.clone(), deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
                 let phases = planner::evaluate(&facts, &budgets)?;
                 let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                        prefill: Pin::Auto, operation: Operation::Serving },
-                    decisions: Decisions { attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+                        prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving },
+                    decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
                         embedding: None, prefill: PrefillShape { rows: rows as u64, waves: 1 }, lanes: lanes as u64 },
                     pool_tokens: 64, facts, budgets: budgets.clone(), phases };
                 let receipts = pair.allocation_receipts("test", devices, lifetime)?;
@@ -380,8 +380,8 @@ mod copy_tests {
                                         baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
                                 let phases = planner::evaluate(&facts, &budgets)?;
                                 let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                                        prefill: Pin::Auto, operation: Operation::Serving },
-                                    decisions: Decisions { attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+                                        prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving },
+                                    decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
                                         embedding: None, prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
                                     pool_tokens: 64, facts, budgets, phases };
                                 planner::reconcile(&plan, Phase::Load, &receipts)?;

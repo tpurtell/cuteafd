@@ -181,7 +181,7 @@ const PULL_PER_RANK_BYTES: usize = 1 << 20;
 
 /// A counter word of the control block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Counter { Landed, Staged(usize), Consumed(usize), Arrived(usize) }
+pub(crate) enum Counter { Landed, Staged(usize), Consumed(usize), Arrived(usize), ReplyFormat(usize) }
 
 impl Counter {
     fn index(self, slots: usize) -> usize {
@@ -189,10 +189,11 @@ impl Counter {
             Self::Landed => 0,
             Self::Staged(slot) => { assert!(slot < slots, "staged counter of slot {slot} past {slots}"); 1 + 2 * slot }
             Self::Consumed(slot) => { assert!(slot < slots, "consumed counter of slot {slot} past {slots}"); 2 + 2 * slot }
+            Self::ReplyFormat(slot) => { assert!(slot < slots); 1 + 2 * slots + MAX_INTAKE_RANKS + slot }
             Self::Arrived(rank) => { assert!(rank < MAX_INTAKE_RANKS, "arrived counter of rank {rank}"); 1 + 2 * slots + rank }
         }
     }
-    fn words(slots: usize) -> usize { 1 + 2 * slots + MAX_INTAKE_RANKS }
+    fn words(slots: usize) -> usize { 1 + 3 * slots + MAX_INTAKE_RANKS }
 }
 
 /// The control block's words as raw addresses: pinned, device-mapped host

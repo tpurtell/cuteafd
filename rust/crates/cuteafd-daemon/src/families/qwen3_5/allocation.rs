@@ -468,9 +468,11 @@ mod tests {
                 pool: Pin::Exact(64),
                 onboard: Pin::Auto,
                 prefill: Pin::Auto,
+                spark_reply_format: None,
                 operation: Operation::Serving,
             },
             decisions: Decisions {
+                spark_reply_format: None,
                 attention: vec![],
                 onboard_layers: vec![vec![]],
                 expert_homes: Default::default(),
@@ -679,9 +681,11 @@ mod tests {
                     pool: Pin::Exact(64),
                     onboard: Pin::Auto,
                     prefill: Pin::Auto,
+                    spark_reply_format: None,
                     operation: Operation::Serving,
                 },
                 decisions: Decisions {
+                    spark_reply_format: None,
                     attention: vec![],
                     onboard_layers: vec![vec![]],
                     expert_homes: Default::default(),

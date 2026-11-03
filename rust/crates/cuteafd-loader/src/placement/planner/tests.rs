@@ -58,11 +58,13 @@ fn request() -> Request {
         pool: Pin::Auto,
         onboard: Pin::Auto,
         prefill: Pin::Auto,
+        spark_reply_format: None,
         operation: Operation::Serving,
     }
 }
 fn decisions(onboard: u64) -> Decisions {
     Decisions {
+        spark_reply_format: None,
         attention: vec![LayerMode::Whole {
             gpu: 0,
             ffn: FfnMode::Owner,
@@ -170,6 +172,34 @@ struct Prepared(Contract);
 impl Recipe for Prepared {
     fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
         Ok(self.0.clone())
+    }
+}
+
+#[test]
+fn immutable_reply_format_flows_to_decisions_and_explicit_conflicts_refuse() {
+    for resolved in [None, Some(SparkReplyFormat::Bf16), Some(SparkReplyFormat::Fp8),
+        Some(SparkReplyFormat::Nvfp4)] {
+        let mut contract = Linear::new().prepare(&request()).unwrap();
+        contract.spark_reply_format = resolved;
+        let selected = vec![0; contract.variables.len()];
+        assert_eq!(contract.decisions(&selected).unwrap().spark_reply_format, resolved);
+        let recipe = Prepared(contract);
+        for requested in [None, Some(SparkReplyFormat::Bf16), Some(SparkReplyFormat::Fp8),
+            Some(SparkReplyFormat::Nvfp4)] {
+            let req = Request { spark_reply_format: requested, ..request() };
+            match solve(req.clone(), vec![budget(1 << 40)], &recipe) {
+                Ok(plan) => {
+                    assert!(requested.is_none() || requested == resolved);
+                    assert_eq!(plan.request.spark_reply_format, requested);
+                    assert_eq!(plan.decisions.spark_reply_format, resolved);
+                    let encoded = serde_json::to_value(&plan).unwrap();
+                    let decoded: ResolvedPlan = serde_json::from_value(encoded).unwrap();
+                    assert_eq!(decoded, plan);
+                }
+                Err(Refusal::PinConflict) => assert!(requested.is_some() && requested != resolved),
+                other => panic!("unexpected reply-format admission: {other:?}"),
+            }
+        }
     }
 }
 

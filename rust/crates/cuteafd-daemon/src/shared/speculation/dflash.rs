@@ -3775,8 +3775,8 @@ mod checkpoint_header_tests {
                             baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
                     let prefill = PrefillShape { rows: 1, waves: 1 };
                     let plan = ResolvedPlan { request: Request { context: 1, pool: Pin::Exact(64), onboard: Pin::Exact(0),
-                            prefill: Pin::Exact(prefill), operation: Operation::Serving },
-                        decisions: Decisions { attention: vec![], onboard_layers: vec![vec![]],
+                            prefill: Pin::Exact(prefill), spark_reply_format: None, operation: Operation::Serving },
+                        decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![vec![]],
                             expert_homes: Default::default(), embedding: None, prefill, lanes: 1 },
                         pool_tokens: 64, phases: planner::evaluate(&facts, &budgets)?, facts, budgets };
                     let h = cfg.hidden;

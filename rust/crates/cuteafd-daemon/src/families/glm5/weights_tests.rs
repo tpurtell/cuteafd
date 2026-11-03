@@ -239,8 +239,8 @@ fn retained_weight_plan(inventory: &cuteafd_loader::placement::families::glm5::w
         }).collect();
     let prefill = PrefillShape { rows: 128, waves: 1 };
     Ok(ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-            prefill: Pin::Exact(prefill), operation: Operation::Serving },
-        decisions: Decisions { attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+            prefill: Pin::Exact(prefill), spark_reply_format: None, operation: Operation::Serving },
+        decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
             embedding: None, prefill, lanes: 1 }, pool_tokens: 64,
         phases: planner::evaluate(&facts, &budgets)?, budgets, facts })
 }

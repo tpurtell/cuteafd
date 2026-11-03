@@ -600,7 +600,7 @@ mod tests {
                 let recipe = DenseFacts { cfg: &cfg, weights: &weights, buffers: &buffers, slots: 4,
                     record_bytes: 4096, drafter: Some(DenseDraft::NativeMtp(&larger)), serving: None };
                 let request = Request { context: cfg.max_context as u64, pool: Pin::Exact(cfg.max_context as u64),
-                    onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving };
+                    onboard: Pin::Auto, prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving };
                 let contract = recipe.prepare(&request)?;
                 let selected = vec![0; contract.variables.len()];
                 for pages in [1, 2, 4096, contract.maximum_pages] {

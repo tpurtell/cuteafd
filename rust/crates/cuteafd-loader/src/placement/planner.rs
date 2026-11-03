@@ -1,7 +1,7 @@
 //! Pure, phase-aware allocation planning. Recipes describe one legal candidate;
 //! policy, exact pins and allocation reconciliation belong here, not in families.
 use super::LayerMode;
-use cuteafd_core::memory_layout::{Basis, Category, Item};
+use cuteafd_core::{SparkReplyFormat, memory_layout::{Basis, Category, Item}};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -161,6 +161,8 @@ pub struct Request {
     pub onboard: Pin<u64>,
     pub prefill: Pin<PrefillShape>,
     pub operation: Operation,
+    /// An explicit format must match the immutable family contract.
+    pub spark_reply_format: Option<SparkReplyFormat>,
 }
 
 /// The physical witness stays independent of a logical memory ceiling.
@@ -302,6 +304,8 @@ pub struct Decisions {
     pub embedding: Option<EmbeddingHome>,
     pub prefill: PrefillShape,
     pub lanes: u64,
+    /// Resolved at preparation; None means this contract has no Spark link.
+    pub spark_reply_format: Option<SparkReplyFormat>,
 }
 impl Decisions {
     fn onboard(&self) -> u64 {

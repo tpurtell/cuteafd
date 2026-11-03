@@ -93,6 +93,7 @@ fn request() -> Request {
         pool: Pin::Exact(4096),
         onboard: Pin::Auto,
         prefill: Pin::Auto,
+        spark_reply_format: None,
         operation: Operation::Serving,
     }
 }
@@ -112,6 +113,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
         maximum_pages: 64,
         attention: vec![LayerMode::ContextSplit; cfg.layers],
         gpus: 2,
+        spark_links: true,
         prefill,
         lanes: vec![1],
         embedding: vec![EmbeddingHome::Device(0), EmbeddingHome::HostPinned],
@@ -280,6 +282,35 @@ fn budgets() -> Vec<Budget> {
         headroom: 0,
     })
     .collect()
+}
+
+#[test]
+fn combined_reply_resolution_is_immutable_and_absent_without_links() {
+    let cfg = cfg();
+    for links in [false, true] {
+        let mut recipe = recipe(&cfg);
+        recipe.spark_links = links;
+        if !links {
+            recipe.experts = None;
+            recipe.owners.clear();
+            recipe.targets.clear();
+            recipe.hooks.clear();
+        }
+        for requested in [None, Some(SparkReplyFormat::Bf16), Some(SparkReplyFormat::Fp8),
+            Some(SparkReplyFormat::Nvfp4)] {
+            let req = Request { spark_reply_format: requested, ..request() };
+            let contract = recipe.prepare(&req).unwrap();
+            let expected = links.then_some(requested.unwrap_or(SparkReplyFormat::Bf16));
+            assert_eq!(contract.spark_reply_format, expected);
+            assert_eq!(contract.decisions(&vec![0; contract.variables.len()]).unwrap().spark_reply_format, expected);
+            let plan = planner::solve(req, budgets(), &recipe);
+            if !links && requested.is_some() {
+                assert!(matches!(plan, Err(Refusal::PinConflict)));
+            } else {
+                assert_eq!(plan.unwrap().decisions.spark_reply_format, expected);
+            }
+        }
+    }
 }
 
 #[test]

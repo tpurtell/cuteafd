@@ -6,6 +6,28 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[test]
+fn reply_format_counters_append_without_shifting_existing_words() {
+    for slots in 1..=4 {
+        let mut indexes = std::collections::BTreeSet::from([Counter::Landed.index(slots)]);
+        assert_eq!(Counter::Landed.index(slots), 0);
+        for slot in 0..slots {
+            assert_eq!(Counter::Staged(slot).index(slots), 1 + 2 * slot);
+            assert_eq!(Counter::Consumed(slot).index(slots), 2 + 2 * slot);
+            assert_eq!(Counter::ReplyFormat(slot).index(slots), 9 + 2 * slots + slot);
+            for counter in [Counter::Staged(slot), Counter::Consumed(slot), Counter::ReplyFormat(slot)] {
+                assert!(indexes.insert(counter.index(slots)));
+            }
+        }
+        for rank in 0..8 {
+            assert_eq!(Counter::Arrived(rank).index(slots), 1 + 2 * slots + rank);
+            assert!(indexes.insert(Counter::Arrived(rank).index(slots)));
+        }
+        assert_eq!(Counter::words(slots), 9 + 3 * slots);
+        assert_eq!(indexes, (0..Counter::words(slots)).collect());
+    }
+}
+
+#[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn retained_wave_storage_matches_independent_contract() -> Result<()> {
     const CHILD: &str = "CUTEAFD_WAVE_OWNER_CHILD";
@@ -53,7 +75,7 @@ fn retained_wave_storage_matches_independent_contract() -> Result<()> {
             let controls = allocate_wave_controls(&library, &intake, &transport, &arenas)?;
             let allocated = audit.events().iter().filter_map(|event| match event {
                 AllocationEvent::Allocated(record) => Some(record.bytes), _ => None }).collect::<Vec<_>>();
-            let mut expected = vec![(9 + 2 * slots) * 64];
+            let mut expected = vec![(9 + 3 * slots) * 64];
             if pinned != 0 { expected.push(slots * 8 * 128); }
             assert_eq!(allocated, expected, "production allocation order and extents");
             let mut storage = WaveStorage { library: &library, control: controls.control.buffer, words: controls.words,
@@ -69,8 +91,8 @@ fn retained_wave_storage_matches_independent_contract() -> Result<()> {
                 baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
             let phases = planner::evaluate(&facts, &budgets)?;
             let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                    prefill: Pin::Auto, operation: Operation::Serving },
-                decisions: Decisions { attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+                    prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving },
+                decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
                     embedding: None, prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
                 pool_tokens: 64, facts, budgets, phases };
             // Storage subset only: no worker thread, numerical kernel or family Ready claim.
@@ -156,8 +178,8 @@ fn retained_wave_storage_matches_independent_contract() -> Result<()> {
     assert!(error.downcast_ref::<WaveError>().is_some());
     let events = audit.events();
     assert_eq!(events.len(), 2);
-    assert!(matches!(events[0], AllocationEvent::Allocated(record) if record.bytes == 960));
-    assert!(matches!(events[1], AllocationEvent::Freed(record) if record.bytes == 960));
+    assert!(matches!(events[0], AllocationEvent::Allocated(record) if record.bytes == 1152));
+    assert!(matches!(events[1], AllocationEvent::Freed(record) if record.bytes == 1152));
     Ok(())
 }
 
@@ -241,6 +263,7 @@ fn retained_link_composition_counts_fallback_egress_once() -> Result<()> {
                 intake.allocation_receipts("test.link.intake", devices, Lifetime::TARGET)?,
                 storage.allocation_receipts("test.link.waves", Lifetime::TARGET)?, endpoints, unused, Lifetime::TARGET)?;
             let spec = SparkLinkOwners {
+                spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 intake: SparkIntakeOwners { gpu: devices.logical_rank(device)?, ranks, rows: rows as u64,
                     row_bytes: row_bytes as u64, waves: slots, mode: match mode {
                         IntakeMode::Gpu => SparkIntakeMode::Gpu, IntakeMode::Pinned => SparkIntakeMode::Pinned,
@@ -262,7 +285,7 @@ fn retained_link_composition_counts_fallback_egress_once() -> Result<()> {
                 baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
             let phases = planner::evaluate(&facts, &budgets)?;
             let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                    prefill: Pin::Auto, operation: Operation::Serving }, decisions: Decisions { attention: vec![],
+                    prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving }, decisions: Decisions { spark_reply_format: None, attention: vec![],
                     onboard_layers: vec![], expert_homes: Default::default(), embedding: None,
                     prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 }, pool_tokens: 64, facts, budgets, phases };
             // Actual allocation subset; numeric ring snapshots are not real RDMA endpoints.

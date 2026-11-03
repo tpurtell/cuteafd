@@ -172,7 +172,8 @@ impl<'a> DenseEngine<'a> {
             cuteafd_ffi::coordinator_gpu_budget().map(|budget| budget.0), host)?;
         let request = planner::Request { context: cfg.max_context as u64,
             pool: requested_pool.map_or(planner::Pin::Auto, planner::Pin::Exact), onboard: planner::Pin::Auto,
-            prefill: planner::Pin::Auto, operation: if full_prefill_logits { planner::Operation::Scoring } else { planner::Operation::Serving } };
+            prefill: planner::Pin::Auto, spark_reply_format: None,
+            operation: if full_prefill_logits { planner::Operation::Scoring } else { planner::Operation::Serving } };
         let plan = placement::families::qwen3_5::admit(request, budgets, DenseFacts { cfg: &cfg,
             weights: &weight_bytes, buffers: &buffers, slots, record_bytes, drafter, serving })?;
         let pool_tokens = usize::try_from(plan.pool_tokens)?;

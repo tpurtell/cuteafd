@@ -552,8 +552,8 @@ mod tests {
         let phases = planner::evaluate(&facts, &budgets)?;
         let plan = ResolvedPlan {
             request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                prefill: Pin::Auto, operation: Operation::Serving },
-            decisions: Decisions { attention: vec![], onboard_layers: vec![],
+                prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving },
+            decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![],
                 expert_homes: Default::default(), embedding: None,
                 prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
             pool_tokens: 64, facts, budgets, phases,

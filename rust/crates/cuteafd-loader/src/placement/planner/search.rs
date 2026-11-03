@@ -679,6 +679,11 @@ pub fn solve(
 ) -> Result<ResolvedPlan, Refusal> {
     let started = std::time::Instant::now();
     let contract = recipe.prepare(&request)?;
+    if request.spark_reply_format.is_some()
+        && request.spark_reply_format != contract.spark_reply_format
+    {
+        return Err(Refusal::PinConflict);
+    }
     contract.validate()?;
     contract.validate_home_budgets(&budgets)?;
     // Validate physical budgets independently of conditional allocation choices.

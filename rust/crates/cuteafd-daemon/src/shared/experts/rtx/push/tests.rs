@@ -174,8 +174,8 @@ fn dense_pool_startup_replays_real_pinned_allocations_below_independent_reserved
     let phases = planner::evaluate(&facts, &budgets)?;
     assert_eq!(phases[0].owned, 65536, "charge four independent bounds, not actual peaks or bound plus peak");
     let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Auto, onboard: Pin::Auto,
-        prefill: Pin::Auto, operation: Operation::Serving },
-        decisions: Decisions { attention: vec![], onboard_layers: vec![vec![], vec![]],
+        prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving },
+        decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![vec![], vec![]],
             expert_homes: Default::default(), embedding: None,
             prefill: planner::PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
         pool_tokens: 64, budgets, facts, phases };

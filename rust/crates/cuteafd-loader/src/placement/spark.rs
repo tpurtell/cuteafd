@@ -96,7 +96,7 @@ impl SparkWaveOwners {
         let owner = |leaf: String, bytes, category| Allocation::buffer(
             format!("{prefix}.{leaf}"), Location::PINNED, bytes, lifetime, category, "Spark wave storage");
         let mut allocations = vec![owner("control".into(),
-            ((1 + 2 * self.waves + SPARK_INTAKE_MAX_RANKS) * SPARK_WAVE_CONTROL_LINE_BYTES) as u64,
+            ((1 + 3 * self.waves + SPARK_INTAKE_MAX_RANKS) * SPARK_WAVE_CONTROL_LINE_BYTES) as u64,
             Category::Transport)];
         if self.pinned != 0 {
             allocations.push(owner("pulls".into(),
@@ -190,6 +190,7 @@ pub struct SparkLinkOwners {
     pub intake: SparkIntakeOwners,
     pub waves: SparkWaveOwners,
     pub endpoints: SparkEndpointOwners,
+    pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// Retained registered backing when staging falls back to standalone slots.
     pub unused_egress_bytes: Option<u64>,
 }
@@ -199,8 +200,12 @@ impl SparkLinkOwners {
         -> Result<Vec<super::planner::Allocation>, super::planner::Refusal> {
         use super::planner::{Allocation, Location, Refusal};
         use cuteafd_core::memory_layout::Category;
+        let geometry = self.endpoints.geometry;
+        let bf16_row_bytes = u64::from(geometry.hidden).checked_mul(2)
+            .ok_or(Refusal::Overflow("Spark reply row"))?;
         if prefix.is_empty() || self.intake.ranks != self.waves.ranks
             || self.intake.ranks != self.endpoints.ranks || self.intake.waves != self.waves.waves
+            || !geometry.partial_replies() && self.intake.row_bytes != bf16_row_bytes
             || self.unused_egress_bytes.is_some_and(|bytes| bytes == 0
                 || matches!(self.waves.staging, SparkWaveStaging::Registered { .. })) {
             return Err(Refusal::InvalidFact("inconsistent Spark link owner geometry".into()));
@@ -208,6 +213,16 @@ impl SparkLinkOwners {
         let mut owners = self.intake.allocations(&format!("{prefix}.intake"), lifetime)?;
         owners.extend(self.waves.allocations(&format!("{prefix}.waves"), lifetime)?);
         owners.extend(self.endpoints.allocations(&format!("{prefix}.endpoints"), lifetime)?);
+        if self.spark_reply_format != cuteafd_core::SparkReplyFormat::Bf16 && !geometry.partial_replies() {
+            let stride = self.spark_reply_format.row_bytes(geometry.hidden as usize)
+                .ok_or_else(|| Refusal::InvalidFact("invalid Spark reply codec geometry".into()))?;
+            // One ordered consumer reuses this plane across ranks and wave slots.
+            let bytes = self.intake.rows.checked_mul(stride as u64)
+                .ok_or(Refusal::Overflow("Spark reply codec scratch"))?;
+            owners.push(Allocation::buffer(format!("{prefix}.waves.reply_codec"),
+                Location::coordinator(self.intake.gpu), bytes, lifetime,
+                Category::Transport, "Spark reply codec"));
+        }
         if let Some(bytes) = self.unused_egress_bytes {
             owners.push(Allocation::buffer(format!("{prefix}.unused-egress"), Location::PINNED,
                 bytes, lifetime, Category::Staging, "Spark unused registered egress"));
@@ -616,6 +631,63 @@ mod tests {
     use cuteafd_core::memory_layout::{Basis, Category};
 
     #[test]
+    fn compressed_reply_adds_one_plane_and_preserves_bf16_raw_reserve() {
+        use super::super::planner::{Facts, Lifetime, Location, PhaseOrder};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkReplyFormat, SparkRings};
+        for geometry in [ExpertGeometry::GLM5, ExpertGeometry::MUSE_SPARK] {
+            for ranks in [1, 6, 8] { for waves in [1, 3, 4] { for rows in [1, 64, 2752] {
+                let base = SparkLinkOwners {
+                    intake: SparkIntakeOwners { gpu: 1, ranks, rows,
+                        row_bytes: u64::from(geometry.hidden) * 2, waves, mode: SparkIntakeMode::Gpu },
+                    waves: SparkWaveOwners { ranks, waves, pinned: 0,
+                        staging: SparkWaveStaging::Registered { slot_bytes: 1 << 20 } },
+                    endpoints: SparkEndpointOwners { ranks, geometry,
+                        endpoint: SparkEndpoint { capacity: rows as u32, ingress: SparkIngress::Bf16,
+                            ring_depth: None, partial_reply_bytes: geometry.partial_reply_bound(rows as u32).map(|b| b as u64) },
+                        rings: SparkRings { max_frame_bytes: 1 << 30, depth: 2, slot_bytes: 256, alignment: 64 } },
+                    spark_reply_format: SparkReplyFormat::Bf16, unused_egress_bytes: None,
+                };
+                let raw = base.allocations("link", Lifetime::TARGET).unwrap();
+                for format in [SparkReplyFormat::Bf16, SparkReplyFormat::Fp8, SparkReplyFormat::Nvfp4] {
+                    let spec = SparkLinkOwners { spark_reply_format: format, ..base };
+                    let owners = spec.allocations("link", Lifetime::TARGET).unwrap();
+                    let extra = usize::from(format != SparkReplyFormat::Bf16 && !geometry.partial_replies());
+                    assert_eq!(owners.len(), raw.len() + extra);
+                    assert_eq!(&owners[..raw.len()], raw.as_slice(), "raw BF16 owners must not shrink");
+                    if extra != 0 {
+                        let owner = owners.last().unwrap();
+                        let hidden = u64::from(geometry.hidden);
+                        let stride = match format {
+                            SparkReplyFormat::Fp8 => hidden + hidden / 32,
+                            SparkReplyFormat::Nvfp4 => hidden / 2 + hidden / 16,
+                            SparkReplyFormat::Bf16 => unreachable!(),
+                        };
+                        assert_eq!(owner.id, "link.waves.reply_codec");
+                        assert_eq!(owner.bytes, rows * stride, "no rank/wave multiplier or allocation floor");
+                        assert_eq!(owner.location, Location::coordinator(1));
+                        assert_eq!(owner.lifetime, Lifetime::TARGET);
+                        assert!(owner.view.is_none());
+                    }
+                    let mut contract = super::super::planner::Contract::fixed(64, 1, 2, Facts {
+                        phase_order: PhaseOrder::DRAFT_THEN_TARGET, allocations: owners.clone(), deferred: vec![],
+                        sequential: vec![], reservations: vec![], allowances: vec![],
+                    });
+                    contract.variables = vec![super::super::planner::Variable::Prefill(vec![
+                        super::super::planner::PrefillShape {rows: 64, waves: 1}]),
+                        super::super::planner::Variable::Lanes(vec![1])];
+                    assert_eq!(contract.facts(&[0, 0], 1).unwrap().allocations, owners);
+                    assert_eq!(spec.components("link", Lifetime::TARGET, 1).unwrap().len(), owners.len());
+                }
+                let shrunk = SparkLinkOwners { intake: SparkIntakeOwners {row_bytes: 1, ..base.intake}, ..base };
+                if !geometry.partial_replies() { assert!(shrunk.allocations("link", Lifetime::TARGET).is_err()); }
+                let overflow = SparkLinkOwners { intake: SparkIntakeOwners {rows: u64::MAX, ..base.intake},
+                    spark_reply_format: SparkReplyFormat::Fp8, ..base };
+                assert!(overflow.allocations("link", Lifetime::TARGET).is_err());
+            } } }
+        }
+    }
+
+    #[test]
     fn endpoint_owners_charge_each_native_span_without_egress_or_landing_aliases() {
         use super::super::planner::{Lifetime, Location};
         use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
@@ -746,7 +818,7 @@ mod tests {
                     let owners = spec.allocations("wave", Lifetime::TARGET).unwrap();
                     let physical = owners.iter().filter(|owner| owner.view.is_none()).collect::<Vec<_>>();
                     assert_eq!(physical.len(), 1 + usize::from(pinned != 0) + if registered { 1 } else { waves });
-                    let expected = (9 + 2 * waves) as u64 * 64
+                    let expected = (9 + 3 * waves) as u64 * 64
                         + if pinned == 0 { 0 } else { waves as u64 * 8 * 128 }
                         + waves as u64 * slot_bytes;
                     assert_eq!(physical.iter().map(|owner| owner.bytes).sum::<u64>(), expected);

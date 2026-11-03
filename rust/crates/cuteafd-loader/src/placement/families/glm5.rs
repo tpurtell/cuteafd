@@ -2508,14 +2508,14 @@ mod tests {
         }
         let recipe = |context| GlmRecipe {
             cfg: inputs.cfg, context, page_tokens: PAGE_ROWS, maximum_pages,
-            attention: attention.clone(), gpus: 2, prefill: vec![shape],
+            attention: attention.clone(), gpus: 2, spark_links: true, prefill: vec![shape],
             lanes: vec![inputs.prefill_lanes], embedding: vec![EmbeddingHome::Device(0)],
             experts: None, targets: vec![], hooks: vec![], exchanges: vec![], weights: vec![],
             graphs: vec![Case { when: vec![], value: OwnedGraphs::new(context, &owners, &tp2).unwrap() }],
             owners: vec![Case { when: vec![], value: components.clone() }],
         };
         let mut request = Request { context: inputs.max_context, pool: Pin::Auto,
-            onboard: Pin::Exact(0), prefill: Pin::Exact(shape), operation: Operation::Serving };
+            onboard: Pin::Exact(0), prefill: Pin::Exact(shape), spark_reply_format: None, operation: Operation::Serving };
         assert!(matches!(planner::solve(request.clone(), budgets.clone(), &recipe(inputs.max_context)),
             Err(Refusal::Capacity { .. })), "the unchanged 1M request must not silently clamp");
 
