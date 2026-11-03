@@ -2051,11 +2051,6 @@ impl Opened {
                 terminal: if peer_stream.is_some() { cuteafd_loader::placement::TerminalHome::Replicated }
                     else { cuteafd_loader::placement::TerminalHome::AttentionOwner },
             })?;
-        if let Some(native) = native_admission.as_ref() {
-            let _loaded = native.load(&self.library, &programs, &loader, &self.cfg, &execution)?;
-            // No native forward/routed adapter may fall through to the legacy engine.
-            return Err(cuteafd_loader::plan::exlr8::native::AdapterPending::Flash.into());
-        }
         // Each coordinator GPU is one push rank: its dense operands (class 2
         // landing, class 3 staged and transformed on the GPU) and, with TP2
         // layers, its EXL3 expert halves. Records are planned from headers
@@ -2090,7 +2085,7 @@ impl Opened {
             })
         };
         let mut coordinator_push = None;
-        let admission = if args.peers.is_some() {
+        let admission = if native_admission.is_none() && args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let geometry = if let Some(catalog) = &self.experts { catalog.routed_experts().geometry()? }
@@ -2128,7 +2123,7 @@ impl Opened {
         } else {
             // No Spark peers: the coordinator GPUs push alone (dense operands and
             // their TP2 expert halves).
-            if dense_pushable(&args) {
+            if native_admission.is_none() && dense_pushable(&args) {
                 coordinator_push = (|| -> Result<_> {
                     let tp2 = tp2_budget_plan()?;
                     let planned = plan_dense(0)?;
@@ -2163,7 +2158,6 @@ impl Opened {
                     args.expert_rows(), budgets)?)
             })
         };
-        let embed = self.embed_source()?;
         let embedding_rank = cuteafd_loader::placement::families::glm5_flash::embedding_home(&placement) as usize;
         let embedding_device = crate::shared::memory::device::Device { library: &self.library,
             id: if embedding_rank == 0 { args.device } else { split_device.context("embedding peer GPU")? } };
@@ -2171,7 +2165,12 @@ impl Opened {
         // token rows, not a second resident table. The drafter borrows it too.
         // Admission is complete; overlap the drafter read with pushed expert/dense operands.
         let draft_read = args.draft.as_deref().map(dspark::DraftRead::start).transpose()?;
-        let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
+        let (embedding, ((model, mut shares), tp2)) = if let Some(native) = &native_admission {
+            let (embedding, model) = native.load(&self.library, &programs, &loader, &self.cfg, &execution)?;
+            (embedding, (model, None))
+        } else {
+            let embed = self.embed_source()?;
+            crate::shared::placement::load_while_admitting(admission, || {
             let load_embedding = || embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(
                 &self.library, embed.clone(), args.token_io.embed_placement, || Ok(())));
             let (pushed, loaded) = match coordinator_push.take() {
@@ -2210,7 +2209,8 @@ impl Opened {
             };
             let tp2 = if tp2_layers.is_empty() { None } else { Some(tp2_weights(pushed)?) };
             Ok((loaded.0, (loaded.1, tp2)))
-        })?;
+            })?
+        };
         ensure!(embedding.owner().id == embedding_device.id
             && embedding.device_bytes() as u64 == placement.items[embedding_rank].iter()
                 .filter(|item| item.category == cuteafd_core::memory_layout::Category::Embedding
@@ -2223,7 +2223,7 @@ impl Opened {
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
         let single = model.check_single_residency(args.kda_fp8, args.fp8_head)?;
         // Header-only resident inventory uses the actual loader flags, not launcher defaults.
-        if args.kda_nvfp4_gate.is_none() {
+        if native_admission.is_none() && args.kda_nvfp4_gate.is_none() {
             let headers = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
             let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights_placed(
                 &headers, &self.cfg, layers, 1 + usize::from(peer_stream.is_some()),
@@ -2262,7 +2262,7 @@ impl Opened {
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
             let mut settings = step_settings(args, index_cache);
             settings.max_context = max_context;
-            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, matches!(model.head, head::GlmfHead::K6(_)), step_experts, settings);
+            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, matches!(model.head, head::GlmfHead::K6(_) | head::GlmfHead::RowFp8(_)), step_experts, settings);
             let lanes = args.prefill_waves;
             Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
         } else { None };
@@ -2292,6 +2292,13 @@ impl Opened {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?, &execution)?;
             tracing::info!(device = args.device, split_device = device, attention = %attention.mode,
                 "GLM 5.3 Flash head split over two GPUs");
+        }
+        if let Some(native) = &native_admission {
+            let shared = native.load_shared(args, &self.cfg, &self.library, &programs)?;
+            let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
+            engine.bind_native(&manifest, &native.charges, shared)?;
+            // Routed Spark/onboarding execution is a separate slice; never fall through unwired.
+            return Err(cuteafd_loader::plan::exlr8::native::AdapterPending::Flash.into());
         }
         engine.bind_core(self.core_admission(args, layers, 1 + usize::from(split_device.is_some()), attention)?)?;
         engine.validate_attention_homes(&execution)?;

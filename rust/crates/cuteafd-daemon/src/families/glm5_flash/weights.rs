@@ -65,8 +65,12 @@ impl GlmfLayer<'_> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
     }
 
+    pub fn buffer(&self, operand: &str) -> Result<CuteafdDeviceBuffer> {
+        Ok(self.operands.get(operand).with_context(|| format!("layer has no weight {operand}"))?.buffer)
+    }
+
     pub fn ptr(&self, operand: &str) -> Result<*mut c_void> {
-        Ok(self.operands.get(operand).with_context(|| format!("layer has no weight {operand}"))?.buffer.ptr)
+        Ok(self.buffer(operand)?.ptr)
     }
 
     /// An FP8 operand, or `fallback`'s pointer when the layer has none (the

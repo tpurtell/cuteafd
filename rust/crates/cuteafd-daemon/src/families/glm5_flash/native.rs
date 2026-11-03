@@ -67,6 +67,26 @@ impl Admission {
         Ok(Self { facts, metadata, dense, charges, resident })
     }
 
+    pub(super) fn load_shared<'a>(&self, args: &EngineArgs, cfg: &GlmNextConfig,
+        library: &'a cuteafd_ffi::NativeLibrary, programs: &cuteafd_ffi::programs::Programs<'_>)
+        -> Result<Vec<crate::shared::experts::exlr8::NativeExperts<'a>>> {
+        use crate::shared::{experts::exlr8::{NativeExperts, NativePlan}, memory::device::Device};
+        let first = cfg.dense.iter().position(|dense| !dense).context("Flash routed suffix")?;
+        let devices = std::iter::once(args.device).chain(args.split_device).collect::<Vec<_>>();
+        ensure!(devices.len() == self.dense.len(), "native Flash shared owner count");
+        devices.into_iter().enumerate().map(|(rank, id)| Device { library, id }.run(|| {
+            let plan = NativePlan::new(&args.snapshot, args.exlr8_manifest.as_deref().context("native Flash manifest")?,
+                first, cfg.layers, programs, cuteafd_ffi::exlr8::KernelFamily::GlmFlash, self.dense.len(), rank)?;
+            ensure!(plan.resident == self.facts.shared_bytes[rank]
+                && plan.workspace as u64 == self.charges.ranks[rank].shared_workspace,
+                "native Flash shared weights/workspace differ from admission");
+            let expected = plan.resident;
+            let shared = NativeExperts::load(library, plan)?;
+            ensure!(shared.resident_bytes() as u64 == expected, "native Flash uploaded shared bytes differ from admission");
+            Ok(shared)
+        })).collect()
+    }
+
     pub(super) fn load<'a>(&self, library: &'a cuteafd_ffi::NativeLibrary,
         programs: &'a cuteafd_ffi::programs::Programs<'a>, loader: &super::weights::GlmfLoader<'a>,
         cfg: &GlmNextConfig, execution: &cuteafd_loader::placement::LayerExecutionPlan)

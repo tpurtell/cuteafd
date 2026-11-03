@@ -92,6 +92,7 @@ impl<'a> Dev<'a> {
 #[path = "engine/context.rs"]
 mod context;
 mod core;
+mod native;
 #[path = "engine/layers.rs"]
 mod layers;
 #[path = "engine/units.rs"]
@@ -766,6 +767,7 @@ pub(crate) fn output_shard_reserve(lanes: usize, prefill_rows: usize, hidden: us
 /// graphs hold its pointers. Sizes: `cuteafd_loader::serving_capacity::glmf_lane_bytes`.
 struct Workspace<'a> {
     core: Option<core::Slot<'a>>,
+    native: Option<native::Slot<'a>>,
     rows: usize,
     /// Zero rows: rank 1's partial of a dense MLP rank 0 runs whole (ModelOpt NVFP4); rank 1 of a
     /// head split only.
@@ -916,10 +918,10 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             cfg,
             native: GlmfCoreScratch {
                 kda: layers.iter().filter(|l| l.attention == GlmNextAttention::Kda)
-                    .all(|l| l.core.contains_key("self_attn.q_proj")),
+                    .all(|l| l.core.contains_key("self_attn.q_proj") || native::is_native(l)),
                 mla: layers.iter().filter(|l| l.attention == GlmNextAttention::Mla && l.attention_share.present())
-                    .all(|l| l.core.contains_key("self_attn.q_a_proj")),
-                ffn: layers.iter().all(core::native_ffn),
+                    .all(|l| l.core.contains_key("self_attn.q_a_proj") || native::is_native(l)),
+                ffn: layers.iter().all(|l| core::native_ffn(l) || native::is_native(l)),
             },
             scratch: GlmfScratchOptions { split, kda_w8: layers.iter().any(|layer| layer.has("w_in_fp8")),
                 kda_fp32_partials: settings.kda_fp32_partials, kda_output_shard: settings.kda_output_shard,
@@ -1071,6 +1073,7 @@ impl<'a> StepPlan<'_, 'a> {
         let bytes = glmf_lane_bytes(self.cfg, rows as u64, decode, &self.shape(rank));
         Ok(Workspace {
             core: None,
+            native: None,
             rows,
             zero: bytes.zero.map(|b| -> Result<_> {
                 let view = alloc(b)?;
@@ -1242,7 +1245,7 @@ impl<'a> Caches<'a> {
         for layer in layers {
             match layer.attention {
                 GlmNextAttention::Mla => {
-                    ensure!(layer.has("w_uk") == layer.attention_share.present(),
+                    ensure!((layer.has("w_uk") || layer.has("w_uk_fp8")) == layer.attention_share.present(),
                         "MLA cache residency disagrees with uploaded attention weights");
                     if !layer.attention_share.present() {
                         kv.push(None);
@@ -1336,6 +1339,7 @@ fn output_rows(rows: usize, rank: usize) -> (usize, usize) {
 
 pub(crate) struct GlmfEngine<'a> {
     core: Vec<Option<core::Rank<'a>>>,
+    native: Vec<native::Rank<'a>>,
     core_admission: Option<cuteafd_loader::families::glm5_flash::core_admission::CoreCharges>,
     core_head: Option<crate::shared::dense_trellis::CoreHead<'a>>,
     draft_core_head: Option<crate::shared::dense_trellis::CoreHead<'a>>,
@@ -1786,7 +1790,7 @@ impl<'a> GlmfEngine<'a> {
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
-        Ok(Self { max_pool_tokens_no_onboard: None, core: Vec::new(), core_admission: None, core_head: None, draft_core_head: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
+        Ok(Self { max_pool_tokens_no_onboard: None, core: Vec::new(), native: Vec::new(), core_admission: None, core_head: None, draft_core_head: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
             prefill_span_rows, pages, slots, decode_rows, verify_rows,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             buckets: DecodeBuckets::new(verify_rows),
@@ -3178,7 +3182,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
-        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, matches!(self.weights.head, GlmfHead::K6(_)), self.step_experts,
+        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, matches!(self.weights.head, GlmfHead::K6(_) | GlmfHead::RowFp8(_)), self.step_experts,
             StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
@@ -3195,7 +3199,11 @@ impl<'a> GlmfEngine<'a> {
         ensure!(self.decode_workspace.borrow().is_none() && self.prefill_slots.borrow().is_empty(),
             "step workspaces already allocated");
         self.core_slot(0, &mut workspaces.decode, true, 0)?;
-        for (lane, w) in workspaces.lanes.iter_mut().enumerate() { self.core_slot(0, w, false, lane)?; }
+        self.native_slot(0, &mut workspaces.decode, true)?;
+        for (lane, w) in workspaces.lanes.iter_mut().enumerate() {
+            self.core_slot(0, w, false, lane)?;
+            self.native_slot(0, w, false)?;
+        }
         *self.decode_workspace.borrow_mut() = Some(workspaces.decode);
         *self.prefill_slots.borrow_mut() = workspaces.lanes;
         Ok(())
@@ -3224,6 +3232,7 @@ impl<'a> GlmfEngine<'a> {
             })?;
             let mut workspace = workspace;
             self.core_slot(rank, &mut workspace, true, 0)?;
+            self.native_slot(rank, &mut workspace, true)?;
             *cell.borrow_mut() = Some(workspace);
         }
         Ok(cell.borrow())
@@ -3242,7 +3251,10 @@ impl<'a> GlmfEngine<'a> {
         };
         if cell.borrow().is_empty() {
             let mut slots = self.on(rank, || self.step_plan().slots(rank, self.prefill_rows, self.prefill_waves))?;
-            for (lane, w) in slots.iter_mut().enumerate() { self.core_slot(rank, w, false, lane)?; }
+            for (lane, w) in slots.iter_mut().enumerate() {
+                self.core_slot(rank, w, false, lane)?;
+                self.native_slot(rank, w, false)?;
+            }
             *cell.borrow_mut() = slots;
         }
         ensure!(count <= cell.borrow().len(), "prefill slots exceed admission");
@@ -3949,7 +3961,7 @@ impl<'a> GlmfEngine<'a> {
     /// 0 runs the MLP whole) or shared-expert half (`shared`).
     fn peer_ffn_out(&self, index: usize, w1: &Workspace<'_>, layer: &GlmfLayer<'_>) -> Result<*mut c_void> {
         if self.tp2_layer(index) { return Ok(w1.delta.buffer.ptr); }
-        match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer)) {
+        match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer) || native::dense_ffn(layer)) {
             (true, true) => Ok(w1.delta.buffer.ptr),
             (true, false) => w1.zero_ptr(),
             (false, _) => Ok(w1.shared.buffer.ptr),
@@ -3993,7 +4005,7 @@ impl<'a> GlmfEngine<'a> {
         // Startup bucket graphs exclude both ranks' real-row shared FFNs and their peer publication.
         if !layer.dense && self.startup_graphs && self.capturing.get() { return Ok(()); }
         // A dense MLP rank 0 runs whole leaves rank 1's zero rows as its partial.
-        match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer)) {
+        match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer) || native::dense_ffn(layer)) {
             (true, false) => {}
             (true, true) => self.ffn_on(1, w1, layer, self.cfg.dense_intermediate, cap, out, rows)?,
             (false, _) if !self.tp2_layer(index) =>
@@ -4620,7 +4632,7 @@ impl<'a> GlmfEngine<'a> {
             GlmNextAttention::Kda => tables.spans().iter().try_for_each(|span| {
                 ensure!(span.first == 0 || (rank == 0 && self.peer.is_none()), "per-sequence rows run on one GPU");
                 self.kda_on(rank, w, index, layer, if tables.segments.is_empty() { rows } else { span.rows() },
-                    span.first, cap, tables.spec)
+                    span.first, cap, tables.spec, native::sequence_count(&tables.kda_slots[span.first..span.first + span.rows]))
             }),
             GlmNextAttention::Mla => self.mla_on(rank, w, index, layer, rows, cap, tables, trace),
         }
@@ -4630,7 +4642,7 @@ impl<'a> GlmfEngine<'a> {
     /// `rows` rows from row `first` (one packed sequence's: its `seq_first` entries are 0).
     #[allow(clippy::too_many_arguments)]
     fn kda_on(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, first: usize,
-        cap: &str, spec: bool) -> Result<()> {
+        cap: &str, spec: bool, sequences: usize) -> Result<()> {
         let ordinal = self.kda_ordinal[index].context("KDA layer without a state pool")?;
         let at = |pool: cuteafd_ffi::CuteafdDeviceBuffer, per: usize| -> *mut c_void {
             // SAFETY: ordinal < KDA layers, so the layer's region lies inside the pool.
@@ -4638,6 +4650,14 @@ impl<'a> GlmfEngine<'a> {
         };
         let caches = self.caches_of(rank);
         let d = caches.kda_heads * self.cfg.kda_head_dim;
+        if native::is_native(layer) {
+            let view = |pool, per| crate::shared::experts::exlr8::view(pool, ordinal * per, per);
+            return self.native_kda(rank, w, layer, rows, first, cap, spec, sequences, [
+                view(caches.kda_conv.buffer, self.slots * 3 * 3 * d * 2)?,
+                view(caches.kda_state.buffer, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes())?,
+                view(caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d, replay_rows_of(cap)))?,
+            ]);
+        }
         let conv_state = at(caches.kda_conv.buffer, self.slots * 3 * 3 * d * 2);
         let state = at(caches.kda_state.buffer, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes());
         // Records of the step's programs' rows, layer by layer (an `_m64` step's 64-row records, a wide
@@ -4735,6 +4755,7 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn ffn_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, inter: usize, cap: &str, out: *mut c_void,
         rows: Scalar) -> Result<()> {
+        if native::is_native(layer) { return self.native_ffn(rank, w, layer, cap, out, rows); }
         if core::native_ffn(layer) { return self.core_ffn(rank, w, layer, cap, out, rows); }
         if layer.has("nvfp4_w1") {
             ensure!(rank == 0, "NVFP4 dense MLPs run on rank 0");
@@ -4798,12 +4819,14 @@ impl<'a> GlmfEngine<'a> {
     fn mla_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
         decode: bool) -> Result<()> {
         let cache = self.caches_of(rank).kv[index].as_ref().context("MLA layer without a record pool")?.buffer;
-        self.mla_producer_into(rank, w, layer, rows, cap, decode, cache.ptr)
+        self.mla_producer_into(rank, w, layer, rows, cap, decode, cache)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn mla_producer_into(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
-        decode: bool, cache: *mut c_void) -> Result<()> {
+        decode: bool, cache: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+        if native::is_native(layer) { return self.native_mla_producer(rank, w, layer, rows, cap, cache); }
+        let cache = cache.ptr;
         if layer.core.contains_key("self_attn.q_a_proj") {
             return self.core_mla_producer(rank, w, layer, rows, cap, cache);
         }
@@ -4823,7 +4846,9 @@ impl<'a> GlmfEngine<'a> {
     /// its pool slot of `pools` (a negative slot skips it).
     #[allow(clippy::too_many_arguments)]
     fn index_producer_part(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar,
-        cap: &str, tables: &StepTables, first: usize, pools: *mut c_void) -> Result<()> {
+        cap: &str, tables: &StepTables, first: usize, pools: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+        if native::is_native(layer) { return self.native_index(rank, w, index, layer, rows, cap, tables, first, pools); }
+        let pools = pools.ptr;
         let caches = self.caches_of(rank);
         let index_cache = caches.index[index].as_ref().context("MLA layer without an index cache")?;
         let t = tables.positions.len();
@@ -4865,12 +4890,13 @@ impl<'a> GlmfEngine<'a> {
     fn index_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar,
         cap: &str, tables: &StepTables) -> Result<()> {
         let pools = self.caches_of(rank).index[index].as_ref().context("MLA layer without an index cache")?.pools.buffer;
-        self.index_producer_part(rank, w, index, layer, rows, cap, tables, 0, pools.ptr)
+        self.index_producer_part(rank, w, index, layer, rows, cap, tables, 0, pools)
     }
 
     /// W_UV + o_proj of this rank's heads over `w.latent` into `delta` (a partial under a split).
     fn mla_output(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, cap: &str, rows: Scalar, decode: bool)
         -> Result<()> {
+        if native::is_native(layer) { return self.native_mla_output(rank, w, layer, rows, cap); }
         if layer.core.contains_key("self_attn.o_proj") {
             return self.core_mla_output(rank, w, layer, rows, cap);
         }
@@ -4896,10 +4922,10 @@ impl<'a> GlmfEngine<'a> {
         // already differ and cannot identify the original numerical cause.
         let trace = trace.filter(|_| tables.decode && index == 3);
         let mode = if tables.decode { "decode" } else { "prefill" };
-        let (cache, pool_cache) = (cache.ptr, pool_buffer.ptr);
         let decode = tables.decode;
         let split = layer.attention_share.split();
         self.mla_producer_into(rank, w, layer, rows, cap, decode, cache)?;
+        let (cache, pool_cache) = (cache.ptr, pool_buffer.ptr);
         if let Some(dir) = trace {
             let qkv_width = self.cfg.q_lora_rank + self.cfg.kv_lora_rank;
             let q_width = heads * self.cfg.qk_nope_dim;
@@ -4935,7 +4961,7 @@ impl<'a> GlmfEngine<'a> {
             let (q_fp8, head_weights) = (row_at(&w.q_fp8, first, INDEX_HEADS * 128), row_at(&w.head_weights, first,
                 INDEX_HEADS * 4));
             let positions = row_at(&w.positions, first, 8);
-            self.index_producer_part(rank, w, index, layer, rows, cap, tables, first, pool_cache)?;
+            self.index_producer_part(rank, w, index, layer, rows, cap, tables, first, pool_buffer)?;
             let pools_at = row_at(&w.pools, first, pools * 4);
             // A packed step is long when any of its sequences is: its short parts skip the top-k.
             if tables.long {
