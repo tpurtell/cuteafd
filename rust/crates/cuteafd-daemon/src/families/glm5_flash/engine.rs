@@ -470,6 +470,7 @@ impl PackedRoutes {
 pub(crate) enum Experts<'a> {
     Local(LocalExperts<'a>),
     LocalExl3(LocalExl3<'a>),
+    LocalNative(RefCell<Box<dyn RtxExpertLayer + 'a>>),
     /// Spark ranks serving the routed experts over RoCE (one BF16 partial per
     /// rank); one transport per prefill lane (decode uses the first).
     Spark { transport: RefCell<SparkLink<'a>> },
@@ -2208,6 +2209,13 @@ impl<'a> GlmfEngine<'a> {
                 local.resident.borrow().as_ref().context("local EXL3 weights must be installed before binding homes")?
                     .1.layers().to_vec()
             }
+            Experts::LocalNative(local) => {
+                let local = local.borrow();
+                ensure!(local.shard() == crate::shared::experts::rtx::RtxShard::Whole
+                    && local.partial() == PartialDtype::Bf16 && local.uses_fp8_input()
+                    && local.device() == self.device, "native whole expert binding differs from engine");
+                local.layers().to_vec()
+            }
             _ => anyhow::bail!("local expert backend required"),
         };
         ensure!(installed == layers, "GLM Flash installed local inventory {installed:?} differs from admitted {layers:?}");
@@ -2330,7 +2338,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn local_layer(&self, layer: usize) -> bool {
-        matches!(self.routed_experts(layer), Some(Experts::Local(_) | Experts::LocalExl3(_)))
+        matches!(self.routed_experts(layer), Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::LocalNative(_)))
     }
 
     fn tp2_layer(&self, layer: usize) -> bool {
@@ -2351,14 +2359,20 @@ impl<'a> GlmfEngine<'a> {
             if weights.dense { return Ok(LayerHome::Dense); }
             let tp = if self.tp2_layer(layer) { 2 } else {
                 match self.routed_experts(layer) {
-                    Some(Experts::Local(_) | Experts::LocalExl3(_)) => 1,
+                    Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::LocalNative(_)) => 1,
                     Some(Experts::Spark { .. }) => remote.len(),
                     _ => anyhow::bail!("GLM Flash layer {layer} has no installed expert home"),
                 }
             };
             ensure!(tp > 0, "GLM Flash layer {layer} has no installed expert ranks");
             let catalog = catalog.context("GLM Flash routed expert catalog missing")?;
-            let slice_bytes = match (catalog.fp8(), catalog.exl3()) {
+            let slice_bytes = if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+                match self.routed_experts(layer) {
+                    Some(Experts::LocalNative(local)) => local.borrow().weight_read_bytes()? as f64,
+                    Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)? as f64,
+                    _ => anyhow::bail!("GLM Flash layer {layer} has no installed native byte descriptor"),
+                }
+            } else { match (catalog.fp8(), catalog.exl3()) {
                 (Some(_), _) => {
                     let bytes = if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
                         tp2.ranks.iter().map(|rank| rank.borrow().weight_read_bytes())
@@ -2372,7 +2386,7 @@ impl<'a> GlmfEngine<'a> {
                 }
                 (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, layer, tp)?,
                 _ => anyhow::bail!("GLM Flash routed expert format cannot be priced"),
-            };
+            }};
             Ok(if matches!(self.routed_experts(layer), Some(Experts::Spark { .. })) && !self.tp2_layer(layer) {
                 LayerHome::Remote { slice_bytes }
             } else { LayerHome::Local { slice_bytes } })
@@ -2386,6 +2400,7 @@ impl<'a> GlmfEngine<'a> {
                     return Ok(group);
                 }
                 match self.routed_experts(layer) {
+                    Some(Experts::LocalNative(local)) => local.borrow().group_rows(rows),
                     Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
                     Some(Experts::LocalExl3(local)) => crate::families::deepseek_v4::local::installed_window_group_rows(
                         &local.resident, || local.ensure(layer, self.stream), rows,
@@ -3570,7 +3585,7 @@ impl<'a> GlmfEngine<'a> {
                         }
                         if !found { cap = 0; }
                     }
-                    Some(Experts::LocalExl3(_)) | None => cap = 0,
+                    Some(Experts::LocalExl3(_) | Experts::LocalNative(_)) | None => cap = 0,
                     Some(Experts::Skip) => {},
                 }
             }
@@ -5187,6 +5202,17 @@ impl<'a> GlmfEngine<'a> {
                     // SAFETY: the engine owns this stream.
                     unsafe { self.library.cuda_stream_synchronize(self.stream)? };
                 }
+            }
+            Experts::LocalNative(local) => {
+                shared()?;
+                let mut experts = local.borrow_mut();
+                let routes = Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr };
+                // SAFETY: the shared owner and operands live through the engine stream;
+                // enqueue drains partial submissions before returning an error.
+                unsafe { experts.enqueue(index, t, ExpertInput::Fp8K32(w.wire.buffer.ptr), routes,
+                    self.stream, &mut || {})?; }
+                return self.run("add", &[("a", experts.output()), ("b", w.shared.buffer.ptr),
+                    ("out", w.delta.buffer.ptr)], &[rows]);
             }
             Experts::LocalExl3(local) => {
                 shared()?;
