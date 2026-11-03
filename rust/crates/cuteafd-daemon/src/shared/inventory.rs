@@ -47,8 +47,7 @@ impl RuntimeInventory {
             library.cuda_set_device(device)?;
             let sample = (|| -> Result<RuntimeSample> {
                 let (before, _) = library.cuda_memory_info()?;
-                load_modules(device)?;
-                let (free, total) = library.cuda_memory_info()?;
+                let (free, total) = after_modules(device, &mut load_modules, || library.cuda_memory_info())?;
                 let tracked = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
                 let info = library.cuda_device_info(device)?;
                 let text = |chars: &[std::ffi::c_char]| {
@@ -97,9 +96,37 @@ impl RuntimeInventory {
     }
 }
 
+fn after_modules<T>(device: i32, load: &mut impl FnMut(i32) -> Result<()>,
+    measure: impl FnOnce() -> Result<T>) -> Result<T> {
+    load(device)?;
+    measure()
+}
+
 #[cfg(test)]
 mod phase_tests {
     use super::InventoryPhase;
+
+    #[test]
+    fn selected_modules_load_before_admission_sample_and_failure_stops_sampling() {
+        use std::cell::RefCell;
+        let events = RefCell::new(Vec::new());
+        let selected = ["exlr8_dense_native", "glmf_stage_kda_projected_m64"];
+        let value = super::after_modules(7, &mut |device| {
+            assert_eq!(device, 7);
+            events.borrow_mut().extend(selected);
+            Ok(())
+        }, || {
+            assert_eq!(*events.borrow(), selected);
+            events.borrow_mut().push("sample");
+            Ok(42)
+        }).unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(*events.borrow(), [selected[0], selected[1], "sample"]);
+        let failed: anyhow::Result<()> = super::after_modules(7, &mut |_| anyhow::bail!("module rejected"), || {
+            panic!("admission must not sample after a failed module load")
+        });
+        assert!(failed.is_err());
+    }
 
     #[test]
     fn unknown_package_live_reservation_uses_same_positive_formula_as_plan() {

@@ -305,7 +305,7 @@ pub(crate) fn load_layer_packed<'a>(library: &'a NativeLibrary, load: &DenseLoad
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cuteafd_loader::plan::exlr8::dense::{DenseExecution, DenseOwnership, KvBGeometry};
 
@@ -315,7 +315,7 @@ mod tests {
 
     /// Native header-only fixture: published shapes, sparse payload, tiny record
     /// tables. No checkpoint payload or GPU is needed for loader selection.
-    fn fixture(family: &str) -> tempfile::TempDir {
+    pub(crate) fn fixture(family: &str) -> tempfile::TempDir {
         use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
         use serde_json::json;
         use std::io::{Seek, SeekFrom, Write};
