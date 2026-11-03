@@ -511,77 +511,78 @@ impl<'a> Exlr8Execution<'a> {
     }
 }
 
+/// Small group capacity bounds CPU memory; the compiled family/ABI remains exact.
+#[cfg(test)]
+pub(crate) fn owner_manifest(family: KernelFamily) -> serde_json::Value {
+    use cuteafd_ffi::exlr8::KernelKind;
+    use serde_json::json;
+    let h = family.geometry().hidden;
+    let mut entries = Vec::new();
+    for (variant, activations) in [(Variant::SharedDecode, Exlr8PrefillActivations::A16),
+        (Variant::DecodeCompact, Exlr8PrefillActivations::A16),
+        (Variant::DecodeGrouped, Exlr8PrefillActivations::A16),
+        (Variant::Prefill, Exlr8PrefillActivations::A16),
+        (Variant::Prefill, Exlr8PrefillActivations::A8)] {
+        let shared = variant == Variant::SharedDecode;
+        let grouped = variant.unit_tables();
+        let rows = if variant == Variant::Prefill { 4096 } else { 64 };
+        let top = if shared { 1 } else { 8 };
+        let g = 4usize;
+        let r = 16usize;
+        let s = h.div_ceil(1024);
+        let mut geometry = json!({"abi_version":3,"hidden":h,"units":16,"top_k":top,
+            "max_groups":g,"max_rows":rows,"split_k_blocks":8,"fc1_splits":s,"ctas_per_sm":4});
+        if family == KernelFamily::GlmFlash { geometry["swiglu_limit"] = json!(10.0); }
+        if grouped { geometry["group_rows"] = json!(r); }
+        if variant == Variant::DecodeCompact { geometry["serving_variant"] = json!("k1_k23_coalesced"); }
+        if variant == Variant::DecodeGrouped { geometry["fc2_partials"] = json!("f32"); }
+        if activations == Exlr8PrefillActivations::A8 { geometry["activations"] = json!("a8"); }
+        let shapes = [format!("[rows,{h}]"), "[E,16,3,3]".into(), "[E,16,3]".into(),
+            format!("[{g}]"), format!("[{g},{r}]"), format!("[rows,{top}]"), format!("[rows,{top}]"),
+            format!("[{g},16,2,{s},{r},128]"), format!("[{g},16,{r},128]"),
+            format!("[{g},{r},{h}]"), format!("[{h}]"), format!("[rows,{h}]"), "[1]".into(),
+            "[E]".into(), "[E,16]".into()];
+        let dtypes = ["float16", "int64", "int32", "int32", "int32", "int32", "float32",
+            "float32", "float16", "float32", "int8", "bfloat16", "int32", "int32", "int32"];
+        entries.push(json!({"name":program_names(family, if shared {ExpertSet::Shared} else {ExpertSet::Routed},
+            variant, activations).0,"capacity_rows":rows,"geometry":geometry,
+            "pointers":pointers(if shared {ExpertSet::Shared} else {ExpertSet::Routed}, variant).iter()
+                .enumerate().map(|(i,name)| json!({"name":name,"dtype":dtypes[i],"shape":shapes[i],
+                    "role":if (7..=9).contains(&i) {"scratch"} else if i==11 {"out"} else {"in"}})).collect::<Vec<_>>(),
+            "scalars":(["rows", "cta_limit", "unit_limit", "l2_bytes"][..if grouped {4} else {2}].iter()
+                .map(|name| json!({"name":name,"type":"int32"})).collect::<Vec<_>>()),
+            "scratch_bytes_at_capacity":{"fc1":g*16*2*s*r*128*4,
+                "intermediate":g*16*r*128*2,"fc2":g*r*h*4}}));
+    }
+    for kind in [KernelKind::SharedGroup, KernelKind::Group, KernelKind::GroupedGroup] {
+        let shared = kind == KernelKind::SharedGroup;
+        let rows = if kind == KernelKind::GroupedGroup {4096} else {64};
+        let top = if shared {1} else {8};
+        let row = if shared {h} else {h+h/32};
+        let descriptors = [("ids", "int32", format!("[rows,{top}]"), "in"),
+            ("x", if shared {"bfloat16"} else {"uint8"}, format!("[rows,{row}]"), "in"),
+            ("signs_in", "int8", format!("[{h}]"), "in"),
+            ("group_expert", "int32", "[4]".into(), "out"),
+            ("route_slots", "int32", "[4,16]".into(), "out"),
+            ("route_group_lane", "int32", format!("[rows,{top}]"), "out"),
+            ("group_count", "int32", "[1]".into(), "out"),
+            ("activation", "float16", format!("[rows,{h}]"), "out")];
+        let mut geometry = json!({"abi_version":2,"experts":if shared {1} else {family.geometry().experts},
+            "top_k":top,"max_groups":4,"max_rows":rows,"hidden":h,"ctas_per_sm":4,"ingress_warps":8,
+            "input_format":if shared {"bf16"} else {"fp8_k32"},"input_row_bytes":if shared {h*2} else {row}});
+        if kind == KernelKind::GroupedGroup { geometry["group_rows"] = json!(16); }
+        entries.push(json!({"name":family.program(kind),"capacity_rows":rows,"geometry":geometry,
+            "pointers":descriptors.iter().map(|(name,dtype,shape,role)|
+                json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>(),
+            "scalars":[{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}],
+            "scratch_bytes_at_capacity":{}}));
+    }
+    json!({"programs":entries})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Small group capacity bounds CPU memory; the compiled family/ABI remains exact.
-    fn owner_manifest(family: KernelFamily) -> serde_json::Value {
-        use cuteafd_ffi::exlr8::KernelKind;
-        use serde_json::json;
-        let h = family.geometry().hidden;
-        let mut entries = Vec::new();
-        for (variant, activations) in [(Variant::SharedDecode, Exlr8PrefillActivations::A16),
-            (Variant::DecodeCompact, Exlr8PrefillActivations::A16),
-            (Variant::DecodeGrouped, Exlr8PrefillActivations::A16),
-            (Variant::Prefill, Exlr8PrefillActivations::A16),
-            (Variant::Prefill, Exlr8PrefillActivations::A8)] {
-            let shared = variant == Variant::SharedDecode;
-            let grouped = variant.unit_tables();
-            let rows = if variant == Variant::Prefill { 4096 } else { 64 };
-            let top = if shared { 1 } else { 8 };
-            let g = 4usize;
-            let r = 16usize;
-            let s = h.div_ceil(1024);
-            let mut geometry = json!({"abi_version":3,"hidden":h,"units":16,"top_k":top,
-                "max_groups":g,"max_rows":rows,"split_k_blocks":8,"fc1_splits":s,"ctas_per_sm":4});
-            if family == KernelFamily::GlmFlash { geometry["swiglu_limit"] = json!(10.0); }
-            if grouped { geometry["group_rows"] = json!(r); }
-            if variant == Variant::DecodeCompact { geometry["serving_variant"] = json!("k1_k23_coalesced"); }
-            if variant == Variant::DecodeGrouped { geometry["fc2_partials"] = json!("f32"); }
-            if activations == Exlr8PrefillActivations::A8 { geometry["activations"] = json!("a8"); }
-            let shapes = [format!("[rows,{h}]"), "[E,16,3,3]".into(), "[E,16,3]".into(),
-                format!("[{g}]"), format!("[{g},{r}]"), format!("[rows,{top}]"), format!("[rows,{top}]"),
-                format!("[{g},16,2,{s},{r},128]"), format!("[{g},16,{r},128]"),
-                format!("[{g},{r},{h}]"), format!("[{h}]"), format!("[rows,{h}]"), "[1]".into(),
-                "[E]".into(), "[E,16]".into()];
-            let dtypes = ["float16", "int64", "int32", "int32", "int32", "int32", "float32",
-                "float32", "float16", "float32", "int8", "bfloat16", "int32", "int32", "int32"];
-            entries.push(json!({"name":program_names(family, if shared {ExpertSet::Shared} else {ExpertSet::Routed},
-                variant, activations).0,"capacity_rows":rows,"geometry":geometry,
-                "pointers":pointers(if shared {ExpertSet::Shared} else {ExpertSet::Routed}, variant).iter()
-                    .enumerate().map(|(i,name)| json!({"name":name,"dtype":dtypes[i],"shape":shapes[i],
-                        "role":if (7..=9).contains(&i) {"scratch"} else if i==11 {"out"} else {"in"}})).collect::<Vec<_>>(),
-                "scalars":(["rows", "cta_limit", "unit_limit", "l2_bytes"][..if grouped {4} else {2}].iter()
-                    .map(|name| json!({"name":name,"type":"int32"})).collect::<Vec<_>>()),
-                "scratch_bytes_at_capacity":{"fc1":g*16*2*s*r*128*4,
-                    "intermediate":g*16*r*128*2,"fc2":g*r*h*4}}));
-        }
-        for kind in [KernelKind::SharedGroup, KernelKind::Group, KernelKind::GroupedGroup] {
-            let shared = kind == KernelKind::SharedGroup;
-            let rows = if kind == KernelKind::GroupedGroup {4096} else {64};
-            let top = if shared {1} else {8};
-            let row = if shared {h} else {h+h/32};
-            let descriptors = [("ids", "int32", format!("[rows,{top}]"), "in"),
-                ("x", if shared {"bfloat16"} else {"uint8"}, format!("[rows,{row}]"), "in"),
-                ("signs_in", "int8", format!("[{h}]"), "in"),
-                ("group_expert", "int32", "[4]".into(), "out"),
-                ("route_slots", "int32", "[4,16]".into(), "out"),
-                ("route_group_lane", "int32", format!("[rows,{top}]"), "out"),
-                ("group_count", "int32", "[1]".into(), "out"),
-                ("activation", "float16", format!("[rows,{h}]"), "out")];
-            let mut geometry = json!({"abi_version":2,"experts":if shared {1} else {family.geometry().experts},
-                "top_k":top,"max_groups":4,"max_rows":rows,"hidden":h,"ctas_per_sm":4,"ingress_warps":8,
-                "input_format":if shared {"bf16"} else {"fp8_k32"},"input_row_bytes":if shared {h*2} else {row}});
-            if kind == KernelKind::GroupedGroup { geometry["group_rows"] = json!(16); }
-            entries.push(json!({"name":family.program(kind),"capacity_rows":rows,"geometry":geometry,
-                "pointers":descriptors.iter().map(|(name,dtype,shape,role)|
-                    json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>(),
-                "scalars":[{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}],
-                "scratch_bytes_at_capacity":{}}));
-        }
-        json!({"programs":entries})
-    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
