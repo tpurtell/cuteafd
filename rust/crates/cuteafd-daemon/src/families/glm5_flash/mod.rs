@@ -413,6 +413,31 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn native_push_records_shared_and_vocabulary_before_group_membership() {
+        let source = include_str!("mod.rs");
+        let plan = source.split("let plan_native =").last().unwrap()
+            .split("let mut native_push =").next().unwrap();
+        let body = plan.find("native.load(").unwrap();
+        let shared = plan.find("native.load_shared(").unwrap();
+        let destinations = plan.find("dense::plan_records(").unwrap();
+        assert!(body < shared && shared < destinations);
+        assert!(plan.contains("dense::recording("));
+        let startup = source.split("let mut native_push =").last().unwrap()
+            .split("// The admitted TP2 expert halves").next().unwrap();
+        for arm in startup.split("let planned = plan_native(").skip(1) {
+            assert!(arm.find("CoordinatorPush::prepare").is_some());
+        }
+        assert_eq!(startup.matches("let planned = plan_native(").count(), 2);
+        let receive = source.split("let mut native_local =").last().unwrap()
+            .split("embedding.validate_residency(").next().unwrap();
+        assert!(receive.contains("Some((push, sparks, (owners, dense)))"));
+        assert!(receive.contains("Some(Ok(dense))"));
+        assert!(receive.contains("push_policy.committed(pushed)?"));
+        assert!(!receive.contains("NoDense"));
+        assert!(source.contains("native_shared.take().context(\"native shared owners missing after load\")?"));
+    }
+
+    #[test]
     fn index_cache_defaults_to_keys_and_takes_compact() {
         let parse_cache = |extra: &[&str]| Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib",
             "/native"].into_iter().chain(extra.iter().copied())).map(|p| p.engine.index_cache);
@@ -2199,6 +2224,16 @@ impl Opened {
                 layers: local_layers.clone(), budgets: vec![native_local_budget()?.checked_sub(workspace)
                     .context("native local workspace exceeds admission")?] }))
         };
+        let plan_native = |sparks: usize| -> Result<_> {
+            let native = native_admission.as_ref().context("native Flash admission")?;
+            let (owners, records) = crate::shared::experts::rtx::dense::recording(|| {
+                let loaded = native.load(&self.library, &programs, &loader, &self.cfg, &execution)?;
+                let shared = native.load_shared(args, &self.cfg, &self.library, &programs)?;
+                Ok((loaded, shared))
+            })?;
+            let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
+            Ok((owners, dense))
+        };
         let mut native_push = None;
         let mut coordinator_push = None;
         let admission = if args.peers.is_some() {
@@ -2221,12 +2256,15 @@ impl Opened {
                 crate::shared::placement::spark_rings(64 << 20)?, executions)?;
             let admission = crate::shared::placement::SparkAdmission::plan_manifest(source, geometry, self.experts.as_ref(),
                 &working, peers.len(), None, model, args.exlr8_manifest.as_deref())?;
-            let native_ranks = if native_admission.is_some() && !local_layers.is_empty() {
-                ensure!(admission.coordinator_pushes(), "native RTX experts require a committed push group");
-                let (push, streams, ranks) = crate::shared::experts::rtx::push::CoordinatorPush::prepare(
-                    &args.snapshot, self.experts.as_ref(), 1, native_push_experts()?)?;
-                native_push = Some((push, peers.len()));
-                Some((streams, ranks))
+            let native_ranks = if native_admission.is_some() {
+                push_policy.plan(|| {
+                    ensure!(admission.coordinator_pushes(), "native Flash Spark admission did not select required push");
+                    let planned = plan_native(peers.len())?;
+                    let (push, streams, ranks) = CoordinatorPush::prepare(
+                        &args.snapshot, self.experts.as_ref(), gpus, native_push_experts()?)?;
+                    native_push = Some((push, peers.len(), planned));
+                    Ok((streams, ranks))
+                })?
             } else { None };
             let ranks = if native_admission.is_none() {
                 push_policy.plan(|| {
@@ -2243,11 +2281,13 @@ impl Opened {
             });
             Some(admission.start_with(&peers, native_ranks.or(ranks))?)
         } else {
-            // Native startup keeps its admitted expert-only group until its dense-push port.
-            if native_admission.is_some() && !local_layers.is_empty() {
-                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(
-                    &args.snapshot, self.experts.as_ref(), 1, native_push_experts()?)?;
-                native_push = Some((push, 0));
+            if native_admission.is_some() {
+                native_push = push_policy.plan(|| {
+                    let planned = plan_native(0)?;
+                    let push = CoordinatorPush::prepare_alone(
+                        &args.snapshot, self.experts.as_ref(), gpus, native_push_experts()?)?;
+                    Ok((push, 0, planned))
+                })?;
             }
             if native_admission.is_none() {
                 coordinator_push = push_policy.plan(|| {
@@ -2294,18 +2334,25 @@ impl Opened {
         // The drafter read overlaps the committed target group.
         let draft_read = args.draft.as_deref().map(dspark::DraftRead::start).transpose()?;
         let mut native_local = None;
+        let mut native_shared = None;
         let mut pushed_whole = None;
         let (embedding, ((model, mut shares), tp2)) = if let Some(native) = &native_admission {
             crate::shared::placement::load_while_admitting(admission, || {
-                let (pushed, loaded) = match native_push.take() {
-                    Some((push, sparks)) => {
-                        let (pushed, loaded) = push.receive_with::<crate::shared::experts::rtx::push::NoDense, _>(
-                            devices.clone(), self.experts.as_ref(), sparks, None,
-                            || native.load(&self.library, &programs, &loader, &self.cfg, &execution));
-                        (Some(pushed?.context("native RTX experts require a committed push group")?), loaded?)
+                let (pushed, (loaded, shared)) = match native_push.take() {
+                    Some((push, sparks, (owners, dense))) => {
+                        // Records borrow these native allocations; retain every owner until
+                        // the single dense/shared/routed group has committed or drained.
+                        let split = crate::shared::memory::load_timing::Split::start();
+                        let (pushed, ()) = push.receive_with(devices.clone(), self.experts.as_ref(), sparks,
+                            Some(Ok(dense)), || ());
+                        let pushed = push_policy.committed(pushed)?;
+                        split.log("glm5_flash native dense push");
+                        (pushed, owners)
                     }
-                    None => (None, native.load(&self.library, &programs, &loader, &self.cfg, &execution)?),
+                    None => (None, (native.load(&self.library, &programs, &loader, &self.cfg, &execution)?,
+                        native.load_shared(args, &self.cfg, &self.library, &programs)?)),
                 };
+                native_shared = Some(shared);
                 if !local_layers.is_empty() {
                     let mut ranks = pushed.context("native RTX expert destination missing")?;
                     ensure!(ranks.len() == 1, "native whole expert push must publish one rank");
@@ -2423,7 +2470,7 @@ impl Opened {
                 "GLM 5.3 Flash head split over two GPUs");
         }
         if let Some(native) = &native_admission {
-            let shared = native.load_shared(args, &self.cfg, &self.library, &programs)?;
+            let shared = native_shared.take().context("native shared owners missing after load")?;
             let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
             engine.bind_native(&manifest, &native.charges, shared)?;
         } else {
