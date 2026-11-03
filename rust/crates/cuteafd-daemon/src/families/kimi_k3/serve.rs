@@ -139,7 +139,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
                 ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
             })?;
-            crate::shared::memory_report::release_load_staging(&library);
+            crate::shared::memory_report::release_load_staging(&library)?;
             loaded.engine.configure_packing(worker_args.prefill_packing)?;
             let backend = KimiBackend::new(&loaded.engine)?;
             // The shared selector allocates on the calling thread's device and

@@ -198,6 +198,16 @@ not establish a pause storm; zero ECN marking is normal for Not-ECT/PFC traffic.
 See [#759](https://github.com/tpurtell/cuteafd/pull/759) for this cluster's
 DSCP 26 / priority 3 switch and NIC configuration and measured evidence.
 
+## Kernel logs on headless Sparks
+
+A Spark that boots from USB, with no BMC or serial console, leaves no evidence of a hard
+lockup unless its logs leave the box first. JigglypAI's recipe on
+[#948](https://github.com/tpurtell/cuteafd/issues/948#issuecomment-6605321994)
+combines three sinks: persistent journald bind-mounted onto NVMe, netconsole over UDP
+with a pinned receiver MAC, and a 1 s host-state sampler. It also covers running the
+container log driver as non-blocking `json-file`, so a journald stall on a slow root
+cannot freeze the engine's stdout.
+
 ## MikroTik CRS8xx lossless RoCE
 
 **Prepared, not applied. Do not merge until TJ applies and measures.** Stop all

@@ -348,6 +348,14 @@ fn wide_selector_bytes(decode_rows: usize, vocab: usize) -> u64 {
         .saturating_sub(glmf_selector_bytes(engine::DECODE_ROWS as u64, vocab as u64))
 }
 
+/// Finish every loader before releasing its reusable staging; priming must not retain it.
+fn finish_loading<S, T>(library: &NativeLibrary, state: &mut S,
+    load: impl FnOnce(&mut S) -> Result<()>, prime: impl FnOnce(&mut S) -> Result<T>) -> Result<T> {
+    load(state)?;
+    crate::shared::memory_report::release_load_staging(library)?;
+    prime(state)
+}
+
 /// One startup owner, before TP2 diagnostics and the serving/golden body.
 fn with_startup_graphs<T>(tp2: bool, serving: Option<(usize, bool)>, golden: (usize, bool),
     warm: impl FnOnce(usize, bool) -> Result<()>, check_tp2: impl FnOnce() -> Result<()>,
@@ -368,6 +376,76 @@ mod draft_cli_tests {
     struct Parse {
         #[command(flatten)]
         engine: EngineArgs,
+    }
+
+    fn staging_boundary(spark: bool, draft: bool) -> Result<()> {
+        use crate::shared::memory::DeviceAllocation;
+        use cuteafd_ffi::{memory_ledger::{self, Space}, native_library_lifetime_fixture::Fixture};
+
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let tag = format!("flash-load-staging/{}", fixture.directory().display());
+        let _owner = memory_ledger::owner(&tag);
+        let staging_bytes = || memory_ledger::snapshot().by_owner(Space::Pinned, -1)
+            .get(tag.as_str()).copied().unwrap_or(0);
+        let mut target = DeviceAllocation::new(&library, 512)?;
+        library.copy_h2d(target.buffer, &[1; 64])?;
+        assert_eq!(staging_bytes(), 64);
+        assert_eq!(fixture.events()?, "DAH");
+
+        // The real production boundary runs these allocation-only load/prime stand-ins.
+        // This checks lifetime ordering, not Flash's numerical kernels or Spark transport.
+        finish_loading(&library, &mut target, |target| {
+            if spark {
+                library.copy_h2d(target.buffer, &[2; 128])?;
+                assert_eq!(staging_bytes(), 128);
+            }
+            if draft {
+                library.copy_h2d(target.buffer, &[3; 256])?;
+                assert_eq!(staging_bytes(), 256);
+            }
+            library.copy_h2d(target.buffer, &[4; 512])?;
+            assert_eq!(staging_bytes(), 512);
+            assert!(fixture.events()?.ends_with('H'), "last load must still own staging");
+            Ok(())
+        }, |_| {
+            assert_eq!(staging_bytes(), 0, "first prime must not retain loader staging");
+            assert!(fixture.events()?.ends_with("HF"), "release must follow the last upload");
+            let prime = DeviceAllocation::new(&library, 16)?;
+            drop(prime);
+            with_startup_graphs(false, Some((1, draft)), (1, false), |_, _| {
+                assert_eq!(staging_bytes(), 0);
+                let warm = DeviceAllocation::new(&library, 16)?;
+                drop(warm);
+                Ok(())
+            }, || unreachable!("no TP2 diagnostics in this fixture"), || {
+                assert_eq!(staging_bytes(), 0, "Ready must not retain loader staging");
+                Ok(())
+            })
+        })?;
+        let events = fixture.events()?;
+        let expected = format!("DAH{}{}FAHFDdDd", if spark { "FAH" } else { "" },
+            if draft { "FAH" } else { "" });
+        assert_eq!(events, expected, "actual DSO alloc/upload/free chronology");
+        assert_eq!(events.matches('A').count(), events.matches('F').count());
+        assert_eq!(library.release_sync_h2d_staging()?, 0);
+        drop(target);
+        assert!(memory_ledger::snapshot().rows.iter().all(|row|
+            row.key.owner != Some(tag.as_str()) || row.allocations == 0));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn local_load_staging_is_released_before_prime_and_ready() -> Result<()> {
+        for draft in [false, true] { staging_boundary(false, draft)?; }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn spark_then_drafter_staging_is_released_before_prime_and_ready() -> Result<()> {
+        staging_boundary(true, true)
     }
 
     #[test]
@@ -2534,31 +2612,34 @@ impl Opened {
             }
         }
         engine.bind_expert_homes(&placement, &spark_layers, args.skip_experts)?;
-        engine.drafter = self.load_drafter(args, &programs, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
-        engine.bind_draft_core_head()?;
-        engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
-        tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
-            "GLM Flash immutable attention reduction plan");
-        if let Some(dspark::Drafter::RemoteDflash(draft)) = &engine.drafter {
-            let (device, stream) = peer_stream.context("remote draft lost its target producer")?;
-            draft.validate_target_peer(crate::shared::peer_split::RankDevice { device, stream })?;
-        }
-        if let Some(dense) = self.load_dense(args, &engine.weights.layers)? { engine.set_dense_nvfp4(dense); }
-        if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
-            engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
-            if engine.ranks() > 1 {
-                engine.attach_peer_l2(budget)?;
+        finish_loading(&self.library, &mut engine, |engine| {
+            engine.drafter = self.load_drafter(args, &programs, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
+            engine.bind_draft_core_head()?;
+            engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
+            tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
+                "GLM Flash immutable attention reduction plan");
+            if let Some(dspark::Drafter::RemoteDflash(draft)) = &engine.drafter {
+                let (device, stream) = peer_stream.context("remote draft lost its target producer")?;
+                draft.validate_target_peer(crate::shared::peer_split::RankDevice { device, stream })?;
             }
-        }
-        if let Some(workspaces) = early_workspaces { engine.install_workspaces(workspaces)?; }
-        if args.serving_graph_policy.is_some() { engine.prepare_serving_workspaces()?; }
-        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
-        probe("workspaces")?;
-        engine.prime_tp2()?;
-        if let Some(dspark::Drafter::RemoteDflash(draft)) = &engine.drafter {
-            draft.prime(&engine.embedding, engine.draft_head())?;
-        }
-        probe("expert-prime")?;
+            if let Some(dense) = self.load_dense(args, &engine.weights.layers)? { engine.set_dense_nvfp4(dense); }
+            if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
+                engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+                if engine.ranks() > 1 {
+                    engine.attach_peer_l2(budget)?;
+                }
+            }
+            if let Some(workspaces) = early_workspaces { engine.install_workspaces(workspaces)?; }
+            if args.serving_graph_policy.is_some() { engine.prepare_serving_workspaces()?; }
+            if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+            probe("workspaces")
+        }, |engine| {
+            engine.prime_tp2()?;
+            if let Some(dspark::Drafter::RemoteDflash(draft)) = &engine.drafter {
+                draft.prime(&engine.embedding, engine.draft_head())?;
+            }
+            probe("expert-prime")
+        })?;
         engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
         let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy,
             (16, engine.drafter.is_some()), |sequences, speculation| {
@@ -2696,7 +2777,6 @@ impl Opened {
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
             args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
         transport.enable_terminal_ownership(self.library.clone())?;
-        crate::shared::memory_report::release_load_staging(&self.library);
         let warm_rows = args.expert_rows();
         let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
         // Publish grouping before the draft planner prices the installed workers.

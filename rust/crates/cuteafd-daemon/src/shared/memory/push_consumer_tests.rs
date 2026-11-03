@@ -14,6 +14,7 @@ use std::{
 
 struct SocketRank(Conn);
 impl RankEvents for SocketRank {
+    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> { Some(self.0.fd()) }
     fn next(&self) -> std::io::Result<Event> {
         self.0
             .event()?
@@ -30,6 +31,7 @@ impl RankEvents for SocketRank {
 #[derive(Clone, Copy)]
 enum Mode {
     Good,
+    Delayed,
     Missing,
     Malformed,
     Failed,
@@ -172,10 +174,12 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
     server.set_timeout(Some(Duration::from_secs(10)))?;
     let released = AtomicUsize::new(0);
     let (prefilled, ready) = std::sync::mpsc::channel();
+    if matches!(mode, Mode::Delayed) { fixture.block_first_stream(&library, true)?; }
     let started = Instant::now();
     let result = std::thread::scope(|scope| -> Result<_> {
         let released = &released;
         let fixture = &fixture;
+        let library = &library;
         let task = scope.spawn(move || -> Result<()> {
             let slots = 8usize;
             let slot_bytes = 1024 * 1024;
@@ -218,7 +222,7 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
                     flush(packer);
                 }
                 // A whole-file replay must not change coverage or data.
-                if matches!(mode, Mode::Good) {
+                if matches!(mode, Mode::Good | Mode::Delayed) {
                     let replay = slots_data.clone();
                     slots_data.extend(replay);
                 }
@@ -249,11 +253,11 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
                         })?;
                         inflight.insert(index);
                         sent += 1;
-                        if matches!(mode, Mode::Good) && sent == slots_data.len() {
+                        if matches!(mode, Mode::Good | Mode::Delayed) && sent == slots_data.len() {
                             // Real Done may arrive while copies and credits remain queued.
                             server.send_event(&Event::Done)?;
                         }
-                        if matches!(mode, Mode::Good) && sent == slots_data.len().min(slots) {
+                        if matches!(mode, Mode::Good | Mode::Delayed) && sent == slots_data.len().min(slots) {
                             prefilled.send(())?;
                         }
                         if matches!(mode, Mode::Failed) {
@@ -282,8 +286,14 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
                     };
                     ensure!(inflight.remove(&(slot as usize)), "duplicate release");
                     let events = fixture_events(&fixture)?;
-                    ensure!(events.contains('S'), "Release preceded CUDA completion");
-                    released.fetch_add(1, Ordering::Relaxed);
+                    let count = released.fetch_add(1, Ordering::Relaxed) + 1;
+                    ensure!(events.matches('L').count() >= count,
+                        "Release {count} preceded successful CUDA copy completion: {events}");
+                    if matches!(mode, Mode::Delayed) && count <= 3 {
+                        ensure!(slot != 0 && slot != 4,
+                            "stalled stream released before three independent completions");
+                        if count == 3 { fixture.block_first_stream(library, false)?; }
+                    }
                     // Poison released storage; delayed source access must never see this.
                     // SAFETY: Release returned this credit to the producer.
                     unsafe {
@@ -294,7 +304,7 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
                         );
                     }
                 }
-                if !matches!(mode, Mode::Good) {
+                if !matches!(mode, Mode::Good | Mode::Delayed) {
                     server.send_event(&Event::Done)?;
                 }
                 Ok(())
@@ -308,12 +318,12 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
         if matches!(mode, Mode::DrainFailed) {
             fixture.configure_pack(&library, 0, 1)?;
         }
-        if matches!(mode, Mode::Good) {
+        if matches!(mode, Mode::Good | Mode::Delayed) {
             ready.recv_timeout(Duration::from_secs(10))?;
         }
         let value = consume(device, arena, ring, SocketRank(client), window);
         let server_result = task.join().expect("fake server panicked");
-        if matches!(mode, Mode::Good) {
+        if matches!(mode, Mode::Good | Mode::Delayed) {
             server_result?;
             let delivered = value?;
             assert_eq!(delivered.validation(), &0xcbac1fedu32.to_le_bytes());
@@ -337,12 +347,9 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
         assert!(library.is_quarantined_after_failed_drain());
         assert!(!events.contains('g') && !events.contains('d'));
     } else {
-        if matches!(mode, Mode::Good) && window == 8 {
-            let queued_before_first_wait = events.split('S').next().unwrap().matches('R').count();
-            assert!(
-                queued_before_first_wait > 1,
-                "pipeline never queued multiple slot events"
-            );
+        if matches!(mode, Mode::Good | Mode::Delayed) && window == 8 {
+            assert_eq!(events.matches('V').count(), COPY_STREAMS);
+            assert!(events.matches('R').count() > 1, "pipeline never queued multiple slot events");
         }
         assert!(events.rfind('S').unwrap() < events.rfind('g').unwrap());
         assert!(events.rfind('S').unwrap() < events.rfind('d').unwrap());
@@ -377,6 +384,15 @@ fn failures_drain_without_partial_publication() -> Result<()> {
     ] {
         exercise(8, mode, 256 * 1024)?;
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn delayed_stream_does_not_hold_other_slot_credits() -> Result<()> {
+    // Three other streams must release (and permit source poisoning) while
+    // stream zero is held. Final bytes and coverage still match mounted loading.
+    exercise(8, Mode::Delayed, 8 * 1024 * 1024)?;
     Ok(())
 }
 

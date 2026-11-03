@@ -68,7 +68,7 @@ impl<'a> RoundProbe<'a> {
         let ring = HostAllocation::new(library, bytes)?;
         let device_ring = DeviceAllocation::new(library, bytes)?;
         // Initialize padding once: the single contiguous download includes unused row slots.
-        library.copy_h2d(device_ring.buffer, ring.bytes())?;
+        library.cuda_zero_bytes(device_ring.buffer, bytes)?;
         let last_owned = dense.iter().rposition(|&dense| !dense);
         Ok(Self { collect_routes: super::binding::configured_needs_routes(),
             clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring,
@@ -230,6 +230,46 @@ fn settle(routes: &mut RoundRoutes, ring: &[u8], capacity: usize, topk: usize, r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn probe_initialization_keeps_load_staging_released_and_ordered_sources_live() -> Result<()> {
+        use cuteafd_ffi::{memory_ledger::{self, Space}, native_library_lifetime_fixture::Fixture};
+
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let tag = format!("draft-probe-staging/{}", fixture.directory().display());
+        let _owner = memory_ledger::owner(&tag);
+        let pinned = || memory_ledger::snapshot().by_owner(Space::Pinned, -1)
+            .get(tag.as_str()).copied().unwrap_or(0);
+        let target = DeviceAllocation::new(&library, 256)?;
+        library.copy_h2d(target.buffer, &[1; 128])?;
+        // SAFETY: the fixture retains this destination and its ordered source until the drain below.
+        unsafe { library.copy_h2d_ordered(target.buffer, &[2; 256], 1usize as *mut c_void)?; }
+        assert_eq!(library.release_sync_h2d_staging()?, 128);
+        assert_eq!(pinned(), 256);
+        let uploads = fixture.events()?.matches('H').count();
+
+        let probe = RoundProbe::new(&library, (0..45).map(|layer| layer < 3).collect(), 8, 64)?;
+        let bytes = 45 * 64 * 8 * 4;
+        assert_eq!(probe.ring.buffer.bytes, bytes);
+        assert!(probe.ring.bytes().iter().all(|&byte| byte == 0));
+        let mut device_bytes = vec![0xFF; bytes];
+        library.copy_d2h(&mut device_bytes, probe.device_ring.buffer)?;
+        assert!(device_bytes.iter().all(|&byte| byte == 0), "unused route slots must be initialized");
+        assert_eq!(fixture.events()?.matches('H').count(), uploads, "probe must not upload through sync staging");
+        assert_eq!(library.release_sync_h2d_staging()?, 0, "probe must not recreate load-only staging");
+        assert_eq!(pinned(), 256 + bytes, "only the ordered source and retained probe ring stay pinned");
+
+        drop(probe);
+        assert_eq!(pinned(), 256);
+        fixture.finish_ordered_uploads(&library)?;
+        assert_eq!(pinned(), 0);
+        drop(target);
+        assert!(memory_ledger::snapshot().rows.iter().all(|row|
+            row.key.owner != Some(tag.as_str()) || row.allocations == 0));
+        Ok(())
+    }
 
     fn ring(layers: usize, capacity: usize, topk: usize, fill: &[(usize, Vec<u32>)]) -> Vec<u8> {
         let mut ring = vec![0u8; layers * capacity * topk * 4];

@@ -836,7 +836,7 @@ impl Opened {
         // opens are the ones every step after it reuses.
         transport.bootstrap(&engine::spark_bootstrap_request(&self.cfg, args.prefill_wave_rows(),
             self.checkpoint.spark_input_is_bf16())?)?;
-        crate::shared::memory_report::release_load_staging(&self.library);
+        crate::shared::memory_report::release_load_staging(&self.library)?;
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), mtp }))
     }
 

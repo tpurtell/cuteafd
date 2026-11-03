@@ -39,6 +39,7 @@ pub mod host_isa;
 pub mod memory_ledger;
 pub mod synchronized_load;
 pub mod push_ring;
+pub mod event_waiters;
 
 static COORDINATOR_GPU_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GPU_BUDGET_ALLOCATION: Mutex<()> = Mutex::new(());

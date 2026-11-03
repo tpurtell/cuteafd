@@ -304,7 +304,9 @@ fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
                         + geometry.compact_wire_bytes(64, input.bf16(true)).unwrap().0) as u64);
                 let device = admission::transport_reservations(&cfg, 2, 0, rows, waves, 6).unwrap();
                 let intake = device.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap();
-                assert_eq!(intake.bytes, (rows.max(64) as u64 * waves as u64 + 64) * cfg.hidden as u64 * 2 * 6);
+                assert_eq!(intake.bytes, crate::serving_capacity::prefill_return_bytes(
+                    waves as u64, rows.max(64) as u64, 6, cfg.hidden as u64)
+                    + crate::serving_capacity::spark_intake_bytes(1, 6, 64, cfg.hidden as u64));
                 let peer = admission::transport_reservations(&cfg, 2, 1, rows, waves, 6).unwrap();
                 assert!(!peer.iter().any(|item| item.name == "transport.spark_intake_planes"));
             }

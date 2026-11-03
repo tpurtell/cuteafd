@@ -192,6 +192,9 @@ pub struct PushRank {
 }
 
 impl PushRank {
+    /// Borrow the landing-event socket for a shared blocking completion wake.
+    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> { self.rank.fd() }
+
     pub fn try_next(&self) -> io::Result<Poll> {
         match self.rank.try_next()? {
             Poll::Ready(event) => {

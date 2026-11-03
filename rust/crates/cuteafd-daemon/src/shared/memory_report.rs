@@ -115,12 +115,12 @@ pub(crate) fn monitor(stage: &'static str, period: Duration) {
 
 /// Frees the pinned upload staging the weight loaders grew (see
 /// `NativeLibrary::release_sync_h2d_staging`) once a family's weights are resident.
-pub(crate) fn release_load_staging(library: &cuteafd_ffi::NativeLibrary) {
-    match library.release_sync_h2d_staging() {
-        Ok(0) => {}
-        Ok(bytes) => tracing::info!(bytes, "released load-time pinned upload staging"),
-        Err(error) => tracing::warn!(%error, "could not release load-time pinned upload staging"),
+pub(crate) fn release_load_staging(library: &cuteafd_ffi::NativeLibrary) -> anyhow::Result<()> {
+    let bytes = library.release_sync_h2d_staging()?;
+    if bytes > 0 {
+        tracing::info!(bytes, "released load-time pinned upload staging");
     }
+    Ok(())
 }
 
 /// An automatic KV pool that has no room after the fixed costs: free memory less each GPU's

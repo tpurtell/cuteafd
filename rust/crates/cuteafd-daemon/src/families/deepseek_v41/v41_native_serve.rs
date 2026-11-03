@@ -685,7 +685,7 @@ fn worker(
     let occupied = total - free;
     cuteafd_ffi::memory_ledger::relabel_other("v41/local-experts");
     admission::startup_phase(&lib, "v41/local-experts", device_total)?;
-    crate::shared::memory_report::release_load_staging(&lib);
+    crate::shared::memory_report::release_load_staging(&lib)?;
     tracing::info!(rtx_layers=local_layers, first_remote_dispatch_layer=local_layers,
         remote_dispatch_layers=40-local_layers, spark_world=args.peers.len(),
         spark_topology=?topology.map(|t| (t.tp(), t.ep())),

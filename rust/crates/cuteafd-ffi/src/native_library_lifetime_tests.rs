@@ -405,3 +405,28 @@ fn failed_drain_marker_retains_module_and_pinned_staging() -> Result<()> {
     assert!(fixture.resident()?);
     Ok(())
 }
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn event_waiters_retain_module_until_workers_join() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let event = library.cuda_event_create()?;
+    let destroy = library.cuteafd_cuda_event_destroy()?;
+    // SAFETY: the fixture event is live and the fixture accepts a null stream.
+    unsafe { library.cuda_event_record(event, std::ptr::null_mut())?; }
+    let mut waiters = crate::event_waiters::EventWaiters::new(&library, 0, 4)?;
+    drop(library);
+    assert!(fixture.resident()?, "idle workers must retain their function pointers' DSO");
+    // SAFETY: workers retain the DSO; the recorded event stays live until completion.
+    unsafe { waiters.submit(0, event, 37)?; }
+    assert_eq!(waiters.complete()?, 37);
+    assert!(fixture.resident()?);
+    assert!(!fixture.events()?.contains('U'));
+    // SAFETY: successful completion drained this event and workers retain destroy's DSO.
+    assert_eq!(unsafe { destroy(event) }, 0);
+    waiters.join()?;
+    assert!(!fixture.resident()?, "joined workers must release the healthy DSO");
+    assert!(fixture.events()?.ends_with("EU"));
+    Ok(())
+}

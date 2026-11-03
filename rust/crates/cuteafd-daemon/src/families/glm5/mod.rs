@@ -1362,7 +1362,7 @@ impl Opened {
         let config = cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?)? } else { 64 << 20 } };
         let row_bytes = self.cfg.hidden * 2;
-        crate::shared::memory_report::release_load_staging(&self.library);
+        crate::shared::memory_report::release_load_staging(&self.library)?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
         let (h, topk, experts, layer) =

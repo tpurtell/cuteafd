@@ -686,7 +686,7 @@ pub(crate) fn with_engine<T>(
             let (rows, kind) = warm_shape(index);
             transport.bootstrap(&engine.warm_request(rows, kind)?)?;
         }
-        crate::shared::memory_report::release_load_staging(&loaded.library);
+        crate::shared::memory_report::release_load_staging(&loaded.library)?;
         let started = Instant::now();
         let identity = if skip { None } else { Some(cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
             &loaded.snapshot, loaded.catalog.routed_experts().geometry()?, spark_world.context("worker identity needs a declared world")?)?) };

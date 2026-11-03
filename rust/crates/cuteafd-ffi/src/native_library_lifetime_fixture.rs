@@ -275,6 +275,16 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn block_first_stream(&self, library: &NativeLibrary, block: bool) -> Result<()> {
+        // SAFETY: the CPU fixture owns this mutex-protected injection control.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32)> =
+                library.lib.get(b"fixture_block_first_stream")?;
+            configure(i32::from(block));
+        }
+        Ok(())
+    }
+
     pub fn resident(&self) -> Result<bool> {
         Ok(fs::read_to_string("/proc/self/maps")?
             .lines()

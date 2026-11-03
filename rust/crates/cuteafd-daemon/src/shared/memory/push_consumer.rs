@@ -7,10 +7,10 @@ use super::{
     weight_arena::{DeliveredArena, LoadingArena},
 };
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::push_ring::RegisteredRing;
+use cuteafd_ffi::{event_waiters::EventWaiters, push_ring::RegisteredRing};
 use cuteafd_loader::push_load::{proto::Event, slot, Poll, PushRank};
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     ffi::c_void,
 };
 
@@ -49,6 +49,7 @@ impl<'a> PushDestination for LoadingArena<'a> {
 }
 
 pub(crate) trait RankEvents {
+    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> { None }
     fn next(&self) -> std::io::Result<Event>;
     /// The group's first event: no hub event (not even Progress) precedes the
     /// group's start, which waits for every rank to join.
@@ -57,6 +58,7 @@ pub(crate) trait RankEvents {
     fn release(&self, slot: u32) -> std::io::Result<()>;
 }
 impl RankEvents for PushRank {
+    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> { Some(self.fd()) }
     fn next(&self) -> std::io::Result<Event> {
         self.next()
     }
@@ -72,63 +74,78 @@ impl RankEvents for PushRank {
     }
 }
 
-struct Pending {
-    slot: u32,
-    event: *mut c_void,
-    fragments: Vec<(u64, u64)>,
-}
+const COPY_STREAMS: usize = 4;
+
 struct Copies<'a> {
     device: Device<'a>,
-    stream: *mut c_void,
+    streams: Vec<*mut c_void>,
+    next_stream: usize,
+    waiters: EventWaiters,
     events: Vec<*mut c_void>,
-    pending: VecDeque<Pending>,
+    pending: BTreeMap<u32, Vec<(u64, u64)>>,
     occupied: BTreeSet<u32>,
 }
 impl<'a> Copies<'a> {
     fn new(device: Device<'a>) -> Result<Self> {
-        let stream = device.run(|| device.library.cuda_stream_create())?;
-        Ok(Self {
+        let mut copies = Self {
             device,
-            stream,
+            streams: Vec::new(),
+            next_stream: 0,
+            waiters: EventWaiters::new(device.library, device.id, COPY_STREAMS)?,
             events: Vec::new(),
-            pending: VecDeque::new(),
+            pending: BTreeMap::new(),
             occupied: BTreeSet::new(),
-        })
+        };
+        for _ in 0..COPY_STREAMS {
+            copies.streams.push(device.run(|| device.library.cuda_stream_create())?);
+        }
+        Ok(copies)
     }
     fn complete(&mut self, arena: &mut impl PushDestination, rank: &impl RankEvents) -> Result<()> {
-        let pending = self.pending.front().context("empty copy queue")?;
-        // SAFETY: event belongs to this stream and follows every copy from its retained slot.
-        self.device
-            .run(|| unsafe { self.device.library.cuda_event_synchronize(pending.event) })?;
-        for &(offset, bytes) in &pending.fragments {
+        // Every stream has a sleeping waiter: one slow stream cannot hold the
+        // credits of a different stream whose event has already completed.
+        let slot = self.waiters.complete()?;
+        let fragments = self.pending.get(&slot).context("unknown completed slot")?;
+        for &(offset, bytes) in fragments {
             arena.copied(offset, bytes)?;
         }
-        rank.release(pending.slot)?;
-        self.occupied.remove(&pending.slot);
-        self.pending.pop_front();
+        rank.release(slot)?;
+        self.occupied.remove(&slot);
+        self.pending.remove(&slot);
         Ok(())
     }
 }
 impl Drop for Copies<'_> {
     fn drop(&mut self) {
         let library = self.device.library;
+        if let Err(error) = self.waiters.join() {
+            library.quarantine_module_after_failed_drain();
+            tracing::error!(%error, "joining push copy waiters");
+        }
         let _ = self
             .device
             .run(|| {
-                // SAFETY: stream is live, and ring/arena owners outlive this guard on every exit.
-                if let Err(error) = unsafe { library.cuda_stream_synchronize(self.stream) } {
-                    library.quarantine_module_after_failed_drain();
-                    tracing::error!(%error, "retaining push buffers after failed drain");
-                    return Ok(());
+                let mut failed = library.is_quarantined_after_failed_drain();
+                for &stream in &self.streams {
+                    // SAFETY: all streams are live; ring/arena outlive this guard.
+                    if let Err(error) = unsafe { library.cuda_stream_synchronize(stream) } {
+                        library.quarantine_module_after_failed_drain();
+                        tracing::error!(%error, "retaining push buffers after failed drain");
+                        failed = true;
+                    }
                 }
+                if failed { return Ok(()); }
                 for &event in &self.events {
                     // SAFETY: stream has drained, so events have no pending users.
                     unsafe {
                         library.cuda_event_destroy(event)?;
                     }
                 }
-                // SAFETY: all copies have drained before stream destruction.
-                unsafe { library.cuda_stream_destroy(self.stream) }
+                for &stream in &self.streams {
+                    // SAFETY: all streams drained and every waiter joined.
+                    unsafe { library.cuda_stream_destroy(stream)?; }
+                }
+                Ok(())
             })
             .map_err(|error| {
                 library.quarantine_module_after_failed_drain();
@@ -138,7 +155,7 @@ impl Drop for Copies<'_> {
 }
 
 /// Own ring and arena through cancellation. No partial load escapes this function.
-/// A queued slot has its own event; Empty waits on the oldest rather than spinning.
+/// A queued slot has its own sleeping event wait; completion order is independent across streams.
 pub(crate) fn consume<'a, A: PushDestination>(
     device: Device<'a>,
     mut arena: A,
@@ -180,7 +197,9 @@ pub(crate) fn consume<'a, A: PushDestination>(
             match rank.try_next()? {
                 Poll::Ready(event) => event,
                 Poll::Empty => {
-                    copies.complete(&mut arena, &rank)?;
+                    if copies.waiters.wait(rank.fd())? {
+                        copies.complete(&mut arena, &rank)?;
+                    }
                     continue;
                 }
                 Poll::Closed => anyhow::bail!("push closed before Done"),
@@ -203,7 +222,7 @@ pub(crate) fn consume<'a, A: PushDestination>(
                 while copies.events.len() <= index as usize {
                     copies
                         .events
-                        .push(device.run(|| device.library.cuda_event_create_ordering())?);
+                        .push(device.run(|| device.library.cuda_event_create_blocking())?);
                 }
                 let event = copies.events[index as usize];
                 let mut fragments = Vec::new();
@@ -233,18 +252,20 @@ pub(crate) fn consume<'a, A: PushDestination>(
                     }
                     source += bytes;
                 }
+                let stream_index = copies.next_stream;
+                copies.next_stream = (stream_index + 1) % COPY_STREAMS;
+                let stream = copies.streams[stream_index];
                 // SAFETY: checked live arena/ring views, retained through the slot's
                 // event or the teardown drain; the copies stream is non-default.
                 device.run(|| unsafe {
-                    device.library.copy_host_buffers_h2d_batch_async(&dsts, &srcs, &lens, copies.stream)
+                    device.library.copy_host_buffers_h2d_batch_async(&dsts, &srcs, &lens, stream)
                 })?;
                 // SAFETY: event and stream belong to device and remain retained by Copies.
-                device.run(|| unsafe { device.library.cuda_event_record(event, copies.stream) })?;
-                copies.pending.push_back(Pending {
-                    slot: index,
-                    event,
-                    fragments,
-                });
+                device.run(|| unsafe { device.library.cuda_event_record(event, stream) })?;
+                copies.pending.insert(index, fragments);
+                // SAFETY: the event is recorded, is not reused until its completion,
+                // and Copies joins all waiters before destroying events or storage.
+                unsafe { copies.waiters.submit(stream_index, event, index)?; }
             }
             other => anyhow::bail!("unexpected push event {other:?}"),
         }
