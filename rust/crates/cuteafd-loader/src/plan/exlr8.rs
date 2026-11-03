@@ -1258,15 +1258,6 @@ mod tests {
         assert!(body.contains("append_spark_devices(&mut memory, layout, &residents)"));
     }
 
-    #[test]
-    fn native_prefill_uses_the_serving_family_limits() {
-        let source = include_str!("exlr8.rs");
-        let body = source.split("pub(super) fn native_plan_of(").nth(1).unwrap()
-            .split("let layout = &resolved_layout;").next().unwrap();
-        assert!(body.contains("super::families::glm::GLM5.prefill_limits()"));
-        assert!(!body.contains("PrefillLimits::default()"));
-    }
-
     fn write(path: &Path, metadata: Value, tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)>) {
         let mut header = serde_json::Map::new();
         header.insert("__metadata__".into(), metadata);

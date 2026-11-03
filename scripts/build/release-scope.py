@@ -19,7 +19,7 @@ import tarfile
 PREFIX = 'CUTEAFD_RELEASE_'
 SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8')
 LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES',
-         'FP8_MOE_BF16_FAMILIES')
+         'FP8_MOE_BF16_FAMILIES', 'EXLR8_FAMILIES')
 # v2.0.0 shipped set: complete releases retain this previous-release floor.
 PREVIOUS_RELEASE_FLOOR = {
     'EXPERT_FAMILIES': {'dsv4p:exl3-k23', 'glm:exl3-k45', 'glmf:exl3-k34', 'qwen4:exl3-k45',
@@ -333,8 +333,10 @@ def check_inventory(root, role, wanted, symbols=None):
                 # exporter records it); the coordinator's sits beside the family programs.
                 exlr8_role = 'coordinator' if role == 'coordinator' else 'spark'
                 manifest = read_json(share / 'PROGRAMS.json')
-                recorded = manifest.get('families', {}).get('exlr8', {})
-                names = {p.get('name') for p in manifest.get('programs', []) if p.get('family') == 'exlr8'}
+                key = {'glm5': 'exlr8', 'glm5_flash': 'exlr8_glmf'}.get(entry['family'])
+                require(key is not None, f'unsupported EXLR8 checkpoint family {entry["family"]}')
+                recorded = manifest.get('families', {}).get(key, {})
+                names = {p.get('name') for p in manifest.get('programs', []) if p.get('family') == key}
                 require(recorded.get('role') == exlr8_role, f'PROGRAMS.json has no EXLR8 {exlr8_role} programs')
                 require(names and names == set(recorded.get('programs', [])),
                         f'PROGRAMS.json EXLR8 programs {sorted(names)} differ from the recorded set')

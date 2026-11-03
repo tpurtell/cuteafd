@@ -309,6 +309,7 @@ cmake \
   -DCUTEAFD_ENABLE_STEP5_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_STEP5_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_KIMIK3_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="$exlr8_aot" \
+  -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_WIP_EXLR8_FAMILIES:-}" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \

@@ -87,6 +87,7 @@ option(CUTEAFD_ENABLE_QWEN4_AOT "Build the Qwen 3.8 Flash Next coordinator progr
 option(CUTEAFD_ENABLE_QWEN_DENSE_AOT "Build dense Qwen 3.5/3.8 BF16 coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_STEP5_AOT "Build Step-5 coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_KIMIK3_AOT "Build Kimi K3 coordinator programs (same table as DeepSeek V4)" OFF)
+set(CUTEAFD_EXLR8_FAMILIES "" CACHE STRING "Explicit EXLR8 checkpoint families: glm;glmf")
 option(CUTEAFD_ENABLE_EXLR8_AOT "Build the EXLR8 programs into the program table (SM120: shared-expert K1 and rotated glue beside the family programs; SM121: routed K1 serving alone)" OFF)
 set(CUTEAFD_DSV4_GEOMETRY "flash,pro,flash2,pro2" CACHE STRING
   "DeepSeek V4 program geometries, comma-separated: flash, pro; flash2 / pro2 their two-GPU head splits")

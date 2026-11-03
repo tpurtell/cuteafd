@@ -132,7 +132,8 @@ mod tests {
         std::fs::create_dir_all(root.join("dense")).unwrap();
         std::fs::create_dir_all(root.join("experts")).unwrap();
         std::fs::create_dir_all(root.join("manifests")).unwrap();
-        std::fs::write(root.join("config.json"), b"{}").unwrap();
+        std::fs::write(root.join("config.json"),
+            serde_json::to_vec(&crate::plan::testing::glm5_config()).unwrap()).unwrap();
         let mut names = [
             "dense/exlr8-dense-000.safetensors",
             "experts/exlr8-layer-003.index.safetensors",
@@ -205,6 +206,10 @@ mod tests {
         native(root.path(), false);
         let mut config = crate::plan::testing::glm5_config();
         config["num_nextn_predict_layers"] = json!(1);
+        config["num_hidden_layers"] = json!(78);
+        config["first_k_dense_replace"] = json!(3);
+        config["indexer_types"] = json!(vec!["full"; 78]);
+        config["mlp_layer_types"] = json!((0..78).map(|layer| if layer < 3 { "dense" } else { "sparse" }).collect::<Vec<_>>());
         config
             .as_object_mut()
             .unwrap()
@@ -214,23 +219,10 @@ mod tests {
             serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
-        std::fs::remove_file(
-            root.path()
-                .join("experts/exlr8-layer-003.index.safetensors"),
-        )
-        .unwrap();
-        header(
-            &root
-                .path()
-                .join("experts/exlr8-layer-001.index.safetensors"),
-            "1",
-        );
-        header(
-            &root
-                .path()
-                .join("experts/exlr8-layer-002.index.safetensors"),
-            "2",
-        );
+        for layer in 3..=78 {
+            header(&root.path().join(format!("experts/exlr8-layer-{layer:03}.index.safetensors")),
+                &layer.to_string());
+        }
         let mut catalog = crate::read_expert_catalog(root.path()).unwrap();
         assert_eq!(catalog.format(), CheckpointFormat::Exlr8);
         assert_eq!(catalog.routed_experts().draft_stages, 1);
@@ -249,7 +241,7 @@ mod tests {
         assert_eq!(catalog.routed_experts().draft_experts, 0);
         std::fs::remove_file(
             root.path()
-                .join("experts/exlr8-layer-002.index.safetensors"),
+                .join("experts/exlr8-layer-078.index.safetensors"),
         )
         .unwrap();
         assert!(crate::read_expert_catalog(root.path()).is_err());

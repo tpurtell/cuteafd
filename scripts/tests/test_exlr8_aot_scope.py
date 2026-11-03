@@ -27,6 +27,7 @@ def test_manifest_derives_exlr8_beside_glm_without_routed_packages():
     family, scopes = aot.config_scopes(dict(EXLR8))
     assert family == 'glm5'
     # GLM attention/dense programs and context split stay; EXLR8 joins both roles.
+    assert scopes['CUTEAFD_WIP_EXLR8_FAMILIES'] == 'glm'
     assert scopes['CUTEAFD_WIP_GLM_AOT'] == 'ON'
     assert scopes['CUTEAFD_WIP_EXLR8_AOT'] == 'ON'
     assert scopes['CUTEAFD_WIP_CONTEXT_SPLIT_AOT'] == 'ON'
@@ -48,6 +49,7 @@ def test_flash_manifest_derives_native_and_family_programs_without_routed_packag
     family, scopes = aot.config_scopes(dict(EXLR8, FAMILY='glm5_flash',
         MODEL_ID='kindlingai/glm-5.3-flash-exlr8-k2-k3-k4', EXLR8_MANIFEST='k4', SPARK_COUNT='1'))
     assert family == 'glm5_flash'
+    assert scopes['CUTEAFD_WIP_EXLR8_FAMILIES'] == 'glmf'
     assert scopes['CUTEAFD_WIP_GLMF_AOT'] == 'ON'
     assert scopes['CUTEAFD_WIP_EXLR8_AOT'] == 'ON'
     for key in ('CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES', 'CUTEAFD_WIP_EXPERT_FAMILIES',
@@ -80,7 +82,10 @@ def test_wip_dry_run_derives_and_explicit_override_wins(tmp_path):
     assert 'CUTEAFD_WIP_EXLR8_AOT=OFF' in off and 'EXLR8 AOT: OFF' in off
     # An explicit ON builds EXLR8 for a config without a manifest.
     plain = config_file(tmp_path, 'glm5', 'GLM-5.3-FP8', 4)
-    assert 'EXLR8 AOT: ON' in dry_run(tmp_path, plain, {'CUTEAFD_WIP_EXLR8_AOT': 'ON'})
+    with pytest.raises(AssertionError, match='EXLR8 enabled without explicit family scope'):
+        dry_run(tmp_path, plain, {'CUTEAFD_WIP_EXLR8_AOT': 'ON'})
+    assert 'EXLR8 AOT: ON' in dry_run(tmp_path, plain, {
+        'CUTEAFD_WIP_EXLR8_AOT': 'ON', 'CUTEAFD_WIP_EXLR8_FAMILIES': 'glm'})
     assert 'EXLR8 AOT: OFF' in dry_run(tmp_path, plain)
     with pytest.raises(AssertionError, match='CUTEAFD_WIP_EXLR8_AOT must be ON or OFF'):
         dry_run(tmp_path, plain, {'CUTEAFD_WIP_EXLR8_AOT': 'yes'})
@@ -91,9 +96,9 @@ def test_wip_passes_the_switch_to_both_legs_and_seals_only_when_on():
     coordinator = wip.split('build_coordinator() {', 1)[1].split('build_expert() (', 1)[0]
     expert = wip.split('build_expert() (', 1)[1].split('\n)\n', 1)[0]
     assert coordinator.count('${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"}') == 2  # build + finalize
-    assert "${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}'}" in expert  # quoted remote build command
+    assert "${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'}" in expert  # quoted remote build command
     assert '${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} "$spark_container"' in expert  # finalize
-    assert "wip_exlr8_env=()\n" in wip and 'wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON)' in wip
+    assert "wip_exlr8_env=()\n" in wip and 'wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON -e' in wip
     # The remote-export env file carries every CUTEAFD_* -e of the coordinator build.
     assert "grep -E '^CUTEAFD_[A-Z0-9_]+='" in wip
     finalize = (ROOT / 'scripts/build/finalize-wip-slot.sh').read_text()
@@ -117,8 +122,11 @@ def test_build_key_changes_only_when_exlr8_is_on():
     unset = build_key_lines(base)
     assert 'EXLR8' not in unset
     assert build_key_lines({**base, 'CUTEAFD_WIP_EXLR8_AOT': 'OFF'}) == unset
-    on = build_key_lines({**base, 'CUTEAFD_WIP_EXLR8_AOT': 'ON'})
-    assert on != unset and on.endswith('CUTEAFD_WIP_EXLR8_AOT=ON\n')
+    on = build_key_lines({**base, 'CUTEAFD_WIP_EXLR8_AOT': 'ON', 'CUTEAFD_WIP_EXLR8_FAMILIES': 'glm'})
+    assert on != unset and 'CUTEAFD_WIP_EXLR8_AOT=ON\n' in on
+    assert on.endswith('CUTEAFD_WIP_EXLR8_FAMILIES=glm\n')
+    assert build_key_lines({**base, 'CUTEAFD_WIP_EXLR8_AOT': 'ON',
+                            'CUTEAFD_WIP_EXLR8_FAMILIES': 'glmf'}) != on
 
 
 def test_native_key_includes_the_switch_through_the_environment():
@@ -168,7 +176,7 @@ def test_cmake_appends_exlr8_last_with_role_by_architecture():
     assert 'set(CUTEAFD_EXLR8_ROLE coordinator)' in cmake and 'set(CUTEAFD_EXLR8_ROLE spark)' in cmake
     # SM121 builds only EXLR8 (never a family table) and only when asked.
     assert 'MATCHES "^121" AND CUTEAFD_ENABLE_EXLR8_AOT AND NOT CUTEAFD_FAMILY_PROGRAMS' in cmake
-    assert 'list(APPEND CUTEAFD_DSV4_EXPORT_ARGS --exlr8-role "${CUTEAFD_EXLR8_ROLE}")' in cmake
+    assert '--exlr8-family "${exlr8_families}")' in cmake
     top = (ROOT / 'native/CMakeLists.txt').read_text()
     assert top.count('CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT)') == 2  # include + link
     assert 'CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)' in top  # SparkInfer AOT runtime
@@ -196,6 +204,7 @@ def test_release_derives_exlr8_and_passes_it_to_both_legs(tmp_path, monkeypatch)
     real = SCOPE.scopes_module(ROOT)
     monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
     env, _ = SCOPE.derive(tmp_path, matrix, 'glm-exlr8', {})
+    assert env['CUTEAFD_RELEASE_EXLR8_FAMILIES'] == 'glm'
     assert env['CUTEAFD_RELEASE_EXLR8_AOT'] == 'ON' and env['CUTEAFD_RELEASE_GLM_AOT'] == 'ON'
     assert env['CUTEAFD_RELEASE_EXPERT_FAMILIES'] == ''
     with pytest.raises(ValueError, match='must be ON or OFF'):
@@ -285,3 +294,54 @@ def test_kimi_native_key_preserves_off_and_keys_on():
     unset = keyed({})
     assert keyed({'CUTEAFD_WIP_KIMIK3_AOT': 'OFF'}) == unset
     assert keyed({'CUTEAFD_WIP_KIMIK3_AOT': 'ON'}) != unset
+
+
+@pytest.mark.parametrize('families', ['', 'mimo', 'glm;glmf'])
+def test_cmake_requires_explicit_supported_exlr8_family(tmp_path, families):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'CMakeLists.txt').write_text(
+        'cmake_minimum_required(VERSION 3.20)\nproject(scope NONE)\n'
+        'set(CUTEAFD_ENABLE_EXLR8_AOT ON)\n'
+        'set(CUTEAFD_CUDA_ARCHITECTURES 121)\n'
+        f'set(CUTEAFD_EXLR8_FAMILIES "{families}")\n'
+        'set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)\n'
+        'add_custom_target(cuteafd_verify_sparkinfer_source)\n'
+        f'include("{ROOT}/native/cmake/shared/dsv4_programs.cmake")\n'
+        'file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/args.txt" "${CUTEAFD_DSV4_EXPORT_ARGS}")\n')
+    result = subprocess.run(['cmake', '-S', str(source), '-B', str(tmp_path / 'build')],
+                            capture_output=True, text=True, timeout=30)
+    if families == 'glm;glmf':
+        assert result.returncode == 0, result.stderr
+        assert '--exlr8-family;glm,glmf' in (tmp_path / 'build/args.txt').read_text()
+    else:
+        assert result.returncode != 0
+        assert ('EXLR8 enabled without explicit family scope' if not families else
+                'unsupported EXLR8 family scope') in result.stderr
+
+
+def test_release_union_keeps_both_explicit_checkpoint_families(tmp_path, monkeypatch):
+    entries = []
+    for family, tag in [('glm5', 'glm'), ('glm5_flash', 'glmf')]:
+        config = tag + '.config'
+        (tmp_path / config).write_text(f'FAMILY={family}\nEXLR8_MANIFEST=other\nSPARK_COUNT=1\nRTX_GPUS=1\n')
+        entries.append(dict(name=tag, family=family, config=config, sparks=['a'], gpus=[0], set={}))
+    matrix = tmp_path / 'matrix.json'
+    matrix.write_text(json.dumps(dict(entries=entries)))
+    real = SCOPE.scopes_module(ROOT)
+    monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
+    env, _ = SCOPE.derive(tmp_path, matrix, 'all', {})
+    assert env['CUTEAFD_RELEASE_EXLR8_FAMILIES'] == 'glm;glmf'
+    # Manifest spelling does not make an unsupported family support EXLR8:
+    # inventory must contain programs for that selected checkpoint family.
+    wanted = [dict(name='other', family='mimo_v2', programs=[], spark_count=1, exlr8=True)]
+    write_programs(tmp_path, [], 'spark', ['exlr8_a16_serving'])
+    with pytest.raises(ValueError, match='unsupported EXLR8 checkpoint family mimo_v2'):
+        SCOPE.check_inventory(tmp_path, 'expert', wanted, symbols=set())
+
+
+def test_release_flash_inventory_cannot_use_glm_experts(tmp_path):
+    wanted = [dict(name='flash', family='glm5_flash', programs=[], spark_count=1, exlr8=True)]
+    write_programs(tmp_path, [], 'spark', ['exlr8_a16_serving'])
+    with pytest.raises(ValueError, match='no EXLR8 spark programs'):
+        SCOPE.check_inventory(tmp_path, 'expert', wanted, symbols=set())

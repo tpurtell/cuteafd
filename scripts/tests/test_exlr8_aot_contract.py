@@ -39,7 +39,7 @@ def test_exlr8_has_separate_comparison_group():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     jobs = [j for j in module.jobs("all") if j[0] == "exlr8"]
-    assert jobs == [("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"])]
+    assert jobs == [("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8", "--exlr8-family", "glm"])]
     assert ("exlr8-glmf", "export_b12x_dsv4_aot.py",
             ["--geometry", "exlr8", "--exlr8-family", "glmf"]) in module.jobs("all")
 

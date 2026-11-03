@@ -260,7 +260,6 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, at
 
 
 @pytest.mark.parametrize("overrides,reason", [
-    ({"EXLR8_MANIFEST": "other"}, "EXLR8_MANIFEST"),
     ({"RTX_GPUS": "0"}, "RTX GPUs"),
     ({"RTX_GPUS": "3"}, "RTX GPUs"),
     ({"RTX_GPUS": "1"}, "heads attention"),

@@ -146,6 +146,15 @@ impl V41CoordinatorTensorReader {
 }
 
 impl OfficialV41Catalog {
+    /// Transport tests use miniature payloads, never a serving admission contract.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn exlr8_transport_fixture(snapshot: &Path, experts: RoutedExpertShape) -> Self {
+        Self { reader: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
+            config: None, experts, snapshot: snapshot.into(), tensors: Vec::new(),
+            exl3: None, nvfp4: None, fp8: None }
+    }
+
     pub(crate) fn shard_file(&self, shard: &str) -> std::io::Result<crate::expert_reader::ShardFile> {
         if let Some(fp8) = &self.fp8 { return fp8.shard_file(shard); }
         self.reader.open(&self.snapshot.join(shard))

@@ -149,7 +149,10 @@ bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
 # legs only when on, so an OFF build's environment and native key are unchanged.
 case "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_EXLR8_AOT must be ON or OFF, got: $CUTEAFD_WIP_EXLR8_AOT" ;; esac
 wip_exlr8_env=()
-[[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == OFF ]] || wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON)
+if [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then
+  [[ -n "${CUTEAFD_WIP_EXLR8_FAMILIES:-}" ]] || release_die "EXLR8 enabled without explicit family scope"
+  wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON -e "CUTEAFD_WIP_EXLR8_FAMILIES=$CUTEAFD_WIP_EXLR8_FAMILIES")
+fi
 echo "WIP AOT scopes ($wip_program_family): ${wip_scope_summary[*]}"
 case "${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}" in registry|build) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry or build" ;; esac
 release_validate_wip_instance
@@ -841,7 +844,7 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
         printf '%s=%s\n' "$local_name" "${!local_name:-<default>}"
       done
       # Keyed only when on, so every existing slot keeps its build key.
-      [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == OFF ]] || printf 'CUTEAFD_WIP_EXLR8_AOT=%s\n' "$CUTEAFD_WIP_EXLR8_AOT"
+      [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == OFF ]] || printf 'CUTEAFD_WIP_EXLR8_AOT=%s\nCUTEAFD_WIP_EXLR8_FAMILIES=%s\n' "$CUTEAFD_WIP_EXLR8_AOT" "$CUTEAFD_WIP_EXLR8_FAMILIES"
     } | sha256sum | awk '{print $1}'
   )"
   # Each role's key adds the dev image that builds it.
@@ -1420,7 +1423,7 @@ build_expert() (
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   local build_command
-  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}'} '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'} '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command rust" ||
     release_die "Spark WIP Rust phase on $seed_host failed (exit $?)"
   local seed_root

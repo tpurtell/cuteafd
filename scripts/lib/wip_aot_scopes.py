@@ -100,6 +100,9 @@ def family_scopes(cards, config_reader):
             if family == fam:
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
                 if exlr8:
+                    families = set(filter(None, env.get('CUTEAFD_WIP_EXLR8_FAMILIES', '').split(';')))
+                    families.add(tag)
+                    env['CUTEAFD_WIP_EXLR8_FAMILIES'] = ';'.join(sorted(families))
                     continue
                 if count and fam != 'step5':
                     counts.add(f"{tag}={int(values.get('SPARK_TP', count))}")
