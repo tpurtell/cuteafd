@@ -1,0 +1,223 @@
+{
+  "projected_kda": [
+    {
+      "name": "q",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "k",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "v",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "decay",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "gate",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "beta",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "conv_w",
+      "dtype": "float32",
+      "align": 4
+    },
+    {
+      "name": "a_log",
+      "dtype": "float32",
+      "align": 4
+    },
+    {
+      "name": "dt_bias",
+      "dtype": "float32",
+      "align": 4
+    },
+    {
+      "name": "o_norm",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "conv_state",
+      "dtype": "bfloat16",
+      "align": 2
+    },
+    {
+      "name": "state",
+      "dtype": "float32",
+      "align": 16
+    },
+    {
+      "name": "slots",
+      "dtype": "int32",
+      "align": 4
+    },
+    {
+      "name": "seq_first",
+      "dtype": "int32",
+      "align": 4
+    },
+    {
+      "name": "out",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "replay",
+      "dtype": "float32",
+      "align": 16
+    },
+    {
+      "name": "scratch",
+      "dtype": "uint8",
+      "align": 16
+    }
+  ],
+  "projected_index_compact": [
+    {
+      "name": "iq",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "kw",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "pool_slots",
+      "dtype": "int64",
+      "align": 8
+    },
+    {
+      "name": "positions",
+      "dtype": "int64",
+      "align": 8
+    },
+    {
+      "name": "kda_slots",
+      "dtype": "int32",
+      "align": 4
+    },
+    {
+      "name": "seq_first",
+      "dtype": "int32",
+      "align": 4
+    },
+    {
+      "name": "k_norm_w",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "k_norm_b",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "ape",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "tails",
+      "dtype": "uint8",
+      "align": 16
+    },
+    {
+      "name": "replay",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "index_cache",
+      "dtype": "uint8",
+      "align": 16
+    },
+    {
+      "name": "q_fp8",
+      "dtype": "float8_e4m3fn",
+      "align": 16
+    },
+    {
+      "name": "head_weights",
+      "dtype": "float32",
+      "align": 16
+    },
+    {
+      "name": "scratch",
+      "dtype": "uint8",
+      "align": 16
+    }
+  ],
+  "projected_index_keys": [
+    {
+      "name": "iq",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "kw",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "slots",
+      "dtype": "int64",
+      "align": 8
+    },
+    {
+      "name": "pool_slots",
+      "dtype": "int64",
+      "align": 8
+    },
+    {
+      "name": "k_norm_w",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "k_norm_b",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "ape",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "token_keys",
+      "dtype": "bfloat16",
+      "align": 16
+    },
+    {
+      "name": "index_cache",
+      "dtype": "uint8",
+      "align": 16
+    },
+    {
+      "name": "q_fp8",
+      "dtype": "float8_e4m3fn",
+      "align": 16
+    },
+    {
+      "name": "head_weights",
+      "dtype": "float32",
+      "align": 16
+    }
+  ]
+}

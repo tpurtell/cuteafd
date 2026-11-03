@@ -928,3 +928,89 @@ def test_packed_program_catalogue_and_explicit_inventory_stay_in_sync(family, me
         assert 'add("head".into(), PackedRows)' in inventory
         units = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine/units.rs").read_text()
         assert 'e.run("head"' in units
+
+
+def test_projected_operand_data_contract_matches_exporter_declarations():
+    """Read declarations as data; never import a GPU exporter or parse Rust source."""
+    base = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd"
+    trees = {name: ast.parse((base / name).read_text()) for name in
+             ("_common.py", "_kda_contract.py", "glmf.py", "kimi_split.py", "glmf_split.py")}
+    contracts = json.loads((ROOT / "rust/crates/cuteafd-ffi/tests/fixtures/"
+                           "projected_operand_contracts.json").read_text())
+
+    def declaration(tree, kind, name):
+        return next(n for n in tree.body if isinstance(n, kind) and n.name == name)
+
+    def assignment(body, name):
+        return next(n.value for n in body if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == name for t in n.targets))
+
+    def same(node, expression):
+        assert ast.dump(node) == ast.dump(ast.parse(expression, mode="eval").body)
+
+    operand = declaration(trees["_common.py"], ast.ClassDef, "Operand")
+    align_default = next(n.value.value for n in operand.body if isinstance(n, ast.AnnAssign)
+                         and n.target.id == "align")
+    geometry = declaration(trees["_common.py"], ast.ClassDef, "GLMFGeometry")
+    assert not any(isinstance(n, ast.AnnAssign) and n.target.id == "o_norm_dtype"
+                   for n in geometry.body)
+    kda = declaration(trees["kimi_split.py"], ast.FunctionDef, "compile_projected_kda_core_aot")
+    defaults = dict(zip((a.arg for a in kda.args.kwonlyargs), kda.args.kw_defaults))
+    state_default = defaults["state_dtype"].value
+    same(assignment(kda.body, "state_torch"), "_kda_state(state_dtype, state_rounding)[1]")
+    state_types = assignment(trees["glmf.py"].body, "_STATE_TYPES")
+    state_type = next(v.elts[1] for k, v in zip(state_types.keys, state_types.values)
+                      if k.value == state_default)
+    state_helper = declaration(trees["glmf.py"], ast.FunctionDef, "_kda_state")
+    state_return = next(n.value for n in state_helper.body if isinstance(n, ast.Return))
+    same(state_return.elts[0].value, "_STATE_TYPES[state_dtype]")
+    assert isinstance(state_return.elts[0], ast.Starred)
+    layout = declaration(trees["_kda_contract.py"], ast.FunctionDef, "kda_layout")
+    layout_dict = next(n.value for n in layout.body if isinstance(n, ast.Return))
+    norm = next(v for k, v in zip(layout_dict.keys, layout_dict.values) if k.value == "o_norm_dtype")
+    assert isinstance(norm, ast.Call) and isinstance(norm.func, ast.Name) and norm.func.id == "getattr"
+    same(norm.args[0], "g")
+    assert [arg.value for arg in norm.args[1:]] == ["o_norm_dtype", "bfloat16"]
+    norm_default = norm.args[2].value
+
+    def dtype(node):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "torch":
+            return node.attr
+        if isinstance(node, ast.Name) and node.id == "state_torch":
+            return dtype(state_type)
+        same(node, 'getattr(torch, kda_layout(g)["o_norm_dtype"])')
+        return norm_default
+
+    def pointer(call, bindings):
+        assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "Operand"
+        name = call.args[0]
+        name = bindings[name.id] if isinstance(name, ast.Name) else name.value
+        explicit = [k.value.value for k in call.keywords if k.arg == "align"]
+        assert len(explicit) <= 1
+        return {"name": name, "dtype": dtype(call.args[1]),
+                "align": explicit[0] if explicit else align_default}
+
+    def declared(fn):
+        operands = assignment(fn.body, "operands")
+        assert isinstance(operands, ast.Tuple)
+        result = []
+        for node in operands.elts:
+            if isinstance(node, ast.Starred):
+                generator = node.value
+                assert isinstance(generator, ast.GeneratorExp) and len(generator.generators) == 1
+                clause = generator.generators[0]
+                assert not clause.ifs and not clause.is_async and isinstance(clause.target, ast.Name)
+                assert isinstance(clause.iter, ast.Tuple)
+                for value in clause.iter.elts:
+                    assert isinstance(value, ast.Constant) and isinstance(value.value, str)
+                    result.append(pointer(generator.elt, {clause.target.id: value.value}))
+            else:
+                result.append(pointer(node, {}))
+        assert len({p["name"] for p in result}) == len(result)
+        return result
+
+    actual = {"projected_kda": declared(kda)}
+    for key, name in (("projected_index_compact", "compile_glmf_projected_index_c_aot"),
+                      ("projected_index_keys", "compile_glmf_projected_index_keys_aot")):
+        actual[key] = declared(declaration(trees["glmf_split.py"], ast.FunctionDef, name))
+    assert actual == contracts

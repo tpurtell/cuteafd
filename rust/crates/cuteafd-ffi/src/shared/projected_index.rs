@@ -1,6 +1,7 @@
 //! Flash index post-stages over native projected rows. Checkpoint weight
 //! formats belong to the caller; normalization, pooling and replay stay unchanged.
 use super::programs::{Program, ProgramSpec, Programs, Scalar};
+use super::projected_buffers::validate_buffers;
 use crate::CuteafdDeviceBuffer as Buffer;
 use std::ffi::c_void;
 
@@ -29,6 +30,7 @@ const POINTERS: &[&str] = &[
     "head_weights",
     "scratch",
 ];
+const ALIGNMENTS: [usize; 15] = [16, 16, 8, 8, 4, 4, 16, 16, 16, 16, 16, 16, 16, 16, 16];
 pub const HEADS: usize = 32;
 pub const KEY_ROW_BYTES: usize = 512;
 pub const TAIL_BYTES: usize = 1552;
@@ -256,42 +258,10 @@ impl Layout {
             (b.head_weights, b.rows * HEADS * 4),
             (b.scratch, self.scratch),
         ];
-        let alignments = [16, 16, 8, 8, 4, 4, 16, 16, 16, 16, 16, 16, 16, 16, 16];
-        validate_buffers(&items, &alignments, &[9, 10, 11, 12, 13, 14])?;
+        validate_buffers(&items, &ALIGNMENTS, &[9, 10, 11, 12, 13, 14])
+            .map_err(IndexError::Invalid)?;
         Ok(items)
     }
-}
-
-fn validate_buffers<const N: usize>(
-    items: &[(Buffer, usize); N],
-    alignments: &[usize; N],
-    writable: &[usize],
-) -> Result<()> {
-    let device = items[0].0.device_id;
-    if device < 0
-        || items.iter().zip(alignments).any(|((b, n), alignment)| {
-            b.ptr.is_null()
-                || b.bytes < *n
-                || b.flags != 0
-                || b.device_id != device
-                || b.ptr as usize % alignment != 0
-                || *n > isize::MAX as usize
-                || (b.ptr as usize).checked_add(*n).is_none()
-        })
-    {
-        return Err(IndexError::Invalid("buffer extent/alignment/device"));
-    }
-    for &i in writable {
-        let (a, na) = items[i];
-        if items.iter().enumerate().any(|(j, (b, nb))| {
-            i != j
-                && (a.ptr as usize) < b.ptr as usize + nb
-                && (b.ptr as usize) < a.ptr as usize + na
-        }) {
-            return Err(IndexError::Invalid("overlapping writable operands"));
-        }
-    }
-    Ok(())
 }
 
 const KEY_POINTERS: &[&str] = &[
@@ -307,6 +277,7 @@ const KEY_POINTERS: &[&str] = &[
     "q_fp8",
     "head_weights",
 ];
+const KEY_ALIGNMENTS: [usize; 11] = [16, 16, 8, 8, 16, 16, 16, 16, 16, 16, 16];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeysLayout {
@@ -394,11 +365,7 @@ impl KeysLayout {
             (b.query_fp8, b.rows * HEADS * 128),
             (b.head_weights, b.rows * HEADS * 4),
         ];
-        validate_buffers(
-            &items,
-            &[16, 16, 8, 8, 16, 16, 16, 16, 16, 16, 16],
-            &[7, 8, 9, 10],
-        )?;
+        validate_buffers(&items, &KEY_ALIGNMENTS, &[7, 8, 9, 10]).map_err(IndexError::Invalid)?;
         Ok(items)
     }
 }
@@ -482,6 +449,23 @@ impl<'a> ProjectedKeys<'a> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn operand_data_contract_matches_runtime_tables() {
+        let (spec, entry) = fixture("glmf_stage", 128);
+        let layout = validate_entry(&spec, &entry).unwrap();
+        super::super::projected_buffers::assert_operand_contract(
+            "projected_index_compact",
+            POINTERS,
+            layout.pointer_contract(),
+            &ALIGNMENTS,
+        );
+        super::super::projected_buffers::assert_operand_contract(
+            "projected_index_keys",
+            KEY_POINTERS,
+            KeysLayout { capacity: 128 }.pointer_contract(),
+            &KEY_ALIGNMENTS,
+        );
+    }
     fn fixture(prefix: &str, capacity: usize) -> (ProgramSpec, serde_json::Value) {
         let l = Layout {
             capacity,
@@ -587,6 +571,10 @@ mod tests {
         };
         let layout = KeysLayout { capacity: 128 };
         assert!(layout.operands(weights, batch).is_ok());
+        let mut subrow = batch;
+        subrow.slots.ptr = subrow.slots.ptr.wrapping_byte_add(8);
+        subrow.pool_slots.ptr = subrow.pool_slots.ptr.wrapping_byte_add(8);
+        assert!(layout.operands(weights, subrow).is_ok());
         let mut bad = batch;
         bad.token_keys.bytes = 1;
         assert!(layout.operands(weights, bad).is_err());
@@ -791,6 +779,9 @@ mod tests {
         assert!(l.operands(w, bad).is_err());
         let mut aligned = b;
         aligned.kda_slots.ptr = (b.kda_slots.ptr as usize + 4) as *mut c_void;
+        aligned.first.ptr = aligned.first.ptr.wrapping_byte_add(4);
+        aligned.positions.ptr = aligned.positions.ptr.wrapping_byte_add(8);
+        aligned.pool_slots.ptr = aligned.pool_slots.ptr.wrapping_byte_add(8);
         assert!(l.operands(w, aligned).is_ok());
         let (s, e) = fixture("glmf_stage", 4096);
         let l = validate_entry(&s, &e).unwrap();

@@ -1,6 +1,7 @@
 //! Fully projected KDA recurrence. Projection formats belong to the caller;
 //! this seam owns the unchanged convolution, state, normalization and replay ABI.
 use super::programs::{Program, ProgramSpec, Programs, Scalar};
+use super::projected_buffers::validate_buffers;
 use crate::CuteafdDeviceBuffer as Buffer;
 use std::ffi::c_void;
 
@@ -31,6 +32,7 @@ const POINTERS: &[&str] = &[
     "replay",
     "scratch",
 ];
+const ALIGNMENTS: [usize; 17] = [16, 16, 16, 16, 16, 16, 4, 4, 4, 16, 2, 16, 4, 4, 16, 16, 16];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
@@ -282,29 +284,7 @@ impl Layout {
             (b.replay, self.replay_bytes()),
             (b.scratch, self.scratch),
         ];
-        let device = items[0].0.device_id;
-        if device < 0
-            || items.iter().any(|(b, n)| {
-                b.ptr.is_null()
-                    || b.bytes < *n
-                    || b.flags != 0
-                    || b.device_id != device
-                    || b.ptr as usize % 16 != 0
-                    || (b.ptr as usize).checked_add(*n).is_none()
-            })
-        {
-            return Err(KdaError::Invalid("buffer extent/alignment/device"));
-        }
-        for i in [10, 11, 14, 15, 16] {
-            let (a, na) = items[i];
-            if items.iter().enumerate().any(|(j, (b, nb))| {
-                i != j
-                    && (a.ptr as usize) < b.ptr as usize + nb
-                    && (b.ptr as usize) < a.ptr as usize + na
-            }) {
-                return Err(KdaError::Invalid("overlapping writable operands"));
-            }
-        }
+        validate_buffers(&items, &ALIGNMENTS, &[10, 11, 14, 15, 16]).map_err(KdaError::Invalid)?;
         Ok(items)
     }
 }
@@ -313,6 +293,54 @@ impl Layout {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn operand_data_contract_matches_runtime_tables() {
+        let (spec, entry) = fixture(64, 128);
+        let layout = validate_entry(&spec, &entry).unwrap();
+        super::super::projected_buffers::assert_operand_contract(
+            "projected_kda",
+            POINTERS,
+            layout.pointer_contract(),
+            &ALIGNMENTS,
+        );
+    }
+
+    #[test]
+    fn packed_subrows_use_exported_operand_alignments() {
+        for heads in [32, 64] {
+            let (s, e) = fixture(heads, 128);
+            let l = validate_entry(&s, &e).unwrap();
+            let (mut w, mut b) = buffers(l);
+            b.slots.ptr = b.slots.ptr.wrapping_byte_add(4);
+            b.first.ptr = b.first.ptr.wrapping_byte_add(4);
+            w.convolution.ptr = w.convolution.ptr.wrapping_byte_add(4);
+            w.a_log.ptr = w.a_log.ptr.wrapping_byte_add(4);
+            w.dt_bias.ptr = w.dt_bias.ptr.wrapping_byte_add(4);
+            b.conv_state.ptr = b.conv_state.ptr.wrapping_byte_add(2);
+            assert!(l.operands(w, b).is_ok());
+            for index in 0..ALIGNMENTS.len() {
+                let mut items = l.operands(w, b).unwrap();
+                items[index].0.ptr = items[index].0.ptr.wrapping_byte_add(ALIGNMENTS[index] / 2);
+                assert!(
+                    validate_buffers(&items, &ALIGNMENTS, &[10, 11, 14, 15, 16]).is_err(),
+                    "{} must retain alignment {}",
+                    POINTERS[index],
+                    ALIGNMENTS[index]
+                );
+            }
+            let mut bad = b;
+            bad.scratch.ptr = (usize::MAX - 15) as *mut c_void;
+            assert!(l.operands(w, bad).is_err());
+            let mut bad = b;
+            bad.q.ptr = std::ptr::null_mut();
+            assert!(l.operands(w, bad).is_err());
+            let mut bad = b;
+            bad.q.flags = 1;
+            assert!(l.operands(w, bad).is_err());
+        }
+    }
+
     fn fixture(heads: usize, capacity: usize) -> (ProgramSpec, serde_json::Value) {
         let decode = capacity <= 128;
         let align = |v: usize| v.div_ceil(1024) * 1024;
