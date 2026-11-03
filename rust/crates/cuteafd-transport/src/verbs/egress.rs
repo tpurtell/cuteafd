@@ -97,6 +97,9 @@ impl StagingArena {
     pub fn host(&self) -> CuteafdHostBuffer {
         self.buffer.target(self.slot).expect("validated egress slot")
     }
+    /// Whole retained physical owner, not the slot returned by `host`.
+    pub fn backing_buffer(&self) -> CuteafdHostBuffer { self.buffer.host }
+    pub fn shares_backing(&self, other: &Self) -> bool { Arc::ptr_eq(&self.buffer, &other.buffer) }
     pub fn bytes(&self) -> usize { self.buffer.slot_bytes }
     /// No request payload views the arena.
     pub fn writable(&self) -> bool { self.buffer.writable(self.slot) }

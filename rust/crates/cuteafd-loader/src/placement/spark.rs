@@ -61,6 +61,76 @@ impl SparkIntakeOwners {
     }
 }
 
+/// Selected request-staging topology; registered slots alias one whole owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparkWaveStaging {
+    Registered { slot_bytes: u64 },
+    Standalone { slot_bytes: u64 },
+}
+
+/// Wave controls, optional mapped pull descriptors and request staging only.
+/// Intake planes, endpoint rings and native overhead are separate components.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkWaveOwners {
+    pub ranks: usize,
+    pub waves: usize,
+    pub pinned: u8,
+    pub staging: SparkWaveStaging,
+}
+
+impl SparkWaveOwners {
+    pub fn allocations(self, prefix: &str, lifetime: super::planner::Lifetime)
+        -> Result<Vec<super::planner::Allocation>, super::planner::Refusal> {
+        use super::planner::{Allocation, Location, Refusal, View};
+        use cuteafd_core::{memory_layout::Category, serving_capacity::*};
+        let all = if self.ranks == SPARK_INTAKE_MAX_RANKS { u8::MAX }
+            else if self.ranks < SPARK_INTAKE_MAX_RANKS { (1u8 << self.ranks) - 1 } else { 0 };
+        let (registered, slot_bytes) = match self.staging {
+            SparkWaveStaging::Registered { slot_bytes } => (true, slot_bytes),
+            SparkWaveStaging::Standalone { slot_bytes } => (false, slot_bytes),
+        };
+        if prefix.is_empty() || !(1..=SPARK_INTAKE_MAX_RANKS).contains(&self.ranks)
+            || !(1..=4).contains(&self.waves) || self.pinned & !all != 0 || slot_bytes == 0 {
+            return Err(Refusal::InvalidFact("invalid Spark wave owner geometry".into()));
+        }
+        let owner = |leaf: String, bytes, category| Allocation::buffer(
+            format!("{prefix}.{leaf}"), Location::PINNED, bytes, lifetime, category, "Spark wave storage");
+        let mut allocations = vec![owner("control".into(),
+            ((1 + 2 * self.waves + SPARK_INTAKE_MAX_RANKS) * SPARK_WAVE_CONTROL_LINE_BYTES) as u64,
+            Category::Transport)];
+        if self.pinned != 0 {
+            allocations.push(owner("pulls".into(),
+                (self.waves * SPARK_INTAKE_MAX_RANKS * SPARK_WAVE_PULL_STRIDE_BYTES) as u64, Category::Transport));
+        }
+        let backing_bytes = if registered {
+            slot_bytes.checked_mul(self.waves as u64)
+                .ok_or(Refusal::Overflow("Spark registered request staging"))?
+        } else { slot_bytes };
+        for slot in 0..if registered { 1 } else { self.waves } {
+            allocations.push(owner(format!("staging.storage.{slot}"), backing_bytes, Category::Staging));
+        }
+        for slot in 0..self.waves {
+            let mut allocation = owner(format!("staging.slot.{slot}"), slot_bytes, Category::Staging);
+            allocation.view = Some(View { backing: format!("{prefix}.staging.storage.{}", if registered { 0 } else { slot }),
+                offset: if registered { slot_bytes * slot as u64 } else { 0 } });
+            allocations.push(allocation);
+        }
+        Ok(allocations)
+    }
+
+    pub fn components(self, prefix: &str, lifetime: super::planner::Lifetime, maximum_pages: u64)
+        -> Result<Vec<super::planner::Component>, super::planner::Refusal> {
+        use super::planner::{ByteCurve, Component, Refusal};
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("Spark waves require a positive pool domain".into()));
+        }
+        Ok(self.allocations(prefix, lifetime)?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }).collect())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkingSetComponent { Always, RtxExperts, SparkExperts }
 
@@ -486,6 +556,47 @@ mod tests {
         assert_eq!((owners[0].bytes, owners[1].bytes), (8192, 256));
         let host = SparkIntakeOwners {mode: SparkIntakeMode::Host, ..tiny};
         assert_eq!(host.allocations("tiny", Lifetime::TARGET).unwrap()[1].bytes, 1);
+    }
+
+    #[test]
+    fn wave_owners_charge_backings_once_and_preserve_slot_views() {
+        use super::super::planner::{Lifetime, Location};
+        for waves in 1..=4 {
+            for pinned in [0, 1, 0b10_1010] {
+                for registered in [false, true] {
+                    let slot_bytes = 12345;
+                    let staging = if registered { SparkWaveStaging::Registered { slot_bytes } }
+                        else { SparkWaveStaging::Standalone { slot_bytes } };
+                    let spec = SparkWaveOwners { ranks: 6, waves, pinned, staging };
+                    let owners = spec.allocations("wave", Lifetime::TARGET).unwrap();
+                    let physical = owners.iter().filter(|owner| owner.view.is_none()).collect::<Vec<_>>();
+                    assert_eq!(physical.len(), 1 + usize::from(pinned != 0) + if registered { 1 } else { waves });
+                    let expected = (9 + 2 * waves) as u64 * 64
+                        + if pinned == 0 { 0 } else { waves as u64 * 8 * 128 }
+                        + waves as u64 * slot_bytes;
+                    assert_eq!(physical.iter().map(|owner| owner.bytes).sum::<u64>(), expected);
+                    assert!(owners.iter().all(|owner| owner.location == Location::PINNED));
+                    for slot in 0..waves {
+                        let view = owners.iter().find(|owner| owner.id == format!("wave.staging.slot.{slot}")).unwrap();
+                        let alias = view.view.as_ref().unwrap();
+                        assert_eq!(alias.backing, format!("wave.staging.storage.{}", if registered { 0 } else { slot }));
+                        assert_eq!((alias.offset, view.bytes), (if registered { slot as u64 * slot_bytes } else { 0 }, slot_bytes));
+                    }
+                    assert_eq!(spec.components("wave", Lifetime::TARGET, 16).unwrap().len(), owners.len());
+                    assert!(spec.components("wave", Lifetime::TARGET, 0).is_err());
+                }
+            }
+        }
+        let base = SparkWaveOwners { ranks: 1, waves: 1, pinned: 0,
+            staging: SparkWaveStaging::Standalone { slot_bytes: 1 } };
+        for spec in [SparkWaveOwners {ranks: 0, ..base}, SparkWaveOwners {ranks: 9, ..base},
+            SparkWaveOwners {waves: 0, ..base}, SparkWaveOwners {waves: 5, ..base},
+            SparkWaveOwners {pinned: 2, ..base},
+            SparkWaveOwners {staging: SparkWaveStaging::Standalone {slot_bytes: 0}, ..base},
+            SparkWaveOwners {waves: 4, staging: SparkWaveStaging::Registered {slot_bytes: u64::MAX}, ..base}] {
+            assert!(spec.allocations("wave", Lifetime::TARGET).is_err());
+        }
+        assert!(base.allocations("", Lifetime::TARGET).is_err());
     }
 
     #[test]

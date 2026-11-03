@@ -173,7 +173,7 @@ pub(crate) fn healthy() -> Result<()> {
 }
 
 /// One cache line per counter (written by different agents).
-const LINE: usize = 64;
+const LINE: usize = cuteafd_core::serving_capacity::SPARK_WAVE_CONTROL_LINE_BYTES;
 /// A wave whose pinned ranks carry more than this lands rank by rank (a wait
 /// and a pull each, overlapping the later ranks' replies); a smaller (decode)
 /// wave pulls all its ranks in one launch behind `landed`.
@@ -595,7 +595,7 @@ impl Transport for SparkExperts {
 }
 
 /// Bytes of one rank's pull descriptor ([`PullFrames`]) in the mapped block.
-const PULL_STRIDE: usize = 128;
+const PULL_STRIDE: usize = cuteafd_core::serving_capacity::SPARK_WAVE_PULL_STRIDE_BYTES;
 const _: () = assert!(std::mem::size_of::<PullFrames>() <= PULL_STRIDE);
 
 /// The mapped pull descriptors: one [`PullFrames`] per (admitted slot, rank),
@@ -838,6 +838,134 @@ fn warm_reducer(library: &NativeLibrary, intake: &Intake) -> Result<()> {
     stream.finish()
 }
 
+struct WaveControls<'a> {
+    control: HostAllocation<'a>,
+    words: Words,
+    pinned: u8,
+    pull_block: Option<HostAllocation<'a>>,
+    pulls: Option<Pulls>,
+    arena_alias: Vec<usize>,
+}
+
+/// Allocation-only part of startup, also exercised by the CPU owner fixture.
+fn allocate_wave_controls<'a, T: Transport>(library: &'a NativeLibrary, intake: &Intake,
+    transport: &T, arenas: &[StagingArena]) -> Result<WaveControls<'a>> {
+    let slots = intake.geometry.slots();
+    let range_bytes = intake.geometry.reserve_rows() * intake.row_bytes;
+    ensure!(arenas.len() == slots, "one staging arena per admitted slot");
+    ensure!(intake.ranges.len() == intake.ranks && intake.ranges.iter().all(|range| range.bytes >= range_bytes),
+        "one reserve range of {range_bytes} bytes per rank");
+    let control = HostAllocation::new(library, Counter::words(slots) * LINE)?;
+    let words = Words { base: control.buffer.ptr as usize, slots };
+    let all = if intake.ranks == 8 { u8::MAX } else { (1u8 << intake.ranks) - 1 };
+    let pinned = all & !intake.landing;
+    check_reply_ring(&transport.retained_reply_slots(), pinned, slots)?;
+    // Pinned ranks reach the planes by SM pulls on the consuming stream
+    // straight from their receive slots; the kernels read the frames'
+    // host addresses, so mapped pinned memory must be device-visible at
+    // its host address (UVA).
+    let pull_block = (pinned != 0).then(|| HostAllocation::new(library, Pulls::bytes(slots))).transpose()?;
+    if let Some(block) = &pull_block {
+        let alias = library.cuda_host_buffer_device_alias(block.buffer)?;
+        ensure!(alias.ptr == block.buffer.ptr,
+            "mapped pinned memory is not device-visible at its host address (no unified addressing)");
+    }
+    let pulls = pull_block.as_ref().map(|block| Pulls { base: block.buffer.ptr as usize });
+    let arena_alias = arenas.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
+        .map(|alias| alias.ptr as usize)).collect::<Result<Vec<_>>>()?;
+    Ok(WaveControls { control, words, pinned, pull_block, pulls, arena_alias })
+}
+
+struct WaveStorage<'s> {
+    library: &'s NativeLibrary,
+    control: cuteafd_ffi::CuteafdHostBuffer,
+    words: Words,
+    pull_block: Option<cuteafd_ffi::CuteafdHostBuffer>,
+    pulls: Option<Pulls>,
+    pinned: u8,
+    arenas: &'s [StagingArena],
+    arena_alias: &'s [usize],
+    slots: usize,
+    ranks: usize,
+}
+
+impl WaveStorage<'_> {
+    fn allocation_receipts(&self, prefix: &str, lifetime: cuteafd_loader::placement::planner::Lifetime)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_ffi::{CuteafdHostBuffer, CUTEAFD_HOST_BUFFER_FLAG_PINNED};
+        use cuteafd_loader::placement::planner::{Allocation, Location, Receipt, View};
+        ensure!(!prefix.is_empty() && (1..=4).contains(&self.slots) && (1..=MAX_INTAKE_RANKS).contains(&self.ranks),
+            "invalid Spark wave storage inventory");
+        let all = if self.ranks == 8 { u8::MAX } else { (1u8 << self.ranks) - 1 };
+        ensure!(self.pinned & !all == 0 && self.arenas.len() == self.slots && self.arena_alias.len() == self.slots,
+            "Spark wave storage ranks or slots disagree");
+        let valid_host = |buffer: CuteafdHostBuffer| -> Result<()> {
+            ensure!(!buffer.ptr.is_null() && buffer.bytes > 0 && buffer.flags & CUTEAFD_HOST_BUFFER_FLAG_PINNED != 0,
+                "Spark wave owner is not live pinned storage");
+            ensure!((buffer.ptr as usize).checked_add(buffer.bytes).is_some(), "Spark wave owner address overflow");
+            Ok(())
+        };
+        let receipt = |leaf: String, buffer: CuteafdHostBuffer, category| Receipt {
+            allocation: Allocation::buffer(format!("{prefix}.{leaf}"), Location::PINNED,
+                buffer.bytes as u64, lifetime, category, "Spark wave storage"), address: buffer.ptr as u64,
+        };
+        valid_host(self.control)?;
+        ensure!(self.words.base == self.control.ptr as usize && self.words.slots == self.slots
+            && self.control.bytes == Counter::words(self.slots) * LINE,
+            "Spark wave counters do not match their retained control owner");
+        let mut receipts = vec![receipt("control".into(), self.control, Category::Transport)];
+        match (self.pinned != 0, self.pull_block, self.pulls) {
+            (true, Some(block), Some(pulls)) => {
+                valid_host(block)?;
+                ensure!(self.library.cuda_host_buffer_device_alias(block)?.ptr == block.ptr,
+                    "Spark pull descriptors no longer have their UVA mapping");
+                ensure!(pulls.base == block.ptr as usize && block.bytes == Pulls::bytes(self.slots),
+                    "Spark wave pull descriptors do not match their retained owner");
+                receipts.push(receipt("pulls".into(), block, Category::Transport));
+            }
+            (false, None, None) => {}
+            _ => anyhow::bail!("Spark wave pull owner inventory disagrees with pinned ranks"),
+        }
+        let mut backings: Vec<(&StagingArena, usize)> = Vec::new();
+        let mut spans = Vec::new();
+        for (slot, arena) in self.arenas.iter().enumerate() {
+            let (backing, host) = (arena.backing_buffer(), arena.host());
+            valid_host(backing)?;
+            valid_host(host)?;
+            let offset = (host.ptr as usize).checked_sub(backing.ptr as usize).context("Spark staging before backing")?;
+            ensure!(host.bytes == arena.bytes() && offset.checked_add(host.bytes).is_some_and(|end| end <= backing.bytes),
+                "Spark staging slot is outside its retained backing");
+            ensure!(self.library.cuda_host_buffer_device_alias(host)?.ptr as usize == self.arena_alias[slot],
+                "Spark staging retained mapped alias changed");
+            let alias_base = self.arena_alias[slot].checked_sub(offset).filter(|base| *base != 0)
+                .context("Spark staging mapped alias is null or before its backing")?;
+            ensure!(self.arena_alias[slot].checked_add(host.bytes).is_some(), "Spark staging mapped alias overflow");
+            let index = if let Some(index) = backings.iter().position(|(other, _)| arena.shares_backing(other)) {
+                let (other, expected_alias) = backings[index];
+                let expected = other.backing_buffer();
+                ensure!(expected.ptr == backing.ptr && expected.bytes == backing.bytes && expected_alias == alias_base,
+                    "shared Spark staging backing metadata or mapped alias differs");
+                index
+            } else {
+                ensure!(backings.iter().all(|(other, _)| other.backing_buffer().ptr != backing.ptr),
+                    "distinct Spark staging owners reuse an address");
+                let index = backings.len();
+                backings.push((arena, alias_base));
+                receipts.push(receipt(format!("staging.storage.{index}"), backing, Category::Staging));
+                index
+            };
+            ensure!(spans.iter().all(|&(other, start, end)| other != index || offset >= end || offset + host.bytes <= start),
+                "Spark staging slots overlap");
+            spans.push((index, offset, offset + host.bytes));
+            let mut view = receipt(format!("staging.slot.{slot}"), host, Category::Staging);
+            view.allocation.view = Some(View { backing: format!("{prefix}.staging.storage.{index}"), offset: offset as u64 });
+            receipts.push(view);
+        }
+        Ok(receipts)
+    }
+}
+
 /// A link's persistent exchange: the engine side of the worker.
 pub(crate) struct Waves<'a> {
     library: &'a NativeLibrary,
@@ -886,28 +1014,8 @@ impl<'a> Waves<'a> {
         arenas: Vec<StagingArena>, timing: bool) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let slots = intake.geometry.slots();
-        let range_bytes = intake.geometry.reserve_rows() * intake.row_bytes;
-        ensure!(arenas.len() == slots, "one staging arena per admitted slot");
-        ensure!(intake.ranges.len() == intake.ranks && intake.ranges.iter().all(|range| range.bytes >= range_bytes),
-            "one reserve range of {range_bytes} bytes per rank");
-        let control = HostAllocation::new(library, Counter::words(slots) * LINE)?;
-        let words = Words { base: control.buffer.ptr as usize, slots };
-        let all = if intake.ranks == 8 { u8::MAX } else { (1u8 << intake.ranks) - 1 };
-        let pinned = all & !intake.landing;
-        check_reply_ring(&transport.retained_reply_slots(), pinned, slots)?;
-        // Pinned ranks reach the planes by SM pulls on the consuming stream
-        // straight from their receive slots; the kernels read the frames'
-        // host addresses, so mapped pinned memory must be device-visible at
-        // its host address (UVA).
-        let pull_block = (pinned != 0).then(|| HostAllocation::new(library, Pulls::bytes(slots))).transpose()?;
-        if let Some(block) = &pull_block {
-            let alias = library.cuda_host_buffer_device_alias(block.buffer)?;
-            ensure!(alias.ptr == block.buffer.ptr,
-                "mapped pinned memory is not device-visible at its host address (no unified addressing)");
-        }
-        let pulls = pull_block.as_ref().map(|block| Pulls { base: block.buffer.ptr as usize });
-        let arena_alias = arenas.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
-            .map(|alias| alias.ptr as usize)).collect::<Result<Vec<_>>>()?;
+        let WaveControls { control, words, pinned, pull_block, pulls, arena_alias } =
+            allocate_wave_controls(library, &intake, &transport, &arenas)?;
         // Every registered native kernel loads now, with nothing pending: a
         // lazily loaded kernel's first launch behind a pending wait stalls the
         // engine thread, for good when the wait's release depends on it.
@@ -945,6 +1053,15 @@ impl<'a> Waves<'a> {
             unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
             next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, sequence: 0,
             outstanding: VecDeque::new(), grouping })
+    }
+
+    /// Retained mapped controls and request staging, excluding intake and endpoint rings.
+    pub(crate) fn allocation_receipts(&self, prefix: &str, lifetime: cuteafd_loader::placement::planner::Lifetime)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        WaveStorage { library: self.library, control: self._control.buffer, words: self.words,
+            pull_block: self._pull_block.as_ref().map(|block| block.buffer), pulls: self.pulls,
+            pinned: self.pinned, arenas: &self.arenas, arena_alias: &self.arena_alias,
+            slots: self.geometry.slots(), ranks: self.ranks }.allocation_receipts(prefix, lifetime)
     }
 
     /// Device planes of `slot` under the current cut, in rank order.

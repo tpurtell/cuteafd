@@ -41,7 +41,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Most ranks a compact reduction sums.
-pub(crate) const MAX_INTAKE_RANKS: usize = 8;
+pub(crate) const MAX_INTAKE_RANKS: usize = cuteafd_core::serving_capacity::SPARK_INTAKE_MAX_RANKS;
 
 /// Waves up to this many partial bytes (all ranks) are small: pinned mode
 /// stages them, and uploads that remain go on the compute stream.

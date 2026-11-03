@@ -5,6 +5,161 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn retained_wave_storage_matches_independent_contract() -> Result<()> {
+    const CHILD: &str = "CUTEAFD_WAVE_OWNER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["shared::spark_waves::tests::retained_wave_storage_matches_independent_contract",
+                "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1").env_remove("CUTEAFD_NATIVE_LIB").status()?;
+        ensure!(status.success(), "wave owner fixture child failed");
+        return Ok(());
+    }
+    use cuteafd_ffi::{memory_ledger::{self, AllocationAudit, AllocationEvent}, native_library_lifetime_fixture::Fixture};
+    use cuteafd_loader::placement::{SparkWaveOwners, SparkWaveStaging, planner::{self, *}};
+    use std::collections::BTreeMap;
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.quiet_events(&library, true)?;
+    cuteafd_transport::set_verbs_host_native_library_path(fixture.directory().join("liblifetime_fixture.so"))?;
+    cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::GLM5)
+        .map_err(|_| anyhow::anyhow!("wave fixture requires isolated GLM geometry"))?;
+    for device in [1, 0] { for ranks in [1, 6, 8] { for slots in [1, 3, 4] {
+        let all = if ranks == 8 { u8::MAX } else { (1u8 << ranks) - 1 };
+        let mut masks = vec![0, all, all & 0b1010_1010];
+        masks.sort_unstable(); masks.dedup();
+        for pinned in masks { for registered in [false, true] {
+            library.cuda_set_device(device)?;
+            fixture.configure_memory(&library, device, 128 << 20)?;
+            let (rows, row_bytes, slot_bytes) = (64, 34, 12345);
+            let plane = crate::shared::memory::DeviceAllocation::new(&library, slots * rows * row_bytes)?;
+            let intake = Intake { ranks, row_bytes, ranges: vec![plane.buffer; ranks],
+                geometry: SlotGeometry::new(slots, rows)?, landing: all & !pinned, placed: true, next_slot: 0 };
+            let tag = format!("wave/{device}/{ranks}/{slots}/{pinned}/{registered}");
+            let _owner = memory_ledger::owner(&tag);
+            let peers = (0..ranks).map(|rank| format!("127.0.0.1:{}", 19441 + rank).parse())
+                .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+            let mut transport = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(ranks)?,
+                &peers, rows as u32, Default::default(), 0)?;
+            transport.set_max_waves(slots)?;
+            let arenas = if registered {
+                transport.enable_egress(slot_bytes)?;
+                transport.egress_arenas()?
+            } else { (0..slots).map(|_| StagingArena::new(slot_bytes)).collect::<Result<Vec<_>>>()? };
+            let audit = AllocationAudit::start();
+            let controls = allocate_wave_controls(&library, &intake, &transport, &arenas)?;
+            let allocated = audit.events().iter().filter_map(|event| match event {
+                AllocationEvent::Allocated(record) => Some(record.bytes), _ => None }).collect::<Vec<_>>();
+            let mut expected = vec![(9 + 2 * slots) * 64];
+            if pinned != 0 { expected.push(slots * 8 * 128); }
+            assert_eq!(allocated, expected, "production allocation order and extents");
+            let mut storage = WaveStorage { library: &library, control: controls.control.buffer, words: controls.words,
+                pull_block: controls.pull_block.as_ref().map(|owner| owner.buffer), pulls: controls.pulls,
+                pinned, arenas: &arenas, arena_alias: &controls.arena_alias, slots, ranks };
+            let spec = SparkWaveOwners { ranks, waves: slots, pinned, staging: if registered {
+                SparkWaveStaging::Registered { slot_bytes: slot_bytes as u64 }
+            } else { SparkWaveStaging::Standalone { slot_bytes: slot_bytes as u64 } } };
+            let facts = Facts { allocations: spec.allocations("test.wave", Lifetime::TARGET)?,
+                deferred: vec![], sequential: vec![], allowances: vec![] };
+            let budgets = vec![Budget { id: "wave fixture pinned".into(), locations: vec![Location::PINNED],
+                physical_bytes: 128 << 20, logical_bytes: 128 << 20, headroom: 0,
+                baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
+            let phases = planner::evaluate(&facts, &budgets)?;
+            let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+                    prefill: Pin::Auto, operation: Operation::Serving },
+                decisions: Decisions { attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+                    embedding: None, prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
+                pool_tokens: 64, facts, budgets, phases };
+            // Storage subset only: no worker thread, numerical kernel or family Ready claim.
+            let receipts = storage.allocation_receipts("test.wave", Lifetime::TARGET)?;
+            planner::reconcile(&plan, Phase::Ready, &receipts)?;
+            let expected = receipts.iter().filter(|r| r.allocation.view.is_none())
+                .map(|r| (r.address as usize, r.allocation.bytes as usize)).collect::<BTreeMap<_, _>>();
+            let actual = memory_ledger::allocations().into_iter().filter(|a| a.key.owner == Some(tag.as_str()))
+                .map(|a| (a.address, a.bytes)).collect::<BTreeMap<_, _>>();
+            assert_eq!(actual, expected, "every retained physical backing is charged once");
+            if slots > 1 {
+                let other = SparkWaveOwners { staging: if registered {
+                    SparkWaveStaging::Standalone { slot_bytes: slot_bytes as u64 }
+                } else { SparkWaveStaging::Registered { slot_bytes: slot_bytes as u64 } }, ..spec };
+                let mut wrong_topology = plan.clone();
+                wrong_topology.facts.allocations = other.allocations("test.wave", Lifetime::TARGET)?;
+                wrong_topology.phases = planner::evaluate(&wrong_topology.facts, &wrong_topology.budgets)?;
+                assert!(planner::reconcile(&wrong_topology, Phase::Ready, &receipts).is_err(),
+                    "equal physical totals cannot hide registered versus standalone topology");
+            }
+            for defect in 0..7 {
+                let mut broken = receipts.clone();
+                match defect {
+                    0 => { broken.remove(0); }
+                    1 => { let mut extra = broken[0].clone(); extra.allocation.id.push_str(".extra"); broken.push(extra); }
+                    2 => broken[0].allocation.bytes += 1,
+                    3 => broken[0].allocation.location = Location::HOST,
+                    4 => { broken[0].allocation.bytes += 1; broken[1].allocation.bytes -= 1; }
+                    5 => broken.iter_mut().find(|r| r.allocation.view.is_some()).unwrap().allocation.view.as_mut().unwrap().offset += 1,
+                    6 => broken.iter_mut().find(|r| r.allocation.view.is_some()).unwrap().address += 1,
+                    _ => unreachable!(),
+                }
+                assert!(planner::reconcile(&plan, Phase::Ready, &broken).is_err());
+            }
+            let original = storage.control;
+            for defect in 0..3 {
+                match defect { 0 => storage.control.bytes -= 1, 1 => storage.control.ptr = std::ptr::null_mut(),
+                    2 => storage.control.flags = 0, _ => unreachable!() }
+                assert!(storage.allocation_receipts("test.wave", Lifetime::TARGET).is_err());
+                storage.control = original;
+            }
+            storage.words.base += 1;
+            assert!(storage.allocation_receipts("test.wave", Lifetime::TARGET).is_err());
+            storage.words = controls.words;
+            storage.slots += 1;
+            assert!(storage.allocation_receipts("test.wave", Lifetime::TARGET).is_err());
+            storage.slots = slots;
+            let mut aliases = controls.arena_alias.clone(); aliases[0] += 1;
+            storage.arena_alias = &aliases;
+            assert!(storage.allocation_receipts("test.wave", Lifetime::TARGET).is_err());
+            storage.arena_alias = &controls.arena_alias;
+            if pinned != 0 {
+                storage.pull_block = None;
+                assert!(storage.allocation_receipts("test.wave", Lifetime::TARGET).is_err());
+                storage.pull_block = controls.pull_block.as_ref().map(|owner| owner.buffer);
+                storage.pulls.as_mut().unwrap().base += 1;
+                assert!(storage.allocation_receipts("test.wave", Lifetime::TARGET).is_err());
+                storage.pulls = controls.pulls;
+            }
+            let mut duplicate = arenas.clone();
+            if slots > 1 {
+                duplicate[1] = duplicate[0].clone();
+                let duplicate_alias = duplicate.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
+                    .map(|buffer| buffer.ptr as usize)).collect::<Result<Vec<_>>>()?;
+                storage.arenas = &duplicate; storage.arena_alias = &duplicate_alias;
+                assert!(storage.allocation_receipts("test.wave", Lifetime::TARGET).is_err());
+            }
+            drop(duplicate);
+            drop(controls); drop(arenas); drop(transport);
+            assert!(memory_ledger::allocations().iter().all(|a| a.key.owner != Some(tag.as_str())));
+            drop(plane);
+            assert_eq!(library.cuda_memory_info()?, (128 << 20, 128 << 20));
+        } }
+    } } }
+    // Ring refusal occurs after allocating the control block, before any pulls.
+    let slots = 3;
+    let intake = Intake { ranks: 1, row_bytes: 2,
+        ranges: vec![CuteafdDeviceBuffer { bytes: 6, ..Default::default() }],
+        geometry: SlotGeometry::new(slots, 1)?, landing: 0, placed: true, next_slot: 0 };
+    let arenas = (0..slots).map(|_| StagingArena::new(256)).collect::<Result<Vec<_>>>()?;
+    let audit = AllocationAudit::start();
+    let error = allocate_wave_controls(&library, &intake, &Ring::new(1, 1, 1, 2), &arenas).err().unwrap();
+    assert!(error.downcast_ref::<WaveError>().is_some());
+    let events = audit.events();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[0], AllocationEvent::Allocated(record) if record.bytes == 960));
+    assert!(matches!(events[1], AllocationEvent::Freed(record) if record.bytes == 960));
+    Ok(())
+}
+
 /// The "GPU": the control words, written by the engine side of the test as
 /// a stream would (staged after copies, consumed after a reduce) and read by
 /// the worker; the worker publishes `landed` here.
