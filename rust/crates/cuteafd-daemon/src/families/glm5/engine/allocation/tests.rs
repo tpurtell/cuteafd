@@ -709,6 +709,15 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             assert!(planner::reconcile(&expected, Phase::Warmup, &aliased).is_err());
             engine.prefill_slots.borrow_mut()[1].h = saved;
         }
+        if core {
+            use crate::shared::peer_split::TerminalState;
+            engine.require_live()?;
+            engine.retire_tp2()?;
+            assert_eq!(engine.terminal.get(), TerminalState::Drained);
+            assert_eq!(engine.exchange.as_ref().unwrap().terminal_state(), TerminalState::Drained);
+            assert!(engine.require_live().is_err());
+            engine.retire_tp2()?;
+        }
     }
     Ok(())
 }

@@ -125,8 +125,10 @@ int cuteafd_peer_wait_abortable(const uint32_t *flag, uint32_t *state,
     return 1;
 }
 int cuteafd_peer_abort_publish(uint32_t *aborted, void *stream) {
-    (void)aborted; (void)stream;
-    return 1;
+    /* Control-only teardown for allocation fixtures; no wait or math executes. */
+    if (!glm_target_programs || !immediate_copies || !aborted || !stream) return 1;
+    *aborted = 1;
+    return 0;
 }
 static const char *glm_target_bases[] = {
     "glm_index_producer", "glm2_producer", "glm2_sparse_mla_decode", "glm2_o",
