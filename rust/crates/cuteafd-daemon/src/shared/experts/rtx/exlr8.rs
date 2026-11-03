@@ -67,7 +67,7 @@ mod copy_tests {
         let geometry = family.geometry();
         let (hidden, experts, units) = (geometry.hidden, geometry.experts, geometry.units);
         let mut bytes = 0usize;
-        let mut reserve = |extent| {
+        let mut reserve = |extent: usize| {
             let start = bytes;
             bytes = (bytes + extent).next_multiple_of(256);
             start
