@@ -1122,7 +1122,11 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
     deployment = json.loads(deployment_path.read_text())
     config = json.loads((snapshot / "config.json").read_text())
     family = deployment["family"]
-    keys = ("SPARK_COUNT=8\nSPECULATOR=off\nVISION=off\nAUDIO=off\nMODEL_REVISION=\n"
+    # Never probe a live server's default port on the shared gate host (#1048).
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        api_port = listener.getsockname()[1]
+    keys = (f"ADDR=127.0.0.1:{api_port}\nSPARK_COUNT=8\nSPECULATOR=off\nVISION=off\nAUDIO=off\nMODEL_REVISION=\n"
             "MAX_CONTEXT_TOKENS=262144\nMAX_OUTPUT_TOKENS=32768\nHOST_CACHE_BYTES=0\nPOOL_TOKENS=262144\n"
             f"RTX_GPUS={deployment['rtx_gpus']}\nSPARK_HOSTS=" +
             ",".join(f"worker-{rank}" for rank in range(8)) + "\n")
