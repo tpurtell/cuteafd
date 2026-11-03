@@ -292,13 +292,13 @@ pub(super) mod owner_tests {
                         WeightArenaTopology::PerLayer, location, Lifetime::RESIDENT)?.allocations;
                     let hooks = HookBuffers { device: rank as u8, maximum_pages: 1, native: None, core: None,
                         shared_workspace: Some(workspace.clone()) };
-                    let mut contract = Contract::fixed(64, 1, 1, Facts { allocations: vec![], deferred: vec![],
+                    let mut contract = Contract::fixed(64, 1, 1, Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: vec![], deferred: vec![],
                         sequential: vec![], allowances: vec![] });
                     contract.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]),
                         Variable::Lanes(vec![1])];
                     contract.components = hooks.components()?;
                     allocations.extend(contract.facts(&[0, 0], 1)?.allocations);
-                    let facts = Facts { allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
+                    let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
                     let budgets = vec![Budget { id: "CPU shared fixture".into(), locations: vec![location],
                         physical_bytes: 128 << 20, logical_bytes: 128 << 20, headroom: 0,
                         baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];

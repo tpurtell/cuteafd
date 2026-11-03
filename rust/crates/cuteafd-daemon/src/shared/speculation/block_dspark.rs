@@ -1390,7 +1390,7 @@ mod tests {
                     draft.prepare_workspace()?;
                     let receipts = draft.allocation_receipts(0)?;
                     let life = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
-                    let mut facts = Facts { allocations: layout.owners.iter().filter(|o| !o.on_use)
+                    let mut facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: layout.owners.iter().filter(|o| !o.on_use)
                         .map(|o| o.allocation(format!("draft.block.{}", o.id), 0, life, "block dSpark owner"))
                         .collect(), deferred: vec![], sequential: vec![], allowances: vec![] };
                     if !layout.packing_sources.is_empty() {

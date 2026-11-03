@@ -66,7 +66,7 @@ fn plan(
         128,
         128,
         2,
-        Facts {
+        Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],
@@ -160,7 +160,7 @@ fn exchange_plan(cfg: &GlmDsaConfig, buffers: &ExchangeBuffers) -> Result<Resolv
         64,
         buffers.maximum_pages,
         2,
-        Facts {
+        Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],

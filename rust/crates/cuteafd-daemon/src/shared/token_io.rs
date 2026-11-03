@@ -1256,7 +1256,7 @@ mod tests {
                 for placement in [SelectPlacement::Device, SelectPlacement::Host] {
                     let owners = SelectorOwners {location, capacity, vocab: 33,
                         device_sampling: placement == SelectPlacement::Device}.allocations("selector", life)?;
-                    let facts = Facts {allocations: owners, deferred: vec![], sequential: vec![], allowances: vec![]};
+                    let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,allocations: owners, deferred: vec![], sequential: vec![], allowances: vec![]};
                     let budgets = vec![Budget {id: "CPU fixture".into(), locations: vec![location, Location::PINNED],
                         physical_bytes: total as u64, logical_bytes: total as u64, headroom: 0,
                         baseline: Baseline::Forecast {occupied: 0, source: "CPU fixture".into(), assumed: false}}];

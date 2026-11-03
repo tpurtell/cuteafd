@@ -229,7 +229,7 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
 fn retained_weight_plan(inventory: &cuteafd_loader::placement::families::glm5::weights::WeightInventory)
     -> Result<cuteafd_loader::placement::planner::ResolvedPlan> {
     use cuteafd_loader::placement::planner::{self, *};
-    let facts = Facts { allocations: inventory.owners.iter().map(|o| o.allocation.clone()).collect(),
+    let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET, allocations: inventory.owners.iter().map(|o| o.allocation.clone()).collect(),
         deferred: vec![], sequential: vec![], allowances: vec![] };
     let budgets: Vec<_> = (0..inventory.ranks).map(|rank| Location::coordinator(rank as u8))
         .chain([Location::PINNED]).enumerate().map(|(index, location)| Budget {

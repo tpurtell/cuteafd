@@ -157,7 +157,7 @@ mod copy_tests {
                     allocations = backend_allocations.clone();
                     allocations.extend(route_facts.allocations("test", lifetime)?);
                 }
-                let facts = Facts { allocations: allocations.clone(), deferred: vec![], sequential: vec![], allowances: vec![] };
+                let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: allocations.clone(), deferred: vec![], sequential: vec![], allowances: vec![] };
                 let phases = planner::evaluate(&facts, &budgets)?;
                 let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
                         prefill: Pin::Auto, operation: Operation::Serving },
@@ -371,7 +371,7 @@ mod copy_tests {
                                 allocations.push(staging.clone());
                                 receipts.push(staging_receipt.clone());
                                 let buffer = expert.output.buffer;
-                                let facts = Facts { allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
+                                let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
                                 let budgets = vec![Budget { id: "CPU constructor".into(), locations: vec![location],
                                     physical_bytes: capacity as u64, logical_bytes: capacity as u64, headroom: 0,
                                     baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } },

@@ -62,7 +62,7 @@ fn retained_wave_storage_matches_independent_contract() -> Result<()> {
             let spec = SparkWaveOwners { ranks, waves: slots, pinned, staging: if registered {
                 SparkWaveStaging::Registered { slot_bytes: slot_bytes as u64 }
             } else { SparkWaveStaging::Standalone { slot_bytes: slot_bytes as u64 } } };
-            let facts = Facts { allocations: spec.allocations("test.wave", Lifetime::TARGET)?,
+            let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: spec.allocations("test.wave", Lifetime::TARGET)?,
                 deferred: vec![], sequential: vec![], allowances: vec![] };
             let budgets = vec![Budget { id: "wave fixture pinned".into(), locations: vec![Location::PINNED],
                 physical_bytes: 128 << 20, logical_bytes: 128 << 20, headroom: 0,

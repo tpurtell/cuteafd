@@ -96,7 +96,7 @@ fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_js
     let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
     let layout = cuteafd_loader::serving_capacity::Exl3WorkspaceLayout::from_manifests(
         manifests, true)?;
-    let facts = Facts {
+    let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
         allocations: layout.allocations("expert.test", location, lifetime),
         deferred: vec![], sequential: vec![], allowances: vec![],
     };

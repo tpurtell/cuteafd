@@ -356,7 +356,7 @@ mod tests {
         std::fs::create_dir(&snapshot)?;
         cuteafd_loader::plan::testing::exlr8::fixture(&snapshot, false);
         let verify = |allocations: Vec<Allocation>, states: &[Exlr8Weights<'_>], location, physical| -> Result<()> {
-            let facts = Facts { allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
+            let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
             let budgets = vec![Budget { id: "CPU fixture".into(), locations: vec![location],
                 physical_bytes: 1 << 30, logical_bytes: 1 << 30, headroom: 0,
                 baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
