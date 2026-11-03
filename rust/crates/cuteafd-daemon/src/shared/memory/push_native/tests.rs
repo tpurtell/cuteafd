@@ -6,8 +6,8 @@ use std::os::unix::fs::FileExt;
 /// write footprint; padding is initialized separately, never counted as a job.
 #[test]
 fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> Result<()> {
-    use crate::shared::experts::rtx::dense::{MAX_OPEN_STEPS, STEP_BYTES};
-    use cuteafd_loader::push_load::plan::{Entry, Steps};
+    use cuteafd_ffi::push_ring::{DEFAULT_SLOT_BYTES, DEFAULT_SLOTS};
+    use cuteafd_loader::push_load::{plan::{Entry, FileEntries, RunWalk, Steps}, slot};
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     let Some(snapshot) = std::env::var_os("CUTEAFD_SCALE_CODES_LAYOUT_SNAPSHOT") else { return Ok(()); };
@@ -16,8 +16,7 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
     let shape = catalog.routed_experts();
     ensure!(catalog.mxfp4_scale_codes() && catalog.nvfp4().is_none(), "requires coded native V4.1");
     assert_eq!((shape.hidden, shape.intermediate, shape.experts, shape.layers), (5120, 2304, 384, 40));
-    let budget = 257usize << 20;
-    assert_eq!(MAX_OPEN_STEPS * STEP_BYTES + (1 << 20), budget);
+    let budget = 512usize << 20;
 
     struct Plane {
         rows: Vec<u8>,
@@ -48,14 +47,15 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
             // Expand row ownership independently into every lane-major code
             // byte and row base. Duplicate writes and unwritten padding fail.
             for group in (0..self.rows.len()).step_by(256) {
+                let tile_rows = (self.rows.len() - group).min(256);
                 let mut first = group;
-                while first < group + 256 {
+                while first < group + tile_rows {
                     let owner = self.rows[first];
                     assert_ne!(owner, 0, "generated plane contains an unwritten row");
-                    let end = (first + 1..group + 256).find(|&row| self.rows[row] != owner)
-                        .unwrap_or(group + 256);
+                    let end = (first + 1..group + tile_rows).find(|&row| self.rows[row] != owner)
+                        .unwrap_or(group + tile_rows);
                     for tile in 0..tiles {
-                        let start = ((group / 256 * tiles + tile) * 256 + first % 256) * 2;
+                        let start = (group * tiles + tile * tile_rows + first % 256) * 2;
                         let range = &mut writes[start..start + (end - first) * 2];
                         assert!(range.iter().all(|&n| n == 0), "overlapping generated code bytes");
                         range.fill(owner);
@@ -70,19 +70,23 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
         }
     }
 
-    for world in [4, 6] {
-        let rank = world - 1;
+    for world in [3, 4, 6] {
+        // The exact golden onboards eight whole layers and leaves TP3 rank 1
+        // with layers 8..39; the card-only TP4/TP6 screen missed this route.
+        let rank = if world == 3 { 1 } else { world - 1 };
         let logical = shape.intermediate / world;
-        let stored = logical.div_ceil(128) * 128;
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(shape.hidden, logical).context("stored width")?;
         let planes = NativePlanes::with_scale_codes(shape.hidden, logical, stored, shape.experts, false, true)?;
-        let slices = (shape.first_layer..shape.layers).map(|layer| SparkSlice {
+        let first_layer = if world == 3 { 8 } else { shape.first_layer };
+        let slices = (first_layer..shape.layers).map(|layer| SparkSlice {
             unit_map: None, layer: layer as u32, first: (rank * logical) as u32,
             width: logical as u32, stored_width: stored as u32, tiers: vec![], projection_counts: vec![],
         }).collect::<Vec<_>>();
         let plan = RankPlan::new(&catalog, &slices, world, rank, slices.len() * planes.bytes)?;
         let checked = plan.checked(&catalog, &snapshot, world, rank)?;
         let tail = plan.scales.base(&plan.layout);
-        assert_eq!(plan.scales.host_peak(), budget);
+        assert!(plan.scales.host_peak()? <= budget);
+        if world == 3 { assert_eq!(plan.scales.host_staging().largest_step, 122880); }
         let mut expected = BTreeMap::new();
         for (region, _) in slices.iter().enumerate() {
             let base = plan.layout.region(region)?.start;
@@ -121,7 +125,99 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
         }
         assert!(separated, "real layout did not exercise scales distant from weights");
 
+        // Replay the scale-only source projection through the actual packer:
+        // 16 MiB read windows, coalesced gaps, and 1 MiB receiver slots. Omitting
+        // resident weight payload makes scales denser, not cheaper to stage.
+        let extents = checked.plan.patterns.iter().map(|p| p.check().ok()).collect::<Vec<_>>();
+        let zeros = vec![0u8; DEFAULT_SLOT_BYTES];
+        let mut packed = BTreeMap::new();
+        for (&file, entries) in &files {
+            let entries = entries.iter().filter(|entry| entry.dst_base >= tail)
+                .map(|entry| (**entry).clone()).collect::<Vec<_>>();
+            let index = FileEntries::new(&entries, &extents);
+            let mut ranges = Vec::<(u64, u64)>::new();
+            for (first, end) in index.ranges() {
+                if let Some(last) = ranges.last_mut().filter(|last| first <= last.1.saturating_add(1 << 20)) {
+                    last.1 = last.1.max(end);
+                } else { ranges.push((first, end)); }
+            }
+            let (mut slots, mut packer) = (Vec::new(), slot::Packer::new(vec![0; DEFAULT_SLOT_BYTES]));
+            for (first, end) in ranges {
+                for from in (first..end).step_by(16 << 20) {
+                    let to = (from + (16 << 20)).min(end);
+                    for entry in index.overlapping(from, to) {
+                        let pattern = &checked.plan.patterns[entry.pattern as usize];
+                        let mut coalesced = Vec::<(u64, usize)>::new();
+                        for (_, dst, len) in RunWalk::new(pattern, entry, from, to) {
+                            if let Some(last) = coalesced.last_mut().filter(|last| last.0 + last.1 as u64 == dst) {
+                                last.1 += len as usize;
+                            } else { coalesced.push((dst, len as usize)); }
+                        }
+                        for (mut dst, mut len) in coalesced {
+                            while len > 0 {
+                                let took = packer.push(dst, &zeros[..len.min(zeros.len())]);
+                                if took == 0 {
+                                    let (buffer, _, _) = packer.finish();
+                                    let parsed = slot::parse(&buffer, plan.scales.logical_bytes(&plan.layout))?;
+                                    slots.push(slot::Fragments::new(&buffer, parsed).collect::<Vec<_>>());
+                                    packer = slot::Packer::new(buffer);
+                                } else { dst += took as u64; len -= took; }
+                            }
+                        }
+                    }
+                }
+            }
+            if !packer.is_empty() {
+                let (buffer, _, _) = packer.finish();
+                let parsed = slot::parse(&buffer, plan.scales.logical_bytes(&plan.layout))?;
+                slots.push(slot::Fragments::new(&buffer, parsed).collect::<Vec<_>>());
+            }
+            packed.insert(file, slots);
+        }
         for sources in [6, 8] {
+            let mut streams = (0..sources).map(|_| VecDeque::new()).collect::<Vec<_>>();
+            for (&file, slots) in &packed { streams[file as usize % sources].extend(slots.iter()); }
+            let mut pending = Vec::new();
+            let (mut opened, mut complete) = (BTreeMap::<usize, usize>::new(), BTreeSet::new());
+            let (mut retained, mut peak_bytes, mut peak_steps, mut max_slot_steps) = (0usize, 0usize, 0usize, 0usize);
+            while streams.iter().any(|stream| !stream.is_empty()) || !pending.is_empty() {
+                for stream in &mut streams {
+                    if pending.len() == DEFAULT_SLOTS { break; }
+                    if let Some(slot) = stream.pop_front() { pending.push(slot); }
+                }
+                if pending.len() < DEFAULT_SLOTS && streams.iter().any(|s| !s.is_empty()) { continue; }
+                // A reversed full ring retains incomplete old steps while
+                // later slots finish others. No byte payload or GPU is needed.
+                while let Some(fragments) = pending.pop() {
+                    let mut touched = BTreeSet::new();
+                    for &(dst, len) in fragments {
+                        let relative = dst - tail;
+                        let index = plan.scales.steps.partition_point(|(start, _)| *start <= relative) - 1;
+                        let (start, step) = &plan.scales.steps[index];
+                        let need = step.rects.iter().map(|rect| rect.bytes()).sum::<usize>();
+                        assert!(relative + u64::from(len) <= start + need as u64);
+                        assert!(!complete.contains(&index));
+                        touched.insert(index);
+                        if !opened.contains_key(&index) { retained += need; }
+                        *opened.entry(index).or_default() += len as usize;
+                        peak_bytes = peak_bytes.max(retained);
+                        peak_steps = peak_steps.max(opened.len());
+                        assert!(retained <= plan.scales.host_staging().staging_bytes);
+                        assert!(opened[&index] <= need);
+                        if opened[&index] == need {
+                            opened.remove(&index);
+                            retained -= need;
+                            assert!(complete.insert(index));
+                        }
+                    }
+                    max_slot_steps = max_slot_steps.max(touched.len());
+                }
+            }
+            assert!(opened.is_empty());
+            assert_eq!(complete.len(), plan.scales.steps.len());
+            assert!(max_slot_steps > 2, "small steps per slot were not exercised");
+            assert!(peak_steps > 8, "old eight-step guard was not exercised");
+            eprintln!("TP{world} rank{rank}, sources={sources}, reversed128-slot windows: peak_steps={peak_steps}, peak_bytes={peak_bytes}, max_slot_steps={max_slot_steps}, admitted={}", plan.scales.host_peak()?);
             let mut queues = (0..sources).map(|_| VecDeque::new()).collect::<Vec<_>>();
             for (&file, entries) in &files {
                 for &entry in entries { queues[file as usize % sources].push_back((entry, 0u64)); }
@@ -163,8 +259,10 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
                     assert_eq!(relative - start, *delivered as u64, "scale source has delivery holes");
                     *delivered += bytes;
                     peak = peak.max(open.len());
-                    assert!(open.len() <= 8 && open.len() <= MAX_OPEN_STEPS, "unbounded open scale steps");
-                    assert!(peak * (32 << 20) + (1 << 20) <= budget, "pinned scale budget exceeded");
+                    assert!(open.len() <= sources, "serial replay holds more than one step per source");
+                    let retained: usize = open.keys().map(|&index| plan.scales.steps[index].1.rects.iter()
+                        .map(|rect| rect.bytes()).sum::<usize>()).sum();
+                    assert!(retained <= plan.scales.host_staging().staging_bytes, "pinned scale budget exceeded");
                     *consumed += bytes as u64;
                     if open[&index] == need {
                         open.remove(&index);
@@ -198,7 +296,7 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
             assert_eq!(completed.len(), plan.scales.steps.len());
             assert_eq!(finished, expected.keys().copied().collect());
             eprintln!("coded V4.1 TP{world} rank{rank}, {sources} file-ordered sources: {} steps, {} planes, peak_open={peak}, peak_pinned_with_table={} <= {budget}, no byte holes",
-                completed.len(), finished.len(), peak * (32 << 20) + (1 << 20));
+                completed.len(), finished.len(), peak * plan.scales.host_staging().largest_step + (1 << 20));
         }
     }
     Ok(())
@@ -374,8 +472,16 @@ fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
     if let Some(root) = std::env::var_os("CUTEAFD_PUSH_V41") { roots.push((root.into(), vec![0, 7])); }
     for (root, layers) in roots {
         let catalog = cuteafd_loader::read_expert_catalog(&root)?;
-        for gpu in 0..2 {
-            let plan = super::super::push_coordinator::CoordinatorExpertPlan::new(&catalog, &layers, gpu, usize::MAX)?;
+        for (expert_world, gpu) in [(1, 0), (2, 0), (2, 1)] {
+            use super::super::push_coordinator::CoordinatorExpertPlan;
+            let make = |budget| if expert_world == 1 {
+                CoordinatorExpertPlan::whole_native(&catalog, &layers, budget)
+            } else { CoordinatorExpertPlan::new(&catalog, &layers, gpu, budget) };
+            let plan = make(usize::MAX)?;
+            let admitted = plan.layout.bytes();
+            assert!(admitted > 0);
+            assert_eq!(make(admitted)?.layout.bytes(), admitted);
+            assert!(make(admitted - 1).is_err());
             assert!(!plan.native.is_empty() && plan.validation.bytes() == 0);
             let world = 6;
             let checked = plan.checked(&catalog, &root, world, 4 + gpu)?;
@@ -398,8 +504,10 @@ fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
             for (region, (&layer, planes)) in layers.iter().zip(&plan.native).enumerate() {
                 let base = plan.layout.region(region)?.start;
                 for expert in [0, planes.experts - 1] {
-                    let staging = catalog.expert_staging(cuteafd_loader::V41ExpertSelection::BackboneTp2 {
-                        layer, expert, rank: gpu })?;
+                    let selection = if expert_world == 1 {
+                        cuteafd_loader::V41ExpertSelection::BackboneFull { layer, expert }
+                    } else { cuteafd_loader::V41ExpertSelection::BackboneTp2 { layer, expert, rank: gpu } };
+                    let staging = catalog.expert_staging(selection)?;
                     let mut staged = vec![0u8; staging.staging_bytes()];
                     let mut scratch = vec![0u8; staging.minimum_read_scratch_bytes().max(1 << 20)];
                     staging.read_into(&mut staged, &mut scratch)?;
@@ -426,6 +534,35 @@ fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
             eprintln!("{}: gpu{gpu} native TP2 halves land mount staging ({} entries)", root.display(),
                 checked.plan.entries.len());
         }
+    }
+    Ok(())
+}
+
+
+#[test]
+fn coordinator_coded_scales_and_family_dense_staging_are_independent_host_owners() -> Result<()> {
+    use crate::shared::{memory::push_coordinator::CoordinatorExpertPlan,
+        experts::rtx::dense::{HostStaging, STEP_BYTES}};
+    let root = tempfile::tempdir()?;
+    cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
+    let catalog = cuteafd_loader::read_official_v41_catalog(root.path())?;
+    for world in [1, 2] {
+        let plans = (0..world).map(|rank| if world == 1 {
+            CoordinatorExpertPlan::whole_native(&catalog, &[0], usize::MAX)
+        } else { CoordinatorExpertPlan::new(&catalog, &[0], rank, usize::MAX) }).collect::<Result<Vec<_>>>()?;
+        for plan in &plans {
+            let geometry = plan.scales.host_staging();
+            assert!(geometry.largest_step > 0 && geometry.largest_step <= STEP_BYTES);
+            assert_eq!(geometry.table_bytes, 1 << 20);
+            assert_eq!(plan.host_bytes()?, geometry.bytes()?);
+        }
+        let dense = vec![HostStaging { staging_bytes: 8 * STEP_BYTES, largest_step: STEP_BYTES,
+            table_bytes: 2 << 20 }; world];
+        let refs = plans.iter().map(Some).collect::<Vec<_>>();
+        let peak = world * 128 * (1 << 20) + plans.iter().map(|plan| plan.host_bytes()).sum::<Result<usize>>()?
+            + dense.iter().map(|staging| staging.bytes()).sum::<Result<usize>>()?;
+        assert_eq!(CoordinatorExpertPlan::admit_host(&refs, &dense, 128, 1 << 20, peak as u64)?, peak);
+        assert!(CoordinatorExpertPlan::admit_host(&refs, &dense, 128, 1 << 20, peak as u64 - 1).is_err());
     }
     Ok(())
 }

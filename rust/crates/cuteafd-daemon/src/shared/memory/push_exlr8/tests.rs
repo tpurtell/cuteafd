@@ -190,9 +190,9 @@ fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() 
                 assert_eq!(plan.exlr8_host_bytes()?, retained + descriptors);
                 let host_peak = retained + descriptors + 128 * (1 << 20);
                 let host_plans = [Some(plan)];
-                assert_eq!(CoordinatorExpertPlan::admit_host(&host_plans, 128, 1 << 20,
+                assert_eq!(CoordinatorExpertPlan::admit_host(&host_plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], 128, 1 << 20,
                     host_peak as u64)?, host_peak);
-                assert!(CoordinatorExpertPlan::admit_host(&host_plans, 128, 1 << 20,
+                assert!(CoordinatorExpertPlan::admit_host(&host_plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], 128, 1 << 20,
                     host_peak as u64 - 1).is_err());
                 assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], 2, gpu,
                     resident - 1).is_err());
@@ -203,8 +203,8 @@ fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() 
                 usize::MAX).map(Some)).collect::<Result<Vec<_>>>()?;
             let host_peak = 2 * 128 * (1 << 20) + host_plans.iter().map(|plan|
                 plan.as_ref().unwrap().exlr8_host_bytes()).collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>();
-            assert_eq!(CoordinatorExpertPlan::admit_host(&host_plans, 128, 1 << 20, host_peak as u64)?, host_peak);
-            assert!(CoordinatorExpertPlan::admit_host(&host_plans, 128, 1 << 20, host_peak as u64 - 1).is_err());
+            assert_eq!(CoordinatorExpertPlan::admit_host(&host_plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], 128, 1 << 20, host_peak as u64)?, host_peak);
+            assert!(CoordinatorExpertPlan::admit_host(&host_plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], 128, 1 << 20, host_peak as u64 - 1).is_err());
             let coordinator = super::super::push_exl3::CoordinatorRanks { ranks: 2,
                 append: Box::new(move |builder, catalog, offers| {
                     let catalog = catalog.context("fixture catalog")?;

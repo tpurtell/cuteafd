@@ -386,6 +386,15 @@ fn worker(
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
     admission::startup_phase(&lib, "v41/startup", device_total)?;
+    use crate::shared::experts::rtx::{dense, push::PushPolicy};
+    let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
+    push_policy.plan(|| {
+        use crate::families::deepseek_v41::v41_tensors::{fp8_head, Fp8Head};
+        ensure!(!matches!(fp8_head(), Fp8Head::Packed | Fp8Head::Draft),
+            "V4.1 required push supports All or Off vocabulary mode, not Packed or Draft");
+        Ok(())
+    })?;
+    let recorder = dense::Recorder::start(push_policy == PushPolicy::Required)?;
     let weights = BackboneLaneWeights::load(
         &lib,
         &catalog,
@@ -432,6 +441,7 @@ fn worker(
         TargetHeadWeights::device_bytes(&catalog)?,
         16 * 1024 * 1024,
     )?;
+    let mut records = recorder.map(|recorder| recorder.finish());
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:head");
     admission::startup_phase(&lib, "v41/weights:head", device_total)?;
     use crate::families::deepseek_v41::v41_target_pass::TargetTapWave;
@@ -538,6 +548,7 @@ fn worker(
         second.enable_l2_prefetch(budget)?;
     }
     let draft_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
+    let recorder = dense::Recorder::start(records.is_some())?;
     let draft_weights = if args.dspark {
         Some(crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(
             &lib,
@@ -551,6 +562,7 @@ fn worker(
     } else {
         None
     };
+    if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     let mut draft = draft_weights
         .as_ref()
         .map(|weights| DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, args.concurrency))
@@ -601,8 +613,39 @@ fn worker(
         "shared V4.1 cache and expert admission");
     let local_layers = pool.placement.onboard_layers;
     cuteafd_bench::context::set_rtx_expert_layers(pool.placement.onboard_layers);
-    let spark_admission = admission::start_sparks(&args, &catalog, local_layers, capacity,
-        topology)?;
+    use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
+    let budgets = (0..local_layers).map(|layer| ExpertWeights::plan(&lib, &catalog,
+        ExpertLayer::BackboneFull { layer })).collect::<Result<Vec<_>>>()?;
+    let selected = budgets.iter().enumerate().map(|(layer, budget)|
+        (ExpertLayer::BackboneFull { layer }, budget.resident_bytes)).collect::<Vec<_>>();
+    let resident_bytes = selected.iter().try_fold(0usize, |sum, (_, bytes)| sum.checked_add(*bytes))
+        .context("V4.1 local expert resident bytes overflow")?;
+    let lane_bytes = |rows: u32| LocalExpertWave::device_bytes_for(&lib, rows, catalog.nvfp4().is_some());
+    let (per_slot, per_decode) = if local_layers > 0 { (lane_bytes(aot_capacity)?, lane_bytes(decode_rows)?) }
+        else { (0, 0) };
+    let admitted_experts = pool.placement.expert_ranges[0];
+    let expected = resident_bytes + if local_layers > 0 {
+        per_slot * slots + per_decode * 2 + budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0)
+    } else { 0 };
+    ensure!(expected as u64 <= admitted_experts.peak_bytes, "runtime local owners exceed shared admission");
+    let spark_plan = admission::plan_sparks(&args, &catalog, local_layers, capacity, topology)?;
+    let coordinator = push_policy.plan(|| {
+        ensure!(spark_plan.as_ref().is_none_or(|spark| spark.coordinator_pushes()),
+            "V4.1 Spark admission did not select required push");
+        coordinator_push::plan_whole(&args.snapshot, &catalog,
+            crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
+            records.as_ref().context("V4.1 required dense push records")?, &selected, args.peers.len())
+    })?;
+    let (coordinator, ranks) = match coordinator {
+        Some((planned, ranks)) => (Some(planned), ranks),
+        None => (None, None),
+    };
+    let spark_admission = spark_plan.map(|plan| plan.start_with(&args.peers, ranks)).transpose()?;
+    let mut pushed = coordinator.map(|planned| planned.receive(
+        crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
+        &catalog, &selected, resident_bytes)).transpose()?;
+    drop(records);
+    if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
     admission::startup_phase(&lib, "v41/kv", device_total)?;
@@ -610,26 +653,15 @@ fn worker(
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv-prefix-install");
     admission::startup_phase(&lib, "v41/kv-prefix-install", device_total)?;
     if args.rtx_expert_layers != admission::LocalLayers::Count(0) {
-        use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
         let local_started = Instant::now();
-        let lane_bytes = |rows: u32| LocalExpertWave::device_bytes_for(&lib, rows, catalog.nvfp4().is_some());
-        let (per_slot, per_decode) = (lane_bytes(aot_capacity)?, lane_bytes(decode_rows)?);
-        let budgets = (0..40).map(|layer| {
-            let selection = ExpertLayer::BackboneFull { layer };
-            ExpertWeights::plan(&lib, &catalog, selection)
-        }).collect::<Result<Vec<_>>>()?;
-        let admitted = pool.placement.expert_ranges[0];
-        let expected = budgets.iter().take(local_layers).map(|b| b.resident_bytes).sum::<usize>()
-            + if local_layers>0 {per_slot*slots + per_decode*2
-                + budgets.iter().take(local_layers).map(|b|b.device_staging_bytes).max().unwrap_or(0)} else {0};
-        ensure!(expected as u64 <= admitted.peak_bytes,"runtime local owners exceed shared admission");
-        tracing::info!(layers=local_layers,peak_bytes=admitted.peak_bytes,"shared RTX expert placement");
+        tracing::info!(layers=local_layers,peak_bytes=admitted_experts.peak_bytes,"shared RTX expert placement");
         if local_layers > 0 {
-            let mut loaded = Vec::with_capacity(local_layers);
-            for layer in 0..local_layers {
-                loaded.push(ExpertWeights::load(&lib, &catalog, ExpertLayer::BackboneFull { layer },
-                    budgets[layer].peak_device_bytes()?)?);
-            }
+            let loaded = match pushed.take() {
+                Some(weights) => weights,
+                None => (0..local_layers).map(|layer| ExpertWeights::load(&lib, &catalog,
+                    ExpertLayer::BackboneFull { layer }, budgets[layer].peak_device_bytes()?))
+                    .collect::<Result<Vec<_>>>()?,
+            };
             let weights = std::rc::Rc::new(loaded);
             for (_, transport) in &mut prefill_slots.slots {
                 transport.install_local(LocalExpertWave::new(&lib, weights.clone(), aot_capacity, per_slot)?)?;

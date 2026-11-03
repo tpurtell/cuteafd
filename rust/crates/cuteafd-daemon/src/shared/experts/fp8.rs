@@ -418,6 +418,27 @@ impl<'a> Fp8Weights<'a> {
         Ok(experts)
     }
 
+    /// Publishes committed layers using the same module, slicing and byte admission as mount loading.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_pushed(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors,
+        directory: &Path, layers: &[usize], tp: usize, rank: usize, capacity: usize,
+        budget: usize, pushed: Vec<Fp8Layer<'a>>) -> Result<Self> {
+        let mut weights = Self::prepare_with_modules(library, tensors, directory, None, layers,
+            tp, rank, capacity, budget, None)?;
+        let slicing = tensors.slicing_for_directory(directory, tp);
+        ensure!(pushed.len() == layers.len(), "pushed FP8-family inventory length differs from admission");
+        for (weight, &layer) in pushed.iter().zip(layers) {
+            let expected = Fp8Layer::loaded_slice(tensors, layer, tp, rank, slicing)?;
+            ensure!(weight.layer == layer && weight.slice == expected,
+                "pushed FP8-family layer {layer} ownership differs from admission");
+        }
+        weights.layers = pushed;
+        let expected = Fp8Layer::bytes_for(tensors, tp, rank, slicing)?.checked_mul(layers.len())
+            .context("pushed FP8-family resident size overflow")?;
+        ensure!(weights.resident_bytes() == expected, "pushed FP8-family arena differs from admitted bytes");
+        Ok(weights)
+    }
+
     pub(crate) fn load_mount(&mut self, library: &'a NativeLibrary, tensors: &Fp8ExpertTensors,
         layers: &[usize], slicing: Slicing) -> Result<()> {
         ensure!(self.layers.is_empty(), "native expert weights already published");
@@ -748,6 +769,18 @@ impl<'a, W> Fp8Experts<'a, W> {
 }
 
 impl<'a> Fp8Experts<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_pushed(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
+        layers: &[usize], tp: usize, rank: usize, capacity: usize, budget: usize,
+        pushed: Vec<Fp8Layer<'a>>) -> Result<Self> {
+        let weights = Fp8Weights::from_pushed(library, tensors, directory, layers, tp, rank,
+            capacity, budget, pushed)?;
+        let scratch = weights.slot_scratch_bytes(capacity)?;
+        ensure!(weights.resident_bytes().checked_add(scratch).is_some_and(|bytes| bytes <= budget),
+            "pushed FP8 resident weights plus execution scratch exceed budget");
+        Self::from_shared(library, weights, capacity)
+    }
+
     pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: &[usize], tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/weights");

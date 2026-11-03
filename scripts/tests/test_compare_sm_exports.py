@@ -162,6 +162,13 @@ def test_kimi_w8_cross_sm_groups(group, names):
                    ["--geometry", "kimik3", "--only", ",".join(names)])
 
 
+def test_ml4_context_fc_has_a_scoped_cross_sm_gate():
+    for scope in ("suspects", "all"):
+        job = next(job for job in compare_sm.jobs(scope) if job[0] == "ml4-draft-context-fc")
+        assert job == ("ml4-draft-context-fc", "export_b12x_dsv4_aot.py",
+                       ["--geometry", "ml4", "--only", "draft_context_fc"])
+
+
 def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
     names = ["mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
              "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
@@ -622,7 +629,9 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
     assert {f"exl3-routes-{name}" for name in compare_sm.EXL3_GEOMETRIES} <= set(names)
     assert {"audio", "vision-attention"} <= set(names)
     assert {f"exl3-{name}-k23" for name in compare_sm.EXL3_GEOMETRIES} <= set(names)
-    assert {"exl3-glm-k45", "exl3-qwen4-k45"} <= set(names)
+    assert {"exl3-glm-k45", "exl3-qwen4-k45", "exl3-ml4-k45"} <= set(names)
+    ml4_args = next(args for name, _, args in jobs if name == "exl3-ml4-k45")
+    assert ml4_args[ml4_args.index("--bits") + 1] == "4,5"
     assert not {"exl3-qwen4-k345", "exl3-qwen4-k2345"} & set(names)
     assert {f"context-split-{name}" for name in ("flash", "pro", "glm", "glmf")} <= set(names)
     assert {"v41-fp8", "v41-experts", "v41-index", "v41-router", "v41-attention"} <= set(names)

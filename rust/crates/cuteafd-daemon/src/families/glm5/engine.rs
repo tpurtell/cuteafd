@@ -148,6 +148,8 @@ fn placement_pages(tables: &StepTables) -> Vec<u32> {
 pub(crate) struct GlmPlacement {
     pub pages: Vec<u32>,
     pub len: usize,
+    /// The sequence's drafter slot (whose draft state its prefix snapshots carry), if any.
+    pub draft_slot: Option<usize>,
 }
 
 impl GlmPlacement {
@@ -178,7 +180,7 @@ impl PageAllocator {
     /// Reserves every page a sequence of up to `capacity` tokens needs.
     pub fn admit(&mut self, capacity: usize) -> Result<GlmPlacement> {
         let pages = self.pool.alloc(self.pool.pages_for(capacity)).context("cache pages exhausted")?;
-        Ok(GlmPlacement { pages, len: 0 })
+        Ok(GlmPlacement { pages, len: 0, draft_slot: None })
     }
 
     /// A second sequence starting as `source`'s first `len` rows: full pages shared, the
@@ -186,7 +188,7 @@ impl PageAllocator {
     pub fn fork(&mut self, source: &GlmPlacement, len: usize, capacity: usize)
         -> Result<(GlmPlacement, Option<cuteafd_engine::prefix::TailCopy>)> {
         let fork = self.pool.fork(&source.pages, len, self.pool.pages_for(capacity)).context("cache pages exhausted")?;
-        Ok((GlmPlacement { pages: fork.pages, len: 0 }, fork.copy))
+        Ok((GlmPlacement { pages: fork.pages, len: 0, draft_slot: None }, fork.copy))
     }
 
     pub fn release(&mut self, placement: GlmPlacement) {
@@ -276,6 +278,61 @@ struct Workspace<'a> {
     core: Option<Rc<super::core_runtime::CoreScratch<'a>>>,
     /// Attention core, down core, reduction target; private to this row slot.
     core_rows: Option<[Buf<'a>; 3]>,
+}
+
+/// The rows of a prefill call's media chunk (indices relative to the call)
+/// that one embed of `t` rows at call offset `begin` covers, rebased to that
+/// embed, with their feature rows (`row` bytes each).
+fn unit_media(chunk: &cuteafd_engine::media::MediaChunk, begin: usize, t: usize, row: usize) -> (Vec<u32>, Vec<u8>) {
+    let (mut indices, mut features) = (Vec::new(), Vec::new());
+    for (i, &index) in chunk.indices.iter().enumerate() {
+        let index = index as usize;
+        if (begin..begin + t).contains(&index) {
+            indices.push((index - begin) as u32);
+            features.extend_from_slice(&chunk.features[i * row..(i + 1) * row]);
+        }
+    }
+    (indices, features)
+}
+
+fn decode_graph_eligible(decode: bool, logit_rows: usize, hooked: bool,
+    complete: bool, pending_media: bool) -> bool {
+    decode && logit_rows > 0 && !hooked && complete && !pending_media
+}
+
+#[cfg(test)]
+mod media_unit_tests {
+    #[test]
+    fn image_chunks_inject_eagerly_but_following_text_uses_graphs() {
+        let route = |pending| super::decode_graph_eligible(true, 1, false, true, pending);
+        assert!(route(false), "text decode retains its captured gather");
+        assert!(!route(true), "pending image rows must use the injecting path");
+        assert!(route(false), "the next text-only call resumes graphs");
+        for (decode, rows, hooked, complete) in [
+            (false, 1, false, true), (true, 0, false, true),
+            (true, 1, true, true), (true, 1, false, false),
+        ] {
+            assert!(!super::decode_graph_eligible(decode, rows, hooked, complete, false));
+        }
+    }
+    /// A call's media rows split across its units exactly once each, rebased to each unit.
+    #[test]
+    fn units_partition_the_call_media_rows() {
+        let row = 4;
+        let chunk = cuteafd_engine::media::MediaChunk { indices: vec![1, 2, 5, 9, 10],
+            features: (0..5u8).flat_map(|i| [i; 4]).collect(), mask: Vec::new() };
+        let mut seen = Vec::new();
+        for (begin, t) in [(0, 3), (3, 4), (7, 5)] {
+            let (indices, features) = super::unit_media(&chunk, begin, t, row);
+            assert_eq!(features.len(), indices.len() * row);
+            assert!(indices.iter().all(|&i| (i as usize) < t));
+            for (k, &i) in indices.iter().enumerate() {
+                seen.push((begin + i as usize, features[k * row]));
+            }
+        }
+        assert_eq!(seen, [(1, 0), (2, 1), (5, 2), (9, 3), (10, 4)]);
+        assert_eq!(super::unit_media(&chunk, 3, 2, row).0, Vec::<u32>::new());
+    }
 }
 
 /// A GPU's prefill slots: one view per slot into the same arenas.
@@ -482,6 +539,10 @@ pub(crate) struct GlmEngine<'a> {
     /// Host time per phase since the last reset: GPU wait before the expert
     /// request, the Spark exchange, the logits download.
     pub profile: RefCell<[f64; 3]>,
+    /// The media rows of the prefill call in flight (absolute start, rows):
+    /// each prefill embed overwrites its rows' image features (see
+    /// [`Self::prefill_media_device`]). Empty for text and decode.
+    pending_media: RefCell<Option<(usize, cuteafd_engine::media::MediaChunk)>>,
     /// Host seconds inside the exchanges: building and posting requests,
     /// copying received partials into the pinned staging.
     pub exchange_host: RefCell<[f64; 4]>,
@@ -495,6 +556,8 @@ pub(crate) struct GlmEngine<'a> {
     graph_misses: Cell<u64>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<crate::shared::speculation::dflash::DflashDrafter<'a>>,
+    /// Prefix marks admission charged for a window-ring drafter's draft windows (0: none).
+    pub draft_window_marks: usize,
     draft_core_head: Option<super::core_runtime::CoreHead<'a>>,
     pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
     /// L2 prefetch of the next layer's weights during decode exchanges.
@@ -526,7 +589,8 @@ pub(crate) struct GlmEngine<'a> {
 /// Per layer the latent record pool and (full-indexer layers) the index-key
 /// pool, zeroed, and the RoPE table, on the current device.
 #[allow(clippy::type_complexity)]
-fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize)
+fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize,
+    rope_alpha: Option<&[f32]>)
     -> Result<(Vec<Dev<'a>>, Vec<Option<Dev<'a>>>, Dev<'a>)> {
     let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
     let zeroed = |bytes: usize| -> Result<Dev<'a>> {
@@ -535,15 +599,20 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
         Ok(allocation)
     };
     // One page past the pool is the scratch page padded decode rows write.
-    let owns = |layer: &GlmLayer<'_>| layer.attention_owner.is_none_or(|owner| {
-        layer.range("q_a_norm").is_some() && owner < 2
-    });
-    let kv = layers.iter().map(|layer| zeroed(if owns(layer) { (pages + 1) * RECORD_PAGE_BYTES } else { 256 })).collect::<Result<Vec<_>>>()?;
+    let owns = |layer: &GlmLayer<'_>| layer.holds_attention();
+    // Each latent owner's records at its own size (656 B with RoPE, 528 B
+    // without); a latent-sharing layer reads its source's pool and holds none.
+    let kv = layers.iter().enumerate().map(|(index, layer)| zeroed(if owns(layer) && cfg.owns_kv(index) {
+        (pages + 1) * PAGE_ROWS * cfg.record_bytes(index) } else { 256 })).collect::<Result<Vec<_>>>()?;
     let index = layers.iter()
         .map(|l| (owns(l) && l.full_indexer).then(|| zeroed((pages + 1) * INDEX_PAGE_BYTES)).transpose())
         .collect::<Result<Vec<_>>>()?;
-    // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq.
+    // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq;
+    // Mistral Large 4: interleaved YaRN with the checkpoint's LeRoPE scale.
     let dim = cfg.qk_rope_head_dim;
+    let table = if let Some(ml4) = cfg.variant.ml4() {
+        ml4.rope_table(rope_alpha.context("Mistral Large 4 RoPE needs lerope.alpha")?, max_context)?
+    } else {
     let mut table = vec![0f32; max_context * dim];
     let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
     for p in 0..max_context {
@@ -553,6 +622,8 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
             table[p * dim + dim / 2 + i] = angle.sin();
         }
     }
+    table
+    };
     let cos_sin = DeviceAllocation::new(library, table.len() * 4)?;
     library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
     Ok((kv, index, cos_sin))
@@ -561,6 +632,49 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
     // SAFETY: plain-old-data slices viewed as bytes for host->device copies.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+#[cfg(test)]
+mod paged_layer_tests {
+    use super::paged_layers;
+    use cuteafd_loader::{families::glm5::GlmDsaConfig, plan::testing};
+
+    /// The prefix snapshot once selected Mistral Large 4's layers by GLM's q-LoRA norm and came
+    /// back empty: every family config, on every placement shape, must page the records its
+    /// cache holds, and exactly the latent owners'.
+    #[test]
+    fn every_placement_pages_every_latent_owner_once() {
+        for config in [testing::glm5_config(), testing::mistral_large4_config()] {
+            let cfg = GlmDsaConfig::from_hf(&config).unwrap();
+            let owners: Vec<u8> = (0..cfg.layers).map(|l| (l % 2) as u8).collect();
+            // One GPU, a head split (both ranks hold every layer), whole-layer owners.
+            let shapes: Vec<Vec<Vec<bool>>> = vec![vec![vec![true; cfg.layers]], vec![vec![true; cfg.layers]; 2],
+                (0..2u8).map(|rank| owners.iter().map(|&o| o == rank).collect()).collect()];
+            for ranks in shapes {
+                let paged: Vec<_> = ranks.iter().map(|holds| paged_layers(&cfg, holds)).collect();
+                for rank in &paged { assert!(!rank.is_empty(), "{}: a rank pages nothing", cfg.family_id()); }
+                for layer in 0..cfg.layers {
+                    let records: Vec<_> = paged.iter().filter_map(|rank| rank.iter().find(|(l, _)| *l == layer)).collect();
+                    assert!(!records.is_empty(), "{}: layer {layer} paged nowhere", cfg.family_id());
+                    for &&(_, bytes) in &records {
+                        assert_eq!(bytes, cfg.owns_kv(layer).then(|| cfg.record_bytes(layer)), "{} layer {layer}", cfg.family_id());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The layers a rank's paged state (cache allocation, prefix snapshots) covers, from whether it
+/// holds each layer's attention: per layer its index and its latent record row bytes (none on a
+/// layer reading another's latent, whose pages its source carries).
+pub(crate) fn paged_layers(cfg: &GlmDsaConfig, holds: &[bool]) -> Vec<(usize, Option<usize>)> {
+    holds.iter().enumerate().filter(|(_, &held)| held)
+        .map(|(layer, _)| (layer, cfg.owns_kv(layer).then(|| cfg.record_bytes(layer)))).collect()
+}
+
+fn latent_cache<'b, T>(cfg: &GlmDsaConfig, index: usize, caches: &'b [T]) -> &'b T {
+    &caches[cfg.kv_source(index)]
 }
 
 impl<'a> GlmEngine<'a> {
@@ -577,7 +691,7 @@ impl<'a> GlmEngine<'a> {
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         let local = if context_mode.is_some() { pages / 2 } else { pages };
-        let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
+        let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context, weights.rope_alpha.as_deref())?;
         let device = library.cuda_get_device()?;
         Ok(Self { max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), native_scratch: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
@@ -587,8 +701,9 @@ impl<'a> GlmEngine<'a> {
             staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), last_prefill_units: Cell::new(0), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
+            pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
 
     pub(crate) fn bind_core(&mut self, admission: Option<cuteafd_loader::families::glm5::core::CoreCharges>) -> Result<()> {
@@ -666,22 +781,29 @@ impl<'a> GlmEngine<'a> {
         Some(observe(routes, &times))
     }
 
-    /// Every layer's latent record pool (656 B per row, 64-row pages) and, on full-indexer
-    /// layers, its index-key pool (8448 B per page: 64 x 128 E4M3 keys, then 64 FP32 scales).
-    pub(crate) fn paged_buffers(&self) -> Vec<(cuteafd_ffi::CuteafdDeviceBuffer, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
+    /// Every layer's latent record pool at its row bytes (64-row pages; none on a layer
+    /// reading another's latent) and, on full-indexer layers, its index-key pool (8448 B per
+    /// page: 64 x 128 E4M3 keys, then 64 FP32 scales).
+    pub(crate) fn paged_buffers(&self)
+        -> Vec<(Option<(cuteafd_ffi::CuteafdDeviceBuffer, usize)>, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
         self.paged_buffers_on(0)
     }
 
     /// [`Self::paged_buffers`] of rank `rank` (1: the head split's copy on its second GPU).
+    /// Rank `rank`'s paged state per attention layer it holds: the latent records at their row
+    /// bytes (656 B; Mistral Large 4's NoPE 528 B; none on a layer reading another's latent,
+    /// whose pages its source carries) and full-indexer layers' index pages.
     pub(crate) fn paged_buffers_on(&self, rank: usize)
-        -> Vec<(cuteafd_ffi::CuteafdDeviceBuffer, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
+        -> Vec<(Option<(cuteafd_ffi::CuteafdDeviceBuffer, usize)>, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
         let (kv, index) = match (rank, &self.peer) {
             (1, Some(peer)) => (&peer.kv, &peer.index),
             _ => (&self.kv, &self.index),
         };
         let layers = if rank == 1 { &self.peer.as_ref().unwrap().layers } else { &self.weights.layers };
-        kv.iter().zip(index).zip(layers).filter(|(_, layer)| layer.range("q_a_norm").is_some())
-            .map(|((kv, index), _)| (kv.buffer, index.as_ref().map(|i| i.buffer))).collect()
+        let holds: Vec<bool> = layers.iter().map(GlmLayer::holds_attention).collect();
+        paged_layers(&self.cfg, &holds).into_iter()
+            .map(|(layer, records)| (records.map(|bytes| (kv[layer].buffer, bytes)), index[layer].as_ref().map(|i| i.buffer)))
+            .collect()
     }
 
     /// GPUs this engine runs on: 2 under a head split.
@@ -704,9 +826,11 @@ impl<'a> GlmEngine<'a> {
             rows * self.cfg.hidden * (self.tp2_exchange.element_bytes() + core_bytes),
             decode_peer_bytes(DECODE_ROWS, self.cfg.hidden, self.tp2_exchange))?;
         let peer = exchange.on(1, || -> Result<GlmPeer<'a>> {
-            let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm", split_family: Some("glm2") };
+            let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.cfg.program_family(),
+                split_family: self.cfg.split_program_family() };
             self.programs.load_matching(|name| selected.contains(name))?;
-            let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.local_pages(), self.max_context)?;
+            let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.local_pages(), self.max_context,
+                self.weights.rope_alpha.as_deref())?;
             let released = crate::shared::memory::device::Event::new(
                 crate::shared::memory::device::Device { library: self.library, id: device })?;
             Ok(GlmPeer { device, stream, released, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),
@@ -726,6 +850,8 @@ impl<'a> GlmEngine<'a> {
     /// Allocates the token-split buffers and exchange once the peer is attached; `extent`:
     /// the admitted compiled context (the staging the solver charged).
     pub fn attach_context(&mut self, extent: usize, manifest: &serde_json::Value) -> Result<()> {
+        // Staging views each layer's own record pitch inside the widest; commits carry one
+        // record plane per contract (GLM 5.x 656 B; Mistral Large 4 656 and 528 B).
         let context = self.context_mode.context("this engine was built without context attention")?;
         let exchange = self.exchange()?;
         let abort = match (exchange.abort_word(0)?, exchange.abort_word(1)?) {
@@ -772,6 +898,18 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
+    /// `stem` in this variant's program namespace (`glm_norm`, `ml4_norm`).
+    fn family_program(&self, stem: &str) -> String {
+        format!("{}_{stem}", self.cfg.program_family())
+    }
+
+    /// The namespace of `layer`'s attention-head programs: the variant's, or a head
+    /// split's share (`ml42_*`) when its heads are split over the two GPUs.
+    fn ml4_attention_family(&self, layer: &GlmLayer<'_>) -> &'static str {
+        if layer.attention_split { self.cfg.split_program_family().unwrap_or(self.cfg.program_family()) }
+        else { self.cfg.program_family() }
+    }
+
     /// Launches `name` on rank `rank`'s stream.
     fn run_on(&self, rank: usize, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
@@ -789,7 +927,7 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn norm_full(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Scalar,
         first: *mut c_void, second: *mut c_void) -> Result<()> {
-        self.run_on(rank, "glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
+        self.run_on(rank, &self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
             ("weight", weight), ("out", w.x.buffer.ptr)], &[rows, Scalar::I32(deltas)])
     }
 
@@ -838,6 +976,10 @@ impl<'a> GlmEngine<'a> {
 
     /// Program scratch of a step (`decode`: the m64 programs).
     fn step_scratch(&self, decode: bool) -> Result<usize> {
+        if !self.cfg.variant.is_glm() {
+            return Ok(cuteafd_loader::placement::families::glm5::step_scratch(&self.cfg, false, decode,
+                |name| self.scratch(name).ok().map(|n| n as u64))?.programs as usize);
+        }
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let mut scratch = 0usize;
         let split = self.weights.layers.first().is_some_and(|l| l.split);
@@ -886,7 +1028,7 @@ impl<'a> GlmEngine<'a> {
         let native_head = matches!(self.weights.head, super::weights::GlmHead::K6(_));
         let head_workspace = cuteafd_loader::placement::families::glm5::head_workspace_bytes(lead, native_head)
             .map(|bytes| self.alloc(bytes as usize).map(Buf::owned)).transpose()?;
-        let topk = self.alloc(self.scratch(&format!("glm_index_topk_{mode}_{cap}"))?)?;
+        let topk = self.alloc(self.scratch(&format!("{}_index_topk_{mode}_{cap}", self.cfg.program_family()))?)?;
         self.library.cuda_zero_bytes(topk.buffer, topk.buffer.bytes)?;
         Ok(SharedStep {
             scratch: Buf::owned(self.alloc(scratch)?),
@@ -1031,6 +1173,66 @@ impl<'a> GlmEngine<'a> {
             Some(StepLogits::Host(_)) => anyhow::bail!("the last prefill row's logits span lanes"),
             None => Ok(None),
         }
+    }
+
+    /// [`Self::prefill_device`] with the request's image features: rows inside a
+    /// media span take the encoder's rows instead of their placeholder
+    /// embeddings (Mistral spans also carry their marker rows). Text is
+    /// unchanged: no spans in range means no injection.
+    pub fn prefill_media_device(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, logit_rows: usize,
+        media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        self.with_media(placement.len, tokens.len(), media,
+            || self.prefill_device(placement, tokens, experts, logit_rows))
+    }
+
+    /// Multirow scoring preserves prefill's host/device routing while injecting image rows.
+    pub fn prefill_scoring_media(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, logit_rows: usize,
+        media: &cuteafd_engine::media::RequestMedia) -> Result<Option<Vec<f32>>> {
+        self.with_media(placement.len, tokens.len(), Some(media),
+            || self.prefill_rows_logits(placement, tokens, experts, None, logit_rows))
+    }
+
+    /// Teacher-forced decode chunks may cross an image span too, not just prefill chunks.
+    pub fn verify_scoring_media(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        media: &cuteafd_engine::media::RequestMedia) -> Result<Option<DeviceLogits>> {
+        self.with_media(placement.len, tokens.len(), Some(media),
+            || self.verify_device(&mut [(placement, tokens.len())], tokens, experts))
+    }
+
+    fn with_media<T>(&self, start: usize, rows: usize,
+        media: Option<&cuteafd_engine::media::RequestMedia>, run: impl FnOnce() -> Result<T>) -> Result<T> {
+        let end = start.checked_add(rows).context("media call extent")?;
+        let chunk = match media.filter(|m| !m.spans().is_empty()) {
+            Some(media) => {
+                let mut chunk = cuteafd_engine::media::MediaChunk::default();
+                media.write_chunk(start, end, &mut chunk)?;
+                (!chunk.indices.is_empty()).then_some(chunk)
+            }
+            None => None,
+        };
+        *self.pending_media.borrow_mut() = chunk.map(|chunk| (start, chunk));
+        let result = run();
+        *self.pending_media.borrow_mut() = None;
+        result
+    }
+
+    /// Overwrites this embed's rows (absolute positions of `tables`) that the
+    /// pending media chunk covers. `delta` (rows x hidden BF16) and `indices`
+    /// are not read before layer 0 writes them, so they stage the rows; all on
+    /// this stream, after the embed and before the first norm.
+    fn inject_media(&self, w: &Workspace<'_>, tables: &StepTables) -> Result<()> {
+        let pending = self.pending_media.borrow();
+        let Some((call, chunk)) = pending.as_ref() else { return Ok(()); };
+        let (Some(&first), t) = (tables.positions.first(), tables.positions.len()) else { return Ok(()); };
+        let begin = usize::try_from(first)?.checked_sub(*call).context("media rows before the call")?;
+        let (indices, features) = unit_media(chunk, begin, t, self.cfg.hidden * 2);
+        if indices.is_empty() { return Ok(()); }
+        self.library.embedding_injection()?.inject_host(&features, &indices, w.delta.buffer, w.indices.buffer,
+            w.h.buffer, t, self.cfg.hidden, 1, self.stream)?;
+        Ok(())
     }
 
     /// Downloads a step's logits (counted in the logits phase).
@@ -1292,10 +1494,13 @@ impl<'a> GlmEngine<'a> {
         }
         if self.layer_execution.is_some() {
             self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+            self.inject_media(w, tables)?;
             return self.layer_step(scope, w, w1.context("owned attention peer")?, &ranked[0],
                 t, logit_rows, &mut experts, on_layer);
         }
-        if tables.decode && logit_rows > 0 && on_layer.is_none() && layers.len() == self.cfg.layers {
+        // Captured gathers overwrite embeddings; only calls with actual image rows inject eagerly.
+        if decode_graph_eligible(tables.decode, logit_rows, on_layer.is_some(),
+            layers.len() == self.cfg.layers, self.pending_media.borrow().is_some()) {
             // The first captured segment gathers the rows from the staged ids;
             // the last runs the head and the greedy selection.
             let gather = self.embedding.device_gather();
@@ -1314,6 +1519,7 @@ impl<'a> GlmEngine<'a> {
             return Ok(Some(self.device_logits(w, logit_rows, head)));
         }
         self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+        self.inject_media(w, tables)?;
         let bytes = t * h * 2;
         if let Some(w1) = w1 {
             self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
@@ -1334,7 +1540,7 @@ impl<'a> GlmEngine<'a> {
                         w.delta.buffer.ptr, self.recv(0, attended)?)?;
                     self.peer_ffn(index, 0, w1, rows, cap, bytes)?;
                 }
-                None => self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                None => self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?,
             }
@@ -1374,7 +1580,7 @@ impl<'a> GlmEngine<'a> {
                 else { self.ffn_norm(0, index, 0, w, layer, weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
             } else {
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?;
             }
@@ -1407,6 +1613,16 @@ impl<'a> GlmEngine<'a> {
     /// Logits of the last `n` of `t` rows of the final norm's output into the workspace's logits,
     /// through the shared BF16 target-head route ([`crate::shared::target_head`]).
     fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<()> {
+        self.launch_head_logits(w, t, n)?;
+        if let Some(cap) = self.cfg.logit_softcap() {
+            // SAFETY: logits holds n rows of vocab F32 on this stream (checked by the head).
+            unsafe { self.library.cuda_logits_softcap_f32_async(w.logits.buffer.ptr, n, self.cfg.vocab_size,
+                self.cfg.vocab_size, cap as f32, self.stream)? };
+        }
+        Ok(())
+    }
+
+    fn launch_head_logits(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<()> {
         let h = self.cfg.hidden;
         if let super::weights::GlmHead::K6(weights) = &self.weights.head {
             ensure!(n <= t && t * h * 2 <= w.x.buffer.bytes && n * self.cfg.vocab_size * 4 <= w.logits.buffer.bytes,
@@ -1635,7 +1851,7 @@ impl<'a> GlmEngine<'a> {
                     }
                     _ => {
                         let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
-                        self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                        self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                             ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                             &[rows, Scalar::I32(deltas)])?;
                     }
@@ -1659,7 +1875,7 @@ impl<'a> GlmEngine<'a> {
                     self.projection_norm(0, index, 0, w, layer, "o", layer.ptr("post_norm")?, rows,
                         w.delta.buffer.ptr, self.recv(0, attended)?)?;
                 } else {
-                    self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                    self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                         ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
                         &[rows, Scalar::I32(1)])?;
                 }
@@ -1904,17 +2120,29 @@ impl<'a> GlmEngine<'a> {
     fn moe_front_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Scalar::I32(t as i32);
-        self.run_on(rank, "glm_router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
-            ("logits", w.router_logits.buffer.ptr)], &[rows])?;
+        let ml4 = self.cfg.variant.ml4().is_some();
+        self.run_on(rank, &self.family_program("router_scores"), &[("x", w.x.buffer.ptr),
+            ("w", layer.ptr("gate")?), ("logits", w.router_logits.buffer.ptr)], &[rows])?;
+        if ml4 {
+            // Softmax top-k over FP32 logits, renormalized, times the routed scale
+            // (the reference router: no BF16 rounding of logits or weights).
+            // SAFETY: logits and route outputs are live buffers of `t` rows.
+            self.on(rank, || unsafe {
+                self.library.router_select_softmax(w.router_logits.buffer.ptr, w.route_ids.buffer.ptr,
+                    w.route_weights.buffer.ptr, t, self.cfg.experts, topk, self.cfg.routed_scale as f32, false,
+                    self.stream_of(rank))
+            })?;
+        } else {
         // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
         self.on(rank, || unsafe {
             self.library.router_select(w.router_logits.buffer.ptr, layer.ptr("gate.bias")?, std::ptr::null(),
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream_of(rank))
         })?;
+        }
         if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.uses_fp8_input()) { return Ok(()); }
         let grid = self.quantize_grid.blocks(t, h);
-        self.run_on(rank, "glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
+        self.run_on(rank, &self.family_program("expert_input_quant"), &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.
             ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
             ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])
@@ -2211,6 +2439,7 @@ impl<'a> GlmEngine<'a> {
                 }
             }
             self.embedding.embed(chunks[unit], w.ids.buffer, 1, w.h.buffer, self.stream)?;
+            self.inject_media(w, &lanes[unit])?;
             // The rank-1 entry copy is published in this unit's first attention,
             // next to its DIRECT wait: Begin admits several slots before any attention.
             Ok(())
@@ -2242,7 +2471,7 @@ impl<'a> GlmEngine<'a> {
                 self.peer_ffn(index, slot, peer_workspaces.as_ref().context("peer workspaces")?.get(slot)?,
                     rows, cap, bytes_of_unit(unit))?;
             } else {
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?;
             }
@@ -2279,7 +2508,7 @@ impl<'a> GlmEngine<'a> {
                 else { self.ffn_norm(0, index, slot, w, &layers[index], weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
             } else {
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?;
             }
@@ -2360,7 +2589,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn norm(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, weight: &str, deltas: i32, rows: Scalar) -> Result<()> {
-        self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+        self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
             ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr(weight)?), ("out", w.x.buffer.ptr)],
             &[rows, Scalar::I32(deltas)])
     }
@@ -2371,7 +2600,8 @@ impl<'a> GlmEngine<'a> {
     /// there); otherwise it gathers its own whole history. Units of a call are one
     /// sequence in order, so unit `lane - 1` is the predecessor.
     pub(super) fn context_unit_turn(&self, index: usize, lane: usize) -> Result<()> {
-        self.context_reuse.set(context_staging_turn(&mut self.staging_owner.borrow_mut(), index % 2, index, lane));
+        self.context_reuse.set(context_staging_turn(&mut self.staging_owner.borrow_mut(),
+            self.cfg.kv_source(index) % 2, index, lane));
         Ok(())
     }
 
@@ -2507,9 +2737,12 @@ impl<'a> GlmEngine<'a> {
         index_cache: Option<cuteafd_ffi::CuteafdDeviceBuffer>) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let heads = self.cfg.heads / if layer.attention_split { 2 } else { 1 };
+        if self.cfg.variant.ml4().is_some() {
+            return self.ml4_attention_over(rank, w, index, layer, rows, cap, tables, kv, index_cache);
+        }
         self.producer(rank, w, layer, rows, cap, kv, w.query.buffer.ptr)?;
         if let Some(index_cache) = index_cache {
-            self.index_producer(rank, w, layer, rows, cap, index_cache)?;
+            self.index_producer(rank, w, index, layer, rows, cap, index_cache)?;
             self.run_on(rank, &format!("glm_index_topk_{mode}_{cap}"), &[
                 ("q_fp8", w.q_fp8.buffer.ptr), ("weights", w.head_weights.buffer.ptr),
                 ("index_k_cache", index_cache.ptr), ("page_table", w.page_table.buffer.ptr),
@@ -2548,8 +2781,52 @@ impl<'a> GlmEngine<'a> {
         self.o_proj(rank, w, layer, cap, rows)
     }
 
+    /// Mistral Large 4's attention (`GlmVariant::MistralLarge4`) on the shared
+    /// GLM structure: the direct-query K6 producer (query scale, absorb) and,
+    /// on latent owners, the record of `wkv_a`; the indexer from LayerNorm(x)
+    /// with its query scale and the shared top-k; sparse MLA on the layer's
+    /// record contract (656-byte RoPE, 528-byte NoPE) at 128^-0.5; W_UV and wo.
+    /// Latent-sharing layers read their source layer's pages (`kv`).
+    #[allow(clippy::too_many_arguments)]
+    fn ml4_attention_over(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Scalar,
+        cap: &str, tables: &StepTables, kv: cuteafd_ffi::CuteafdDeviceBuffer,
+        index_cache: Option<cuteafd_ffi::CuteafdDeviceBuffer>) -> Result<()> {
+        let mode = if tables.decode { "decode" } else { "prefill" };
+        let rope = self.cfg.rope(index);
+        self.ml4_core_producer(rank, w, index, layer, scalar_rows(rows)?, cap, kv, w.query.buffer.ptr, false)?;
+        if let Some(index_cache) = index_cache {
+            self.ml4_core_index_producer(rank, w, index, layer, scalar_rows(rows)?, cap, index_cache)?;
+            self.run_on(rank, &format!("ml4_index_topk_{mode}_{cap}"), &[
+                ("q_fp8", w.q_fp8.buffer.ptr), ("weights", w.head_weights.buffer.ptr),
+                ("index_k_cache", index_cache.ptr), ("page_table", w.page_table.buffer.ptr),
+                ("cache_lengths", w.cache_lengths.buffer.ptr), ("output_indices", w.indices.buffer.ptr),
+                ("scratch", w.topk_scratch.buffer.ptr)],
+                &[rows, Scalar::I32(tables.table_width as i32), Scalar::I32(tables.table_stride as i32)])?;
+        }
+        let decode_scalars = [rows, Scalar::I32(self.attention_plan.rows() as i32)];
+        let prefill_scalars = [rows];
+        let scalars = if tables.decode { &decode_scalars[..] } else { &prefill_scalars[..] };
+        let tag = if rope { "" } else { "_nope" };
+        let family = self.ml4_attention_family(layer);
+        self.run_on(rank, &format!("{family}_sparse_mla{tag}_{mode}_{cap}"), &[
+            ("q", w.query.buffer.ptr), ("kv_cache", kv.ptr), ("indices", w.indices.buffer.ptr),
+            ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+            scalars)?;
+        self.ml4_core_o_proj(rank, w, layer, scalar_rows(rows)?, cap)
+    }
+
     /// Rank `rank`'s latent and (full-indexer layers) index-key pools of layer `index`, and its RoPE table.
+    /// A latent-sharing layer (`kv_source(index) != index`) reads its source layer's latent pool.
     fn rank_caches(&self, rank: usize, index: usize) -> (&Dev<'a>, Option<&Dev<'a>>, &Dev<'a>) {
+        let (_, index_pool, cos_sin) = self.rank_caches_of(rank, index);
+        let caches = match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.kv,
+            _ => &self.kv,
+        };
+        (latent_cache(&self.cfg, index, caches), index_pool, cos_sin)
+    }
+
+    fn rank_caches_of(&self, rank: usize, index: usize) -> (&Dev<'a>, Option<&Dev<'a>>, &Dev<'a>) {
         match (rank, &self.peer) {
             (1, Some(peer)) => (&peer.kv[index], peer.index[index].as_ref(), &peer.cos_sin),
             _ => (&self.kv[index], self.index[index].as_ref(), &self.cos_sin),
@@ -2588,8 +2865,11 @@ impl<'a> GlmEngine<'a> {
 
     /// The DSA index producer on `rank`: index keys at the rows' slots in `index_cache`,
     /// the FP8 index query and head weights into the workspace.
-    fn index_producer(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: Scalar, cap: &str,
-        index_cache: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+    fn index_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Scalar,
+        cap: &str, index_cache: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+        if self.cfg.variant.ml4().is_some() {
+            return self.ml4_core_index_producer(rank, w, index, layer, scalar_rows(rows)?, cap, index_cache);
+        }
         if layer.is_native() {
             return self.native_index_producer(rank, w, layer, scalar_rows(rows)?, cap, index_cache);
         }
@@ -2610,6 +2890,9 @@ impl<'a> GlmEngine<'a> {
 
     /// W_UV + o_proj of this rank's heads over `attn` into `delta` (a partial sum under a split).
     fn o_proj(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, cap: &str, rows: Scalar) -> Result<()> {
+        if self.cfg.variant.ml4().is_some() {
+            return self.ml4_core_o_proj(rank, w, layer, scalar_rows(rows)?, cap);
+        }
         if layer.core.contains_key("o") {
             return self.core_o_proj(rank, w, layer, scalar_rows(rows)?, cap);
         }
@@ -2628,7 +2911,7 @@ impl<'a> GlmEngine<'a> {
 
     /// Scalars of the programs over FP8 weights: `rows`, plus the prefill
     /// programs' `fp8_rows` (1: W8A8, 0: W8A16).
-    fn projection_scalars(&self, rows: Scalar, cap: &str) -> Vec<Scalar> {
+    pub(super) fn projection_scalars(&self, rows: Scalar, cap: &str) -> Vec<Scalar> {
         if cap == "m64" {
             vec![rows]
         } else {
@@ -3261,6 +3544,21 @@ mod prefill_unit_tests {
 #[cfg(test)]
 mod decode_extent_tests {
     use super::*;
+
+    #[test]
+    fn ml4_decode_extent_matches_checkpoint_transfers() -> Result<()> {
+        let cfg = GlmDsaConfig::from_hf(&cuteafd_loader::plan::testing::mistral_large4_config())?;
+        assert_eq!((cfg.hidden, cfg.topk), (6144, 4));
+        let residual_hop = DECODE_ROWS * cfg.hidden * std::mem::size_of::<u16>();
+        assert_eq!(residual_hop, 786_432);
+        for exchange in [ExchangeDtype::Bf16, ExchangeDtype::F32] {
+            let projection = DECODE_ROWS * cfg.hidden * std::mem::size_of::<u16>();
+            let routed = DECODE_ROWS * cfg.hidden * exchange.element_bytes();
+            assert_eq!(decode_peer_bytes(DECODE_ROWS, cfg.hidden, exchange),
+                [residual_hop, projection, routed].into_iter().max().unwrap());
+        }
+        Ok(())
+    }
 
     #[test]
     fn declared_decode_extent_is_largest_single_transfer() {

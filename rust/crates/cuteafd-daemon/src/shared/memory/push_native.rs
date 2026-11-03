@@ -16,6 +16,7 @@ use std::{ops::Range, path::Path};
 pub(crate) struct ScalePlan {
     steps: Vec<(u64, ScaleStep)>,
     bytes: u64,
+    host_staging: crate::shared::experts::rtx::dense::HostStaging,
 }
 struct ScaleStep {
     rects: Vec<crate::shared::experts::rtx::dense::Rect>,
@@ -66,16 +67,18 @@ impl ScalePlan {
                 }
             }
         }
+        let table = if plan.steps.is_empty() { 0 } else { crate::shared::fp8_load_quant::scale_code_table_bytes(1)? };
+        plan.host_staging = crate::shared::experts::rtx::dense::HostStaging::for_steps(
+            plan.steps.iter().map(|(_, step)| step.rects.as_slice()), table)?;
+        plan.host_staging.bytes()?;
         Ok(plan)
     }
     pub fn base(&self, layout: &ArenaLayout) -> u64 { (layout.logical_bytes() as u64 + 1).next_multiple_of(256) }
     pub fn logical_bytes(&self, layout: &ArenaLayout) -> u64 {
         if self.steps.is_empty() { layout.logical_bytes() as u64 } else { self.base(layout) + self.bytes }
     }
-    pub fn host_peak(&self) -> usize {
-        if self.steps.is_empty() { 0 } else { crate::shared::experts::rtx::dense::MAX_OPEN_STEPS
-            * crate::shared::experts::rtx::dense::STEP_BYTES + (1 << 20) }
-    }
+    pub fn host_staging(&self) -> crate::shared::experts::rtx::dense::HostStaging { self.host_staging }
+    pub fn host_peak(&self) -> Result<usize> { self.host_staging().bytes() }
     pub fn append(&self, builder: &mut Builder, rank: u32, base: u64) -> Result<()> {
         for (start, step) in &self.steps {
             let mut at = base + start;
@@ -222,7 +225,8 @@ impl RankPlan {
         }
         let layout = layout.with_generated(generated)?;
         let scales = ScalePlan::new(catalog, scale_layers, world, rank)?;
-        let host_scratch = scalar_bytes.checked_add(vectors).and_then(|n| n.checked_add(scales.host_peak()))
+        let scale_host = scales.host_peak()?;
+        let host_scratch = scalar_bytes.checked_add(vectors).and_then(|n| n.checked_add(scale_host))
             .context("native host scratch overflow")?;
         Ok(Self { layers, layout, placement, scratch, host_scratch, scales })
     }

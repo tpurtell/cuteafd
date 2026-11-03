@@ -1,4 +1,4 @@
-//! Optional EXL3 startup transaction; all GPU owners remain on the worker thread.
+//! Namespace-required EXL3 startup transaction; GPU owners stay on the worker thread.
 #[cfg(test)]
 mod tests;
 use super::NativeExpertServiceConfig;
@@ -15,9 +15,7 @@ use std::{net::TcpStream, os::fd::AsRawFd, rc::Rc};
 pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig, layers: &[usize], budgets: &[ExpertLoadBudget],
     resident: usize, stream: &mut TcpStream) -> Result<Option<Vec<Exl3Weights<'a>>>> {
-    // Metadata only: failure here sends a mount offer, with no push allocation.
-    let planned = (|| -> Result<_> {
-        let (root, host) = cuteafd_loader::push_load::namespace(&config.snapshot)?;
+    let Some(((plan, checked), (group, token))) = plan_offer(&config.snapshot, stream, |root, host| {
         let plan = RankPlan::new(catalog, layers, config.world, config.rank, resident)?;
         let checked = plan.checked(catalog, &root, config.world, config.rank)?;
         ensure!(checked.plan.files.iter().all(|file| cuteafd_loader::push_load::is_push_shard(&root.join(file))),
@@ -32,15 +30,49 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
             ring_bytes = DEFAULT_SLOTS * DEFAULT_SLOT_BYTES, validation_bytes = plan.validation.bytes(),
             headroom_bytes = headroom, load_peak_bytes = peak, available_bytes = available,
             "Spark push admitted independent ring and validation host memory");
-        let offer = Offer { rank: config.rank, host, arena_bytes: plan.layout.logical_bytes() as u64,
+        let offer = Offer { rank: config.rank, host: host.into(), arena_bytes: plan.layout.logical_bytes() as u64,
             placement: plan.placement.clone() };
-        Ok((plan, checked, offer))
+        Ok(((plan, checked), offer))
+    })? else { return Ok(None); };
+    required_receive(receive(library, plan, &checked, budgets, config.rank, &PushClient::default(), stream, group, token))
+}
+
+/// Decline before returning a startup error, so other ranks leave Begin cleanly.
+/// No allocation occurs for snapshots outside a SparkNest namespace.
+pub(super) fn plan_offer<T>(snapshot: &std::path::Path, stream: &mut TcpStream,
+    plan: impl FnOnce(&std::path::Path, &str) -> Result<(T, Offer)>)
+    -> Result<Option<(T, (u64, u64))>> {
+    plan_offer_namespace(snapshot, stream, cuteafd_loader::push_load::namespace(snapshot), plan)
+}
+
+fn plan_offer_namespace<T>(snapshot: &std::path::Path, stream: &mut TcpStream,
+    namespace: std::io::Result<(std::path::PathBuf, String)>,
+    plan: impl FnOnce(&std::path::Path, &str) -> Result<(T, Offer)>)
+    -> Result<Option<(T, (u64, u64))>> {
+    use crate::shared::experts::rtx::push::{PushPolicy, PushStartupError};
+    let planned = (|| -> Result<_> {
+        match namespace {
+            Ok((root, host)) => PushPolicy::Required.plan(|| plan(&root, &host)).map_err(Into::into),
+            Err(error) => {
+                PushPolicy::from_namespace(snapshot, Err(error))?;
+                Ok(None)
+            }
+        }
     })();
-    if let Err(error) = &planned { tracing::warn!(%error, "Spark push unavailable; offering mount"); }
-    let credentials = push::offer_with(stream, planned.as_ref().map(|(_, _, offer)| offer.clone()).map_err(|error| format!("{error:#}")))?;
-    let Some((group, token)) = credentials else { return Ok(None); };
-    let (plan, checked, _) = planned?;
-    receive(library, plan, &checked, budgets, config.rank, &PushClient::default(), stream, group, token)
+    let offer = match &planned {
+        Ok(Some((_, offer))) => Ok(offer.clone()),
+        Ok(None) => Err("snapshot is not a SparkNest namespace".into()),
+        Err(error) => Err(format!("{error:#}")),
+    };
+    let credentials = push::offer_with(stream, offer).map_err(PushStartupError::Delivery)?;
+    let Some((planned, _)) = planned? else { return Ok(None); };
+    let credentials = credentials.ok_or(PushStartupError::Uncommitted)?;
+    Ok(Some((planned, credentials)))
+}
+
+/// Receive routines return only after the whole group commits or drains.
+pub(super) fn required_receive<T>(received: Result<Option<T>>) -> Result<Option<T>> {
+    crate::shared::experts::rtx::push::PushPolicy::Required.committed(received).map_err(Into::into)
 }
 
 // Push and mount are alternative loaders. Charge the actual push transient,
@@ -89,10 +121,10 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
         return Ok(Some(weights));
     }
     // Drop every rank-arena reference before the drained acknowledgment. The
-    // coordinator releases mount retry only after all ranks cross this barrier.
+    // coordinator releases failed startup only after all ranks cross this barrier.
     drop(candidate);
-    ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe mount retry");
+    ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe startup cleanup");
     push::drained(stream)?;
-    tracing::info!(group, rank = rank_id, "whole Spark push group discarded; loading through mount");
+    tracing::info!(group, rank = rank_id, "whole Spark push group discarded before startup failure");
     Ok(None)
 }

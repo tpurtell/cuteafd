@@ -167,9 +167,12 @@ impl MediaPreparer {
             .get()
             .copied()
             .unwrap_or((4096, ImageUrlFetch::Public));
-        config.max_image_tokens = if config.family == cuteafd_loader::media::ImageFamily::Qwen {
-            cap.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)
-        } else { cap };
+        config.max_image_tokens = match config.family {
+            cuteafd_loader::media::ImageFamily::Qwen => cap.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS),
+            // Mistral's span cap follows the checkpoint's longest edge; the policy only lowers it.
+            cuteafd_loader::media::ImageFamily::Mistral => cap.min(config.max_image_tokens),
+            _ => cap,
+        };
         Self::new(config, encoder, fetch, slots)
     }
     pub fn new(

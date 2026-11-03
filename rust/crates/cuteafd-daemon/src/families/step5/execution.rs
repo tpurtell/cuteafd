@@ -474,14 +474,30 @@ impl<'e, 'a> Execution<'e, 'a> {
 pub(super) struct LoadedNative<'a>(NativeOwners<'a>);
 
 impl<'a> LoadedNative<'a> {
+    /// Predictor weights share the target's admitted owners before publication.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load_predictor(&self, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        cache: &CacheRank<'a>, stream: Rc<crate::shared::memory::device::Stream<'a>>,
+        depth: usize, rows: usize, available: u64, reservations: &[u64]) -> Result<super::mtp::Runtime<'a>> {
+        let rank = cache.rank();
+        super::mtp::Runtime::load(&self.0.contract, self.0.rope.get(rank).context("Step-5 predictor rope rank")?.clone(),
+            self.0.arenas.get(rank).context("Step-5 predictor arena rank")?, stream,
+            programs, checkpoint, cache, depth, rows, available, reservations)
+    }
+
     /// Loads the solver's onboarded routed layers whole on `device` (the entry
     /// GPU) from the installed `rtx-tp1` package, inside `budget` bytes.
     pub(super) fn with_onboarded(mut self, device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
-        package: &std::path::Path, layers: &[usize], rows: usize, budget: usize) -> Result<Self> {
+        package: &std::path::Path, layers: &[usize], rows: usize, budget: usize,
+        pushed: Option<crate::shared::experts::rtx::push::PushedExperts<'a>>) -> Result<Self> {
         if layers.is_empty() { return Ok(self); }
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
-        let weights = Exl3Tp2::load_whole_weights(device, catalog, package, layers.to_vec(), rows, budget,
-            RtxSelectionPolicy::CanonicalDecode)?;
+        let weights = match pushed {
+            Some(pushed) => Exl3Tp2::pushed_whole_weights(device, catalog, package, layers.to_vec(), rows,
+                budget, RtxSelectionPolicy::CanonicalDecode, pushed.exl3()?)?,
+            None => Exl3Tp2::load_whole_weights(device, catalog, package, layers.to_vec(), rows, budget,
+                RtxSelectionPolicy::CanonicalDecode)?,
+        };
         self.0.onboarded = Some(RefCell::new(weights.execution()?));
         tracing::info!(layers = layers.len(), "Step-5 EXL3 routed layers onboarded on the entry RTX");
         Ok(self)
@@ -491,15 +507,25 @@ impl<'a> LoadedNative<'a> {
     /// from the installed TP2 package (EXL3 `rtx-tp2`, or fp8moe `tp2`),
     /// inside each rank's TP2 arena peak.
     pub(super) fn with_onboarded_tp2(mut self, devices: [Device<'a>; 2], catalog: &cuteafd_loader::OfficialV41Catalog,
-        package: &std::path::Path, layers: &[usize], rows: usize, budgets: [usize; 2]) -> Result<Self> {
+        package: &std::path::Path, layers: &[usize], rows: usize, budgets: [usize; 2],
+        pushed: Option<[crate::shared::experts::rtx::push::PushedExperts<'a>; 2]>) -> Result<Self> {
         if layers.is_empty() { return Ok(self); }
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxSelectionPolicy, Tp2Weights};
         self.0.onboarded_tp2 = Some(if catalog.exl3().is_some() {
-            Tp2Weights::Exl3(Exl3Tp2::load_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::STEP5,
-                [package, package], layers.to_vec(), rows, budgets, RtxSelectionPolicy::CanonicalDecode)?)
+            Tp2Weights::Exl3(match pushed {
+                Some([first, second]) => Exl3Tp2::pushed_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::STEP5,
+                    [package, package], layers.to_vec(), rows, budgets, RtxSelectionPolicy::CanonicalDecode,
+                    [first.exl3()?, second.exl3()?])?,
+                None => Exl3Tp2::load_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::STEP5,
+                    [package, package], layers.to_vec(), rows, budgets, RtxSelectionPolicy::CanonicalDecode)?,
+            })
         } else {
-            Tp2Weights::Fp8(Fp8MoeTp2::load_pair(devices, catalog.fp8().context("Step-5 FP8 expert tensors")?,
-                package, layers.to_vec(), rows, budgets)?)
+            let tensors = catalog.fp8().context("Step-5 FP8 expert tensors")?;
+            Tp2Weights::Fp8(match pushed {
+                Some([first, second]) => Fp8MoeTp2::pushed_pair(devices, tensors, package, layers.to_vec(), rows,
+                    budgets, [first.fp8()?, second.fp8()?])?,
+                None => Fp8MoeTp2::load_pair(devices, tensors, package, layers.to_vec(), rows, budgets)?,
+            })
         });
         tracing::info!(layers = layers.len(), "Step-5 routed layers onboarded TP2 over both RTX");
         Ok(self)
@@ -846,18 +872,6 @@ impl<'e, 'a> Execution<'e, 'a> {
             };
             resource::worker_group_rows_for_input(&reports, layer, rows, ffn.wire_dtype() == ExpertV2Dtype::Bf16)
         })
-    }
-    pub(super) fn predictor_contract(&self) -> &CoordinatorContract {
-        &self.main.native.contract
-    }
-    pub(super) fn predictor_rope(&self) -> Rc<TargetTables<'a>> {
-        self.main.native.rope[self.ownership().execution().spec().head_gpu as usize].clone()
-    }
-    pub(super) fn predictor_arena(&self) -> &Arena<'a> {
-        &self.main.native.arenas[self.ownership().execution().spec().head_gpu as usize]
-    }
-    pub(super) fn predictor_stream(&self) -> Rc<crate::shared::memory::device::Stream<'a>> {
-        self.main.stages[self.ownership().execution().spec().head_gpu as usize].stream.clone()
     }
     pub(super) fn poison_scratch_between_layers(&self) { self.main.poison_scratch.set(true); }
     pub(super) fn retain_diagnostic_outputs(&self, layers: &[usize]) -> Result<()> {
@@ -1700,8 +1714,6 @@ mod tests {
         let start = swa.find("pub(super) fn for_mtp_stage(").context("MTP constructor")?;
         let end = start + swa[start..].find("\n    }").context("MTP constructor end")?;
         assert!(swa[start..end].contains("Some(contract)"));
-        let mtp = include_str!("mtp.rs");
-        assert!(mtp.contains("cache.layout().kv_format, execution.predictor_contract())?"));
         Ok(())
     }
 

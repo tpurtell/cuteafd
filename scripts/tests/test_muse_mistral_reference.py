@@ -248,6 +248,42 @@ def test_mistral_fixed_geometry_prefix_is_bit_exact_and_matches_untiled():
     assert ((long - untiled).norm() / untiled.norm()).item() < 1e-5
 
 
+@pytest.mark.parametrize("layer_index", [0, 3])
+def test_mistral_sparse_selection_uses_official_full_window_geometry(monkeypatch, layer_index):
+    from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
+    import torch.nn.functional as functional
+    import shape_invariant
+    config = tiny_mistral_config()
+    indexer = reference.MistralLarge4TextIndexer(config, layer_index).eval()
+    randomize(indexer)
+    hidden = torch.randn(1, 385, config.hidden_size)
+    positions = torch.arange(hidden.shape[1])[None]
+    rotary = reference.MistralLarge4TextRotaryEmbedding(config)
+    embeddings = rotary(hidden, positions)
+    mask = mistral.causal_mask(hidden.shape[1], device="cpu", dtype=hidden.dtype)[:, 0]
+    original = reference.MistralLarge4TextIndexer.forward
+    linear, layer_norm = functional.linear, torch.nn.LayerNorm.forward
+    calls = []
+
+    def observed(self, states, *args, **kwargs):
+        calls.append(states.shape[1])
+        assert functional.linear is linear
+        assert torch.nn.LayerNorm.forward is layer_norm
+        return original(self, states, *args, **kwargs)
+
+    with torch.inference_mode(), mistral.stable_ties(reference):
+        expected = indexer(hidden, embeddings, mask, positions)
+    monkeypatch.setattr(reference.MistralLarge4TextIndexer, "forward", observed)
+    with torch.inference_mode(), mistral.geometry(reference):
+        actual = indexer(hidden, embeddings, mask, positions)
+        assert functional.linear is shape_invariant.linear
+        assert torch.nn.LayerNorm.forward is not layer_norm
+    assert calls == [385]
+    assert torch.equal(actual, expected)
+    assert functional.linear is linear
+    assert torch.nn.LayerNorm.forward is layer_norm
+
+
 def stable_topk(reference):
     return mistral.stable_ties(reference)
 
@@ -510,6 +546,70 @@ def test_muse_ordered_experts_equal_the_official_cpu_accumulation():
         official = moe.experts(hidden, index, weights)
         ordered = muse.ordered_experts(moe.experts, hidden, index, weights)
     assert torch.equal(official, ordered)
+
+
+@pytest.mark.parametrize("filename", [
+    "models/mistral_large4/modeling_mistral_large4.py",
+    "models/pixtral/modeling_pixtral.py",
+    "models/pixtral/configuration_pixtral.py",
+    "models/pixtral/image_processing_pil_pixtral.py",
+    "models/pixtral/processing_pixtral.py",
+])
+def test_mistral_vision_source_pins_fail_before_construction(monkeypatch, filename):
+    monkeypatch.setattr(mistral, "SOURCE_PINS", {**mistral.SOURCE_PINS, filename: "0" * 64})
+    with pytest.raises(ValueError, match="source differs"):
+        mistral.load_vision_official({})
+
+
+def test_mistral_vision_qualifier_preserves_official_rope_and_weights(monkeypatch):
+    import importlib.util
+    import numpy as np
+    path = Path(__file__).resolve().parents[2] / "python/tools/qualify/mistral_large4/qualify-vision.py"
+    spec = importlib.util.spec_from_file_location("ml4_vision_qualification", path)
+    qualifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qualifier)
+    monkeypatch.setattr(qualifier, "DEPTH", 1)
+    config = {
+        "vision_config": {"hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1,
+                          "num_attention_heads": 4, "patch_size": 14, "image_size": 56},
+        "text_config": {"hidden_size": 48},
+        "spatial_merge_size": 2,
+    }
+    tower, projector = mistral.load_vision_official(config)
+    tensors = {}
+    def keep(name, value):
+        tensors[name] = value.detach().bfloat16().view(torch.uint16).cpu().numpy().copy()
+    keep("vision_encoder.patch_conv.weight", tower.patch_conv.weight)
+    keep("vision_encoder.ln_pre.weight", tower.ln_pre.weight)
+    rename = {"attention.q_proj": "attention.wq", "attention.k_proj": "attention.wk",
+              "attention.v_proj": "attention.wv", "attention.o_proj": "attention.wo",
+              "feed_forward.gate_proj": "feed_forward.w1", "feed_forward.up_proj": "feed_forward.w3",
+              "feed_forward.down_proj": "feed_forward.w2", "attention_norm": "attention_norm",
+              "ffn_norm": "ffn_norm"}
+    for target, source in rename.items():
+        keep(f"vision_encoder.transformer.layers.0.{source}.weight",
+             tower.get_parameter(f"transformer.layers.0.{target}.weight"))
+    for target, source in {"norm": "pre_mm_projector_norm", "patch_merger.merging_layer": "patch_merger.merging_layer",
+                           "linear_1": "vision_language_adapter.w_in", "linear_2": "vision_language_adapter.w_out"}.items():
+        keep(source + ".weight", projector.get_parameter(target + ".weight"))
+    expected_buffers = dict(tower.named_buffers())
+    actual, projected, sources = qualifier.reference(config, tensors, torch.bfloat16, device="cpu")
+    assert actual.config._attn_implementation == "sdpa"
+    for name, buffer in actual.named_buffers():
+        assert buffer.dtype == expected_buffers[name].dtype == torch.float32
+        assert torch.equal(buffer, expected_buffers[name])
+    assert expected_buffers and all(p.dtype == torch.bfloat16 for p in actual.parameters())
+    assert all(p.dtype == torch.bfloat16 for p in projected.parameters())
+    assert {p.name for p in sources} >= {"modeling_pixtral.py", "modeling_mistral_large4.py", "model.py"}
+    pixel_values = torch.randn(1, 3, 56, 56).bfloat16()
+    sizes = torch.tensor([[56, 56]])
+    with torch.inference_mode(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        features = actual(pixel_values, image_sizes=sizes).last_hidden_state
+        assert projected(features.squeeze(0), sizes).shape == (4, 48)
+        assert torch.isfinite(features).all()
+    for name, value in actual.state_dict().items():
+        expected = tower.state_dict()[name].bfloat16()
+        np.testing.assert_array_equal(value.view(torch.uint16).numpy(), expected.view(torch.uint16).numpy())
 
 
 def test_mistral_ordered_experts_equal_the_official_cpu_accumulation():

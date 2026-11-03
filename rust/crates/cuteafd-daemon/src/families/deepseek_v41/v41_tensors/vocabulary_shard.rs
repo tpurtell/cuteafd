@@ -30,6 +30,25 @@ impl<'a> VocabularyShard<'a> {
         mode.load_bytes(source as u64) as usize
     }
 
+    /// Device-free recipe shared with header-only startup admission checks.
+    pub(crate) fn pack_steps(whole: crate::shared::experts::rtx::dense::Rect, device: i32,
+        values: CuteafdDeviceBuffer, scale: CuteafdDeviceBuffer,
+    ) -> Result<Vec<crate::shared::experts::rtx::dense::Step>> {
+        use crate::shared::experts::rtx::dense::{Job, Step};
+        let rows = whole.rows.len();
+        ensure!(whole.width() == Self::ROW_BYTES && rows % 16 == 0,
+            "vocabulary rows are not whole 16-row tiles");
+        let per = 16;
+        Ok((0..rows).step_by(per).map(|first| Step { device,
+            rects: vec![whole.sub(first..first + per)], jobs: vec![Job::W8a16Pack { n: per, k: 5120,
+                rule: crate::shared::fp8_linear::Fp8Scales::Best,
+                packed: CuteafdDeviceBuffer { ptr: values.ptr.cast::<u8>().wrapping_add(first * 5120).cast(),
+                    bytes: per * 5120, ..values },
+                scale: CuteafdDeviceBuffer { ptr: scale.ptr.cast::<u8>().wrapping_add(first * 160).cast(),
+                    bytes: per * 160, ..scale },
+            }] }).collect())
+    }
+
     /// The caller scopes construction/destruction to the owning GPU. Admission
     /// precedes allocation and payload reads. No full-head GPU staging is used.
     pub fn load(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
@@ -48,22 +67,10 @@ impl<'a> VocabularyShard<'a> {
             // staged BF16 rows straight into it (tiles are independent).
             let packed = crate::shared::fp8_linear::Fp8Weight::allocate(library, rows, 5120)?;
             let (values, scale) = packed.buffers();
-            let per = (crate::shared::experts::rtx::dense::STEP_BYTES / Self::ROW_BYTES) / 16 * 16;
+            let steps = Self::pack_steps(whole, device_id, values, scale)?;
             let stream = library.cuda_stream_create()?;
             let staged = (|| -> Result<()> {
-                for first in (0..rows).step_by(per) {
-                    let n = per.min(rows - first);
-                    ensure!(n % 16 == 0, "vocabulary rows are not whole 16-row tiles");
-                    let job = crate::shared::experts::rtx::dense::Job::W8a16Pack { n, k: 5120,
-                        rule: crate::shared::fp8_linear::Fp8Scales::Best,
-                        // SAFETY (offsets): rows first..first + n of the packed copy and its scales.
-                        packed: CuteafdDeviceBuffer { ptr: unsafe { values.ptr.cast::<u8>().add(first * 5120) }.cast(),
-                            bytes: n * 5120, ..values },
-                        scale: CuteafdDeviceBuffer { ptr: unsafe { scale.ptr.cast::<u8>().add(first * 160) }.cast(),
-                            bytes: n * 160, ..scale } };
-                    dense.step(crate::shared::experts::rtx::dense::Step { device: device_id,
-                        rects: vec![whole.sub(first..first + n)], jobs: vec![job] }, stream)?;
-                }
+                for step in steps { dense.step(step, stream)?; }
                 Ok(())
             })();
             // SAFETY: every job drained before returning; the stream has no other users.

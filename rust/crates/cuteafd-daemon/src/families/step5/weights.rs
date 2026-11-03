@@ -149,14 +149,23 @@ fn load_records(device: Device<'_>, checkpoint: &Checkpoint, layout: &RankWeight
             lands.push((rect, at));
             at += n;
         } else {
-            // F32 -> BF16 on the GPU: one tensor per step (CSA indexer tensors).
-            let n = rect.bytes();
-            ensure!(n <= STEP_BYTES, "{}: F32 narrowing step beyond the staging bound", meta.name);
-            // SAFETY (offset): the narrowed values lie inside the operand.
-            let dst = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>().add(at) }.cast(), bytes: n / 2, ..buffer };
-            device.run(|| dense.step(Step { device: device.id, rects: vec![rect],
-                jobs: vec![Job::NarrowF32Bf16 { at: 0, bytes: n, dst }] }, std::ptr::null_mut()))?;
-            at += n / 2;
+            // Elementwise narrowing permits small windows even for a vector
+            // represented as one checkpoint row.
+            let limit = crate::shared::experts::rtx::dense::TRANSFORM_BYTES;
+            for row in 0..rect.rows.len() {
+                for first in (0..rect.width()).step_by(limit) {
+                    let n = limit.min(rect.width() - first);
+                    ensure!(n % 4 == 0 && n <= STEP_BYTES, "{}: invalid F32 narrowing window", meta.name);
+                    let piece = Rect { cols: rect.cols.start + first..rect.cols.start + first + n,
+                        ..rect.sub(row..row + 1) };
+                    // SAFETY: every narrowed window lies inside the operand.
+                    let dst = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>().add(at) }.cast(),
+                        bytes: n / 2, ..buffer };
+                    device.run(|| dense.step(Step { device: device.id, rects: vec![piece],
+                        jobs: vec![Job::NarrowF32Bf16 { at: 0, bytes: n, dst }] }, std::ptr::null_mut()))?;
+                    at += n / 2;
+                }
+            }
         }
     }
     let expected = operand.shape.iter().try_fold(elem, |n: usize, dim| n.checked_mul(*dim))

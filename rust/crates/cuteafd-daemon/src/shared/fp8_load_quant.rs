@@ -121,6 +121,22 @@ impl<'a> GpuQuantizer<'a> {
     }
 }
 
+/// Retained pinned table allocation, shared by load execution and admission.
+pub(crate) fn quant_table_bytes(rows: usize, layout: Layout) -> Result<usize> {
+    let unit = if layout == Layout::Block { 128 } else { 1 };
+    ensure!(rows > 0 && rows % unit == 0, "quantization table needs whole scale units");
+    let bytes = std::mem::size_of::<Segment>().checked_add(std::mem::size_of::<Job>())
+        .and_then(|stride| stride.checked_mul(rows / unit)).context("quantization job table overflow")?;
+    Ok(bytes.max(1 << 20))
+}
+
+pub(crate) fn scale_code_table_bytes(targets: usize) -> Result<usize> {
+    ensure!(targets > 0, "no scale-code source rectangles");
+    let bytes = targets.checked_mul(std::mem::size_of::<cuteafd_ffi::V41ScaleCodeJob>())
+        .and_then(|bytes| bytes.checked_add(8)).context("scale-code job table overflow")?;
+    Ok(bytes.max(1 << 20))
+}
+
 impl<'a> LoadKernels<'a> {
     pub fn new(library: &'a NativeLibrary) -> Result<Self> {
         let (job, segment, _) = library.fp8_load_quant_abi()?;
@@ -154,7 +170,7 @@ impl<'a> LoadKernels<'a> {
             "quantized rows exceed their operand");
         let scale_need = match target.kmajor { Some((scale_rows, row0)) => (kb - 1) * scale_rows + row0 + units, None => units * kb };
         ensure!(target.scales.bytes >= scale_need * 4, "quantized scales exceed their operand");
-        let tables = std::mem::size_of::<Segment>() * units + std::mem::size_of::<Job>() * units;
+        let tables = quant_table_bytes(rows.len(), layout)?;
         Self::grow(self.library, &mut self.tables, tables, "staging/fp8-load-quant")?;
         let base = source.as_ptr();
         let table = self.tables.as_mut().context("pinned tables")?;
@@ -193,8 +209,7 @@ impl<'a> LoadKernels<'a> {
         use cuteafd_ffi::V41ScaleCodeJob;
         use cuteafd_loader::formats::scale_codes::{plane_bytes, ScaleCodeError};
         ensure!(!targets.is_empty(), "no scale-code source rectangles");
-        let bytes = 8usize.checked_add(targets.len().checked_mul(std::mem::size_of::<V41ScaleCodeJob>())
-            .context("scale-code job table overflow")?).context("scale-code job table overflow")?;
+        let bytes = scale_code_table_bytes(targets.len())?;
         Self::grow(self.library, &mut self.tables, bytes, "staging/scale-code-jobs")?;
         let table = self.tables.as_mut().context("scale-code job table")?;
         table.bytes_mut()[..8].copy_from_slice(&u64::MAX.to_le_bytes());

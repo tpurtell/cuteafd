@@ -36,11 +36,81 @@ pub(crate) fn append(rect: &Rect, builder: &mut Builder, rank: u32, offset: u64)
 }
 
 
-/// Staged steps a dense rank may hold open at once: one per push source
-/// (SparkNest streams each file from one source; a rank's files come from at
-/// most this many storage hosts). Pinned staging peaks at this many
-/// [`STEP_BYTES`] buffers.
-pub(crate) const MAX_OPEN_STEPS: usize = 8;
+/// Independent pinned owners retained by one DenseArena through Done/drop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostStaging {
+    pub staging_bytes: usize,
+    pub largest_step: usize,
+    pub table_bytes: usize,
+}
+
+impl HostStaging {
+    /// Bound retained transforms from the receiver ring, not the source's send
+    /// concurrency. A missing slot retains its payload plus at most two boundary
+    /// steps. Each file may additionally hold one step at its stream frontier.
+    /// Mixed-file or overlapping source intervals cannot use this argument;
+    /// charge their entire footprint separately.
+    pub fn for_steps<'s>(steps: impl IntoIterator<Item = &'s [Rect]>, table_bytes: usize) -> Result<Self> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut files = BTreeSet::new();
+        let mut extents = BTreeMap::<std::path::PathBuf, Vec<(u64, u64, usize)>>::new();
+        let (mut total, mut fallback, mut largest) = (0usize, 0usize, 0usize);
+        for rects in steps {
+            let bytes = rects.iter().try_fold(0usize, |sum, rect| sum.checked_add(rect.bytes())
+                .context("dense step size overflow"))?;
+            total = total.checked_add(bytes).context("dense staging footprint overflow")?;
+            largest = largest.max(bytes);
+            let mut contiguous = !rects.is_empty();
+            let mut end = 0;
+            for (i, rect) in rects.iter().enumerate() {
+                ensure!(!rect.rows.is_empty() && !rect.cols.is_empty() && rect.cols.end <= rect.row_bytes,
+                    "invalid staged rectangle");
+                let first = rect.base.checked_add((rect.rows.start * rect.row_bytes + rect.cols.start) as u64)
+                    .context("dense source start overflow")?;
+                if i > 0 && (rect.path != rects[0].path || first != end) { contiguous = false; }
+                end = rect.base.checked_add(((rect.rows.end - 1) * rect.row_bytes + rect.cols.end) as u64)
+                    .context("dense source end overflow")?;
+            }
+            if contiguous {
+                let rect = &rects[0];
+                files.insert(rect.path.clone());
+                let first = rect.base + (rect.rows.start * rect.row_bytes + rect.cols.start) as u64;
+                extents.entry(rect.path.clone()).or_default().push((first, end, bytes));
+            } else {
+                fallback = fallback.checked_add(bytes).context("dense fallback staging overflow")?;
+            }
+        }
+        // Any overlapping intervals are conservatively charged in full. Such
+        // steps may remain open while all later source rows are delivered.
+        for entries in extents.values_mut() {
+            entries.sort_unstable_by_key(|entry| entry.0);
+            let (mut end, mut group_bytes, mut count) = (0, 0usize, 0usize);
+            for &(first, last, bytes) in entries.iter() {
+                if first >= end {
+                    if count > 1 { fallback = fallback.checked_add(group_bytes).context("dense overlap staging overflow")?; }
+                    group_bytes = 0;
+                    count = 0;
+                }
+                group_bytes = group_bytes.checked_add(bytes).context("dense overlap footprint overflow")?;
+                count += 1;
+                end = end.max(last);
+            }
+            if count > 1 { fallback = fallback.checked_add(group_bytes).context("dense overlap staging overflow")?; }
+        }
+        let window = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES.checked_add(largest.checked_mul(2)
+            .context("dense boundary staging overflow")?).and_then(|bytes|
+                bytes.checked_mul(cuteafd_ffi::push_ring::DEFAULT_SLOTS)).context("dense ring staging overflow")?;
+        let frontiers = files.len().checked_mul(largest).context("dense frontier staging overflow")?;
+        let staging_bytes = fallback.checked_add(window).and_then(|bytes| bytes.checked_add(frontiers))
+            .context("dense pinned staging overflow")?.min(total);
+        let bound = Self { staging_bytes, largest_step: largest, table_bytes };
+        bound.bytes()?;
+        Ok(bound)
+    }
+    pub fn bytes(self) -> Result<usize> {
+        self.staging_bytes.checked_add(self.table_bytes).context("dense pinned staging overflow")
+    }
+}
 
 /// One GPU's operands and steps in its rank's logical space.
 pub(crate) struct RankLayout {
@@ -53,12 +123,48 @@ pub(crate) struct RankLayout {
     pub host_bytes: u64,
     /// Device-to-device transforms of this GPU's landed operands, run at Done.
     pub finishes: Vec<Finish>,
+    pub host_staging: HostStaging,
 }
 
 impl RankLayout {
     /// `device`'s records in loader order: 256-byte aligned with a gap byte
     /// between neighbours, so no slot fragment spans two of them.
     pub fn new(operands: Vec<Operand>, steps: Vec<Step>, device: i32) -> Result<Self> {
+        let mut operands = operands;
+        let mut transformed = Vec::new();
+        for step in steps.into_iter().filter(|s| s.device == device) {
+            if step.jobs.iter().all(|job| matches!(job, Job::Upload { .. })) && !step.jobs.is_empty() {
+                for job in &step.jobs {
+                    let Job::Upload { at, bytes, dst } = *job else { unreachable!() };
+                    ensure!(bytes <= dst.bytes && at.checked_add(bytes).is_some_and(|end| end <= step.bytes()),
+                        "direct upload outside its step");
+                    let (mut source_at, mut lands) = (0usize, Vec::new());
+                    for rect in &step.rects {
+                        let (lo, hi) = (at.max(source_at), (at + bytes).min(source_at + rect.bytes()));
+                        if lo < hi {
+                            let (lo, hi) = (lo - source_at, hi - source_at);
+                            if lo % rect.width() == 0 && hi % rect.width() == 0 {
+                                lands.push((rect.sub(lo / rect.width()..hi / rect.width()), source_at + lo - at));
+                                source_at += rect.bytes();
+                                continue;
+                            }
+                            let mut cursor = lo;
+                            while cursor < hi {
+                                let row = cursor / rect.width();
+                                let column = cursor % rect.width();
+                                let end = hi.min((row + 1) * rect.width());
+                                let piece = Rect { cols: rect.cols.start + column..rect.cols.start + column + end - cursor,
+                                    ..rect.sub(row..row + 1) };
+                                lands.push((piece, source_at + cursor - at));
+                                cursor = end;
+                            }
+                        }
+                        source_at += rect.bytes();
+                    }
+                    operands.push(Operand { device, buffer: dst, lands, bytes });
+                }
+            } else { transformed.push(step); }
+        }
         let mut placed = Vec::new();
         let mut cursor = 0u64;
         for operand in operands.into_iter().filter(|o| o.device == device) {
@@ -70,13 +176,28 @@ impl RankLayout {
         let base = cursor.next_multiple_of(256);
         let mut staged = Vec::new();
         let mut cursor = 0u64;
-        for step in steps.into_iter().filter(|s| s.device == device) {
+        for step in transformed {
             let start = cursor.next_multiple_of(256);
             cursor = start + step.bytes() as u64 + 1;
             staged.push((start, step));
         }
+        let mut table_bytes = 0;
+        for (_, step) in &staged {
+            ensure!(step.bytes() > 0 && step.bytes() <= STEP_BYTES, "dense step exceeds bounded staging");
+            for job in &step.jobs {
+                let bytes = match job {
+                    Job::Quant { rows, layout, .. } =>
+                        crate::shared::fp8_load_quant::quant_table_bytes(rows.len(), *layout)?,
+                    Job::ScaleCodes { .. } => crate::shared::fp8_load_quant::scale_code_table_bytes(1)?,
+                    _ => 0,
+                };
+                table_bytes = table_bytes.max(bytes);
+            }
+        }
+        let host_staging = HostStaging::for_steps(staged.iter().map(|(_, step)| step.rects.as_slice()), table_bytes)?;
+        host_staging.bytes()?;
         Ok(Self { device, operands: placed, steps: staged, base, host_bytes: if cursor == 0 { 0 } else { cursor },
-            finishes: Vec::new() })
+            finishes: Vec::new(), host_staging })
     }
 
     /// [`Self::new`] with `device`'s finishes from `finishes`.
@@ -91,7 +212,7 @@ impl RankLayout {
         let operands: Vec<(u64, Vec<(Rect, usize)>)> = self.operands.iter()
             .map(|(start, o)| (*start, o.lands.clone())).collect();
         let steps: Vec<(u64, Vec<Rect>)> = self.steps.iter().map(|(start, s)| (*start, s.rects.clone())).collect();
-        super::push::DensePlan { base: self.base, host_bytes: self.host_bytes,
+        super::push::DensePlan { base: self.base, host_bytes: self.host_bytes, host_staging: self.host_staging,
             append: Box::new(move |builder, rank, host_base| {
                 for (start, lands) in &operands {
                     for (rect, at) in lands { append(rect, builder, rank, start + *at as u64)?; }
@@ -212,23 +333,24 @@ impl PushDestination for DenseArena<'_> {
         let (index, at) = self.step(offset, length)?;
         let need = self.layout.steps[index].1.bytes();
         if !self.open.contains_key(&index) {
-            // Admission planned one staged step per open source: a step whose
-            // bytes interleave with others (sources in file order over a
-            // layout that scatters a step) would grow pinned staging without
-            // bound, so refuse it rather than pin unplanned memory.
-            ensure!(self.open.len() < MAX_OPEN_STEPS,
-                "coordinator dense rank on GPU {} would open {} staged steps ({} MiB pinned), beyond the planned {}                  (one {} MiB step per source): a step's bytes interleave with others in the push order",
-                self.device.id, self.open.len() + 1, (self.open.len() + 1) * (STEP_BYTES >> 20), MAX_OPEN_STEPS,
-                STEP_BYTES >> 20);
-            // Uniform buffers (every step is within the bound, checked when
-            // recorded), so returned staging always fits the next step.
-            let staging = match self.pool.iter().position(|s| s.buffer.bytes >= need) {
+            let staging = match self.pool.iter().position(|s| s.buffer.bytes == need) {
                 Some(found) => self.pool.swap_remove(found),
                 None => {
-                    let bytes = STEP_BYTES;
-                    self.held += bytes as u64;
+                    // Exact-size buffers keep tiny coded-scale steps cheap.
+                    // Discard unused size classes before allocating; retained
+                    // pools must never exceed the same admitted byte bound.
+                    while self.held + need as u64 > self.layout.host_staging.staging_bytes as u64 {
+                        let Some(unused) = self.pool.pop() else { break; };
+                        self.held -= unused.buffer.bytes as u64;
+                        drop(unused);
+                    }
+                    ensure!(self.held + need as u64 <= self.layout.host_staging.staging_bytes as u64,
+                        "dense rank GPU {} needs {} pinned staging bytes, beyond admitted ring/step bound {}",
+                        self.device.id, self.held + need as u64, self.layout.host_staging.staging_bytes);
+                    let allocation = HostAllocation::named(self.device.library, need, "staging/coordinator-dense")?;
+                    self.held += need as u64;
                     self.peak_held = self.peak_held.max(self.held);
-                    HostAllocation::named(self.device.library, bytes, "staging/coordinator-dense")?
+                    allocation
                 }
             };
             self.staged += staging.buffer.bytes as u64;

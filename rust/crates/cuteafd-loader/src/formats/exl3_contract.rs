@@ -5,8 +5,32 @@ use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub(crate) fn check_native_quantization_config(quant: &Value) -> Result<()> {
+    let Some(value) = quant.get("native_quantization_config") else { return Ok(()); };
+    let object = value.as_object().context("EXL3 native_quantization_config must be an object")?;
+    for key in object.keys() {
+        ensure!(matches!(key.as_str(), "quant_method" | "activation_scheme" | "weight_block_size"
+            | "modules_to_not_convert"), "EXL3 native_quantization_config unexpected key {key}");
+    }
+    for (key, expected) in [("quant_method", serde_json::json!("fp8")),
+        ("activation_scheme", serde_json::json!("dynamic")),
+        ("weight_block_size", serde_json::json!([128, 128]))] {
+        ensure!(value.get(key) == Some(&expected), "EXL3 native_quantization_config unsupported {key}: {}", value[key]);
+    }
+    let exclusions = value["modules_to_not_convert"].as_array()
+        .context("EXL3 native_quantization_config modules_to_not_convert must be a string list")?;
+    let mut seen = std::collections::BTreeSet::new();
+    for exclusion in exclusions {
+        let name = exclusion.as_str().filter(|s| !s.is_empty())
+            .context("EXL3 native_quantization_config modules_to_not_convert must be a string list")?;
+        ensure!(seen.insert(name), "EXL3 native_quantization_config duplicate exclusion {name}");
+    }
+    Ok(())
+}
+
 fn head(name: &str) -> bool {
-    name == "lm_head" || name.ends_with(".lm_head")
+    // Mistral consolidated checkpoints name the vocabulary head `output`.
+    name == "lm_head" || name.ends_with(".lm_head") || name == "output"
 }
 
 pub(crate) fn routed(name: &str) -> bool {
@@ -15,7 +39,8 @@ pub(crate) fn routed(name: &str) -> bool {
 }
 
 fn mtp(name: &str, backbone_layers: usize) -> bool {
-    name.starts_with("mtp.") || name.contains(".mtp.") || name.split_once(".layers.")
+    // `mtp_dspark.`: Mistral Large 4's bundled dSpark drafter.
+    name.starts_with("mtp.") || name.starts_with("mtp_dspark.") || name.contains(".mtp.") || name.split_once(".layers.")
         .and_then(|(_, tail)| tail.split('.').next()?.parse::<usize>().ok())
         .is_some_and(|layer| layer >= backbone_layers)
 }
@@ -99,7 +124,7 @@ pub(crate) fn check_gptqmodel_manifest(
             "bits" | "checkpoint_format" | "codebook" | "core_bits" | "head_bits" | "mtp_bits"
             | "desc_act" | "format" | "group_size" | "lm_head" | "meta" | "method" | "module_include"
             | "out_scales" | "pack_dtype" | "quant_method" | "tensor_storage" | "per_module_metadata"
-            | "sym" | "calibration" | "mcg_multiplier" | "expert_bits" | "expert_bits_by_layer"
+            | "sym" | "calibration" | "native_quantization_config" | "mcg_multiplier" | "expert_bits" | "expert_bits_by_layer"
             | "kept_tensors"), "EXL3 manifest has unexpected key {key}");
     }
     if let Some(multiplier) = manifest.get("mcg_multiplier") {
@@ -109,6 +134,9 @@ pub(crate) fn check_gptqmodel_manifest(
     if let Some(kept) = manifest.get("kept_tensors") {
         ensure!(kept.is_object(), "EXL3 kept_tensors must map tensor names to native dtypes/shapes");
     }
+    check_native_quantization_config(manifest)?;
+    ensure!(compact.get("native_quantization_config") == manifest.get("native_quantization_config"),
+        "compact/full EXL3 metadata disagree at native_quantization_config");
     check_header_widths(manifest, derived, backbone_layers)?;
     let compact = compact.as_object().context("missing compact EXL3 config")?;
     ensure!(compact.get("quant_method") == Some(&Value::from("exl3")), "config must declare EXL3 quantization");
@@ -192,6 +220,42 @@ mod tests {
             assert!(error.contains(stem) && error.contains(key), "{error}");
             assert!(check_header_widths(&compact, &wrong, 2).is_err());
         }
+    }
+
+    #[test]
+    fn native_fp8_compact_and_full_claims_must_agree() {
+        let official: Value = serde_json::from_str(include_str!(
+            "../families/mistral_large4/official-config.json")).unwrap();
+        let (mut compact, mut manifest) = publication();
+        compact["native_quantization_config"] = official["quantization_config"].clone();
+        manifest["native_quantization_config"] = official["quantization_config"].clone();
+        check_gptqmodel_manifest(&compact, &manifest, &storage(), 2).unwrap();
+        for key in ["quant_method", "activation_scheme", "weight_block_size", "modules_to_not_convert"] {
+            let mut bad = manifest.clone();
+            bad["native_quantization_config"].as_object_mut().unwrap().remove(key);
+            assert!(check_gptqmodel_manifest(&compact, &bad, &storage(), 2).unwrap_err().to_string().contains(key));
+        }
+        compact.as_object_mut().unwrap().remove("native_quantization_config");
+        assert!(check_gptqmodel_manifest(&compact, &manifest, &storage(), 2).unwrap_err().to_string()
+            .contains("compact/full"));
+    }
+
+    #[test]
+    fn mistral_consolidated_head_and_dspark_drafter_widths() {
+        let module = |bits| Exl3Module { codebook: Exl3Codebook::Mcg, bits,
+            input_features: 128, output_features: 128, tensors: BTreeMap::new() };
+        let storage: Exl3StorageMap = BTreeMap::from([
+            ("layers.0.attention.wq".into(), module(6)),
+            ("layers.1.shared_experts.w2".into(), module(6)),
+            ("layers.1.experts.0.w1".into(), module(4)),
+            ("mtp_dspark.backbone.layers.0.attention.wq".into(), module(4)),
+            ("output".into(), module(6)),
+        ]);
+        let (compact, manifest) = publication();
+        check_gptqmodel_manifest(&compact, &manifest, &storage, 72).unwrap();
+        let mut wrong = storage.clone();
+        wrong.get_mut("output").unwrap().bits = 4;
+        assert!(check_header_widths(&compact, &wrong, 72).unwrap_err().to_string().contains("head_bits"));
     }
 
     #[test]

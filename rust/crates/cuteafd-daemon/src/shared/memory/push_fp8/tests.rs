@@ -142,8 +142,13 @@ pub(crate) fn compare(
     rank: usize,
     image: &[u8],
 ) -> Result<()> {
+    compare_tensors(plan, catalog.fp8().unwrap(), world, rank, image)
+}
+
+fn compare_tensors(plan: &RankPlan, tensors: &Fp8ExpertTensors, world: usize, rank: usize,
+    image: &[u8]) -> Result<()> {
     for layer in &plan.layers {
-        let tensors = catalog.fp8().unwrap().for_layer_metadata(layer.layer)?;
+        let tensors = tensors.for_layer_metadata(layer.layer)?;
         for (index, projection) in Fp8Projection::ALL.into_iter().enumerate() {
             let (w, s) = tensors.slice_bytes_with(projection, world, rank, layer.slicing)?;
             let mut weights = vec![0; w];
@@ -187,6 +192,40 @@ pub(crate) fn compare(
                             .read_input_scale(layer.layer, expert, projection)?
                             .to_le_bytes()
                     );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn coordinator_whole_and_tp2_selected_planes_match_mount_after_spark_ranks() -> Result<()> {
+    use crate::shared::memory::push_coordinator::CoordinatorExpertPlan;
+    for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
+        let root = tempfile::tempdir()?;
+        let catalog = fixture(root.path(), format, false)?;
+        let tensors = catalog.fp8().unwrap().for_coordinator();
+        for world in [1, 2] {
+            for shard in 0..world {
+                for layer in [1, 2] {
+                    let admitted = tensors.for_layer_metadata(layer)?.layer_load(layer, world, shard,
+                        tensors.exact_slicing(world))?.resident;
+                    let plan = if world == 1 {
+                        CoordinatorExpertPlan::whole_native(&catalog, &[layer], admitted)?
+                    } else { CoordinatorExpertPlan::new(&catalog, &[layer], shard, admitted)? };
+                    assert_eq!(plan.layout.bytes(), admitted);
+                    assert_eq!(plan.layers, [layer]);
+                    let fp8 = plan.fp8.as_ref().unwrap();
+                    let group_rank = 6 + shard;
+                    let checked = plan.checked(&catalog, root.path(), 8, group_rank)?;
+                    assert!(checked.plan.entries.iter().all(|entry| entry.rank == group_rank as u32));
+                    let mut image = landed(&checked, root.path(), group_rank)?;
+                    spread_packed(fp8, &mut image);
+                    compare_tensors(fp8, &tensors, world, shard, &image)?;
+                    assert!(if world == 1 {
+                        CoordinatorExpertPlan::whole_native(&catalog, &[layer], admitted - 1)
+                    } else { CoordinatorExpertPlan::new(&catalog, &[layer], shard, admitted - 1) }.is_err());
                 }
             }
         }

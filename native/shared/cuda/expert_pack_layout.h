@@ -61,6 +61,41 @@ static CUTEAFD_PACK_HD inline void cuteafd_expert_pack_layout_coordinates(
     *col = kt * block_columns + local / (128 * n32) * 4 + (local / 4) % 4;
   }
 }
+/* A projection window owns complete rows, including only its final padding.
+ * Legacy FC1 halves may share a tile; the kernel masks individual uint32 lanes. */
+struct cuteafd_expert_pack_window {
+  uint32_t n, k, half, compact, row_first, row_end;
+  uint64_t begin, count;
+};
+static inline int cuteafd_expert_pack_window_geometry(uint32_t hidden,
+    uint32_t intermediate, uint32_t stored, uint32_t projection,
+    uint32_t first, uint32_t rows, struct cuteafd_expert_pack_window* out) {
+  if (!out || !hidden || hidden % 256 || !intermediate || intermediate % 32 ||
+      stored < intermediate || stored % 32 || projection > 2 || !rows) return 0;
+  const uint32_t total = projection == 2 ? hidden : intermediate;
+  if (first >= total || rows > total - first) return 0;
+  const uint32_t compact = stored == intermediate && intermediate % 128;
+  const uint32_t tile = compact ? 128 : 256;
+  if (first % tile || (first + rows != total && rows % tile)) return 0;
+  const uint32_t half = projection == 0 ? stored : 0;
+  const uint32_t end = first + rows == total && projection != 2 ? stored : first + rows;
+  const uint32_t k = projection == 2 ? intermediate : hidden;
+  const uint32_t n = projection == 2 ? hidden : 2 * stored;
+  const uint64_t columns = k / 8;
+  const uint64_t base = compact ? (uint64_t)half * columns : 0;
+  const uint32_t local_first = compact ? first : half + first;
+  const uint32_t local_end = compact ? end : half + end;
+  const uint64_t begin = base + (uint64_t)(local_first / tile) * tile * columns;
+  const uint64_t limit = compact && projection != 2 ? base + (uint64_t)stored * columns
+      : (uint64_t)n * columns;
+  uint64_t stop = base + (uint64_t)((local_end + tile - 1) / tile) * tile * columns;
+  if (stop > limit) stop = limit;
+  out->n = n; out->k = k;
+  out->half = compact && projection != 2 ? stored : 0;
+  out->compact = compact; out->row_first = half + first;
+  out->row_end = half + end; out->begin = begin; out->count = stop - begin;
+  return 1;
+}
 static CUTEAFD_PACK_HD inline uint64_t cuteafd_nvfp4_scale_offset(
     uint64_t row, uint64_t col, uint64_t padded_cols) {
   return (row / 128) * (padded_cols * 128) + (col / 4) * 512

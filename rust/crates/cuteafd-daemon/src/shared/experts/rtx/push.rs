@@ -4,6 +4,8 @@
 //! Spark rank. Publication follows the whole-group commit.
 #[cfg(test)]
 pub(crate) mod tests;
+mod policy;
+pub(crate) use policy::{PushPolicy, PushStartupError};
 use crate::shared::memory::{push_consumer::PushDestination, push_coordinator::CoordinatorExpertPlan};
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{push_load::builder::CheckedPlan, OfficialV41Catalog, V41Exl3Layer};
@@ -80,6 +82,7 @@ pub(crate) enum PushedExperts<'a> {
     Exl3(Vec<crate::shared::experts::exl3::Exl3Weights<'a>>),
     Exlr8(Vec<crate::shared::experts::exlr8::Exlr8Weights<'a>>),
     Native(Vec<crate::shared::experts::layer::ExpertWeights<'a>>),
+    Fp8(Vec<crate::shared::experts::fp8::Fp8Layer<'a>>),
 }
 
 impl<'a> Default for PushedExperts<'a> {
@@ -87,17 +90,37 @@ impl<'a> Default for PushedExperts<'a> {
 }
 
 impl<'a> PushedExperts<'a> {
-    pub fn len(&self) -> usize { match self { Self::Exl3(w) => w.len(), Self::Native(w) => w.len(), Self::Exlr8(w) => w.len() } }
+    pub fn len(&self) -> usize { match self { Self::Exl3(w) => w.len(), Self::Native(w) => w.len(), Self::Exlr8(w) => w.len(), Self::Fp8(w) => w.len() } }
     pub fn exl3(self) -> Result<Vec<crate::shared::experts::exl3::Exl3Weights<'a>>> {
         match self { Self::Exl3(w) => Ok(w), _ => anyhow::bail!("non-EXL3 TP2 halves where EXL3 expected") }
     }
     pub fn exlr8(self) -> Result<Vec<crate::shared::experts::exlr8::Exlr8Weights<'a>>> {
         match self { Self::Exlr8(w) => Ok(w), _ => anyhow::bail!("non-EXLR8 TP2 halves where EXLR8 expected") }
     }
+    pub fn fp8(self) -> Result<Vec<crate::shared::experts::fp8::Fp8Layer<'a>>> {
+        match self { Self::Fp8(w) => Ok(w), _ => anyhow::bail!("non-FP8-family payload where FP8-family expected") }
+    }
     pub fn native(self) -> Result<Vec<crate::shared::experts::layer::ExpertWeights<'a>>> {
         match self { Self::Native(w) => Ok(w), Self::Exl3(w) if w.is_empty() => Ok(Vec::new()),
             _ => anyhow::bail!("non-native TP2 halves where native expected") }
     }
+
+    pub fn whole_native(self, expected: &[(crate::shared::experts::layer::ExpertLayer, usize)],
+        admitted: usize) -> Result<Vec<crate::shared::experts::layer::ExpertWeights<'a>>> {
+        let weights = self.native()?;
+        let actual = weights.iter().map(|w| (w.layer, w.budget.resident_bytes)).collect::<Vec<_>>();
+        validate_whole_inventory(&actual, expected, admitted)?;
+        Ok(weights)
+    }
+}
+
+fn validate_whole_inventory(actual: &[(crate::shared::experts::layer::ExpertLayer, usize)],
+    expected: &[(crate::shared::experts::layer::ExpertLayer, usize)], admitted: usize) -> Result<()> {
+    ensure!(actual == expected, "committed whole expert inventory differs from selected layers or resident bytes");
+    let bytes = actual.iter().try_fold(0usize, |total, (_, bytes)| total.checked_add(*bytes))
+        .context("committed whole expert bytes overflow")?;
+    ensure!(bytes <= admitted, "committed whole experts exceed admitted resident bytes");
+    Ok(())
 }
 
 /// A family's dense operands for one GPU: their destination, and where the
@@ -182,6 +205,19 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
             (None, None) => unreachable!("checked above"),
         };
         let Some(((catalog, plan, _), delivered)) = tp2.zip(delivered) else { return Ok(PushedExperts::default()) };
+        if let Some(fp8) = &plan.fp8 {
+            let initialize = fp8.layers.iter().map(|layer| match &layer.initialize {
+                push_initialize::Layer::Fp8 { widen, scalars, inputs, expand } => push_initialize::Layer::Fp8 {
+                    widen: widen.clone(), scalars: scalars.clone(), inputs: inputs.clone(), expand: expand.clone(),
+                },
+                _ => unreachable!("FP8 planner only emits FP8 initializers"),
+            }).collect::<Vec<_>>();
+            let ready = std::rc::Rc::new(push_initialize::initialize(delivered, &initialize, None, 0)?);
+            return fp8.layers.iter().enumerate().map(|(region, layer)| {
+                crate::shared::experts::fp8::Fp8Layer::from_push(ready.clone(), region, layer,
+                    fp8.layout.region(region)?.start)
+            }).collect::<Result<Vec<_>>>().map(PushedExperts::Fp8);
+        }
         if !plan.exlr8.is_empty() {
             let initialize = plan.exlr8.iter().enumerate().map(|(region, residency)|
                 push_initialize::Layer::Exlr8 { region, residency }).collect::<Vec<_>>();
@@ -197,7 +233,9 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
                 push_initialize::Layer::Native { region, layout, scalars: 0..0 }).collect::<Vec<_>>();
             let ready = std::rc::Rc::new(push_initialize::initialize(delivered, &initialize, None, plan.scratch_bytes())?);
             return plan.native.iter().zip(&plan.layers).enumerate().map(|(region, (layout, &layer))| {
-                let selection = crate::shared::experts::layer::ExpertLayer::BackboneTp2 { layer, rank: plan.gpu };
+                let selection = if plan.world == 1 {
+                    crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }
+                } else { crate::shared::experts::layer::ExpertLayer::BackboneTp2 { layer, rank: plan.gpu } };
                 let budget = crate::shared::experts::layer::ExpertWeights::plan(library, catalog, selection)?;
                 crate::shared::experts::layer::ExpertWeights::from_push(library, ready.clone(), region, selection,
                     layout, budget)
@@ -226,9 +264,9 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
         return Ok(Some(weights));
     }
     drop(candidate);
-    ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe mount retry");
+    ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe startup cleanup");
     push::drained(stream).context("coordinator push drained barrier")?;
-    tracing::warn!(group, rank, "whole push group discarded; coordinator loads through mount");
+    tracing::warn!(group, rank, "whole push group discarded before coordinator startup failure");
     Ok(None)
 }
 
@@ -239,6 +277,7 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
 pub(crate) struct DensePlan {
     pub base: u64,
     pub host_bytes: u64,
+    pub host_staging: super::dense::HostStaging,
     pub append: Box<dyn Fn(&mut cuteafd_loader::push_load::builder::Builder, u32, u64) -> Result<()> + Send>,
 }
 
@@ -275,6 +314,13 @@ impl CoordinatorExperts {
                 ensure!(gpu == 0, "whole coordinator expert layers live on one GPU");
                 ensure!(selections.iter().all(|s| matches!(s, ExpertLayer::BackboneFull { .. } | ExpertLayer::Dspark { .. })),
                     "a whole-layer coordinator plan takes full backbone layers and draft stages");
+                if catalog.exl3().is_none() {
+                    let layers = selections.iter().map(|s| match s {
+                        ExpertLayer::BackboneFull { layer } => Ok(*layer),
+                        _ => anyhow::bail!("native whole coordinator push requires backbone layers"),
+                    }).collect::<Result<Vec<_>>>()?;
+                    return CoordinatorExpertPlan::whole_native(catalog, &layers, *budget);
+                }
                 let residencies = selections.iter().map(|&s| crate::shared::experts::exl3::planned_residency(catalog, s))
                     .collect::<Result<Vec<_>>>()?;
                 CoordinatorExpertPlan::whole(residencies, *budget)
@@ -345,7 +391,7 @@ impl CoordinatorPush {
             None => (0..gpus).map(|_| None).collect(),
         };
         let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-        let host_peak = CoordinatorExpertPlan::admit_host(&plans, cuteafd_ffi::push_ring::DEFAULT_SLOTS,
+        let host_peak = CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], cuteafd_ffi::push_ring::DEFAULT_SLOTS,
             cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, available)?;
         tracing::info!(gpus, host_peak_bytes = host_peak, "coordinator push host memory admitted");
         let (mut driver, mut ranks) = (Vec::new(), Vec::new());
@@ -386,7 +432,7 @@ impl CoordinatorPush {
 
     /// [`Self::prepare`] for a launch without Spark peers: the coordinator GPUs
     /// form the push group alone, driven by a thread of this owner (the same
-    /// whole-group commit or mount fallback). Every family's coordinator dense
+    /// whole-group commit or drained failure). Every family's coordinator dense
     /// records push this way on Spark-free layouts.
     /// With `experts`, the GPUs' admitted expert layers join the group too.
     pub(crate) fn prepare_alone(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
@@ -419,9 +465,8 @@ impl CoordinatorPush {
     /// `beside` runs on this thread. `dense`: each GPU's plan (published to the
     /// group driver before the offers) and destination (unaliased descriptors of
     /// operand allocations the caller keeps alive and unread until this returns
-    /// and the group commits). `Ok(None)`: the whole group fell back. A dense
-    /// planning error makes every coordinator GPU offer mount, so the whole
-    /// group (Sparks and TP2 halves too) loads through the mount.
+    /// and the group commits). Planning/admission failures decline all coordinator
+    /// ranks and fail startup only after the peer handshake completes.
     #[allow(clippy::type_complexity)]
     pub(crate) fn receive_with<'a, D: PushDestination<Delivered = ()>, U>(self,
         devices: Vec<crate::shared::memory::device::Device<'a>>, catalog: Option<&OfficialV41Catalog>, sparks: usize,
@@ -434,13 +479,19 @@ impl CoordinatorPush {
             return (Err(anyhow::anyhow!("coordinator push GPUs differ from their plans")), beside());
         }
         let world = sparks + gpus.len();
-        let declined = match &dense {
-            Some(Err(error)) => {
-                tracing::info!(%error, "coordinator dense push planning failed; whole group uses mount");
-                true
-            }
-            _ => false,
-        };
+        // Destinations have no pinned pool/table allocations yet. Admit all independent
+        // owners before offers; a refusal still sends declines to release Spark peers.
+        let admission = (|| -> Result<()> {
+            if let Some(Err(error)) = &dense { anyhow::bail!("dense planning: {error:#}"); }
+            let staging = dense.as_ref().and_then(|d| d.as_ref().ok())
+                .map(|(plans, _)| plans.iter().map(|p| p.host_staging).collect::<Vec<_>>()).unwrap_or_default();
+            let plans = gpus.iter().map(|(plan, _)| plan.as_ref()).collect::<Vec<_>>();
+            let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+            let peak = CoordinatorExpertPlan::admit_host(&plans, &staging, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, available)?;
+            tracing::info!(host_peak_bytes = peak, "coordinator push complete host peak admitted before offers");
+            Ok(())
+        })();
+        let declined = admission.is_err();
         let (bases, destinations): (Vec<(u64, u64)>, Vec<Option<D>>) = match dense.and_then(Result::ok) {
             Some((plans, destinations)) => {
                 let bases = plans.iter().map(|p| (p.base, p.host_bytes)).collect();
@@ -467,15 +518,14 @@ impl CoordinatorPush {
                     "coordinator push source is not a SparkNest shard");
                 Ok(Some(checked))
             })();
-            if let Err(error) = &planned { tracing::warn!(gpu, %error, "coordinator push unavailable; offering mount"); }
+            if let Err(error) = &planned { tracing::warn!(gpu, %error, "coordinator push planning failed; declining group"); }
             let tp2_bytes = tp2.as_ref().map_or(0, |p| p.logical_bytes());
             let (host_base, arena_bytes) = rank_bytes(base, tp2_bytes, host);
             let offer = planned.as_ref().map(|_| cuteafd_transport::worker_selection::push::Offer {
                 rank, host: namespace_host.clone(), arena_bytes, placement: Vec::new() })
                 .map_err(|error| format!("{error:#}"));
-            let credentials = cuteafd_transport::worker_selection::push::offer_with(&mut stream, offer)?;
-            let Some(credentials) = credentials else { return Ok(None) };
-            let checked = planned?;
+            let credentials = planned_offer(&mut stream, planned, offer)?;
+            let Some((checked, credentials)) = credentials else { return Ok(None) };
             let tp2 = match (tp2, checked.as_ref()) {
                 (Some(plan), Some(checked)) => Some((catalog.context("expert catalog")?, plan, checked)),
                 _ => None,
@@ -509,6 +559,19 @@ impl CoordinatorPush {
                 _ => anyhow::bail!("coordinator push GPUs disagree on the group commit"),
             }
         });
+        let pushed = match admission {
+            Err(error) => Err(PushStartupError::Planning(error).into()),
+            Ok(()) => PushPolicy::Required.committed(pushed).map_err(Into::into),
+        };
         (pushed, value)
     }
+}
+
+/// Planning failures must participate in Begin/decline before being returned.
+fn planned_offer<T>(stream: &mut std::net::TcpStream, planned: Result<T>,
+    offer: std::result::Result<cuteafd_transport::worker_selection::push::Offer, String>)
+    -> Result<Option<(T, (u64, u64))>> {
+    let credentials = cuteafd_transport::worker_selection::push::offer_with(stream, offer)?;
+    let planned = planned.map_err(PushStartupError::Planning)?;
+    Ok(credentials.map(|credentials| (planned, credentials)))
 }

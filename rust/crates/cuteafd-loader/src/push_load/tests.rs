@@ -169,6 +169,35 @@ fn namespace_uses_mount_identity_and_follows_snapshot_symlinks() {
 }
 
 #[test]
+fn namespace_skips_only_absent_or_unsupported_attributes() {
+    let root = tempfile::tempdir().unwrap();
+    let child = root.path().join("snapshot");
+    std::fs::create_dir(&child).unwrap();
+    for errno in [rustix::io::Errno::NODATA, rustix::io::Errno::NOTSUP] {
+        let mut reads = 0;
+        let found = namespace_with(&child, |_, bytes| {
+            reads += 1;
+            if reads == 1 { return Err(errno.into()); }
+            let identity = br#"{"me":"ancestor"}"#;
+            bytes[..identity.len()].copy_from_slice(identity);
+            Ok(identity.len())
+        }).unwrap();
+        assert_eq!(found, (root.path().into(), "ancestor".into()));
+        assert_eq!(reads, 2);
+    }
+    for errno in [rustix::io::Errno::ACCESS, rustix::io::Errno::IO, rustix::io::Errno::NOENT,
+        rustix::io::Errno::RANGE] {
+        let mut reads = 0;
+        let error = namespace_with(&child, |_, _| {
+            reads += 1;
+            Err(errno.into())
+        }).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(errno.raw_os_error()));
+        assert_eq!(reads, 1, "a failed ancestor must not be hidden by a higher namespace");
+    }
+}
+
+#[test]
 fn container_subtree_bind_does_not_guess_the_hidden_namespace_root() {
     let directory = tempfile::tempdir().unwrap();
     let namespace_root = directory.path().join("namespace");

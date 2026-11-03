@@ -1,4 +1,4 @@
-//! EXLR8 optional whole-group transaction; no execution view exists before Done.
+//! Namespace-required EXLR8 transaction; no execution view exists before Done.
 #[cfg(test)]
 #[path = "push_exlr8/tests.rs"]
 mod tests;
@@ -17,13 +17,12 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, config: &NativeExpertServiceC
     residencies: &[Residency], budgets: &[ExpertLoadBudget], resident: usize,
     workspace: usize, retained_host: usize, descriptors: usize, stream: &mut TcpStream,
 ) -> Result<Option<Vec<Exlr8Weights<'a>>>> {
-    let planned = (|| -> Result<_> {
-        let (root, host) = cuteafd_loader::push_load::namespace(&config.snapshot)?;
+    let Some(((plan, checked), (group, token))) = super::push::plan_offer(&config.snapshot, stream, |root, host| {
         let plan = RankPlan::from_residencies(&config.snapshot, residencies.to_vec(), resident)?;
         let checked = plan.checked(&config.snapshot, &root, config.world, config.rank)?;
         ensure!(checked.plan.files.iter().all(|file|
             cuteafd_loader::push_load::is_push_shard(&root.join(file))), "EXLR8 push source is not a SparkNest shard");
-        // Original plans stay available for mount fallback until the group commits.
+        // Original plans stay alive until the group commits or drains.
         let headroom = super::spark_runtime_headroom()?;
         let extra = workspace.checked_add(retained_host.checked_mul(2).ok_or_else(||
             anyhow::anyhow!("EXLR8 retained host overflow"))?)
@@ -34,15 +33,12 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, config: &NativeExpertServiceC
             library.cuda_allocatable_memory_info()?.0)?;
         tracing::info!(rank = config.rank, resident_bytes = plan.layout.bytes(),
             load_peak_bytes = peak, "Spark EXLR8 push admitted");
-        let offer = Offer { rank: config.rank, host, arena_bytes: plan.layout.logical_bytes() as u64,
+        let offer = Offer { rank: config.rank, host: host.into(), arena_bytes: plan.layout.logical_bytes() as u64,
             placement: plan.placement.clone() };
-        Ok((plan, checked, offer))
-    })();
-    if let Err(error) = &planned { tracing::warn!(%error, "Spark EXLR8 push unavailable; offering mount"); }
-    let credentials = push::offer_with(stream, planned.as_ref().map(|(_, _, offer)| offer.clone()).map_err(|error| format!("{error:#}")))?;
-    let Some((group, token)) = credentials else { return Ok(None); };
-    let (plan, checked, _) = planned?;
-    receive(library, plan, &checked, budgets, config.rank, &PushClient::default(), stream, group, token)
+        Ok(((plan, checked), offer))
+    })? else { return Ok(None); };
+    super::push::required_receive(receive(library, plan, &checked, budgets, config.rank,
+        &PushClient::default(), stream, group, token))
 }
 
 fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
@@ -77,7 +73,7 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
         return Ok(Some(weights));
     }
     drop(candidate);
-    ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe mount retry");
+    ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe startup cleanup");
     push::drained(stream)?;
     Ok(None)
 }

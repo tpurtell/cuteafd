@@ -11,33 +11,45 @@ pub(super) fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Resu
     Ok(config.get("vision_config").is_some().then_some(config))
 }
 
-fn local_vision_gpu(mode: MediaMode, device: i32, split_device: Option<i32>) -> Result<i32> {
+pub(crate) fn local_vision_gpu(mode: MediaMode, device: i32, split_device: Option<i32>) -> Result<i32> {
     // Explicit CLI indices name CUDA devices; only defaults use logical ranks.
     if let MediaMode::Rtx(Some(gpu)) = mode { return Ok(i32::try_from(gpu)?); }
     let rank = cuteafd_loader::plan::encoder::rtx_encoder_gpu(mode, false, 1 + usize::from(split_device.is_some()));
     Ok(if rank == 0 { device } else { split_device.context("vision peer GPU")? })
 }
 
-pub(super) struct RemoteVision {
+pub(crate) struct RemoteVision {
     addresses: Vec<std::net::SocketAddr>,
     plan_hash: [u8; 32],
     revision: String,
 }
 impl RemoteVision {
+    pub(crate) fn revision(&self) -> &str { &self.revision }
+    pub(crate) fn plan_hash(&self) -> [u8; 32] { self.plan_hash }
+    /// Connects every replica with the coordinator's expected handshake.
+    pub(crate) fn connect(self, expected: crate::shared::vision::remote::EncoderHandshake) -> Result<Encoder> {
+        Ok(Encoder::Remote(crate::shared::vision::remote::RemoteEncoder::connect(self.addresses, expected,
+            std::time::Duration::from_secs(60))?))
+    }
     pub fn from_args(args: &super::serve::ServeArgs) -> Result<Option<Self>> {
-        let Some(peers) = &args.vision_peers else {
-            anyhow::ensure!(args.encoder_plan_hash.is_none() && args.encoder_revision.is_none(),
+        Self::from_parts(args.vision, args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())
+    }
+    /// The planner-resolved Spark encoder endpoints from their CLI values (any serve family).
+    pub(crate) fn from_parts(vision: MediaMode, peers: Option<&str>, plan_hash: Option<&str>, revision: Option<&str>)
+        -> Result<Option<Self>> {
+        let Some(peers) = peers else {
+            anyhow::ensure!(plan_hash.is_none() && revision.is_none(),
                 "encoder plan hash/revision require --vision-peers");
             return Ok(None);
         };
-        anyhow::ensure!(matches!(args.vision, MediaMode::Auto | MediaMode::Spark(_)),
+        anyhow::ensure!(matches!(vision, MediaMode::Auto | MediaMode::Spark(_)),
             "--vision-peers requires Spark/auto vision placement");
         let addresses = peers.split(',').map(|peer| peer.trim().parse()
             .context("vision peer must be an IP:port")).collect::<Result<Vec<_>>>()?;
         anyhow::ensure!((1..=8).contains(&addresses.len()), "vision needs 1..8 replicas");
-        let plan_hash = crate::shared::vision::worker::parse_plan_hash(args.encoder_plan_hash.as_deref()
+        let plan_hash = crate::shared::vision::worker::parse_plan_hash(plan_hash
             .context("--vision-peers requires --encoder-plan-hash")?)?;
-        let revision = args.encoder_revision.clone().context("--vision-peers requires --encoder-revision")?;
+        let revision = revision.context("--vision-peers requires --encoder-revision")?.to_owned();
         anyhow::ensure!(!revision.is_empty(), "encoder revision must not be empty");
         Ok(Some(Self { addresses, plan_hash, revision }))
     }
@@ -65,7 +77,7 @@ impl ReadyVision {
             anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "GLM Flash tower capacity is 4096 tokens per image");
             let expected = crate::shared::vision::remote::EncoderHandshake {
                 encoder_id: id, max_patches: 4096 * processor.merge.pow(2), output_width: spec.native.output_width,
-                patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
+                patch_size: processor.patch, merge_size: processor.merge, row_markers: 0, plan_hash: remote.plan_hash,
             };
             anyhow::ensure!(expected.output_width as usize == width, "GLM Flash tower/LM output width mismatch");
             let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,
@@ -109,7 +121,7 @@ impl ReadyVision {
     }
 }
 
-pub(super) enum Encoder {
+pub(crate) enum Encoder {
     Local(crate::shared::vision::local::LocalEncoder),
     Remote(crate::shared::vision::remote::RemoteEncoder),
     Off,
@@ -135,7 +147,7 @@ impl cuteafd_engine::media::EncoderClient for Encoder {
         match self { Self::Local(client) => client.cancel(ticket), Self::Remote(client) => client.cancel(ticket), Self::Off => () }
     }
 }
-pub(super) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
+pub(crate) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
     match error {
         cuteafd_engine::media::MediaError::Encoder(_) => cuteafd_api::openai::NativeFailure::Unavailable("vision encoder unavailable".into()),
         error @ (cuteafd_engine::media::MediaError::QueueFull | cuteafd_engine::media::MediaError::CacheFull { .. }) =>

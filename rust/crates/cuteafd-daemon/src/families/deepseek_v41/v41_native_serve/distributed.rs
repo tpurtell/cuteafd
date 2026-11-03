@@ -73,7 +73,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let expert_demands=admission::expert_demands(&lib,&catalog,capacity,2)?;
     // Dense owners allocate exactly as through the mount; with coordinator push
     // possible their bytes are recorded and arrive in the Spark push group.
-    let pushing = super::coordinator_push::wanted(&args, &catalog);
+    let pushing = super::coordinator_push::wanted(&args, &catalog)?;
     let recorder = crate::shared::experts::rtx::dense::Recorder::start(pushing)?;
     let weights = BackboneLaneWeights::load_distributed_with_split(
         &lib,
@@ -430,16 +430,13 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         topology)?;
     // Coordinator ranks join only a pushing group, planned before membership:
     // a planning error leaves them out (the Sparks still push).
-    let coordinator = match (records.as_ref(), spark_plan.as_ref()) {
-        (Some(records), Some(spark)) if spark.coordinator_pushes() => (|| {
-            let (landed, operands, staged, steps, largest, finishes) = records.summary();
-            tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
-                "V4.1 coordinator dense records planned");
-            super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets,
-                args.peers.len())
-        })().map_err(|error| tracing::info!(%error, "V4.1 coordinator push unavailable; mount")).ok(),
-        _ => None,
-    };
+    let coordinator = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&args.snapshot)?.plan(|| {
+        ensure!(spark_plan.as_ref().is_some_and(|spark| spark.coordinator_pushes()),
+            "V4.1 Spark admission did not select required push");
+        let records = records.as_ref().context("V4.1 required dense push records")?;
+        super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets,
+            args.peers.len())
+    })?;
     let (coordinator, ranks) = match coordinator {
         Some((planned, streams, ranks)) => (Some(planned), Some((streams, ranks))),
         None => (None, None),

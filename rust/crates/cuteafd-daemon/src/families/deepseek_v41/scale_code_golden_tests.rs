@@ -90,7 +90,7 @@ fn installed_mount_scale_codes_equal_cpu_pack() -> Result<()> {
 #[test]
 #[ignore = "requires CUTEAFD_PUSH_V41, CUTEAFD_NATIVE_LIB and one GPU"]
 fn installed_pushed_scale_codes_equal_cpu_pack() -> Result<()> {
-    use crate::shared::{experts::rtx::dense::{testing::FakeRank, MAX_OPEN_STEPS, STEP_BYTES},
+    use crate::shared::{experts::rtx::dense::{testing::FakeRank},
         memory::{push_consumer, push_native::ScalePlan}};
     use cuteafd_loader::push_load::{builder::Builder, native::NativePlanes};
     let snapshot = snapshot().context("set CUTEAFD_PUSH_V41")?;
@@ -130,8 +130,8 @@ fn installed_pushed_scale_codes_equal_cpu_pack() -> Result<()> {
         }
         let peaks = crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.take());
         for (staged, pinned) in peaks {
-            ensure!(staged <= (MAX_OPEN_STEPS * STEP_BYTES) as u64
-                && pinned <= (MAX_OPEN_STEPS * STEP_BYTES) as u64, "unbounded scale staging");
+            ensure!(staged <= scales.host_staging().staging_bytes as u64
+                && pinned <= scales.host_staging().staging_bytes as u64, "unbounded scale staging");
             eprintln!("push TP{world}: scale planes byte-exact; staged={staged} pinned={pinned}");
         }
     }

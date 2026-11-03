@@ -276,6 +276,13 @@ workloads are unchanged.
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg)
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg)
 
+## Mistral Large 4
+
+- 2026-11-02 · Custom · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (310–550) + 6× DGX Spark · build ed34ed61ebdd · [report](mistral_large4/2026-11-02-custom-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max-candidate-r1/report.svg)
+  measured on ed34, layers placement, before the #1077 prefill port and the context borrower fix; v5 release cards supersede
+- 2026-11-02 · Custom · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 1× RTX PRO 6000 @ gpu-powerd 455 W (450–600) + 5× DGX Spark · build ed34ed61ebdd · [report](mistral_large4/2026-11-02-custom-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min-candidate-r1/report.svg)
+  measured on ed34, layers placement, before the #1077 prefill port and the context borrower fix; v5 release cards supersede
+
 ## Qwen 3.5 / 3.8 dense
 
 - 2026-10-30 · Release smoke · Qwen/Qwen3.8-27B-FP8 · 1× RTX PRO 6000 @ gpu-powerd 365/525 W (300–600) · build v4.0.0-rc2 · [report](qwen3_5/2026-10-30-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min-nospec/report.svg)

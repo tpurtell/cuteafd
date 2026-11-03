@@ -625,13 +625,15 @@ pub(super) struct Runtime<'a> {
     rank: usize,
 }
 impl<'a> Runtime<'a> {
-    pub(super) fn load(execution: &super::execution::Execution<'_, 'a>,
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load(contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract,
+        rope: Rc<super::rope::TargetTables<'a>>, arena: &Arena<'a>, stream: Rc<Stream<'a>>,
         programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         cache: &super::cache::CacheRank<'a>, depth: usize, rows: usize,
         available: u64, reservations: &[u64]) -> Result<Self> {
         ensure!((1..=3).contains(&depth) && rows > depth,
             "Step-5 predictor runtime depth/row capacity");
-        let immutable = RankWeightLayout::mtp_from_contract(checkpoint, execution.predictor_contract(), depth)?.resident_bytes;
+        let immutable = RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?.resident_bytes;
         let total = reservations.iter().try_fold(immutable, |n, bytes| n.checked_add(*bytes))
             .context("Step-5 predictor runtime reservation overflow")?;
         ensure!(total <= available && cache.layout().ranks[cache.rank()].mtp_lengths.len() == depth,
@@ -639,8 +641,7 @@ impl<'a> Runtime<'a> {
         let mut stages = Vec::with_capacity(depth);
         for stage in 0..depth {
             let owner = StageOwner::load(cache.stream.device, programs, checkpoint, stage,
-                rows, execution.predictor_rope(), available, &[], execution.predictor_arena(),
-                execution.predictor_stream(), cache.layout().kv_format, execution.predictor_contract())?;
+                rows, rope.clone(), available, &[], arena, stream.clone(), cache.layout().kv_format, contract)?;
             owner.bind_cache(cache)?;
             stages.push(owner);
         }
@@ -860,16 +861,11 @@ mod tests {
         let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);
         let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
         let stream = Rc::new(Stream::new(device)?);
-        let mut stages = Vec::new();
-        for stage in 0..3 {
-            let owner = StageOwner::load(device, &programs, &checkpoint, stage, 64,
-                rope.clone(), u64::MAX, &[], &arena, stream.clone(), kv_format, &contract)?;
-            owner.bind_cache(&cache)?;
-            stages.push(owner);
-        }
-        let runtime = Runtime { stages: std::cell::RefCell::new(stages),
-            tokens: std::cell::RefCell::new(vec![Vec::new()]),
-            selected: std::cell::RefCell::new(crate::shared::memory::HostAllocation::new(&library, 24)?), rank: 0 };
+        let (runtime, records) = crate::shared::experts::rtx::dense::recording(||
+            Runtime::load(&contract, rope.clone(), &arena, stream.clone(), &programs, &checkpoint,
+                &cache, 3, 64, u64::MAX, &[]))?;
+        assert!(!records.operands.is_empty() || !records.steps.is_empty(), "predictor weights must join the target group");
+        crate::shared::experts::rtx::dense::fill_records_by_mount(&library, &records, |_| stream.raw)?;
         let source = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight")
             .context("Step-5 embedding fixture source")?;
         let source = EmbedSource::new(&checkpoint.snapshot, &source.shard, &source.meta, H)?;

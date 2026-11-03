@@ -664,6 +664,20 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Pack tile-aligned rows of one projection into its native plane.
+    /// # Safety
+    /// Buffers are disjoint on the current device and live through completion.
+    pub unsafe fn v41_pack_window_async(&self, source: CuteafdDeviceBuffer,
+        destination: CuteafdDeviceBuffer, intermediate: u32, projection: u32,
+        first: u32, rows: u32, stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const u8, u64, *mut u8, u64, u32, u32, u32, u32, *mut c_void) -> i32;
+        let pack = unsafe { self.lib.get::<F>(b"cuteafd_pack_expert_window_async")? };
+        let status = unsafe { pack(source.ptr.cast(), source.bytes as u64,
+            destination.ptr.cast(), destination.bytes as u64, intermediate, projection, first, rows, stream) };
+        ensure!(status == 0, "expert window packing failed with CUDA status {status}");
+        Ok(())
+    }
+
     /// Pack W1/W3/W2 payloads without allocating raw scale destinations.
     /// # Safety
     /// Sources and destinations are disjoint, correctly sized device buffers

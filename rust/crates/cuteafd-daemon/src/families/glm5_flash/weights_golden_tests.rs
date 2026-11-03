@@ -135,7 +135,7 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
             for job in &step.jobs {
                 let kind = match job { Job::Upload { .. } => "upload", Job::Widen { .. } => "widen", Job::NarrowF32Bf16 { .. } => "narrow",
                     Job::Quant { .. } => "quant", Job::Absorb { .. } => "absorb", Job::ALog { .. } => "a_log",
-                    Job::W8a16Pack { .. } => "w8a16", Job::NativePlane { .. } => "plane", Job::RowQuant { .. } => "row-quant",
+                    Job::W8a16Pack { .. } => "w8a16", Job::NativeWindow { .. } => "native-window", Job::RowQuant { .. } => "row-quant",
                     Job::Product { .. } | Job::TrellisTiles { .. } => panic!("GLM Flash records no Kimi jobs"),
                     Job::AbsorbFp8 { .. } => panic!("GLM Flash records no FP8 kv_b split"),
                     Job::ScaleCodes { .. } => panic!("GLM Flash must not record V4.1 scale coding") };

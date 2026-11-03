@@ -101,6 +101,29 @@ impl<'a> Fp8MoeTp2<'a> {
 
     pub(crate) fn load(device: Device<'a>, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize) -> Result<Self> {
+        Self::bind_rank(device, tensors, directory, layers, rank, max_rows, budget, None)
+    }
+
+    /// Committed rank payloads use the same package, workspace and output admission as mount loading.
+    pub(crate) fn pushed_pair(devices: [Device<'a>; 2], tensors: &Fp8ExpertTensors, directory: &Path,
+        layers: Vec<usize>, max_rows: usize, budgets: [usize; 2], pushed: [Vec<Fp8Layer<'a>>; 2]) -> Result<[Self; 2]> {
+        ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
+            "invalid pushed FP8 MoE TP2 device pair");
+        validate_layers(&layers, tensors.shape(), 0)?;
+        for rank in 0..2 {
+            let plan = Self::plan(tensors, directory, rank, max_rows)?;
+            let required = plan.resident_layer_bytes.checked_mul(layers.len())
+                .and_then(|bytes| bytes.checked_add(plan.workspace_bytes)).context("FP8 TP2 admission overflow")?;
+            ensure!(required <= budgets[rank], "pushed FP8 TP2 rank {rank} exceeds admitted budget");
+        }
+        let [left, right] = pushed;
+        Ok([Self::bind_rank(devices[0], tensors, directory, layers.clone(), 0, max_rows, budgets[0], Some(left))?,
+            Self::bind_rank(devices[1], tensors, directory, layers, 1, max_rows, budgets[1], Some(right))?])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_rank(device: Device<'a>, tensors: &Fp8ExpertTensors, directory: &Path,
+        layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize, pushed: Option<Vec<Fp8Layer<'a>>>) -> Result<Self> {
         let coordinator = tensors.for_coordinator();
         let tensors = &coordinator;
         validate_layers(&layers, tensors.shape(), rank)?;
@@ -112,8 +135,12 @@ impl<'a> Fp8MoeTp2<'a> {
             plan.workspace_bytes);
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
         let completion = RankCompletion::new(Event::new(device)?);
-        let experts = device.own(|| Fp8Weights::load(device.library, tensors, &plan.directory, &layers,
-            2, rank, max_rows, budget - plan.output_bytes))?;
+        let experts = device.own(|| match pushed {
+            Some(pushed) => Fp8Weights::from_pushed(device.library, tensors, &plan.directory, &layers,
+                2, rank, max_rows, budget - plan.output_bytes, pushed),
+            None => Fp8Weights::load(device.library, tensors, &plan.directory, &layers,
+                2, rank, max_rows, budget - plan.output_bytes),
+        })?;
         validate_installed(&layers, experts.layers.iter().map(|layer| layer.layer))?;
         ensure!(experts.resident_bytes() == resident && experts.slot_scratch_bytes(max_rows)? == plan.scratch_bytes,
             "FP8 MoE TP2 static allocation plan disagrees with runtime");

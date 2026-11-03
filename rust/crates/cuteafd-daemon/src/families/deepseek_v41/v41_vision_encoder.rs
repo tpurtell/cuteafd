@@ -50,6 +50,7 @@ pub(crate) fn handshake(
         output_width: 5120,
         patch_size: 14,
         merge_size: 3,
+        row_markers: 0,
         plan_hash,
     })
 }

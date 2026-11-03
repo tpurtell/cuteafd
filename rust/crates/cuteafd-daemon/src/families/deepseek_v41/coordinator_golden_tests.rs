@@ -55,6 +55,119 @@ pub(crate) fn library() -> Result<NativeLibrary> {
     unsafe { NativeLibrary::load(path) }
 }
 
+/// Full checkpoint admission without CUDA allocations or weight payload reads.
+/// Direct rectangles/Done-only scale packs have no pinned owner; the staged
+/// head and dSpark recipes are the same constructors the serving loaders use.
+#[test]
+fn installed_full_v41_push_host_owners_are_admitted_exactly() -> Result<()> {
+    use crate::shared::{experts::{layer::{native_coded_scale_steps, native_weight_windows},
+        rtx::dense::{HostStaging, Operand, RankLayout, Rect}},
+        memory::{push_coordinator::CoordinatorExpertPlan, push_native::ScalePlan}};
+    use cuteafd_ffi::push_ring::{DEFAULT_SLOTS, DEFAULT_SLOT_BYTES};
+    use cuteafd_loader::{push_load::native::NativePlanes, V41ExpertSelection, V41TensorPlacement};
+    let Some(snapshot) = snapshot() else { return Ok(()) };
+    let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
+    let shape = catalog.routed_experts();
+    anyhow::ensure!(catalog.mxfp4_scale_codes() && shape.layers == 40 && shape.draft_stages == 3
+        && shape.draft_experts == 128, "requires the complete coded V4.1 checkpoint");
+    let ring = DEFAULT_SLOTS * DEFAULT_SLOT_BYTES;
+    let buffer = |device, bytes| CuteafdDeviceBuffer { device_id: device, bytes, ..Default::default() };
+    eprintln!("layout\towner\tdense_staging\tdense_table\texpert_staging\texpert_table\tvalidation\tring\ttotal");
+    for (gpus, onboarded) in [(1, 8), (2, 20)] {
+        let mut layouts = Vec::new();
+        let mut experts = Vec::new();
+        for gpu in 0..gpus {
+            let device = gpu as i32;
+            let draft_gpu = gpus - 1;
+            let mut operands = Vec::new();
+            let mut direct_layers = std::collections::BTreeSet::new();
+            // All native dense headers, including GPU embedding and all forty
+            // target layers. Vision headers are not part of text startup.
+            for tensor in catalog.tensors() {
+                let name = &tensor.metadata.name;
+                if !matches!(tensor.placement, V41TensorPlacement::CoordinatorRtx)
+                    || name == "head.weight" || name.contains(".ffn.experts.") { continue; }
+                let layer = name.strip_prefix("layers.").and_then(|s| s.split('.').next())
+                    .and_then(|s| s.parse::<usize>().ok());
+                let owner = if let Some(layer) = layer {
+                    if gpus == 1 { 0 } else { CachePlacement::encoder_decoder().attention(layer)? }
+                } else if name == "embed.weight" { 0 }
+                else if name == "norm.weight" || name.starts_with("mtp.") { draft_gpu }
+                else { continue; };
+                if owner != gpu { continue; }
+                if let Some(layer) = layer { direct_layers.insert(layer); }
+                let rect = super::v41_tensors::rect(&catalog, name, None)?;
+                operands.push(Operand { device, buffer: buffer(device, rect.bytes()),
+                    bytes: rect.bytes(), lands: vec![(rect, 0)] });
+            }
+            assert_eq!(direct_layers.len(), 40 / gpus);
+            let tokens = if gpus == 1 { 0..129280 } else { gpu * 64640..(gpu + 1) * 64640 };
+            let head = super::v41_tensors::rect(&catalog, "head.weight", Some(tokens))?;
+            let mut steps = VocabularyShard::pack_steps(head, device,
+                buffer(device, 129280 * 5120), buffer(device, 129280 * 160))?;
+            assert!(steps.iter().all(|step| step.bytes() == 16 * 10240));
+            if gpu == draft_gpu {
+                for stage in 0..shape.draft_stages { for expert in 0..shape.draft_experts {
+                    let selection = catalog.expert_staging(V41ExpertSelection::Dspark { stage, expert })?;
+                    let names = selection.tensor_names();
+                    for (slot, projection) in [(0, 0), (1, 1), (2, 2)] {
+                        let tensor = catalog.tensor(&names[slot])?;
+                        let rows = tensor.metadata.shape[0];
+                        let width = tensor.metadata.byte_length as usize / rows;
+                        let rect = Rect { name: names[slot].clone(), path: snapshot.join(&tensor.shard),
+                            base: tensor.metadata.byte_offset, row_bytes: width, rows: 0..rows, cols: 0..width };
+                        steps.extend(native_weight_windows(rect, device, shape.hidden, shape.intermediate as u32,
+                            projection, buffer(device, 2 * shape.hidden * shape.intermediate))?);
+                    }
+                    steps.extend(native_coded_scale_steps(&catalog, names, shape.intermediate, device,
+                        [buffer(device, 2 * shape.hidden * shape.intermediate); 2])?);
+                } }
+            }
+            let layout = RankLayout::new(operands, steps, device)?;
+            let direct = RankLayout::new(layout.operands.iter().map(|(_, operand)| operand.clone()).collect(), vec![], device)?;
+            assert_eq!(direct.host_staging, HostStaging::default(), "direct dense owners must not stage");
+            assert!(layout.host_staging.largest_step <= 256 * 2560);
+            let layers = (0..onboarded).collect::<Vec<_>>();
+            let plan = if gpus == 1 { CoordinatorExpertPlan::whole_native(&catalog, &layers, usize::MAX)? }
+                else { CoordinatorExpertPlan::new(&catalog, &layers, gpu, usize::MAX)? };
+            let dense = layout.host_staging;
+            let scales = plan.scales.host_staging();
+            let extra = plan.validation.bytes() + plan.exlr8_host_bytes()?;
+            assert_eq!(extra, 0, "native coded experts have no scalar/vector validation owner");
+            let total = dense.bytes()? + scales.bytes()? + extra + ring;
+            assert_eq!(CoordinatorExpertPlan::admit_host(&[Some(&plan)], &[dense], DEFAULT_SLOTS,
+                DEFAULT_SLOT_BYTES, total as u64)?, total);
+            assert!(CoordinatorExpertPlan::admit_host(&[Some(&plan)], &[dense], DEFAULT_SLOTS,
+                DEFAULT_SLOT_BYTES, total as u64 - 1).is_err());
+            assert!(total < 768 << 20, "unexpected coordinator staging growth: {total}");
+            eprintln!("{gpus}RTX\tGPU{gpu}\t{}\t{}\t{}\t{}\t{extra}\t{ring}\t{total}",
+                dense.staging_bytes, dense.table_bytes, scales.staging_bytes, scales.table_bytes);
+            layouts.push(layout);
+            experts.push(plan);
+        }
+        let dense = layouts.iter().map(|layout| layout.host_staging).collect::<Vec<_>>();
+        let refs = experts.iter().map(Some).collect::<Vec<_>>();
+        let named = experts.iter().zip(&dense).try_fold(gpus * ring, |sum, (plan, dense)|
+            Ok::<_, anyhow::Error>(sum + plan.host_bytes()? + dense.bytes()?))?;
+        assert_eq!(CoordinatorExpertPlan::admit_host(&refs, &dense, DEFAULT_SLOTS,
+            DEFAULT_SLOT_BYTES, named as u64)?, named);
+    }
+    for world in [3, 4, 6] {
+        let rank = if world == 3 { 1 } else { world - 1 };
+        let first_layer = if world == 3 { 8 } else { 0 };
+        let logical = shape.intermediate / world;
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(shape.hidden, logical).context("native width")?;
+        let planes = NativePlanes::with_scale_codes(shape.hidden, logical, stored, shape.experts, false, true)?;
+        let plan = ScalePlan::new(&catalog, (first_layer..shape.layers).map(|layer| (layer, planes.clone(), 0)), world, rank)?;
+        let scales = plan.host_staging();
+        let total = scales.bytes()? + ring;
+        assert!(total <= 320 << 20, "unexpected Spark staging growth: {total}");
+        eprintln!("TP{world}\tSpark{rank}\t0\t0\t{}\t{}\t0\t{ring}\t{total}", scales.staging_bytes, scales.table_bytes);
+    }
+    rss_guard(2)?;
+    Ok(())
+}
+
 /// The two-GPU (encoder/decoder) dense owners as `distributed::worker` builds them.
 pub(crate) fn mount_two_gpu(library: &NativeLibrary, catalog: &cuteafd_loader::OfficialV41Catalog,
     out: &mut Digests) -> Result<()> {

@@ -1,0 +1,891 @@
+[
+ {
+  "name": "single_user",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ]
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]What is 2 + 2?[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   14603,
+   1460,
+   1032,
+   1050,
+   1677,
+   1032,
+   1050,
+   1063,
+   4
+  ]
+ },
+ {
+  "name": "system_low_effort",
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "reasoning_effort": "low"
+  },
+  "expected": "<s>[SYSTEM_PROMPT]You are terse.[/SYSTEM_PROMPT][MODEL_SETTINGS]{\"reasoning_effort\": \"low\"}[/MODEL_SETTINGS][INST]Hi[/INST]",
+  "token_ids": [
+   1,
+   17,
+   8683,
+   1907,
+   1265,
+   14716,
+   1046,
+   18,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   2358,
+   23665,
+   37,
+   3,
+   25415,
+   4
+  ]
+ },
+ {
+  "name": "medium_effort_multi_turn_reasoning",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": "7",
+     "reasoning_content": "Any number works."
+    },
+    {
+     "role": "user",
+     "content": "Another?"
+    }
+   ],
+   "reasoning_effort": "medium"
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"medium\"}[/MODEL_SETTINGS][INST]Pick a number.[/INST][THINK]Any number works.[/THINK]7</s>[INST]Another?[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   33593,
+   23665,
+   37,
+   3,
+   62261,
+   1263,
+   3824,
+   1046,
+   4,
+   34,
+   23416,
+   3824,
+   8299,
+   1046,
+   35,
+   1055,
+   2,
+   3,
+   48196,
+   1063,
+   4
+  ]
+ },
+ {
+  "name": "tools_and_calls",
+  "request": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city (°C).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. 台北"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 7
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "run_tests",
+      "description": "Run the suite.",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "Use tools."
+    },
+    {
+     "role": "user",
+     "content": "Weather in 台北 for 2 days, then run tests."
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "reasoning_content": "Two calls.",
+     "tool_calls": [
+      {
+       "id": "a1b2c3d4e",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\":\"台北\",\"days\":2}"
+       }
+      },
+      {
+       "id": "f5g6h7i8j",
+       "type": "function",
+       "function": {
+        "name": "run_tests",
+        "arguments": "{}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "a1b2c3d4e",
+     "name": "get_weather",
+     "content": "22 °C, rain"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "f5g6h7i8j",
+     "name": "run_tests",
+     "content": "ok: 12 passed"
+    },
+    {
+     "role": "user",
+     "content": "Summarize."
+    }
+   ]
+  },
+  "expected": "<s>[SYSTEM_PROMPT]Use tools.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city (°C).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 台北\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 7}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"run_tests\", \"description\": \"Run the suite.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}][/AVAILABLE_TOOLS][MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Weather in 台北 for 2 days, then run tests.[/INST][THINK]Two calls.[/THINK][TOOL_CALLS]get_weather[ARGS]{\"city\": \"台北\", \"days\": 2}[TOOL_CALLS]run_tests[ARGS]{}</s>[TOOL_RESULTS]22 °C, rain[/TOOL_RESULTS][TOOL_RESULTS]ok: 12 passed[/TOOL_RESULTS][INST]Summarize.[/INST]",
+  "token_ids": [
+   1,
+   17,
+   17379,
+   12017,
+   1046,
+   18,
+   5,
+   1091,
+   3745,
+   4999,
+   1557,
+   1418,
+   3980,
+   1588,
+   1418,
+   3980,
+   1557,
+   6333,
+   2061,
+   1557,
+   1418,
+   1751,
+   1095,
+   45333,
+   1588,
+   1418,
+   8490,
+   1557,
+   1418,
+   13218,
+   29317,
+   1476,
+   1263,
+   11205,
+   165098,
+   1067,
+   110012,
+   1418,
+   27766,
+   1557,
+   6333,
+   4999,
+   1557,
+   1418,
+   6692,
+   1588,
+   1418,
+   58455,
+   1557,
+   6333,
+   27348,
+   1557,
+   6333,
+   4999,
+   1557,
+   1418,
+   3711,
+   1588,
+   1418,
+   8490,
+   1557,
+   1418,
+   27830,
+   2715,
+   1044,
+   1294,
+   4043,
+   1046,
+   37582,
+   17847,
+   10274,
+   1418,
+   48897,
+   1557,
+   6333,
+   4999,
+   1557,
+   1418,
+   37375,
+   1588,
+   1418,
+   113747,
+   1557,
+   1032,
+   1049,
+   1044,
+   1418,
+   105661,
+   1557,
+   1032,
+   1055,
+   29147,
+   1418,
+   21036,
+   1557,
+   10003,
+   27348,
+   6230,
+   3500,
+   2424,
+   6333,
+   4999,
+   1557,
+   1418,
+   3980,
+   1588,
+   1418,
+   3980,
+   1557,
+   6333,
+   2061,
+   1557,
+   1418,
+   23563,
+   134297,
+   1588,
+   1418,
+   8490,
+   1557,
+   1418,
+   19774,
+   1327,
+   17807,
+   11069,
+   1418,
+   27766,
+   1557,
+   6333,
+   4999,
+   1557,
+   1418,
+   6692,
+   1588,
+   1418,
+   58455,
+   1557,
+   1426,
+   3500,
+   3500,
+   1093,
+   6,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   54892,
+   1320,
+   37582,
+   17847,
+   1476,
+   1032,
+   1050,
+   8179,
+   1044,
+   3351,
+   5198,
+   14999,
+   1046,
+   4,
+   34,
+   24699,
+   16527,
+   1046,
+   35,
+   9,
+   1751,
+   1095,
+   45333,
+   32,
+   3745,
+   27348,
+   1557,
+   1418,
+   23367,
+   17847,
+   1588,
+   1418,
+   48897,
+   1557,
+   1032,
+   1050,
+   1125,
+   9,
+   23563,
+   134297,
+   32,
+   25742,
+   2,
+   7,
+   2251,
+   11518,
+   1067,
+   1044,
+   36864,
+   8,
+   7,
+   1755,
+   1058,
+   1032,
+   1690,
+   19784,
+   8,
+   3,
+   24305,
+   82954,
+   1046,
+   4
+  ]
+ },
+ {
+  "name": "json_schema",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Give me a point."
+    }
+   ],
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "point",
+     "strict": true,
+     "schema": {
+      "type": "object",
+      "properties": {
+       "x": {
+        "type": "integer"
+       },
+       "y": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "x",
+       "y"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"json_schema\": {\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"integer\"}, \"y\": {\"type\": \"integer\"}}, \"required\": [\"x\", \"y\"], \"additionalProperties\": false}, \"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Give me a point.[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   7928,
+   90526,
+   1557,
+   6333,
+   4999,
+   1557,
+   1418,
+   6692,
+   1588,
+   1418,
+   58455,
+   1557,
+   6333,
+   1120,
+   1557,
+   6333,
+   4999,
+   1557,
+   1418,
+   37375,
+   10274,
+   1418,
+   1121,
+   1557,
+   6333,
+   4999,
+   1557,
+   1418,
+   37375,
+   23665,
+   2424,
+   1418,
+   21036,
+   1557,
+   10003,
+   1120,
+   1588,
+   1418,
+   1121,
+   26477,
+   1418,
+   121068,
+   17157,
+   1557,
+   2954,
+   2424,
+   1418,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   129057,
+   1775,
+   1263,
+   4133,
+   1046,
+   4
+  ]
+ },
+ {
+  "name": "json_object",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Reply in JSON."
+    }
+   ],
+   "response_format": {
+    "type": "json_object"
+   }
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"json_schema\": {\"anyOf\": [{\"type\": \"object\"}, {\"type\": \"array\"}]}, \"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Reply in JSON.[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   7928,
+   90526,
+   1557,
+   6333,
+   3146,
+   5644,
+   1557,
+   80322,
+   4999,
+   1557,
+   1418,
+   6692,
+   10274,
+   6333,
+   4999,
+   1557,
+   1418,
+   4744,
+   171811,
+   2424,
+   1418,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   39643,
+   1320,
+   12933,
+   1046,
+   4
+  ]
+ },
+ {
+  "name": "text_blocks_and_marker_literals",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Quote: "
+      },
+      {
+       "type": "text",
+       "text": "a [b] {c}\n\n  d"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Quote: a [b] {c}\n\n  d[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   51430,
+   1058,
+   1263,
+   1638,
+   1098,
+   1093,
+   1426,
+   1099,
+   2106,
+   1032,
+   1261,
+   4
+  ]
+ },
+ {
+  "name": "consecutive_users",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "First."
+    },
+    {
+     "role": "user",
+     "content": "Second."
+    }
+   ]
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]First.\n\nSecond.[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   12826,
+   1369,
+   17744,
+   1046,
+   4
+  ]
+ },
+ {
+  "name": "image_then_text",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+       }
+      },
+      {
+       "type": "text",
+       "text": "What is this?"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST][IMG]What is this?[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   10,
+   14603,
+   1460,
+   1769,
+   1063,
+   4
+  ]
+ },
+ {
+  "name": "text_then_image_reordered",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Describe:"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST][IMG]Describe:[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   10,
+   159287,
+   1058,
+   4
+  ]
+ },
+ {
+  "name": "two_images_and_literal_marker_text",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+       }
+      },
+      {
+       "type": "text",
+       "text": "versus"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+       }
+      },
+      {
+       "type": "text",
+       "text": "Compare."
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST][IMG]versus[IMG]Compare.[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   10,
+   3084,
+   1334,
+   10,
+   58705,
+   1046,
+   4
+  ]
+ },
+ {
+  "name": "assistant_prefix_history",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi! How can I help?"
+    },
+    {
+     "role": "user",
+     "content": "Tell me a joke."
+    }
+   ],
+   "reasoning_effort": "high"
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Hello[/INST]Hi! How can I help?</s>[INST]Tell me a joke.[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   21424,
+   4,
+   25415,
+   1033,
+   4989,
+   2093,
+   1408,
+   5485,
+   1063,
+   2,
+   3,
+   177312,
+   1775,
+   1263,
+   133394,
+   1046,
+   4
+  ]
+ }
+]

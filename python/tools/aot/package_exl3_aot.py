@@ -268,12 +268,14 @@ GEOMETRIES = {
     # Qwen 3.8 Flash Next (qwen4_exp): 512 experts, softmax top-10, unclamped SiLU.
     'qwen4': (2560, 640, 512, 10),
     'kimik3': (3584, 3072, 896, 16),
+    # Mistral Large 4 (mistral_large4): 128 experts, softmax top-4, unclamped SiLU.
+    'ml4': (6144, 6144, 128, 4),
     # Step-5: 352 experts, top-8, post-SiLU clamp at 7 (K4 experts, K6 tails 88-90).
     'step5': (4096, 1536, 352, 8),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'ml4': None}
 # Activation per geometry, mirroring cuteafd_core::ExpertGeometry::activation.
 ACTIVATIONS = {'kimik3': 'situ', 'step5': 'silu_post_clamp'}
 
@@ -385,6 +387,9 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('kimik3', 1536, 5504): _WS_K3_PREROTATE,
     ('kimik3', 3072, 8256): _WS_K3_PREROTATE,
     ('kimik3', 1536, 8256): _WS_K3_PREROTATE,
+    # ML4 K4/empty-K5, 2026-11-01: 1.036x even / 1.060x synthetic-skew.
+    # Confirmed PRO 6000: 1.05-1.07x (#924 comment 6566325329); exact cell only.
+    ('ml4', 3072, 2752): _WS_K3_PREROTATE,
 }
 
 
@@ -406,6 +411,9 @@ def coordinator_ws_cell(geometry: str, role: str, width: int, capacity: int) -> 
         return measured
     if measured is not None:
         return measured
+    # A provisional ML4 rank is evidence for one capacity, not its neighbours.
+    if geometry == 'ml4':
+        return _WS_S14_M256 if capacity <= 256 else _WS_S14
     # Preserve measured cells; extend the nearest same-width WS recipe first.
     candidates = [(abs(c - capacity), options) for (g, w, c), options
                   in COORDINATOR_WS_CELLS.items() if g == geometry and w == width]
@@ -420,6 +428,25 @@ SPARK_WS_CELLS = {
     ('qwen4', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
     ('qwen4', 256): dict(dynamic=False, tile=(64, 256, 64, 256)),
     ('qwen4', 128): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    # ML4 K4/empty-K5, GB10 2026-11-01: exact synthetic-skew-qualified cells;
+    # real-route confirmation pending. No extrapolation across rows or widths.
+    ('ml4', 1024, 256): _WS_K3_PREROTATE,
+    ('ml4', 1024, 2048): _WS_K3_PREROTATE,
+    ('ml4', 1024, 2752): _WS_K3_PREROTATE,
+    ('ml4', 1152, 256): _WS_S14,
+    ('ml4', 1152, 1024): _WS_S14,
+    ('ml4', 1152, 2752): _WS_S14,
+    ('ml4', 1152, 4096): _WS_S14,
+    ('ml4', 1280, 256): _WS_K3_PREROTATE,
+    ('ml4', 1280, 2752): _WS_K3_PREROTATE,
+    ('ml4', 1280, 4096): _WS_K3_PREROTATE,
+    ('ml4', 896, 256): _WS_S14,
+    ('ml4', 896, 1024): _WS_S14,
+    ('ml4', 896, 2752): _WS_S14,
+    ('ml4', 768, 256): _WS_K3_PREROTATE,
+    ('ml4', 768, 2048): _WS_K3_PREROTATE,
+    ('ml4', 768, 2752): _WS_K3_PREROTATE,
+    ('ml4', 768, 4096): _WS_K3_PREROTATE,
     # Step-5 K4/K6, GB10 2026-11-01: random and synthetic Gini .4/.7/.8,
     # exact against each tier's control; K6 ties within measured noise pass.
     # Real-route confirmation is pending; other capacities keep their controls.

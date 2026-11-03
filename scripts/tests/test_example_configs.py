@@ -23,8 +23,9 @@ TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
          "tp3ep2-native.config", "tp4ep1-explicit-native.config", "tp6ep1-native.config"}
 # WIP qualification configs for families without a release card yet (#273, #274):
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
+ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-core-k6-{size}.config" for size in ("min", "max")}
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
-                 "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"}
+                 "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION
 V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
            "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config",
            "glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config"}
@@ -561,6 +562,52 @@ def test_v41_starting_config_matches_the_launcher_defaults(path: Path, tmp_path:
             assert defaults[key] == "", "V4.1 now defaults POOL_TOKENS; drop the exception"
         else:
             assert values[key] == defaults[key], key
+
+
+@pytest.mark.parametrize("name", sorted(ML4_QUALIFICATION))
+def test_ml4_qualification_config_preserves_native_draft_defaults(name: str, tmp_path: Path) -> None:
+    from test_run_family_dispatch import _family_launch_result
+
+    path = EXAMPLES / name
+    values = keys(path)
+    minimum = name.endswith("-min.config")
+    assert values["MODEL_ID"] == "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6"
+    assert values["MODEL_REVISION"] == "03c80aebaa483d55760703ae5bc0c9734c9d67d6"
+    assert values["SPECULATOR"] == "dspark" and values["POOL_TOKENS"] == "auto"
+    assert not {"SPECULATOR_MODEL_ID", "SPECULATOR_DEPTH", "RTX_EXPERT_LAYERS"}.intersection(values)
+    assert values["SPARK_COUNT"] == ("5" if minimum else "6")
+    assert values["RTX_GPUS"] == ("1" if minimum else "2")
+    assert f"./run.sh --config examples/configs/{name} --dry-run" in path.read_text()
+    assert not any(needle in path.read_text().lower() for needle in PRIVATE)
+    for rank in range(int(values["SPARK_COUNT"])):
+        assert values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
+        assert values[f"SPARK_{rank}_LANE_A"] == f"192.0.2.{rank + 1}"
+    checkpoint = {"model_type": "mistral_large4", "text_config": {
+        "model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}}
+    launches = []
+    for label, drop in (("example", ()), ("bare", SPECULATOR_KEYS + POOL_KEYS)):
+        config = "".join(f"{k}={v}\n" for k, v in values.items()
+                         if k not in ("MODEL_ID", "MODEL_REVISION", *drop))
+        result = _family_launch_result(tmp_path / label, checkpoint, values["MODEL_ID"], config,
+                                      extra_args=("--wip", "ml4-test"))
+        launch = _coordinator(result)
+        assert "serve-glm" in launch and "--dspark" in launch and "--draft " not in launch
+        assert "--pool-tokens 0" in launch
+        assert result.stderr.count("cuteafd expertd-native") == int(values["SPARK_COUNT"])
+        launches.append(_speculation(launch))
+    assert launches[0] == launches[1]
+
+
+def test_ml4_smoke_entries_use_published_examples_and_minimum_sparks() -> None:
+    matrix = json.loads((ROOT / "scripts/bench/kits/gate/matrix-ml4.json").read_text())
+    entries = {entry["name"]: entry for entry in matrix["entries"]}
+    for size, gpus, sparks in (("min", [1], 5), ("max", [0, 1], 6)):
+        entry = entries[f"ml4-exl3-{size}"]
+        assert entry["config"] == f"examples/configs/mistral-large4-exl3-k4-core-k6-{size}.config"
+        assert entry["family"] == "mistral_large4" and entry["gpus"] == gpus
+        assert len(entry["sparks"]) == sparks and entry["set"]["SPARK_COUNT"] == str(sparks)
+        assert not any(k.startswith(f"SPARK_{sparks}_") for k in entry["set"])
+        assert keys(ROOT / entry["config"])["SPECULATOR"] == "dspark"
 
 
 def test_tp_ep_examples_are_left_alone() -> None:

@@ -40,15 +40,27 @@ pub fn is_push_shard(shard: &Path) -> bool {
 /// Discover the namespace root and this host from ADR-064, never from a
 /// container hostname or a coordinator-side address-to-host guess.
 pub fn namespace(path: &Path) -> io::Result<(std::path::PathBuf, String)> {
+    namespace_with(path, |root, bytes| {
+        rustix::fs::getxattr(root, "user.sparknest.cluster", bytes).map_err(Into::into)
+    })
+}
+
+fn namespace_with(path: &Path, mut read: impl FnMut(&Path, &mut [u8]) -> io::Result<usize>)
+    -> io::Result<(std::path::PathBuf, String)> {
     let path = path.canonicalize()?;
+    let mut bytes = vec![0; 65536];
     for root in path.ancestors() {
-        let mut bytes = vec![0; 65536];
-        if let Ok(size) = rustix::fs::getxattr(root, "user.sparknest.cluster", &mut bytes[..]) {
-            let value: serde_json::Value = serde_json::from_slice(&bytes[..size])?;
-            let host = value["me"].as_str().filter(|host| !host.is_empty())
-                .ok_or_else(|| io::Error::other("SparkNest cluster has no local host"))?;
-            return Ok((root.into(), host.into()));
-        }
+        let size = match read(root, &mut bytes) {
+            Ok(size) => size,
+            Err(error) if matches!(error.raw_os_error(), Some(code) if
+                code == rustix::io::Errno::NODATA.raw_os_error()
+                    || code == rustix::io::Errno::NOTSUP.raw_os_error()) => continue,
+            Err(error) => return Err(error),
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes[..size])?;
+        let host = value["me"].as_str().filter(|host| !host.is_empty())
+            .ok_or_else(|| io::Error::other("SparkNest cluster has no local host"))?;
+        return Ok((root.into(), host.into()));
     }
     Err(io::Error::new(io::ErrorKind::NotFound, "not a SparkNest namespace"))
 }

@@ -4,6 +4,7 @@ pub mod dspark;
 pub mod glm;
 pub mod kimi;
 pub mod mimo;
+pub mod mistral_large4;
 pub mod qwen;
 pub mod qwen35;
 

@@ -559,6 +559,25 @@ impl<'a> Exl3Tp2<'a> {
         package: &Path, layers: Vec<usize>, max_rows: usize, budget: usize,
         selection: RtxSelectionPolicy,
     ) -> Result<Exl3Tp2Weights<'a>> {
+        Self::whole_weights(device, catalog, package, layers, max_rows, budget, selection, None)
+    }
+
+    /// Binds committed whole-layer payloads with the mount path's package and admission checks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pushed_whole_weights(
+        device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &Path, layers: Vec<usize>, max_rows: usize, budget: usize,
+        selection: RtxSelectionPolicy, pushed: Vec<Exl3Weights<'a>>,
+    ) -> Result<Exl3Tp2Weights<'a>> {
+        Self::whole_weights(device, catalog, package, layers, max_rows, budget, selection, Some(pushed))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn whole_weights(
+        device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &Path, layers: Vec<usize>, max_rows: usize, budget: usize,
+        selection: RtxSelectionPolicy, pushed: Option<Vec<Exl3Weights<'a>>>,
+    ) -> Result<Exl3Tp2Weights<'a>> {
         validate_layers(&layers, 0)?;
         let geometry = expert_geometry();
         let row_policy = Exl3RowPolicy::for_geometry(geometry);
@@ -576,14 +595,28 @@ impl<'a> Exl3Tp2<'a> {
         let label = format!("experts/whole expert layers {layers:?}");
         let weights = device.own(|| {
             let _scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
-            let mut weights = Vec::with_capacity(layers.len());
-            let mut remaining = budget.checked_sub(workspace_bytes).context("EXL3 whole workspace exceeds budget")?;
-            for &layer in &layers {
-                let weight = Exl3Weights::load(device.library, catalog,
-                    ExpertLayer::BackboneFull { layer }, remaining)?;
-                remaining -= weight.budget.resident_bytes;
-                weights.push(weight);
-            }
+            let weights = match pushed {
+                Some(weights) => {
+                    ensure!(weights.len() == plans.len() && weights.iter().zip(&layers).zip(&plans)
+                        .all(|((weight, &layer), plan)|
+                            matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(id) if id == layer)
+                            && weight.layout.world == 1 && weight.layout.rank == 0
+                            && weight.budget.resident_bytes == plan.resident_bytes),
+                        "pushed whole EXL3 weights differ from the admitted inventory and footprint");
+                    weights
+                }
+                None => {
+                    let mut weights = Vec::with_capacity(layers.len());
+                    let mut remaining = budget.checked_sub(workspace_bytes).context("EXL3 whole workspace exceeds budget")?;
+                    for &layer in &layers {
+                        let weight = Exl3Weights::load(device.library, catalog,
+                            ExpertLayer::BackboneFull { layer }, remaining)?;
+                        remaining -= weight.budget.resident_bytes;
+                        weights.push(weight);
+                    }
+                    weights
+                }
+            };
             Ok(Rc::new(weights))
         })?;
         Ok(Exl3Tp2Weights { device, rank: 0, shard: RtxShard::Whole, layers, geometry,

@@ -39,6 +39,13 @@ int32_t cuteafd_zero_pitched_async(void* destination, uint64_t destination_bytes
 int32_t cuteafd_pack_expert_plane_async(const uint8_t* source, uint64_t source_bytes,
     uint8_t* destination, uint64_t destination_bytes, uint32_t intermediate,
     uint32_t plane, void* stream);
+/* Tile-aligned rows of one weight projection, using the same pack kernel.
+ * Projection 0 gate, 1 up, 2 down; source contains only [first, first+rows).
+ * Destination is the full native W13/W2 plane. Each launch writes only its
+ * rows' uint32 lanes, including final padding, even for shared FC1 tiles. */
+int32_t cuteafd_pack_expert_window_async(const uint8_t* source, uint64_t source_bytes,
+    uint8_t* destination, uint64_t destination_bytes, uint32_t intermediate,
+    uint32_t projection, uint32_t first, uint32_t rows, void* stream);
 /* Load-time V4.1 scales: uint16 K128 offsets in N256 lane-major order,
  * followed by stored_rows uint8 row bases. The caller zeros omitted rows.
  * Sources are device-visible (device or mapped pinned memory); the jobs table

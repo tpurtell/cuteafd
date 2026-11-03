@@ -219,6 +219,8 @@ def test_shared_scope_knob_keeps_k6_default_and_native_family_fallback():
     assert scope("glmf,kimik3,glm,glm", "glm") == (("kimik3", "glm", "glmf"), ("glm", "glmf"))
     assert scope("kimik3", "glm") == (("kimik3",), ())
     assert scope("step5", "glm") == (("step5",), ())
+    assert scope("ml4", "glm") == (("ml4",), ())
+    assert scope("ml4,glmf,step5,glm", "glm") == (("glm", "glmf", "step5", "ml4"), ("glm", "glmf"))
     assert scope("step5,glmf,glm", "glm") == (("glm", "glmf", "step5"), ("glm", "glmf"))
     for families in ("", "glm,", "other"):
         with pytest.raises(ValueError, match="dense-trellis-families"):

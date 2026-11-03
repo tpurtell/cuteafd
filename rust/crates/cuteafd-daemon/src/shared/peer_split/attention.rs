@@ -177,6 +177,9 @@ mod terminal_tests {
 pub(crate) struct Query {
     pub values: *const c_void,
     pub row_pitch: usize,
+    /// Bytes of this rank's half per row when a layer's query is narrower than the exchange's
+    /// widest (Mistral Large 4's NoPE 512 beside its 576 latent); None: the exchange's width.
+    pub width: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -218,7 +221,10 @@ trait ContextProtocol {
 
 impl ContextProtocol for ContextExchange<'_> {
     fn push_query(&self, rank: usize, slot: usize, query: Query, rows: usize) -> Result<()> {
-        self.push_query(rank, slot, query.values, query.row_pitch, rows)
+        match query.width {
+            Some(width) => self.push_query_width(rank, slot, query.values, query.row_pitch, rows, width),
+            None => self.push_query(rank, slot, query.values, query.row_pitch, rows),
+        }
     }
     fn push_candidates(&self, rank: usize, slot: usize, candidates: Candidates, rows: usize) -> Result<()> {
         self.push_candidates(rank, slot, candidates.scores, candidates.indices, rows)
@@ -1028,7 +1034,7 @@ mod tests {
     impl ContextKernels for &Recorder {
         fn produce(&mut self) -> Result<Query> {
             self.note("produce");
-            Ok(Query { values: std::ptr::null(), row_pitch: 32 })
+            Ok(Query { values: std::ptr::null(), row_pitch: 32, width: None })
         }
         fn score(&mut self) -> Result<Option<Candidates>> {
             self.note("score");

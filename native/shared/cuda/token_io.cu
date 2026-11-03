@@ -190,6 +190,30 @@ extern "C" cuteafd_status_t cuteafd_cuda_embed_gather_bf16_async(
   return status_from_cuda(cudaGetLastError());
 }
 
+// Final-logit soft cap in place: x = tanh(x / cap) * cap in FP32 (Gemma 2,
+// Mistral Large 4: `logits / c; tanh; * c`, each an FP32 op, as the reference).
+__global__ void logits_softcap_f32_kernel(float* __restrict__ logits, size_t rows, size_t vocab,
+                                          size_t stride, float cap) {
+  const size_t row = blockIdx.y;
+  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < vocab; i += size_t(gridDim.x) * blockDim.x) {
+    float* x = logits + row * stride + i;
+    *x = tanhf(__fdiv_rn(*x, cap)) * cap;
+  }
+}
+
+extern "C" cuteafd_status_t cuteafd_cuda_logits_softcap_f32_async(
+    float* logits, size_t rows, size_t vocab, size_t stride, float cap, void* cuda_stream) {
+  if (logits == nullptr || rows == 0 || vocab == 0 || stride < vocab || !(cap > 0.0f) ||
+      rows > 65535) {
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
+  }
+  const dim3 grid(static_cast<unsigned>((vocab + 255) / 256 < 1024 ? (vocab + 255) / 256 : 1024),
+                  static_cast<unsigned>(rows));
+  logits_softcap_f32_kernel<<<grid, 256, 0, reinterpret_cast<cudaStream_t>(cuda_stream)>>>(
+      logits, rows, vocab, stride, cap);
+  return status_from_cuda(cudaGetLastError());
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_logits_greedy_f32_async(
     const float* logits, size_t rows, size_t vocab, size_t stride, uint32_t* out_ids,
     float* out_logprob, uint32_t* out_status, void* cuda_stream) {

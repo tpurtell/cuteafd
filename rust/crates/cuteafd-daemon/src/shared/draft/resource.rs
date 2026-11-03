@@ -601,6 +601,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_only_candidates_do_not_inherit_selector_cold_floor() {
+        let mut policy = DraftPolicy::seeded(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), seed()).unwrap();
+        let prior = [0.; 7];
+        let token_only = Candidate { id: 1, prior: &prior, limit: 7, selector: false, cold: true };
+        let without = select_drafted(&mut policy, &[token_only], 3, 64, 1);
+        let selector = Candidate { id: 1, prior: &prior, limit: 7, selector: true, cold: true };
+        let with = select_drafted(&mut policy, &[selector], 3, 64, 1);
+        assert!(without.lengths[0] < START_DRAFTS);
+        assert_eq!(with.lengths[0], START_DRAFTS);
+    }
+
+    #[test]
     fn matches_frozen_glmrt_calibration() {
         let actual = crate::shared::draft_confidence::SelectorFit::default().confidence(&[0.75, 0.6, 0.8, 0.4, 0.9, 0.5, 0.7], &[
             [0.0, 0.0625, 2.765625, 0.0], [1.0, 0.5, 1.0, 2.0], [4.0, 0.96875, 0.25, 0.0], [0.125, 0.25, 1.5, 4.0],
@@ -658,7 +670,7 @@ mod tests {
         // GLM/GLMF/MiMo call this cap after draft generation (including fixed
         // and run_draft cold shortcuts); Qwen/Kimi/Step cap before generation.
         // V4's selected lengths pass through the same policy fallback.
-        for family in ["glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5", "deepseek_v4"] {
+        for family in ["glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5", "deepseek_v4", "mistral_large4"] {
             for count in [17, 32, 64] {
                 let sure = vec![0.99; 7];
                 let poor = vec![0.; 7];

@@ -59,6 +59,27 @@ def exporter(monkeypatch):
     return module
 
 
+def test_ml4_context_fc_exports_the_canonical_bf16_projection(exporter, monkeypatch):
+    package = sys.modules["b12x.integration.cuteafd"]
+    ml4 = _Compilers("b12x.integration.cuteafd.mistral_large4")
+    ml4.rope_attention = lambda g: g
+    ml4.ML4_DRAFT = types.SimpleNamespace(kv_cache="fp8", window_size=2048)
+    monkeypatch.setattr(package, "mistral_large4", ml4, raising=False)
+    monkeypatch.setitem(sys.modules, ml4.__name__, ml4)
+    g = types.SimpleNamespace(hidden=6144, index_head_dim=128, index_heads=32,
+                              dense_inter=24576, moe_inter=6144, index_norm_eps=1e-5)
+    programs = exporter.ml4_programs(g, 64, 4096, 1048576)
+    op, params, build = next((op, params, build) for stem, op, params, build in programs
+                            if stem == "draft_context_fc")
+    assert op == "bf16_projection"
+    assert params == {"width": 30720, "outputs": 6144, "max_rows": 2048}
+    assert build() == ("pointwise", "compile_bf16_projection_aot", (), {"width": 30720, "outputs": 6144})
+    source = (ROOT / "third_party/sparkinfer/b12x/integration/cuteafd/pointwise.py").read_text()
+    canonical = source.split("def compile_bf16_projection_aot(", 1)[1].split("\ndef ", 1)[0]
+    assert "max_skinny_rows=0" in canonical
+    assert '"exact_row_cap"' in canonical
+
+
 @pytest.mark.parametrize("intermediates", [(12288, 2048), (6144, 1024)])
 @pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (128, 4096), (64, 64)])
 def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, intermediates, decode_rows, prefill_rows):

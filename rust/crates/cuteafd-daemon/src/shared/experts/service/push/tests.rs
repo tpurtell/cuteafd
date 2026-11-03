@@ -109,6 +109,60 @@ fn control_pair() -> Result<(TcpStream, TcpStream)> {
 }
 
 #[test]
+fn namespace_access_failure_declines_all_spark_ranks_before_typed_startup_error() -> Result<()> {
+    use crate::shared::experts::rtx::push::PushStartupError;
+    let root = tempfile::tempdir()?;
+    let (first_driver, mut first) = control_pair()?;
+    let (second_driver, mut second) = control_pair()?;
+    let driver = std::thread::spawn(move || {
+        cuteafd_transport::worker_selection::push::coordinate(&mut [first_driver, second_driver], |_| {
+            anyhow::bail!("a declined namespace must not open a push group")
+        })
+    });
+    let peer = std::thread::spawn(move || -> Result<()> {
+        let planned = Ok((std::path::PathBuf::from("/fixture"), "spark".into()));
+        let error = plan_offer_namespace(std::path::Path::new("/fixture"), &mut second, planned,
+            |_, host| Ok(((), Offer { rank: 1, host: host.into(), arena_bytes: 1, placement: vec![] })))
+            .unwrap_err();
+        assert!(matches!(error.downcast_ref::<PushStartupError>(), Some(PushStartupError::Uncommitted)));
+        Ok(())
+    });
+    let error = plan_offer_namespace::<()>(root.path(), &mut first,
+        Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+        |_, _| panic!("namespace discovery must fail before planning"))
+        .unwrap_err();
+    match error.downcast_ref::<PushStartupError>() {
+        Some(PushStartupError::Namespace { source, .. }) => assert_eq!(source.raw_os_error(), Some(libc::EACCES)),
+        other => panic!("expected typed namespace error, got {other:?}"),
+    }
+    peer.join().map_err(|_| anyhow::anyhow!("peer panicked"))??;
+    driver.join().map_err(|_| anyhow::anyhow!("driver panicked"))??;
+    Ok(())
+}
+
+#[test]
+fn required_receive_reports_failure_only_after_the_peer_drain_barrier() -> Result<()> {
+    use crate::shared::experts::rtx::push::PushStartupError;
+    let (mut driver, mut worker) = control_pair()?;
+    let rank = std::thread::spawn(move || -> Result<()> {
+        assert!(!push::completed_with(&mut worker, Err("injected delivery failure".into()))?);
+        push::drained(&mut worker)?;
+        let error = required_receive::<()>(Ok(None)).unwrap_err();
+        assert!(matches!(error.downcast_ref::<PushStartupError>(), Some(PushStartupError::Uncommitted)));
+        Ok(())
+    });
+    let completed: serde_json::Value = read_control(&driver)?;
+    assert_eq!(completed["message"], "completed");
+    assert_eq!(completed["success"], false);
+    write_control(&mut driver, &serde_json::json!({"message":"commit","success":false}))?;
+    let drained: serde_json::Value = read_control(&driver)?;
+    assert_eq!(drained["message"], "drained");
+    write_control(&mut driver, &serde_json::json!({"message":"mount"}))?;
+    rank.join().map_err(|_| anyhow::anyhow!("rank panicked"))??;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn spark_exl3_ring_to_shared_owner_is_mount_exact_and_drops_before_retry() -> Result<()> {
     let fixture = Fixture::build()?;

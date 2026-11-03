@@ -190,15 +190,26 @@ mod tests {
                     }
                     testing::write_snapshot(&snapshot, &config, &tensors, None);
                 }
+                // The full release header inventory (every expert layer), EXL3 K4 + Core-K6.
+                ("ml4", _) => testing::write_mistral_large4_snapshot(&snapshot, None, true),
                 _ => anyhow::bail!("missing full launch fixture for covered {key}"),
             }
-            if !matches!(family, "v41" | "kimik3") {
+            if !matches!(family, "v41" | "kimik3" | "ml4") {
                 expand_eight_rank_fixture(&snapshot)?;
             }
             let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
             let gpus = if family == "kimik3" { 2 } else { 1 };
             let manifest = if family == "v41" { Some(testing::write_v41_workspaces(&snapshot)) }
                 else if family == "kimik3" { Some(testing::write_kimi_installed_inventory(root.path(), false)) }
+                else if family == "ml4" {
+                    // Its K6 core plans against the native programs of its own geometry.
+                    let checkpoint = cuteafd_loader::plan::Checkpoint::open(&snapshot)?;
+                    let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
+                    let core = cuteafd_loader::families::glm5::core::CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+                    let path = root.path().join("PROGRAMS.json");
+                    std::fs::write(&path, testing::glm_k6_programs(&cfg, &core)?.to_string())?;
+                    Some(path)
+                }
                 else { None };
             let options = PlanOptions {
                 placement: ExpertPlacement::from_spark_ranks(8),

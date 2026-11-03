@@ -112,7 +112,8 @@ pub(crate) struct TokenEmbedding<'a> {
 impl<'a> TokenEmbedding<'a> {
     /// Opens the table. With [`EmbedPlacement::Gpu`] the table is allocated
     /// first (so it is admitted with the weights) and filled on a background
-    /// thread while `during` (the caller's weight load) runs on this one.
+    /// thread while `during` runs. Under dense recording, its operand is
+    /// recorded on the caller's thread instead, and filled before publication.
     pub fn load<T>(library: &'a NativeLibrary, source: EmbedSource, placement: EmbedPlacement,
         during: impl FnOnce() -> Result<T>) -> Result<(Self, T)> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("embedding");
@@ -126,20 +127,27 @@ impl<'a> TokenEmbedding<'a> {
         let mut table = ResidentWeight::new(library, source.bytes(), placement == EmbedPlacement::Host)?;
         let device = library.cuda_get_device()?;
         let (address, started) = (table.buffer().ptr as usize, std::time::Instant::now());
-        let result = std::thread::scope(|scope| -> Result<T> {
+        // The recorder is thread-local: record the GPU destination before the
+        // caller's weights, on this thread, without starting a mount reader.
+        let record = placement == EmbedPlacement::Gpu
+            && crate::shared::experts::rtx::dense::is_recording();
+        let result = if record {
+            fill_table(library, device, &source, address)?;
+            during()
+        } else { std::thread::scope(|scope| -> Result<T> {
             let filler = match &mut table {
                 ResidentWeight::Host { storage, .. } => {
                     let bytes = storage.bytes_mut();
                     let (file, offset) = (&file, source.offset);
                     scope.spawn(move || file.read_exact_at(bytes, offset).map_err(anyhow::Error::from))
                 }
-                ResidentWeight::Device(_) => scope.spawn(|| fill_table(library, device, &file, &source, address)),
+                ResidentWeight::Device(_) => scope.spawn(|| fill_table(library, device, &source, address)),
             };
             let value = during();
             let filled = filler.join().map_err(|_| anyhow::anyhow!("embedding table loader panicked"))?;
             filled.context("loading the embedding table")?;
             value
-        })?;
+        }) }?;
         tracing::info!(vocab = source.vocab, hidden = source.hidden, gib = source.bytes() as f64 / (1u64 << 30) as f64,
             ?placement, device_bytes = table.device_bytes(), pinned_bytes = if table.is_host() { source.bytes() } else { 0 },
             elapsed_ms = started.elapsed().as_millis() as u64, "token embedding placement (single residency)");
@@ -361,25 +369,17 @@ fn bf16_rne(value: f32) -> u16 {
     ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
-/// Reads the shard's table into the device allocation at `address` through
-/// pinned 64 MiB chunks (runs on the loader thread).
-fn fill_table(library: &NativeLibrary, device: i32, file: &std::fs::File, source: &EmbedSource, address: usize)
-    -> Result<()> {
+/// One unchanged operand for both pushed and bounded mounted GPU loading.
+fn fill_table(library: &NativeLibrary, device: i32, source: &EmbedSource, address: usize) -> Result<()> {
+    use crate::shared::experts::rtx::dense::{DenseLoad, Operand, Rect};
     let _memory_scope = cuteafd_ffi::memory_ledger::scope("embedding");
-    library.cuda_set_device(device)?;
-    let chunk = 64usize << 20;
-    let mut staging = HostAllocation::new(library, chunk)?;
-    let total = source.bytes();
-    let mut at = 0;
-    while at < total {
-        let n = chunk.min(total - at);
-        file.read_exact_at(&mut staging.bytes_mut()[..n], source.offset + at as u64)?;
-        let dst = CuteafdDeviceBuffer { ptr: (address + at) as *mut c_void, bytes: n, device_id: device,
-            ..CuteafdDeviceBuffer::default() };
-        library.copy_host_buffer_h2d(dst, staging.buffer, n)?;
-        at += n;
-    }
-    Ok(())
+    let bytes = source.bytes();
+    let row_bytes = source.hidden * 2;
+    DenseLoad::mount(library).operand(Operand { device,
+        buffer: CuteafdDeviceBuffer { ptr: address as *mut c_void, bytes, device_id: device,
+            ..CuteafdDeviceBuffer::default() },
+        lands: vec![(Rect { name: source.tensor_name.clone(), path: source.path.clone(), base: source.offset,
+            row_bytes, rows: 0..source.vocab, cols: 0..row_bytes }, 0)], bytes })
 }
 
 /// FP32 logits rows on the device: `rows` rows of `vocab`, `stride` floats
@@ -1121,6 +1121,58 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn embedding_recording_defers_payload_io_and_replays_mount_bytes() -> Result<()> {
+        use crate::shared::experts::rtx::dense;
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        std::fs::write(fixture.directory().join("events"), [])?;
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let path = dir.path().join("embedding.bin");
+        // An empty shard can be opened, but any eager payload read must fail.
+        std::fs::write(&path, [])?;
+        let source = EmbedSource { path: path.clone(), offset: 7, vocab: 5, hidden: 3,
+            snapshot: None, tensor_name: "model.embed_tokens.weight".into() };
+        let payload = (0..source.bytes()).map(|i| (i * 29 + 11) as u8).collect::<Vec<_>>();
+        let before = fixture.events()?.matches('H').count();
+        let ((pushed, value), records) = dense::recording(|| {
+            TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || {
+                assert_eq!(fixture.events()?.matches('H').count(), before);
+                Ok(17)
+            })
+        })?;
+        assert_eq!(value, 17);
+        assert_eq!(records.summary(), (payload.len(), 1, 0, 0, 0, 0));
+        assert_eq!(records.operands[0].buffer.ptr, pushed.table.buffer().ptr);
+        let rect = &records.operands[0].lands[0].0;
+        assert_eq!((rect.base, rect.rows.clone(), rect.cols.clone()), (7, 0..5, 0..6));
+        assert_eq!(fixture.events()?.matches('H').count(), before);
+        std::fs::write(&path, [vec![0xcc; 7], payload.clone()].concat())?;
+        dense::fill_records_by_mount(&library, &records, |_| std::ptr::null_mut())?;
+        let (mounted, ()) = TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || Ok(()))?;
+        assert_eq!(pushed.verify_resident()?, payload.len());
+        assert_eq!(mounted.verify_resident()?, payload.len());
+        let read = |table: &TokenEmbedding<'_>| -> Result<Vec<u8>> {
+            let mut bytes = vec![0; payload.len()];
+            library.copy_d2h(&mut bytes, table.table.buffer())?;
+            Ok(bytes)
+        };
+        assert_eq!(read(&pushed)?, payload);
+        assert_eq!(read(&mounted)?, payload);
+        // Mapped-host embeddings remain immediate and never enter the GPU group.
+        let ((host, ()), host_records) = dense::recording(||
+            TokenEmbedding::load(&library, source, EmbedPlacement::Host, || Ok(())))?;
+        assert_eq!(host_records.summary(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(host.device_bytes(), 0);
+        assert_eq!(host.host_rows(&[4, 0])?, [payload[24..30].to_vec(), payload[..6].to_vec()].concat());
+
         Ok(())
     }
 

@@ -59,13 +59,16 @@ impl RankPlan {
         rank: usize,
         admitted: usize,
     ) -> Result<Self> {
+        Self::from_tensors(catalog.fp8().context("push requires native expert headers")?,
+            layers, world, rank, admitted)
+    }
+
+    pub(crate) fn from_tensors(tensors: &Fp8ExpertTensors, layers: &[(usize, Slicing)],
+        world: usize, rank: usize, admitted: usize) -> Result<Self> {
         ensure!(
             !layers.is_empty() && layers.windows(2).all(|v| v[0].0 < v[1].0),
             "push native layers must be sorted and unique"
         );
-        let tensors = catalog
-            .fp8()
-            .context("push requires native expert headers")?;
         let mut sizes = Vec::new();
         let mut plans = Vec::new();
         for &(layer, slicing) in layers {
@@ -198,15 +201,26 @@ impl RankPlan {
         rank: u32,
         world: usize,
     ) -> Result<()> {
-        let tensors = catalog.fp8().context("native expert headers absent")?;
+        self.append_tensors(builder, catalog.fp8().context("native expert headers absent")?,
+            rank, world, rank as usize, 0)
+    }
+
+    /// The destination group rank is independent of the checkpoint TP shard.
+    pub(crate) fn append_tensors(&self, builder: &mut Builder, tensors: &Fp8ExpertTensors,
+        rank: u32, world: usize, shard: usize, base: u64) -> Result<()> {
+        let destination = |rank, plane: &Range<usize>, offset, bytes| -> Result<Destination> {
+            let mut destination = destination(rank, plane, offset, bytes)?;
+            destination.offset = destination.offset.checked_add(base).context("FP8 destination overflow")?;
+            Ok(destination)
+        };
         for layer in &self.layers {
             let tensors = tensors.for_layer_metadata(layer.layer)?;
             let experts = tensors.shape().experts;
             for (index, projection) in Fp8Projection::ALL.into_iter().enumerate() {
                 let [weight, scale] =
-                    tensors.projection_slices(projection, world, rank as usize, layer.slicing)?;
+                    tensors.projection_slices(projection, world, shard, layer.slicing)?;
                 let (w_bytes, s_bytes) =
-                    tensors.slice_bytes_with(projection, world, rank as usize, layer.slicing)?;
+                    tensors.slice_bytes_with(projection, world, shard, layer.slicing)?;
                 for expert in 0..experts {
                     let names = source_names(&tensors, layer.layer, expert, projection);
                     let (source, _) = tensors.push_source(&names[0])?;

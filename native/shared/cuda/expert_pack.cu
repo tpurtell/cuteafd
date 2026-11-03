@@ -10,23 +10,27 @@ namespace {
 // Aligned widths retain N256/K128; exact tails use compact N128/K32 tiles.
 template<bool Gated, bool Scales>
 __global__ void pack(const uint8_t* first, const uint8_t* second, uint8_t* output,
-    uint32_t n, uint32_t k, uint32_t n_pad, uint64_t count, bool compact) {
-  for (uint64_t index = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < count; index += uint64_t(gridDim.x) * blockDim.x) {
+    uint32_t n, uint32_t k, uint32_t n_pad, uint64_t count, bool compact,
+    uint64_t begin = 0, uint32_t row_first = 0, uint32_t row_end = UINT32_MAX,
+    uint32_t source_first = 0, uint32_t source_rows = UINT32_MAX) {
+  for (uint64_t index = begin + uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < begin + count; index += uint64_t(gridDim.x) * blockDim.x) {
     uint32_t row, col;
     cuteafd_expert_pack_layout_coordinates(index, Gated ? 2 * n_pad : n, k,
         n_pad, Scales, compact, &row, &col);
+    if (row < row_first || row >= row_end) continue;
     const uint8_t* source = first;
     if constexpr (Gated) {
       if (row >= n_pad) { row -= n_pad; source = second; }
     }
     constexpr uint32_t divisor = Scales ? 32 : 8;
-    const bool valid = row < n && col < k / divisor;
+    const bool valid = row < n && col < k / divisor && row >= source_first
+        && row - source_first < source_rows;
     if constexpr (Scales) {
-      output[index] = valid ? source[uint64_t(row) * (k / divisor) + col] : 0;
+      output[index] = valid ? source[uint64_t(row - source_first) * (k / divisor) + col] : 0;
     } else {
       reinterpret_cast<uint32_t*>(output)[index] = valid
-        ? reinterpret_cast<const uint32_t*>(source)[uint64_t(row) * (k / divisor) + col] : 0;
+        ? reinterpret_cast<const uint32_t*>(source)[uint64_t(row - source_first) * (k / divisor) + col] : 0;
     }
   }
 }
@@ -177,6 +181,38 @@ extern "C" int32_t cuteafd_pack_expert_plane_async(
   else
     pack<false, true><<<blocks, 256, 0, s>>>(source, nullptr, destination,
         hidden, intermediate, 0, sizes[plane], compact);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_pack_expert_window_async(
+    const uint8_t* source, uint64_t source_bytes, uint8_t* destination,
+    uint64_t destination_bytes, uint32_t intermediate, uint32_t projection,
+    uint32_t first, uint32_t rows, void* stream) {
+  const auto hidden = cuteafd_expert_hidden();
+  const auto stored = cuteafd_mxfp4_stored_width(hidden, intermediate);
+  cuteafd_expert_pack_window window;
+  uint64_t sizes[4];
+  if (!source || !destination || cuteafd_expert_packed_sizes(intermediate, sizes) ||
+      !cuteafd_expert_pack_window_geometry(hidden, intermediate, stored,
+          projection, first, rows, &window)) return cudaErrorInvalidValue;
+  const uint64_t required = uint64_t(rows) * window.k / 2;
+  const uint64_t output = sizes[projection == 2 ? 2 : 0];
+  if (source_bytes < required || destination_bytes < output ||
+      reinterpret_cast<uintptr_t>(source) % 4 ||
+      reinterpret_cast<uintptr_t>(destination) % 16 ||
+      overlaps(source, required, destination, output)) return cudaErrorInvalidValue;
+  int device, sms;
+  auto status = cudaGetDevice(&device);
+  if (status != cudaSuccess) return status;
+  status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  if (status != cudaSuccess) return status;
+  if (sms <= 0) return cudaErrorInvalidDevice;
+  const unsigned blocks = static_cast<unsigned>(
+      std::min<uint64_t>((window.count + 255) / 256, uint64_t(sms) * 4));
+  pack<false, false><<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      source, nullptr, destination, window.n, window.k, window.half,
+      window.count, window.compact, window.begin, window.row_first,
+      window.row_end, window.row_first, rows);
   return cudaGetLastError();
 }
 

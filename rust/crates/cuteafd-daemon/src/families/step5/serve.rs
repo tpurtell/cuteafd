@@ -17,6 +17,51 @@ use std::{cell::RefCell, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
 #[derive(Debug, Clone, Copy)]
 enum OnboardBudget { Whole(usize), Tp2([usize; 2]) }
 
+impl OnboardBudget {
+    fn package(self, format: &super::experts::StepExperts, native_lib: &std::path::Path) -> Result<PathBuf> {
+        match (self, format) {
+            (Self::Whole(_), super::experts::StepExperts::Native(_)) =>
+                anyhow::bail!("Step-5 whole-layer onboarding requires EXL3 experts"),
+            (_, super::experts::StepExperts::Exl3(_)) => Ok(format.package_manifest(native_lib)?
+                .parent().context("EXL3 package")?.join(if matches!(self, Self::Whole(_)) { "rtx-tp1" } else { "rtx-tp2" })),
+            (Self::Tp2(_), super::experts::StepExperts::Native(expert)) =>
+                Ok(crate::shared::experts::fp8::package_directory(native_lib, 2, *expert)),
+        }
+    }
+
+    fn push_plan(self, catalog: &cuteafd_loader::OfficialV41Catalog, package: &std::path::Path,
+        layers: &[usize], rows: usize, gpus: usize) -> Result<crate::shared::experts::rtx::push::CoordinatorExperts> {
+        use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, push::CoordinatorExperts, RtxSelectionPolicy};
+        use crate::shared::experts::{exl3::execution::Exl3RowPolicy, layer::ExpertLayer};
+        match self {
+            Self::Whole(peak) => {
+                ensure!(gpus == 1, "Step-5 whole expert push requires one coordinator GPU");
+                let workspace = Exl3Tp2::whole_workspace_bytes(package, rows, ExpertGeometry::STEP5,
+                    RtxSelectionPolicy::CanonicalDecode)?;
+                Ok(CoordinatorExperts::Whole { selections: layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }).collect(),
+                    budget: resident_budget(peak, workspace)? })
+            }
+            Self::Tp2(peaks) => {
+                ensure!(gpus == 2, "Step-5 TP2 expert push requires two coordinator GPUs");
+                let budgets = (0..2).map(|rank| {
+                    let workspace = if catalog.exl3().is_some() {
+                        Exl3Tp2::workspace_bytes_for_selection(package, ExpertGeometry::STEP5.hidden as usize,
+                            rows, Exl3RowPolicy::for_geometry(ExpertGeometry::STEP5), RtxSelectionPolicy::CanonicalDecode)?
+                    } else {
+                        Fp8MoeTp2::plan(catalog.fp8().context("Step-5 FP8 expert tensors")?, package, rank, rows)?.workspace_bytes
+                    };
+                    resident_budget(peaks[rank], workspace)
+                }).collect::<Result<Vec<_>>>()?;
+                Ok(CoordinatorExperts::Tp2 { layers: layers.to_vec(), budgets })
+            }
+        }
+    }
+}
+
+fn resident_budget(peak: usize, workspace: usize) -> Result<usize> {
+    peak.checked_sub(workspace).context("Step-5 expert workspace exceeds solved arena")
+}
+
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
     #[arg(long)]
@@ -340,91 +385,80 @@ fn with_backend<T>(args: &ServeArgs,
     let ownership = admission.ownership;
     let caches_ref: Vec<_> = caches.iter().collect();
     let stages_ref: Vec<_> = stages.iter().collect();
-    // Admission precedes allocation: `load_native` re-checks every rank's
-    // admitted budget before allocating. With coordinator push, the native
-    // owners are allocated and their records planned before membership (a
-    // planning error offers no coordinator ranks: the Sparks still push and the
-    // coordinator fills through the mount); otherwise they load through the
-    // mount while the Sparks load.
+    // Required namespace pushes plan all selected expert payloads before membership.
+    use crate::shared::experts::rtx::{dense, push::{CoordinatorPush, PushPolicy}};
     let native_start = std::time::Instant::now();
-    let push = spark_admission.coordinator_pushes();
-    let mut native = None;
-    let mut coordinator = None;
-    let mut ranks = None;
-    if push {
-        let recorder = crate::shared::experts::rtx::dense::Recorder::start(true)?.context("dense recorder")?;
-        let loaded = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
-            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan);
+    let policy = PushPolicy::for_snapshot(&args.snapshot)?;
+    let load = || TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || -> Result<_> {
+        let native = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
+            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan)?;
+        let mtp = predictor_budget.map(|(available, reserved)| native.load_predictor(
+            &programs, &checkpoint, &caches[head_rank].borrow(), stages[head_rank].stream.clone(),
+            usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
+        Ok((native, mtp))
+    });
+    let planned = policy.plan(|| -> Result<_> {
+        ensure!(spark_admission.coordinator_pushes(), "Step-5 Spark admission did not select required push");
+        let recorder = dense::Recorder::start(true)?.context("dense recorder")?;
+        let loaded = load();
         let records = recorder.finish();
-        native = Some(loaded?);
-        let planned = (|| -> Result<_> {
-            let (landed, operands, staged, steps, largest, finishes) = records.summary();
-            tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
-                "Step-5 coordinator dense records planned");
-            let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(), &devices,
-                args.peers.len())?;
-            let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&args.snapshot, None,
-                devices.len(), None)?;
-            Ok((prepared, dense))
-        })();
-        match planned {
-            Ok(((push, streams, offered), dense)) => {
-                coordinator = Some((push, records, dense));
-                ranks = Some((streams, offered));
-            }
-            Err(error) => {
-                // No coordinator ranks: the Sparks still push; fill the recorded owners here.
-                tracing::info!(%error, "Step-5 coordinator push unavailable; mount");
-                crate::shared::experts::rtx::dense::fill_records_by_mount(&library, &records, |_| std::ptr::null_mut())?;
-            }
-        }
-    }
+        let loaded = loaded?;
+        let (landed, operands, staged, steps, largest, finishes) = records.summary();
+        tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
+            "Step-5 coordinator dense records planned");
+        let dense = dense::plan_records(&args.snapshot, records.clone(), &devices, args.peers.len())?;
+        let experts = if ownership.onboarded_layers().is_empty() { None } else {
+            let budget = onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")?;
+            let package = budget.package(&format, &args.native_lib)?;
+            Some(budget.push_plan(&catalog, &package, ownership.onboarded_layers(), inputs.unit_rows(), devices.len())?)
+        };
+        let prepared = CoordinatorPush::prepare(&args.snapshot, Some(&catalog), devices.len(), experts)?;
+        Ok((prepared, loaded, records, dense))
+    })?;
+    let (coordinator, ranks) = match planned {
+        Some(((push, streams, ranks), loaded, records, dense)) => (Some((push, loaded, records, dense)), Some((streams, ranks))),
+        None => (None, None),
+    };
     tracing::info!(elapsed_s = native_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup native preparation complete");
     let push_start = std::time::Instant::now();
     let pending = spark_admission.start_with(&args.peers, ranks)?;
-    let (embedding, native) = crate::shared::placement::load_while_admitting(Some(pending), || {
-        TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || -> Result<super::execution::LoadedNative<'_>> {
-            if let Some((push, records, dense)) = coordinator {
+    let (embedding, native, mtp) = crate::shared::placement::load_while_admitting(Some(pending), || {
+        let ((embedding, (native, mtp)), mut pushed) = match coordinator {
+            Some((push, loaded, records, dense)) => {
                 let split = crate::shared::memory::load_timing::Split::start();
-                let (pushed, ()) = push.receive_with(devices.clone(), None, args.peers.len(), Some(Ok(dense)), || ());
-                let pushed = pushed?;
-                if pushed.is_none() {
-                    crate::shared::experts::rtx::dense::fill_records_by_mount(&library, &records, |_| std::ptr::null_mut())?;
-                }
-                split.log(if pushed.is_some() { "step5 dense push" } else { "step5 dense mount fill" });
-                tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
+                let (received, ()) = push.receive_with(devices.clone(), Some(&catalog), args.peers.len(), Some(Ok(dense)), || ());
+                let pushed = policy.committed(received)?;
+                split.log("step5 dense and onboarded expert push");
+                tracing::info!(operands = records.operands.len(), steps = records.steps.len(),
                     "Step-5 coordinator dense operands landed");
+                (loaded, pushed)
             }
-            let native = match native {
-                Some(native) => native,
-                None => Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
-                    inputs.unit_rows(), inputs.rows, inputs.logit_rows(),
-                    &available, &reserves, 92, &native_plan)?,
-            };
-            // Onboarded EXL3 routed layers inside their solved expert arenas:
-            // TP2 halves over two GPUs, else whole on the entry GPU.
-            let entry = usize::from(ownership.execution().spec().entry_gpu);
-            let onboarded = ownership.onboarded_layers();
-            if onboarded.is_empty() { return Ok(native); }
-            match onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")? {
-                OnboardBudget::Whole(peak) => {
-                    ensure!(format.is_exl3(), "Step-5 whole-layer onboarding runs EXL3 experts (FP8 is TP2 on two RTX)");
-                    let package = format.package_manifest(&args.native_lib)?.parent().context("EXL3 package")?.join("rtx-tp1");
-                    native.with_onboarded(devices[entry], &catalog, &package, onboarded, inputs.unit_rows(), peak)
-                }
-                OnboardBudget::Tp2(peaks) => {
-                    let package = match &format {
-                        super::experts::StepExperts::Exl3(_) => format.package_manifest(&args.native_lib)?
-                            .parent().context("EXL3 package")?.join("rtx-tp2"),
-                        super::experts::StepExperts::Native(expert) => crate::shared::experts::fp8::package_directory(
-                            &args.native_lib, 2, *expert),
-                    };
-                    native.with_onboarded_tp2([devices[0], devices[1]], &catalog, &package, onboarded,
-                        inputs.unit_rows(), peaks)
-                }
+            None => (load()?, None),
+        };
+        // Onboarded EXL3 routed layers inside their solved expert arenas:
+        // TP2 halves over two GPUs, else whole on the entry GPU.
+        let entry = usize::from(ownership.execution().spec().entry_gpu);
+        let onboarded = ownership.onboarded_layers();
+        if onboarded.is_empty() { return Ok((embedding, native, mtp)); }
+        let budget = onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")?;
+        let package = budget.package(&format, &args.native_lib)?;
+        let native = match budget {
+            OnboardBudget::Whole(peak) => {
+                let payload = pushed.take().map(|ranks| {
+                    ensure!(ranks.len() == 1, "Step-5 whole expert payload requires one coordinator rank");
+                    ranks.into_iter().next().context("Step-5 whole expert payload")
+                }).transpose()?;
+                native.with_onboarded(devices[entry], &catalog, &package, onboarded, inputs.unit_rows(), peak, payload)
             }
-        })
+            OnboardBudget::Tp2(peaks) => {
+                let payload = pushed.take().map(|ranks| <[_; 2]>::try_from(ranks)
+                    .map_err(|_| anyhow::anyhow!("Step-5 TP2 payload requires two coordinator ranks"))).transpose()?;
+                native.with_onboarded_tp2([devices[0], devices[1]], &catalog, &package, onboarded,
+                    inputs.unit_rows(), peaks, payload)
+            }
+        }?;
+        Ok((embedding, native, mtp))
     })?;
     tracing::info!(elapsed_s = push_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup weight delivery complete");
@@ -443,9 +477,6 @@ fn with_backend<T>(args: &ServeArgs,
     library.cuda_set_device(args.device)?;
     let execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
         Some(transport), 92, 1)?;
-    let mtp = predictor_budget.map(|(available, reserved)| super::mtp::Runtime::load(
-        &execution, &programs, &checkpoint, &caches[head_rank].borrow(),
-        usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
@@ -1213,25 +1244,27 @@ mod tests {
 }
 
 #[cfg(test)]
-mod load_order_tests {
-    /// Serving admits every coordinator owner, plans the Spark admission from
-    /// headers, records (pushing) or starts first, loads the native owners
-    /// while the Sparks load (`load_while_admitting`: a Spark failure returns
-    /// its error after the coordinator owners drop), and connects the Spark
-    /// transport only after admission completed.
+mod push_admission_tests {
+    use super::*;
+
     #[test]
-    fn coordinator_loads_while_admitting_and_connects_after() {
-        let source = include_str!("serve.rs");
-        let start = source.find("fn with_backend<T>").unwrap();
-        let body = &source[start..start + source[start..].find("\nfn worker(").unwrap()];
-        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
-        assert!(at("admission::admit_mtp_with_contract(") < at("let spark_admission = SparkAdmission::plan("));
-        assert!(at("let spark_admission = SparkAdmission::plan(") < at("Execution::load_native_with_plan("));
-        assert!(at("Execution::load_native_with_plan(") < at("spark_admission.start_with("));
-        assert!(at("spark_admission.start_with(") < at("load_while_admitting(Some(pending)"));
-        assert!(at("load_while_admitting(Some(pending)") < at("require_peer_clients("));
-        assert!(at("require_peer_clients(") < at("SparkLink::new_waves("));
-        assert!(at("SparkLink::new_waves(") < at("Execution::bind_native("));
-        assert!(!body.contains(".select(&args.peers)"), "admission must not block before the coordinator load");
+    fn push_resident_budget_never_spends_execution_workspace() -> Result<()> {
+        assert_eq!(resident_budget(768, 256)?, 512);
+        assert_eq!(resident_budget(256, 256)?, 0);
+        assert!(resident_budget(255, 256).is_err());
+        assert_eq!(resident_budget(usize::MAX, 256)?, usize::MAX - 256);
+        Ok(())
+    }
+
+    #[test]
+    fn required_push_never_turns_planning_or_delivery_failure_into_mount() {
+        use crate::shared::experts::rtx::push::{PushPolicy, PushStartupError};
+        let policy = PushPolicy::Required;
+        assert!(matches!(policy.plan::<()>(|| anyhow::bail!("unsupported expert payload")),
+            Err(PushStartupError::Planning(_))));
+        assert!(matches!(policy.committed::<()>(Ok(None)), Err(PushStartupError::Uncommitted)));
+        assert!(matches!(policy.committed::<()>(Err(anyhow::anyhow!("peer failed"))),
+            Err(PushStartupError::Delivery(_))));
+        assert_eq!(PushPolicy::Mount.plan(|| -> Result<()> { panic!("mounted startup must not plan push") }).unwrap(), None);
     }
 }

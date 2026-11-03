@@ -61,6 +61,12 @@ pub(super) enum Ticket {
     Lane,
 }
 
+fn validate_owned_kv(cfg: &GlmDsaConfig, index: usize, pages: usize, owned: bool, bytes: usize) -> Result<()> {
+    ensure!(bytes == if owned { (pages + 1) * PAGE_ROWS * cfg.record_bytes(index) } else { 256 },
+        "GLM layer {index} KV ownership differs from placement");
+    Ok(())
+}
+
 impl<'a> GlmEngine<'a> {
     pub(crate) fn layers_kv(&self) -> bool {
         self.weights.layers.first().is_some_and(|layer| layer.attention_owner.is_some())
@@ -78,10 +84,10 @@ impl<'a> GlmEngine<'a> {
             for rank in 0..2 {
                 let layer = if rank == 0 { &self.weights.layers[index] } else { &self.peer()?.layers[index] };
                 ensure!(layer.split && !layer.attention_split && layer.attention_owner == Some(gpu)
-                    && layer.range("q_a_norm").is_some() == (gpu as usize == rank), "GLM layer {index} owner differs from loaded weights");
-                let (kv, index_cache, _) = self.rank_caches(rank, index);
-                ensure!(kv.buffer.bytes == if rank == gpu as usize { (self.pages + 1) * RECORD_PAGE_BYTES } else { 256 },
-                    "GLM layer {index} KV ownership differs from placement");
+                    && layer.holds_attention() == (gpu as usize == rank), "GLM layer {index} owner differs from loaded weights");
+                let (kv, index_cache, _) = self.rank_caches_of(rank, index);
+                let owned = rank == gpu as usize && self.cfg.owns_kv(index);
+                validate_owned_kv(&self.cfg, index, self.pages, owned, kv.buffer.bytes)?;
                 ensure!(index_cache.is_some() == (rank == gpu as usize && layer.full_indexer), "GLM index ownership");
             }
             if self.cfg.index_source(index) < plan.modes().len() {
@@ -106,7 +112,7 @@ impl<'a> GlmEngine<'a> {
         (0..self.weights.layers.len()).map(|index| (0..2).filter(|&rank| {
             let layer = if rank == 0 { &self.weights.layers[index] }
                 else { &self.peer.as_ref().unwrap().layers[index] };
-            layer.range("q_a_norm").is_some() && self.rank_caches(rank, index).0.buffer.bytes > 256
+            layer.holds_attention() && self.rank_caches(rank, index).0.buffer.bytes > 256
         }).map(|rank| rank as u8).collect()).collect()
     }
 
@@ -412,6 +418,25 @@ mod tests {
         order::{self, host::{check_host, HostSchedule}}}};
     use cuteafd_loader::placement::{plan_hops, residual_homes, AttentionPlacement, ExpertHome,
         HopSpec, LayerAssignment, TerminalHome};
+
+    #[test]
+    fn ml4_binding_validates_local_kv_while_execution_reads_the_latent_source() -> Result<()> {
+        let cfg = GlmDsaConfig::from_hf(&cuteafd_loader::plan::testing::mistral_large4_config())?;
+        let borrower = (0..cfg.layers).find(|&layer| !cfg.owns_kv(layer)).context("ML4 latent borrower")?;
+        let source = cfg.kv_source(borrower);
+        let pages = 3;
+        let mut buffers = vec![256usize; cfg.layers];
+        buffers[source] = (pages + 1) * PAGE_ROWS * cfg.record_bytes(source);
+        assert!(cfg.owns_kv(source));
+        validate_owned_kv(&cfg, source, pages, true, buffers[source])?;
+        validate_owned_kv(&cfg, borrower, pages, false, buffers[borrower])?;
+        let effective = latent_cache(&cfg, borrower, &buffers);
+        assert!(std::ptr::eq(effective, &buffers[source]));
+        assert!(!std::ptr::eq(effective, &buffers[borrower]));
+        assert!(validate_owned_kv(&cfg, borrower, pages, false, *effective).is_err());
+        assert!(validate_owned_kv(&cfg, source, pages, true, 256).is_err());
+        Ok(())
+    }
 
     struct Trace {
         plan: LayerExecutionPlan,

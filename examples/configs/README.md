@@ -73,6 +73,7 @@ outside a matching WIP slot.
 | GLM 5.3 Flash · EXL3 K4 + native K6 core | [min](glm53f-exl3-k4-core-k6-min.config) · [max](glm53f-exl3-k4-core-k6-max.config) | 1 RTX + 2 Spark / 2 RTX, no Sparks; DFlash2, admitted KV pool |
 | Kimi K3 · EXL3 K2 (#273) | [max](kimi-k3-exl3-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 5 routed layers on the RTX |
 | Kimi K3 · EXL3 K2 + K6 core (#273) | [max](kimi-k3-exl3-k6-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 12 routed layers on the RTX, full 1M context, DFlash2 |
+| Mistral Large 4 · EXL3 K4 + native K6 core (#924) | [min](mistral-large4-exl3-k4-core-k6-min.config) · [max](mistral-large4-exl3-k4-core-k6-max.config) | 1 RTX + 5 Spark / 2 RTX + 6 Spark; bundled dSpark depth 3, pool-first; TP2 qualification pending |
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
 | Step-5-Preview · EXL3 K4 + Core K6 (#911) | [min](step5-exl3-k6core-min.config) · [max](step5-exl3-k6core-max.config) | 1 RTX + 3 Spark · 2 RTX + 6 Spark |

@@ -8,14 +8,128 @@ use cuteafd_loader::{plan::testing::{qwen4_config, qwen4_exl3, write_snapshot},
 use std::{fs::File, net::TcpStream, os::unix::fs::FileExt, time::Duration};
 
 #[test]
+fn whole_binding_requires_exact_selected_inventory_and_admission() -> Result<()> {
+    use crate::shared::experts::layer::ExpertLayer::BackboneFull;
+    let expected = [(BackboneFull { layer: 0 }, 256), (BackboneFull { layer: 1 }, 512)];
+    validate_whole_inventory(&expected, &expected, 768)?;
+    assert!(validate_whole_inventory(&expected, &expected, 767).is_err());
+    assert!(validate_whole_inventory(&expected[..1], &expected, 768).is_err());
+    assert!(validate_whole_inventory(&[expected[1], expected[0]], &expected, 768).is_err());
+    assert!(validate_whole_inventory(&[expected[0], expected[0]], &expected, 768).is_err());
+    assert!(validate_whole_inventory(&[(BackboneFull { layer: 0 }, 257), expected[1]], &expected, 769).is_err());
+    let overflow = [(BackboneFull { layer: 0 }, usize::MAX), (BackboneFull { layer: 1 }, 1)];
+    assert!(validate_whole_inventory(&overflow, &overflow, usize::MAX).is_err());
+    validate_whole_inventory(&[], &[], 0)?;
+    Ok(())
+}
+
+#[test]
 fn coordinator_host_admission_charges_every_concurrent_receive_ring() -> Result<()> {
     for gpus in [1, 2] {
         let plans = (0..gpus).map(|_| None).collect::<Vec<_>>();
         let peak = gpus * 128 * (1 << 20);
-        assert_eq!(CoordinatorExpertPlan::admit_host(&plans, 128, 1 << 20, peak as u64)?, peak);
-        assert!(CoordinatorExpertPlan::admit_host(&plans, 128, 1 << 20, peak as u64 - 1).is_err());
-        assert!(CoordinatorExpertPlan::admit_host(&plans, usize::MAX, 2, u64::MAX).is_err());
+        assert_eq!(CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], 128, 1 << 20, peak as u64)?, peak);
+        assert!(CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], 128, 1 << 20, peak as u64 - 1).is_err());
+        assert!(CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], usize::MAX, 2, u64::MAX).is_err());
     }
+    Ok(())
+}
+
+#[test]
+fn dense_host_geometry_tracks_pools_and_large_quant_tables_without_allocating() -> Result<()> {
+    use crate::shared::{experts::rtx::dense::{HostStaging, Job, RankLayout, Rect, Step, STEP_BYTES},
+        fp8_load_quant::{Layout, Target}, fp8_linear::Fp8Scales};
+    let buffer = cuteafd_ffi::CuteafdDeviceBuffer { device_id: 0, ..Default::default() };
+    let target = Target { q: buffer, q_stride: 128, scales: buffer, kmajor: None };
+    let rect = Rect { name: "rows".into(), path: "header-only".into(), base: 0,
+        row_bytes: 256, rows: 0..131072, cols: 0..256 };
+    let step = Step { device: 0, rects: vec![rect], jobs: vec![Job::Quant { rows: 0..131072,
+        pitch: 128, col0: 0, cols: 128, layout: Layout::Channel, rule: Fp8Scales::Amax, target }] };
+    let empty = RankLayout::new(vec![], vec![], 0)?;
+    assert_eq!(empty.host_staging, HostStaging::default());
+    for count in [1, 2, 8, 11] {
+        let layout = RankLayout::new(vec![], vec![step.clone(); count], 0)?;
+        let staging = layout.plan().host_staging;
+        assert_eq!(staging.staging_bytes, count * STEP_BYTES);
+        assert_eq!(staging.largest_step, STEP_BYTES);
+        assert!(staging.table_bytes > 1 << 20, "row tables are not capped at the allocation floor");
+        assert_eq!(staging.table_bytes, crate::shared::fp8_load_quant::quant_table_bytes(131072, Layout::Channel)?);
+        assert_eq!(staging.bytes()?, count * STEP_BYTES + staging.table_bytes);
+    }
+    let block = crate::shared::fp8_load_quant::quant_table_bytes(131072, Layout::Block)?;
+    assert_eq!(block, 1 << 20);
+    assert!(crate::shared::fp8_load_quant::quant_table_bytes(usize::MAX, Layout::Channel).is_err());
+    assert!(crate::shared::fp8_load_quant::scale_code_table_bytes(usize::MAX).is_err());
+    assert!(HostStaging { staging_bytes: usize::MAX, largest_step: 2, table_bytes: 1 }.bytes().is_err());
+    Ok(())
+}
+
+#[test]
+fn staging_uses_actual_sizes_and_charges_disconnected_transforms_in_full() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{HostStaging, Rect};
+    let rect = |base, bytes| Rect { name: "scale".into(), path: "shard".into(), base,
+        row_bytes: bytes, rows: 0..1, cols: 0..bytes };
+    let steps = (0..4096).map(|i| vec![rect(i * 122880, 122880)]).collect::<Vec<_>>();
+    let bound = HostStaging::for_steps(steps.iter().map(Vec::as_slice), 1 << 20)?;
+    assert_eq!(bound.largest_step, 122880);
+    assert_eq!(bound.staging_bytes, 128 * ((1 << 20) + 2 * 122880) + 122880);
+    assert!(bound.bytes()? < 160 << 20);
+    let mixed = (0..1024).map(|i| vec![rect(i * 4096, 4096), rect((1 << 30) + i * 4096, 4096)])
+        .collect::<Vec<_>>();
+    assert_eq!(HostStaging::for_steps(mixed.iter().map(Vec::as_slice), 0)?.staging_bytes, 1024 * 8192);
+    let overlapping = vec![vec![rect(0, 4096)]; 1024];
+    assert_eq!(HostStaging::for_steps(overlapping.iter().map(Vec::as_slice), 0)?.staging_bytes, 1024 * 4096);
+    Ok(())
+}
+
+#[test]
+fn coordinator_host_admission_adds_dense_pools_and_exl3_validation_for_every_rank() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{HostStaging, STEP_BYTES};
+    let root = tempfile::tempdir()?;
+    let (tensors, _) = qwen4_exl3(1, 4);
+    let tensors = tensors.into_iter().filter(|t| !t.0.contains(".experts.") || t.0.contains(".experts.0."))
+        .collect::<Vec<_>>();
+    let mut config = qwen4_config(1);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    for gpus in [1, 2] {
+        let plans = (0..gpus).map(|gpu| if gpus == 1 {
+            CoordinatorExpertPlan::whole(vec![catalog.exl3().unwrap().residency(V41Exl3Layer::Backbone(0), 1, 0)?], usize::MAX)
+        } else { CoordinatorExpertPlan::new(&catalog, &[0], gpu, usize::MAX) }).collect::<Result<Vec<_>>>()?;
+        let owners = plans.iter().map(Some).collect::<Vec<_>>();
+        let dense = vec![HostStaging { staging_bytes: 12 * STEP_BYTES, largest_step: STEP_BYTES, table_bytes: 2 << 20 }; gpus];
+        let validation = plans.iter().map(|p| p.validation.bytes()).sum::<usize>();
+        assert!(validation > 0);
+        let peak = gpus * (128 * (1 << 20) + 12 * STEP_BYTES + (2 << 20)) + validation;
+        assert_eq!(CoordinatorExpertPlan::admit_host(&owners, &dense, 128, 1 << 20, peak as u64)?, peak);
+        assert!(CoordinatorExpertPlan::admit_host(&owners, &dense, 128, 1 << 20, peak as u64 - 1).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn host_admission_refusal_declines_peers_before_returning_a_typed_planning_error() -> Result<()> {
+    use crate::shared::experts::rtx::dense::HostStaging;
+    let (first_driver, mut first) = control_pair()?;
+    let (second_driver, mut second) = control_pair()?;
+    let driver = std::thread::spawn(move || cuteafd_transport::worker_selection::push::coordinate(
+        &mut [first_driver, second_driver], |_| anyhow::bail!("refused admission must not create a group")));
+    let peer = std::thread::spawn(move || -> Result<()> {
+        let offer = cuteafd_transport::worker_selection::push::Offer { rank: 1, host: "spark".into(),
+            arena_bytes: 1, placement: vec![] };
+        assert!(planned_offer(&mut second, Ok(()), Ok(offer))?.is_none());
+        Ok(())
+    });
+    let planned = CoordinatorExpertPlan::admit_host(&[None], &[HostStaging { staging_bytes: 8 << 20, largest_step: 1 << 20, table_bytes: 1 << 20 }],
+        128, 1 << 20, 128 << 20);
+    let offer = planned.as_ref().map(|_| unreachable!("staging must exceed this ring-only budget"))
+        .map_err(|error| format!("{error:#}"));
+    let error = planned_offer(&mut first, planned, offer).unwrap_err();
+    assert!(matches!(error.downcast_ref::<PushStartupError>(), Some(PushStartupError::Planning(_))));
+    peer.join().map_err(|_| anyhow::anyhow!("peer panicked"))??;
+    driver.join().map_err(|_| anyhow::anyhow!("driver panicked"))??;
     Ok(())
 }
 
@@ -409,59 +523,21 @@ fn dense_error_mount_group(library: &cuteafd_ffi::NativeLibrary, root: &std::pat
     let devices = [Device { library, id: 0 }, Device { library, id: 1 }];
     let dense: Option<Result<(Vec<DensePlan>, Vec<NoDense>)>> = Some(Err(anyhow::anyhow!("injected dense planning error")));
     let (pushed, ()) = push.receive_with(devices.to_vec(), Some(catalog), sparks, dense, || ());
-    assert!(pushed?.is_none(), "a declined dense plan must fall back to mount");
+    assert!(pushed.is_err(), "an uncommitted required coordinator group must fail startup after draining");
     assert!(!driver.join().map_err(|_| anyhow::anyhow!("driver panicked"))??, "the group driver must not prepare a group");
     assert_eq!(spark_thread.join().map_err(|_| anyhow::anyhow!("spark panicked"))??, None,
         "the Spark rank receives the whole-group mount decision");
     Ok(())
 }
 
-/// The families plan their dense records before membership: a planning error
-/// there offers no coordinator ranks, so the group driver sees the Spark
-/// ranks alone and opens their push group (the coordinator then loads by
-/// mount). The whole-group fallback stays only for errors after membership.
 #[test]
-fn pre_membership_dense_planning_error_offers_no_coordinator_ranks_and_sparks_push() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    // The families' pre-membership step: planning fails, so nothing is offered.
-    let planned = (|| -> Result<(CoordinatorPush, Vec<std::net::TcpStream>,
-        crate::shared::memory::push_exl3::CoordinatorRanks)> {
+fn pre_membership_dense_planning_error_aborts_required_startup() {
+    let planned = PushPolicy::Required.plan::<(CoordinatorPush, Vec<TcpStream>,
+        crate::shared::memory::push_exl3::CoordinatorRanks)>(|| {
         anyhow::bail!("injected dense planning error")
-    })().map_err(|error| tracing::info!(%error, "coordinator push unavailable; mount")).ok();
-    assert!(planned.is_none());
-    let coordinator_streams = planned.map(|(_, streams, _)| streams).unwrap_or_default();
-    // One Spark rank offering push, and no coordinator rank: the group opens.
-    let (mut spark_driver, mut spark) = control_pair()?;
-    let spark_thread = std::thread::spawn(move || cuteafd_transport::worker_selection::push::offer(&mut spark,
-        Some(cuteafd_transport::worker_selection::push::Offer { rank: 0, host: "spark".into(), arena_bytes: 1,
-            placement: Vec::new() })));
-    let socket = root.path().join("group.sock").to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
-    let server_socket = socket.clone();
-    let server = std::thread::spawn(move || -> Result<usize> {
-        let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(120))?;
-        conn.set_timeout(Some(Duration::from_secs(10)))?;
-        let (request, _) = conn.next_request()?.context("no Create")?;
-        let Request::Create { ranks, .. } = request else { anyhow::bail!("expected Create") };
-        conn.send_event(&Event::Created { group: 7, token: 11 })?;
-        Ok(ranks.len())
     });
-    let mut streams = vec![spark_driver.try_clone()?];
-    streams.extend(coordinator_streams);
-    let mut offered = 0;
-    let client = PushClient::at(socket, Duration::from_secs(10))?;
-    let _ = cuteafd_transport::worker_selection::push::coordinate(&mut streams, |offers| {
-        offered = offers.len();
-        let ranks = offers.iter().map(|o| cuteafd_loader::push_load::proto::RankSpec {
-            rank: o.rank as u32, host: o.host.clone(), arena_bytes: o.arena_bytes }).collect();
-        Ok(client.create(ranks, Vec::new())?)
-    });
-    drop(spark_driver.shutdown(std::net::Shutdown::Both));
-    assert_eq!(offered, 1, "the Spark rank alone is offered");
-    assert_eq!(server.join().map_err(|_| anyhow::anyhow!("server panicked"))??, 1, "the group opens with the Spark rank");
-    let credentials = spark_thread.join().map_err(|_| anyhow::anyhow!("spark panicked"))??;
-    assert_eq!(credentials, Some((7, 11)), "the Spark rank receives the group's push credentials");
-    Ok(())
+    assert!(matches!(planned, Err(PushStartupError::Planning(_))),
+        "failed required planning must not become a Spark-only group plus mount loading");
 }
 
 /// A model of SparkNest's push credit flow (crates/nest-data/src/push.rs
@@ -763,22 +839,18 @@ fn fake_source_accept_is_bounded() -> Result<()> {
     Ok(())
 }
 
-/// A shard that stores every expert's scales at its front and the weights
-/// after them (the V4.1 dSpark layout), streamed by one source in file order:
-/// one staged step per expert holding both pieces opens every step at once and
-/// is refused by the staging bound; the recipe that stages only each expert's
-/// contiguous weights (scales landing as operands) keeps one step open and
-/// pinned staging at one buffer.
+/// Upload-only steps require no transform staging, even when their checkpoint
+/// rectangles live far apart. Both mixed and split recipes land bytes directly.
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
-fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
-    use crate::shared::experts::rtx::dense::{testing::PEAKS, Job, Operand, Rect, Records, Step, MAX_OPEN_STEPS};
+fn scales_first_shard_uploads_land_without_transform_staging() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{testing::PEAKS, Job, Operand, Rect, Records, Step};
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
     fixture.configure_memory(&library, 0, 64 << 30)?;
     let root = tempfile::tempdir_in(fixture.directory())?;
     // A SparkNest-shaped namespace with one shard: 16 scales (4 KiB each), then 16 weights (256 KiB each).
-    let experts = MAX_OPEN_STEPS * 2;
+    let experts = 16;
     let (scale, weight) = (4096usize, 256usize << 10);
     let shard = root.path().join("model-00001-of-00001.safetensors");
     std::fs::write(&shard, (0..experts * (scale + weight)).map(|i| (i % 251) as u8).collect::<Vec<_>>())?;
@@ -807,13 +879,23 @@ fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
     let staged = crate::shared::memory::DeviceAllocation::new(&library, experts * (scale + weight))?;
     let mut mixed = Records::default();
     for e in 0..experts {
-        let dst = cuteafd_ffi::CuteafdDeviceBuffer { bytes: scale + weight, ..staged.buffer };
+        // SAFETY: expert e's complete image lies inside the retained allocation.
+        let dst = cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe {
+            staged.buffer.ptr.cast::<u8>().add(e * (scale + weight)).cast()
+        }, bytes: scale + weight, ..staged.buffer };
         mixed.steps.push(Step { device: 0, rects: vec![rect(scale_at(e), scale), rect(weight_at(e), weight)],
             jobs: vec![Job::Upload { at: 0, bytes: scale + weight, dst }] });
     }
-    let refused = receive_pushed(device, Some(&catalog), root.path(), sockets.path(), &mixed, None, 1, 0);
-    anyhow::ensure!(refused.is_err(), "interleaved steps must be refused by the staging bound");
-    PEAKS.with(|p| p.take());
+    receive_pushed(device, Some(&catalog), root.path(), sockets.path(), &mixed, None, 1, 0)?;
+    assert_eq!(PEAKS.with(|p| p.take()), vec![(0, 0)]);
+    let file = std::fs::read(&shard)?;
+    let mut actual = vec![0; experts * (scale + weight)];
+    library.copy_d2h(&mut actual, staged.buffer)?;
+    for e in 0..experts {
+        let base = e * (scale + weight);
+        assert_eq!(&actual[base..base + scale], &file[scale_at(e)..scale_at(e) + scale]);
+        assert_eq!(&actual[base + scale..base + scale + weight], &file[weight_at(e)..weight_at(e) + weight]);
+    }
     // New shape: weights-only steps, scales as operands.
     let scales = crate::shared::memory::DeviceAllocation::new(&library, experts * scale)?;
     let weights = crate::shared::memory::DeviceAllocation::new(&library, experts * weight)?;
@@ -831,8 +913,7 @@ fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
     let peaks = PEAKS.with(|p| p.take());
     assert_eq!(peaks.len(), 1);
     let (staged, pinned) = peaks[0];
-    assert_eq!((staged, pinned), (crate::shared::experts::rtx::dense::STEP_BYTES as u64,
-        crate::shared::experts::rtx::dense::STEP_BYTES as u64), "one open step, one pinned buffer");
+    assert_eq!((staged, pinned), (0, 0), "uploads bypass whole-step staging");
     let mut actual = vec![0u8; experts * weight];
     library.copy_d2h(&mut actual, weights.buffer)?;
     let file = std::fs::read(&shard)?;

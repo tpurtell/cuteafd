@@ -285,6 +285,8 @@ fn scale_label(encoding: ScaleEncoding) -> &'static str {
 /// Suffixes that belong to the logical weight named by the stem before them.
 const SUFFIXES: &[&str] = &[
     "weight_scale_inv",
+    // Mistral consolidated checkpoints: FP32 block scales, w = q * s.
+    "qscale_weight",
     "weight_scale_2",
     "weight_scale",
     "input_scale",
@@ -398,7 +400,7 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
     };
     // A stacked projection has independent quantization grids/scalars per expert.
     // Validate the expert axis before applying the existing matrix contract.
-    if weight.shape.len() == 3 && ["weight_scale_inv", "weight_scale", "scale"].iter().any(|suffix|
+    if weight.shape.len() == 3 && ["weight_scale_inv", "qscale_weight", "weight_scale", "scale"].iter().any(|suffix|
         members.get(*suffix).is_some_and(|scale| scale.meta.shape.iter().product::<usize>() != 1)) {
         let experts = &weight.shape[0];
         if *experts == 0 {
@@ -431,7 +433,7 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
         DType::F8E4M3 | DType::F8E5M2 => {
             let encoding = if weight.dtype == DType::F8E4M3 { Encoding::E4m3 } else { Encoding::E5m2 };
             let mut operand = QuantOperand::plain(encoding, weight);
-            let scale = ["weight_scale_inv", "scale", "weight_scale"].into_iter().find_map(|s| get(s).map(|m| (s, m)));
+            let scale = ["weight_scale_inv", "qscale_weight", "scale", "weight_scale"].into_iter().find_map(|s| get(s).map(|m| (s, m)));
             if let Some((suffix, scale)) = scale {
                 operand.scale = Some(fp8_scale(weight, suffix, scale)?);
             }
@@ -452,13 +454,13 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
     }
     operand.companions = companions;
     if operand.scale.is_none() && !matches!(operand.encoding, Encoding::E4m3 | Encoding::E5m2 | Encoding::E2m1) {
-        if let Some(suffix) = ["weight_scale_inv", "weight_scale", "scale", "weight_scale_2"].into_iter()
+        if let Some(suffix) = ["weight_scale_inv", "qscale_weight", "weight_scale", "scale", "weight_scale_2"].into_iter()
             .find(|s| members.contains_key(*s) && members.len() > 1) {
             return Err(malformed(&members[suffix].meta.name, format!("a scale beside the unquantized {} weight {}",
                 operand.label(), weight.name)));
         }
     }
-    let known = ["weight", "weight_scale_inv", "weight_scale", "scale", "weight_scale_2", "input_scale", "bias", ""];
+    let known = ["weight", "weight_scale_inv", "qscale_weight", "weight_scale", "scale", "weight_scale_2", "input_scale", "bias", ""];
     if let Some((suffix, tensor)) = members.iter().find(|(s, _)| !known.contains(&s.as_str())) {
         return Err(malformed(&tensor.meta.name, format!("unexpected member .{suffix} beside {}", weight.name)));
     }

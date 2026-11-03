@@ -31,6 +31,7 @@ pub fn family_title(family: &str) -> &str {
         "deepseek_v41" => "DeepSeek V4.1",
         "deepseek_v4" => "DeepSeek V4",
         "glm5" => "GLM 5.3",
+        "mistral_large4" => "Mistral Large 4",
         "glm5_flash" => "GLM 5.3 Flash",
         "mimo_v2" => "MiMo V2",
         "qwen4" => "Qwen 3.8",
@@ -437,7 +438,7 @@ fn link(dir: &Path, file: &str) -> String {
 }
 
 /// Family display order.
-const FAMILIES: [&str; 6] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"];
+const FAMILIES: [&str; 7] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4", "mimo_v2", "qwen4"];
 
 fn without_release_candidate(name: &str) -> &str {
     name.rsplit_once("-rc").filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
@@ -896,6 +897,12 @@ pub fn one_row_of(placed: &Placed) -> Matrix {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mistral_large4_is_named_and_published() {
+        assert_eq!(super::family_title("mistral_large4"), "Mistral Large 4");
+        assert!(super::FAMILIES.contains(&"mistral_large4"));
+    }
+
     use super::*;
 
     /// A publication marker: cell selection reads report data, never a directory name.

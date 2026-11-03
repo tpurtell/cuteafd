@@ -3,6 +3,7 @@
 use crate::programs::{Program, ProgramSpec, Programs, Scalar};
 use crate::CuteafdDeviceBuffer as Buffer;
 use cuteafd_core::coordinator_programs::MlaDraftProgramLayout as Layout;
+pub use cuteafd_core::coordinator_programs::MlaDraftKind;
 use std::ffi::c_void;
 use cuteafd_core::MlaCacheFormat;
 use thiserror::Error;
@@ -15,6 +16,9 @@ const PRODUCER: &[&str] = &["x", "kv_slots", "positions", "inv_freq", "w_qkv_a",
 const ATTENTION: &[&str] = &["query", "kv_cache", "page_table", "cache_seqlens", "cu_seqlens_q",
     "attn", "lse", "scratch"];
 const OUTPUT: &[&str] = &["attn", "w_uv", "w_o", "out", "scratch"];
+/// Mistral Large 4's mtp_dspark producer (no q-LoRA; RoPE through a unit query scale).
+const ML4_PRODUCER: &[&str] = &["x", "kv_slots", "positions", "cos_sin", "unit_s", "unit_b", "w_q", "w_kv_a",
+    "kv_a_norm", "w_uk", "kv_cache", "query", "scratch"];
 
 #[derive(Debug, Error)]
 pub enum MlaDraftError {
@@ -25,14 +29,75 @@ pub enum MlaDraftError {
 }
 type Result<T> = std::result::Result<T, MlaDraftError>;
 
+/// ML4's five-tap context FC always uses canonical K16 TMA arithmetic.
+/// cuBLAS default-algorithm GEMMs are not invariant to restore chunk sizes.
+pub struct Ml4ContextProjection<'a> { program: Program<'a> }
+
+impl<'a> Ml4ContextProjection<'a> {
+    const NAME: &'static str = "ml4_draft_context_fc";
+    const WIDTH: usize = 5 * 6144;
+    const OUTPUTS: usize = 6144;
+    const ROWS: usize = 2048;
+
+    pub fn validate(programs: &Programs<'_>) -> Result<()> {
+        validate_ml4_context_projection(programs.spec(Self::NAME)?)
+    }
+
+    pub fn load(programs: &'a Programs<'a>) -> Result<Self> {
+        Self::validate(programs)?;
+        Ok(Self { program: programs.program(Self::NAME, &["x", "w", "out"])? })
+    }
+
+    pub fn launch(&self, x: Buffer, weight: Buffer, out: Buffer, rows: usize,
+        stream: *mut c_void) -> Result<()> {
+        validate_ml4_context_buffers(x, weight, out, rows)?;
+        // SAFETY: checked, nonoverlapping BF16 buffers stay owned on the caller's stream.
+        unsafe { self.program.launch(&[x.ptr, weight.ptr, out.ptr], &[Scalar::I32(rows as i32)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_ml4_context_projection(spec: &ProgramSpec) -> Result<()> {
+    let g = &spec.geometry;
+    if spec.name != Ml4ContextProjection::NAME
+        || spec.capacity_rows as usize != Ml4ContextProjection::ROWS
+        || spec.scalar_kinds != b"i" || !spec.scratch.is_empty()
+        || !spec.pointers.iter().map(String::as_str).eq(["x", "w", "out"])
+        || g["width"].as_u64() != Some(Ml4ContextProjection::WIDTH as u64)
+        || g["outputs"].as_u64() != Some(Ml4ContextProjection::OUTPUTS as u64)
+        || g["output_dtype"].as_str() != Some("torch.bfloat16")
+        || g["skinny_rows"].as_u64() != Some(0)
+        || g["exact_row_cap"].as_u64() != Some(i32::MAX as u64)
+        || !g["compensated"].is_null() || !g["tiles_by_rows"].is_null() {
+        return Err(MlaDraftError::Invalid("ML4 context FC canonical geometry/ABI/capacity"));
+    }
+    Ok(())
+}
+
+fn validate_ml4_context_buffers(x: Buffer, weight: Buffer, out: Buffer, rows: usize) -> Result<()> {
+    if !(1..=Ml4ContextProjection::ROWS).contains(&rows) {
+        return Err(MlaDraftError::Invalid("ML4 context FC rows"));
+    }
+    validate_buffers(&[(x, rows * Ml4ContextProjection::WIDTH * 2),
+        (weight, Ml4ContextProjection::WIDTH * Ml4ContextProjection::OUTPUTS * 2),
+        (out, rows * Ml4ContextProjection::OUTPUTS * 2)], x.device_id)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MlaDraftWindow { Full, Sliding4096 }
+pub enum MlaDraftWindow { Full, Sliding4096, BlockAnchored2048 }
 impl MlaDraftWindow {
-    fn suffix(self) -> &'static str { match self { Self::Full => "full", Self::Sliding4096 => "w4096" } }
-    fn rows(self) -> Option<u64> { match self { Self::Full => None, Self::Sliding4096 => Some(4096) } }
+    fn suffix(self) -> &'static str {
+        match self { Self::Full => "full", Self::Sliding4096 => "w4096", Self::BlockAnchored2048 => "w2048b" }
+    }
+    fn rows(self) -> Option<u64> {
+        match self { Self::Full => None, Self::Sliding4096 => Some(4096), Self::BlockAnchored2048 => Some(2048) }
+    }
 }
 
 /// BF16 low-rank operands. Unlike the target, draft output has no gate.
+/// DFlash2 fills every field; mtp_dspark has no q-LoRA: `qkv_a` holds `wq`,
+/// `q_b` holds `wkv_a_with_mqa`, `q_a_norm` the unit query-scale vectors
+/// ([64] zeros then [64] ones, BF16).
 #[derive(Clone, Copy, Debug)]
 pub struct MlaDraftWeights {
     pub qkv_a: Buffer, pub q_a_norm: Buffer, pub kv_a_norm: Buffer,
@@ -60,6 +125,7 @@ pub struct MlaDraft<'a> {
     producer: Program<'a>, attention: Program<'a>, output: Program<'a>,
     layout: Layout,
     cache_format: MlaCacheFormat,
+    kind: MlaDraftKind,
 }
 
 impl<'a> MlaDraft<'a> {
@@ -69,8 +135,20 @@ impl<'a> MlaDraft<'a> {
         let attention = programs.program(&format!("{program_namespace}_mla_draft_attention_{}{cache}_m64", window.suffix()), ATTENTION)?;
         let output = programs.program(&format!("{program_namespace}_mla_draft_output_m64"), OUTPUT)?;
         let layout = validate_manifest([producer.spec(), attention.spec(), output.spec()], window, cache_format)?;
-        Ok(Self { producer, attention, output, layout, cache_format })
+        Ok(Self { producer, attention, output, layout, cache_format, kind: MlaDraftKind::Dflash2 })
     }
+
+    /// Mistral Large 4's bundled mtp_dspark (`ml4_draft_*`): FP8 656-byte records,
+    /// every block row windowed to the 2048 records before its block.
+    pub fn load_ml4(programs: &'a Programs<'a>) -> Result<Self> {
+        let producer = programs.program("ml4_draft_producer_m64", ML4_PRODUCER)?;
+        let attention = programs.program("ml4_draft_attention_m64", ATTENTION)?;
+        let output = programs.program("ml4_draft_output_m64", OUTPUT)?;
+        let layout = validate_ml4_manifest([producer.spec(), attention.spec(), output.spec()])?;
+        Ok(Self { producer, attention, output, layout, cache_format: MlaCacheFormat::Fp8, kind: MlaDraftKind::Ml4Dspark })
+    }
+
+    pub fn kind(&self) -> MlaDraftKind { self.kind }
 
     pub fn cache_format(&self) -> MlaCacheFormat { self.cache_format }
 
@@ -80,24 +158,35 @@ impl<'a> MlaDraft<'a> {
 
     /// Preflight an entire multi-layer/chunk operation before its first cache write.
     pub fn check_produce(&self, w: MlaDraftWeights, b: MlaDraftBatch) -> Result<()> {
-        validate_producer(w, b, self.layout, self.cache_format)
+        validate_producer_kind(self.kind, w, b, self.layout, self.cache_format)
     }
 
     pub fn check_launch(&self, w: MlaDraftWeights, b: MlaDraftBatch) -> Result<()> {
-        validate_batch(w, b, self.layout, self.cache_format)
+        validate_batch_kind(self.kind, w, b, self.layout, self.cache_format)
     }
 
     /// Context-only projection uses the same producer, without attention or
     /// output. The owner chunks taps to at most 64 rows and joins their producer.
     pub fn produce(&self, w: MlaDraftWeights, b: MlaDraftBatch, stream: *mut c_void) -> Result<()> {
-        validate_producer(w, b, self.layout, self.cache_format)?;
-        // SAFETY: host extents/devices/scalars are validated. The owner retains
-        // storage and stream, and stages checked positions and physical slots.
-        unsafe {
-            self.producer.launch(&[b.x.ptr, b.slots.ptr, b.positions.ptr, b.inv_freq.ptr,
-                w.qkv_a.ptr, w.q_a_norm.ptr, w.kv_a_norm.ptr, w.q_b.ptr, w.uk.ptr,
-                b.cache.ptr, b.query.ptr, b.q_resid.ptr, b.producer_scratch.ptr],
-                &[Scalar::F32(b.rotary_factor), Scalar::I32(b.rows as i32)], stream)?;
+        validate_producer_kind(self.kind, w, b, self.layout, self.cache_format)?;
+        match self.kind {
+            // SAFETY: host extents/devices/scalars are validated. The owner retains
+            // storage and stream, and stages checked positions and physical slots.
+            MlaDraftKind::Dflash2 => unsafe {
+                self.producer.launch(&[b.x.ptr, b.slots.ptr, b.positions.ptr, b.inv_freq.ptr,
+                    w.qkv_a.ptr, w.q_a_norm.ptr, w.kv_a_norm.ptr, w.q_b.ptr, w.uk.ptr,
+                    b.cache.ptr, b.query.ptr, b.q_resid.ptr, b.producer_scratch.ptr],
+                    &[Scalar::F32(b.rotary_factor), Scalar::I32(b.rows as i32)], stream)?;
+            },
+            // SAFETY: as above; `inv_freq` holds the FP32 cos|sin table [positions, 64]
+            // and `q_a_norm` the unit scale vectors (zeros, then ones).
+            MlaDraftKind::Ml4Dspark => unsafe {
+                let unit_b = w.q_a_norm.ptr.cast::<u8>().add(HEADS * 2).cast();
+                self.producer.launch(&[b.x.ptr, b.slots.ptr, b.positions.ptr, b.inv_freq.ptr,
+                    w.q_a_norm.ptr, unit_b, w.qkv_a.ptr, w.q_b.ptr, w.kv_a_norm.ptr, w.uk.ptr,
+                    b.cache.ptr, b.query.ptr, b.producer_scratch.ptr],
+                    &[Scalar::I32(b.rows as i32)], stream)?;
+            },
         }
         Ok(())
     }
@@ -105,7 +194,7 @@ impl<'a> MlaDraft<'a> {
     /// Validate the entire operation before the producer can mutate cache.
     /// Scratch may overlap across these strictly ordered phases, not live data.
     pub fn launch(&self, w: MlaDraftWeights, b: MlaDraftBatch, stream: *mut c_void) -> Result<()> {
-        validate_batch(w, b, self.layout, self.cache_format)?;
+        validate_batch_kind(self.kind, w, b, self.layout, self.cache_format)?;
         self.produce(w, b, stream)?;
         // SAFETY: the full batch was validated before any launch. Metadata,
         // buffers and stream remain owned and ordered through completion.
@@ -159,6 +248,91 @@ fn validate_manifest(specs: [&ProgramSpec; 3], window: MlaDraftWindow, cache_for
         return Err(MlaDraftError::Invalid("manifest traversal/scratch"));
     }
     Ok(layout)
+}
+
+/// The ml4_draft_* manifest: Mistral Large 4's draft geometry (hidden 6144, no
+/// q-LoRA, nope 64, v 128, FP8 656-byte records, block-anchored window 2048).
+fn validate_ml4_manifest(specs: [&ProgramSpec; 3]) -> Result<Layout> {
+    let scalars: [&[u8]; 3] = [b"i", b"iilif", b"i"];
+    for (i, spec) in specs.iter().enumerate() {
+        let g = &spec.geometry;
+        let pointers = [ML4_PRODUCER, ATTENTION, OUTPUT][i];
+        if spec.capacity_rows as usize != ROWS || spec.scalar_kinds != scalars[i]
+            || !spec.pointers.iter().map(String::as_str).eq(pointers.iter().copied())
+            || [("heads", 64), ("hidden", 6144), ("q_lora_rank", 0), ("kv_lora_rank", 512),
+                ("qk_nope_dim", 64), ("qk_rope_dim", 64), ("v_head_dim", 128), ("page_rows", 64),
+                ("window_size", 2048)].iter().any(|&(key, n)| g[key].as_u64() != Some(n))
+            || g["name"].as_str() != Some("ml4_draft") || g["norm_eps"].as_f64() != Some(1e-5)
+            || g["kv_cache"].as_str() != Some("fp8") {
+            return Err(MlaDraftError::Invalid("ML4 draft manifest geometry/pointers/scalars"));
+        }
+    }
+    let a = &specs[1].geometry;
+    if a["noncausal_block"].as_bool() != Some(true) || a["block_window"].as_bool() != Some(true)
+        || specs[2].geometry["output_gate"].as_bool() != Some(false) {
+        return Err(MlaDraftError::Invalid("ML4 draft manifest window/gate contract"));
+    }
+    let context = a["max_context"].as_u64().filter(|&n| n > 0 && n <= 1048576)
+        .ok_or(MlaDraftError::Invalid("manifest context"))? as usize;
+    let layout = Layout::for_kind(MlaDraftKind::Ml4Dspark, context)
+        .map_err(|_| MlaDraftError::Invalid("manifest context"))?;
+    if [("num_splits", layout.splits), ("chunks_per_split", layout.chunks_per_split),
+        ("partial_output_bytes", layout.partial_output_bytes), ("partial_lse_bytes", layout.partial_lse_bytes),
+        ("scratch_bytes", layout.scratch[1])]
+        .iter().any(|&(key, n)| a[key].as_u64() != Some(n as u64))
+        || specs.iter().zip(layout.scratch).any(|(s, bytes)| s.scratch.len() != 1
+            || s.scratch.get("scratch").copied() != Some(bytes as u64)) {
+        return Err(MlaDraftError::Invalid("ML4 draft manifest traversal/scratch"));
+    }
+    Ok(layout)
+}
+
+fn ml4_producer_requirements(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout) -> Result<Vec<(Buffer, usize)>> {
+    if !(1..=ROWS).contains(&b.rows) || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize {
+        return Err(MlaDraftError::Invalid("producer geometry"));
+    }
+    let cache = b.cache_pages.checked_mul(PAGE * MlaCacheFormat::Fp8.record_bytes())
+        .ok_or(MlaDraftError::Invalid("cache extent overflow"))?;
+    let hidden = MlaDraftKind::Ml4Dspark.hidden();
+    // The cos|sin table covers every position the owner stages (checked by the owner);
+    // here at least one row.
+    Ok(vec![(b.x, b.rows * hidden * 2), (b.slots, b.rows * 8), (b.positions, b.rows * 8),
+        (b.inv_freq, 64 * 4), (w.q_a_norm, 2 * HEADS * 2), (w.qkv_a, HEADS * 128 * hidden * 2),
+        (w.q_b, 576 * hidden * 2), (w.kv_a_norm, 512 * 2), (w.uk, HEADS * 512 * 64 * 2),
+        (b.cache, cache), (b.query, b.rows * HEADS * 576 * 2), (b.producer_scratch, l.scratch[0])])
+}
+
+fn validate_producer_kind(kind: MlaDraftKind, w: MlaDraftWeights, b: MlaDraftBatch, l: Layout,
+    cache_format: MlaCacheFormat) -> Result<()> {
+    match kind {
+        MlaDraftKind::Dflash2 => validate_producer(w, b, l, cache_format),
+        MlaDraftKind::Ml4Dspark => validate_buffers(&ml4_producer_requirements(w, b, l)?, b.x.device_id),
+    }
+}
+
+fn validate_batch_kind(kind: MlaDraftKind, w: MlaDraftWeights, b: MlaDraftBatch, l: Layout,
+    cache_format: MlaCacheFormat) -> Result<()> {
+    if kind == MlaDraftKind::Dflash2 { return validate_batch(w, b, l, cache_format); }
+    if b.requests == 0 || b.requests > b.rows || b.page_table_width == 0
+        || b.page_table_width > l.context.div_ceil(PAGE) + 1
+        || b.active_splits != l.splits || !b.attention_scale.is_finite() || b.attention_scale <= 0.0 {
+        return Err(MlaDraftError::Invalid("batch/context/split/attention scale"));
+    }
+    let hidden = MlaDraftKind::Ml4Dspark.hidden();
+    let mut requirements = ml4_producer_requirements(w, b, l)?;
+    let scratch = requirements.pop().ok_or(MlaDraftError::Invalid("producer scratch"))?;
+    requirements.extend([(b.page_table, b.requests * b.page_table_width * 4),
+        (b.lengths, b.requests * 4), (b.query_offsets, (b.requests + 1) * 4),
+        (b.attention, b.rows * HEADS * 512 * 2), (b.lse, b.rows * HEADS * 4),
+        (b.output, b.rows * hidden * 2), (w.uv, HEADS * 128 * 512 * 2),
+        (w.output, hidden * HEADS * 128 * 2)]);
+    validate_buffers(&requirements, b.x.device_id)?;
+    for plane in [scratch, (b.attention_scratch, l.scratch[1]), (b.output_scratch, l.scratch[2])] {
+        let mut phase = requirements.clone();
+        phase.push(plane);
+        validate_buffers(&phase, b.x.device_id)?;
+    }
+    Ok(())
 }
 
 fn producer_requirements(w: MlaDraftWeights, b: MlaDraftBatch, l: Layout, cache_format: MlaCacheFormat) -> Result<Vec<(Buffer, usize)>> {
@@ -226,6 +400,57 @@ fn validate_buffers(requirements: &[(Buffer, usize)], device: i32) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ml4_context_fc_rejects_noncanonical_routes_geometry_and_abi() {
+        let good = ProgramSpec { name: "ml4_draft_context_fc".into(),
+            pointers: ["x", "w", "out"].map(String::from).to_vec(), scalar_kinds: b"i".to_vec(),
+            capacity_rows: 2048, scratch: Default::default(),
+            geometry: serde_json::json!({"width": 30720, "outputs": 6144,
+                "output_dtype": "torch.bfloat16", "skinny_rows": 0, "exact_row_cap": i32::MAX}) };
+        validate_ml4_context_projection(&good).unwrap();
+        for (key, value) in [("width", 6144.into()), ("outputs", 7168.into()),
+            ("output_dtype", "torch.float32".into()), ("skinny_rows", 16.into()),
+            ("exact_row_cap", 2048.into()), ("compensated", true.into()),
+            ("tiles_by_rows", serde_json::json!([]))] {
+            let mut bad = good.clone(); bad.geometry[key] = value;
+            assert!(validate_ml4_context_projection(&bad).is_err(), "{key}");
+        }
+        for key in ["width", "outputs", "output_dtype", "skinny_rows", "exact_row_cap"] {
+            let mut bad = good.clone(); bad.geometry.as_object_mut().unwrap().remove(key);
+            assert!(validate_ml4_context_projection(&bad).is_err(), "missing {key}");
+        }
+        for defect in 0..5 {
+            let mut bad = good.clone();
+            match defect {
+                0 => bad.name = "ml4_index_kw".into(), 1 => bad.capacity_rows = 4096,
+                2 => bad.scalar_kinds = b"l".to_vec(), 3 => bad.pointers.swap(0, 1),
+                _ => { bad.scratch.insert("scratch".into(), 256); }
+            }
+            assert!(validate_ml4_context_projection(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn ml4_context_fc_checks_live_extents_devices_and_aliases() {
+        let x = Buffer { ptr: 0x10000000usize as *mut c_void, bytes: 2048 * 30720 * 2, device_id: 1, flags: 0 };
+        let weight = Buffer { ptr: 0x30000000usize as *mut c_void, bytes: 30720 * 6144 * 2, ..x };
+        let out = Buffer { ptr: 0x50000000usize as *mut c_void, bytes: 2048 * 6144 * 2, ..x };
+        for rows in [1, 16, 64, 140, 2048] { validate_ml4_context_buffers(x, weight, out, rows).unwrap(); }
+        for rows in [0, 2049, usize::MAX] { assert!(validate_ml4_context_buffers(x, weight, out, rows).is_err()); }
+        for index in 0..3 {
+            for defect in 0..4 {
+                let mut buffers = [x, weight, out];
+                match defect {
+                    0 => buffers[index].bytes -= 1, 1 => buffers[index].device_id = 0,
+                    2 => buffers[index].ptr = 1usize as *mut c_void,
+                    _ => buffers[index].ptr = std::ptr::null_mut(),
+                }
+                assert!(validate_ml4_context_buffers(buffers[0], buffers[1], buffers[2], 2048).is_err());
+            }
+        }
+        assert!(validate_ml4_context_buffers(x, weight, x, 1).is_err());
+    }
 
     fn specs(window: MlaDraftWindow, context: usize) -> [ProgramSpec; 3] {
         let splits = context.div_ceil(PAGE).min(16);
@@ -304,6 +529,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn ml4_specs(context: usize) -> [ProgramSpec; 3] {
+        let layout = Layout::for_kind(MlaDraftKind::Ml4Dspark, context).unwrap();
+        std::array::from_fn(|i| {
+            let mut geometry = serde_json::json!({"name": "ml4_draft", "heads": 64, "hidden": 6144,
+                "q_lora_rank": 0, "kv_lora_rank": 512, "qk_nope_dim": 64, "qk_rope_dim": 64,
+                "v_head_dim": 128, "page_rows": 64, "norm_eps": 1e-5, "window_size": 2048, "kv_cache": "fp8"});
+            match i {
+                0 => geometry["max_rows"] = 64.into(),
+                1 => {
+                    for (key, value) in [("max_context", context), ("num_splits", layout.splits),
+                        ("chunks_per_split", layout.chunks_per_split),
+                        ("partial_output_bytes", layout.partial_output_bytes),
+                        ("partial_lse_bytes", layout.partial_lse_bytes), ("scratch_bytes", layout.scratch[1])] {
+                        geometry[key] = value.into();
+                    }
+                    geometry["noncausal_block"] = true.into();
+                    geometry["block_window"] = true.into();
+                }
+                _ => geometry["output_gate"] = false.into(),
+            }
+            ProgramSpec { name: format!("ml4{i}"), capacity_rows: ROWS as u32, geometry,
+                pointers: [ML4_PRODUCER, ATTENTION, OUTPUT][i].iter().map(|s| s.to_string()).collect(),
+                scalar_kinds: [b"i".as_slice(), b"iilif".as_slice(), b"i".as_slice()][i].to_vec(),
+                scratch: [("scratch".into(), layout.scratch[i] as u64)].into_iter().collect() }
+        })
+    }
+
+    #[test]
+    fn ml4_draft_manifest_is_its_own_contract_and_dflash2_is_unchanged() {
+        let good = ml4_specs(1048576);
+        let layout = validate_ml4_manifest(good.each_ref()).unwrap();
+        // mtp_dspark producer: [64, 64, 128] q then [64, 576] kv_a; the other planes are DFlash2's.
+        assert_eq!(layout.scratch[0], 64 * 64 * 128 * 2 + 73728);
+        assert_eq!(layout.scratch[1..], Layout::new(1048576).unwrap().scratch[1..]);
+        assert_eq!(Layout::new(1048576).unwrap(), Layout::for_kind(MlaDraftKind::Dflash2, 1048576).unwrap());
+        for (i, key, bad) in [(0, "hidden", serde_json::json!(7168)), (1, "block_window", false.into()),
+            (1, "window_size", 4096.into()), (0, "q_lora_rank", 1536.into()), (2, "kv_cache", "bf16".into()),
+            (1, "noncausal_block", false.into()), (2, "output_gate", true.into())] {
+            let mut wrong = good.clone(); wrong[i].geometry[key] = bad;
+            assert!(validate_ml4_manifest(wrong.each_ref()).is_err(), "{key}");
+        }
+        let mut wrong = good.clone(); wrong[0].pointers.swap(4, 5);
+        assert!(validate_ml4_manifest(wrong.each_ref()).is_err());
+        // Neither validator admits the other's programs.
+        assert!(validate_manifest(good.each_ref(), MlaDraftWindow::BlockAnchored2048, MlaCacheFormat::Fp8).is_err());
+        let kimi = specs(MlaDraftWindow::Sliding4096, 1048576);
+        assert!(validate_ml4_manifest(kimi.each_ref()).is_err());
     }
 
     fn fixture() -> (MlaDraftWeights, MlaDraftBatch, Layout) {

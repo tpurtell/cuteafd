@@ -1,4 +1,4 @@
-//! Optional native Spark load; execution views are constructed only after Done.
+//! Namespace-required native Spark load; execution views exist only after Done.
 use super::{ExpertLayer, ExpertWeights, NativeExpertServiceConfig};
 use crate::shared::{experts::layer::ExpertLoadBudget, memory::{device::Device,
     push_consumer, push_initialize, push_native::RankPlan,
@@ -12,8 +12,7 @@ use std::{net::TcpStream, os::fd::AsRawFd, rc::Rc};
 pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig, resident: usize, stream: &mut TcpStream)
     -> Result<Option<Vec<ExpertWeights<'a>>>> {
-    let planned = (|| -> Result<_> {
-        let (root, host) = cuteafd_loader::push_load::namespace(&config.snapshot)?;
+    let Some(((plan, checked, selections, budgets), (group, token))) = super::push::plan_offer(&config.snapshot, stream, |root, host| {
         let selections = config.resident_layers(catalog.routed_experts().layers)?.into_iter()
             .map(|layer| config.selection(layer)).collect::<Result<Vec<_>>>()?;
         let mut slices = Vec::new();
@@ -38,17 +37,14 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         if config.declared_world.ownership_topology().is_some() {
             ensure!(peak <= config.device_budget, "native push unified peak exceeds configured admission");
         }
-        let offer = Offer { rank: config.rank, host, arena_bytes: plan.logical_bytes(),
+        let offer = Offer { rank: config.rank, host: host.into(), arena_bytes: plan.logical_bytes(),
             placement: plan.placement.clone() };
         tracing::info!(rank = config.rank, resident_bytes = resident, transform_bytes = plan.scratch,
             host_scratch_bytes = plan.host_scratch, load_peak_bytes = peak, "Spark native planes push admitted");
-        Ok((plan, checked, offer, selections, budgets))
-    })();
-    if let Err(error) = &planned { tracing::warn!(%error, "Spark native planes push unavailable; offering mount"); }
-    let credentials = push::offer_with(stream, planned.as_ref().map(|(_, _, offer, _, _)| offer.clone()).map_err(|error| format!("{error:#}")))?;
-    let Some((group, token)) = credentials else { return Ok(None); };
-    let (plan, checked, _, selections, budgets) = planned?;
-    receive(library, plan, &checked, &selections, &budgets, config.rank, &PushClient::default(), stream, group, token)
+        Ok(((plan, checked, selections, budgets), offer))
+    })? else { return Ok(None); };
+    super::push::required_receive(receive(library, plan, &checked, &selections, &budgets, config.rank,
+        &PushClient::default(), stream, group, token))
 }
 
 fn admit_peak(resident: usize, scratch: usize, host: usize, headroom: usize, available: usize) -> Result<usize> {
@@ -98,8 +94,8 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
         return Ok(Some(weights));
     }
     drop(candidate);
-    ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe mount retry");
-    push::drained(stream).context("native planes push fallback drain barrier")?;
+    ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe startup cleanup");
+    push::drained(stream).context("native planes push failure drain barrier")?;
     Ok(None)
 }
 

@@ -312,6 +312,21 @@ mod tests {
     }
 
     #[test]
+    fn ml4_loaded_identity_uses_glm_executor_without_relabeling_the_checkpoint() {
+        let config = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(
+            &cuteafd_loader::plan::testing::mistral_large4_config()).unwrap();
+        assert_eq!(config.family_id(), "mistral_large4");
+        let mut context = ServerContext { command: "serve-glm".into(), ..Default::default() };
+        context.set_family(config.family_id());
+        let report = server_info_from_context("mistralai/Mistral-Large-4-1T-A52B", &context, Hardware::default());
+        assert_eq!(report.family.as_deref(), Some("mistral_large4"));
+        assert_eq!(report.executor.as_deref(), Some("serve-glm"));
+        let probe = crate::runner::probe_server(&report.model, &context);
+        assert_eq!(probe["family"], "mistral_large4");
+        assert_eq!(probe["executor"], "serve-glm");
+    }
+
+    #[test]
     fn legacy_reports_without_executor_still_deserialize() {
         let report = ServerInfo { model: "legacy".into(), ..Default::default() };
         let mut value = serde_json::to_value(report).unwrap();

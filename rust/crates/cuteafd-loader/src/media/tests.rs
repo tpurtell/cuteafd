@@ -280,3 +280,83 @@ fn legacy_processor_serialization_and_ids_stay_bicubic() {
         assert!(String::from_utf8_lossy(&serde_json::to_vec(&lanczos).unwrap()).contains("Lanczos"));
     }
 }
+
+fn mistral_processor() -> ProcessorConfig {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("processor_config.json"), include_str!(
+        "../families/mistral_large4/official-processor-config.json")).unwrap();
+    ProcessorConfig::from_snapshot(dir.path(), ImageFamily::Mistral).unwrap()
+}
+
+/// The checkpoint's own processor_config.json (@f12dabdc): PixtralImageProcessor,
+/// patch 14, spatial merge 2, longest edge 1540, CLIP mean/std, bicubic.
+#[test]
+fn mistral_processor_reads_the_checkpoint_pixtral_config() {
+    let config = mistral_processor();
+    assert_eq!((config.family, config.patch, config.merge, config.max_pixels), (ImageFamily::Mistral, 14, 2, 1540));
+    assert_eq!(config.max_image_tokens, 55 * 56);
+    assert_eq!(config.resample, Resample::Bicubic);
+    assert_eq!(config.mean, CLIP_MEAN);
+    let low = config.with_detail(true);
+    assert_eq!((low.max_pixels, low.max_image_tokens), (15 * 28, 15 * 16));
+    assert!(low.max_image_tokens <= 256);
+    let image = low.prepare_rgb(rgb(4000, 3000), EncoderId([0; 32])).unwrap();
+    assert!(image.tokens <= 256);
+}
+
+/// Token layout against mistral_common 1.13.0's ImageEncoder (`([img] * w +
+/// [img_break]) * h`, last -> img_end) for 264 sizes; grids follow HF's
+/// Pixtral resize (floor on downscale), which differs from mistral_common's
+/// round on some oversized images, so those use the HF grid and the
+/// mistral_common layout rule.
+#[test]
+fn mistral_spans_match_mistral_common_layout_on_hf_grids() {
+    use sha2::{Digest, Sha256};
+    let oracle: serde_json::Value = serde_json::from_str(include_str!("mistral-span-oracle.json")).unwrap();
+    let config = mistral_processor();
+    let expander = MistralSpanExpander { image: 10, row_break: 12, end: 13, merge: 2, vocabulary: 100 };
+    let (mut checked, mut divergent) = (0, 0);
+    for case in oracle["cases"].as_array().unwrap() {
+        let [h, w, mc, hf, digest] = case.as_array().unwrap().as_slice() else { panic!() };
+        let (h, w) = (h.as_u64().unwrap() as u32, w.as_u64().unwrap() as u32);
+        let grid = |g: &serde_json::Value| (g[0].as_u64().unwrap() as u32, g[1].as_u64().unwrap() as u32);
+        let (hf, mc) = (grid(hf), grid(mc));
+        // HF floors a 1-pixel side to 0 at extreme aspect; the engine clamps to one cell as mistral_common does.
+        let expected = (hf.0.max(1), hf.1.max(1));
+        let (rh, rw) = config.resize_shape(h, w).unwrap();
+        assert_eq!((rh / 28, rw / 28), expected, "{h}x{w}");
+        let image = config.prepare_rgb(rgb(w, h), EncoderId([0; 32])).unwrap();
+        let expanded = expander.expand(&[1, 10, 2], std::slice::from_ref(&image), 1 << 20).unwrap();
+        let span = &expanded.tokens[1..expanded.tokens.len() - 1];
+        assert_eq!(expanded.media[0].len, span.len());
+        if expected == mc {
+            let text = format!("[{}]", span.iter().map(u32::to_string).collect::<Vec<_>>().join(", "));
+            assert_eq!(hex(&Sha256::digest(text.as_bytes())[..8]), digest.as_str().unwrap(), "{h}x{w}");
+            checked += 1;
+        } else {
+            divergent += 1;
+        }
+    }
+    assert!(checked >= 250, "{checked} checked, {divergent} divergent");
+}
+
+fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+
+#[test]
+fn mistral_expansion_refuses_bare_markers_and_mismatched_spans() {
+    let config = mistral_processor();
+    let image = config.prepare_rgb(rgb(56, 84), EncoderId([0; 32])).unwrap();
+    assert_eq!((image.grid.h, image.grid.w, image.tokens), (6, 4, 3 * 3));
+    let expander = MistralSpanExpander { image: 10, row_break: 12, end: 13, merge: 2, vocabulary: 100 };
+    let expanded = expander.expand(&[1, 10, 2, 10], &[image.clone(), image.clone()], 64).unwrap();
+    assert_eq!(expanded.tokens, [1, 10, 10, 12, 10, 10, 12, 10, 10, 13, 2, 10, 10, 12, 10, 10, 12, 10, 10, 13]);
+    assert_eq!(expanded.media.iter().map(|m| (m.start, m.len)).collect::<Vec<_>>(), [(1, 9), (11, 9)]);
+    for bad in [&[1, 12, 10][..], &[13, 10]] {
+        assert!(expander.expand(bad, std::slice::from_ref(&image), 64).is_err());
+    }
+    assert!(expander.expand(&[10], &[], 64).is_err());
+    assert!(expander.expand(&[10], std::slice::from_ref(&image), 8).is_err());
+    let mut wrong = image.clone();
+    wrong.tokens += 1;
+    assert!(expander.expand(&[10], &[wrong], 64).is_err());
+}

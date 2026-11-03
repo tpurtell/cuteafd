@@ -10,6 +10,92 @@ use cuteafd_loader::plan::testing as fixture;
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::FileExt;
 
+#[test]
+fn tp2_peer_router_names_match_installed_checkpoint_headers() -> Result<()> {
+    let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
+    let models = [
+        ("zai-org--GLM-5.3", "aca966e4e02791568aa6a4ced368624b3d897f42", "model.safetensors.index.json", true),
+        ("mistralai--Mistral-Large-4-1T-A52B", "f12dabdc0c1e99e7f7924461a6f308859b05af4d", "consolidated.safetensors.index.json", false),
+    ];
+    for (model, revision, index_file, bias) in models {
+        let snapshot = home.join("hub").join(format!("models--{model}")).join("snapshots").join(revision);
+        if !snapshot.join("config.json").is_file() {
+            eprintln!("checkpoint headers unavailable: {}", snapshot.display());
+            continue;
+        }
+        let cfg = GlmDsaConfig::read(&snapshot)?;
+        let index: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join(index_file))?)?;
+        let mut headers = HashMap::new();
+        for layer in cfg.first_moe_layer..cfg.layers {
+            let names: Vec<_> = peer_router_names(&cfg, layer).collect();
+            assert_eq!(names.len(), if bias { 2 } else { 1 });
+            assert_eq!(names[0].0, "gate");
+            for (operand, name) in names {
+                let shard = index["weight_map"][&name].as_str().with_context(|| format!("missing peer router {name}"))?;
+                if !headers.contains_key(shard) {
+                    headers.insert(shard.to_owned(), cuteafd_loader::read_safetensors_metadata(&snapshot.join(shard))?);
+                }
+                let tensor = headers[shard].iter().find(|t| t.name == name).with_context(|| format!("missing header {name}"))?;
+                assert_eq!(tensor.shape, if operand == "gate" { vec![cfg.experts, cfg.hidden] } else { vec![cfg.experts] });
+                assert_eq!(tensor.dtype, if operand == "gate" { DType::Bf16 } else { DType::F32 });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn attention_residency_does_not_depend_on_optional_operand_names() {
+    for owner in [None, Some(0), Some(1)] {
+        for rank in 0..2 {
+            let resident = owner.is_none_or(|owner| usize::from(owner) == rank);
+            let layer = GlmLayer {
+                dense: false, full_indexer: false,
+                mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision,
+                split: true, attention_split: owner.is_none(), attention_owner: owner,
+                attention_resident: resident, operands: HashMap::new(), native: HashMap::new(),
+                core: Default::default(), native_projections: HashMap::new(),
+            };
+            assert_eq!(layer.holds_attention(), resident, "owner={owner:?}, rank={rank}");
+            assert!(layer.range("q_a_norm").is_none());
+            assert!(layer.range("w_uk").is_none());
+        }
+    }
+}
+
+#[test]
+fn attention_residency_matches_installed_variant_checkpoint_headers() -> Result<()> {
+    let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
+    for (model, revision, index_file, q_lora) in [
+        ("zai-org--GLM-5.3", "aca966e4e02791568aa6a4ced368624b3d897f42", "model.safetensors.index.json", true),
+        ("mistralai--Mistral-Large-4-1T-A52B", "f12dabdc0c1e99e7f7924461a6f308859b05af4d", "consolidated.safetensors.index.json", false),
+    ] {
+        let snapshot = home.join("hub").join(format!("models--{model}")).join("snapshots").join(revision);
+        if !snapshot.join("config.json").is_file() {
+            eprintln!("checkpoint headers unavailable: {}", snapshot.display());
+            continue;
+        }
+        let cfg = GlmDsaConfig::read(&snapshot)?;
+        let index: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join(index_file))?)?;
+        let mut headers = HashMap::new();
+        for layer in 0..cfg.layers {
+            // Both variants load KV-B on the attention owner, but ML4 has no q-LoRA norm.
+            assert_eq!(cfg.weight(layer, Op::QANorm).is_some(), q_lora);
+            let name = cfg.weight(layer, Op::KvB).context("resident attention KV-B")?;
+            let shard = index["weight_map"][&name].as_str().with_context(|| format!("missing attention {name}"))?;
+            if !headers.contains_key(shard) {
+                headers.insert(shard.to_owned(), cuteafd_loader::read_safetensors_metadata(&snapshot.join(shard))?);
+            }
+            let tensor = headers[shard].iter().find(|t| t.name == name).with_context(|| format!("missing header {name}"))?;
+            assert_eq!(tensor.shape, vec![cfg.heads * (cfg.nope_dim(layer) + cfg.v_head_dim), cfg.kv_lora_rank],
+                "{model} layer {layer}: {name}");
+        }
+    }
+    Ok(())
+}
+
 /// Deterministic, finite payloads: FP32 grids are positive normals, BF16 and
 /// E4M3 bytes vary with the tensor and position.
 fn fill(root: &std::path::Path) -> Result<()> {

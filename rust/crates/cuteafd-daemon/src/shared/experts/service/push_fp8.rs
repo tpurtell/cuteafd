@@ -1,4 +1,4 @@
-//! Optional native Spark transaction; prepared code survives mount fallback.
+//! Namespace-required FP8-family Spark startup transaction.
 #[cfg(test)]
 #[path = "push_fp8/tests.rs"]
 mod tests;
@@ -33,8 +33,7 @@ pub(super) fn load<'a>(
     resident: usize,
     stream: &mut TcpStream,
 ) -> Result<Option<Vec<Fp8Layer<'a>>>> {
-    let planned = (|| -> Result<_> {
-        let (root, host) = cuteafd_loader::push_load::namespace(&config.snapshot)?;
+    let Some(((plan, checked), (group, token))) = super::push::plan_offer(&config.snapshot, stream, |root, host| {
         let mut layers = groups
             .iter()
             .flat_map(|group| group.layers.iter().map(|&layer| (layer, group.slicing)))
@@ -71,33 +70,14 @@ pub(super) fn load<'a>(
         );
         let offer = Offer {
             rank: config.rank,
-            host,
+            host: host.into(),
             arena_bytes: plan.layout.logical_bytes() as u64,
             placement: plan.placement.clone(),
         };
-        Ok((plan, checked, offer))
-    })();
-    if let Err(error) = &planned {
-        tracing::warn!(%error, "Spark native push unavailable; offering mount");
-    }
-    let credentials = push::offer_with(
-        stream,
-        planned.as_ref().map(|(_, _, offer)| offer.clone()).map_err(|error| format!("{error:#}")),
-    )?;
-    let Some((group, token)) = credentials else {
-        return Ok(None);
-    };
-    let (plan, checked, _) = planned?;
-    receive(
-        library,
-        plan,
-        &checked,
-        config.rank,
-        &PushClient::default(),
-        stream,
-        group,
-        token,
-    )
+        Ok(((plan, checked), offer))
+    })? else { return Ok(None); };
+    super::push::required_receive(receive(library, plan, &checked, config.rank,
+        &PushClient::default(), stream, group, token))
 }
 
 fn receive<'a>(
@@ -198,7 +178,7 @@ fn receive<'a>(
     drop(candidate);
     ensure!(
         !library.is_quarantined_after_failed_drain(),
-        "failed push drain prevents safe mount retry"
+        "failed push drain prevents safe startup cleanup"
     );
     push::drained(stream).context("native push fallback drain barrier")?;
     Ok(None)

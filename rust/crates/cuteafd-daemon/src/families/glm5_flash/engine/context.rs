@@ -267,7 +267,7 @@ impl<'a> GlmfEngine<'a> {
             fn produce(&mut self) -> Result<Query> {
                 let (e, w) = (self.engine, self.w);
                 e.mla_producer(self.rank, w, self.index, self.layer, self.rows, self.cap, true)?;
-                Ok(Query { values: w.query.buffer.ptr, row_pitch: e.cfg.heads / 2 * e.cfg.kv_lora_rank * 2 })
+                Ok(Query { values: w.query.buffer.ptr, row_pitch: e.cfg.heads / 2 * e.cfg.kv_lora_rank * 2, width: None })
             }
             fn score(&mut self) -> Result<Option<Candidates>> {
                 let (e, w, rank) = (self.engine, self.w, self.rank);

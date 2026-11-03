@@ -633,6 +633,30 @@ int cuteafd_pack_expert_plane_async(const uint8_t *source, uint64_t source_bytes
     }
     event('P'); return 0;
 }
+int cuteafd_pack_expert_window_async(const uint8_t *source, uint64_t source_bytes,
+    uint8_t *destination, uint64_t destination_bytes, uint32_t intermediate,
+    uint32_t projection, uint32_t first, uint32_t rows, void *stream) {
+    int status = cuteafd_cuda_stream_synchronize(stream);
+    if (status) return status;
+    if (pack_status) return pack_status;
+    uint32_t stored = cuteafd_mxfp4_stored_width(5120, intermediate);
+    struct cuteafd_expert_pack_window window;
+    if (!source || !destination || !cuteafd_expert_pack_window_geometry(5120,
+        intermediate, stored, projection, first, rows, &window) ||
+        source_bytes < (uint64_t)rows * window.k / 2 ||
+        destination_bytes < (uint64_t)window.n * window.k / 2) return 1;
+    for (uint64_t index = window.begin; index < window.begin + window.count; ++index) {
+        uint32_t row, col;
+        cuteafd_expert_pack_layout_coordinates(index, window.n, window.k,
+            window.half, 0, window.compact, &row, &col);
+        if (row < window.row_first || row >= window.row_end) continue;
+        uint64_t at = ((uint64_t)(row - window.row_first) * (window.k / 8) + col) * 4;
+        if (row - window.row_first < rows && col < window.k / 8)
+            memcpy(destination + index * 4, source + at, 4);
+        else memset(destination + index * 4, 0, 4);
+    }
+    event('P'); return 0;
+}
 int cuteafd_cuda_nvfp4_swizzle_scale_async(struct device_buffer src, struct device_buffer dst,
     size_t rows, size_t cols, void *stream) {
     int status = cuteafd_cuda_stream_synchronize(stream);

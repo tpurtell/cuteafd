@@ -12,7 +12,7 @@
 //!   while planning, before any record exists.
 use super::*;
 use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights};
-use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, STEP_BYTES};
+use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, TRANSFORM_BYTES};
 use cuteafd_loader::{plan::Checkpoint, formats::exl3_storage::exl3_module};
 
 /// One coordinator GPU's records target.
@@ -159,7 +159,7 @@ impl<'a> KimiRecords<'_, 'a> {
         let cols = (n0 / 16) * tile_bytes..(n0 + local_n) / 16 * tile_bytes;
         let width = cols.len();
         let k16 = local_k / 16;
-        let per = (STEP_BYTES / width).max(1);
+        let per = (TRANSFORM_BYTES / width).max(1);
         let mut kr = 0;
         while kr < k16 {
             let rows = per.min(k16 - kr);
@@ -411,7 +411,7 @@ impl<'a> KimiRecords<'_, 'a> {
             // kv_b absorbed per head on the GPU, whole heads per step.
             let uk = self.allocate(device, local * lat * nope * 2)?;
             let uv = self.allocate(device, local * v * lat * 2)?;
-            let per = (STEP_BYTES / ((nope + v) * lat * 2)).max(1);
+            let per = (TRANSFORM_BYTES / ((nope + v) * lat * 2)).max(1);
             let mut h = 0;
             while h < local {
                 let count = per.min(local - h);

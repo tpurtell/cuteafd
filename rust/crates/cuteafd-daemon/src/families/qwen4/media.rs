@@ -77,7 +77,7 @@ impl ReadyVision {
             warn_cache_capacity(cache_bytes, preparer.config().max_image_tokens, width)?;
             let expected = crate::shared::vision::remote::EncoderHandshake {
                 encoder_id: id, max_patches: max_tokens as u32 * processor.merge.pow(2), output_width: spec.native.output_width,
-                patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
+                patch_size: processor.patch, merge_size: processor.merge, row_markers: 0, plan_hash: remote.plan_hash,
             };
             anyhow::ensure!(expected.output_width as usize == width, "Qwen tower/LM output width mismatch");
             let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,

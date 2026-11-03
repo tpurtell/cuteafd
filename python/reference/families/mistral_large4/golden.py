@@ -163,7 +163,7 @@ class Family:
 
     def golden_meta(self):
         return {"reference": "official transformers 5.22.1 MistralLarge4TextDecoderLayer; fixed-M128 linears; "
-                             "128-row causal eager tiles; DSA indexer on 128-row tiles with stable lower-id ties",
+                             "128-row causal eager tiles; official full-window DSA indexer with stable lower-id ties",
                 "expert_storage": "FP8 bytes + qscale resident; one F32 expert matrix per official F.linear call",
                 "index_topk_ties": "relu scores tie at 0.0; selection by score, ties to lower key id "
                                    "(official topk tie order is unspecified)",
@@ -190,10 +190,15 @@ def main():
     parser.add_argument("--wait-shards", type=float, default=0,
                         help="seconds to wait for a layer's shards to finish downloading")
     parser.add_argument("--layers", type=int, default=None)
+    parser.add_argument("--media", action="store_true", help="inject the verified official BF16 Pixtral features")
+    parser.add_argument("--media-root", type=Path)
+    parser.add_argument("--media-features-out", type=Path)
+    parser.add_argument("--tower-dtype", choices=("bf16",), default="bf16")
     args = parser.parse_args()
     if args.layers is not None:
         raise ValueError("partial layers cannot qualify a reference")
-    layer_major.run(args, Family(args.snapshot))
+    import mistral_large4_media
+    layer_major.run(args, Family(args.snapshot), media_adapter=mistral_large4_media if args.media else None)
 
 
 if __name__ == "__main__":

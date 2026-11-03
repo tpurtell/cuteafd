@@ -301,7 +301,7 @@ impl<'a> MimoLoader<'a> {
     #[allow(clippy::type_complexity)]
     fn fp8_projection_bf16(&self, name: &str, ranks: usize, kmajor_scale: bool)
         -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>, Option<DeviceAllocation<'a>>)>> {
-        use crate::shared::experts::rtx::dense::{Job, Step, STEP_BYTES};
+        use crate::shared::experts::rtx::dense::{Job, Step, TRANSFORM_BYTES};
         let shape = self.tensor(name)?.meta.shape.clone();
         ensure!(shape.len() == 2 && shape[1] % (ranks * 128) == 0,
             "{name}: FP8-only projection requires [N,K] with K divisible by 128 per rank");
@@ -309,7 +309,7 @@ impl<'a> MimoLoader<'a> {
         let layout = MimoProjectionLayout::new(rows as u64, cols as u64, MimoProjectionRepresentation::Fp8,
             if kmajor_scale { 2 } else { 1 })?;
         let kb = cols / 128;
-        let per = (STEP_BYTES / (cols * 2)).max(1);
+        let per = (TRANSFORM_BYTES / (cols * 2)).max(1);
         (0..ranks).map(|rank| {
             let (device, stream) = self.rank_device(rank)?;
             let (values, scales) = self.on_rank(rank, |_| Ok((

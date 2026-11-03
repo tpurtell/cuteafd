@@ -623,7 +623,7 @@ impl<'a> GlmfLoader<'a> {
         ensure!(n % ranks == 0, "{n} MLA heads do not split over {ranks} GPUs");
         let heads = n / ranks;
         // Steps of whole heads, each at most the step bound.
-        let per = (crate::shared::experts::rtx::dense::STEP_BYTES / ((nope + v) * lat * 2)).max(1);
+        let per = (crate::shared::experts::rtx::dense::TRANSFORM_BYTES / ((nope + v) * lat * 2)).max(1);
         (0..ranks).map(|rank| {
             let (uk, uv) = self.on_rank(rank, || Ok((
                 DeviceAllocation::new(self.library, (heads * lat * nope * 2).max(256))?,
