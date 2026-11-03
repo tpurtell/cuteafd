@@ -191,7 +191,7 @@ pub struct SparkLinkOwners {
     pub waves: SparkWaveOwners,
     pub endpoints: SparkEndpointOwners,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
-    /// Constructor-selected link role, never inferred from row capacity.
+    /// Physical link capability, including shared decode/prefill links; never a request role.
     pub prefill: bool,
     /// Retained registered backing when staging falls back to standalone slots.
     pub unused_egress_bytes: Option<u64>,
@@ -215,14 +215,22 @@ impl SparkLinkOwners {
         let mut owners = self.intake.allocations(&format!("{prefix}.intake"), lifetime)?;
         owners.extend(self.waves.allocations(&format!("{prefix}.waves"), lifetime)?);
         owners.extend(self.endpoints.allocations(&format!("{prefix}.endpoints"), lifetime)?);
-        if self.prefill && self.spark_reply_format != cuteafd_core::SparkReplyFormat::Bf16
-            && !geometry.partial_replies() {
-            let stride = self.spark_reply_format.row_bytes(geometry.hidden as usize)
-                .ok_or_else(|| Refusal::InvalidFact("invalid Spark reply codec geometry".into()))?;
-            // Slots have disjoint slices; each slice is reused across ranks.
-            let bytes = self.intake.rows.checked_mul(stride as u64)
-                .and_then(|bytes| bytes.checked_mul(self.waves.waves as u64))
-                .ok_or(Refusal::Overflow("Spark reply codec scratch"))?;
+        let hidden = usize::try_from(geometry.hidden)
+            .map_err(|_| Refusal::Overflow("Spark reply codec width"))?;
+        let rows = usize::try_from(self.intake.rows)
+            .map_err(|_| Refusal::Overflow("Spark reply codec rows"))?;
+        let scratch = self.spark_reply_format.combined_scratch_bytes(
+            hidden, rows, self.waves.waves, self.prefill, geometry.partial_replies(),
+        ).ok_or_else(|| {
+            if self.spark_reply_format.row_bytes(hidden).is_none() {
+                Refusal::InvalidFact("invalid Spark reply codec geometry".into())
+            } else {
+                Refusal::Overflow("Spark reply codec scratch")
+            }
+        })?;
+        if scratch != 0 {
+            let bytes = u64::try_from(scratch)
+                .map_err(|_| Refusal::Overflow("Spark reply codec scratch"))?;
             owners.push(Allocation::buffer(format!("{prefix}.waves.reply_codec"),
                 Location::coordinator(self.intake.gpu), bytes, lifetime,
                 Category::Transport, "Spark reply codec"));
