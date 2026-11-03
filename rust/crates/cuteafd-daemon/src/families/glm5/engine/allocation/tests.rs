@@ -559,11 +559,27 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             let record = match event { AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) => r };
             record.key.space == Space::Pinned && record.key.scope == "staging/sync-h2d"
         }).collect::<Vec<_>>();
-        assert_eq!(events.len(), 2, "no sync-H2D reallocations after presizing");
+        assert!(events.len() >= 2, "missing sync-H2D release/successor events");
         assert!(matches!(events[0], AllocationEvent::Freed(r)
             if r.address == load_backing.ptr as usize && r.bytes == load_backing.bytes));
         assert!(matches!(events[1], AllocationEvent::Allocated(r)
             if r.address == successor.address as usize && r.bytes == successor_bytes));
+        // Ordered destinations use the same staging allocator/scope. Every later
+        // event must create one of their independently inventoried live stores.
+        let ordered = engine.target_buffer_receipts()?.into_iter()
+            .filter(|r| r.allocation.location == Location::PINNED)
+            .map(|r| (r.address as usize, r.allocation.bytes as usize))
+            .collect::<BTreeMap<_, _>>();
+        let mut created = BTreeMap::new();
+        for event in &events[2..] {
+            let AllocationEvent::Allocated(record) = event else {
+                panic!("unexpected staging free after presizing: {event:?}");
+            };
+            assert_ne!(record.address, successor.address as usize);
+            assert!(created.insert(record.address, record.bytes).is_none(),
+                "ordered staging address allocated twice");
+        }
+        assert_eq!(created, ordered, "unaccounted staging allocation after presizing");
         if core {
             // Allocate through the production CoreScratch constructor; program binding is not
             // emulated. The retained workspaces expose the actual projection owners and views.
