@@ -71,13 +71,12 @@ mod tests {
 
 #[cfg(test)]
 mod path_tests {
-    use super::*;
     use crate::openai::{build, ModelEncoding, ModelProfile, NativeLimits};
     use serde_json::json;
 
     #[test]
     fn unsupported_runtime_family_and_constraint_paths_reject_before_admission() {
-        let request = json!({"messages":[{"role":"user","content":"hi"}],
+        let request = json!({"model":crate::openai::MODEL,"messages":[{"role":"user","content":"hi"}],
             "speculative_acceptance":{"mode":"min_p","min_p":0.8}});
         let mut profile = ModelProfile::default();
         profile.relaxed_acceptance_supported = false;
