@@ -1,4 +1,4 @@
-//! Header-native physical weights and the current synchronous K6 load subset.
+//! Header-native weights and serialized K6/BF16 KV-B loading subsets.
 //! Other loading temporaries and serving arenas join separately; this inventory
 //! alone cannot authorize family Ready.
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer, core::CoreInventory};
@@ -46,25 +46,28 @@ impl CoreLoading {
         self.sync_upload_bytes = self.sync_upload_bytes.max(payload).max(input).max(output);
         Ok(())
     }
+}
 
-    pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
-        if maximum_pages == 0 {
-            return Err(Refusal::InvalidFact("empty GLM core load page domain".into()));
-        }
-        if self.heap_payload_bytes == 0 {
-            return Ok(Vec::new());
-        }
-        Ok(vec![Component {
-            activation: Activation::always(),
-            bytes: ByteCurve::fixed(self.heap_payload_bytes, maximum_pages),
-            kind: ComponentKind::Allowance(Allowance {
-                location: Location::HOST,
-                bytes: self.heap_payload_bytes,
-                lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
-                source: "GLM synchronous K6 payload heap: maximum serialized projection's four source header bytes (including marker) plus packed local payload/suh/svh Vec capacities; ordinary Rust heap, unmeasured assumption; excludes allocator/metadata overhead and concurrent draft prefetch".into(),
-                assumed: true,
-            }),
-        }])
+/// BF16 KV-B absorption still runs when the other attention weights use K6.
+/// Its source, transposed outputs and one rank's upload slice coexist.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct KvBLoading {
+    pub heap_payload_bytes: u64,
+    pub sync_upload_bytes: u64,
+}
+
+impl KvBLoading {
+    fn include(&mut self, source: u64, uk: u64, uv: u64, ranks: usize) -> Result<()> {
+        ensure!((1..=2).contains(&ranks) && uk > 0 && uv > 0
+            && uk % ranks as u64 == 0 && uv % ranks as u64 == 0,
+            "GLM BF16 KV-B load split");
+        let outputs = sum([uk, uv])?;
+        ensure!(outputs == source, "GLM BF16 KV-B source differs from absorbed outputs");
+        let upload = uk.max(uv) / ranks as u64;
+        let heap = sum([source, outputs, upload])?;
+        self.heap_payload_bytes = self.heap_payload_bytes.max(heap);
+        self.sync_upload_bytes = self.sync_upload_bytes.max(upload);
+        Ok(())
     }
 }
 
@@ -73,9 +76,33 @@ pub struct WeightInventory {
     pub ranks: usize,
     pub owners: Vec<WeightOwner>,
     pub core_loading: CoreLoading,
+    pub kv_b_loading: KvBLoading,
 }
 
 impl WeightInventory {
+    /// These target operations serialize, so their heap peaks do not add.
+    /// Concurrent draft prefetch and embedding filler join as separate charges.
+    pub fn loading_components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("empty GLM load page domain".into()));
+        }
+        let bytes = self.core_loading.heap_payload_bytes.max(self.kv_b_loading.heap_payload_bytes);
+        if bytes == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(vec![Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(bytes, maximum_pages),
+            kind: ComponentKind::Allowance(Allowance {
+                location: Location::HOST,
+                bytes,
+                lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
+                source: "GLM serialized target payload heap subset: max(K6 full four-member source including marker + local packed payload/suh/svh, BF16 KV-B source + full uk/uv outputs + largest single-rank upload slice); ordinary Rust heap, unmeasured assumption; excludes allocator/metadata/thread overhead, other target operations, concurrent draft prefetch and embedding filler".into(),
+                assumed: true,
+            }),
+        }])
+    }
+
     fn add(
         &mut self,
         rank: usize,
@@ -267,6 +294,7 @@ impl WeightInventory {
             ranks,
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
+            kv_b_loading: KvBLoading::default(),
         };
         for layer in 0..layers {
             let root = format!("model.layers.{layer}");
@@ -286,6 +314,22 @@ impl WeightInventory {
             let bf16 = core_attention || native_bf16 && headers.all_bf16(&attention)?;
             let layouts =
                 core.layer_weights(&cfg, layer, ranks, owners.map(|owners| owners[layer]))?;
+            if bf16 {
+                let name = format!("{attn}.kv_b_proj.weight");
+                let header = headers.get(&name)?;
+                let shape = headers.matrix(&name)?;
+                let uk = product(&[cfg.heads as u64, cfg.kv_lora_rank as u64,
+                    cfg.nope_dim(layer) as u64, 2])?;
+                let uv = product(&[cfg.heads as u64, cfg.v_head_dim as u64,
+                    cfg.kv_lora_rank as u64, 2])?;
+                ensure!(header.dtype == DType::Bf16
+                    && product(&[shape[0], shape[1], 2])? == header.byte_length
+                    && shape == [product(&[cfg.heads as u64,
+                        sum([cfg.nope_dim(layer) as u64, cfg.v_head_dim as u64])?])?,
+                        cfg.kv_lora_rank as u64], "GLM BF16 kv_b source geometry");
+                out.kv_b_loading.include(header.byte_length, uk, uv,
+                    if owners.is_some() { 1 } else { ranks })?;
+            }
             for rank in 0..ranks {
                 let prefix = format!("layer.{layer}.operand");
                 for (key, tensor) in [
@@ -566,6 +610,7 @@ impl WeightInventory {
             ranks: plans.len(),
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
+            kv_b_loading: KvBLoading::default(),
         };
         out.extend_native(selection, layers, &plans.iter().collect::<Vec<_>>())?;
         Ok(out)
@@ -587,6 +632,7 @@ impl WeightInventory {
             ranks: self.ranks,
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
+            kv_b_loading: KvBLoading::default(),
         };
         let mut embedding = false;
         for (rank, plan) in plans.iter().enumerate() {

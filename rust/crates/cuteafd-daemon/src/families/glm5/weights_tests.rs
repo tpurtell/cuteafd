@@ -426,6 +426,89 @@ fn synchronous_core_load_reuses_one_pinned_upload_maximum_across_ranks() -> Resu
     Ok(())
 }
 
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn bf16_kv_b_absorption_preserves_bytes_and_reuses_one_upload_slice() -> Result<()> {
+    use cuteafd_ffi::memory_ledger::{AllocationAudit, AllocationEvent, Space};
+    use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::EmbeddingHome};
+    let fixture_dso = Fixture::build()?;
+    let library = fixture_dso.load()?;
+    for device in 0..2 { fixture_dso.configure_memory(&library, device, 1 << 34)?; }
+    let root = tempfile::tempdir_in(fixture_dso.directory())?;
+    let (config, tensors) = fixture::glm5_compact_weights();
+    let tensors = tensors.into_iter().filter(|t| !t.0.ends_with("_scale_inv"))
+        .map(|(name, dtype, shape)| (name, if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape))
+        .collect::<Vec<_>>();
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    fill(root.path())?;
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(root.path(), false, false)?;
+    let cfg = GlmDsaConfig::from_hf(&config)?;
+    let tensor = catalog.tensor("model.layers.0.self_attn.kv_b_proj.weight")?;
+    let mut source = vec![0u8; usize::try_from(tensor.metadata.byte_length)?];
+    std::fs::File::open(root.path().join(&tensor.shard))?
+        .read_exact_at(&mut source, tensor.metadata.byte_offset)?;
+    for (ranks, first) in [(1, 0), (1, 1), (2, 0), (2, 1)] {
+        library.cuda_set_device(first)?;
+        let loader = GlmLoader { library: &library, catalog: &catalog, stream: std::ptr::null_mut(),
+            device: first, peers: (ranks == 2).then_some(crate::shared::peer_split::RankDevice {
+                device: 1 - first, stream: std::ptr::null_mut() }).into_iter().collect(), push: None };
+        let inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers,
+            None, true, false, EmbeddingHome::HostPinned)?;
+        let audit = AllocationAudit::start();
+        let parts = loader.kv_b_bf16(&cfg, 0, ranks)?;
+        let largest = cfg.heads * cfg.kv_lora_rank * cfg.v_head_dim.max(cfg.nope_dim(0)) * 2 / ranks;
+        assert_eq!(inventory.kv_b_loading.sync_upload_bytes, largest as u64);
+        assert_eq!(inventory.kv_b_loading.heap_payload_bytes, source.len() as u64 * 2 + largest as u64);
+        let backing = library.sync_h2d_staging_buffer()?;
+        assert_eq!(backing.bytes, largest);
+        for (rank, (uk, uv)) in parts.iter().enumerate() {
+            let heads = cfg.heads / ranks;
+            let (d, v, c) = (cfg.nope_dim(0), cfg.v_head_dim, cfg.kv_lora_rank);
+            let mut expected_uk = Vec::new();
+            let mut expected_uv = Vec::new();
+            for h in rank * heads..(rank + 1) * heads {
+                for col in 0..c { for row in 0..d {
+                    let at = ((h * (d + v) + row) * c + col) * 2;
+                    expected_uk.extend_from_slice(&source[at..at + 2]);
+                } }
+                let at = (h * (d + v) + d) * c * 2;
+                expected_uv.extend_from_slice(&source[at..at + v * c * 2]);
+            }
+            let actual = |owner: &DeviceAllocation<'_>| -> Result<Vec<u8>> {
+                let mut bytes = vec![0u8; owner.buffer.bytes];
+                crate::shared::peer_split::on_device(&library, owner.buffer.device_id,
+                    || library.copy_d2h(&mut bytes, owner.buffer))?;
+                Ok(bytes)
+            };
+            assert_eq!(actual(uk)?, expected_uk);
+            assert_eq!(actual(uv)?, expected_uv);
+        }
+        // Repeat the real load before release: the single upload backing must be reused.
+        drop(loader.kv_b_bf16(&cfg, 0, ranks)?);
+        assert_eq!(library.sync_h2d_staging_buffer()?.ptr, backing.ptr);
+        assert_eq!(library.release_sync_h2d_staging()?, largest);
+        let (mut live, mut peak) = (None, 0);
+        for event in audit.events() {
+            let record = match event { AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) => r };
+            if record.key.space != Space::Pinned { continue; }
+            assert_eq!(record.key.scope, "staging/sync-h2d");
+            match event {
+                AllocationEvent::Allocated(record) => {
+                    assert!(live.replace((record.address, record.bytes)).is_none());
+                    peak = peak.max(record.bytes);
+                }
+                AllocationEvent::Freed(record) => assert_eq!(live.take(), Some((record.address, record.bytes))),
+            }
+        }
+        assert!(live.is_none());
+        assert_eq!(peak, largest);
+        eprintln!("BF16 KV-B subset: ranks={ranks}, first={first}, pinned_peak={peak} B; source/output/slice payload allowance={} B (unmeasured ordinary heap)",
+            inventory.kv_b_loading.heap_payload_bytes);
+    }
+    Ok(())
+}
+
 fn vocabulary_manifest() -> serde_json::Value {
     use serde_json::json;
     let pointer = |name, dtype, shape, role| json!({"name":name,"dtype":dtype,"shape":shape,"role":role});

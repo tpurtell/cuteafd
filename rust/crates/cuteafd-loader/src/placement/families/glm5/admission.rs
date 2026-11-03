@@ -518,7 +518,7 @@ impl Recipe for GlmRecipe<'_> {
                 return Err(invalid("weight rank count differs from contract"));
             }
             let mut components = case.value.components(self.maximum_pages)?;
-            components.extend(case.value.core_loading.components(self.maximum_pages)?);
+            components.extend(case.value.loading_components(self.maximum_pages)?);
             domains.append(&mut contract, &case.when, components)?;
         }
         for case in &self.graphs {

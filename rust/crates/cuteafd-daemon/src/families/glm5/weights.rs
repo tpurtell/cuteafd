@@ -702,8 +702,11 @@ impl<'a> GlmLoader<'a> {
             }
         });
         let part = |bytes: &[u8], rank: usize| bytes[rank * bytes.len() / ranks..(rank + 1) * bytes.len() / ranks].to_vec();
-        (0..ranks).map(|rank| self.on_rank(rank, |_| Ok((self.upload(&part(&uk, rank))?, self.upload(&part(&uv, rank))?))))
-            .collect()
+        (0..ranks).map(|rank| self.on_rank(rank, |_| {
+            let uk = self.upload(&part(&uk, rank))?;
+            let uv = self.upload(&part(&uv, rank))?;
+            Ok((uk, uv))
+        })).collect()
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {

@@ -213,7 +213,7 @@ fn core_load_payload_peak_adds_full_source_to_one_local_pack_not_ranks_or_layers
             assert_eq!(inventory.core_loading.heap_payload_bytes, (source + packed) as u64);
             assert_eq!(inventory.core_loading.sync_upload_bytes,
                 (512 * 256 * 6 / 8 / ranks) as u64);
-            let components = inventory.core_loading.components(16).unwrap();
+            let components = inventory.loading_components(16).unwrap();
             assert_eq!(components.len(), 1);
             let ComponentKind::Allowance(allowance) = &components[0].kind else { panic!("heap is not exact") };
             assert_eq!(allowance.location, Location::HOST);
@@ -222,7 +222,8 @@ fn core_load_payload_peak_adds_full_source_to_one_local_pack_not_ranks_or_layers
             assert!(allowance.source.contains("unmeasured"));
             assert!(allowance.source.contains("excludes allocator/metadata"));
             assert!(allowance.source.contains("concurrent draft prefetch"));
-            assert_eq!(allowance.bytes, (source + packed) as u64);
+            assert_eq!(allowance.bytes, ((source + packed) as u64)
+                .max(inventory.kv_b_loading.heap_payload_bytes));
             assert_eq!(components[0].bytes.at(16).unwrap(), allowance.bytes);
             // Pinned upload is a shared maximum fact, not another allocation
             // emitted by each rank or by this target-only subset.
@@ -233,8 +234,9 @@ fn core_load_payload_peak_adds_full_source_to_one_local_pack_not_ranks_or_layers
     let (config, tensors) = testing::glm5_compact_weights();
     let plain = ordinary(&config, &tensors, 2, None, false, EmbeddingHome::Device(0));
     assert_eq!(plain.core_loading, CoreLoading::default());
-    assert!(plain.core_loading.components(16).unwrap().is_empty());
-    assert!(plain.core_loading.components(0).is_err());
+    assert_eq!(plain.kv_b_loading, KvBLoading::default());
+    assert!(plain.loading_components(16).unwrap().is_empty());
+    assert!(plain.loading_components(0).is_err());
 }
 
 #[test]
@@ -245,12 +247,61 @@ fn unsplit_k6_head_can_set_both_heap_and_single_upload_maxima() {
         let packed = 2048 * 256 * 6 / 8 + (2048 + 256) * 2;
         assert_eq!(inventory.core_loading.heap_payload_bytes, packed * 2 + 4);
         assert_eq!(inventory.core_loading.sync_upload_bytes, 2048 * 256 * 6 / 8);
-        assert_eq!(inventory.core_loading.components(8).unwrap().len(), 1);
+        assert_eq!(inventory.loading_components(8).unwrap().len(), 1);
     }
     let (config, tensors) = core_checkpoint(2048, false);
     let body = ordinary(&config, &tensors, 2, None, false, EmbeddingHome::Device(0));
     assert_eq!(body.core_loading.sync_upload_bytes, 512 * 256 * 6 / 8 / 2);
     assert!(body.core_loading.heap_payload_bytes < (2048 * 256 * 6 / 8) * 2);
+}
+
+#[test]
+fn bf16_kv_b_load_adds_source_outputs_and_one_slice_then_maxes_serial_core() {
+    let source = 2 * (64 + 128) * 128 * 2;
+    let largest = 2 * 128 * 128 * 2;
+    for core in [false, true] {
+        let (config, tensors) = if core { core_checkpoint(256, true) } else {
+            let (config, tensors) = testing::glm5_compact_weights();
+            (config, tensors.into_iter().filter(|t| !t.0.ends_with("_scale_inv"))
+                .map(|(name, dtype, shape)| (name,
+                    if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape)).collect())
+        };
+        for (ranks, owners, parts) in [(1, None, 1), (2, None, 2),
+            (2, Some([0, 1]), 1), (2, Some([1, 0]), 1)] {
+            let inventory = ordinary(&config, &tensors, ranks,
+                owners.as_ref().map(|o| o.as_slice()), true, EmbeddingHome::HostPinned);
+            assert_eq!(inventory.kv_b_loading.heap_payload_bytes, source * 2 + largest / parts);
+            assert_eq!(inventory.kv_b_loading.sync_upload_bytes, largest / parts);
+            let components = inventory.loading_components(16).unwrap();
+            assert_eq!(components.len(), 1);
+            let ComponentKind::Allowance(allowance) = &components[0].kind else { panic!("heap is not exact") };
+            assert_eq!(allowance.bytes, inventory.core_loading.heap_payload_bytes
+                .max(source * 2 + largest / parts));
+            assert!(allowance.assumed && allowance.source.contains("largest single-rank upload slice")
+                && allowance.source.contains("other target operations"));
+            assert_eq!(allowance.location, Location::HOST);
+            assert_eq!(allowance.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+        }
+    }
+}
+
+#[test]
+fn bf16_kv_b_loading_refuses_bad_geometry_and_overflow_without_partial_update() {
+    for (source, uk, uv, ranks) in [(2, 1, 1, 0), (2, 1, 1, 3),
+        (2, 1, 1, 2), (1, 0, 1, 1), (2, 2, 2, 1),
+        (u64::MAX, u64::MAX - 1, 1, 1), (u64::MAX, u64::MAX, 1, 1)] {
+        let mut loading = KvBLoading::default();
+        assert!(loading.include(source, uk, uv, ranks).is_err());
+        assert_eq!(loading, KvBLoading::default());
+    }
+    let (config, mut tensors) = core_checkpoint(256, true);
+    tensors.iter_mut().find(|t| t.0 == "model.layers.0.self_attn.kv_b_proj.weight")
+        .unwrap().2[0] -= 1;
+    let root = tempfile::tempdir().unwrap();
+    write_snapshot(root.path(), &config, &tensors, None);
+    let checkpoint = Checkpoint::open(root.path()).unwrap();
+    assert!(WeightInventory::from_checkpoint(&checkpoint, 2, 2, None,
+        false, false, EmbeddingHome::Device(0)).is_err());
 }
 
 #[test]

@@ -197,6 +197,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
             value: WeightInventory {
                 ranks: 2,
                 core_loading: super::super::weights::CoreLoading::default(),
+                kv_b_loading: super::super::weights::KvBLoading::default(),
                 owners: vec![super::super::weights::WeightOwner {
                     allocation: Allocation::buffer(
                         "glm.weights.embedding",
@@ -371,13 +372,17 @@ fn dflash_prefetch_refuses_missing_empty_nonfile_and_zero_pool_extent() {
 }
 
 #[test]
-fn core_heap_allowance_follows_weight_case_and_adds_concurrent_prefetch() {
+fn serialized_heap_max_follows_weight_case_and_adds_concurrent_prefetch() {
     let cfg = cfg();
     let mut recipe = recipe(&cfg);
     for (index, case) in recipe.weights.iter_mut().enumerate() {
         case.value.core_loading = super::super::weights::CoreLoading {
             heap_payload_bytes: 4096 * (index as u64 + 1),
             sync_upload_bytes: 1024,
+        };
+        case.value.kv_b_loading = super::super::weights::KvBLoading {
+            heap_payload_bytes: 6144,
+            sync_upload_bytes: 512,
         };
     }
     // The current loader reads the whole sparse file, including header and any
@@ -402,7 +407,7 @@ fn core_heap_allowance_follows_weight_case_and_adds_concurrent_prefetch() {
         let phases = planner::evaluate(&facts, &budgets).unwrap();
         let opaque = |phase| phases.iter().find(|p| p.budget == "physical.2" && p.phase == phase)
             .unwrap().opaque;
-        assert_eq!(opaque(Phase::Load), file_bytes + 4096 * (embedding as u64 + 1));
+        assert_eq!(opaque(Phase::Load), file_bytes + (4096 * (embedding as u64 + 1)).max(6144));
         assert_eq!(opaque(Phase::DraftLoad), file_bytes);
         assert!(facts.allowances.iter().any(|a| a.bytes == file_bytes
             && a.source.contains("metadata.len()") && a.source.contains("unmeasured")
