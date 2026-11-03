@@ -242,6 +242,7 @@ fn actual_exchange_owners_match_independent_contract() -> Result<()> {
             head: super::super::super::weights::GlmHead::Bf16(DeviceAllocation::new(
                 &library, 256,
             )?),
+            rope_alpha: None,
         };
         let (embedding, ()) = TokenEmbedding::load(
             &library,
@@ -435,6 +436,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             head: super::super::super::weights::GlmHead::Bf16(DeviceAllocation::new(
                 &library, 256,
             )?),
+            rope_alpha: None,
         };
         let (embedding, ()) = TokenEmbedding::load(
             &library,

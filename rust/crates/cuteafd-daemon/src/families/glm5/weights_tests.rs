@@ -304,7 +304,7 @@ fn retained_weight_owners_match_actual_loader_and_physical_embedding() -> Result
             if host { EmbedPlacement::Host } else { EmbedPlacement::Gpu },
             || loader.model(&cfg, cfg.layers, owners.as_ref().map(|o| o.as_slice()), native_shared))?;
         if ranks == 2 {
-            loader.peer_routers(&mut peers[0], 1..2)?;
+            loader.peer_routers(&cfg, &mut peers[0], 1..2)?;
             inventory.add_peer_routers(&[1])?;
         }
         let plan = retained_weight_plan(&inventory)?;
@@ -438,7 +438,7 @@ fn native_vocabulary_retained_owner_sharing_and_load_history_reconcile() -> Resu
             vocab: 256, hidden: 128, snapshot: None, tensor_name: records[0].tensor.clone() };
         let embedding = TokenEmbedding::row_fp8(&library, source(), owner.clone())?;
         let mut model = GlmWeights { layers: vec![], norm: DeviceAllocation::new(&library, 256)?,
-            head: GlmHead::RowFp8(owner.clone()) };
+            head: GlmHead::RowFp8(owner.clone()), rope_alpha: None };
         let peers = (1..ranks).map(|_| Vec::new()).collect::<Vec<_>>();
         let plans = (0..ranks).map(|rank| DensePlan::for_rank(&records, ranks, rank)).collect::<std::result::Result<Vec<_>, _>>()?;
         let inventory = WeightInventory::from_native(&selection, 1, &plans)?;
