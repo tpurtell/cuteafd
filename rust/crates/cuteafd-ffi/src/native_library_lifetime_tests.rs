@@ -123,7 +123,13 @@ fn peer_copy_trace_resolves_live_owners_and_preserves_copy_modes() -> Result<()>
             assert_eq!(&landed[32..96], &input[17..81]);
             assert_eq!(&landed[128..133], &[0; 5], "one advance must not run the next copy");
         }
-        fixture.drain(&library)?;
+        if mode == 0 {
+            fixture.drain(&library)?;
+            library.copy_d2h(&mut landed, destination)?;
+            assert_eq!(&landed[32..96], &[0; 64], "default-stream drain must not complete stream 1");
+        }
+        // SAFETY: all copies use this synthetic stream and retain their owners.
+        unsafe { library.cuda_stream_synchronize(stream)?; }
         library.copy_d2h(&mut landed, destination)?;
         assert_eq!(&landed[32..96], &input[17..81]);
         for row in 0..3 { assert_eq!(&landed[128 + row * 11..133 + row * 11], &input[128 + row * 9..133 + row * 9]); }
