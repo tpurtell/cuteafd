@@ -8,6 +8,47 @@ use std::sync::atomic::AtomicUsize;
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyKind {
+    Initialize = 0,
+    SmLinear = 1,
+    SmRows = 2,
+    DmaLinear = 3,
+    DmaRows = 4,
+}
+
+/// Submission metadata resolved from actual fake-device allocation owners.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyRecord {
+    pub kind: CopyKind,
+    pub device: i32,
+    pub destination_device: i32,
+    pub source_device: i32,
+    pub destination: u64,
+    pub source: u64,
+    pub destination_backing: u64,
+    pub source_backing: u64,
+    pub destination_offset: u64,
+    pub source_offset: u64,
+    pub bytes: u64,
+    pub width: u64,
+    pub rows: u64,
+    pub destination_pitch: u64,
+    pub source_pitch: u64,
+    pub stream: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct RawCopyRecord {
+    kind: u32,
+    device: i32,
+    destination_device: i32,
+    source_device: i32,
+    geometry: [u64; 12],
+}
+
 pub struct Fixture {
     module: PathBuf,
     events: PathBuf,
@@ -85,7 +126,7 @@ impl Fixture {
             .status()?;
         anyhow::ensure!(status.success(), "generating CPU fixture MXFP4 layouts failed");
         let status = Command::new("cc")
-            .args(["-c", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror"])
+            .args(["-c", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror", "-pthread"])
             .arg(fixtures.join("native_library_lifetime.c"))
             .arg("-I")
             .arg(&directory)
@@ -104,7 +145,7 @@ impl Fixture {
             .status()?;
         anyhow::ensure!(status.success(), "building CPU fixture kernels failed");
         let status = Command::new("c++")
-            .args(["-shared", "-fPIC"])
+            .args(["-shared", "-fPIC", "-pthread"])
             .arg(&c_object)
             .arg(&cc_object)
             .arg("-o")
@@ -223,6 +264,47 @@ impl Fixture {
             configure();
         }
         Ok(())
+    }
+
+    /// Enable one allocation-aware trace for both SM and DMA submissions.
+    /// Enabling resets only the trace, not queued operations or their lifetimes.
+    pub fn record_peer_copies(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this control export belongs only to the CPU fixture built above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> = library.lib.get(b"fixture_record_peer_copies")?;
+            configure();
+        }
+        Ok(())
+    }
+
+    pub fn peer_copy_records(&self, library: &NativeLibrary) -> Result<Vec<CopyRecord>> {
+        // SAFETY: both exports belong to this fixture; readback copies one repr(C)
+        // record synchronously. Call after submission threads have joined.
+        unsafe {
+            let count: Symbol<unsafe extern "C" fn() -> usize> =
+                library.lib.get(b"fixture_peer_copy_record_count")?;
+            let get: Symbol<unsafe extern "C" fn(usize, *mut RawCopyRecord) -> i32> =
+                library.lib.get(b"fixture_peer_copy_record")?;
+            (0..count()).map(|index| {
+                let mut raw = RawCopyRecord::default();
+                anyhow::ensure!(get(index, &mut raw) == 0, "fixture copy record {index} is missing");
+                let kind = match raw.kind {
+                    0 => CopyKind::Initialize,
+                    1 => CopyKind::SmLinear,
+                    2 => CopyKind::SmRows,
+                    3 => CopyKind::DmaLinear,
+                    4 => CopyKind::DmaRows,
+                    other => anyhow::bail!("unknown fixture copy kind {other}"),
+                };
+                let [destination, source, destination_backing, source_backing,
+                    destination_offset, source_offset, bytes, width, rows,
+                    destination_pitch, source_pitch, stream] = raw.geometry;
+                Ok(CopyRecord { kind, device: raw.device, destination_device: raw.destination_device,
+                    source_device: raw.source_device, destination, source, destination_backing,
+                    source_backing, destination_offset, source_offset, bytes, width, rows,
+                    destination_pitch, source_pitch, stream })
+            }).collect()
+        }
     }
 
     /// Queue copies and deterministic route-dependent fake expert reads, rather

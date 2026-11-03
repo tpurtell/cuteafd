@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include "../../../../../native/shared/cuda/expert_pack_layout.h"
 #include "cuteafd_mxfp4_layouts.h"
 
@@ -265,6 +266,112 @@ int cuteafd_free_host_buffer(struct host_buffer *buffer) {
 
 struct device_buffer { void *ptr; size_t bytes; int device_id; uint64_t flags; };
 
+/* Raw SM-copy exports carry no device IDs. Resolve their views against live
+ * owners, never the caller's view metadata, under the same lock as the trace. */
+struct live_allocation {
+    void *base;
+    size_t bytes;
+    int device;
+    struct live_allocation *next;
+};
+static struct live_allocation *live_allocations;
+static pthread_mutex_t copy_lock = PTHREAD_MUTEX_INITIALIZER;
+struct fixture_copy_record {
+    uint32_t kind;
+    int32_t device, destination_device, source_device;
+    uint64_t destination, source, destination_backing, source_backing;
+    uint64_t destination_offset, source_offset, bytes, width, rows;
+    uint64_t destination_pitch, source_pitch, stream;
+};
+/* Kinds: initialize, SM linear, SM rows, DMA linear, DMA rows. */
+static struct fixture_copy_record copy_records[65536];
+static size_t copy_record_count;
+static int record_copies;
+void fixture_record_peer_copies(void) {
+    pthread_mutex_lock(&copy_lock);
+    record_copies = 1;
+    copy_record_count = 0;
+    pthread_mutex_unlock(&copy_lock);
+}
+size_t fixture_peer_copy_record_count(void) {
+    pthread_mutex_lock(&copy_lock);
+    size_t count = copy_record_count;
+    pthread_mutex_unlock(&copy_lock);
+    return count;
+}
+int fixture_peer_copy_record(size_t index, struct fixture_copy_record *out) {
+    pthread_mutex_lock(&copy_lock);
+    int status = !out || index >= copy_record_count;
+    if (!status) *out = copy_records[index];
+    pthread_mutex_unlock(&copy_lock);
+    return status;
+}
+static int track_allocation(struct device_buffer buffer) {
+    struct live_allocation *entry = malloc(sizeof(*entry));
+    if (!entry) return 1;
+    *entry = (struct live_allocation){buffer.ptr, buffer.bytes, buffer.device_id, NULL};
+    pthread_mutex_lock(&copy_lock);
+    entry->next = live_allocations;
+    live_allocations = entry;
+    pthread_mutex_unlock(&copy_lock);
+    return 0;
+}
+static void untrack_allocation(void *base) {
+    pthread_mutex_lock(&copy_lock);
+    for (struct live_allocation **at = &live_allocations; *at; at = &(*at)->next) {
+        if ((*at)->base == base) {
+            struct live_allocation *entry = *at;
+            *at = entry->next;
+            free(entry);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&copy_lock);
+}
+static struct live_allocation *find_allocation(const void *ptr, size_t bytes) {
+    uintptr_t address = (uintptr_t)ptr;
+    for (struct live_allocation *entry = live_allocations; entry; entry = entry->next) {
+        uintptr_t base = (uintptr_t)entry->base;
+        if (address >= base && address - base <= entry->bytes &&
+                bytes <= entry->bytes - (address - base)) return entry;
+    }
+    return NULL;
+}
+static int record_copy(uint32_t kind, void *destination, const void *source,
+        size_t width, size_t rows, size_t destination_pitch, size_t source_pitch,
+        void *stream, int strict) {
+    pthread_mutex_lock(&copy_lock);
+    if (!strict && !record_copies) { pthread_mutex_unlock(&copy_lock); return 0; }
+    if (!width || !rows || destination_pitch < width || source_pitch < width ||
+            rows > SIZE_MAX / width || (rows > 1 &&
+            (destination_pitch > (SIZE_MAX - width) / (rows - 1) ||
+             source_pitch > (SIZE_MAX - width) / (rows - 1)))) {
+        pthread_mutex_unlock(&copy_lock);
+        return 1;
+    }
+    size_t dst_bytes = (rows - 1) * destination_pitch + width;
+    size_t src_bytes = (rows - 1) * source_pitch + width;
+    struct live_allocation *dst = find_allocation(destination, dst_bytes);
+    struct live_allocation *src = find_allocation(source, src_bytes);
+    int status = !dst || !src || dst->device != current_device ||
+        (record_copies && copy_record_count == 65536);
+    if (!status && record_copies) {
+        copy_records[copy_record_count++] = (struct fixture_copy_record){
+            .kind = kind, .device = current_device,
+            .destination_device = dst->device, .source_device = src->device,
+            .destination = (uintptr_t)destination, .source = (uintptr_t)source,
+            .destination_backing = (uintptr_t)dst->base, .source_backing = (uintptr_t)src->base,
+            .destination_offset = (uintptr_t)destination - (uintptr_t)dst->base,
+            .source_offset = (uintptr_t)source - (uintptr_t)src->base,
+            .bytes = width * rows, .width = width, .rows = rows,
+            .destination_pitch = destination_pitch, .source_pitch = source_pitch,
+            .stream = (uintptr_t)stream
+        };
+    }
+    pthread_mutex_unlock(&copy_lock);
+    return status;
+}
+
 int cuteafd_cuda_host_buffer_device_alias(struct host_buffer host, struct device_buffer *out) {
     if (!host.ptr || !host.bytes || !out) return 1;
     *out = (struct device_buffer){ .ptr = host.ptr, .bytes = host.bytes,
@@ -288,6 +395,7 @@ int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
     out->bytes = bytes;
     out->device_id = current_device;
     out->flags = 1;
+    if (track_allocation(*out)) { free(out->ptr); memset(out, 0, sizeof(*out)); return 1; }
     memory_used[current_device] += bytes;
     event('D');
     return 0;
@@ -296,6 +404,7 @@ int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
 int cuteafd_free_device_buffer(struct device_buffer *buffer) {
     event('d');
     if (buffer->flags == 1) memory_used[buffer->device_id] -= buffer->bytes;
+    untrack_allocation(buffer->ptr);
     free(buffer->ptr);
     memset(buffer, 0, sizeof(*buffer));
     return 0;
@@ -308,6 +417,7 @@ int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out)
     out->bytes = bytes;
     out->device_id = current_device;
     out->flags = 2;
+    if (track_allocation(*out)) { free(out->ptr); memset(out, 0, sizeof(*out)); return 1; }
     event('D');
     return 0;
 }
@@ -406,6 +516,58 @@ void fixture_advance_queued_experts(size_t operations) {
 }
 static struct upload pending_uploads[65536];
 static size_t pending_count;
+
+int cuteafd_peer_copy_initialize(void) {
+    pthread_mutex_lock(&copy_lock);
+    int status = record_copies && copy_record_count == 65536;
+    if (!status && record_copies) {
+        copy_records[copy_record_count++] = (struct fixture_copy_record){
+            .device = current_device, .destination_device = -1, .source_device = -1
+        };
+    }
+    pthread_mutex_unlock(&copy_lock);
+    return status;
+}
+static int peer_extent(uint64_t width, uint64_t rows, uint64_t pitch, size_t *bytes) {
+    if (!width || width > (1ull << 40) || !rows || rows > 4096 || pitch < width ||
+            (rows > 1 && pitch > ((1ull << 40) - width) / (rows - 1))) return 1;
+    *bytes = (size_t)((rows - 1) * pitch + width);
+    return 0;
+}
+static int peer_copy(uint32_t kind, void *destination, const void *source,
+        uint64_t width, uint64_t rows, uint64_t destination_pitch,
+        uint64_t source_pitch, void *stream) {
+    size_t dst_bytes, src_bytes;
+    uintptr_t dst = (uintptr_t)destination, src = (uintptr_t)source;
+    if (!stream || !dst || !src ||
+            peer_extent(width, rows, destination_pitch, &dst_bytes) ||
+            peer_extent(width, rows, source_pitch, &src_bytes) ||
+            dst > UINTPTR_MAX - dst_bytes || src > UINTPTR_MAX - src_bytes ||
+            !(dst + dst_bytes <= src || src + src_bytes <= dst)) return 1;
+    if (queued_experts && queued_count == 65536) return 1;
+    if (!queued_experts && !immediate_copies && rows > 65536 - pending_count) return 1;
+    if (record_copy(kind, destination, source, width, rows,
+            destination_pitch, source_pitch, stream, 1)) return 1;
+    if (queued_experts) return enqueue((struct queued_op){ .stream = stream,
+        .dst = destination, .src = source, .bytes = width, .rows = rows,
+        .dst_pitch = destination_pitch, .src_pitch = source_pitch });
+    for (size_t row = 0; row < rows; ++row) {
+        void *to = (char *)destination + row * destination_pitch;
+        const void *from = (const char *)source + row * source_pitch;
+        if (immediate_copies) memcpy(to, from, width);
+        else pending_uploads[pending_count++] = (struct upload){to, from, width};
+    }
+    return 0;
+}
+int cuteafd_peer_copy_async(void *destination, const void *source, uint64_t bytes, void *stream) {
+    return peer_copy(1, destination, source, bytes, 1, bytes, bytes, stream);
+}
+int cuteafd_peer_copy_rows_async(void *destination, const void *source,
+        uint64_t width, uint64_t rows, uint64_t destination_pitch,
+        uint64_t source_pitch, void *stream) {
+    return peer_copy(2, destination, source, width, rows, destination_pitch, source_pitch, stream);
+}
+
 static void finish_uploads(struct upload_event *upload) {
     for (size_t i = 0; i < upload->count; ++i) {
         struct upload *copy = &upload->copies[i];
@@ -463,6 +625,7 @@ int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
 int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src,
                            size_t bytes, void *stream) {
     if (bytes > dst.bytes || bytes > src.bytes) return 1;
+    if (record_copy(3, dst.ptr, src.ptr, bytes, 1, bytes, bytes, stream, 0)) return 1;
     if (!immediate_copies) return cuteafd_copy_h2d_async(dst, src.ptr, bytes, stream);
     if (dst.device_id != current_device) return 1;
     memcpy(dst.ptr, src.ptr, bytes);
@@ -673,6 +836,7 @@ int cuteafd_cuda_nvfp4_swizzle_scale_async(struct device_buffer src, struct devi
 int cuteafd_copy_d2d_2d_async(struct device_buffer dst, size_t dst_pitch,
                             struct device_buffer src, size_t src_pitch,
                             size_t width, size_t rows, void *stream) {
+    if (record_copy(4, dst.ptr, src.ptr, width, rows, dst_pitch, src_pitch, stream, 0)) return 1;
     if (queued_experts) return enqueue((struct queued_op){ .stream = stream,
         .dst = dst.ptr, .src = src.ptr, .bytes = width,
         .dst_pitch = dst_pitch, .src_pitch = src_pitch, .rows = rows });
