@@ -44,11 +44,23 @@ def test_without_manifest_glm_scope_is_unchanged():
     assert scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'glm=4'
 
 
-@pytest.mark.parametrize('family', ['glm5_flash', 'deepseek_v4', 'mimo_v2', 'qwen4', 'step5'])
-def test_manifest_on_other_family_fails_closed(family):
-    with pytest.raises(ValueError, match='EXLR8_MANIFEST is supported only for glm5'):
-        aot.family_scopes([dict(family=family, name='x', config=None)],
-                          lambda _: dict(EXLR8_MANIFEST='up1', SPARK_COUNT='4'))
+def test_flash_manifest_derives_native_and_family_programs_without_routed_packages():
+    family, scopes = aot.config_scopes(dict(EXLR8, FAMILY='glm5_flash',
+        MODEL_ID='kindlingai/glm-5.3-flash-exlr8-k2-k3-k4', EXLR8_MANIFEST='k4', SPARK_COUNT='1'))
+    assert family == 'glm5_flash'
+    assert scopes['CUTEAFD_WIP_GLMF_AOT'] == 'ON'
+    assert scopes['CUTEAFD_WIP_EXLR8_AOT'] == 'ON'
+    for key in ('CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES', 'CUTEAFD_WIP_EXPERT_FAMILIES',
+                'CUTEAFD_WIP_GENERIC_SPARK_COUNTS', 'CUTEAFD_WIP_SPARK_TP_ROLES'):
+        assert scopes[key] == ''
+
+
+def test_flash_wip_dry_run_derives_native_exports(tmp_path):
+    path = config_file(tmp_path, 'glm5_flash', 'glm-5.3-flash-exlr8-k2-k3-k4', 1)
+    path.write_text(path.read_text() + 'EXLR8_MANIFEST=k4\n')
+    output = dry_run(tmp_path, path)
+    assert 'CUTEAFD_WIP_GLMF_AOT=ON' in output
+    assert 'CUTEAFD_WIP_EXLR8_AOT=ON' in output
 
 
 def test_card_union_keeps_other_glm_cards_packages():

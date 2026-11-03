@@ -86,6 +86,35 @@ def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, 
             assert f"--exlr8-prefill-activations {activations}" in line
 
 
+@pytest.mark.parametrize("wip", [False, True])
+def test_flash_native_published_manifest_reaches_plan_coordinator_and_workers(tmp_path, wip):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    keys = ("EXLR8_MANIFEST=k4\nEXLR8_PREFILL_ACTIVATIONS=a16\nSPARK_COUNT=1\nRTX_GPUS=1\n"
+            "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    result = _family_launch_result(tmp_path, config, "test/flash-exlr8", keys,
+                                  extra_args=("--wip", "native-test") if wip else ())
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plans = [line for line in lines if "cuteafd plan" in line]
+    coordinators = [line for line in lines if "cuteafd serve-glmf --snapshot" in line]
+    workers = [line for line in lines if "cuteafd expertd-native" in line]
+    assert plans and coordinators and workers, result.stderr
+    for line in plans + coordinators + workers:
+        assert "--exlr8-manifest k4" in line
+        assert "--exlr8-prefill-activations a16" in line
+
+
+@pytest.mark.parametrize("manifest", ["../k4", "k4.json", "k4/other", "k4;false", "k4 space"])
+def test_native_manifest_rejects_paths_and_shell_syntax(tmp_path, manifest):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/exlr8",
+        f"EXLR8_MANIFEST={manifest}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    assert result.returncode != 0
+    assert "EXLR8_MANIFEST must be a published name, not a path" in result.stderr
+
+
 @pytest.mark.parametrize("gpus", [1, 2])
 @pytest.mark.parametrize("onboard", [None, "auto", "0", "1"])
 def test_exlr8_onboarding_reaches_shared_admission_without_zero_override(tmp_path, gpus, onboard):
