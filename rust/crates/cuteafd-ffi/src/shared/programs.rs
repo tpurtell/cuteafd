@@ -392,13 +392,18 @@ fn validate_glm_stage_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Re
 
 fn validate_exlr8_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<()> {
     super::exlr8::validate_entry(spec, entry)?;
-    let expected: &[(&str, &str)] = match spec.name.as_str() {
-        "exlr8_a16_grouped" | "exlr8_a8_grouped" | "exlr8_a16_grouped64" => &[
+    let (_, kind) = super::exlr8::KernelFamily::of(spec)?;
+    validate_exlr8_scalars(kind, entry)
+}
+
+fn validate_exlr8_scalars(kind: super::exlr8::KernelKind, entry: &serde_json::Value) -> Result<()> {
+    use super::exlr8::KernelKind::*;
+    let expected: &[(&str, &str)] = match kind {
+        GroupedA16 | GroupedA8 | GroupedDecode => &[
             ("rows", "int32"), ("cta_limit", "int32"), ("unit_limit", "int32"), ("l2_bytes", "int32"),
         ],
-        "exlr8_a16_serving" | "exlr8_shared_a16_serving" => &[("rows", "int32"), ("cta_limit", "int32")],
-        "exlr8_group" | "exlr8_shared_group" | "exlr8_grouped_group" => &[("rows", "int32"), ("cta_limit", "int32")],
-        _ => &[("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")],
+        Routed | Shared | Group | SharedGroup | GroupedGroup => &[("rows", "int32"), ("cta_limit", "int32")],
+        Decode => &[("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")],
     };
     let scalars = entry["scalars"].as_array().context("EXLR8 scalar ABI missing")?;
     ensure!(scalars.len() == expected.len() && scalars.iter().zip(expected).all(
@@ -472,32 +477,89 @@ mod tests {
         )).unwrap();
         let entries = manifest["programs"].as_array().unwrap();
         assert_eq!(entries.len(), 3);
-        for entry in entries {
-            let spec = ProgramSpec {
-                name: entry["name"].as_str().unwrap().to_owned(),
-                pointers: entry["pointers"].as_array().unwrap().iter()
-                    .map(|p| p["name"].as_str().unwrap().to_owned()).collect(),
-                scalar_kinds: b"iiii".to_vec(),
-                scratch: entry["scratch_bytes_at_capacity"].as_object().unwrap().iter()
-                    .map(|(name, bytes)| (name.clone(), bytes.as_u64().unwrap())).collect(),
-                capacity_rows: entry["capacity_rows"].as_u64().unwrap().try_into().unwrap(),
-                geometry: entry["geometry"].clone(),
-            };
-            validate_exlr8_entry(&spec, entry).unwrap();
-            for defect in ["missing", "renamed", "wrong_type", "reordered", "extra"] {
-                let mut broken = entry.clone();
-                let scalars = broken["scalars"].as_array_mut().unwrap();
-                match defect {
-                    "missing" => { scalars.pop(); }
-                    "renamed" => scalars[3]["name"] = "l2_size".into(),
-                    "wrong_type" => scalars[3]["type"] = "int64".into(),
-                    "reordered" => scalars.swap(2, 3),
-                    "extra" => scalars.push(serde_json::json!({"name": "extra", "type": "int32"})),
-                    _ => unreachable!(),
+        use super::super::exlr8::KernelFamily;
+        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
+            for exported in entries {
+                let mut entry = exported.clone();
+                if family == KernelFamily::GlmFlash {
+                    entry["name"] = entry["name"].as_str().unwrap().replacen("exlr8_", "exlr8_glmf_", 1).into();
+                    entry["geometry"]["hidden"] = 4096.into();
+                    entry["geometry"]["fc1_splits"] = 4.into();
+                    entry["geometry"]["swiglu_limit"] = 10.0.into();
+                    for pointer in entry["pointers"].as_array_mut().unwrap() {
+                        pointer["shape"] = pointer["shape"].as_str().unwrap()
+                            .replace("6144", "4096").replace(",6,", ",4,").into();
+                    }
+                    for name in ["fc1", "fc2"] {
+                        entry["scratch_bytes_at_capacity"][name] =
+                            (entry["scratch_bytes_at_capacity"][name].as_u64().unwrap() / 3 * 2).into();
+                    }
                 }
-                let error = validate_exlr8_entry(&spec, &broken).unwrap_err();
-                assert!(error.to_string().contains("EXLR8 scalar names or types disagree with ABI"),
-                    "{} {defect}: {error}", spec.name);
+                let spec = ProgramSpec {
+                    name: entry["name"].as_str().unwrap().to_owned(),
+                    pointers: entry["pointers"].as_array().unwrap().iter()
+                        .map(|p| p["name"].as_str().unwrap().to_owned()).collect(),
+                    scalar_kinds: b"iiii".to_vec(),
+                    scratch: entry["scratch_bytes_at_capacity"].as_object().unwrap().iter()
+                        .map(|(name, bytes)| (name.clone(), bytes.as_u64().unwrap())).collect(),
+                    capacity_rows: entry["capacity_rows"].as_u64().unwrap().try_into().unwrap(),
+                    geometry: entry["geometry"].clone(),
+                };
+                validate_exlr8_entry(&spec, &entry).unwrap();
+                for defect in ["missing", "renamed", "wrong_type", "reordered", "extra"] {
+                    let mut broken = entry.clone();
+                    let scalars = broken["scalars"].as_array_mut().unwrap();
+                    match defect {
+                        "missing" => { scalars.pop(); }
+                        "renamed" => scalars[3]["name"] = "l2_size".into(),
+                        "wrong_type" => scalars[3]["type"] = "int64".into(),
+                        "reordered" => scalars.swap(2, 3),
+                        "extra" => scalars.push(serde_json::json!({"name": "extra", "type": "int32"})),
+                        _ => unreachable!(),
+                    }
+                    let error = validate_exlr8_entry(&spec, &broken).unwrap_err();
+                    assert!(error.to_string().contains("EXLR8 scalar names or types disagree with ABI"),
+                        "{} {defect}: {error}", spec.name);
+                }
+            }
+    }
+    }
+
+    #[test]
+    fn exlr8_scalar_layouts_follow_typed_kind_for_both_families() {
+        use super::super::exlr8::{KernelFamily, KernelKind::*};
+        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
+            for (kind, expected) in [
+                (Decode, vec!["rows", "groups", "cta_limit"]),
+                (Routed, vec!["rows", "cta_limit"]),
+                (Shared, vec!["rows", "cta_limit"]),
+                (Group, vec!["rows", "cta_limit"]),
+                (SharedGroup, vec!["rows", "cta_limit"]),
+                (GroupedGroup, vec!["rows", "cta_limit"]),
+                (GroupedA16, vec!["rows", "cta_limit", "unit_limit", "l2_bytes"]),
+                (GroupedA8, vec!["rows", "cta_limit", "unit_limit", "l2_bytes"]),
+                (GroupedDecode, vec!["rows", "cta_limit", "unit_limit", "l2_bytes"]),
+            ] {
+                let spec = ProgramSpec { name: family.program(kind).into(), pointers: Vec::new(),
+                    scalar_kinds: vec![b'i'; expected.len()], scratch: Default::default(),
+                    capacity_rows: 64, geometry: serde_json::json!({}) };
+                let (_, resolved) = KernelFamily::of(&spec).unwrap();
+                let entry = serde_json::json!({"scalars": expected.iter().map(|name|
+                    serde_json::json!({"name": name, "type": "int32"})).collect::<Vec<_>>()});
+                validate_exlr8_scalars(resolved, &entry).unwrap();
+                for defect in ["missing", "renamed", "wrong_type", "reordered", "extra"] {
+                    let mut broken = entry.clone();
+                    let scalars = broken["scalars"].as_array_mut().unwrap();
+                    match defect {
+                        "missing" => { scalars.pop(); }
+                        "renamed" => scalars[0]["name"] = "unknown".into(),
+                        "wrong_type" => scalars[0]["type"] = "int64".into(),
+                        "reordered" => scalars.swap(0, 1),
+                        "extra" => scalars.push(serde_json::json!({"name":"extra", "type":"int32"})),
+                        _ => unreachable!(),
+                    }
+                    assert!(validate_exlr8_scalars(resolved, &broken).is_err(), "{} {defect}", spec.name);
+                }
             }
         }
     }
