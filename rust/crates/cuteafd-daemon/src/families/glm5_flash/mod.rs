@@ -2102,7 +2102,7 @@ impl Opened {
             let native = native_admission.as_ref().context("native expert admission")?;
             let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
             let planned = cuteafd_loader::plan::exlr8::native::flash_routed_workspace(
-                &native.metadata, &self.cfg, layers, 1, args.expert_rows() as u64, &manifest)?;
+                &native.metadata, &self.cfg, &manifest, 1, args.expert_rows() as u64)?;
             ensure!(workspace as u64 == planned, "native whole expert workspace differs from planner");
             Ok(Some(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8 {
                 manifest: args.exlr8_manifest.clone().context("native Flash manifest")?,
