@@ -2153,7 +2153,7 @@ impl<'a> MimoEngine<'a> {
             if gather {
                 // SAFETY: the step's ids are in `ids` before the replay; `h` holds its rows.
                 unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, 1, std::ptr::null(),
-                    w.h.buffer.ptr, self.stream)? };
+                    w.h.buffer.ptr, None, self.stream)? };
             }
             if let Some(w1) = w1 {
                 // The embedded rows to the second GPU's residual stream.

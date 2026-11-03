@@ -243,6 +243,10 @@ impl<'a> Projection<'a> {
         let core=self.core(rows,input,weights,scratch,stream)?;
         self.program.output(rows,core,weights.svh.buffer,output,stream)?;Ok(())
     }
+    pub(crate) fn reduced_f32(&self,add:&cuteafd_ffi::F32Add<'_>,rows:usize,rank0:Buffer,rank1:Buffer,reduced:Buffer,
+        weights:&CoreWeights<'_>,output:Buffer,stream:*mut c_void)->Result<()> {
+        self.program.reduce_f32_output(add,rows,rank0,rank1,reduced,weights.svh.buffer,output,stream)?;Ok(())
+    }
     pub(crate) fn reduced(&self,add:&Bf16F32Add<'_>,rows:usize,rank0:Buffer,rank1:Buffer,reduced:Buffer,
         weights:&CoreWeights<'_>,output:Buffer,stream:*mut c_void)->Result<()> {
         self.program.reduce_output(add,rows,rank0,rank1,reduced,weights.svh.buffer,output,stream)?;Ok(())

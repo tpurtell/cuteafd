@@ -888,6 +888,7 @@ release_known_key() {
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
     HOST_WAIT|IDLE_PARK_SECONDS) return 0 ;;
+    EXPERT_PARTIAL_BF16_MAX_ROWS|EXPERT_PARTIAL_WIDE_FORMAT) return 0 ;; # Muse Spark partial-reply cutoff and wide format.
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;
     GLM5_FLASH_DRAFT_LINEAR) return 0 ;;
@@ -1049,21 +1050,15 @@ except (OSError, ValueError, KeyError, TypeError):
 ' "$index" "$state" "$kda" "$geometry" >/dev/null 2>&1
 }
 
-# Header-only eligibility; the Rust planner validates the complete tower contract.
+# Absence alone disables auto. The planner maps the checkpoint's declared tower
+# kind and refuses unsupported config, headers or geometry rather than hiding it.
 release_resolve_audio_mode() {
   local mode="$1" snapshot="$2"
   [[ "$mode" == auto ]] || { printf '%s' "$mode"; return; }
-  python3 - "$snapshot" <<'PY'
+  python3 -I - "$snapshot" <<'PY'
 import json, pathlib, sys
-p = pathlib.Path(sys.argv[1])
-try:
-    c = json.loads((p / "config.json").read_text())
-    qualified = (c.get("model_type") == "mimo_v2" and c.get("hidden_size") in (4096, 6144)
-                 and bool(c.get("audio_config")) and (p / "audio_tokenizer/config.json").is_file()
-                 and (p / "audio_tokenizer/model.safetensors").is_file())
-except (OSError, ValueError):
-    qualified = False
-print("auto" if qualified else "off")
+c = json.loads((pathlib.Path(sys.argv[1]) / "config.json").read_text())
+print("auto" if c.get("audio_config") is not None else "off")
 PY
 }
 

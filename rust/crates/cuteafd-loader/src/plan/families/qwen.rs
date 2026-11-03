@@ -29,6 +29,7 @@ impl Family for Qwen {
     fn id(&self) -> &'static str {
         "qwen4"
     }
+    fn media_cache_headroom(&self) -> bool { true }
     fn runtime(&self) -> RuntimeStatus {
         RuntimeStatus::Serving
     }

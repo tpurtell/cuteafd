@@ -27,6 +27,12 @@ struct Program {
   cudaLibrary_t library_sm188 = nullptr;
   // Zero is unloaded; 1/2 retain the selected 170/188-SM plan before capture.
   uint8_t loaded[kMaxDevices] = {};
+  int32_t sm_count[kMaxDevices] = {};
+
+  bool runtime_sms() const { return std::strchr(kinds, 's') != nullptr; }
+  uint32_t public_scalars() const {
+    return static_cast<uint32_t>(std::strlen(kinds)) - (runtime_sms() ? 1 : 0);
+  }
 };
 Program programs[] = {CUTEAFD_DSV4_PROGRAMS};
 constexpr uint32_t kCount = sizeof(programs) / sizeof(programs[0]);
@@ -43,8 +49,8 @@ extern "C" int32_t cuteafd_dsv4_program_info(uint32_t index, cuteafd_dsv4_progra
   std::memset(out, 0, sizeof(*out));
   std::strncpy(out->name, program->name, sizeof(out->name) - 1);
   out->pointers = program->pointers;
-  out->scalars = static_cast<uint32_t>(std::strlen(program->kinds));
-  std::strncpy(out->scalar_kinds, program->kinds, sizeof(out->scalar_kinds) - 1);
+  out->scalars = program->public_scalars();
+  std::memcpy(out->scalar_kinds, program->kinds, out->scalars);
   return cudaSuccess;
 }
 
@@ -61,7 +67,7 @@ extern "C" int32_t cuteafd_dsv4_program_load(uint32_t index) {
   if (status != cudaSuccess) return status;
   if (major != 12 || minor != CUTEAFD_DSV4_CC_MINOR) return cudaErrorNoKernelImageForDevice;
   int sms = 0;
-  if (program->minimum_sms || program->launch_sm188) {
+  if (program->minimum_sms || program->launch_sm188 || program->runtime_sms()) {
     status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
     if (status != cudaSuccess) return status;
     if (sms <= 0) return cudaErrorInvalidDevice;
@@ -86,6 +92,7 @@ extern "C" int32_t cuteafd_dsv4_program_load(uint32_t index) {
   void* load_args[] = {&library, &device_id, &status};
   (use_sm188 ? program->load_sm188 : program->load)(load_args);
   if (status != cudaSuccess) return status;
+  program->sm_count[device] = sms;
   program->loaded[device] = use_sm188 ? 2 : 1;
   return cudaSuccess;
 }
@@ -94,7 +101,7 @@ extern "C" int32_t cuteafd_dsv4_program_launch(uint32_t index, void* const* poin
     const uint64_t* scalars, void* stream) {
   auto* program = at(index);
   const uint32_t scalar_count = program ? static_cast<uint32_t>(std::strlen(program->kinds)) : 0;
-  if (!program || !pointers || (scalar_count && !scalars) ||
+  if (!program || !pointers || (program->public_scalars() && !scalars) ||
       program->pointers + scalar_count + 2 > kMaxArguments)
     return cudaErrorInvalidValue;
   int device = -1;
@@ -113,6 +120,7 @@ extern "C" int32_t cuteafd_dsv4_program_launch(uint32_t index, void* const* poin
   }
   for (uint32_t i = 0; i < scalar_count; ++i) {
     switch (program->kinds[i]) {
+      case 's': i32[i] = program->sm_count[device]; arguments[count++] = &i32[i]; break;
       case 'i': i32[i] = static_cast<int32_t>(scalars[i]); arguments[count++] = &i32[i]; break;
       case 'l': i64[i] = static_cast<int64_t>(scalars[i]); arguments[count++] = &i64[i]; break;
       case 'f': {

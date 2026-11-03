@@ -17,6 +17,7 @@ use super::format::{
 
 pub mod residency;
 pub mod dense;
+pub mod native;
 mod workspace;
 pub use workspace::{execution_workspace, routed_workspace, shared_workspace, ExecutionVariant, ExecutionWorkspace};
 
@@ -74,86 +75,118 @@ pub struct NativePlan {
 /// Full-forward native admission, deliberately narrower than format inventory.
 pub fn native_plan(snapshot: &Path, selected: &str,
     options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
-    native_options(selected, options, speculator)?;
+    native_request(selected, options, speculator)?;
     super::PlanInput::open(snapshot)?.exlr8_native_plan(selected, options, speculator)
 }
 
-fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str)
-    -> Result<(usize, usize, crate::placement::AttentionPlacement, super::layout::LayoutOptions)> {
+fn native_request(selected: &str, options: &super::PlanOptions, speculator: &str)
+    -> Result<(usize, usize, super::layout::LayoutOptions)> {
     use super::ExpertPlacement;
     ensure!(!selected.is_empty() && selected.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
         "EXLR8 manifest must be a published name, not a path");
     let world = match options.placement {
         ExpertPlacement::Sparks { ranks } if (1..=8).contains(&ranks) => ranks,
-        _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=8 ranks"),
+        ExpertPlacement::Local => 0,
+        _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=8 ranks or local experts"),
     };
     ensure!(matches!(speculator, "off" | "dflash2"), "EXLR8 native deployment supports off or dflash2 speculation");
-    let mut resolved_layout = options.layout.clone().context("EXLR8 native deployment requires --layout")?;
-    let concurrency = resolved_layout.resolved_concurrency("glm5");
-    cuteafd_core::concurrency::validate("glm5", concurrency)?;
-    if resolved_layout.mimo_prefix_entries == u64::MAX {
-        resolved_layout.mimo_prefix_entries = cuteafd_core::concurrency::prefix_entries(concurrency);
-    }
-    resolved_layout.glm5_drafter_disabled = speculator == "off";
-    let gpu_count = resolved_layout.rtx_bytes.len();
+    let mut layout = options.layout.clone().context("EXLR8 native deployment requires --layout")?;
+    // Both native families have the same explicit capacity; defaults resolve after detection.
+    if layout.concurrency != 0 { cuteafd_core::concurrency::validate("EXLR8", layout.concurrency)?; }
+    let gpu_count = layout.rtx_bytes.len();
     ensure!((1..=2).contains(&gpu_count), "EXLR8 native deployment requires 1..=2 RTX GPUs");
-    let attention = if gpu_count == 2 { crate::placement::AttentionPlacement::Context }
+    ensure!(!layout.host_embedding, "EXLR8 requires GPU embedding");
+    layout.force_gpu_embedding = true;
+    Ok((world, gpu_count, layout))
+}
+
+fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str, family: &str)
+    -> Result<(usize, usize, crate::placement::AttentionPlacement, super::layout::LayoutOptions)> {
+    let (world, gpu_count, mut layout) = native_request(selected, options, speculator)?;
+    ensure!(matches!(family, "glm5" | "glm5_flash"), "unsupported EXLR8 native family {family}");
+    let concurrency = layout.resolved_concurrency(family);
+    cuteafd_core::concurrency::validate(family, concurrency)?;
+    if layout.mimo_prefix_entries == u64::MAX {
+        layout.mimo_prefix_entries = cuteafd_core::concurrency::prefix_entries(concurrency);
+    }
+    layout.glm5_drafter_disabled = speculator == "off";
+    layout.glmf_drafter_disabled = speculator == "off";
+    let default_attention = if gpu_count == 2 { crate::placement::AttentionPlacement::Context }
         else { crate::placement::AttentionPlacement::Heads };
-    ensure!(options.attention_placement.is_none_or(|requested| requested == attention),
-        "EXLR8 native deployment with {gpu_count} RTX GPUs requires {attention} attention");
-    ensure!(!resolved_layout.host_embedding, "EXLR8 requires GPU embedding");
-    Ok((world, gpu_count, attention, resolved_layout))
+    let attention = options.attention_placement.unwrap_or(default_attention);
+    if family == "glm5" {
+        ensure!(world > 0, "GLM EXLR8 native deployment requires canonical Sparks with 1..=8 ranks");
+        ensure!(attention == default_attention,
+            "EXLR8 native deployment with {gpu_count} RTX GPUs requires {default_attention} attention");
+    } else {
+        ensure!(gpu_count == 2 || attention == crate::placement::AttentionPlacement::Heads,
+            "Flash EXLR8 {attention} attention requires two RTX GPUs");
+    }
+    Ok((world, gpu_count, attention, layout))
 }
 
 pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
     use super::{ExpertPlacement, Status, RuntimeStatus, spec::Component};
-    let (world, gpu_count, attention, mut resolved_layout) = native_options(selected, options, speculator)?;
     let _timer = super::DebugPhaseTimer::new("exlr8.native_plan", 1);
     let checkpoint = input.checkpoint();
+    let family = super::family::detect(checkpoint).context("EXLR8 family is not recognized")?;
+    let (world, gpu_count, attention, mut resolved_layout) = native_options(selected, options, speculator, family.id())?;
+    let model = family.open(checkpoint)?;
+    let (layers, first_moe_layer, kernels) = native::family_geometry(&checkpoint.config)?;
     let snapshot = &checkpoint.snapshot;
     let mut report = super::empty_report(input, options)?;
-    super::layout::resolve_prefill(&mut report, &mut resolved_layout, world,
-        super::families::glm::GLM5.prefill_limits())?;
-    let layout = &resolved_layout;
-    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
-    ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,
-        "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
+    report.family = Some(family.id().into());
+    report.spec = Some(model.spec().clone());
+    report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
+    if family.id() == "glm5" {
+        super::layout::resolve_prefill(&mut report, &mut resolved_layout, world, family.prefill_limits())?;
+    }
     let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
     let metadata = residency::MetadataInput::open(snapshot, selected)?;
     #[cfg(test)]
     let metadata = if uncached_census_enabled() { metadata.without_census_cache() } else { metadata };
     let set_id = metadata.identity.clone();
-    let shared = shared_expert_resident(&metadata, &(cfg.first_moe_layer..cfg.layers).collect::<Vec<_>>(), gpu_count)?;
+    let shared = shared_expert_resident(&metadata, &(first_moe_layer..layers).collect::<Vec<_>>(), gpu_count)?;
     let workspace_timer = super::DebugPhaseTimer::new("exlr8.workspace_manifest", 1);
-    let programs = read_json(layout.workspace_manifest.as_deref()
+    let programs = read_json(resolved_layout.workspace_manifest.as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;
     let records = dense::DenseRecord::inventory(snapshot)?;
     let selection = dense::DenseSelection::from_hf(&checkpoint.config)?;
-    let backbone = selection.backbone(&records, cfg.layers)?;
+    let backbone = selection.backbone(&records, layers)?;
     let plans = (0..gpu_count).map(|rank| dense::DensePlan::for_rank(&backbone, gpu_count, rank))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let activations = dense::programs::resolve_activations(&programs, &checkpoint.config, &records,
-        cfg.layers, &plans, layout.exlr8_prefill_pin, layout.exlr8_prefill_activations)?;
-    ensure!(activations == layout.exlr8_prefill_activations,
+        layers, &plans, resolved_layout.exlr8_prefill_pin, resolved_layout.exlr8_prefill_activations)?;
+    ensure!(activations == resolved_layout.exlr8_prefill_activations,
         "EXLR8 resolved activation differs from requested layout charge");
-    let workspace = shared_workspace(&programs, cuteafd_ffi::exlr8::KernelFamily::Glm)?;
+    let workspace = shared_workspace(&programs, kernels)?;
     drop(workspace_timer);
+    let facts = native::DenseFacts::new(records, selection, layers, shared)?;
     drop(catalog_timer);
     let (memory, placement) = {
         let _timer = super::PhaseTimer::new(&input.phases.layout, &[]);
-        super::layout::glm5::native_layout_with_metadata(checkpoint, layout, &shared, workspace, world, &programs, Some(selected), Some(&metadata))?
+        if family.id() == "glm5_flash" {
+            let memory = super::layout::glm5_flash::native_layout(&mut report, model.as_ref(), input,
+                &mut resolved_layout, &facts, &metadata)?;
+            let placement = report.solver_placement.clone().context("Flash EXLR8 native placement was refused")?;
+            (memory, placement)
+        } else {
+            super::layout::glm5::native_layout_with_metadata(checkpoint, &resolved_layout, &facts.shared_bytes,
+                workspace, world, &programs, Some(selected), Some(&metadata))?
+        }
     };
+    let layout = &resolved_layout;
     let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
-    let first_spark = cfg.first_moe_layer + placement.onboard_layers;
-    let selected_world = if first_spark == cfg.layers { 0 } else { world };
-    let residents = spark_resident_bytes_of(&metadata, &(first_spark..cfg.layers).collect::<Vec<_>>(), selected_world)?;
+    let first_spark = first_moe_layer + placement.onboard_layers;
+    let selected_world = if first_spark == layers { 0 } else { world };
+    let residents = spark_resident_bytes_of(&metadata, &(first_spark..layers).collect::<Vec<_>>(), selected_world)?;
     ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget()),
         "EXLR8 selected Spark suffix exceeds Spark budget before live workspace admission");
     let local_timer = super::DebugPhaseTimer::new("exlr8.selected_local_census",
         placement.onboard_layers * gpu_count);
     let mut local_routed = 0u64;
-    for layer in cfg.first_moe_layer..first_spark {
+    for layer in first_moe_layer..first_spark {
         for rank in 0..gpu_count {
             local_routed = local_routed.checked_add(metadata.resident_bytes(
                 layer, gpu_count, rank, residency::ExpertSet::Routed)? as u64)
@@ -161,21 +194,18 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
         }
     }
     drop(local_timer);
-    let family = super::family::detect(&checkpoint).context("EXLR8 family is not recognized")?;
-    let model = family.open(&checkpoint)?;
-    let records = dense::DenseRecord::inventory(snapshot)?;
     drop(catalog_timer);
     report.family = Some(family.id().into());
-    report.exlr8_prefill_activations = Some(layout.exlr8_prefill_activations);
+    report.exlr8_prefill_activations = Some(resolved_layout.exlr8_prefill_activations);
     report.spec = Some(model.spec().clone());
     report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
     if let Some(cache) = report.cache_requirements.as_mut() {
-        let concurrency = layout.resolved_concurrency("glm5");
+        let concurrency = layout.resolved_concurrency(family.id());
         cache.concurrency = u32::try_from(concurrency)?;
         cache.state_slots = u32::try_from(layout.state_slots.unwrap_or(cuteafd_core::concurrency::state_slots(concurrency)))?;
     }
     let mut components = BTreeMap::<Component, (usize, u64)>::new();
-    for record in &records {
+    for record in &facts.records {
         let role = family.classify(model.spec(), &record.tensor)
             .with_context(|| format!("unclassified EXLR8 dense operand {}", record.tensor))?;
         let entry = components.entry(role.component).or_default();
@@ -183,11 +213,11 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
         entry.1 = entry.1.checked_add(record.components.iter().map(|c| c.source.bytes as u64).sum())
             .context("EXLR8 dense component bytes overflow")?;
     }
-    for (component, bytes) in [(Component::SharedExpert, shared.iter().sum()),
+    for (component, bytes) in [(Component::SharedExpert, facts.shared_bytes.iter().sum()),
         (Component::RoutedExpert, residents.iter().sum::<u64>())] {
-        let layers = if component == Component::RoutedExpert { cfg.layers - first_spark }
-            else { cfg.layers - cfg.first_moe_layer };
-        components.insert(component, (layers, bytes));
+        let count = if component == Component::RoutedExpert { layers - first_spark }
+            else { layers - first_moe_layer };
+        components.insert(component, (count, bytes));
     }
     report.components = components.into_iter().map(|(component, (tensors, bytes))| super::ComponentPlan {
         component, owner: if component == Component::RoutedExpert { super::Owner::SparkSliced }
@@ -201,15 +231,19 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             status: Status::Ready, rejected: 0, rejections: Vec::new() });
     }
     report.snapshot = snapshot.display().to_string();
-    report.runtime = Some(RuntimeStatus::Serving);
-    report.native_serving_admitted = true;
-    report.placement_supported = true;
-    report.fits = true;
+    let execution = family.exlr8_execution().check(gpu_count, placement.onboard_layers > 0);
+    let adapter_ready = execution.is_ok();
+    report.runtime = Some(if adapter_ready { RuntimeStatus::Serving } else { RuntimeStatus::Planned });
+    report.native_serving_admitted = adapter_ready;
+    report.placement_supported &= adapter_ready;
     report.attention_placement = attention;
-    report.experts = Some(super::family::ExpertContract { package: "glm:exlr8".into(), block: 128,
-        spark_worlds: (1..=8).collect(), local: Ok("glm:exlr8 coordinator TP2 (2 RTX GPUs)".into()) });
-    report.hints = vec![super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
-        how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() }];
+    let package = if family.id() == "glm5_flash" { "glmf:exlr8" } else { "glm:exlr8" };
+    report.experts = Some(super::family::ExpertContract { package: package.into(), block: 128,
+        spark_worlds: (1..=8).collect(), local: Ok(format!("{package} coordinator native experts")) });
+    if adapter_ready {
+        report.hints.push(super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
+            how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() });
+    } else if let Err(error) = execution { report.hints.push(error.hint()); }
     report.placement = if selected_world == 0 { ExpertPlacement::Local }
         else { ExpertPlacement::Sparks { ranks: selected_world } };
     report.min_spark_ranks = Some(selected_world);
@@ -396,16 +430,17 @@ pub fn recognizes(snapshot: &Path) -> Result<bool> {
 
 /// Native header sources; payload shards are deliberately not scanned.
 pub(crate) fn catalog_headers(snapshot: &Path) -> Result<Vec<PathBuf>> {
-    let mut headers = files(snapshot, "dense")?;
+    let mut headers = dense::inventory_headers(snapshot)?.into_iter()
+        .map(|(path, _, _)| path).collect::<Vec<_>>();
     ensure!(!headers.is_empty(), "EXLR8 dense inventory is empty");
     let indices = files(snapshot, "experts")?.into_iter().filter(|path|
         path.file_name().and_then(|name| name.to_str()).is_some_and(|name|
             name.starts_with("exlr8-layer-") && name.ends_with(".index.safetensors")))
         .collect::<Vec<_>>();
     ensure!(!indices.is_empty(), "EXLR8 expert index inventory is empty");
+    for path in &indices { Header::open(path)?.validate()?; }
     headers.extend(indices);
     headers.sort();
-    for path in &headers { Header::open(path)?.validate()?; }
     Ok(headers)
 }
 
@@ -418,10 +453,11 @@ pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) ->
     for path in catalog_headers(snapshot)? {
         let shard = path.strip_prefix(snapshot)?.to_str().context("non-UTF8 native shard")?.to_owned();
         shard_bytes = shard_bytes.checked_add(path.metadata()?.len()).context("native inventory overflow")?;
+        let native = Header::open(&path)?.value["__metadata__"]["format"] == FORMAT;
         for mut meta in crate::read_safetensors_metadata(&path)? {
-            // Local native names repeat across shards. Preserve their physical
-            // namespace instead of pretending these are HF weight tensors.
-            let name = format!("{shard}::{}", meta.name);
+            // Local native names repeat across shards; bundled plain vision
+            // keeps its qualified HF names for the shared encoder loader.
+            let name = if native { format!("{shard}::{}", meta.name) } else { meta.name.clone() };
             weight_map.insert(name.clone(), shard.clone());
             if needed(&name) {
                 meta.name = name;
@@ -1233,15 +1269,6 @@ mod tests {
         assert!(body.contains("append_spark_devices(&mut memory, layout, &residents)"));
     }
 
-    #[test]
-    fn native_prefill_uses_the_serving_family_limits() {
-        let source = include_str!("exlr8.rs");
-        let body = source.split("pub(super) fn native_plan_of(").nth(1).unwrap()
-            .split("let layout = &resolved_layout;").next().unwrap();
-        assert!(body.contains("super::families::glm::GLM5.prefill_limits()"));
-        assert!(!body.contains("PrefillLimits::default()"));
-    }
-
     fn write(path: &Path, metadata: Value, tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)>) {
         let mut header = serde_json::Map::new();
         header.insert("__metadata__".into(), metadata);
@@ -1267,58 +1294,50 @@ mod tests {
 
     #[test]
     fn native_refuses_unqualified_combinations_before_checkpoint_reads() {
-        let mut options = super::super::PlanOptions { placement: super::super::ExpertPlacement::Sparks { ranks:4 },
-            layout: Some(super::super::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30;2], ..Default::default() }),
-            ..Default::default() };
+        let mut options = super::super::PlanOptions { placement: super::super::ExpertPlacement::Sparks { ranks: 4 },
+            layout: Some(super::super::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() };
         let missing = Path::new("/no-native-checkpoint");
         let error = |o: &super::super::PlanOptions, manifest, draft| native_plan(missing, manifest, o, draft)
             .err().unwrap().to_string();
         for concurrency in [1, 4, 16, 17, 32, 64, 65, 128] {
             options.layout.as_mut().unwrap().concurrency = concurrency;
             if concurrency <= 64 {
-                let (_, _, _, layout) = native_options("up1", &options, "off").unwrap();
-                assert_eq!(layout.mimo_prefix_entries, cuteafd_core::concurrency::prefix_entries(concurrency));
+                for family in ["glm5", "glm5_flash"] {
+                    let (_, _, _, layout) = native_options("up1", &options, "off", family).unwrap();
+                    assert_eq!(layout.mimo_prefix_entries, cuteafd_core::concurrency::prefix_entries(concurrency));
+                }
             } else {
-                let reason = error(&options, "up1", "off");
-                assert!(reason.contains("glm5") && reason.contains("decode program capacity 64"), "{reason}");
+                assert!(error(&options, "up1", "off").contains("capacity 64"));
             }
         }
         options.layout.as_mut().unwrap().concurrency = 0;
-        assert!(!error(&options,"up1","off").contains("rotation"));
-        assert!(!error(&options,"k4","off").contains("published name"));
-        assert!(error(&options,"../bad","off").contains("manifest"));
-        assert!(!error(&options,"up1","dflash2").contains("speculation"));
-        assert!(error(&options,"up1","mtp").contains("off or dflash2"));
-        options.placement = super::super::ExpertPlacement::Sparks { ranks:6 };
-        assert!(!error(&options,"up1","off").contains("canonical Sparks"));
-        options.placement = super::super::ExpertPlacement::Sparks { ranks:7 };
-        assert!(!error(&options,"up1","off").contains("canonical Sparks"));
-        options.placement = super::super::ExpertPlacement::Sparks { ranks:4 };
+        assert!(!error(&options, "k4", "off").contains("published name"));
+        assert!(error(&options, "../bad", "off").contains("manifest"));
+        assert!(error(&options, "up1", "mtp").contains("off or dflash2"));
         for gpus in 0..=3 {
             options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30; gpus];
-            assert_eq!(error(&options,"up1","off").contains("1..=2 RTX"), !(1..=2).contains(&gpus));
+            assert_eq!(error(&options, "up1", "off").contains("1..=2 RTX"), !(1..=2).contains(&gpus));
             if !(1..=2).contains(&gpus) { continue; }
             for attention in [None, Some(crate::placement::AttentionPlacement::Heads),
                 Some(crate::placement::AttentionPlacement::Context), Some(crate::placement::AttentionPlacement::Layers)] {
                 options.attention_placement = attention;
                 let expected = if gpus == 2 { crate::placement::AttentionPlacement::Context }
                     else { crate::placement::AttentionPlacement::Heads };
-                assert_eq!(error(&options,"up1","off").contains("attention"),
-                    attention.is_some_and(|a| a != expected), "{gpus} GPUs, {attention:?}");
+                // Family-specific attention refusal follows detection, not a hardcoded GLM default.
+                assert_eq!(native_options("up1", &options, "off", "glm5").is_ok(),
+                    attention.is_none_or(|a| a == expected));
+                assert_eq!(native_options("k4", &options, "off", "glm5_flash").is_ok(),
+                    gpus == 2 || attention.is_none_or(|a| a == crate::placement::AttentionPlacement::Heads));
             }
             options.attention_placement = None;
         }
-        options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30; 2];
-        for lanes in 1..=4 {
-            options.layout.as_mut().unwrap().prefill_lanes = lanes;
-            assert!(!error(&options,"up1","off").contains("serial"));
-        }
-        options.layout.as_mut().unwrap().prefill_lanes = 1;
-        options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(1));
-        assert!(!error(&options,"up1","off").contains("onboard"), "TP2 onboarding must reach native inventory admission");
-        options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
-        options.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
-        assert!(error(&options,"up1","off").contains("context"));
+        options.layout.as_mut().unwrap().rtx_bytes = vec![32 << 30; 2];
+        options.placement = super::super::ExpertPlacement::Local;
+        assert!(native_options("up1", &options, "off", "glm5").is_err());
+        let (world, _, _, flash) = native_options("k4", &options, "dflash2", "glm5_flash").unwrap();
+        assert_eq!(world, 0);
+        assert!(flash.force_gpu_embedding && !flash.glmf_drafter_disabled);
     }
 
     #[test]

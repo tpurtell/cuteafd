@@ -215,13 +215,15 @@ impl<'a> BlockingWait<'a> {
     /// Waits until everything queued on `stream` so far has completed.
     ///
     /// # Safety
-    /// `stream` is a live stream of the current device.
+    /// `stream` is live until this wait completes (its device need not be current).
     pub(crate) unsafe fn wait(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
+        // SAFETY: forwarded from this function's contract.
+        let device = unsafe { self.library.cuda_stream_device(stream)? };
+        let _device = device::Device { library: self.library, id: device }.enter()?;
         if cuteafd_transport::wait_policy::wait_policy().wait == cuteafd_transport::wait_policy::HostWait::Spin {
             // SAFETY: forwarded from this function's contract.
             return unsafe { self.library.cuda_stream_synchronize(stream) };
         }
-        let device = self.library.cuda_get_device()?;
         let event = match self.events.iter().find(|(owner, _)| *owner == device) {
             Some(&(_, event)) => event,
             None => {

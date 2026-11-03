@@ -113,10 +113,62 @@ impl AudioTowerSpec {
     }
 }
 
+/// Shared placement/worker description; numerics stay native to the checkpoint.
+pub enum BundledAudioSpec {
+    Mimo(AudioTowerSpec),
+    Pcm(super::pcm_audio::PcmTowerSpec),
+}
+impl BundledAudioSpec {
+    pub fn from_snapshot(snapshot: &Path, max_samples: usize) -> Result<Self> {
+        let config: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
+        use cuteafd_loader::media::AudioTowerKind;
+        match AudioTowerKind::from_config(&config).map_err(VisionError::Unsupported)? {
+            Some(AudioTowerKind::MusePcm) => Ok(Self::Pcm(super::pcm_audio::PcmTowerSpec::from_snapshot(snapshot, max_samples)?)),
+            Some(AudioTowerKind::MimoRvq) => Ok(Self::Mimo(AudioTowerSpec::from_snapshot(snapshot, max_samples)?)),
+            None => Err(VisionError::Unsupported("checkpoint has no bundled audio tower".into())),
+        }
+    }
+    pub fn required_bytes(&self, library: &Path) -> Result<u64> {
+        match self { Self::Mimo(spec) => Ok(NativeAudio::required(library, spec.native())?.total_bytes()?),
+            Self::Pcm(spec) => spec.required_bytes() }
+    }
+    pub fn geometry(&self) -> cuteafd_core::media::AudioTokenGeometry {
+        match self { Self::Mimo(_) => cuteafd_core::media::AudioTokenGeometry::MimoRvq,
+            Self::Pcm(_) => cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: 1920 } }
+    }
+    pub fn backend(&self, library: &Path) -> Result<String> {
+        match self { Self::Mimo(_) => Ok(NativeAudio::backend(library)?), Self::Pcm(_) => Ok("pcm-bf16-aot-v1".into()) }
+    }
+    pub fn handshake(&self, revision: &str, sm: u32, backend: &str, plan_hash: [u8; 32]) -> super::remote::AudioHandshake {
+        let (encoder_id, max_samples, output_width) = match self {
+            Self::Mimo(spec) => (spec.plan().encoder_id(revision, sm, backend), spec.native().max_samples, spec.native().output_width),
+            Self::Pcm(spec) => (spec.encoder_id(revision, sm), spec.native_spec().max_samples, spec.native_spec().output_width),
+        };
+        super::remote::AudioHandshake { encoder_id, max_samples, output_width, plan_hash, geometry: self.geometry() }
+    }
+    pub fn owner(self, admitted_bytes: u64) -> AudioOwnerConfig {
+        match self { Self::Mimo(spec) => AudioOwnerConfig::Mimo { spec, admitted_bytes },
+            Self::Pcm(spec) => AudioOwnerConfig::Pcm { spec, admitted_bytes } }
+    }
+}
+
 /// The native export owns its transform tables; no serving sidecar is required.
-pub struct AudioOwnerConfig {
-    pub spec: AudioTowerSpec,
-    pub admitted_bytes: u64,
+pub enum AudioOwnerConfig {
+    Mimo { spec: AudioTowerSpec, admitted_bytes: u64 },
+    Pcm { spec: super::pcm_audio::PcmTowerSpec, admitted_bytes: u64 },
+}
+impl AudioOwnerConfig {
+    pub fn admitted_bytes(&self) -> u64 {
+        match self { Self::Mimo { admitted_bytes, .. } | Self::Pcm { admitted_bytes, .. } => *admitted_bytes }
+    }
+    pub fn geometry(&self) -> cuteafd_core::media::AudioTokenGeometry {
+        match self { Self::Mimo { .. } => cuteafd_core::media::AudioTokenGeometry::MimoRvq,
+            Self::Pcm { .. } => cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: 1920 } }
+    }
+    pub fn required_bytes(&self, library: &Path) -> Result<u64> {
+        match self { Self::Mimo { spec, .. } => Ok(NativeAudio::required(library, spec.native())?.total_bytes()?),
+            Self::Pcm { spec, .. } => spec.required_bytes() }
+    }
 }
 pub struct AudioEncodeJob {
     pub pcm: Arc<[f32]>,
@@ -139,32 +191,50 @@ impl AudioEncodeJob {
     }
 }
 
-pub(super) struct AudioRuntime {
-    native: NativeAudio,
-    spec: AudioSpec,
+pub(super) enum AudioRuntime {
+    Mimo { native: NativeAudio, spec: AudioSpec },
+    Pcm(super::pcm_audio::PcmTower),
 }
 impl AudioRuntime {
     pub(super) fn load(config: AudioOwnerConfig, library: &Path, device: i32) -> Result<Self> {
-        let spec = *config.spec.native();
+        let (tower, admitted_bytes) = match config {
+            AudioOwnerConfig::Pcm { spec, admitted_bytes } => return Ok(Self::Pcm(spec.load(library, device, admitted_bytes)?)),
+            AudioOwnerConfig::Mimo { spec, admitted_bytes } => (spec, admitted_bytes),
+        };
+        let spec = *tower.native();
         let required = NativeAudio::required(library, &spec)?.total_bytes()?;
-        if required > config.admitted_bytes {
+        if required > admitted_bytes {
             return Err(VisionError::Unsupported(format!(
-                "audio weight/scratch admission needs {required}, got {}",
-                config.admitted_bytes
+                "audio weight/scratch admission needs {required}, got {admitted_bytes}"
             )));
         }
-        let weights = config.spec.plan.load_weights(config.admitted_bytes)?;
-        let native =
-            NativeAudio::load_embedded(library, &spec, device, config.admitted_bytes, &weights)?;
-        Ok(Self { native, spec })
+        let weights = tower.plan.load_weights(admitted_bytes)?;
+        let native = NativeAudio::load_embedded(library, &spec, device, admitted_bytes, &weights)?;
+        Ok(Self::Mimo { native, spec })
     }
     pub(super) fn ledger(&self) -> Result<AudioLedger> {
-        Ok(self.native.ledger()?)
+        match self {
+            Self::Mimo { native, .. } => Ok(native.ledger()?),
+            Self::Pcm(tower) => {
+                let ledger = tower.ledger()?;
+                Ok(AudioLedger { weights: ledger.weights, scratch: ledger.scratch,
+                    device_allocations: ledger.device_allocations, encodes: ledger.encodes, ..Default::default() })
+            }
+        }
     }
     pub(super) fn encode(&mut self, mut job: AudioEncodeJob) -> Result<Vec<u16>> {
-        job.validate(&self.spec)?;
-        self.native
-            .encode_into(&job.pcm, &mut job.fp32_scratch, None)?;
+        let (native, spec) = match self {
+            Self::Pcm(tower) => {
+                let tokens = job.pcm.len().div_ceil(1920);
+                if job.output.len() != tokens * 8192 || !job.fp32_scratch.is_empty() {
+                    return Err(cuteafd_ffi::audio::AudioError::InvalidInput("PCM output extent").into());
+                }
+                return tower.encode(&job.pcm);
+            }
+            Self::Mimo { native, spec } => (native, spec),
+        };
+        job.validate(spec)?;
+        native.encode_into(&job.pcm, &mut job.fp32_scratch, None)?;
         for (output, value) in job.output.iter_mut().zip(job.fp32_scratch) {
             if !value.is_finite() {
                 return Err(cuteafd_ffi::audio::AudioError::Native(-2001).into());
@@ -206,12 +276,14 @@ mod tests {
         let capacity = manifest["max_samples"].as_u64().unwrap() as usize;
         let spec = AudioTowerSpec::from_snapshot(&snapshot, capacity).unwrap();
         let ledger = NativeAudio::required(&library, spec.native()).unwrap();
-        let config = || AudioOwnerConfig {
+        let config = || AudioOwnerConfig::Mimo {
             spec: spec.clone(),
             admitted_bytes: ledger.total_bytes().unwrap(),
         };
-        let mut denied = config();
-        denied.admitted_bytes -= 1;
+        let denied = AudioOwnerConfig::Mimo {
+            spec: spec.clone(),
+            admitted_bytes: ledger.total_bytes().unwrap() - 1,
+        };
         assert!(EncoderService::start_audio(library.clone(), 0, denied).is_err());
         let service = EncoderService::start_audio(library, 0, config()).unwrap();
         assert!(service.healthy());

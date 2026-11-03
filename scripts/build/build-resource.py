@@ -105,13 +105,19 @@ def acquire(directory: Path, host: str, slots: int):
     return None
 
 
-def take_export_turn(stack: contextlib.ExitStack, directory: Path, host: str, args, cancelled) -> str:
+def take_export_turn(stack: contextlib.ExitStack, directory: Path, host: str, args, cancelled,
+                     handles: list | None = None) -> str:
     """The seed's GPU-export turn for this lease: the fair hwlock SEED-export lock
     on a LAN seed, whose counting lease admits other builds; a seed under an
-    exclusive lock (rhea, moa) is already ours. Tells wip.sh through export-granted
-    or export-failed; the turn is held in `stack` until export-done or teardown."""
+    exclusive lock (rhea, moa) is already ours. Drop the plain-flocked SEED.lock
+    umbrella before queueing in hwlock so a fair-queued job wanting both SEED and
+    SEED-export cannot deadlock with this turn; the counting slot stays held.
+    Tells wip.sh through export-granted or export-failed; the turn is held in
+    `stack` until export-done or teardown."""
     started = time.monotonic()
     if host in LAN_SEEDS:
+        while handles and len(handles) > 1:
+            handles.pop(0).close()
         hwlock = _hwlock()
         hwlock.LOCK_DIR = directory
         try:
@@ -228,7 +234,8 @@ def main():
             if os.read(fd, 1):
                 break
             if export_state == 'idle' and (args.lease_dir / 'export-request').exists():
-                export_state = take_export_turn(export_turn, directory, host, args, lambda: stopping or not owner_alive(args.owner, start))
+                export_state = take_export_turn(export_turn, directory, host, args,
+                                                lambda: stopping or not owner_alive(args.owner, start), handles)
                 if export_state == 'cancelled':
                     break
             elif export_state == 'held' and (args.lease_dir / 'export-done').exists():

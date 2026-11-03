@@ -7,7 +7,7 @@ use cuteafd_core::{DType, memory_layout::{Basis, Category}};
 use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaWeights, KimiMlaWeights};
 use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, kda, mla,
     w8::{self, ResidualWeightSite}}, formats::mla::MlaOperand, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
-use std::{collections::BTreeMap, os::unix::fs::FileExt};
+use std::collections::BTreeMap;
 use cuteafd_loader::families::kimi_k3::core::CoreInventory;
 use cuteafd_loader::formats::dense_trellis::{LoadedDenseTrellis, TrellisSide};
 use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights};
@@ -16,26 +16,9 @@ use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights};
 pub(crate) use cuteafd_loader::families::kimi_k3::weight_layout::routed_owner;
 
 /// Reads only the coordinator's header-selected tensors through the standard
-/// checkpoint inventory. Routed payloads remain on the Spark loading path.
+/// checkpoint inventory (the shared reader). Routed payloads remain on the Spark loading path.
 pub(crate) fn read_tensor(checkpoint: &cuteafd_loader::plan::Checkpoint, name: &str) -> Result<LoadedTensor> {
-    let at = checkpoint.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name))
-        .map_err(|_| anyhow::anyhow!("Kimi coordinator checkpoint lacks {name}"))?;
-    let tensor = &checkpoint.tensors[at];
-    ensure!(checkpoint.weight_map.get(name) == Some(&tensor.shard),
-        "Kimi tensor header differs from checkpoint index: {name}");
-    let metadata = &tensor.meta;
-    let bytes = usize::try_from(metadata.byte_length).context("Kimi tensor extent exceeds host address space")?;
-    let source_path = checkpoint.snapshot.join(&tensor.shard);
-    cuteafd_ffi::memory_ledger::tensor(name);
-    let mut bytes = vec![0; bytes];
-    let started = std::time::Instant::now();
-    std::fs::File::open(&source_path)?.read_exact_at(&mut bytes, metadata.byte_offset)
-        .with_context(|| format!("reading Kimi coordinator tensor {name}"))?;
-    Ok(LoadedTensor { info: cuteafd_core::TensorInfo { name: name.into(), file: tensor.shard.clone(),
-        dtype: metadata.dtype.clone(), shape: metadata.shape.clone(), byte_offset: metadata.byte_offset,
-        byte_length: metadata.byte_length, role: cuteafd_core::TensorRole::Other, layer_id: None,
-        expert_id: None, is_quantization_metadata: false }, source_path, bytes,
-        elapsed_micros: started.elapsed().as_micros(), sha256: String::new() })
+    crate::shared::checkpoint_read::read_tensor(checkpoint, name)
 }
 
 /// Global tensors follow the shared entry/head ranks: one embedding on rank 0,

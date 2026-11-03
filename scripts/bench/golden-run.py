@@ -6,7 +6,7 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
       [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
-      [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] [--rdma] \\
+      [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] [--mount PATH] [--rdma] \\
       [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
       -- ARGS...
 
@@ -33,7 +33,8 @@ PYTHONDONTWRITEBYTECODE=1), with CUTEAFD_NATIVE_LIB and CUTEAFD_PROGRAM_MANIFEST
 Placeholders in ARGS and in --env/--arm-env values: {snapshot} (the checkpoint's
 container path), {hub} (the resolved host hub path), {out} (the run's writable output directory, e.g.
 `--save-logits {out}/logits`), {fixtures}, {peers} and {expert_layers}. Other existing
-absolute host paths in ARGS are mounted read-only at the same path. --fixtures DIR is
+non-executable host data paths in ARGS (outside image directories) are mounted read-only
+at the same path; pass --mount PATH to mount a host file or binary explicitly. --fixtures DIR is
 mounted at its own path (read-only; --fixtures-writable for a fixture-generation run,
 which must write under ~/.cache/cuteafd/builds/TASK/ outside golden/ and never holds
 Sparks) and exported as CUTEAFD_GOLDEN_FIXTURES.
@@ -98,7 +99,7 @@ SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 
                'mimo': 'mimo-golden', 'qwen4': 'qwen4-golden', 'qwen35': 'qwen35-golden',
                'step5': 'step5-golden'}
 # Families without a golden subcommand yet: native tests and commands only.
-RAW_FAMILIES = ('kimi',)
+RAW_FAMILIES = ('kimi', 'muse')
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
@@ -554,7 +555,7 @@ def worker_command(state, arm, rank, record):
         cmd += ['--memory', str(sparks['memory']), '--memory-swap', str(sparks['memory'])]
     for source, target in mounts:
         cmd += ['-v', f'{source}:{target}:ro']
-    env = {'PATH': f'{SLOT_BIN}:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    env = {'PATH': f'{SLOT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/local/cuda/bin:/usr/sbin:/usr/bin:/sbin:/bin',
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
            # As the coordinator gets it: workers resolve installed programs and packages from it.
            'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json',
@@ -687,15 +688,38 @@ def vocab_size(snapshot):
     raise ValueError(f'{snapshot}/config.json has no vocab_size; pass --vocab')
 
 
+IMAGE_ROOTS = (Path('/usr'), Path('/bin'), Path('/sbin'), Path('/lib'), Path('/lib64'),
+               Path('/opt'), Path('/etc'), Path(SOURCE))
+
+
 def path_mounts(args, covered):
-    """Existing absolute host paths in ARGS, outside the paths already mounted."""
+    """Existing non-executable host data paths in ARGS, outside image and already-mounted paths."""
     mounts = []
     for arg in args:
         value = arg.split('=', 1)[1] if arg.startswith('--') and '=' in arg else arg
         if not value.startswith('/') or value.startswith(OUT) or '{' in value:
             continue
         path = Path(value)
-        if not path.exists() or any(path.resolve().is_relative_to(c) for c in covered):
+        if any(path.is_relative_to(r) for r in IMAGE_ROOTS):
+            continue
+        if not path.exists() or (path.is_file() and os.access(path, os.X_OK)):
+            continue
+        resolved = path.resolve()
+        if any(resolved.is_relative_to(c) for c in covered + list(IMAGE_ROOTS)):
+            continue
+        if str(path) not in mounts:
+            mounts.append(str(path))
+    return mounts
+
+
+def resolve_mounts(values, covered):
+    """Caller-requested read-only host mounts (--mount PATH)."""
+    mounts = []
+    for value in values:
+        path = Path(value).expanduser()
+        if not path.is_absolute() or not path.exists():
+            raise ValueError(f'--mount {value!r} is not an existing absolute host path')
+        if any(path.resolve().is_relative_to(c) for c in covered):
             continue
         if str(path) not in mounts:
             mounts.append(str(path))
@@ -877,7 +901,7 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
         cmd += ['-w', SOURCE]
     # The sealed program manifest in every mode: family goldens read it from the
     # environment as well as from --manifest.
-    env = {'PATH': f'{SLOT_BIN}:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    env = {'PATH': f'{SLOT_BIN}:/usr/local/sbin:/usr/local/bin:/usr/local/cuda/bin:/usr/sbin:/usr/bin:/sbin:/bin',
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
            'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json', 'RUST_LOG': 'info',
            'HF_HOME': namespace_root() + '/hf-home'}
@@ -1298,9 +1322,11 @@ def build_state(args, arms):
     if not hub.is_relative_to(namespace_root()):
         extra = [str(hub)] + [path for path in extra if not Path(path).is_relative_to(hub)]
     covered = [hub, Path(namespace_root()), snapshot] + ([Path(fixtures)] if fixtures else [])
+    explicit = resolve_mounts(getattr(args, 'mount', ()), covered + [Path(p) for p in extra])
+    extra_mounts = extra + explicit + path_mounts(golden, covered + [Path(p) for p in extra + explicit])
     state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus), memory=args.memory_bytes,
                  snapshot=str(snapshot), snapshot_container=container_path, hub=str(hub), timeout=args.timeout,
-                 golden=golden, extra_mounts=extra + path_mounts(golden, covered + [Path(p) for p in extra]),
+                 golden=golden, extra_mounts=extra_mounts,
                  mode=mode, native_test=native_test, native_test_sha256=native_digest, fixtures=fixtures,
                  fixtures_writable=bool(args.fixtures_writable), sparks=sparks,
                  rdma=bool(args.rdma))
@@ -1343,6 +1369,8 @@ def main(argv=None):
     parser.add_argument('--fixtures', metavar='DIR', help='fixture directory, mounted at its own path; {fixtures}')
     parser.add_argument('--fixtures-writable', action='store_true',
                         help='mount --fixtures writable (a GPU-only fixture-generation run under the task)')
+    parser.add_argument('--mount', action='append', default=[], metavar='PATH',
+                        help='mount an existing absolute host path read-only at the same path (repeatable)')
     parser.add_argument('--rdma', action='store_true',
                         help='host networking and /dev/infiniband without Sparks (same-host verbs loopback)')
     parser.add_argument('--spark-hosts', metavar='H1,H2,...', help='start real expert workers, rank = position')

@@ -149,6 +149,57 @@ def window_tokens(window):
     return len(window["tokens"])
 
 
+def trace_window(manifest, window_id, tokens):
+    """Select the identical prefix used by native diagnostics, never alter the source set."""
+    matches = [w for w in manifest["windows"] if w["id"] == window_id]
+    if len(matches) != 1:
+        raise ValueError(f"activation trace needs one matching window id: {window_id}")
+    if tokens < 1 or tokens > len(matches[0]["tokens"]):
+        raise ValueError("activation trace token count exceeds the selected window")
+    window = copy.deepcopy(matches[0])
+    window["tokens"] = window["tokens"][:tokens]
+    window["roles"] = window.get("roles", ["ctx"] * tokens)[:tokens]
+    return window
+
+
+def run_trace(a, family, manifest):
+    """Diagnostic-only single prefix: no golden or resumable layer-state publication."""
+    if getattr(a, "prefix_only", False) or getattr(a, "_prefix_probe", False):
+        raise ValueError("activation trace cannot run with golden prefix qualification")
+    if a.out.exists():
+        raise ValueError("activation trace refuses a normal golden output directory")
+    window = trace_window(manifest, os.environ["CUTEAFD_ACTIVATION_TRACE_WINDOW"],
+                          int(os.environ["CUTEAFD_ACTIVATION_TRACE_TOKENS"]))
+    position = int(os.environ["CUTEAFD_ACTIVATION_TRACE_POSITION"])
+    if not 0 <= position < len(window["tokens"]):
+        raise ValueError("activation trace position is outside the selected prefix")
+    if Path(os.environ["CUTEAFD_ACTIVATION_TRACE_DIR"]).resolve() != a.out.resolve():
+        raise ValueError("activation trace output must equal CUTEAFD_ACTIVATION_TRACE_DIR")
+    import torch
+    family.configure()
+    torch.manual_seed(0)
+    with torch.inference_mode():
+        wait_for_tensors(family, family.outer_tensors("embed"), getattr(a, "wait_shards", 0))
+        hidden = family.embed(window["tokens"])
+        family.release_outer()
+        for index in range(family.layers):
+            wait_for_shards(family, index, getattr(a, "wait_shards", 0))
+            family.check_layer(index)
+            if DEVICE == "cuda":
+                admit_reference_memory(torch.cuda, family.layer_bytes(index) + family.work_bytes(len(window["tokens"])))
+            module = family.load_layer(index)
+            with family.geometry():
+                hidden, _, _ = family.forward(module, index, hidden, {})
+            family.release_layer(module)
+            del module
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
+        if hasattr(family, "finish_trace"):
+            wait_for_tensors(family, family.outer_tensors("final"), getattr(a, "wait_shards", 0))
+            family.finish_trace(hidden, position, a.out)
+    return {"diagnostic": True, "window": window["id"], "tokens": len(window["tokens"])}
+
+
 def reference_geometry(a, family, manifest):
     geometry = getattr(a, "geometry", "tiled")
     if geometry == "auto":
@@ -213,6 +264,18 @@ def run(a, family, *, extras_root=None, media_adapter=None):
     import transformers
     import tokenizers
     from shape_invariant import qualify
+
+    trace = os.environ.get("CUTEAFD_ACTIVATION_TRACE_POSITION") is not None
+    trace_selection = (os.environ.get("CUTEAFD_ACTIVATION_TRACE_WINDOW"),
+                       os.environ.get("CUTEAFD_ACTIVATION_TRACE_TOKENS"))
+    if trace or any(value is not None for value in trace_selection):
+        if not trace or not all(value is not None for value in trace_selection):
+            raise ValueError("activation trace requires position, window id and token count together")
+        manifest = load_set(a.windows)
+        if manifest["family"] != family.name or any(w.get("media") for w in manifest["windows"]):
+            raise ValueError("activation trace requires the family's own text panel")
+        verify_snapshot(manifest, a.snapshot)
+        return run_trace(a, family, manifest)
 
     checking = getattr(a, "_prefix_probe", False)
     started = time.monotonic()

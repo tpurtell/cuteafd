@@ -946,7 +946,8 @@ impl EndpointReservation {
     pub(crate) fn contract(&self) -> (cuteafd_core::SparkEndpoint, cuteafd_core::SparkRings) {
         let model = self.endpoints.selection.model().expect("typed endpoint");
         let endpoint = model.endpoints[self.index];
-        (endpoint, endpoint.resolved_rings(model.rings).expect("validated endpoint rings"))
+        (endpoint, endpoint.endpoint_rings(self.endpoints.selection.geometry(), model.rings)
+            .expect("validated endpoint rings"))
     }
 }
 
@@ -1009,7 +1010,7 @@ mod tests {
     #[test]
     fn model_admission_extents_are_the_typed_owner_maxima() {
         let endpoint = cuteafd_core::SparkEndpoint { capacity: 2752,
-            ingress: cuteafd_core::SparkIngress::Fp8K32, ring_depth: Some(1) };
+            ingress: cuteafd_core::SparkIngress::Fp8K32, ring_depth: Some(1), partial_reply_bytes: None };
         let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
         let model = ModelAdmission::new(vec![endpoint; 2], rings, executions(80, 4096, 2752, 3)).unwrap();
@@ -1153,7 +1154,7 @@ mod tests {
         use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
         WorkerSelection::new(WorkerIdentity { world: 1, topology: [1, 1], ..identity() }, &[13]).unwrap()
             .with_model(ModelAdmission { executions: executions(80, 4096, 4096, 1),
-                endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 } }],
+                endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 }, partial_reply_bytes: None }],
                 rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 } }).unwrap()
     }
 
@@ -1395,7 +1396,7 @@ mod tests {
         use cuteafd_core::{SparkEndpoint, SparkIngress, ExpertGeometry};
         use std::sync::atomic::Ordering;
         let geometry = ExpertGeometry::STEP5;
-        let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16 };
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16, partial_reply_bytes: None };
         let rings = admission_selection().model().unwrap().rings;
         for clients in [0, 9, usize::MAX] {
             assert!(ModelAdmission::for_clients(geometry, endpoint, rings, clients, executions(80, 640, 640, 1)).is_err());
@@ -1549,9 +1550,9 @@ mod tests {
                 world: u32::from(tp), topology: [tp, 1], ..identity()
             };
             let model = ModelAdmission::new(vec![
-                SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None },
-                SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None },
-                SparkEndpoint { capacity: 2752, ingress: SparkIngress::Bf16, ring_depth: None },
+                SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None, partial_reply_bytes: None },
+                SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None, partial_reply_bytes: None },
+                SparkEndpoint { capacity: 2752, ingress: SparkIngress::Bf16, ring_depth: None, partial_reply_bytes: None },
             ], SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
                 SparkExecutions::admit(&[verify, verify], 2752, 2752, 3, &exports.capacities)?)?;
             let loaded = WorkerSelection::new(identity.clone(), &[13])?.with_model(model)?;
@@ -1607,7 +1608,7 @@ mod tests {
         let rings = SparkRings { max_frame_bytes: 128 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         for (unit, endpoint_rows) in [(1024, 3072), (2752, 2752), (4096, 4096)] {
             let mut selection = admission_selection();
-            let endpoint = SparkEndpoint { ring_depth: None, capacity: endpoint_rows, ingress: SparkIngress::Bf16 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: endpoint_rows, ingress: SparkIngress::Bf16, partial_reply_bytes: None };
             let model = ModelAdmission::for_clients(selection.geometry(), endpoint, rings, 2,
                 executions(80, unit, unit, 3))?;
             assert_eq!((model.capacity(), model.compiled_capacity()), (unit, cuteafd_core::covering_export(&cuteafd_core::EXL3_CAPACITIES, unit).unwrap()));
@@ -1630,7 +1631,7 @@ mod tests {
             assert!(validate_endpoint_request(&selection, 0, &header).is_err());
         }
         let selection = admission_selection();
-        let span = SparkEndpoint { ring_depth: None, capacity: 8256, ingress: SparkIngress::Bf16 };
+        let span = SparkEndpoint { ring_depth: None, capacity: 8256, ingress: SparkIngress::Bf16, partial_reply_bytes: None };
         assert!(ModelAdmission::for_clients(selection.geometry(), span, rings, 2, executions(80, 4096, 2752, 3)).is_err(),
             "a whole three-unit lane span is not a legal per-request endpoint");
         Ok(())
@@ -1642,8 +1643,7 @@ mod tests {
         let mut admission = selection.model().unwrap().clone();
         admission.validate(selection.geometry()).unwrap();
         admission.endpoints.push(cuteafd_core::SparkEndpoint { ring_depth: None,
-            capacity: 80, ingress: cuteafd_core::SparkIngress::Bf16
-        });
+            capacity: 80, ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None });
         admission.validate(selection.geometry()).unwrap();
         admission.endpoints[0].capacity = 128;
         let error = admission.validate(selection.geometry()).unwrap_err().to_string();
@@ -1744,7 +1744,7 @@ mod tests {
         let mut selection = admission_selection();
         let geometry = selection.geometry();
         selection.model = Some(ModelAdmission::for_clients(geometry,
-            SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16 },
+            SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16, partial_reply_bytes: None },
             selection.model().unwrap().rings, 2, executions(80, 640, 640, 1))?);
         for shrink_selection in [true, false] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;

@@ -9,7 +9,7 @@ use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
 use crate::plan::experts::spark_worlds;
-use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
+use crate::plan::family::{ConfigError, ExpertContract, Exlr8Execution, Family, FamilyModel, Hint, RuntimeStatus};
 use crate::plan::format::{QuantOperand, ScaleEncoding};
 use crate::plan::names::indexed;
 use crate::plan::spec::*;
@@ -18,6 +18,8 @@ pub struct Glm {
     id: &'static str,
     architecture: &'static str,
     runtime: RuntimeStatus,
+    exlr8: Exlr8Execution,
+    media_cache_headroom: bool,
     /// Rows of one decode step's Spark request (the engine's decode programs).
     decode_rows: u32,
     decode_lanes: crate::plan::decode_lanes::LaneSupport,
@@ -25,13 +27,15 @@ pub struct Glm {
 
 /// GLM 5.x: serve-glm / glm-golden on the glm coordinator programs.
 pub static GLM5: Glm =
-    Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving,
+    Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving, media_cache_headroom: false,
+        exlr8: Exlr8Execution { dense_worlds: &[1, 2], onboard_worlds: &[2] },
         decode_rows: crate::placement::families::glm5::DECODE_ROWS as u32,
         decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
             reason: "a second lane needs its own graph set, about 3 GiB per GPU today (213 shapes), more than one onboarded layer (2.26 GiB per GPU), and the big dense core leaves little round trip to hide (predicted loss, #705, #744)" } };
 /// GLM 5.3 Flash: serve-glmf / glmf-golden on the glmf coordinator programs.
 pub static GLM5_FLASH: Glm =
-    Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving,
+    Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving, media_cache_headroom: true,
+        exlr8: Exlr8Execution { dense_worlds: &[1], onboard_worlds: &[1] },
         decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS as u32,
         decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
             reason: "the second lane is not wired yet: only the Spark-bound min card (1 RTX + 2 Sparks) can hide a round trip, and it is the OneOrTwo candidate awaiting its A/B; the 0-Spark layout has no exchange to hide (#744)" } };
@@ -49,6 +53,7 @@ fn strip_model_prefix(name: &str) -> Option<&str> {
 }
 
 impl Family for Glm {
+    fn exlr8_execution(&self) -> Exlr8Execution { self.exlr8 }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })
@@ -56,6 +61,7 @@ impl Family for Glm {
     fn id(&self) -> &'static str {
         self.id
     }
+    fn media_cache_headroom(&self) -> bool { self.media_cache_headroom }
     fn runtime(&self) -> RuntimeStatus {
         self.runtime
     }

@@ -1,6 +1,6 @@
 mod families;
 mod shared;
-pub use shared::{audio, dense_trellis, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, native_dense_glue, peer_exchange, programs, vision};
+pub use shared::{audio, pcm_audio, dense_trellis, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, native_dense_glue, peer_exchange, programs, projected_index, projected_kda, vision};
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
     KimiFfn, KimiFfnBatch, KimiFfnMode, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
     KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit,
@@ -1673,6 +1673,7 @@ native_symbols! {
     cuteafd_free_host_buffer: FreeHostBufferFn,
     cuteafd_cuda_memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CuteafdStatus,
     cuteafd_cuda_get_device: unsafe extern "C" fn(*mut i32) -> CuteafdStatus,
+    cuteafd_cuda_stream_device: unsafe extern "C" fn(*mut c_void, *mut i32) -> CuteafdStatus,
     cuteafd_cuda_set_device: unsafe extern "C" fn(i32) -> CuteafdStatus,
     cuteafd_cuda_enable_peer: unsafe extern "C" fn(i32) -> CuteafdStatus,
     cuteafd_copy_peer_async: unsafe extern "C" fn(CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize, *mut c_void) -> CuteafdStatus,
@@ -2460,6 +2461,18 @@ impl NativeLibrary {
         let call: unsafe extern "C" fn(*mut i32) -> CuteafdStatus = self.cuteafd_cuda_get_device()?;
         let mut device = -1;
         self.status_to_result("cuteafd_cuda_get_device", unsafe { call(&mut device) })?;
+        Ok(device)
+    }
+
+    /// Owning device of a live stream, independent of the host thread's device.
+    /// # Safety
+    /// `stream` must remain a live CUDA stream for this call.
+    pub unsafe fn cuda_stream_device(&self, stream: *mut c_void) -> Result<i32> {
+        let call = self.cuteafd_cuda_stream_device()?;
+        let mut device = -1;
+        // SAFETY: the caller retains the stream; device is a writable out-pointer.
+        self.status_to_result("cuteafd_cuda_stream_device", unsafe { call(stream, &mut device) })?;
+        anyhow::ensure!(device >= 0, "CUDA stream device query returned {device}");
         Ok(device)
     }
 

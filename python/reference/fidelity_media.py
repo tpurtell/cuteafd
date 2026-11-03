@@ -70,6 +70,13 @@ def processor_contract(snapshot):
     elif kind in ("Qwen2VLImageProcessor", "Qwen2VLImageProcessorPil", "Qwen2VLImageProcessorFast",
                   "Glm5NextImageProcessor", "Glm5NextImageProcessorPil", "Glm5NextImageProcessorFast"):
         contract = {"merge": processor.get("merge_size", 2), "row_markers": 0}
+    elif all(type(processor.get(field)) is int for field in ("merge_size", "patch_size", "temporal_patch_size")):
+        vision = config.get("vision_config", {})
+        for field in ("merge_size", "patch_size", "temporal_patch_size"):
+            target = "patch_temporal" if field == "temporal_patch_size" and "patch_temporal" in vision else field
+            if processor[field] != vision.get(target):
+                raise ValueError(f"processor_config.{field}={processor[field]} disagrees with vision_config.{target}={vision.get(target)}")
+        contract = {"merge": processor["merge_size"], "row_markers": 0}
     else:
         raise ValueError(f"unsupported shared image processor: {kind}")
     merge = contract["merge"]
@@ -91,21 +98,30 @@ def image_extent(grid, contract=None):
     return h, w, h * (w + markers)
 
 
-def validate_media(media, tokens, roles, score_from, *, processor=None):
+def validate_media(media, tokens, roles, score_from, *, processor=None, audio_processor=None):
     if not isinstance(media, list):
         raise ValueError("media must be an ordered list")
     previous = 0
     for span in media:
-        if not isinstance(span, dict) or span.get("kind") != "image":
+        if not isinstance(span, dict) or span.get("kind") not in ("image", "audio"):
             raise ValueError("unsupported fidelity media kind")
         start, length = span.get("start"), span.get("len")
         if (type(start) is not int or type(length) is not int or length < 1
                 or start < previous or start + length > score_from):
             raise ValueError("media spans must be sorted, disjoint and before scoring")
-        grid = span.get("grid")
-        h, w, expected = image_extent(grid, processor)
-        if expected != length:
-            raise ValueError("image grid does not match merged token extent")
+        if span["kind"] == "image":
+            h, w, expected = image_extent(span.get("grid"), processor)
+            if expected != length:
+                raise ValueError("image grid does not match merged token extent")
+        else:
+            policy = audio_processor or {}
+            samples, stride = span.get("samples"), policy.get("samples_per_token")
+            if (policy.get("sampling_rate") != 24000 or type(stride) is not int or stride <= 0
+                    or type(samples) is not int or not 1 <= samples <= 7_200_000
+                    or length != (samples + stride - 1) // stride):
+                raise ValueError("audio span differs from declared PCM processor geometry")
+            if not isinstance(span.get("pcm_sha256"), str) or not HEX.fullmatch(span["pcm_sha256"]):
+                raise ValueError("audio span requires canonical PCM SHA256")
         if not isinstance(span.get("key"), str) or not HEX.fullmatch(span["key"]):
             raise ValueError("media key must be lowercase SHA256 hex")
         fixture = span.get("fixture")
@@ -120,7 +136,7 @@ def validate_media(media, tokens, roles, score_from, *, processor=None):
             raise ValueError("fixture lacks a SHA256")
         if any(r != "ctx" for r in roles[start:start + length]):
             raise ValueError("image placeholders cannot be generated positions")
-        if processor and processor.get("row_markers") == 1:
+        if span["kind"] == "image" and processor and processor.get("row_markers") == 1:
             ids = [processor.get(key) for key in ("image_token_id", "row_break_token_id", "end_token_id")]
             if any(type(n) is not int or n < 0 for n in ids) or len(set(ids)) != 3:
                 raise ValueError("processor image marker ids are absent or invalid")
@@ -150,6 +166,33 @@ def read_fixture(root: Path, span: dict) -> bytes:
     if hashlib.sha256(data).hexdigest() != span["fixture"]["sha256"]:
         raise ValueError("fixture bytes differ from pinned media identity")
     return data
+
+
+def read_pcm_fixture(root: Path, span: dict):
+    """Pinned mono 24 kHz IEEE float WAV; never resample or silently quantize."""
+    import struct
+    import numpy as np
+    data = read_fixture(root, span)
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE" or struct.unpack_from("<I", data, 4)[0] != len(data) - 8:
+        raise ValueError("audio fixture requires canonical mono 24000 Hz float WAV")
+    offset, chunks = 12, {}
+    while offset < len(data):
+        if offset + 8 > len(data):
+            raise ValueError("truncated PCM WAV chunk")
+        name, size = struct.unpack_from("<4sI", data, offset)
+        offset += 8
+        if offset + size > len(data) or name in chunks:
+            raise ValueError("invalid or duplicate PCM WAV chunk")
+        chunks[name] = data[offset:offset + size]
+        offset += size + size % 2
+    fmt, payload = chunks.get(b"fmt ", b""), chunks.get(b"data", b"")
+    if (len(fmt) < 16 or struct.unpack_from("<HHIIHH", fmt) != (3, 1, 24000, 96000, 4, 32)
+            or len(payload) != span["samples"] * 4 or not 1 <= span["samples"] <= 7_200_000):
+        raise ValueError("audio fixture requires canonical mono 24000 Hz float WAV sample count")
+    values = np.frombuffer(payload, dtype="<f4").copy()
+    if not np.isfinite(values).all() or hashlib.sha256(values.astype("<f4").tobytes()).hexdigest() != span["pcm_sha256"]:
+        raise ValueError("audio fixture differs from canonical PCM identity")
+    return values
 
 
 def require_media_flag(manifest, enabled, family, *, implemented_families=()):
@@ -237,7 +280,9 @@ def write_features(root: Path, span: dict, values, *, tower_dtype: str, identity
         raise ValueError("unsafe feature key")
     data = bits.astype("<u2").tobytes()
     meta = {"schema": "cuteafd.media.features/1", "key": span["key"],
-            "grid": span["grid"], "shape": list(bits.shape), "dtype": "bf16-le",
+            **({"grid": span["grid"]} if span["kind"] == "image" else
+               {"kind": "audio", "samples": span["samples"], "pcm_sha256": span["pcm_sha256"]}),
+            "shape": list(bits.shape), "dtype": "bf16-le",
             "sha256": hashlib.sha256(data).hexdigest(), "tower_dtype": tower_dtype,
             "fixture_sha256": span["fixture"]["sha256"], "snapshot_identity": identity}
     encoded = json.dumps(meta, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"

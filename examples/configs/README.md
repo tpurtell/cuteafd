@@ -76,6 +76,7 @@ outside a matching WIP slot.
 | Mistral Large 4 · EXL3 K4 + native K6 core (#924) | [min](mistral-large4-exl3-k4-core-k6-min.config) · [max](mistral-large4-exl3-k4-core-k6-max.config) | 1 RTX + 5 Spark / 2 RTX + 6 Spark; bundled dSpark depth 3, pool-first; TP2 qualification pending |
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
+| Muse Spark · EXL3 K4 + Core K6 (#923) | [min](muse-spark-exl3-min.config) · [max](muse-spark-exl3-max.config) | 1 RTX + 4 Spark text qualified / 2 RTX + 6 Spark planned; pinned NVIDIA DFlash2, pool-first; media off |
 | Step-5-Preview · EXL3 K4 + Core K6 (#911) | [min](step5-exl3-k6core-min.config) · [max](step5-exl3-k6core-max.config) | 1 RTX + 3 Spark · 2 RTX + 6 Spark |
 
 ## TP x EP layout examples (DeepSeek V4.1)

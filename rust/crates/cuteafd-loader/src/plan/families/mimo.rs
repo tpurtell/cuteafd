@@ -125,6 +125,7 @@ impl Family for MiMo {
     fn id(&self) -> &'static str {
         "mimo_v2"
     }
+    fn media_cache_headroom(&self) -> bool { true }
     fn runtime(&self) -> RuntimeStatus {
         RuntimeStatus::Serving
     }

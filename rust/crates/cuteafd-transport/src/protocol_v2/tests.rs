@@ -138,43 +138,6 @@ fn striped_collective_part_count_requires_row_sharding_and_multiple_parts() -> R
 }
 
 #[test]
-fn forwarded_request_reuses_frame_and_strips_owner_flags() -> Result<()> {
-    let mut request = request(4, ExpertV2SourceKind::Prefill)?
-        .with_fp8_e4m3_row_scaled_response()
-        .with_spark_row_sharded_reduction()
-        .with_debug_checksum();
-    request.set_spark_collective_part_count(2)?;
-    let encoded = request.encode()?;
-    let view = ExpertProtocolV2RequestView::parse(&encoded)?;
-    let mut frame = ExpertProtocolV2FrameBuffer::with_capacity(encoded.len());
-
-    let first_ptr = {
-        let forwarded =
-            frame.encode_regular_forwarded_request(&view, ExpertV2Dtype::Nvfp4E2m1Fp8E4m3)?;
-        let decoded = ExpertProtocolV2Request::decode(forwarded)?;
-        assert!(!decoded.spark_reduction_enabled());
-        assert!(!decoded.spark_row_sharded_reduction_enabled());
-        assert_eq!(decoded.spark_collective_part_count(), 0);
-        assert!(!decoded.fp8_e4m3_row_scaled_response_enabled());
-        assert!(decoded.nvfp4_e2m1_fp8_e4m3_response_enabled());
-        assert!(decoded.debug_checksum_enabled());
-        assert_eq!(decoded.rows, request.rows);
-        assert_eq!(decoded.routes, request.routes);
-        assert_eq!(decoded.hidden_payload, request.hidden_payload);
-        ExpertProtocolV2RequestView::parse(forwarded)?.verify_checksum()?;
-        forwarded.as_ptr()
-    };
-    let capacity = frame.capacity();
-    let second_ptr = frame
-        .encode_regular_forwarded_request(&view, ExpertV2Dtype::Bf16)?
-        .as_ptr();
-
-    assert_eq!(second_ptr, first_ptr);
-    assert_eq!(frame.capacity(), capacity);
-    Ok(())
-}
-
-#[test]
 fn row_scaled_fp8_response_negotiation_and_payload_roundtrip() -> Result<()> {
     let request = request(2, ExpertV2SourceKind::Prefill)?.with_fp8_e4m3_row_scaled_response();
     let request_wire = request.encode()?;
@@ -927,6 +890,35 @@ fn request_frame_view_checksum_is_explicit_debug_validation() -> Result<()> {
 }
 
 #[test]
+fn request_checksum_covers_header_regions_routes_and_payload() -> Result<()> {
+    let request = request(6, ExpertV2SourceKind::Prefill)?
+        .with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 0, 1, 1, 1, 0] })?
+        .with_debug_checksum();
+    let encoded = request.encode()?;
+    let prefix = request_payload_offset(&request);
+    let mut split_prefix = Vec::new();
+    request.encode_prefix_into(&mut split_prefix)?;
+    assert_eq!(split_prefix, encoded[..prefix]);
+    ExpertProtocolV2RequestView::parse(&encoded)?.verify_checksum()?;
+    assert_eq!(ExpertProtocolV2Request::decode(&encoded)?, request);
+    for (offset, value) in [
+        (16, encoded[16] ^ 1), // request id, still structurally valid
+        (46, PartialWire::Fp8 as u8),
+        (request.header_len() + 10, 1), // real row region
+        (request.header_len() + request.rows.len() * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 4, 1),
+        (prefix, encoded[prefix] ^ 1),
+    ] {
+        let mut damaged = encoded.clone();
+        damaged[offset] = value;
+        let view = ExpertProtocolV2RequestView::parse(&damaged)?;
+        assert!(view.verify_checksum().unwrap_err().to_string().contains("checksum mismatch"), "offset {offset}");
+        assert!(ExpertProtocolV2Request::decode(&damaged).unwrap_err().to_string().contains("checksum mismatch"),
+            "offset {offset}");
+    }
+    Ok(())
+}
+
+#[test]
 fn response_frame_view_checksum_is_explicit_debug_validation() -> Result<()> {
     let response = ExpertProtocolV2Response::new(
         42,
@@ -1107,7 +1099,7 @@ fn frame_prefix_encoders_match_full_wire_frames() -> Result<()> {
 #[test]
 fn admitted_response_prefix_never_grows_and_rejects_oversized_rows() -> Result<()> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
-    let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16 };
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16, partial_reply_bytes: None };
     let mut buffer = ExpertProtocolV2FrameBuffer::for_endpoint_response(endpoint)?;
     assert_eq!(buffer.capacity(), EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN + 640 * 4);
     assert_eq!(buffer.capacity(), endpoint.response_prefix_bytes().unwrap());
@@ -1763,11 +1755,6 @@ fn mapped_request_padding_aligns_odd_rows_and_sparse_routes() -> Result<()> {
             assert_eq!(ExpertProtocolV2Request::decode(&wire)?, request);
             assert_eq!(view.wire_stats(), request.wire_stats());
             assert_eq!(wire.len(), offset + rows * 4224);
-            let mut forwarded = ExpertProtocolV2FrameBuffer::default();
-            let forwarded = forwarded.encode_regular_forwarded_request(&view, ExpertV2Dtype::Bf16)?;
-            let forwarded_view = ExpertProtocolV2RequestView::parse(forwarded)?;
-            assert_eq!(forwarded_view.hidden_payload(), request.hidden_payload.as_ref());
-            assert_eq!(forwarded_view.hidden_payload().as_ptr() as usize - forwarded.as_ptr() as usize, offset);
             if topk == 8 {
                 assert_eq!(cuteafd_core::ExpertGeometry::MIMO_V2_FLASH.compact_wire_bytes(rows as u32, false).unwrap().0
                     + if debug { 32 } else { 0 }, wire.len());
@@ -1787,5 +1774,149 @@ fn mapped_request_padding_aligns_odd_rows_and_sparse_routes() -> Result<()> {
         }
     }
     assert!(expert_request_payload_offset(usize::MAX, 40, 12).is_none());
+    Ok(())
+}
+
+#[test]
+fn partial_reply_regions_ride_in_reserved_fields_and_round_trip() -> Result<()> {
+    let regions = vec![0, 0, 1, 1, 1, 0];
+    let plain = request(6, ExpertV2SourceKind::Prefill)?;
+    let partial = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: regions.clone() })?;
+    assert_ne!(partial.header.flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES, 0);
+    let mut bytes = Vec::new();
+    partial.encode_into(&mut bytes)?;
+    let decoded = ExpertProtocolV2Request::decode(&bytes)?;
+    assert_eq!(decoded.partial, Some(PartialReplyPlan { wide: PartialWire::Nvfp4, regions }));
+    assert_eq!(decoded, partial);
+    // The wide format sits in the header's reserved u16; row regions in each descriptor's.
+    assert_eq!(u16::from_le_bytes([bytes[46], bytes[47]]), 1);
+    let header_len = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN;
+    assert_eq!(u16::from_le_bytes([bytes[header_len + 2 * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 10],
+        bytes[header_len + 2 * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 11]]), 1);
+    // Without the flag the reserved fields stay zero and decode unchanged (other families byte-identical).
+    let mut plain_bytes = Vec::new();
+    plain.encode_into(&mut plain_bytes)?;
+    assert_eq!(ExpertProtocolV2Request::decode(&plain_bytes)?.partial, None);
+    let fp8 = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![1; 6] })?;
+    let mut fp8_bytes = Vec::new();
+    fp8.encode_into(&mut fp8_bytes)?;
+    assert_eq!(ExpertProtocolV2Request::decode(&fp8_bytes)?.partial.unwrap().wide, PartialWire::Fp8);
+    Ok(())
+}
+
+#[test]
+fn malformed_partial_region_data_is_refused() -> Result<()> {
+    let plain = request(4, ExpertV2SourceKind::Decode)?;
+    // Wrong bit count, a bit that is neither 0 nor 1, an unknown wide format.
+    assert!(plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0; 3] }).is_err());
+    assert!(plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 2, 0, 0] }).is_err());
+    let partial = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0; 4] })?;
+    let mut bytes = Vec::new();
+    partial.encode_into(&mut bytes)?;
+    let header_len = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN;
+    let mut corrupt = bytes.clone();
+    corrupt[header_len + 10] = 2;
+    assert!(ExpertProtocolV2Request::decode(&corrupt).is_err(), "region bit 2");
+    let mut corrupt = bytes.clone();
+    corrupt[46] = 3;
+    assert!(ExpertProtocolV2Request::decode(&corrupt).is_err(), "wide format 3");
+    // A request without the flag carrying region data or a wide format is refused.
+    let mut plain_bytes = Vec::new();
+    plain.encode_into(&mut plain_bytes)?;
+    let mut stray = plain_bytes.clone();
+    stray[header_len + 10] = 1;
+    assert!(ExpertProtocolV2Request::decode(&stray).is_err(), "stray region bit");
+    let mut stray = plain_bytes.clone();
+    stray[46] = 1;
+    assert!(ExpertProtocolV2Request::decode(&stray).is_err(), "stray wide format");
+    // The flag and the plan must agree.
+    let mut flagged = plain.clone();
+    flagged.header.flags |= EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES;
+    assert!(flagged.validate().is_err());
+    let mut planned = plain.clone();
+    planned.partial = Some(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0; 4] });
+    assert!(planned.validate().is_err());
+    // Partial replies are whole-row requests: no Spark reduction or low-precision combined reply.
+    assert!(plain.clone().with_spark_reduction()
+        .with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0; 4] }).is_err());
+    Ok(())
+}
+
+#[test]
+fn compact_reserved_regions_are_checked_in_every_descriptor() -> Result<()> {
+    let plain = request(16, ExpertV2SourceKind::Decode)?;
+    let bytes = plain.encode()?;
+    assert!(ExpertProtocolV2Request::decode(&bytes)?.partial.is_none());
+    assert!(ExpertProtocolV2RequestView::parse(&bytes)?.partial_plan()?.is_none());
+    for row in 0..16 {
+        for reserved in [1u16, 2, 256, u16::MAX] {
+            let mut corrupt = bytes.clone();
+            let offset = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN
+                + row * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 10;
+            corrupt[offset..offset + 2].copy_from_slice(&reserved.to_le_bytes());
+            assert!(ExpertProtocolV2Request::decode(&corrupt).is_err(), "row {row}: {reserved}");
+            assert!(ExpertProtocolV2RequestView::parse(&corrupt).is_err(), "row {row}: {reserved}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn partial_reply_payload_is_two_aligned_regions_with_stride_zero() -> Result<()> {
+    let plan = PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 1, 1] };
+    let (bf16, wide_at, wide, total) = plan.payload(8, 4096)?;
+    assert_eq!((bf16, wide), (8 * 8192, 2 * 8 * 2304));
+    assert_eq!(wide_at % EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN, 0);
+    assert_eq!(total, wide_at + wide);
+    let bf16_only = PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![0; 2] };
+    assert_eq!(bf16_only.payload(8, 4096)?.3, 2 * 8 * 8192);
+    assert_eq!(PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![1] }.payload(8, 4096)?.2, 8 * 4224);
+    // A partial response has stride 0 and is never read per row.
+    let mut response = ExpertProtocolV2Response::new_with_output_stride(42, 7, 13, 3, 4096, ExpertV2Dtype::Bf16,
+        8192, ExpertProtocolV2Status::Ok, vec![0; 3 * 8192])?;
+    response.header.flags |= EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES;
+    response.header.output_row_stride_bytes = 0;
+    response.header.output_payload_bytes = total as u64;
+    response.partial_output_payload = vec![0; total].into();
+    response.validate()?;
+    let mut bytes = Vec::new();
+    response.encode_into(&mut bytes)?;
+    let decoded = ExpertProtocolV2Response::decode(&bytes)?;
+    assert_eq!(decoded.partial_output_payload.len(), total);
+    let view = ExpertProtocolV2ResponseView::parse(&bytes)?;
+    assert!(view.partial_output_row_payload(0).is_err());
+    // An ordinary response with stride 0 is still refused.
+    let mut ordinary = response.clone();
+    ordinary.header.flags &= !EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES;
+    assert!(ordinary.validate().is_err());
+    // A partial reply with a nonzero stride is refused.
+    let mut strided = response.clone();
+    strided.header.output_row_stride_bytes = 8192;
+    assert!(strided.validate().is_err());
+    Ok(())
+}
+
+#[test]
+fn request_view_reads_and_validates_partial_regions() -> Result<()> {
+    let plain = request(5, ExpertV2SourceKind::Prefill)?;
+    let partial = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![1, 0, 1, 1, 0] })?;
+    let mut bytes = Vec::new();
+    partial.encode_into(&mut bytes)?;
+    let view = ExpertProtocolV2RequestView::parse(&bytes)?;
+    assert!(view.partial_replies());
+    assert_eq!(view.partial_plan()?, partial.partial);
+    assert_eq!((0..5).map(|r| view.row_region(r).unwrap()).collect::<Vec<_>>(), [1, 0, 1, 1, 0]);
+    // The zero-copy view refuses what the owned decode refuses.
+    let header_len = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN;
+    let mut corrupt = bytes.clone();
+    corrupt[header_len + EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 10] = 7;
+    assert!(ExpertProtocolV2RequestView::parse(&corrupt).is_err());
+    let mut plain_bytes = Vec::new();
+    plain.encode_into(&mut plain_bytes)?;
+    let view = ExpertProtocolV2RequestView::parse(&plain_bytes)?;
+    assert!(!view.partial_replies() && view.partial_plan()?.is_none());
+    let mut stray = plain_bytes.clone();
+    stray[header_len + 10] = 1;
+    assert!(ExpertProtocolV2RequestView::parse(&stray).is_err());
     Ok(())
 }

@@ -279,8 +279,8 @@ impl LocalVerbsExpertConnection {
         if let Some(installed) = selection {
             if let Some(spec) = installed.endpoint_spec(start.model_endpoint)? {
                 let model = installed.selection().model().expect("typed endpoint");
-                let rings = spec.resolved_rings(model.rings)
-                    .context("invalid admitted endpoint ring depth")?;
+                let rings = spec.endpoint_rings(installed.selection().geometry(), model.rings)
+                    .context("invalid admitted endpoint ring depth or frame")?;
                 let (request, response) = spec.wire_bytes(installed.selection().geometry())
                     .context("invalid admitted endpoint wire geometry")?;
                 let slot = |bytes: usize| bytes.max(rings.slot_bytes).min(rings.max_frame_bytes);
@@ -946,7 +946,7 @@ mod budget_tests {
         let selection = placement_selection(&[13]).with_model(ModelAdmission {
             executions: crate::worker_selection::SparkExecutions::admit(&[80], 80, 80, 1, &cuteafd_core::EXL3_CAPACITIES)?,
             endpoints: depths.iter().map(|&ring_depth| SparkEndpoint {
-                capacity: 80, ingress: SparkIngress::Bf16, ring_depth }).collect(),
+                capacity: 80, ingress: SparkIngress::Bf16, ring_depth, partial_reply_bytes: None }).collect(),
             rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }
         })?;
         let report = ModelAdmissionResponse {

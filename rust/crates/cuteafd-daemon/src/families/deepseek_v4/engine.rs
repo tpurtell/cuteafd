@@ -1169,7 +1169,7 @@ impl<'a> Engine<'a> {
         // SAFETY: the lane's token ids are copied in before the stream reaches
         // the gather; its streams hold [rows, 4, dim] BF16.
         unsafe { self.embedding.gather(lane.tokens.buffer.ptr, std::ptr::null(), rows, 4, std::ptr::null(),
-            lane.stream_a.buffer.ptr, self.stream) }
+            lane.stream_a.buffer.ptr, None, self.stream) }
     }
 
     /// The first `rows` rows of the workspace's vocabulary logits.

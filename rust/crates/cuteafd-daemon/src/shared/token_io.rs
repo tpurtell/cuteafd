@@ -159,8 +159,10 @@ impl<'a> TokenEmbedding<'a> {
     pub fn row_fp8(library: &'a NativeLibrary, source: EmbedSource,
         owner: std::rc::Rc<native::NativeVocabulary<'a>>) -> Result<Self> {
         let file = std::fs::File::open(&source.path).with_context(|| format!("opening {}", source.path.display()))?;
-        ensure!(owner.embedding.payload().bytes == source.vocab * source.hidden,
-            "row-FP8 embedding payload differs from [{}, {}]", source.vocab, source.hidden);
+        ensure!(owner.embedding.payload().bytes == source.vocab * source.hidden
+            && owner.embedding.scales().bytes == source.vocab * 4
+            && owner.embedding.payload().device_id == owner.embedding.scales().device_id,
+            "row-FP8 embedding payload/scales differ from [{}, {}] on one device", source.vocab, source.hidden);
         let table = ResidentWeight::new(library, 256, false)?;
         tracing::info!(vocab = source.vocab, hidden = source.hidden, "token embedding: checkpoint row-FP8 (single residency)");
         Ok(Self { library, source, file, table, row_fp8: Some(owner) })
@@ -172,11 +174,20 @@ impl<'a> TokenEmbedding<'a> {
 
     /// CUDA owner of the resident table or mapped alias.
     pub(crate) fn owner(&self) -> crate::shared::memory::device::Device<'a> {
-        crate::shared::memory::device::Device { library: self.library, id: self.table.buffer().device_id }
+        let id = self.row_fp8.as_ref().map_or_else(|| self.table.buffer().device_id,
+            |owner| owner.embedding.residency().device);
+        crate::shared::memory::device::Device { library: self.library, id }
     }
 
-    /// Table bytes this embedding charges (a row-FP8 table is charged by its owner's head).
-    pub(crate) fn device_bytes(&self) -> usize { if self.row_fp8.is_some() { 0 } else { self.table.device_bytes() } }
+    /// Device bytes of this table only; the vocabulary head charges its own table.
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.row_fp8.as_ref().map_or_else(|| self.table.device_bytes(),
+            |owner| owner.embedding.residency().bytes)
+    }
+
+    pub(crate) fn validate_residency(&self, device: i32, bytes: u64) -> Result<()> {
+        validate_embedding_residency(self.owner().id, self.device_bytes(), device, bytes)
+    }
 
     pub(crate) fn allocation_buffer(&self) -> CuteafdDeviceBuffer { self.table.buffer() }
 
@@ -288,7 +299,7 @@ impl<'a> TokenEmbedding<'a> {
         // pinned input live and orders replacement after previous consumers.
         unsafe { self.library.copy_h2d_ordered(ids, &bytes, stream)?; }
         // SAFETY: `ids` becomes initialized before the gather on this stream; out holds the rows.
-        unsafe { self.gather(ids.ptr, std::ptr::null(), tokens.len(), copies, std::ptr::null(), out.ptr, stream) }
+        unsafe { self.gather(ids.ptr, std::ptr::null(), tokens.len(), copies, std::ptr::null(), out.ptr, None, stream) }
     }
 
     /// Gathers the rows of `rows` device-resident ids (`ids[index[r]]` with a
@@ -301,14 +312,26 @@ impl<'a> TokenEmbedding<'a> {
     /// `fallback` is null or a live row, all on the stream's device. A BF16
     /// table may live on a peer with peer access enabled from this device;
     /// its upload must finish before gathering and its lifetime spans the work.
+    /// Row-FP8 with multiple copies requires disjoint caller scratch of at least
+    /// `[rows, hidden]` BF16 on this device, live until the same stream drains.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gather(&self, ids: *const c_void, index: *const c_void, rows: usize, copies: usize,
-        fallback: *const c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
+        fallback: *const c_void, out: *mut c_void, scratch: Option<CuteafdDeviceBuffer>,
+        stream: *mut c_void) -> Result<()> {
         if let Some(owner) = &self.row_fp8 {
-            ensure!(index.is_null() && fallback.is_null() && copies == 1,
-                "the row-FP8 embedding gathers plain ids (no index, fallback or copies)");
-            // SAFETY: the caller's contract; u32 ids below vocab are the gather's I32 ids.
-            return unsafe { owner.embed(ids.cast_mut(), out, rows, stream) };
+            ensure!(index.is_null() && fallback.is_null(),
+                "the row-FP8 embedding gathers plain ids (no index or fallback)");
+            let device = owner.embedding.residency().device;
+            return gather_row_fp8_copies(rows, self.source.hidden, copies, out, scratch, device, |op| {
+                match op {
+                    // SAFETY: the caller retains ids, output and optional scratch through this stream.
+                    EmbeddingOp::Gather(output) => unsafe { owner.embed(ids.cast_mut(), output, rows, stream) },
+                    // SAFETY: checked disjoint pitched views, ordered after the gather on this stream.
+                    EmbeddingOp::Copy { dst, src, width, dst_pitch } => unsafe {
+                        self.library.copy_device_rows_async(dst, src, width, rows, dst_pitch, width, stream)
+                    },
+                }
+            });
         }
         let table = self.table.buffer();
         // SAFETY: the caller's contract; the table is a live [vocab, hidden] BF16 buffer.
@@ -329,7 +352,7 @@ impl<'a> TokenEmbedding<'a> {
         let index_ptr = index.map_or(std::ptr::null(), |(device, _)| device);
         let fallback = fallback.map_or(std::ptr::null(), |(device, _)| device);
         // SAFETY: both placements expose a stable device-visible table; caller owns the stream and outputs.
-        unsafe { self.gather(ids.ptr, index_ptr, rows, copies, fallback, out.ptr, stream) }
+        unsafe { self.gather(ids.ptr, index_ptr, rows, copies, fallback, out.ptr, None, stream) }
     }
 
     /// Compares every byte of the resident table with the shard (the
@@ -352,6 +375,43 @@ impl<'a> TokenEmbedding<'a> {
         }
         Ok(total)
     }
+}
+
+enum EmbeddingOp {
+    Gather(*mut c_void),
+    Copy { dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer, width: usize, dst_pitch: usize },
+}
+
+fn gather_row_fp8_copies(rows: usize, hidden: usize, copies: usize, out: *mut c_void,
+    scratch: Option<CuteafdDeviceBuffer>, device: i32, mut launch: impl FnMut(EmbeddingOp) -> Result<()>) -> Result<()> {
+    ensure!(rows > 0 && hidden > 0 && copies > 0 && !out.is_null(), "empty row-FP8 embedding gather");
+    let width = hidden.checked_mul(2).context("embedding row overflow")?;
+    let bytes = rows.checked_mul(width).context("embedding scratch overflow")?;
+    let pitch = copies.checked_mul(width).context("embedding copies overflow")?;
+    let output_bytes = rows.checked_mul(pitch).context("embedding output overflow")?;
+    let output_end = (out as usize).checked_add(output_bytes).context("embedding output address overflow")?;
+    if copies == 1 { return launch(EmbeddingOp::Gather(out)); }
+    let src = scratch.context("row-FP8 embedding copies require caller scratch")?;
+    ensure!(!src.ptr.is_null() && src.bytes >= bytes && src.device_id == device && src.flags == 0,
+        "row-FP8 embedding scratch differs from required device/extent");
+    let scratch_end = (src.ptr as usize).checked_add(bytes).context("embedding scratch address overflow")?;
+    ensure!(output_end <= src.ptr as usize || scratch_end <= out as usize,
+        "row-FP8 embedding scratch overlaps output");
+    launch(EmbeddingOp::Gather(src.ptr))?;
+    for copy in 0..copies {
+        let offset = copy * width;
+        let dst = CuteafdDeviceBuffer { ptr: out.cast::<u8>().wrapping_add(offset).cast(),
+            bytes: output_bytes - offset, device_id: device, flags: 0 };
+        launch(EmbeddingOp::Copy { dst, src, width, dst_pitch: pitch })?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_embedding_residency(actual_device: i32, actual_bytes: usize,
+    device: i32, bytes: u64) -> Result<()> {
+    ensure!(actual_device == device && actual_bytes as u64 == bytes,
+        "embedding differs from admitted owner/bytes: actual GPU {actual_device}, {actual_bytes} bytes; admitted GPU {device}, {bytes} bytes");
+    Ok(())
 }
 
 /// E4M3 byte to F32 (finite codes; NaN for 0x7f/0xff).
@@ -423,7 +483,9 @@ impl DeviceLogits {
         ensure!(spans.iter().all(|&(row, count)| row + count <= self.rows && (count == 1 || self.stride == self.vocab)),
             "logits download outside {} rows", self.rows);
         let mut out = vec![0f32; total * self.vocab];
-        let device_id = library.cuda_get_device()?;
+        // SAFETY: DeviceLogits retains its producing stream through this download.
+        let device_id = unsafe { library.cuda_stream_device(self.stream)? };
+        let _device = crate::shared::memory::device::Device { library, id: device_id }.enter()?;
         let mut rest = out.as_mut_slice();
         let queued = spans.iter().try_for_each(|&(row, count)| {
             let (dst, tail) = std::mem::take(&mut rest).split_at_mut(count * self.vocab);
@@ -604,6 +666,11 @@ fn host_logprob(logits: &[f32], token: u32) -> f32 {
     logits[token as usize] - max - sum.ln() as f32
 }
 
+fn check_selector_device(output: i32, stream: i32) -> Result<()> {
+    ensure!(output == stream, "token selector output operand on device {output}, logits stream on device {stream}");
+    Ok(())
+}
+
 impl<'a> TokenSelector<'a> {
     /// A selector for up to `capacity` rows of `vocab` logits.
     pub fn new(library: &'a NativeLibrary, placement: SelectPlacement, vocab: usize, capacity: usize) -> Result<Self> {
@@ -634,6 +701,7 @@ impl<'a> TokenSelector<'a> {
     /// Allocates the GPU sampler now (eager start-up); otherwise the first sampled or masked
     /// selection does.
     pub fn reserve_sampler(&mut self) -> Result<()> {
+        let _device = crate::shared::memory::device::Device { library: self.library, id: self.out.buffer.device_id }.enter()?;
         self.landed.reserve_current_device()?;
         if self.wave.is_none() && self.placement != SelectPlacement::Host {
             self.wave = Some(TargetSamplingWave::new(self.library, self.capacity.min(128), self.vocab)?);
@@ -695,6 +763,10 @@ impl<'a> TokenSelector<'a> {
         if n > self.capacity {
             return Err(TokenIoError::Capacity { rows: n, capacity: self.capacity }.into());
         }
+        // SAFETY: selection consumes live rows on the producing engine's stream.
+        let owner = unsafe { self.library.cuda_stream_device(logits.stream)? };
+        let _device = crate::shared::memory::device::Device { library: self.library, id: owner }.enter()?;
+        self.bind_device(owner)?;
         if self.placement == SelectPlacement::Host {
             self.counts[2] += n as u64;
             let host = logits.to_host(self.library)?;
@@ -707,6 +779,24 @@ impl<'a> TokenSelector<'a> {
             return self.greedy(logits, rows);
         }
         self.sampled(logits, rows, &routes)
+    }
+
+    /// A selector can follow a different head, but must never reuse the old
+    /// head's output/sampler allocations on the new stream. Selections drain
+    /// their landing copies before returning, so the old arena is retired.
+    fn bind_device(&mut self, owner: i32) -> Result<()> {
+        let previous = self.out.buffer.device_id;
+        if previous != owner {
+            let out = DeviceAllocation::new(self.library, self.capacity * 12)?;
+            let old = std::mem::replace(&mut self.out, out);
+            let wave = self.wave.take();
+            crate::shared::memory::device::Device { library: self.library, id: previous }.run(|| {
+                drop(wave);
+                drop(old);
+                Ok(())
+            })?;
+        }
+        check_selector_device(self.out.buffer.device_id, owner)
     }
 
     fn host_select(logits: &[f32], row: &RowSelect) -> RowResult {
@@ -1004,6 +1094,99 @@ fn chi_square_critical(dof: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_fp8_copies_gather_once_then_expand_on_device() -> Result<()> {
+        use std::cell::RefCell;
+        for rows in [1, 3, 64] {
+            for copies in [1, 4] {
+                let hidden = 7;
+                let width = hidden * 2;
+                let output = RefCell::new(vec![0u8; rows * copies * width]);
+                let scratch = RefCell::new(vec![0u8; rows * width]);
+                let out = output.borrow_mut().as_mut_ptr().cast();
+                let src = CuteafdDeviceBuffer { ptr: scratch.borrow_mut().as_mut_ptr().cast(),
+                    bytes: rows * width, device_id: 2, flags: 0 };
+                let mut events = Vec::new();
+                gather_row_fp8_copies(rows, hidden, copies, out, (copies > 1).then_some(src), 2, |op| {
+                    match op {
+                        EmbeddingOp::Gather(ptr) => {
+                            assert!(events.is_empty());
+                            events.push("gather");
+                            let mut table = if ptr == out { output.borrow_mut() } else {
+                                assert_eq!(ptr, src.ptr); scratch.borrow_mut()
+                            };
+                            for (row, bytes) in table.chunks_exact_mut(width).enumerate() {
+                                bytes.fill((row + 1) as u8);
+                            }
+                        }
+                        EmbeddingOp::Copy { dst, src: actual_src, width: actual_width, dst_pitch } => {
+                            assert_eq!(events.first(), Some(&"gather"));
+                            assert_eq!(actual_src.ptr, src.ptr);
+                            assert_eq!(actual_width, width);
+                            assert_eq!(dst_pitch, copies * width);
+                            let offset = dst.ptr as usize - out as usize;
+                            assert_eq!(dst.bytes, rows * dst_pitch - offset);
+                            for row in 0..rows {
+                                let at = offset + row * dst_pitch;
+                                output.borrow_mut()[at..at + width]
+                                    .copy_from_slice(&scratch.borrow()[row * width..(row + 1) * width]);
+                            }
+                            events.push("copy");
+                        }
+                    }
+                    Ok(())
+                })?;
+                assert_eq!(events.iter().filter(|&&event| event == "gather").count(), 1);
+                assert_eq!(events.len(), if copies == 1 { 1 } else { 1 + copies });
+                for (row, bytes) in output.borrow().chunks_exact(copies * width).enumerate() {
+                    assert!(bytes.iter().all(|&byte| byte == (row + 1) as u8));
+                }
+                if copies > 1 {
+                    for bad in [None, Some(CuteafdDeviceBuffer { bytes: src.bytes - 1, ..src }),
+                        Some(CuteafdDeviceBuffer { device_id: 0, ..src }),
+                        Some(CuteafdDeviceBuffer { ptr: out, ..src })] {
+                        let mut launched = false;
+                        assert!(gather_row_fp8_copies(rows, hidden, copies, out, bad, 2,
+                            |_| { launched = true; Ok(()) }).is_err());
+                        assert!(!launched);
+                    }
+                }
+            }
+        }
+        let mut launches = 0;
+        let mut output = [0u8; 32];
+        let mut scratch = [0u8; 8];
+        let src = CuteafdDeviceBuffer { ptr: scratch.as_mut_ptr().cast(), bytes: 8,
+            device_id: 0, flags: 0 };
+        assert!(gather_row_fp8_copies(1, 4, 4, output.as_mut_ptr().cast(), Some(src), 0, |_| {
+            launches += 1; anyhow::bail!("injected gather failure")
+        }).is_err());
+        assert_eq!(launches, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn selection_and_download_follow_the_producing_stream_device() {
+        let source = include_str!("token_io.rs").split("#[cfg(test)]").next().unwrap();
+        let download = source.split("fn download(").nth(1).unwrap().split("/// One row to select").next().unwrap();
+        assert!(download.find("cuda_stream_device(self.stream)").unwrap() < download.find("copy_d2h_async(").unwrap());
+        assert!(!download.contains("cuda_get_device()"));
+        let select = source.split("pub fn select(").nth(1).unwrap().split("fn bind_device(").next().unwrap();
+        assert!(select.find("cuda_stream_device(logits.stream)").unwrap() < select.find("self.greedy(").unwrap());
+        assert!(select.find("self.bind_device(owner)?").unwrap() < select.find("self.sampled(").unwrap());
+        let memory = include_str!("memory.rs");
+        let wait = memory.split("pub(crate) unsafe fn wait(").nth(1).unwrap().split("impl Drop for BlockingWait").next().unwrap();
+        assert!(wait.find("cuda_stream_device(stream)").unwrap() < wait.find("cuda_event_create_blocking()").unwrap());
+        assert!(!wait.contains("cuda_get_device()"));
+    }
+
+    #[test]
+    fn selector_device_check_names_the_rejected_operand() {
+        for device in [0, 1] { check_selector_device(device, device).unwrap(); }
+        let error = check_selector_device(0, 1).unwrap_err().to_string();
+        assert!(error.contains("output operand on device 0") && error.contains("logits stream on device 1"), "{error}");
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]

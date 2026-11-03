@@ -999,7 +999,36 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
             jobs: vec![Job::Upload { at: 0, bytes: rects[1].bytes(), dst: allocations[1].buffer }] });
         owned.push((rects, allocations));
     }
-    let dense = plan_records(root.path(), records, &devices, 0)?;
+    let replica = devices[0].run(|| crate::shared::memory::DeviceAllocation::new(&library, owned[1].0[0].bytes()))?;
+    library.copy_h2d(replica.buffer, &vec![0xa5; replica.buffer.bytes])?;
+    records.peer_copies.push(crate::shared::experts::rtx::dense::PeerCopy::new(
+        owned[1].1[0].buffer, replica.buffer, replica.buffer.bytes)?);
+    let mut untouched = vec![0; replica.buffer.bytes];
+    devices[0].run(|| library.copy_d2h(&mut untouched, replica.buffer))?;
+    assert_eq!(untouched, vec![0xa5; replica.buffer.bytes], "recording must not copy an unfilled source");
+    let (plans, destinations) = plan_records(root.path(), records, &devices, 0)?;
+    struct Observed<D> { inner: D, done: std::sync::mpsc::Sender<()> }
+    impl<D: PushDestination<Delivered = ()>> PushDestination for Observed<D> {
+        type Delivered = ();
+        fn belongs_to(&self, device: Device<'_>) -> bool { self.inner.belongs_to(device) }
+        fn logical_bytes(&self) -> usize { self.inner.logical_bytes() }
+        fn device_bytes(&self) -> usize { self.inner.device_bytes() }
+        fn check_fragment(&self, offset: u64, bytes: u64) -> Result<()> { self.inner.check_fragment(offset, bytes) }
+        fn destination(&self, offset: usize, bytes: usize) -> Result<cuteafd_ffi::CuteafdDeviceBuffer> {
+            self.inner.destination(offset, bytes)
+        }
+        fn copy_validation(&mut self, offset: u64, bytes: &[u8]) -> Result<()> { self.inner.copy_validation(offset, bytes) }
+        fn copied(&mut self, offset: u64, bytes: u64) -> Result<()> { self.inner.copied(offset, bytes) }
+        fn done(self) -> Result<()> {
+            self.inner.done()?;
+            self.done.send(())?;
+            Ok(())
+        }
+    }
+    let (rank_done, completed) = std::sync::mpsc::channel();
+    let dense = (plans, destinations.into_iter().map(|inner| Observed { inner, done: rank_done.clone() }).collect());
+    drop(rank_done);
+    let (allow_commit, commit_allowed) = std::sync::mpsc::channel();
     let sockets = tempfile::tempdir_in(fixture.directory())?;
     let socket = sockets.path().join("hub.sock").to_string_lossy().into_owned();
     let listener = Listener::bind(&socket)?;
@@ -1077,16 +1106,35 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
             if !packer.is_empty() { send(packer.finish().0)?; }
             conn.send_event(&Event::Done)?;
         }
+        // Withhold group Done until both rank finishes and the replica-byte check.
+        commit_allowed.recv_timeout(Duration::from_secs(60))?;
         coordinator.send_event(&Event::Done)?;
         // The driver keeps the group open until every rank initialized, then closes it.
         anyhow::ensure!(coordinator.next_request()?.is_none(), "the driver closes its group after the commit");
         Ok(())
     });
-    let (pushed, ()) = push.receive_with(devices.to_vec(), None, 0, Some(Ok(dense)), || ());
+    let (pushed, observed) = push.receive_with(devices.to_vec(), None, 0, Some(Ok(dense)), || -> Result<()> {
+        for _ in 0..2 { completed.recv_timeout(Duration::from_secs(60))?; }
+        let checked = devices[0].run(|| -> Result<()> {
+            let mut actual = vec![0; replica.buffer.bytes];
+            library.copy_d2h(&mut actual, replica.buffer)?;
+            anyhow::ensure!(actual == untouched, "rank Done must not copy before whole-group commit");
+            Ok(())
+        });
+        // Release the protocol even if the assertion fails, so cleanup cannot deadlock.
+        allow_commit.send(())?;
+        checked
+    });
     let served = hub.join().map_err(|_| anyhow::anyhow!("fake hub panicked"))?;
-    let pushed = pushed?;
     served?;
+    observed?;
+    let pushed = pushed?;
     assert_eq!(pushed.map(|ranks| ranks.len()), Some(2), "both coordinator ranks commit");
+    let mut expected_replica = vec![0; replica.buffer.bytes];
+    owned[1].0[0].read(&mut expected_replica)?;
+    let mut actual_replica = vec![0; replica.buffer.bytes];
+    devices[0].run(|| library.copy_d2h(&mut actual_replica, replica.buffer))?;
+    assert_eq!(actual_replica, expected_replica, "group-post-commit peer copy reads the other rank's landed bytes");
     for (gpu, (rects, allocations)) in owned.iter().enumerate() {
         for (rect, allocation) in rects.iter().zip(allocations) {
             let mut expected = vec![0; rect.bytes()];

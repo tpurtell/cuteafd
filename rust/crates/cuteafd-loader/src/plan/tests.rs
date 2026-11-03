@@ -251,7 +251,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     let moe = spec.moe.as_ref().unwrap();
     let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
         topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
-    let endpoint = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 };
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
     let (request, response) = endpoint.wire_bytes(geometry).unwrap();
     let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
@@ -287,9 +287,9 @@ fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
                 let ingress = match input { MimoExpertInput::Fp8 => SparkIngress::Fp8K32,
                     MimoExpertInput::Bf16 => SparkIngress::Bf16,
                     MimoExpertInput::Bf16Decode => SparkIngress::Fp8K32 };
-                let endpoint = SparkEndpoint { capacity: rows as u32, ingress, ring_depth: None };
+                let endpoint = SparkEndpoint { capacity: rows as u32, ingress, ring_depth: None, partial_reply_bytes: None };
                 let decode = SparkEndpoint { capacity: 64, ingress: if input.bf16(true) { SparkIngress::Bf16 }
-                    else { SparkIngress::Fp8K32 }, ring_depth: Some(1) };
+                    else { SparkIngress::Fp8K32 }, ring_depth: Some(1), partial_reply_bytes: None };
                 assert_eq!(admission::spark_endpoints(rows, input).unwrap(), [decode, endpoint]);
                 let (request, response) = endpoint.wire_bytes(geometry).unwrap();
                 let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
@@ -351,7 +351,7 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                 }
                 let endpoints = layout::spark_endpoints(family, 1) as u64;
                 let ingress = if !native && family == "glm5" { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress };
+                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress, partial_reply_bytes: None };
                 let (frame_request, response) = endpoint.wire_bytes(geometry).unwrap();
                 let request = geometry.compact_wire_bytes(unit as u32,
                     !native && input.checkpoint().spark_input_is_bf16()).unwrap().0;
@@ -428,6 +428,9 @@ fn boot_concurrency_full_plan_matrix() {
     write_kimi_snapshot(kimi.path(), false);
     fixtures.push(("kimi_k3", kimi));
     fixtures.push(("step5", families::step5::tests::snapshot("fp8")));
+    let muse = tempfile::tempdir().unwrap();
+    write_muse_spark_snapshot(muse.path(), &(0..62).collect::<Vec<_>>());
+    fixtures.push(("muse_spark", muse));
     let ml4 = tempfile::tempdir().unwrap();
     write_mistral_large4_snapshot(ml4.path(), None, true);
     fixtures.push(("mistral_large4", ml4));
@@ -920,6 +923,15 @@ fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
 
 #[test]
 fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
+    use super::encoder::{EncoderKind, EncoderPlacement};
+    let placement = |mode| Some(EncoderPlacement {
+        kind: match mode {
+            MediaMode::Off => EncoderKind::Off,
+            MediaMode::Spark(_) => EncoderKind::Spark { rank: 0 },
+            _ => EncoderKind::Rtx { gpu: 0 },
+        },
+        weights: 1024, scratch: 512, replicas: vec![], reason: "admitted fixture".into(), shortfall: 0,
+    });
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
     let mut report = input.plan(&PlanOptions::default()).unwrap();
@@ -937,11 +949,23 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
     ] {
         report.vision = vision;
         report.audio = audio;
+        report.encoder = placement(vision);
+        report.audio_encoder = placement(audio);
         options.media_cache_bytes = quota;
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         let media: u64 = report.host_ledger.as_ref().unwrap().items.iter()
             .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum();
         assert_eq!(media, expected);
+    }
+    // Requested media without an admitted tower cannot allocate a runtime cache.
+    report.vision = MediaMode::Rtx(Some(0));
+    report.audio = MediaMode::Rtx(Some(0));
+    for admitted in [None, placement(MediaMode::Off)] {
+        report.encoder = admitted.clone();
+        report.audio_encoder = admitted;
+        layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+        assert!(!report.host_ledger.as_ref().unwrap().items.iter()
+            .any(|item| item.group == "media/embedding-cache"));
     }
 }
 
@@ -1393,8 +1417,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                         // lanes plus each further prefill slot), as serve opens them.
                         let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None,
                             capacity: report.prefill_unit_rows.unwrap() as u32,
-                            ingress
-                        }; report.prefill_waves.unwrap().max(2) as usize];
+                            ingress, partial_reply_bytes: None }; report.prefill_waves.unwrap().max(2) as usize];
                         assert_eq!(rings.bytes, endpoints.iter().map(|endpoint| endpoint.ring_bytes(
                             cuteafd_core::ExpertGeometry::DEEPSEEK_V41, cuteafd_core::SparkRings {
                                 max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
@@ -2209,6 +2232,29 @@ fn audio_defaults_off_without_qualified_bundle_and_explicit_placement_refuses() 
     assert!(auto.audio_encoder.is_none());
     assert_eq!(off.encoder_plan_hash, auto.encoder_plan_hash);
     assert_eq!(off.hints.iter().map(|h| &h.what).collect::<Vec<_>>(), auto.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
+}
+
+#[test]
+fn declared_audio_kind_is_checkpoint_native_and_invalid_towers_never_disable_auto() {
+    use crate::media::AudioTowerKind;
+    let cases = [
+        (json!({"model_type":"muse_spark", "audio_config":{"model_type":"muse_spark_audio"}}),
+            Some(AudioTowerKind::MusePcm), "MusePcm"),
+        (json!({"model_type":"mimo_v2", "audio_config":{"audio_channels":20}}),
+            Some(AudioTowerKind::MimoRvq), "MimoRvq"),
+        (json!({"model_type":"mimo_v2", "audio_config":{"model_type":"unknown_audio"}}),
+            None, "unknown_audio"),
+        (json!({"model_type":"qwen4_exp", "audio_config":{}}), None, "qwen4_exp"),
+    ];
+    for (config, kind, named) in cases {
+        let declared = AudioTowerKind::from_config(&config);
+        if let Some(kind) = kind { assert_eq!(declared.unwrap(), Some(kind)); }
+        else { assert!(declared.unwrap_err().contains(named)); }
+        let dir = snapshot(config, &[]);
+        let error = resolve_audio(MediaMode::Auto, dir.path()).unwrap_err().to_string();
+        assert!(error.contains(named), "{error}");
+        assert_eq!(resolve_audio(MediaMode::Off, dir.path()).unwrap(), MediaMode::Off);
+    }
 }
 
 #[test]

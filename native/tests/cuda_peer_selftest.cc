@@ -43,6 +43,11 @@ int main() {
     check(dst.device_id == destination);
     check(cuteafd_cuda_stream_create(&consumer) == CUTEAFD_STATUS_OK);
     check(cuteafd_cuda_stream_create(&pending) == CUTEAFD_STATUS_OK);
+    int owner = -1, current = -1;
+    check(cuteafd_cuda_stream_device(producer, nullptr) == CUTEAFD_STATUS_INVALID_ARGUMENT);
+    check(cuteafd_cuda_stream_device(producer, &owner) == CUTEAFD_STATUS_OK && owner == source);
+    check(cuteafd_cuda_stream_device(consumer, &owner) == CUTEAFD_STATUS_OK && owner == destination);
+    check(cuteafd_cuda_get_device(&current) == CUTEAFD_STATUS_OK && current == destination);
     check(cuteafd_copy_peer_async(dst, src, bytes + 1, consumer) == CUTEAFD_STATUS_INVALID_ARGUMENT);
     check(cuteafd_copy_peer_async(dst, src, bytes, nullptr) == CUTEAFD_STATUS_INVALID_ARGUMENT);
     std::vector<unsigned char> host(bytes);

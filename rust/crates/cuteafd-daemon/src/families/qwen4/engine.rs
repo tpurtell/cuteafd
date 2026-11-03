@@ -2174,7 +2174,7 @@ impl<'a> Qwen4Engine<'a> {
         if !defer_gather {
             // SAFETY: the ids are staged on this stream; `out` holds the rows.
             unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), tokens.len(), copies,
-                std::ptr::null(), w.live(out, copies * self.cfg.hidden * 2), self.execution_stream())? };
+                std::ptr::null(), w.live(out, copies * self.cfg.hidden * 2), None, self.execution_stream())? };
         }
         Ok(())
     }
@@ -3206,7 +3206,7 @@ impl<'a> Qwen4Engine<'a> {
                     if index == 0 && self.embedding.device_gather() {
                         // SAFETY: staged token ids and persistent root streams cover this graph bucket.
                         unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC,
-                            std::ptr::null(), w.live(&w.streams[0], HC * self.cfg.hidden * 2), self.execution_stream())?; }
+                            std::ptr::null(), w.live(&w.streams[0], HC * self.cfg.hidden * 2), None, self.execution_stream())?; }
                     }
                     if index == 0 || boundary {
                         self.enter(w, &mut c, None, layer, index, rows, tables.spec)?;
@@ -3384,7 +3384,7 @@ impl<'a> Qwen4Engine<'a> {
                 if index == 0 && gather {
                     // SAFETY: the step's ids are staged before the replay; the streams hold its rows.
                     unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
-                        w.live(&w.streams[0], HC * self.cfg.hidden * 2), self.execution_stream())? };
+                        w.live(&w.streams[0], HC * self.cfg.hidden * 2), None, self.execution_stream())? };
                 }
                 if index == 0 {
                     self.enter(w, &mut c, None, layer, index, rows, spec)?;

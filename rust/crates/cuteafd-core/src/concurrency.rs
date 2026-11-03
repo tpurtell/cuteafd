@@ -29,7 +29,7 @@ pub struct ConcurrencyError {
 pub fn validate(family: &str, concurrency: u64) -> Result<(), ConcurrencyError> {
     let (capacity, cause) = match family {
         "deepseek_v41" => (MAX_CONCURRENCY, "native request/descriptor program"),
-        "deepseek_v4" | "glm5" | "glm5_flash" | "mimo_v2" | "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "mistral_large4" =>
+        "deepseek_v4" | "glm5" | "glm5_flash" | "mimo_v2" | "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark" | "mistral_large4" =>
             (64, "decode program"),
         _ => (MAX_CONCURRENCY, "boot-time concurrency"),
     };

@@ -16,6 +16,13 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertEqual(tool.swiglu_limit('dsv4p'), 10.0)
         self.assertEqual(tool.package_name('glm', [4, 5]), 'exl3-glm-k45')
 
+    def test_muse_and_ml4_keep_distinct_unclamped_geometries(self):
+        for family, geometry in (("muse", (4096, 4096, 256, 8)),
+                                 ("ml4", (6144, 6144, 128, 4))):
+            with self.subTest(family=family):
+                self.assertEqual(tool.GEOMETRIES[family], geometry)
+                self.assertIsNone(tool.swiglu_limit(family))
+
     def test_kimi_geometry_activation_and_profiles(self):
         self.assertEqual(tool.GEOMETRIES["kimik3"], (3584, 3072, 896, 16))
         self.assertEqual(tool.activation("kimik3"), "situ")
@@ -29,7 +36,8 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertEqual(set(coordinator), {"rtx-tp1", "rtx-tp2"})
         self.assertEqual(coordinator["rtx-tp1"], (3072, 896, 16, "fp32", ["rtx-tp1"]))
         self.assertEqual(coordinator["rtx-tp2"], (1536, 896, 16, "fp32", ["rtx-tp2"]))
-        for geometry in set(tool.GEOMETRIES) - {"kimik3"}:
+        self.assertEqual(tool.activation("step5"), "silu_post_clamp")
+        for geometry in set(tool.GEOMETRIES) - {"kimik3", "step5"}:
             self.assertEqual(tool.activation(geometry), "silu")
 
     def test_kimi_capacity_set(self):

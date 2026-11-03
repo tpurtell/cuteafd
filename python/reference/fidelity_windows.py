@@ -360,7 +360,8 @@ def validate_set(manifest: dict) -> dict:
         if w["bucket"] != bucket(start):
             raise ValueError("context bucket does not match first scored position")
         from fidelity_media import validate_media
-        validate_media(w.get("media", []), tokens, roles, start, processor=manifest.get("image_processor"))
+        validate_media(w.get("media", []), tokens, roles, start, processor=manifest.get("image_processor"),
+                       audio_processor=manifest.get("audio_processor"))
     if not seen or len(set(manifest["quick_windows"])) != len(manifest["quick_windows"]) or not set(manifest["quick_windows"]) <= seen:
         raise ValueError("invalid quick subset")
     return manifest

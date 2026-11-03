@@ -31,10 +31,14 @@ extern "C" uint64_t cuteafd_glm_dflash_topk_workspace(int32_t rows) {
   return uint64_t(rows) * 64 * 16 * 8;
 }
 
-// glm_dflash.cu:454-456 reserves two query slices with 128-wide heads.
+// The native d128/d64 entry points each reserve two query slices.
 extern "C" uint64_t cuteafd_glm_dflash_attention_workspace(int32_t sequences, int32_t kv_heads,
     int32_t max_keys) {
   return cuteafd_block_dspark_attention_workspace(sequences, 2 * kv_heads, kv_heads, 32, max_keys, 128);
+}
+extern "C" uint64_t cuteafd_glm_dflash_attention_workspace_d64(int32_t sequences, int32_t kv_heads,
+    int32_t max_keys) {
+  return cuteafd_block_dspark_attention_workspace(sequences, 2 * kv_heads, kv_heads, 32, max_keys, 64);
 }
 
 extern "C" int32_t cuteafd_glmf_dspark_markov_norms(const void* w2, void* norms, int32_t vocab,

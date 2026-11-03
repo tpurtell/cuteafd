@@ -949,11 +949,29 @@ def test_fixture_and_spark_argument_refusals(env, capsys, extra, match):
     assert not runs(env)
 
 
-def test_raw_family_requires_raw_mode(env, capsys):
+@pytest.mark.parametrize('family', ['kimi', 'muse'])
+def test_raw_family_requires_raw_mode(env, capsys, family):
     write_slot(env['home'], 'i1')
-    argv = ['--task', 'gr', '--family', 'kimi', '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
+    argv = ['--task', 'gr', '--family', family, '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
     assert golden.main(argv) == 2
     assert 'has no golden subcommand' in capsys.readouterr().err
+
+
+def test_muse_command_runs_from_sealed_slot_without_sparks(env):
+    write_slot(env['home'], 'i1')
+    command = ['python3', '-m', 'pytest', '-q',
+               'python/tests/test_dense_trellis_k6_exports.py::test_muse_f32_head_chunk_row_invariance']
+    argv = ['--task', 'gr', '--family', 'muse', '--model', 'org/model', '--arm', 'a=i1:s1',
+            '--gpus', '0', '--command', '--env', 'CUTEAFD_MUSE_HEAD_GPU_TEST=1', '--', *command]
+    assert golden.main(argv) == 0
+    call = runs(env)[0]
+    assert call[-len(command):] == command
+    assert call[call.index('-w') + 1] == '/workspace/cuteafd'
+    assert '--network' not in call
+    assert any('/coordinator/workspace:/workspace/cuteafd:ro' in arg for arg in call)
+    record = json.loads((env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
+    assert record['mode'] == 'command' and record['gpus'] == [0]
+    assert record['arm_env']['CUTEAFD_MUSE_HEAD_GPU_TEST'] == '1'
 
 
 def test_dense_native_test_without_sparks(env, monkeypatch):
@@ -1011,3 +1029,32 @@ def test_namespace_root_keeps_mount_loading_paths_identical(env, monkeypatch):
     assert not extra
     assert (Path(container) / 'config.json').read_bytes() == (host / 'config.json').read_bytes()
     assert golden.hub_root() == root / 'hf-home/hub'
+
+
+def test_command_mode_does_not_auto_mount_host_executables_and_prefers_usr_local_bin(env):
+    write_slot(env['home'], 'i1')
+    host_exe = env['tmp'] / 'host-nsys'
+    host_exe.write_text('#!/bin/sh\n')
+    host_exe.chmod(0o755)
+    data_file = env['tmp'] / 'inputs.bin'
+    data_file.write_bytes(b'data')
+    argv = BASE + ['--arm', 'a=i1:s1', '--gpus', '1', '--command', '--',
+                   '/usr/local/bin/nsys', '/usr/bin/env', str(host_exe), f'--input={data_file}']
+    assert golden.main(argv) == 0
+    call = runs(env)[0]
+    mounts = [call[i + 1] for i, a in enumerate(call) if a == '-v']
+    assert not any('/usr/local/bin/nsys:' in m for m in mounts)
+    assert not any('/usr/bin/env:' in m for m in mounts)
+    assert f'{host_exe}:{host_exe}:ro' not in mounts
+    assert f'{data_file}:{data_file}:ro' in mounts
+    assert call[-4:] == ['/usr/local/bin/nsys', '/usr/bin/env', str(host_exe), f'--input={data_file}']
+    path_env = next(call[i + 1].split('=', 1)[1] for i, a in enumerate(call)
+                    if a == '-e' and call[i + 1].startswith('PATH=')).split(':')
+    assert path_env.index('/usr/local/bin') < path_env.index('/usr/local/cuda/bin')
+
+    # Explicit --mount mounts a host executable when the caller asks for it.
+    explicit = BASE + ['--arm', 'a=i1:s1', '--gpus', '1', '--command', '--overwrite',
+                       '--mount', str(host_exe), '--', str(host_exe)]
+    assert golden.main(explicit) == 0
+    mounts = [runs(env)[-1][i + 1] for i, a in enumerate(runs(env)[-1]) if a == '-v']
+    assert f'{host_exe}:{host_exe}:ro' in mounts

@@ -16,6 +16,9 @@ const OUTPUT: &[&str] = &["input", "svh", "output"];
 pub enum DenseTrellisError {
     #[error("native dense trellis invalid {0}")]
     Invalid(&'static str),
+    #[error("native dense trellis {stage} operand {operand}: {reason}; ptr={address:#x}, bytes={actual}, required={required}, device={device}, expected_device={expected_device}, flags={flags}, alignment=16")]
+    Buffer { stage: &'static str, operand: &'static str, reason: &'static str,
+        address: usize, actual: usize, required: usize, device: i32, expected_device: i32, flags: u64 },
     #[error("dense_trellis_k6 has no native K{bits} row policy for [N={output}, K={input}], side={side}, codebook={codebook}")]
     MissingGeometry { input: usize, output: usize, side: usize, codebook: String, bits: usize },
     #[error("native dense trellis program: {0}")]
@@ -101,8 +104,8 @@ impl<'a> DenseTrellis<'a> {
         scales: Buffer, stream: *mut c_void) -> Result<()> {
         self.rows(rows)?;
         let k = self.geometry.input;
-        buffers(&[(input, rows*k*self.geometry.input_dtype.bytes()), (suh, k*2),
-            (rotated, rows*k*2), (scales, self.workspace.block_scales)])?;
+        buffers("input", &[("input", input, rows*k*self.geometry.input_dtype.bytes()), ("suh", suh, k*2),
+            ("rotated", rotated, rows*k*2), ("scales", scales, self.workspace.block_scales)])?;
         disjoint(&[input, suh, rotated, scales])?;
         // SAFETY: shape/device/extents and nonaliasing checked; the engine keeps
         // every allocation and stream live through completion and graph replay.
@@ -117,9 +120,9 @@ impl<'a> DenseTrellis<'a> {
         partial: Buffer, accumulator: Buffer, stream: *mut c_void) -> Result<()> {
         self.rows(rows)?;
         let g = self.geometry;
-        buffers(&[(pointer_table, 8), (payload, g.input*g.output*g.bits/8),
-            (scales, self.workspace.block_scales), (partial, rows.min(TRELLIS_PARTIAL_ROWS)*g.input.div_ceil(1024)*g.output*4),
-            (accumulator, rows*g.output*4)])?;
+        buffers("core", &[("pointer_table", pointer_table, 8), ("payload", payload, g.input*g.output*g.bits/8),
+            ("scales", scales, self.workspace.block_scales), ("partial", partial, rows.min(TRELLIS_PARTIAL_ROWS)*g.input.div_ceil(1024)*g.output*4),
+            ("accumulator", accumulator, rows*g.output*4)])?;
         disjoint(&[pointer_table, payload, scales, partial, accumulator])?;
         // SAFETY: buffer metadata and scratch extents checked. The caller owns
         // the initialized pointer table and rotated inputs through completion.
@@ -134,7 +137,7 @@ impl<'a> DenseTrellis<'a> {
         stream: *mut c_void) -> Result<()> {
         self.rows(rows)?;
         let n = self.geometry.output;
-        buffers(&[(accumulator, rows*n*4), (svh, n*2), (output, rows*n*self.geometry.output_dtype.bytes())])?;
+        validate_output_buffers(rows, n, self.geometry.output_dtype, accumulator, svh, output)?;
         disjoint(&[accumulator, svh, output])?;
         // SAFETY: extents/devices and nonaliasing checked; caller retains storage
         // and stream until all queued work and captured replays have drained.
@@ -235,12 +238,29 @@ fn matching_rotated_dtype(input: &serde_json::Value, core: &serde_json::Value) -
     matches!(input_dtype, Some("f16" | "bf16")) && input_dtype == core_dtype
 }
 
-fn buffers(items: &[(Buffer, usize)]) -> Result<()> {
-    let device = items[0].0.device_id;
-    if device < 0 || items.iter().any(|(b, bytes)| b.ptr.is_null() || b.bytes < *bytes
-        || b.device_id != device || b.flags != 0 || b.ptr as usize % 16 != 0
-        || (b.ptr as usize).checked_add(b.bytes).is_none()) {
-        return Err(DenseTrellisError::Invalid("buffer extent/alignment/device"));
+/// Validate typed output operands without launching device work.
+pub fn validate_output_buffers(rows: usize, width: usize, dtype: TrellisDType,
+    accumulator: Buffer, svh: Buffer, output: Buffer) -> Result<()> {
+    let elements = rows.checked_mul(width).filter(|&n| n > 0)
+        .ok_or(DenseTrellisError::Invalid("output extent overflow or empty"))?;
+    let bytes = |n: usize, size: usize| n.checked_mul(size)
+        .ok_or(DenseTrellisError::Invalid("output extent overflow"));
+    buffers("output", &[("accumulator", accumulator, bytes(elements, 4)?),
+        ("svh", svh, bytes(width, 2)?), ("output", output, bytes(elements, dtype.bytes())?)])
+}
+
+fn buffers(stage: &'static str, items: &[(&'static str, Buffer, usize)]) -> Result<()> {
+    let device = items[0].1.device_id;
+    for &(operand, b, required) in items {
+        let reason = if b.ptr.is_null() { "null pointer" }
+            else if b.bytes < required { "short extent" }
+            else if device < 0 || b.device_id != device { "device mismatch" }
+            else if b.flags != 0 { "unsupported flags" }
+            else if b.ptr as usize % 16 != 0 { "misaligned pointer" }
+            else if (b.ptr as usize).checked_add(b.bytes).is_none() { "address overflow" }
+            else { continue };
+        return Err(DenseTrellisError::Buffer { stage, operand, reason, address: b.ptr as usize,
+            actual: b.bytes, required, device: b.device_id, expected_device: device, flags: b.flags });
     }
     Ok(())
 }
@@ -347,13 +367,29 @@ mod tests {
         let b = |at, bytes, device_id| Buffer { ptr: at as *mut c_void, bytes, device_id, flags: 0 };
         let a = b(0x1000, 128, 0);
         let c = b(0x1080, 128, 0);
-        buffers(&[(a,128),(c,128)]).unwrap();
+        buffers("test", &[("a",a,128),("c",c,128)]).unwrap();
         disjoint(&[a,c]).unwrap();
         assert!(disjoint(&[a,b(0x1040,128,0)]).is_err());
-        assert!(buffers(&[(a,129)]).is_err());
-        assert!(buffers(&[(a,128),(b(0x1080,128,1),128)]).is_err());
-        assert!(buffers(&[(b(usize::MAX - 15, 32, 0),16)]).is_err());
-        assert!(buffers(&[(Buffer { flags: 1, ..a },128)]).is_err());
+        assert!(buffers("test", &[("a",a,129)]).is_err());
+        assert!(buffers("test", &[("a",a,128),("peer",b(0x1080,128,1),128)]).is_err());
+        assert!(buffers("test", &[("overflow",b(usize::MAX - 15, 32, 0),16)]).is_err());
+        assert!(buffers("test", &[("flags",Buffer { flags: 1, ..a },128)]).is_err());
+        for (bad, required, reason) in [
+            (Buffer { ptr: std::ptr::null_mut(), ..a }, 128, "null pointer"),
+            (a, 129, "short extent"), (Buffer { device_id: 1, ..c }, 128, "device mismatch"),
+            (Buffer { ptr: 0x1081usize as *mut c_void, ..c }, 128, "misaligned pointer"),
+            (Buffer { flags: 1, ..c }, 128, "unsupported flags"),
+            (b(usize::MAX - 15, 32, 0), 16, "address overflow"),
+        ] {
+            let error = buffers("fixture", &[("input", a, 128), ("output", bad, required)]).unwrap_err();
+            assert!(matches!(&error, DenseTrellisError::Buffer { stage: "fixture", operand: "output", reason: found,
+                actual, required: need, device, expected_device: 0, flags, .. }
+                if *found == reason && *actual == bad.bytes && *need == required && *device == bad.device_id && *flags == bad.flags));
+            let text = error.to_string();
+            for field in ["fixture", "output", reason, "ptr=", "bytes=", "required=", "device=", "expected_device=", "alignment=16"] {
+                assert!(text.contains(field), "{text}");
+            }
+        }
     }
 }
 
@@ -460,10 +496,11 @@ impl<'a> DenseTrellisDispatch<'a> {
     pub fn core(&self, rows: usize, b: DenseTrellisBuffers, stream: *mut c_void) -> Result<()> {
         self.native.rows(rows)?;
         let p=&self.policy;
-        buffers(&[(b.input,rows*p.input*2),(b.suh,p.input*2),(b.rotated,rows*p.input*2),
-            (b.pointer_table,8),(b.payload,p.input*p.output*p.bits/8),(b.scales,p.input/128*2),
-            (b.partial,rows.min(TRELLIS_PARTIAL_ROWS)*p.input.div_ceil(1024)*p.output*4),
-            (b.accumulator,rows*p.output*4)])?;
+        buffers("dispatch core", &[("input", b.input,rows*p.input*2),("suh", b.suh,p.input*2),
+            ("rotated", b.rotated,rows*p.input*2),("pointer_table", b.pointer_table,8),
+            ("payload", b.payload,p.input*p.output*p.bits/8),("scales", b.scales,p.input/128*2),
+            ("partial", b.partial,rows.min(TRELLIS_PARTIAL_ROWS)*p.input.div_ceil(1024)*p.output*4),
+            ("accumulator", b.accumulator,rows*p.output*4)])?;
         disjoint(&[b.input,b.suh,b.rotated,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator])?;
         self.native.input(rows,b.input,b.suh,b.rotated,b.scales,stream)?;
         self.native.core(rows,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator,stream)
@@ -555,6 +592,19 @@ fn reduced_egress<T>(reduce: impl FnOnce()->Result<T>,egress:impl FnOnce(T)->Res
     egress(reduce()?)
 }
 impl DenseTrellisDispatch<'_> {
+    /// Preserve both F32 partials until their rank-ordered sum, then egress once.
+    pub fn reduce_f32_output(&self, add: &crate::F32Add<'_>, rows: usize, rank0: Buffer, rank1: Buffer,
+        reduced: Buffer, svh: Buffer, output: Buffer, stream: *mut c_void) -> Result<()> {
+        self.native.rows(rows)?;
+        if self.policy.side != 2 { return Err(DenseTrellisError::Invalid("K-split reduction side")); }
+        reduced_egress(|| {
+            // SAFETY: F32Add validates distinct full-width operands; the caller
+            // orders the peer exchange and retains both partials through drain.
+            unsafe { add.launch(rank0, rank1, reduced, rows*self.policy.output, stream)?; }
+            Ok(reduced)
+        }, |sum| self.output(rows, sum, svh, output, stream))
+    }
+
     /// Both rank partials are retained/published as BF16. Widen before the
     /// rank-ordered F32 add, then perform exactly one H128/svh egress.
     pub fn reduce_output(&self,add:&crate::Bf16F32Add<'_>,rows:usize,rank0:Buffer,rank1:Buffer,
@@ -720,13 +770,14 @@ impl<'a> GroupedTrellis<'a> {
         stream: *mut c_void) -> Result<()> {
         let (k, n) = (self.k, self.n);
         let w = GroupedWorkspace::new(k, n, rows)?;
-        let mut checked = vec![(input, rows*k*2), (rotated, w.rotated), (pointer_table, w.pointer_table),
-            (scales, w.block_scales), (partial, w.partial), (accumulator, w.accumulator)];
+        let mut checked = vec![("input", input, rows*k*2), ("rotated", rotated, w.rotated), ("pointer_table", pointer_table, w.pointer_table),
+            ("scales", scales, w.block_scales), ("partial", partial, w.partial), ("accumulator", accumulator, w.accumulator)];
         for m in &members {
-            checked.extend([(m.payload, k*n*6/8), (m.suh, k*2), (m.svh, n*2), (m.output, rows*n*2)]);
+            checked.extend([("member payload", m.payload, k*n*6/8), ("member suh", m.suh, k*2),
+                ("member svh", m.svh, n*2), ("member output", m.output, rows*n*2)]);
         }
-        buffers(&checked)?;
-        disjoint(&checked.iter().map(|(b, _)| *b).collect::<Vec<_>>())?;
+        buffers("grouped", &checked)?;
+        disjoint(&checked.iter().map(|(_, b, _)| *b).collect::<Vec<_>>())?;
         let quarters = |buffer: Buffer, need: usize| -> Result<Vec<Buffer>> {
             let parts = (0..GROUPS).map(|i| GroupedWorkspace::slice(buffer, i)).collect::<Result<Vec<_>>>()?;
             if parts[0].bytes < need { return Err(DenseTrellisError::Invalid("grouped quarter extent")); }

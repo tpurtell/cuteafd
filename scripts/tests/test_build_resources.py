@@ -676,8 +676,10 @@ def test_seed_export_progresses_with_an_older_queued_serving_ticket(tmp_path, lo
     serving = None
     try:
         _wait_file(lease[0] / 'granted')
-        # This older job cannot get the umbrella until the build exits. The
-        # build's later export turn must not wait behind an unrelated ticket.
+        # The older serving ticket queues while the build holds the kakapo.lock
+        # umbrella. On export-request the build drops the umbrella, gets its
+        # disjoint kakapo-export turn without waiting behind the ticket, and
+        # keeps holding its counting slot while the umbrella is gone.
         marker = tmp_path / 'served'
         serving = subprocess.Popen([sys.executable, str(ROOT / 'scripts/hw/hwlock.py'),
                                     '--locks', 'sparks,kakapo', '--wait', '20', '--',
@@ -689,17 +691,88 @@ def test_seed_export_progresses_with_an_older_queued_serving_ticket(tmp_path, lo
             time.sleep(0.02)
         (lease[0] / 'export-request').touch()
         _wait_file(lease[0] / 'export-granted', timeout=5)
-        assert not marker.exists()
+        assert serving.wait(timeout=5) == 0 and marker.exists()
+        probe = resource.try_lock(locks / 'kakapo.lock')
+        assert probe is not None
+        probe.close()
+        assert resource.try_lock(locks / 'kakapo.build.0.lock') is None
         (lease[0] / 'export-done').touch()
         _end(*lease)
         lease = None
-        assert serving.wait(timeout=5) == 0 and marker.exists()
     finally:
         if lease:
             _end(*lease)
         if serving and serving.poll() is None:
             serving.terminate()
             serving.wait(timeout=5)
+
+
+def test_seed_export_releases_host_umbrella_before_queueing_and_avoids_deadlock(tmp_path, locks, monkeypatch):
+    # Direct sequence check: the host umbrella is released before hwlock.hold is
+    # entered for SEED-export, while the counting slot stays held.
+    import contextlib
+    import types
+    handles = resource.acquire(locks, 'cassowary', 3)
+    assert handles is not None and len(handles) == 2
+    assert resource.try_lock(locks / 'cassowary.lock') is None
+    assert resource.try_lock(locks / 'cassowary.build.0.lock') is None
+    real_hwlock = resource._hwlock()
+    events = []
+
+    @contextlib.contextmanager
+    def checked_hold(names, wait, label='', **kwargs):
+        probe = resource.try_lock(locks / 'cassowary.lock')
+        assert probe is not None, 'cassowary.lock still held when queueing for cassowary-export'
+        probe.close()
+        assert resource.try_lock(locks / 'cassowary.build.0.lock') is None
+        events.append(list(names))
+        real_hwlock.LOCK_DIR = locks
+        with real_hwlock.hold(names, wait, label, **kwargs) as held:
+            yield held
+
+    stub = types.SimpleNamespace(LOCK_DIR=locks, Cancelled=real_hwlock.Cancelled, hold=checked_hold)
+    monkeypatch.setattr(resource, '_hwlock', lambda: stub)
+    lease_dir = tmp_path / 'unit-lease'
+    lease_dir.mkdir()
+    stack = contextlib.ExitStack()
+    try:
+        state = resource.take_export_turn(stack, locks, 'cassowary',
+                                          types.SimpleNamespace(wait=5, lease_dir=lease_dir),
+                                          lambda: False, handles)
+        assert state == 'held' and events == [['cassowary-export']]
+        assert len(handles) == 1
+        assert resource.try_lock(locks / 'cassowary-export.lock') is None
+    finally:
+        stack.close()
+        for handle in handles:
+            handle.close()
+
+    # End-to-end #1038 reproduction: a fair-queued job wanting both cassowary and
+    # cassowary-export queues while a build holds cassowary's CPU lease; when the
+    # build then requests cassowary-export, releasing cassowary.lock before queueing
+    # lets both complete without deadlocking.
+    lease = _lease(tmp_path, 'build-both', '--host', 'cassowary')
+    queued = None
+    try:
+        _wait_file(lease[0] / 'granted')
+        marker = tmp_path / 'both-done'
+        queued = subprocess.Popen([sys.executable, str(ROOT / 'scripts/hw/hwlock.py'),
+                                   '--locks', 'cassowary,cassowary-export', '--wait', '20', '--',
+                                   'touch', str(marker)],
+                                  env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks)})
+        deadline = time.monotonic() + 5
+        while not list((locks / 'hwq').glob('*.ticket')):
+            assert queued.poll() is None and time.monotonic() < deadline
+            time.sleep(0.02)
+        (lease[0] / 'export-request').touch()
+        assert queued.wait(timeout=10) == 0 and marker.exists()
+        _wait_file(lease[0] / 'export-granted', timeout=10)
+        (lease[0] / 'export-done').touch()
+    finally:
+        _end(*lease)
+        if queued and queued.poll() is None:
+            queued.terminate()
+            queued.wait(timeout=5)
 
 
 def test_two_builds_on_one_seed_share_cpu_slots_but_serialize_the_export(tmp_path, locks):

@@ -101,6 +101,98 @@ pub(crate) fn check_header_widths(
     Ok(())
 }
 
+fn check_fused_expert_layout(value: &Value, derived: &Exl3StorageMap, layers: usize) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Layout {
+        down_shape: [usize; 3],
+        gate_up_shape: [usize; 3],
+        expert_axis: usize,
+        input_axis: usize,
+        output_axis: usize,
+        gate_output_rows: [usize; 2],
+        up_output_rows: [usize; 2],
+        output_names: String,
+    }
+    let layout: Layout = serde_json::from_value(value.clone()).context("EXL3 fused_expert_layout schema")?;
+    ensure!([layout.expert_axis, layout.output_axis, layout.input_axis] == [0, 1, 2],
+        "EXL3 fused_expert_layout unsupported source axes (expected expert/output/input=0/1/2)");
+    let [experts, outputs, input] = layout.gate_up_shape;
+    let [down_experts, down_output, down_input] = layout.down_shape;
+    let [gate_start, gate_end] = layout.gate_output_rows;
+    let [up_start, up_end] = layout.up_output_rows;
+    ensure!(experts > 0 && input > 0 && gate_start == 0 && gate_end > 0
+        && up_start == gate_end && up_end == outputs && up_end > up_start
+        && gate_end == up_end - up_start && down_experts == experts
+        && down_output == input && down_input == gate_end,
+        "EXL3 fused_expert_layout source shapes or gate/up row ranges disagree");
+    let template = layout.output_names.strip_suffix(".{gate_proj,up_proj,down_proj}")
+        .context("EXL3 fused_expert_layout output_names must name gate_proj,up_proj,down_proj")?;
+    let (prefix, tail) = template.split_once(".N.")
+        .context("EXL3 fused_expert_layout output_names missing layer placeholder N")?;
+    ensure!(tail == "mlp.experts.E" && prefix.ends_with("layers"),
+        "EXL3 fused_expert_layout output_names unsupported expert template");
+    // These are source-fusion provenance fields: the published payload is already
+    // split into independently rotated per-expert EXL3 modules, never a fused view.
+    let expected = layers.checked_mul(experts).and_then(|n| n.checked_mul(3))
+        .context("EXL3 fused_expert_layout module count overflow")?;
+    ensure!(layers > 0 && derived.keys().filter(|name| routed(name)).count() == expected,
+        "EXL3 fused_expert_layout expert/module count disagrees with emitted headers");
+    for layer in 0..layers {
+        for expert in 0..experts {
+            for (projection, k, n) in [("gate_proj", input, gate_end),
+                ("up_proj", input, up_end - up_start), ("down_proj", down_input, down_output)] {
+                let name = format!("{prefix}.{layer}.mlp.experts.{expert}.{projection}");
+                let module = derived.get(&name).with_context(||
+                    format!("EXL3 fused_expert_layout output_names missing emitted header {name}"))?;
+                ensure!(module.input_features == k && module.output_features == n,
+                    "EXL3 fused_expert_layout {name}: emitted headers are {}x{}, source declares {k}x{n}",
+                    module.input_features, module.output_features);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_retained_native_tensors(
+    manifest: &Value, derived: &Exl3StorageMap, headers: &[&crate::SafetensorsTensorMetadata],
+) -> Result<()> {
+    let Some(value) = manifest.get("retained_native_tensors") else { return Ok(()); };
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NativeTensor { dtype: String, shape: Vec<usize> }
+    let declarations: std::collections::BTreeMap<String, NativeTensor> =
+        serde_json::from_value(value.clone()).context("EXL3 retained_native_tensors schema")?;
+    let is_exl3 = |name: &str| name.rsplit_once('.').is_some_and(|(stem, suffix)|
+        derived.get(stem).is_some_and(|module| module.tensors.contains_key(suffix)));
+    let mut native = std::collections::BTreeMap::new();
+    for header in headers.iter().filter(|header| !is_exl3(&header.name)) {
+        ensure!(native.insert(header.name.as_str(), *header).is_none(),
+            "EXL3 retained_native_tensors duplicate header {}", header.name);
+    }
+    for (name, declaration) in declarations {
+        ensure!(!is_exl3(&name), "EXL3 retained_native_tensors {name} is an EXL3 storage member");
+        let header = native.remove(name.as_str()).with_context(||
+            format!("EXL3 retained_native_tensors {name} missing from native headers"))?;
+        let dtype = cuteafd_core::DType::from_safetensors(&declaration.dtype);
+        use cuteafd_core::DType;
+        let width = match dtype {
+            DType::Bf16 | DType::F16 | DType::I16 => 2u64,
+            DType::F32 | DType::I32 => 4,
+            DType::I64 => 8,
+            DType::I8 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::F8E8M0 => 1,
+            _ => anyhow::bail!("EXL3 retained_native_tensors {name} unsupported dtype {}", declaration.dtype),
+        };
+        let bytes = declaration.shape.iter().try_fold(width, |bytes, &dim| bytes.checked_mul(dim as u64))
+            .with_context(|| format!("EXL3 retained_native_tensors {name} byte extent overflow"))?;
+        ensure!(dtype == header.dtype && declaration.shape == header.shape && bytes == header.byte_length,
+            "EXL3 retained_native_tensors {name} dtype/shape/bytes disagree with the safetensors header");
+    }
+    ensure!(native.is_empty(), "EXL3 retained_native_tensors omits native header {}",
+        native.keys().next().copied().unwrap_or_default());
+    Ok(())
+}
+
 pub(crate) fn check_gptqmodel_manifest(
     compact: &Value, manifest: &Value, derived: &Exl3StorageMap, backbone_layers: usize,
 ) -> Result<()> {
@@ -108,6 +200,12 @@ pub(crate) fn check_gptqmodel_manifest(
         ensure!(manifest.get(field).and_then(Value::as_str) == Some("exl3"),
             "EXL3 manifest requires {field}=exl3");
     }
+    // Codebook/packing/scale fields constrain native decoder semantics; core_bits,
+    // head_bits and lm_head are checked against headers below. tensor_storage is
+    // consumed by parse_storage_metadata before this check; per_module_metadata
+    // must point to that map. Headers, not module_include's quantizer-selection
+    // regexes, determine inventory. calibration and meta record how weights were
+    // produced, not runtime transforms; retain them only as publication provenance.
     // out_scales describes whether the quantizer folded scales into svh.
     ensure!(manifest["codebook"] == "mcg"
         && matches!(manifest["out_scales"].as_str(), Some("never" | "auto"))
@@ -125,7 +223,10 @@ pub(crate) fn check_gptqmodel_manifest(
             | "desc_act" | "format" | "group_size" | "lm_head" | "meta" | "method" | "module_include"
             | "out_scales" | "pack_dtype" | "quant_method" | "tensor_storage" | "per_module_metadata"
             | "sym" | "calibration" | "native_quantization_config" | "mcg_multiplier" | "expert_bits" | "expert_bits_by_layer"
-            | "kept_tensors"), "EXL3 manifest has unexpected key {key}");
+            | "kept_tensors" | "fused_expert_layout" | "retained_native_tensors"), "EXL3 manifest has unexpected key {key}");
+    }
+    if let Some(layout) = manifest.get("fused_expert_layout") {
+        check_fused_expert_layout(layout, derived, backbone_layers)?;
     }
     if let Some(multiplier) = manifest.get("mcg_multiplier") {
         ensure!(multiplier.as_u64() == Some(super::exl3_storage::EXL3_MCG_MULTIPLIER),
@@ -197,6 +298,64 @@ mod tests {
             "calibration":{"samples":1426, "tokens":1097737}, "meta":{}, "module_include":[],
             "tensor_storage":true}).as_object().unwrap().clone());
         (compact, manifest)
+    }
+
+    #[test]
+    fn published_muse_fused_source_provenance_matches_emitted_expert_headers() {
+        use crate::SafetensorsTensorMetadata;
+        use cuteafd_core::DType;
+        use crate::formats::exl3_storage::derive_storage_map;
+        // Muse 89998fb1 layer-0/expert-0 down header, copied from the published shard.
+        // Gate/up emit the same geometry with independent rotations and trellises.
+        let raw = serde_json::json!({
+            "mcg":{"data_offsets":[16384,16388],"dtype":"I32","shape":[]},
+            "suh":{"data_offsets":[16388,24580],"dtype":"F16","shape":[4096]},
+            "svh":{"data_offsets":[24580,32772],"dtype":"F16","shape":[4096]},
+            "trellis":{"data_offsets":[32772,8421380],"dtype":"I16","shape":[256,256,64]}
+        });
+        let layout = serde_json::json!({"down_shape":[256,4096,4096], "expert_axis":0,
+            "gate_output_rows":[0,4096], "gate_up_shape":[256,8192,4096], "input_axis":2,
+            "output_axis":1, "output_names":"model.language_model.layers.N.mlp.experts.E.{gate_proj,up_proj,down_proj}",
+            "up_output_rows":[4096,8192]});
+        let mut headers = Vec::new();
+        for expert in 0..256 {
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                for (suffix, h) in raw.as_object().unwrap() {
+                    let start = h["data_offsets"][0].as_u64().unwrap();
+                    headers.push(SafetensorsTensorMetadata {
+                        name: format!("model.language_model.layers.0.mlp.experts.{expert}.{projection}.{suffix}"),
+                        dtype: match h["dtype"].as_str().unwrap() {
+                            "I32" => DType::I32, "F16" => DType::F16, "I16" => DType::I16, _ => unreachable!(),
+                        },
+                        shape: serde_json::from_value(h["shape"].clone()).unwrap(), byte_offset: start,
+                        byte_length: h["data_offsets"][1].as_u64().unwrap() - start,
+                    });
+                }
+            }
+        }
+        let mut derived = derive_storage_map(&headers).unwrap();
+        check_fused_expert_layout(&layout, &derived, 1).unwrap();
+        let (mut compact, mut manifest) = publication();
+        for key in ["core_bits", "head_bits", "mtp_bits", "lm_head"] {
+            compact.as_object_mut().unwrap().remove(key);
+            manifest.as_object_mut().unwrap().remove(key);
+        }
+        manifest["fused_expert_layout"] = layout.clone();
+        check_gptqmodel_manifest(&compact, &manifest, &derived, 1).unwrap();
+        for (key, wrong) in [("expert_axis", serde_json::json!(1)),
+            ("gate_output_rows", serde_json::json!([1,4096])),
+            ("gate_up_shape", serde_json::json!([255,8192,4096])),
+            ("down_shape", serde_json::json!([256,4096,2048])),
+            ("output_names", serde_json::json!("other.layers.N.mlp.experts.E.{gate_proj,up_proj,down_proj}"))] {
+            let mut bad = layout.clone(); bad[key] = wrong;
+            assert!(format!("{:#}", check_fused_expert_layout(&bad, &derived, 1).unwrap_err())
+                .contains("fused_expert_layout"), "accepted {key}");
+        }
+        let name = "model.language_model.layers.0.mlp.experts.17.up_proj";
+        derived.get_mut(name).unwrap().output_features = 2048;
+        assert!(check_fused_expert_layout(&layout, &derived, 1).unwrap_err().to_string().contains(name));
+        derived.remove(name);
+        assert!(check_fused_expert_layout(&layout, &derived, 1).unwrap_err().to_string().contains("count"));
     }
 
     #[test]

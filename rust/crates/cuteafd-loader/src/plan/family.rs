@@ -114,8 +114,41 @@ impl FamilyModel for Described {
     }
 }
 
+/// Native dense execution and routed onboarding are independently implemented.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Exlr8Execution {
+    pub dense_worlds: &'static [usize],
+    pub onboard_worlds: &'static [usize],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("EXLR8 native {operation} is unsupported for {world} coordinator GPUs (supported worlds: {supported:?})")]
+pub struct Exlr8ExecutionError {
+    pub operation: &'static str,
+    pub world: usize,
+    pub supported: &'static [usize],
+}
+impl Exlr8ExecutionError {
+    pub fn hint(&self) -> Hint {
+        Hint { what: self.to_string(),
+            how: "Select a supported coordinator world; routed onboarding additionally requires an implemented native RTX expert owner.".into() }
+    }
+}
+impl Exlr8Execution {
+    pub fn check(self, world: usize, onboarded: bool) -> Result<(), Exlr8ExecutionError> {
+        for (operation, supported, required) in [("dense execution", self.dense_worlds, true),
+            ("routed onboarding", self.onboard_worlds, onboarded)] {
+            if required && !supported.contains(&world) {
+                return Err(Exlr8ExecutionError { operation, world, supported });
+            }
+        }
+        Ok(())
+    }
+}
+
 pub trait Family: Sync {
     fn id(&self) -> &'static str;
+    fn exlr8_execution(&self) -> Exlr8Execution { Exlr8Execution::default() }
     /// Base timing estimate and hard executor limits, consumed unchanged by
     /// shared planning, serving and golden. Pins bypass only the estimate.
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
@@ -133,6 +166,9 @@ pub trait Family: Sync {
     /// How the executor feeds the single Spark prefill owner.
     fn detect(&self, checkpoint: &Checkpoint) -> bool;
     fn runtime(&self) -> RuntimeStatus;
+    /// Runtime reserves a shared host embedding cache via `with_media_headroom`
+    /// when a bundled media tower is admitted.
+    fn media_cache_headroom(&self) -> bool { false }
     /// Parses the checkpoint's configuration into the family's canonical model
     /// (the same parser its runtime uses), or the reason the runtime refuses it.
     fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn FamilyModel>, ConfigError>;
@@ -162,7 +198,7 @@ pub trait Family: Sync {
     }
 }
 
-static REGISTRY: [&dyn Family; 12] = [
+static REGISTRY: [&dyn Family; 13] = [
     &super::families::deepseek::DEEPSEEK_V41,
     &super::families::deepseek::DEEPSEEK_V4,
     &super::families::glm::GLM5,
@@ -172,6 +208,7 @@ static REGISTRY: [&dyn Family; 12] = [
     &super::families::qwen35::QWEN35,
     &super::families::step5::STEP5,
     &super::families::kimi::KIMI_K3,
+    &super::families::muse_spark::MUSE_SPARK,
     &super::families::mistral_large4::MISTRAL_LARGE4,
     &super::families::dflash::DFLASH2,
     &super::families::dspark::DSPARK,
@@ -183,4 +220,26 @@ pub fn registry() -> &'static [&'static dyn Family] {
 
 pub fn detect(checkpoint: &Checkpoint) -> Option<&'static dyn Family> {
     registry().iter().copied().find(|family| family.detect(checkpoint))
+}
+
+#[cfg(test)]
+mod exlr8_execution_tests {
+    use super::*;
+    use crate::plan::families::glm::{GLM5, GLM5_FLASH};
+
+    #[test]
+    fn dense_and_onboarding_worlds_are_independent_family_capabilities() {
+        assert!(GLM5.exlr8_execution().check(1, false).is_ok());
+        let error = GLM5.exlr8_execution().check(1, true).unwrap_err();
+        assert_eq!(error.operation, "routed onboarding");
+        assert_eq!(error.supported, &[2]);
+        for onboarded in [false, true] {
+            assert!(GLM5.exlr8_execution().check(2, onboarded).is_ok());
+            assert!(GLM5_FLASH.exlr8_execution().check(1, onboarded).is_ok());
+            let error = GLM5_FLASH.exlr8_execution().check(2, onboarded).unwrap_err();
+            assert_eq!(error.operation, "dense execution");
+            assert_eq!(error.supported, &[1]);
+        }
+        assert!(Exlr8Execution::default().check(1, false).is_err());
+    }
 }

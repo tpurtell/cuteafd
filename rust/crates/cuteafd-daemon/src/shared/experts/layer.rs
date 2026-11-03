@@ -376,7 +376,7 @@ mod format_dispatch_tests {
                 // Reverse both projection and window order; the shared 1152-row
                 // FC1 tile must retain every byte written by its other half.
                 steps.reverse();
-                fill_records_by_mount(library, &Records { operands: vec![], steps, finishes: vec![] }, |_| std::ptr::null_mut())?;
+                fill_records_by_mount(library, &Records { steps, ..Default::default() }, |_| std::ptr::null_mut())?;
                 let (mut expected, mut actual) = (vec![0; bytes], vec![0; bytes]);
                 library.copy_d2h(&mut expected, mounted.buffer)?;
                 library.copy_d2h(&mut actual, pushed.buffer)?;

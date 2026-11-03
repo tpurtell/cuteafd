@@ -471,3 +471,214 @@ def test_kimi_delegates_unservable_counts_to_planner(tmp_path, ranks):
     assert result.returncode != 0
     assert "invalid deployment specification" in result.stderr
     assert "cuteafd expertd-native" not in result.stderr
+
+
+# --- Muse Spark (#923) -----------------------------------------------------------
+
+MUSE = {"model_type": "muse_spark", "vision_config": {"depth": 2},
+        "audio_config": {"model_type": "muse_spark_audio"},
+        "text_config": {"model_type": "muse_spark_text", "num_hidden_layers": 62,
+                        "mlp_layer_types": ["sparse"] * 62}}
+MUSE_ID = "meta-models/Muse-Spark-Open-816B-A42B"
+MUSE_PLANNED = {**PLANNED, "spark_ranks": 6, "encoder_plan_hash": "ab" * 32,
+                "encoder": None, "audio_encoder": {"kind": {"kind": "off"}, "replicas": []}}
+
+
+def _muse(tmp_path: Path, keys: str = "", *, wip: bool = True, **kwargs):
+    return _family_launch_result(tmp_path, MUSE, MUSE_ID, "SPARK_COUNT=6\nRTX_GPUS=2\nSPECULATOR=off\n" + _hosts(6) + keys,
+                                 extra_args=("--wip", "muse") if wip else (),
+                                 encoder_plan=kwargs.pop("encoder_plan", MUSE_PLANNED), **kwargs)
+
+
+def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> None:
+    result = _muse(tmp_path)
+    serve = _line(result, "cuteafd serve-muse --snapshot")
+    assert f"/hf/hub/models--{MUSE_ID.replace('/', '--')}/snapshots/abc" in serve
+    assert _flag(serve, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(6))
+    # The head-split pair every family's launcher passes; serve-muse defaults to one GPU.
+    assert (_flag(serve, "--device"), _flag(serve, "--split-device")) == ("0", "1")
+    assert _flag(serve, "--rtx-expert-layers") == "auto"
+    assert _flag(serve, "--prefix-cache-entries") == "20"
+    assert _flag(serve, "--vision") == _flag(serve, "--audio") == "off"
+    for absent in ("--max-context", "--pool-tokens", "--draft", "--mtp", "--kv-cache",
+                   "--prefill-packing", "--expert-partial-bf16-max-rows", "--expert-partial-wide-format"):
+        assert absent not in serve.split(), absent
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == 6 and all("--world 6 " in worker for worker in workers)
+    plan = _line(result, "cuteafd plan")
+    assert _flag(plan, "--speculator") == "off" and "--drafter-snapshot" not in plan.split()
+    assert "--vision auto --audio auto" in plan
+    lines = result.stderr.splitlines()
+    probe = next(i for i, line in enumerate(lines) if "dst=/opt/cuteafd-serve-probe" in line)
+    assert lines[probe].endswith("serve-muse --help ")
+
+
+@pytest.mark.parametrize("mode", [None, "dflash2", "off"])
+def test_muse_default_drafter_is_pinned_and_off_is_explicit(tmp_path: Path, mode) -> None:
+    drafter = "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
+    revision = "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
+    _snapshot(tmp_path / "hf", drafter, {}, revision=revision)
+    # The shared fixture creates a repository once; add a second cached revision.
+    root = tmp_path / "hf/hub" / f"models--{drafter.replace('/', '--')}"
+    moving = root / "snapshots/unqualified-main"
+    moving.mkdir()
+    (moving / "config.json").write_text("{}")
+    (root / "refs/main").write_text("unqualified-main")
+    keys = "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6)
+    if mode is not None:
+        keys += f"SPECULATOR={mode}\n"
+    result = _family_launch_result(tmp_path, MUSE, MUSE_ID, keys,
+                                  extra_args=("--wip", "muse"), encoder_plan=MUSE_PLANNED)
+    serve, plan = _line(result, "cuteafd serve-muse --snapshot"), _line(result, "cuteafd plan")
+    assert _flag(plan, "--speculator") == ("off" if mode == "off" else "dflash2")
+    if mode == "off":
+        assert "--draft" not in serve.split() and "--drafter-snapshot" not in plan.split()
+    else:
+        snapshot = str(tmp_path / f"hf/hub/models--{drafter.replace('/', '--')}/snapshots/{revision}")
+        assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
+
+
+@pytest.mark.parametrize("setting", ["", "off", "on"])
+def test_muse_prefill_scoring_is_launch_admitted(tmp_path: Path, setting: str) -> None:
+    result = _muse(tmp_path, f"FULL_PREFILL_LOGITS={setting}\n" if setting else "")
+    serve, plan = _line(result, "cuteafd serve-muse --snapshot"), _line(result, "cuteafd plan")
+    assert serve.split().count("--full-prefill-logits") == int(setting == "on")
+    assert plan.split().count("--full-prefill-logits") == int(setting == "on")
+
+
+def test_muse_forwards_speculation_trace(tmp_path: Path) -> None:
+    trace = tmp_path / "trace" / "speculation-trace.jsonl"
+    result = _muse(tmp_path, f"SPECULATION_TRACE={trace}\n")
+    serve = _line(result, "cuteafd serve-muse --snapshot")
+    assert f"CUTEAFD_SPECULATION_TRACE={trace}" in serve
+    assert f"{trace.parent}:{trace.parent}" in serve
+
+
+def test_muse_trace_registration_still_rejects_unknown_keys(tmp_path: Path) -> None:
+    trace = tmp_path / "trace" / "speculation-trace.jsonl"
+    result = _muse(tmp_path, f"SPECULATION_TRACE={trace}\nSPECULATION_TRACE_TYPO=on\n")
+    assert result.returncode == 2, result.stderr
+    assert "unknown configuration key: SPECULATION_TRACE_TYPO" in result.stderr
+    assert "docker run -d" not in result.stderr
+
+@pytest.mark.parametrize("vision,audio", [("spark", "spark"), ("rtx", "spark"), ("off", "spark"), ("spark", "rtx")])
+def test_muse_generic_media_plan_handoff(tmp_path: Path, vision: str, audio: str) -> None:
+    def placed(kind, index):
+        return {"kind": {"kind": kind, **({"rank": index} if kind == "spark" else {"gpu": index})}, "replicas": []}
+    plan = {**PLANNED, "spark_ranks": 6, "encoder_plan_hash": "ab" * 32,
+            "encoder": None if vision == "off" else placed(vision, 0),
+            "audio_encoder": placed(audio, 1)}
+    result = _muse(tmp_path, f"VISION={'off' if vision == 'off' else 'auto'}\nAUDIO=auto\n", encoder_plan=plan)
+    serve = _line(result, "cuteafd serve-muse --snapshot")
+    assert _flag(serve, "--vision") == ("off" if vision == "off" else f"{vision}:0")
+    assert _flag(serve, "--audio") == f"{audio}:1"
+    assert "--audio-encoder-backend" not in serve.split()
+    if vision == "spark":
+        assert _flag(serve, "--vision-peers") == "10.0.0.1:19442"
+        assert _flag(serve, "--encoder-plan-hash") == "ab" * 32
+        assert _flag(serve, "--encoder-revision") == "abc"
+    if audio == "spark":
+        assert _flag(serve, "--audio-peers") == "10.0.0.2:19443"
+        assert _flag(serve, "--audio-encoder-plan-hash") == "ab" * 32
+        assert _flag(serve, "--audio-encoder-revision") == "abc"
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert sum("--encoder " in worker for worker in workers) == (vision == "spark")
+    assert sum("--audio-encoder " in worker for worker in workers) == (audio == "spark")
+
+
+def test_muse_forwards_typed_keys_when_set(tmp_path: Path) -> None:
+    result = _muse(tmp_path, "RTX_EXPERT_LAYERS=3\nPOOL_TOKENS=1048576\nMAX_CONTEXT_TOKENS=262144\n"
+                             "CONCURRENCY=8\nEXPERT_PARTIAL_BF16_MAX_ROWS=128\nEXPERT_PARTIAL_WIDE_FORMAT=fp8\n"
+                             "SPARK_DEVICE_BUDGET_BYTES=107374182400\n")
+    serve, plan = _line(result, "cuteafd serve-muse --snapshot"), _line(result, "cuteafd plan")
+    # The planner admits the same partial-reply overrides the server runs with.
+    assert _flag(plan, "--expert-partial-bf16-max-rows") == "128"
+    assert _flag(plan, "--expert-partial-wide-format") == "fp8"
+    assert _flag(serve, "--rtx-expert-layers") == "3"
+    assert _flag(serve, "--pool-tokens") == "1048576"
+    assert _flag(serve, "--max-context") == "262144"
+    assert _flag(serve, "--max-sequences") == "8"
+    assert _flag(serve, "--expert-partial-bf16-max-rows") == "128"
+    assert _flag(serve, "--expert-partial-wide-format") == "fp8"
+    assert _flag(serve, "--spark-budget-gib") == "100.0"
+
+
+@pytest.mark.parametrize("drafter,revision", [
+    ("RadixArk/Muse-Spark-Open-DFlash2", "46c90f41a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"),
+    ("nvidia/Muse-Spark-Open-816B-A42B-DFlash2", "22e2669ea0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"),
+])
+@pytest.mark.parametrize("cache", [None, "bf16"])
+def test_muse_dflash2_resolves_one_snapshot_for_plan_and_serve(tmp_path: Path, drafter, revision, cache) -> None:
+    _snapshot(tmp_path / "hf", drafter, {}, revision=revision)
+    keys = (f"SPECULATOR=dflash2\nSPECULATOR_MODEL_ID={drafter}\nSPECULATOR_MODEL_REVISION={revision}\n"
+            "SPECULATOR_DRAFTS=5\n" + ("" if cache is None else f"DRAFT_KV_CACHE={cache}\n"))
+    result = _muse(tmp_path, keys)
+    serve, plan = _line(result, "cuteafd serve-muse --snapshot"), _line(result, "cuteafd plan")
+    snapshot = str(tmp_path / f"hf/hub/models--{drafter.replace('/', '--')}/snapshots/{revision}")
+    assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
+    assert _flag(plan, "--speculator") == "dflash2"
+    assert _flag(serve, "--draft-kv-cache") == _flag(plan, "--draft-kv-cache") == (cache or "fp8")
+    assert _flag(serve, "--draft-fixed") == "5"
+    assert "--draft-fp8" not in serve.split()
+
+
+@pytest.mark.parametrize("keys,diagnostic", [
+    ("ATTENTION_PLACEMENT=layers\n", "supports only ATTENTION_PLACEMENT=auto"),
+    ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to muse_spark"),
+    ("PREFILL_PACKING=unrestricted\n", "Muse Spark has no packed prefill yet (#923)"),
+    ("SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=RadixArk/Muse-Spark-Open-DFlash2\nDRAFT_KV_CACHE=fp16\n",
+     "DRAFT_KV_CACHE must be bf16 or fp8"),
+])
+def test_muse_refuses_unsupported_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:
+    if "SPECULATOR_MODEL_ID=" in keys:
+        _snapshot(tmp_path / "hf", "RadixArk/Muse-Spark-Open-DFlash2", {})
+    result = _muse(tmp_path, keys)
+    assert result.returncode != 0
+    assert diagnostic in result.stderr, result.stderr[-2000:]
+    assert "docker run -d" not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_muse_refuses_a_slot_without_serve_muse(tmp_path: Path) -> None:
+    result = _muse(tmp_path, probe_fails=True)
+    assert result.returncode == 2, result.stderr
+    assert "WIP slot muse has no 'serve-muse' command; build the slot from a commit that serves muse_spark" in result.stderr
+    assert "cuteafd plan" not in result.stderr and "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("size,gpus,ranks", [("min", [0], 4), ("max", [0, 1], 6)])
+def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size, gpus, ranks) -> None:
+    path = ROOT / f"examples/configs/muse-spark-exl3-{size}.config"
+    values = _keys(path)
+    assert values["MODEL_ID"] == "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6"
+    assert values["MODEL_REVISION"] == "89998fb177acd9a862ac8bd4fb79bfd50e940c97"
+    assert values["SPECULATOR"] == "dflash2"
+    assert values["SPECULATOR_MODEL_ID"] == "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
+    assert values["SPECULATOR_MODEL_REVISION"] == "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
+    assert (values["RTX_GPUS"], values["SPARK_COUNT"], values["POOL_TOKENS"]) == (str(len(gpus)), str(ranks), "auto")
+    assert values["VISION"] == values["AUDIO"] == "off"
+    assert not any(key in values for key in ("MAX_CONTEXT_TOKENS", "RTX_EXPERT_LAYERS", "CONCURRENCY", "SPARK_DEVICE_BUDGET_BYTES"))
+    assert not any(needle in path.read_text().lower() for needle in PRIVATE)
+    _snapshot(tmp_path / "hf", values["SPECULATOR_MODEL_ID"], {}, revision=values["SPECULATOR_MODEL_REVISION"])
+    keys = "".join(f"{k}={v}\n" for k, v in values.items()
+                   if k not in ("MODEL_ID", "MODEL_REVISION") and not k.startswith("SPARK_"))
+    keys += f"SPARK_COUNT={ranks}\n" + _hosts(ranks)
+    result = _family_launch_result(tmp_path, MUSE, values["MODEL_ID"], keys,
+                                  extra_args=("--wip", "muse"), encoder_plan=MUSE_PLANNED)
+    serve = _line(result, "cuteafd serve-muse --snapshot")
+    assert "--draft" in serve.split() and "--pool-tokens" not in serve.split()
+    matrix = json.loads((ROOT / "scripts/bench/release-smoke-muse.json").read_text())
+    entry = next(e for e in matrix["entries"] if e["name"] == f"muse-spark-exl3-{size}")
+    assert entry["gpus"] == gpus and len(entry["sparks"]) == ranks
+    assert entry["config"] == str(path.relative_to(ROOT)) and entry["run_args"] == ["--wip", "muse"]
+    for key in ("MODEL_ID", "MODEL_REVISION", "SPECULATOR", "SPECULATOR_MODEL_ID", "SPECULATOR_MODEL_REVISION"):
+        assert entry["set"][key] == values[key]
+
+
+def test_family_table_and_planner_fixtures_name_muse() -> None:
+    out = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"), "/dev/stdin"],
+                         input=json.dumps(MUSE), capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["muse_spark", "muse_spark", "0", "61"]
+    fixtures = json.loads((ROOT / "rust/crates/cuteafd-loader/tests/fixtures/launch-families.json").read_text())
+    assert "muse_spark muse_spark 0 61" in {case["line"] for case in fixtures}
+    assert '"muse_spark" =>' in (ROOT / "rust/crates/cuteafd-loader/src/plan/launch.rs").read_text()

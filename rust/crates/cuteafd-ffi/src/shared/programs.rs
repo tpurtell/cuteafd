@@ -215,6 +215,19 @@ impl<'a> Programs<'a> {
             }
             if name.starts_with("glm_stage_") || name.starts_with("glm2_stage_") {
                 validate_glm_stage_entry(spec, entry)?;
+            } else if name.starts_with("glmf_stage_kda_projected_m")
+                || name.starts_with("glmf2_stage_kda_projected_m") {
+                super::projected_kda::validate_entry(spec, entry)?;
+            } else if name.starts_with("glmf_stage_index_projected_c_m")
+                || name.starts_with("glmf2_stage_index_projected_c_m") {
+                super::projected_index::validate_entry(spec, entry)?;
+            } else if name.starts_with("glmf_stage_index_projected_keys_m")
+                || name.starts_with("glmf2_stage_index_projected_keys_m") {
+                super::projected_index::validate_keys_entry(spec, entry)?;
+            } else if (name.starts_with("glmf_stage_") || name.starts_with("glmf2_stage_"))
+                && (name.contains("_absorb_fp8_") || name.contains("_values_fp8_")) {
+                ensure!(entry["op"] == "attention_stage", "{name}: expected attention_stage");
+                super::glm_stage::validate_entry(spec, entry)?;
             } else if name.starts_with("exlr8_dense_") {
                 // Companions (transforms, unpack, prefill GEMM, glue) by their op; the
                 // ABI-v1 linears and the embedding gather by name.

@@ -83,6 +83,23 @@ GLMF_SHAPES = (
     ("glmf_shared_down_tp2", 1024, 4096, 2),
     ("glmf_lm_head", 4096, 154880, 1),
 )
+# Muse K/V share geometry, not calibration: run the KV program twice.
+MUSE_SHAPES = (
+    ("muse_q_tp2", 8192, 4096, 1),
+    ("muse_q", 8192, 8192, 1),
+    ("muse_kv_tp2", 8192, 512, 1),
+    ("muse_kv", 8192, 1024, 1),
+    ("muse_o_tp2", 4096, 8192, 2),
+    ("muse_o", 8192, 8192, 1),
+    ("muse_pre_expert", 8192, 4096, 1),
+    ("muse_post_expert", 4096, 8192, 1),
+    # The MoE frontend/backend split on a pair (single residency): pre_expert by output
+    # columns, post_expert by input columns (an F32 K-split core reduced in rank order).
+    ("muse_pre_expert_tp2", 8192, 2048, 1),
+    ("muse_post_expert_tp2", 2048, 8192, 2),
+    ("muse_lm_head", 8192, 202112, 1),
+)
+
 # Mistral Large 4: MLA without q-LoRA (wq straight from the hidden state),
 # kv_a N576 padded to N640 on RoPE layers and native N512 on NoPE layers,
 # 64 heads x 128 (v 128), dense layer 0 (I 24576), one shared expert (I 6144).
@@ -128,8 +145,13 @@ STEP5_SHAPES = (
     ("step5_mtp_eh", 8192, 4096, 1, 4),
     ("step5_mtp_head", 4096, 128896, 1, 4),
 )
-FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "ml4": ML4_SHAPES}
-F32_OUTPUTS = (163840, 154880, 128896, 204800)
+FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "muse": MUSE_SHAPES, "ml4": ML4_SHAPES}
+F32_OUTPUTS = (163840, 154880, 128896, 202112, 204800)
+F32_GEOMETRIES = frozenset({(4096, 8192, 2), (2048, 8192, 2)})
+
+
+def output_dtype(k, n, side, f32_outputs=F32_OUTPUTS):
+    return "f32" if n in f32_outputs or (k, n, side) in F32_GEOMETRIES else "bf16"
 
 
 def _bits(item):
@@ -171,7 +193,7 @@ def row_policies(families=("kimik3",)):
                 **({} if _bits(item) == 6 else {"bits": _bits(item)}),
                 native_program=f"trellis_{name}_{book}",
                 native_input=f"trellis_input_k{k}_bf16",
-                output_program=f"trellis_output_n{n}_{'f32' if n in F32_OUTPUTS else 'bf16'}",
+                output_program=f"trellis_output_n{n}_{output_dtype(k, n, side)}",
                 **({"grouped": grouped_policy(name, k, n, book)} if name in GROUPED_SHAPES else {})))
     return result
 
@@ -221,8 +243,8 @@ def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=F32_OUTPUTS, input
         params = dict(features=k, input_dtype="bf16", max_rows=max_rows, **ingress_dtype)
         result.append((f"trellis_input_k{k}_bf16", "trellis_input", params,
                        partial(compile_trellis_input_aot, **params)))
-    for n in sorted({item[2] for item in shapes}):
-        dtype = "f32" if n in f32_outputs else "bf16"
+    for n, dtype in sorted({(item[2], output_dtype(*item[1:4], f32_outputs))
+                            for item in shapes}):
         params = dict(features=n, output_dtype=dtype, max_rows=max_rows)
         result.append((f"trellis_output_n{n}_{dtype}", "trellis_output", params,
                        partial(compile_trellis_output_aot, **params)))

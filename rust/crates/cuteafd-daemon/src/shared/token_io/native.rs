@@ -152,7 +152,24 @@ pub(crate) struct RowFp8Weights<'a> {
     scales: DeviceAllocation<'a>,
 }
 
+/// One named table's residency, independent of the shared vocabulary lifetime owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowFp8Residency {
+    pub(crate) device: i32,
+    pub(crate) bytes: usize,
+}
+
+impl RowFp8Residency {
+    pub(crate) fn from_buffers(payload: CuteafdDeviceBuffer, scales: CuteafdDeviceBuffer) -> Self {
+        Self { device: payload.device_id, bytes: payload.bytes + scales.bytes }
+    }
+}
+
 impl RowFp8Weights<'_> {
+    pub(crate) fn residency(&self) -> RowFp8Residency {
+        RowFp8Residency::from_buffers(self.payload(), self.scales())
+    }
+
     pub(crate) fn payload(&self) -> CuteafdDeviceBuffer {
         self.payload.buffer
     }
@@ -260,10 +277,9 @@ impl NativeVocabulary<'_> {
         Ok(())
     }
 
-    /// Device bytes of the payloads and scales.
+    /// Whole-owner inventory; named embedding/head charges partition this total.
     pub(crate) fn bytes(&self) -> usize {
-        [self.embedding.payload(), self.embedding.scales(), self.head.payload(), self.head.scales()]
-            .iter().map(|b| b.bytes).sum()
+        self.embedding.residency().bytes + self.head.residency().bytes
     }
 }
 
@@ -410,6 +426,43 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn native_embedding_and_head_charges_partition_planned_residency() -> Result<()> {
+        use super::super::validate_embedding_residency;
+        let root = tempfile::tempdir()?;
+        let records = [record(root.path(), EMBEDDING), record(root.path(), HEAD)];
+        for flash in [false, true] {
+            let mut records = records.clone();
+            for (record, name) in records.iter_mut().zip(selection(flash).vocabulary_names()) {
+                record.tensor = name.into();
+            }
+            for world in [1, 2] {
+                let plan = VocabularyPlan::new(&records, &selection(flash), world, 0, 8, 256)?;
+                let named = plan.dense.tensors.iter().map(|table| {
+                    let buffers = table.components.iter().map(|component| CuteafdDeviceBuffer {
+                        bytes: component.source.bytes, device_id: 3, ..Default::default()
+                    }).collect::<Vec<_>>();
+                    RowFp8Residency::from_buffers(buffers[0], buffers[1])
+                }).collect::<Vec<_>>();
+                let (embedding, head) = (named[0], named[1]);
+                assert_eq!(embedding, RowFp8Residency { device: 3, bytes: 3072 });
+                assert_eq!(head.bytes, 3072);
+                assert_eq!(embedding.bytes + head.bytes, plan.resident_bytes());
+                validate_embedding_residency(embedding.device, embedding.bytes, 3, 3072)?;
+                for (device, bytes) in [(0, 3072), (3, 0), (3, 256), (3, 6144), (3, 2048)] {
+                    assert!(validate_embedding_residency(embedding.device, embedding.bytes, device, bytes).is_err());
+                }
+                // GLM previously put both tables in the head charge; splitting owners must conserve bytes.
+                let body = 12345;
+                let before = body + plan.resident_bytes();
+                let after = body + head.bytes + embedding.bytes;
+                assert_eq!(before, after);
+                assert_ne!(after + embedding.bytes, before);
+            }
+        }
+        Ok(())
     }
 
     #[test]

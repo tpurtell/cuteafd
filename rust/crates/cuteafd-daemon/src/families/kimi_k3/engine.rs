@@ -168,7 +168,7 @@ impl<'a> Engine<'a> {
             && std::ptr::eq(devices[0].library, library.as_ref()),
             "Kimi startup programs differ from exchange devices/library");
         let rows = u32::try_from(admission.unit_rows())?;
-        let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32 };
+        let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
             plan.spec().lanes as usize];
         let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
         let executions = cuteafd_loader::plan::spark_executions::admit_family("kimi_k3",

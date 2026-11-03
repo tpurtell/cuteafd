@@ -149,8 +149,8 @@ impl GlmDraftRuntimeLayout {
             || g.hidden % g.conv_group != 0 || tap_rows == 0 {
             return Err(GlmDraftStorageError::Unsupported("invalid drafter geometry"));
         }
-        if g.head_dim != 128 || g.selector_rank != 256 {
-            return Err(GlmDraftStorageError::Unsupported("kernels require head_dim 128 and selector rank 256"));
+        if !matches!(g.head_dim, 128 | 64) || g.selector_rank != 256 {
+            return Err(GlmDraftStorageError::Unsupported("kernels require head_dim 128 or 64 and selector rank 256"));
         }
         let h = g.hidden;
         let attention = mul(g.heads, g.head_dim)?;
@@ -327,7 +327,7 @@ impl GlmDraftRuntimeLayout {
             ("tables", I32, vec![3, seq]), ("topk_workspace", Bytes, vec![mul(drafted, 64 * 16 * 8)?]),
         ] { add_owner(id.into(), dtype, dims)?; }
         let attention_scratch = crate::serving_capacity::draft_attention_workspace_bytes(seq,
-            g.kv_heads, 2, 2048 + block as u64, 128, sms).map_err(|_| GlmDraftStorageError::Overflow)?;
+            g.kv_heads, 2, 2048 + block as u64, g.head_dim, sms).map_err(|_| GlmDraftStorageError::Overflow)?;
         add_owner("attention_scratch".into(), Bytes, vec![attention_scratch])?;
         if let Some(scratch) = &self.fp8_scratch {
             let bytes = scratch.shapes.iter().map(|s|
@@ -586,6 +586,34 @@ mod tests {
         assert_eq!(scratch,30_491_648 + 128 * 80 * 4 + new_attention);
         let mut invalid = g; invalid.conv_group = 0;
         assert!(draft_workspace_bytes(invalid,capacity,8,true,188,2, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
+    }
+
+    #[test]
+    fn gqa_named_attention_scratch_tracks_supported_head_dimensions() {
+        use crate::families::qwen4::Qwen4KvCache;
+        let capacity = GlmDraftCapacity::new(20, 16, 8).unwrap();
+        for head_dim in [64, 128] {
+            let mut g = geometry(true);
+            g.head_dim = head_dim;
+            for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+                let layout = GlmDraftRuntimeLayout::new(g, representation, capacity, 2048).unwrap();
+                for sms in [170, 188] {
+                    let owners = layout.device_owners(sms, 2, Qwen4KvCache::Bf16).unwrap();
+                    let attention = owners.iter().find(|owner| owner.id == "attention_scratch").unwrap();
+                    let expected = crate::serving_capacity::draft_attention_workspace_bytes(16,
+                        g.kv_heads, 2, 2056, head_dim, sms).unwrap().max(256);
+                    assert_eq!(attention.bytes as u64, expected);
+                    let (_, scratch) = draft_workspace_bytes(g, capacity, 8,
+                        representation == GlmDraftRepresentation::Fp8Only, sms, 2, Qwen4KvCache::Bf16).unwrap();
+                    assert_eq!(scratch, owners.iter().filter(|owner|
+                        matches!(owner.id.as_str(), "attention_scratch" | "fp8_scratch"))
+                        .map(|owner| owner.bytes as u64).sum::<u64>());
+                }
+            }
+        }
+        let mut g = geometry(true);
+        g.head_dim = 96;
+        assert!(GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Bf16Only, capacity, 2048).is_err());
     }
 
     #[test]

@@ -805,6 +805,18 @@ extern "C" cuteafd_status_t cuteafd_cuda_get_device(int* device_id) {
 #endif
 }
 
+extern "C" cuteafd_status_t cuteafd_cuda_stream_device(void* cuda_stream, int* device_id) {
+  if (device_id == nullptr) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stream device output is null");
+  *device_id = -1;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  const auto err = cudaStreamGetDevice(reinterpret_cast<cudaStream_t>(cuda_stream), device_id);
+  if (err != cudaSuccess) return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamGetDevice failed", err);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "stream device query requires CUDA");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_set_device(int device_id) {
   if (device_id < 0) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "negative CUDA device");
 #if CUTEAFD_NATIVE_ENABLE_CUDA

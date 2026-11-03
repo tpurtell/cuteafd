@@ -322,7 +322,7 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
 /// then each GPU's dense records and native TP2 halves pushed through a ring
 /// into its rank (staged steps packed on the GPU, scale packs at Done) and
 /// published: every operand matches the mount golden, each step stays within
-/// the bound, and each rank's staging peaks at one buffer.
+/// the bound, and each rank's staging peaks within its geometry-derived admission.
 #[test]
 #[ignore = "requires CUTEAFD_PUSH_V41 (a SparkNest namespace), CUTEAFD_NATIVE_LIB and two RTX GPUs"]
 fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> {
@@ -373,6 +373,10 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
     let plans = (0..2).map(|gpu| crate::shared::memory::push_coordinator::CoordinatorExpertPlan::new(&catalog,
         &(0..layers).collect::<Vec<_>>(), gpu, usize::MAX)).collect::<Result<Vec<_>>>()?;
     rss_guard(32)?;
+    let bounds = devices.iter().map(|device| crate::shared::experts::rtx::dense::RankLayout::new(
+        records.operands.clone(), records.steps.clone(), device.id).map(|layout| layout.host_staging))
+        .collect::<Result<Vec<_>>>()?;
+    crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.borrow_mut().clear());
     let mut pushed = Vec::new();
     for (gpu, plan) in plans.into_iter().enumerate() {
         let started = std::time::Instant::now();
@@ -398,9 +402,10 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
         collect(&library, owners_ref, |f| native.visit(f))?;
     }
     let peaks = crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.take());
-    for (staged, pinned) in &peaks {
-        eprintln!("rank staging peak {staged} B in use, {pinned} B pinned");
-        assert!(*staged <= STEP_BYTES as u64 && *pinned <= STEP_BYTES as u64);
+    assert_eq!(peaks.len(), bounds.len(), "one staging measurement per coordinator rank");
+    for ((staged, pinned), bound) in peaks.iter().zip(bounds) {
+        eprintln!("rank staging peak {staged} B in use, {pinned} B pinned, admitted {} B", bound.staging_bytes);
+        assert!(*staged <= bound.staging_bytes as u64 && *pinned <= bound.staging_bytes as u64);
     }
     check(&owners, true)
 }

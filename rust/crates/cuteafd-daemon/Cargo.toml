@@ -44,6 +44,7 @@ tikv-jemalloc-ctl = { version = "0.6.1", optional = true, features = ["stats", "
 tikv-jemallocator = { version = "0.6.1", optional = true, features = ["stats"] }
 
 [dev-dependencies]
+cuteafd-loader = { path = "../cuteafd-loader", features = ["test-support"] }
 cuteafd-ffi = { path = "../cuteafd-ffi", features = ["test-support"] }
 tempfile.workspace = true
 tower.workspace = true

@@ -283,6 +283,8 @@ cuteafd_status_t cuteafd_cuda_device_info(int device_id, cuteafd_cuda_device_inf
 cuteafd_status_t cuteafd_cuda_memory_info(size_t* free_bytes, size_t* total_bytes);
 // Device selection is host-thread-local. Restore it before yielding a task.
 cuteafd_status_t cuteafd_cuda_get_device(int* device_id);
+// Query a live stream independently of the calling thread's current device.
+cuteafd_status_t cuteafd_cuda_stream_device(void* cuda_stream, int* device_id);
 cuteafd_status_t cuteafd_cuda_set_device(int device_id);
 // Enable current-device access to peer. Idempotent; does not silently stage via host.
 cuteafd_status_t cuteafd_cuda_enable_peer(int peer_device_id);

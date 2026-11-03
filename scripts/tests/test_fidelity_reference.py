@@ -1418,3 +1418,61 @@ def test_glm5_archive_guard_uses_cumulative_and_consecutive_rates(tmp_path, rate
     weights.check_layer_read_rate("model.layers.0.", 600_000_000, 1)
     assert weights.layer_read_bytes == 600_000_000
     assert weights.layer_read_seconds == 1 and weights.slow_layers == 0
+
+
+@pytest.mark.parametrize("window_id,tokens,error", [("missing", 2, "matching window"), ("a", 0, "token count"), ("a", 5, "token count")])
+def test_activation_trace_window_refuses_invalid_selection(window_id, tokens, error):
+    import layer_major
+    manifest = {"windows": [{"id": "a", "tokens": [1, 2, 3, 4]}]}
+    with pytest.raises(ValueError, match=error):
+        layer_major.trace_window(manifest, window_id, tokens)
+
+
+def test_activation_trace_selects_one_exact_prefix_without_mutating_set():
+    import layer_major
+    manifest = {"windows": [{"id": "a", "tokens": [1, 2, 3, 4], "roles": ["ctx"] * 4},
+                            {"id": "b", "tokens": [8, 9, 10], "roles": ["gen"] * 3}]}
+    before = canonical(manifest)
+    selected = layer_major.trace_window(manifest, "b", 2)
+    assert selected["id"] == "b" and selected["tokens"] == [8, 9] and selected["roles"] == ["gen", "gen"]
+    assert canonical(manifest) == before
+
+
+def test_activation_trace_comparison_uses_f32_reference_and_exact_ids(tmp_path, capsys):
+    spec = importlib.util.spec_from_file_location("trace_compare", ROOT / "python/reference/families/glm5/compare.py")
+    compare = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(compare)
+    a, b = tmp_path / "reference", tmp_path / "native"
+    a.mkdir()
+    b.mkdir()
+    for folder, ids in [(a, [5, 1]), (b, [1, 5])]:
+        np.array(ids, dtype="<i4").tofile(folder / "layer2-route_ids.bin")
+        (np.array([1, 2], dtype="<f4").view("<u4") >> 16).astype("<u2").tofile(folder / "layer2-hidden.bin")
+    np.array([1.25, 2.25], dtype="<f4").tofile(a / "layer2-hidden.f32.bin")
+    compare.compare_trace(a, b)
+    output = capsys.readouterr().out
+    assert "ids_equal False ids_set_equal True" in output
+    cos, rel = compare.cosine_error([1.25, 2.25], [1, 2])
+    assert f"cosine {cos:.9f} rel_l2 {rel:.6e}" in output
+    assert compare.cosine_error([0, 0], [0, 0]) == (1, 0)
+    for left, right in [([1], [1, 2]), ([np.nan], [0]), ([1], [np.inf])]:
+        with pytest.raises(ValueError, match="shapes differ or contain nonfinite"):
+            compare.cosine_error(left, right)
+    (b / "layer2-hidden.bin").unlink()
+    with pytest.raises(ValueError, match="component sets differ"):
+        compare.compare_trace(a, b)
+
+
+def test_activation_trace_mode_refuses_golden_output_and_prefix_probes(tmp_path, monkeypatch):
+    import layer_major
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_WINDOW", "a")
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_TOKENS", "2")
+    monkeypatch.setenv("CUTEAFD_ACTIVATION_TRACE_POSITION", "1")
+    manifest = {"windows": [{"id": "a", "tokens": [1, 2]}]}
+    args = SimpleNamespace(out=tmp_path / "golden", prefix_only=True)
+    with pytest.raises(ValueError, match="prefix qualification"):
+        layer_major.run_trace(args, None, manifest)
+    args.prefix_only = False
+    args.out.mkdir()
+    with pytest.raises(ValueError, match="normal golden output"):
+        layer_major.run_trace(args, None, manifest)

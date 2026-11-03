@@ -121,7 +121,8 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
         }
         let head = (gpus == 2 && !oshard).then(|| loader.fp8(&["lm_head.weight".to_string()],
             crate::families::glm5_flash::fp8::Layout::Row128)).transpose()?;
-        let (records, steps) = load.sink.as_ref().context("push sink")?.take();
+        let all = load.sink.as_ref().context("push sink")?.take_all();
+        let (records, steps) = (&all.operands, &all.steps);
         let landed: usize = records.iter().map(|r| r.bytes).sum();
         let staged: usize = steps.iter().map(|s| s.bytes()).sum();
         eprintln!("records gpus={gpus} oshard={oshard}: class2 {landed} B in {} operands; class3 {staged} B in {} steps \
@@ -130,7 +131,7 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
         // uniform staging buffer exactly or below.
         use crate::shared::experts::rtx::dense::{Job, STEP_BYTES};
         let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
-        for step in &steps {
+        for step in steps {
             assert!(step.bytes() <= STEP_BYTES, "a step stages {} bytes", step.bytes());
             for job in &step.jobs {
                 let kind = match job { Job::Upload { .. } => "upload", Job::Widen { .. } => "widen", Job::NarrowF32Bf16 { .. } => "narrow",
@@ -153,6 +154,7 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
             testing::replay(crate::shared::memory::device::Device { library: &library, id: gpu }, layout, &snapshot,
                 sparks + gpus, sparks + gpu as usize)?;
         }
+        crate::shared::experts::rtx::dense::run_peer_copies(&library, &all.peer_copies)?;
         assert!(peak_steps <= crate::shared::experts::rtx::dense::STEP_BYTES, "a staged step exceeds its bound");
         // In plan order (one source), one step is open at a time: staging stays
         // one bounded buffer per rank, pinned once and reused.

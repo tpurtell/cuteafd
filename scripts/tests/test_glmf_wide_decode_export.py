@@ -88,7 +88,15 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
     caps = decode_caps | {prefill_rows}
-    assert len(calls) == len(programs) == 6 * len(caps)
+    assert len(calls) == len(programs) == 11 * len(caps)
+    existing = []
+    for rows in sorted(caps):
+        existing.extend([f"kda_core_m{rows}", *[f"{stage}_m{rows}" for stage in ("rank_norm", "absorb", "values")],
+                         *[f"swiglu_i{inter}_m{rows}" for inter in sorted(intermediates)]])
+    for rows in sorted(caps):
+        existing.extend([f"kda_projected_m{rows}", f"absorb_fp8_m{rows}", f"values_fp8_m{rows}"])
+    existing.extend(f"index_projected_c_m{rows}" for rows in sorted(caps))
+    assert list(calls) == existing + [f"index_projected_keys_m{rows}" for rows in sorted(caps)]
     for rows in caps:
         op, params, (module, compiler, args, kwargs) = calls[f"kda_core_m{rows}"]
         assert (op, module, compiler) == ("kda_core", "glmf_split", "compile_glmf_kda_core_aot")
@@ -99,6 +107,24 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
             assert op == "attention_stage"
             assert (module, compiler, args) == ("glmf_split", "compile_glmf_stage_aot", (geometry,))
             assert params == kwargs == {"stage": stage, "max_rows": rows}
+        op, params, (module, compiler, args, kwargs) = calls[f"kda_projected_m{rows}"]
+        assert (op, module, compiler, args) == (
+            "kda_core", "glmf_split", "compile_glmf_projected_kda_aot", (geometry,))
+        assert params == kwargs == {"max_rows": rows, "decode": rows in decode_caps}
+        for stage in ("absorb", "values"):
+            op, params, (module, compiler, args, kwargs) = calls[f"{stage}_fp8_m{rows}"]
+            assert (op, module, compiler, args) == (
+                "attention_stage", "glmf_split", "compile_glmf_fp8_stage_aot", (geometry,))
+            assert params == kwargs == {"stage": stage, "max_rows": rows,
+                                       "mode": "decode" if rows in decode_caps else "prefill"}
+        op, params, (module, compiler, args, kwargs) = calls[f"index_projected_c_m{rows}"]
+        assert (op, module, compiler, args) == (
+            "index_producer", "glmf_split", "compile_glmf_projected_index_c_aot", (geometry,))
+        assert params == kwargs == {"max_rows": rows, "verify_rows": rows if rows in decode_caps else 64}
+        op, params, (module, compiler, args, kwargs) = calls[f"index_projected_keys_m{rows}"]
+        assert (op, module, compiler, args) == (
+            "index_producer", "glmf_split", "compile_glmf_projected_index_keys_aot", (geometry,))
+        assert params == kwargs == {"max_rows": rows}
         for inter in intermediates:
             op, params, (_, compiler, args, kwargs) = calls[f"swiglu_i{inter}_m{rows}"]
             assert op == "swiglu_split"
@@ -106,12 +132,63 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
             assert params == kwargs == {"stage": "swiglu", "max_rows": rows, "inter": inter}
 
 
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("rows", [1, 17, 64, 129, 4096])
+@pytest.mark.parametrize("chunked", [0, 12345])
+def test_projected_kda_pack_aliases_admitted_body_scratch(heads, rows, chunked):
+    fork = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd"
+    align = lambda n: (n + 1023) // 1024 * 1024
+    d = heads * 128
+    g = types.SimpleNamespace(kda_width=d, kda_in_width=3*d+256+heads)
+    tree = ast.parse((fork / "glmf.py").read_text())
+    scratch = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "kda_scratch_bytes")
+    scratch.body = [n for n in scratch.body if not isinstance(n, ast.ImportFrom)]
+    scope = {"GLMFGeometry": object, "_align": align}
+    exec(compile(ast.Module(body=[scratch], type_ignores=[]), "kda_scratch", "exec"), scope)
+    admitted = scope["kda_scratch_bytes"](g, rows, chunked)
+    body = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Kda")
+    body = next(n for n in body.body if isinstance(n, ast.FunctionDef) and n.name == "body")
+    env = dict(self=types.SimpleNamespace(d=d, p=g.kda_in_width, chunked_bytes=chunked),
+               rows=rows, Int64=int, _align=align, _align_i64=align,
+               scratch=types.SimpleNamespace(toint=lambda: 0))
+    offsets = {"d", "m", "base", "fg_off", "qkv_off", "o_off", "y_off", "qscratch"}
+    for assignment in body.body:
+        if isinstance(assignment, ast.Assign):
+            names = {n.id for target in assignment.targets for n in ast.walk(target) if isinstance(n, ast.Name)}
+            if names & offsets:
+                exec(compile(ast.Module(body=[assignment], type_ignores=[]), "body_offsets", "exec"), env)
+    assert env["qscratch"] == admitted
+    intervals = [(0, rows*g.kda_in_width*2), (env["fg_off"], rows*2*d*2),
+                 (env["qkv_off"], rows*3*d*2), (env["o_off"], rows*d*2),
+                 (env["y_off"], rows*d*2), (env["y_off"]+align(rows*d*2), chunked)]
+    assert all(begin + size <= admitted for begin, size in intervals)
+    assert all(begin + size <= following for (begin, size), (following, _) in zip(intervals, intervals[1:]))
+    shared = ast.parse((fork / "kimi_split.py").read_text())
+    core = next(n for n in shared.body if isinstance(n, ast.ClassDef) and n.name == "_ProjectedKdaCore")
+    call = next(n for n in core.body if isinstance(n, ast.FunctionDef) and n.name == "__call__")
+    pack_env = dict(env, self=types.SimpleNamespace(p=g.kda_in_width),
+                    BFloat16=object, _ptr=lambda dtype, address: address)
+    for assignment in call.body:
+        if isinstance(assignment, ast.Assign):
+            exec(compile(ast.Module(body=[assignment], type_ignores=[]), "pack_offsets", "exec"), pack_env)
+    assert pack_env["base"] == 0 and pack_env["fg"] == env["fg_off"]
+    compiler = next(n for n in shared.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "compile_projected_kda_core_aot")
+    allocation = next(n for n in ast.walk(compiler) if isinstance(n, ast.Call)
+                      and isinstance(n.func, ast.Name) and n.func.id == "compile_program")
+    callback = next(kw.value for kw in allocation.keywords if kw.arg == "scratch")
+    builder = dict(scope, g=g, launch=types.SimpleNamespace(core=types.SimpleNamespace(chunked_bytes=chunked)))
+    assert eval(compile(ast.Expression(callback), "scratch_metadata", "eval"), builder)["scratch"](rows) == admitted
+    assert admitted == (align(rows*g.kda_in_width*2) + align(rows*2*d*2)
+                        + align(rows*3*d*2) + 2*align(rows*d*2) + align(chunked))
+
+
 def test_flash_wide_native_stages_preserve_narrow_catalog(exporter):
     narrow = exporter.glmf_stage_programs(GEOMETRY, 64, 4096)
     wide = exporter.glmf_stage_programs(GEOMETRY, 128, 4096)
     describe = lambda programs: {name: (op, params, thunk()) for name, op, params, thunk in programs}
     narrow, wide = describe(narrow), describe(wide)
-    assert len(narrow) == 12 and len(wide) == 18
+    assert len(narrow) == 22 and len(wide) == 33
     assert {name: wide[name] for name in narrow} == narrow
     assert all(name.endswith("_m128") for name in wide.keys() - narrow.keys())
     assert "g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)" in EXPORTER.read_text()
@@ -872,3 +949,89 @@ def test_packed_program_catalogue_and_explicit_inventory_stay_in_sync(family, me
         assert 'add("head".into(), PackedRows)' in inventory
         units = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine/units.rs").read_text()
         assert 'e.run("head"' in units
+
+
+def test_projected_operand_data_contract_matches_exporter_declarations():
+    """Read declarations as data; never import a GPU exporter or parse Rust source."""
+    base = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd"
+    trees = {name: ast.parse((base / name).read_text()) for name in
+             ("_common.py", "_kda_contract.py", "glmf.py", "kimi_split.py", "glmf_split.py")}
+    contracts = json.loads((ROOT / "rust/crates/cuteafd-ffi/tests/fixtures/"
+                           "projected_operand_contracts.json").read_text())
+
+    def declaration(tree, kind, name):
+        return next(n for n in tree.body if isinstance(n, kind) and n.name == name)
+
+    def assignment(body, name):
+        return next(n.value for n in body if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == name for t in n.targets))
+
+    def same(node, expression):
+        assert ast.dump(node) == ast.dump(ast.parse(expression, mode="eval").body)
+
+    operand = declaration(trees["_common.py"], ast.ClassDef, "Operand")
+    align_default = next(n.value.value for n in operand.body if isinstance(n, ast.AnnAssign)
+                         and n.target.id == "align")
+    geometry = declaration(trees["_common.py"], ast.ClassDef, "GLMFGeometry")
+    assert not any(isinstance(n, ast.AnnAssign) and n.target.id == "o_norm_dtype"
+                   for n in geometry.body)
+    kda = declaration(trees["kimi_split.py"], ast.FunctionDef, "compile_projected_kda_core_aot")
+    defaults = dict(zip((a.arg for a in kda.args.kwonlyargs), kda.args.kw_defaults))
+    state_default = defaults["state_dtype"].value
+    same(assignment(kda.body, "state_torch"), "_kda_state(state_dtype, state_rounding)[1]")
+    state_types = assignment(trees["glmf.py"].body, "_STATE_TYPES")
+    state_type = next(v.elts[1] for k, v in zip(state_types.keys, state_types.values)
+                      if k.value == state_default)
+    state_helper = declaration(trees["glmf.py"], ast.FunctionDef, "_kda_state")
+    state_return = next(n.value for n in state_helper.body if isinstance(n, ast.Return))
+    same(state_return.elts[0].value, "_STATE_TYPES[state_dtype]")
+    assert isinstance(state_return.elts[0], ast.Starred)
+    layout = declaration(trees["_kda_contract.py"], ast.FunctionDef, "kda_layout")
+    layout_dict = next(n.value for n in layout.body if isinstance(n, ast.Return))
+    norm = next(v for k, v in zip(layout_dict.keys, layout_dict.values) if k.value == "o_norm_dtype")
+    assert isinstance(norm, ast.Call) and isinstance(norm.func, ast.Name) and norm.func.id == "getattr"
+    same(norm.args[0], "g")
+    assert [arg.value for arg in norm.args[1:]] == ["o_norm_dtype", "bfloat16"]
+    norm_default = norm.args[2].value
+
+    def dtype(node):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "torch":
+            return node.attr
+        if isinstance(node, ast.Name) and node.id == "state_torch":
+            return dtype(state_type)
+        same(node, 'getattr(torch, kda_layout(g)["o_norm_dtype"])')
+        return norm_default
+
+    def pointer(call, bindings):
+        assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "Operand"
+        name = call.args[0]
+        name = bindings[name.id] if isinstance(name, ast.Name) else name.value
+        explicit = [k.value.value for k in call.keywords if k.arg == "align"]
+        assert len(explicit) <= 1
+        return {"name": name, "dtype": dtype(call.args[1]),
+                "align": explicit[0] if explicit else align_default}
+
+    def declared(fn):
+        operands = assignment(fn.body, "operands")
+        assert isinstance(operands, ast.Tuple)
+        result = []
+        for node in operands.elts:
+            if isinstance(node, ast.Starred):
+                generator = node.value
+                assert isinstance(generator, ast.GeneratorExp) and len(generator.generators) == 1
+                clause = generator.generators[0]
+                assert not clause.ifs and not clause.is_async and isinstance(clause.target, ast.Name)
+                assert isinstance(clause.iter, ast.Tuple)
+                for value in clause.iter.elts:
+                    assert isinstance(value, ast.Constant) and isinstance(value.value, str)
+                    result.append(pointer(generator.elt, {clause.target.id: value.value}))
+            else:
+                result.append(pointer(node, {}))
+        assert len({p["name"] for p in result}) == len(result)
+        return result
+
+    actual = {"projected_kda": declared(kda)}
+    for key, name in (("projected_index_compact", "compile_glmf_projected_index_c_aot"),
+                      ("projected_index_keys", "compile_glmf_projected_index_keys_aot")):
+        actual[key] = declared(declaration(trees["glmf_split.py"], ast.FunctionDef, name))
+    assert actual == contracts

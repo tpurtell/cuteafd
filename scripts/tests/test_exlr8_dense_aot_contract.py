@@ -120,6 +120,7 @@ def test_exlr8_coordinator_enables_dense_and_both_stage_geometries(tmp_path):
             'set(CUTEAFD_GLM_GEOMETRIES "glm;glm2")',
             f'set(CUTEAFD_ENABLE_GLM_AOT {"ON" if glm else "OFF"})',
             "set(CUTEAFD_ENABLE_EXLR8_AOT ON)",
+            "set(CUTEAFD_EXLR8_FAMILIES glm)",
             "add_custom_target(cuteafd_verify_sparkinfer_source)",
             f'include("{cmake}")',
             'file(WRITE "${CMAKE_BINARY_DIR}/scope.txt" "${CUTEAFD_PROGRAM_GEOMETRY}")',
@@ -155,7 +156,7 @@ def test_geometry_catalog_is_deduplicated_and_a16_only(monkeypatch):
     legacy = [(name, op, params) for name, op, params, _ in entries[:60]]
     assert hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest() == (
         "a35a432bf52b58c0611ae59aa05bddcc27eadbacc83e0d199077cd53fef6addd")
-    assert len(entries) == 99
+    assert len(entries) == 102
     assert len({name for name, *_ in entries}) == len(entries)
     geometries = []
     for name, op, params, thunk in entries:
@@ -187,8 +188,8 @@ def test_dense_family_scope_preserves_legacy_and_unions_shared_geometry(monkeypa
     assert hashlib.sha256(json.dumps(triples(glm), sort_keys=True).encode()).hexdigest() == (
         "a35a432bf52b58c0611ae59aa05bddcc27eadbacc83e0d199077cd53fef6addd")
     assert triples(union[:len(glm)]) == triples(glm)
-    assert len(flash) == 55
-    assert len(union) == 99
+    assert len(flash) == 58
+    assert len(union) == 102
     glm_names = {name for name, *_ in glm}
     flash_names = {name for name, *_ in flash}
     assert glm_names | flash_names == {name for name, *_ in union}
@@ -201,6 +202,28 @@ def test_dense_family_scope_preserves_legacy_and_unions_shared_geometry(monkeypa
     for families in ((), ("kimik3",), ("glm", "unknown")):
         with pytest.raises(ValueError, match="families"):
             catalog(monkeypatch, families)
+
+
+def test_flash_index_companions_pack_native_bf16_weights_without_quantization(monkeypatch):
+    entries = {name: (op, params, thunk)
+               for name, op, params, thunk in catalog(monkeypatch, ("glmf",))}
+    for outputs in (32, 128):
+        op, params, thunk = entries[f"bf16_projection_k4096_n{outputs}"]
+        assert op == "bf16_projection"
+        assert params == {"width": 4096, "outputs": outputs, "output_dtype": "torch.float32"}
+        assert thunk() == params
+    # MXFP8 key projection occupies columns0:128; native BF16 weights/gate
+    # projections fill128:160 and160:288 without touching those key columns.
+    for width, column in ((32, 128), (128, 160)):
+        op, params, thunk = entries[f"f32_narrow_pack_n{width}_p288"]
+        assert op == "f32_narrow_pack"
+        assert params == {"width": width, "pitch": 288}
+        assert column + width <= params["pitch"]
+        assert thunk() == params
+    glm_names = {name for name, *_ in catalog(monkeypatch, ("glm",))}
+    assert "bf16_projection_k4096_n128" not in glm_names
+    assert "f32_narrow_pack_n128_p288" not in glm_names
+    assert "f32_narrow_pack_n32_p288" not in glm_names
 
 
 def test_shared_scope_knob_keeps_k6_default_and_native_family_fallback():

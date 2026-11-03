@@ -303,6 +303,50 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
 }
 
 #[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn static_scale_tail_dispatch_accepts_out_of_order_validation() -> Result<()> {
+    use super::super::{device::Device, weight_arena::ExpectedCoverage};
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let device = Device { library: &library, id: 0 };
+    let plan = ScalePlan::default();
+    let layout = ArenaLayout::new([256], 256)?.with_validation(4, 4)?;
+    let base = plan.base(&layout);
+    assert!(base > layout.logical_bytes() as u64);
+    let tail = 0xcbac1fedu32.to_le_bytes();
+    for tail_first in [false, true] {
+        let expected = ExpectedCoverage::spans(&[(0, 4), (256, 4)]);
+        let mut arena = plan.destination(device, layout.clone(), expected)?;
+        assert!(arena.staged.is_none());
+        // The validation tail is ordinary resident-plan data, not a scale
+        // staging destination. Either source may land first.
+        if tail_first {
+            arena.check_fragment(256, 4)?;
+            arena.copy_validation(256, &tail)?;
+        }
+        arena.check_fragment(0, 4)?;
+        arena.copied(0, 4)?;
+        if !tail_first {
+            arena.check_fragment(256, 4)?;
+            arena.copy_validation(256, &tail)?;
+        }
+        // A bogus address remains invalid even after every expected byte lands;
+        // waiting for Done cannot create a scale staging plan.
+        assert_eq!(arena.check_fragment(base, 4).unwrap_err().to_string(), "scale tail absent");
+        assert_eq!(arena.copy_validation(base, &tail).unwrap_err().to_string(), "scale tail absent");
+        let delivered = arena.done()?;
+        assert_eq!(delivered.validation(), &tail);
+    }
+    let expected = ExpectedCoverage::spans(&[(0, 4), (256, 4)]);
+    let mut incomplete = plan.destination(device, layout, expected)?;
+    incomplete.copied(0, 4)?;
+    assert!(incomplete.done().is_err());
+    Ok(())
+}
+
+#[test]
 fn native_plane_geometry_keeps_tp4_tp6_mount_admission() -> Result<()> {
     for nvfp4 in [false, true] {
         for world in [4, 6] {

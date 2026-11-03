@@ -588,7 +588,7 @@ mod tests {
             peers.len(),
             None,
             crate::families::step5::serve::spark_model(&exports,
-                SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Native },
+                SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Native, partial_reply_bytes: None },
                 1, 1, config.max_frame_bytes)?,
         )?
         .select(&peers)?;

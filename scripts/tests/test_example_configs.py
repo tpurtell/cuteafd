@@ -25,6 +25,7 @@ TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
 ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-core-k6-{size}.config" for size in ("min", "max")}
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
+                 "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
                  "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION
 V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
            "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config",

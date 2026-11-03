@@ -1,0 +1,304 @@
+{
+  "families": {
+    "dense_trellis_k6": {
+      "abi_version": 1,
+      "row_policies": [
+        {
+          "shape": "muse_o_tp2",
+          "input_features": 4096,
+          "output_features": 8192,
+          "sharded_side": 2,
+          "codebook": "mcg",
+          "native_program": "trellis_muse_o_tp2_mcg",
+          "native_input": "trellis_input_k4096_bf16",
+          "output_program": "trellis_output_n8192_f32"
+        },
+        {
+          "shape": "muse_post_expert_tp2",
+          "input_features": 2048,
+          "output_features": 8192,
+          "sharded_side": 2,
+          "codebook": "mcg",
+          "native_program": "trellis_muse_post_expert_tp2_mcg",
+          "native_input": "trellis_input_k2048_bf16",
+          "output_program": "trellis_output_n8192_f32"
+        }
+      ]
+    }
+  },
+  "programs": [
+    {
+      "name": "dense_trellis_k6_trellis_muse_o_tp2_mcg",
+      "pointers": [
+        {
+          "name": "rotated_inputs",
+          "dtype": "int64",
+          "shape": "[1]",
+          "role": "in"
+        },
+        {
+          "name": "payload",
+          "dtype": "uint8",
+          "shape": "[25165824]",
+          "role": "in"
+        },
+        {
+          "name": "input_block_scales",
+          "dtype": "float16",
+          "shape": "[32]",
+          "role": "in"
+        },
+        {
+          "name": "partial",
+          "dtype": "float32",
+          "shape": "[rows,4,8192]",
+          "role": "scratch"
+        },
+        {
+          "name": "output",
+          "dtype": "float32",
+          "shape": "[rows,8192]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "rotation_id",
+          "type": "int32"
+        },
+        {
+          "name": "cta_limit",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "partial": 536870912
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "abi_version": 1,
+        "input_features": 4096,
+        "output_features": 8192,
+        "bits": 6,
+        "codebook": "mcg",
+        "sharded_side": 2,
+        "rotation_count": 1,
+        "max_rows": 4096,
+        "split_k_blocks": 8,
+        "splits": 4,
+        "input_dtype": "bf16",
+        "ctas_per_sm": 4,
+        "exact_row_cap": 129
+      }
+    },
+    {
+      "name": "dense_trellis_k6_trellis_muse_post_expert_tp2_mcg",
+      "pointers": [
+        {
+          "name": "rotated_inputs",
+          "dtype": "int64",
+          "shape": "[1]",
+          "role": "in"
+        },
+        {
+          "name": "payload",
+          "dtype": "uint8",
+          "shape": "[12582912]",
+          "role": "in"
+        },
+        {
+          "name": "input_block_scales",
+          "dtype": "float16",
+          "shape": "[16]",
+          "role": "in"
+        },
+        {
+          "name": "partial",
+          "dtype": "float32",
+          "shape": "[rows,2,8192]",
+          "role": "scratch"
+        },
+        {
+          "name": "output",
+          "dtype": "float32",
+          "shape": "[rows,8192]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "rotation_id",
+          "type": "int32"
+        },
+        {
+          "name": "cta_limit",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "partial": 268435456
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "abi_version": 1,
+        "input_features": 2048,
+        "output_features": 8192,
+        "bits": 6,
+        "codebook": "mcg",
+        "sharded_side": 2,
+        "rotation_count": 1,
+        "max_rows": 4096,
+        "split_k_blocks": 8,
+        "splits": 2,
+        "input_dtype": "bf16",
+        "ctas_per_sm": 4,
+        "exact_row_cap": 129
+      }
+    },
+    {
+      "name": "dense_trellis_k6_trellis_input_k2048_bf16",
+      "pointers": [
+        {
+          "name": "input",
+          "dtype": "bfloat16",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "suh",
+          "dtype": "float16",
+          "shape": "[2048]",
+          "role": "in"
+        },
+        {
+          "name": "rotated",
+          "dtype": "bfloat16",
+          "shape": "[rows,2048]",
+          "role": "out"
+        },
+        {
+          "name": "input_block_scales",
+          "dtype": "float16",
+          "shape": "[16]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "cta_limit",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "geometry": {
+        "features": 2048,
+        "input_dtype": "bf16",
+        "max_rows": 4096,
+        "output_dtype": "bf16",
+        "exact_row_cap": 2147483647
+      }
+    },
+    {
+      "name": "dense_trellis_k6_trellis_input_k4096_bf16",
+      "pointers": [
+        {
+          "name": "input",
+          "dtype": "bfloat16",
+          "shape": "[rows,4096]",
+          "role": "in"
+        },
+        {
+          "name": "suh",
+          "dtype": "float16",
+          "shape": "[4096]",
+          "role": "in"
+        },
+        {
+          "name": "rotated",
+          "dtype": "bfloat16",
+          "shape": "[rows,4096]",
+          "role": "out"
+        },
+        {
+          "name": "input_block_scales",
+          "dtype": "float16",
+          "shape": "[32]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "cta_limit",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "geometry": {
+        "features": 4096,
+        "input_dtype": "bf16",
+        "max_rows": 4096,
+        "output_dtype": "bf16",
+        "exact_row_cap": 2147483647
+      }
+    },
+    {
+      "name": "dense_trellis_k6_trellis_output_n8192_f32",
+      "pointers": [
+        {
+          "name": "input",
+          "dtype": "float32",
+          "shape": "[rows,8192]",
+          "role": "in"
+        },
+        {
+          "name": "svh",
+          "dtype": "float16",
+          "shape": "[8192]",
+          "role": "in"
+        },
+        {
+          "name": "output",
+          "dtype": "float32",
+          "shape": "[rows,8192]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "cta_limit",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {},
+      "capacity_rows": 4096,
+      "geometry": {
+        "features": 8192,
+        "output_dtype": "f32",
+        "max_rows": 4096,
+        "exact_row_cap": 2147483647
+      }
+    }
+  ]
+}

@@ -100,7 +100,13 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
             or response.get("server", {}).get("model") != checkpoint
             or family is not None and response.get("server", {}).get("family") != family):
         raise ValueError("media scoring identity/cold/path contract not honored")
-    check_media_echo(window, record.get("media", []))
+    images = [span for span in window.get("media", []) if span.get("kind", "image") == "image"]
+    check_media_echo({"media": images}, record.get("media", []))
+    audio_fields = ("start", "len", "key", "samples", "pcm_sha256")
+    expected_audio = [{k: span[k] for k in audio_fields} for span in window.get("media", []) if span.get("kind") == "audio"]
+    actual_audio = [{k: span.get(k) for k in audio_fields} for span in record.get("audio", [])]
+    if actual_audio != expected_audio:
+        raise ValueError("prepared audio echo differs")
     positions = list(range(window["score_from"], len(window["tokens"])))
     if ([row["position"] for row in record.get("rows", [])] != positions
             or record.get("scored") != len(positions)
@@ -168,8 +174,10 @@ def capture(a):
         raise ValueError("capture output must be new")
     models = http(a.url.rstrip("/") + "/v1/models", a.bench_token)
     records = [m for m in models.get("data", []) if m.get("id") == panel["checkpoint"]]
-    if len(records) != 1 or records[0].get("capabilities", {}).get("vision") is not True:
-        raise ValueError("checkpoint must advertise vision")
+    kinds = {span.get("kind", "image") for window in panel["windows"] for span in window.get("media", [])}
+    required = {"audio" if kind == "audio" else "vision" for kind in kinds} or {"vision"}
+    if len(records) != 1 or any(records[0].get("capabilities", {}).get(kind) is not True for kind in required):
+        raise ValueError("checkpoint must advertise " + "/".join(sorted(required)))
     if a.mode == "reference" and a.features is None:
         raise ValueError("reference capture needs --features")
     selected = [w for w in panel["windows"] if not a.quick or w["id"] in panel["quick_windows"]]
@@ -178,10 +186,17 @@ def capture(a):
     admitted_encoder = None
     started = time.monotonic()
     for window in selected:
-        media = []
+        media, audio, audio_content = [], [], []
         for span in window.get("media", []):
             data = read_fixture(a.media_root, span)
-            media.append({**span, "image_url": {"url": "data:image/png;base64," + base64.b64encode(data).decode()}})
+            if span.get("kind") == "audio":
+                from fidelity_media import read_pcm_fixture
+                read_pcm_fixture(a.media_root, span)
+                audio.append({k: span[k] for k in ("start", "len", "key", "samples", "pcm_sha256")})
+                audio_content.append({"type": "input_audio", "input_audio": {
+                    "data": base64.b64encode(data).decode(), "format": "wav"}})
+            else:
+                media.append({**span, "image_url": {"url": "data:image/png;base64," + base64.b64encode(data).decode()}})
         leaf = window["id"]
         if (a.host_dump / leaf).exists():
             raise ValueError("dump leaf already exists")
@@ -190,6 +205,11 @@ def capture(a):
                 "spec": {"prompt_ids": window["tokens"], "media": media, "score_from": window["score_from"],
                          "cold": True, "no_speculation": True, "score_path": "decode", "verify_rows": 1,
                          "top_k": 1, "dump_rows": str(a.server_dump / leaf)}}
+        if audio:
+            if a.mode != "native":
+                raise ValueError("audio capture requires native mode and an official-feature LM golden")
+            body["spec"]["audio"] = audio
+            body["body"]["messages"][0]["content"] = [*audio_content, {"type": "text", "text": "media fidelity probe"}]
         try:
             response = http(a.url.rstrip("/") + "/v1/bench/probe", a.bench_token, body, a.timeout)
         except urllib.error.HTTPError as error:

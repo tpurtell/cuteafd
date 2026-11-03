@@ -574,9 +574,10 @@ def real_vision_fixtures(path, destination, snapshot):
     from fidelity_media import HEX, processor_contract, publish_immutable, read_fixture
     contract = processor_contract(snapshot)
     document = json.loads(path.read_bytes())
-    images = document.get("images", [])
-    if not isinstance(images, list) or not 1 <= len(images) <= 64:
-        raise ValueError("vision manifest needs 1..64 pinned images")
+    images, audio = document.get("images", []), document.get("audio", [])
+    if (not isinstance(images, list) or not isinstance(audio, list)
+            or not 1 <= len(images) + len(audio) <= 64):
+        raise ValueError("vision manifest needs 1..64 pinned image/audio fixtures")
     destination.mkdir(parents=True, exist_ok=True)
     records, sources = [], {}
     for index, item in enumerate(images):
@@ -629,6 +630,29 @@ def real_vision_fixtures(path, destination, snapshot):
         records.append({"id": f"resize_{index:02d}", "fixture": fixture,
             "provenance": {"source": source, "case": case, "grid": [1, gh, gw],
                 "resize": "Pillow RGB bicubic", "derived_sha256": fixture["sha256"]}})
+    from fidelity_media import read_pcm_fixture
+    for index, item in enumerate(audio):
+        name, samples, digest = item.get("file"), item.get("samples"), item.get("pcm_sha256")
+        if (not isinstance(name, str) or not name or "\\" in name
+                or pathlib.Path(name).is_absolute() or any(p in ("", ".", "..") for p in name.split("/"))
+                or name in sources or type(samples) is not int or not 1 <= samples <= 7_200_000
+                or not isinstance(digest, str) or not HEX.fullmatch(digest)
+                or not isinstance(item.get("sha256"), str) or not HEX.fullmatch(item["sha256"])):
+            raise ValueError("audio source requires a unique relative path, sample count and pinned PCM SHA256")
+        fixture = {"path": name, "sha256": item["sha256"]}
+        span = {"fixture": fixture, "samples": samples, "pcm_sha256": digest}
+        read_pcm_fixture(path.parent, span)
+        data = read_fixture(path.parent, span)
+        target = destination / name
+        if not target.resolve().is_relative_to(destination.resolve()):
+            raise ValueError("audio destination escapes fixture root")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        publish_immutable(target, data)
+        sources[name] = (data, fixture)
+        records.append({"id": f"audio_{index:02d}", "kind": "audio", "fixture": fixture,
+            "samples": samples, "pcm_sha256": digest,
+            "provenance": {"source": fixture, "kind": "audio", "samples": samples,
+                "pcm_sha256": digest, "sampling_rate": 24000}})
     return records, contract
 
 
@@ -638,6 +662,13 @@ def build_real_vision_set(*, family, model, checkpoint, version, arm, probe, fix
     from fidelity_media import validate_media, prepared_span
     arm_policy(arm, checkpoint)
     records, contract = real_vision_fixtures(vision_manifest, fixtures, snapshot)
+    audio_contract = None
+    if any(item.get("kind") == "audio" for item in records):
+        parameters = json.loads((snapshot / "processor_config.json").read_bytes())["feature_extractor"]
+        stride = parameters.get("samples_per_token")
+        if parameters.get("sampling_rate") != 24000 or type(stride) is not int or stride <= 0:
+            raise ValueError("audio fixtures require declared 24000 Hz PCM processor geometry")
+        audio_contract = {"sampling_rate": 24000, "samples_per_token": stride}
     windows, servers = [], []
     manifest_hash = hashlib.sha256(vision_manifest.read_bytes()).hexdigest()
     for item in [*records, {"id": "text_control"}]:
@@ -646,8 +677,13 @@ def build_real_vision_set(*, family, model, checkpoint, version, arm, probe, fix
         if "fixture" in item:
             from fidelity_media import read_fixture
             data = read_fixture(fixtures, {"fixture": item["fixture"]})
-            content.insert(0, {"type": "image_url", "image_url": {
-                "url": "data:image/" + ("png" if data.startswith(b"\x89PNG") else "jpeg") + ";base64," + base64.b64encode(data).decode(), "detail": "auto"}})
+            if item.get("kind") == "audio":
+                content[0]["text"] = "Describe the audible content faithfully, including speech and sounds. Do not invent inaudible details. Give a detailed answer of at least 800 words."
+                content.insert(0, {"type": "input_audio", "input_audio": {
+                    "data": base64.b64encode(data).decode(), "format": "wav"}})
+            else:
+                content.insert(0, {"type": "image_url", "image_url": {
+                    "url": "data:image/" + ("png" if data.startswith(b"\x89PNG") else "jpeg") + ";base64," + base64.b64encode(data).decode(), "detail": "auto"}})
         else:
             content[0]["text"] = "Explain how to inspect a document, photograph, diagram, screenshot and chart faithfully, without inventing details. Give a detailed answer of at least 800 words."
         body = {"model": model, "messages": [{"role": "user", "content": content}],
@@ -656,11 +692,20 @@ def build_real_vision_set(*, family, model, checkpoint, version, arm, probe, fix
         record, server = chat["probe"], chat.get("server", {})
         if server.get("model") != checkpoint or server.get("family") != family:
             raise ValueError("media generation server identity differs from manifest")
-        spans = record.get("media", [])
+        spans, audio = record.get("media", []), record.get("audio", [])
+        is_audio = item.get("kind") == "audio"
         expected = int("fixture" in item)
-        if not isinstance(spans, list) or len(spans) != expected:
-            raise ValueError("media probe must bind exactly the requested prepared image")
-        spans = [{**prepared_span(span), "fixture": item["fixture"]} for span in spans]
+        if (not isinstance(spans, list) or not isinstance(audio, list)
+                or len(audio) != (expected if is_audio else 0)
+                or len(spans) != (0 if is_audio else expected)):
+            raise ValueError("media probe must bind exactly the requested prepared image/audio")
+        if is_audio:
+            fields = ("start", "len", "key", "samples", "pcm_sha256")
+            spans = [{**{k: span[k] for k in fields}, "kind": "audio", "fixture": item["fixture"]} for span in audio]
+            if spans[0]["samples"] != item["samples"] or spans[0]["pcm_sha256"] != item["pcm_sha256"]:
+                raise ValueError("prepared audio echo differs from canonical PCM identity")
+        else:
+            spans = [{**prepared_span(span), "fixture": item["fixture"]} for span in spans]
         if "grid" in item.get("provenance", {}) and spans[0]["grid"] != item["provenance"]["grid"]:
             raise ValueError("prepared resize grid differs from pinned resize case")
         generated, prompt = record["generated"], record["prompt_ids"]
@@ -670,8 +715,8 @@ def build_real_vision_set(*, family, model, checkpoint, version, arm, probe, fix
             raise ValueError("vision golden needs at least 576 real generated tokens for prefix qualification")
         tokens, roles = prompt + generated, ["ctx"] * len(prompt) + ["gen"] * len(generated)
         start = len(tokens) - 512
-        validate_media(spans, tokens, roles, start, processor=contract)
-        windows.append({"id": item["id"], "block": "vision" if spans else "E", "bucket": bucket(start),
+        validate_media(spans, tokens, roles, start, processor=contract, audio_processor=audio_contract)
+        windows.append({"id": item["id"], "block": ("audio" if is_audio else "vision") if spans else "E", "bucket": bucket(start),
             "tokens": tokens, "roles": roles, "score_from": start, **({"media": spans} if spans else {}),
             "provenance": {"fixture_manifest_sha256": manifest_hash, **item.get("provenance", {}),
                 "prompt_sha256": hashlib.sha256(canonical(body)).hexdigest(), "engine": record["engine"],
@@ -685,6 +730,9 @@ def build_real_vision_set(*, family, model, checkpoint, version, arm, probe, fix
         "quick_windows": [windows[0]["id"], "text_control"], "fixtures_sha256": manifest_hash,
         "recipe": {"windows": len(windows), "positions_per_window": 512,
             "quick_windows": 2, "prompt_roles": "image/text ctx; actual assistant output gen"}, "windows": windows}
+    if audio_contract is not None:
+        result["audio_processor"] = audio_contract
+        result["recipe"]["prompt_roles"] = "image/audio/text ctx; actual assistant output gen"
     result["set_sha256"] = set_hash(result)
     return validate_set(result)
 

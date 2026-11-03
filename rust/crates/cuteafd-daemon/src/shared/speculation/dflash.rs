@@ -177,7 +177,11 @@ struct RawConfig {
     rms_norm_eps: f64,
     sliding_window: usize,
     vocab_size: usize,
-    rope_parameters: RawRope,
+    /// Newer configs nest the base in `rope_parameters`; others keep a flat `rope_theta`.
+    #[serde(default)]
+    rope_parameters: Option<RawRope>,
+    #[serde(default)]
+    rope_theta: Option<f64>,
     dflash_config: RawDflash,
 }
 
@@ -230,10 +234,10 @@ impl DflashConfig {
         let raw: RawConfig = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)
             .context("parsing the DFlash2 config.json")?;
         let d = &raw.dflash_config;
-        ensure!(raw.head_dim == 128 && raw.num_key_value_heads > 0
+        ensure!(matches!(raw.head_dim, 128 | 64) && raw.num_key_value_heads > 0
             && raw.num_attention_heads % raw.num_key_value_heads == 0
             && raw.num_attention_heads / raw.num_key_value_heads * d.block_size <= 64,
-            "DFlash2 kernels take 128-wide heads and at most 64 queries per kv head and block \
+            "DFlash2 kernels take 128- or 64-wide heads and at most 64 queries per kv head and block \
              (got {} heads, {} kv, block {})", raw.num_attention_heads, raw.num_key_value_heads, d.block_size);
         ensure!(d.conv_kernel_size == 2 && d.selector_rank == 256 && d.selector_top_k == 16,
             "DFlash2 kernels take two-tap convolutions and a rank-256 top-16 selector");
@@ -246,7 +250,8 @@ impl DflashConfig {
             kv_heads: raw.num_key_value_heads,
             head_dim: raw.head_dim,
             eps: raw.rms_norm_eps as f32,
-            theta: raw.rope_parameters.rope_theta as f32,
+            theta: raw.rope_parameters.as_ref().map(|r| r.rope_theta).or(raw.rope_theta)
+                .context("DFlash2 config lacks rope_parameters.rope_theta and rope_theta")? as f32,
             block: d.block_size,
             group: d.conv_group_size,
             mask_token: d.mask_token_id,
@@ -2102,7 +2107,8 @@ impl<'a> DflashDrafter<'a> {
                 self.library.glm_dflash_qk_rope(context.kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, context.slots.buffer.ptr,
                     std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads,
-                    self.cfg.theta, self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                    self.cfg.theta, self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+                    self.cfg.head_dim, s)?;
             }
         }
         self.timing.end(context_span, s)?;
@@ -2613,7 +2619,7 @@ impl<'a> DflashDrafter<'a> {
         let owners = layout.device_owners(self.library.sm_count()? as u64, self.fp8_admitted.code() as u8, self.kv_cache)?;
         let expected = |id: &str| owners.iter().find(|owner| owner.id == id).map(|owner| owner.bytes)
             .with_context(|| format!("GQA workspace missing {id} recipe"));
-        let attention_bytes = self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block)?.max(256);
+        let attention_bytes = self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block, c.head_dim)?.max(256);
         let topk_bytes = self.library.glm_dflash_topk_workspace(drafted)?.max(256);
         ensure!(attention_bytes == expected("attention_scratch")? && topk_bytes == expected("topk_workspace")?,
             "GQA native workspace queries differ from named recipe");
@@ -2860,12 +2866,12 @@ impl<'a> DflashDrafter<'a> {
                         self.linear(w.dflash()?.conv.buffer.ptr, &a.qkv, 0, attention.qkv.buffer.ptr, rows, h, c.qkv_width())?;
                         l.glm_dflash_qk_rope(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
                             w.positions.buffer.ptr, std::ptr::null(), attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
-                            rows, c.heads, c.kv_heads, c.theta, eps, false, s)?;
+                            rows, c.heads, c.kv_heads, c.theta, eps, false, c.head_dim, s)?;
                         l.glm_dflash_attention(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
                             a.k_ring.buffer.ptr, a.v_ring.buffer.ptr, attention.tables.buffer.ptr,
                             at(&attention.tables, s_count * 4), at(&attention.tables, 2 * s_count * 4),
                             attention.attn.buffer.ptr, attention.scratch.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                            max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                            max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, c.head_dim, s)?;
                         self.linear(attention.attn.buffer.ptr, &a.o, 0, w.delta.buffer.ptr, rows, attention_width, h)?;
                     }
                     (DraftAttention::Mla(a), AttentionWorkspace::Mla(attention), DraftContext::Mla(context)) => {
@@ -4100,6 +4106,26 @@ mod checkpoint_header_tests {
         DflashConfig { hidden: 128, intermediate: 128, layers: 2, heads: 1, kv_heads: 1, head_dim: 128,
             eps: 1e-6, theta: 10000., block: 8, group: 16, mask_token: 0, rank: 256,
             taps: vec![0], vocab: 16, window: RING, row_window: false, sample_from_anchor: false }
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn gqa_native_workspace_queries_match_named_d64_and_d128_owners() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        for head_dim in [64, 128] {
+            let mut cfg = small_config();
+            cfg.head_dim = head_dim;
+            let capacity = GlmDraftCapacity::new(2, 2, cfg.block)?;
+            let layout = cfg.runtime_layout(GlmDraftRepresentation::Bf16Only, capacity)?;
+            let owners = layout.device_owners(library.sm_count()? as u64, 0,
+                cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+            let expected = owners.iter().find(|owner| owner.id == "attention_scratch").unwrap();
+            assert_eq!(library.glm_dflash_attention_workspace(2, cfg.kv_heads,
+                RING + cfg.block, head_dim)?.max(256), expected.bytes);
+        }
+        assert!(library.glm_dflash_attention_workspace(2, 1, RING + 8, 96).is_err());
+        Ok(())
     }
 
     fn complete_headers(cfg: &DflashConfig) -> (HashMap<String, SafetensorsTensorMetadata>, u64) {

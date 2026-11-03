@@ -256,9 +256,9 @@ pub(crate) enum GlmHead<'a> {
 }
 
 impl<'a> GlmHead<'a> {
-    /// Device bytes of the head (and, for row-FP8, the embedding the same owner holds).
+    /// Device bytes of the head only; TokenEmbedding charges the embedding table.
     pub fn bytes(&self) -> usize {
-        match self { Self::Bf16(head) => head.buffer.bytes, Self::RowFp8(owner) => owner.bytes(),
+        match self { Self::Bf16(head) => head.buffer.bytes, Self::RowFp8(owner) => owner.head.residency().bytes,
             Self::K6(head) => head.payload.buffer.bytes + head.suh.buffer.bytes + head.svh.buffer.bytes }
     }
 

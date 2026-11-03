@@ -81,8 +81,8 @@ pub(crate) fn spark_model(backend: cuteafd_loader::plan::spark_executions::Spark
     let executions = cuteafd_loader::plan::spark_executions::admit_family("deepseek_v4", &backend.exports(),
         Some(u32::try_from(decode_rows)?), unit_rows as u64, waves as u64)?;
     let endpoints = vec![
-        SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 },
-        SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows.max(decode_rows))?, ingress: SparkIngress::Fp8K32 },
+        SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None },
+        SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows.max(decode_rows))?, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None },
     ];
     cuteafd_transport::worker_selection::ModelAdmission::new(endpoints,
         crate::shared::placement::spark_rings(64 << 20)?, executions)

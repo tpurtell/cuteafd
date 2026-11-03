@@ -22,10 +22,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--role", choices=("all", "coordinator", "spark"), default="all")
+    parser.add_argument("--family", choices=("glm", "glmf"), required=True)
     args = parser.parse_args()
     from export_b12x_dsv4_aot import main as export
     sys.argv = [sys.argv[0], "--geometry", "exlr8", "--exlr8-role", args.role,
-                "--output-dir", str(args.output_dir)]
+                "--exlr8-family", args.family, "--output-dir", str(args.output_dir)]
     export()
 
 

@@ -1,0 +1,826 @@
+{
+ "programs": {
+  "muse2_attention_full_decode": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "int32",
+    "bfloat16",
+    "uint8"
+   ],
+   "pointers": [
+    "q",
+    "kv_cache",
+    "positions",
+    "page_table",
+    "out",
+    "scratch"
+   ],
+   "scalars": [
+    "rows",
+    "table_stride",
+    "splits"
+   ]
+  },
+  "muse2_attention_full_prefill": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "int32",
+    "bfloat16",
+    "uint8"
+   ],
+   "pointers": [
+    "q",
+    "kv_cache",
+    "positions",
+    "page_table",
+    "out",
+    "scratch"
+   ],
+   "scalars": [
+    "rows",
+    "table_stride"
+   ]
+  },
+  "muse2_attention_output": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "attn",
+    "gate",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_attention_swa_decode": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "int64",
+    "int32",
+    "bfloat16",
+    "uint8"
+   ],
+   "pointers": [
+    "q",
+    "kv_step",
+    "ring",
+    "positions",
+    "ring_slots",
+    "seq_first",
+    "out",
+    "scratch"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_attention_swa_prefill": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "int64",
+    "int32",
+    "bfloat16",
+    "uint8"
+   ],
+   "pointers": [
+    "q",
+    "kv_step",
+    "ring",
+    "positions",
+    "ring_slots",
+    "seq_first",
+    "out",
+    "scratch"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_embed_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_expert_input_quant": {
+   "dtypes": [
+    "bfloat16",
+    "uint32",
+    "uint8",
+    "uint8"
+   ],
+   "pointers": [
+    "source_ptr",
+    "values_ptr",
+    "scale_rows_ptr",
+    "scale_mma_ptr"
+   ],
+   "scalars": [
+    "m",
+    "grid_x"
+   ]
+  },
+  "muse2_final_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_gate_proj": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "w",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_input_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_post_attn_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_post_ffn_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_pre_expert_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_pre_ffn_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_qk_norm_nope_full": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "q_raw",
+    "k_raw",
+    "v",
+    "positions",
+    "cos",
+    "sin",
+    "kv_slots",
+    "q",
+    "kv_dst"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_qk_norm_rope_swa": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "q_raw",
+    "k_raw",
+    "v",
+    "positions",
+    "cos",
+    "sin",
+    "kv_slots",
+    "q",
+    "kv_dst"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_residual_gate": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "float32",
+    "float32",
+    "bfloat16"
+   ],
+   "pointers": [
+    "residual",
+    "x",
+    "alpha",
+    "beta",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_route_select": {
+   "dtypes": [
+    "float32",
+    "float32",
+    "int32",
+    "float32"
+   ],
+   "pointers": [
+    "logits",
+    "bias",
+    "ids",
+    "weights"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_router": {
+   "dtypes": [
+    "bfloat16",
+    "float32",
+    "float32"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_softcap": {
+   "dtypes": [
+    "float32",
+    "float32"
+   ],
+   "pointers": [
+    "logits",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse2_swa_commit": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "int32"
+   ],
+   "pointers": [
+    "kv_step",
+    "ring",
+    "ring_slots",
+    "seq_first"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_attention_full_decode": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "int32",
+    "bfloat16",
+    "uint8"
+   ],
+   "pointers": [
+    "q",
+    "kv_cache",
+    "positions",
+    "page_table",
+    "out",
+    "scratch"
+   ],
+   "scalars": [
+    "rows",
+    "table_stride",
+    "splits"
+   ]
+  },
+  "muse_attention_full_prefill": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "int32",
+    "bfloat16",
+    "uint8"
+   ],
+   "pointers": [
+    "q",
+    "kv_cache",
+    "positions",
+    "page_table",
+    "out",
+    "scratch"
+   ],
+   "scalars": [
+    "rows",
+    "table_stride"
+   ]
+  },
+  "muse_attention_output": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "attn",
+    "gate",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_attention_swa_decode": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "int64",
+    "int32",
+    "bfloat16",
+    "uint8"
+   ],
+   "pointers": [
+    "q",
+    "kv_step",
+    "ring",
+    "positions",
+    "ring_slots",
+    "seq_first",
+    "out",
+    "scratch"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_attention_swa_prefill": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "int64",
+    "int32",
+    "bfloat16",
+    "uint8"
+   ],
+   "pointers": [
+    "q",
+    "kv_step",
+    "ring",
+    "positions",
+    "ring_slots",
+    "seq_first",
+    "out",
+    "scratch"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_embed_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_expert_input_quant": {
+   "dtypes": [
+    "bfloat16",
+    "uint32",
+    "uint8",
+    "uint8"
+   ],
+   "pointers": [
+    "source_ptr",
+    "values_ptr",
+    "scale_rows_ptr",
+    "scale_mma_ptr"
+   ],
+   "scalars": [
+    "m",
+    "grid_x"
+   ]
+  },
+  "muse_final_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_gate_proj": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "w",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_input_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_post_attn_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_post_ffn_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_pre_expert_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_pre_ffn_norm": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_qk_norm_nope_full": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "q_raw",
+    "k_raw",
+    "v",
+    "positions",
+    "cos",
+    "sin",
+    "kv_slots",
+    "q",
+    "kv_dst"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_qk_norm_rope_swa": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "q_raw",
+    "k_raw",
+    "v",
+    "positions",
+    "cos",
+    "sin",
+    "kv_slots",
+    "q",
+    "kv_dst"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_residual_gate": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "float32",
+    "float32",
+    "bfloat16"
+   ],
+   "pointers": [
+    "residual",
+    "x",
+    "alpha",
+    "beta",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_route_select": {
+   "dtypes": [
+    "float32",
+    "float32",
+    "int32",
+    "float32"
+   ],
+   "pointers": [
+    "logits",
+    "bias",
+    "ids",
+    "weights"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_router": {
+   "dtypes": [
+    "bfloat16",
+    "float32",
+    "float32"
+   ],
+   "pointers": [
+    "x",
+    "weight",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_softcap": {
+   "dtypes": [
+    "float32",
+    "float32"
+   ],
+   "pointers": [
+    "logits",
+    "out"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_swa_commit": {
+   "dtypes": [
+    "bfloat16",
+    "bfloat16",
+    "int64",
+    "int32"
+   ],
+   "pointers": [
+    "kv_step",
+    "ring",
+    "ring_slots",
+    "seq_first"
+   ],
+   "scalars": [
+    "rows"
+   ]
+  },
+  "muse_tp_combine_bf16": {
+   "dtypes": [
+    "int64",
+    "uint32",
+    "float32",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "rank_regions",
+    "row_map",
+    "weights",
+    "norm",
+    "out"
+   ],
+   "scalars": [
+    "ranks",
+    "region_rows",
+    "rows"
+   ]
+  },
+  "muse_tp_combine_fp8": {
+   "dtypes": [
+    "int64",
+    "uint32",
+    "float32",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "rank_regions",
+    "row_map",
+    "weights",
+    "norm",
+    "out"
+   ],
+   "scalars": [
+    "ranks",
+    "region_rows",
+    "rows"
+   ]
+  },
+  "muse_tp_combine_nvfp4": {
+   "dtypes": [
+    "int64",
+    "uint32",
+    "float32",
+    "bfloat16",
+    "bfloat16"
+   ],
+   "pointers": [
+    "rank_regions",
+    "row_map",
+    "weights",
+    "norm",
+    "out"
+   ],
+   "scalars": [
+    "ranks",
+    "region_rows",
+    "rows"
+   ]
+  }
+ },
+ "source": "compare-sm-exports.py --sms 188 at f2849a995 (pin bc500b11), muse coordinator groups"
+}

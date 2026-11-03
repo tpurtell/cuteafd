@@ -8977,6 +8977,7 @@ def main():
         declarations = builders(widths=tuple(map(int, args.stage_widths.split(","))),
             patches=tuple(map(int, args.patches.split(","))), output_width=args.output_width)
         export_programs(destination, "audio_pcm", declarations)
+        write_pcm_dispatcher(destination)
         if torch.cuda.is_initialized():
             raise RuntimeError("offline audio export initialized CUDA")
         return
@@ -9016,6 +9017,77 @@ def main():
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     if torch.cuda.is_initialized():
         raise RuntimeError("offline audio export initialized CUDA")
+
+
+def write_pcm_dispatcher(destination):
+    """Static, validated AOT modules; no live-shape compilation or allocation."""
+    records = json.loads((destination / "audio_pcm.json").read_text())["programs"]
+    header = ['#pragma once', '#include <stdint.h>',
+        'extern "C" int cuteafd_pcm_support_create(void**);',
+        'extern "C" int cuteafd_pcm_support_destroy(void*);',
+        'extern "C" int cuteafd_pcm_support_launch(void*,int,int,int,void**,int,void*);']
+    code = ['#include "cuteafd_pcm_support_internal.h"', '#include <cuda_runtime.h>',
+            '#include <new>', '#include <mutex>']
+    for record in records:
+        code.append(f'#include "{record["name"]}.h"')
+    code += ['namespace {', 'constexpr int MAX_DEVICES=32;',
+        'using ModuleFn=void (*)(void**);', 'using LaunchFn=int (*)(void**,int,void*);',
+        'struct Program { int op,width,outputs; ModuleFn initialize,load; LaunchFn launch;',
+        'cudaLibrary_t library=nullptr; bool loaded[MAX_DEVICES]{}; };',
+        'struct Entry { Program* programs; unsigned count; unsigned references=0; };',
+        'struct Owner { Entry* entry; int device; };', 'std::mutex module_mutex;']
+    entries = []
+    for i, record in enumerate(records):
+        name, geom, abi = record['name'], record['geometry'], record['abi']
+        if 'projection_k' in name:
+            op, width, outputs = 0, geom['width'], geom['outputs']
+        elif 'causal_conv7' in name:
+            op, width, outputs = 1, geom['width'], 0
+        elif 'rms_h' in name:
+            op, width, outputs = 2, geom['width'], 0
+        elif 'gelu_h' in name:
+            op, width, outputs = 3, geom['width'], 0
+        elif 'residual_h' in name:
+            op, width, outputs = 4, geom['width'], 0
+        else:
+            raise ValueError(f'unknown PCM operation {name}')
+        arguments = [f'a[{j}]' for j in range(len(abi['pointers']))]
+        arguments += ['1' if scalar == 'batch' else 'rows' for scalar, _ in abi['scalars']]
+        arguments += ['static_cast<cudaStream_t>(stream)']
+        code.append(f'static int launch_{i}(void** a,int rows,void* stream){{return '
+                    f'cute_dsl_cuteafd_{name}_wrapper(nullptr,' + ','.join(arguments) + ');}')
+        symbol = f'cuteafd_{name}'
+        entries.append(f'{{{op},{width},{outputs},_mlir_{symbol}_cuda_init,'
+                       f'_mlir_{symbol}_cuda_load_to_device,launch_{i}' + '}')
+    code += ['Program programs[]={'+','.join(entries)+'};',
+        'Entry entry{programs,sizeof(programs)/sizeof(programs[0])};',
+        '// Generated wrappers retain process-global handles: one module set, loaded per device.',
+        'int release(Entry& e){int first=0;for(unsigned i=0;i<e.count;++i){auto& p=e.programs[i];if(!p.library)continue;',
+        'int status=cudaLibraryUnload(p.library);if(!first)first=status;',
+        'if(!status){p.library=nullptr;for(auto& flag:p.loaded)flag=false;}}return first;}',
+        'int load(Entry& e,int device){for(unsigned i=0;i<e.count;++i){auto& p=e.programs[i];int status=0;auto* lib=&p.library;',
+        'if(!p.library){void* a[]={&lib,&status};p.initialize(a);}',
+        'if(!status&&!p.loaded[device]){void* a[]={&lib,&device,&status};p.load(a);if(!status)p.loaded[device]=true;}',
+        'if(status){if(!e.references)release(e);return status;}}return 0;}', '}',
+        'extern "C" int cuteafd_pcm_support_create(void** out){',
+        'if(!out)return cudaErrorInvalidValue;*out=nullptr;int device=-1,status=cudaGetDevice(&device);if(status)return status;',
+        'if(device<0||device>=MAX_DEVICES)return cudaErrorInvalidDevice;',
+        'auto* owner=new(std::nothrow)Owner{&entry,device};if(!owner)return cudaErrorMemoryAllocation;',
+        'std::lock_guard<std::mutex> guard(module_mutex);status=load(entry,device);',
+        'if(status){delete owner;return status;}++entry.references;*out=owner;return 0;}',
+        'extern "C" int cuteafd_pcm_support_destroy(void* p){if(!p)return 0;',
+        '// Caller drains its stream before releasing the shared modules.',
+        'auto* owner=static_cast<Owner*>(p);std::lock_guard<std::mutex> guard(module_mutex);',
+        'int status=--owner->entry->references?0:release(*owner->entry);delete owner;return status;}',
+        'extern "C" int cuteafd_pcm_support_launch(void* p,int op,int width,int outputs,void** a,int rows,void* stream){',
+        'if(!p||!a||rows<=0)return cudaErrorInvalidValue;auto* owner=static_cast<Owner*>(p);',
+        'int device=-1,status=cudaGetDevice(&device);if(status)return status;if(device!=owner->device)return cudaErrorInvalidDevice;',
+        'for(unsigned i=0;i<owner->entry->count;++i){auto& program=owner->entry->programs[i];',
+        'if(program.op!=op||program.width!=width||program.outputs!=outputs)continue;',
+        'if(!program.loaded[device])return cudaErrorInvalidResourceHandle;return program.launch(a,rows,stream);}',
+        'return cudaErrorInvalidValue;}']
+    (destination / 'cuteafd_pcm_support_internal.h').write_text('\n'.join(header) + '\n')
+    (destination / 'audio_pcm_support.cc').write_text('\n'.join(code) + '\n')
 
 
 def builders(*, widths=(256, 512, 1024, 2048), patches=(16, 6, 5, 4), output_width=8192):

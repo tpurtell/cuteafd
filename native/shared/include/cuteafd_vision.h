@@ -24,7 +24,7 @@ typedef struct {
   /* Numerics 1 = MiMo; numerics 2: reserved Qwen=2 or GLM Flash=3.
    * Every array below contains exactly depth host entries. */
   uint32_t hidden, depth, heads, kv_heads, head_dim, intermediate, patch_size, merger_width;
-  float norm_eps;
+  float norm_eps; /* Muse: public feature RMS epsilon, internal LayerNorm stays 1e-5. */
   uint32_t geometry_reserved;
   uint64_t patch_bias, pos_embed, merger_norm_bias, merger_fc1_bias, merger_fc2_bias;
   uint64_t merger_extra[8];

@@ -795,7 +795,7 @@ mod tests {
         let working = cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![],
             spark_layers: (1..93).collect(), spark_ranks: 6, prefill_lanes: 1 };
         let spark = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
-            &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+            &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, rows as u64)?)?;

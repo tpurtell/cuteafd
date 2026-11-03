@@ -278,6 +278,7 @@ pub(crate) struct DensePlan {
     pub base: u64,
     pub host_bytes: u64,
     pub host_staging: super::dense::HostStaging,
+    pub peer_copies: Vec<super::dense::PeerCopy>,
     pub append: Box<dyn Fn(&mut cuteafd_loader::push_load::builder::Builder, u32, u64) -> Result<()> + Send>,
 }
 
@@ -478,6 +479,8 @@ impl CoordinatorPush {
             .is_ok_and(|(p, d)| p.len() != gpus.len() || d.len() != gpus.len())) {
             return (Err(anyhow::anyhow!("coordinator push GPUs differ from their plans")), beside());
         }
+        let peer_copies = dense.as_ref().and_then(|d| d.as_ref().ok()).map(|(plans, _)|
+            plans.iter().flat_map(|plan| plan.peer_copies.iter().cloned()).collect::<Vec<_>>()).unwrap_or_default();
         let world = sparks + gpus.len();
         // Destinations have no pinned pool/table allocations yet. Admit all independent
         // owners before offers; a refusal still sends declines to release Spark peers.
@@ -563,6 +566,8 @@ impl CoordinatorPush {
             Err(error) => Err(PushStartupError::Planning(error).into()),
             Ok(()) => PushPolicy::Required.committed(pushed).map_err(Into::into),
         };
+        let pushed = devices.first().context("peer load copies need a coordinator device")
+            .and_then(|device| super::dense::committed_peer_copies(device.library, pushed, &peer_copies));
         (pushed, value)
     }
 }

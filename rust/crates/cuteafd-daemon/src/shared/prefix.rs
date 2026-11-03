@@ -305,6 +305,101 @@ mod tests {
     }
 
     #[test]
+    fn every_media_cache_capability_matches_admitted_plan_and_runtime() -> Result<()> {
+        use cuteafd_loader::plan::{self, encoder::EncoderKind, family, layout::LayoutOptions,
+            testing, ExpertPlacement, Family, MediaMode, PlanOptions};
+        use anyhow::Context;
+        use serde_json::json;
+        let prefix = Cli::parse_from(["serve", "--host-cache-bytes", "0"]).prefix;
+        let memory = budget::HostMemory { total: 256 << 30, available: 256 << 30 };
+        let mut covered = std::collections::BTreeSet::new();
+        for adapter in family::registry().iter().filter(|family| family.media_cache_headroom()) {
+            let dir = tempfile::tempdir()?;
+            let mut options = LayoutOptions { host_memory: Some((memory.total, memory.available)),
+                host_cache_bytes: Some(0), pool_tokens: Some(32768), target_pool_tokens: 32768,
+                ..Default::default() };
+            let mut placement = ExpertPlacement::Local;
+            match adapter.id() {
+                "mimo_v2" => {
+                    let mut config = testing::mimo_flash_config();
+                    config["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
+                        "num_heads":32,"num_key_value_heads":8,"out_hidden_size":4096,"patch_size":16,
+                        "temporal_patch_size":2,"spatial_merge_size":2,"hidden_act":"silu"});
+                    let mut tensors = testing::mimo_flash_tensors();
+                    tensors.push(testing::t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
+                    testing::write_snapshot(dir.path(), &config, &tensors, None);
+                    let package = dir.path().join("mimo-experts.json");
+                    std::fs::write(&package, serde_json::to_vec(&json!({"layouts":{"tp1":{
+                        "input":"bf16", "tp":1, "hidden":4096, "experts":256,
+                        "top_k":8, "intermediate":2048, "slice":2048, "weights":"fp8",
+                        "capacities":[{"capacity":4096,"scratch_bytes":671_354_880}]
+                    }}}))?)?;
+                    options.mimo_expert_manifest = Some(package);
+                }
+                "qwen4" => {
+                    let mut config = testing::qwen4_config(1);
+                    config["vision_config"] = json!({"depth":27,"hidden_size":1152,"intermediate_size":4304,
+                        "num_heads":16,"num_position_embeddings":2304,"out_hidden_size":2560,
+                        "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
+                        "hidden_act":"gelu_pytorch_tanh","deepstack_visual_indexes":[]});
+                    let tensors = [testing::t("model.visual.patch_embed.proj.weight", "BF16", &[1152,3,2,16,16]),
+                        testing::t("model.visual.patch_embed.proj.bias", "BF16", &[1152]),
+                        testing::t("model.visual.blocks.0.norm1.weight", "BF16", &[1152]),
+                        testing::t("model.visual.blocks.0.norm1.bias", "BF16", &[1152])];
+                    testing::write_snapshot(dir.path(), &config, &tensors, None);
+                }
+                "glm5_flash" => {
+                    let mut config = testing::glm5_flash_config(2);
+                    config["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
+                        "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
+                        "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
+                        "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+                    let tensors = testing::glm5_flash_vision_tensors();
+                    testing::write_snapshot(dir.path(), &config, &tensors, Some(4));
+                }
+                "muse_spark" => {
+                    testing::write_muse_vision_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+                    let path = testing::write_muse_exl3_capacities(&dir.path().join("image"));
+                    let programs = crate::families::muse_spark::programs::required(2)?.into_iter()
+                        .map(|(name, _)| name)
+                        .chain([crate::families::muse_spark::programs::ROPE_TABLES.to_string()])
+                        .map(|name| json!({"name":name,"capacity_rows":4096})).collect::<Vec<_>>();
+                    std::fs::write(&path, serde_json::to_vec(&json!({"schema":1,"programs":programs}))?)?;
+                    options.workspace_manifest = Some(path);
+                    options.rtx_bytes = vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2];
+                    options.head_split = true;
+                    placement = ExpertPlacement::from_spark_ranks(6);
+                }
+                id => panic!("add an admitted media fixture for capability-enabled family {id}"),
+            }
+            let input = testing::BudgetedPlanInput::open(dir.path())?;
+            assert_eq!(family::detect(input.checkpoint()).unwrap().id(), adapter.id());
+            for quota in [None, Some(0), Some(123_456_789)] {
+                options.media_cache_bytes = quota;
+                for vision in [MediaMode::Rtx(Some(0)), MediaMode::Off] {
+                    let report = input.plan(&PlanOptions { placement, vision, audio: MediaMode::Off,
+                        layout: Some(options.clone()), ..Default::default() })?;
+                    let admitted = report.encoder.as_ref().context("admitted encoder record")?;
+                    assert_eq!(admitted.kind != EncoderKind::Off, vision != MediaMode::Off,
+                        "{}: {:?}", adapter.id(), report.hints);
+                    let runtime = if admitted.kind == EncoderKind::Off { 0 } else {
+                        let (_, bytes) = prefix.media_headroom(quota, memory)?;
+                        assert_eq!(cuteafd_engine::media::EmbeddingCache::new(bytes).capacity(), bytes);
+                        bytes as u64
+                    };
+                    let planned = report.host_ledger.as_ref().context("host media ledger")?.items.iter()
+                        .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum::<u64>();
+                    assert_eq!(planned, runtime, "{}: vision={vision:?}, quota={quota:?}", adapter.id());
+                }
+            }
+            covered.insert(adapter.id());
+        }
+        assert_eq!(covered, std::collections::BTreeSet::from(["glm5_flash", "mimo_v2", "muse_spark", "qwen4"]));
+        assert!(!plan::families::deepseek::DEEPSEEK_V41.media_cache_headroom());
+        Ok(())
+    }
+
+    #[test]
     fn prefix_knobs_default_on_with_the_host_tier_off() {
         let mut cli = Cli::parse_from(["serve"]);
         cli.prefix.resolve_entries(16);

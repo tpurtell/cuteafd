@@ -145,8 +145,9 @@ impl<'a> DeploymentSpec<'a> {
             let intermediate = report.spec.as_ref().and_then(|spec| spec.moe.as_ref())
                 .context("Spark deployment requires routed expert geometry")?.intermediate;
             if native.is_none() { super::experts::spark_recipe(&experts.package, intermediate, topology.tp)?; }
-            else { ensure!(family == "glm5" && (1..=8).contains(&ranks) && experts.package == "glm:exlr8",
-                "EXLR8 deployment requires GLM native canonical Sparks"); }
+            else { ensure!((1..=8).contains(&ranks) && matches!((family, experts.package.as_str()),
+                ("glm5", "glm:exlr8") | ("glm5_flash", "glmf:exlr8")),
+                "EXLR8 deployment requires a matching native family/package and canonical Sparks"); }
         }
         ensure!(options.peers.is_empty() || options.peers.len() >= ranks,
             "deployment peer inventory does not cover selected Spark ranks");
@@ -309,6 +310,36 @@ mod tests {
         options.spark_ep = None;
         options.speculator = "auto".into();
         assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
+    }
+
+    #[test]
+    fn native_flash_deployment_admits_only_declared_coordinator_worlds() {
+        use crate::plan::exlr8::{NativePlan, NativeSelection, SparkRequirements};
+        for gpus in [1, 2] {
+            let (_dir, mut report) = fixture(gpus, 4);
+            report.family = Some("glm5_flash".into());
+            report.experts.as_mut().unwrap().package = "glmf:exlr8".into();
+            use crate::plan::family::Family;
+            let execution = crate::plan::families::glm::GLM5_FLASH.exlr8_execution().check(gpus, true);
+            let admitted = execution.is_ok();
+            report.runtime = Some(if admitted { crate::plan::RuntimeStatus::Serving }
+                else { crate::plan::RuntimeStatus::Planned });
+            report.native_serving_admitted = admitted;
+            report.placement_supported = admitted;
+            if let Err(error) = execution { report.hints.push(error.hint()); }
+            let mut native = NativePlan { report,
+                selection: NativeSelection { manifest: "k4".into(), set_id: "flash-set".into() },
+                sparks: SparkRequirements { resident_bytes_per_rank: vec![100; 4],
+                    k1_workspace: "checked_by_worker_live_admission" } };
+            let options = DeploymentOptions { rtx_gpus: gpus, speculator: "off".into(), ..Default::default() };
+            let deployment = DeploymentSpec::from_exlr8(&native, &options).unwrap();
+            assert_eq!(deployment.wip_launchable, gpus == 1);
+            if gpus == 2 { assert!(!deployment.executable); }
+            assert_eq!(deployment.exlr8.unwrap().manifest, "k4");
+            assert_eq!(deployment.memory_layout, native.report.memory_layout.as_ref().unwrap());
+            native.report.experts.as_mut().unwrap().package = "glm:exlr8".into();
+            assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
+        }
     }
 
     #[test]

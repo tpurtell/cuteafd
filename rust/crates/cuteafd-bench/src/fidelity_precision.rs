@@ -314,7 +314,8 @@ fn manifest_precision(snapshot: &Path, config: &Value, name: &str) -> Result<Pre
             m["format"], m["name"]
         )));
     }
-    let layers = config["num_hidden_layers"]
+    let text_config = config.get("text_config").unwrap_or(config);
+    let layers = text_config["num_hidden_layers"]
         .as_u64()
         .ok_or_else(|| Error::Invalid("EXLR8 num_hidden_layers missing".into()))?;
     let mut sum = 0.0;
@@ -624,6 +625,32 @@ mod tests {
         assert_eq!(p.expert_bpw, 20.0 / 6.0);
         assert_eq!(p.tier, Tier::Mid);
         assert!(manifest_precision(temp.path(), &config, "../test").is_err());
+    }
+
+    #[test]
+    fn nested_text_config_manifest_precision_uses_backbone_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("manifests")).unwrap();
+        // The nested text model owns the backbone depth, not the multimodal
+        // wrapper. Layer 2 is MTP and must not lower the routed-expert tier.
+        let config = json!({"num_hidden_layers":3,"text_config":{"num_hidden_layers":2}});
+        std::fs::write(temp.path().join("config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            temp.path().join("manifests/exlr8-manifest-k4.json"),
+            json!({"format":"exlr8-v2-manifest","name":"k4","layers":{
+                "1":{"gate":[[4,4]],"up":[[4,4]],"down":[4]},
+                "2":{"gate":[[2,2]],"up":[[2,2]],"down":[2]}}}).to_string(),
+        ).unwrap();
+        let settings = json!([{"name":"exlr8-manifest","value":"k4"}]);
+        let p = resolve("test/flash-exlr8", Some(temp.path()), &settings, "test/root", None).unwrap();
+        assert_eq!(p.expert_bpw, 4.0);
+        assert_eq!(p.tier, Tier::Mid);
+        assert_eq!((p.tier_kl_max, p.tier_top1_min), (0.05, 0.93));
+        std::fs::write(temp.path().join("config.json"), json!({"text_config":{"num_hidden_layers":2}}).to_string()).unwrap();
+        assert_eq!(resolve("test/flash-exlr8", Some(temp.path()), &settings, "test/root", None).unwrap(), p);
+        std::fs::write(temp.path().join("config.json"), json!({"num_hidden_layers":3,"text_config":{}}).to_string()).unwrap();
+        assert!(matches!(resolve("test/flash-exlr8", Some(temp.path()), &settings, "test/root", None),
+            Err(Error::Invalid(message)) if message.contains("num_hidden_layers missing")));
     }
 
     #[test]

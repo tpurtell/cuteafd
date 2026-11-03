@@ -181,6 +181,11 @@ def test_fused_diagnostic_load_fails_before_cuda_initialization_on_sm170():
 #include "cuda_runtime.h"
 inline int initializes=0;
 inline void counted_init(void** args) { ++initializes; init(args); }
+inline int recorded_sms=0;
+inline void runtime_launch(void** args, int count) {
+ assert(count==5); recorded_sms=*static_cast<int32_t*>(args[2]);
+ *static_cast<int32_t*>(args[4])=0;
+}
 #define CUTEAFD_DSV4_CC_MINOR 0
 #define CUTEAFD_DSV4_PROGRAMS \
  {"flash",counted_init,load,noop,1,"i",188}, \
@@ -189,7 +194,8 @@ inline void counted_init(void** args) { ++initializes; init(args); }
  {"glmf",counted_init,load,noop,1,"i",188}, \
  {"m16",counted_init,load,noop,1,"i",11}, \
  {"ordinary",counted_init,load,noop,1,"i",0}, \
- {"dual",counted_init,load,plan170,1,"i",0,counted_init,load,plan188}
+ {"dual",counted_init,load,plan170,1,"i",0,counted_init,load,plan188}, \
+ {"runtime",counted_init,load,runtime_launch,1,"is",0}
 ''')
         (directory / "main.cc").write_text(r'''
 #include <cassert>
@@ -222,6 +228,17 @@ int main() {
   assert(cuteafd_dsv4_program_launch(6,pointers,scalars,nullptr)==0);
   assert(recorded_plan==(dev==2 ? 170 : 188));
  }
+ cuteafd_dsv4_program_info_t info{};
+ assert(cuteafd_dsv4_program_info(7,&info)==0);
+ assert(info.scalars==1 && std::strcmp(info.scalar_kinds,"i")==0);
+ for (int dev : {2,5}) {
+  device=dev; override_sms=dev==2 ? 170 : 188;
+  assert(cuteafd_dsv4_program_load(7)==0);
+  attribute_error=999;
+  assert(cuteafd_dsv4_program_launch(7,pointers,scalars,nullptr)==0);
+  assert(recorded_sms==(dev==2 ? 170 : 188));
+  attribute_error=0;
+ }
  attribute_error=999;
  assert(cuteafd_dsv4_program_load(6)==999);
  attribute_error=0;
@@ -234,6 +251,26 @@ int main() {
                         str(directory / "main.cc"), "-o", str(directory / "test")],
                        check=True, timeout=750)
         subprocess.run([str(directory / "test")], check=True, timeout=30)
+
+
+def test_runtime_sms_absent_and_false_generate_identical_native_abi(monkeypatch):
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    spec = importlib.util.spec_from_file_location(
+        "runtime_sms_test_export", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    scalars = [("rows", "int32"), ("width", "int64")]
+    old = exporter.native_scalar_abi("old", {}, scalars)
+    assert old == exporter.native_scalar_abi("new", {"runtime_sm_count": False}, scalars)
+    assert old == ("il", scalars)
+    hidden = scalars + [("device_sm_count", "int32")]
+    assert exporter.native_scalar_abi("runtime", {"runtime_sm_count": True}, hidden) == ("ils", scalars)
+    for invalid in ([], scalars, hidden + [("extra", "int32")], hidden + hidden[-1:]):
+        with pytest.raises(ValueError, match="last int32 scalar"):
+            exporter.native_scalar_abi("bad", {"runtime_sm_count": True}, invalid)
+    for invalid in (None, 0, 1, "false"):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            exporter.native_scalar_abi("bad", {"runtime_sm_count": invalid}, scalars)
 
 
 @pytest.mark.parametrize("options,message", [

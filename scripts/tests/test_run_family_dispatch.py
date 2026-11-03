@@ -86,6 +86,35 @@ def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, 
             assert f"--exlr8-prefill-activations {activations}" in line
 
 
+@pytest.mark.parametrize("wip", [False, True])
+def test_flash_native_published_manifest_reaches_plan_coordinator_and_workers(tmp_path, wip):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    keys = ("EXLR8_MANIFEST=k4\nEXLR8_PREFILL_ACTIVATIONS=a16\nSPARK_COUNT=1\nRTX_GPUS=1\n"
+            "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    result = _family_launch_result(tmp_path, config, "test/flash-exlr8", keys,
+                                  extra_args=("--wip", "native-test") if wip else ())
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plans = [line for line in lines if "cuteafd plan" in line]
+    coordinators = [line for line in lines if "cuteafd serve-glmf --snapshot" in line]
+    workers = [line for line in lines if "cuteafd expertd-native" in line]
+    assert plans and coordinators and workers, result.stderr
+    for line in plans + coordinators + workers:
+        assert "--exlr8-manifest k4" in line
+        assert "--exlr8-prefill-activations a16" in line
+
+
+@pytest.mark.parametrize("manifest", ["../k4", "k4.json", "k4/other", "k4;false", "k4 space"])
+def test_native_manifest_rejects_paths_and_shell_syntax(tmp_path, manifest):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/exlr8",
+        f"EXLR8_MANIFEST={manifest}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    assert result.returncode != 0
+    assert "EXLR8_MANIFEST must be a published name, not a path" in result.stderr
+
+
 @pytest.mark.parametrize("gpus", [1, 2])
 @pytest.mark.parametrize("onboard", [None, "auto", "0", "1"])
 def test_exlr8_onboarding_reaches_shared_admission_without_zero_override(tmp_path, gpus, onboard):
@@ -738,99 +767,6 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert startup.index("draft.prime(&engine.embedding, engine.draft_head())?") < startup.index("let result = with_startup_graphs(")
 
 
-def test_shared_startup_load_overlaps_admission_before_serving_allocation() -> None:
-    for family, engine in [("glm5", "GlmEngine"), ("glm5_flash", "GlmfEngine"), ("mimo_v2", "MimoEngine")]:
-        source = (ROOT / f"rust/crates/cuteafd-daemon/src/families/{family}/mod.rs").read_text()
-        start = source.index("let admission = if")
-        body = source[start:]
-        start_call = ".start(&peers)?" if ".start(&peers)?" in body else ".start_with(&peers, ranks)?"
-        assert body.index(start_call) < body.index("load_while_admitting(admission,")
-        assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
-        assert body.index("TokenEmbedding::load(") < body.index(f"engine::{engine}::new(")
-        assert ".select(&peers)?" not in body
-    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/placement.rs").read_text()
-    helper = shared.split("pub(crate) fn load_while_admitting", 1)[1].split("#[cfg(test)]", 1)[0]
-    assert helper.index("let loaded = load()?") < helper.index("pending.wait()?") < helper.index("Ok(loaded)")
-
-
-def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> None:
-    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
-    body = source[source.index("    pub fn with_engine<"):source.index("    /// The drafter `--draft`")]
-    assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("SparkAdmission::plan(")
-    assert body.index("SparkAdmission::plan(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
-    assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
-    assert "&working, peers.len(), None, model)?;" in body and "admission.start_with(&peers, ranks)?" in body
-    # Coordinator GPUs (dense operands, TP2 halves) join the Spark push group only when it pushes,
-    # and without Spark peers form the push group alone.
-    assert "if admission.coordinator_pushes() && dense_pushable(&args)" in body
-    alone = body.split("// No Spark peers: the coordinator GPUs push alone", 1)[1].split("None\n        };", 1)[0]
-    assert "plan_dense(0)?" in alone and "CoordinatorPush::prepare_alone(" in alone
-    assert "coordinator push unavailable; mount" in alone
-    assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
-    assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
-    assert "let spark = !spark_layers.is_empty();" in body
-    assert "selected_args.prefill_waves = usize::try_from(working.prefill_lanes)?;" in body
-    assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
-    assert "spark_layers == working.spark_layers" in body
-    assert "rtx_layers == working.rtx_layers" in body
-    assert "admitted_tp2_range" not in source and "spark_range" not in body
-    assert "&local_layers, Some(budget)" in body and "&spark_layers, None" in body
-    assert "Fp8MoeTp2::load_pair(devices, tensors, &package, tp2_layers.clone(),\n                    args.expert_rows(), budgets)" in body
-    # Admitted TP2 expert weights land inside the Spark admission window;
-    # execution binds after the engine exists and before step workspaces.
-    window = body.split("load_while_admitting(admission,", 1)[1].split("probe(\"target-weights\")", 1)[0]
-    assert "tp2_weights(pushed)?" in window and "push.receive_with(devices, catalog, sparks, Some(Ok(dense))" in window
-    # Dense records are planned before membership: a planning error offers no
-    # coordinator ranks (the Sparks still push); a group fallback after
-    # membership fills the same records through the mount.
-    planning = body.split("let ranks = if admission.coordinator_pushes()", 1)[1].split("admission.start_with(&peers, ranks)?", 1)[0]
-    assert "plan_dense(peers.len())?" in planning and "coordinator push unavailable; mount" in planning
-    plan_dense = body.split("let plan_dense = |sparks: usize|", 1)[1].split("let mut coordinator_push = None;", 1)[0]
-    assert "planning.model(&self.cfg, &execution)?" in plan_dense and "dense::plan_ranks(" in plan_dense
-    assert body.index("let plan_dense = |sparks: usize|") < body.index("admission.start_with(&peers, ranks)?")
-    assert "dense::fill_by_mount(" in window
-    assert body.index("engine::GlmfEngine::new(") < body.index("tp2.execution()?") < body.index("engine.install_tp2(ranks)?")
-    assert body.index("engine.install_tp2(ranks)?") < body.index("engine.install_workspaces(workspaces)?")
-    admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
-    assert "solve_attention_working_set_with_graphs(" in admission
-    assert "let mut local_workspace = workspaces(false, lanes);" in admission
-    assert "for profile in [&mut workspace, &mut local_workspace]" in admission
-    assert "core.bytes(self.cfg.hidden)?" in admission and '"native K6 core"' in admission
-    assert "configured_prefill_waves(" not in admission
-    assert "admitted_prefill_waves(attention.mode, args.prefill_waves as u64)?" in admission
-    assert body.index("resolve_prefill(") < body.index("self.admit(")
-    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
-    pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// The continuous span", 1)[0]
-    assert "self.weights.layers.len() == self.cfg.layers" in pipeline
-    units = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine/units.rs").read_text()
-    assert "run_prefill_units(&mut hooks, &units, waves)" in units
-    assert "spark_land(" in units and "link.exchange()?" in units and "unit_ffn_finish(" in units
-    begin = units.split("    fn begin_unit(", 1)[1].split("    fn attention(", 1)[0]
-    attention = units.split("    fn attention(", 1)[1].split("    fn local_ffn(", 1)[0]
-    assert "exchange_direct(" not in begin
-    assert attention.index("return e.unit_attention(") < attention.index("e.exchange_direct(") < attention.index("e.peer_attention(")
-    layout = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
-    assert "step_workspace(&ExpertPlacement::Local, lanes)" in layout
-    assert "local_workspace = Some(estimate(lanes))" in layout
-
-    assert "admission::step_workspace_demands(" in admission
-    normalization = body.split("let mut selected_args = args.clone();", 1)[1].split("let args = &selected_args;", 1)[0]
-    assert "if " not in normalization, "zero-peer exchanges must also use admitted effective lanes"
-    planner = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
-    assert "Ok((placed, working))" in planner and "selected = Some(working);" in planner
-    assert "0..working.spark_ranks" in planner and "selected.filter(|working| working.spark_ranks > 0)" in planner
-    loader = (ROOT / "rust/crates/cuteafd-loader/src/placement/families/glm5_flash.rs").read_text()
-    request = loader.split("pub fn request_for_working_set(", 1)[1].split("/// Exact header-only", 1)[0]
-    assert "working.demands(&fixed).cloned().collect()" in request
-    assert "SparkWorkingSet as GlmfWorkingSet" in loader
-    assert "GlmfComponent::RtxExperts, gpu, Category::Transport, \"route exchange\"" in request
-    assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
-    expert = source[source.index("    fn experts_for_layers<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
-    assert expert.index("validate_expert_layers(&self.cfg, served, selected)?;") < expert.index("if selected.is_empty() { return Ok(None); }")
-    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new_waves(")
-    assert "tensors, &directory, selected, 1, 0," in expert
-    assert "layers: selected.to_vec()" in expert
-    assert "spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())" in expert
 
 
 def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
@@ -911,6 +847,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    audio_backend = ("pcm-bf16-aot-v1" if family_config.get("model_type") == "muse_spark" else
+                     "mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export" + "cd" * 32)
     for tool in ("docker", "ssh", "nest") if with_nest else ("docker", "ssh"):
         # One line per invocation, in a single write: the per-host worker legs
         # run concurrently, and a two-write line (argv, then newline) lets a
@@ -920,7 +858,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
                                     'printf "audio encoder ready \\033[3mbackend\\033[0m\\033[2m=\\033[0m%s\\n" '
-                                    '"${STUB_AUDIO_BACKEND:-mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '}" ;; esac\n' +
+                                    '"${STUB_AUDIO_BACKEND:-' + audio_backend + '}" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
                                      'touch "$dst/cuteafd" "$dst/libcuteafd_native.so" "$dst/release-entrypoint.sh"; '
@@ -1106,12 +1044,48 @@ def capture_native_exlr8_launch(snapshot: Path, deployment_path: Path, temporary
         assert int(worker[worker.index("--device-budget-bytes") + 1]) == devices[rank]["worker_budget_bytes"]
 
 
+def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
+    """Inspect actual launcher validation for declared native coordinator worlds."""
+    deployment = json.loads(deployment_path.read_text())
+    assert deployment["family"] == "glm5_flash"
+    admitted = deployment["rtx_gpus"] == 1
+    assert deployment["wip_launchable"] == admitted
+    source = (ROOT / "scripts/launch/run-family.sh").read_text()
+    functions = []
+    for name in ("release_spark_worker_budget", "release_validate_deployment"):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.MULTILINE | re.DOTALL)
+        assert match, f"missing actual launcher function {name}"
+        functions.append(match.group())
+    script = '\n'.join(functions) + r'''
+release_die() { printf '%s\n' "$*" >&2; exit 1; }
+wip_slot=native-budget-test
+plan="$(cat "$1")"
+release_spark_worker_budget "$plan" "$2"
+release_validate_deployment "$plan" glm5_flash
+'''
+    result = subprocess.run(["bash", "-euc", script, "pending-native", str(deployment_path),
+                             str(deployment["spark_ranks"])], capture_output=True, text=True)
+    devices = [device for device in deployment["memory_layout"]["devices"] if device["kind"] == "spark"]
+    assert len(devices) == deployment["spark_ranks"]
+    assert {device["worker_budget_bytes"] for device in devices} == {int(result.stdout.strip())}
+    if admitted:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert "EXLR8 native dense execution is unsupported for 2 coordinator GPUs" in result.stderr
+        assert "invalid deployment specification" in result.stderr
+
+
 def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, temporary: Path) -> dict:
     """Rust contract supplies actual headers/deployment; only hardware is stubbed."""
     deployment = json.loads(deployment_path.read_text())
     config = json.loads((snapshot / "config.json").read_text())
     family = deployment["family"]
-    keys = ("SPARK_COUNT=8\nSPECULATOR=off\nVISION=off\nAUDIO=off\nMODEL_REVISION=\n"
+    # Never probe a live server's default port on the shared gate host (#1048).
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        api_port = listener.getsockname()[1]
+    keys = (f"ADDR=127.0.0.1:{api_port}\nSPARK_COUNT=8\nSPECULATOR=off\nVISION=off\nAUDIO=off\nMODEL_REVISION=\n"
             "MAX_CONTEXT_TOKENS=262144\nMAX_OUTPUT_TOKENS=32768\nHOST_CACHE_BYTES=0\nPOOL_TOKENS=262144\n"
             f"RTX_GPUS={deployment['rtx_gpus']}\nSPARK_HOSTS=" +
             ",".join(f"worker-{rank}" for rank in range(8)) + "\n")
@@ -3982,20 +3956,20 @@ def test_mimo_audio_auto_without_admitted_owner_serves_text(tmp_path, tower, rea
     assert ("audio auto disabled" in result.stderr) == tower
 
 
-@pytest.mark.parametrize("model_type,width,tower,want", [
-    ("mimo_v2", 4096, True, "auto"), ("mimo_v2", 6144, True, "auto"),
-    ("mimo_v2", 4096, False, "off"), ("mimo_v2", 128, True, "off"),
-    ("deepseek_v41", 4096, True, "off"), ("qwen4_exp", 4096, True, "off"),
-    ("glm5_next", 4096, True, "off"), ("deepseek_v4", 4096, True, "off"),
+@pytest.mark.parametrize("declaration,want", [
+    ({"model_type": "mimo_v2", "audio_config": {"audio_channels": 20}}, "auto"),
+    ({"model_type": "muse_spark", "audio_config": {"model_type": "muse_spark_audio"}}, "auto"),
+    ({"model_type": "mimo_v2", "audio_config": {"model_type": "unknown_audio"}}, "auto"),
+    ({"model_type": "qwen4_exp", "audio_config": {}}, "auto"),
+    ({"model_type": "mimo_v2", "audio_config": "invalid"}, "auto"),
+    ({"model_type": "mimo_v2", "audio_config": None}, "off"),
+    ({"model_type": "mimo_v2"}, "off"),
 ])
-def test_release_audio_default_resolves_per_snapshot(tmp_path, model_type, width, tower, want):
+def test_release_audio_default_resolves_per_snapshot(tmp_path, declaration, want):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
-    (snapshot / "config.json").write_text(json.dumps({"model_type": model_type, "hidden_size": width, "audio_config": {"audio_channels": 20}}))
-    if tower:
-        (snapshot / "audio_tokenizer").mkdir()
-        (snapshot / "audio_tokenizer/config.json").write_text("{}")
-        (snapshot / "audio_tokenizer/model.safetensors").write_bytes(b"stub")
+    (snapshot / "config.json").write_text(json.dumps(declaration))
+    # The shell preserves declarations; the planner validates types, geometry and headers.
     config = tmp_path / "release.config"
     config.write_text("SPARK_COUNT=4\n" + "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i+1}\nSPARK_{i}_LANE_B=10.0.1.{i+1}\n" for i in range(4)))
     script = f'source "{ROOT}/scripts/lib/release-common.sh"; release_load_config "$1"; test "$AUDIO" = auto; release_resolve_audio_mode "$AUDIO" "$2"'

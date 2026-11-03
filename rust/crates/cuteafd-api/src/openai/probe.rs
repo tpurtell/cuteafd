@@ -220,6 +220,10 @@ impl ProbeSpec {
     }
 
     pub fn validate_audio(&self) -> anyhow::Result<()> {
+        self.validate_audio_geometry(cuteafd_core::media::AudioTokenGeometry::MimoRvq)
+    }
+
+    pub fn validate_audio_geometry(&self, policy: cuteafd_core::media::AudioTokenGeometry) -> anyhow::Result<()> {
         if self.audio.is_empty() { return Ok(()); }
         anyhow::ensure!(self.media.is_empty(), "mixed expanded image/audio probes are not supported");
         let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe audio requires prompt_ids"))?;
@@ -227,7 +231,7 @@ impl ProbeSpec {
         let mut previous = 0;
         let mut samples = 0usize;
         for span in &self.audio {
-            let geometry = cuteafd_loader::media::audio::AudioGeometry::for_samples(span.samples)?;
+            let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(span.samples, policy)?;
             let end = span.start.checked_add(span.len).ok_or_else(|| anyhow::anyhow!("probe audio extent overflow"))?;
             anyhow::ensure!(span.len == geometry.tokens && span.start >= previous && end <= tokens.len()
                 && self.score_from.is_none_or(|from| end <= from), "probe audio spans must match geometry and precede scoring");
@@ -244,7 +248,12 @@ impl ProbeSpec {
     }
 
     pub fn validate_media_geometry(&self, geometry: cuteafd_core::media::ImageTokenGeometry) -> anyhow::Result<()> {
-        self.validate_audio()?;
+        self.validate_media_geometries(geometry, cuteafd_core::media::AudioTokenGeometry::MimoRvq)
+    }
+
+    pub fn validate_media_geometries(&self, geometry: cuteafd_core::media::ImageTokenGeometry,
+        audio: cuteafd_core::media::AudioTokenGeometry) -> anyhow::Result<()> {
+        self.validate_audio_geometry(audio)?;
         if self.media.is_empty() { return Ok(()); }
         let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe media requires prompt_ids"))?;
         anyhow::ensure!(self.media.len() <= 128, "probe media exceeds history limit");
@@ -616,6 +625,27 @@ mod tests {
             assert!(bad.validate_audio().is_err(), "{mutation}");
         }
     }
+    #[test]
+    fn audio_probe_uses_selected_tower_policy() {
+        use cuteafd_core::media::{AudioTokenGeometry, ImageTokenGeometry};
+        let policy = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        for (samples, len) in [(1, 1), (1920, 1), (1921, 2), (24000, 13)] {
+            let spec = ProbeSpec { prompt_ids: Some(vec![0; len + 4]), score_from: Some(len + 2),
+                audio: vec![ProbeAudio { start: 1, len, key: "ab".repeat(32), samples,
+                    pcm_sha256: "cd".repeat(32) }], ..Default::default() };
+            spec.validate_media_geometries(ImageTokenGeometry::MERGED, policy).unwrap();
+            if samples == 1 || samples == 24000 {
+                assert!(spec.validate_audio().is_err(), "distinct PCM geometry must not use MiMo policy");
+            }
+            let mut bad = spec.clone();
+            bad.audio[0].len += 1;
+            assert!(bad.validate_audio_geometry(policy).is_err());
+        }
+        let spec = ProbeSpec { prompt_ids: Some(vec![0; 4]), audio: vec![ProbeAudio {
+            start: 1, len: 1, key: "ab".repeat(32), samples: 1, pcm_sha256: "cd".repeat(32)
+        }], ..Default::default() };
+        assert!(spec.validate_audio_geometry(AudioTokenGeometry::PcmPatches { samples_per_token: 0 }).is_err());
+    }
     use super::*;
 
     fn dumped_row(path: &std::path::Path) -> Vec<f32> {
@@ -871,38 +901,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod input_identity_tests {
-    use super::*;
-    use cuteafd_loader::media::{EncoderId, ImageFamily, ImageProcessor, ProcessorConfig, RgbImage};
-
-    #[test]
-    fn fixture_input_is_exact_across_encoder_architectures_for_mistral_qwen_and_mimo() {
-        for family in [ImageFamily::Mistral, ImageFamily::Qwen, ImageFamily::Mimo] {
-            let processor = ProcessorConfig::for_family(family);
-            let rgb = RgbImage { width: 64, height: 64, data: vec![37; 64 * 64 * 3] };
-            let resident = processor.prepare_rgb(rgb.clone(), EncoderId([120; 32])).unwrap();
-            let mut remote = processor.prepare_rgb(rgb, EncoderId([121; 32])).unwrap();
-            assert_ne!(resident.key, remote.key);
-            assert_eq!(resident.grid, remote.grid);
-            assert_eq!(resident.rgb8, remote.rgb8);
-            if family == ImageFamily::Mistral {
-                assert_eq!(resident.tokens, 12);
-                assert_eq!([resident.grid.t, resident.grid.h, resident.grid.w], [1, 6, 6]);
-            }
-            let span = ProbeMedia { start: 1, len: resident.tokens, kind: "image".into(),
-                key: hex(&resident.key.0), grid: [resident.grid.t, resident.grid.h, resident.grid.w],
-                identity: Some(ProbeImageIdentity::prepared(&resident)), input_key: None,
-                fixture: None, image_url: None };
-            span.verify_image(&resident).unwrap();
-            span.verify_image(&remote).unwrap();
-            assert_ne!(ProbeImageIdentity::prepared(&resident), ProbeImageIdentity::prepared(&remote));
-            let mut changed = remote.rgb8.to_vec(); changed[0] ^= 1; remote.rgb8 = changed.into();
-            assert!(span.verify_image(&remote).is_err());
-            remote.rgb8 = resident.rgb8.clone(); remote.processor.0[0] ^= 1;
-            assert!(span.verify_image(&remote).is_err());
-            let mut legacy = span.clone(); legacy.identity = None;
-            legacy.verify_image(&resident).unwrap();
-            assert!(legacy.verify_image(&remote).is_err());
-        }
-    }
-}
+mod input_identity_tests;

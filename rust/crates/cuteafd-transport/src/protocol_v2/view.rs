@@ -3,16 +3,14 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use super::{
-    CHECKSUM_LEN, EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
-    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
-    EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
+    CHECKSUM_LEN, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
     EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN,
     EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN, ExpertProtocolV2RequestHeader,
     ExpertProtocolV2ResponseHeader, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertProtocolV2Status, ExpertProtocolV2WireStats, ExpertV2Dtype, REQUEST_CHECKSUM_OFFSET,
     REQUEST_KIND, RESPONSE_CHECKSUM_OFFSET, RESPONSE_EXECUTOR_ID_OFFSET, RESPONSE_KIND,
     checked_usize, debug_checksum_enabled, decode_route_entry, decode_row_descriptor,
-    payload_checksum, precompile_warmup_enabled, read_u16, read_u32, read_u64,
+    request_checksum, precompile_warmup_enabled, read_u16, read_u32, read_u64,
     request_header_len_from_flags, response_fp8_e4m3_row_scaled_enabled,
     response_header_len_from_flags, response_more_chunks_enabled,
     response_nvfp4_e2m1_fp8_e4m3_enabled, response_row_indices_enabled,
@@ -147,6 +145,26 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
         Ok(view)
     }
 
+    pub fn partial_replies(&self) -> bool {
+        self.header.flags & super::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0
+    }
+
+    /// Row `index`'s partial-reply region (0 BF16, 1 wide; 0 without the flag).
+    pub fn row_region(&self, index: usize) -> Result<u16> {
+        let offset = index.checked_mul(super::EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN)
+            .context("row region offset overflow")?;
+        read_u16(self.row_descriptor_bytes, offset + 10, "row_region")
+    }
+
+    /// The request's partial-reply plan (validated at parse), when flagged.
+    pub fn partial_plan(&self) -> Result<Option<super::PartialReplyPlan>> {
+        if !self.partial_replies() { return Ok(None); }
+        let wide = super::PartialWire::from_u16(read_u16(self.frame_bytes, 46, "partial_wide")?)?;
+        let regions = (0..self.header.row_count as usize).map(|row| Ok(self.row_region(row)? as u8))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(super::PartialReplyPlan { wide, regions }))
+    }
+
     pub fn header_len(&self) -> usize {
         request_header_len_from_flags(self.header.flags)
     }
@@ -161,40 +179,6 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
 
     pub fn hidden_payload(&self) -> &'a [u8] {
         self.hidden_payload
-    }
-
-    pub(crate) fn encode_regular_forwarded_into(
-        &self,
-        response_dtype: ExpertV2Dtype,
-        out: &mut Vec<u8>,
-    ) -> Result<()> {
-        if self.stream_plan_enabled()
-            || self.stream_data_enabled()
-            || self.precompile_warmup_enabled()
-        {
-            bail!("only regular ExpertProtocolV2 requests can be forwarded");
-        }
-        let response_flags = match response_dtype {
-            ExpertV2Dtype::Bf16 => 0,
-            ExpertV2Dtype::Fp8E4m3RowScaled => EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
-            ExpertV2Dtype::Nvfp4E2m1Fp8E4m3 => EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3,
-            other => bail!("unsupported forwarded response dtype {other:?}"),
-        };
-        let flags = response_flags
-            | if self.debug_checksum_enabled() {
-                EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
-            } else {
-                0
-            };
-        validate_flags(flags, "request")?;
-
-        out.clear();
-        if out.capacity() < self.frame_bytes.len() {
-            out.reserve(self.frame_bytes.len() - out.capacity());
-        }
-        out.extend_from_slice(self.frame_bytes);
-        out[84..88].copy_from_slice(&flags.to_le_bytes());
-        Ok(())
     }
 
     pub fn hidden_row_payload(&self, index: usize) -> Result<&'a [u8]> {
@@ -305,23 +289,8 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
         if !self.debug_checksum_enabled() {
             bail!("ExpertProtocolV2 request debug checksum flag is not set");
         }
-        let descriptor_rows = if self.stream_data_enabled() {
-            0
-        } else {
-            self.header.row_count as usize
-        };
-        let route_entries = if self.stream_data_enabled() {
-            0
-        } else {
-            self.header.route_count as usize
-        };
-        let rows = (0..descriptor_rows)
-            .map(|index| self.row(index))
-            .collect::<Result<Vec<_>>>()?;
-        let routes = (0..route_entries)
-            .map(|index| self.route(index))
-            .collect::<Result<Vec<_>>>()?;
-        let actual = payload_checksum(&rows, &routes, self.hidden_payload);
+        let prefix_len = self.frame_bytes.len() - self.hidden_payload.len();
+        let actual = request_checksum(&self.frame_bytes[..prefix_len], self.hidden_payload);
         let Some(checksum) = self.checksum else {
             bail!("ExpertProtocolV2 request checksum header is malformed");
         };
@@ -390,8 +359,23 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
         } else {
             self.header.route_count as usize
         };
+        let partial = self.partial_replies();
+        let wide = read_u16(self.frame_bytes, 46, "partial_wide")?;
+        if partial {
+            super::PartialWire::from_u16(wide)?;
+        } else if wide != 0 {
+            bail!("ExpertProtocolV2 request without partial replies carries partial region data");
+        }
         for row_index in 0..descriptor_rows {
             let row = self.row(row_index)?;
+            let region = self.row_region(row_index)?;
+            if partial {
+                if region > 1 {
+                    bail!("ExpertProtocolV2 partial region bit {region} is neither 0 nor 1");
+                }
+            } else if region != 0 {
+                bail!("ExpertProtocolV2 request without partial replies carries partial region data");
+            }
             let end =
                 row.route_offset
                     .checked_add(row.route_count)
@@ -550,17 +534,7 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
                 pace,
         };
         header.validate_row_capacity_error()?;
-        if header.output_dim == 0 {
-            bail!("ExpertProtocolV2 response output_dim must be non-zero");
-        }
-        let logical_row_bytes = header
-            .output_dtype
-            .row_bytes(header.output_dim as usize)
-            .context("ExpertProtocolV2 response output row byte count")?;
-        if (header.output_row_stride_bytes as usize) < logical_row_bytes {
-            bail!("ExpertProtocolV2 response output row stride is smaller than a row");
-        }
-        let expected = u64::from(row_count) * u64::from(header.output_row_stride_bytes);
+        let expected = super::response_payload_bytes(&header)?.map_or(output_payload_bytes, |bytes| bytes as u64);
         if expected != output_payload_bytes
             || wire_bytes != header_len as u64 + output_payload_bytes
         {
@@ -611,6 +585,9 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
                 "ExpertProtocolV2 response row index {index} exceeds row count {}",
                 self.header.row_count
             );
+        }
+        if self.header.flags & super::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0 {
+            bail!("ExpertProtocolV2 partial reply has no per-row output; read its regions");
         }
         let stride = self.header.output_row_stride_bytes as usize;
         let start = index
@@ -677,25 +654,8 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
                 bail!("ExpertProtocolV2 response row indices must be unique within a chunk");
             }
         }
-        if self.header.output_dim == 0 {
-            bail!("ExpertProtocolV2 response output_dim must be non-zero");
-        }
-        let logical_row_bytes = self
-            .header
-            .output_dtype
-            .row_bytes(self.header.output_dim as usize)
-            .context("ExpertProtocolV2 response output row byte count")?;
-        let output_row_stride_bytes = self.header.output_row_stride_bytes as usize;
-        if output_row_stride_bytes < logical_row_bytes {
-            bail!(
-                "ExpertProtocolV2 response output row stride bytes {} smaller than logical row bytes {}",
-                self.header.output_row_stride_bytes,
-                logical_row_bytes
-            );
-        }
-        let expected_payload = (self.header.row_count as usize)
-            .checked_mul(output_row_stride_bytes)
-            .context("ExpertProtocolV2 response output payload byte count overflow")?;
+        let expected_payload = super::response_payload_bytes(&self.header)?
+            .unwrap_or(self.partial_output_payload.len());
         if expected_payload != self.partial_output_payload.len() {
             bail!(
                 "ExpertProtocolV2 response output payload bytes mismatch: expected={} actual={}",

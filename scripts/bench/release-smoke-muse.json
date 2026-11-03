@@ -1,0 +1,97 @@
+{
+  "build": "REPLACE-ME-muse-wip",
+  "profile": "smoke",
+  "defaults": {
+    "timeout_s": 1800,
+    "run_timeout_s": 1800,
+    "fabric": true,
+    "set": {
+      "ENABLE_BENCH": "on"
+    }
+  },
+  "entries": [
+    {
+      "name": "muse-spark-exl3-min",
+      "family": "muse_spark",
+      "config": "examples/configs/muse-spark-exl3-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "run_args": [
+        "--wip",
+        "muse"
+      ],
+      "set": {
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "89998fb177acd9a862ac8bd4fb79bfd50e940c97",
+        "SPECULATOR": "dflash2",
+        "SPECULATOR_MODEL_ID": "nvidia/Muse-Spark-Open-816B-A42B-DFlash2",
+        "SPECULATOR_MODEL_REVISION": "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "0",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8897",
+        "EXPERT_PORT": "21940",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4"
+      }
+    },
+    {
+      "name": "muse-spark-exl3-max",
+      "family": "muse_spark",
+      "config": "examples/configs/muse-spark-exl3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "run_args": [
+        "--wip",
+        "muse"
+      ],
+      "set": {
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "89998fb177acd9a862ac8bd4fb79bfd50e940c97",
+        "SPECULATOR": "dflash2",
+        "SPECULATOR_MODEL_ID": "nvidia/Muse-Spark-Open-816B-A42B-DFlash2",
+        "SPECULATOR_MODEL_REVISION": "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8898",
+        "EXPERT_PORT": "21960",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6"
+      }
+    }
+  ]
+}

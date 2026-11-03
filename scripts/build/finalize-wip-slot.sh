@@ -44,7 +44,8 @@ fi
 if [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then
   "$build_output/cuteafd" programs-check --native-lib "$build_output/libcuteafd_native.so" \
     --manifest "$build_output/PROGRAMS.json" \
-    --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)"
+    --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)" \
+    --exlr8-family "${CUTEAFD_WIP_EXLR8_FAMILIES:-}"
 fi
 
 slot_root="/wip/slots/$slot/$role"

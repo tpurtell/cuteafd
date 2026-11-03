@@ -212,7 +212,7 @@ impl RankLayout {
         let operands: Vec<(u64, Vec<(Rect, usize)>)> = self.operands.iter()
             .map(|(start, o)| (*start, o.lands.clone())).collect();
         let steps: Vec<(u64, Vec<Rect>)> = self.steps.iter().map(|(start, s)| (*start, s.rects.clone())).collect();
-        super::push::DensePlan { base: self.base, host_bytes: self.host_bytes, host_staging: self.host_staging,
+        super::push::DensePlan { base: self.base, host_bytes: self.host_bytes, host_staging: self.host_staging, peer_copies: Vec::new(),
             append: Box::new(move |builder, rank, host_base| {
                 for (start, lands) in &operands {
                     for (rect, at) in lands { append(rect, builder, rank, start + *at as u64)?; }
@@ -404,7 +404,7 @@ impl PushDestination for DenseArena<'_> {
 pub(crate) fn plan_ranks<'a>(snapshot: &std::path::Path, operands: Vec<Operand>, steps: Vec<Step>,
     devices: &[Device<'a>], sparks: usize)
     -> Result<(Vec<super::push::DensePlan>, Vec<DenseArena<'a>>)> {
-    plan_records(snapshot, Records { operands, steps, finishes: Vec::new() }, devices, sparks)
+    plan_records(snapshot, Records { operands, steps, ..Default::default() }, devices, sparks)
 }
 
 /// [`plan_ranks`] for a whole record set (each GPU's finishes run at its Done).
@@ -412,7 +412,9 @@ pub(crate) fn plan_ranks<'a>(snapshot: &std::path::Path, operands: Vec<Operand>,
 pub(crate) fn plan_records<'a>(snapshot: &std::path::Path, records: Records,
     devices: &[Device<'a>], sparks: usize)
     -> Result<(Vec<super::push::DensePlan>, Vec<DenseArena<'a>>)> {
-    let Records { operands, steps, finishes } = records;
+    let Records { operands, steps, finishes, peer_copies } = records;
+    ensure!(peer_copies.iter().all(|copy| devices.iter().any(|d| d.id == copy.source_device)
+        && devices.iter().any(|d| d.id == copy.destination_device)), "peer load copy outside the push group");
     ensure!(finishes.iter().all(|f| devices.iter().any(|d| d.id == f.device())),
         "dense finish on a GPU outside the push group");
     let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
@@ -430,7 +432,9 @@ pub(crate) fn plan_records<'a>(snapshot: &std::path::Path, records: Records,
         ensure!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
             "coordinator dense source is not a SparkNest shard");
         let expected = ExpectedCoverage::from_plan(&checked, u32::try_from(sparks + gpu)?)?;
-        out.0.push(layout.plan());
+        let mut plan = layout.plan();
+        plan.peer_copies = peer_copies.iter().filter(|copy| copy.destination_device == device.id).cloned().collect();
+        out.0.push(plan);
         out.1.push(DenseArena::new(*device, layout, expected)?);
     }
     ensure!(operands.is_empty() && steps.is_empty(), "dense records on a GPU outside the push group");

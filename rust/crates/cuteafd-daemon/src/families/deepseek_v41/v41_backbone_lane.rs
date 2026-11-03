@@ -1365,14 +1365,9 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     }
     /// Opt-in diagnostic at a completed layer boundary; never used by normal serving.
     pub fn trace_output(&self, directory: &std::path::Path) -> Result<()> {
-        use std::io::Write;
         let output = self.output()?;
         for (name, buffer) in [("residual", output.residual), ("pre", output.pre)] {
-            let path = directory.join(format!("layer{}-{name}.bin", output.layer));
-            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-            let mut bytes = vec![0; buffer.bytes];
-            self.weights.library.copy_d2h(&mut bytes, buffer)?;
-            file.write_all(&bytes)?;
+            crate::shared::activation_trace::write_device(self.weights.library, directory, output.layer, name, buffer)?;
         }
         Ok(())
     }

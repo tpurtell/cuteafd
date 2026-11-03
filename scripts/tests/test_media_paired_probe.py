@@ -57,6 +57,76 @@ def test_capture_retains_http_error_body(tmp_path, monkeypatch, family):
     assert not (args.out / "capture.json").exists()
 
 
+def test_audio_capture_uses_ordinary_source_and_probe_audio_echo(tmp_path, monkeypatch):
+    import base64
+    from types import SimpleNamespace
+    span = {"start": 1, "len": 1, "kind": "audio", "key": "a" * 64,
+        "samples": 1, "pcm_sha256": "b" * 64,
+        "fixture": {"path": "clip.wav", "sha256": "c" * 64}}
+    window = {"id": "audio00", "tokens": [1, 9, 2], "score_from": 2, "media": [span]}
+    panel = {"family": "muse_spark", "checkpoint": "model", "set_sha256": "d" * 64,
+        "quick_windows": ["audio00"], "windows": [window]}
+    monkeypatch.setattr(module, "load_panel", lambda a: panel)
+    monkeypatch.setattr(module, "read_fixture", lambda *args: b"wav")
+    import fidelity_media
+    monkeypatch.setattr(fidelity_media, "read_pcm_fixture", lambda *args: np.zeros(1, dtype="<f4"))
+    fields = ("start", "len", "key", "samples", "pcm_sha256")
+    echo = {k: span[k] for k in fields}
+    seen = []
+    response = {"probe": {"engine": "muse", "cold": True, "no_speculation": True,
+        "cached_tokens": 0, "score_path": "decode", "prompt_ids": window["tokens"],
+        "audio": [echo.copy()], "rows": [{"position": 2, "finite": True}], "scored": 1},
+        "server": {"model": "model", "family": "muse_spark"}}
+    def http(url, token, body=None, timeout=240):
+        if body is None:
+            return {"data": [{"id": "model", "capabilities": {"audio": True}}]}
+        seen.append(body)
+        assert body["spec"]["audio"] == [echo] and body["spec"]["media"] == []
+        ordinary = body["body"]["messages"][0]["content"][0]
+        assert ordinary["type"] == "input_audio"
+        assert base64.b64decode(ordinary["input_audio"]["data"]) == b"wav"
+        assert ordinary["input_audio"]["format"] == "wav"
+        return response
+    monkeypatch.setattr(module, "http", http)
+    dump = tmp_path / "host/audio00"
+    args = SimpleNamespace(out=tmp_path / "out", url="http://localhost", bench_token=None,
+        mode="native", features=None, quick=False, media_root=tmp_path, host_dump=tmp_path / "host",
+        server_dump=tmp_path / "server", timeout=10)
+    def rows(*args):
+        dump.mkdir(parents=True)
+        (dump / "manifest.jsonl").write_text("unused")
+        return {}
+    monkeypatch.setattr(module, "dump_rows", rows)
+    module.capture(args)
+    assert len(seen) == 1 and (args.out / "capture.json").exists()
+    response["probe"]["audio"][0]["pcm_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="echo"):
+        module.check_record(window, response, "model", "native", family="muse_spark")
+
+
+def test_mixed_record_checks_rebound_image_and_exact_audio_independently():
+    image = {"start": 0, "len": 1, "kind": "image", "key": "a" * 64, "grid": [1, 2, 2],
+             "identity": {"encoder": "b" * 64, "processor": "c" * 64}}
+    audio = {"start": 1, "len": 1, "kind": "audio", "key": "d" * 64,
+             "samples": 1, "pcm_sha256": "e" * 64}
+    window = {"tokens": [9, 8, 2], "score_from": 2, "media": [image, audio]}
+    admitted = {**image, "key": "f" * 64, "input_key": image["key"],
+                "identity": {**image["identity"], "encoder": "0" * 64}}
+    audio_echo = {k: audio[k] for k in ("start", "len", "key", "samples", "pcm_sha256")}
+    record = {"engine": "muse", "cold": True, "no_speculation": True, "cached_tokens": 0,
+              "score_path": "decode", "prompt_ids": window["tokens"], "media": [admitted],
+              "audio": [audio_echo], "rows": [{"position": 2, "finite": True}], "scored": 1}
+    response = {"probe": record, "server": {"model": "model", "family": "muse_spark"}}
+    module.check_record(window, response, "model", "native", family="muse_spark")
+    admitted["identity"]["processor"] = "1" * 64
+    with pytest.raises(ValueError, match="identity"):
+        module.check_record(window, response, "model", "native", family="muse_spark")
+    admitted["identity"]["processor"] = image["identity"]["processor"]
+    audio_echo["pcm_sha256"] = "2" * 64
+    with pytest.raises(ValueError, match="audio echo"):
+        module.check_record(window, response, "model", "native", family="muse_spark")
+
+
 def test_window_bootstrap_is_paired_and_deterministic():
     stats, counts = [[.02, .01], [.04, .02]], [10, 20]
     result = module.paired_bounds(stats, counts, 500, 7)

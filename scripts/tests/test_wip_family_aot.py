@@ -1,7 +1,9 @@
 """Direct WIP builds derive the same family scopes as single gate cards."""
+import ast
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -30,6 +32,7 @@ CASES = [
     ('step5', 'Step-5-Preview', 6, 'STEP5', 'step5:fp8'),
     ('step5', 'Step-5-Preview-EXL3-K4-Core-K6', 6, 'STEP5', 'step5:exl3-k46'),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23'),
+    ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6', 6, 'MUSE', 'muse:exl3-k45'),
     ('mistral_large4', 'Mistral-Large-4-EXL3-K4-Core-K6', 6, 'ML4', 'ml4:exl3-k45'),
 ]
 
@@ -170,6 +173,44 @@ def test_missing_metadata_fails_closed_unless_family_is_explicit(tmp_path, monke
         aot.config_family(dict(FAMILY='unknown'))
 
 
+def test_every_build_aot_switch_is_forwarded_to_coordinator_container():
+    build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    required = set(re.findall(r'CUTEAFD_WIP_[A-Z0-9_]+_AOT\b', build))
+    wip = (ROOT / 'wip.sh').read_text()
+    command = wip.split('local -a coordinator_build=(docker exec', 1)[1].split(
+        '"$coordinator_container"', 1)[0]
+    # EXLR8 is passed via an optional -e array; inspect its definition too.
+    for array in set(re.findall(r'\$\{([a-z0-9_]+)\[@\]', command)):
+        command += '\n' + '\n'.join(re.findall(r'\b' + array + r'=\([^\n]*', wip))
+    forwarded = set(re.findall(r'-e\s+[\"\']?(CUTEAFD_WIP_[A-Z0-9_]+_AOT)=', command))
+    assert required and required <= forwarded, sorted(required - forwarded)
+
+
+@pytest.mark.parametrize('mode', ['empty', 'muse', 'spark-partial'])
+def test_program_geometry_is_validated_at_configure_time(tmp_path, mode):
+    cmake = ROOT / 'native/cmake/shared/dsv4_programs.cmake'
+    (tmp_path / 'CMakeLists.txt').write_text('\n'.join([
+        'cmake_minimum_required(VERSION 3.18)', 'project(muse_scope NONE)',
+        f'set(CUTEAFD_CUDA_ARCHITECTURES {121 if mode == "spark-partial" else 120})',
+        'set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)',
+        f'set(CUTEAFD_ENABLE_MUSE_AOT {"ON" if mode == "muse" else "OFF"})',
+        'set(CUTEAFD_PARTIAL_REPLY_PROGRAMS ON)',
+        'add_custom_target(cuteafd_verify_sparkinfer_source)', f'include("{cmake}")',
+        'file(WRITE "${CMAKE_BINARY_DIR}/geometry.txt" "${CUTEAFD_PROGRAM_GEOMETRY}")',
+    ]))
+    build = tmp_path / 'build'
+    result = subprocess.run(['cmake', '-S', str(tmp_path), '-B', str(build)],
+                            capture_output=True, text=True, timeout=30)
+    if mode == 'empty':
+        assert result.returncode != 0
+        assert 'Coordinator program geometry is empty' in result.stdout + result.stderr
+        assert not (build / 'geometry.txt').exists()
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        expected = 'muse,muse2,expert_partial,dense_trellis_k6' if mode == 'muse' else 'expert_partial'
+        assert (build / 'geometry.txt').read_text() == expected
+
+
 def test_seal_guard_is_forwarded_after_native_build():
     wip = (ROOT / 'wip.sh').read_text()
     coordinator = wip.split('build_coordinator() {', 1)[1].split('build_expert() (', 1)[0]
@@ -261,6 +302,7 @@ def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
      {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_MIMO_GEOMETRIES': 'mimop'}),
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3', 0, 'QWEN4', 'qwen4:exl3-k45;qwen4:nvfp4', '', '', '', {}),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23', 'kimik3:exl3-k23', 'kimik3=6', '', {}),
+    ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6', 6, 'MUSE', 'muse:exl3-k45', 'muse:exl3-k45', 'muse=6', '', {}),
     ('mistral_large4', 'Mistral-Large-4-EXL3-K4-Core-K6', 6, 'ML4', 'ml4:exl3-k45', 'ml4:exl3-k45', 'ml4=6', '', {}),
 ])
 def test_existing_family_scope_outputs_are_unchanged(family, model, count, program,
@@ -346,6 +388,7 @@ def test_non_kimi_scope_does_not_enable_kimi_programs(tmp_path):
 def test_native_k6_architecture_tables_follow_existing_cmake_scope(tmp_path, kimi, glm, glmf, exlr8, families):
     cmake = ROOT / 'native/cmake/shared/dsv4_programs.cmake'
     source = tmp_path / 'CMakeLists.txt'
+    exlr8_families = ';'.join(family for family in families.split(',') if family in {'glm', 'glmf'})
     source.write_text('\n'.join([
         'cmake_minimum_required(VERSION 3.18)',
         'project(native_scope NONE)',
@@ -356,6 +399,7 @@ def test_native_k6_architecture_tables_follow_existing_cmake_scope(tmp_path, kim
         f'set(CUTEAFD_ENABLE_KIMIK3_AOT {"ON" if kimi else "OFF"})',
         f'set(CUTEAFD_ENABLE_GLM_AOT {"ON" if glm else "OFF"})',
         f'set(CUTEAFD_ENABLE_EXLR8_AOT {"ON" if exlr8 else "OFF"})',
+        f'set(CUTEAFD_EXLR8_FAMILIES "{exlr8_families}")',
         'add_custom_target(cuteafd_verify_sparkinfer_source)',
         f'include("{cmake}")',
         'file(WRITE "${CMAKE_BINARY_DIR}/scope.txt" "${CUTEAFD_PROGRAM_GEOMETRY}\\n${CUTEAFD_DSV4_EXPORT_ARGS}\\n")',
@@ -387,6 +431,7 @@ def test_glm_context_only_passes_only_supported_base_geometries(tmp_path, mode, 
         'set(CUTEAFD_GLM_GEOMETRIES "glm;glm2")', 'set(CUTEAFD_ENABLE_GLM_AOT ON)',
         f'set(CUTEAFD_ENABLE_KIMIK3_AOT {"ON" if kimi else "OFF"})',
         f'set(CUTEAFD_ENABLE_EXLR8_AOT {"ON" if exlr8 else "OFF"})',
+        'set(CUTEAFD_EXLR8_FAMILIES glm)',
         'add_custom_target(cuteafd_verify_sparkinfer_source)', f'include("{cmake}")',
         'file(WRITE "${CMAKE_BINARY_DIR}/args.txt" "${CUTEAFD_DSV4_EXPORT_ARGS}")',
     ]))
@@ -410,6 +455,67 @@ def test_glm_context_only_passes_only_supported_base_geometries(tmp_path, mode, 
         if exlr8:
             expected += ['exlr8', 'exlr8_dense']
         assert geometries == expected
+
+
+@pytest.mark.parametrize('ranks', [1, 2])
+def test_muse_scoped_exports_cover_every_startup_program(ranks, monkeypatch):
+    from functools import partial
+    from types import ModuleType
+
+    # Run the real program-list builders on CPU; only GPU compiler entrypoints
+    # are stubbed. No static list duplicates the exporter's scope decisions.
+    source = ROOT / 'python/tools/aot/export_b12x_muse_aot.py'
+    module = ast.parse(source.read_text())
+    body = [node for node in module.body if isinstance(node, ast.FunctionDef)]
+    scope = {'partial': partial, 'EXPERT_WIDTH': 4096, 'WINDOW': 2048, 'SWA_RING_STEP': 64}
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(source), 'exec'), scope)
+
+    muse_source = (ROOT / 'third_party/sparkinfer/b12x/integration/cuteafd/muse.py').read_text()
+    norms = next(node.value for node in ast.parse(muse_source).body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == 'NORMS' for target in node.targets))
+    compiler_calls = []
+
+    def compiler(**kwargs):
+        compiler_calls.append(kwargs)
+
+    packages = {}
+    for name in ('b12x', 'b12x.integration', 'b12x.integration.cuteafd',
+                 'b12x.integration.cuteafd.muse', 'b12x.integration.cuteafd.rope',
+                 'b12x.integration.cuteafd.muse_tp', 'b12x.integration.cuteafd.pointwise',
+                 'b12x.integration.cuteafd._muse_attention'):
+        packages[name] = ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, packages[name])
+        if '.' in name:
+            parent, child = name.rsplit('.', 1)
+            monkeypatch.setattr(packages[parent], child, packages[name], raising=False)
+    packages['b12x.integration.cuteafd.muse'].NORMS = ast.literal_eval(norms)
+    for name, functions in {
+        'muse': ('compile_norm_aot', 'compile_residual_gate_aot', 'compile_route_select_aot',
+                 'compile_softcap_aot', 'compile_qk_norm_rope_aot', 'compile_attention_output_aot',
+                 'compile_router_aot'),
+        'rope': ('compile_rope_tables_aot',), 'muse_tp': ('compile_tp_combine_aot',),
+        'pointwise': ('compile_bf16_projection_aot',),
+        '_muse_attention': ('compile_attention_aot', 'compile_swa_commit_aot'),
+    }.items():
+        for function in functions:
+            setattr(packages[f'b12x.integration.cuteafd.{name}'], function, compiler)
+
+    exported = {f'{prefix}_{name}' for heads, prefix in ((128, 'muse'), (64, 'muse2'))
+                for name, _, _, _ in scope['programs'](heads)}
+    rust = ROOT / 'rust/crates/cuteafd-daemon/src/families/muse_spark'
+    bindings = (rust / 'programs.rs').read_text()
+    required = set()
+    for section, prefix in (('POINTWISE', 'muse'), ('PER_HEADS', 'muse' if ranks == 1 else 'muse2')):
+        table = bindings.split(f'const {section}:', 1)[1].split('\n];', 1)[0]
+        required.update(f'{prefix}_{name}' for name in re.findall(r'\("([a-z0-9_]+)",', table))
+    rope = re.search(r'const ROPE_TABLES: &str = "([^"]+)";', bindings).group(1)
+    required.add(rope)
+    assert len(required) == 25
+    assert required <= exported, sorted(required - exported)
+    assert 'required.push(programs::ROPE_TABLES.into())' in (rust / 'startup.rs').read_text()
+    assert 'RotaryTables::load(device, programs, plan, "muse_",' in (rust / 'engine.rs').read_text()
+    scope['builders']()['rope_s64_plain']()
+    assert compiler_calls == [{'rotary_span': 64, 'llama3': False}]
 
 
 def test_kimi_builds_always_package_k6_programs(tmp_path):

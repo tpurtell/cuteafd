@@ -718,30 +718,14 @@ fn validate_response_shape(
             bail!("ExpertProtocolV2 response row indices must be unique within a chunk");
         }
     }
-    if header.output_dim == 0 {
-        bail!("ExpertProtocolV2 response output_dim must be non-zero");
-    }
-    let logical_row_bytes = header
-        .output_dtype
-        .row_bytes(header.output_dim as usize)
-        .context("ExpertProtocolV2 response output row byte count")?;
-    let output_row_stride_bytes = header.output_row_stride_bytes as usize;
-    if output_row_stride_bytes < logical_row_bytes {
-        bail!(
-            "ExpertProtocolV2 response output row stride bytes {} smaller than logical row bytes {}",
-            header.output_row_stride_bytes,
-            logical_row_bytes
-        );
-    }
-    let expected_payload = (header.row_count as usize)
-        .checked_mul(output_row_stride_bytes)
-        .context("ExpertProtocolV2 response output payload byte count overflow")?;
-    if expected_payload != payload_bytes {
-        bail!(
-            "ExpertProtocolV2 response output payload bytes mismatch: expected={} actual={}",
-            expected_payload,
-            payload_bytes
-        );
+    if let Some(expected_payload) = super::response_payload_bytes(header)? {
+        if expected_payload != payload_bytes {
+            bail!(
+                "ExpertProtocolV2 response output payload bytes mismatch: expected={} actual={}",
+                expected_payload,
+                payload_bytes
+            );
+        }
     }
     if header.output_payload_bytes as usize != payload_bytes {
         bail!("ExpertProtocolV2 response output_payload_bytes mismatch");

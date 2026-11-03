@@ -1,9 +1,11 @@
 //! Code every family uses.
 
+pub(crate) mod activation_trace;
 pub(crate) mod api;
 pub(crate) mod console;
 pub(crate) mod malloc_tune;
 pub(crate) mod context;
+pub(crate) mod checkpoint_read;
 pub(crate) mod constraints;
 pub(crate) mod decode_graph;
 pub(crate) mod dense_trellis;

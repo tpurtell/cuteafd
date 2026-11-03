@@ -1823,7 +1823,7 @@ impl<'a> GlmEngine<'a> {
                 if index == 0 && gather {
                     // SAFETY: the step's ids are in `ids` before the replay; `h` holds its rows.
                     unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, 1, std::ptr::null(),
-                        w.h.buffer.ptr, self.stream)? };
+                        w.h.buffer.ptr, None, self.stream)? };
                 }
                 if let (0, Some(w1)) = (index, w1) {
                     self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;

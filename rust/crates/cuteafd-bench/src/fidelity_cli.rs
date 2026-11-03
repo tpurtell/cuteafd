@@ -595,6 +595,30 @@ mod tests {
         assert!(discovered_prefill_logits_at(&unrelated, home.path()).unwrap_err().to_string().contains("cannot read"));
     }
 
+    #[test]
+    #[ignore = "requires the pinned Muse quant snapshot and its official base model card"]
+    fn family_discovery_real_muse_snapshot_and_reference() {
+        use cuteafd_loader::plan::{checkpoint::{read_json, Checkpoint}, family};
+        let home = cuteafd_loader::default_hf_home();
+        let model = "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6";
+        let relative = "models--wrldsuksgo2mars--Muse-Spark-Open-EXL3-K4-Core-K6/snapshots/89998fb177acd9a862ac8bd4fb79bfd50e940c97";
+        let snapshot = home.join("hub").join(relative);
+        let checkpoint = Checkpoint { snapshot: snapshot.clone(), config: read_json(&snapshot.join("config.json")).unwrap(),
+            quantize_config: None, weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
+        let detected = family::registry().iter().find(|f| f.detect(&checkpoint)).unwrap();
+        assert_eq!(detected.id(), "muse_spark");
+        for advertised in [snapshot.clone(), PathBuf::from("/hf/hub").join(relative)] {
+            let mut status = json!({"snapshot": advertised, "full_prefill_logits": true});
+            assert!(discovered_prefill_logits_at(&status, &home).unwrap());
+            status["full_prefill_logits"] = json!(false);
+            assert!(!discovered_prefill_logits_at(&status, &home).unwrap());
+            let reference = crate::fidelity_match::resolve_in(model, Some(&advertised), &home.join("hub")).unwrap();
+            assert_eq!(reference.reference_root, "meta-models/Muse-Spark-Open-816B-A42B");
+            assert_eq!(reference.revision, "d18a3b292cc0a279998123f2ddd16999869bb658");
+            assert_eq!(reference.config, "muse-spark-v1_20261031_own-text-bf16");
+        }
+    }
+
     fn fixture_run(args: &RunArgs) -> Run {
         let report = crate::sample::full_report();
         let panel = report.panel("fidelity").unwrap().latest().unwrap();

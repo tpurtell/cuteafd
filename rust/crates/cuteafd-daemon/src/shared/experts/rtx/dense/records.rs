@@ -435,6 +435,7 @@ pub(crate) struct DenseSink {
     operands: std::cell::RefCell<Vec<Operand>>,
     steps: std::cell::RefCell<Vec<Step>>,
     finishes: std::cell::RefCell<Vec<Finish>>,
+    peer_copies: std::cell::RefCell<Vec<PeerCopy>>,
 }
 
 impl DenseSink {
@@ -452,10 +453,15 @@ impl DenseSink {
     }
     pub fn finish(&self, finish: Finish) { self.finishes.borrow_mut().push(finish); }
     /// The recorded operands and steps (leaves the sink empty).
-    pub fn take(&self) -> (Vec<Operand>, Vec<Step>) { (self.operands.take(), self.steps.take()) }
+    pub fn take(&self) -> (Vec<Operand>, Vec<Step>) {
+        assert!(self.finishes.borrow().is_empty() && self.peer_copies.borrow().is_empty(),
+            "dense load has deferred work; consume take_all");
+        (self.operands.take(), self.steps.take())
+    }
     /// Every record, finishes included (leaves the sink empty).
     pub fn take_all(&self) -> Records {
-        Records { operands: self.operands.take(), steps: self.steps.take(), finishes: self.finishes.take() }
+        Records { operands: self.operands.take(), steps: self.steps.take(), finishes: self.finishes.take(),
+            peer_copies: self.peer_copies.take() }
     }
 }
 
@@ -525,12 +531,69 @@ pub(crate) unsafe fn v41_pack_scales(kernel: &cuteafd_ffi::V41Fp8Kernel<'_>, sou
     unsafe { kernel.pack_scales(source, packed, stream) }
 }
 
-/// One load's recorded class-2 operands, class-3 steps and finishes.
+/// A copy whose source may belong to another push rank. Addresses, not owners,
+/// cross the planning thread; the loader retains both allocations until commit.
+#[derive(Clone, Debug)]
+pub(crate) struct PeerCopy {
+    source: usize,
+    destination: usize,
+    bytes: usize,
+    pub source_device: i32,
+    pub destination_device: i32,
+    source_flags: u64,
+    destination_flags: u64,
+}
+
+impl PeerCopy {
+    pub fn new(source: CuteafdDeviceBuffer, destination: CuteafdDeviceBuffer, bytes: usize) -> Result<Self> {
+        ensure!(bytes > 0 && bytes <= source.bytes && bytes <= destination.bytes
+            && !source.ptr.is_null() && !destination.ptr.is_null(), "peer load copy exceeds its owners");
+        Ok(Self { source: source.ptr as usize, destination: destination.ptr as usize, bytes,
+            source_device: source.device_id, destination_device: destination.device_id,
+            source_flags: source.flags, destination_flags: destination.flags })
+    }
+
+    fn run_drained(&self, library: &NativeLibrary) -> Result<()> {
+        Device { library, id: self.destination_device }.run(|| {
+            let source = CuteafdDeviceBuffer { ptr: self.source as *mut c_void, bytes: self.bytes,
+                device_id: self.source_device, flags: self.source_flags };
+            let destination = CuteafdDeviceBuffer { ptr: self.destination as *mut c_void, bytes: self.bytes,
+                device_id: self.destination_device, flags: self.destination_flags };
+            // SAFETY: the loader retains both admitted regions through group commit
+            // and this drain; no consumer reads either unpublished allocation yet.
+            let copied = unsafe { library.copy_d2d_async(destination, source, self.bytes, std::ptr::null_mut()) };
+            // SAFETY: the destination's default stream issued this copy.
+            if let Err(drain) = unsafe { library.cuda_stream_synchronize(std::ptr::null_mut()) } {
+                library.quarantine_module_after_failed_drain();
+                return Err(copied.err().unwrap_or_else(|| anyhow::anyhow!("peer load copy completion failed"))
+                    .context(format!("load owners quarantined after peer-copy drain failed: {drain}")));
+            }
+            copied
+        })
+    }
+}
+
+/// Runs only after all source ranks have committed, or after a complete mount fill.
+pub(crate) fn run_peer_copies(library: &NativeLibrary, copies: &[PeerCopy]) -> Result<()> {
+    for copy in copies { copy.run_drained(library)?; }
+    Ok(())
+}
+
+/// Preserves failed/uncommitted delivery without touching either copy owner.
+pub(crate) fn committed_peer_copies<T>(library: &NativeLibrary, delivered: Result<Option<T>>,
+    copies: &[PeerCopy]) -> Result<Option<T>> {
+    let delivered = delivered?;
+    if delivered.is_some() { run_peer_copies(library, copies)?; }
+    Ok(delivered)
+}
+
+/// One load's recorded operands, staged transforms, rank finishes and group copies.
 #[derive(Clone, Default)]
 pub(crate) struct Records {
     pub operands: Vec<Operand>,
     pub steps: Vec<Step>,
     pub finishes: Vec<Finish>,
+    pub peer_copies: Vec<PeerCopy>,
 }
 
 impl Records {
@@ -539,6 +602,7 @@ impl Records {
         self.operands.extend(other.operands);
         self.steps.extend(other.steps);
         self.finishes.extend(other.finishes);
+        self.peer_copies.extend(other.peer_copies);
     }
 
     /// Runs every finish on its GPU (after all operands landed), drained.
@@ -611,6 +675,14 @@ impl<'a> DenseLoad<'a> {
         if recorded(|r| r.finishes.push(finish.clone())) { return Ok(()); }
         let device = Device { library: self.library, id: finish.device() };
         device.run(|| finish.run_drained(self.library, stream))
+    }
+
+    /// Mount copies drain immediately; recorded copies wait for whole-group commit.
+    pub fn peer_copy(&self, source: CuteafdDeviceBuffer, destination: CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
+        let copy = PeerCopy::new(source, destination, bytes)?;
+        if let Some(sink) = &self.sink { sink.peer_copies.borrow_mut().push(copy); return Ok(()); }
+        if recorded(|r| r.peer_copies.push(copy.clone())) { return Ok(()); }
+        copy.run_drained(self.library)
     }
 
     /// Releases the mount runner's pinned staging (after the load).
@@ -702,13 +774,51 @@ pub(crate) fn fill_by_mount(library: &NativeLibrary, operands: &[Operand], steps
 pub(crate) fn fill_records_by_mount(library: &NativeLibrary, records: &Records,
     stream: impl Fn(i32) -> *mut c_void) -> Result<()> {
     fill_by_mount(library, &records.operands, &records.steps, &stream)?;
-    records.run_finishes(library, stream)
+    records.run_finishes(library, stream)?;
+    run_peer_copies(library, &records.peer_copies)
 }
 
 
 #[cfg(test)]
 mod window_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn peer_load_copies_wait_for_group_success_and_mount_fill() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        for id in 0..2 { fixture.configure_memory(&library, id, 1 << 30)?; }
+        fixture.immediate_copies(&library)?;
+        let source = Device { library: &library, id: 1 }.run(||
+            crate::shared::memory::DeviceAllocation::new(&library, 256))?;
+        let destination = Device { library: &library, id: 0 }.run(||
+            crate::shared::memory::DeviceAllocation::new(&library, 256))?;
+        let bytes: Vec<_> = (0..256).map(|i| (i as u8).wrapping_mul(29)).collect();
+        let untouched = vec![0xa5; 256];
+        library.copy_h2d(source.buffer, &bytes)?;
+        library.copy_h2d(destination.buffer, &untouched)?;
+        let (_, records) = recording(|| DenseLoad::mount(&library).peer_copy(source.buffer, destination.buffer, 256))?;
+        assert_eq!(records.peer_copies.len(), 1);
+        let read = || -> Result<Vec<u8>> {
+            let mut bytes = vec![0; 256];
+            library.copy_d2h(&mut bytes, destination.buffer)?;
+            Ok(bytes)
+        };
+        assert_eq!(read()?, untouched);
+        assert!(committed_peer_copies::<()>(&library, Ok(None), &records.peer_copies)?.is_none());
+        assert!(committed_peer_copies::<()>(&library, Err(anyhow::anyhow!("failed group")), &records.peer_copies).is_err());
+        assert_eq!(read()?, untouched, "uncommitted or failed groups never copy");
+        committed_peer_copies(&library, Ok(Some(())), &records.peer_copies)?;
+        assert_eq!(read()?, bytes);
+        library.copy_h2d(destination.buffer, &untouched)?;
+        fill_records_by_mount(&library, &records, |_| std::ptr::null_mut())?;
+        assert_eq!(read()?, bytes, "mount fill runs deferred copies after all operands");
+        library.copy_h2d(destination.buffer, &untouched)?;
+        DenseLoad::mount(&library).peer_copy(source.buffer, destination.buffer, 256)?;
+        assert_eq!(read()?, bytes, "ordinary mount copy is immediate and drained");
+        Ok(())
+    }
 
     fn rect(name: &str, base: u64, rows: usize, width: usize) -> Rect {
         Rect { name: name.into(), path: "shard".into(), base, row_bytes: width, rows: 0..rows, cols: 0..width }

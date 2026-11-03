@@ -23,7 +23,7 @@ DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 # Official V4.1 releases, for builds whose checkpoint metadata is not local.
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
-                        qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', mistral_large4='ML4')
+                        qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', muse_spark='MUSE', mistral_large4='ML4')
 
 
 def require_mapping(family):
@@ -92,6 +92,13 @@ def family_scopes(cards, config_reader):
             scopes.add('kimik3:exl3-k23')
             if count:
                 counts.add(f'kimik3={tp}')
+        if family == 'muse_spark':
+            # EXL3 K4 experts, intermediate-sliced on the Sparks (partial replies) and
+            # whole or TP2 on onboarded RTX layers: one package on both roles.
+            env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
+            scopes.add('muse:exl3-k45')
+            if count:
+                counts.add(f"muse={int(values.get('SPARK_TP', count))}")
         if family == 'mistral_large4':
             # The GLM engine's ml4 variant: its own coordinator programs and K6
             # core (ML4_AOT), EXL3 K4/K5 experts at the card's Spark TP.
@@ -102,13 +109,14 @@ def family_scopes(cards, config_reader):
         # EXLR8 checkpoints retain family coordinator programs without expert packages.
         exlr8 = bool(values.get('EXLR8_MANIFEST'))
         if exlr8:
-            if family != 'glm5':
-                raise ValueError(f'EXLR8_MANIFEST is supported only for glm5 checkpoints, not {family}')
             env['CUTEAFD_WIP_EXLR8_AOT'] = 'ON'
         for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4'), ('step5', 'step5', 'STEP5')]:
             if family == fam:
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
                 if exlr8:
+                    families = set(filter(None, env.get('CUTEAFD_WIP_EXLR8_FAMILIES', '').split(';')))
+                    families.add(tag)
+                    env['CUTEAFD_WIP_EXLR8_FAMILIES'] = ';'.join(sorted(families))
                     continue
                 if count and fam != 'step5':
                     counts.add(f"{tag}={int(values.get('SPARK_TP', count))}")

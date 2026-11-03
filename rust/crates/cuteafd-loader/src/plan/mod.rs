@@ -51,15 +51,33 @@ impl std::str::FromStr for MediaMode {
     }
 }
 
-/// Auto enables only the complete, qualified MiMo V2.6 Flash/Pro tower.
+/// Resolve a checkpoint's bundled native audio tower before placement.
 /// Explicit placement still reports missing or unsupported checkpoint tensors.
 pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, PlanError> {
     if mode == MediaMode::Off { return Ok(mode); }
-    match crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
-        crate::media::audio_tower::AudioStorage::Fp32) {
-        Ok(_) => Ok(mode),
-        Err(_) if mode == MediaMode::Auto => Ok(MediaMode::Off),
-        Err(error) => Err(PlanError::InvalidOption { option: "audio placement", reason: error.to_string() }),
+    let config: serde_json::Value = crate::read_json_file(&snapshot.join("config.json"))
+        .map_err(|error| PlanError::InvalidOption { option: "audio placement", reason: error.to_string() })?;
+    resolve_audio_config(mode, snapshot, &config)
+}
+
+pub(crate) fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value)
+    -> Result<MediaMode, PlanError> {
+    if mode == MediaMode::Off { return Ok(mode); }
+    let kind = crate::media::AudioTowerKind::from_config(config)
+        .map_err(|reason| PlanError::InvalidOption { option: "audio placement", reason })?;
+    if let Some(kind) = kind {
+        let validation = match kind {
+            crate::media::AudioTowerKind::MusePcm => crate::media::pcm_audio::PcmAudioPlan::from_snapshot(snapshot).map(|_| ()),
+            crate::media::AudioTowerKind::MimoRvq => crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
+                crate::media::audio_tower::AudioStorage::Fp32).map(|_| ()),
+        };
+        return validation.map(|_| mode).map_err(|error| PlanError::InvalidOption {
+            option: "audio placement", reason: format!("{kind:?}: {error}") });
+    }
+    match mode {
+        MediaMode::Auto => Ok(MediaMode::Off),
+        _ => Err(PlanError::InvalidOption { option: "audio placement",
+            reason: "checkpoint has no declared bundled audio tower".into() }),
     }
 }
 
@@ -762,7 +780,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         spark_budget_bytes: options.spark_budget(),
         requested_attention: options.attention_placement,
         vision: options.vision,
-        audio: resolve_audio(options.audio, &checkpoint.snapshot)?,
+        audio: resolve_audio_config(options.audio, &checkpoint.snapshot, &checkpoint.config)?,
         disabled_media_bytes: 0,
         encoder: None,
         audio_encoder: None,
@@ -1204,9 +1222,31 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         if let Some(owner) = owner { report.bytes_by_owner.insert(owner, encoder.admitted_bytes()); }
     }
     use sha2::{Digest, Sha256};
+    let selected_tower = |name: &str| family.classify(spec, name).is_some_and(|r|
+        matches!(r.component, Component::Vision | Component::Audio));
+    // A coordinator's role view omits remote towers. Hash the selected headers
+    // from their own shards too, independently of which rank owns the encoder.
+    let present: std::collections::BTreeSet<_> = checkpoint.tensors.iter().map(|t| &t.meta.name).collect();
+    let mut additional = Vec::new();
+    let shards: BTreeSet<_> = checkpoint.weight_map.iter()
+        .filter(|(name, shard)| selected_tower(name) && !present.contains(name)
+            && !checkpoint.missing_shards.contains(shard))
+        .map(|(_, shard)| shard).collect();
+    // Reuse the opened inventory: re-reading config/index breaks preflight
+    // reuse and loses synthetic or partial-checkpoint facts.
+    for shard in shards {
+        for meta in crate::read_safetensors_metadata(&checkpoint.snapshot.join(shard))? {
+            if selected_tower(&meta.name) && !present.contains(&meta.name) {
+                if checkpoint.weight_map.get(&meta.name) != Some(shard) {
+                    return Err(anyhow::anyhow!("media tensor {} appears in unexpected shard {shard}", meta.name).into());
+                }
+                additional.push(checkpoint::CheckpointTensor { shard: shard.clone(), meta });
+            }
+        }
+    }
     let tower_headers: BTreeMap<_, _> = checkpoint.tensors.iter()
-        .filter(|t| family.classify(spec, &t.meta.name).is_some_and(|r| r.component == Component::Vision
-            || (report.audio != MediaMode::Off && r.component == Component::Audio)))
+        .chain(&additional)
+        .filter(|t| selected_tower(&t.meta.name))
         .map(|t| (&t.meta.name, format!("{:?}:{:?}:{}:{}", t.meta.dtype, t.meta.shape, t.meta.byte_offset, t.meta.byte_length))).collect();
     // Preserve the vision-only peer contract exactly while audio is disabled.
     let contract = if report.audio == MediaMode::Off {
@@ -1581,6 +1621,7 @@ pub fn render(report: &PlanReport) -> String {
         let attention = match report.family.as_deref() {
             Some("qwen4") => "Qwen full-image head72 attention",
             Some("glm5_flash") => "GLM Flash full-image head64 attention",
+            Some("muse_spark") => "Muse axial/window attention",
             Some("mistral_large4") => "Pixtral full-image head128 attention",
             _ => "MiMo key-0 attention",
         };

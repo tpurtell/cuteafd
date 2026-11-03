@@ -15,9 +15,9 @@ fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, wave
     // The two decode lanes' links at the decode width and the one prefill
     // link at the unit (its `waves` units are the prefill owner's buffered units).
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
-        vec![SparkEndpoint { ring_depth: None, capacity: decode.min(capacity), ingress },
-             SparkEndpoint { ring_depth: None, capacity: decode.min(capacity), ingress },
-             SparkEndpoint { ring_depth: None, capacity, ingress }],
+        vec![SparkEndpoint { ring_depth: None, capacity: decode.min(capacity), ingress, partial_reply_bytes: None },
+             SparkEndpoint { ring_depth: None, capacity: decode.min(capacity), ingress, partial_reply_bytes: None },
+             SparkEndpoint { ring_depth: None, capacity, ingress, partial_reply_bytes: None }],
         crate::shared::placement::spark_rings(64 << 20)?, executions)?;
     model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
     Ok(model)

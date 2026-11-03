@@ -153,7 +153,7 @@ fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() 
         config["indexer_types"] = serde_json::json!(vec!["full"; 8]);
         config["mlp_layer_types"] = serde_json::json!(["dense", "dense", "dense", "sparse", "sparse", "sparse", "sparse", "sparse"]);
         std::fs::write(config_path, serde_json::to_vec(&config)?)?;
-        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let catalog = fixture_catalog(root.path())?;
         for (layers, gpu) in [(vec![], 0), (vec![7, 5], 0), (vec![5, 5], 0), (vec![5, 7], 2)] {
             assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &layers, 2, gpu, usize::MAX).is_err());
         }
@@ -237,25 +237,11 @@ fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() 
 }
 
 pub(crate) fn fixture_catalog(root: &Path) -> Result<cuteafd_loader::OfficialV41Catalog> {
-    use std::io::Write;
-    // Inventory needs a dense native header as well as the routed index.
-    std::fs::create_dir(root.join("dense"))?;
-    let header = serde_json::to_vec(&serde_json::json!({
-        "__metadata__": {"format": "exlr8-v2", "scheme": "exlr8-e4m3-v2"},
-        "norm": {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]}
-    }))?;
-    let mut file = File::create(root.join("dense/exlr8-dense-000.safetensors"))?;
-    file.write_all(&(header.len() as u64).to_le_bytes())?;
-    file.write_all(&header)?;
-    file.write_all(&[0, 0])?;
-    let mut config = cuteafd_loader::plan::testing::glm5_config();
-    for (key, value) in [("hidden_size", 128), ("moe_intermediate_size", 384),
-        ("n_routed_experts", 2), ("num_experts_per_tok", 1), ("num_hidden_layers", 4),
-        ("first_k_dense_replace", 3)] { config[key] = value.into(); }
-    config["indexer_types"] = serde_json::json!(["full", "full", "full", "full"]);
-    config["mlp_layer_types"] = serde_json::json!(["dense", "dense", "dense", "sparse"]);
-    std::fs::write(root.join("config.json"), serde_json::to_vec(&config)?)?;
-    let catalog = cuteafd_loader::read_expert_catalog(root)?;
-    assert!(matches!(catalog.format(), cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8));
-    Ok(catalog)
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("config.json"))?)?;
+    Ok(cuteafd_loader::OfficialV41Catalog::exlr8_transport_fixture(root,
+        cuteafd_loader::RoutedExpertShape {
+            layers: config["num_hidden_layers"].as_u64().context("fixture layers")? as usize,
+            first_layer: 3, experts: 2, topk: 1, hidden: 128, intermediate: 384,
+            draft_stages: 0, draft_experts: 0,
+        }))
 }

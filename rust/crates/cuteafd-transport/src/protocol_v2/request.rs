@@ -16,7 +16,8 @@ use super::{
     ExpertProtocolV2RequestHeader, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertProtocolV2WireStats, ExpertV2Dtype, MAGIC, REQUEST_CHECKSUM_OFFSET, REQUEST_KIND,
     VERSION, checked_u32, checked_usize, debug_checksum_enabled, decode_route_entry,
-    decode_row_descriptor, encode_route_entry, encode_row_descriptor, payload_checksum,
+    decode_row_descriptor, decode_row_region, encode_route_entry, encode_row_descriptor, request_checksum,
+    PartialReplyPlan, PartialWire, EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES,
     precompile_warmup_enabled, push_u16, push_u32, push_u64, read_u16, read_u32, read_u64,
     request_header_len_from_flags, response_fp8_e4m3_row_scaled_enabled,
     response_nvfp4_e2m1_fp8_e4m3_enabled, spark_collective_part_count, spark_reduction_enabled,
@@ -135,6 +136,7 @@ impl ExpertProtocolV2Request {
             rows,
             routes,
             hidden_payload,
+            partial: None,
         };
         request.validate()?;
         Ok(request)
@@ -177,6 +179,7 @@ impl ExpertProtocolV2Request {
             rows,
             routes,
             hidden_payload: plan_payload.into(),
+            partial: None,
         };
         request.validate()?;
         Ok(request)
@@ -220,9 +223,19 @@ impl ExpertProtocolV2Request {
             rows: Vec::new(),
             routes: Vec::new(),
             hidden_payload: hidden_payload.into(),
+            partial: None,
         };
         request.validate()?;
         Ok(request)
+    }
+
+    /// Per-expert partial replies in the regions `plan` names (one bit per row).
+    pub fn with_partial_replies(mut self, plan: PartialReplyPlan) -> Result<Self> {
+        plan.validate(self.rows.len())?;
+        self.header.flags |= EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES;
+        self.partial = Some(plan);
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn with_debug_checksum(mut self) -> Self {
@@ -355,7 +368,8 @@ impl ExpertProtocolV2Request {
         push_u32(out, self.header.row_count);
         push_u32(out, self.header.hidden_dim);
         push_u16(out, self.header.hidden_dtype as u16);
-        push_u16(out, 0);
+        // Partial-reply wide format (0 without the flag).
+        push_u16(out, self.partial.as_ref().map_or(0, |plan| plan.wide as u16));
         push_u32(out, self.header.route_count);
         push_u32(out, self.header.row_descriptor_bytes);
         push_u32(out, self.header.route_bytes);
@@ -364,22 +378,20 @@ impl ExpertProtocolV2Request {
         push_u64(out, wire_bytes as u64);
         push_u32(out, self.header.flags);
         push_u32(out, self.header.hidden_row_stride_bytes);
-        if self.debug_checksum_enabled() {
-            out.extend_from_slice(&payload_checksum(
-                &self.rows,
-                &self.routes,
-                &self.hidden_payload,
-            ));
-        }
         out.resize(header_len, 0);
 
-        for row in &self.rows {
-            encode_row_descriptor(out, row);
+        for (index, row) in self.rows.iter().enumerate() {
+            encode_row_descriptor(out, row, self.partial.as_ref().map_or(0, |plan| plan.regions[index]));
         }
         for route in &self.routes {
             encode_route_entry(out, route);
         }
         out.resize(prefix_bytes, 0);
+        if self.debug_checksum_enabled() {
+            let checksum = request_checksum(out, &self.hidden_payload);
+            out[REQUEST_CHECKSUM_OFFSET..REQUEST_CHECKSUM_OFFSET + CHECKSUM_LEN]
+                .copy_from_slice(&checksum);
+        }
         Ok(())
     }
 
@@ -394,6 +406,7 @@ impl ExpertProtocolV2Request {
         let row_count = read_u32(bytes, 36, "row_count")?;
         let hidden_dim = read_u32(bytes, 40, "hidden_dim")?;
         let hidden_dtype = ExpertV2Dtype::from_u16(read_u16(bytes, 44, "hidden_dtype")?)?;
+        let partial_wide = read_u16(bytes, 46, "partial_wide")?;
         let route_count = read_u32(bytes, 48, "route_count")?;
         let row_descriptor_bytes = read_u32(bytes, 52, "row_descriptor_bytes")?;
         let route_bytes = read_u32(bytes, 56, "route_bytes")?;
@@ -465,10 +478,29 @@ impl ExpertProtocolV2Request {
         anyhow::ensure!(bytes[routes_end..payload_start].iter().all(|&byte| byte == 0),
             "request alignment padding must be zero");
 
+        let mut partial = if flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0 {
+            Some(PartialReplyPlan { wide: PartialWire::from_u16(partial_wide)?,
+                regions: Vec::with_capacity(rows_len) })
+        } else {
+            if partial_wide != 0 {
+                bail!("ExpertProtocolV2 request without partial replies carries partial region data");
+            }
+            None
+        };
         let rows = (0..rows_len)
             .map(|idx| {
                 let offset = rows_start + idx * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN;
-                decode_row_descriptor(bytes, offset)
+                let row = decode_row_descriptor(bytes, offset)?;
+                let region = decode_row_region(bytes, offset)?;
+                if let Some(plan) = &mut partial {
+                    if region > 1 {
+                        bail!("ExpertProtocolV2 partial region bit {region} is neither 0 nor 1");
+                    }
+                    plan.regions.push(region as u8);
+                } else if region != 0 {
+                    bail!("ExpertProtocolV2 request without partial replies carries partial region data");
+                }
+                Ok(row)
             })
             .collect::<Result<Vec<_>>>()?;
         let routes = (0..routes_len)
@@ -484,7 +516,7 @@ impl ExpertProtocolV2Request {
                 ..REQUEST_CHECKSUM_OFFSET
                     .checked_add(CHECKSUM_LEN)
                     .expect("checksum range overflow")];
-            let actual_checksum = payload_checksum(&rows, &routes, &hidden_payload);
+            let actual_checksum = request_checksum(&bytes[..payload_start], &bytes[payload_start..frame_end]);
             if actual_checksum.as_slice() != expected_checksum {
                 bail!("ExpertProtocolV2 request checksum mismatch");
             }
@@ -508,6 +540,7 @@ impl ExpertProtocolV2Request {
             rows,
             routes,
             hidden_payload,
+            partial,
         };
         request.validate()?;
         Ok(request)
@@ -525,6 +558,11 @@ impl ExpertProtocolV2Request {
 
     pub fn validate(&self) -> Result<()> {
         validate_flags(self.header.flags, "request")?;
+        match (&self.partial, self.header.flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0) {
+            (Some(plan), true) => plan.validate(self.rows.len())?,
+            (None, false) => {}
+            _ => bail!("ExpertProtocolV2 partial reply flag and plan disagree"),
+        }
         let stream_plan = self.stream_plan_enabled();
         let stream_data = self.stream_data_enabled();
         if stream_data {
