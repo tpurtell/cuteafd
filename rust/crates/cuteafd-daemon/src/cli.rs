@@ -56,6 +56,15 @@ pub(crate) struct Cli {
     #[arg(long, global = true, env = "CUTEAFD_IDLE_PARK_SECONDS", default_value_t = 30.0,
         value_parser = parse_idle_park)]
     pub(crate) idle_park_seconds: f64,
+    /// Permit clients to opt into approximate, greedy-only draft acceptance.
+    #[arg(long, global = true, action = clap::ArgAction::Set, default_value_t = true)]
+    pub(crate) allow_relaxed_acceptance: bool,
+    /// Lowest client acceptance min_p (not the target sampling filter).
+    #[arg(long, global = true)]
+    pub(crate) acceptance_min_min_p: Option<f32>,
+    /// Highest client typical-acceptance epsilon.
+    #[arg(long, global = true)]
+    pub(crate) acceptance_max_epsilon: Option<f32>,
     #[command(subcommand)]
     pub(crate) command: Commands,
 }

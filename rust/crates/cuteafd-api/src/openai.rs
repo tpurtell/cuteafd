@@ -16,7 +16,7 @@ use deepseek_recipe::{
 };
 use deepseek_recipe_encoding::{v4::dsv4::DeepseekV4Encoding, PromptEncoding};
 use deepseek_recipe_core::conversation::ReasoningEffort;
-use cuteafd_core::TargetSamplingParams;
+use cuteafd_core::{AcceptanceError, AcceptancePolicy, SpeculativeAcceptance, TargetSamplingParams};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,6 +107,9 @@ pub fn vision_input_enabled() -> bool {
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
+    pub acceptance_policy: AcceptancePolicy,
+    /// Runtime owner must disable this for unimplemented token-selection paths.
+    pub relaxed_acceptance_supported: bool,
     pub literal_tokens: Arc<cuteafd_loader::LiteralTokens>,
     pub engine_health: Option<health::HealthWitness>,
     /// Live readiness for remote vision; absent on existing local serving paths.
@@ -153,7 +156,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
+        Self { relaxed_acceptance_supported: matches!(encoding, ModelEncoding::DeepseekV41), acceptance_policy: acceptance::default_policy(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
             audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
             literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
@@ -219,6 +222,8 @@ impl Default for ModelProfile {
 pub mod auth;
 pub mod health;
 mod limits;
+mod acceptance;
+pub use acceptance::set_acceptance_policy;
 mod admission;
 mod constraints;
 mod tools;
@@ -293,6 +298,8 @@ pub struct NativeRequest {
     /// keeps the legacy device-argmax route; anything else selects from the
     /// full vocabulary through the shared exact sampler.
     pub sampling: TargetSamplingParams,
+    /// Draft acceptance is independent of target token selection.
+    pub acceptance: SpeculativeAcceptance,
     /// Token ids that end generation: the profile's EOS ids plus, for GLM,
     /// its turn markers (and `<tool_call>` when no tools are declared).
     /// DeepSeek engines keep their built-in EOS handling.
@@ -670,6 +677,7 @@ pub(crate) struct Built {
     constraint: Option<NativeConstraint>,
     max_tokens: usize,
     sampling: TargetSamplingParams,
+    acceptance: SpeculativeAcceptance,
     stop_token_ids: Vec<u32>,
     processor: OutputProcessor,
     validator: tools::CompletionValidator,
@@ -799,6 +807,11 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         body["response_format"] = json!({"type":"text"});
     }
     let sampling = request_target_sampling(&body).map_err(Rejection::bad)?;
+    let acceptance = acceptance::request_acceptance(&body, sampling, profile.acceptance_policy)
+        .map_err(Rejection::bad)?;
+    if !acceptance.is_exact() && !profile.relaxed_acceptance_supported {
+        return Err(Rejection::bad(AcceptanceError::UnsupportedPath("this model/runtime path")));
+    }
     // V4.1's checkpoint encoder also takes a numeric budget (1-100), which the
     // adapter's enum cannot parse: take it out here and apply it after rendering.
     let v41_budget = v41_numeric_effort(&mut body, &profile.encoding).map_err(Rejection::bad)?;
@@ -878,6 +891,9 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         None => constraints::kimi_response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref()),
     }.map_err(Rejection::bad)?;
+    if !acceptance.is_exact() && constraint.is_some() {
+        return Err(Rejection::bad(AcceptanceError::UnsupportedPath("constrained decoding")));
+    }
     let validator = tools::CompletionValidator::new(response_validator, tool_constraints);
     let tools_declared = !converted.conversation.tools.is_empty();
     let stop_token_ids = profile.stop_token_ids(tools_declared);
@@ -990,7 +1006,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         return Err(Rejection::bad("at most 16 images are supported"));
     }
     let (prompt, literal_spans) = shield.finish(prompt, matches!(profile.encoding, ModelEncoding::DeepseekV41));
-    Ok(Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, validator,
+    Ok(Built { prompt, literal_spans, constraint, max_tokens, sampling, acceptance, stop_token_ids, processor, validator,
         work: MediaWork { images: image_sources, media: media_sources, audio: audio_sources },
         probe, streaming, include_usage, id, model, stop_sequences, tap })
 }
@@ -1116,7 +1132,7 @@ impl Submitter {
     /// handle; the gateway accounts its own turns from their events instead.
     pub(crate) async fn submit(&self, profile: &ModelProfile, built: Built, usage: Option<crate::usage::UsageHandle>,
         chat_accounting: bool) -> Result<Running, Rejection> {
-        let Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, mut validator, work, probe,
+        let Built { prompt, literal_spans, constraint, max_tokens, sampling, acceptance, stop_token_ids, processor, mut validator, work, probe,
             streaming, include_usage, id, model, tap, .. } = built;
         let queue_started = std::time::Instant::now();
         let permit = match self.admission.reserve(self.queue.clone()).await {
@@ -1143,6 +1159,7 @@ impl Submitter {
             images: prepared.images,
             max_tokens,
             sampling,
+            acceptance,
             stop_token_ids,
             events,
             probe,

@@ -171,6 +171,9 @@ KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS
 THERMAL
 API_KEY_FILE
 ENABLE_BENCH
+ALLOW_RELAXED_ACCEPTANCE
+ACCEPTANCE_MIN_MIN_P
+ACCEPTANCE_MAX_EPSILON
 CONSOLE_ASSETS
 USAGE
 GATEWAY
@@ -477,6 +480,9 @@ DSPARK_DRAFT_LIMIT
 DSPARK_DRAFT_POLICY
 EMBEDDING
 ENABLE_BENCH
+ALLOW_RELAXED_ACCEPTANCE
+ACCEPTANCE_MIN_MIN_P
+ACCEPTANCE_MAX_EPSILON
 ENGRAM_WARM
 EXPERT_FORMAT
 EXPERT_PORT
@@ -884,6 +890,29 @@ case "$ENABLE_BENCH" in
   off) ;;
   *) echo "ENABLE_BENCH must be on or off" >&2; exit 2 ;;
 esac
+case "$(get ALLOW_RELAXED_ACCEPTANCE)" in
+  on) api_args+=(--allow-relaxed-acceptance true) ;;
+  off) api_args+=(--allow-relaxed-acceptance false) ;;
+  "") ;;
+  *) release_die "ALLOW_RELAXED_ACCEPTANCE must be on or off" ;;
+esac
+for pair in 'ACCEPTANCE_MIN_MIN_P:--acceptance-min-min-p' 'ACCEPTANCE_MAX_EPSILON:--acceptance-max-epsilon'; do
+  key="${pair%%:*}"; value="$(get "$key")"
+  if [[ -n "$value" ]]; then
+    python3 - "$key" "$value" <<'PY_POLICY'
+import math
+import sys
+try:
+    value = float(sys.argv[2])
+    valid = math.isfinite(value) and 0 <= value <= 1
+except ValueError:
+    valid = False
+if not valid:
+    sys.exit(f"{sys.argv[1]} must be a finite number in [0, 1]")
+PY_POLICY
+    api_args+=("${pair#*:}" "$value")
+  fi
+done
 # GATEWAY=off drops the Messages/Responses/Realtime routes; unset keeps the binary default (on).
 gateway="$(get GATEWAY "")"
 case "$gateway" in on|off) api_args+=(--gateway "$gateway") ;; "") ;; *) echo "GATEWAY must be on or off" >&2; exit 2 ;; esac
@@ -1352,7 +1381,7 @@ if ((SPARK_COUNT == 0)); then
 else
   peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
 fi
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" "acceptance=$(get ALLOW_RELAXED_ACCEPTANCE on):$(get ACCEPTANCE_MIN_MIN_P 0):$(get ACCEPTANCE_MAX_EPSILON 1)" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.

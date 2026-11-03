@@ -471,3 +471,23 @@ def test_kimi_delegates_unservable_counts_to_planner(tmp_path, ranks):
     assert result.returncode != 0
     assert "invalid deployment specification" in result.stderr
     assert "cuteafd expertd-native" not in result.stderr
+
+
+@pytest.mark.parametrize("allowed,forwarded", [("on", "true"), ("off", "false")])
+def test_relaxed_acceptance_policy_forwards_to_coordinator_only(tmp_path: Path, allowed: str, forwarded: str) -> None:
+    result = _kimi(tmp_path, f"ALLOW_RELAXED_ACCEPTANCE={allowed}\nACCEPTANCE_MIN_MIN_P=0.8\nACCEPTANCE_MAX_EPSILON=0.1\n")
+    serve = _line(result, "cuteafd serve-kimi --snapshot")
+    assert _flag(serve, "--allow-relaxed-acceptance") == forwarded
+    assert _flag(serve, "--acceptance-min-min-p") == "0.8"
+    assert _flag(serve, "--acceptance-max-epsilon") == "0.1"
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert workers and all("--allow-relaxed-acceptance" not in line for line in workers)
+
+
+@pytest.mark.parametrize("setting", ["ALLOW_RELAXED_ACCEPTANCE=maybe", "ACCEPTANCE_MIN_MIN_P=nan",
+                                      "ACCEPTANCE_MIN_MIN_P=-0.1", "ACCEPTANCE_MAX_EPSILON=1.1"])
+def test_relaxed_acceptance_policy_rejects_bad_operator_bounds(tmp_path: Path, setting: str) -> None:
+    result = _kimi(tmp_path, setting + "\n")
+    assert result.returncode != 0
+    assert setting.split("=")[0] in result.stderr
+    assert "cuteafd serve-kimi --snapshot" not in result.stderr

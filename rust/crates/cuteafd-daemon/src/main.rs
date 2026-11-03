@@ -134,6 +134,11 @@ async fn run() -> Result<()> {
     for replacement in cli::deprecated_budget_flags(std::env::args()) {
         eprintln!("warning: deprecated coordinator budget flag; use {replacement}");
     }
+    let initial_acceptance = (
+        matches.get_flag("allow_relaxed_acceptance"),
+        matches.get_one::<f32>("acceptance_min_min_p").copied(),
+        matches.get_one::<f32>("acceptance_max_epsilon").copied(),
+    );
     // `serve` and `golden` pick the family and stand for its own command.
     let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
@@ -147,6 +152,11 @@ async fn run() -> Result<()> {
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
             initial_wait),
     };
+    cuteafd_api::openai::set_acceptance_policy(cuteafd_core::AcceptancePolicy::new(
+        matches.get_flag("allow_relaxed_acceptance") && initial_acceptance.0,
+        matches.get_one::<f32>("acceptance_min_min_p").copied().or(initial_acceptance.1).unwrap_or(0.0),
+        matches.get_one::<f32>("acceptance_max_epsilon").copied().or(initial_acceptance.2).unwrap_or(1.0),
+    )?)?;
     // Read by the coordinator and every Spark worker from the same key.
     cuteafd_transport::wait_policy::set_wait_policy(wait_policy)?;
     if let Some((_, options)) = matches.subcommand() {

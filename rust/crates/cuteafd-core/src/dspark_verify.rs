@@ -79,9 +79,92 @@ pub fn verify_dspark_greedy_vocab(inputs: &[u32], target_next: &[u32], eos: Opti
     Ok(result)
 }
 
+/// Host-side greedy verification with request-local acceptance. `stats[i]`
+/// describes draft `inputs[i + 1]` under target row i; no bonus-row stats are
+/// needed. Exact mode retains the old verifier, including its validation.
+pub fn verify_dspark_relaxed_vocab(
+    inputs: &[u32], target_next: &[u32], stats: &[crate::AcceptanceStats],
+    acceptance: crate::SpeculativeAcceptance, eos: Option<u32>, remaining: usize, vocab: usize,
+) -> Result<GreedyVerification, &'static str> {
+    if acceptance.is_exact() {
+        return verify_dspark_greedy_vocab(inputs, target_next, eos, remaining, vocab);
+    }
+    acceptance.validate(crate::TargetSamplingParams::greedy())
+        .map_err(|_| "invalid speculative acceptance parameters")?;
+    if inputs.is_empty() || inputs.len() != target_next.len() {
+        return Err("verification requires nonempty corresponding target rows");
+    }
+    if remaining == 0 || eos == Some(inputs[0]) {
+        return Err("completed request cannot verify another anchor");
+    }
+    if vocab == 0 || eos.is_some_and(|id| id as usize >= vocab)
+        || inputs.iter().chain(target_next).any(|&id| id as usize >= vocab) {
+        return Err("verification token outside target vocabulary");
+    }
+    if stats.len() < inputs.len() - 1 {
+        return Err("verification requires statistics for every draft position");
+    }
+    if stats[..inputs.len() - 1].iter().any(|s| {
+        !s.draft_probability.is_finite() || !s.argmax_probability.is_finite()
+            || !(0.0..=1.0).contains(&s.draft_probability)
+            || !(0.0..=1.0).contains(&s.argmax_probability)
+            || s.draft_probability > s.argmax_probability
+            || s.argmax_probability == 0.0 || !s.entropy.is_finite() || s.entropy < 0.0
+    }) {
+        return Err("invalid target acceptance statistics");
+    }
+    let mut result = GreedyVerification {
+        accepted_inputs: 1, emitted: Vec::with_capacity(inputs.len()), eos: false, length_limit: false,
+    };
+    for (i, &argmax) in target_next.iter().enumerate() {
+        let accepted = inputs.get(i + 1).is_some() && acceptance.accepts_draft(stats[i]);
+        let token = if accepted { inputs[i + 1] } else { argmax };
+        result.emitted.push(token);
+        if accepted { result.accepted_inputs += 1; }
+        result.eos = eos == Some(token);
+        result.length_limit = result.emitted.len() == remaining;
+        if !accepted || result.eos || result.length_limit { break; }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AcceptanceStats, SpeculativeAcceptance};
+
+    #[test]
+    fn relaxed_emits_drafts_corrects_misses_and_preserves_exact() {
+        let inputs = [10, 11, 12, 13];
+        let target = [90, 91, 92, 93];
+        let good = AcceptanceStats { draft_probability: 0.25, argmax_probability: 0.5, entropy: 1.0 };
+        for mode in [SpeculativeAcceptance::MinP { min_p: 0.5 },
+            SpeculativeAcceptance::Typical { epsilon: 0.1, delta: 1.0 }] {
+            for miss in 0..4 {
+                let mut stats = [good; 3];
+                if miss < 3 { stats[miss].draft_probability = 0.0; }
+                let result = verify_dspark_relaxed_vocab(&inputs, &target, &stats, mode, None, 10, 100).unwrap();
+                let mut expected = inputs[1..=miss].to_vec();
+                expected.push(target[miss]);
+                assert_eq!(result.emitted, expected);
+                assert_eq!(result.accepted_inputs as usize, miss + 1);
+            }
+            let limited = verify_dspark_relaxed_vocab(&inputs, &target, &[good; 3], mode, None, 2, 100).unwrap();
+            assert_eq!(limited.emitted, [11, 12]);
+            assert_eq!(limited.accepted_inputs, 3);
+            assert!(limited.length_limit);
+            let eos = verify_dspark_relaxed_vocab(&inputs, &target, &[good; 3], mode, Some(12), 10, 100).unwrap();
+            assert_eq!(eos.emitted, [11, 12]);
+            assert!(eos.eos);
+            assert_eq!(verify_dspark_relaxed_vocab(&[10], &[90], &[], mode, None, 2, 100).unwrap().emitted, [90]);
+        }
+        assert_eq!(verify_dspark_relaxed_vocab(&inputs, &target, &[], SpeculativeAcceptance::Exact, None, 10, 100),
+            verify_dspark_greedy_vocab(&inputs, &target, None, 10, 100));
+        assert!(verify_dspark_relaxed_vocab(&inputs, &target, &[], SpeculativeAcceptance::MinP { min_p: 0.5 }, None, 10, 100).is_err());
+        let invalid = AcceptanceStats { entropy: f32::NAN, ..good };
+        assert!(verify_dspark_relaxed_vocab(&inputs, &target, &[invalid; 3], SpeculativeAcceptance::MinP { min_p: 0.5 }, None, 10, 100).is_err());
+    }
+
     #[test]
     fn checkpoint_vocabulary_supports_large_ids_without_changing_legacy_results() {
         let result = verify_dspark_greedy_vocab(&[248077, 200001], &[200001, 200002], None, 8, 248320).unwrap();

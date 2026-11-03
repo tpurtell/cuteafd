@@ -375,3 +375,55 @@ async fn native_v41_long_offending_input_is_bounded_in_the_error_body() {
         "sampling validation must not echo the offending value"
     );
 }
+
+#[tokio::test]
+async fn speculative_acceptance_resolves_before_admission_and_is_request_local() {
+    use cuteafd_core::{AcceptancePolicy, SpeculativeAcceptance};
+    use crate::openai::{router_for_model, ConsoleHub, ModelProfile, NativeLimits};
+    for (acceptance, temperature, policy, expected) in [
+        (None, 0.0, AcceptancePolicy::default(), Some(SpeculativeAcceptance::Exact)),
+        (None, 0.7, AcceptancePolicy::default(), Some(SpeculativeAcceptance::Exact)),
+        (Some(json!({"mode":"exact"})), 0.7, AcceptancePolicy::default(), Some(SpeculativeAcceptance::Exact)),
+        (Some(json!({"mode":"min_p","min_p":0.5})), 0.0, AcceptancePolicy::default(), Some(SpeculativeAcceptance::MinP { min_p: 0.5 })),
+        (Some(json!({"mode":"typical","epsilon":0.1,"delta":2.0})), 0.0, AcceptancePolicy::default(), Some(SpeculativeAcceptance::Typical { epsilon: 0.1, delta: 2.0 })),
+        (Some(json!({"mode":"min_p","min_p":0.5})), 0.7, AcceptancePolicy::default(), None),
+        (Some(json!({"mode":"typical","epsilon":0.1,"delta":2.0})), 0.7, AcceptancePolicy::default(), None),
+        (Some(json!({"mode":"min_p","min_p":0.5})), 0.0, AcceptancePolicy::new(false, 0.0, 1.0).unwrap(), None),
+        (Some(json!({"mode":"min_p","min_p":0.5})), 0.0, AcceptancePolicy::new(true, 0.6, 1.0).unwrap(), None),
+        (Some(json!({"mode":"typical","epsilon":0.2,"delta":2.0})), 0.0, AcceptancePolicy::new(true, 0.0, 0.1).unwrap(), None),
+        (Some(json!({"mode":"min_p"})), 0.0, AcceptancePolicy::default(), None),
+        (Some(json!({"mode":"unknown"})), 0.0, AcceptancePolicy::default(), None),
+    ] {
+        let (queue, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(4);
+        let mut profile = ModelProfile::default();
+        profile.acceptance_policy = policy;
+        let app = router_for_model(queue, NativeLimits::default(), Default::default(),
+            std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
+        let (tx, captured) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Some(job) = rx.recv().await {
+                let _ = tx.send((job.acceptance, job.sampling));
+                let _ = job.events.send(Ok(InferenceChunk::Ready {
+                    system_fingerprint: None, prompt_usage: Default::default(),
+                }));
+                let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop }));
+            }
+        });
+        let mut body = valid_request();
+        body["temperature"] = json!(temperature);
+        // This is the independent target-sampling filter, not acceptance min_p.
+        body["min_p"] = json!(0.01);
+        if let Some(acceptance) = acceptance { body["speculative_acceptance"] = acceptance; }
+        let response = app.oneshot(post_json(body)).await.unwrap();
+        assert_eq!(response.status(), if expected.is_some() { StatusCode::OK } else { StatusCode::BAD_REQUEST });
+        match expected {
+            Some(expected) => {
+                let (actual, sampling) = captured.await.unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(sampling.is_greedy(), temperature == 0.0);
+                if temperature != 0.0 { assert_eq!(sampling.min_p(), 0.01); }
+            }
+            None => assert!(captured.await.is_err(), "rejection must precede worker admission"),
+        }
+    }
+}
