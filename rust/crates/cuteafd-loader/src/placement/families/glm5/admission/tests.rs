@@ -315,6 +315,28 @@ fn combined_reply_resolution_is_immutable_and_absent_without_links() {
 }
 
 #[test]
+fn dflash_prefetch_refuses_missing_empty_nonfile_and_zero_pool_extent() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(DflashPrefetch::from_snapshot(root.path()).is_err());
+    let path = root.path().join("model.safetensors");
+    std::fs::File::create(&path).unwrap();
+    assert!(DflashPrefetch::from_snapshot(root.path()).is_err());
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(DflashPrefetch::from_snapshot(root.path()).is_err());
+    std::fs::remove_dir(&path).unwrap();
+    crate::plan::testing::write_safetensors(&path, &[
+        ("fc.weight".into(), "BF16", vec![128, 128]),
+    ]);
+    let prefetch = DflashPrefetch::from_snapshot(root.path()).unwrap();
+    assert!(matches!(prefetch.components(0), Err(Refusal::InvalidFact(_))));
+    let components = prefetch.components(64).unwrap();
+    assert_eq!(components.len(), 1);
+    assert!(matches!(components[0].kind, ComponentKind::Allowance(_)));
+    assert_eq!(components[0].bytes.at(1).unwrap(), std::fs::metadata(&path).unwrap().len());
+}
+
+#[test]
 fn core_heap_allowance_follows_weight_case_and_adds_concurrent_prefetch() {
     let cfg = cfg();
     let mut recipe = recipe(&cfg);
@@ -324,17 +346,19 @@ fn core_heap_allowance_follows_weight_case_and_adds_concurrent_prefetch() {
             sync_upload_bytes: 1024,
         };
     }
-    // This synthetic whole-file allowance models the real prefetch's overlap;
-    // its size is not evidence for any installed drafter checkpoint.
-    recipe.owners.push(Case { when: vec![], value: vec![Component {
-        activation: Activation::always(),
-        bytes: ByteCurve::fixed(16384, recipe.maximum_pages),
-        kind: ComponentKind::Allowance(Allowance {
-            location: Location::HOST, bytes: 16384,
-            lifetime: Lifetime { first: Phase::Load, last: Phase::DraftLoad },
-            source: "synthetic concurrent DFlash prefetch Vec".into(), assumed: true,
-        }),
-    }] });
+    // The current loader reads the whole sparse file, including header and any
+    // unused tensor payload. This is not an installed checkpoint measurement.
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("model.safetensors");
+    crate::plan::testing::write_safetensors(&path, &[
+        ("fc.weight".into(), "BF16", vec![128, 128]),
+        ("unused.weight".into(), "BF16", vec![1024, 128]),
+    ]);
+    let file_bytes = std::fs::metadata(&path).unwrap().len();
+    assert!(file_bytes > (128 * 128 + 1024 * 128) * 2);
+    recipe.owners.push(Case { when: vec![],
+        value: DflashPrefetch::from_snapshot(root.path()).unwrap()
+            .components(recipe.maximum_pages).unwrap() });
     let contract = recipe.prepare(&request()).unwrap();
     for embedding in 0..2 {
         let facts = contract.facts(&[0, 0, 0, 0, embedding, 0, 0], 32).unwrap();
@@ -344,8 +368,11 @@ fn core_heap_allowance_follows_weight_case_and_adds_concurrent_prefetch() {
         let phases = planner::evaluate(&facts, &budgets).unwrap();
         let opaque = |phase| phases.iter().find(|p| p.budget == "physical.2" && p.phase == phase)
             .unwrap().opaque;
-        assert_eq!(opaque(Phase::Load), 16384 + 4096 * (embedding as u64 + 1));
-        assert_eq!(opaque(Phase::DraftLoad), 16384);
+        assert_eq!(opaque(Phase::Load), file_bytes + 4096 * (embedding as u64 + 1));
+        assert_eq!(opaque(Phase::DraftLoad), file_bytes);
+        assert!(facts.allowances.iter().any(|a| a.bytes == file_bytes
+            && a.source.contains("metadata.len()") && a.source.contains("unmeasured")
+            && a.source.contains("excludes allocator/tensor-map metadata")));
         assert_eq!(opaque(Phase::PostTargetKv), 0);
         assert_eq!(opaque(Phase::Warmup), 0);
         // No per-target pinned allocation: the upload maximum must join draft

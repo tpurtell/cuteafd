@@ -67,6 +67,42 @@ pub struct GlmRecipe<'a> {
     pub owners: Vec<Case<Vec<Component>>>,
 }
 
+/// The current DFlash prefetch reads one entire file while target weights load.
+/// Its ordinary Vec payload is an assumption, not an allocator/RSS receipt.
+#[derive(Debug, Clone)]
+pub struct DflashPrefetch {
+    file_bytes: u64,
+}
+
+impl DflashPrefetch {
+    pub fn from_snapshot(snapshot: &std::path::Path) -> anyhow::Result<Self> {
+        use anyhow::{Context, ensure};
+        let path = snapshot.join("model.safetensors");
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("DFlash prefetch file {}", path.display()))?;
+        ensure!(metadata.is_file() && metadata.len() > 0,
+            "DFlash prefetch needs a nonempty regular file: {}", path.display());
+        Ok(Self { file_bytes: metadata.len() })
+    }
+
+    pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if maximum_pages == 0 {
+            return Err(invalid("zero DFlash prefetch pool extent"));
+        }
+        Ok(vec![Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(self.file_bytes, maximum_pages),
+            kind: ComponentKind::Allowance(Allowance {
+                location: Location::HOST,
+                bytes: self.file_bytes,
+                lifetime: Lifetime { first: Phase::Load, last: Phase::DraftLoad },
+                source: "DFlash whole-file prefetch Vec payload: model.safetensors metadata.len(); overlaps target read/pack heap in Load and is released when drafter load returns; ordinary Rust heap, unmeasured assumption; excludes allocator/tensor-map metadata overhead".into(),
+                assumed: true,
+            }),
+        }])
+    }
+}
+
 /// Exact owned-attention startup keys and separately bounded opaque graph memory.
 /// The selected full context fixes the key census for every admissible pool.
 #[derive(Debug, Clone)]
