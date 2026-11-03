@@ -36,6 +36,16 @@ impl SparkReplyFormat {
         }
     }
 
+    /// One compressed staging slice per physical prefill-capable link slot.
+    /// Dedicated decode and partial-reply links do not use the combined codec.
+    pub fn combined_scratch_bytes(self, hidden: usize, unit_rows: usize, slots: usize,
+        prefill: bool, partial_replies: bool) -> Option<usize> {
+        if !prefill || partial_replies || self == Self::Bf16 {
+            return Some(0);
+        }
+        self.row_bytes(hidden)?.checked_mul(unit_rows)?.checked_mul(slots)
+    }
+
     /// The one source of omission defaults: Muse preserves its split-wire
     /// NVFP4 prefill; all combined-reply families preserve BF16.
     pub fn resolve(requested: Option<Self>, partial_replies: bool) -> Self {
@@ -131,6 +141,20 @@ mod tests {
                 }
             );
         }
+    }
+    #[test]
+    fn combined_scratch_tracks_physical_slots_not_ranks_or_request_role() {
+        for format in [SparkReplyFormat::Bf16, SparkReplyFormat::Fp8, SparkReplyFormat::Nvfp4] {
+            for slots in [1, 3, 4] {
+                let expected = if format == SparkReplyFormat::Bf16 { 0 }
+                    else { format.row_bytes(5120).unwrap() * 2752 * slots };
+                assert_eq!(format.combined_scratch_bytes(5120, 2752, slots, true, false), Some(expected));
+                assert_eq!(format.combined_scratch_bytes(5120, 80, slots, false, false), Some(0));
+                assert_eq!(format.combined_scratch_bytes(5120, 2752, slots, true, true), Some(0));
+            }
+        }
+        assert_eq!(SparkReplyFormat::Fp8.combined_scratch_bytes(5120, usize::MAX, 4, true, false), None);
+        assert_eq!(SparkReplyFormat::Nvfp4.combined_scratch_bytes(17, 80, 1, true, false), None);
     }
     #[test]
     fn layouts_and_omission_defaults() {
