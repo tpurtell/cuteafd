@@ -60,7 +60,7 @@ fn native_hooks_name_physical_owners_and_k6_route_aliases_once() {
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],
-            allowances: vec![],
+            reservations: vec![], allowances: vec![],
         },
     );
     contract.variables = vec![

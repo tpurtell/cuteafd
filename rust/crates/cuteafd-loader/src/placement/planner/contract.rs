@@ -170,6 +170,7 @@ pub enum ComponentKind {
         deferred: bool,
     },
     Sequential(Sequential),
+    Reservation(Reservation),
     Allowance(Allowance),
 }
 #[derive(Debug, Clone)]
@@ -232,6 +233,7 @@ impl Component {
                 .members
                 .first()
                 .map(|a| (a.location, a.lifetime, false)),
+            ComponentKind::Reservation(r) => Some((r.location, r.lifetime, false)),
             ComponentKind::Allowance(a) => Some((a.location, a.lifetime, true)),
         }
     }
@@ -274,6 +276,11 @@ impl Contract {
             bytes: ByteCurve::fixed(group.peak(), maximum_pages),
             kind: ComponentKind::Sequential(group),
         }));
+        components.extend(facts.reservations.into_iter().map(|r| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(r.bytes, maximum_pages),
+            kind: ComponentKind::Reservation(r),
+        }));
         components.extend(facts.allowances.into_iter().map(|a| Component {
             activation: Activation::always(),
             bytes: ByteCurve::fixed(a.bytes, maximum_pages),
@@ -307,7 +314,7 @@ impl Contract {
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],
-            allowances: vec![],
+            reservations: vec![], allowances: vec![],
         };
         for component in &self.components {
             if !component.activation.active(selected) {
@@ -346,6 +353,11 @@ impl Contract {
                         ));
                     }
                     result.sequential.push(group.clone());
+                }
+                ComponentKind::Reservation(template) => {
+                    let mut reservation = template.clone();
+                    reservation.bytes = bytes;
+                    result.reservations.push(reservation);
                 }
                 ComponentKind::Allowance(template) => {
                     let mut allowance = template.clone();
@@ -569,6 +581,11 @@ impl Contract {
             if component.charge().is_some_and(|(_, life, _)|
                 !self.phase_order.at_or_before(life.first, life.last)) {
                 return Err(Refusal::InvalidFact("component lifetime contradicts family phase order".into()));
+            }
+            if let ComponentKind::Reservation(reservation) = &component.kind {
+                let facts = Facts { phase_order: self.phase_order, allocations: vec![], deferred: vec![],
+                    sequential: vec![], reservations: vec![reservation.clone()], allowances: vec![] };
+                validate_owners(&facts)?;
             }
             if let ComponentKind::Sequential(group) = &component.kind {
                 group.validate(self.phase_order)?;

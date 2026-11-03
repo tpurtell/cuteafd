@@ -1392,7 +1392,7 @@ mod tests {
                     let life = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
                     let mut facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: layout.owners.iter().filter(|o| !o.on_use)
                         .map(|o| o.allocation(format!("draft.block.{}", o.id), 0, life, "block dSpark owner"))
-                        .collect(), deferred: vec![], sequential: vec![], allowances: vec![] };
+                        .collect(), deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
                     if !layout.packing_sources.is_empty() {
                         facts.sequential.push(Sequential { id: "draft.block.packing".into(),
                             members: layout.packing_sources.iter().map(|o| o.allocation(format!("draft.block.{}", o.id),
@@ -1441,7 +1441,8 @@ mod tests {
                         _ => None,
                     }) {
                         let missing = events.iter().filter(|event| match event {
-                            OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. } =>
+                            OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. }
+                                | OwnerEvent::Reserved { receipt, .. } =>
                                 receipt.allocation.id != source,
                         }).cloned().collect::<Vec<_>>();
                         assert_eq!(events.len() - missing.len(), 2);

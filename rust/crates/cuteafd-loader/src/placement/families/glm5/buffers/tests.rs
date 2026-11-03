@@ -44,7 +44,7 @@ fn facts(target: &TargetBuffers, pages: u64) -> Facts {
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],
-            allowances: vec![],
+            reservations: vec![], allowances: vec![],
         },
     );
     contract.variables = vec![
@@ -97,7 +97,7 @@ fn prefix_backings_charge_tail_and_window_marks_but_no_target_or_draft_aliases()
                     && a.location == Location::coordinator(device) && a.category == Category::Prefix));
                 let mut contract = Contract::fixed(64, 16, 2, Facts {
                     phase_order: planner::PhaseOrder::DRAFT_THEN_TARGET, allocations: vec![],
-                    deferred: vec![], sequential: vec![], allowances: vec![] });
+                    deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] });
                 contract.variables = vec![Variable::Prefill(vec![PrefillShape {rows: 64, waves: 1}]), Variable::Lanes(vec![1])];
                 contract.components = spec.components(16).unwrap();
                 for pages in [1, 8, 16] {

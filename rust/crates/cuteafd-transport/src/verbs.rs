@@ -4969,7 +4969,7 @@ mod persistent_tests {
                 let receipts = snapshots.iter().map(|snapshot| snapshot.allocation_receipts("link", device, devices, Lifetime::TARGET))
                     .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
                 let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,allocations: SparkEndpointOwners {ranks, geometry, endpoint, rings}
-                    .allocations("link", Lifetime::TARGET)?, deferred: vec![], sequential: vec![], allowances: vec![]};
+                    .allocations("link", Lifetime::TARGET)?, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![]};
                 let budgets = vec![Budget {id: "numeric endpoint fixture".into(), locations: vec![Location::PINNED],
                     physical_bytes: 16 << 30, logical_bytes: 16 << 30, headroom: 0,
                     baseline: Baseline::Forecast {occupied: 0, source: "CPU metadata fixture".into(), assumed: false}}];

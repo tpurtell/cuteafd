@@ -63,7 +63,7 @@ fn retained_wave_storage_matches_independent_contract() -> Result<()> {
                 SparkWaveStaging::Registered { slot_bytes: slot_bytes as u64 }
             } else { SparkWaveStaging::Standalone { slot_bytes: slot_bytes as u64 } } };
             let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: spec.allocations("test.wave", Lifetime::TARGET)?,
-                deferred: vec![], sequential: vec![], allowances: vec![] };
+                deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
             let budgets = vec![Budget { id: "wave fixture pinned".into(), locations: vec![Location::PINNED],
                 physical_bytes: 128 << 20, logical_bytes: 128 << 20, headroom: 0,
                 baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
@@ -256,7 +256,7 @@ fn retained_link_composition_counts_fallback_egress_once() -> Result<()> {
                 unused_egress_bytes: (topology == 2).then_some((256 * slots) as u64),
             };
             let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET,
-                allocations: spec.allocations("test.link", Lifetime::TARGET)?, deferred: vec![], sequential: vec![], allowances: vec![] };
+                allocations: spec.allocations("test.link", Lifetime::TARGET)?, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
             let budgets = vec![Budget { id: "CPU link owners".into(), locations: vec![devices.location(device)?, Location::PINNED],
                 physical_bytes: 512 << 20, logical_bytes: 512 << 20, headroom: 0,
                 baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];

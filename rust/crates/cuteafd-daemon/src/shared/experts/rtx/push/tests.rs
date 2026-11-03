@@ -98,11 +98,93 @@ fn dense_host_geometry_tracks_pools_and_large_quant_tables_without_allocating() 
         assert_eq!(staging.table_bytes, crate::shared::fp8_load_quant::quant_table_bytes(131072, Layout::Channel)?);
         assert_eq!(staging.bytes()?, count * STEP_BYTES + staging.table_bytes);
     }
+    let residual = Step { device: 0, rects: vec![Rect { name: "gate".into(), path: "header-only".into(),
+        base: STEP_BYTES as u64, row_bytes: 32, rows: 0..1, cols: 0..32 }],
+        jobs: vec![Job::ResidualGate { temperature: 1.0, alpha: buffer, beta: buffer }] };
+    let mixed = RankLayout::new(vec![], vec![step, residual], 0)?.host_staging;
+    assert_eq!(mixed.staging_bytes, STEP_BYTES + 32);
+    assert_eq!(mixed.scratch_bytes, 320, "ordinary coefficient Vecs are not pinned tables");
+    assert_eq!(mixed.table_bytes, crate::shared::fp8_load_quant::quant_table_bytes(131072, Layout::Channel)?);
+    assert_eq!(mixed.bytes()?, mixed.staging_bytes + mixed.table_bytes + mixed.scratch_bytes,
+        "retained pinned tables coexist with the ordinary residual scratch");
+    assert!(HostStaging { staging_bytes: 0, largest_step: 0, table_bytes: usize::MAX, scratch_bytes: 1 }.bytes().is_err());
     let block = crate::shared::fp8_load_quant::quant_table_bytes(131072, Layout::Block)?;
     assert_eq!(block, 1 << 20);
     assert!(crate::shared::fp8_load_quant::quant_table_bytes(usize::MAX, Layout::Channel).is_err());
     assert!(crate::shared::fp8_load_quant::scale_code_table_bytes(usize::MAX).is_err());
-    assert!(HostStaging { staging_bytes: usize::MAX, largest_step: 2, table_bytes: 1 }.bytes().is_err());
+    assert!(HostStaging { staging_bytes: usize::MAX, largest_step: 2, table_bytes: 1 , scratch_bytes: 0}.bytes().is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn dense_pool_startup_replays_real_pinned_allocations_below_independent_reserved_bounds() -> Result<()> {
+    use crate::shared::{experts::rtx::dense::{DenseArena, RankLayout, Rect, Step, testing::FakeRank},
+        memory::{startup::StartupHistory, weight_arena::ExpectedCoverage, push_consumer}};
+    use cuteafd_loader::placement::planner::{self, Baseline, Budget, CoordinatorDevices, Decisions,
+        Facts, Lifetime, Location, Operation, Phase, PhaseOrder, Pin, Request, Reservation, ResolvedPlan};
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let source = root.path().join("steps.bin");
+    std::fs::write(&source, vec![0x5a; 16384])?;
+    let mut history = StartupHistory::start();
+    let mut reservations = Vec::new();
+    for (rank, gpu) in [1, 0].into_iter().enumerate() {
+        fixture.configure_memory(&library, gpu, 64 << 30)?;
+        let device = Device { library: &library, id: gpu };
+        for kind in ["dense", "coded-scales"] {
+            device.run(|| -> Result<()> {
+                let mut at = 0;
+                let steps = [4096, 8192, 4096].into_iter().map(|bytes| {
+                    let step = Step { device: gpu, rects: vec![Rect { name: "bounded".into(), path: source.clone(),
+                        base: at, row_bytes: bytes, rows: 0..1, cols: 0..bytes }], jobs: vec![] };
+                    at += bytes as u64;
+                    step
+                }).collect();
+                let layout = RankLayout::new(vec![], steps, gpu)?;
+                let spec = Reservation { id: format!("{kind}.{rank}"), location: Location::PINNED,
+                    bytes: layout.host_staging.staging_bytes as u64,
+                    lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
+                    source: "DenseArena checked ring/step geometry".into() };
+                assert_eq!(spec.bytes, 16384);
+                let checked = layout.checked(root.path(), 1, 0)?;
+                let expected = ExpectedCoverage::from_plan(&checked, 0)?;
+                let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8, 4096)?;
+                let fake = FakeRank::new(&checked, root.path(), 0, &ring)?;
+                let arena = DenseArena::new(device, layout, expected)?.with_reservation(history.reserve(spec.clone())?)?;
+                push_consumer::consume(device, arena, ring, fake, 8)?;
+                reservations.push(spec);
+                Ok(())
+            })?;
+        }
+    }
+    let order = PhaseOrder::DRAFT_THEN_TARGET;
+    for &phase in &order.phases()[1..5] { history.begin(phase)?; }
+    let (events, views, actual) = history.owners(order, Phase::Ready, &[],
+        CoordinatorDevices::new(&[1, 0])?, |_| Ok(None))?;
+    assert!(views.is_empty());
+    assert_eq!(actual.len(), 4);
+    assert!(actual.iter().all(|r| r.peak == 12288 && r.peak < r.reservation.bytes));
+    let facts = Facts { phase_order: order, allocations: vec![], deferred: vec![], sequential: vec![],
+        reservations, allowances: vec![] };
+    let budgets = vec![Budget { id: "host-pinned".into(), locations: vec![Location::PINNED],
+        physical_bytes: 65536, logical_bytes: 65536,
+        baseline: Baseline::Forecast { occupied: 0, source: "bounded CPU fixture".into(), assumed: false }, headroom: 0 }];
+    let phases = planner::evaluate(&facts, &budgets)?;
+    assert_eq!(phases[0].owned, 65536, "charge four independent bounds, not actual peaks or bound plus peak");
+    let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Auto, onboard: Pin::Auto,
+        prefill: Pin::Auto, operation: Operation::Serving },
+        decisions: Decisions { attention: vec![], onboard_layers: vec![vec![], vec![]],
+            expert_homes: Default::default(), embedding: None,
+            prefill: planner::PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
+        pool_tokens: 64, budgets, facts, phases };
+    planner::reconcile_startup(&plan, Phase::Ready, &events, &views, &actual)?;
+    let mut wrong = actual.clone(); wrong[1].peak += 1;
+    assert!(planner::reconcile_startup(&plan, Phase::Ready, &events, &views, &wrong).is_err());
+    assert!(planner::reconcile_startup(&plan, Phase::Ready, &events, &views, &actual[..3]).is_err());
+    let mut wrong = actual.clone(); wrong[1].reservation.id = wrong[0].reservation.id.clone();
+    assert!(planner::reconcile_startup(&plan, Phase::Ready, &events, &views, &wrong).is_err());
     Ok(())
 }
 
@@ -141,7 +223,7 @@ fn coordinator_host_admission_adds_dense_pools_and_exl3_validation_for_every_ran
             CoordinatorExpertPlan::whole(vec![catalog.exl3().unwrap().residency(V41Exl3Layer::Backbone(0), 1, 0)?], usize::MAX)
         } else { CoordinatorExpertPlan::new(&catalog, &[0], gpu, usize::MAX) }).collect::<Result<Vec<_>>>()?;
         let owners = plans.iter().map(Some).collect::<Vec<_>>();
-        let dense = vec![HostStaging { staging_bytes: 12 * STEP_BYTES, largest_step: STEP_BYTES, table_bytes: 2 << 20 }; gpus];
+        let dense = vec![HostStaging { staging_bytes: 12 * STEP_BYTES, largest_step: STEP_BYTES, table_bytes: 2 << 20 , scratch_bytes: 0}; gpus];
         let validation = plans.iter().map(|p| p.validation.bytes()).sum::<usize>();
         assert!(validation > 0);
         let peak = gpus * (128 * (1 << 20) + 12 * STEP_BYTES + (2 << 20)) + validation;
@@ -164,7 +246,7 @@ fn host_admission_refusal_declines_peers_before_returning_a_typed_planning_error
         assert!(planned_offer(&mut second, Ok(()), Ok(offer))?.is_none());
         Ok(())
     });
-    let planned = CoordinatorExpertPlan::admit_host(&[None], &[HostStaging { staging_bytes: 8 << 20, largest_step: 1 << 20, table_bytes: 1 << 20 }],
+    let planned = CoordinatorExpertPlan::admit_host(&[None], &[HostStaging { staging_bytes: 8 << 20, largest_step: 1 << 20, table_bytes: 1 << 20 , scratch_bytes: 0}],
         128, 1 << 20, 128 << 20);
     let offer = planned.as_ref().map(|_| unreachable!("staging must exceed this ring-only budget"))
         .map_err(|error| format!("{error:#}"));

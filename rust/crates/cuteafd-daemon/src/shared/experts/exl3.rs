@@ -543,7 +543,7 @@ mod tests {
         physical: i32,
     ) -> Result<()> {
         use cuteafd_loader::placement::planner::{self, *};
-        let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
+        let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
         let budgets = vec![Budget {
             id: "CPU fixture".into(), locations: vec![location],
             physical_bytes: 1 << 30, logical_bytes: 1 << 30, headroom: 0,

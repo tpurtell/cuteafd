@@ -665,6 +665,7 @@ impl DenseFacts<'_> {
             allocations,
             deferred: vec![],
             sequential,
+            reservations: vec![],
             allowances,
         })
     }

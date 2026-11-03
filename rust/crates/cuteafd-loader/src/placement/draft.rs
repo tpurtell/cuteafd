@@ -195,7 +195,7 @@ impl crate::families::glm5::draft_representation::GlmDraftRuntimeLayout {
         let members: Vec<_> = self.packing_sources().iter().map(|owner| owner.allocation(
             format!("draft.gqa.{}", owner.id), gpu,
             Lifetime { first: Phase::Load, last: Phase::Load }, "BF16 packing source")).collect();
-        Ok(Facts { phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], allowances: vec![],
+        Ok(Facts { phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], reservations: vec![], allowances: vec![],
             sequential: if members.is_empty() { vec![] } else {
                 vec![Sequential { id: "draft.gqa.packing".into(), members }]
             } })
@@ -220,7 +220,7 @@ impl crate::formats::dflash::MlaDraftRuntimeLayout {
         let members: Vec<_> = self.packing_sources().iter().map(|owner| owner.allocation(
             format!("draft.mla.{}", owner.id), gpu,
             Lifetime { first: Phase::Load, last: Phase::Load }, "BF16 packing source")).collect();
-        Facts { phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], allowances: vec![],
+        Facts { phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], reservations: vec![], allowances: vec![],
             sequential: if members.is_empty() { vec![] } else {
                 vec![Sequential { id: "draft.mla.packing".into(), members }]
             } }

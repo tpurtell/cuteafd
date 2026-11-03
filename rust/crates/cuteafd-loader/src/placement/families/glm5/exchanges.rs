@@ -211,7 +211,7 @@ mod tests {
                 allocations: vec![],
                 deferred: vec![],
                 sequential: vec![],
-                allowances: vec![],
+                reservations: vec![], allowances: vec![],
             },
         );
         contract.variables = vec![

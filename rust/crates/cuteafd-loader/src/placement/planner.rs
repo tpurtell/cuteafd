@@ -354,6 +354,19 @@ impl Sequential {
     }
 }
 
+/// A delivery-order-dependent load pool, not a fictitious physical backing.
+/// Forecasts charge the proven bound; startup records every actual allocation
+/// and requires its independently replayed peak <= bound. All other owner
+/// extents remain exact. This exception must never become a total-byte equality.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reservation {
+    pub id: String,
+    pub location: Location,
+    pub bytes: u64,
+    pub lifetime: Lifetime,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
     pub phase_order: PhaseOrder,
@@ -361,6 +374,7 @@ pub struct Facts {
     /// Reserved by a later owner port; never evidence that it was allocated.
     pub deferred: Vec<Allocation>,
     pub sequential: Vec<Sequential>,
+    pub reservations: Vec<Reservation>,
     pub allowances: Vec<Allowance>,
 }
 
@@ -499,6 +513,7 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
             .allowances
             .iter()
             .any(|a| !locations.contains(&a.location))
+        || facts.reservations.iter().any(|r| !locations.contains(&r.location))
     {
         return Err(Refusal::InvalidFact(
             "allocation outside memory budgets".into(),
@@ -565,6 +580,18 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
             }
         }
     }
+    let mut reservation_ids = BTreeSet::new();
+    for reservation in &facts.reservations {
+        if reservation.id.is_empty() || !reservation_ids.insert(&reservation.id)
+            || ids.contains_key(&reservation.id) || groups.contains(reservation.id.as_str())
+            || reservation.bytes == 0 || reservation.source.is_empty()
+            || reservation.lifetime.first != reservation.lifetime.last
+            || order.at_or_before(Phase::Ready, reservation.lifetime.last)
+            || reservation.location.domain != Domain::Pinned
+        {
+            return Err(Refusal::InvalidFact(format!("invalid load pool reservation {}", reservation.id)));
+        }
+    }
     for allowance in &facts.allowances {
         if allowance.source.is_empty() || !order.at_or_before(allowance.lifetime.first, allowance.lifetime.last) {
             return Err(Refusal::InvalidFact("invalid opaque allowance".into()));
@@ -601,6 +628,14 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
                         .ok_or(Refusal::Overflow("sequential phase peak"))?;
                 }
             }
+            for reservation in &facts.reservations {
+                if reservation.lifetime.contains(phase, facts.phase_order)
+                    && budget.locations.contains(&reservation.location)
+                {
+                    owned = owned.checked_add(reservation.bytes)
+                        .ok_or(Refusal::Overflow("phase reservations"))?;
+                }
+            }
             let opaque = facts
                 .allowances
                 .iter()
@@ -631,6 +666,10 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
                                 })
                                 .map(|g| g.id.clone()),
                         )
+                        .chain(facts.reservations.iter()
+                            .filter(|r| r.lifetime.contains(phase, facts.phase_order)
+                                && budget.locations.contains(&r.location))
+                            .map(|r| r.id.clone()))
                         .collect(),
                 });
             }
@@ -667,10 +706,19 @@ pub struct Observation {
     pub freed: Option<Phase>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationReceipt {
+    pub reservation: Reservation,
+    pub peak: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum OwnerEvent {
     Allocated { receipt: Receipt, phase: Phase },
     Freed { receipt: Receipt, phase: Phase },
+    /// Actual physical allocation/free edges inside one bounded load pool.
+    /// These are not charged again alongside the pool's reservation.
+    Reserved { reservation: String, receipt: Receipt, phase: Phase, allocate: bool },
 }
 
 /// Startup observations carry actual creation/free phases, not merely the
@@ -693,8 +741,20 @@ pub fn reconcile_events(
     events: &[OwnerEvent],
     views: &[Observation],
 ) -> Result<(), Refusal> {
+    reconcile_startup(plan, phase, events, views, &[])
+}
+
+/// Exact owner replay plus the sole bounded-pool exception: the actual replayed
+/// peak must equal its independent census and stay at or below the reservation.
+pub fn reconcile_startup(
+    plan: &ResolvedPlan,
+    phase: Phase,
+    events: &[OwnerEvent],
+    views: &[Observation],
+    reservations: &[ReservationReceipt],
+) -> Result<(), Refusal> {
     validate(&plan.facts, &plan.budgets)?;
-    reconcile_owner_events(&plan.facts, phase, events, views)
+    reconcile_owner_events(&plan.facts, phase, events, views, reservations)
 }
 
 /// Temporary owner-only bridge for the legacy Kimi MLA drafter. This proves
@@ -705,12 +765,13 @@ pub fn reconcile_legacy_mla_events(
     phase: Phase,
     events: &[OwnerEvent],
 ) -> Result<(), Refusal> {
-    if !facts.phase_order.at_or_before(phase, Phase::Warmup) || !facts.deferred.is_empty() || !facts.allowances.is_empty() {
+    if !facts.phase_order.at_or_before(phase, Phase::Warmup) || !facts.deferred.is_empty()
+        || !facts.allowances.is_empty() || !facts.reservations.is_empty() {
         return Err(Refusal::InvalidFact(
             "legacy MLA bridge only checks startup owners".into(),
         ));
     }
-    reconcile_owner_events(facts, phase, events, &[])
+    reconcile_owner_events(facts, phase, events, &[], &[])
 }
 
 fn reconcile_owner_events(
@@ -718,6 +779,7 @@ fn reconcile_owner_events(
     phase: Phase,
     events: &[OwnerEvent],
     views: &[Observation],
+    reservations: &[ReservationReceipt],
 ) -> Result<(), Refusal> {
     validate_owners(facts)?;
     let mut expected = facts
@@ -737,19 +799,67 @@ fn reconcile_owner_events(
     let mut groups = BTreeMap::<usize, &str>::new();
     let mut observations = BTreeMap::<&str, Observation>::new();
     let mut previous = Phase::Load;
+    let mut held = BTreeMap::<&str, u64>::new();
+    let mut peaks = BTreeMap::<&str, u64>::new();
+    let mut reserved_live = BTreeMap::<&str, (&str, &Receipt)>::new();
     for event in events {
-        let (receipt, at, allocate) = match event {
-            OwnerEvent::Allocated { receipt, phase } => (receipt, *phase, true),
-            OwnerEvent::Freed { receipt, phase } => (receipt, *phase, false),
+        let (receipt, at, allocate, reservation) = match event {
+            OwnerEvent::Allocated { receipt, phase } => (receipt, *phase, true, None),
+            OwnerEvent::Freed { receipt, phase } => (receipt, *phase, false, None),
+            OwnerEvent::Reserved { reservation, receipt, phase, allocate } =>
+                (receipt, *phase, *allocate, Some(reservation.as_str())),
         };
         let id = receipt.allocation.id.as_str();
         if !facts.phase_order.at_or_before(previous, at) || !facts.phase_order.at_or_before(at, phase) {
             errors.push(Mismatch::Lifetime(id.into()));
         }
         previous = at;
-        let Some(&(group, spec)) = expected.get(id) else {
-            errors.push(Mismatch::Extra(id.into()));
-            continue;
+        let reserved = reservation.and_then(|id| facts.reservations.iter().find(|r| r.id == id));
+        let (group, spec) = if let Some(reservation) = reservation {
+            let Some(bound) = reserved else {
+                errors.push(Mismatch::Extra(reservation.into()));
+                continue;
+            };
+            let a = &receipt.allocation;
+            if expected.contains_key(id) || facts.deferred.iter().any(|a| a.id == id)
+                || facts.reservations.iter().any(|r| r.id == id)
+                || a.id.is_empty() || a.bytes == 0 || a.view.is_some() || a.slot.is_some()
+                || a.location != bound.location || a.lifetime != bound.lifetime
+                || a.alignment == 0 || !a.alignment.is_power_of_two()
+                || a.dtype != "bytes" || a.shape != [a.bytes]
+            {
+                errors.push(Mismatch::Contract(id.into()));
+            }
+            if allocate {
+                if held.get(reservation).copied().unwrap_or(0) > bound.bytes.saturating_sub(a.bytes)
+                    || a.bytes > bound.bytes
+                {
+                    errors.push(Mismatch::Contract(reservation.into()));
+                }
+                let current = held.entry(reservation).or_default();
+                *current = current.checked_add(a.bytes).ok_or(Refusal::Overflow("reserved pool held"))?;
+                let peak = peaks.entry(reservation).or_default();
+                *peak = (*peak).max(*current);
+                if reserved_live.insert(id, (reservation, receipt)).is_some() {
+                    errors.push(Mismatch::Duplicate(id.into()));
+                }
+            } else {
+                match reserved_live.remove(id) {
+                    Some((owner, live)) if owner == reservation && live.allocation == *a
+                        && live.address == receipt.address => {
+                        let current = held.entry(reservation).or_default();
+                        *current = current.checked_sub(a.bytes).ok_or(Refusal::Overflow("reserved pool free"))?;
+                    }
+                    _ => errors.push(Mismatch::Lifetime(id.into())),
+                }
+            }
+            (None, a)
+        } else {
+            let Some(&(group, spec)) = expected.get(id) else {
+                errors.push(Mismatch::Extra(id.into()));
+                continue;
+            };
+            (group, spec)
         };
         if receipt.allocation != *spec {
             errors.push(Mismatch::Contract(id.into()));
@@ -768,7 +878,7 @@ fn reconcile_owner_events(
                 errors.push(Mismatch::Duplicate(id.into()));
             }
             let end = receipt.address.checked_add(receipt.allocation.bytes);
-            if receipt.address == 0 || receipt.address % spec.alignment != 0 || end.is_none() {
+            if receipt.address == 0 || spec.alignment == 0 || receipt.address % spec.alignment != 0 || end.is_none() {
                 errors.push(Mismatch::Address(id.into()));
             }
             for live in active.values() {
@@ -786,7 +896,7 @@ fn reconcile_owner_events(
                 if groups.insert(group, id).is_some() {
                     errors.push(Mismatch::Lifetime(facts.sequential[group].id.clone()));
                 }
-            } else {
+            } else if reservation.is_none() {
                 observations.entry(id).or_insert_with(|| Observation {
                     receipt: receipt.clone(),
                     created: at,
@@ -810,6 +920,29 @@ fn reconcile_owner_events(
             } else if let Some(observation) = observations.get_mut(id) {
                 observation.freed = Some(at);
             }
+        }
+    }
+    let mut reported = BTreeSet::new();
+    for actual in reservations {
+        let id = &actual.reservation.id;
+        if !reported.insert(id.as_str()) { errors.push(Mismatch::Duplicate(id.clone())); }
+        match facts.reservations.iter().find(|r| &r.id == id) {
+            Some(spec) if *spec == actual.reservation
+                && facts.phase_order.at_or_before(spec.lifetime.first, phase)
+                && actual.peak <= spec.bytes
+                && actual.peak == peaks.get(id.as_str()).copied().unwrap_or(0) => {}
+            Some(_) => errors.push(Mismatch::Contract(id.clone())),
+            None => errors.push(Mismatch::Extra(id.clone())),
+        }
+    }
+    for spec in &facts.reservations {
+        if facts.phase_order.at_or_before(spec.lifetime.first, phase) && !reported.contains(spec.id.as_str()) {
+            errors.push(Mismatch::Missing(spec.id.clone()));
+        }
+    }
+    for (id, (_, receipt)) in reserved_live {
+        if !facts.phase_order.at_or_before(phase, receipt.allocation.lifetime.last) {
+            errors.push(Mismatch::Lifetime(id.into()));
         }
     }
     for group in &facts.sequential {
@@ -957,6 +1090,9 @@ fn reconcile_snapshot(
         );
     }
     if !ordered_proved {
+        errors.extend(facts.reservations.iter()
+            .filter(|r| facts.phase_order.at_or_before(r.lifetime.first, phase))
+            .map(|r| Mismatch::Missing(r.id.clone())));
         errors.extend(
             facts
                 .sequential

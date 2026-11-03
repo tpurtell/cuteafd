@@ -402,7 +402,7 @@ mod cuda_tests {
             Baseline, Budget, Decisions, Facts, Location, Operation, Phase, Pin, PrefillShape, Request, ResolvedPlan};
         let life = ServingOwners::LIFETIME;
         let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,allocations: HostPrefixOwners {quota_bytes: 2 * 4096 + 17, chunk_bytes: 4096}
-            .allocations("host.prefix", life)?, deferred: vec![], sequential: vec![], allowances: vec![]};
+            .allocations("host.prefix", life)?, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![]};
         let budgets = vec![Budget {id: "CPU pinned fixture".into(), locations: vec![Location::PINNED],
             physical_bytes: 8192, logical_bytes: 8192, headroom: 0,
             baseline: Baseline::Forecast {occupied: 0, source: "CPU fixture".into(), assumed: false}}];

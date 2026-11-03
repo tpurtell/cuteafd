@@ -70,7 +70,7 @@ fn plan(
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],
-            allowances: vec![],
+            reservations: vec![], allowances: vec![],
         },
     );
     contract.variables = vec![Variable::Prefill(vec![shape]), Variable::Lanes(vec![1])];
@@ -164,7 +164,7 @@ fn exchange_plan(cfg: &GlmDsaConfig, buffers: &ExchangeBuffers) -> Result<Resolv
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],
-            allowances: vec![],
+            reservations: vec![], allowances: vec![],
         },
     );
     contract.variables = vec![

@@ -366,9 +366,9 @@ fn reconcile_startup(
     history: &StartupHistory,
     receipts: &[Receipt],
 ) -> Result<()> {
-    let (events, views) = history.owners(plan.facts.phase_order, phase, receipts,
+    let (events, views, reservations) = history.owners(plan.facts.phase_order, phase, receipts,
         CoordinatorDevices::new(&[device.id])?, transient_owner)?;
-    planner::reconcile_events(plan, phase, &events, &views)?;
+    planner::reconcile_startup(plan, phase, &events, &views, &reservations)?;
     let before = match plan.budgets[0].baseline {
         planner::Baseline::Sampled { free, .. } => free,
         _ => anyhow::bail!("live reconciliation requires a before-weights sample"),
@@ -448,7 +448,7 @@ mod tests {
                     spec("draft.pack.b", 200, transient, "BF16 packing source"),
                 ],
             }],
-            allowances: vec![],
+            reservations: vec![], allowances: vec![],
         };
         let budgets = vec![Budget {
             id: "coordinator.0".into(),
@@ -517,7 +517,7 @@ mod tests {
                 &[(Phase::Load, 0), (Phase::PostTargetKv, 0), (Phase::DraftLoad, 1),
                     (Phase::Warmup, audit.len()), (Phase::Ready, audit.len())],
                 plan.facts.phase_order, Phase::Ready, &receipts, CoordinatorDevices::new(&[0])?,
-                census, &mut transient_owner)
+                census, &[], &mut transient_owner)
         };
         let (events, views) = history(&audit, &census)?;
         assert_eq!(events.len(), audit.len());
@@ -671,7 +671,7 @@ mod tests {
                 allocations: owners,
                 deferred: vec![],
                 sequential: vec![],
-                allowances: vec![],
+                reservations: vec![], allowances: vec![],
             };
             let plan = ResolvedPlan {
                 request: Request {

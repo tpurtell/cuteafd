@@ -601,7 +601,7 @@ fn coordinator_coded_scales_and_family_dense_staging_are_independent_host_owners
             assert_eq!(plan.host_bytes()?, geometry.bytes()?);
         }
         let dense = vec![HostStaging { staging_bytes: 8 * STEP_BYTES, largest_step: STEP_BYTES,
-            table_bytes: 2 << 20 }; world];
+            table_bytes: 2 << 20 , scratch_bytes: 0}; world];
         let refs = plans.iter().map(Some).collect::<Vec<_>>();
         let peak = world * 128 * (1 << 20) + plans.iter().map(|plan| plan.host_bytes()).sum::<Result<usize>>()?
             + dense.iter().map(|staging| staging.bytes()).sum::<Result<usize>>()?;

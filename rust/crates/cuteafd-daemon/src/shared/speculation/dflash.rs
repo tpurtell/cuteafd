@@ -2032,6 +2032,7 @@ impl<'a> DflashDrafter<'a> {
             match event {
                 planner::OwnerEvent::Allocated { receipt, .. } => { retained.insert(&receipt.allocation.id, receipt); }
                 planner::OwnerEvent::Freed { receipt, .. } => { retained.remove(&receipt.allocation.id); }
+                planner::OwnerEvent::Reserved { .. } => anyhow::bail!("legacy MLA history cannot contain a load reservation"),
             }
         }
         ensure!(retained.len() == receipts.len() && receipts.iter().all(|receipt|
@@ -3703,7 +3704,8 @@ mod checkpoint_header_tests {
                 for source in &facts.sequential {
                     for member in &source.members {
                         let missing = events.iter().filter(|event| match event {
-                            OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. } =>
+                            OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. }
+                                | OwnerEvent::Reserved { receipt, .. } =>
                                 receipt.allocation.id != member.id,
                         }).cloned().collect::<Vec<_>>();
                         assert_eq!(events.len() - missing.len(), 2);
@@ -3812,7 +3814,8 @@ mod checkpoint_header_tests {
                     for source in &plan.facts.sequential {
                         for member in &source.members {
                             let missing = events.iter().filter(|event| match event {
-                                OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. } =>
+                                OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. }
+                                | OwnerEvent::Reserved { receipt, .. } =>
                                     receipt.allocation.id != member.id,
                             }).cloned().collect::<Vec<_>>();
                             assert_eq!(events.len() - missing.len(), 2);

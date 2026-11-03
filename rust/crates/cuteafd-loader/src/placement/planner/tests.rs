@@ -49,7 +49,7 @@ fn facts(allocations: Vec<Allocation>) -> Facts {
         allocations,
         deferred: vec![],
         sequential: vec![],
-        allowances: vec![],
+        reservations: vec![], allowances: vec![],
     }
 }
 fn request() -> Request {
@@ -1711,6 +1711,80 @@ fn packing_history(p: &ResolvedPlan) -> (Vec<Observation>, Vec<OwnerEvent>) {
 }
 
 #[test]
+fn load_pool_reservations_charge_bounds_and_replay_independent_actual_peaks() {
+    let mut exact = allocation("exact", 80);
+    exact.location = Location::PINNED;
+    exact.lifetime = Lifetime { first: Phase::Load, last: Phase::Growth };
+    let mut p = plan(vec![]);
+    p.facts.allocations = vec![exact.clone()];
+    p.facts.reservations = vec![Reservation { id: "dense.0".into(), location: Location::PINNED,
+        bytes: 300, lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
+        source: "checked ring/step bound".into() }];
+    p.budgets[0].locations = vec![Location::PINNED];
+    p.phases = evaluate(&p.facts, &p.budgets).unwrap();
+    assert_eq!(p.phases.iter().find(|r| r.phase == Phase::Load).unwrap().owned, 380);
+    assert_eq!(p.phases.iter().find(|r| r.phase == Phase::Ready).unwrap().owned, 80);
+    let contract = Contract::fixed(64, 1, 1, p.facts.clone());
+    assert_curve_census(&contract, &p.budgets, &[]);
+    assert_eq!(contract.facts(&[], 1).unwrap(), p.facts);
+    let pool = &p.facts.reservations[0];
+    let edge = |id: &str, bytes, address, allocate| OwnerEvent::Reserved {
+        reservation: pool.id.clone(), receipt: Receipt {
+            allocation: Allocation::buffer(id, pool.location, bytes, pool.lifetime, Category::Staging, "pool"), address },
+        phase: Phase::Load, allocate,
+    };
+    let exact_event = OwnerEvent::Allocated { receipt: Receipt { allocation: exact.clone(), address: 4096 }, phase: Phase::Load };
+    let check = |events: &[OwnerEvent], reports: &[ReservationReceipt]| reconcile_startup(&p, Phase::Ready, events, &[], reports);
+    for peak in [200, 300] {
+        let events = vec![exact_event.clone(), edge("buffer.a", peak, 8192, true), edge("buffer.a", peak, 8192, false)];
+        let report = ReservationReceipt { reservation: pool.clone(), peak };
+        check(&events, &[report.clone()]).unwrap();
+        assert!(check(&events, &[]).is_err());
+        assert!(check(&events, &[report.clone(), report.clone()]).is_err());
+        let mut wrong = report.clone(); wrong.peak -= 1;
+        assert!(check(&events, &[wrong]).is_err());
+        let mut wrong = report.clone(); wrong.reservation.bytes += 1;
+        assert!(check(&events, &[wrong]).is_err());
+        let mut extra = report.clone(); extra.reservation.id = "unknown".into();
+        assert!(check(&events, &[report.clone(), extra]).is_err());
+        let mut wrong = events.clone();
+        if let OwnerEvent::Allocated { receipt, .. } = &mut wrong[0] { receipt.allocation.bytes += 1; }
+        assert!(check(&wrong, &[report.clone()]).is_err(), "unused reservation cannot cancel an exact mismatch");
+        assert!(check(&events[..2], &[report.clone()]).is_err());
+        for mutation in 0..9 {
+            let mut wrong = events.clone();
+            if let OwnerEvent::Reserved { reservation, receipt, phase, .. } = &mut wrong[1] {
+                match mutation {
+                    0 => *reservation = "unknown".into(),
+                    1 => receipt.allocation.location = Location::HOST,
+                    2 => receipt.allocation.lifetime.last = Phase::Ready,
+                    3 => receipt.address = 4096,
+                    4 => receipt.allocation.id = "exact".into(),
+                    5 => *phase = Phase::DraftLoad,
+                    6 => receipt.allocation.dtype = "bf16".into(),
+                    7 => receipt.allocation.shape = vec![1],
+                    _ => receipt.allocation.alignment = 0,
+                }
+            }
+            assert!(check(&wrong, &[report.clone()]).is_err(), "mutation {mutation}");
+        }
+        let mut wrong = events.clone();
+        if let OwnerEvent::Reserved { receipt, .. } = &mut wrong[2] { receipt.address += 16; }
+        assert!(check(&wrong, &[report.clone()]).is_err());
+        let ordinary = [Observation { receipt: Receipt { allocation: exact.clone(), address: 4096 }, created: Phase::Load, freed: None }];
+        assert!(reconcile_history(&p, Phase::Ready, &ordinary).is_err());
+        assert!(reconcile_events(&p, Phase::Ready, &events, &[]).is_err());
+    }
+    let events = vec![exact_event.clone(), edge("buffer.a", 301, 8192, true), edge("buffer.a", 301, 8192, false)];
+    assert!(check(&events, &[ReservationReceipt { reservation: pool.clone(), peak: 301 }]).is_err());
+    let events = vec![exact_event, edge("buffer.a", 200, 8192, true), edge("buffer.b", 101, 12288, true),
+        edge("buffer.a", 200, 8192, false), edge("buffer.b", 101, 12288, false)];
+    assert!(check(&events, &[ReservationReceipt { reservation: pool.clone(), peak: 301 }]).is_err());
+    let mut small = p.budgets.clone(); small[0].physical_bytes = 379; small[0].logical_bytes = 379;
+    assert!(matches!(evaluate(&p.facts, &small), Err(Refusal::Capacity { owners, .. }) if owners.contains(&pool.id)));
+}
+
+#[test]
 fn sequential_sources_charge_maximum_but_require_every_actual_pair() {
     let p = packing_plan();
     let at = |phase| p.phases.iter().find(|r| r.phase == phase).unwrap().owned;
@@ -1742,7 +1816,8 @@ fn sequential_sources_charge_maximum_but_require_every_actual_pair() {
         .cloned()
         .map(|mut event| {
             let receipt = match &mut event {
-                OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. } => {
+                OwnerEvent::Allocated { receipt, .. } | OwnerEvent::Freed { receipt, .. }
+                                | OwnerEvent::Reserved { receipt, .. } => {
                     receipt
                 }
             };

@@ -36,12 +36,15 @@ pub(crate) fn append(rect: &Rect, builder: &mut Builder, rank: u32, offset: u64)
 }
 
 
-/// Independent pinned owners retained by one DenseArena through Done/drop.
+/// Independent memory domains of one DenseArena through Done/drop. The step
+/// pool is a proven bound, not one physical allocation; tables are pinned and
+/// residual coefficient scratch is ordinary host memory that coexists with them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HostStaging {
     pub staging_bytes: usize,
     pub largest_step: usize,
     pub table_bytes: usize,
+    pub scratch_bytes: usize,
 }
 
 impl HostStaging {
@@ -103,12 +106,13 @@ impl HostStaging {
         let frontiers = files.len().checked_mul(largest).context("dense frontier staging overflow")?;
         let staging_bytes = fallback.checked_add(window).and_then(|bytes| bytes.checked_add(frontiers))
             .context("dense pinned staging overflow")?.min(total);
-        let bound = Self { staging_bytes, largest_step: largest, table_bytes };
+        let bound = Self { staging_bytes, largest_step: largest, table_bytes, scratch_bytes: 0 };
         bound.bytes()?;
         Ok(bound)
     }
     pub fn bytes(self) -> Result<usize> {
-        self.staging_bytes.checked_add(self.table_bytes).context("dense pinned staging overflow")
+        self.staging_bytes.checked_add(self.table_bytes)
+            .and_then(|bytes| bytes.checked_add(self.scratch_bytes)).context("dense host staging overflow")
     }
 }
 
@@ -181,23 +185,27 @@ impl RankLayout {
             cursor = start + step.bytes() as u64 + 1;
             staged.push((start, step));
         }
-        let mut table_bytes = 0;
+        let (mut table_bytes, mut scratch_bytes) = (0, 0);
         for (_, step) in &staged {
             ensure!(step.bytes() > 0 && step.bytes() <= STEP_BYTES, "dense step exceeds bounded staging");
             for job in &step.jobs {
                 let bytes = match job {
                     Job::Quant { rows, layout, .. } =>
                         crate::shared::fp8_load_quant::quant_table_bytes(rows.len(), *layout)?,
-                    // BF16 -> F32 input, coefficient pairs, then two output vectors.
-                    Job::ResidualGate { .. } => step.bytes().checked_mul(10)
-                        .context("residual coefficient host scratch overflow")?,
+                    // The ordinary Vecs coexist with previously retained pinned tables.
+                    Job::ResidualGate { .. } => {
+                        scratch_bytes = scratch_bytes.max(step.bytes().checked_mul(10)
+                            .context("residual coefficient host scratch overflow")?);
+                        0
+                    },
                     Job::ScaleCodes { .. } => crate::shared::fp8_load_quant::scale_code_table_bytes(1)?,
                     _ => 0,
                 };
                 table_bytes = table_bytes.max(bytes);
             }
         }
-        let host_staging = HostStaging::for_steps(staged.iter().map(|(_, step)| step.rects.as_slice()), table_bytes)?;
+        let mut host_staging = HostStaging::for_steps(staged.iter().map(|(_, step)| step.rects.as_slice()), table_bytes)?;
+        host_staging.scratch_bytes = scratch_bytes;
         host_staging.bytes()?;
         Ok(Self { device, operands: placed, steps: staged, base, host_bytes: if cursor == 0 { 0 } else { cursor },
             finishes: Vec::new(), host_staging })
@@ -261,6 +269,7 @@ pub(crate) struct DenseArena<'a> {
     /// Bytes of staging allocated (open steps and the pool), and their peak.
     held: u64,
     peak_held: u64,
+    reservation: Option<crate::shared::memory::startup::ReservationCensus>,
 }
 
 impl<'a> DenseArena<'a> {
@@ -276,7 +285,18 @@ impl<'a> DenseArena<'a> {
             }
         };
         Ok(Self { device, layout, expected, coverage: Coverage::default(), kernels, stream,
-            open: Default::default(), pool: Vec::new(), scratch: None, run: 0, staged: 0, peak: 0, held: 0, peak_held: 0 })
+            open: Default::default(), pool: Vec::new(), scratch: None, run: 0, staged: 0, peak: 0, held: 0, peak_held: 0,
+            reservation: None })
+    }
+
+    /// Bind before delivery. The caller supplies a distinct semantic pool ID per
+    /// rank/use (family dense and coded-scale pools are separate reservations).
+    pub(crate) fn with_reservation(mut self, census: crate::shared::memory::startup::ReservationCensus) -> Result<Self> {
+        ensure!(self.reservation.is_none() && self.held == 0 && self.run == 0
+            && census.spec().bytes == self.layout.host_staging.staging_bytes as u64,
+            "dense pool reservation differs from admitted staging bound");
+        self.reservation = Some(census);
+        Ok(self)
     }
 
     fn operand(&self, offset: u64, bytes: u64) -> Result<(CuteafdDeviceBuffer, usize)> {
@@ -350,6 +370,7 @@ impl PushDestination for DenseArena<'_> {
                     ensure!(self.held + need as u64 <= self.layout.host_staging.staging_bytes as u64,
                         "dense rank GPU {} needs {} pinned staging bytes, beyond admitted ring/step bound {}",
                         self.device.id, self.held + need as u64, self.layout.host_staging.staging_bytes);
+                    let _owner = self.reservation.as_ref().map(|r| cuteafd_ffi::memory_ledger::owner(&r.spec().id));
                     let allocation = HostAllocation::named(self.device.library, need, "staging/coordinator-dense")?;
                     self.held += need as u64;
                     self.peak_held = self.peak_held.max(self.held);
@@ -380,7 +401,7 @@ impl PushDestination for DenseArena<'_> {
             "completed fragment is outside checked plan footprint");
         self.expected.record(&mut self.coverage, offset, bytes)
     }
-    fn done(self) -> Result<()> {
+    fn done(mut self) -> Result<()> {
         ensure!(self.expected.complete(&self.coverage), "rank Done before all planned operand bytes completed");
         ensure!(self.open.is_empty() && self.run == self.layout.steps.len(), "rank Done before every staged step ran");
         let (library, stream) = (self.device.library, self.stream);
@@ -397,6 +418,7 @@ impl PushDestination for DenseArena<'_> {
             peak_pinned_mib = self.peak_held as f64 / (1u64 << 20) as f64, "coordinator dense rank delivered");
         #[cfg(test)]
         testing::PEAKS.with(|p| p.borrow_mut().push((self.peak, self.peak_held)));
+        if let Some(census) = self.reservation.take() { census.complete(self.peak_held)?; }
         Ok(())
     }
 }

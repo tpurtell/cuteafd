@@ -98,7 +98,7 @@ fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_js
         manifests, true)?;
     let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
         allocations: layout.allocations("expert.test", location, lifetime),
-        deferred: vec![], sequential: vec![], allowances: vec![],
+        deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
     };
     let budgets = vec![Budget {
         id: "fixture physical device".into(), locations: vec![location],

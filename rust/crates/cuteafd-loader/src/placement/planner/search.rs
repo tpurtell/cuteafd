@@ -688,7 +688,7 @@ pub fn solve(
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],
-            allowances: vec![],
+            reservations: vec![], allowances: vec![],
         },
         &budgets,
     )?;

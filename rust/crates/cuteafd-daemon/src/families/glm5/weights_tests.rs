@@ -230,7 +230,7 @@ fn retained_weight_plan(inventory: &cuteafd_loader::placement::families::glm5::w
     -> Result<cuteafd_loader::placement::planner::ResolvedPlan> {
     use cuteafd_loader::placement::planner::{self, *};
     let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET, allocations: inventory.owners.iter().map(|o| o.allocation.clone()).collect(),
-        deferred: vec![], sequential: vec![], allowances: vec![] };
+        deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
     let budgets: Vec<_> = (0..inventory.ranks).map(|rank| Location::coordinator(rank as u8))
         .chain([Location::PINNED]).enumerate().map(|(index, location)| Budget {
             id: format!("weights.fixture.{index}"), locations: vec![location],

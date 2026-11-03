@@ -661,7 +661,7 @@ mod ownership_tests {
                     let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET,
                         allocations: PrefixBuffers { device: mapping.logical_rank(physical)?,
                             draft_windows: windows.map(|n| n as u64), mark_slots: slots as u64 }.allocations(life)?,
-                        deferred: vec![], sequential: vec![], allowances: vec![] };
+                        deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
                     let budgets = vec![Budget { id: "CPU prefix owners".into(), locations: vec![mapping.location(physical)?],
                         physical_bytes: 16 << 20, logical_bytes: 16 << 20, headroom: 0,
                         baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];

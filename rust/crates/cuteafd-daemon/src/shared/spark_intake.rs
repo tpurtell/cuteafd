@@ -2024,7 +2024,7 @@ mod tests {
                             IntakeMode::Host => SparkIntakeMode::Host,
                         } };
                     let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: spec.allocations("test.intake", Lifetime::TARGET)?,
-                        deferred: vec![], sequential: vec![], allowances: vec![] };
+                        deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
                     let budgets = vec![Budget { id: "CPU intake fixture".into(),
                         locations: vec![devices.location(device)?, Location::PINNED],
                         physical_bytes: 256 << 20, logical_bytes: 256 << 20, headroom: 0,

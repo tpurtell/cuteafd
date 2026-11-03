@@ -628,7 +628,7 @@ mod tests {
                         let layout = cuteafd_loader::plan::exlr8::execution_workspace(spec, rows, set,
                             public_variant, 3, activations)?;
                         let allocations = layout.allocations("test.execution", location, Lifetime::RESIDENT)?;
-                        let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
+                        let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
                         let budgets = vec![Budget { id:"CPU fixture".into(),locations:vec![location],
                             physical_bytes:64<<20,logical_bytes:64<<20,headroom:0,
                             baseline:Baseline::Forecast {occupied:0,source:"CPU fixture".into(),assumed:false} }];
