@@ -51,7 +51,8 @@ impl Admission {
         let first = cfg.dense.iter().position(|dense| !dense).context("Flash routed suffix")?;
         let shared = exlr8::shared_expert_resident(&metadata, &(first..layers).collect::<Vec<_>>(), ranks)?;
         let records = DenseRecord::inventory(&args.snapshot)?;
-        let selection = DenseSelection::from_hf(&metadata.config)?;
+        let config = serde_json::from_slice(&std::fs::read(args.snapshot.join("config.json"))?)?;
+        let selection = DenseSelection::from_hf(&config)?;
         let owners = whole_mla(cfg, layers, attention);
         let dense = (0..ranks).map(|rank| NativeDenseRecords::new(&args.snapshot, layers, ranks, rank, &owners))
             .collect::<Result<Vec<_>>>()?;

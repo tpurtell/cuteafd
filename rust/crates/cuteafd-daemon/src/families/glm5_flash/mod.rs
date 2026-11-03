@@ -1503,7 +1503,8 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     cuteafd_bench::context::set_family(cfg.family_id());
     native::validate_headers(format, || {
         header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
-        precision::check_projection_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))
+        precision::check_projection_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
+        Ok(())
     })?;
     if let Some(snapshot) = &args.draft {
         let core = if native { Default::default() } else {
