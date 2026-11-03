@@ -148,11 +148,23 @@ mod copy_tests {
                             let tag = format!("{}/world{world}/rank{rank}/{activations:?}/{rows}/{pushed}/{short}", fixture.directory().display());
                             let _owner = memory_ledger::owner(&tag);
                             let audit = AllocationAudit::start();
+                            let upload_bytes = layouts.iter().map(|layout| {
+                                let descriptors = layout.experts * layout.units * 3 * 3 * 8;
+                                descriptors.max(layout.hidden).max(if pushed { layout.resident_bytes } else { 0 })
+                            }).max().unwrap();
+                            let staging_lifetime = Lifetime { first: Phase::Load, last: Phase::DraftLoad };
+                            let staging = planner::Allocation::buffer("test.staging.sync-h2d", Location::PINNED,
+                                upload_bytes as u64, staging_lifetime, Category::Staging, "synchronous loader upload staging");
                             let weights = constructor_weights(device, &layouts, pushed)?;
                             fixture.finish_ordered_uploads(&library)?;
-                            // The library, not the expert, retains the synchronous loader staging.
-                            // End that startup lifetime before counting the expert's retained owners.
-                            assert!(library.release_sync_h2d_staging()? > 0);
+                            // This library owner remains live through weight/execution construction.
+                            let actual_staging = library.sync_h2d_staging_buffer()?;
+                            assert!(!actual_staging.ptr.is_null());
+                            assert_eq!(actual_staging.bytes, upload_bytes);
+                            let actual_staging_allocation = planner::Allocation::buffer("test.staging.sync-h2d", Location::PINNED,
+                                actual_staging.bytes as u64, staging_lifetime, Category::Staging, "synchronous loader upload staging");
+                            let staging_receipt = Receipt { allocation: actual_staging_allocation,
+                                address: actual_staging.ptr as u64 };
                             fixture.record_peer_copies(&library)?;
                             library.cuda_set_device(1 - physical)?;
                             let owner = Exlr8RtxWeights::pushed_rank(device, &programs, layers.clone(), rows,
@@ -161,6 +173,7 @@ mod copy_tests {
                             if short {
                                 assert!(owner.is_err(), "one-byte-short peak must refuse before execution allocation");
                                 assert!(fixture.peer_copy_records(&library)?.is_empty());
+                                assert_eq!(library.release_sync_h2d_staging()?, upload_bytes);
                             } else {
                                 let expert = owner?.execution()?;
                                 assert_eq!(expert.shard(), native_shard(world, rank)?);
@@ -186,6 +199,8 @@ mod copy_tests {
                                     (rows * family.geometry().hidden * 2) as u64, lifetime, Category::Workspace, "EXLR8 stable output");
                                 output.alignment = 256;
                                 allocations.push(output);
+                                allocations.push(staging.clone());
+                                receipts.push(staging_receipt.clone());
                                 let buffer = expert.output.buffer;
                                 let mut actual = planner::Allocation::buffer("test.output", location, buffer.bytes as u64,
                                     lifetime, Category::Workspace, "EXLR8 stable output");
@@ -194,7 +209,10 @@ mod copy_tests {
                                 let facts = Facts { allocations, deferred: vec![], sequential: vec![], allowances: vec![] };
                                 let budgets = vec![Budget { id: "CPU constructor".into(), locations: vec![location],
                                     physical_bytes: capacity as u64, logical_bytes: capacity as u64, headroom: 0,
-                                    baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
+                                    baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } },
+                                    Budget { id: "CPU pinned staging".into(), locations: vec![Location::PINNED],
+                                        physical_bytes: capacity as u64, logical_bytes: capacity as u64, headroom: 0,
+                                        baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
                                 let phases = planner::evaluate(&facts, &budgets)?;
                                 let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
                                         prefill: Pin::Auto, operation: Operation::Serving },
@@ -206,11 +224,22 @@ mod copy_tests {
                                     .map(|receipt| (receipt.address as usize, receipt.allocation.bytes as usize)).collect::<BTreeMap<_, _>>();
                                 let live = memory_ledger::allocations().into_iter().filter(|record| record.key.owner == Some(tag.as_str()))
                                     .map(|record| {
-                                        assert_eq!((record.key.space, record.key.device), (Space::Device, physical));
+                                        if record.address == actual_staging.ptr as usize {
+                                            assert_eq!((record.key.space, record.key.device, record.key.scope),
+                                                (Space::Pinned, -1, "staging/sync-h2d"));
+                                        } else {
+                                            assert_eq!((record.key.space, record.key.device), (Space::Device, physical));
+                                        }
                                         (record.address, record.bytes)
                                     }).collect::<BTreeMap<_, _>>();
                                 assert_eq!(live, owners, "every actual retained owner must have exactly one receipt");
-                                assert_eq!(owners.len(), usize::from(!pushed) + 1 + expert.executions.len() + 1);
+                                assert_eq!(owners.len(), usize::from(!pushed) + 1 + expert.executions.len() + 2);
+                                // Match the production post-load/pre-prime release, after construction.
+                                assert_eq!(library.release_sync_h2d_staging()?, upload_bytes);
+                                assert!(library.sync_h2d_staging_buffer()?.ptr.is_null());
+                                let resident_receipts = receipts.iter().filter(|receipt|
+                                    receipt.allocation.location != Location::PINNED).cloned().collect::<Vec<_>>();
+                                planner::reconcile(&plan, Phase::Warmup, &resident_receipts)?;
                                 for execution in expert.executions.iter() {
                                     assert_ne!(execution.allocation_buffer().ptr, buffer.ptr);
                                     assert_ne!(execution.output()?.ptr, buffer.ptr);
