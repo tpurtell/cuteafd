@@ -371,7 +371,74 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.status = verdict.status();
     check.summary = verdict.summary();
     cache_continuation(run, check, minimum)?;
+    if !matches!(run.client.configuration.speculative_acceptance, cuteafd_core::SpeculativeAcceptance::Exact) {
+        relaxed_cache_prefix(run, check, minimum)?;
+    }
     Ok(())
+}
+
+/// A relaxed turn may emit tokens an independent exact continuation never would.
+/// Restore that turn's actual frontier, then recompute precisely those input IDs
+/// with speculation disabled; never compare two independently generated answers.
+fn relaxed_cache_prefix(run: &mut Run<'_>, check: &mut Check, minimum: usize) -> Result<()> {
+    let client = run.client;
+    let (_, text) = cache_prompts();
+    let source = probed(client, plain(client, &text, TURN_TOKENS as u64), ProbeSpec {
+        record_rows: TURN_TOKENS, top_k: 1, record_state: true, pair_exempt: true,
+        ..ProbeSpec::default() })?;
+    if !honoured(&source) { unsupported(check); return Ok(()); }
+    if !cache_coverage(check, "relaxed source", source.prompt_ids.len(), minimum) { return Ok(()); }
+    let ids = emitted_cache_prefix(&source)?;
+    let spec = |cold| ProbeSpec { prompt_ids: Some(ids.clone()), cold, no_speculation: true,
+        record_rows: 1, top_k: 1, record_state: true, output_dependent: true, pair_exempt: true,
+        ..ProbeSpec::default() };
+    let restored = probed(client, plain(client, "restore relaxed emitted prefix", 1), spec(false))?;
+    let cold = probed(client, plain(client, "recompute relaxed emitted prefix", 1), spec(true))?;
+    let (status, evidence) = relaxed_prefix_verdict(&source, &restored, &cold)?;
+    check.set("relaxed_emitted_prefix", evidence);
+    if status == CheckStatus::Fail || (status == CheckStatus::Info && check.status == CheckStatus::Pass) {
+        check.status = status;
+    }
+    check.summary.push_str(match status {
+        CheckStatus::Pass => " · relaxed emitted prefix: exact restore",
+        CheckStatus::Fail => " · relaxed emitted prefix: CACHE MISMATCH",
+        _ => " · relaxed emitted prefix: restore coverage incomplete",
+    });
+    Ok(())
+}
+
+fn emitted_cache_prefix(source: &ProbeRecord) -> Result<Vec<u32>> {
+    anyhow::ensure!(source.generated.len() >= 2, "relaxed cache source emitted fewer than two tokens");
+    let mut ids = source.prompt_ids.clone();
+    // The last emitted token has not yet been consumed into the turn snapshot.
+    ids.extend_from_slice(&source.generated[..source.generated.len() - 1]);
+    Ok(ids)
+}
+
+fn relaxed_prefix_verdict(source: &ProbeRecord, restored: &ProbeRecord, cold: &ProbeRecord)
+    -> Result<(CheckStatus, Value)> {
+    let ids = emitted_cache_prefix(source)?;
+    anyhow::ensure!(restored.prompt_ids == ids && cold.prompt_ids == ids,
+        "relaxed cache restore/recompute must use the same emitted-token prefix");
+    anyhow::ensure!(restored.no_speculation && cold.no_speculation && cold.cold && cold.cached_tokens == 0,
+        "relaxed cache comparison requires a no-spec restore and cold recompute");
+    let at = ids.len();
+    let retained = source.rows.iter().find(|row| row.position == at);
+    let warm = restored.rows.iter().find(|row| row.position == at);
+    let recomputed = cold.rows.iter().find(|row| row.position == at);
+    let row_exact = retained.zip(warm).map(|(a, b)| a.hash == b.hash);
+    let cold_exact = warm.zip(recomputed).map(|(a, b)| a.hash == b.hash);
+    let state = source.states.iter().find(|state| state.kind == "turn" && state.end == at)
+        .zip(restored.states.iter().find(|state| state.kind == "restore" && state.end == at));
+    let state_exact = state.map(|(a, b)| a.bytes == b.bytes && a.sha256 == b.sha256);
+    let hit = restored.cached_tokens == at;
+    let status = if hit && (row_exact == Some(false) || state_exact == Some(false)) { CheckStatus::Fail }
+        else if hit && row_exact == Some(true) { CheckStatus::Pass }
+        else { CheckStatus::Info };
+    Ok((status, json!({"source_generated": source.generated, "prompt_ids": ids,
+        "cached_tokens": restored.cached_tokens, "rows_identical": row_exact, "state_identical": state_exact,
+        "cold_rows_identical": cold_exact,
+        "cold_note": "identical emitted input IDs; prefill rounding differences are informational"})))
 }
 
 /// Exercise a short fresh prefill immediately after a multi-unit prompt. Whole
@@ -1183,6 +1250,30 @@ mod tests {
         let again = record(52, 52, again_rows, &[6, 9]);
         let cold = record(50, 0, &[(50, cold_row)], &[4]);
         Restores::judge(&first, &restored, &turn, &reference, &again, &cold)
+    }
+
+    #[test]
+    fn relaxed_cache_uses_its_emitted_prefix_not_an_independent_exact_answer() {
+        let source = record(3, 0, &[(5, "source-frontier")], &[41, 99, 17]);
+        assert_eq!(emitted_cache_prefix(&source).unwrap(), vec![1, 1, 1, 41, 99]);
+        let mut restored = record(5, 5, &[(5, "source-frontier")], &[17]);
+        restored.prompt_ids = emitted_cache_prefix(&source).unwrap();
+        restored.no_speculation = true;
+        let mut cold = restored.clone();
+        cold.cached_tokens = 0;
+        cold.cold = true;
+        // Cold prefill can round differently, but is fed the same actual relaxed IDs.
+        cold.rows[0].hash = "cold-rounding".into();
+        let (status, evidence) = relaxed_prefix_verdict(&source, &restored, &cold).unwrap();
+        assert_eq!(status, CheckStatus::Pass);
+        assert_eq!(evidence["cold_rows_identical"], false);
+        cold.prompt_ids[4] = 7; // An independent exact arm's different token is not comparable.
+        assert!(relaxed_prefix_verdict(&source, &restored, &cold).is_err());
+        cold.prompt_ids = restored.prompt_ids.clone();
+        restored.rows[0].hash = "corrupt-restore".into();
+        assert_eq!(relaxed_prefix_verdict(&source, &restored, &cold).unwrap().0, CheckStatus::Fail);
+        restored.cached_tokens = 0;
+        assert_eq!(relaxed_prefix_verdict(&source, &restored, &cold).unwrap().0, CheckStatus::Info);
     }
 
     const REFERENCE: [(usize, &str); 4] = [(50, "t0"), (51, "t1"), (52, "t2"), (53, "t3")];
