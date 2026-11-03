@@ -479,6 +479,13 @@ pub(crate) enum Experts<'a> {
     Skip,
 }
 
+fn native_local_layers(experts: &dyn RtxExpertLayer, device: i32) -> Result<Vec<usize>> {
+    ensure!(experts.shard() == crate::shared::experts::rtx::RtxShard::Whole
+        && experts.partial() == PartialDtype::Bf16 && experts.uses_fp8_input()
+        && experts.device() == device, "native whole expert binding differs from engine");
+    Ok(experts.layers().to_vec())
+}
+
 /// Per-program GPU times (CUTEAFD_GLMF_PROFILE_OPS=1): timing events around
 /// every launch, read back by [`GlmfEngine::op_profile`].
 #[derive(Default)]
@@ -2211,10 +2218,7 @@ impl<'a> GlmfEngine<'a> {
             }
             Experts::LocalNative(local) => {
                 let local = local.borrow();
-                ensure!(local.shard() == crate::shared::experts::rtx::RtxShard::Whole
-                    && local.partial() == PartialDtype::Bf16 && local.uses_fp8_input()
-                    && local.device() == self.device, "native whole expert binding differs from engine");
-                local.layers().to_vec()
+                native_local_layers(local.as_ref(), self.device)?
             }
             _ => anyhow::bail!("local expert backend required"),
         };
@@ -2279,8 +2283,20 @@ impl<'a> GlmfEngine<'a> {
             for (rank, (layers, caches)) in ranks.iter().enumerate() {
                 let layer = &layers[index];
                 ensure!(layer.attention_share == shares[rank], "attention share differs from admission at layer {index} rank {rank}");
+                let checkpoint_native = native::is_native(layer);
+                if checkpoint_native {
+                    let projections: &[&str] = match layer.attention {
+                        GlmNextAttention::Kda => &["q", "k", "v", "o", "beta", "f_a", "f_b", "g_a", "g_b"],
+                        GlmNextAttention::Mla => &["q_a", "kv_a", "q_b", "o", "index_q", "index_k"],
+                    };
+                    ensure!(projections.iter().all(|name| layer.native_projections.contains_key(name))
+                        && shares[rank].present(), "native attention projections differ from admission at layer {index} rank {rank}");
+                }
                 let native = layer.core.contains_key("self_attn.o_proj");
                 let operands: &[&str] = match layer.attention {
+                    GlmNextAttention::Mla if checkpoint_native => &["q_a_norm", "kv_a_norm", "w_uk_fp8", "w_uk_scale",
+                        "w_uv_fp8", "w_uv_scale", "k_norm_w", "k_norm_b", "ape", "index_gate"],
+                    GlmNextAttention::Kda if checkpoint_native => &["conv_w", "a_log", "dt_bias", "o_norm"],
                     GlmNextAttention::Mla if native => &["q_a_norm", "kv_a_norm", "w_uk", "w_uv", "w_iq", "w_ik",
                         "k_norm_w", "k_norm_b", "ape"],
                     GlmNextAttention::Mla => &["q_a_norm", "kv_a_norm", "w_uk", "w_uv", "w_qkv_a_fp8",
@@ -2311,7 +2327,7 @@ impl<'a> GlmfEngine<'a> {
                         else if layer.has("w_in_fp8") {
                             &["w_in_fp8", "w_in_kscale", "w_o_fp8", "w_o_kscale"]
                         } else { &["w_in", "w_o"] };
-                        ensure!(projections.iter().all(|name| layer.has(name)),
+                        ensure!(checkpoint_native || projections.iter().all(|name| layer.has(name)),
                             "KDA projections missing at layer {index} rank {rank}");
                         ensure!(shares[rank].present() && caches.kda_heads > 0, "KDA state missing on rank {rank}");
                         kv.push(rank as u8);
@@ -5207,8 +5223,8 @@ impl<'a> GlmfEngine<'a> {
                 shared()?;
                 let mut experts = local.borrow_mut();
                 let routes = Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr };
-                // SAFETY: the shared owner and operands live through the engine stream;
-                // enqueue drains partial submissions before returning an error.
+                // SAFETY: operands and owner outlive this serialized stream. Whole
+                // execution has no peer wait to abort; its completion owner drains on drop.
                 unsafe { experts.enqueue(index, t, ExpertInput::Fp8K32(w.wire.buffer.ptr), routes,
                     self.stream, &mut || {})?; }
                 return self.run("add", &[("a", experts.output()), ("b", w.shared.buffer.ptr),
@@ -5428,6 +5444,31 @@ mod warm_exchange_tests;
 #[cfg(test)]
 mod tp2_tests {
     use super::*;
+    #[test]
+    fn native_whole_binding_checks_independent_wire_and_partial_types() {
+        use crate::shared::experts::rtx::RtxShard;
+        struct Rank { shard: RtxShard, partial: PartialDtype, fp8: bool, device: i32 }
+        impl RtxExpertLayer for Rank {
+            fn shard(&self) -> RtxShard { self.shard }
+            fn partial(&self) -> PartialDtype { self.partial }
+            fn uses_fp8_input(&self) -> bool { self.fp8 }
+            fn layers(&self) -> &[usize] { &[3, 7] }
+            fn device(&self) -> i32 { self.device }
+            fn workspace_bytes(&self) -> usize { 0 }
+            fn output(&self) -> *mut c_void { std::ptr::null_mut() }
+            unsafe fn enqueue(&mut self, _: usize, _: usize, _: ExpertInput, _: Routes,
+                _: *mut c_void, _: &mut dyn FnMut()) -> Result<()> { unreachable!() }
+        }
+        let valid = || Rank { shard: RtxShard::Whole, partial: PartialDtype::Bf16, fp8: true, device: 4 };
+        assert_eq!(native_local_layers(&valid(), 4).unwrap(), [3, 7]);
+        let mut wrong = valid(); wrong.shard = RtxShard::Tp2 { rank: 0 };
+        assert!(native_local_layers(&wrong, 4).is_err());
+        let mut wrong = valid(); wrong.partial = PartialDtype::F32;
+        assert!(native_local_layers(&wrong, 4).is_err());
+        let mut wrong = valid(); wrong.fp8 = false;
+        assert!(native_local_layers(&wrong, 4).is_err());
+        assert!(native_local_layers(&valid(), 0).is_err());
+    }
     #[test]
     fn kda_only_owner_has_no_compact_index_storage() {
         for index in [IndexCache::Keys, IndexCache::Compact] {

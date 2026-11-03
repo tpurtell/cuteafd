@@ -2356,8 +2356,8 @@ impl Opened {
             engine.bind_native(&manifest, &native.charges, shared)?;
         } else {
             engine.bind_core(self.core_admission(args, layers, 1 + usize::from(split_device.is_some()), attention)?)?;
-            engine.validate_attention_homes(&execution)?;
         }
+        engine.validate_attention_homes(&execution)?;
         if attention.mode == cuteafd_loader::placement::AttentionPlacement::Layers {
             engine.bind_layer_execution(execution)?;
         }
