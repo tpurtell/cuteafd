@@ -2463,6 +2463,90 @@ mod tests {
         assert!(attention_owners(&cfg, 0).is_err());
     }
 
+    /// Hold the issue's final non-graph ledger fixed so a solver comparison
+    /// isolates the lost ceiling, not weight/arena changes in the live cutover.
+    fn assert_shared_owned_graph_fixed_census(
+        inputs: &GlmInputs<'_>, placed: &Placement, legacy: &PlacementRequest,
+        terms: &[(u64, u64)],
+    ) {
+        use super::admission::{Case, GlmRecipe, OwnedGraphs};
+        use crate::placement::planner::{self, Allocation, Allowance, Baseline, Budget,
+            ByteCurve, Component, ComponentKind, EmbeddingHome, Lifetime, Location,
+            Operation, Pin, PrefillShape, Recipe, Refusal, Request};
+
+        let maximum_pages = legacy.pool.target / PAGE_ROWS;
+        let context = placed.pool_tokens - 256;
+        let attention: Vec<_> = placed.layers.iter().map(|layer| layer.mode).collect();
+        let owners: Vec<_> = attention.iter().map(|mode| match mode {
+            LayerMode::Whole { gpu, .. } => *gpu, _ => unreachable!(),
+        }).collect();
+        let tp2 = vec![false; inputs.layers];
+        let shape = PrefillShape { rows: inputs.prefill_rows, waves: inputs.prefill_lanes };
+        let mut components = Vec::new();
+        let mut budgets = Vec::new();
+        for (rank, &(available, unit)) in terms.iter().enumerate() {
+            let gpu = legacy.inventory.gpus[rank];
+            let crate::placement::Baseline::Planned { context_bytes, loaded_bytes } = gpu.baseline else {
+                unreachable!("the issue reproducer uses a forecast baseline")
+            };
+            budgets.push(Budget { id: format!("issue1120.gpu.{rank}"),
+                locations: vec![Location::coordinator(rank as u8)],
+                physical_bytes: gpu.capacity_bytes, logical_bytes: gpu.capacity_bytes,
+                headroom: gpu.headroom_bytes,
+                baseline: Baseline::Forecast { occupied: context_bytes + loaded_bytes,
+                    source: "issue #1120 two 32 GiB fixture".into(), assumed: true } });
+            components.push(Component { activation: planner::Activation::always(),
+                bytes: ByteCurve::fixed(gpu.available() - available, maximum_pages),
+                kind: ComponentKind::Allowance(Allowance {
+                    location: Location::coordinator(rank as u8), bytes: gpu.available() - available,
+                    lifetime: Lifetime::RESIDENT, assumed: true,
+                    source: "issue #1120 unchanged final non-graph fixture ledger".into() }) });
+            components.push(Component::allocation(Allocation::buffer(
+                format!("issue1120.gpu.{rank}.records"), Location::coordinator(rank as u8),
+                unit, Lifetime::TARGET, Category::Kv, "issue #1120 records and page tables"),
+                ByteCurve::linear(unit, unit, maximum_pages), false, maximum_pages));
+        }
+        let recipe = |context| GlmRecipe {
+            cfg: inputs.cfg, context, page_tokens: PAGE_ROWS, maximum_pages,
+            attention: attention.clone(), gpus: 2, prefill: vec![shape],
+            lanes: vec![inputs.prefill_lanes], embedding: vec![EmbeddingHome::Device(0)],
+            experts: None, targets: vec![], hooks: vec![], exchanges: vec![], weights: vec![],
+            graphs: vec![Case { when: vec![], value: OwnedGraphs::new(context, &owners, &tp2).unwrap() }],
+            owners: vec![Case { when: vec![], value: components.clone() }],
+        };
+        let mut request = Request { context: inputs.max_context, pool: Pin::Auto,
+            onboard: Pin::Exact(0), prefill: Pin::Exact(shape), operation: Operation::Serving };
+        assert!(matches!(planner::solve(request.clone(), budgets.clone(), &recipe(inputs.max_context)),
+            Err(Refusal::Capacity { .. })), "the unchanged 1M request must not silently clamp");
+
+        request.context = context;
+        let recipe = recipe(context);
+        let graphs = recipe.graphs[0].value.startup();
+        let expected = terms.iter().enumerate().map(|(rank, &(available, unit))|
+            (available - graphs.inventory.bytes(rank)) / unit)
+            .min().unwrap().min(maximum_pages) * PAGE_ROWS;
+        assert!(expected > placed.pool_tokens);
+        let plan = planner::solve(request.clone(), budgets.clone(), &recipe).unwrap();
+        assert_eq!(plan.pool_tokens, expected);
+        assert_eq!(plan.request.context, context);
+        assert_eq!(plan.decisions.lanes, 2);
+        assert_eq!(plan.decisions.attention, attention);
+        assert_eq!(recipe.prepare(&request).unwrap().maximum_pages, maximum_pages);
+        for pages in [context.div_ceil(PAGE_ROWS), expected / PAGE_ROWS, maximum_pages] {
+            let census = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
+                context as usize, pages as usize, &owners, &tp2).unwrap();
+            assert_eq!(&census, graphs, "admissible pools have a fixed graph census");
+        }
+        request.pool = Pin::Exact(expected);
+        assert_eq!(planner::solve(request.clone(), budgets.clone(), &recipe).unwrap().pool_tokens, expected);
+        request.pool = Pin::Exact(expected + PAGE_ROWS);
+        assert!(matches!(planner::solve(request.clone(), budgets.clone(), &recipe), Err(Refusal::Capacity { .. })));
+        request.pool = Pin::Exact(context - PAGE_ROWS);
+        assert!(matches!(planner::solve(request, budgets, &recipe), Err(Refusal::PoolBelowContext { .. })));
+        eprintln!("#1120 two 32 GiB GPUs, owned, two lanes, unchanged final fixture ledger: default context {} refuses; explicit context {}; legacy pool {} -> shared/fixed-census maximum {} (+{} tokens)",
+            inputs.max_context, context, placed.pool_tokens, expected, expected - placed.pool_tokens);
+    }
+
     #[test]
     fn owned_graphs_use_the_runtime_clamped_context_at_small_pools() {
         let cfg = config();
@@ -2516,6 +2600,7 @@ mod tests {
                 assert!(first.keys.len() > final_graphs.keys.len());
                 assert!(fit(Some(&final_graphs.inventory)) > placed.pool_tokens);
                 assert!((1 << 16..1 << 17).contains(&placed.pool_tokens));
+                assert_shared_owned_graph_fixed_census(&i, &placed, &req, &terms);
             }
             let context = crate::serving_capacity::pool_context(i.max_context as usize,
                 i.automatic_context, placed.pool_tokens as usize, 256).unwrap();
