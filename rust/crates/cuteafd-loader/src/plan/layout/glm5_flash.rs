@@ -232,7 +232,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             decode_rows as usize, index, manifest.context("native Flash requires PROGRAMS.json")?)).transpose()?;
         if let Some(charge) = &native_charge {
             for profile in [&mut workspace, &mut local_workspace] {
-                for (rank, bytes) in charge.bytes(cfg.hidden)?.into_iter().enumerate() {
+                for (rank, bytes) in charge.bytes()?.into_iter().enumerate() {
                     profile.push(glmf::GlmfBufferDemand::new(glmf::GlmfComponent::Always, rank as u8,
                         Category::Workspace, "native EXLR8 core/shared expert", bytes, Basis::Exact));
                 }

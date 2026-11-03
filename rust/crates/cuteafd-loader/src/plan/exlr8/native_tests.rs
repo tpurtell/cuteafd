@@ -34,11 +34,12 @@ fn flash_native_stages_charge_separate_projected_inputs_once() -> Result<()> {
     let linear = LinearScratchLayout { rotated: 256, table: 256, block_scales: 256, partial: 256, records: None, acc: 256 };
     let stage = FlashStageLayout::new(&cfg, 64, 2, true, 128, 4096)?;
     let rank = FlashRankLayout { linear: [linear.clone(), linear.clone()], stages: [stage.clone(), stage.clone()],
-        retained_rows: 64 + 3 * 4096, receive_suffix: 4 * 3 * 4096 * cfg.hidden * 2, shared_workspace: 12345 };
-    assert_eq!(rank.bytes(cfg.hidden)?, 12345 + (2 * linear.bytes()? + 2 * stage.bytes()?
-        + rank.retained_rows * cfg.hidden * 8 + rank.receive_suffix) as u64);
-    let mut overflow = rank; overflow.retained_rows = usize::MAX;
-    assert!(overflow.bytes(cfg.hidden).is_err());
+        shared_workspace: 12345 };
+    assert_eq!(rank.bytes()?, 12345 + (2 * linear.bytes()? + 2 * stage.bytes()?) as u64);
+    let charges = FlashCharges { ranks: vec![rank.clone(), rank.clone()], programs: BTreeSet::new() };
+    assert_eq!(charges.bytes()?, vec![rank.bytes()?; 2]);
+    let mut overflow = rank; overflow.shared_workspace = u64::MAX;
+    assert!(overflow.bytes().is_err());
     Ok(())
 }
 

@@ -93,17 +93,16 @@ impl FlashStageLayout {
 pub struct FlashRankLayout {
     pub linear: [LinearScratchLayout; 2],
     pub stages: [FlashStageLayout; 2],
-    pub retained_rows: usize,
-    pub receive_suffix: usize,
     pub shared_workspace: u64,
 }
 impl FlashRankLayout {
-    pub fn bytes(&self, hidden: usize) -> Result<u64> {
+    pub fn bytes(&self) -> Result<u64> {
         let mut bytes = self.shared_workspace;
         for layout in &self.linear { bytes = bytes.checked_add(layout.bytes()? as u64).context("native Flash linear total")?; }
         for layout in &self.stages { bytes = bytes.checked_add(layout.bytes()? as u64).context("native Flash stage total")?; }
-        let retained = self.retained_rows.checked_mul(hidden).and_then(|n| n.checked_mul(8)).context("native Flash retained overflow")?;
-        bytes.checked_add(retained as u64).and_then(|n| n.checked_add(self.receive_suffix as u64)).context("native Flash workspace total")
+        // NativePrograms transforms/narrows each rank before the ordinary BF16
+        // exchange; K6's retained core rows and receive suffix are not used.
+        Ok(bytes)
     }
 }
 
@@ -151,8 +150,6 @@ impl FlashCharges {
             }
         }
         let shared = super::shared_workspace(manifest, KernelFamily::GlmFlash)?;
-        let retained_rows = rows.checked_mul(waves).and_then(|n| n.checked_add(decode)).context("native Flash retained rows")?;
-        let receive = crate::families::glm5_flash::core_admission::receive_suffix_bytes(rows.max(decode), cfg.hidden, waves, false)?;
         let mut layouts = Vec::new();
         for plan in &plans {
             programs.extend(super::dense::programs::select_manifest(manifest, &facts.selection, &backbone, cfg.layers, plan, false)?);
@@ -161,12 +158,12 @@ impl FlashCharges {
                     LinearScratchLayout::from_manifest(manifest, &facts.selection, &backbone, cfg.layers, plan, rows, false)?],
                 stages: [FlashStageLayout::new(cfg, decode, ranks, owned, auxiliary_width, stage_scratch[0])?,
                     FlashStageLayout::new(cfg, rows, ranks, owned, auxiliary_width, stage_scratch[1])?],
-                retained_rows, receive_suffix: if ranks == 2 { receive } else { 0 }, shared_workspace: shared,
+                shared_workspace: shared,
             });
         }
         Ok(Self { ranks: layouts, programs })
     }
-    pub fn bytes(&self, hidden: usize) -> Result<Vec<u64>> { self.ranks.iter().map(|r| r.bytes(hidden)).collect() }
+    pub fn bytes(&self) -> Result<Vec<u64>> { self.ranks.iter().map(FlashRankLayout::bytes).collect() }
 }
 
 fn flash_index_stage(manifest: &Value, prefix: &str, capacity: usize,
