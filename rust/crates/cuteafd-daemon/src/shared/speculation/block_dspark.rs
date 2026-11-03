@@ -1379,8 +1379,11 @@ mod tests {
                     let layout = BlockDraftLayout::read(&snapshot, 2, 2, context, 512, 1,
                         representation, 2, kv_cache)?;
                     library.reserve_sync_h2d_staging(layout.sync_upload_bytes)?;
+                    let programs = fixture.draft_projection_programs(&library,
+                        &[(h * cfg.taps.len(), h), (h, cfg.qkv_width()), (h, 2 * kv),
+                            (cfg.q_width(), h), (h, 2 * inter), (inter, h)], TAP_ROWS)?;
                     let audit = AllocationAudit::start();
-                    let draft = DsparkDrafter::load_paged(&library, &snapshot,
+                    let draft = DsparkDrafter::load_paged(&library, &programs, &snapshot,
                         prefetch(&snapshot).join().map_err(|_| anyhow::anyhow!("fixture prefetch panicked"))??,
                         std::ptr::null_mut(), 2, 2, vec![0; h * 2], representation,
                         fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a8, context, 512, kv_cache)?;

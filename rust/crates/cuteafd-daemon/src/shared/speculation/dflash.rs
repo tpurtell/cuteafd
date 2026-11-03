@@ -3751,8 +3751,13 @@ mod checkpoint_header_tests {
                         decisions: Decisions { attention: vec![], onboard_layers: vec![vec![]],
                             expert_homes: Default::default(), embedding: None, prefill, lanes: 1 },
                         pool_tokens: 64, phases: planner::evaluate(&facts, &budgets)?, facts, budgets };
+                    let h = cfg.hidden;
+                    let programs = fixture.draft_projection_programs(&library,
+                        &[(h, 2 * cfg.intermediate), (cfg.intermediate, h),
+                            (h * cfg.taps.len(), h), (h, cfg.conv_width()), (h, cfg.rank),
+                            (h, cfg.qkv_width()), (h, 2 * cfg.kv_width()), (cfg.heads * cfg.head_dim, h)], TAP_ROWS)?;
                     let audit = AllocationAudit::start();
-                    let draft = DflashDrafter::load(&library, &snapshot, std::fs::read(snapshot.join("model.safetensors"))?,
+                    let draft = DflashDrafter::load(&library, &programs, &snapshot, std::fs::read(snapshot.join("model.safetensors"))?,
                         std::ptr::null_mut(), 2, 2, vec![0; 256], false, representation,
                         fp8_linear::Fp8Scales::Amax, arithmetic, cache)?;
                     let mut events = draft.gqa_allocation_events(&audit.events(), Phase::Load)?;

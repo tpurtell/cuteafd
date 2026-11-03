@@ -1583,7 +1583,29 @@ mod mounted_tests {
             let uncached = plan(true);
             assert_eq!(cached.memory_layout, uncached.memory_layout, "{name}");
             assert_eq!(cached.bytes_by_owner, uncached.bytes_by_owner, "{name}");
-            assert_eq!(serde_json::to_value(&cached.memory_layout).unwrap(), saved["memory_layout"], "{name}");
+            // Historical evidence predates #1141: normalize only its reviewed raw intake owners.
+            let mut expected = saved["memory_layout"].clone();
+            let ranks = if gpus == 2 { 6 } else { 4 };
+            let old_bytes = if gpus == 2 { 613_416_960 } else { 408_944_640 };
+            let intake = |rows| cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * 6144 * 2).unwrap();
+            let new_bytes = ranks * (intake(64) + intake(3 * 2752));
+            assert_eq!(new_bytes - old_bytes, if gpus == 2 { 49_152 } else { 32_768 });
+            let mut changed = 0;
+            for device in expected["devices"].as_array_mut().unwrap() {
+                let rtx0 = device["kind"] == "rtx" && device["index"] == 0;
+                for item in device["items"].as_array_mut().unwrap() {
+                    if item["group"] != "Spark intake planes" { continue; }
+                    assert!(rtx0);
+                    assert_eq!(item["category"], "transport");
+                    assert_eq!(item["basis"], "formula");
+                    assert_eq!(item["lifetime"], "ready_resident");
+                    assert_eq!(item["bytes"], old_bytes);
+                    item["bytes"] = new_bytes.into();
+                    changed += 1;
+                }
+            }
+            assert_eq!(changed, 1);
+            assert_eq!(serde_json::to_value(&cached.memory_layout).unwrap(), expected, "{name}");
             assert_eq!(serde_json::to_value(&cached.bytes_by_owner).unwrap(), saved["bytes_by_owner"], "{name}");
         }
     }
