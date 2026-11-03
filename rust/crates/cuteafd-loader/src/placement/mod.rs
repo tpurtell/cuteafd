@@ -27,7 +27,7 @@ pub mod attention;
 mod residual;
 mod solve;
 mod spark;
-pub use spark::{ComponentDemand, SparkAssignment, SparkBudgetInventory, SparkIoBytes, SparkResidentLayout, SparkRingGeometry, SparkWorkingSet, WorkingSetComponent};
+pub use spark::{ComponentDemand, SparkAssignment, SparkBudgetInventory, SparkIntakeMode, SparkIntakeOwners, SparkIoBytes, SparkResidentLayout, SparkRingGeometry, SparkWorkingSet, WorkingSetComponent};
 #[cfg(test)]
 mod tests;
 

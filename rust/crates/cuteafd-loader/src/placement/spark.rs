@@ -2,6 +2,65 @@
 use super::{Demand, PlacementError};
 use cuteafd_core::ExpertGeometry;
 
+/// Selected receive mode is a physical fact; this recipe never runs the probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparkIntakeMode { Gpu, Pinned, Host }
+
+/// Raw intake storage only. Worker arenas, endpoint rings, native code and
+/// stream/event overhead must be composed independently before family Ready.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkIntakeOwners {
+    pub gpu: u8,
+    pub ranks: usize,
+    pub rows: u64,
+    pub row_bytes: u64,
+    pub waves: usize,
+    pub mode: SparkIntakeMode,
+}
+
+impl SparkIntakeOwners {
+    pub fn allocations(self, prefix: &str, lifetime: super::planner::Lifetime)
+        -> Result<Vec<super::planner::Allocation>, super::planner::Refusal> {
+        use super::planner::{Allocation, Location, Refusal};
+        use cuteafd_core::memory_layout::Category;
+        if prefix.is_empty() || self.gpu > 1 || !(1..=8).contains(&self.ranks)
+            || !(1..=4).contains(&self.waves) || self.rows == 0 || self.row_bytes == 0 {
+            return Err(Refusal::InvalidFact("invalid Spark intake owner geometry".into()));
+        }
+        let plane = self.rows.checked_mul(self.row_bytes)
+            .ok_or(Refusal::Overflow("Spark intake plane"))?;
+        let logical = plane.checked_mul(self.waves as u64)
+            .ok_or(Refusal::Overflow("Spark intake reserve"))?;
+        let raw = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(logical.max(256))
+            .map_err(|e| Refusal::InvalidFact(e.to_string()))?;
+        let mut owners = (0..self.ranks).map(|rank| Allocation::buffer(
+            format!("{prefix}.rank.{rank}.storage"), Location::coordinator(self.gpu), raw,
+            lifetime, Category::Transport, "Spark intake")).collect::<Vec<_>>();
+        if self.mode != SparkIntakeMode::Gpu {
+            let whole = plane.checked_mul(self.ranks as u64)
+                .ok_or(Refusal::Overflow("Spark intake pinned staging"))?;
+            let bytes = if self.mode == SparkIntakeMode::Pinned {
+                whole.min(cuteafd_core::serving_capacity::SPARK_INTAKE_SMALL_WAVE_BYTES).max(256)
+            } else { whole };
+            owners.push(Allocation::buffer(format!("{prefix}.staging"), Location::PINNED,
+                bytes, lifetime, Category::Staging, "Spark intake"));
+        }
+        Ok(owners)
+    }
+
+    pub fn components(self, prefix: &str, lifetime: super::planner::Lifetime, maximum_pages: u64)
+        -> Result<Vec<super::planner::Component>, super::planner::Refusal> {
+        use super::planner::{ByteCurve, Component, Refusal};
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("Spark intake requires a positive pool domain".into()));
+        }
+        Ok(self.allocations(prefix, lifetime)?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }).collect())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkingSetComponent { Always, RtxExperts, SparkExperts }
 
@@ -388,6 +447,46 @@ pub struct SparkIoBytes {
 mod tests {
     use super::*;
     use cuteafd_core::memory_layout::{Basis, Category};
+
+    #[test]
+    fn intake_owner_geometry_charges_raw_padding_and_one_shared_staging_owner() {
+        use super::super::planner::{Lifetime, Location};
+        let base = SparkIntakeOwners { gpu: 1, ranks: 6, rows: 2752,
+            row_bytes: 6144 * 2, waves: 3, mode: SparkIntakeMode::Gpu };
+        for mode in [SparkIntakeMode::Gpu, SparkIntakeMode::Pinned, SparkIntakeMode::Host] {
+            let spec = SparkIntakeOwners { mode, ..base };
+            let owners = spec.allocations("prefill", Lifetime::TARGET).unwrap();
+            assert_eq!(owners.len(), if mode == SparkIntakeMode::Gpu { 6 } else { 7 });
+            let logical = 3 * 2752 * 6144 * 2;
+            let raw = (logical + 4095) / 4096 * 4096 + 4096;
+            for (rank, owner) in owners[..6].iter().enumerate() {
+                assert_eq!(owner.id, format!("prefill.rank.{rank}.storage"));
+                assert_eq!(owner.location, Location::coordinator(1));
+                assert_eq!(owner.bytes, raw);
+                assert!(owner.view.is_none());
+            }
+            if mode != SparkIntakeMode::Gpu {
+                assert_eq!(owners[6].location, Location::PINNED);
+                assert_eq!(owners[6].bytes, if mode == SparkIntakeMode::Pinned { 1 << 20 }
+                    else { 6 * 2752 * 6144 * 2 });
+            }
+            assert_eq!(spec.components("prefill", Lifetime::TARGET, 16).unwrap().len(), owners.len());
+        }
+        for spec in [SparkIntakeOwners {gpu: 2, ..base}, SparkIntakeOwners {ranks: 0, ..base},
+            SparkIntakeOwners {ranks: 9, ..base}, SparkIntakeOwners {rows: 0, ..base},
+            SparkIntakeOwners {row_bytes: 0, ..base}, SparkIntakeOwners {waves: 0, ..base},
+            SparkIntakeOwners {waves: 5, ..base}, SparkIntakeOwners {rows: u64::MAX, ..base}] {
+            assert!(spec.allocations("prefill", Lifetime::TARGET).is_err());
+        }
+        assert!(base.allocations("", Lifetime::TARGET).is_err());
+        assert!(base.components("prefill", Lifetime::TARGET, 0).is_err());
+        let tiny = SparkIntakeOwners {ranks: 1, rows: 1, row_bytes: 1, waves: 1,
+            mode: SparkIntakeMode::Pinned, ..base};
+        let owners = tiny.allocations("tiny", Lifetime::TARGET).unwrap();
+        assert_eq!((owners[0].bytes, owners[1].bytes), (8192, 256));
+        let host = SparkIntakeOwners {mode: SparkIntakeMode::Host, ..tiny};
+        assert_eq!(host.allocations("tiny", Lifetime::TARGET).unwrap()[1].bytes, 1);
+    }
 
     #[test]
     fn header_assignment_uses_installed_native_width_and_rejects_missing_headers() {

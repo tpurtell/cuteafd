@@ -45,7 +45,7 @@ pub(crate) const MAX_INTAKE_RANKS: usize = 8;
 
 /// Waves up to this many partial bytes (all ranks) are small: pinned mode
 /// stages them, and uploads that remain go on the compute stream.
-const SMALL_WAVE_BYTES: usize = 1 << 20;
+const SMALL_WAVE_BYTES: usize = cuteafd_core::serving_capacity::SPARK_INTAKE_SMALL_WAVE_BYTES as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -551,6 +551,53 @@ impl<'a> SparkIntake<'a> {
     pub(crate) fn ranks(&self) -> usize { self.ranks }
     pub(crate) fn copy_stream(&self) -> *mut c_void { self.copy_stream }
     pub(crate) fn landed_event(&self, slot: usize) -> *mut c_void { self.landed[slot] }
+    /// Raw retained owners only; endpoint rings and exchange-worker storage are separate.
+    pub(crate) fn allocation_receipts(&self, prefix: &str,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+        lifetime: cuteafd_loader::placement::planner::Lifetime,
+    ) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Location, Receipt};
+        ensure!(!prefix.is_empty() && (1..=8).contains(&self.ranks)
+            && self.planes.len() == self.ranks && (1..=4).contains(&self.waves)
+            && self.rows > 0 && self.row_bytes > 0, "invalid retained Spark intake inventory");
+        let geometry = self.geometry.try_borrow().context("Spark intake geometry is borrowed")?;
+        ensure!(geometry.slots() == self.waves && geometry.cut().rows == self.rows,
+            "Spark intake slot geometry differs from its retained reserve");
+        let logical = self.rows.checked_mul(self.row_bytes)
+            .and_then(|bytes| bytes.checked_mul(self.waves)).context("Spark intake logical extent overflow")?;
+        let physical = self.planes[0]._allocation.buffer.device_id;
+        let location = devices.location(physical)?;
+        let mut receipts = Vec::new();
+        for (rank, plane) in self.planes.iter().enumerate() {
+            let owner = plane._allocation.buffer;
+            let range = plane.buffer;
+            ensure!(!owner.ptr.is_null() && owner.device_id == physical && range.device_id == physical,
+                "Spark intake rank {rank} is on the wrong device");
+            let base = owner.ptr as u64;
+            let (offset, bytes) = cuteafd_core::serving_capacity::spark_intake_export_range(base, logical.max(256) as u64)?;
+            ensure!(base.checked_add(offset) == Some(range.ptr as u64) && range.bytes as u64 == bytes
+                && offset.checked_add(bytes).is_some_and(|end| end <= owner.bytes as u64),
+                "Spark intake rank {rank} export is not its aligned retained range");
+            for slot in 0..self.waves {
+                let (offset, bytes) = geometry.slice(slot, self.row_bytes);
+                ensure!(offset.checked_add(bytes).is_some_and(|end| end <= range.bytes),
+                    "Spark intake slot {slot} exceeds rank {rank} export");
+            }
+            receipts.push(Receipt { allocation: Allocation::buffer(
+                format!("{prefix}.rank.{rank}.storage"), location, owner.bytes as u64,
+                lifetime, Category::Transport, "Spark intake"), address: base });
+        }
+        if let Some(staging) = &self.staging {
+            let buffer = staging.try_borrow().context("Spark intake staging is borrowed")?.buffer;
+            ensure!(!buffer.ptr.is_null() && buffer.bytes > 0, "empty retained Spark intake staging");
+            receipts.push(Receipt { allocation: Allocation::buffer(format!("{prefix}.staging"),
+                Location::PINNED, buffer.bytes as u64, lifetime, Category::Staging, "Spark intake"),
+                address: buffer.ptr as u64 });
+        }
+        Ok(receipts)
+    }
+
     /// The CUDA device the planes live on.
     pub(crate) fn device(&self) -> i32 { self.planes[0].buffer.device_id }
 
@@ -1829,6 +1876,107 @@ impl Drop for SparkLink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn retained_intake_owners_match_independent_contract() -> Result<()> {
+        use cuteafd_ffi::{memory_ledger, native_library_lifetime_fixture::Fixture};
+        use cuteafd_loader::placement::{SparkIntakeMode, SparkIntakeOwners, planner::{self, *}};
+        use std::collections::BTreeMap;
+        let fixture = Fixture::build()?;
+        for physical in [vec![1], vec![1, 0]] {
+            for (ranks, rows, row_bytes, waves) in [(1, 1, 2, 1), (6, 64, 12288, 3), (8, 1, 34, 4)] {
+                for mode in [IntakeMode::Gpu, IntakeMode::Pinned, IntakeMode::Host] {
+                    let library = fixture.load()?;
+                    fixture.quiet_events(&library, true)?;
+                    let device = *physical.last().unwrap();
+                    library.cuda_set_device(device)?;
+                    fixture.configure_memory(&library, device, 128 << 20)?;
+                    let devices = CoordinatorDevices::new(&physical)?;
+                    let tag = format!("intake/{physical:?}/{ranks}/{rows}/{waves}/{mode:?}");
+                    let _owner = memory_ledger::owner(&tag);
+                    let mut intake = SparkIntake::with_waves(&library, mode, ranks, rows, row_bytes, waves)?;
+                    let spec = SparkIntakeOwners { gpu: devices.logical_rank(device)?, ranks,
+                        rows: rows as u64, row_bytes: row_bytes as u64, waves, mode: match mode {
+                            IntakeMode::Gpu => SparkIntakeMode::Gpu, IntakeMode::Pinned => SparkIntakeMode::Pinned,
+                            IntakeMode::Host => SparkIntakeMode::Host,
+                        } };
+                    let facts = Facts { allocations: spec.allocations("test.intake", Lifetime::TARGET)?,
+                        deferred: vec![], sequential: vec![], allowances: vec![] };
+                    let budgets = vec![Budget { id: "CPU intake fixture".into(),
+                        locations: vec![devices.location(device)?, Location::PINNED],
+                        physical_bytes: 256 << 20, logical_bytes: 256 << 20, headroom: 0,
+                        baseline: Baseline::Forecast {occupied: 0, source: "CPU fixture".into(), assumed: false} }];
+                    let phases = planner::evaluate(&facts, &budgets)?;
+                    let plan = ResolvedPlan { request: Request {context: 64, pool: Pin::Exact(64),
+                            onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving},
+                        decisions: Decisions {attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+                            embedding: None, prefill: PrefillShape {rows: 64, waves: 1}, lanes: 1},
+                        pool_tokens: 64, facts, budgets, phases };
+                    let receipts = intake.allocation_receipts("test.intake", devices, Lifetime::TARGET)?;
+                    // This reconciles intake storage only, not complete family Ready admission.
+                    planner::reconcile(&plan, Phase::Ready, &receipts)?;
+                    let expected = receipts.iter().map(|r| (r.address as usize, r.allocation.bytes as usize))
+                        .collect::<BTreeMap<_, _>>();
+                    let actual = memory_ledger::allocations().into_iter().filter(|a| a.key.owner == Some(tag.as_str()))
+                        .map(|a| (a.address, a.bytes)).collect::<BTreeMap<_, _>>();
+                    assert_eq!(actual, expected, "every physical intake owner appears once");
+                    assert!(intake.allocation_receipts("", devices, Lifetime::TARGET).is_err());
+                    assert!(intake.allocation_receipts("test.intake", CoordinatorDevices::new(&[7])?, Lifetime::TARGET).is_err());
+                    for defect in 0..6 {
+                        let original = intake.planes[0].buffer;
+                        let owner = intake.planes[0]._allocation.buffer;
+                        match defect {
+                            0 => intake.planes[0].buffer.ptr = (original.ptr as usize + 1) as *mut c_void,
+                            1 => intake.planes[0].buffer.bytes -= 1,
+                            2 => intake.planes[0].buffer.device_id = 7,
+                            3 => intake.planes[0]._allocation.buffer.device_id = 7,
+                            4 => intake.planes[0]._allocation.buffer.bytes = 1,
+                            5 => intake.ranks += 1,
+                            _ => unreachable!(),
+                        }
+                        assert!(intake.allocation_receipts("test.intake", devices, Lifetime::TARGET).is_err(), "defect {defect}");
+                        intake.planes[0].buffer = original;
+                        intake.planes[0]._allocation.buffer = owner;
+                        intake.ranks = ranks;
+                    }
+                    let borrowed = intake.geometry.borrow_mut();
+                    assert!(intake.allocation_receipts("test.intake", devices, Lifetime::TARGET).is_err());
+                    drop(borrowed);
+                    for defect in 0..4 {
+                        let mut broken = receipts.clone();
+                        match defect {
+                            0 => { broken.remove(0); }
+                            1 => { let mut extra = broken[0].clone(); extra.allocation.id.push_str(".extra"); broken.push(extra); }
+                            2 => broken[0].allocation.bytes += 1,
+                            3 => broken[0].allocation.location = Location::coordinator(1 - spec.gpu),
+                            _ => unreachable!(),
+                        }
+                        assert!(planner::reconcile(&plan, Phase::Ready, &broken).is_err());
+                    }
+                    if ranks > 1 {
+                        intake.planes[0]._allocation.buffer.bytes += 1;
+                        intake.planes[1]._allocation.buffer.bytes -= 1;
+                        let equal_total = intake.allocation_receipts("test.intake", devices, Lifetime::TARGET)?;
+                        assert!(planner::reconcile(&plan, Phase::Ready, &equal_total).is_err());
+                        intake.planes[0]._allocation.buffer.bytes -= 1;
+                        intake.planes[1]._allocation.buffer.bytes += 1;
+                    }
+                    if let Some(staging) = intake.staging.take() {
+                        assert!(planner::reconcile(&plan, Phase::Ready,
+                            &intake.allocation_receipts("test.intake", devices, Lifetime::TARGET)?).is_err());
+                        intake.staging = Some(staging);
+                    }
+                    planner::reconcile(&plan, Phase::Ready,
+                        &intake.allocation_receipts("test.intake", devices, Lifetime::TARGET)?)?;
+                    drop(intake);
+                    assert!(memory_ledger::allocations().iter().all(|a| a.key.owner != Some(tag.as_str())));
+                    assert_eq!(library.cuda_memory_info()?, (128 << 20, 128 << 20));
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
