@@ -87,6 +87,17 @@ int cuteafd_cuda_enable_peer(int peer) { (void)peer; return 0; }
 int cuteafd_tp2_native_initialize(void) { return 0; }
 int cuteafd_peer_exchange_initialize(void) { return 0; }
 int cuteafd_peer_diagnostic_initialize(void) { return 0; }
+/* Allocation-only paired ownership fixtures load these ABI symbols. Math refuses. */
+int cuteafd_rtx_tp2_partial_async(const float *routed, const uint16_t *shared,
+        void *out, uint64_t count, uint32_t dtype, void *stream) {
+    (void)routed; (void)shared; (void)out; (void)count; (void)dtype; (void)stream;
+    return 1;
+}
+int cuteafd_rtx_tp2_sum_async(const void *rank0, const void *rank1,
+        uint16_t *out, uint64_t count, uint32_t dtype, void *stream) {
+    (void)rank0; (void)rank1; (void)out; (void)count; (void)dtype; (void)stream;
+    return 1;
+}
 
 /* Ownership-only MLA programs: real Rust manifest/ABI validation still runs.
  * Numerical launches are deliberately unsupported by this CPU fixture. */

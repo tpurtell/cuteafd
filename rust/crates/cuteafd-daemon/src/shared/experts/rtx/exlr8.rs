@@ -60,6 +60,160 @@ mod copy_tests {
         constructor_owners(super::KernelFamily::GlmFlash)
     }
 
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn retained_paired_rtx_owners_match_independent_contract() -> anyhow::Result<()> {
+        // Environment-selected diagnostics run in isolated processes, never via set_var.
+        if std::env::var_os("CUTEAFD_PAIRED_RECEIPT_CHILD").is_none() {
+            for diagnostics in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe()?)
+                    .args(["shared::experts::rtx::exlr8::copy_tests::retained_paired_rtx_owners_match_independent_contract",
+                        "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+                    .env("CUTEAFD_PAIRED_RECEIPT_CHILD", "1")
+                    .env("CUTEAFD_PEER_WAIT_DIAGNOSTICS", diagnostics)
+                    .env("CUTEAFD_ROUTE_CHECK", "0").status()?;
+                anyhow::ensure!(status.success(), "paired ownership child diagnostics={diagnostics} failed");
+            }
+            return Ok(());
+        }
+        use super::*;
+        use crate::shared::{experts::rtx::pair::Pair, peer_split::RankDevice};
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_ffi::{memory_ledger::{self, Space}, native_library_lifetime_fixture::Fixture};
+        use cuteafd_loader::{placement::{planner::{self, *}, rtx_onboard::PairedRouteBuffers},
+            plan::exlr8::{execution_workspace, residency::WeightLayout, ExecutionVariant}};
+        use std::collections::BTreeMap;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.quiet_events(&library, true)?;
+        fixture.immediate_copies(&library)?;
+        fixture.glm_target_programs(&library)?;
+        fixture.exlr8_programs(&library, false)?;
+        let manifest = fixture.directory().join("PROGRAMS.json");
+        std::fs::write(&manifest, serde_json::to_vec(&crate::shared::experts::exlr8::owner_manifest(KernelFamily::Glm))?)?;
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let physical = [1, 0];
+        let devices = CoordinatorDevices::new(&physical)?;
+        let capacity = 128 << 20;
+        for device in physical { fixture.configure_memory(&library, device, capacity)?; }
+        let lifetime = Lifetime::RESIDENT;
+        let layers = vec![3, 7];
+        let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
+        for (rows, lanes, pushed, wire) in [(64, 1, false, false), (128, 2, true, true)] {
+            let tag = format!("paired/{rows}/{lanes}/{pushed}/{wire}");
+            let _owner = memory_ledger::owner(&tag);
+            let mut allocations = Vec::new();
+            let mut backends: Vec<Box<dyn RtxExpertLayer>> = Vec::new();
+            for (rank, &id) in physical.iter().enumerate() {
+                let location = Location::coordinator(rank as u8);
+                let device = crate::shared::memory::device::Device { library: &library, id };
+                let layouts = layers.iter().map(|&layer| allocation_only_residency(KernelFamily::Glm, layer, 2, rank)).collect::<Vec<_>>();
+                let unit_limit = layouts[0].compact_unit_limit();
+                let workspace = Exlr8RtxWeights::workspace_bytes_with_limit(&programs, KernelFamily::Glm,
+                    rows, unit_limit, Exlr8PrefillActivations::A16)?;
+                let resident = layouts.iter().map(|layout| layout.resident_bytes).sum::<usize>();
+                let weights = constructor_weights(device, &layouts, pushed)?;
+                let backend = Exlr8RtxWeights::pushed_rank(device, &programs, layers.clone(), rows,
+                    resident + workspace, Exlr8PrefillActivations::A16, 2, rank, weights)?.execution()?;
+                let prefix = format!("test.rank.{rank}.backend");
+                allocations.extend(WeightLayout::from_residencies(&format!("{prefix}.weights"),
+                    &layouts.iter().collect::<Vec<_>>(), if pushed { WeightArenaTopology::SharedRank }
+                    else { WeightArenaTopology::PerLayer }, location, lifetime)?.allocations);
+                for (index, variant) in [ExecutionVariant::DecodeCompact, ExecutionVariant::DecodeGrouped,
+                    ExecutionVariant::Prefill].into_iter().enumerate().take(if rows == 64 { 2 } else { 3 }) {
+                    let shape = if index < 2 { 64 } else { rows };
+                    allocations.extend(execution_workspace(programs.spec(variant.program(KernelFamily::Glm,
+                        Exlr8PrefillActivations::A16))?, shape, ExpertSet::Routed, variant,
+                        unit_limit, Exlr8PrefillActivations::A16)?.allocations(
+                            &format!("{prefix}.execution.{index}"), location, lifetime)?);
+                }
+                let mut output = planner::Allocation::buffer(format!("{prefix}.output"), location,
+                    (rows * KernelFamily::Glm.geometry().hidden * 2) as u64, lifetime,
+                    Category::Workspace, "EXLR8 stable output");
+                output.alignment = 256;
+                allocations.push(output);
+                backends.push(Box::new(backend));
+            }
+            fixture.finish_ordered_uploads(&library)?;
+            library.release_sync_h2d_staging()?;
+            let ranks = physical.map(|device| RankDevice { device, stream: (device as usize + 1) as *mut c_void });
+            let backends = backends.try_into().map_err(|_| anyhow::anyhow!("two paired backends"))?;
+            let mut pair = Pair::new_with_wire(&library, ranks, backends, KernelFamily::Glm.geometry().hidden,
+                8, rows, 64, lanes, super::super::ExchangeDtype::Bf16, wire)?;
+            let mut route_facts = PairedRouteBuffers { rows: rows as u64, topk: 8, lanes: lanes as u64,
+                input_row_bytes: if wire { (KernelFamily::Glm.geometry().hidden * 33 / 32) as u64 } else { 0 },
+                layers: layers.clone(), peer_diagnostics: diagnostics, route_checks: false };
+            let backend_allocations = allocations.clone();
+            allocations.extend(route_facts.allocations("test", lifetime)?);
+            let budgets = [Location::coordinator(0), Location::coordinator(1), Location::PINNED, Location::HOST]
+                .into_iter().enumerate().map(|(rank, location)| Budget { id: format!("paired.{rank}"),
+                    locations: vec![location], physical_bytes: capacity as u64, logical_bytes: capacity as u64,
+                    baseline: Baseline::Forecast { occupied: 0, source: "CPU allocation-only fixture".into(), assumed: false },
+                    headroom: 0 }).collect::<Vec<_>>();
+            for route_checks in [false, true] {
+                if route_checks {
+                    assert!(pair.start_checks(true)?);
+                    route_facts.route_checks = true;
+                    allocations = backend_allocations.clone();
+                    allocations.extend(route_facts.allocations("test", lifetime)?);
+                }
+                let facts = Facts { allocations: allocations.clone(), deferred: vec![], sequential: vec![], allowances: vec![] };
+                let phases = planner::evaluate(&facts, &budgets)?;
+                let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+                        prefill: Pin::Auto, operation: Operation::Serving },
+                    decisions: Decisions { attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+                        embedding: None, prefill: PrefillShape { rows: rows as u64, waves: 1 }, lanes: lanes as u64 },
+                    pool_tokens: 64, facts, budgets: budgets.clone(), phases };
+                let receipts = pair.allocation_receipts("test", devices, lifetime)?;
+                planner::reconcile(&plan, Phase::Ready, &receipts)?;
+                assert!(pair.allocation_receipts("", devices, lifetime).is_err());
+                assert!(pair.allocation_receipts("test", CoordinatorDevices::new(&[0, 1])?, lifetime).is_err());
+                pair.layers[0] += 1;
+                assert!(pair.allocation_receipts("test", devices, lifetime).is_err());
+                pair.layers[0] -= 1;
+                for negative in 0..5 {
+                    let mut bad = receipts.clone();
+                    let first = bad.iter().position(|r| r.allocation.id == "test.rank.0.routes.peer.control").unwrap();
+                    let second = bad.iter().position(|r| r.allocation.id == "test.rank.1.routes.peer.control").unwrap();
+                    match negative {
+                        0 => { bad.remove(first); },
+                        1 => { let mut extra = bad[first].clone(); extra.allocation.id.push_str(".extra"); bad.push(extra); },
+                        2 => bad[first].allocation.bytes += 1,
+                        3 => { bad[first].allocation.bytes += 1; bad[second].allocation.bytes -= 1; },
+                        4 => bad[first].allocation.location = Location::coordinator(1),
+                        _ => unreachable!(),
+                    }
+                    assert!(planner::reconcile(&plan, Phase::Ready, &bad).is_err(), "paired negative {negative}");
+                }
+                let expected = receipts.iter().filter(|r| r.allocation.view.is_none() && r.allocation.location != Location::HOST)
+                    .map(|r| (r.address as usize, r.allocation.bytes as usize)).collect::<BTreeMap<_, _>>();
+                let actual = memory_ledger::allocations().into_iter().filter(|r| r.key.owner == Some(tag.as_str()))
+                    .map(|r| { assert!(matches!(r.key.space, Space::Device | Space::Pinned)); (r.address, r.bytes) })
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(actual, expected, "paired owners must enumerate every retained device/pinned allocation once");
+                if route_checks {
+                    assert!(pair.start_checks(true)?);
+                    planner::reconcile(&plan, Phase::Ready, &pair.allocation_receipts("test", devices, lifetime)?)?;
+                }
+            }
+            drop(pair);
+            assert!(memory_ledger::allocations().iter().all(|r| r.key.owner != Some(tag.as_str())));
+            for device in physical {
+                library.cuda_set_device(device)?;
+                assert_eq!(library.cuda_memory_info()?, (capacity, capacity));
+            }
+        }
+        // SAFETY: allocation-only stubs reject before touching null pointers or enqueueing work.
+        unsafe {
+            let combine = library.rtx_tp2_combine()?;
+            assert!(combine.partial(std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), 1,
+                super::super::ExchangeDtype::Bf16, std::ptr::null_mut()).is_err());
+            assert!(combine.sum(std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), 1,
+                super::super::ExchangeDtype::Bf16, std::ptr::null_mut()).is_err());
+        }
+        Ok(())
+    }
+
     /// Full family geometry and descriptor extents, deliberately no expert payload.
     /// This can test allocation/ownership construction, never checkpoint or math fidelity.
     fn allocation_only_residency(family: super::KernelFamily, layer: usize, world: usize, rank: usize)

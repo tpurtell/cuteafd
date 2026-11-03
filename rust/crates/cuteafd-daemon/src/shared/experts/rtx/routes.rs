@@ -93,6 +93,11 @@ impl<T> SlotRouteChecks<T> {
         Ok(Self { slots: storage.into_iter().map(|storage| (storage, None)).collect(), strict })
     }
 
+    /// Census retained storage without activating or completing any diagnostic unit.
+    pub(crate) fn retained_storage(&self) -> impl ExactSizeIterator<Item = &T> {
+        self.slots.iter().map(|(storage, _)| storage)
+    }
+
     pub(crate) fn begin(&mut self, slot: usize, unit: usize, rows: usize, enabled: bool) -> anyhow::Result<()> {
         let (_, active) = self.slots.get_mut(slot).ok_or_else(|| anyhow::anyhow!("route diagnostic slot {slot}"))?;
         anyhow::ensure!(rows > 0 && active.is_none(), "route diagnostic slot {slot} still live or empty unit {unit}");

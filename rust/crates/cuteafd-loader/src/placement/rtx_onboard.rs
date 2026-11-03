@@ -6,6 +6,139 @@
 use super::{inventory, Bytes2, ExpertCost};
 use anyhow::{ensure, Context, Result};
 
+/// Physical route/diagnostic storage of the shared paired executor. Backend
+/// weights/workspaces and native code/events compose separately.
+#[derive(Debug, Clone)]
+pub struct PairedRouteBuffers {
+    pub rows: u64,
+    pub topk: u64,
+    pub lanes: u64,
+    pub input_row_bytes: u64,
+    pub layers: Vec<usize>,
+    pub peer_diagnostics: bool,
+    pub route_checks: bool,
+}
+
+impl PairedRouteBuffers {
+    pub fn allocations(&self, prefix: &str, lifetime: super::planner::Lifetime)
+        -> Result<Vec<super::planner::Allocation>, super::planner::Refusal> {
+        use cuteafd_core::memory_layout::Category;
+        use super::planner::{Allocation, Location, Refusal};
+        let invalid = || Refusal::InvalidFact("paired expert route geometry".into());
+        if prefix.is_empty() || self.rows == 0 || self.topk == 0 || self.lanes == 0
+            || self.layers.is_empty() || self.layers.windows(2).any(|ids| ids[0] >= ids[1]) {
+            return Err(invalid());
+        }
+        let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(Refusal::Overflow("paired expert routes"));
+        let add = |a: u64, b: u64| a.checked_add(b).ok_or(Refusal::Overflow("paired expert routes"));
+        let aligned = |bytes: u64| add(bytes, 15).map(|n| n / 16 * 16);
+        let section = mul(mul(self.rows, self.topk)?, 4)?;
+        let packed = aligned(add(aligned(section)?, section)?)?;
+        let receive = add(packed, mul(self.rows, self.input_row_bytes)?)?;
+        if receive % 16 != 0 { return Err(invalid()); }
+        let slots = mul(self.lanes, 2)?;
+        let flags = add(slots, 1)?;
+        let control = mul(flags, 16)?.max(256);
+        let progress = mul(flags, std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>() as u64)?.max(256);
+        let checks = mul(mul(self.rows, self.topk)?, 8)?;
+        let rank_count = add(add(slots, 2 + u64::from(self.peer_diagnostics))?,
+            if self.route_checks { mul(self.lanes, self.layers.len() as u64)? } else { 0 })?;
+        let count = add(mul(rank_count, 2)?, u64::from(self.peer_diagnostics))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(usize::try_from(count).map_err(|_| invalid())?)
+            .map_err(|_| invalid())?;
+        for rank in 0..2 {
+            let location = Location::coordinator(rank);
+            let name = format!("{prefix}.rank.{rank}");
+            for slot in 0..slots {
+                out.push(Allocation::buffer(format!("{name}.routes.peer.recv.{slot}"), location,
+                    receive.max(256), lifetime, Category::Transport, "paired expert routes"));
+            }
+            for (field, bytes) in [("control", control), ("abort", 256)] {
+                out.push(Allocation::buffer(format!("{name}.routes.peer.{field}"), location,
+                    bytes, lifetime, Category::Transport, "paired expert routes"));
+            }
+            if self.peer_diagnostics {
+                out.push(Allocation::buffer(format!("{name}.routes.peer.progress"), location,
+                    progress, lifetime, Category::Transport, "paired expert routes"));
+            }
+            if self.route_checks {
+                for slot in 0..self.lanes {
+                    for layer in &self.layers {
+                        out.push(Allocation::buffer(format!("{name}.checks.slot.{slot}.layer.{layer}"),
+                            Location::PINNED, checks, lifetime, Category::Staging, "paired expert diagnostics"));
+                    }
+                }
+            }
+        }
+        if self.peer_diagnostics {
+            let bytes = mul(flags, std::mem::size_of::<[[u64; 2]; 2]>() as u64)?;
+            out.push(Allocation::buffer(format!("{prefix}.routes.peer.host_ordinals"), Location::HOST,
+                bytes, lifetime, Category::Transport, "paired expert diagnostics"));
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod paired_owner_tests {
+    use super::*;
+    use super::super::planner::{Lifetime, Location};
+
+    #[test]
+    fn route_storage_prices_floors_wire_progress_and_each_retained_check() -> Result<()> {
+        for rows in [1u64, 16, 64, 128] {
+            for lanes in [1u64, 2, 3] {
+                for input_row_bytes in [0, 32, 6336] {
+                    for peer_diagnostics in [false, true] {
+                        for route_checks in [false, true] {
+                            let geometry = PairedRouteBuffers { rows, topk: 8, lanes, input_row_bytes,
+                                layers: vec![3, 7], peer_diagnostics, route_checks };
+                            let allocations = geometry.allocations("test", Lifetime::RESIDENT)?;
+                            let receive = (rows * 64 + rows * input_row_bytes).max(256);
+                            let flags = 2 * lanes + 1;
+                            let rank_bytes = 2 * lanes * receive + (flags * 16).max(256) + 256
+                                + if peer_diagnostics { (flags * 48).max(256) } else { 0 };
+                            for rank in 0..2 {
+                                assert_eq!(allocations.iter().filter(|a| a.location == Location::coordinator(rank))
+                                    .map(|a| a.bytes).sum::<u64>(), rank_bytes);
+                            }
+                            assert_eq!(allocations.iter().filter(|a| a.location == Location::PINNED)
+                                .map(|a| a.bytes).sum::<u64>(), if route_checks { 2 * lanes * 2 * rows * 8 * 8 } else { 0 });
+                            assert_eq!(allocations.iter().filter(|a| a.location == Location::HOST)
+                                .map(|a| a.bytes).sum::<u64>(), if peer_diagnostics { flags * 32 } else { 0 });
+                            assert_eq!(allocations.iter().map(|a| &a.id).collect::<std::collections::BTreeSet<_>>().len(), allocations.len());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn route_storage_refuses_invalid_and_overflowing_geometry() {
+        let good = PairedRouteBuffers { rows: 64, topk: 8, lanes: 2, input_row_bytes: 0,
+            layers: vec![3, 7], peer_diagnostics: false, route_checks: false };
+        assert!(good.allocations("", Lifetime::RESIDENT).is_err());
+        for case in 0..8 {
+            let mut bad = good.clone();
+            match case {
+                0 => bad.rows = 0,
+                1 => bad.topk = 0,
+                2 => bad.lanes = 0,
+                3 => bad.layers.clear(),
+                4 => bad.layers = vec![7, 3],
+                5 => bad.rows = u64::MAX,
+                6 => bad.lanes = u64::MAX,
+                7 => bad.input_row_bytes = u64::MAX,
+                _ => unreachable!(),
+            }
+            assert!(bad.allocations("test", Lifetime::RESIDENT).is_err(), "case {case}");
+        }
+    }
+}
+
 /// Whole and (when `tp2`) TP2-half residency of each routed layer, from the
 /// checkpoint's own expert headers.
 pub fn expert_costs(catalog: &crate::OfficialV41Catalog, tp2: bool) -> Result<Vec<ExpertCost>> {

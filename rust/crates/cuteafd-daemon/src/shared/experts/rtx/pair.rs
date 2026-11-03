@@ -10,6 +10,8 @@ use crate::shared::{
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
+use cuteafd_core::memory_layout::Category;
+use cuteafd_loader::placement::planner::{Allocation, CoordinatorDevices, Lifetime, Location, Receipt};
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -334,6 +336,51 @@ impl<'a> Pair<'a> {
             topk,
             hidden,
         })
+    }
+
+    /// Retained backend and exchange payloads; native code/events and startup
+    /// chronology are separate owners, not inferred from this snapshot.
+    pub(crate) fn allocation_receipts(&self, prefix: &str, devices: CoordinatorDevices<'_>,
+        lifetime: Lifetime) -> Result<Vec<Receipt>> {
+        ensure!(!prefix.is_empty() && !self.layers.is_empty()
+            && self.layers.windows(2).all(|ids| ids[0] < ids[1]), "invalid paired expert receipt identity");
+        let mut out = Vec::new();
+        for rank in 0..2 {
+            let backend = self.ranks[rank].try_borrow()?;
+            let physical = devices.physical_device(rank as u8)?;
+            ensure!(backend.shard() == RtxShard::Tp2 { rank: rank as u8 }
+                && backend.layers() == self.layers && backend.device() == physical
+                && self.devices[rank].device == physical && self.routes.device(rank) == physical,
+                "paired expert receipt rank/inventory differs from retained owners");
+            out.extend(backend.allocation_receipts(&format!("{prefix}.rank.{rank}.backend"), devices, lifetime)?);
+        }
+        for (rank, name, buffer) in self.routes.allocation_buffers() {
+            ensure!(buffer.device_id == devices.physical_device(u8::try_from(rank)?)?
+                && !buffer.ptr.is_null() && buffer.bytes > 0, "invalid paired route device owner");
+            out.push(Receipt { allocation: Allocation::buffer(format!("{prefix}.rank.{rank}.routes.{name}"),
+                Location::coordinator(u8::try_from(rank)?), u64::try_from(buffer.bytes)?, lifetime,
+                Category::Transport, "paired expert routes"), address: buffer.ptr as u64 });
+        }
+        if let Some((address, bytes)) = self.routes.diagnostic_host_backing()? {
+            out.push(Receipt { allocation: Allocation::buffer(format!("{prefix}.routes.peer.host_ordinals"),
+                Location::HOST, bytes, lifetime, Category::Transport, "paired expert diagnostics"), address });
+        }
+        if let Some(checks) = self.checks.try_borrow()?.as_ref() {
+            ensure!(checks.retained_storage().len() == self.lanes, "paired diagnostic slot inventory differs");
+            for (slot, layers) in checks.retained_storage().enumerate() {
+                ensure!(layers.keys().copied().eq(self.layers.iter().copied()), "paired diagnostic layer inventory differs");
+                for (layer, ranks) in layers {
+                    for (rank, host) in ranks.iter().enumerate() {
+                        ensure!(!host.buffer.ptr.is_null() && host.buffer.bytes > 0, "empty paired diagnostic owner");
+                        out.push(Receipt { allocation: Allocation::buffer(
+                            format!("{prefix}.rank.{rank}.checks.slot.{slot}.layer.{layer}"), Location::PINNED,
+                            u64::try_from(host.buffer.bytes)?, lifetime, Category::Staging, "paired expert diagnostics"),
+                            address: host.buffer.ptr as u64 });
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn partial(&self) -> PartialDtype {

@@ -231,6 +231,15 @@ impl<'a> PeerExchange<'a> {
         out
     }
 
+    /// Ordinary host backing retained by opt-in progress diagnostics.
+    pub(crate) fn diagnostic_host_backing(&self) -> Result<Option<(u64, u64)>> {
+        let ordinals = self.host_ordinals.try_borrow()?;
+        if ordinals.capacity() == 0 { return Ok(None); }
+        let bytes = ordinals.capacity().checked_mul(std::mem::size_of::<[[u64; 2]; 2]>())
+            .context("peer diagnostic host backing overflow")?;
+        Ok(Some((ordinals.as_ptr() as u64, u64::try_from(bytes)?)))
+    }
+
     /// Enables peer access both ways and allocates `slots` zeroed receive
     /// buffers of `slot_bytes` and the control words on each rank; `ranks[0]`'s
     /// device must be current (and is again on return).
