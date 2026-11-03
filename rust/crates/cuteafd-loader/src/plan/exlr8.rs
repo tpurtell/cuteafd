@@ -1547,13 +1547,13 @@ mod mounted_tests {
                     else { crate::placement::AttentionPlacement::Heads }),
                 layout: Some(LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
                     host_memory: Some((256 << 30, 256 << 30)), host_cache_bytes: Some(32 << 30),
-                    workspace_manifest: Some(programs.clone()), glm5_drafter_disabled: true, ..Default::default() }),
+                    workspace_manifest: Some(programs.clone()), ..Default::default() }),
                 ..Default::default()
             };
             let plan = |uncached| {
                 super::UNCACHED_CENSUS.with(|flag| flag.set(uncached));
                 let start = std::time::Instant::now();
-                let report = if name.starts_with("exlr8") { input.exlr8_native_plan("up1", &options, "off").unwrap().report }
+                let report = if name.starts_with("exlr8") { input.exlr8_native_plan("up1", &options, "dflash2").unwrap().report }
                     else { input.plan(&options).unwrap() };
                 let elapsed = start.elapsed();
                 assert!(elapsed.as_secs() < 30, "{name}: {elapsed:?}");
