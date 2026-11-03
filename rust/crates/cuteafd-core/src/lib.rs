@@ -11,6 +11,8 @@ pub use ffn_activation::FfnActivation;
 pub mod coordinator_programs;
 pub mod expert_geometry;
 pub mod spark_executions;
+pub mod spark_reply;
+pub use spark_reply::SparkReplyFormat;
 pub use spark_executions::{covering_export, DecodeExecution, ExecutionAdmissionError, ExecutionOwner,
     OwnerBytes, OwnerExtent, PrefillExecution, SparkExecutions, MAX_BUFFERED_PREFILL_UNITS, MAX_SPARK_DECODE_LANES};
 pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, Exl3RowPolicy, EXL3_CAPACITIES,
