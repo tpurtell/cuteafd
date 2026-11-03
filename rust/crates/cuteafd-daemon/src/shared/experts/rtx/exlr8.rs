@@ -150,6 +150,9 @@ mod copy_tests {
                             let audit = AllocationAudit::start();
                             let weights = constructor_weights(device, &layouts, pushed)?;
                             fixture.finish_ordered_uploads(&library)?;
+                            // The library, not the expert, retains the synchronous loader staging.
+                            // End that startup lifetime before counting the expert's retained owners.
+                            assert!(library.release_sync_h2d_staging()? > 0);
                             fixture.record_peer_copies(&library)?;
                             library.cuda_set_device(1 - physical)?;
                             let owner = Exlr8RtxWeights::pushed_rank(device, &programs, layers.clone(), rows,
@@ -225,7 +228,9 @@ mod copy_tests {
                                 assert_eq!(fixture.peer_copy_records(&library)?, trace);
                             }
                             assert_eq!(library.cuda_get_device()?, 1 - physical);
-                            assert!(memory_ledger::allocations().iter().all(|record| record.key.owner != Some(tag.as_str())));
+                            let remaining = memory_ledger::allocations().into_iter()
+                                .filter(|record| record.key.owner == Some(tag.as_str())).collect::<Vec<_>>();
+                            assert!(remaining.is_empty(), "{tag}: unfreed allocations {remaining:?}");
                             assert_eq!(device.run(|| library.cuda_memory_info())?, (capacity, capacity));
                             let mut live = BTreeMap::new();
                             let mut allocated = 0;
