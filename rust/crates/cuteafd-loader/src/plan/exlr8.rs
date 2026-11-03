@@ -1587,7 +1587,7 @@ mod mounted_tests {
             let mut expected = saved["memory_layout"].clone();
             let ranks = if gpus == 2 { 6 } else { 4 };
             let old_bytes = if gpus == 2 { 613_416_960 } else { 408_944_640 };
-            let intake = |rows| cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * 6144 * 2).unwrap();
+            let intake = |rows: u64| cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * 6144 * 2).unwrap();
             let new_bytes = ranks * (intake(64) + intake(3 * 2752));
             assert_eq!(new_bytes - old_bytes, if gpus == 2 { 49_152 } else { 32_768 });
             let mut changed = 0;
