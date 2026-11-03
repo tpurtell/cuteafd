@@ -2804,7 +2804,8 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let notes = layout.notes.clone();
             let device = layout.devices.remove(0);
             let steps = device.items.iter().find(|i| i.group == "steps").unwrap_or_else(|| panic!("{gib} {context}: {notes:?}"));
-            let intake = (2 * 4096 + 64) * 2 * cfg.dim as u64 * 2;
+            let intake = 2 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(2 * 4096 * cfg.dim as u64 * 2).unwrap()
+                + 2 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(64 * cfg.dim as u64 * 2).unwrap();
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
             let records = device.items.iter().find(|i| i.group == "records").unwrap();
             let cache = crate::serving_capacity::deepseek_v4_cache_geometry(&cfg, 1, 4096, 0).unwrap();
@@ -3361,7 +3362,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             let slots = 2 * working.prefill_lanes;
             assert_eq!(charged("route exchange"), if expected_rtx == 0 { 0 } else {
                 slots * (4096 * 8 * 8) + ((slots + 1) * 16).max(256) });
-            assert_eq!(charged("Spark intake"), if rank == 0 && spark { 268435456 } else { 0 });
+            assert_eq!(charged("Spark intake"), if rank == 0 && spark { 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                working.prefill_lanes * 4096 * cfg.hidden as u64 * 2).unwrap() } else { 0 });
             assert!(request.fixed.iter().filter(|d| d.gpu as usize == rank && d.category == Category::Workspace)
                 .map(|d| d.bytes).sum::<u64>() > 0);
         }
@@ -3502,8 +3504,8 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let engine = glmf_step_workspaces(&cfg, 3, rows, decode_rows, &shape,
             glmf_step_scratch(&lookup, &cfg, Default::default(), decode_rows, true).unwrap(),
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
-        let intake = crate::serving_capacity::spark_intake_bytes(3, 4, intake_rows, 4096);
-        assert_eq!(intake, 3 * 4 * intake_rows * 4096 * 2);
+        let intake = crate::serving_capacity::prefill_return_bytes(3, intake_rows, 4, 4096);
+        assert_eq!(intake, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(3 * intake_rows * 4096 * 2).unwrap());
         assert_eq!(item(&lane(rows, decode_rows), "steps"), Some((Category::Workspace, engine, Basis::Formula)),
             "{rows} prefill rows, {decode_rows} decode rows");
     }

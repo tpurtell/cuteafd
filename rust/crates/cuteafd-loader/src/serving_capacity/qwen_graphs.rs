@@ -393,7 +393,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(crate::serving_capacity::prefill_return_bytes(2, 2048, 4, 2048), 64 << 20);
+        assert_eq!(crate::serving_capacity::prefill_return_bytes(2, 2048, 4, 2048), 4
+            * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(2 * 2048 * 2048 * 2).unwrap());
     }
 
     #[test]

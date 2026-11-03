@@ -137,27 +137,10 @@ def test_blas_handle_diagnostics_log_only_after_successful_creation():
     assert "configured_workspace=runtime-default configured_workspace_bytes=unknown" in logging
     assert "cuda" not in logging and "cublas" not in logging
     blas = source.split("cuteafd_status_t cublas_handle(", 1)[1].split("\n}", 1)[0]
-    lt = source.split("cublasLtHandle_t cublaslt_handle()", 1)[1].split("\n}", 1)[0]
     assert blas.index("cublasCreate(&handle)") < blas.index("return status_from_cublas(status)") < blas.index('log_blas_handle_created("cublas")')
-    assert lt.index("cublasLtCreate(&handle)") < lt.index("return nullptr") < lt.index('log_blas_handle_created("cublasLt")')
-    assert "static thread_local" in blas and "static thread_local" in lt
-    assert "cublasSetWorkspace" not in blas + lt
+    assert "static thread_local" in blas
+    assert "cublasSetWorkspace" not in blas
 
-
-def test_blas_plan_workspace_log_names_successful_allocation_and_shape_cache():
-    source = (ROOT / "native/shared/cuda/linear.cu").read_text()
-    plan = source.split("CublasLtM1ParityBatchedPlan* create_cublaslt_m1_parity_plan(", 1)[1].split("\n}", 1)[0]
-    allocated = plan.split("  char thread_name[16]", 1)[1]
-    assert plan.index("cudaMalloc(&plan->workspace, plan->workspace_bytes)") < plan.index("  char thread_name[16]")
-    assert "pthread_getname_np" in allocated
-    assert "rows=%zu input_dim=%zu output_dim=%zu workspace_bytes=%zu" in allocated
-    assert "scope=device-shape-cache allocator=cudaMalloc" in allocated
-    assert "thread_name, rows, input_dim, output_dim, plan->workspace_bytes" in allocated
-    assert "cudaGetDevice" not in allocated and "cudaMemGetInfo" not in allocated
-    assert "cudaMalloc(" not in allocated and "cudaFree(" not in allocated
-    cache = source.split("CublasLtM1ParityBatchedPlan* cublaslt_m1_parity_plan(", 1)[1].split("\n}", 1)[0]
-    for key in ("std::to_string(device)", "std::to_string(rows)", "std::to_string(input_dim)", "std::to_string(output_dim)"):
-        assert key in cache
 
 
 def test_glm_text_cold_replay_uses_serving_decode_not_eager_scoring():

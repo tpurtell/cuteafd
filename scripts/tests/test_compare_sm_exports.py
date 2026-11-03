@@ -61,6 +61,14 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+def test_draft_bf16_group_matches_exported_shapes():
+    exporter = compare_sm.load_file("test_draft_bf16_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    expected = ",".join(f"k{k}_n{n}" for k, n in sorted(exporter.draft_bf16_shapes()))
+    for scope in ("all", "suspects"):
+        job, = (job for job in compare_sm.jobs(scope) if job[0] == "draft-bf16")
+        assert job[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "qwen38", "--only", expected])
+
+
 def test_pro_native_tp3_has_equal_k32_geometry_without_v41_identity():
     path = ROOT / "python/tools/aot/export_b12x_slices_aot.py"
     tree = ast.parse(path.read_text())

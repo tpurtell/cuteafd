@@ -71,7 +71,8 @@ pub(super) fn plan_whole<'a>(snapshot: &std::path::Path, catalog: &OfficialV41Ca
     let budget = selected.iter().try_fold(0usize, |sum, (_, bytes)| sum.checked_add(*bytes))
         .context("V4.1 whole expert resident bytes overflow")?;
     let experts = (!selected.is_empty()).then(|| crate::shared::experts::rtx::push::CoordinatorExperts::Whole {
-        selections: selected.iter().map(|(selection, _)| *selection).collect(), budget,
+        owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
+            selections: selected.iter().map(|(selection, _)| *selection).collect(), budget }],
     });
     let (push, ranks) = if sparks == 0 {
         (CoordinatorPush::prepare_alone(snapshot, Some(catalog), 1, experts)?, None)

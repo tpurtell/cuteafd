@@ -51,6 +51,53 @@ CHECKPOINT_CONTEXTS = {
 }
 
 
+def draft_bf16_shapes():
+    # hidden, query heads, KV heads, head width, MLP width, tap count
+    families = {
+        "dspark-qwen": (5120, 40, 8, 128, 10240, 5),
+        "dspark-kimi": (7168, 64, 16, 64, 14336, 5),
+        "dflash2-glm": (6144, 64, 8, 128, 12288, 6),
+        "dflash2-glmf": (4096, 32, 8, 128, 12288, 5),
+        "dflash-qwen27": (5120, 32, 8, 128, 17408, 5),
+        "dflash-qwen35": (2048, 32, 8, 128, 6144, 8),
+        "dflash-kimi-modal": (7168, 32, 8, 128, 14336, 6),
+        "dflash-mimo-pro": (6144, 128, 8, 128, 16384, 5),
+        "dflash-mimo-flash": (4096, 64, 8, 128, 16384, 5),
+        "dflash2-muse-radix": (8192, 64, 8, 128, 28672, 5),
+        "dflash2-muse-nvidia": (8192, 128, 16, 64, 24576, 5),
+    }
+    result = {}
+    for family, (h, heads, kv, d, inter, taps) in families.items():
+        for k, n in ((h * taps, h), (h, (heads + 2 * kv) * d),
+                     (h, 2 * kv * d), (heads * d, h), (h, 2 * inter), (inter, h)):
+            result.setdefault((k, n), []).append(family)
+    for h in (2048, 4096, 5120, 6144, 7168, 8192):
+        result.setdefault((h, h // 4), []).append("dflash-convolution")
+        result.setdefault((h, 256), []).append("dflash-selector")
+    for h, inter in ((7168, 14336), (6144, 24576)):
+        result.setdefault((h, 2 * inter), []).append("mla-dflash/ml4-ffn")
+        result.setdefault((inter, h), []).append("mla-dflash/ml4-ffn")
+    for h in (2048, 4096, 5120, 6144):
+        result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
+    result.setdefault((30720, 6144), []).append("ml4-context-fc")
+    return result
+
+
+def compile_draft_bf16_projection(k, n):
+    import torch
+    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    tiles = ((16, 1, 4, 16, 64, 6),)
+    launch = TmaBf16Projection(n, k, tiles_by_rows=tiles)
+    return compile_program(launch, name="draft_bf16_projection", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        Operand("w", torch.bfloat16, f"[{n},{k}]"),
+        Operand("out", torch.bfloat16, f"[rows,{n}]", "out")),
+        scalars=(Scalar("rows"),), key=launch.key(), geometry=dict(
+            width=k, outputs=n, output_dtype="torch.bfloat16",
+            reduction="ordered_k16", tiles_by_rows=tiles))
+
+
 def native_scalar_abi(stem: str, geometry: dict, scalars: list) -> tuple[str, list]:
     # Old geometry has no flag; explicit false must generate the same native ABI.
     runtime_sms = geometry.get("runtime_sm_count", False)
@@ -1311,6 +1358,11 @@ def main() -> None:
             manifest["families"][family] = {**geometry, "role": args.exlr8_role,
                                            "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
             work += [(family, *item) for item in exlr8_work]
+    # Append shared drafter exports after all existing objects: table indices stay stable.
+    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2")):
+        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 2048},
+                  lambda k=k, n=n: compile_draft_bf16_projection(k, n))
+                 for k, n in sorted(draft_bf16_shapes())]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue

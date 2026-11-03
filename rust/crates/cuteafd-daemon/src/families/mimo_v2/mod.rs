@@ -1080,8 +1080,9 @@ impl Opened {
                 let resident = crate::shared::experts::fp8::Fp8Layer::bytes_for(&tensors, 1, 0, tensors.exact_slicing(1))?
                     .checked_mul(range.layers).context("MiMo whole expert size overflow")?;
                 ensure!(resident <= range.peak_bytes as usize, "MiMo whole expert residency exceeds admission");
-                Some(CoordinatorExperts::Whole { selections: (range.first..range.first + range.layers)
-                    .map(|layer| crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(), budget: resident })
+                Some(CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
+                    selections: (range.first..range.first + range.layers)
+                        .map(|layer| crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(), budget: resident }] })
             } else { None };
             let prepared = if sparks == 0 {
                 (CoordinatorPush::prepare_alone(&args.snapshot, self.catalog.as_ref(), devices.len(), experts)?, None)
@@ -1163,7 +1164,7 @@ impl Opened {
                     ring: zeroed(args.rings * engine::RING_ROWS * record)? })
             }).collect::<Result<Vec<_>>>()?;
             let rows = engine::DECODE_ROWS;
-            let drafter = mtp::MtpDrafter { stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
+            let drafter = mtp::MtpDrafter { projection: cuteafd_ffi::draft_projection::DraftProjections::load(&programs, &[(2 * h, h)], rows)?, stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
                 embed: zeroed(rows * h * 2)?, rows_h: zeroed(rows * h * 2)?, normed_e: zeroed(rows * h * 2)?,
                 normed_h: zeroed(rows * h * 2)?, cat: zeroed(rows * 2 * h * 2)?,
                 ext: std::cell::RefCell::new(vec![vec![0; args.mtp]; args.rings]),
@@ -1219,7 +1220,7 @@ impl Opened {
                     .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
                 let capacity = args.draft_capacity(cfg.block)?;
                 let representation = self.weight_formats.draft;
-                let drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, capacity.context_slots,
+                let drafter = dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
                     capacity.max_batch_sequences, mask, representation, args.fp8_scales, args.draft_kv_cache)?;
                 engine.drafter = Some(drafter);
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");

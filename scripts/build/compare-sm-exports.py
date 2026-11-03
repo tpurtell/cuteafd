@@ -116,6 +116,10 @@ def dense_geometry_jobs():
 
 def jobs(scope):
     result = []
+    drafter = load_file("compare_draft_bf16", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    result.append(("draft-bf16", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "qwen38", "--only", ",".join(
+                       f"k{k}_n{n}" for k, n in sorted(drafter.draft_bf16_shapes()))]))
     # Small-row top-k deliberately exercises the fused persistent route, which
     # the production m64 table does not select.
     for geometry in ("flash", "pro", "glm", "glmf"):

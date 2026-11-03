@@ -40,7 +40,7 @@ pub(crate) struct MuseDraft<'a> {
 impl<'a> MuseDraft<'a> {
     /// Loads `snapshot` on the head rank's device and stream. `sequences`
     /// bounds a draft batch and the context slots (the admitted charge).
-    pub(crate) fn load(cfg: &MuseSparkConfig, head: &RankResources<'a>, stream: *mut c_void, snapshot: &Path,
+    pub(crate) fn load(programs: &'a cuteafd_ffi::programs::Programs<'a>, cfg: &MuseSparkConfig, head: &RankResources<'a>, stream: *mut c_void, snapshot: &Path,
         table: &crate::shared::token_io::TokenEmbedding<'_>, admitted: &cuteafd_loader::placement::families::muse_spark::MuseDrafter,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let device = head.device;
@@ -51,7 +51,7 @@ impl<'a> MuseDraft<'a> {
             .map_err(|_| anyhow::anyhow!("Muse drafter read panicked"))??;
         let mask = table.host_rows(&[config.mask_token])?;
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
-        let drafter = device.run(|| DflashDrafter::load(device.library, snapshot, file, stream, admitted.context_slots,
+        let drafter = device.run(|| DflashDrafter::load(device.library, programs, snapshot, file, stream, admitted.context_slots,
             admitted.sequences, mask, true,
             cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
             crate::shared::fp8_linear::Fp8Scales::Amax, crate::shared::fp8_linear::Fp8Rows::W8a16, kv_cache))?;

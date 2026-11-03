@@ -79,7 +79,7 @@ mod tests {
         // The coordinator intake the link allocates (ranks x waves x unit x row) is the charge.
         let (row, planes) = shared::intake(&cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
             &testing::muse_spark_config())?, prefill, Cutoff::new(64, 1)?, 16, 6)?;
-        assert_eq!(planes, (6 * 3 * 2752 * row) as u64);
+        assert_eq!(planes, 6 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes((3 * 2752 * row) as u64)?);
         let charged = placement.items[0].iter().find(|item| item.group == "Muse Spark partial reply planes")
             .context("intake charge")?.bytes;
         assert_eq!(charged, planes);

@@ -111,7 +111,7 @@ impl<'a> Drafter<'a> {
     /// else DFlash2) for a target of `hidden` x `vocab` with `layers` layers:
     /// `slots` ring contexts, draft steps of up to `sequences` sequences.
     #[allow(clippy::too_many_arguments)]
-    pub fn load(library: &'a NativeLibrary, snapshot: &Path, stream: *mut c_void, slots: usize, sequences: usize,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, stream: *mut c_void, slots: usize, sequences: usize,
         embedding: &TokenEmbedding<'_>, hidden: usize, vocab: usize, layers: usize,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, read: DraftRead)
         -> Result<Self> {
@@ -122,7 +122,7 @@ impl<'a> Drafter<'a> {
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
             let tensors = handle.join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-            return Ok(Self::Dspark(DsparkDrafter::load(library, snapshot, tensors, stream, slots,
+            return Ok(Self::Dspark(DsparkDrafter::load(library, programs, snapshot, tensors, stream, slots,
                 sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache)?));
         }
         let cfg = crate::shared::speculation::dflash::DflashConfig::read(snapshot)?;
@@ -131,7 +131,7 @@ impl<'a> Drafter<'a> {
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
         let file = read.join_dflash()?;
-        Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load(library, snapshot, file, stream, slots,
+        Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load(library, programs, snapshot, file, stream, slots,
             sequences, mask, true, representation, scales, fp8_rows, kv_cache)?))
     }
 

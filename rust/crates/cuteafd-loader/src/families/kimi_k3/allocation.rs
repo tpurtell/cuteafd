@@ -464,7 +464,7 @@ mod tests {
             assert_eq!(lane.metadata_extent("KDA slots", 0)?.1, unit as usize * 4);
             assert_eq!(lane.metadata_extent("MLA slots", 0)?.1, unit as usize * 8);
             for ranks in 1..=8 {
-                assert_eq!(spark_demand(shape, 0, ranks).bytes, rows * ranks as u64 * 3584 * 2);
+                assert_eq!(spark_demand(shape, 0, ranks).bytes, ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * 3584 * 2)?);
             }
             assert!(prefill_shape_with(rows as usize - 64, waves as usize, Some(unit as usize)).is_err());
         }

@@ -35,6 +35,25 @@ pub(super) fn validate_headers(format: CheckpointFormat, legacy: impl FnOnce() -
     if format == CheckpointFormat::Exlr8 { Ok(()) } else { legacy() }
 }
 
+pub(super) fn legacy_embedding_source(native: bool,
+    legacy: impl FnOnce() -> Result<crate::shared::token_io::EmbedSource>)
+    -> Result<Option<crate::shared::token_io::EmbedSource>> {
+    if native { Ok(None) } else { legacy().map(Some) }
+}
+
+fn embedding_source(records: &[DenseRecord], selection: &DenseSelection, hidden: usize, vocab: usize)
+    -> Result<crate::shared::token_io::EmbedSource> {
+    let name = selection.vocabulary_names()[0].clone();
+    let record = records.iter().find(|record| record.tensor == name).context("native Flash embedding")?;
+    ensure!(record.encoding == exlr8::dense::DenseEncoding::RowFp8 && record.shape == [vocab, hidden],
+        "native Flash embedding requires the manifest row-FP8 vocabulary");
+    let payload = record.components.iter().find(|c| c.suffix == "fp8").context("native Flash embedding payload")?;
+    ensure!(payload.source.bytes == vocab.checked_mul(hidden).context("native Flash embedding size overflow")?,
+        "native Flash embedding payload extent");
+    Ok(crate::shared::token_io::EmbedSource { path: payload.source.path.clone(), offset: payload.source.offset,
+        vocab, hidden, snapshot: None, tensor_name: name })
+}
+
 pub(super) fn whole_mla(cfg: &GlmNextConfig, layers: usize, attention: engine::GlmfAttention)
     -> BTreeMap<usize, usize> {
     let mut owner = attention.first_owner as usize;
@@ -104,7 +123,7 @@ impl Admission {
         cfg: &GlmNextConfig, execution: &cuteafd_loader::placement::LayerExecutionPlan)
         -> Result<(crate::shared::token_io::TokenEmbedding<'a>,
             (super::weights::GlmfWeights<'a>, Vec<Vec<super::weights::GlmfLayer<'a>>>))> {
-        use crate::shared::token_io::{native::NativeVocabulary, EmbedSource, TokenEmbedding};
+        use crate::shared::token_io::{native::NativeVocabulary, TokenEmbedding};
         let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
         let available = usize::try_from(available)?;
         let peak = self.dense.iter().try_fold(0usize, |sum, rank|
@@ -114,11 +133,7 @@ impl Admission {
             cfg.hidden, cfg.vocab_size)?;
         let vocabulary = std::rc::Rc::new(NativeVocabulary::load(library, programs, plan, available, 0, peak)?
             .context("native Flash rank0 owns vocabulary")?);
-        let name = self.facts.selection.vocabulary_names()[0].clone();
-        let record = self.facts.records.iter().find(|record| record.tensor == name).context("native Flash embedding")?;
-        let payload = record.components.iter().find(|c| c.suffix == "fp8").context("native Flash embedding payload")?;
-        let source = EmbedSource { path: payload.source.path.clone(), offset: payload.source.offset,
-            vocab: cfg.vocab_size, hidden: cfg.hidden, snapshot: None, tensor_name: name };
+        let source = embedding_source(&self.facts.records, &self.facts.selection, cfg.hidden, cfg.vocab_size)?;
         let embedding = TokenEmbedding::row_fp8(library, source, vocabulary.clone())?;
         let model = loader.native_model(cfg, execution, &self.dense, vocabulary)?;
         Ok((embedding, model))
@@ -158,6 +173,45 @@ mod tests {
             assert!(validate_headers(format, || { called.set(true); anyhow::bail!("legacy validation") }).is_err());
             assert!(called.get());
         }
+    }
+
+    #[test]
+    fn vocabulary_source_uses_native_manifest_or_legacy_bf16_without_crossing() -> Result<()> {
+        use crate::shared::token_io::EmbedSource;
+        use exlr8::dense::{DenseComponent, DenseEncoding, DenseExecution, DenseOwnership, DenseRange, ShardSide};
+        let root = crate::shared::experts::exlr8::dense_weights::tests::fixture("flash");
+        let config = serde_json::from_slice(&std::fs::read(root.path().join("config.json"))?)?;
+        let selection = DenseSelection::from_hf(&config)?;
+        let name = selection.vocabulary_names()[0].clone();
+        let (vocab, hidden) = (256, 8);
+        let path = root.path().join("native-vocabulary.bin");
+        std::fs::write(&path, vec![17u8; vocab * hidden + 32])?;
+        let mut records = vec![DenseRecord { tensor: name.clone(), encoding: DenseEncoding::RowFp8,
+            shape: vec![vocab, hidden], side: ShardSide::Output,
+            ownership: DenseOwnership::new(DenseExecution::RankZero), channels_per_shard: 128,
+            rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 2,
+            components: vec![DenseComponent { suffix: "fp8".into(), dtype: "U8".into(),
+                shape: vec![vocab, hidden], source: DenseRange { path: path.clone(), offset: 32,
+                    bytes: vocab * hidden }, window: None }] }];
+        let source = embedding_source(&records, &selection, hidden, vocab)?;
+        assert_eq!((source.path, source.offset, source.snapshot), (path, 32, None));
+        assert!(legacy_embedding_source(true, || panic!("native startup attempted BF16 source"))?.is_none());
+        let mut meta = cuteafd_loader::SafetensorsTensorMetadata { name, dtype: cuteafd_core::DType::Bf16,
+            shape: vec![vocab, hidden], byte_offset: 64, byte_length: (vocab * hidden * 2) as u64 };
+        let legacy = || EmbedSource::new(root.path(), "legacy.safetensors", &meta, hidden);
+        let source = legacy_embedding_source(false, legacy)?.context("legacy embedding")?;
+        assert_eq!((source.path, source.offset, source.snapshot),
+            (root.path().join("legacy.safetensors"), 64, Some(root.path().to_owned())));
+        meta.dtype = cuteafd_core::DType::U8;
+        assert!(legacy_embedding_source(false, ||
+            EmbedSource::new(root.path(), "legacy.safetensors", &meta, hidden)).is_err());
+        records[0].encoding = DenseEncoding::Mxfp8;
+        assert!(embedding_source(&records, &selection, hidden, vocab).is_err());
+        assert!(embedding_source(&[], &selection, hidden, vocab).is_err());
+        records[0].encoding = DenseEncoding::RowFp8;
+        records[0].components.clear();
+        assert!(embedding_source(&records, &selection, hidden, vocab).is_err());
+        Ok(())
     }
 
     #[test]

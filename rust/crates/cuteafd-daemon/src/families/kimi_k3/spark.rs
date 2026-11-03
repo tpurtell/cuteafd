@@ -297,11 +297,11 @@ mod tests {
                 if rows % 2 == 0 && rows >= 128 {
                     let charge = admitted_demand(2, rows / 2, 1, ranks)?;
                     assert_eq!(charge.gpu, 1);
-                    assert_eq!(charge.bytes, (ranks * rows * LATENT * 2) as u64);
+                    assert_eq!(charge.bytes, ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes((rows * LATENT * 2) as u64)?);
                 }
                 let unit = rows.max(64).next_multiple_of(64);
                 assert_eq!(admitted_demand(1, unit, 1, ranks)?.bytes,
-                    (ranks * unit * LATENT * 2) as u64);
+                    ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes((unit * LATENT * 2) as u64)?);
             }
         }
         Ok(())
@@ -312,7 +312,7 @@ mod tests {
         for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             let charge = admitted_demand(3, 2752, 1, ranks)?;
             assert_eq!(charge.gpu, 1);
-            assert_eq!(charge.bytes, (3 * 2752 * ranks * LATENT * 2) as u64);
+            assert_eq!(charge.bytes, ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes((3 * 2752 * LATENT * 2) as u64)?);
         }
         Ok(())
     }
@@ -337,7 +337,7 @@ mod tests {
         for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             for (rows, waves, unit) in [(8192, 2, 4096), (8256, 3, 2752), (8192, 4, 2048)] {
                 let charge = admitted_demand(waves, unit, 0, ranks)?;
-                assert_eq!(charge.bytes, (rows * ranks * LATENT * 2) as u64);
+                assert_eq!(charge.bytes, ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes((rows * LATENT * 2) as u64)?);
                 assert_eq!(charge, cuteafd_loader::families::kimi_k3::allocation::spark_demand(
                     cuteafd_loader::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: waves as u64 }, 0, ranks));
             }

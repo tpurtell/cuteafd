@@ -1104,13 +1104,6 @@ cuteafd_status_t cuteafd_cuda_linear_bf16_cublas_async(
 cuteafd_status_t cuteafd_cuda_linear_bf16_f32_cublas_async(
     const uint16_t* input, const uint16_t* weight, float* output, size_t rows,
     size_t input_dim, size_t output_dim, void* cuda_stream);
-// M=2..8 shared-weight BF16 projection selected from the recurrent M=1
-// cuBLASLt plan. The first live launch self-qualifies bitwise parity against
-// repeated M=1 cuBLAS calls and retains that exact fallback if the local
-// driver/toolkit selects an incompatible plan.
-cuteafd_status_t cuteafd_cuda_linear_bf16_m1_parity_batched_cublaslt_async(
-    const uint16_t* input, const uint16_t* weight, uint16_t* output,
-    size_t rows, size_t input_dim, size_t output_dim, void* cuda_stream);
 // One-row GEMV over losslessly packed BF16 weights. Each 1,024-value tile uses
 // one sign/mantissa byte per value, two four-bit exponent codes per byte, and a
 // metadata row whose header is base | (escape_count << 8). Remaining metadata

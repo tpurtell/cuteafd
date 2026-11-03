@@ -137,6 +137,7 @@ pub(crate) struct Draft {
 pub(crate) struct MimoDrafter<'a> {
     pub(crate) kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     library: &'a NativeLibrary,
+    projections: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
     stream: *mut c_void,
@@ -377,11 +378,19 @@ impl<'a> MimoDrafter<'a> {
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. `mask_row` is the mask token's embedding.
-    pub fn load(library: &'a NativeLibrary, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, representation: MimoDraftRepresentation,
         scales: fp8_linear::Fp8Scales, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig::read(dir)?;
+        let h = cfg.hidden;
+        let shapes = [(h * cfg.taps.len(), h), (h, cfg.qkv_width()), (h, 2 * cfg.kv_heads * cfg.head_dim),
+            (cfg.heads * cfg.head_dim, h), (h, 2 * cfg.intermediate), (cfg.intermediate, h)];
+        let projections = cuteafd_ffi::draft_projection::DraftProjections::load(programs,
+            if representation == MimoDraftRepresentation::Bf16Only { &shapes } else { &[] },
+            cuteafd_ffi::draft_projection::batch_rows(TAP_ROWS, cfg.block, max_sequences,
+                programs.capacities().decode_rows.unwrap_or(0)))?;
+
         ensure!(matches!(representation, MimoDraftRepresentation::Bf16Only | MimoDraftRepresentation::Fp8Only),
             "MiMo serving supports only immutable bf16-only or fp8-only drafter storage; historical dual/mixed controls are not production modes");
         let mut capacity = MimoDraftCapacity::new(slots, max_sequences, cfg.block)?;
@@ -467,7 +476,7 @@ impl<'a> MimoDrafter<'a> {
             "DFlash immutable weight storage");
         Ok(Self {
             kv_cache,
-            library,
+            library, projections,
             stream,
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
             slots,
@@ -551,7 +560,7 @@ impl<'a> MimoDrafter<'a> {
             DraftWeight::Fp8(_) => anyhow::bail!("FP8-only DFlash has no BF16 fallback"),
         };
         // SAFETY: the selected rows belong to the live BF16 matrix.
-        unsafe { self.library.linear_bf16(x, at(bf16, first * k * 2), out, rows, k, n, self.stream) }
+        unsafe { Ok(self.projections.launch(x, at(bf16, first * k * 2), out, rows, k, n, self.stream)?) }
     }
 
     pub fn context_rings(&self) -> Vec<CuteafdDeviceBuffer> {

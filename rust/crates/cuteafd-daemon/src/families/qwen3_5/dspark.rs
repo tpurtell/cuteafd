@@ -151,7 +151,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     let stream = engine.target_stream().raw;
     let weights = block_dspark::prefetch(snapshot);
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
-    let drafter = DsparkDrafter::load_paged(library, snapshot,
+    let drafter = DsparkDrafter::load_paged(library, programs, snapshot,
         weights.join().map_err(|_| anyhow::anyhow!("draft tensor loader panicked"))??,
         stream, 1, 1, mask, GlmDraftRepresentation::Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16,
         cfg.max_context, engine.pool_tokens, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;

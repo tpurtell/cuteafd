@@ -37,6 +37,7 @@ pub(crate) struct MtpStage<'a> {
 }
 
 pub(crate) struct MtpDrafter<'a> {
+    pub projection: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     pub stages: Vec<MtpStage<'a>>,
     /// [rings * HIDDEN_ROWS, H] BF16: target last-layer outputs by (ring, position % 256).
     pub hidden: Dev<'a>,

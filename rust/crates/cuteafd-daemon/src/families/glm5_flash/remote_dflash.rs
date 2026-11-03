@@ -268,6 +268,7 @@ mod tests {
         // SAFETY: this library outlives every fixture stream and device owner.
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
+        let programs = library.programs()?.with_manifest(&PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
         let device = Device { library: &library, id: 0 };
         let lead = Stream::new(device)?;
         let peer_target = Stream::new(Device { library: &library, id: 1 })?;
@@ -293,10 +294,10 @@ mod tests {
         for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
             let prepared = Prepared::new(&library, RankDevice { device: 0, stream: lead.raw },
                 RankDevice { device: 1, stream: peer_target.raw }, 0, IDENTITY, crate::shared::draft::remote::decode_extent(4 * cfg.block, cfg.hidden, cfg.vocab, 0)?)?;
-            let local = DflashDrafter::load(&library, &draft_path, file.clone(), lead.raw, 4, 4,
+            let local = DflashDrafter::load(&library, &programs, &draft_path, file.clone(), lead.raw, 4, 4,
                 mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
             let draft_device = prepared.stream.device;
-            let draft = draft_device.own(|| DflashDrafter::load(&library, &draft_path, file.clone(),
+            let draft = draft_device.own(|| DflashDrafter::load(&library, &programs, &draft_path, file.clone(),
                 prepared.stream.raw, 4, 4, mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16))?;
             let remote = RemoteDflash::new(draft, prepared)?;
             let result = (|| -> Result<()> {

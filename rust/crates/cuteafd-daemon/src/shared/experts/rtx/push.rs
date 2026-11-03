@@ -291,28 +291,55 @@ fn rank_bytes(base: u64, tp2: u64, host: u64) -> (u64, u64) {
 
 type DenseSlot = std::sync::Arc<std::sync::Mutex<Option<Vec<DensePlan>>>>;
 
-/// The expert layers coordinator GPUs push beside their dense records, as the
-/// mount admits them: TP2 halves of `layers` (two GPUs, each with its own
-/// resident budget), or whole layers and draft stages on one GPU.
+/// Whole experts on one placement-selected coordinator rank. The checkpoint
+/// shard remains world 1/rank 0, independently of the owning coordinator rank.
+#[derive(Clone, Debug)]
+pub(crate) struct WholeOwner {
+    pub rank: usize,
+    pub selections: Vec<crate::shared::experts::layer::ExpertLayer>,
+    pub budget: usize,
+}
+
+/// Expert owners are independent of the dense ranks: every dense GPU joins,
+/// including ranks with no whole expert layers assigned by placement.
 #[derive(Clone, Debug)]
 pub(crate) enum CoordinatorExperts {
     Tp2 { layers: Vec<usize>, budgets: Vec<usize> },
     Exlr8 { manifest: String, layers: Vec<usize>, budgets: Vec<usize> },
-    Whole { selections: Vec<crate::shared::experts::layer::ExpertLayer>, budget: usize },
+    Whole { owners: Vec<WholeOwner> },
 }
 
 impl CoordinatorExperts {
-    fn gpus(&self) -> usize { match self { Self::Tp2 { .. } => 2, Self::Exlr8 { budgets, .. } => budgets.len(), Self::Whole { .. } => 1 } }
-    /// GPU `gpu`'s plan, re-derived from headers alone.
-    fn plan(&self, catalog: &OfficialV41Catalog, gpu: usize) -> Result<CoordinatorExpertPlan> {
+    fn validate_ranks(&self, gpus: usize) -> Result<()> {
         match self {
+            Self::Tp2 { budgets, .. } => ensure!(gpus == 2 && budgets.len() == gpus,
+                "coordinator TP2 budgets require two ranks"),
+            Self::Exlr8 { budgets, .. } => ensure!(budgets.len() == gpus,
+                "coordinator EXLR8 budgets differ from dense ranks"),
+            Self::Whole { owners } => {
+                ensure!(!owners.is_empty(), "whole coordinator push needs expert owners");
+                let mut ranks = std::collections::BTreeSet::new();
+                for owner in owners {
+                    ensure!(owner.rank < gpus && ranks.insert(owner.rank) && !owner.selections.is_empty(),
+                        "whole expert owner is empty, duplicated or outside coordinator ranks");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Dense-only ranks have no expert plan. A whole owner's checkpoint shard
+    /// identity never depends on its position in the coordinator group.
+    fn plan(&self, catalog: &OfficialV41Catalog, gpu: usize) -> Result<Option<CoordinatorExpertPlan>> {
+        let plan = match self {
             Self::Exlr8 { manifest, layers, budgets } => CoordinatorExpertPlan::exlr8(catalog, manifest, layers, budgets.len(), gpu,
-                *budgets.get(gpu).context("coordinator EXLR8 TP2 budget per GPU")?),
+                *budgets.get(gpu).context("coordinator EXLR8 TP2 budget per GPU")?)?,
             Self::Tp2 { layers, budgets } => CoordinatorExpertPlan::new(catalog, layers, gpu,
-                *budgets.get(gpu).context("coordinator TP2 budget per GPU")?),
-            Self::Whole { selections, budget } => {
+                *budgets.get(gpu).context("coordinator TP2 budget per GPU")?)?,
+            Self::Whole { owners } => {
+                let Some(WholeOwner { selections, budget, .. }) = owners.iter().find(|owner| owner.rank == gpu)
+                    else { return Ok(None) };
                 use crate::shared::experts::layer::ExpertLayer;
-                ensure!(gpu == 0, "whole coordinator expert layers live on one GPU");
                 ensure!(selections.iter().all(|s| matches!(s, ExpertLayer::BackboneFull { .. } | ExpertLayer::Dspark { .. })),
                     "a whole-layer coordinator plan takes full backbone layers and draft stages");
                 if catalog.exl3().is_none() {
@@ -320,13 +347,15 @@ impl CoordinatorExperts {
                         ExpertLayer::BackboneFull { layer } => Ok(*layer),
                         _ => anyhow::bail!("native whole coordinator push requires backbone layers"),
                     }).collect::<Result<Vec<_>>>()?;
-                    return CoordinatorExpertPlan::whole_native(catalog, &layers, *budget);
+                    CoordinatorExpertPlan::whole_native(catalog, &layers, *budget)?
+                } else {
+                    let residencies = selections.iter().map(|&s| crate::shared::experts::exl3::planned_residency(catalog, s))
+                        .collect::<Result<Vec<_>>>()?;
+                    CoordinatorExpertPlan::whole(residencies, *budget)?
                 }
-                let residencies = selections.iter().map(|&s| crate::shared::experts::exl3::planned_residency(catalog, s))
-                    .collect::<Result<Vec<_>>>()?;
-                CoordinatorExpertPlan::whole(residencies, *budget)
             }
-        }
+        };
+        Ok(Some(plan))
     }
 }
 
@@ -385,9 +414,9 @@ impl CoordinatorPush {
         let (_, host) = cuteafd_loader::push_load::namespace(snapshot)?;
         let plans = match &experts {
             Some(experts) => {
-                ensure!(experts.gpus() == gpus, "coordinator expert layers span {} GPUs, not {gpus}", experts.gpus());
+                experts.validate_ranks(gpus)?;
                 let catalog = catalog.context("coordinator expert push needs the expert catalog")?;
-                (0..gpus).map(|gpu| experts.plan(catalog, gpu).map(Some)).collect::<Result<Vec<_>>>()?
+                (0..gpus).map(|gpu| experts.plan(catalog, gpu)).collect::<Result<Vec<_>>>()?
             }
             None => (0..gpus).map(|_| None).collect(),
         };
@@ -417,7 +446,7 @@ impl CoordinatorPush {
                 let (base, host) = dense.as_ref().map_or((0, 0), |dense| (dense[gpu].base, dense[gpu].host_bytes));
                 let tp2 = append_experts.as_ref().map(|experts| experts.plan(
                     catalog.context("coordinator expert push needs the expert catalog")?, gpu))
-                    .transpose()?;
+                    .transpose()?.flatten();
                 let (host_base, total) = rank_bytes(base, tp2.as_ref().map_or(0, |p| p.logical_bytes()), host);
                 if let Some(dense) = dense.as_ref() { (dense[gpu].append)(builder, rank, host_base)?; }
                 if let (Some(plan), Some(catalog)) = (&tp2, catalog) { plan.append_at(builder, catalog, rank, base)?; }

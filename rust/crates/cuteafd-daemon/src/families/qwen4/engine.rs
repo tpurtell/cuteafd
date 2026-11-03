@@ -200,8 +200,8 @@ impl LocalExl3<'_> {
             else { return Ok(false) };
         if selections.is_empty() { return Ok(false); }
         let started = std::time::Instant::now();
-        let experts = crate::shared::experts::rtx::push::CoordinatorExperts::Whole { selections: selections.clone(),
-            budget: weights_budget };
+        let experts = crate::shared::experts::rtx::push::CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
+            selections: selections.clone(), budget: weights_budget }] };
         let push = match crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(snapshot, Some(self.catalog), 1,
             Some(experts)) {
             Ok(push) => push,

@@ -29,6 +29,25 @@ pub(crate) struct Rect {
 }
 
 impl Rect {
+    /// Header-only source selection; never opens the tensor payload.
+    pub fn tensor(checkpoint: &cuteafd_loader::plan::Checkpoint, name: &str,
+        rows: Option<Range<usize>>, cols: Option<Range<usize>>) -> Result<Self> {
+        let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+            .map_err(|_| anyhow::anyhow!("checkpoint lacks {name}"))?;
+        let tensor = &checkpoint.tensors[at];
+        ensure!(checkpoint.weight_map.get(name) == Some(&tensor.shard),
+            "tensor header differs from checkpoint index: {name}");
+        let total = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
+        let bytes = usize::try_from(tensor.meta.byte_length)?;
+        ensure!(total > 0 && bytes % total == 0, "{name}: invalid tensor row extent");
+        let row_bytes = bytes / total;
+        let (rows, cols) = (rows.unwrap_or(0..total), cols.unwrap_or(0..row_bytes));
+        ensure!(!rows.is_empty() && !cols.is_empty() && rows.end <= total && cols.end <= row_bytes,
+            "{name}: rectangle outside the tensor");
+        Ok(Self { name: name.into(), path: checkpoint.snapshot.join(&tensor.shard),
+            base: tensor.meta.byte_offset, row_bytes, rows, cols })
+    }
+
     pub fn width(&self) -> usize { self.cols.len() }
     pub fn bytes(&self) -> usize { self.rows.len() * self.cols.len() }
 
@@ -86,6 +105,9 @@ pub(crate) struct Operand {
 pub(crate) enum Job {
     /// Staged bytes `at..at + bytes` copied unchanged to `dst`.
     Upload { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// BF16 gate parameters converted by the checkpoint's host coefficient
+    /// contract (no device transcendental rounding changes).
+    ResidualGate { temperature: f32, alpha: CuteafdDeviceBuffer, beta: CuteafdDeviceBuffer },
     /// BF16 `at..at + bytes` widened to F32 into `dst`.
     Widen { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
     /// F32 `at..at + bytes` narrowed to BF16 (round to nearest even, NaN
@@ -257,6 +279,15 @@ impl Step {
         };
         for job in &self.jobs {
             match *job {
+                Job::ResidualGate { temperature, alpha, beta } => {
+                    let (a, b) = residual_gate_bytes(&staged[..self.bytes()], temperature)?;
+                    ensure!(a.len() == alpha.bytes && b.len() == beta.bytes,
+                        "residual gate differs from admitted operands");
+                    load_timing::upload(a.len() + b.len(), || {
+                        library.copy_h2d(alpha, &a)?;
+                        library.copy_h2d(beta, &b)
+                    })?;
+                }
                 Job::Upload { at, bytes, dst } => {
                     ensure!(at + bytes <= staged.len() && bytes <= dst.bytes, "upload outside its step");
                     load_timing::upload(bytes, || library.copy_h2d(CuteafdDeviceBuffer { bytes, ..dst },
@@ -378,6 +409,16 @@ impl Step {
         }
         Ok(())
     }
+}
+
+pub(crate) fn residual_gate_bytes(bytes: &[u8], temperature: f32) -> Result<(Vec<u8>, Vec<u8>)> {
+    ensure!(!bytes.is_empty() && bytes.len() % 2 == 0 && temperature.is_finite() && temperature > 0.0,
+        "invalid residual gate parameters");
+    let gate = bytes.chunks_exact(2).map(|b|
+        f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect::<Vec<_>>();
+    let coefficients = cuteafd_loader::families::muse_spark::reference::residual_gate_coefficients(&gate, temperature);
+    Ok((coefficients.iter().flat_map(|(a, _)| a.to_le_bytes()).collect(),
+        coefficients.iter().flat_map(|(_, b)| b.to_le_bytes()).collect()))
 }
 
 /// `rects` (rows of equal width, back to back) as steps of at most

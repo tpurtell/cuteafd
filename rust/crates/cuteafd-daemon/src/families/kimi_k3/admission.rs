@@ -1804,7 +1804,9 @@ pub(super) mod tests {
             let demand = super::super::spark::admitted_demand(waves, unit, lane, ranks)?;
             let items = admitted.placement.items[1].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].bytes, (ranks * waves * unit * 3584 * 2) as u64);
+            assert_eq!(items[0].bytes, ranks as u64
+                * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                    (waves * unit * 3584 * 2) as u64)?);
             assert_eq!(items[0].basis, Basis::Exact);
             assert_eq!(items[0].category, Category::Workspace);
             assert!(!admitted.placement.items[0].iter().any(|item| item.group == demand.group));

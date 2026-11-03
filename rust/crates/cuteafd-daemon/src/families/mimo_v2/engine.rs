@@ -2754,7 +2754,7 @@ impl<'a> MimoEngine<'a> {
         unsafe {
             self.library.glm_dflash_tap(mtp.normed_e.buffer.ptr, mtp.cat.buffer.ptr, t, h, 2 * h, 0, self.stream)?;
             self.library.glm_dflash_tap(mtp.normed_h.buffer.ptr, mtp.cat.buffer.ptr, t, h, 2 * h, h, self.stream)?;
-            self.library.linear_bf16(mtp.cat.buffer.ptr, stage.eh.buffer.ptr, w.h.buffer.ptr, t, 2 * h, h, self.stream)?;
+            mtp.projection.launch(mtp.cat.buffer.ptr, stage.eh.buffer.ptr, w.h.buffer.ptr, t, 2 * h, h, self.stream)?;
         }
         let layer = &stage.layer;
         self.norm(w, layer.ptr("input_norm")?, 0, rows)?;

@@ -12,6 +12,53 @@ pub const PREFILL_DEPTH: u64 = 3;
 pub const PREFILL_ROW_PAGE: u64 = 64;
 pub const PREFILL_MAX_WAVES: u64 = 4;
 
+/// DMA_BUF needs a host-page-aligned base and length (4 KiB on supported
+/// hosts). cudaMalloc can suballocate at sub-page bases: overallocate one
+/// page, then register the aligned interior range, retaining the raw owner.
+pub const SPARK_INTAKE_EXPORT_ALIGNMENT: u64 = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SparkIntakeAllocationError {
+    #[error("Spark intake allocation byte size overflow")]
+    Overflow,
+    #[error("Spark intake export base {ptr:#x} and length {bytes} must be nonzero and {alignment}-byte aligned")]
+    Alignment { ptr: u64, bytes: u64, alignment: u64 },
+}
+
+fn spark_intake_export_bytes(logical_bytes: u64) -> Result<u64, SparkIntakeAllocationError> {
+    let page = SPARK_INTAKE_EXPORT_ALIGNMENT;
+    logical_bytes.checked_add(page - 1).map(|bytes| bytes / page * page)
+        .ok_or(SparkIntakeAllocationError::Overflow)
+}
+
+/// Raw cudaMalloc size of one whole-rank reserve, including alignment slack.
+pub fn spark_intake_allocation_bytes(logical_bytes: u64) -> Result<u64, SparkIntakeAllocationError> {
+    if logical_bytes == 0 { return Ok(0); }
+    spark_intake_export_bytes(logical_bytes)?.checked_add(SPARK_INTAKE_EXPORT_ALIGNMENT)
+        .ok_or(SparkIntakeAllocationError::Overflow)
+}
+
+/// Aligned byte offset and registered length inside the raw cudaMalloc.
+/// The raw allocation must have `spark_intake_allocation_bytes(logical_bytes)` bytes.
+pub fn spark_intake_export_range(allocation_ptr: u64, logical_bytes: u64)
+    -> Result<(u64, u64), SparkIntakeAllocationError> {
+    let bytes = spark_intake_export_bytes(logical_bytes)?;
+    let page = SPARK_INTAKE_EXPORT_ALIGNMENT;
+    let aligned = allocation_ptr.checked_add(page - 1)
+        .map(|ptr| ptr / page * page).ok_or(SparkIntakeAllocationError::Overflow)?;
+    aligned.checked_add(bytes).ok_or(SparkIntakeAllocationError::Overflow)?;
+    validate_spark_intake_export(aligned, bytes)?;
+    Ok((aligned - allocation_ptr, bytes))
+}
+
+pub fn validate_spark_intake_export(ptr: u64, bytes: u64) -> Result<(), SparkIntakeAllocationError> {
+    let alignment = SPARK_INTAKE_EXPORT_ALIGNMENT;
+    if ptr == 0 || bytes == 0 || ptr % alignment != 0 || bytes % alignment != 0 {
+        return Err(SparkIntakeAllocationError::Alignment { ptr, bytes, alignment });
+    }
+    Ok(())
+}
+
 pub fn prefill_unit_rows_in(waves: u64, reserve: u64) -> u64 {
     reserve.div_ceil(waves.clamp(2, PREFILL_MAX_WAVES)).div_ceil(PREFILL_ROW_PAGE) * PREFILL_ROW_PAGE
 }
@@ -446,8 +493,42 @@ pub fn resolve_capacity_with_startup_peaks(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefill_default_and_wave_clamp() {
+        assert_eq!(super::default_prefill_unit_rows(), 2752);
+        for (depth, expected) in [(0, 4096), (1, 4096), (3, 2752), (4, 2048), (8, 2048)] {
+            assert_eq!(super::prefill_unit_rows_in(depth, super::PREFILL_RESERVE_ROWS), expected);
+        }
+    }
+
     use super::*;
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn spark_intake_backing_rounds_the_whole_reserve_and_checks_export_alignment() {
+        let page = SPARK_INTAKE_EXPORT_ALIGNMENT;
+        for logical in [1, 655_360, 819_200, 287_837_184, 289_406_976] {
+            let allocation = spark_intake_allocation_bytes(logical).unwrap();
+            assert_eq!(allocation, logical.div_ceil(page) * page + page);
+            for base in [4096, 4096 + 512, 8191] {
+                let (offset, bytes) = spark_intake_export_range(base, logical).unwrap();
+                assert_eq!((base + offset) % page, 0);
+                assert_eq!(bytes, logical.div_ceil(page) * page);
+                assert!(offset < page && offset + bytes <= allocation);
+                assert!(validate_spark_intake_export(base + offset, bytes).is_ok());
+            }
+        }
+        assert_eq!(spark_intake_allocation_bytes(0), Ok(0));
+        assert_eq!(spark_intake_allocation_bytes(u64::MAX), Err(SparkIntakeAllocationError::Overflow));
+        assert!(spark_intake_export_range(u64::MAX, 4096).is_err());
+        for bytes in [655_360, 819_200, 289_406_976] {
+            assert!(validate_spark_intake_export(4096, bytes).is_ok());
+        }
+        for (ptr, bytes) in [(0, 4096), (4096, 0), (4608, 655_360), (4096, 287_837_184)] {
+            assert!(matches!(validate_spark_intake_export(ptr, bytes),
+                Err(SparkIntakeAllocationError::Alignment { .. })));
+        }
+    }
 
     #[test]
     fn default_concurrency_uses_logical_capacity_not_free_memory() {

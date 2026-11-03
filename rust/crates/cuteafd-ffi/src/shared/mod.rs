@@ -7,6 +7,7 @@ pub(crate) mod packed_head;
 pub mod fp8_moe;
 pub mod programs;
 pub mod mla_draft;
+pub mod draft_projection;
 pub mod native_dense;
 pub mod native_dense_glue;
 pub mod glm_stage;

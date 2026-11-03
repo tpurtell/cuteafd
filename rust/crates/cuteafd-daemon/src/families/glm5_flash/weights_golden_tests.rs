@@ -8,6 +8,72 @@ use super::*;
 use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
 use sha2::{Digest, Sha256};
 
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn native_k6_core_and_head_records_match_host_pack() -> Result<()> {
+    use cuteafd_loader::{formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook,
+        trellis_core::{CoreProjection, CoreSplit, CoreWeightLayout}}, plan::testing::{t, write_snapshot}};
+    use crate::shared::{checkpoint_read::read_tensor, dense_trellis,
+        experts::rtx::dense::{Job, Records, STEP_BYTES}, memory::device::Device};
+    use std::os::unix::fs::FileExt;
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 1 << 30)?; }
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let stem = "lm_head";
+    let book = Exl3Codebook::Mcg;
+    let tensors = [t(format!("{stem}.trellis"), "I16", &[16, 16, 96]),
+        t(format!("{stem}.suh"), "F16", &[256]), t(format!("{stem}.svh"), "F16", &[256]),
+        t(format!("{stem}.{}", book.marker()), "I32", &[])];
+    write_snapshot(root.path(), &serde_json::json!({}), &tensors, None);
+    let checkpoint = Checkpoint::open(root.path())?;
+    for tensor in &checkpoint.tensors {
+        let bytes = if tensor.meta.name.ends_with(book.marker()) { book.multiplier().to_le_bytes().to_vec() }
+            else { (0..tensor.meta.byte_length).map(|i| (i as u8).wrapping_mul(29) ^ tensor.meta.name.len() as u8).collect() };
+        std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+            .write_all_at(&bytes, tensor.meta.byte_offset)?;
+    }
+    let projection = CoreProjection { stem: stem.into(), bits: 6, codebook: book, shape: [256, 256],
+        stored_outputs: 256, split: CoreSplit::Output, source_bytes: 0 };
+    let stream = std::ptr::null_mut();
+    let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream,
+        kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Off, kda_output_shard: false,
+        fp8_head: false, kda_nvfp4: None, fp8_scales: crate::shared::fp8_linear::Fp8Scales::Pow2,
+        device: 0, peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }],
+        dense: std::rc::Rc::new(DenseLoad::mount(&library)) };
+    for (ranks, side) in [(1, TrellisSide::Output), (2, TrellisSide::Output), (2, TrellisSide::Input)] {
+        let load = std::rc::Rc::new(DenseLoad::push(&library));
+        let pushed_loader = GlmfLoader { dense: load.clone(), ..loader.clone() };
+        let mut actual = Vec::new();
+        for rank in 0..ranks {
+            let layout = CoreWeightLayout::new(&projection, side, rank, ranks)?;
+            let device = Device { library: &library, id: rank as i32 };
+            let packed = dense_trellis::CoreWeightLayout::from_shared(layout.clone())
+                .read(|name| read_tensor(&checkpoint, name))?;
+            let expected = dense_trellis::CoreWeightLayout::from_shared(layout.clone()).upload(device, packed)?;
+            let expected = device.run(|| Ok([digest(&library, expected.payload.buffer)?,
+                digest(&library, expected.suh.buffer)?, digest(&library, expected.svh.buffer)?]))?;
+            actual.push((device, expected, pushed_loader.core_weights(layout, rank)?));
+        }
+        let records = load.sink.as_ref().context("K6 push sink")?.take_all();
+        assert_eq!(records.operands.len(), ranks * 2);
+        assert!(!records.steps.is_empty());
+        assert!(records.steps.iter().all(|s| s.bytes() <= STEP_BYTES
+            && s.jobs.iter().all(|j| matches!(j, Job::TrellisTiles { .. }))));
+        let sockets = tempfile::tempdir_in(fixture.directory())?;
+        for (device, expected, weights) in actual {
+            let mine = Records { operands: records.operands.iter().filter(|o| o.device == device.id).cloned().collect(),
+                steps: records.steps.iter().filter(|s| s.device == device.id).cloned().collect(), ..Default::default() };
+            crate::shared::experts::rtx::push::tests::receive_pushed(device, None, root.path(), sockets.path(),
+                &mine, None, 0, device.id as usize)?;
+            let actual = device.run(|| Ok([digest(&library, weights.payload.buffer)?,
+                digest(&library, weights.suh.buffer)?, digest(&library, weights.svh.buffer)?]))?;
+            assert_eq!(actual, expected, "{ranks} ranks {side:?} GPU{}", device.id);
+        }
+    }
+    Ok(())
+}
+
 /// The pinned digests: CUTEAFD_GLMF_GOLDEN (another checkpoint's golden,
 /// e.g. the stitched Core FP8) or the checked-in file.
 fn golden_path() -> std::path::PathBuf {
@@ -137,7 +203,7 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
                 let kind = match job { Job::Upload { .. } => "upload", Job::Widen { .. } => "widen", Job::NarrowF32Bf16 { .. } => "narrow",
                     Job::Quant { .. } => "quant", Job::Absorb { .. } => "absorb", Job::ALog { .. } => "a_log",
                     Job::W8a16Pack { .. } => "w8a16", Job::NativeWindow { .. } => "native-window", Job::RowQuant { .. } => "row-quant",
-                    Job::Product { .. } | Job::TrellisTiles { .. } => panic!("GLM Flash records no Kimi jobs"),
+                    Job::ResidualGate { .. } | Job::Product { .. } | Job::TrellisTiles { .. } => panic!("GLM Flash records no Kimi jobs"),
                     Job::AbsorbFp8 { .. } => panic!("GLM Flash records no FP8 kv_b split"),
                     Job::ScaleCodes { .. } => panic!("GLM Flash must not record V4.1 scale coding") };
                 let largest = kinds.entry(kind).or_default();

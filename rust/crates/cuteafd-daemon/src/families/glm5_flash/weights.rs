@@ -688,19 +688,11 @@ impl<'a> GlmfLoader<'a> {
     fn core_weights(&self, layout: cuteafd_loader::formats::trellis_core::CoreWeightLayout,
         rank: usize) -> Result<crate::shared::dense_trellis::CoreWeights<'a>> {
         let layout = crate::shared::dense_trellis::CoreWeightLayout::from_shared(layout);
-        let loaded = layout.read(|name| {
-            let (bytes, dtype, shape) = self.raw(name)?;
-            let tensor = self.tensor(name)?;
-            Ok(cuteafd_loader::LoadedTensor {
-                info: cuteafd_core::TensorInfo { name: name.into(), file: tensor.shard.clone(), dtype, shape,
-                    byte_offset: tensor.meta.byte_offset, byte_length: tensor.meta.byte_length,
-                    role: cuteafd_core::TensorRole::Other, layer_id: None, expert_id: None,
-                    is_quantization_metadata: false }, source_path: self.checkpoint.snapshot.join(&tensor.shard),
-                bytes, elapsed_micros: 0, sha256: String::new(),
-            })
-        })?;
-        self.on_rank(rank, || layout.upload(crate::shared::memory::device::Device {
-            library: self.library, id: self.library.cuda_get_device()? }, loaded))
+        let stream = if rank == 0 { self.stream } else {
+            self.peers.get(rank - 1).context("native K6 load peer")?.stream
+        };
+        self.on_rank(rank, || layout.load_recorded(crate::shared::memory::device::Device {
+            library: self.library, id: self.library.cuda_get_device()? }, self.checkpoint, &self.dense, stream))
     }
 
     fn native_layer_shares(&self, cfg: &GlmNextConfig, layer: usize, mode: LayerMode,

@@ -194,9 +194,9 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, args.expert_partial_wide_format)?;
     let sequences = usize::from(args.max_sequences);
     let spark = super::admission::spark_plan(&placement, prefill, cutoff, sequences, args.peers.len())?;
-    let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
+    let admission_plan = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
         cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
-        spark.model.clone())?.start(&args.peers)?;
+        spark.model.clone())?;
     let devices = device_ids.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
         .collect::<Vec<_>>();
     let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
@@ -219,20 +219,56 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
             prefill.unit_rows)?.0)
     };
     let program_refs = programs.iter().collect::<Vec<_>>();
-    let (embedding, (ranks, local)) = crate::shared::placement::load_while_admitting(Some(admission), || {
-        devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
+    use crate::shared::experts::rtx::{dense, push::{CoordinatorPush, PushPolicy}};
+    let policy = PushPolicy::for_snapshot(&args.snapshot)?;
+    let prepared = policy.plan(|| {
+        let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, &placement,
+            gpus, &onboarded, usize::try_from(prefill.unit_rows)?, package)).transpose()?;
+        if admission_plan.coordinator_pushes() {
+            let (push, streams, ranks) = CoordinatorPush::prepare(&args.snapshot, Some(&catalog), gpus, experts)?;
+            Ok((push, Some((streams, ranks)), args.peers.len()))
+        } else {
+            Ok((CoordinatorPush::prepare_alone(&args.snapshot, Some(&catalog), gpus, experts)?, None, 0))
+        }
+    })?;
+    let (push, coordinator, push_sparks) = match prepared {
+        Some((push, coordinator, sparks)) => (Some(push), coordinator, sparks),
+        None => (None, None, 0),
+    };
+    let admission = admission_plan.start_with(&args.peers, coordinator)?;
+    let (embedding, ranks, local) = crate::shared::placement::load_while_admitting(Some(admission), || {
+        let load = || devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
             crate::shared::memory::EmbedPlacement::Gpu, || {
-            devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
-                super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
-                    checkpoint: &checkpoint, built: &built, placement: &placement, rank, slots: sequences as u64,
-                    unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
-                .collect::<Result<Vec<_>>>()
-                .and_then(|ranks| Ok((ranks, match &package {
-                    None => Vec::new(),
-                    Some(package) => super::onboard::load(&devices, &program_refs, &cfg, &catalog, package, &placement,
-                        onboarded.clone(), usize::try_from(prefill.unit_rows)?)?,
-                })))
-        }))
+                devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
+                    super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
+                        checkpoint: &checkpoint, built: &built, placement: &placement, rank, slots: sequences as u64,
+                        unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
+                    .collect::<Result<Vec<_>>>()
+            }));
+        let ((embedding, ranks), records) = if push.is_some() { dense::recording(load)? }
+            else { (load()?, dense::Records::default()) };
+        let pushed = match push {
+            Some(push) => {
+                let summary = records.summary();
+                tracing::info!(class2_bytes = summary.0, operands = summary.1, class3_bytes = summary.2,
+                    steps = summary.3, largest_step = summary.4, "Muse coordinator dense push records");
+                let dense = dense::plan_records(&args.snapshot, records, &devices, push_sparks);
+                let (delivered, ()) = push.receive_with(devices.clone(), Some(&catalog), push_sparks,
+                    Some(dense), || ());
+                policy.committed(delivered)?
+            }
+            None => None,
+        };
+        let local = match &package {
+            None => {
+                ensure!(pushed.as_ref().is_none_or(|ranks| ranks.iter().all(|rank| rank.len() == 0)),
+                    "Muse received unselected onboarded experts");
+                Vec::new()
+            }
+            Some(package) => super::onboard::load(&devices, &program_refs, &cfg, &catalog, package, &placement,
+                onboarded.clone(), usize::try_from(prefill.unit_rows)?, pushed)?,
+        };
+        Ok((embedding, ranks, local))
     })?;
     tracing::info!(layers = ?onboarded, gpus = local.len(), "Muse onboarded expert layers loaded");
     let streams = devices.iter().map(|&device| crate::shared::memory::device::Stream::new(device).map(std::rc::Rc::new))
@@ -251,7 +287,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     // The drafter beside the target head, on the head rank's stream (admission charged it there).
     let head_stream = *streams.last().context("Muse head stream")?;
     let draft = match (args.draft.as_deref(), &built.drafter) {
-        (Some(snapshot), Some(admitted)) => Some(super::draft::MuseDraft::load(&cfg, ranks.last().context("Muse head rank")?,
+        (Some(snapshot), Some(admitted)) => Some(super::draft::MuseDraft::load(programs.last().context("Muse head programs")?, &cfg, ranks.last().context("Muse head rank")?,
             head_stream, snapshot, &embedding, admitted, args.draft_kv_cache)?),
         (None, None) => None,
         _ => anyhow::bail!("Muse drafter admission differs from --draft"),

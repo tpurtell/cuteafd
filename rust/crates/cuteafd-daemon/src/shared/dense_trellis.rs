@@ -58,6 +58,75 @@ impl CoreWeightLayout {
         Ok(loaded)
     }
 
+    /// The shared native K6 recipe, used unchanged by mount and push loads.
+    pub(crate) fn load_recorded<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
+        dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void) -> Result<CoreWeights<'a>> {
+        use crate::shared::experts::rtx::dense::{Job, Operand, Rect, Step, TRANSFORM_BYTES};
+        let metadata = |name: &str| -> Result<&cuteafd_loader::SafetensorsTensorMetadata> {
+            let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+                .map_err(|_| anyhow::anyhow!("checkpoint lacks {name}"))?;
+            Ok(&checkpoint.tensors[at].meta)
+        };
+        let allocate = |bytes| {
+            let _scope = cuteafd_ffi::memory_ledger::scope("weights/native K6 core");
+            Allocation::new(device, bytes)
+        };
+        let landed = |r: Rect, bytes| -> Result<Allocation<'a>> {
+            let allocation = allocate(bytes)?;
+            dense.operand(Operand { device: device.id, buffer: allocation.buffer, lands: vec![(r, 0)], bytes })?;
+            Ok(allocation)
+        };
+        let stem = &self.stem;
+        let suffixes = ["trellis", "suh", "svh", self.codebook.marker()];
+        let metadata = suffixes.iter().map(|&s| Ok((s, metadata(&format!("{stem}.{s}"))?.clone())))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let module = exl3_module(stem, &suffixes, |s| metadata.get(s))?;
+        ensure!(module.codebook == self.codebook && module.bits == 6, "{stem}: K6 codebook/bits differ from admission");
+        // The marker is four bytes: checked on the host while planning.
+        let marker = crate::shared::checkpoint_read::read_tensor(checkpoint, &format!("{stem}.{}", self.codebook.marker()))?;
+        ensure!(marker.bytes.as_slice() == self.codebook.multiplier().to_le_bytes(),
+            "{stem}: unsupported {} marker payload", self.codebook.marker());
+        let (n, k) = (module.output_features, module.input_features);
+        let [local_n, local_k] = self.shape;
+        let (n0, k0) = match self.side {
+            TrellisSide::Output => (self.rank * local_n, 0),
+            TrellisSide::Input => (0, self.rank * local_k),
+        };
+        ensure!(match self.side { TrellisSide::Output => local_k == k && local_n * self.ranks == n,
+            TrellisSide::Input => local_n == n && local_k * self.ranks == k }
+            && local_n % 128 == 0 && local_k % 128 == 0, "{stem}: K6 shard geometry");
+        let tile_bytes = 32 * module.bits;
+        let payload = allocate(local_n * local_k * module.bits / 8)?;
+        let trellis = format!("{stem}.trellis");
+        // Checkpoint [K16][N16][tile]: rows are K16, this shard's tiles are a
+        // contiguous N16 column window of each row.
+        let row_bytes = (n / 16) * tile_bytes;
+        let cols = (n0 / 16) * tile_bytes..(n0 + local_n) / 16 * tile_bytes;
+        let width = cols.len();
+        let k16 = local_k / 16;
+        let per = (TRANSFORM_BYTES / width).max(1);
+        let mut kr = 0;
+        while kr < k16 {
+            let rows = per.min(k16 - kr);
+            let source = Rect::tensor(checkpoint, &trellis, Some(k0 / 16 + kr..k0 / 16 + kr + rows), Some(cols.clone()))?;
+            ensure!(source.row_bytes == row_bytes, "{trellis}: trellis row extent");
+            dense.step(Step { device: device.id, rects: vec![source], jobs: vec![Job::TrellisTiles { rows, k0: kr, tiles: local_n / 16, tile_bytes,
+                k16, input: self.side == TrellisSide::Input, dst: payload.buffer }] }, stream)?;
+            kr += rows;
+        }
+        let vector = |suffix: &str, start: usize, count: usize| -> Result<Allocation<'a>> {
+            let name = format!("{stem}.{suffix}");
+            let r = Rect::tensor(checkpoint, &name, None, Some(start * 2..(start + count) * 2))?;
+            let bytes = r.bytes();
+            landed(r, bytes)
+        };
+        let suh = vector("suh", k0, local_k)?;
+        let svh = vector("svh", n0, local_n)?;
+        ensure!(payload.buffer.bytes + suh.buffer.bytes + svh.buffer.bytes == self.bytes,
+            "{stem}: K6 shard differs from admitted bytes");
+        Ok(CoreWeights { payload, suh, svh, shape: self.shape, side: self.side, bits: self.bits, codebook: self.codebook })
+    }
+
     pub(crate) fn demand(&self, device: u8) -> Demand {
         Demand::new(device,Category::Weights,format!("native K6 {}",self.stem),self.bytes as u64,Basis::Exact)
     }

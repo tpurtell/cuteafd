@@ -13,7 +13,7 @@
 use super::*;
 use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights};
 use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, TRANSFORM_BYTES};
-use cuteafd_loader::{plan::Checkpoint, formats::exl3_storage::exl3_module};
+use cuteafd_loader::plan::Checkpoint;
 
 /// One coordinator GPU's records target.
 pub(crate) struct KimiRecords<'l, 'a> {
@@ -131,55 +131,9 @@ impl<'a> KimiRecords<'_, 'a> {
     /// now, the trellis rows staged a K16 window at a time and reordered on
     /// the GPU into `layout`'s side, `suh`/`svh` slices landed unchanged.
     fn core(&self, device: Device<'a>, layout: &CoreWeightLayout) -> Result<CoreWeights<'a>> {
-        let stem = &layout.stem;
-        let suffixes = ["trellis", "suh", "svh", layout.codebook.marker()];
-        let metadata = suffixes.iter().map(|&s| Ok((s, meta(self.checkpoint, &format!("{stem}.{s}"))?.clone())))
-            .collect::<Result<BTreeMap<_, _>>>()?;
-        let module = exl3_module(stem, &suffixes, |s| metadata.get(s))?;
-        ensure!(module.codebook == layout.codebook && module.bits == 6, "{stem}: K6 codebook/bits differ from admission");
-        // The marker is four bytes: checked on the host while planning.
-        let marker = read_tensor(self.checkpoint, &format!("{stem}.{}", layout.codebook.marker()))?;
-        ensure!(marker.bytes.as_slice() == layout.codebook.multiplier().to_le_bytes(),
-            "{stem}: unsupported {} marker payload", layout.codebook.marker());
-        let (n, k) = (module.output_features, module.input_features);
-        let [local_n, local_k] = layout.shape;
-        let (n0, k0) = match layout.side {
-            TrellisSide::Output => (layout.rank * local_n, 0),
-            TrellisSide::Input => (0, layout.rank * local_k),
-        };
-        ensure!(match layout.side { TrellisSide::Output => local_k == k && local_n * layout.ranks == n,
-            TrellisSide::Input => local_n == n && local_k * layout.ranks == k }
-            && local_n % 128 == 0 && local_k % 128 == 0, "{stem}: K6 shard geometry");
-        let tile_bytes = 32 * module.bits;
-        let payload = self.allocate(device, local_n * local_k * module.bits / 8)?;
-        let trellis = format!("{stem}.trellis");
-        // Checkpoint [K16][N16][tile]: rows are K16, this shard's tiles are a
-        // contiguous N16 column window of each row.
-        let row_bytes = (n / 16) * tile_bytes;
-        let cols = (n0 / 16) * tile_bytes..(n0 + local_n) / 16 * tile_bytes;
-        let width = cols.len();
-        let k16 = local_k / 16;
-        let per = (TRANSFORM_BYTES / width).max(1);
-        let mut kr = 0;
-        while kr < k16 {
-            let rows = per.min(k16 - kr);
-            let source = rect(self.checkpoint, &trellis, Some(k0 / 16 + kr..k0 / 16 + kr + rows), Some(cols.clone()))?;
-            ensure!(source.row_bytes == row_bytes, "{trellis}: trellis row extent");
-            self.step(device, vec![source], vec![Job::TrellisTiles { rows, k0: kr, tiles: local_n / 16, tile_bytes,
-                k16, input: layout.side == TrellisSide::Input, dst: payload.buffer }])?;
-            kr += rows;
-        }
-        let vector = |suffix: &str, start: usize, count: usize| -> Result<Allocation<'a>> {
-            let name = format!("{stem}.{suffix}");
-            let r = rect(self.checkpoint, &name, None, Some(start * 2..(start + count) * 2))?;
-            let bytes = r.bytes();
-            self.landed(device, vec![(r, 0)], bytes)
-        };
-        let suh = vector("suh", k0, local_k)?;
-        let svh = vector("svh", n0, local_n)?;
-        ensure!(payload.buffer.bytes + suh.buffer.bytes + svh.buffer.bytes == layout.bytes,
-            "{stem}: K6 shard differs from admitted bytes");
-        Ok(CoreWeights { payload, suh, svh, shape: layout.shape, side: layout.side, bits: layout.bits, codebook: layout.codebook })
+        let stream = self.streams.iter().find(|(id, _)| *id == device.id)
+            .context("Kimi load stream for device")?.1;
+        layout.load_recorded(device, self.checkpoint, self.dense, stream)
     }
 
     /// One rank's global weights, allocated from `layout`.

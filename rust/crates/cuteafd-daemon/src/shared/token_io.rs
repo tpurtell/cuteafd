@@ -1351,11 +1351,39 @@ mod tests {
         assert_eq!(read(&mounted)?, payload);
         // Mapped-host embeddings remain immediate and never enter the GPU group.
         let ((host, ()), host_records) = dense::recording(||
-            TokenEmbedding::load(&library, source, EmbedPlacement::Host, || Ok(())))?;
+            TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Host, || Ok(())))?;
         assert_eq!(host_records.summary(), (0, 0, 0, 0, 0, 0));
         assert_eq!(host.device_bytes(), 0);
         assert_eq!(host.host_rows(&[4, 0])?, [payload[24..30].to_vec(), payload[..6].to_vec()].concat());
-
+        // Flash combines a caller-thread embedding recorder with an explicit
+        // model sink on the entry GPU. Neither source may be read eagerly.
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        let devices = [0, 1].map(|id| crate::shared::memory::device::Device { library: &library, id });
+        std::fs::write(&path, [])?;
+        let load = dense::DenseLoad::push(&library);
+        let ((peer_embedding, model), mut combined) = dense::recording(|| devices[1].run(||
+            TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || devices[0].run(|| {
+                let model = DeviceAllocation::new(&library, source.bytes())?;
+                load.operand(dense::Operand { device: 0, buffer: model.buffer, bytes: source.bytes(),
+                    lands: vec![(dense::Rect { name: "model.weight".into(), path: path.clone(), base: 7,
+                        row_bytes: source.bytes(), rows: 0..1, cols: 0..source.bytes() }, 0)] })?;
+                Ok(model)
+            }))))?;
+        assert_eq!(combined.operands.len(), 1);
+        combined.extend(load.sink.as_ref().context("model sink")?.take_all());
+        assert_eq!(combined.summary(), (2 * payload.len(), 2, 0, 0, 0, 0));
+        assert_eq!(combined.operands.iter().map(|operand| operand.device).collect::<Vec<_>>(), [1, 0]);
+        assert_eq!(peer_embedding.owner().id, 1);
+        assert_eq!(model.buffer.device_id, 0);
+        std::fs::write(&path, [vec![0xcc; 7], payload.clone()].concat())?;
+        dense::fill_records_by_mount(&library, &combined, |_| std::ptr::null_mut())?;
+        devices[1].run(|| -> Result<()> { assert_eq!(read(&peer_embedding)?, payload); Ok(()) })?;
+        devices[0].run(|| -> Result<()> {
+            let mut actual = vec![0; payload.len()];
+            library.copy_d2h(&mut actual, model.buffer)?;
+            assert_eq!(actual, payload);
+            Ok(())
+        })?;
         Ok(())
     }
 

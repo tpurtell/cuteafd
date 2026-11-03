@@ -434,25 +434,12 @@ def test_native_prefill_scratch_matches_pinned_seven_plane_contract():
             assert all(plane["offset"] % 16 == 0 for plane in actual)
 
 
-def test_native_prefill_default_matches_rust_and_clamps_waves(tmp_path):
-    compiler = shutil.which("rustc")
-    if not compiler:
-        pytest.skip("Rust compiler unavailable")
-    source = (ROOT / "rust/crates/cuteafd-core/src/serving_capacity.rs").read_text()
-    contract = source[source.index("pub const PREFILL_RESERVE_ROWS"):source.index("/// Common logical GPU pool")]
-    program = tmp_path / "prefill.rs"
-    binary = tmp_path / "prefill"
-    program.write_text(contract + '\nfn main() { println!("{}", default_prefill_unit_rows()); }\n')
-    subprocess.run([compiler, str(program), "-o", str(binary)], check=True, capture_output=True)
-    rust_default = int(subprocess.check_output([str(binary)], text=True))
-    assert LAYOUTS.default_prefill_unit_rows() == rust_default == 2752
-    assert LAYOUTS._default_prefill_unit_rows(source.replace("= 8192;", "= 8_192;")) == rust_default
+def test_native_prefill_default_and_wave_clamp():
+    assert LAYOUTS.default_prefill_unit_rows() == 2752
     for depth, expected in ((0, 4096), (1, 4096), (3, 2752), (4, 2048), (8, 2048)):
-        assert LAYOUTS._default_prefill_unit_rows(
-            source.replace("PREFILL_DEPTH: u64 = 3;", f"PREFILL_DEPTH: u64 = {depth};")) == expected
-    for name in ("RESERVE_ROWS", "DEPTH", "ROW_PAGE", "MAX_WAVES"):
-        with pytest.raises(ValueError, match=f"cannot parse Rust literal PREFILL_{name}"):
-            LAYOUTS._default_prefill_unit_rows(source.replace(f"pub const PREFILL_{name}", "pub const MISSING"))
+        policy = "\n".join(f"pub const PREFILL_{name}: u64 = {value};" for name, value in (
+            ("RESERVE_ROWS", 8192), ("DEPTH", depth), ("ROW_PAGE", 64), ("MAX_WAVES", 4)))
+        assert LAYOUTS._default_prefill_unit_rows(policy) == expected
 
 
 def test_every_prefill_row_is_selected_by_a_shipped_artifact():

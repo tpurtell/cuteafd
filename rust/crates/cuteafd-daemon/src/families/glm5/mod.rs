@@ -1273,7 +1273,7 @@ impl Opened {
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
             let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
                 ::from_fp8_option(args.draft_fp8);
-            let drafter = dflash::DflashDrafter::load(&self.library, snapshot, file, stream,
+            let drafter = dflash::DflashDrafter::load(&self.library, &programs, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
                 mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
             // Admission includes the shared drafter's maximum serving workspace.

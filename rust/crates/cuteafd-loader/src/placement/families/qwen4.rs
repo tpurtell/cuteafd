@@ -1035,7 +1035,9 @@ mod tests {
             let planned = request(&inputs(Baseline::Planned { context_bytes, loaded_bytes }), 0).unwrap();
             let intake = planned.fixed.iter().find(|d| d.group == "Spark intake planes").unwrap().clone();
             // The checkpoint's hidden width is 2560, not 2048.
-            assert_eq!(intake.bytes, shape.map_or(80 << 20, |s| s.slot_rows() * 4 * 2560 * 2));
+            assert_eq!(intake.bytes, 4
+                * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+                    shape.map_or(4096, |s| s.slot_rows()) * 2560 * 2).unwrap());
             let measured = inputs(Baseline::Measured {
                 free_bytes: total - context_bytes - loaded_bytes - intake.bytes });
             let runtime = request(&measured, 0).unwrap();

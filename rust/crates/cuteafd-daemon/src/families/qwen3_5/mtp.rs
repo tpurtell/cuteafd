@@ -26,6 +26,7 @@ struct Mtp<'a> {
     stream: *mut std::ffi::c_void,
     layer: DenseLayer<'a>,
     fc: Allocation<'a>,
+    projection: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     norm_hidden: Allocation<'a>,
     norm_embedding: Allocation<'a>,
     norm: Allocation<'a>,
@@ -89,6 +90,7 @@ impl<'a> Mtp<'a> {
             hidden_bytes: cfg.hidden * 2 };
         let out = Self {
             library: device.library, stream: engine.stream.raw,
+            projection: cuteafd_ffi::draft_projection::DraftProjections::load(engine.programs, &[(2 * cfg.hidden, cfg.hidden)], HEAD_ROWS)?,
             layer: reader.dense_layer("mtp.layers.0", HybridAttention::Full, format)?,
             fc: reader.bf16("mtp.fc.weight")?, norm_hidden: reader.bf16("mtp.pre_fc_norm_hidden.weight")?,
             norm_embedding: reader.bf16("mtp.pre_fc_norm_embedding.weight")?, norm: reader.bf16("mtp.norm.weight")?,
@@ -161,7 +163,7 @@ impl<'a> Mtp<'a> {
                 pitch, rows, engine.stream.raw)?;
             engine.stream.device.library.copy_d2d_2d_async(second, 2 * pitch, p.delta, pitch,
                 pitch, rows, engine.stream.raw)?;
-            engine.stream.device.library.linear_bf16(self.concat.buffer.ptr, self.fc.buffer.ptr,
+            self.projection.launch(self.concat.buffer.ptr, self.fc.buffer.ptr,
                 p.residual.ptr, rows, 2 * self.cfg.hidden, self.cfg.hidden, engine.stream.raw)?;
         }
         let blocks = Blocks { programs: engine.programs, admitted: &self.programs, cfg: &self.cfg,

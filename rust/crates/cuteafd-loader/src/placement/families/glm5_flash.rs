@@ -385,8 +385,8 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
                         - cache::glmf_selector_bytes(cache::GLMF_DECODE_ROWS, i.cfg.vocab_size as u64), Basis::Formula));
             }
             fixed.push(GlmfBufferDemand::new(GlmfComponent::SparkExperts, gpu, Category::Transport, "Spark intake",
-                cache::spark_intake_bytes(working.prefill_lanes, working.spark_ranks as u64,
-                    cache::glmf_expert_rows(i.prefill_rows, i.decode_rows), i.cfg.hidden as u64), Basis::Formula));
+                cache::prefill_return_bytes(working.prefill_lanes, i.prefill_rows,
+                    working.spark_ranks as u64, i.cfg.hidden as u64), Basis::Formula));
             fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Workspace, "probe prefill logits", i.full_prefill_logits, Basis::Formula));
         }
     }
@@ -898,7 +898,7 @@ mod tests {
             assert_eq!((p.pool_tokens, &p.layers, p.tp2), (r.pool_tokens, &r.layers, r.tp2));
             let group = |placed: &Placement, rank: usize, name: &str| placed.items[rank].iter()
                 .filter(|d| d.group == name).map(|d| d.bytes).sum::<u64>();
-            assert_eq!(group(&p, 0, "Spark intake"), if spark { 268_435_456 } else { 0 });
+            assert_eq!(group(&p, 0, "Spark intake"), if spark { 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(2 * 4096 * cfg.hidden as u64 * 2).unwrap() } else { 0 });
             for rank in 0..2 {
                 assert_eq!(group(&p, rank, "steps"), if spark { planned.workspace[rank].demand.bytes } else { planned.local_workspace[rank].demand.bytes });
                 let total = |input: &GlmfInputs<'_>, placed: &Placement| input.gpus[rank].0 - GpuBudget {
@@ -908,6 +908,18 @@ mod tests {
                 assert_eq!(total(&planned, &p), total(&measured, &r));
             }
         }
+    }
+
+    #[test]
+    fn spark_prefill_slots_share_one_padded_backing_per_rank() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.onboard = Onboard::Layers(1);
+        input.prefill_rows = 80;
+        let request = request(&input).unwrap();
+        let intake = request.fixed.iter().filter(|d| d.group == "Spark intake")
+            .map(|d| d.bytes).sum::<u64>();
+        assert_eq!(intake, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(input.prefill_lanes * 80 * cfg.hidden as u64 * 2).unwrap());
     }
 
     #[test]

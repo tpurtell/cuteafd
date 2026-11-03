@@ -188,6 +188,9 @@ impl RankLayout {
                 let bytes = match job {
                     Job::Quant { rows, layout, .. } =>
                         crate::shared::fp8_load_quant::quant_table_bytes(rows.len(), *layout)?,
+                    // BF16 -> F32 input, coefficient pairs, then two output vectors.
+                    Job::ResidualGate { .. } => step.bytes().checked_mul(10)
+                        .context("residual coefficient host scratch overflow")?,
                     Job::ScaleCodes { .. } => crate::shared::fp8_load_quant::scale_code_table_bytes(1)?,
                     _ => 0,
                 };

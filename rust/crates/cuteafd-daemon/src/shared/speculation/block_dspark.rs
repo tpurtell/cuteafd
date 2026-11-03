@@ -300,6 +300,7 @@ pub(crate) struct DsparkDrafter<'a> {
     context_capacity: usize,
     paged: Option<PagedContext<'a>>,
     inv_freq: Option<Dev<'a>>,
+    projections: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     fc: Weight<'a>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
@@ -346,36 +347,43 @@ impl<'a> DsparkDrafter<'a> {
     /// `mask_row` is the target embedding of the mask token; `fp8_rows` how the
     /// FP8 GEMMs run.
     #[allow(clippy::too_many_arguments)]
-    pub fn load(library: &'a NativeLibrary, snapshot: &Path, tensors: HashMap<String, Vec<u8>>, stream: *mut c_void,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, tensors: HashMap<String, Vec<u8>>, stream: *mut c_void,
         slots: usize, max_sequences: usize, mask_row: Vec<u8>, representation: GlmDraftRepresentation,
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let cfg = DsparkConfig::read(snapshot)?;
         let capacity = cfg.window.context("full-context dSpark requires explicit admitted context capacity")?;
-        Self::load_admitted(library, snapshot, tensors, stream, slots, max_sequences, mask_row,
+        Self::load_admitted(library, programs, snapshot, tensors, stream, slots, max_sequences, mask_row,
             representation, scales, fp8_rows, capacity, kv_cache)
     }
 
     /// Full-context capacity is explicit: reject positions beyond admission,
     /// never silently wrap them into the GLM sliding window.
     #[allow(clippy::too_many_arguments)]
-    pub fn load_admitted(library: &'a NativeLibrary, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
+    pub fn load_admitted(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
         stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let target_tokens = slots.checked_mul(context_capacity).context("dSpark token budget overflow")?;
-        Self::load_paged(library, snapshot, tensors, stream, slots, max_sequences, mask_row,
+        Self::load_paged(library, programs, snapshot, tensors, stream, slots, max_sequences, mask_row,
             representation, scales, fp8_rows, context_capacity, target_tokens, kv_cache)
     }
 
     /// Serving full-context layers use the same aggregate token budget as target KV.
     #[allow(clippy::too_many_arguments)]
-    pub fn load_paged(library: &'a NativeLibrary, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
+    pub fn load_paged(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
         stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, target_tokens: usize,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DsparkConfig::read(snapshot)?;
+        let h = cfg.hidden;
+        let shapes = [(h * cfg.taps.len(), h), (h, cfg.qkv_width()), (h, 2 * cfg.kv_heads * cfg.head_dim),
+            (cfg.q_width(), h), (h, 2 * cfg.intermediate), (cfg.intermediate, h)];
+        let projections = cuteafd_ffi::draft_projection::DraftProjections::load(programs,
+            if representation == GlmDraftRepresentation::Bf16Only { &shapes } else { &[] },
+            cuteafd_ffi::draft_projection::batch_rows(TAP_ROWS, cfg.block, max_sequences,
+                programs.capacities().decode_rows.unwrap_or(0)))?;
         ensure!(context_capacity > 0 && slots > 0 && max_sequences <= slots,
             "dSpark requires nonzero admitted context slots and capacity");
         ensure!(cfg.window.is_none_or(|window| window == context_capacity),
@@ -554,7 +562,7 @@ impl<'a> DsparkDrafter<'a> {
             context_slots: zeroed("context_slots", TAP_ROWS * 4)?,
             mask_row,
             workspace: RefCell::new(None),
-            representation,
+            projections, representation,
             fp8_workspace,
             head_mode: Cell::new(DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
@@ -586,7 +594,7 @@ impl<'a> DsparkDrafter<'a> {
         k: usize, n: usize) -> Result<()> {
         match weight {
             // SAFETY: rows first..first + n lie in the matrix; the caller's contract.
-            Weight::Bf16(w) => unsafe { self.library.linear_bf16(x, at(w, first * k * 2), out, rows, k, n, self.stream) },
+            Weight::Bf16(w) => unsafe { Ok(self.projections.launch(x, at(w, first * k * 2), out, rows, k, n, self.stream)?) },
             Weight::Fp8(w) => {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 dSpark scratch was not admitted")?;
                 // SAFETY: the scratch covers every shape for up to max(TAP_ROWS, sequences x block) rows

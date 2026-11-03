@@ -38,8 +38,9 @@ impl OnboardBudget {
                 ensure!(gpus == 1, "Step-5 whole expert push requires one coordinator GPU");
                 let workspace = Exl3Tp2::whole_workspace_bytes(package, rows, ExpertGeometry::STEP5,
                     RtxSelectionPolicy::CanonicalDecode)?;
-                Ok(CoordinatorExperts::Whole { selections: layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }).collect(),
-                    budget: resident_budget(peak, workspace)? })
+                Ok(CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
+                    selections: layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }).collect(),
+                    budget: resident_budget(peak, workspace)? }] })
             }
             Self::Tp2(peaks) => {
                 ensure!(gpus == 2, "Step-5 TP2 expert push requires two coordinator GPUs");

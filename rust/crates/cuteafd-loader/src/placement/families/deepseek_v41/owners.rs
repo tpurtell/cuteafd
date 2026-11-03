@@ -89,7 +89,7 @@ pub fn window_batch_bytes(rows: u64) -> Result<u64> {
 pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
     ensure!((1..=4096).contains(&rows) && (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&ranks),
         "invalid V4.1 transport geometry");
-    Ok(rows * (ranks as u64 * 5120 * 2 + 2 * 5120 * 2))
+    Ok(crate::serving_capacity::spark_intake_bytes(1, ranks as u64, rows, 5120) + rows * 2 * 5120 * 2)
 }
 
 /// Every Spark transport (PLAN "Prefill contract"): the two decode lanes'
@@ -99,10 +99,9 @@ pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
 /// rank's partial-sum plane over its `slots` return slots.
 pub fn transports_bytes(decode_rows: u64, rows: u64, ranks: usize, slots: usize) -> Result<u64> {
     ensure!((1..=4).contains(&slots), "invalid V4.1 prefill slots");
-    let reserve = slots as u64 * rows;
     let lanes = 2 * transport_bytes(decode_rows, ranks)?;
     let outputs = slots as u64 * rows * 5120 * 2;
-    Ok(lanes + outputs + reserve * ranks as u64 * 5120 * 2)
+    Ok(lanes + outputs + crate::serving_capacity::prefill_return_bytes(slots as u64, rows, ranks as u64, 5120))
 }
 
 /// Full vocabulary packing peak above the pre-weight sample: the resident
@@ -503,12 +502,28 @@ mod tests {
         assert!(vocabulary_load_phase(&[demand("attention", u64::MAX)], &target, 400).is_err());
         assert!(vocabulary_load_phase(&[demand("attention", 1).on(1)], &target, 400).is_err());
         for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
-            assert_eq!(transport_bytes(1024, ranks)?, 1024 * (ranks as u64 + 2) * 10240);
+            assert_eq!(transport_bytes(1024, ranks)?, ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(1024 * 10240)?
+                + 2 * 1024 * 10240);
         }
         assert!(transport_bytes(0, 4).is_err());
         assert!(transport_bytes(4097, 4).is_err());
         assert!(transport_bytes(1024, 0).is_err());
         assert!(transport_bytes(1024, cuteafd_core::MAX_SPARK_WORLD + 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn transport_backing_pads_decode_ranges_and_the_whole_prefill_reserve() -> Result<()> {
+        for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
+            for decode_rows in [64, 80] {
+                let decode = ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(decode_rows * 10240)?
+                    + decode_rows * 20480;
+                assert_eq!(transport_bytes(decode_rows, ranks)?, decode);
+                let outputs = 3 * 2752 * 10240;
+                assert_eq!(transports_bytes(decode_rows, 2752, ranks, 3)?,
+                    2 * decode + outputs + ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(3 * 2752 * 10240)?);
+            }
+        }
         Ok(())
     }
 

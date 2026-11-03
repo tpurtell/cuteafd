@@ -625,7 +625,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 let config = block_dspark::DsparkConfig::read(snapshot)?;
                 let weights = block_dspark::prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("draft loader panicked"))??;
                 let mask = target.token_embedding().host_rows(&[config.mask_token])?;
-                let draft = Rc::new(DsparkDrafter::load_paged(&library, snapshot, weights, target.target_stream().raw,
+                let draft = Rc::new(DsparkDrafter::load_paged(&library, &programs, snapshot, weights, target.target_stream().raw,
                     lanes, lanes, mask, cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
                     Fp8Scales::Amax, Fp8Rows::W8a16, target.cfg.max_context, target.pool_tokens,
                     cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?);
@@ -755,7 +755,7 @@ mod tests {
             let tensors = block_dspark::prefetch(&draft_snapshot).join()
                 .map_err(|_| anyhow::anyhow!("draft loader panicked"))??;
             let mask = target.token_embedding().host_rows(&[cfg.mask_token])?;
-            Rc::new(DsparkDrafter::load_paged(&library, &draft_snapshot, tensors, target.target_stream().raw,
+            Rc::new(DsparkDrafter::load_paged(&library, &programs, &draft_snapshot, tensors, target.target_stream().raw,
                 4, 4, mask, cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
                 Fp8Scales::Amax, Fp8Rows::W8a16, target.cfg.max_context, target.pool_tokens,
                 cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?)

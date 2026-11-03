@@ -41,31 +41,72 @@ pub(crate) struct OnboardedExperts<'a> {
 /// Bytes of one GPU's own partial plane at `rows`.
 pub(crate) fn own_bytes(cfg: &MuseSparkConfig, rows: usize) -> usize { rows * cfg.topk * cfg.expert_hidden * 2 }
 
+/// The execution loader and push planner use the same admitted arena remainder.
+fn budgets(cfg: &MuseSparkConfig, placement: &Placement, gpus: usize, rows: usize) -> Result<Vec<usize>> {
+    let own = own_bytes(cfg, rows);
+    let fixed = 2 * rows * 4 + CombineTables { capacity: rows }.bytes();
+    let peaks = match gpus {
+        2 => placement.tp2.context("Muse onboarded pair without a TP2 arena")?.peak_bytes.to_vec(),
+        1 => vec![placement.expert_ranges.first().context("Muse onboarded GPU without an expert arena")?.peak_bytes],
+        _ => anyhow::bail!("Muse onboarding on one GPU or a pair"),
+    };
+    peaks.into_iter().map(|peak| usize::try_from(peak)?.checked_sub(gpus * own + fixed)
+        .context("Muse partial planes exceed the admitted expert arena")).collect()
+}
+
+pub(crate) fn push_plan(cfg: &MuseSparkConfig, placement: &Placement, gpus: usize,
+    layers: &[usize], rows: usize, package: &std::path::Path)
+    -> Result<crate::shared::experts::rtx::push::CoordinatorExperts> {
+    use crate::shared::experts::{layer::ExpertLayer, rtx::push::{CoordinatorExperts, WholeOwner}};
+    let budgets = budgets(cfg, placement, gpus, rows)?;
+    let workspace = Exl3Tp2::workspace_bytes_for_selection(package, cfg.expert_hidden, rows,
+        crate::shared::experts::exl3::execution::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::MUSE_SPARK),
+        RtxSelectionPolicy::CanonicalDecode)?;
+    let budgets = budgets.into_iter().map(|budget| budget.checked_sub(workspace)
+        .context("Muse expert workspace exceeds admitted arena")).collect::<Result<Vec<_>>>()?;
+    Ok(if gpus == 2 { CoordinatorExperts::Tp2 { layers: layers.to_vec(), budgets } }
+        else { CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
+            selections: layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }).collect(),
+            budget: budgets[0] }] } })
+}
+
 /// Loads every GPU's onboarded layers (`layers`, ascending) from the installed
 /// coordinator package (`package`: `rtx-tp2` on a pair, `rtx-tp1` on one GPU).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cfg: &MuseSparkConfig,
     catalog: &cuteafd_loader::OfficialV41Catalog, package: &std::path::Path, placement: &Placement,
-    layers: Vec<usize>, unit_rows: usize) -> Result<Vec<OnboardedExperts<'a>>> {
+    layers: Vec<usize>, unit_rows: usize,
+    pushed: Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>) -> Result<Vec<OnboardedExperts<'a>>> {
     ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1]), "Muse onboarded layers ascending");
     ensure!(devices.len() == programs.len() && matches!(devices.len(), 1 | 2), "Muse onboarding on one GPU or a pair");
     let own = own_bytes(cfg, unit_rows);
     let layout = CombineTables { capacity: unit_rows };
-    // Allocated here, outside the loader's budget: the epilogue's row maps and the combine tables.
-    let fixed = 2 * unit_rows * 4 + layout.bytes();
+    let budgets = budgets(cfg, placement, devices.len(), unit_rows)?;
     let geometry = cuteafd_core::expert_geometry();
     let executors: Vec<Exl3Tp2<'a>> = if devices.len() == 2 {
-        // The pair's arenas hold the executor, the halves and both partial planes.
-        let tp2 = placement.tp2.context("Muse onboarded pair without a TP2 arena")?;
-        let budgets = tp2.peak_bytes.map(|bytes| usize::try_from(bytes).unwrap_or(0).saturating_sub(2 * own + fixed));
-        let weights = Exl3Tp2::load_pair_weights([devices[0], devices[1]], catalog, geometry, [package; 2],
-            layers.clone(), unit_rows, budgets, RtxSelectionPolicy::CanonicalDecode)?;
+        let budgets = [budgets[0], budgets[1]];
+        let weights = match pushed {
+            Some(pushed) => {
+                let pushed: [Vec<_>; 2] = pushed.into_iter().map(|rank| rank.exl3()).collect::<Result<Vec<_>>>()?
+                    .try_into().map_err(|_| anyhow::anyhow!("Muse committed pair rank count"))?;
+                Exl3Tp2::pushed_pair_weights([devices[0], devices[1]], catalog, geometry, [package; 2],
+                    layers.clone(), unit_rows, budgets, RtxSelectionPolicy::CanonicalDecode, pushed)?
+            }
+            None => Exl3Tp2::load_pair_weights([devices[0], devices[1]], catalog, geometry, [package; 2],
+                layers.clone(), unit_rows, budgets, RtxSelectionPolicy::CanonicalDecode)?,
+        };
         weights.iter().map(|weights| weights.execution()).collect::<Result<_>>()?
     } else {
-        let range = placement.expert_ranges.first().context("Muse onboarded GPU without an expert arena")?;
-        let budget = usize::try_from(range.peak_bytes)?.saturating_sub(own + fixed);
-        vec![Exl3Tp2::load_whole_weights(devices[0], catalog, package, layers.clone(), unit_rows, budget,
-            RtxSelectionPolicy::CanonicalDecode)?.execution()?]
+        let weights = match pushed {
+            Some(mut pushed) => {
+                ensure!(pushed.len() == 1, "Muse committed whole rank count");
+                Exl3Tp2::pushed_whole_weights(devices[0], catalog, package, layers.clone(), unit_rows,
+                    budgets[0], RtxSelectionPolicy::CanonicalDecode, pushed.pop().context("Muse whole rank")?.exl3()?)?
+            }
+            None => Exl3Tp2::load_whole_weights(devices[0], catalog, package, layers.clone(), unit_rows,
+                budgets[0], RtxSelectionPolicy::CanonicalDecode)?,
+        };
+        vec![weights.execution()?]
     };
     executors.into_iter().zip(devices).zip(programs).map(|((executor, &device), programs)| {
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/muse onboarded partials");

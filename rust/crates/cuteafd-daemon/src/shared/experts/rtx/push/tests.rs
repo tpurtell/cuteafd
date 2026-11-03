@@ -24,6 +24,48 @@ fn whole_binding_requires_exact_selected_inventory_and_admission() -> Result<()>
 }
 
 #[test]
+fn whole_owners_preserve_checkpoint_shards_on_either_dense_rank() -> Result<()> {
+    use crate::shared::experts::layer::ExpertLayer::BackboneFull;
+    let root = tempfile::tempdir()?;
+    let (tensors, _) = qwen4_exl3(1, 4);
+    let tensors = tensors.into_iter().filter(|t| !t.0.contains(".experts.") || t.0.contains(".experts.0."))
+        .collect::<Vec<_>>();
+    let mut config = qwen4_config(1);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let owner = |rank| WholeOwner { rank, selections: vec![BackboneFull { layer: 0 }], budget: usize::MAX };
+    for (gpus, rank) in [(1, 0), (2, 0), (2, 1)] {
+        let experts = CoordinatorExperts::Whole { owners: vec![owner(rank)] };
+        experts.validate_ranks(gpus)?;
+        let plans = (0..gpus).map(|gpu| experts.plan(&catalog, gpu)).collect::<Result<Vec<_>>>()?;
+        for (gpu, plan) in plans.iter().enumerate() {
+            assert_eq!(plan.is_some(), gpu == rank, "dense-only ranks have no expert arena");
+            if let Some(plan) = plan {
+                assert_eq!((plan.world, plan.gpu), (1, 0), "checkpoint shard is not coordinator rank");
+                assert_eq!(plan.layers, [0]);
+                let checked = plan.checked(&catalog, root.path(), 3 + gpus, 3 + gpu)?;
+                assert!(!checked.plan.entries.is_empty());
+                assert!(checked.plan.entries.iter().all(|entry| entry.rank as usize == 3 + rank));
+                let residency = &plan.residencies[0];
+                assert_eq!((residency.world, residency.rank), (1, 0));
+            }
+        }
+        let refs = plans.iter().map(Option::as_ref).collect::<Vec<_>>();
+        let expert_host = plans[rank].as_ref().unwrap().host_bytes()?;
+        assert_eq!(CoordinatorExpertPlan::admit_host(&refs, &[], 128, 1 << 20, u64::MAX)?,
+            gpus * 128 * (1 << 20) + expert_host, "dense-only ranks retain their receive ring");
+    }
+    CoordinatorExperts::Whole { owners: vec![owner(0), owner(1)] }.validate_ranks(2)?;
+    for owners in [vec![], vec![owner(2)], vec![owner(0), owner(0)],
+        vec![WholeOwner { selections: vec![], ..owner(0) }]] {
+        assert!(CoordinatorExperts::Whole { owners }.validate_ranks(2).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn coordinator_host_admission_charges_every_concurrent_receive_ring() -> Result<()> {
     for gpus in [1, 2] {
         let plans = (0..gpus).map(|_| None).collect::<Vec<_>>();

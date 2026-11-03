@@ -1554,62 +1554,6 @@ void test_cuda_linear_bf16_matches_ref() {
   free_buffer(&doutput);
 }
 
-void test_cuda_linear_bf16_m1_parity_batched_matches_recurrent_m1() {
-  constexpr size_t max_rows = 8;
-  constexpr size_t input_dim = 6144;
-  std::vector<uint16_t> input(max_rows * input_dim, 0);
-  for (size_t index = 0; index < input.size(); ++index) {
-    input[index] = f32_to_bf16(
-        (static_cast<float>((index * 17 + index / input_dim) % 53) - 26.0f) /
-        13.0f);
-  }
-  auto dinput = device_buffer(input.size() * sizeof(uint16_t));
-  copy_h2d(dinput, input);
-  cudaStream_t stream = nullptr;
-  require_cuda(cudaStreamCreate(&stream),
-               "cudaStreamCreate BF16 M1-parity batch");
-  for (const size_t output_dim : {size_t{128}, size_t{2048}, size_t{2112}}) {
-    std::vector<uint16_t> weight(output_dim * input_dim, 0);
-    for (size_t index = 0; index < weight.size(); ++index) {
-      weight[index] = f32_to_bf16(
-          (static_cast<float>((index * 29 + index / input_dim) % 67) - 33.0f) /
-          21.0f);
-    }
-    auto dweight = device_buffer(weight.size() * sizeof(uint16_t));
-    auto dbatched = device_buffer(max_rows * output_dim * sizeof(uint16_t));
-    auto drecurrent = device_buffer(max_rows * output_dim * sizeof(uint16_t));
-    copy_h2d(dweight, weight);
-    for (size_t rows = 2; rows <= max_rows; ++rows) {
-      require_status(
-          cuteafd_cuda_linear_bf16_m1_parity_batched_cublaslt_async(
-              static_cast<uint16_t*>(dinput.ptr),
-              static_cast<uint16_t*>(dweight.ptr),
-              static_cast<uint16_t*>(dbatched.ptr), rows, input_dim, output_dim,
-              stream),
-          "cuteafd_cuda_linear_bf16_m1_parity_batched_cublaslt_async");
-      for (size_t row = 0; row < rows; ++row) {
-        require_status(
-            cuteafd_cuda_linear_bf16_cublas_async(
-                static_cast<uint16_t*>(dinput.ptr) + row * input_dim,
-                static_cast<uint16_t*>(dweight.ptr), nullptr,
-                static_cast<uint16_t*>(drecurrent.ptr) + row * output_dim, 1,
-                input_dim, output_dim, stream),
-            "cuteafd_cuda_linear_bf16_cublas_async parity reference");
-      }
-      require_cuda(cudaStreamSynchronize(stream),
-                   "cudaStreamSynchronize BF16 M1-parity batch");
-      assert(copy_d2h<uint16_t>(dbatched, rows * output_dim) ==
-             copy_d2h<uint16_t>(drecurrent, rows * output_dim));
-    }
-    free_buffer(&dweight);
-    free_buffer(&dbatched);
-    free_buffer(&drecurrent);
-  }
-
-  require_cuda(cudaStreamDestroy(stream),
-               "cudaStreamDestroy BF16 M1-parity batch");
-  free_buffer(&dinput);
-}
 
 void test_cuda_w8a16_parity_batched_matches_recurrent_m1() {
   constexpr size_t rows = 7;
@@ -2906,7 +2850,6 @@ int main(int argc, char** argv) {
   test_cuda_router_topk_bf16_matches_ref();
   test_cuda_linear_matches_ref();
   test_cuda_linear_bf16_matches_ref();
-  test_cuda_linear_bf16_m1_parity_batched_matches_recurrent_m1();
   test_cuda_w8a16_parity_batched_matches_recurrent_m1();
   test_cuda_w8a16_packed_parity_batched_matches_recurrent_m1();
   test_cuda_matmul_bf16_strided_batched_matches_ref();

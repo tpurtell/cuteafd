@@ -283,9 +283,13 @@ fn plan_matrix(column: usize) {
             assert!(report.solver_placement.as_ref().unwrap().max_pool_tokens_no_onboard >= memory.pool_tokens);
         }
     }
-    // Planned family: the inventory is not a serving claim.
+    // The installed inventory supports the serving path at the qualified width.
     let report = input.plan(&with_layout(column, 6)).unwrap();
-    assert!(!report.executable());
+    assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
+    assert_eq!(report.spark_ranks, 6, "the serving plan preserves the requested Spark width");
+    assert!(report.executable() && report.fits && report.placement_supported, "{:?}", report.hints);
+    assert!(report.memory_layout.as_ref().unwrap().pool_tokens >= 256 << 10,
+        "the executable layout must preserve the agentic context floor");
 }
 
 /// Each Spark's rings carry the shared Muse endpoint: the worst partial reply
