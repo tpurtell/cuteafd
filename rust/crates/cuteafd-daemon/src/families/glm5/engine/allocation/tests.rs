@@ -508,6 +508,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
         let mut expected = plan(&cfg, partitioned, owners, pages, shape, full, native, core, shared_layout.as_ref())?;
         fixture.exlr8_programs(&library, false)?;
         shared_programs = library.programs()?.with_manifest(&shared_path)?;
+        let mut native_experts = Vec::new();
         if core {
             use crate::shared::experts::exlr8::{NativeExperts, NativePlan, shared_residency};
             use cuteafd_loader::plan::exlr8::residency::WeightLayout;
@@ -518,7 +519,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                 expected.facts.allocations.extend(WeightLayout::from_residencies(
                     &format!("glm.experts.rank.{rank}.shared"), &layouts.iter().collect::<Vec<_>>(),
                     WeightArenaTopology::PerLayer, Location::coordinator(rank as u8), Lifetime::RESIDENT)?.allocations);
-                engine.native_experts.push(crate::shared::peer_split::on_device(&library, physical, || {
+                native_experts.push(crate::shared::peer_split::on_device(&library, physical, || {
                     NativeExperts::load(&library, NativePlan::allocation_fixture(family, layouts,
                         shared_layout.as_ref().unwrap().bytes))
                 })?);
@@ -555,32 +556,10 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
         assert_successor(&engine)?;
         engine.ensure_prefill_slots()?;
         assert_successor(&engine)?;
-        let events = upload_audit.events().into_iter().filter(|event| {
-            let record = match event { AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) => r };
-            record.key.space == Space::Pinned && record.key.scope == "staging/sync-h2d"
-        }).collect::<Vec<_>>();
-        assert!(events.len() >= 2, "missing sync-H2D release/successor events");
-        assert!(matches!(events[0], AllocationEvent::Freed(r)
-            if r.address == load_backing.ptr as usize && r.bytes == load_backing.bytes));
-        assert!(matches!(events[1], AllocationEvent::Allocated(r)
-            if r.address == successor.address as usize && r.bytes == successor_bytes));
-        // Ordered destinations use the same staging allocator/scope. Every later
-        // event must create one of their independently inventoried live stores.
-        let ordered = engine.target_buffer_receipts()?.into_iter()
-            .filter(|r| r.allocation.location == Location::PINNED)
-            .map(|r| (r.address as usize, r.allocation.bytes as usize))
-            .collect::<BTreeMap<_, _>>();
-        let mut created = BTreeMap::new();
-        for event in &events[2..] {
-            let AllocationEvent::Allocated(record) = event else {
-                panic!("unexpected staging free after presizing: {event:?}");
-            };
-            assert_ne!(record.address, successor.address as usize);
-            assert!(created.insert(record.address, record.bytes).is_none(),
-                "ordered staging address allocated twice");
-        }
-        assert_eq!(created, ordered, "unaccounted staging allocation after presizing");
         if core {
+            // The fixture's GLM and EXLR8 registries are separate snapshots. Weights were
+            // loaded before release; bind their real executions with the EXLR8 registry.
+            engine.native_experts = native_experts;
             // Allocate through the production CoreScratch constructor; program binding is not
             // emulated. The retained workspaces expose the actual projection owners and views.
             for rank in 0..2 {
@@ -608,13 +587,8 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                 };
                 let decode = allocate(0)?;
                 let prefill = allocate(1)?;
-                let shared = shared_layout.as_ref().unwrap();
                 let shared_execution = || device.run(|| {
-                    let mut execution = crate::shared::experts::exlr8::Exlr8Execution::new_shared(
-                        &library, &shared_programs, cuteafd_ffi::exlr8::KernelFamily::Glm,
-                        DECODE_ROWS, shared.bytes)?;
-                    execution.seal_graph_storage()?;
-                    Ok(Rc::new(execution))
+                    engine.native_experts[rank].execution(&library, &shared_programs).map(Rc::new)
                 });
                 let shared_decode = shared_execution()?;
                 let shared_prefill = shared_execution()?;
@@ -697,6 +671,31 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
         assert_successor(&engine)?;
         assert_eq!(ordered_owners()?, ordered_before,
             "sync-H2D successor reuse must preserve every ordered owner and address");
+        let events = upload_audit.events().into_iter().filter(|event| {
+            let record = match event { AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) => r };
+            record.key.space == Space::Pinned && record.key.scope == "staging/sync-h2d"
+        }).collect::<Vec<_>>();
+        assert!(events.len() >= 2, "missing sync-H2D release/successor events");
+        assert!(matches!(events[0], AllocationEvent::Freed(r)
+            if r.address == load_backing.ptr as usize && r.bytes == load_backing.bytes));
+        assert!(matches!(events[1], AllocationEvent::Allocated(r)
+            if r.address == successor.address as usize && r.bytes == successor_bytes));
+        // Ordered destinations use the same staging allocator/scope. Every later
+        // event must create one of their independently inventoried live stores.
+        let ordered = engine.target_buffer_receipts()?.into_iter()
+            .filter(|r| r.allocation.location == Location::PINNED)
+            .map(|r| (r.address as usize, r.allocation.bytes as usize))
+            .collect::<BTreeMap<_, _>>();
+        let mut created = BTreeMap::new();
+        for event in &events[2..] {
+            let AllocationEvent::Allocated(record) = event else {
+                panic!("unexpected staging free after presizing: {event:?}");
+            };
+            assert_ne!(record.address, successor.address as usize);
+            assert!(created.insert(record.address, record.bytes).is_none(),
+                "ordered staging address allocated twice");
+        }
+        assert_eq!(created, ordered, "unaccounted staging allocation after presizing");
         let actual = receipts()?;
         for rank in 0..2 {
             let prefix = format!("glm.target.gpu.{rank}.");
@@ -845,6 +844,9 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             assert!(engine.require_live().is_err());
             engine.retire_tp2()?;
         }
+        eprintln!("GLM successor fixture devices={devices:?} partitioned={partitioned} owned={owned} \
+            waves={waves} pages={pages} native={native} core={core}: successor={successor_bytes} B \
+            ordered={} stores; exact Warmup/Ready/Growth", ordered.len());
     }
     Ok(())
 }
