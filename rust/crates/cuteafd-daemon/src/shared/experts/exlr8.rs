@@ -1,5 +1,6 @@
 //! EXLR8 unit arena ownership, shared by Spark and coordinator K1 execution.
 use super::layer::{EXPERT_READ_LANES, ExpertLoadBudget};
+use super::rtx::dense::{self, DenseLoad, Operand, Rect};
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
@@ -39,6 +40,26 @@ pub(crate) fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> 
         bytes,
         ..buffer
     })
+}
+
+/// Records discontiguous payload ranges into the existing native allocation.
+/// Descriptor/sign bytes are initialized by the owner, never overwritten by delivery.
+fn record_payload(layout: &Residency, buffer: CuteafdDeviceBuffer,
+    mut publish: impl FnMut(Operand) -> Result<()>) -> Result<()> {
+    let mut blocks = std::collections::BTreeSet::new();
+    for unit in &layout.loads {
+        for (component, (source, &destination)) in unit.source.iter().zip(&unit.destination).enumerate() {
+            if component == 2 && !blocks.insert(destination) { continue; }
+            ensure!(source.bytes > 0, "empty EXLR8 payload component");
+            source.offset.checked_add(source.bytes as u64).context("EXLR8 source extent overflow")?;
+            let buffer = view(buffer, destination, source.bytes)?;
+            let rect = Rect { name: format!("exlr8/{}/{}/{}/{component}", layout.layer, unit.expert, unit.unit),
+                path: source.path.clone(), base: source.offset, row_bytes: source.bytes,
+                rows: 0..1, cols: 0..source.bytes };
+            publish(Operand { device: buffer.device_id, buffer, lands: vec![(rect, 0)], bytes: source.bytes })?;
+        }
+    }
+    Ok(())
 }
 
 impl<'a> Exlr8Weights<'a> {
@@ -202,23 +223,6 @@ impl<'a> Exlr8Weights<'a> {
         layout.check_budget(available, &[])?;
         let arena =
             DeviceAllocation::named(library, layout.resident_bytes, "experts/weights/exlr8")?;
-        let per_bank = layout.staging_bytes.max(16);
-        let mut hosts = (0..BANKS)
-            .map(|_| {
-                (0..EXPERT_READ_LANES)
-                    .map(|_| HostAllocation::named(library, per_bank, "experts/load/exlr8"))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Drain queued uploads before pinned banks or the arena on all exits.
-        let streams = (0..BANKS)
-            .map(|_| {
-                Ok(LoadStream {
-                    library,
-                    raw: library.cuda_stream_create()?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
         let (pointers, bits) = layout.descriptors(arena.buffer.ptr as u64)?;
         // Synchronous uploads finish before the bounded pinned banks are reused.
         for (offset, bytes) in layout.signs_offsets.iter().zip(&layout.signs) {
@@ -238,6 +242,20 @@ impl<'a> Exlr8Weights<'a> {
                 library.copy_h2d(view(arena.buffer, offset, bytes.len())?, &bytes)?;
             }
         }
+        if dense::is_recording() {
+            let load = DenseLoad::mount(library);
+            record_payload(&layout, arena.buffer, |operand| load.operand(operand))?;
+            return Ok(Self { buffer: arena.buffer, _arena: ArenaOwner::Mount { _allocation: arena },
+                layout, budget });
+        }
+        let per_bank = layout.staging_bytes.max(16);
+        let mut hosts = (0..BANKS).map(|_| (0..EXPERT_READ_LANES)
+            .map(|_| HostAllocation::named(library, per_bank, "experts/load/exlr8"))
+            .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+        // Declared after the banks so every exit drains before releasing pinned memory.
+        let streams = (0..BANKS).map(|_| Ok(LoadStream {
+            library, raw: library.cuda_stream_create()?,
+        })).collect::<Result<Vec<_>>>()?;
         let started = std::time::Instant::now();
         let mut uploaded_blocks = std::collections::BTreeSet::new();
         for (batch, first) in (0..layout.loads.len())
@@ -426,6 +444,45 @@ mod tests {
             drop(ready);
             drop(states);
             assert_eq!(library.cuda_memory_info()?, (1 << 30, 1 << 30));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exlr8_recorded_payload_matches_mount_units_without_descriptor_writes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::exlr8::fixture(root.path(), false);
+        for set in [ExpertSet::Shared, ExpertSet::Routed] {
+            for world in [1, 2, 3] {
+                let layout = Residency::plan(root.path(), "mixed", 3, world, 0, set)?;
+                let mut expected = vec![0xa5; layout.resident_bytes];
+                let mut actual = expected.clone();
+                for unit in &layout.loads {
+                    let mut bytes = vec![0; unit.staging_bytes()];
+                    unit.read(&mut bytes)?;
+                    let mut at = 0;
+                    for (source, &destination) in unit.source.iter().zip(&unit.destination) {
+                        expected[destination..destination + source.bytes].copy_from_slice(&bytes[at..at + source.bytes]);
+                        at += source.bytes;
+                    }
+                }
+                let buffer = CuteafdDeviceBuffer { ptr: actual.as_mut_ptr().cast(),
+                    bytes: actual.len(), device_id: 3, ..Default::default() };
+                let sink = dense::DenseSink::default();
+                record_payload(&layout, buffer, |operand| sink.operand(operand))?;
+                assert!(actual.iter().all(|&byte| byte == 0xa5));
+                let records = sink.take_all();
+                let mut destinations = std::collections::BTreeSet::new();
+                for operand in records.operands {
+                    assert_eq!(operand.device, 3);
+                    assert!(destinations.insert(operand.buffer.ptr as usize));
+                    for (rect, at) in &operand.lands {
+                        let offset = operand.buffer.ptr as usize - buffer.ptr as usize + at;
+                        rect.read(&mut actual[offset..offset + rect.bytes()])?;
+                    }
+                }
+                assert_eq!(actual, expected);
+            }
         }
         Ok(())
     }

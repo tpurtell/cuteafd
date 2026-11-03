@@ -596,3 +596,92 @@ def test_ml4_engine_program_names_are_exported_stems():
         if pattern.startswith('{family}'):
             missing = [n for n in missing if not (n.startswith('ml4_') and '_context' in n)]
         assert not missing, f'{pattern}: not exported: {missing}'
+
+
+@pytest.mark.parametrize('family,exl3_model,fp8_model,exl3_scope,extra', [
+    ('glm5', 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1', 'zai-org/GLM-5.3', 'glm:exl3-k45', {}),
+    ('glm5_flash', 'brandonmusic/GLM-5.3-Flash-tr3-4bpw', 'zai-org/GLM-5.3-Flash', 'glmf:exl3-k34', {}),
+    ('mimo_v2', 'test/MiMo-V2.6-Flash-EXL3-K4', 'XiaomiMiMo/MiMo-V2.6-Flash-MOPD', 'mimof:exl3-k45', {}),
+    ('qwen4', 'wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1', 'nvidia/Qwen3.8-Flash-Next-NVFP4', 'qwen4:exl3-k45', {}),
+    ('step5', 'wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6', 'stepfun-ai/Step-5-Preview', 'step5:exl3-k46', {}),
+    ('deepseek_v4', 'wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1', 'deepseek-ai/DeepSeek-V4-Pro', 'dsv4p:exl3-k23', {'MODEL_VARIANT': 'pro'}),
+])
+def test_expert_scope_derived_from_checkpoint_not_card_name(tmp_path, monkeypatch, family, exl3_model, fp8_model, exl3_scope, extra):
+    monkeypatch.setenv('HF_HOME', str(tmp_path))
+    base_values = dict(SPARK_COUNT='4', RTX_GPUS='1', **extra)
+
+    # 1. Identical EXL3 card named without 'exl3' or 'tr3' still gets the exl3 scope
+    #    (both from MODEL_ID and from local config.json quantization_config).
+    exl3_values = dict(base_values, MODEL_ID=exl3_model)
+    named_card = dict(family=family, name=exl3_model.lower(), config=None)
+    renamed_card = dict(family=family, name='renamed-plain-card', config=None)
+    expected = aot.family_scopes([named_card], lambda _: exl3_values)
+    assert aot.family_scopes([renamed_card], lambda _: exl3_values) == expected
+    assert exl3_scope in expected['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
+    assert exl3_scope in expected['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
+
+    snap = tmp_path / 'hub/models--test--custom-checkpoint/snapshots/rev'
+    snap.mkdir(parents=True, exist_ok=True)
+    (snap / 'config.json').write_text(json.dumps({'quantization_config': {'quant_method': 'exl3'}}))
+    metadata_values = dict(base_values, MODEL_ID='test/custom-checkpoint', MODEL_REVISION='rev')
+    assert aot.family_scopes([renamed_card], lambda _: metadata_values) == expected
+
+    # 2. A card whose name contains 'exl3'/'tr3' but whose checkpoint is not EXL3 does not get exl3_scope.
+    misleading_card = dict(family=family, name='misleading-exl3-tr3-card', config=None)
+    fp8_values = dict(base_values, MODEL_ID=fp8_model)
+    fp8_scopes = aot.family_scopes([misleading_card], lambda _: fp8_values)
+    assert exl3_scope not in fp8_scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
+    assert exl3_scope not in fp8_scopes['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
+
+    (snap / 'config.json').write_text(json.dumps({'quantization_config': {'quant_method': 'fp8'}}))
+    fp8_meta_scopes = aot.family_scopes([misleading_card], lambda _: metadata_values)
+    assert exl3_scope not in fp8_meta_scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
+    assert exl3_scope not in fp8_meta_scopes['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
+
+    # 3. Unknown checkpoint without quantization metadata fails closed instead of guessing from card name.
+    (snap / 'config.json').write_text(json.dumps({'model_type': family}))
+    with pytest.raises(ValueError, match='cannot derive WIP AOT expert format'):
+        aot.family_scopes([misleading_card], lambda _: metadata_values)
+    with pytest.raises(ValueError, match='cannot derive WIP AOT expert format'):
+        aot.family_scopes([misleading_card], lambda _: dict(base_values))
+
+
+@pytest.mark.parametrize('family,exl3_model,fp8_model,exl3_scope,extra', [
+    ('glm5', 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1', 'zai-org/GLM-5.3', 'glm:exl3-k45', {}),
+    ('glm5_flash', 'brandonmusic/GLM-5.3-Flash-tr3-4bpw', 'zai-org/GLM-5.3-Flash', 'glmf:exl3-k34', {}),
+    ('mimo_v2', 'test/MiMo-V2.6-Flash-EXL3-K4', 'XiaomiMiMo/MiMo-V2.6-Flash-MOPD', 'mimof:exl3-k45', {}),
+    ('qwen4', 'wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1', 'nvidia/Qwen3.8-Flash-Next-NVFP4', 'qwen4:exl3-k45', {}),
+    ('step5', 'wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6', 'stepfun-ai/Step-5-Preview', 'step5:exl3-k46', {}),
+    ('deepseek_v4', 'wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1', 'deepseek-ai/DeepSeek-V4-Pro', 'dsv4p:exl3-k23', {'MODEL_VARIANT': 'pro'}),
+])
+def test_expert_format_config_key_overrides_checkpoint_and_card_name(tmp_path, monkeypatch, family, exl3_model, fp8_model, exl3_scope, extra):
+    monkeypatch.setenv('HF_HOME', str(tmp_path))
+    base_values = dict(SPARK_COUNT='4', RTX_GPUS='1', **extra)
+
+    # EXPERT_FORMAT=fp8 overrides an EXL3 checkpoint (both MODEL_ID and local config.json) and 'exl3' card name.
+    exl3_snap = tmp_path / ('hub/models--' + exl3_model.replace('/', '--') + '/snapshots/rev')
+    exl3_snap.mkdir(parents=True, exist_ok=True)
+    (exl3_snap / 'config.json').write_text(json.dumps({'quantization_config': {'quant_method': 'exl3'}}))
+    overridden_to_fp8 = aot.family_scopes(
+        [dict(family=family, name='card-with-exl3-tr3', config=None)],
+        lambda _: dict(base_values, MODEL_ID=exl3_model, MODEL_REVISION='rev', EXPERT_FORMAT='fp8'),
+    )
+    assert exl3_scope not in overridden_to_fp8['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
+    assert exl3_scope not in overridden_to_fp8['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
+
+    # EXPERT_FORMAT=exl3 overrides an FP8 checkpoint (both MODEL_ID and local config.json) and plain card name.
+    fp8_snap = tmp_path / ('hub/models--' + fp8_model.replace('/', '--') + '/snapshots/rev')
+    fp8_snap.mkdir(parents=True, exist_ok=True)
+    (fp8_snap / 'config.json').write_text(json.dumps({'quantization_config': {'quant_method': 'fp8'}}))
+    overridden_to_exl3 = aot.family_scopes(
+        [dict(family=family, name='plain-fp8-card', config=None)],
+        lambda _: dict(base_values, MODEL_ID=fp8_model, MODEL_REVISION='rev', EXPERT_FORMAT='exl3'),
+    )
+    assert exl3_scope in overridden_to_exl3['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
+    assert exl3_scope in overridden_to_exl3['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
+
+    with pytest.raises(ValueError, match='unsupported EXPERT_FORMAT'):
+        aot.family_scopes(
+            [dict(family=family, name='plain-card', config=None)],
+            lambda _: dict(base_values, MODEL_ID=fp8_model, EXPERT_FORMAT='bogus'),
+        )

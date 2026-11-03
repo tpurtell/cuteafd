@@ -20,6 +20,10 @@ use std::sync::Arc;
 pub const TOKENS: u64 = 192;
 /// Upper bound for a sweep's per-request output length.
 pub const MAX_TOKENS: u64 = 8192;
+/// `tokens == 0` requests no output budget: the body omits `max_tokens` and the
+/// server's own output default bounds the request (a KV-reservation admission
+/// probe: the lifetime is the whole server default, not the sweep's width).
+pub const OMIT_TOKENS: u64 = 0;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Point {
@@ -293,8 +297,9 @@ pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: boo
 }
 
 /// [`run`], calling `on_timed` once just before the first timed request. `tokens`
-/// is each decode request's output length ([`TOKENS`] by default; longer runs give
-/// a profiled wave more decode steps at every width).
+/// is each decode request's output length ([`TOKENS`] by default, [`OMIT_TOKENS`]
+/// to omit the budget entirely; longer runs give a profiled wave more decode
+/// steps at every width).
 #[allow(clippy::too_many_arguments)]
 pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
     post_load_repeat: bool, prefill_lengths: &[u64], prefill_options: &PrefillOptions, fabric: bool, tokens: u64,
@@ -315,8 +320,8 @@ pub fn run_c1_windowed(url: &str, api_key: Option<&str>, options: &C1Options,
 fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
     post_load_repeat: bool, prefill_lengths: &[u64], prefill_options: &PrefillOptions, fabric: bool, tokens: u64,
     mut on_timed: OnTimed, c1: Option<&C1Options>) -> Result<Sweep> {
-    if !(1..=MAX_TOKENS).contains(&tokens) {
-        bail!("sweep tokens must be 1..={MAX_TOKENS}, got {tokens}");
+    if tokens > MAX_TOKENS {
+        bail!("sweep tokens must be {OMIT_TOKENS} (omit max_tokens) or 1..={MAX_TOKENS}, got {tokens}");
     }
     if post_load_repeat && !(post_load_c1 && levels.contains(&1)) {
         bail!("post_load_repeat needs post_load_c1 and a levels list that includes 1 (it replays the levels C1)");

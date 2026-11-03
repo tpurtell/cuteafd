@@ -176,7 +176,7 @@ impl Family for MuseSpark {
     }
     fn id(&self) -> &'static str { "muse_spark" }
     fn media_cache_headroom(&self) -> bool { true }
-    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
+    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
         MuseSparkConfig::is_muse_spark(&checkpoint.config)
     }

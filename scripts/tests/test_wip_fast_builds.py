@@ -268,7 +268,7 @@ def test_zero_spark_card_sets_build_coordinator_only(tmp_path, monkeypatch, caps
     monkeypatch.setattr(cards, 'toolchain_hash', lambda rev: '0123456789abcdef')
     monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: False)
     config = tmp_path / 'card.config'
-    config.write_text('SPARK_COUNT=0\n')
+    config.write_text('MODEL_ID=zai-org/GLM-5.3-Flash\nSPARK_COUNT=0\n')
     entry = {'name': 'glmf-max', 'family': 'glm5_flash', 'config': str(config), 'sparks': [], 'gpus': [0, 1]}
     arms = cards.arms_from(['cand=c:s'])
     cards.build_arms({'cand': 'new'}, arms, [entry], tmp_path, 'task', True)

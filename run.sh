@@ -40,6 +40,7 @@ container-name characters, [A-Za-z0-9_.-].
   --restart                     replace this instance's deployment
   --all                         with --restart, sweep worker ports on selected hosts
   --dry-run                     validate a DeepSeek V4.1 launch without changing services
+  --total-capacity              with --dry-run, plan against total GPU capacity (or COORDINATOR_GPU_BUDGET_GIB) without reading live free memory
 
 DeepSeek V4.1 keys (cuteafd.config documents each): RTX_GPUS, RTX_EXPERT_LAYERS,
 CONCURRENCY, HTTP_QUEUE_DEPTH, HTTP_QUEUE_WAIT_MS, POOL_TOKENS, EMBEDDING,
@@ -88,7 +89,7 @@ while [[ $# -gt 0 ]]; do
     --embedding-placement) family_args+=(--embedding-placement "${2:?$1 requires host or gpu}"); shift 2 ;;
     --wip) family_args+=(--wip "${2:?$1 requires SLOT}"); shift 2 ;;
     --rotate-console-secret) exec "$repo_root/scripts/launch/console-secret.sh" rotate ;;
-    --restart|--all|--dry-run) family_args+=("$1"); shift ;;
+    --restart|--all|--dry-run|--total-capacity) family_args+=("$1"); shift ;;
     -h|--help) usage; exit 0 ;;
     --dspark|--no-dspark|--tp2-*|--no-tp2-*)
       release_die "$1 was removed: set the configuration key instead (--set SPECULATOR=dspark|off, --set TP2_<OPTION>=on|off)" ;;

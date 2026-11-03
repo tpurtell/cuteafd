@@ -2404,7 +2404,8 @@ def main():
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
     parser.add_argument('--sweep-tokens', type=int, metavar='N', help='output tokens per --levels decode request '
-                        '(default 192); longer runs give profiled waves more decode steps at every width')
+                        '(default 192); longer runs give profiled waves more decode steps at every width, and 0 omits '
+                        'max_tokens so the server output default bounds each request (KV-reservation admission probes)')
     parser.add_argument('--post-load-repeat', action='store_true', help='make that post-load C1 re-send the levels C1 prompts '
                         '(needs PREFIX_CACHE_ENTRIES=0; the sweep fails if a repeat hits the cache)')
     parser.add_argument('--context-lengths', metavar='N,N', help='shared base contexts for context_load (256..1048576; default 32768,131072)')
@@ -2531,8 +2532,8 @@ def main():
         parser.error('--post-load-repeat needs --post-load-c1')
     if args.prefill_repeat and not args.prefill_lengths:
         parser.error('--prefill-repeat needs --prefill-lengths')
-    if args.sweep_tokens is not None and not (args.levels and 1 <= args.sweep_tokens <= 8192):
-        parser.error('--sweep-tokens needs --levels and 1..8192 tokens')
+    if args.sweep_tokens is not None and not (args.levels and 0 <= args.sweep_tokens <= 8192):
+        parser.error('--sweep-tokens needs --levels and 0 (omit max_tokens) or 1..8192 tokens')
     levels = None
     if args.levels:
         levels = [int(x) for x in args.levels.split(',') if x.strip()]

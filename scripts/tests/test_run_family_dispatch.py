@@ -4338,3 +4338,68 @@ def test_missing_remote_site_snapshot_fails_before_worker_docker(tmp_path):
     assert not remote_hf.exists()
     assert not any(line.startswith("docker run -d") and "expertd-native" in line
                    for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("budget,expected_gib", [("", 96.0), ("32", 32.0)])
+def test_dry_run_total_capacity_ignores_foreign_gpu_memory_and_preserves_live_launch(
+    tmp_path: Path, budget: str, expected_gib: float,
+) -> None:
+    config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}
+    keys = f"SPARK_COUNT=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\nCOORDINATOR_GPU_BUDGET_GIB={budget}\n"
+    total_mib = 96 * 1024
+    busy_free_mib = 12 * 1024
+
+    # 1. Opt-in --dry-run --total-capacity succeeds while foreign processes hold 84 GiB,
+    # never queries memory.free, and resolves plan_gib to total capacity or explicit budget.
+    opt_in_dir = tmp_path / f"opt-in-{budget or 'total'}"
+    opt_in_smi_log = tmp_path / f"opt-in-{budget or 'total'}-smi.log"
+    opt_in = _family_launch_result(
+        opt_in_dir, config, "test/qwen", keys, preferred_ranks=1,
+        gpu_total_mib=total_mib, gpu_free_mib=busy_free_mib,
+        gpu_allocations=((999, 84 * 1024),), plan_rtx_bytes=24 << 30,
+        root_launcher=True, extra_args=("--dry-run", "--total-capacity"),
+        extra_env={"FAKE_NVIDIA_SMI_LOG": str(opt_in_smi_log)},
+    )
+    assert opt_in.returncode == 0, opt_in.stderr
+    assert "docker run -d" not in opt_in.stderr
+    assert "memory.free" not in opt_in_smi_log.read_text()
+    plan_argv = shlex.split(next(line for line in opt_in.stderr.splitlines() if "cuteafd plan" in line))
+    for flag in ("--coordinator-gpu-budget-gib", "--coordinator-weight-budget-gib"):
+        assert float(plan_argv[plan_argv.index(flag) + 1]) == expected_gib
+
+    # 2. Plain --dry-run without --total-capacity still queries live memory.free and fails
+    # when foreign memory leaves less free VRAM than the deployment requires.
+    plain_dir = tmp_path / f"plain-dry-{budget or 'total'}"
+    plain_smi_log = tmp_path / f"plain-dry-{budget or 'total'}-smi.log"
+    plain_dry = _family_launch_result(
+        plain_dir, config, "test/qwen", keys, preferred_ranks=1,
+        gpu_total_mib=total_mib, gpu_free_mib=busy_free_mib,
+        gpu_allocations=((999, 84 * 1024),), plan_rtx_bytes=24 << 30,
+        root_launcher=True, extra_args=("--dry-run",),
+        extra_env={"FAKE_NVIDIA_SMI_LOG": str(plain_smi_log)},
+    )
+    assert plain_dry.returncode == 2
+    assert "memory.free" in plain_smi_log.read_text()
+    assert "coordinator GPU cannot hold this deployment" in plain_dry.stderr
+
+    # 3. Real launch path rejects --total-capacity and continues querying live memory.free.
+    rejected = _family_launch_result(
+        tmp_path / f"rejected-{budget or 'total'}", config, "test/qwen", keys,
+        preferred_ranks=1, root_launcher=True, extra_args=("--total-capacity",),
+    )
+    assert rejected.returncode == 2
+    assert "--total-capacity requires --dry-run" in rejected.stderr
+
+    live_dir = tmp_path / f"live-{budget or 'total'}"
+    live_smi_log = tmp_path / f"live-{budget or 'total'}-smi.log"
+    live = _family_launch_result(
+        live_dir, config, "test/qwen", keys, preferred_ranks=1,
+        gpu_total_mib=total_mib, gpu_free_mib=90 * 1024,
+        gpu_allocations=((999, 6 * 1024),), plan_rtx_bytes=24 << 30,
+        root_launcher=True, extra_env={"FAKE_NVIDIA_SMI_LOG": str(live_smi_log)},
+    )
+    assert live.returncode == 0, live.stderr
+    assert "memory.free" in live_smi_log.read_text()
+    live_plan = shlex.split(next(line for line in live.stderr.splitlines() if "cuteafd plan" in line))
+    assert float(live_plan[live_plan.index("--coordinator-gpu-budget-gib") + 1]) == expected_gib - 6.0
+

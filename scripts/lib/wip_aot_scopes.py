@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import sys
 
 SPEC = importlib.util.spec_from_file_location('checkpoint_family', Path(__file__).with_name('checkpoint-family.py'))
@@ -24,6 +25,16 @@ DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
                         qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', muse_spark='MUSE', mistral_large4='ML4')
+FORMAT_ALIASES = dict(exl3='exl3', tr3='exl3', nvfp4='nvfp4', nvfp4a4='nvfp4',
+                      fp8='fp8', mxfp4='fp8', bf16='fp8', native='fp8')
+NATIVE_FAMILY_TOKENS = {'deepseek', 'glm', 'glmf', 'mimo', 'mimof', 'mimop', 'qwen', 'qwen4', 'step', 'step5'}
+NATIVE_FP8_SLUGS = {
+    'deepseek-v4-flash', 'deepseek-v4-flash-0731', 'deepseek-v4-pro',
+    'deepseek-v4.1-flash', 'deepseek-v4.1-flash-1017',
+    'glm-5.3', 'glm-5.3-flash',
+    'mimo-v2.6-flash', 'mimo-v2.6-flash-mopd', 'mimo-v2.6-pro', 'mimo-v2.6-pro-mopd',
+    'step-5-preview',
+}
 
 
 def require_mapping(family):
@@ -31,8 +42,10 @@ def require_mapping(family):
         raise ValueError(f'no WIP AOT scope mapping for {family}')
 
 
-def checkpoint_config(values):
-    model = values.get('MODEL_ID', DEFAULT_MODEL_ID)
+def checkpoint_config(values, default_model=DEFAULT_MODEL_ID):
+    model = values.get('MODEL_ID', values.get('MODEL', default_model))
+    if not model:
+        return None
     hub = Path(os.environ.get('HF_HOME', Path.home() / '.cache/huggingface')) / 'hub'
     root = hub / ('models--' + model.replace('/', '--'))
     revision = values.get('MODEL_REVISION', '')
@@ -40,6 +53,67 @@ def checkpoint_config(values):
         revision = (root / 'refs/main').read_text().strip()
     path = root / 'snapshots' / revision / 'config.json'
     return json.loads(path.read_text()) if revision and path.is_file() else None
+
+
+def config_quant_format(config):
+    quant = config.get('quantization_config') or (config.get('text_config') or {}).get('quantization_config')
+    if not isinstance(quant, dict) or not quant:
+        return None
+    for key in ('quant_method', 'method', 'format', 'checkpoint_format'):
+        value = str(quant.get(key, '')).strip().lower()
+        if value in ('exl3', 'tr3'):
+            return 'exl3'
+    method = str(quant.get('quant_method') or quant.get('method') or '').strip().lower()
+    algo = str(quant.get('moe_quant_algo') or quant.get('quant_algo') or '').strip().lower()
+    store = str(quant.get('store_dtype') or '').strip().lower()
+    if method in ('nvfp4', 'modelopt') or algo == 'nvfp4':
+        return 'nvfp4'
+    if method in ('fp8', 'mxfp8', 'mxfp4', 'bf16', 'compressed-tensors') or algo in ('fp8', 'mxfp4') or store in ('fp8', 'mxfp4', 'bf16'):
+        return 'fp8'
+    raise ValueError(f'unsupported checkpoint quantization_config: {quant}')
+
+
+def model_id_format(model):
+    found = spark_packages.checkpoint_expert_format(model)
+    if found is not None:
+        return found
+    slug = model.strip().rsplit('/', 1)[-1].lower()
+    tokens = set(re.split(r'[^a-z0-9.]+', slug)) - {''}
+    if 'exl3' in tokens or 'tr3' in tokens or 'exl3' in slug:
+        return 'exl3'
+    if 'nvfp4' in tokens or 'nvfp4' in slug:
+        return 'nvfp4'
+    if tokens & ({'fp8', 'mxfp4', 'bf16'} | NATIVE_FAMILY_TOKENS) or slug in NATIVE_FP8_SLUGS:
+        return 'fp8'
+    return None
+
+
+def expert_format(family, values):
+    declared = str(values.get('EXPERT_FORMAT', '')).strip().lower()
+    if declared:
+        if declared not in FORMAT_ALIASES:
+            raise ValueError(f'unsupported EXPERT_FORMAT={values["EXPERT_FORMAT"]!r} for {family}')
+        return FORMAT_ALIASES[declared]
+    model = str(values.get('MODEL_ID') or values.get('MODEL') or '').strip()
+    config = checkpoint_config(values, default_model='')
+    if config is not None:
+        quant_fmt = config_quant_format(config)
+        if quant_fmt is not None:
+            return quant_fmt
+    if model:
+        from_model = model_id_format(model)
+        if from_model is not None:
+            return from_model
+    raise ValueError(f'cannot derive WIP AOT expert format for {family} ({model or "missing MODEL_ID"}): '
+                     'checkpoint config.json is missing; download its metadata or set EXPERT_FORMAT')
+
+
+def is_pro_variant(values):
+    variant = str(values.get('MODEL_VARIANT', '')).strip().lower()
+    if variant in ('pro', 'flash'):
+        return variant == 'pro'
+    model = str(values.get('MODEL_ID') or values.get('MODEL') or '').lower()
+    return 'pro' in model
 
 
 def dense_switch(values):
@@ -79,12 +153,12 @@ def family_scopes(cards, config_reader):
         if family == 'deepseek_v41' and count != 4 and count in native_spark_artifacts('v41'):
             roles.add('tp' + str(count))
         if family == 'deepseek_v4':
-            tag = 'dsv4p' if 'pro' in card['name'] else 'dsv4f'
+            tag = 'dsv4p' if is_pro_variant(values) else 'dsv4f'
             scopes.update({tag + ':rtx_backbone', tag + (f':spark_tp{count}' if count != 4 and count in native_spark_artifacts(tag) else ':spark')})
             if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2:
                 scopes.add(tag + ':rtx_tp2')
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
-            if tag == 'dsv4p' and 'exl3' in card['name']:
+            if tag == 'dsv4p' and expert_format(family, values) == 'exl3':
                 scopes.add(tag + ':exl3-k23')
         if family == 'kimi_k3':
             tp = int(values.get('SPARK_TP', count))
@@ -110,7 +184,7 @@ def family_scopes(cards, config_reader):
         exlr8 = bool(values.get('EXLR8_MANIFEST'))
         if exlr8:
             env['CUTEAFD_WIP_EXLR8_AOT'] = 'ON'
-        for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4'), ('step5', 'step5', 'STEP5')]:
+        for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if is_pro_variant(values) else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4'), ('step5', 'step5', 'STEP5')]:
             if family == fam:
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
                 if exlr8:
@@ -118,15 +192,14 @@ def family_scopes(cards, config_reader):
                     families.add(tag)
                     env['CUTEAFD_WIP_EXLR8_FAMILIES'] = ';'.join(sorted(families))
                     continue
+                fmt = expert_format(family, values)
                 if count and fam != 'step5':
                     counts.add(f"{tag}={int(values.get('SPARK_TP', count))}")
                 # Qwen's FP8 package has no Spark TP layout (intermediate 640): request the NVFP4 family,
                 # which CMake expands to nvfp4, nvfp4a4 and, on the coordinator only, the FP8 MTP sibling
                 # (fp8_moe.cmake), as the release image ships them.
-                checkpoint_id = values.get('MODEL_ID', values.get('MODEL', ''))
-                nvfp4 = any('nvfp4' in str(value).lower() for value in
-                            (card['name'], checkpoint_id, values.get('EXPERT_FORMAT', '')))
-                if fam == 'step5' and 'exl3' in card['name']:
+                nvfp4 = fmt == 'nvfp4'
+                if fam == 'step5' and fmt == 'exl3':
                     # EXL3 K4 experts with K6 tails (layers 88-90) as one two-tier package;
                     # the K6 core and K4 MTP run the shared dense trellis programs.
                     scopes.add('step5:exl3-k46')
@@ -145,7 +218,7 @@ def family_scopes(cards, config_reader):
                         counts.update(f"{scope}={int(values.get('SPARK_TP', count))}" for scope in scopes)
                 if fam == 'glm5_flash' and nvfp4:
                     scopes.add('glmfdense:nvfp4')
-                if 'exl3' in card['name'] or 'tr3' in card['name']:
+                if fmt == 'exl3':
                     scopes.add(tag + (':exl3-k34' if tag == 'glmf' else ':exl3-k45'))
                 if fam == 'mimo_v2':
                     # MiMo places its audio tower unless the card turns audio off.
@@ -205,8 +278,7 @@ def config_scopes(values):
         resolved.pop('SPARK_TP', None)
     if 'SPARK_COUNT' not in resolved:
         resolved['SPARK_COUNT'] = str(sum(bool(values.get(f'SPARK_{i}_HOST')) for i in range(8)))
-    hint = ' '.join(str(values.get(key, '')) for key in ('MODEL_ID', 'MODEL_VARIANT', 'EXPERT_FORMAT')).lower()
-    card = dict(family=family, name=hint, config=None)
+    card = dict(family=family, name='', config=None)
     scopes = family_scopes([card], lambda _: resolved)
     # Direct configs name their Spark TP explicitly (TP2xEP3 on six Sparks is
     # the tp2 role, not tp6); cards keep the Spark-count role.

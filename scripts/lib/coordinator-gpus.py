@@ -92,6 +92,8 @@ def parse_args() -> argparse.Namespace:
     resolve_parser.add_argument("--selectors", default="", help="COORDINATOR_GPUS")
     resolve_parser.add_argument("--count", choices=("auto", "1", "2"), default="auto",
                                 help="GPUs the launch asks for; an explicit list must name that many")
+    resolve_parser.add_argument("--total-capacity", action="store_true",
+                                help="query total GPU memory only; do not read live free memory")
     select = commands.add_parser("select", help="DeepSeek V4.1's one- or two-RTX selection, as JSON")
     select.add_argument("--selectors", default="", help="COORDINATOR_GPUS")
     select.add_argument("--mode", choices=("auto", "1", "2"), required=True)
@@ -108,10 +110,14 @@ def parse_args() -> argparse.Namespace:
     select.add_argument("--minimum-expert-layers", type=int, choices=range(1, 41), default=20)
     select.add_argument("--expert-format", choices=tuple(DUAL_LAYER_BYTES_BY_FORMAT), default="native")
     select.add_argument("--reclaim-pid", action="append", type=int, default=[])
+    select.add_argument("--total-capacity", action="store_true",
+                        help="check total GPU capacity only; do not read live free memory")
     admit = commands.add_parser("admit", help="check the selected GPUs against a deployment plan")
     admit.add_argument("--uuids", required=True, help="selected GPU UUIDs, logical order")
     admit.add_argument("--deployment", required=True, help="deployment plan JSON file")
     admit.add_argument("--reclaim-pid", action="append", type=int, default=[])
+    admit.add_argument("--total-capacity", action="store_true",
+                       help="check total GPU capacity only; do not read live free memory")
     return parser.parse_args()
 
 
@@ -123,10 +129,11 @@ def run(command: list[str]) -> str:
         raise SelectionError(f"GPU query failed: {' '.join(command)}{': ' + detail if detail else ''}") from error
 
 
-def inventory(tool: str, reclaim_pids: set[int]) -> list[Gpu]:
-    raw = run([tool, "--query-gpu=index,uuid,pci.bus_id,memory.total,memory.free", "--format=csv,noheader,nounits"])
+def inventory(tool: str, reclaim_pids: set[int], *, total_capacity: bool = False) -> list[Gpu]:
+    query = "index,uuid,pci.bus_id,memory.total" if total_capacity else "index,uuid,pci.bus_id,memory.total,memory.free"
+    raw = run([tool, f"--query-gpu={query}", "--format=csv,noheader,nounits"])
     reclaim: dict[str, int] = {}
-    if reclaim_pids:
+    if reclaim_pids and not total_capacity:
         apps = run([tool, "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"])
         for line in apps.splitlines():
             fields = [field.strip() for field in line.split(",")]
@@ -137,9 +144,13 @@ def inventory(tool: str, reclaim_pids: set[int]) -> list[Gpu]:
     result = []
     for line in raw.splitlines():
         fields = [field.strip() for field in line.split(",")]
-        if len(fields) != 5:
+        if total_capacity and len(fields) in (4, 5):
+            index, uuid, pci, total = fields[:4]
+            free = total
+        elif not total_capacity and len(fields) == 5:
+            index, uuid, pci, total, free = fields
+        else:
             raise SelectionError(f"invalid nvidia-smi GPU row: {line}")
-        index, uuid, pci, total, free = fields
         if not (index.isdigit() and total.isdigit() and free.isdigit()):
             raise SelectionError(f"non-numeric nvidia-smi GPU row: {line}")
         result.append(Gpu(int(index), uuid, pci, int(total), int(free), reclaim.get(uuid, 0)))
@@ -284,7 +295,7 @@ def bidirectional(peers: set[tuple[int, int]], first: Gpu, second: Gpu) -> bool:
 
 
 def select(args: argparse.Namespace) -> dict:
-    gpus = inventory(args.nvidia_smi, set(args.reclaim_pid))
+    gpus = inventory(args.nvidia_smi, set(args.reclaim_pid), total_capacity=args.total_capacity)
     chosen, explicit = resolve(gpus, args.selectors, args.mode)
     primary = chosen[0]
     mode = str(len(chosen)) if explicit else args.mode
@@ -363,7 +374,7 @@ def admit(args: argparse.Namespace) -> None:
     The KV pool sizes itself into what remains, and with Spark ranks so do the
     RTX-onboarded expert layers; everything else must fit the GPU's free memory
     now. A GPU another job occupies fails here, before any container starts."""
-    gpus = inventory(args.nvidia_smi, set(args.reclaim_pid))
+    gpus = inventory(args.nvidia_smi, set(args.reclaim_pid), total_capacity=args.total_capacity)
     selected = []
     for uuid in (uuid for uuid in args.uuids.split(",") if uuid):
         found = [gpu for gpu in gpus if gpu.uuid == uuid]
@@ -395,7 +406,8 @@ def main() -> int:
     args = parse_args()
     try:
         if args.command == "resolve":
-            chosen, _ = resolve(inventory(args.nvidia_smi, set()), args.selectors, args.count)
+            chosen, _ = resolve(inventory(args.nvidia_smi, set(), total_capacity=args.total_capacity),
+                                args.selectors, args.count)
             for gpu in chosen:
                 print(gpu.index, gpu.uuid, gpu.pci)
         elif args.command == "select":

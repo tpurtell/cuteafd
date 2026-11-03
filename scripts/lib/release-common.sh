@@ -1419,7 +1419,9 @@ release_validate_stop_config() {
 # primary's RELEASE_COORDINATOR_GPU_{UUID,HOST_INDEX}.
 release_resolve_coordinator_gpus() {
   local resolved index uuid pci
-  resolved="$(python3 "$(dirname "${BASH_SOURCE[0]}")/coordinator-gpus.py" resolve --selectors "$1" --count "$2")" ||
+  local -a extra=()
+  ((${dry_run_total_capacity:-0} == 0)) || extra=(--total-capacity)
+  resolved="$(python3 "$(dirname "${BASH_SOURCE[0]}")/coordinator-gpus.py" resolve --selectors "$1" --count "$2" ${extra[@]+"${extra[@]}"})" ||
     exit 2
   RELEASE_COORDINATOR_GPU_INDICES=() RELEASE_COORDINATOR_GPU_UUIDS=()
   while read -r index uuid pci; do
@@ -1438,7 +1440,9 @@ release_resolve_coordinator_gpus() {
 release_admit_coordinator_gpus() {
   local uuids="$1" deployment="$2"
   shift 2
-  python3 "$(dirname "${BASH_SOURCE[0]}")/coordinator-gpus.py" admit --uuids "$uuids" --deployment /dev/stdin "$@" \
+  local -a extra=()
+  ((${dry_run_total_capacity:-0} == 0)) || extra=(--total-capacity)
+  python3 "$(dirname "${BASH_SOURCE[0]}")/coordinator-gpus.py" admit --uuids "$uuids" --deployment /dev/stdin ${extra[@]+"${extra[@]}"} "$@" \
     <<<"$deployment" || exit 2
 }
 

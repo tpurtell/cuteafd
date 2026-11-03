@@ -419,64 +419,230 @@ fn onboard_all_resolves_to_each_target_models_routed_layer_count() {
     }
 }
 
+fn qwen4_matrix_snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
+    let config = qwen4_config(4);
+    let mut tensors = qwen4_coordinator(&config, false);
+    let (experts, storage) = qwen4_exl3(4, 4);
+    tensors.extend(experts);
+    let dir = snapshot(config, &tensors);
+    write_quantize_config(dir.path(), &storage);
+    let manifest = write_qwen4_exl3_capacities(dir.path(), "45");
+    for (rank, width) in [384, 256].into_iter().enumerate() {
+        for capacity in crate::placement::inventory::exl3_capacities(4096) {
+            let path = dir.path().join(format!("lib/exl3/exl3-qwen4-k45/rtx-tp2-rank{rank}/m{capacity}"));
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
+                "hidden": 2560, "intermediate": width, "experts": 512, "top_k": 10,
+                "capacity": capacity, "output_dtype": "fp32", "tile": [64, 128, 64, 128],
+                "trellis_lut": {"bytes": 32}, "buffers": {
+                    "scratch": {"allocation": "scratch", "dtype": "f16", "bytes": capacity * width,
+                        "zero_on_create": false}}
+            })).unwrap()).unwrap();
+        }
+    }
+    (dir, manifest)
+}
+
+fn write_mistral_large4_matrix_manifest(root: &Path) -> std::path::PathBuf {
+    let checkpoint = Checkpoint::open(root).unwrap();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+    let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
+    let manifest = root.join("PROGRAMS.json");
+    let mut programs = testing::glm_k6_programs(&cfg, &core).unwrap();
+    let entries = programs["programs"].as_array_mut().unwrap();
+    let mut context: Vec<String> = crate::placement::families::glm5::context_program_list(&cfg)
+        .split(", ").map(|name| name.replace("_s*_", "_s2_")).collect();
+    context.extend(crate::families::glm5::core::ml4_split_programs(&cfg, true).unwrap());
+    for name in context {
+        if !entries.iter().any(|entry| entry["name"] == name) {
+            entries.push(json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}}));
+        }
+    }
+    std::fs::write(&manifest, programs.to_string()).unwrap();
+    manifest
+}
+
+fn check_concurrency_plan_cell(
+    input: &PlanInput,
+    family: &str,
+    label: &str,
+    gpus: usize,
+    ranks: usize,
+    c: u64,
+    options: &PlanOptions,
+) {
+    let (report, phases) = input.plan_with_timings(options);
+    assert!(phases.total() < std::time::Duration::from_secs(10),
+        "{label} C{c} GPUs={gpus} Sparks={ranks}: {phases:?}");
+    let report = report.unwrap();
+    assert_eq!(report.family.as_deref(), Some(family));
+    if let Err(error) = cuteafd_core::concurrency::validate(family, c) {
+        assert!(!report.fits && !report.placement_supported && !report.executable(),
+            "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+        assert!(report.hints.iter().any(|hint| hint.what.contains(&error.to_string())),
+            "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+    } else {
+        let cache = report.cache_requirements.as_ref().unwrap();
+        assert_eq!(u64::from(cache.concurrency), c);
+        assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
+        assert!(report.fits && report.placement_supported && report.executable(),
+            "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+    }
+}
+
 #[test]
 fn boot_concurrency_full_plan_matrix() {
-    let mut fixtures = shared_wave_snapshots();
-    fixtures.push(("deepseek_v41", strict_v41_snapshot(false)));
-    fixtures.push(("mimo_v2", snapshot(mimo_flash_config(), &mimo_flash_tensors())));
-    let kimi = tempfile::tempdir().unwrap();
-    write_kimi_snapshot(kimi.path(), false);
-    fixtures.push(("kimi_k3", kimi));
-    fixtures.push(("step5", families::step5::tests::snapshot("fp8")));
-    let muse = tempfile::tempdir().unwrap();
-    write_muse_spark_snapshot(muse.path(), &(0..62).collect::<Vec<_>>());
-    fixtures.push(("muse_spark", muse));
-    let ml4 = tempfile::tempdir().unwrap();
-    write_mistral_large4_snapshot(ml4.path(), None, true);
-    fixtures.push(("mistral_large4", ml4));
-    fixtures.push(("step5", families::step5::tests::exl3_snapshot()));
-    let (dense, dense_options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
-    fixtures.push(("qwen3_5", dense));
-    for (family, dir) in fixtures {
-        let input = PlanInput::open(dir.path()).unwrap();
-        for gpus in [1, 2] {
-            for c in [1, 4, 16, 17, 32, 64, 65, 128] {
-                let mut options = if family == "qwen3_5" { dense_options.clone() }
-                    else { wave_plan_options(dir.path(), if family == "deepseek_v41" { gpus * 3 } else { 4 }) };
-                let layout = options.layout.as_mut().unwrap();
-                layout.state_slots = None;
-                layout.rtx_bytes = vec![96 << 30; gpus];
-                layout.concurrency = c;
-                if family == "deepseek_v41" {
-                    layout.workspace_manifest = v41_workspace(dir.path());
-                    layout.native_mtp_layers = 3;
-                    layout.pool_tokens = Some(262_144);
-                }
-                let (report, phases) = input.plan_with_timings(&options);
-                assert!(phases.total() < std::time::Duration::from_secs(10),
-                    "{family} C{c} GPUs={gpus}: {phases:?}");
-                let report = report.unwrap();
-                assert_eq!(report.family.as_deref(), Some(family));
-                if let Err(error) = cuteafd_core::concurrency::validate(family, c) {
-                    assert!(!report.fits && !report.placement_supported);
-                    assert!(report.hints.iter().any(|hint| hint.what.contains(&error.to_string())),
-                        "{family} C{c}: {}", render(&report));
-                } else {
-                    let cache = report.cache_requirements.as_ref().unwrap();
-                    assert_eq!(u64::from(cache.concurrency), c);
-                    assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
-                    if family == "deepseek_v41" {
-                        assert!(report.fits && report.placement_supported && report.executable(),
-                            "V4.1 C{c} GPUs={gpus}: {}", render(&report));
+    const ALL_CONCURRENCIES: &[u64] = &[1, 4, 16, 17, 32, 64, 65, 128];
+    struct Case {
+        family: &'static str,
+        label: &'static str,
+        dir: tempfile::TempDir,
+        topologies: &'static [(usize, usize)],
+        concurrencies: &'static [u64],
+        manifest: Option<std::path::PathBuf>,
+        base_options: Option<PlanOptions>,
+    }
+    type Builder = Box<dyn FnOnce() -> Case + Send>;
+    let builders: Vec<Builder> = vec![
+        Box::new(|| {
+            let dir = tempfile::tempdir().unwrap();
+            write_kimi_snapshot(dir.path(), true);
+            let manifest = write_kimi_installed_inventory(dir.path(), false);
+            Case { family: "kimi_k3", label: "kimi_k3", dir, topologies: &[(2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            let dir = families::step5::tests::snapshot("fp8");
+            let manifest = testing::step5_native_manifest(dir.path());
+            Case { family: "step5", label: "step5_fp8", dir, topologies: &[(2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            let dir = families::step5::tests::exl3_snapshot();
+            let manifest = testing::step5_native_manifest(dir.path());
+            testing::install_step5_exl3_rtx_package(&manifest);
+            Case { family: "step5", label: "step5_exl3", dir, topologies: &[(1, 4), (2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            Case { family: "deepseek_v41", label: "deepseek_v41", dir: strict_v41_snapshot(false), topologies: &[(1, 3), (2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
+        }),
+        Box::new(|| {
+            // Supported concurrencies C=1..64 are covered in `boot_concurrency_full_plan_matrix_muse_spark`.
+            let dir = tempfile::tempdir().unwrap();
+            write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+            let manifest = write_muse_exl3_capacities(dir.path());
+            Case { family: "muse_spark", label: "muse_spark", dir, topologies: &[(1, 4), (2, 4)], concurrencies: &[65, 128], manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            let dir = tempfile::tempdir().unwrap();
+            write_mistral_large4_snapshot(dir.path(), None, true);
+            let manifest = write_mistral_large4_matrix_manifest(dir.path());
+            Case { family: "mistral_large4", label: "mistral_large4", dir, topologies: &[(1, 6), (2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            let (dir, manifest) = qwen4_matrix_snapshot();
+            Case { family: "qwen4", label: "qwen4", dir, topologies: &[(1, 0), (2, 0), (1, 4), (2, 4)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: None }
+        }),
+        Box::new(|| {
+            let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+            Case { family: "glm5", label: "glm5", dir, topologies: &[(1, 4), (2, 4)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
+        }),
+        Box::new(|| {
+            let flash = glm5_flash_config(2);
+            let dir = snapshot(flash.clone(), &glm5_flash_tensors(&flash));
+            Case { family: "glm5_flash", label: "glm5_flash", dir, topologies: &[(1, 4), (2, 4)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
+        }),
+        Box::new(|| {
+            Case { family: "deepseek_v4", label: "deepseek_v4", dir: v4_snapshot(), topologies: &[(1, 4), (2, 4)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
+        }),
+        Box::new(|| {
+            let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+            Case { family: "mimo_v2", label: "mimo_v2", dir, topologies: &[(1, 4), (2, 4)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: None }
+        }),
+        Box::new(|| {
+            let (dir, options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
+            Case { family: "qwen3_5", label: "qwen3_5", dir, topologies: &[(1, 0)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: Some(options) }
+        }),
+    ];
+
+    let queue = std::sync::Mutex::new(builders.into_iter());
+    let seen = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                loop {
+                    let Some(build) = ({
+                        let mut guard = queue.lock().unwrap();
+                        guard.next()
+                    }) else {
+                        break;
+                    };
+                    let case = build();
+                    let family = case.family;
+                    seen.lock().unwrap().insert(family);
+                    let input = PlanInput::open(case.dir.path()).unwrap();
+                    for &(gpus, ranks) in case.topologies {
+                        for &c in case.concurrencies {
+                            let mut options = case.base_options.clone()
+                                .unwrap_or_else(|| wave_plan_options(case.dir.path(), ranks));
+                            if family == "qwen4" && gpus == 2 && ranks == 0 {
+                                options.attention_placement = Some(AttentionPlacement::Layers);
+                            }
+                            if family == "step5" {
+                                options.draft_ownership = Some(spec::DraftOwnership::None);
+                            }
+                            let layout = options.layout.as_mut().unwrap();
+                            layout.state_slots = None;
+                            layout.rtx_bytes = vec![96 << 30; gpus];
+                            layout.concurrency = c;
+                            if let Some(manifest) = &case.manifest {
+                                layout.workspace_manifest = Some(manifest.clone());
+                            }
+                            if family == "deepseek_v41" {
+                                layout.workspace_manifest = v41_workspace(case.dir.path());
+                                layout.native_mtp_layers = 3;
+                                layout.pool_tokens = Some(262_144);
+                            } else if family == "kimi_k3" {
+                                layout.context_tokens = 262_144;
+                                layout.pool_tokens = Some(262_144);
+                            } else if family == "step5" {
+                                layout.context_tokens = 262_144;
+                                layout.pool_tokens = Some(262_144);
+                                layout.prefix_slots = None;
+                            }
+                            check_concurrency_plan_cell(&input, family, case.label, gpus, ranks, c, &options);
+                        }
                     }
-                    if !report.fits || !report.placement_supported {
-                        let memory = report.memory_layout.as_ref().unwrap();
-                        assert!(!report.hints.is_empty() || !memory.notes.is_empty()
-                            || memory.devices.iter().any(|device| device.used_bytes() > device.capacity_bytes),
-                            "{family} C{c}: refusal must name its cause");
-                    }
                 }
-            }
+            });
+        }
+    });
+    let seen = seen.into_inner().unwrap();
+    for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2",
+        "qwen4", "qwen3_5", "kimi_k3", "step5", "muse_spark", "mistral_large4"] {
+        assert!(seen.contains(family), "missing concurrency family {family}");
+    }
+    for entry in family::registry() {
+        let id = entry.id();
+        if cuteafd_core::concurrency::validate(id, 0).unwrap_err().cause != "boot-time concurrency" {
+            assert!(seen.contains(id), "missing declared concurrency family {id}");
+        }
+    }
+}
+
+#[test]
+fn boot_concurrency_full_plan_matrix_muse_spark() {
+    let dir = tempfile::tempdir().unwrap();
+    write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+    let manifest = write_muse_exl3_capacities(dir.path());
+    let input = PlanInput::open(dir.path()).unwrap();
+    for (gpus, ranks) in [(1, 4), (2, 4)] {
+        for c in [1, 4, 16, 17, 32, 64, 65, 128] {
+            let mut options = wave_plan_options(dir.path(), ranks);
+            let layout = options.layout.as_mut().unwrap();
+            layout.state_slots = None;
+            layout.rtx_bytes = vec![96 << 30; gpus];
+            layout.concurrency = c;
+            layout.workspace_manifest = Some(manifest.clone());
+            check_concurrency_plan_cell(&input, "muse_spark", "muse_spark", gpus, ranks, c, &options);
         }
     }
 }

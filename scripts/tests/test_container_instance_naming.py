@@ -296,6 +296,88 @@ remove_wip_containers
     assert [(state / part).exists() for part in ["build", "output", "slots"]] == [not local] * 3
 
 
+@pytest.mark.parametrize("role,local,remote", [("coordinator", True, False), ("expert", False, True), ("both", True, True)])
+def test_wip_refresh_containers_recreates_containers_and_preserves_slot_artifacts(tmp_path, role, local, remote):
+    text = (ROOT / "wip.sh").read_text()
+    section = "recreate_local=1 recreate_remote=1" + text.split("recreate_local=1 recreate_remote=1", 1)[1].split("preflight_existing_container_images() {", 1)[0]
+    ensure_local = "ensure_local_container() {" + text.split("ensure_local_container() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    log = tmp_path / "calls"
+    removed = tmp_path / "removed"
+    state = tmp_path / "state"
+    for part in ["build", "output", "slots", "incoming", "run", "cache"]:
+        (state / part).mkdir(parents=True)
+        (state / part / "artifact.txt").write_text(f"sealed-{part}")
+    (binary / "docker").write_text(f'''#!/usr/bin/env bash
+printf "docker %s\\n" "$*" >> "{log}"
+case "$1" in
+  rm) : > "{removed}"; exit 0 ;;
+  image) echo img ;;
+  container) [[ ! -e "{removed}" ]] && exit 0 || exit 1 ;;
+  inspect)
+    case "$3" in
+      '{{{{.Config.User}}}}') echo "$(id -u):$(id -g)" ;;
+      *build-caches*) echo "on:hash" ;;
+      '{{{{.Image}}}}') echo img ;;
+      *Mounts*) echo "{state}" ;;
+      '{{{{.State.Running}}}}') echo true ;;
+    esac ;;
+  exec) exit 0 ;;
+  run) rm -f "{removed}"; echo new-container ;;
+esac
+''')
+    (binary / "docker").chmod(0o755)
+    (binary / "ssh").write_text(f'#!/usr/bin/env bash\nprintf "ssh %s\\n" "$*" >> "{log}"\ncat >/dev/null 2>&1 || true\n')
+    (binary / "ssh").chmod(0o755)
+    script = f'''set -euo pipefail
+source "{COMMON}"
+source "{ROOT / 'scripts/lib/cdi-gpus.sh'}"
+CUTEAFD_CDI_CHECK=off
+cuteafd_build_cache_docker_args() {{ printf '%s\\n' "-v" "{state}/cache:/wip/cache"; }}
+wip_container_gpu_ok() {{ return 0; }}
+WIP_INSTANCE=own
+role={role}
+recreate=0
+refresh_containers=1
+state_dir="{state}"
+wip_mount_root="{state}"
+hf_home="{tmp_path}"
+COORDINATOR_DOCKER_DEV=img
+RELEASE_COORDINATOR_GPU_UUID=GPU-x
+wip_toolchain_hash=hash
+CUTEAFD_BUILD_CACHES=on
+coordinator_container="$(release_wip_container coordinator)"
+spark_container="$(release_wip_container spark-expert)"
+wip_container_hosts=(rhea moa)
+{section}
+{ensure_local}
+ensure_local_container
+'''
+    result = subprocess.run(["bash", "-c", script], env=dict(os.environ, PATH=f"{binary}:{os.environ['PATH']}"),
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text().splitlines() if log.exists() else []
+    assert ("docker rm -f cuteafd-coordinator-wip-own" in calls) == local
+    assert any(c.startswith("docker run -d --name cuteafd-coordinator-wip-own ") and f"-v {state}:/wip" in c for c in calls) == local
+    spark_calls = [c for c in calls if c.startswith("ssh ")]
+    assert any("docker rm -f 'cuteafd-spark-expert-wip-own'" in c for c in spark_calls) == remote
+    assert not any(" build" in c or " slots" in c or " cache" in c or " output" in c for c in spark_calls)
+    for part in ["build", "output", "slots", "incoming", "run", "cache"]:
+        assert (state / part / "artifact.txt").read_text() == f"sealed-{part}"
+
+
+def test_wip_refresh_containers_cli_and_mutual_exclusion(tmp_path):
+    config = write_config(tmp_path / "cuteafd.config", "own")
+    ok = subprocess.run(["bash", str(ROOT / "wip.sh"), "--config", str(config), "--refresh-containers", "--dry-run"],
+                        capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stderr
+    both = subprocess.run(["bash", str(ROOT / "wip.sh"), "--config", str(config), "--recreate", "--refresh-containers", "--dry-run"],
+                          capture_output=True, text=True)
+    assert both.returncode == 2
+    assert "--recreate and --refresh-containers cannot be combined" in both.stderr
+
+
 @pytest.mark.parametrize("root", ["/tmp/build", "/mnt/scratch/wip", "/home/tj/.cache/cuteafd/builds/../wrong", "/home/tj/.cache/cuteafd/builds"])
 def test_wip_root_rejects_paths_outside_build_cache(root):
     result = subprocess.run(["bash", "-c", f'source "{COMMON}"; WIP_ROOT="$1"; release_validate_wip_root', "_", root],

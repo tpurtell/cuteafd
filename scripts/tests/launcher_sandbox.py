@@ -118,6 +118,9 @@ import json, os, re, sys
 gpus = json.loads(os.environ["FAKE_GPUS"])
 args = sys.argv[1:]
 joined = " ".join(args)
+if os.environ.get("FAKE_NVIDIA_SMI_LOG"):
+    with open(os.environ["FAKE_NVIDIA_SMI_LOG"], "a") as stream:
+        stream.write(joined + "\n")
 selector = next((a.split("=", 1)[1] for a in args if a.startswith("--id=")), None)
 if selector is None and "-i" in args:
     selector = args[args.index("-i") + 1]

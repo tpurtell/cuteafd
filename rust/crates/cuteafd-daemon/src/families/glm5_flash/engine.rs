@@ -5714,7 +5714,10 @@ mod prefill_lane_tests {
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;
             // 34317cc1 adds Int8 without changing BF16/FP8 mappings or projection routes.
-            ("integration/cuteafd/_common.py", 0x7e63_b6fc_ae75_9f0a),
+            // Fork 417f09fc appends an optional runtime SM scalar in the Python launch helper
+            // only for flagged indexer programs; decode projections set no such metadata.
+            // Projection shapes, arithmetic routes and capacity thresholds are unchanged.
+            ("integration/cuteafd/_common.py", 0x47fa_7c5a_585a_eb49),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
             // Fork #71 adds Step-5 DECODE_TMA_TILES keys (4096,12288), (4096,6144), (384,4096) and

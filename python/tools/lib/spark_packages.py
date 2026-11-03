@@ -22,6 +22,22 @@ def package_entry(family: str, format: str) -> dict:
     return json.loads(RANGES_PATH.read_text())['entries'][f'{family}:{format}']
 
 
+def checkpoint_expert_format(model: str) -> str | None:
+    target = model.strip().lower()
+    if not target:
+        return None
+    entries = json.loads(RANGES_PATH.read_text())['entries']
+    for key, entry in entries.items():
+        if entry.get('basis') == 'companion' or key == 'step5:nvfp4':
+            continue
+        fmt = key.split(':', 1)[1]
+        for item in entry.get('checkpoints', ()):
+            ckpt = (item.get('model', '') if isinstance(item, dict) else str(item)).lower()
+            if ckpt == target:
+                return 'exl3' if fmt.startswith('exl3') else ('nvfp4' if fmt.startswith('nvfp4') else 'fp8')
+    return None
+
+
 def width_keys(intermediate: int, unit: int, world: int, *, exl3: bool = False,
                native: bool = False, nvfp4: bool = False) -> set[tuple[bool, int]]:
     """Descriptor ABI and stored columns; world/rank do not determine code."""

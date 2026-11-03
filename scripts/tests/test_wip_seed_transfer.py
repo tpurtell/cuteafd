@@ -27,7 +27,7 @@ WIP = (ROOT / 'wip.sh').read_text()
 @pytest.fixture
 def entry(tmp_path):
     base = tmp_path / 'model.config'
-    base.write_text('MODEL_ID=test/model\n')
+    base.write_text('MODEL_ID=XiaomiMiMo/MiMo-V2.6-Flash-MOPD\n')
     return dict(name='mimo26-flash-max', family='mimo_v2', config=str(base), gpus=[0, 1],
                 sparks=['ostrich', 'dodo', 'emu', 'kiwi'], set={'SPARK_COUNT': '4'})
 

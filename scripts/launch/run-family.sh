@@ -32,6 +32,7 @@ family=""
 embedding_override=""
 wip_slot=""
 dry_run=0
+dry_run_total_capacity=0
 # --set KEY=VALUE overrides one configuration key for this launch (validated by
 # the same key grammar as the file).
 declare -A cfg_overrides=()
@@ -49,11 +50,13 @@ while [[ $# -gt 0 ]]; do
     --all) restart_all=1; shift ;;
     --wip) wip_slot="${2:?--wip requires SLOT}"; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
-    *) echo "usage: $0 [--config FILE] [--family ID] [--set KEY=VALUE]... [--embedding-placement host|gpu] [--restart [--all]] [--wip SLOT] [--dry-run]" >&2; exit 2 ;;
+    --total-capacity) dry_run_total_capacity=1; shift ;;
+    *) echo "usage: $0 [--config FILE] [--family ID] [--set KEY=VALUE]... [--embedding-placement host|gpu] [--restart [--all]] [--wip SLOT] [--dry-run [--total-capacity]]" >&2; exit 2 ;;
   esac
 done
 ((restart_all == 0 || restart == 1)) || release_die "--all requires --restart"
 ((restart == 0 || dry_run == 0)) || release_die "--restart and --dry-run are mutually exclusive"
+((dry_run_total_capacity == 0 || dry_run == 1)) || release_die "--total-capacity requires --dry-run"
 [[ -z "$embedding_override" ]] || cfg_overrides[EMBEDDING]="$embedding_override"
 # Overrides are appended to a copy of the file (a later line wins in every
 # parser), so they get exactly the file's validation. The copy is named by its
@@ -1075,6 +1078,7 @@ if [[ "$gpu_selection_mode" == auto && "$COORDINATOR_GPUS" != *,* ]] &&
   gpu_selection_mode=1
 fi
 compact_selection_args=()
+((dry_run_total_capacity == 0)) || compact_selection_args+=(--total-capacity)
 gpu_selection="$(python3 "$repo_root/scripts/lib/coordinator-gpus.py" select \
   --selectors "$COORDINATOR_GPUS" \
   --mode "$gpu_selection_mode" \
@@ -2736,7 +2740,7 @@ audio_encoder_hash=""
     plan_pool_args=(--pool-tokens "$plan_pool")
   fi
   plan_gib="$profile_gib"
-  if [[ "$family" == qwen4 ]]; then
+  if [[ "$family" == qwen4 ]] && ((!dry_run_total_capacity)); then
     total_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')"
     free_mib="$(nvidia-smi --id="$gpu" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d ' ')"
     if ((restart)); then

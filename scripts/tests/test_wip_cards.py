@@ -380,12 +380,16 @@ def test_slot_check_every_host_and_seal(monkeypatch):
 
 
 @pytest.mark.parametrize('family,tag,count', [('glm5', 'glm', 4), ('glm5_flash', 'glmf', 2), ('qwen4', 'qwen4', 4)])
-@pytest.mark.parametrize('declared_by', ['name', 'model', 'format'])
-def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, tag, count, declared_by, tmp_path):
+@pytest.mark.parametrize('declared_by', ['config', 'model', 'format'])
+def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, tag, count, declared_by, tmp_path, monkeypatch):
     values = {'SPARK_COUNT': str(count)}
     name = 'unlabelled-native-card'
-    if declared_by == 'name':
-        name = tag + '-nvfp4-min'
+    if declared_by == 'config':
+        monkeypatch.setenv('HF_HOME', str(tmp_path))
+        snap = tmp_path / 'hub/models--test--model/snapshots/rev'
+        snap.mkdir(parents=True)
+        (snap / 'config.json').write_text(json.dumps({'quantization_config': {'quant_method': 'modelopt', 'moe_quant_algo': 'NVFP4'}}))
+        values['MODEL_REVISION'] = 'rev'
     elif declared_by == 'model':
         values['MODEL_ID'] = 'nvidia/Model-NVFP4'
     else:
@@ -412,7 +416,8 @@ def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, ta
 
 
 def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_path, monkeypatch, capsys):
-    other = {**entry, 'name': 'glmf-min', 'family': 'glm5_flash', 'sparks': ['rhea', 'moa'], 'set': {'SPARK_COUNT': '2'}}
+    other = {**entry, 'name': 'glmf-min', 'family': 'glm5_flash', 'sparks': ['rhea', 'moa'],
+             'set': {'MODEL_ID': 'zai-org/GLM-5.3-Flash', 'SPARK_COUNT': '2'}}
     arms = cards.arms_from(['base=b:s', 'candidate=c:s'])
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     # A revision whose wip.sh predates build slots keeps the outer build.lock.
@@ -433,15 +438,18 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     assert scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] == 'tp3'
     assert scopes['CUTEAFD_WIP_EXPORT_LOCKS'] == 'on'
     # Qwen has no Spark FP8 layout: its scope is the NVFP4 family (CMake adds the coordinator FP8 sibling).
-    qwen = {**entry, 'name': 'qwen38-nvfp4-min', 'family': 'qwen4', 'sparks': [], 'set': {'SPARK_COUNT': '0'}}
+    qwen = {**entry, 'name': 'qwen38-nvfp4-min', 'family': 'qwen4', 'sparks': [],
+            'set': {'MODEL_ID': 'nvidia/Qwen3.8-Flash-Next-NVFP4', 'SPARK_COUNT': '0'}}
     built = cards.build_scopes([qwen, other])
     families = built['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
     # A 0-Spark card adds coordinator scopes only (per-card derivation).
     assert 'qwen4:nvfp4' not in families and 'glmf:fp8' in families
     coordinator = built['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
     assert 'qwen4:nvfp4' in coordinator and 'qwen4:fp8' not in coordinator
-    nvfp4 = [{**entry, 'name': 'glm53-nvfp4-min', 'family': 'glm5'},
-             {**other, 'name': 'glmf-nvfp4-min', 'family': 'glm5_flash'}]
+    nvfp4 = [{**entry, 'name': 'glm53-nvfp4-min', 'family': 'glm5',
+              'set': {**entry['set'], 'MODEL_ID': 'nvidia/GLM-5.3-NVFP4'}},
+             {**other, 'name': 'glmf-nvfp4-min', 'family': 'glm5_flash',
+              'set': {**other['set'], 'MODEL_ID': 'nvidia/GLM-5.3-Flash-NVFP4'}}]
     scopes = cards.build_scopes(nvfp4)
     families = set(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
     coordinator = set(scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';'))
@@ -456,10 +464,13 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     assert 'CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES' not in expert_leg
 
 
-@pytest.mark.parametrize('name,tag', [('v4-flash-min', 'dsv4f'), ('v4-pro-exl3-max', 'dsv4p')])
+@pytest.mark.parametrize('name,tag,model', [
+    ('v4-flash-min', 'dsv4f', 'deepseek-ai/DeepSeek-V4-Flash'),
+    ('v4-pro-exl3-max', 'dsv4p', 'wrldsuksgo2mars/DeepSeek-V4-Pro-EXL3-K2-Core-K6'),
+])
 @pytest.mark.parametrize('gpus,override,wants_tp2', [([0], None, False), ([0, 1], None, True), ([0], '2', True), ([0, 1], '1', False)])
-def test_v4_scopes_keep_full_experts_and_add_dual_rtx_halves(entry, name, tag, gpus, override, wants_tp2):
-    values = {'SPARK_COUNT': '4'}
+def test_v4_scopes_keep_full_experts_and_add_dual_rtx_halves(entry, name, tag, model, gpus, override, wants_tp2):
+    values = {'MODEL_ID': model, 'SPARK_COUNT': '4'}
     if override is not None:
         values['RTX_GPUS'] = override
     scope = cards.build_scopes([{**entry, 'name': name, 'family': 'deepseek_v4', 'gpus': gpus, 'set': values}])
@@ -1215,21 +1226,24 @@ def test_post_load_repeat_reaches_every_job(entry, tmp_path, monkeypatch):
         assert matrix['post_load_c1'] is True and matrix['post_load_repeat'] is True
 
 
-def test_sweep_tokens_reach_every_job(entry, tmp_path, monkeypatch):
+@pytest.mark.parametrize('tokens', ['1536', '0'])
+def test_sweep_tokens_reach_every_job(entry, tmp_path, monkeypatch, tokens):
+    """0 is the omit-max_tokens probe (#951); any value reaches every job as given."""
     kit = _kit(tmp_path, entry)
     state = tmp_path / 'state'
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--interleave', '--repeats', '1',
         '--arm', 'a=b:s', '--arm', 'c=d:s', '--state', str(state), '--panels', 'none', '--levels', '1,16',
-        '--sweep-tokens', '1536', '--dry-run'])
+        '--sweep-tokens', tokens, '--dry-run'])
     assert cards.main() == 0
     for job in json.loads((state / 'plan.json').read_text())['jobs']:
         matrix = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
-        assert matrix['sweep_tokens'] == 1536
+        assert matrix['sweep_tokens'] == int(tokens)
 
 
 @pytest.mark.parametrize('extra,match', [(['--post-load-c1'], 'needs --levels'),
     (['--levels', '1,16', '--post-load-repeat'], 'needs --post-load-c1'), (['--panels', 'none'], 'runs nothing'),
-    (['--sweep-tokens', '1536'], 'needs --levels'), (['--levels', '1,16', '--sweep-tokens', '0'], '1..8192'),
+    (['--sweep-tokens', '1536'], 'needs --levels'), (['--levels', '1,16', '--sweep-tokens', '-1'], '1..8192'),
+    (['--levels', '1,16', '--sweep-tokens', '8193'], '1..8192'),
     (['--levels', '1,1'], 'distinct'), (['--panels', 'bogus'], 'unknown requested panel')])
 def test_subset_flags_refuse_nonsense(entry, tmp_path, monkeypatch, extra, match):
     kit = _kit(tmp_path, entry)
@@ -1656,15 +1670,17 @@ def test_prefill_sweep_rows(entry, tmp_path):
 
 def test_build_scopes_are_per_card_zero_spark_and_family_counts():
     base = {'config': '/dev/null'}
-    local = {**base, 'name': 'qwen38-exl3-min', 'family': 'qwen4', 'sparks': [], 'set': {'SPARK_COUNT': '0'}}
-    glm = {**base, 'name': 'glm53-exl3-max', 'family': 'glm5', 'sparks': list(cards.HOSTS), 'set': {'SPARK_COUNT': '6'}}
+    qwen_model = 'wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1'
+    glm_model = 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1'
+    local = {**base, 'name': 'qwen38-exl3-min', 'family': 'qwen4', 'sparks': [], 'set': {'MODEL_ID': qwen_model, 'SPARK_COUNT': '0'}}
+    glm = {**base, 'name': 'glm53-exl3-max', 'family': 'glm5', 'sparks': list(cards.HOSTS), 'set': {'MODEL_ID': glm_model, 'SPARK_COUNT': '6'}}
     mixed = cards.build_scopes([glm, local])
     spark = set(mixed['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
     assert not any(scope.startswith('qwen4:') for scope in spark)
     assert 'qwen4:exl3-k45' in mixed['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
     assert mixed['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'glm=6'
     assert mixed['CUTEAFD_WIP_QWEN4_AOT'] == 'ON'
-    qwen4 = {**local, 'sparks': list(cards.HOSTS[:4]), 'set': {'SPARK_COUNT': '4'}}
+    qwen4 = {**local, 'sparks': list(cards.HOSTS[:4]), 'set': {'MODEL_ID': qwen_model, 'SPARK_COUNT': '4'}}
     both = cards.build_scopes([glm, qwen4])
     assert 'qwen4:exl3-k45' in both['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
     assert both['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'glm=6;qwen4=4'
@@ -2120,7 +2136,7 @@ def test_coordinator_only_build_claims_its_root_before_any_build_work(tmp_path, 
     home = tmp_path / 'home'
     monkeypatch.setattr(Path, 'home', lambda: home)
     config = tmp_path / 'zero.config'
-    config.write_text('MODEL_ID=test/model\nSPARK_COUNT=0\n')
+    config.write_text('MODEL_ID=zai-org/GLM-5.3\nSPARK_COUNT=0\n')
     card = dict(name='zero', family='glm5', config=str(config), sparks=[], set={})
     root = home / '.cache/cuteafd/builds/wip-test-base'
     marker = root / '.wip-card-owner.json'
@@ -2560,9 +2576,9 @@ def test_serving_turn_wait_is_bounded(entry, tmp_path, monkeypatch):
 
 def test_grouped_smoke_inherits_union_turn(entry, tmp_path, monkeypatch):
     entries = [dict(entry, name='one', family='glm5_flash', gpus=[0], sparks=['ostrich'],
-                    set={'SPARK_COUNT': '1', 'ADDR': '0.0.0.0:8500', 'EXPERT_PORT': '19600'}),
+                    set={'MODEL_ID': 'zai-org/GLM-5.3-Flash', 'SPARK_COUNT': '1', 'ADDR': '0.0.0.0:8500', 'EXPERT_PORT': '19600'}),
                dict(entry, name='two', family='glm5_flash', gpus=[1], sparks=['rhea', 'moa'],
-                    set={'SPARK_COUNT': '2', 'ADDR': '0.0.0.0:8501', 'EXPERT_PORT': '19601'})]
+                    set={'MODEL_ID': 'zai-org/GLM-5.3-Flash', 'SPARK_COUNT': '2', 'ADDR': '0.0.0.0:8501', 'EXPERT_PORT': '19601'})]
     state = tmp_path / 'state'
     seen = []
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(_kit(tmp_path, *entries)),

@@ -14,8 +14,16 @@ pub fn messages(text: &str) -> Value {
 }
 
 /// Greedy, thinking off when the checkpoint renderer supports it.
+///
+/// `max_tokens: 0` sends no output budget at all, so the server applies its own
+/// output default: the request reserves the whole default lifetime, which is
+/// what a KV-reservation admission probe has to exercise.
 pub fn plain(client: &crate::client::Client, text: &str, max_tokens: u64) -> Value {
-    crate::request::thinking_off(&client.configuration, json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}}))
+    let mut body = json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}});
+    if max_tokens == 0 {
+        body.as_object_mut().expect("benchmark request object").remove("max_tokens");
+    }
+    crate::request::thinking_off(&client.configuration, body)
 }
 
 /// The probe a request whose prompt re-renders model output carries: a
@@ -229,6 +237,18 @@ pub fn doublings(from: u64, max: u64) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zero_tokens_omits_the_output_budget() {
+        use serde_json::json;
+        let client = crate::client::Client::new("http://127.0.0.1:1", None, std::sync::Arc::default());
+        let omitted = super::plain(&client, "test", 0);
+        assert_eq!(omitted.get("max_tokens"), None, "{omitted}");
+        assert_eq!(omitted, json!({"messages":[{"role":"user","content":"test"}], "temperature":0,
+            "thinking":{"type":"disabled"}}));
+        let explicit = super::plain(&client, "test", 192);
+        assert_eq!(explicit["max_tokens"], 192);
+    }
+
     #[test]
     fn counters_support_v41_totals_and_generic_verify_without_mixing_scopes() {
         use serde_json::json;
