@@ -340,6 +340,92 @@ fn retained_weight_owners_match_actual_loader_and_physical_embedding() -> Result
     Ok(())
 }
 
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn synchronous_core_load_reuses_one_pinned_upload_maximum_across_ranks() -> Result<()> {
+    use cuteafd_ffi::memory_ledger::{AllocationAudit, AllocationEvent, Space};
+    use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::EmbeddingHome};
+    let fixture_dso = Fixture::build()?;
+    let library = fixture_dso.load()?;
+    for device in 0..2 { fixture_dso.configure_memory(&library, device, 1 << 34)?; }
+    for (ranks, vocab, owned) in [(1, 256, false), (2, 256, false), (2, 256, true), (2, 2048, true)] {
+        assert_eq!(library.sync_h2d_staging_buffer()?.bytes, 0);
+        library.cuda_set_device(1)?;
+        let root = tempfile::tempdir_in(fixture_dso.directory())?;
+        let (mut config, tensors) = fixture::glm5_compact_weights();
+        config["vocab_size"] = serde_json::json!(vocab);
+        let cfg = GlmDsaConfig::from_hf(&config)?;
+        let tensors = tensors.into_iter().filter(|t| !t.0.ends_with("_scale_inv"))
+            .flat_map(|(name, dtype, mut shape)| {
+                if ["lm_head.weight", "model.embed_tokens.weight"].contains(&name.as_str()) { shape[0] = vocab; }
+                if let Some(stem) = name.strip_suffix(".weight").filter(|stem|
+                    cuteafd_loader::families::glm5::core::split(&cfg, stem).is_some()) {
+                    let n = if stem.ends_with("kv_a_proj_with_mqa") { shape[0].next_multiple_of(128) } else { shape[0] };
+                    fixture::exl3(stem, n, shape[1], 6)
+                } else { vec![(name, if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape)] }
+            }).collect::<Vec<_>>();
+        fixture::write_snapshot(root.path(), &config, &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        for tensor in catalog.tensors().iter().filter(|t| t.metadata.name.ends_with(".mcg")) {
+            std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+                .write_all_at(&0xcbac1fedu32.to_le_bytes(), tensor.metadata.byte_offset)?;
+        }
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(root.path(), false, false)?;
+        let owners = owned.then_some([0, 1]);
+        let inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers,
+            owners.as_ref().map(|o| o.as_slice()), false, false, EmbeddingHome::Device(0))?;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        let loader = GlmLoader { library: &library, catalog: &catalog, stream: std::ptr::null_mut(), device: 1,
+            peers: (ranks == 2).then_some(crate::shared::peer_split::RankDevice {
+                device: 0, stream: std::ptr::null_mut() }).into_iter().collect(), push: None };
+        let audit = AllocationAudit::start();
+        for layer in 0..cfg.layers {
+            for (rank, layouts) in core.layer_weights(&cfg, layer, ranks,
+                owners.as_ref().map(|o| o[layer]))?.into_iter().enumerate() {
+                for layout in layouts.into_values() { drop(loader.core_weights(layout, rank)?); }
+            }
+        }
+        let head = cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(
+            core.get_weight("lm_head").context("K6 head")?,
+            cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?;
+        drop(loader.core_weights(head, 0)?);
+        let actual = library.sync_h2d_staging_buffer()?;
+        assert!(!actual.ptr.is_null());
+        assert_eq!(actual.bytes as u64, inventory.core_loading.sync_upload_bytes);
+        let expected_upload = if vocab == 2048 { 2048 * 256 * 6 / 8 }
+            else { 512 * 256 * 6 / 8 / ranks };
+        assert_eq!(actual.bytes, expected_upload);
+        assert_eq!(library.release_sync_h2d_staging()?, expected_upload);
+        assert!(library.sync_h2d_staging_buffer()?.ptr.is_null());
+        // Actual NativeLibrary events, not a projected receipt. Growth frees the
+        // previous backing before allocating the next, including peer uploads.
+        let mut live = None;
+        let mut peak = 0;
+        let mut allocations = 0;
+        for event in audit.events() {
+            let record = match event { AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) => r };
+            if record.key.space != Space::Pinned { continue; }
+            assert_eq!(record.key.scope, "staging/sync-h2d");
+            match event {
+                AllocationEvent::Allocated(record) => {
+                    assert!(live.replace((record.address, record.bytes)).is_none());
+                    peak = peak.max(record.bytes);
+                    allocations += 1;
+                }
+                AllocationEvent::Freed(record) => {
+                    assert_eq!(live.take(), Some((record.address, record.bytes)));
+                }
+            }
+        }
+        assert!(allocations > 0);
+        assert!(live.is_none());
+        assert_eq!(peak, expected_upload);
+        eprintln!("K6 pinned subset: ranks={ranks}, owned={owned}, vocab={vocab}, peak={peak} B, source+pack payload allowance={} B (unmeasured ordinary heap)",
+            inventory.core_loading.heap_payload_bytes);
+    }
+    Ok(())
+}
+
 fn vocabulary_manifest() -> serde_json::Value {
     use serde_json::json;
     let pointer = |name, dtype, shape, role| json!({"name":name,"dtype":dtype,"shape":shape,"role":role});

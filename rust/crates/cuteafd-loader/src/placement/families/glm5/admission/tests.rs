@@ -196,6 +196,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
             when: vec![When::Embedding(*home)],
             value: WeightInventory {
                 ranks: 2,
+                core_loading: super::super::weights::CoreLoading::default(),
                 owners: vec![super::super::weights::WeightOwner {
                     allocation: Allocation::buffer(
                         "glm.weights.embedding",
@@ -310,6 +311,51 @@ fn combined_reply_resolution_is_immutable_and_absent_without_links() {
                 assert_eq!(plan.unwrap().decisions.spark_reply_format, expected);
             }
         }
+    }
+}
+
+#[test]
+fn core_heap_allowance_follows_weight_case_and_adds_concurrent_prefetch() {
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    for (index, case) in recipe.weights.iter_mut().enumerate() {
+        case.value.core_loading = super::super::weights::CoreLoading {
+            heap_payload_bytes: 4096 * (index as u64 + 1),
+            sync_upload_bytes: 1024,
+        };
+    }
+    // This synthetic whole-file allowance models the real prefetch's overlap;
+    // its size is not evidence for any installed drafter checkpoint.
+    recipe.owners.push(Case { when: vec![], value: vec![Component {
+        activation: Activation::always(),
+        bytes: ByteCurve::fixed(16384, recipe.maximum_pages),
+        kind: ComponentKind::Allowance(Allowance {
+            location: Location::HOST, bytes: 16384,
+            lifetime: Lifetime { first: Phase::Load, last: Phase::DraftLoad },
+            source: "synthetic concurrent DFlash prefetch Vec".into(), assumed: true,
+        }),
+    }] });
+    let contract = recipe.prepare(&request()).unwrap();
+    for embedding in 0..2 {
+        let facts = contract.facts(&[0, 0, 0, 0, embedding, 0, 0], 32).unwrap();
+        assert_eq!(facts.allowances.len(), 2);
+        assert!(facts.allowances.iter().all(|a| a.location == Location::HOST && a.assumed));
+        let budgets = budgets();
+        let phases = planner::evaluate(&facts, &budgets).unwrap();
+        let opaque = |phase| phases.iter().find(|p| p.budget == "physical.2" && p.phase == phase)
+            .unwrap().opaque;
+        assert_eq!(opaque(Phase::Load), 16384 + 4096 * (embedding as u64 + 1));
+        assert_eq!(opaque(Phase::DraftLoad), 16384);
+        assert_eq!(opaque(Phase::PostTargetKv), 0);
+        assert_eq!(opaque(Phase::Warmup), 0);
+        // No per-target pinned allocation: the upload maximum must join draft
+        // and workspace requirements before their one shared owner is emitted.
+        assert!(!facts.allocations.iter().any(|a| a.id.contains("upload.sync")));
+        let peak = phases.iter().find(|p| p.budget == "physical.2" && p.phase == Phase::Load).unwrap();
+        let mut tight = budgets;
+        tight[2].physical_bytes = peak.owned + peak.opaque - 1;
+        tight[2].logical_bytes = tight[2].physical_bytes;
+        assert!(matches!(planner::evaluate(&facts, &tight), Err(Refusal::Capacity { .. })));
     }
 }
 

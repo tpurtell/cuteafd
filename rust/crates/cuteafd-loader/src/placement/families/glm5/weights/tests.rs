@@ -19,6 +19,29 @@ fn ordinary(
     WeightInventory::from_checkpoint(&checkpoint, ranks, 2, owners, bf16, false, embedding).unwrap()
 }
 
+fn core_checkpoint(vocab: usize, core_head: bool) -> (serde_json::Value, Vec<Tensor>) {
+    let (mut config, tensors) = testing::glm5_compact_weights();
+    config["vocab_size"] = serde_json::json!(vocab);
+    let cfg = GlmDsaConfig::from_hf(&config).unwrap();
+    let tensors = tensors.into_iter().filter(|t| !t.0.ends_with("_scale_inv"))
+        .flat_map(|(name, dtype, mut shape)| {
+            if ["lm_head.weight", "model.embed_tokens.weight"].contains(&name.as_str()) {
+                shape[0] = vocab;
+            }
+            let stem = name.strip_suffix(".weight").filter(|stem|
+                crate::families::glm5::core::split(&cfg, stem).is_some()
+                    && (core_head || *stem != "lm_head"));
+            if let Some(stem) = stem {
+                let n = if stem.ends_with("kv_a_proj_with_mqa") { shape[0].next_multiple_of(128) }
+                    else { shape[0] };
+                exl3(stem, n, shape[1], 6)
+            } else {
+                vec![(name, if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape)]
+            }
+        }).collect();
+    (config, tensors)
+}
+
 fn bytes(inventory: &WeightInventory, suffix: &str) -> u64 {
     inventory
         .owners
@@ -128,7 +151,7 @@ fn checkpoint_owners_match_loader_floors_splits_and_pinned_embedding() {
 
 #[test]
 fn bf16_and_k6_owners_keep_distinct_payload_and_vector_requests() {
-    let (mut config, tensors) = testing::glm5_compact_weights();
+    let (config, tensors) = testing::glm5_compact_weights();
     let bf16: Vec<_> = tensors
         .into_iter()
         .filter(|t| !t.0.ends_with("_scale_inv"))
@@ -150,28 +173,7 @@ fn bf16_and_k6_owners_keep_distinct_payload_and_vector_requests() {
             .any(|o| o.allocation.id.ends_with("w_qkv_a_kscale"))
     );
 
-    config["vocab_size"] = serde_json::json!(256);
-    let cfg = GlmDsaConfig::from_hf(&config).unwrap();
-    let core: Vec<_> = bf16
-        .into_iter()
-        .flat_map(|(name, dtype, mut shape)| {
-            if ["lm_head.weight", "model.embed_tokens.weight"].contains(&name.as_str()) {
-                shape[0] = 256;
-            }
-            let Some(stem) = name
-                .strip_suffix(".weight")
-                .filter(|stem| crate::families::glm5::core::split(&cfg, stem).is_some())
-            else {
-                return vec![(name, dtype, shape)];
-            };
-            let n = if stem.ends_with("kv_a_proj_with_mqa") {
-                shape[0].next_multiple_of(128)
-            } else {
-                shape[0]
-            };
-            exl3(stem, n, shape[1], 6)
-        })
-        .collect();
+    let (config, core) = core_checkpoint(256, true);
     let inventory = ordinary(
         &config,
         &core,
@@ -193,6 +195,76 @@ fn bf16_and_k6_owners_keep_distinct_payload_and_vector_requests() {
             .iter()
             .any(|o| o.allocation.id.contains(".operand.w_gate_up"))
     );
+}
+
+#[test]
+fn core_load_payload_peak_adds_full_source_to_one_local_pack_not_ranks_or_layers() {
+    let (config, tensors) = core_checkpoint(256, true);
+    for ranks in [1, 2] {
+        let choices: Vec<_> = if ranks == 1 { vec![None] }
+            else { vec![None, Some([0, 1]), Some([1, 0])] };
+        for owners in choices {
+            let inventory = ordinary(&config, &tensors, ranks,
+                owners.as_ref().map(|o| o.as_slice()), false, EmbeddingHome::Device(0));
+            // Dense gate/up/down dominate this compact checkpoint. The marker is
+            // read on host; vectors are duplicated only on the unsplit dimension.
+            let source = 512 * 256 * 6 / 8 + (512 + 256) * 2 + 4;
+            let packed = 512 * 256 * 6 / 8 / ranks + (512 / ranks + 256) * 2;
+            assert_eq!(inventory.core_loading.heap_payload_bytes, (source + packed) as u64);
+            assert_eq!(inventory.core_loading.sync_upload_bytes,
+                (512 * 256 * 6 / 8 / ranks) as u64);
+            let components = inventory.core_loading.components(16).unwrap();
+            assert_eq!(components.len(), 1);
+            let ComponentKind::Allowance(allowance) = &components[0].kind else { panic!("heap is not exact") };
+            assert_eq!(allowance.location, Location::HOST);
+            assert_eq!(allowance.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+            assert!(allowance.assumed);
+            assert!(allowance.source.contains("unmeasured"));
+            assert!(allowance.source.contains("excludes allocator/metadata"));
+            assert!(allowance.source.contains("concurrent draft prefetch"));
+            assert_eq!(allowance.bytes, (source + packed) as u64);
+            assert_eq!(components[0].bytes.at(16).unwrap(), allowance.bytes);
+            // Pinned upload is a shared maximum fact, not another allocation
+            // emitted by each rank or by this target-only subset.
+            assert!(!components.iter().any(|c| matches!(&c.kind,
+                ComponentKind::Allocation { .. })));
+        }
+    }
+    let (config, tensors) = testing::glm5_compact_weights();
+    let plain = ordinary(&config, &tensors, 2, None, false, EmbeddingHome::Device(0));
+    assert_eq!(plain.core_loading, CoreLoading::default());
+    assert!(plain.core_loading.components(16).unwrap().is_empty());
+    assert!(plain.core_loading.components(0).is_err());
+}
+
+#[test]
+fn unsplit_k6_head_can_set_both_heap_and_single_upload_maxima() {
+    let (config, tensors) = core_checkpoint(2048, true);
+    for ranks in [1, 2] {
+        let inventory = ordinary(&config, &tensors, ranks, None, false, EmbeddingHome::HostPinned);
+        let packed = 2048 * 256 * 6 / 8 + (2048 + 256) * 2;
+        assert_eq!(inventory.core_loading.heap_payload_bytes, packed * 2 + 4);
+        assert_eq!(inventory.core_loading.sync_upload_bytes, 2048 * 256 * 6 / 8);
+        assert_eq!(inventory.core_loading.components(8).unwrap().len(), 1);
+    }
+    let (config, tensors) = core_checkpoint(2048, false);
+    let body = ordinary(&config, &tensors, 2, None, false, EmbeddingHome::Device(0));
+    assert_eq!(body.core_loading.sync_upload_bytes, 512 * 256 * 6 / 8 / 2);
+    assert!(body.core_loading.heap_payload_bytes < (2048 * 256 * 6 / 8) * 2);
+}
+
+#[test]
+fn core_load_payload_overflow_refuses_before_updating_maxima() {
+    use crate::formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook};
+    let layout = CoreWeightLayout { stem: "projection".into(), side: TrellisSide::Output,
+        rank: 0, ranks: 1, shape: [128, 128], bytes: 128 * 128 * 6 / 8 + 512,
+        bits: 6, codebook: Exl3Codebook::Mcg };
+    let mut loading = CoreLoading::default();
+    assert!(loading.include(u64::MAX, &layout).is_err());
+    assert_eq!(loading, CoreLoading::default());
+    let bad = CoreWeightLayout { bytes: layout.bytes - 1, ..layout };
+    assert!(loading.include(1, &bad).is_err());
+    assert_eq!(loading, CoreLoading::default());
 }
 
 #[test]

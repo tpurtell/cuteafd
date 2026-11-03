@@ -1,9 +1,11 @@
-//! Header-native physical weight owners. Loading temporaries and serving arenas
-//! join separately; a retained census alone cannot authorize family Ready.
+//! Header-native physical weights and the current synchronous K6 load subset.
+//! Other loading temporaries and serving arenas join separately; this inventory
+//! alone cannot authorize family Ready.
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer, core::CoreInventory};
 use crate::formats::trellis_core::CoreWeightLayout;
 use crate::placement::planner::{
-    Allocation, ByteCurve, Component, EmbeddingHome, Lifetime, Location, Refusal,
+    Activation, Allocation, Allowance, ByteCurve, Component, ComponentKind, EmbeddingHome,
+    Lifetime, Location, Phase, Refusal,
 };
 use crate::plan::{
     Checkpoint,
@@ -20,10 +22,57 @@ pub struct WeightOwner {
     pub format: String,
 }
 
+/// Serialized K6 read/pack/upload facts, not a complete target load census.
+/// Ordinary Vec payload capacities are unmeasured; metadata/allocator overhead
+/// and a concurrent prefetched draft file must be charged separately.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CoreLoading {
+    pub heap_payload_bytes: u64,
+    /// Largest single payload/vector copy, never the sum of three uploads.
+    /// All target, draft and workspace users share one reusable pinned buffer.
+    pub sync_upload_bytes: u64,
+}
+
+impl CoreLoading {
+    fn include(&mut self, source_bytes: u64, layout: &CoreWeightLayout) -> Result<()> {
+        let [n, k] = layout.shape.map(|n| n as u64);
+        let payload = product(&[n, k, layout.bits as u64])? / 8;
+        let input = product(&[k, 2])?;
+        let output = product(&[n, 2])?;
+        ensure!(sum([payload, input, output])? == layout.bytes as u64,
+            "GLM K6 loading extent differs from physical layout");
+        let heap = sum([source_bytes, layout.bytes as u64])?;
+        self.heap_payload_bytes = self.heap_payload_bytes.max(heap);
+        self.sync_upload_bytes = self.sync_upload_bytes.max(payload).max(input).max(output);
+        Ok(())
+    }
+
+    pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("empty GLM core load page domain".into()));
+        }
+        if self.heap_payload_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(vec![Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(self.heap_payload_bytes, maximum_pages),
+            kind: ComponentKind::Allowance(Allowance {
+                location: Location::HOST,
+                bytes: self.heap_payload_bytes,
+                lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
+                source: "GLM synchronous K6 payload heap: maximum serialized projection's four source header bytes (including marker) plus packed local payload/suh/svh Vec capacities; ordinary Rust heap, unmeasured assumption; excludes allocator/metadata overhead and concurrent draft prefetch".into(),
+                assumed: true,
+            }),
+        }])
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WeightInventory {
     pub ranks: usize,
     pub owners: Vec<WeightOwner>,
+    pub core_loading: CoreLoading,
 }
 
 impl WeightInventory {
@@ -69,6 +118,7 @@ impl WeightInventory {
         name: &str,
         group: &str,
         layout: &CoreWeightLayout,
+        source_bytes: u64,
     ) -> Result<()> {
         let [n, k] = layout.shape.map(|n| n as u64);
         let payload = product(&[n, k, layout.bits as u64])? / 8;
@@ -82,6 +132,7 @@ impl WeightInventory {
         for (suffix, bytes) in [("payload", payload), ("suh", input), ("svh", output)] {
             self.add(rank, &format!("{name}.{suffix}"), group, "exl3-k6", bytes)?;
         }
+        self.core_loading.include(source_bytes, layout)?;
         Ok(())
     }
 
@@ -215,6 +266,7 @@ impl WeightInventory {
         let mut out = Self {
             ranks,
             owners: Vec::new(),
+            core_loading: CoreLoading::default(),
         };
         for layer in 0..layers {
             let root = format!("model.layers.{layer}");
@@ -462,6 +514,7 @@ impl WeightInventory {
                             group
                         },
                         layout,
+                        core.get_weight(&layout.stem).context("GLM core source projection")?.source_bytes,
                     )?;
                 }
             }
@@ -475,7 +528,7 @@ impl WeightInventory {
                 0,
                 1,
             )?;
-            out.core(0, "core.head", "lm_head", &layout)?;
+            out.core(0, "core.head", "lm_head", &layout, projection.source_bytes)?;
         } else {
             let head = headers.get("lm_head.weight")?;
             let bytes = if head.dtype == DType::F8E4M3 {
@@ -512,6 +565,7 @@ impl WeightInventory {
         let mut out = Self {
             ranks: plans.len(),
             owners: Vec::new(),
+            core_loading: CoreLoading::default(),
         };
         out.extend_native(selection, layers, &plans.iter().collect::<Vec<_>>())?;
         Ok(out)
@@ -532,6 +586,7 @@ impl WeightInventory {
         let mut out = Self {
             ranks: self.ranks,
             owners: Vec::new(),
+            core_loading: CoreLoading::default(),
         };
         let mut embedding = false;
         for (rank, plan) in plans.iter().enumerate() {
