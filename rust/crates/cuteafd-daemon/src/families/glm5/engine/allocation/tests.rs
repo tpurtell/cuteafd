@@ -464,7 +464,10 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             EmbedPlacement::Gpu,
             || Ok(()),
         )?;
-        let stream = std::ptr::null_mut();
+        let [lead_stream, peer_stream] = devices.map(|id| crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library: &library, id }));
+        let (lead_stream, peer_stream) = (lead_stream?, peer_stream?);
+        let stream = lead_stream.raw;
         let mut engine = GlmEngine::new(
             &library,
             &programs,
@@ -482,7 +485,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
         let layers = crate::shared::peer_split::on_device(&library, devices[1], || {
             GlmLayer::allocation_fixture(&library, &cfg, 1, owners)
         })?;
-        engine.attach_peer(devices[1], stream, layers)?;
+        engine.attach_peer(devices[1], peer_stream.raw, layers)?;
         if native {
             // Only an ownership marker is loaded; no numerical native programs run.
             engine.weights.layers[0]
