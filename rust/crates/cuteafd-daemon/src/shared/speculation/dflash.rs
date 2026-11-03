@@ -1749,7 +1749,7 @@ impl<'a> DflashDrafter<'a> {
         -> Result<Vec<cuteafd_loader::placement::planner::OwnerEvent>> {
         use cuteafd_loader::placement::planner::Phase;
         let device = self.fused.buffer.device_id;
-        let receipts = self.gqa_allocation_receipts(devices, phase >= Phase::Warmup)?;
+        let receipts = self.gqa_allocation_receipts(devices, matches!(phase, Phase::Warmup | Phase::Ready | Phase::Growth))?;
         draft_owner_events(audit, &receipts, device, devices, phase, "draft.gqa")
     }
 
@@ -2023,7 +2023,7 @@ impl<'a> DflashDrafter<'a> {
         let physical_devices = [device];
         let devices = planner::CoordinatorDevices::new(&physical_devices)?;
         let gpu = devices.logical_rank(device)?;
-        let receipts = self.mla_allocation_receipts(devices, phase >= Phase::Warmup)?;
+        let receipts = self.mla_allocation_receipts(devices, matches!(phase, Phase::Warmup | Phase::Ready | Phase::Growth))?;
         let mut events = self.legacy_mla_events.borrow().clone();
         events.extend(draft_owner_events(audit, &receipts, device, devices, phase, "draft.mla")?);
         planner::reconcile_legacy_mla_events(&context.layout.legacy_mla_facts(gpu), phase, &events)?;

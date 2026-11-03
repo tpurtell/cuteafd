@@ -1,12 +1,12 @@
 //! Actual-owner receipts for target, drafter and serving startup, including pinned owners.
 use super::*;
 use cuteafd_core::memory_layout::Category;
-use cuteafd_ffi::memory_ledger::{self, AllocationAudit, AllocationEvent, Space};
+use cuteafd_ffi::memory_ledger::{self, Space};
+use crate::shared::memory::startup::StartupHistory;
 use cuteafd_loader::placement::planner::{
-    self, Allocation as Spec, Domain, Lifetime, Location, Observation, OwnerEvent, Phase, Receipt,
+    self, Allocation as Spec, CoordinatorDevices, Lifetime, Location, Phase, Receipt,
     ResolvedPlan,
 };
-use std::collections::BTreeMap;
 
 fn receipt(
     id: String,
@@ -34,8 +34,7 @@ pub(super) fn reconcile_target(
     library: &NativeLibrary,
     device: Device<'_>,
     stream: *mut std::ffi::c_void,
-    audit: &AllocationAudit,
-    loaded_events: usize,
+    history: &StartupHistory,
     embedding: &TokenEmbedding<'_>,
     weights: &DenseWeights<'_>,
     planes: &[Allocation<'_>],
@@ -299,10 +298,7 @@ pub(super) fn reconcile_target(
         library,
         device,
         Phase::PostTargetKv,
-        audit,
-        loaded_events,
-        audit.events().len(),
-        None,
+        history,
         &receipts,
     )?;
     Ok(receipts)
@@ -310,10 +306,7 @@ pub(super) fn reconcile_target(
 
 pub(super) struct Startup {
     pub plan: ResolvedPlan,
-    pub audit: AllocationAudit,
-    pub loaded_events: usize,
-    pub target_events: usize,
-    pub draft_events: Option<usize>,
+    pub history: StartupHistory,
     pub receipts: Vec<Receipt>,
 }
 
@@ -324,23 +317,16 @@ impl Startup {
         device: Device<'_>,
         owners: Vec<Receipt>,
     ) -> Result<()> {
-        ensure!(
-            self.draft_events.is_none(),
-            "drafter startup boundary already recorded"
-        );
         self.receipts.extend(owners);
-        self.draft_events = Some(self.audit.events().len());
         reconcile_startup(
             &self.plan,
             library,
             device,
             Phase::DraftLoad,
-            &self.audit,
-            self.loaded_events,
-            self.target_events,
-            self.draft_events,
+            &self.history,
             &self.receipts,
-        )
+        )?;
+        self.history.begin(Phase::Warmup)
     }
 
     pub fn ready(
@@ -359,15 +345,13 @@ impl Startup {
         if let Some(copy) = cache.host_engine_mut() {
             receipts.extend(copy.allocation_receipts("host.prefix", lifetime)?);
         }
+        if self.history.phase() != Phase::Ready { self.history.begin(Phase::Ready)?; }
         reconcile_startup(
             &self.plan,
             library,
             device,
             Phase::Ready,
-            &self.audit,
-            self.loaded_events,
-            self.target_events,
-            self.draft_events,
+            &self.history,
             &receipts,
         )
     }
@@ -379,21 +363,11 @@ fn reconcile_startup(
     library: &NativeLibrary,
     device: Device<'_>,
     phase: Phase,
-    audit: &AllocationAudit,
-    loaded_events: usize,
-    target_events: usize,
-    draft_events: Option<usize>,
+    history: &StartupHistory,
     receipts: &[Receipt],
 ) -> Result<()> {
-    let (events, views) = startup_history(
-        &audit.events(),
-        loaded_events,
-        target_events,
-        draft_events,
-        receipts,
-        device.id,
-        &memory_ledger::allocations(),
-    )?;
+    let (events, views) = history.owners(plan.facts.phase_order, phase, receipts,
+        CoordinatorDevices::new(&[device.id])?, transient_owner)?;
     planner::reconcile_events(plan, phase, &events, &views)?;
     let before = match plan.budgets[0].baseline {
         planner::Baseline::Sampled { free, .. } => free,
@@ -409,147 +383,22 @@ fn reconcile_startup(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn startup_history(
-    audit: &[AllocationEvent],
-    loaded_events: usize,
-    target_events: usize,
-    draft_events: Option<usize>,
-    receipts: &[Receipt],
-    device: i32,
-    census: &[memory_ledger::AllocationRecord],
-) -> Result<(Vec<OwnerEvent>, Vec<Observation>)> {
-    ensure!(
-        loaded_events <= target_events
-            && target_events <= audit.len()
-            && draft_events.is_none_or(|end| end >= target_events && end <= audit.len()),
-        "invalid startup audit boundaries"
-    );
-    let key = |a: &memory_ledger::AllocationRecord| (a.key.space, a.key.device, a.address);
-    let mut live = BTreeMap::new();
-    let mut events = Vec::new();
-    for (index, event) in audit.iter().enumerate() {
-        let at = if index < loaded_events {
-            Phase::Load
-        } else if index < target_events {
-            Phase::PostTargetKv
-        } else if draft_events.is_some_and(|end| index < end) {
-            Phase::DraftLoad
-        } else {
-            Phase::Warmup
-        };
-        match event {
-            AllocationEvent::Allocated(a) => {
-                let domain = match a.key.space {
-                    Space::Device => Domain::Device,
-                    Space::Host => Domain::Host,
-                    Space::Pinned => Domain::Pinned,
-                    Space::Managed => Domain::Managed,
-                };
-                if matches!(domain, Domain::Device | Domain::Managed) {
-                    ensure!(
-                        a.key.device == device,
-                        "dense allocation on wrong physical device"
-                    );
-                }
-                let receipt = if a.key.space == Space::Pinned && a.key.scope == "embedding" {
-                    Receipt {
-                        allocation: Spec::buffer(
-                            "embedding.upload",
-                            Location::PINNED,
-                            a.bytes as u64,
-                            Lifetime {
-                                first: Phase::Load,
-                                last: Phase::Load,
-                            },
-                            Category::Staging,
-                            "embedding upload staging",
-                        ),
-                        address: a.address as u64,
-                    }
-                } else if a.key.scope == "draft.pack.source" {
-                    ensure!(
-                        domain == Domain::Device,
-                        "packing source is not device memory"
-                    );
-                    Receipt {
-                        allocation: Spec::buffer(
-                            a.key.owner.context("packing source without owner ID")?,
-                            Location::coordinator(0),
-                            a.bytes as u64,
-                            Lifetime {
-                                first: Phase::DraftLoad,
-                                last: Phase::DraftLoad,
-                            },
-                            Category::Drafter,
-                            "BF16 packing source",
-                        ),
-                        address: a.address as u64,
-                    }
-                } else {
-                    receipts
-                        .iter()
-                        .find(|r| {
-                            r.allocation.view.is_none()
-                                && r.address == a.address as u64
-                                && r.allocation.location.domain == domain
-                        })
-                        .context("audited allocation absent from independent owner receipts")?
-                        .clone()
-                };
-                ensure!(
-                    receipt.allocation.bytes == a.bytes as u64,
-                    "allocation census differs from object receipt {}",
-                    receipt.allocation.id
-                );
-                events.push(OwnerEvent::Allocated {
-                    receipt: receipt.clone(),
-                    phase: at,
-                });
-                ensure!(
-                    live.insert(key(a), (*a, receipt)).is_none(),
-                    "startup allocation reused a live pointer"
-                );
-            }
-            AllocationEvent::Freed(a) => {
-                let (allocated, receipt) = live
-                    .remove(&key(a))
-                    .context("free without audited allocation")?;
-                ensure!(
-                    allocated.key == a.key && allocated.bytes == a.bytes,
-                    "free differs from audited owner"
-                );
-                events.push(OwnerEvent::Freed { receipt, phase: at });
-            }
-        }
-    }
-    let current = census
-        .iter()
-        .map(|a| (key(a), a))
-        .collect::<BTreeMap<_, _>>();
-    for (k, (owner, _)) in &live {
-        ensure!(
-            current
-                .get(k)
-                .is_some_and(|a| a.key == owner.key && a.bytes == owner.bytes),
-            "retained owner absent from live census"
-        );
-    }
-    let views = receipts
-        .iter()
-        .filter(|r| r.allocation.view.is_some())
-        .map(|r| Observation {
-            receipt: r.clone(),
-            created: r.allocation.lifetime.first,
-            freed: None,
-        })
-        .collect();
-    Ok((events, views))
+fn transient_owner(a: &memory_ledger::AllocationRecord) -> Result<Option<Receipt>> {
+    let (id, location, phase, category, group) = if a.key.space == Space::Pinned && a.key.scope == "embedding" {
+        ("embedding.upload".to_owned(), Location::PINNED, Phase::Load, Category::Staging, "embedding upload staging")
+    } else if a.key.scope == "draft.pack.source" {
+        ensure!(a.key.space == Space::Device, "packing source is not device memory");
+        (a.key.owner.context("packing source without owner ID")?.to_owned(), Location::coordinator(0),
+            Phase::DraftLoad, Category::Drafter, "BF16 packing source")
+    } else { return Ok(None) };
+    Ok(Some(Receipt { allocation: Spec::buffer(id, location, a.bytes as u64,
+        Lifetime { first: phase, last: phase }, category, group), address: a.address as u64 }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cuteafd_ffi::memory_ledger::AllocationEvent;
     use crate::shared::{
         memory::device::Allocation,
         prefix::CudaCopyEngine,
@@ -589,6 +438,7 @@ mod tests {
             address: 4096,
         };
         let facts = Facts {
+            phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
             allocations: vec![target.allocation.clone(), draft.allocation.clone()],
             deferred: vec![],
             sequential: vec![planner::Sequential {
@@ -662,26 +512,24 @@ mod tests {
         ];
         let receipts = [target, draft];
         let census = [target_record, draft_record];
-        let (events, views) =
-            startup_history(&audit, 0, 1, Some(audit.len()), &receipts, 0, &census)?;
+        let history = |audit: &[AllocationEvent], census: &[memory_ledger::AllocationRecord]| {
+            crate::shared::memory::startup::observed_owners(audit,
+                &[(Phase::Load, 0), (Phase::PostTargetKv, 0), (Phase::DraftLoad, 1),
+                    (Phase::Warmup, audit.len()), (Phase::Ready, audit.len())],
+                plan.facts.phase_order, Phase::Ready, &receipts, CoordinatorDevices::new(&[0])?,
+                census, &mut transient_owner)
+        };
+        let (events, views) = history(&audit, &census)?;
         assert_eq!(events.len(), audit.len());
         planner::reconcile_events(&plan, Phase::Ready, &events, &views)?;
         let mut overlap = audit.clone();
         overlap.swap(2, 3);
         assert!(
-            startup_history(&overlap, 0, 1, Some(overlap.len()), &receipts, 0, &census).is_err()
+            history(&overlap, &census).is_err()
         );
         let mut missing_free = audit.clone();
         missing_free.pop();
-        let (events, views) = startup_history(
-            &missing_free,
-            0,
-            1,
-            Some(missing_free.len()),
-            &receipts,
-            0,
-            &[target_record, draft_record, second],
-        )?;
+        let (events, views) = history(&missing_free, &[target_record, draft_record, second])?;
         assert!(planner::reconcile_events(&plan, Phase::Ready, &events, &views).is_err());
         for mutation in 0..4 {
             let mut bad = audit.clone();
@@ -695,7 +543,7 @@ mod tests {
                 }
             }
             assert!(
-                startup_history(&bad, 0, 1, Some(bad.len()), &receipts, 0, &census)
+                history(&bad, &census)
                     .and_then(|(events, views)| planner::reconcile_events(
                         &plan,
                         Phase::Ready,
@@ -708,7 +556,7 @@ mod tests {
             );
         }
         assert!(
-            startup_history(&audit, 0, 1, Some(audit.len()), &receipts, 0, &census[..1]).is_err()
+            history(&audit, &census[..1]).is_err()
         );
         Ok(())
     }
@@ -726,9 +574,11 @@ mod tests {
             id: 0,
         };
         for placement in [SelectPlacement::Device, SelectPlacement::Host] {
-            let audit = AllocationAudit::start();
+            let mut history = StartupHistory::start();
+            history.begin(Phase::PostTargetKv)?;
             let target = Allocation::new(device, 256)?;
-            let target_events = audit.events().len();
+            history.begin(Phase::DraftLoad)?;
+            history.begin(Phase::Warmup)?;
             let target_receipt = receipt(
                 "fixture.target".into(),
                 target.buffer,
@@ -817,6 +667,7 @@ mod tests {
                 },
             ];
             let facts = Facts {
+                phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
                 allocations: owners,
                 deferred: vec![],
                 sequential: vec![],
@@ -848,10 +699,7 @@ mod tests {
             };
             let mut startup = Startup {
                 plan,
-                audit,
-                loaded_events: 0,
-                target_events,
-                draft_events: None,
+                history,
                 receipts: vec![target_receipt],
             };
             let mut selector = TokenSelector::new(&library, placement, 33, 64)?;

@@ -327,6 +327,7 @@ impl Recipe for GlmRecipe<'_> {
             return Err(invalid("attention ownership or context page quantum"));
         }
         let mut contract = Contract {
+            phase_order: crate::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
             page_rows: self.page_tokens,
             maximum_pages: self.maximum_pages,
             gpus: self.gpus,

@@ -1577,7 +1577,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         let cache = plan.facts.allocations.iter().filter(|a| a.group == "retained host prefix chunk")
             .map(|a| a.bytes).sum();
         for allowance in &plan.facts.allowances {
-            if budget.locations.contains(&allowance.location) && allowance.lifetime.contains(Phase::Ready) {
+            if budget.locations.contains(&allowance.location) && allowance.lifetime.contains(Phase::Ready, plan.facts.phase_order) {
                 items.push(Item::new(Category::Workspace, &allowance.source, "ordinary heap allowance",
                     allowance.bytes, Basis::Estimated).with_lifetime(ItemLifetime::PostReadyReserve));
             }

@@ -270,7 +270,7 @@ fn native_host_report_uses_the_shared_phase_ledger_without_duplicate_cache_or_ro
     assert_eq!(host.items.iter().filter(|i| i.group == "retained host prefix chunk").count(), 1);
     assert!(!host.items.iter().any(|i| i.group.contains("router") || i.group.contains("Spark")));
     let expected: u64 = plan.facts.allocations.iter().filter(|a| a.location == Location::PINNED
-        && a.view.is_none() && a.lifetime.contains(Phase::Ready)).map(|a| a.bytes).sum();
+        && a.view.is_none() && a.lifetime.contains(Phase::Ready, plan.facts.phase_order)).map(|a| a.bytes).sum();
     assert_eq!(host.resident_bytes, expected);
 }
 
@@ -292,10 +292,10 @@ fn native_token_selection_charges_only_the_selected_sampler_owners() {
             ("selector.landing", Location::PINNED)] {
             let owner = owners.iter().find(|a| a.id == id).unwrap();
             assert_eq!((owner.location, owner.bytes), (location, 64 * 12));
-            assert!(owner.lifetime.contains(Phase::Ready));
+            assert!(owner.lifetime.contains(Phase::Ready, plan.facts.phase_order));
         }
         assert!(plan.facts.allowances.iter().any(|a| a.location == Location::HOST
-            && a.bytes > 0 && a.lifetime.contains(Phase::Ready)));
+            && a.bytes > 0 && a.lifetime.contains(Phase::Ready, plan.facts.phase_order)));
         assert_eq!(report.host_budget_bytes, 2 * (256 << 20));
         inventories.push(owners.iter().filter(|a| !a.id.starts_with("selector.sampler."))
             .cloned().collect::<Vec<_>>());

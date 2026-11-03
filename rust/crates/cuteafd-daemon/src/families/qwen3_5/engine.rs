@@ -178,7 +178,7 @@ impl<'a> DenseEngine<'a> {
         let pool_tokens = usize::try_from(plan.pool_tokens)?;
         tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits,
             head_rows = buffers.head_rows, deferred_owners = plan.facts.deferred.len(), "dense Qwen admitted before weight/state allocation");
-        let audit = cuteafd_ffi::memory_ledger::AllocationAudit::start();
+        let mut history = crate::shared::memory::startup::StartupHistory::start();
         let upload = weight_bytes.allocations.iter().map(|a| a.upload_bytes).max().unwrap_or(0)
             .max(drafter.map_or(0, DenseDraft::sync_upload_bytes));
         library.reserve_sync_h2d_staging(usize::try_from(upload)?)?;
@@ -186,7 +186,7 @@ impl<'a> DenseEngine<'a> {
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
         let (embedding, weights) = TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
             || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format))?;
-        let loaded_events = audit.events().len();
+        history.begin(planner::Phase::PostTargetKv)?;
         let mut allocated = sizes.into_iter().map(|bytes| Allocation::new(device, alloc_bytes(bytes)))
             .collect::<Result<Vec<_>>>()?;
         let views: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
@@ -217,11 +217,11 @@ impl<'a> DenseEngine<'a> {
             Some(std::rc::Rc::new(Allocation::new(device, prefix_bytes)?))
         };
         stream.drain()?;
-        let receipts = allocation::reconcile_target(&plan, library, device, stream.raw, &audit, loaded_events, &embedding, &weights, &allocated,
+        let receipts = allocation::reconcile_target(&plan, library, device, stream.raw, &history, &embedding, &weights, &allocated,
             &ids, &logits, &head_workspace, &bank, &kv, &verification, prefix_arena.as_deref())?;
         tracing::info!("dense target allocation IDs reconciled at PostTargetKv; scheduler owners still pending");
-        let target_events = audit.events().len();
-        let startup = serving.map(|_| allocation::Startup { plan, audit, loaded_events, target_events, draft_events: None, receipts });
+        history.begin(planner::Phase::DraftLoad)?;
+        let startup = serving.map(|_| allocation::Startup { plan, history, receipts });
         Ok(Self { stream, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
             pool_tokens, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],

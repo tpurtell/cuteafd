@@ -61,6 +61,7 @@ struct Group {
 }
 pub(super) struct Compiled {
     starts: Vec<u64>,
+    phase_order: PhaseOrder,
     groups: Vec<Group>,
     rows: usize,
 }
@@ -73,7 +74,7 @@ impl Compiled {
             }
         }
         let starts: Vec<_> = starts.into_iter().collect();
-        let rows = budgets.len() * PHASES.len();
+        let rows = budgets.len() * contract.phase_order.phases().len();
         let mut groups = BTreeMap::<Activation, Vec<Vec<Cost>>>::new();
         for component in &contract.components {
             let Some((location, lifetime, opaque)) = component.charge() else {
@@ -89,8 +90,8 @@ impl Compiled {
             for (index, &first) in starts[..starts.len() - 1].iter().enumerate() {
                 let piece = component.bytes.piece(first)?;
                 let bytes = component.bytes.at(first)?;
-                for (phase, at) in PHASES.iter().enumerate() {
-                    if !lifetime.contains(*at) {
+                for (phase, at) in contract.phase_order.phases().iter().enumerate() {
+                    if !lifetime.contains(*at, contract.phase_order) {
                         continue;
                     }
                     let cost = if opaque {
@@ -106,12 +107,13 @@ impl Compiled {
                             ..Cost::default()
                         }
                     };
-                    costs[index][budget * PHASES.len() + phase].add(cost)?;
+                    costs[index][budget * contract.phase_order.phases().len() + phase].add(cost)?;
                 }
             }
         }
         Ok(Self {
             starts,
+            phase_order: contract.phase_order,
             rows,
             groups: groups
                 .into_iter()
@@ -145,10 +147,10 @@ impl Compiled {
             .enumerate()
             .map(|(row, cost)| {
                 let cost = cost.at(pages - self.starts[piece])?;
-                let budget = &budgets[row / PHASES.len()];
+                let budget = &budgets[row / self.phase_order.phases().len()];
                 Ok(PhaseBudget {
                     budget: budget.id.clone(),
-                    phase: PHASES[row % PHASES.len()],
+                    phase: self.phase_order.phases()[row % self.phase_order.phases().len()],
                     owned: cost.owned,
                     opaque: cost.opaque,
                     available: budget.available()?,
@@ -172,7 +174,7 @@ impl Compiled {
             }
             for (row, cost) in self.costs(selected, piece)?.into_iter().enumerate() {
                 let cost = cost.at(first - self.starts[piece])?;
-                let available = budgets[row / PHASES.len()].available()?;
+                let available = budgets[row / self.phase_order.phases().len()].available()?;
                 let required = cost.required()?;
                 if required > available {
                     last = 0;
@@ -247,7 +249,7 @@ impl Compiled {
                 }
             }
             for (row, cost) in result.into_iter().enumerate() {
-                let available = budgets[row / PHASES.len()].available()?;
+                let available = budgets[row / self.phase_order.phases().len()].available()?;
                 let required = cost.required()?;
                 if required > available {
                     last = 0;
@@ -322,14 +324,14 @@ fn add_bytes(destination: &mut [u64], bytes: &[u64]) -> Result<(), Refusal> {
     }
     Ok(())
 }
-fn capacity(rows: &[u64], budgets: &[Budget]) -> Result<(), Refusal> {
+fn capacity(rows: &[u64], budgets: &[Budget], order: PhaseOrder) -> Result<(), Refusal> {
     for (row, &required) in rows.iter().enumerate() {
-        let budget = &budgets[row / PHASES.len()];
+        let budget = &budgets[row / order.phases().len()];
         let available = budget.available()?;
         if required > available {
             return Err(Refusal::Capacity {
                 budget: budget.id.clone(),
-                phase: PHASES[row % PHASES.len()],
+                phase: order.phases()[row % order.phases().len()],
                 required,
                 available,
                 owners: vec![],
@@ -437,7 +439,7 @@ fn propagate(
         if !logical(contract, domains, exact) {
             return Err(Refusal::PinConflict);
         }
-        capacity(&costs.lower_bound(domains, lower, upper)?, budgets)?;
+        capacity(&costs.lower_bound(domains, lower, upper)?, budgets, contract.phase_order)?;
         let before = domains.to_vec();
         for variable in 0..domains.len() {
             let mut retained = Vec::new();
@@ -446,7 +448,7 @@ fn propagate(
                 let mut forced = domains.to_vec();
                 forced[variable] = vec![option];
                 if logical(contract, &mut forced, exact) {
-                    match capacity(&costs.lower_bound(&forced, lower, upper)?, budgets) {
+                    match capacity(&costs.lower_bound(&forced, lower, upper)?, budgets, contract.phase_order) {
                         Ok(()) => retained.push(option),
                         Err(error @ Refusal::Capacity { .. }) => {
                             capacity_failure.get_or_insert(error);
@@ -476,15 +478,12 @@ fn remaining(phases: &[PhaseBudget]) -> u64 {
 fn coordinator_slack(phases: &[PhaseBudget], budgets: &[Budget]) -> u64 {
     phases
         .iter()
-        .enumerate()
-        .filter(|(row, phase)| {
-            phase.phase >= Phase::Warmup
-                && budgets[row / PHASES.len()]
-                    .locations
-                    .iter()
-                    .any(|l| matches!(l.device, Device::Coordinator(_)))
+        .filter(|phase| {
+            matches!(phase.phase, Phase::Warmup | Phase::Ready | Phase::Growth)
+                && budgets.iter().any(|budget| budget.id == phase.budget
+                    && budget.locations.iter().any(|l| matches!(l.device, Device::Coordinator(_))))
         })
-        .map(|(_, p)| p.available - p.owned - p.opaque)
+        .map(|p| p.available - p.owned - p.opaque)
         .min()
         .unwrap_or(0)
 }
@@ -685,6 +684,7 @@ pub fn solve(
     // Validate physical budgets independently of conditional allocation choices.
     validate(
         &Facts {
+            phase_order: contract.phase_order,
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Load,
     PostTargetKv,
@@ -14,6 +14,43 @@ pub enum Phase {
     Warmup,
     Ready,
     Growth,
+}
+
+/// A family's real allocation chronology, not the declaration order of Phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "[Phase; 6]", into = "[Phase; 6]")]
+pub struct PhaseOrder([Phase; 6]);
+impl PhaseOrder {
+    pub const TARGET_THEN_DRAFT: Self = Self([
+        Phase::Load, Phase::PostTargetKv, Phase::DraftLoad,
+        Phase::Warmup, Phase::Ready, Phase::Growth,
+    ]);
+    pub const DRAFT_THEN_TARGET: Self = Self([
+        Phase::Load, Phase::DraftLoad, Phase::PostTargetKv,
+        Phase::Warmup, Phase::Ready, Phase::Growth,
+    ]);
+
+    pub fn phases(&self) -> &[Phase; 6] { &self.0 }
+
+    pub fn at_or_before(self, first: Phase, last: Phase) -> bool {
+        self.index(first) <= self.index(last)
+    }
+
+    fn index(self, phase: Phase) -> usize {
+        self.0.iter().position(|&at| at == phase).expect("validated phase order")
+    }
+}
+impl TryFrom<[Phase; 6]> for PhaseOrder {
+    type Error = Refusal;
+    fn try_from(phases: [Phase; 6]) -> Result<Self, Refusal> {
+        if phases != Self::TARGET_THEN_DRAFT.0 && phases != Self::DRAFT_THEN_TARGET.0 {
+            return Err(Refusal::InvalidFact("invalid startup phase order".into()));
+        }
+        Ok(Self(phases))
+    }
+}
+impl From<PhaseOrder> for [Phase; 6] {
+    fn from(order: PhaseOrder) -> Self { order.0 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,8 +67,8 @@ impl Lifetime {
         first: Phase::PostTargetKv,
         last: Phase::Growth,
     };
-    pub fn contains(self, phase: Phase) -> bool {
-        self.first <= phase && phase <= self.last
+    pub fn contains(self, phase: Phase, order: PhaseOrder) -> bool {
+        order.at_or_before(self.first, phase) && order.at_or_before(phase, self.last)
     }
 }
 
@@ -287,7 +324,7 @@ impl Sequential {
         self.members.iter().map(|a| a.bytes).max().unwrap_or(0)
     }
 
-    fn validate(&self) -> Result<(), Refusal> {
+    fn validate(&self, order: PhaseOrder) -> Result<(), Refusal> {
         let Some(first) = self.members.first() else {
             return Err(Refusal::InvalidFact(
                 "empty sequential allocation group".into(),
@@ -296,7 +333,7 @@ impl Sequential {
         let mut ids = BTreeSet::new();
         if self.id.is_empty()
             || first.lifetime.first != first.lifetime.last
-            || first.lifetime.last >= Phase::Ready
+            || order.at_or_before(Phase::Ready, first.lifetime.last)
             || self.members.iter().any(|a| {
                 a.id.is_empty()
                     || !ids.insert(a.id.as_str())
@@ -319,6 +356,7 @@ impl Sequential {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
+    pub phase_order: PhaseOrder,
     pub allocations: Vec<Allocation>,
     /// Reserved by a later owner port; never evidence that it was allocated.
     pub deferred: Vec<Allocation>,
@@ -364,7 +402,7 @@ impl ResolvedPlan {
         for allocation in &self.facts.allocations {
             if allocation.location != location
                 || allocation.view.is_some()
-                || !allocation.lifetime.contains(Phase::Ready)
+                || !allocation.lifetime.contains(Phase::Ready, self.facts.phase_order)
             {
                 continue;
             }
@@ -423,15 +461,6 @@ pub enum Refusal {
     Reconciliation(Vec<Mismatch>),
 }
 
-const PHASES: [Phase; 6] = [
-    Phase::Load,
-    Phase::PostTargetKv,
-    Phase::DraftLoad,
-    Phase::Warmup,
-    Phase::Ready,
-    Phase::Growth,
-];
-
 fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
     let mut locations = BTreeSet::new();
     let mut names = BTreeSet::new();
@@ -479,9 +508,10 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
 }
 
 fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
+    let order = facts.phase_order;
     let mut groups = BTreeSet::new();
     for group in &facts.sequential {
-        group.validate()?;
+        group.validate(order)?;
         if !groups.insert(group.id.as_str()) {
             return Err(Refusal::InvalidFact(format!(
                 "duplicate sequential group {}",
@@ -501,7 +531,7 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
             || allocation.bytes == 0
             || allocation.alignment == 0
             || !allocation.alignment.is_power_of_two()
-            || allocation.lifetime.first > allocation.lifetime.last
+            || !order.at_or_before(allocation.lifetime.first, allocation.lifetime.last)
         {
             return Err(Refusal::InvalidFact(format!(
                 "invalid allocation {}",
@@ -525,8 +555,8 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
                     .offset
                     .checked_add(allocation.bytes)
                     .is_none_or(|end| end > backing.bytes)
-                || backing.lifetime.first > allocation.lifetime.first
-                || backing.lifetime.last < allocation.lifetime.last
+                || !order.at_or_before(backing.lifetime.first, allocation.lifetime.first)
+                || !order.at_or_before(allocation.lifetime.last, backing.lifetime.last)
             {
                 return Err(Refusal::InvalidFact(format!(
                     "invalid backing view {}",
@@ -536,7 +566,7 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
         }
     }
     for allowance in &facts.allowances {
-        if allowance.source.is_empty() || allowance.lifetime.first > allowance.lifetime.last {
+        if allowance.source.is_empty() || !order.at_or_before(allowance.lifetime.first, allowance.lifetime.last) {
             return Err(Refusal::InvalidFact("invalid opaque allowance".into()));
         }
     }
@@ -548,14 +578,14 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
     let mut rows = Vec::new();
     for budget in budgets {
         let available = budget.available()?;
-        for phase in PHASES {
+        for &phase in facts.phase_order.phases() {
             let owners: Vec<_> = facts
                 .allocations
                 .iter()
                 .chain(&facts.deferred)
                 .filter(|a| {
                     a.view.is_none()
-                        && a.lifetime.contains(phase)
+                        && a.lifetime.contains(phase, facts.phase_order)
                         && budget.locations.contains(&a.location)
                 })
                 .collect();
@@ -565,7 +595,7 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
             })?;
             for group in &facts.sequential {
                 let member = &group.members[0];
-                if member.lifetime.contains(phase) && budget.locations.contains(&member.location) {
+                if member.lifetime.contains(phase, facts.phase_order) && budget.locations.contains(&member.location) {
                     owned = owned
                         .checked_add(group.peak())
                         .ok_or(Refusal::Overflow("sequential phase peak"))?;
@@ -574,7 +604,7 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
             let opaque = facts
                 .allowances
                 .iter()
-                .filter(|a| a.lifetime.contains(phase) && budget.locations.contains(&a.location))
+                .filter(|a| a.lifetime.contains(phase, facts.phase_order) && budget.locations.contains(&a.location))
                 .try_fold(0u64, |n, a| {
                     n.checked_add(a.bytes)
                         .ok_or(Refusal::Overflow("phase allowances"))
@@ -596,7 +626,7 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
                                 .sequential
                                 .iter()
                                 .filter(|g| {
-                                    g.members[0].lifetime.contains(phase)
+                                    g.members[0].lifetime.contains(phase, facts.phase_order)
                                         && budget.locations.contains(&g.members[0].location)
                                 })
                                 .map(|g| g.id.clone()),
@@ -675,7 +705,7 @@ pub fn reconcile_legacy_mla_events(
     phase: Phase,
     events: &[OwnerEvent],
 ) -> Result<(), Refusal> {
-    if phase > Phase::Warmup || !facts.deferred.is_empty() || !facts.allowances.is_empty() {
+    if !facts.phase_order.at_or_before(phase, Phase::Warmup) || !facts.deferred.is_empty() || !facts.allowances.is_empty() {
         return Err(Refusal::InvalidFact(
             "legacy MLA bridge only checks startup owners".into(),
         ));
@@ -713,7 +743,7 @@ fn reconcile_owner_events(
             OwnerEvent::Freed { receipt, phase } => (receipt, *phase, false),
         };
         let id = receipt.allocation.id.as_str();
-        if at < previous || at > phase {
+        if !facts.phase_order.at_or_before(previous, at) || !facts.phase_order.at_or_before(at, phase) {
             errors.push(Mismatch::Lifetime(id.into()));
         }
         previous = at;
@@ -784,7 +814,7 @@ fn reconcile_owner_events(
     }
     for group in &facts.sequential {
         for spec in &group.members {
-            if spec.lifetime.first <= phase && !seen.contains(spec.id.as_str()) {
+            if facts.phase_order.at_or_before(spec.lifetime.first, phase) && !seen.contains(spec.id.as_str()) {
                 errors.push(Mismatch::Missing(spec.id.clone()));
             }
             if active.contains_key(spec.id.as_str()) {
@@ -828,11 +858,11 @@ fn reconcile_observations(
                     errors.push(Mismatch::Contract(id.clone()));
                 }
                 if observation.created != spec.lifetime.first
-                    || observation.created > phase
+                    || !facts.phase_order.at_or_before(observation.created, phase)
                     || observation.freed.is_some_and(|freed| {
-                        freed < observation.created || freed > phase || freed != spec.lifetime.last
+                        !facts.phase_order.at_or_before(observation.created, freed) || !facts.phase_order.at_or_before(freed, phase) || freed != spec.lifetime.last
                     })
-                    || (spec.lifetime.last < phase && observation.freed.is_none())
+                    || (!facts.phase_order.at_or_before(phase, spec.lifetime.last) && observation.freed.is_none())
                 {
                     errors.push(Mismatch::Lifetime(id.clone()));
                 }
@@ -840,14 +870,14 @@ fn reconcile_observations(
         }
     }
     for spec in &facts.allocations {
-        if spec.lifetime.first <= phase && !seen.contains(spec.id.as_str()) {
+        if facts.phase_order.at_or_before(spec.lifetime.first, phase) && !seen.contains(spec.id.as_str()) {
             errors.push(Mismatch::Missing(spec.id.clone()));
         }
     }
     if !ordered_proved {
         for group in &facts.sequential {
             for spec in &group.members {
-                if spec.lifetime.first <= phase {
+                if facts.phase_order.at_or_before(spec.lifetime.first, phase) {
                     errors.push(Mismatch::Missing(spec.id.clone()));
                 }
             }
@@ -856,10 +886,10 @@ fn reconcile_observations(
     if !errors.is_empty() {
         return Err(Refusal::Reconciliation(errors));
     }
-    for at in PHASES.into_iter().take_while(|at| *at <= phase) {
+    for &at in facts.phase_order.phases().iter().take_while(|&&at| facts.phase_order.at_or_before(at, phase)) {
         let receipts = observations
             .iter()
-            .filter(|o| o.created <= at && o.freed.is_none_or(|freed| at <= freed))
+            .filter(|o| facts.phase_order.at_or_before(o.created, at) && o.freed.is_none_or(|freed| facts.phase_order.at_or_before(at, freed)))
             .map(|o| o.receipt.clone())
             .collect::<Vec<_>>();
         reconcile_snapshot(facts, at, &receipts, ordered_proved)?;
@@ -913,12 +943,12 @@ fn reconcile_snapshot(
     let expected: BTreeMap<_, _> = facts
         .allocations
         .iter()
-        .filter(|a| a.lifetime.contains(phase))
+        .filter(|a| a.lifetime.contains(phase, facts.phase_order))
         .map(|a| (a.id.as_str(), a))
         .collect();
     let mut actual = BTreeMap::new();
     let mut errors = Vec::new();
-    if phase >= Phase::Ready {
+    if facts.phase_order.at_or_before(Phase::Ready, phase) {
         errors.extend(
             facts
                 .deferred
@@ -932,7 +962,7 @@ fn reconcile_snapshot(
                 .sequential
                 .iter()
                 .flat_map(|g| &g.members)
-                .filter(|a| a.lifetime.first <= phase)
+                .filter(|a| facts.phase_order.at_or_before(a.lifetime.first, phase))
                 .map(|a| Mismatch::Missing(a.id.clone())),
         );
     }

@@ -239,6 +239,7 @@ impl Component {
 
 #[derive(Debug, Clone)]
 pub struct Contract {
+    pub phase_order: PhaseOrder,
     pub page_rows: u64,
     pub maximum_pages: u64,
     pub gpus: usize,
@@ -279,6 +280,7 @@ impl Contract {
             kind: ComponentKind::Allowance(a),
         }));
         Self {
+            phase_order: facts.phase_order,
             page_rows,
             maximum_pages,
             gpus,
@@ -301,6 +303,7 @@ impl Contract {
     pub fn facts(&self, selected: &[usize], pages: u64) -> Result<Facts, Refusal> {
         self.decisions(selected)?;
         let mut result = Facts {
+            phase_order: self.phase_order,
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],
@@ -563,8 +566,12 @@ impl Contract {
                 return Err(Refusal::InvalidFact("invalid component activation".into()));
             }
             component.bytes.validate(self.maximum_pages)?;
+            if component.charge().is_some_and(|(_, life, _)|
+                !self.phase_order.at_or_before(life.first, life.last)) {
+                return Err(Refusal::InvalidFact("component lifetime contradicts family phase order".into()));
+            }
             if let ComponentKind::Sequential(group) = &component.kind {
-                group.validate()?;
+                group.validate(self.phase_order)?;
                 if component.bytes != ByteCurve::fixed(group.peak(), self.maximum_pages) {
                     return Err(Refusal::InvalidFact("invalid sequential peak curve".into()));
                 }

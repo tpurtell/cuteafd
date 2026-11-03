@@ -228,7 +228,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         items.push(Item::new(reservation.category, &reservation.group, "", reservation.bytes, Basis::Formula));
     }
     for allowance in &result.facts.allowances {
-        if allowance.location == planner::Location::coordinator(0) && allowance.lifetime.contains(planner::Phase::Ready) {
+        if allowance.location == planner::Location::coordinator(0) && allowance.lifetime.contains(planner::Phase::Ready, result.facts.phase_order) {
             items.push(Item::new(Category::Runtime, &allowance.source, "", allowance.bytes, Basis::Estimated));
         }
     }

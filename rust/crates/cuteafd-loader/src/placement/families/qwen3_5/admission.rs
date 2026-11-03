@@ -661,6 +661,7 @@ impl DenseFacts<'_> {
         }
         allowances.retain(|allowance| allowance.bytes > 0);
         Ok(Facts {
+            phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
             allocations,
             deferred: vec![],
             sequential,

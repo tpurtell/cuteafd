@@ -45,6 +45,7 @@ fn allocation(id: &str, bytes: u64) -> Allocation {
 }
 fn facts(allocations: Vec<Allocation>) -> Facts {
     Facts {
+        phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
         allocations,
         deferred: vec![],
         sequential: vec![],
@@ -1202,7 +1203,7 @@ fn correlated_count_profiles_match_exhaustive_full_score_oracle() {
                                         };
                                         let active = phases
                                             .iter()
-                                            .filter(|p| p.phase >= Phase::Warmup)
+                                            .filter(|p| matches!(p.phase, Phase::Warmup | Phase::Ready | Phase::Growth))
                                             .map(|p| p.available - p.owned - p.opaque)
                                             .min()
                                             .unwrap();
@@ -2001,4 +2002,97 @@ fn invalid_inputs_return_typed_errors() {
         evaluate(&invalid, &p.budgets),
         Err(Refusal::Overflow(_))
     ));
+}
+
+
+#[test]
+fn family_phase_order_changes_packing_peak_pool_and_event_validation_together() {
+    struct Ordered(PhaseOrder);
+    impl Recipe for Ordered {
+        fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
+            let mut target = allocation("kv", 64);
+            target.lifetime = Lifetime::TARGET;
+            let mut weights = allocation("weights", 100);
+            weights.lifetime = Lifetime::RESIDENT;
+            let mut draft = allocation("draft", 100);
+            draft.lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+            let mut pack = allocation("pack", 600);
+            pack.lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad };
+            let mut owners = facts(vec![weights, target, draft]);
+            owners.phase_order = self.0;
+            owners.sequential.push(Sequential { id: "packing".into(), members: vec![pack] });
+            let mut contract = Contract::fixed(64, 16, 1, owners);
+            contract.set_byte_extent("kv", ByteCurve::linear(64, 64, 16))?;
+            contract.variables = vec![Variable::Attention { layer: 0, values: decisions(0).attention },
+                Variable::Prefill(vec![decisions(0).prefill]), Variable::Lanes(vec![1])];
+            Ok(contract)
+        }
+    }
+    for (order, expected_pool, peak_phase, peak_bytes) in [
+        (PhaseOrder::TARGET_THEN_DRAFT, 192, Phase::DraftLoad, 992),
+        (PhaseOrder::DRAFT_THEN_TARGET, 768, Phase::PostTargetKv, 968),
+    ] {
+        let recipe = Ordered(order);
+        let plan = solve(request(), vec![budget(1000)], &recipe).unwrap();
+        assert_eq!(plan.facts.phase_order, order);
+        assert_eq!(plan.pool_tokens, expected_pool);
+        assert_eq!(plan.phases.iter().max_by_key(|row| row.owned).unwrap().owned, peak_bytes);
+        assert_eq!(plan.phases.iter().find(|row| row.phase == peak_phase).unwrap().owned, peak_bytes);
+        let contract = recipe.prepare(&request()).unwrap();
+        let roomy = [budget(10000)];
+        let compiled = search::Compiled::new(&contract, &roomy).unwrap();
+        for pages in 1..=16 {
+            let facts = contract.facts(&[0, 0, 0], pages).unwrap();
+            assert_eq!(compiled.phases(&roomy, &[0, 0, 0], pages).unwrap(), evaluate(&facts, &roomy).unwrap());
+        }
+        let receipts = plan.facts.allocations.iter().chain(&plan.facts.sequential[0].members)
+            .enumerate().map(|(i, allocation)| Receipt { allocation: allocation.clone(),
+                address: (i as u64 + 1) * 4096 }).collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for &phase in order.phases() {
+            for receipt in receipts.iter().filter(|r| r.allocation.lifetime.first == phase) {
+                events.push(OwnerEvent::Allocated { receipt: receipt.clone(), phase });
+            }
+            for receipt in receipts.iter().filter(|r| r.allocation.lifetime.last == phase && phase == Phase::DraftLoad) {
+                events.push(OwnerEvent::Freed { receipt: receipt.clone(), phase });
+            }
+            if phase == Phase::Ready { break; }
+        }
+        reconcile_events(&plan, Phase::Ready, &events, &[]).unwrap();
+        let mut wrong = plan.clone();
+        wrong.facts.phase_order = if order == PhaseOrder::TARGET_THEN_DRAFT {
+            PhaseOrder::DRAFT_THEN_TARGET
+        } else { PhaseOrder::TARGET_THEN_DRAFT };
+        assert!(reconcile_events(&wrong, Phase::Ready, &events, &[]).is_err());
+    }
+    let pinned = Request { pool: Pin::Exact(512), ..request() };
+    assert!(matches!(solve(pinned.clone(), vec![budget(1000)], &Ordered(PhaseOrder::TARGET_THEN_DRAFT)),
+        Err(Refusal::Capacity { phase: Phase::DraftLoad, .. })));
+    assert!(solve(pinned, vec![budget(1000)], &Ordered(PhaseOrder::DRAFT_THEN_TARGET)).is_ok());
+}
+
+#[test]
+fn family_phase_order_validates_lifetimes_views_and_serialized_phase_lists() {
+    for order in [PhaseOrder::TARGET_THEN_DRAFT, PhaseOrder::DRAFT_THEN_TARGET] {
+        let value = serde_json::to_value(order).unwrap();
+        assert_eq!(serde_json::from_value::<PhaseOrder>(value).unwrap(), order);
+        let first = order.phases()[1];
+        let last = order.phases()[2];
+        let mut backing = allocation("backing", 100);
+        backing.lifetime = Lifetime { first, last };
+        let mut view = allocation("view", 20);
+        view.lifetime = Lifetime { first: last, last };
+        view.view = Some(View { backing: "backing".into(), offset: 0 });
+        let mut owners = facts(vec![backing, view]);
+        owners.phase_order = order;
+        evaluate(&owners, &[budget(100)]).unwrap();
+        owners.allocations[0].lifetime = Lifetime { first: last, last: first };
+        assert!(matches!(evaluate(&owners, &[budget(100)]), Err(Refusal::InvalidFact(_))));
+        owners.allocations[0].lifetime = Lifetime { first, last: first };
+        assert!(matches!(evaluate(&owners, &[budget(100)]), Err(Refusal::InvalidFact(_))));
+    }
+    let mut invalid = *PhaseOrder::TARGET_THEN_DRAFT.phases();
+    invalid[2] = Phase::PostTargetKv;
+    assert!(PhaseOrder::try_from(invalid).is_err());
+    assert!(serde_json::from_value::<PhaseOrder>(serde_json::to_value(invalid).unwrap()).is_err());
 }

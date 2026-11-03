@@ -22,6 +22,8 @@ pub(crate) mod chain;
 #[path = "memory/row_window.rs"]
 pub(crate) mod row_window;
 
+#[path = "memory/startup.rs"]
+pub(crate) mod startup;
 #[path = "memory/budget.rs"]
 pub(crate) mod budget;
 #[path = "memory/load_timing.rs"]

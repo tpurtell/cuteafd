@@ -656,7 +656,10 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 backend.selector = RefCell::new(Some(selector));
                 engine.borrow_mut().reconcile_draft(owners)?;
                 scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp), fixed: false }
-            } else { scheduler::Drafts::None };
+            } else {
+                engine.borrow_mut().reconcile_draft(vec![])?;
+                scheduler::Drafts::None
+            };
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 drafts, eos, engine_args.decode_share, &engine_args.prefix,
                 engine_args.token_io.token_select, &mut text_media(), None, || {

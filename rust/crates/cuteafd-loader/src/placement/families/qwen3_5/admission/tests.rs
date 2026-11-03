@@ -571,12 +571,12 @@ fn serving_ready_requires_exact_scheduler_sampler_and_whole_host_chunks() {
     }
     let receipts = all
         .iter()
-        .filter(|r| r.allocation.lifetime.contains(Phase::Ready))
+        .filter(|r| r.allocation.lifetime.contains(Phase::Ready, plan.facts.phase_order))
         .cloned()
         .collect::<Vec<_>>();
     let target = all
         .iter()
-        .filter(|r| r.allocation.lifetime.contains(Phase::PostTargetKv))
+        .filter(|r| r.allocation.lifetime.contains(Phase::PostTargetKv, plan.facts.phase_order))
         .cloned()
         .collect::<Vec<_>>();
     reconcile(&plan, Phase::PostTargetKv, &target).unwrap();
@@ -586,7 +586,7 @@ fn serving_ready_requires_exact_scheduler_sampler_and_whole_host_chunks() {
         .map(|receipt| Observation {
             receipt: receipt.clone(),
             created: receipt.allocation.lifetime.first,
-            freed: (receipt.allocation.lifetime.last < Phase::Ready)
+            freed: (!plan.facts.phase_order.at_or_before(Phase::Ready, receipt.allocation.lifetime.last))
                 .then_some(receipt.allocation.lifetime.last),
         })
         .collect::<Vec<_>>();

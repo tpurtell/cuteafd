@@ -40,6 +40,7 @@ fn facts(target: &TargetBuffers, pages: u64) -> Facts {
         target.maximum_pages,
         2,
         Facts {
+            phase_order: crate::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],

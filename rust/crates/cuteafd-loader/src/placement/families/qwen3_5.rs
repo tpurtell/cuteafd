@@ -625,7 +625,7 @@ mod tests {
                     let backing = receipts.iter().find(|r| r.allocation.id == view.backing).unwrap();
                     receipts.push(Receipt { allocation: allocation.clone(), address: backing.address + view.offset });
                 }
-                receipts.retain(|r| r.allocation.lifetime.contains(Phase::Ready));
+                receipts.retain(|r| r.allocation.lifetime.contains(Phase::Ready, plan.facts.phase_order));
                 reconcile(&plan, Phase::Ready, &receipts)?;
                 let sidecar = receipts.iter().position(|r| r.allocation.id == "draft.mtp.sidecars").unwrap();
                 receipts[sidecar].allocation.shape[0] += 1;

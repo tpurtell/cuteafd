@@ -56,6 +56,7 @@ fn native_hooks_name_physical_owners_and_k6_route_aliases_once() {
         16,
         2,
         Facts {
+            phase_order: crate::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
             allocations: vec![],
             deferred: vec![],
             sequential: vec![],
