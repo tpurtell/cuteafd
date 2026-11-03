@@ -191,6 +191,8 @@ pub struct SparkLinkOwners {
     pub waves: SparkWaveOwners,
     pub endpoints: SparkEndpointOwners,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
+    /// Constructor-selected link role, never inferred from row capacity.
+    pub prefill: bool,
     /// Retained registered backing when staging falls back to standalone slots.
     pub unused_egress_bytes: Option<u64>,
 }
@@ -213,11 +215,13 @@ impl SparkLinkOwners {
         let mut owners = self.intake.allocations(&format!("{prefix}.intake"), lifetime)?;
         owners.extend(self.waves.allocations(&format!("{prefix}.waves"), lifetime)?);
         owners.extend(self.endpoints.allocations(&format!("{prefix}.endpoints"), lifetime)?);
-        if self.spark_reply_format != cuteafd_core::SparkReplyFormat::Bf16 && !geometry.partial_replies() {
+        if self.prefill && self.spark_reply_format != cuteafd_core::SparkReplyFormat::Bf16
+            && !geometry.partial_replies() {
             let stride = self.spark_reply_format.row_bytes(geometry.hidden as usize)
                 .ok_or_else(|| Refusal::InvalidFact("invalid Spark reply codec geometry".into()))?;
-            // One ordered consumer reuses this plane across ranks and wave slots.
+            // Slots have disjoint slices; each slice is reused across ranks.
             let bytes = self.intake.rows.checked_mul(stride as u64)
+                .and_then(|bytes| bytes.checked_mul(self.waves.waves as u64))
                 .ok_or(Refusal::Overflow("Spark reply codec scratch"))?;
             owners.push(Allocation::buffer(format!("{prefix}.waves.reply_codec"),
                 Location::coordinator(self.intake.gpu), bytes, lifetime,
@@ -631,58 +635,67 @@ mod tests {
     use cuteafd_core::memory_layout::{Basis, Category};
 
     #[test]
-    fn compressed_reply_adds_one_plane_and_preserves_bf16_raw_reserve() {
+    fn compressed_prefill_reply_reserves_every_slot_without_shrinking_raw_bf16() {
         use super::super::planner::{Facts, Lifetime, Location, PhaseOrder};
         use cuteafd_core::{SparkEndpoint, SparkIngress, SparkReplyFormat, SparkRings};
         for geometry in [ExpertGeometry::GLM5, ExpertGeometry::MUSE_SPARK] {
-            for ranks in [1, 6, 8] { for waves in [1, 3, 4] { for rows in [1, 64, 2752] {
-                let base = SparkLinkOwners {
-                    intake: SparkIntakeOwners { gpu: 1, ranks, rows,
-                        row_bytes: u64::from(geometry.hidden) * 2, waves, mode: SparkIntakeMode::Gpu },
-                    waves: SparkWaveOwners { ranks, waves, pinned: 0,
-                        staging: SparkWaveStaging::Registered { slot_bytes: 1 << 20 } },
-                    endpoints: SparkEndpointOwners { ranks, geometry,
-                        endpoint: SparkEndpoint { capacity: rows as u32, ingress: SparkIngress::Bf16,
-                            ring_depth: None, partial_reply_bytes: geometry.partial_reply_bound(rows as u32).map(|b| b as u64) },
-                        rings: SparkRings { max_frame_bytes: 1 << 30, depth: 2, slot_bytes: 256, alignment: 64 } },
-                    spark_reply_format: SparkReplyFormat::Bf16, unused_egress_bytes: None,
-                };
-                let raw = base.allocations("link", Lifetime::TARGET).unwrap();
-                for format in [SparkReplyFormat::Bf16, SparkReplyFormat::Fp8, SparkReplyFormat::Nvfp4] {
-                    let spec = SparkLinkOwners { spark_reply_format: format, ..base };
-                    let owners = spec.allocations("link", Lifetime::TARGET).unwrap();
-                    let extra = usize::from(format != SparkReplyFormat::Bf16 && !geometry.partial_replies());
-                    assert_eq!(owners.len(), raw.len() + extra);
-                    assert_eq!(&owners[..raw.len()], raw.as_slice(), "raw BF16 owners must not shrink");
-                    if extra != 0 {
-                        let owner = owners.last().unwrap();
-                        let hidden = u64::from(geometry.hidden);
-                        let stride = match format {
-                            SparkReplyFormat::Fp8 => hidden + hidden / 32,
-                            SparkReplyFormat::Nvfp4 => hidden / 2 + hidden / 16,
-                            SparkReplyFormat::Bf16 => unreachable!(),
-                        };
-                        assert_eq!(owner.id, "link.waves.reply_codec");
-                        assert_eq!(owner.bytes, rows * stride, "no rank/wave multiplier or allocation floor");
-                        assert_eq!(owner.location, Location::coordinator(1));
-                        assert_eq!(owner.lifetime, Lifetime::TARGET);
-                        assert!(owner.view.is_none());
+            for ranks in [1, 6, 8] { for waves in [1, 3, 4] { for rows in [1, 64, 80, 2752] {
+                for prefill in [false, true] {
+                    let base = SparkLinkOwners {
+                        intake: SparkIntakeOwners { gpu: 1, ranks, rows,
+                            row_bytes: u64::from(geometry.hidden) * 2, waves, mode: SparkIntakeMode::Gpu },
+                        waves: SparkWaveOwners { ranks, waves, pinned: 0,
+                            staging: SparkWaveStaging::Registered { slot_bytes: 1 << 20 } },
+                        endpoints: SparkEndpointOwners { ranks, geometry,
+                            endpoint: SparkEndpoint { capacity: rows as u32, ingress: SparkIngress::Bf16,
+                                ring_depth: None, partial_reply_bytes: geometry.partial_reply_bound(rows as u32).map(|b| b as u64) },
+                            rings: SparkRings { max_frame_bytes: 1 << 30, depth: 2, slot_bytes: 256, alignment: 64 } },
+                        spark_reply_format: SparkReplyFormat::Bf16, prefill, unused_egress_bytes: None,
+                    };
+                    let raw = base.allocations("link", Lifetime::TARGET).unwrap();
+                    for format in [SparkReplyFormat::Bf16, SparkReplyFormat::Fp8, SparkReplyFormat::Nvfp4] {
+                        let spec = SparkLinkOwners { spark_reply_format: format, ..base };
+                        let owners = spec.allocations("link", Lifetime::TARGET).unwrap();
+                        let extra = usize::from(prefill && format != SparkReplyFormat::Bf16 && !geometry.partial_replies());
+                        assert_eq!(owners.len(), raw.len() + extra);
+                        assert_eq!(&owners[..raw.len()], raw.as_slice(), "raw BF16 owners must not shrink");
+                        if extra != 0 {
+                            let owner = owners.last().unwrap();
+                            let hidden = u64::from(geometry.hidden);
+                            let stride = match format {
+                                SparkReplyFormat::Fp8 => hidden + hidden / 32,
+                                SparkReplyFormat::Nvfp4 => hidden / 2 + hidden / 16,
+                                SparkReplyFormat::Bf16 => unreachable!(),
+                            };
+                            assert_eq!(owner.id, "link.waves.reply_codec");
+                            let plane = rows * stride;
+                            assert_eq!(owner.bytes, plane * waves as u64, "one allocation, no rank multiplier or floor");
+                            let mut end = 0;
+                            for slot in 0..waves as u64 {
+                                assert_eq!(slot * plane, end, "slot slices are contiguous and disjoint");
+                                end += plane;
+                            }
+                            assert_eq!(end, owner.bytes);
+                            assert_eq!(owner.location, Location::coordinator(1));
+                            assert_eq!(owner.lifetime, Lifetime::TARGET);
+                            assert!(owner.view.is_none());
+                        }
+                        let mut contract = super::super::planner::Contract::fixed(64, 1, 2, Facts {
+                            phase_order: PhaseOrder::DRAFT_THEN_TARGET, allocations: owners.clone(), deferred: vec![],
+                            sequential: vec![], reservations: vec![], allowances: vec![],
+                        });
+                        contract.variables = vec![super::super::planner::Variable::Prefill(vec![
+                            super::super::planner::PrefillShape {rows: 64, waves: 1}]),
+                            super::super::planner::Variable::Lanes(vec![1])];
+                        assert_eq!(contract.facts(&[0, 0], 1).unwrap().allocations, owners);
+                        assert_eq!(spec.components("link", Lifetime::TARGET, 1).unwrap().len(), owners.len());
                     }
-                    let mut contract = super::super::planner::Contract::fixed(64, 1, 2, Facts {
-                        phase_order: PhaseOrder::DRAFT_THEN_TARGET, allocations: owners.clone(), deferred: vec![],
-                        sequential: vec![], reservations: vec![], allowances: vec![],
-                    });
-                    contract.variables = vec![super::super::planner::Variable::Prefill(vec![
-                        super::super::planner::PrefillShape {rows: 64, waves: 1}]),
-                        super::super::planner::Variable::Lanes(vec![1])];
-                    assert_eq!(contract.facts(&[0, 0], 1).unwrap().allocations, owners);
-                    assert_eq!(spec.components("link", Lifetime::TARGET, 1).unwrap().len(), owners.len());
+                    let shrunk = SparkLinkOwners { intake: SparkIntakeOwners {row_bytes: 1, ..base.intake}, ..base };
+                    if !geometry.partial_replies() { assert!(shrunk.allocations("link", Lifetime::TARGET).is_err()); }
+                    let overflow = SparkLinkOwners { intake: SparkIntakeOwners {rows: u64::MAX, ..base.intake},
+                        spark_reply_format: SparkReplyFormat::Fp8, ..base };
+                    assert!(overflow.allocations("link", Lifetime::TARGET).is_err());
                 }
-                let shrunk = SparkLinkOwners { intake: SparkIntakeOwners {row_bytes: 1, ..base.intake}, ..base };
-                if !geometry.partial_replies() { assert!(shrunk.allocations("link", Lifetime::TARGET).is_err()); }
-                let overflow = SparkLinkOwners { intake: SparkIntakeOwners {rows: u64::MAX, ..base.intake},
-                    spark_reply_format: SparkReplyFormat::Fp8, ..base };
-                assert!(overflow.allocations("link", Lifetime::TARGET).is_err());
             } } }
         }
     }

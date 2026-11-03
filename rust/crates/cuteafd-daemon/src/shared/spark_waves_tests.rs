@@ -264,6 +264,7 @@ fn retained_link_composition_counts_fallback_egress_once() -> Result<()> {
                 storage.allocation_receipts("test.link.waves", Lifetime::TARGET)?, endpoints, unused, Lifetime::TARGET)?;
             let spec = SparkLinkOwners {
                 spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+                prefill: true,
                 intake: SparkIntakeOwners { gpu: devices.logical_rank(device)?, ranks, rows: rows as u64,
                     row_bytes: row_bytes as u64, waves: slots, mode: match mode {
                         IntakeMode::Gpu => SparkIntakeMode::Gpu, IntakeMode::Pinned => SparkIntakeMode::Pinned,
