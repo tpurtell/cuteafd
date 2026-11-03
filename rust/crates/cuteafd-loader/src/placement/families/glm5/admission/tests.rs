@@ -6,6 +6,87 @@ fn cfg() -> GlmDsaConfig {
     GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap()
 }
 
+#[test]
+fn glm_draft_first_peak_excludes_target_kv_and_changes_tight_pool_admission() {
+    use crate::families::glm5::draft_representation::{
+        GlmDraftCapacity, GlmDraftGeometry, GlmDraftRepresentation, GlmDraftRuntimeLayout,
+    };
+    use crate::families::qwen4::Qwen4KvCache;
+
+    struct Prepared(Contract);
+    impl Recipe for Prepared {
+        fn prepare(&self, _: &Request) -> Result<Contract, Refusal> {
+            Ok(self.0.clone())
+        }
+    }
+
+    // Real-width drafter and two-layer target owners, not a complete card forecast.
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    let draft = GlmDraftRuntimeLayout::new(
+        GlmDraftGeometry {
+            hidden: 6144, intermediate: 12288, layers: 6, heads: 64, kv_heads: 8,
+            head_dim: 128, taps: 6, vocab: 154880, conv_group: 16, selector_rank: 256,
+        },
+        GlmDraftRepresentation::Fp8Only,
+        GlmDraftCapacity::new(20, 16, 8).unwrap(),
+        2048,
+    ).unwrap();
+    let mut owners = draft.gqa_facts(0, 188, 2, Qwen4KvCache::Bf16).unwrap();
+    owners.phase_order = PhaseOrder::DRAFT_THEN_TARGET;
+    // GLM calls both load and prepare_workspace before GlmEngine::new.
+    for owner in &mut owners.allocations {
+        owner.lifetime.first = Phase::DraftLoad;
+    }
+    for group in &mut owners.sequential {
+        for member in &mut group.members {
+            member.lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad };
+        }
+    }
+    recipe.owners.push(Case {
+        when: vec![],
+        value: Contract::fixed(recipe.page_tokens, recipe.maximum_pages, 2, owners).components,
+    });
+    let req = Request {
+        pool: Pin::Auto,
+        onboard: Pin::Exact(0),
+        prefill: Pin::Exact(recipe.prefill[0]),
+        ..request()
+    };
+    let actual = recipe.prepare(&req).unwrap();
+    assert_eq!(actual.phase_order, PhaseOrder::DRAFT_THEN_TARGET);
+    let mut target_first = actual.clone();
+    target_first.phase_order = PhaseOrder::TARGET_THEN_DRAFT;
+    let selected = vec![0; actual.variables.len()];
+    let pages = req.context / recipe.page_tokens;
+    let facts = actual.facts(&selected, pages).unwrap();
+    let target_bytes: u64 = facts.allocations.iter()
+        .filter(|a| a.location == Location::coordinator(0)
+            && a.lifetime.first == Phase::PostTargetKv && a.view.is_none())
+        .map(|a| a.bytes).sum();
+    assert!(target_bytes > 0);
+    let room = budgets();
+    let after = planner::evaluate(&facts, &room).unwrap();
+    let before = planner::evaluate(&target_first.facts(&selected, pages).unwrap(), &room).unwrap();
+    let draft_peak = |rows: &[PhaseBudget]| rows.iter()
+        .find(|row| row.budget == "physical.0" && row.phase == Phase::DraftLoad).unwrap().owned;
+    assert_eq!(draft_peak(&before) - draft_peak(&after), target_bytes);
+    for rows in [&before, &after] {
+        let peak = rows.iter().filter(|row| row.budget == "physical.0")
+            .max_by_key(|row| row.owned + row.opaque).unwrap();
+        assert_eq!(peak.phase, Phase::DraftLoad);
+    }
+    let mut tight = room;
+    tight[0].physical_bytes = draft_peak(&before);
+    tight[0].logical_bytes = draft_peak(&before);
+    let old = planner::solve(req.clone(), tight.clone(), &Prepared(target_first)).unwrap();
+    let new = planner::solve(req, tight, &Prepared(actual)).unwrap();
+    assert_eq!(old.pool_tokens, 4096);
+    assert_eq!(new.pool_tokens, 8192);
+    eprintln!("GLM bounded owner fixture: pool {} -> {}; DraftLoad peak {} -> {} B; target overlap {} B",
+        old.pool_tokens, new.pool_tokens, draft_peak(&before), draft_peak(&after), target_bytes);
+}
+
 fn request() -> Request {
     Request {
         context: 4096,

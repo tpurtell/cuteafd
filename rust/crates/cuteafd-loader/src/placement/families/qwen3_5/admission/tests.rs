@@ -12,6 +12,55 @@ fn block_layout(fp8: bool) -> BlockDraftLayout {
 }
 use crate::plan::checkpoint::Checkpoint;
 
+#[test]
+fn qwen_target_first_peak_keeps_kv_live_during_block_draft_packing() {
+    use crate::placement::planner;
+
+    let (cfg, weights, buffers) = fixture();
+    let draft = block_layout(true);
+    let mut recipe = facts(&cfg, &weights, &buffers);
+    recipe.drafter = Some(DenseDraft::Block(&draft));
+    let req = request();
+    let contract = recipe.prepare(&req).unwrap();
+    assert_eq!(contract.phase_order, PhaseOrder::TARGET_THEN_DRAFT);
+    let selected = vec![0; contract.variables.len()];
+    let pages = req.context / PAGE_ROWS;
+    let actual = contract.facts(&selected, pages).unwrap();
+    let expected = recipe.owner_templates(req.context).unwrap();
+    assert_eq!(actual, expected);
+    let target_bytes: u64 = actual.allocations.iter()
+        .filter(|a| a.location == Location::coordinator(0)
+            && a.lifetime.first == Phase::PostTargetKv && a.view.is_none())
+        .map(|a| a.bytes).sum();
+    let packing = draft.packing_sources.iter().map(|a| a.bytes as u64).max().unwrap();
+    let mut room = budgets();
+    for budget in &mut room {
+        budget.physical_bytes = 1 << 50;
+        budget.logical_bytes = 1 << 50;
+    }
+    let before = planner::evaluate(&expected, &room).unwrap();
+    let after = planner::evaluate(&actual, &room).unwrap();
+    assert_eq!(before, after);
+    let peak = after.iter().filter(|row| row.budget == "coordinator.0")
+        .max_by_key(|row| row.owned + row.opaque).unwrap();
+    assert_eq!(peak.phase, Phase::DraftLoad);
+    let ready = after.iter().find(|row|
+        row.budget == "coordinator.0" && row.phase == Phase::Ready).unwrap();
+    assert_eq!(peak.owned - ready.owned, packing);
+    let mut wrong = actual.clone();
+    wrong.phase_order = PhaseOrder::DRAFT_THEN_TARGET;
+    let wrong_rows = planner::evaluate(&wrong, &room).unwrap();
+    let wrong_load = wrong_rows.iter().find(|row|
+        row.budget == "coordinator.0" && row.phase == Phase::DraftLoad).unwrap();
+    assert_eq!(peak.owned - wrong_load.owned, target_bytes);
+    let old = planner::solve(req.clone(), budgets(), &recipe).unwrap();
+    let new = admit(req, budgets(), recipe).unwrap();
+    assert_eq!(old, new);
+    eprintln!("Qwen bounded native/block owner fixture: pool {} -> {}; DraftLoad peak {} -> {} B; retained target overlap {} B; packing {} B",
+        old.pool_tokens, new.pool_tokens, peak.owned + peak.opaque,
+        peak.owned + peak.opaque, target_bytes, packing);
+}
+
 fn request() -> Request {
     Request {
         context: 262144,
