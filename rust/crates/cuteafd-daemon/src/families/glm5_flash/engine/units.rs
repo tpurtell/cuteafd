@@ -378,6 +378,7 @@ mod tests {
     #[test]
     fn scoring_tiles_follow_admitted_logits_storage() -> Result<()> {
         use cuteafd_loader::families::glm5_flash::GlmNextAttention;
+        use cuteafd_loader::serving_capacity::GlmfScratch;
         let cfg = GlmNextConfig { vocab_size: 154880, hidden: 4096, layers: 2,
             attention: vec![GlmNextAttention::Kda, GlmNextAttention::Mla], dense: vec![false; 2],
             dense_intermediate: 12288, experts: 288, topk: 8, moe_intermediate: 2048,
