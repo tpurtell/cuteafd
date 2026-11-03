@@ -46,6 +46,7 @@ pub struct MetadataInput {
 }
 impl MetadataInput {
     pub fn open(snapshot: &Path, selected: &str) -> anyhow::Result<Self> {
+        let _timer = crate::plan::DebugPhaseTimer::new("exlr8.metadata", 1);
         use sha2::{Digest, Sha256};
         ensure!(!selected.is_empty() && selected.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
             "manifest must be a published name, not a path");

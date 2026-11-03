@@ -109,6 +109,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
     use super::{ExpertPlacement, Status, RuntimeStatus, spec::Component};
     let (world, gpu_count, attention, mut resolved_layout) = native_options(selected, options, speculator)?;
+    let _timer = super::DebugPhaseTimer::new("exlr8.native_plan", 1);
     let checkpoint = input.checkpoint();
     let snapshot = &checkpoint.snapshot;
     let mut report = super::empty_report(input, options)?;
@@ -122,6 +123,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let metadata = residency::MetadataInput::open(snapshot, selected)?;
     let set_id = metadata.identity.clone();
     let shared = shared_expert_resident(&metadata, &(cfg.first_moe_layer..cfg.layers).collect::<Vec<_>>(), gpu_count)?;
+    let workspace_timer = super::DebugPhaseTimer::new("exlr8.workspace_manifest", 1);
     let programs = read_json(layout.workspace_manifest.as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;
     let records = dense::DenseRecord::inventory(snapshot)?;
@@ -134,6 +136,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     ensure!(activations == layout.exlr8_prefill_activations,
         "EXLR8 resolved activation differs from requested layout charge");
     let workspace = shared_workspace(&programs, cuteafd_ffi::exlr8::KernelFamily::Glm)?;
+    drop(workspace_timer);
     drop(catalog_timer);
     let (memory, placement) = {
         let _timer = super::PhaseTimer::new(&input.phases.layout, &[]);
@@ -145,6 +148,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let residents = spark_resident_bytes_of(&metadata, &(first_spark..cfg.layers).collect::<Vec<_>>(), selected_world)?;
     ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget()),
         "EXLR8 selected Spark suffix exceeds Spark budget before live workspace admission");
+    let local_timer = super::DebugPhaseTimer::new("exlr8.selected_local_census",
+        placement.onboard_layers * gpu_count);
     let mut local_routed = 0u64;
     for layer in cfg.first_moe_layer..first_spark {
         for rank in 0..gpu_count {
@@ -153,6 +158,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
                 .context("EXLR8 local routed residency overflow")?;
         }
     }
+    drop(local_timer);
     let family = super::family::detect(&checkpoint).context("EXLR8 family is not recognized")?;
     let model = family.open(&checkpoint)?;
     let records = dense::DenseRecord::inventory(snapshot)?;
@@ -250,6 +256,7 @@ pub fn routed_expert_costs(input: &residency::MetadataInput, layers: &[usize])
     -> Result<Vec<crate::placement::ExpertCost>> {
     use crate::placement::{Bytes2, ExpertCost};
     use residency::ExpertSet;
+    let _timer = super::DebugPhaseTimer::new("exlr8.routed_census", layers.len() * 3);
     served_routed_layers(input, layers)?;
     layers.iter().map(|&layer| {
         let resident = |world, rank| -> Result<Bytes2> {
@@ -263,6 +270,7 @@ pub fn routed_expert_costs(input: &residency::MetadataInput, layers: &[usize])
 
 /// Shared-expert arenas summed once per admitted target rank; never include native MTP.
 pub fn shared_expert_resident(input: &residency::MetadataInput, layers: &[usize], world: usize) -> Result<Vec<u64>> {
+    let _timer = super::DebugPhaseTimer::new("exlr8.shared_census", layers.len().saturating_mul(world));
     served_routed_layers(input, layers)?;
     ensure!(matches!(world, 1 | 2), "EXLR8 shared experts require one/two target ranks");
     (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
@@ -281,6 +289,7 @@ pub fn spark_resident_bytes(snapshot: &Path, selected: &str, layers: &[usize], w
 }
 
 fn spark_resident_bytes_of(input: &residency::MetadataInput, layers: &[usize], world: usize) -> Result<Vec<u64>> {
+    let _timer = super::DebugPhaseTimer::new("exlr8.spark_census", layers.len().saturating_mul(world));
     if layers.is_empty() {
         ensure!(world == 0, "EXLR8 empty Spark suffix must select zero ranks");
         return Ok(Vec::new());

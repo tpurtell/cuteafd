@@ -494,6 +494,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
+    let workspace_timer = super::super::DebugPhaseTimer::new("exlr8.layout_workspace_manifest", 1);
     let (draft, draft_staging, active_drafts, _) = drafter_admission(options, checkpoint)?;
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
@@ -545,6 +546,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,
             capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes), worker_budget_bytes: 0, items, kv_tokens: 0 });
     }
+    drop(workspace_timer);
     let onboard = options.resolve_onboard(cfg.layers.saturating_sub(cfg.first_moe_layer)).unwrap_or_else(glm::default_onboard);
     let local = if let Some(selected) = selected {
         let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;

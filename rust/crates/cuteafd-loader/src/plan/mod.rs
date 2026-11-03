@@ -494,6 +494,29 @@ impl Drop for PhaseTimer<'_> {
     }
 }
 
+/// Inclusive, opt-in CPU phase timing; nested phases are reported separately.
+pub(crate) struct DebugPhaseTimer {
+    start: Option<Instant>,
+    phase: &'static str,
+    count: usize,
+}
+impl DebugPhaseTimer {
+    pub(crate) fn new(phase: &'static str, count: usize) -> Self {
+        Self { start: tracing::enabled!(target: "cuteafd_loader::plan::timing", tracing::Level::DEBUG)
+            .then(Instant::now), phase, count }
+    }
+}
+impl Drop for DebugPhaseTimer {
+    fn drop(&mut self) {
+        if let Some(start) = self.start {
+            let elapsed_s = start.elapsed().as_secs_f64();
+            tracing::debug!(target: "cuteafd_loader::plan::timing", phase = self.phase,
+                count = self.count, elapsed_s, mean_ms = elapsed_s * 1000.0 / self.count.max(1) as f64,
+                "planner CPU phase (inclusive)");
+        }
+    }
+}
+
 /// A checkpoint opened once, with its routed-expert catalog initialized on first use.
 /// Reuse an input when evaluating multiple layouts over the same snapshot.
 pub struct PlanInput {

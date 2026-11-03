@@ -652,6 +652,7 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
     let routed = if inputs.skip_routed_experts { 0 }
         else { inputs.layers.saturating_sub(inputs.cfg.first_moe_layer) };
     let run = |branch: &GlmInputs<'_>, cap: Option<u64>, floor: Option<u64>| {
+        let _timer = crate::plan::DebugPhaseTimer::new("glm.candidate_solve", 1);
         let mut req = request(branch)?;
         configure_attention(&mut req, attention)?;
         let owned = if attention == Some(AttentionPlacement::Layers) {
@@ -708,11 +709,14 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
         branch.tp2_workspace = serial_tp2_workspace;
         return run(&branch, None, None);
     }
+    let enumeration_timer = crate::plan::DebugPhaseTimer::new("glm.candidate_enumeration", 1);
     let counts: Vec<_> = match inputs.onboard.layers(routed) {
         Some(n) => vec![n],
         None if inputs.experts.is_empty() => vec![0],
         None => (0..=routed).collect(),
     };
+    drop(enumeration_timer);
+    let _timer = crate::plan::DebugPhaseTimer::new("glm.candidates", counts.len());
     let policy = request(inputs)?.pool;
     let cap = inputs.onboard.layers(routed).is_none().then_some(policy.target);
     let requested = policy.requested;
@@ -1122,6 +1126,7 @@ pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest
     anyhow::ensure!(cfg.hidden == 6144 && cfg.moe_intermediate == 2048 && cfg.experts == 256
         && cfg.topk == 8 && (cfg.first_moe_layer..=cfg.layers).contains(&selected_layers)
         && (1..=4).contains(&lanes), "GLM EXLR8 TP2 geometry/layer extent");
+    let workspace_timer = crate::plan::DebugPhaseTimer::new("exlr8.local_workspace_manifest", 1);
     let programs = crate::plan::checkpoint::read_json(manifest)?;
     let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, cuteafd_ffi::exlr8::KernelFamily::Glm, rows, 8, activations)?;
     let records = crate::plan::exlr8::dense::DenseRecord::inventory(snapshot)?;
@@ -1131,6 +1136,7 @@ pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest
             anyhow::ensure!(records.iter().any(|record| record.tensor == name), "EXLR8 missing local router {name}");
         }
     }
+    drop(workspace_timer);
     let experts = exlr8_expert_costs_of(input, cfg.first_moe_layer, selected_layers, &records)?;
     Ok(LocalInventory { package: manifest.to_path_buf(), format: GlmLocalFormat::Exlr8, experts, backend_workspace,
         extra_workspace: local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64, rows, lanes, false) })
