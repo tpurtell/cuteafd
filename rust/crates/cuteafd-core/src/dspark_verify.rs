@@ -117,7 +117,9 @@ pub fn verify_dspark_relaxed_vocab(
         accepted_inputs: 1, emitted: Vec::with_capacity(inputs.len()), eos: false, length_limit: false,
     };
     for (i, &argmax) in target_next.iter().enumerate() {
-        let accepted = inputs.get(i + 1).is_some() && acceptance.accepts_draft(stats[i]);
+        let accepted = inputs.get(i + 1).is_some_and(|&draft| {
+            draft == argmax || acceptance.accepts_draft(stats[i])
+        });
         let token = if accepted { inputs[i + 1] } else { argmax };
         result.emitted.push(token);
         if accepted { result.accepted_inputs += 1; }
@@ -163,6 +165,21 @@ mod tests {
         assert!(verify_dspark_relaxed_vocab(&inputs, &target, &[], SpeculativeAcceptance::MinP { min_p: 0.5 }, None, 10, 100).is_err());
         let invalid = AcceptanceStats { entropy: f32::NAN, ..good };
         assert!(verify_dspark_relaxed_vocab(&inputs, &target, &[invalid; 3], SpeculativeAcceptance::MinP { min_p: 0.5 }, None, 10, 100).is_err());
+    }
+
+    #[test]
+    fn relaxed_typical_never_rejects_an_exact_argmax_match() {
+        let mode = SpeculativeAcceptance::Typical { epsilon: 1.0, delta: 2.0 };
+        let stats = AcceptanceStats { draft_probability: 0.5, argmax_probability: 0.5, entropy: 0.7 };
+        assert!(!mode.accepts_draft(stats), "threshold alone would reject this exact match");
+        let result = verify_dspark_relaxed_vocab(&[10, 11, 12], &[11, 12, 13], &[stats; 2],
+            mode, None, 10, 100).unwrap();
+        assert_eq!(result.accepted_inputs, 3);
+        assert_eq!(result.emitted, [11, 12, 13]);
+        let miss = verify_dspark_relaxed_vocab(&[10, 11, 99], &[11, 12, 13], &[stats; 2],
+            mode, None, 10, 100).unwrap();
+        assert_eq!(miss.accepted_inputs, 2);
+        assert_eq!(miss.emitted, [11, 12]);
     }
 
     #[test]
