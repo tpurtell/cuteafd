@@ -120,11 +120,54 @@ impl crate::shared::qwen::scheduler::DraftState for MtpSeq {
     fn close(&mut self, token: u32) { MtpSeq::close(self, token); }
 }
 
-/// Runs the pending rows of every sequence (canonical history) and drafts up
-/// to each sequence's depth; returns each sequence's drafts. Every chain
-/// step embeds the previous step's drafts on the device, so the steps queue
-/// back to back and the drafts come back once, at the end.
+#[derive(Debug, thiserror::Error)]
+#[error("sequence {sequence} has {rows} pending MTP rows, exceeding capacity {capacity}")]
+struct PendingCapacityError {
+    sequence: usize,
+    rows: usize,
+    capacity: usize,
+}
+
+fn pending_groups(counts: &[usize]) -> Result<Vec<std::ops::Range<usize>>> {
+    let (mut first, mut rows) = (0, 0);
+    let mut groups = Vec::new();
+    for (sequence, &count) in counts.iter().enumerate() {
+        if count > MTP_PENDING_ROWS || count > DECODE_ROWS {
+            return Err(PendingCapacityError { sequence, rows: count,
+                capacity: MTP_PENDING_ROWS.min(DECODE_ROWS) }.into());
+        }
+        if rows + count > DECODE_ROWS {
+            groups.push(first..sequence);
+            first = sequence;
+            rows = 0;
+        }
+        rows += count;
+    }
+    if first < counts.len() { groups.push(first..counts.len()); }
+    Ok(groups)
+}
+
+fn grouped_drafts<T>(counts: &[usize], mut work: impl FnMut(std::ops::Range<usize>) -> Result<Vec<T>>)
+    -> Result<Vec<T>> {
+    let mut output = Vec::with_capacity(counts.len());
+    for group in pending_groups(counts)? {
+        let expected = group.len();
+        let values = work(group)?;
+        ensure!(values.len() == expected, "MTP group returned {} of {expected} sequences", values.len());
+        output.extend(values);
+    }
+    Ok(output)
+}
+
+/// Consume canonical pending rows and run complete draft chains in whole-sequence batches.
 pub(crate) fn draft(engine: &Qwen4Engine<'_>, seqs: &mut [DraftSeq<'_>], timing: &mut DraftTiming)
+    -> Result<Vec<Vec<u32>>> {
+    let counts: Vec<_> = seqs.iter().map(|s| s.seq.pending.len()).collect();
+    // A group's complete chain must finish before another group reuses its hidden rows and draft offsets.
+    grouped_drafts(&counts, |group| draft_group(engine, &mut seqs[group], timing))
+}
+
+fn draft_group(engine: &Qwen4Engine<'_>, seqs: &mut [DraftSeq<'_>], timing: &mut DraftTiming)
     -> Result<Vec<Vec<u32>>> {
     let mut drafts = vec![Vec::new(); seqs.len()];
     let started = std::time::Instant::now();
@@ -319,6 +362,75 @@ fn stash_accepted(seq: &mut MtpSeq, start: usize, rows: &[u32], kept: Option<(us
 #[cfg(test)]
 mod request_state_tests {
     use super::*;
+
+    #[test]
+    fn pending_batches_keep_the_existing_single_group() -> Result<()> {
+        for count in 1..=64 {
+            for rows in count..=64 {
+                let mut pending = vec![1; count];
+                pending[0] += rows - count;
+                assert_eq!(pending_groups(&pending)?, vec![0..count]);
+                let mut calls = Vec::new();
+                let actual = grouped_drafts(&pending, |group| {
+                    calls.push(group.clone());
+                    Ok(group.collect::<Vec<_>>())
+                })?;
+                assert_eq!(calls, vec![0..count]);
+                assert_eq!(actual, (0..count).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(pending_groups(&[0, 64, 0])?, vec![0..3]);
+        assert!(pending_groups(&[])?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn c64_pending_batches_preserve_hidden_and_complete_chain_offsets() -> Result<()> {
+        for pending in [
+            (0..64).map(|i| if i < 4 { 4 } else { 1 }).collect::<Vec<_>>(),
+            vec![4; 64], vec![64; 64],
+        ] {
+            assert!(pending.iter().sum::<usize>() >= 76);
+            let groups = pending_groups(&pending)?;
+            assert_eq!(groups.first().unwrap().start, 0);
+            assert_eq!(groups.last().unwrap().end, 64);
+            assert!(groups.windows(2).all(|pair| pair[0].end == pair[1].start));
+            let mut last_hidden = vec![usize::MAX; DECODE_ROWS];
+            let mut deferred = vec![vec![usize::MAX; DECODE_ROWS]; 3];
+            let actual = grouped_drafts(&pending, |group| {
+                assert!(pending[group.clone()].iter().sum::<usize>() <= DECODE_ROWS);
+                let mut row = 0;
+                let mut previous = Vec::new();
+                for sequence in group.clone() {
+                    row += pending[sequence];
+                    let head = previous.len();
+                    last_hidden[row - 1] = sequence;
+                    deferred[0][head] = sequence * 10;
+                    previous.push((row - 1, head));
+                }
+                // Model the reused workspace and step-local draft storage through a complete chain.
+                for step in 1..3 {
+                    let tokens = previous.iter().map(|&(source, draft)| {
+                        assert_eq!(last_hidden[source] * 10 + step - 1, deferred[step - 1][draft]);
+                        last_hidden[source]
+                    }).collect::<Vec<_>>();
+                    for (row, sequence) in tokens.into_iter().enumerate() {
+                        last_hidden[row] = sequence;
+                        deferred[step][row] = sequence * 10 + step;
+                    }
+                    previous = (0..group.len()).map(|row| (row, row)).collect();
+                }
+                Ok((0..group.len()).map(|head|
+                    (0..3).map(|step| deferred[step][head]).collect::<Vec<_>>()).collect())
+            })?;
+            assert_eq!(actual, (0..64).map(|sequence|
+                (0..3).map(|step| sequence * 10 + step).collect::<Vec<_>>()).collect::<Vec<_>>());
+        }
+        let error = pending_groups(&[1, 65, 1]).unwrap_err();
+        let capacity = error.downcast_ref::<PendingCapacityError>().unwrap();
+        assert_eq!((capacity.sequence, capacity.rows, capacity.capacity), (1, 65, 64));
+        Ok(())
+    }
 
     #[test]
     fn cold_target_mtp_uses_target_workspace_capacity() -> Result<()> {
