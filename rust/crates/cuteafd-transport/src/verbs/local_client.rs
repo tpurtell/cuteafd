@@ -236,6 +236,12 @@ impl LocalTp4Client {
     pub(crate) fn landing_ranks(&self) -> Vec<bool> {
         self.sessions.iter().map(|s| s.as_ref().is_some_and(|s| s.gpu_landing)).collect()
     }
+    pub(crate) fn endpoint_snapshots(&self) -> Result<Vec<SparkEndpointSnapshot>> {
+        self.sessions.iter().enumerate().map(|(rank, session)| {
+            session.as_ref().with_context(|| format!("Spark rank {rank} has no live endpoint"))?
+                .endpoint_snapshot(rank)
+        }).collect()
+    }
     /// Per rank: how many final reply frames its live session can leave with
     /// consumers at once (its response ring depth; 0 without a retained ring).
     pub(crate) fn retained_reply_slots(&self) -> Vec<usize> {
@@ -929,6 +935,19 @@ mod tests {
                     }
                     let row_bytes = hidden as usize * 2;
                     let result = (|| -> Result<()> {
+                        use cuteafd_loader::placement::{SparkEndpointOwners, planner::{CoordinatorDevices, Lifetime}};
+                        assert!(client.endpoint_snapshots().is_err(), "unopened sessions have no allocation snapshot");
+                        let mut endpoint_snapshot = None;
+                        // This echo has one route per row, unlike a model's top-k fixture.
+                        let endpoint = cuteafd_core::SparkEndpoint {capacity, ingress: cuteafd_core::SparkIngress::Bf16,
+                            ring_depth: None, partial_reply_bytes: None};
+                        let forecast = SparkEndpointOwners {ranks: 1,
+                            geometry: cuteafd_core::ExpertGeometry {hidden, topk: 1, ..cuteafd_core::ExpertGeometry::GLM5},
+                            endpoint, rings: cuteafd_core::SparkRings {max_frame_bytes: client.config.max_frame_bytes,
+                                depth: parse_env_usize("CUTEAFD_VERBS_HOST_RING_DEPTH", VERBS_HOST_RDMA_RING_DEPTH)?,
+                                slot_bytes: parse_env_usize("CUTEAFD_VERBS_HOST_RING_SLOT_BYTES", VERBS_HOST_RDMA_RING_SLOT_BYTES)?,
+                                alignment: crate::verbs_host_capabilities().preferred_alignment}}
+                            .allocations("loopback", Lifetime::TARGET)?;
                         // Placed: the slot width of pass `p` (rows), inside the
                         // same `waves` x capacity range; rotating: the capacity.
                         let widths = [2048u32, 1376, 1024];
@@ -943,14 +962,26 @@ mod tests {
                                 "request {} payload changed while in flight", request.header.request_id);
                             let mut got = vec![0u8; expected.len()];
                             let mut landed = false;
+                            let snapshot = client.endpoint_snapshots()?[0];
+                            let mut retained = false;
                             while !client.poll(|chunk| {
                                 landed |= chunk.landed;
+                                if let Some(view) = chunk.partial_output_payload.pinned_host_buffer() {
+                                    let address = view.ptr as u64;
+                                    anyhow::ensure!(address >= snapshot.recv.address
+                                        && address.checked_add(view.bytes as u64)
+                                            .is_some_and(|end| end <= snapshot.recv.address + snapshot.recv.bytes),
+                                        "retained response must alias the native receive span");
+                                    retained = true;
+                                }
                                 if !chunk.landed {
                                     let bytes = chunk.partial_output_payload.as_ref();
                                     got[..bytes.len()].copy_from_slice(bytes);
                                 }
                                 Ok(())
                             })? {}
+                            anyhow::ensure!(retained == plane.is_none(), "host replies must retain the native receive owner");
+                            anyhow::ensure!(client.endpoint_snapshots()? == vec![snapshot], "poll changed native ring owners");
                             if let Some(buffer) = plane.filter(|_| landed) {
                                 // SAFETY: the slot lies inside the allocated plane, whose wave landed.
                                 let view = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>()
@@ -992,6 +1023,33 @@ mod tests {
                             let request = bf16_request(index as u64 + 1, rows, hidden, payload)?;
                             let slice = [LandingSlice { offset, bytes: width as usize * row_bytes }];
                             client.dispatch(&request, placed.then_some(&slice[..]))?;
+                            let snapshots = client.endpoint_snapshots()?;
+                            anyhow::ensure!(snapshots.len() == 1 && snapshots[0].rank == 0, "endpoint snapshot rank inventory");
+                            let snapshot = snapshots[0];
+                            let session = client.sessions[0].as_ref().unwrap();
+                            anyhow::ensure!(snapshot.send == SparkEndpointSpan::from_native(session.endpoint.send_buffer_view()?)?
+                                && snapshot.recv == SparkEndpointSpan::from_native(session.endpoint.recv_buffer_view()?)?,
+                                "snapshot differs from real native allocation views");
+                            anyhow::ensure!(snapshot.send.bytes == session.request_ring.registered_span_bytes as u64
+                                && snapshot.recv.bytes == session.response_ring.registered_span_bytes as u64,
+                                "snapshot differs from retained ring dimensions");
+                            let physical = [library.cuda_get_device()?];
+                            let receipts = snapshot.allocation_receipts("loopback", physical[0],
+                                CoordinatorDevices::new(&physical)?, Lifetime::TARGET)?;
+                            anyhow::ensure!(receipts.len() == 2 && receipts.iter().zip(&forecast)
+                                .all(|(actual, expected)| actual.allocation == *expected),
+                                "native ring owners differ from independent endpoint forecast");
+                            if let Some(egress) = &client.egress {
+                                let buffer = egress.host();
+                                let start = buffer.ptr as u64;
+                                anyhow::ensure!(receipts.iter().all(|receipt| receipt.address >= start + buffer.bytes as u64
+                                    || start >= receipt.address + receipt.allocation.bytes),
+                                    "egress registration is not another native send-ring owner");
+                            }
+                            match endpoint_snapshot {
+                                Some(original) => anyhow::ensure!(snapshot == original, "waves replaced a native ring owner"),
+                                None => endpoint_snapshot = Some(snapshot),
+                            }
                             sent.push_back((request, expected, offset));
                         }
                         while let Some((request, expected, offset)) = sent.pop_front() {
@@ -1003,7 +1061,9 @@ mod tests {
                         Ok(())
                     })();
                     client.reset();
+                    let reset_snapshot = client.endpoint_snapshots();
                     if let Some(mut buffer) = plane { library.free_device_buffer(&mut buffer)?; }
+                    anyhow::ensure!(reset_snapshot.is_err(), "reset must invalidate endpoint inventory");
                     result?;
                 }
             }

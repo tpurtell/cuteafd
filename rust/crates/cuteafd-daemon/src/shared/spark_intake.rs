@@ -1596,6 +1596,8 @@ pub(crate) struct SparkLink<'a> {
     /// The transport while no exchange runs (before bootstrap, and while it
     /// is handed back for a reset or terminal teardown).
     transport: Option<SparkExperts>,
+    /// Plain native span metadata captured before the transport moves to its worker.
+    endpoint_snapshots: Vec<cuteafd_transport::SparkEndpointSnapshot>,
     /// Widest wave staging each slot needs (bytes), sized at bootstrap.
     staging_bytes: usize,
     /// The bootstrap request without its (all-zero) hidden payload, and that
@@ -1678,7 +1680,7 @@ impl<'a> SparkLink<'a> {
         let world = transport.world();
         Ok(Self { intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
             terminal_library: None, terminal_released: false, exchange: None, transport: Some(transport),
-            staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity })
+            endpoint_snapshots: Vec::new(), staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity })
     }
 
     /// The transport while no exchange runs (setup and teardown only).
@@ -1727,6 +1729,7 @@ impl<'a> SparkLink<'a> {
 
     /// Starts the exchange worker on the idle transport.
     fn start(&mut self) -> Result<()> {
+        self.endpoint_snapshots.clear();
         let intake = &self.intake;
         intake.release_uploads()?;
         let transport = self.transport.take().context("Spark link has no transport")?;
@@ -1758,9 +1761,31 @@ impl<'a> SparkLink<'a> {
             next_slot: intake.dispatch_slot() };
         // Read-only worker metadata, kept so callers need not reach the transport.
         let grouping = transport.installed_grouping().unwrap_or_default();
+        // Native mapped views report the query-time CUDA device, not an owner ordinal.
+        let device = crate::shared::memory::device::Device { library: intake.library, id: intake.device() };
+        let endpoint_snapshots = match device.run(|| transport.endpoint_snapshots()) {
+            Ok(snapshots) => snapshots,
+            Err(error) => { self.transport = Some(transport); return Err(error); }
+        };
         self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
             arenas, self.timing)?);
+        self.endpoint_snapshots = endpoint_snapshots;
         Ok(())
+    }
+
+    /// Endpoint rings only; the worker is never consulted by this census.
+    pub(crate) fn endpoint_allocation_receipts(&self, prefix: &str,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+        lifetime: cuteafd_loader::placement::planner::Lifetime)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        ensure!(self.exchange.is_some() && self.endpoint_snapshots.len() == self.world_size,
+            "Spark endpoint snapshot is not current for its running exchange");
+        let mut receipts = Vec::with_capacity(2 * self.world_size);
+        for (rank, snapshot) in self.endpoint_snapshots.iter().enumerate() {
+            ensure!(snapshot.rank == rank, "Spark endpoint snapshot rank inventory differs");
+            receipts.extend(snapshot.allocation_receipts(prefix, self.device(), devices, lifetime)?);
+        }
+        Ok(receipts)
     }
 
     /// The link's exchange: every Spark wave goes through it.
@@ -1772,6 +1797,7 @@ impl<'a> SparkLink<'a> {
     /// terminal teardown). Every wave must have landed and been consumed, and
     /// the consuming streams drained.
     fn stop(&mut self) -> Result<()> {
+        self.endpoint_snapshots.clear();
         if let Some(exchange) = self.exchange.take() {
             let (transport, frames, next) = exchange.stop::<SparkExperts>()?;
             self.intake.keep_frames(frames)?;
@@ -1784,6 +1810,7 @@ impl<'a> SparkLink<'a> {
     /// Reuse after cancellation: stops the exchange (its consumers drained),
     /// resets the connections and starts it again.
     pub(crate) fn reset_connections(&mut self) -> Result<()> {
+        self.endpoint_snapshots.clear();
         if let Some(exchange) = self.exchange.take() {
             // A failed exchange already abandoned its waves; a cancelled one
             // gives up the engine's unlanded waves without a failure (the
@@ -1833,6 +1860,7 @@ impl<'a> SparkLink<'a> {
     /// wait), takes its transport back and quiesces the QPs (#784: the
     /// exchange owns the transport once started).
     pub(crate) fn terminal_quiesce(&mut self) -> Result<()> {
+        self.endpoint_snapshots.clear();
         if let Some(exchange) = self.exchange.take() {
             // Teardown may abandon waves; the worker then fails, releases its
             // waits and still hands the transport back.
@@ -1876,6 +1904,38 @@ impl Drop for SparkLink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn endpoint_metadata_capture_restores_device_after_partial_failure() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
+        use cuteafd_transport::{SparkEndpointSnapshot, SparkEndpointSpan};
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let devices = CoordinatorDevices::new(&[1, 0])?;
+        for (caller, selected) in [(0, 1), (1, 0)] {
+            library.cuda_set_device(caller)?;
+            let reached = Cell::new(0);
+            let capture = crate::shared::memory::device::Device {library: &library, id: selected}.run(|| {
+                (0..2).map(|rank| {
+                    let current = library.cuda_get_device()?;
+                    assert_eq!(current, selected);
+                    let span = |address| SparkEndpointSpan {address, bytes: 256, device_address: address,
+                        device: current,
+                        host_flags: cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED | cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_MAPPED};
+                    let snapshot = SparkEndpointSnapshot {rank, send: span(0x1000), recv: span(if rank == 0 {0x2000} else {0})};
+                    let receipts = snapshot.allocation_receipts("numeric", selected, devices, Lifetime::TARGET)?;
+                    reached.set(reached.get() + 1);
+                    Ok(receipts)
+                }).collect::<Result<Vec<_>>>()
+            });
+            assert!(capture.is_err(), "second numeric snapshot must fail after the first completed");
+            assert_eq!(reached.get(), 1);
+            assert_eq!(library.cuda_get_device()?, caller, "partial capture must restore the caller's device");
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]

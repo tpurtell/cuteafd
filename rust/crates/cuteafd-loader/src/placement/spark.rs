@@ -131,6 +131,58 @@ impl SparkWaveOwners {
     }
 }
 
+/// One coordinator link's native send/receive allocations. Registered egress,
+/// GPU landing and retained receive-frame views are not additional ring owners.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkEndpointOwners {
+    pub ranks: usize,
+    pub geometry: ExpertGeometry,
+    pub endpoint: cuteafd_core::SparkEndpoint,
+    pub rings: cuteafd_core::SparkRings,
+}
+
+impl SparkEndpointOwners {
+    pub fn allocations(self, prefix: &str, lifetime: super::planner::Lifetime)
+        -> Result<Vec<super::planner::Allocation>, super::planner::Refusal> {
+        use super::planner::{Allocation, Location, Refusal};
+        use cuteafd_core::memory_layout::Category;
+        if prefix.is_empty() || !(1..=cuteafd_core::serving_capacity::SPARK_INTAKE_MAX_RANKS).contains(&self.ranks)
+            || self.geometry.hidden == 0 || self.geometry.topk == 0 {
+            return Err(Refusal::InvalidFact("invalid Spark endpoint owner geometry".into()));
+        }
+        let rings = self.endpoint.endpoint_rings(self.geometry, self.rings)
+            .ok_or_else(|| Refusal::InvalidFact("invalid Spark endpoint ring geometry".into()))?;
+        let (send, recv) = self.endpoint.wire_bytes(self.geometry)
+            .ok_or_else(|| Refusal::InvalidFact("invalid Spark endpoint wire geometry".into()))?;
+        if rings.max_frame_bytes == 0 || rings.slot_bytes == 0 || rings.alignment == 0
+            || send > rings.max_frame_bytes || recv > rings.max_frame_bytes {
+            return Err(Refusal::InvalidFact("Spark endpoint wire exceeds its ring capacity".into()));
+        }
+        let span = |wire: usize| -> Result<u64, Refusal> {
+            let slot = wire.max(rings.slot_bytes).min(rings.max_frame_bytes);
+            slot.checked_add(rings.alignment - 1).map(|bytes| bytes / rings.alignment * rings.alignment)
+                .and_then(|stride| stride.checked_mul(rings.depth))
+                .and_then(|bytes| u64::try_from(bytes).ok()).ok_or(Refusal::Overflow("Spark endpoint ring"))
+        };
+        let (send, recv) = (span(send)?, span(recv)?);
+        Ok((0..self.ranks).flat_map(|rank| [("send", send), ("recv", recv)].into_iter().map(move |(name, bytes)|
+            Allocation::buffer(format!("{prefix}.rank.{rank}.{name}"), Location::PINNED, bytes,
+                lifetime, Category::Transport, "Spark endpoint rings"))).collect())
+    }
+
+    pub fn components(self, prefix: &str, lifetime: super::planner::Lifetime, maximum_pages: u64)
+        -> Result<Vec<super::planner::Component>, super::planner::Refusal> {
+        use super::planner::{ByteCurve, Component, Refusal};
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("Spark endpoints require a positive pool domain".into()));
+        }
+        Ok(self.allocations(prefix, lifetime)?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }).collect())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkingSetComponent { Always, RtxExperts, SparkExperts }
 
@@ -517,6 +569,84 @@ pub struct SparkIoBytes {
 mod tests {
     use super::*;
     use cuteafd_core::memory_layout::{Basis, Category};
+
+    #[test]
+    fn endpoint_owners_charge_each_native_span_without_egress_or_landing_aliases() {
+        use super::super::planner::{Lifetime, Location};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        let geometry = ExpertGeometry::GLM5;
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 1 << 20, alignment: 4096 };
+        for ranks in [1, 6, 8] {
+            for rows in [1, 64, 2752, 4096] {
+                for ingress in [SparkIngress::Fp8K32, SparkIngress::Bf16, SparkIngress::Native,
+                    SparkIngress::Bf16Decode { rows: rows.min(21) }] {
+                    for (depth, partial) in [(None, None), (Some(3), None), (Some(4), Some(80 << 20))] {
+                        let endpoint = SparkEndpoint { capacity: rows, ingress, ring_depth: depth, partial_reply_bytes: partial };
+                        let spec = SparkEndpointOwners { ranks, geometry, endpoint, rings };
+                        let owners = spec.allocations("link", Lifetime::TARGET).unwrap();
+                        // Independently spell out the wire layout and aligned physical spans.
+                        let wire_request = |count: u32, bf16: bool| {
+                            let rows = count as usize;
+                            let prefix = (96 + rows * 40 + rows * 8 * 12 + 15) / 16 * 16;
+                            prefix + rows * if bf16 { 6144 * 2 } else { 6144 + 6144 / 32 }
+                        };
+                        let request = match ingress {
+                            SparkIngress::Bf16 | SparkIngress::Native => wire_request(rows, true),
+                            SparkIngress::Fp8K32 => wire_request(rows, false),
+                            SparkIngress::Bf16Decode {rows: decode} => wire_request(rows, false).max(wire_request(decode, true)),
+                        };
+                        let response = partial.map_or(96 + rows as usize * (4 + 6144 * 2), |bytes| bytes as usize + 128);
+                        let frame = if partial.is_some() { rings.max_frame_bytes.max(request).max(response) }
+                            else { rings.max_frame_bytes };
+                        let span = |wire: usize| {
+                            let slot = wire.max(rings.slot_bytes).min(frame);
+                            ((slot + rings.alignment - 1) / rings.alignment * rings.alignment * depth.unwrap_or(rings.depth)) as u64
+                        };
+                        assert_eq!(owners.len(), ranks * 2);
+                        for rank in 0..ranks {
+                            for (index, name, bytes) in [(0, "send", span(request)), (1, "recv", span(response))] {
+                                let owner = &owners[2 * rank + index];
+                                assert_eq!(owner.id, format!("link.rank.{rank}.{name}"));
+                                assert_eq!(owner.location, Location::PINNED);
+                                assert_eq!(owner.bytes, bytes);
+                                assert_eq!(owner.lifetime, Lifetime::TARGET);
+                                assert!(owner.view.is_none());
+                            }
+                        }
+                        assert_eq!(spec.components("link", Lifetime::TARGET, 16).unwrap().len(), owners.len());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_owners_refuse_invalid_or_overflowing_selected_geometry() {
+        use super::super::planner::Lifetime;
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        let base = SparkEndpointOwners { ranks: 6, geometry: ExpertGeometry::GLM5,
+            endpoint: SparkEndpoint { capacity: 64, ingress: SparkIngress::Fp8K32, ring_depth: None, partial_reply_bytes: None },
+            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 1 << 20, alignment: 4096 } };
+        for spec in [SparkEndpointOwners {ranks: 0, ..base}, SparkEndpointOwners {ranks: 9, ..base},
+            SparkEndpointOwners {geometry: ExpertGeometry {hidden: 0, ..base.geometry}, ..base},
+            SparkEndpointOwners {geometry: ExpertGeometry {topk: 0, ..base.geometry}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {capacity: 0, ..base.endpoint}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {capacity: 4097, ..base.endpoint}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {ring_depth: Some(0), ..base.endpoint}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {ring_depth: Some(9), ..base.endpoint}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {ingress: SparkIngress::Bf16Decode {rows: 65}, ..base.endpoint}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {partial_reply_bytes: Some(u64::MAX), ..base.endpoint}, ..base},
+            SparkEndpointOwners {rings: SparkRings {max_frame_bytes: 1, ..base.rings}, ..base},
+            SparkEndpointOwners {rings: SparkRings {slot_bytes: 0, ..base.rings}, ..base},
+            SparkEndpointOwners {rings: SparkRings {alignment: 0, ..base.rings}, ..base},
+            SparkEndpointOwners {rings: SparkRings {depth: 0, ..base.rings}, ..base},
+            SparkEndpointOwners {rings: SparkRings {alignment: usize::MAX, ..base.rings}, ..base},
+            SparkEndpointOwners {rings: SparkRings {max_frame_bytes: usize::MAX, slot_bytes: usize::MAX, alignment: 1, ..base.rings}, ..base}] {
+            assert!(spec.allocations("link", Lifetime::TARGET).is_err(), "{spec:?}");
+        }
+        assert!(base.allocations("", Lifetime::TARGET).is_err());
+        assert!(base.components("link", Lifetime::TARGET, 0).is_err());
+    }
 
     #[test]
     fn intake_owner_geometry_charges_raw_padding_and_one_shared_staging_owner() {

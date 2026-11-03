@@ -2289,6 +2289,15 @@ impl VerbsHostProtocolV2PersistentClientSession {
         })
     }
 
+    fn endpoint_snapshot(&self, rank: usize) -> Result<SparkEndpointSnapshot> {
+        let send = SparkEndpointSpan::from_native(self.endpoint.send_buffer_view()?)?;
+        let recv = SparkEndpointSpan::from_native(self.endpoint.recv_buffer_view()?)?;
+        anyhow::ensure!(send.bytes == self.request_ring.registered_span_bytes as u64
+            && recv.bytes == self.response_ring.registered_span_bytes as u64 && send.device == recv.device,
+            "Spark endpoint native spans disagree with retained ring geometry");
+        Ok(SparkEndpointSnapshot { rank, send, recv })
+    }
+
     /// Final reply frames this session can leave with consumers at once.
     pub(crate) fn retained_reply_slots(&self) -> usize {
         if self.retained_response_ring.is_some() { self.response_ring.depth } else { 0 }
@@ -3352,6 +3361,68 @@ impl Drop for EndpointCredits {
         // A failed quiesce retains registered memory, so keep its charge too.
         std::mem::forget(self.rings.take());
         std::mem::forget(self.endpoint.take());
+    }
+}
+
+/// Plain native allocation metadata captured before a transport moves to its
+/// worker. It neither retains an endpoint nor permits access to its contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparkEndpointSpan {
+    pub address: u64,
+    pub bytes: u64,
+    pub device_address: u64,
+    pub device: i32,
+    pub host_flags: u64,
+}
+
+impl SparkEndpointSpan {
+    fn from_native(view: CuteafdRdmaRcEndpointBufferView) -> Result<Self> {
+        let span = Self { address: view.host_ptr as u64, bytes: view.bytes as u64,
+            device_address: view.device_ptr as u64, device: view.device_id, host_flags: view.host_flags };
+        span.validate()?;
+        Ok(span)
+    }
+
+    fn validate(self) -> Result<()> {
+        let required = CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED;
+        anyhow::ensure!(self.address != 0 && self.bytes > 0 && self.address.checked_add(self.bytes).is_some()
+            && self.device_address != 0 && self.device_address.checked_add(self.bytes).is_some()
+            && self.device >= 0 && self.host_flags & required == required,
+            "Spark endpoint span is not live mapped pinned storage");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparkEndpointSnapshot {
+    pub rank: usize,
+    pub send: SparkEndpointSpan,
+    pub recv: SparkEndpointSpan,
+}
+
+impl SparkEndpointSnapshot {
+    /// Reads only the retained snapshot, never a live endpoint or worker.
+    pub fn allocation_receipts(self, prefix: &str, physical_device: i32,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+        lifetime: cuteafd_loader::placement::planner::Lifetime)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, Location, Receipt};
+        anyhow::ensure!(!prefix.is_empty() && self.rank < cuteafd_core::serving_capacity::SPARK_INTAKE_MAX_RANKS,
+            "invalid Spark endpoint snapshot identity");
+        devices.logical_rank(physical_device)?;
+        let mut receipts = Vec::with_capacity(2);
+        for (name, span) in [("send", self.send), ("recv", self.recv)] {
+            span.validate()?;
+            anyhow::ensure!(span.device == physical_device, "Spark endpoint mapped device differs from link device");
+            receipts.push(Receipt { allocation: Allocation::buffer(format!("{prefix}.rank.{}.{name}", self.rank),
+                Location::PINNED, span.bytes, lifetime, Category::Transport, "Spark endpoint rings"),
+                address: span.address });
+        }
+        anyhow::ensure!(self.send.address >= self.recv.address + self.recv.bytes
+            || self.recv.address >= self.send.address + self.send.bytes,
+            "Spark endpoint send and receive physical owners overlap");
+        Ok(receipts)
     }
 }
 
@@ -4848,6 +4919,98 @@ mod persistent_tests {
     use super::*;
     use crate::{ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
 
+
+    #[test]
+    fn endpoint_span_metadata_refuses_invalid_native_views() -> Result<()> {
+        let view = CuteafdRdmaRcEndpointBufferView { host_ptr: 0x1000usize as *mut std::ffi::c_void,
+            device_ptr: 0x9000usize as *mut std::ffi::c_void, bytes: 256, device_id: 3,
+            host_flags: CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED };
+        let span = SparkEndpointSpan::from_native(view)?;
+        assert_eq!((span.address, span.bytes, span.device_address, span.device), (0x1000, 256, 0x9000, 3));
+        for defect in 0..8 {
+            let mut broken = view;
+            match defect {
+                0 => broken.host_ptr = std::ptr::null_mut(),
+                1 => broken.device_ptr = std::ptr::null_mut(),
+                2 => broken.bytes = 0,
+                3 => broken.device_id = -1,
+                4 => broken.host_flags &= !CUTEAFD_HOST_BUFFER_FLAG_PINNED,
+                5 => broken.host_flags &= !CUTEAFD_HOST_BUFFER_FLAG_MAPPED,
+                6 => broken.host_ptr = (usize::MAX - 1) as *mut std::ffi::c_void,
+                7 => broken.device_ptr = (usize::MAX - 1) as *mut std::ffi::c_void,
+                _ => unreachable!(),
+            }
+            assert!(SparkEndpointSpan::from_native(broken).is_err(), "defect {defect}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_snapshot_metadata_reconciles_separate_spans_and_never_cancels_mismatches() -> Result<()> {
+        use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+        use cuteafd_loader::placement::{SparkEndpointOwners, planner::{self, *}};
+        let geometry = ExpertGeometry::GLM5;
+        let endpoint = SparkEndpoint {capacity: 2752, ingress: SparkIngress::Bf16, ring_depth: Some(3), partial_reply_bytes: None};
+        let rings = SparkRings {max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 1 << 20, alignment: 4096};
+        // Numeric metadata only: real native endpoints are covered by the ignored loopback gate.
+        let (send_wire, recv_wire) = crate::protocol_v2::compact_expert_wire_bytes(geometry, endpoint.capacity, true)?;
+        let (send_ring, recv_ring) = persistent_ring_geometry(rings.max_frame_bytes, send_wire, recv_wire,
+            rings.slot_bytes, rings.alignment, endpoint.ring_depth.unwrap())?;
+        for physical in [vec![1], vec![1, 0], vec![7, 3]] {
+            let devices = CoordinatorDevices::new(&physical)?;
+            let device = *physical.last().unwrap();
+            for ranks in [1, 6, 8] {
+                let span = |address, ring: VerbsHostRdmaRing| SparkEndpointSpan { address,
+                    bytes: ring.registered_span_bytes as u64, device_address: address + (1 << 40), device,
+                    host_flags: CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED };
+                let snapshots = (0..ranks).map(|rank| SparkEndpointSnapshot {rank,
+                    send: span((1 + 2 * rank as u64) << 30, send_ring),
+                    recv: span((2 + 2 * rank as u64) << 30, recv_ring)}).collect::<Vec<_>>();
+                let receipts = snapshots.iter().map(|snapshot| snapshot.allocation_receipts("link", device, devices, Lifetime::TARGET))
+                    .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
+                let facts = Facts {allocations: SparkEndpointOwners {ranks, geometry, endpoint, rings}
+                    .allocations("link", Lifetime::TARGET)?, deferred: vec![], sequential: vec![], allowances: vec![]};
+                let budgets = vec![Budget {id: "numeric endpoint fixture".into(), locations: vec![Location::PINNED],
+                    physical_bytes: 16 << 30, logical_bytes: 16 << 30, headroom: 0,
+                    baseline: Baseline::Forecast {occupied: 0, source: "CPU metadata fixture".into(), assumed: false}}];
+                let phases = planner::evaluate(&facts, &budgets)?;
+                let plan = ResolvedPlan {request: Request {context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+                    prefill: Pin::Auto, operation: Operation::Serving}, decisions: Decisions {attention: vec![],
+                    onboard_layers: vec![], expert_homes: Default::default(), embedding: None,
+                    prefill: PrefillShape {rows: 64, waves: 1}, lanes: 1}, pool_tokens: 64, facts, budgets, phases};
+                planner::reconcile(&plan, Phase::Ready, &receipts)?;
+                assert_eq!(receipts.len(), 2 * ranks);
+                for (rank, snapshot) in snapshots.iter().enumerate() {
+                    assert_eq!(receipts[2 * rank].address, snapshot.send.address);
+                    assert_eq!(receipts[2 * rank + 1].address, snapshot.recv.address);
+                }
+                for defect in 0..7 {
+                    let mut broken = receipts.clone();
+                    match defect {
+                        0 => { broken.remove(0); }
+                        1 => { let mut extra = broken[0].clone(); extra.allocation.id.push_str(".extra"); broken.push(extra); }
+                        2 => broken[0].allocation.bytes += 1,
+                        3 => broken[0].allocation.location = Location::coordinator(0),
+                        4 => { broken[0].allocation.bytes += 1; broken[1].allocation.bytes -= 1; }
+                        5 => broken[0].address = 0,
+                        6 => broken[1].address = broken[0].address,
+                        _ => unreachable!(),
+                    }
+                    assert!(planner::reconcile(&plan, Phase::Ready, &broken).is_err(), "defect {defect}");
+                }
+                let snapshot = snapshots[0];
+                for broken in [SparkEndpointSnapshot {rank: 8, ..snapshot},
+                    SparkEndpointSnapshot {recv: snapshot.send, ..snapshot},
+                    SparkEndpointSnapshot {recv: SparkEndpointSpan {address: snapshot.send.address + 1, ..snapshot.recv}, ..snapshot},
+                    SparkEndpointSnapshot {recv: SparkEndpointSpan {device: 99, ..snapshot.recv}, ..snapshot}] {
+                    assert!(broken.allocation_receipts("link", device, devices, Lifetime::TARGET).is_err());
+                }
+                assert!(snapshot.allocation_receipts("", device, devices, Lifetime::TARGET).is_err());
+                assert!(snapshot.allocation_receipts("link", 99, devices, Lifetime::TARGET).is_err());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn rdma_device_map_selects_device_by_control_destination_ip() {

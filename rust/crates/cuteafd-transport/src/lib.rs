@@ -90,7 +90,7 @@ pub use synthetic::{
 };
 pub use verbs::{
     DeviceLanding, FlowProbesOnly, GpuLandingProbe, GpuLandingRegistrationError, LandingSlice, LocalVerbsExpertConnection,
-    RingBudget, RingReservation, StagingArena, copy_pool_parallel, VerbsHostMappedRdmaPollStats,
+    RingBudget, RingReservation, SparkEndpointSnapshot, SparkEndpointSpan, StagingArena, copy_pool_parallel, VerbsHostMappedRdmaPollStats,
     VerbsHostMappedRdmaRing, VerbsHostMappedRdmaRingConfig, VerbsHostMappedRdmaSlot,
     VerbsHostNativeEndpointDescriptor, VerbsHostProtocolV2EndpointPlan,
     VerbsHostProtocolV2HandshakeContract, VerbsHostProtocolV2HandshakeValidation,

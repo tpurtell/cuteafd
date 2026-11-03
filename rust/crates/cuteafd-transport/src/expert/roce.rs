@@ -179,6 +179,10 @@ impl SparkExperts {
     pub fn world_size(&self) -> usize {
         self.executors.len()
     }
+    /// Native allocation spans, captured only during setup before worker ownership.
+    pub fn endpoint_snapshots(&self) -> Result<Vec<crate::SparkEndpointSnapshot>> {
+        self.clients.endpoint_snapshots()
+    }
     /// Bind this transport to one immutable ModelAdmission endpoint on every
     /// rank before bootstrap or dispatch. Reconnect retains the same identity;
     /// missing, incompatible or busy endpoints fail without automatic fallback.
