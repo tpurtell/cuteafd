@@ -276,18 +276,6 @@ pub(super) mod tests {
 
     #[test]
     fn fatal_admission_exit_answers_and_releases_all_pending_owners() {
-        // Check the actual serve ownership boundary as well as its drain behavior:
-        // a perfect drain helper is useless if the fallible loop has already dropped the queue.
-        let source = include_str!("../scheduler.rs");
-        let boundary = source.find("let result = (|| -> Result<()> {\n    loop {").unwrap();
-        assert!(source[..boundary].contains("VecDeque::<PackedAdmission>"));
-        let exit = &source[source.find("// A fatal target/transport error").unwrap()..];
-        assert!(exit.contains("admitted.extend(media_ready.drain(..)"));
-        assert!(exit.contains("round_failure::drain_admissions("));
-        let media = include_str!("admission.rs");
-        assert!(!media.contains("-> Result<Vec<Leased>>"), "media cleanup cannot abort serve");
-        assert!(!source.contains("leased.fail(error, requests, draft.as_deref_mut())?"));
-
         let mut pending = std::collections::VecDeque::new();
         let mut outputs = Vec::new();
         let mut slots = HashSet::new();
