@@ -117,6 +117,9 @@ fn plan(
             .components()?,
         );
     }
+    let successor = cuteafd_loader::placement::families::glm5::buffers::sync_h2d_successor(shape)?;
+    contract.components.push(Component::allocation(successor.clone(),
+        ByteCurve::fixed(successor.bytes, contract.maximum_pages), false, contract.maximum_pages));
     let facts = contract.facts(&[0, 0], pages / 2)?;
     let budgets: Vec<_> = [
         Location::coordinator(0),
@@ -503,13 +506,6 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                 .collect::<Result<_>>()?;
         }
         let mut expected = plan(&cfg, partitioned, owners, pages, shape, full, native, core, shared_layout.as_ref())?;
-        assert!(
-            planner::reconcile(&expected, Phase::Warmup, &engine.target_buffer_receipts()?)
-                .is_err()
-        );
-        *engine.decode_workspace.borrow_mut() = Some(engine.workspace(DECODE_ROWS, true)?);
-        let _ = engine.peer_workspaces(true, 1)?;
-        engine.ensure_prefill_slots()?;
         fixture.exlr8_programs(&library, false)?;
         shared_programs = library.programs()?.with_manifest(&shared_path)?;
         if core {
@@ -528,6 +524,47 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                 })?);
             }
             expected.phases = planner::evaluate(&expected.facts, &expected.budgets)?;
+        }
+        assert!(
+            planner::reconcile(&expected, Phase::Warmup, &engine.target_buffer_receipts()?)
+                .is_err()
+        );
+        // Match production: release the larger load backing before Warmup,
+        // then presize its independent retained successor before any workspace.
+        use cuteafd_ffi::memory_ledger::{AllocationAudit, AllocationEvent, Space};
+        let successor_bytes = (128 * waves as usize).max(DECODE_ROWS) * 4;
+        library.reserve_sync_h2d_staging(successor_bytes + 4096)?;
+        let load_backing = library.sync_h2d_staging_buffer()?;
+        let upload_audit = AllocationAudit::start();
+        crate::shared::memory_report::release_load_staging(&library)?;
+        assert!(library.sync_h2d_staging_buffer()?.ptr.is_null());
+        assert!(engine.warmup_upload_receipt().is_err());
+        engine.reserve_warmup_upload()?;
+        let successor = engine.warmup_upload_receipt()?;
+        assert_eq!(successor.allocation.bytes as usize, successor_bytes);
+        let assert_successor = |engine: &GlmEngine<'_>| -> Result<()> {
+            let actual = engine.warmup_upload_receipt()?;
+            assert_eq!(actual.allocation, successor.allocation);
+            assert_eq!(actual.address, successor.address);
+            Ok(())
+        };
+        *engine.decode_workspace.borrow_mut() = Some(engine.workspace(DECODE_ROWS, true)?);
+        let _ = engine.peer_workspaces(true, 1)?;
+        assert_successor(&engine)?;
+        engine.ensure_prefill_slots()?;
+        assert_successor(&engine)?;
+        engine.ensure_prefill_slots()?;
+        assert_successor(&engine)?;
+        let events = upload_audit.events().into_iter().filter(|event| {
+            let record = match event { AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) => r };
+            record.key.space == Space::Pinned && record.key.scope == "staging/sync-h2d"
+        }).collect::<Vec<_>>();
+        assert_eq!(events.len(), 2, "no sync-H2D reallocations after presizing");
+        assert!(matches!(events[0], AllocationEvent::Freed(r)
+            if r.address == load_backing.ptr as usize && r.bytes == load_backing.bytes));
+        assert!(matches!(events[1], AllocationEvent::Allocated(r)
+            if r.address == successor.address as usize && r.bytes == successor_bytes));
+        if core {
             // Allocate through the production CoreScratch constructor; program binding is not
             // emulated. The retained workspaces expose the actual projection owners and views.
             for rank in 0..2 {
@@ -623,6 +660,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             let mut actual = engine.target_buffer_receipts()?;
             actual.extend(engine.target_hook_receipts()?);
             actual.extend(engine.expert_receipts()?);
+            actual.push(engine.warmup_upload_receipt()?);
             Ok(actual)
         };
         let ordered_owners = || -> Result<BTreeMap<String, (Allocation, u64)>> {
@@ -639,10 +677,10 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                     "missing ordered {kind} stores before sync-only release on rank {rank}");
             }
         }
-        // Production releases load-only synchronous staging, not the reserved ordered stores.
-        assert!(library.release_sync_h2d_staging()? > 0);
+        engine.reserve_warmup_upload()?;
+        assert_successor(&engine)?;
         assert_eq!(ordered_owners()?, ordered_before,
-            "sync-only staging release must preserve every ordered owner and address");
+            "sync-H2D successor reuse must preserve every ordered owner and address");
         let actual = receipts()?;
         for rank in 0..2 {
             let prefix = format!("glm.target.gpu.{rank}.");
@@ -650,7 +688,14 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
                 && r.allocation.location != Location::PINNED)
                 .all(|r| r.allocation.location == Location::coordinator(rank as u8)));
         }
-        planner::reconcile(&expected, Phase::Warmup, &actual)?;
+        for phase in [Phase::Warmup, Phase::Ready, Phase::Growth] {
+            planner::reconcile(&expected, phase, &actual)?;
+        }
+        let mut wrong_successor = actual.clone();
+        wrong_successor.iter_mut().find(|r| r.allocation.id == "glm.upload.sync-successor")
+            .unwrap().allocation.bytes += 1;
+        assert!(planner::reconcile(&expected, Phase::Ready, &wrong_successor).is_err());
+        assert_successor(&engine)?;
         // Independent serving-only admission: the prefix's registered target pools
         // remain aliases and must not appear as new serving backings.
         {

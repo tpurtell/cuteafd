@@ -955,6 +955,20 @@ impl<'a> GlmEngine<'a> {
         Ok(self.programs.spec(name)?.scratch.get("scratch").copied().unwrap_or(0) as usize)
     }
 
+    /// After releasing load staging, retain one exact backing for every later
+    /// synchronous workspace-length upload, including lazily created prefill slots.
+    pub(super) fn reserve_warmup_upload(&self) -> Result<()> {
+        let owner = cuteafd_loader::placement::families::glm5::buffers::sync_h2d_successor(
+            cuteafd_loader::placement::planner::PrefillShape {
+                rows: u64::try_from(self.prefill_rows)?, waves: u64::try_from(self.prefill_lanes)?,
+            },
+        )?;
+        let actual = self.library.reserve_sync_h2d_staging(usize::try_from(owner.bytes)?)?;
+        ensure!(actual.bytes as u64 == owner.bytes,
+            "GLM warmup upload backing differs from admitted workspace shape");
+        Ok(())
+    }
+
     pub fn prepare_scoring_prefill(&self) -> Result<()> {
         self.ensure_prefill_slots()
     }

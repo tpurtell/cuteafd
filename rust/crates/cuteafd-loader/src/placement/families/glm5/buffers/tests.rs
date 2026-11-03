@@ -79,6 +79,28 @@ fn budgets() -> Vec<Budget> {
 }
 
 #[test]
+fn synchronous_upload_successor_uses_one_checked_workspace_span_and_decode_floor() {
+    for (rows, waves, expected) in [(1, 1, 256), (64, 1, 256), (128, 3, 1536),
+        (2752, 3, 33024), (4096, 4, 65536)] {
+        let owner = sync_h2d_successor(PrefillShape { rows, waves }).unwrap();
+        assert_eq!(owner.bytes, expected);
+        assert_eq!(owner.shape, [expected]);
+        assert_eq!(owner.id, "glm.upload.sync-successor");
+        assert_eq!(owner.location, Location::PINNED);
+        assert_eq!(owner.category, Category::Staging);
+        assert_eq!(owner.lifetime, Lifetime { first: Phase::Warmup, last: Phase::Growth });
+        assert!(owner.view.is_none());
+    }
+    for shape in [PrefillShape { rows: 0, waves: 1 }, PrefillShape { rows: 64, waves: 0 }] {
+        assert!(matches!(sync_h2d_successor(shape), Err(Refusal::InvalidFact(_))));
+    }
+    for shape in [PrefillShape { rows: u64::MAX, waves: 2 },
+        PrefillShape { rows: u64::MAX / 4 + 1, waves: 1 }] {
+        assert!(matches!(sync_h2d_successor(shape), Err(Refusal::Overflow(_))));
+    }
+}
+
+#[test]
 fn prefix_backings_charge_tail_and_window_marks_but_no_target_or_draft_aliases() {
     let life = Lifetime { first: Phase::Warmup, last: Phase::Growth };
     for device in [0, 1] {

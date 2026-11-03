@@ -315,6 +315,40 @@ fn combined_reply_resolution_is_immutable_and_absent_without_links() {
 }
 
 #[test]
+fn warmup_upload_is_one_exact_successor_per_selected_shape_not_per_rank() {
+    let cfg = cfg();
+    for gpus in [1, 2] {
+        let mut recipe = recipe(&cfg);
+        recipe.gpus = gpus;
+        recipe.attention = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }; cfg.layers];
+        recipe.experts = None;
+        recipe.targets.clear();
+        recipe.hooks.clear();
+        recipe.exchanges.clear();
+        recipe.weights.clear();
+        recipe.owners.clear();
+        let contract = recipe.prepare(&request()).unwrap();
+        for (selected, shape) in recipe.prefill.iter().enumerate() {
+            let mut choices = vec![0; contract.variables.len()];
+            choices[recipe.attention.len()] = selected;
+            let facts = contract.facts(&choices, 32).unwrap();
+            assert_eq!(facts.allocations.len(), 1);
+            let owner = &facts.allocations[0];
+            assert_eq!(owner.id, "glm.upload.sync-successor");
+            assert_eq!(owner.bytes, (shape.rows * shape.waves).max(64) * 4);
+            assert_eq!(owner.location, Location::PINNED);
+            assert_eq!(owner.lifetime, Lifetime { first: Phase::Warmup, last: Phase::Growth });
+            assert!(facts.reservations.is_empty());
+            let phases = planner::evaluate(&facts, &budgets()).unwrap();
+            for row in phases.iter().filter(|p| p.budget == "physical.2") {
+                assert_eq!(row.owned, if matches!(row.phase, Phase::Warmup | Phase::Ready | Phase::Growth)
+                    { owner.bytes } else { 0 });
+            }
+        }
+    }
+}
+
+#[test]
 fn dflash_prefetch_refuses_missing_empty_nonfile_and_zero_pool_extent() {
     let root = tempfile::tempdir().unwrap();
     assert!(DflashPrefetch::from_snapshot(root.path()).is_err());
@@ -375,9 +409,11 @@ fn core_heap_allowance_follows_weight_case_and_adds_concurrent_prefetch() {
             && a.source.contains("excludes allocator/tensor-map metadata")));
         assert_eq!(opaque(Phase::PostTargetKv), 0);
         assert_eq!(opaque(Phase::Warmup), 0);
-        // No per-target pinned allocation: the upload maximum must join draft
-        // and workspace requirements before their one shared owner is emitted.
-        assert!(!facts.allocations.iter().any(|a| a.id.contains("upload.sync")));
+        // The later successor is distinct from the still-uncomposed load maximum.
+        let uploads = facts.allocations.iter().filter(|a| a.id.contains("upload.sync"))
+            .collect::<Vec<_>>();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].lifetime.first, Phase::Warmup);
         let peak = phases.iter().find(|p| p.budget == "physical.2" && p.phase == Phase::Load).unwrap();
         let mut tight = budgets;
         tight[2].physical_bytes = peak.owned + peak.opaque - 1;

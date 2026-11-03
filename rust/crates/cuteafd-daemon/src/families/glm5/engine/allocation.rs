@@ -354,6 +354,19 @@ impl Census<'_> {
 }
 
 impl GlmEngine<'_> {
+    pub(crate) fn warmup_upload_receipt(&self) -> Result<Receipt> {
+        let actual = self.library.sync_h2d_staging_buffer()?;
+        ensure!(!actual.ptr.is_null() && actual.bytes > 0, "GLM warmup upload is absent");
+        Ok(Receipt {
+            allocation: Allocation::buffer(
+                "glm.upload.sync-successor", Location::PINNED, actual.bytes as u64,
+                Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                Category::Staging, "GLM warmup sync-H2D",
+            ),
+            address: actual.ptr as u64,
+        })
+    }
+
     pub(super) fn census_physical_devices(&self) -> Result<Vec<i32>> {
         (0..self.ranks()).map(|rank| self.exchange_device(rank)).collect()
     }

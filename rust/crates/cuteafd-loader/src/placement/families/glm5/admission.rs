@@ -453,6 +453,13 @@ impl Recipe for GlmRecipe<'_> {
             onboard,
             remote,
         };
+        for &shape in &self.prefill {
+            let owner = super::buffers::sync_h2d_successor(shape)?;
+            let bytes = ByteCurve::fixed(owner.bytes, self.maximum_pages);
+            domains.append(&mut contract, &[When::Prefill(shape)], vec![
+                Component::allocation(owner, bytes, false, self.maximum_pages),
+            ])?;
+        }
         for case in &self.targets {
             let target = &case.value;
             let expected: Vec<_> = self

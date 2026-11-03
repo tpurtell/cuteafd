@@ -11,6 +11,23 @@ use cuteafd_core::memory_layout::Category;
 
 const FLOOR: u64 = 256;
 
+/// One reusable synchronous upload backing after load staging is released.
+/// Warmup presizes it for decode lengths and the largest admitted prefill arena.
+/// Serialized ranks and slots reuse this store; they do not own separate copies.
+pub fn sync_h2d_successor(prefill: PrefillShape) -> Result<Allocation, Refusal> {
+    if prefill.rows == 0 || prefill.waves == 0 {
+        return Err(Refusal::InvalidFact("empty GLM workspace upload shape".into()));
+    }
+    let rows = mul(prefill.rows, prefill.waves)?.max(DECODE_ROWS);
+    let bytes = mul(rows, 4)?;
+    usize::try_from(bytes).map_err(|_| Refusal::Overflow("GLM workspace upload"))?;
+    Ok(Allocation::buffer(
+        "glm.upload.sync-successor", Location::PINNED, bytes,
+        Lifetime { first: Phase::Warmup, last: Phase::Growth },
+        Category::Staging, "GLM warmup sync-H2D",
+    ))
+}
+
 /// Prefix-owned storage only. KV pools and the drafter's live windows are
 /// aliases owned by their respective target/draft recipes, not new backings.
 #[derive(Debug, Clone, Copy)]
