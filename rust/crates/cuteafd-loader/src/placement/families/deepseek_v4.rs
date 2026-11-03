@@ -202,8 +202,9 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
             + cache.fixed_state_bytes + cache.speculative_replay_bytes + mul(table_bytes, inputs.sequences, "V4 tables")?;
         let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
         let intake = if rank == 0 && inputs.spark_ranks > 0 {
-            (inputs.prefill_waves * inputs.prefill_rows + inputs.decode_rows)
-                * inputs.spark_ranks as u64 * hidden * 2
+            crate::serving_capacity::prefill_return_bytes(inputs.prefill_waves, inputs.prefill_rows,
+                inputs.spark_ranks as u64, hidden)
+                + crate::serving_capacity::spark_intake_bytes(1, inputs.spark_ranks as u64, inputs.decode_rows, hidden)
         } else { 0 };
         let exchange = if gpus == 2 {
             deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank, inputs.prefill_waves)

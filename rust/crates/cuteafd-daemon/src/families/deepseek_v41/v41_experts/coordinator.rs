@@ -196,7 +196,9 @@ impl<'a> V41Link<'a> {
     /// plane over its `reserve_rows` (slots x unit) rows.
     pub(crate) fn prefill_device_bytes(reserve_rows: usize, ranks: usize) -> Result<usize> {
         ensure!((1..=8).contains(&ranks) && reserve_rows > 0, "invalid V4.1 prefill link geometry");
-        reserve_rows.checked_mul(ranks * V41_PARTIAL_ROW_BYTES as usize).context("prefill link budget overflow")
+        let logical = reserve_rows.checked_mul(V41_PARTIAL_ROW_BYTES as usize).context("prefill link budget overflow")?;
+        let backing = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(u64::try_from(logical)?)?;
+        usize::try_from(backing)?.checked_mul(ranks).context("prefill link budget overflow")
     }
     pub(crate) fn link(&mut self) -> &mut crate::shared::spark_intake::SparkLink<'a> { &mut self.link }
     pub(crate) fn capacity(&self) -> u32 { self.link.capacity() }
@@ -341,9 +343,8 @@ impl<'a> NativeTp4Wave<'a> {
             (1..=8).contains(&ranks),
             "native TP wave requires one through eight ranks"
         );
-        (capacity as usize)
-            .checked_mul(ranks * V41_PARTIAL_ROW_BYTES as usize + 2 * 5120 * 2)
-            .context("native TP wave budget overflow")
+        usize::try_from(cuteafd_loader::placement::families::deepseek_v41::owners::transport_bytes(
+            u64::from(capacity), ranks)?).context("native TP wave budget overflow")
     }
     pub fn new(
         library: &'a NativeLibrary,
@@ -987,9 +988,10 @@ mod replicated_tests {
         for capacity in [1u32, 16, 80, 4096] {
             let legacy = NativeTp4Wave::device_bytes(capacity).unwrap();
             assert_eq!(legacy, NativeTp4Wave::device_bytes_for(capacity, 4).unwrap());
-            assert_eq!(legacy, capacity as usize * 6 * 10240);
+            let backing = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(u64::from(capacity) * 10240).unwrap() as usize;
+            assert_eq!(legacy, 4 * backing + capacity as usize * 20480);
             for ranks in 1usize..=8 {
-                let expected = capacity as usize * (ranks * 10240 + 20480);
+                let expected = ranks * backing + capacity as usize * 20480;
                 assert_eq!(NativeTp4Wave::device_bytes_for(capacity, ranks).unwrap(), expected);
                 assert!(expected >= capacity as usize * ranks * 10240);
             }

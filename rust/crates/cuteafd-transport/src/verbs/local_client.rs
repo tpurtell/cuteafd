@@ -138,7 +138,8 @@ impl LocalTp4Client {
         self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
             self.peers[rank], &self.config, request, self.execution_lane(), landing,
             if egress { self.egress.as_ref() } else { None },
-            self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint)?);
+            self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint)
+            .with_context(|| format!("opening Spark rank {rank} session"))?);
         self.retain_grouping(rank)
     }
 

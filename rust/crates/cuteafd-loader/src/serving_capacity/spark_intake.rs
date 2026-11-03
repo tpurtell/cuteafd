@@ -1,14 +1,16 @@
 //! BF16 coordinator receive planes shared by Spark-backed families, and the
 //! shared prefill unit shape (PLAN "Prefill contract").
-/// One full-capacity BF16 partial plane per rank and independently queued lane.
+use cuteafd_core::serving_capacity::spark_intake_allocation_bytes;
+
+/// One independently allocated BF16 partial plane per rank and lane.
 pub fn spark_intake_bytes(lanes: u64, ranks: u64, rows: u64, hidden: u64) -> u64 {
-    lanes * ranks * rows * hidden * 2
+    lanes * ranks * spark_intake_allocation_bytes(rows * hidden * 2).expect("Spark intake backing overflow")
 }
 
-/// Return slots for `waves` outstanding prefill waves of `unit_rows` each on
-/// one transport: one BF16 plane per rank per slot.
+/// One allocation per rank containing every outstanding wave's logical slot.
+/// Round the whole reserve once, matching `SparkIntake::with_waves`.
 pub fn prefill_return_bytes(waves: u64, unit_rows: u64, ranks: u64, hidden: u64) -> u64 {
-    spark_intake_bytes(waves, ranks, unit_rows, hidden)
+    spark_intake_bytes(1, ranks, waves * unit_rows, hidden)
 }
 
 /// Prefill row units and how many are in flight on one lane and transport.
@@ -35,8 +37,18 @@ impl PrefillShape {
 mod tests {
     use super::*;
     #[test]
-    fn glm_flash_intake_charge_is_unchanged() {
-        for lanes in [1, 2, 4] { for ranks in [0, 4, 6] { for rows in [64, 4096] {
+    fn partial_reply_plan_charges_one_padded_reserve_per_rank() {
+        for ranks in [4, 6] {
+            assert_eq!(prefill_return_bytes(3, 2752, ranks, 34_864 / 2), ranks * 289_406_976);
+        }
+        // Slots share one allocation: rounding each one separately overcharges.
+        assert_eq!(prefill_return_bytes(3, 64, 4, 16), 4 * (2 << 20));
+        assert_eq!(spark_intake_bytes(3, 4, 64, 16), 12 * (2 << 20));
+    }
+
+    #[test]
+    fn aligned_intake_charge_is_unchanged() {
+        for lanes in [1, 2, 4] { for ranks in [0, 4, 6] { for rows in [1024, 4096] {
             assert_eq!(spark_intake_bytes(lanes, ranks, rows, 6144), lanes * ranks * rows * 6144 * 2);
         } } }
         assert_eq!(spark_intake_bytes(1, 6, 4096, 3584), 176_160_768);

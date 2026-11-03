@@ -89,7 +89,7 @@ pub use synthetic::{
     synthetic_expert_response,
 };
 pub use verbs::{
-    DeviceLanding, FlowProbesOnly, GpuLandingProbe, LandingSlice, LocalVerbsExpertConnection,
+    DeviceLanding, FlowProbesOnly, GpuLandingProbe, GpuLandingRegistrationError, LandingSlice, LocalVerbsExpertConnection,
     RingBudget, RingReservation, StagingArena, copy_pool_parallel, VerbsHostMappedRdmaPollStats,
     VerbsHostMappedRdmaRing, VerbsHostMappedRdmaRingConfig, VerbsHostMappedRdmaSlot,
     VerbsHostNativeEndpointDescriptor, VerbsHostProtocolV2EndpointPlan,

@@ -3825,12 +3825,27 @@ cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t by
   if (offset > size || bytes > size - offset) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing range exceeds its allocation");
   }
+  // CUDA exports require host-page alignment, including allocations that the
+  // driver suballocated within a larger chunk. Never export a neighbor's range.
+  const long host_page = sysconf(_SC_PAGESIZE);
+  if (host_page <= 0 || base % static_cast<size_t>(host_page) != 0 ||
+      size % static_cast<size_t>(host_page) != 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing allocation is not host-page aligned; base=" +
+        std::to_string(base) + " bytes=" + std::to_string(size) + " host page=" + std::to_string(host_page));
+  }
   int fd = -1;
   result = cuMemGetHandleForAddressRange(&fd, base, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
   if (result != CUDA_SUCCESS || fd < 0) {
+    const char* name = "unknown";
+    cuGetErrorName(result, &name);
+    int device = -1;
+    cudaGetDevice(&device);
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
-                "cuMemGetHandleForAddressRange(DMA_BUF_FD) failed (" +
-                    std::to_string(static_cast<int>(result)) + ")");
+                "cuMemGetHandleForAddressRange(DMA_BUF_FD) failed (CUDA " +
+                    std::to_string(static_cast<int>(result)) + " " + (name ? name : "unknown") +
+                    "); device=" + std::to_string(device) + " allocation base=" + std::to_string(base) +
+                    " bytes=" + std::to_string(size) + " requested ptr=" +
+                    std::to_string(reinterpret_cast<uint64_t>(ptr)) + " bytes=" + std::to_string(bytes));
   }
   ibv_mr* mr = ibv_reg_dmabuf_mr(pd, offset, bytes, reinterpret_cast<uint64_t>(ptr), fd,
                                  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_RELAXED_ORDERING);

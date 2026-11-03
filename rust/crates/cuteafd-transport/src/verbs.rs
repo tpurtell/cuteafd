@@ -1,7 +1,7 @@
 mod registered_response;
 mod send_queue;
 mod landing;
-pub use landing::{gpu_landing_probe, DeviceLanding, GpuLandingProbe, LandingSlice};
+pub use landing::{gpu_landing_probe, DeviceLanding, GpuLandingProbe, GpuLandingRegistrationError, LandingSlice};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
 mod egress;
 pub use egress::StagingArena;
@@ -2238,7 +2238,10 @@ impl VerbsHostProtocolV2PersistentClientSession {
         }
         endpoint.connect_with_flow_label(&ready.server_native_endpoint, flow_label)?;
         // Before any receive is posted, so every response slot scatters alike.
-        let gpu_landing = landing.is_some_and(|landing| landing::attach(&endpoint, landing, addr));
+        let gpu_landing = if let Some(landing) = landing {
+            landing::attach(&endpoint, landing, addr)?;
+            true
+        } else { false };
         // A placed landing posts each receive with its request (at that
         // wave's slice); everything else keeps the whole ring posted.
         let placed_landing = gpu_landing && landing.is_some_and(|landing| landing.placed);

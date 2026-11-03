@@ -428,7 +428,8 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         if rank == 0 {
             if inputs.skip_routed_experts {
                 rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Transport, "diagnostic zero expert planes",
-                    SKIP_RANKS as u64 * (inputs.prefill_rows.max(DECODE_ROWS) * cfg.hidden as u64 * 2).max(FLOOR),
+                    crate::serving_capacity::spark_intake_bytes(1, SKIP_RANKS as u64,
+                        inputs.prefill_rows.max(DECODE_ROWS), cfg.hidden as u64),
                     Basis::Formula)));
             }
             if inputs.spark_ranks > 0 {
@@ -438,7 +439,8 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                     prefill_span(inputs.prefill_rows, inputs.prefill_lanes),
                     inputs.spark_ranks as u64, cfg.hidden as u64);
                 rows.push(GlmBufferRow::new(GlmComponent::SparkExperts, Demand::new(gpu, Category::Transport, "Spark intake planes",
-                    inputs.spark_ranks as u64 * DECODE_ROWS * cfg.hidden as u64 * 2 + prefill, Basis::Formula)));
+                    crate::serving_capacity::spark_intake_bytes(1, inputs.spark_ranks as u64,
+                        DECODE_ROWS, cfg.hidden as u64) + prefill, Basis::Formula)));
             }
         }
         pool_overhead.push(table_bytes);
@@ -1226,7 +1228,8 @@ mod tests {
         let h = cfg.hidden as u64;
         assert_eq!(term(&split, "steps") - term(&ordinary, "steps"),
             2 * 123456);
-        assert_eq!(term(&split, "Spark intake planes"), 4 * (DECODE_ROWS + base.prefill_rows) * h * 2);
+        let intake = |rows| crate::serving_capacity::spark_intake_bytes(1, 4, rows, h);
+        assert_eq!(term(&split, "Spark intake planes"), intake(DECODE_ROWS) + intake(base.prefill_rows));
         for lanes in 1..=4 {
             let mut parallel = native.clone(); parallel.prefill_lanes = lanes;
             let mut ordinary = base.clone(); ordinary.prefill_lanes = lanes;
@@ -1234,9 +1237,8 @@ mod tests {
             assert_eq!(term(&request(&parallel).unwrap(), "steps")
                 - term(&request(&ordinary).unwrap(), "steps"), 2 * 123456);
             // One reserve range per rank every admitted depth is cut from.
-            let prefill = prefill_span(parallel.prefill_rows, lanes) * 4 * h * 2;
-            assert_eq!(term(&request(&parallel).unwrap(), "Spark intake planes"),
-                4 * DECODE_ROWS * h * 2 + prefill);
+            let prefill = intake(prefill_span(parallel.prefill_rows, lanes));
+            assert_eq!(term(&request(&parallel).unwrap(), "Spark intake planes"), intake(DECODE_ROWS) + prefill);
         }
         for gpus in 1..=2 {
             let mut drafting = native.clone();

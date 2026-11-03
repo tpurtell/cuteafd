@@ -27,8 +27,9 @@
 //! copy engine or receive-slot retention, and prefill lanes overlap each
 //! wave's wire time with the other lanes' GPU work, so a wave's standalone
 //! landing time (18 ms for V4 Pro TP6's 352 MB) is not on the critical path.
-//! Any `gpu` failure (no dma-buf, no registration, GPUDirect writes not
-//! ordered for kernels) falls back to `pinned` and says why.
+//! An unusable capability probe selects `pinned` and says why. Once `gpu`
+//! is selected, range alignment or registration failure refuses startup;
+//! the selected path never silently changes to pinned receives.
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
@@ -472,9 +473,16 @@ impl<'a> SparkIntake<'a> {
         ensure!((1..=4).contains(&waves), "Spark intake admits 1..=4 return slots");
         let geometry = SlotGeometry::new(waves, rows)?;
         let reserve_rows = geometry.reserve_rows();
-        let plane_bytes = rows * row_bytes;
-        let planes = (0..ranks).map(|_| DeviceAllocation::new(library, (reserve_rows * row_bytes).max(256)))
-            .collect::<Result<Vec<_>>>()?;
+        let plane_bytes = rows.checked_mul(row_bytes).context("Spark intake plane size overflow")?;
+        let logical_bytes = reserve_rows.checked_mul(row_bytes).context("Spark intake reserve size overflow")?;
+        let reserve_bytes = usize::try_from(cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+            u64::try_from(logical_bytes.max(256))?)?)?;
+        let planes = (0..ranks).map(|rank| {
+            let plane = DeviceAllocation::new(library, reserve_bytes)?;
+            tracing::info!(rank, waves, rows, row_bytes, logical_bytes, allocation_bytes = reserve_bytes,
+                ptr = ?plane.buffer.ptr, "allocated Spark intake reserve");
+            Ok(plane)
+        }).collect::<Result<Vec<_>>>()?;
         // Host mode stages every wave; pinned mode only small ones (see `stages`).
         let staging = match mode {
             IntakeMode::Host => Some(RefCell::new(HostAllocation::new(library, ranks * plane_bytes)?)),
@@ -1804,6 +1812,23 @@ impl Drop for SparkLink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padded_partial_reserve_keeps_logical_wave_offsets_and_plan_charge() -> Result<()> {
+        let (waves, rows, row_bytes, ranks) = (3, 2752, 34_864, 6);
+        let geometry = SlotGeometry::new(waves, rows)?;
+        let logical = geometry.reserve_rows() * row_bytes;
+        let backing = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(logical as u64)?;
+        assert!(backing > logical as u64);
+        for slot in 0..waves {
+            let (offset, bytes) = geometry.slice(slot, row_bytes);
+            assert_eq!((offset, bytes), (slot * rows * row_bytes, rows * row_bytes));
+            assert!((offset + bytes) as u64 <= backing);
+        }
+        assert_eq!(cuteafd_loader::serving_capacity::prefill_return_bytes(
+            waves as u64, rows as u64, ranks, row_bytes as u64 / 2), ranks * backing);
+        Ok(())
+    }
 
     fn probe(gpu_gbps: f64) -> GpuLandingProbe {
         GpuLandingProbe {
