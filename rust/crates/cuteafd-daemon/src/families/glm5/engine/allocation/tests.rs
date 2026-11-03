@@ -585,8 +585,6 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             assert!(engine.expert_receipts().is_err(), "shared experts must match target layer inventory");
             engine.cfg.first_moe_layer -= 1;
         }
-        fixture.finish_ordered_uploads(&library)?;
-        library.release_sync_h2d_staging()?;
         // Emulate the actual warmup metadata writers without launching a numerical kernel.
         for rank in 0..2 {
             let decode = if rank == 0 {
@@ -622,6 +620,24 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             actual.extend(engine.expert_receipts()?);
             Ok(actual)
         };
+        let ordered_owners = || -> Result<BTreeMap<String, (Allocation, u64)>> {
+            Ok(engine.target_buffer_receipts()?.into_iter()
+                .filter(|receipt| receipt.allocation.location == Location::PINNED)
+                .map(|receipt| (receipt.allocation.id.clone(), (receipt.allocation, receipt.address)))
+                .collect())
+        };
+        let ordered_before = ordered_owners()?;
+        for rank in 0..2 {
+            for kind in ["decode", "prefill"] {
+                let prefix = format!("glm.target.gpu.{rank}.{kind}.upload.");
+                assert!(ordered_before.keys().any(|id| id.starts_with(&prefix)),
+                    "missing ordered {kind} stores before sync-only release on rank {rank}");
+            }
+        }
+        // Production releases load-only synchronous staging, not the reserved ordered stores.
+        assert!(library.release_sync_h2d_staging()? > 0);
+        assert_eq!(ordered_owners()?, ordered_before,
+            "sync-only staging release must preserve every ordered owner and address");
         let actual = receipts()?;
         for rank in 0..2 {
             let prefix = format!("glm.target.gpu.{rank}.");
