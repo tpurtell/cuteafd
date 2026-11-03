@@ -150,12 +150,15 @@ impl<'a> GlmContextSplit<'a> {
         -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
         use super::allocation::Census;
         use cuteafd_core::memory_layout::Category;
-        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Receipt};
+        use cuteafd_loader::placement::planner::{Allocation, CoordinatorDevices, Lifetime, Location, Receipt};
         let mut out = Vec::new();
+        let physical_devices = engine.census_physical_devices()?;
+        let devices = CoordinatorDevices::new(&physical_devices)?;
         let storage = self.exchange.allocation_buffers();
         for (rank, r) in self.ranks.iter().enumerate() {
             let mut census = Census {
                 prefix: format!("glm.exchange.rank.{rank}"), receipts: Vec::new(),
+                devices, rank: u8::try_from(rank)?,
             };
             for (name, buffer, category) in [
                 ("exchange", storage[rank], Category::Transport),

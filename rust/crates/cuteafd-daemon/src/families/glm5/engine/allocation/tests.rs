@@ -297,7 +297,7 @@ fn actual_exchange_owners_match_independent_contract() -> Result<()> {
         let receive_bytes = if !abort { vec![512; 3] } else { sizes.clone() };
         let extent = if reverse { 65 } else { 4096 };
         let buffers = ExchangeBuffers {
-            devices: devices.map(|device| device as u8),
+            physical_devices: devices,
             maximum_pages: 128,
             receive_bytes: receive_bytes
                 .into_iter()
@@ -330,6 +330,12 @@ fn actual_exchange_owners_match_independent_contract() -> Result<()> {
             engine.attach_context(extent as usize, &manifest)?;
         }
         let actual = engine.exchange_receipts()?;
+        for rank in 0..2 {
+            let prefix = format!("glm.exchange.rank.{rank}.");
+            assert!(actual.iter().filter(|r| r.allocation.id.starts_with(&prefix)
+                && r.allocation.location != Location::PINNED)
+                .all(|r| r.allocation.location == Location::coordinator(rank as u8)));
+        }
         planner::reconcile(&expected, Phase::PostTargetKv, &actual)?;
         assert_eq!(
             actual
@@ -376,7 +382,7 @@ fn actual_exchange_owners_match_independent_contract() -> Result<()> {
                     broken[0].allocation.bytes += 1;
                     broken[1].allocation.bytes -= 1;
                 }
-                4 => broken[0].allocation.location = Location::coordinator((1 - devices[0]) as u8),
+                4 => broken[0].allocation.location = Location::coordinator(1),
                 5 => broken[0].address = 0,
                 _ => broken[1].address = broken[0].address,
             }
@@ -410,12 +416,12 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
     let directory = tempfile::tempdir_in(fixture.directory())?;
     let path = directory.path().join("embedding.bf16");
     std::fs::write(&path, vec![0; cfg.vocab_size * cfg.hidden * 2])?;
-    for (partitioned, owned, waves, full, pages, native, core) in [
+    for ((partitioned, owned, waves, full, pages, native, core), devices) in [
         (false, false, 1, false, 2, false, false),
         (true, false, 3, true, 64, false, false),
         (false, true, 3, false, 66, false, false),
         (false, false, 3, false, 2, true, true),
-    ] {
+    ].into_iter().flat_map(|case| [[0, 1], [1, 0]].map(|devices| (case, devices))) {
         let library = fixture.load()?;
         fixture.quiet_events(&library, true)?;
         fixture.immediate_copies(&library)?;
@@ -426,7 +432,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
         let programs = library.programs()?;
         // Only metadata and real allocation constructors run; no numerical program launches.
         assert!(programs.spec("glm_index_producer_m64").is_ok());
-        library.cuda_set_device(0)?;
+        library.cuda_set_device(devices[0])?;
         let owners = owned.then_some([0, 1]);
         let owners = owners.as_ref().map(|a| a.as_slice());
         let shape = PrefillShape { rows: 128, waves };
@@ -466,10 +472,10 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             partitioned.then_some(GlmContext::default()),
         )?;
         engine.full_prefill_logits = full;
-        let layers = crate::shared::peer_split::on_device(&library, 1, || {
+        let layers = crate::shared::peer_split::on_device(&library, devices[1], || {
             GlmLayer::allocation_fixture(&library, &cfg, 1, owners)
         })?;
-        engine.attach_peer(1, stream, layers)?;
+        engine.attach_peer(devices[1], stream, layers)?;
         if native {
             // Only an ownership marker is loaded; no numerical native programs run.
             engine.weights.layers[0]
@@ -498,7 +504,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             for rank in 0..2 {
                 let device = crate::shared::memory::device::Device {
                     library: &library,
-                    id: rank as i32,
+                    id: devices[rank],
                 };
                 let layout = core_layout(&cfg, shape.rows as usize)?;
                 let allocate = |index: usize| {
@@ -567,6 +573,12 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             Ok(actual)
         };
         let actual = receipts()?;
+        for rank in 0..2 {
+            let prefix = format!("glm.target.gpu.{rank}.");
+            assert!(actual.iter().filter(|r| r.allocation.id.starts_with(&prefix)
+                && r.allocation.location != Location::PINNED)
+                .all(|r| r.allocation.location == Location::coordinator(rank as u8)));
+        }
         planner::reconcile(&expected, Phase::Warmup, &actual)?;
         if core {
             let slots = engine.prefill_slots.borrow();
@@ -574,7 +586,7 @@ fn actual_target_buffers_and_aliases_match_independent_contract() -> Result<()> 
             drop(slots);
             let device = crate::shared::memory::device::Device {
                 library: &library,
-                id: 0,
+                id: devices[0],
             };
             let layout = core_layout(&cfg, shape.rows as usize)?;
             let projection = layout.prefill.as_ref().unwrap();

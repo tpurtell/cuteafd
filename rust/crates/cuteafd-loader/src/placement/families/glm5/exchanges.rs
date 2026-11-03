@@ -3,7 +3,7 @@
 use super::{GlmContext, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_PAGE_BYTES};
 use crate::families::glm5::GlmDsaConfig;
 use crate::placement::planner::{
-    Allocation, ByteCurve, Component, Lifetime, Location, PrefillShape, Refusal,
+    Allocation, ByteCurve, Component, CoordinatorDevices, Lifetime, Location, PrefillShape, Refusal,
 };
 use cuteafd_core::memory_layout::Category;
 
@@ -12,7 +12,7 @@ const FLOOR: u64 = 256;
 #[derive(Debug, Clone)]
 pub struct ExchangeBuffers {
     /// Rank identity is independent of the physical device that owns its storage.
-    pub devices: [u8; 2],
+    pub physical_devices: [i32; 2],
     pub maximum_pages: u64,
     pub receive_bytes: Vec<u64>,
     pub terminal_abort: bool,
@@ -33,9 +33,8 @@ fn mul(a: u64, b: u64) -> Result<u64, Refusal> {
 
 impl ExchangeBuffers {
     pub fn components(&self, cfg: &GlmDsaConfig) -> Result<Vec<Component>, Refusal> {
+        let devices = CoordinatorDevices::new(&self.physical_devices)?;
         if self.maximum_pages == 0
-            || self.devices[0] == self.devices[1]
-            || self.devices.iter().any(|&device| device > 1)
             || self.receive_bytes.is_empty()
             || self
                 .receive_bytes
@@ -54,7 +53,8 @@ impl ExchangeBuffers {
         )?
         .max(FLOOR);
         let mut out = Vec::new();
-        for (rank, &device) in self.devices.iter().enumerate() {
+        for &device in &self.physical_devices {
+            let rank = devices.logical_rank(device)?;
             let prefix = format!("glm.exchange.rank.{rank}");
             let mut add = |name: &str, location: Location, bytes: u64, category: Category| {
                 out.push(Component::allocation(
@@ -71,7 +71,7 @@ impl ExchangeBuffers {
                     self.maximum_pages,
                 ));
             };
-            let location = Location::coordinator(device);
+            let location = devices.location(device)?;
             for (slot, &bytes) in self.receive_bytes.iter().enumerate() {
                 add(
                     &format!("peer.recv.{slot}"),
@@ -191,7 +191,7 @@ mod tests {
         (
             GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap(),
             ExchangeBuffers {
-                devices: [1, 0],
+                physical_devices: [1, 0],
                 maximum_pages: 128,
                 receive_bytes: vec![16, 512],
                 terminal_abort: false,
@@ -243,7 +243,7 @@ mod tests {
                     );
                     assert!(rank_owners
                         .iter()
-                        .all(|a| a.location == Location::coordinator(buffers.devices[rank])));
+                        .all(|a| a.location == Location::coordinator(rank as u8)));
                     for (name, bytes) in [("recv.0", 256), ("recv.1", 512), ("control", 256)] {
                         assert_eq!(
                             rank_owners
@@ -342,9 +342,9 @@ mod tests {
             .components(&cfg)
             .is_err());
         }
-        for devices in [[0, 0], [0, 2]] {
+        for physical_devices in [[0, 0], [0, -1]] {
             assert!(ExchangeBuffers {
-                devices,
+                physical_devices,
                 ..buffers.clone()
             }
             .components(&cfg)

@@ -92,7 +92,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
         recipe.exchanges.push(Case {
             when: vec![When::Prefill(shape)],
             value: ExchangeBuffers {
-                devices: [0, 1],
+                physical_devices: [0, 1],
                 maximum_pages: recipe.maximum_pages,
                 receive_bytes: vec![shape.rows * cfg.hidden as u64 * 2; (4 * shape.waves) as usize],
                 terminal_abort: true,

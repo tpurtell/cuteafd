@@ -1,6 +1,24 @@
 use super::*;
 use crate::placement::FfnMode;
 
+#[test]
+fn coordinator_devices_preserve_logical_rank_for_reversed_and_sparse_ordinals() {
+    for physical in [[0, 1], [1, 0], [7, 3]] {
+        let devices = CoordinatorDevices::new(&physical).unwrap();
+        for (rank, device) in physical.into_iter().enumerate() {
+            assert_eq!(devices.logical_rank(device).unwrap(), rank as u8);
+            assert_eq!(devices.location(device).unwrap(), Location::coordinator(rank as u8));
+            assert_eq!(devices.physical_device(rank as u8).unwrap(), device);
+        }
+        assert!(devices.logical_rank(9).is_err());
+        assert!(devices.physical_device(2).is_err());
+    }
+    for physical in [&[][..], &[0, 0], &[-1, 0], &[0, 1, 2]] {
+        assert!(CoordinatorDevices::new(physical).is_err());
+    }
+    assert_eq!(CoordinatorDevices::new(&[1]).unwrap().location(1).unwrap(), Location::coordinator(0));
+}
+
 fn budget(bytes: u64) -> Budget {
     Budget {
         id: "gpu".into(),

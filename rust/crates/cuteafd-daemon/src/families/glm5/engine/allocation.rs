@@ -2,14 +2,16 @@
 //! This is not a complete family census and cannot by itself authorize Ready.
 use super::*;
 use cuteafd_core::memory_layout::Category;
-use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Phase, Receipt, View};
+use cuteafd_loader::placement::planner::{Allocation, CoordinatorDevices, Lifetime, Location, Phase, Receipt, View};
 use std::collections::BTreeMap;
 
-pub(super) struct Census {
+pub(super) struct Census<'a> {
     pub(super) prefix: String,
     pub(super) receipts: Vec<Receipt>,
+    pub(super) devices: CoordinatorDevices<'a>,
+    pub(super) rank: u8,
 }
-impl Census {
+impl Census<'_> {
     fn buffer(
         &mut self,
         id: &str,
@@ -27,11 +29,12 @@ impl Census {
         category: Category,
         source: &str,
     ) -> Result<()> {
-        let device = u8::try_from(buffer.device_id).context("GLM buffer physical device")?;
+        let rank = self.devices.logical_rank(buffer.device_id)?;
+        ensure!(rank == self.rank, "GLM buffer belongs to the wrong logical rank");
         self.receipts.push(Receipt {
             allocation: Allocation::buffer(
                 format!("{}.{id}", self.prefix),
-                Location::coordinator(device),
+                self.devices.location(buffer.device_id)?,
                 buffer.bytes as u64,
                 lifetime,
                 category,
@@ -105,6 +108,7 @@ impl Census {
             let mut actual = Census {
                 prefix: self.prefix.clone(),
                 receipts: Vec::new(),
+                devices: self.devices, rank: self.rank,
             };
             if let Some(native) = &w.native_dense {
                 for (name, buffer) in native.allocation_buffers() {
@@ -353,12 +357,19 @@ impl Census {
 }
 
 impl GlmEngine<'_> {
+    pub(super) fn census_physical_devices(&self) -> Result<Vec<i32>> {
+        (0..self.ranks()).map(|rank| self.exchange_device(rank)).collect()
+    }
+
     pub(crate) fn exchange_receipts(&self) -> Result<Vec<Receipt>> {
         let mut out = Vec::new();
+        let physical_devices = self.census_physical_devices()?;
+        let devices = CoordinatorDevices::new(&physical_devices)?;
         if let Some(exchange) = &self.exchange {
             for (rank, name, buffer) in exchange.allocation_buffers() {
                 let mut census = Census {
                     prefix: format!("glm.exchange.rank.{rank}"), receipts: Vec::new(),
+                    devices, rank: u8::try_from(rank)?,
                 };
                 census.record(&name, buffer, Lifetime::TARGET, Category::Transport, "GLM exchanges")?;
                 out.extend(census.receipts);
@@ -372,6 +383,8 @@ impl GlmEngine<'_> {
 
     pub(crate) fn target_hook_receipts(&self) -> Result<Vec<Receipt>> {
         let mut out = Vec::new();
+        let physical_devices = self.census_physical_devices()?;
+        let devices = CoordinatorDevices::new(&physical_devices)?;
         for rank in 0..self.ranks() {
             let (decode, prefill) = if rank == 0 {
                 (&self.decode_workspace, &self.prefill_slots)
@@ -379,10 +392,11 @@ impl GlmEngine<'_> {
                 let peer = self.peer()?;
                 (&peer.decode_workspace, &peer.prefill_slots)
             };
-            let device = u8::try_from(self.exchange_device(rank)?).context("GLM hook device")?;
+            let logical_rank = devices.logical_rank(self.exchange_device(rank)?)?;
             let mut census = Census {
-                prefix: format!("glm.target.gpu.{device}"),
+                prefix: format!("glm.target.gpu.{logical_rank}"),
                 receipts: Vec::new(),
+                devices, rank: logical_rank,
             };
             if let Some(w) = decode.borrow().as_ref() {
                 census.hooks("decode", std::slice::from_ref(w))?;
@@ -437,6 +451,8 @@ impl GlmEngine<'_> {
 
     pub(crate) fn target_buffer_receipts(&self) -> Result<Vec<Receipt>> {
         let mut out = Vec::new();
+        let physical_devices = self.census_physical_devices()?;
+        let devices = CoordinatorDevices::new(&physical_devices)?;
         for rank in 0..self.ranks() {
             let (kv, index, rope, decode, prefill) = if rank == 0 {
                 (
@@ -456,11 +472,11 @@ impl GlmEngine<'_> {
                     &peer.prefill_slots,
                 )
             };
-            let device =
-                u8::try_from(rope.buffer.device_id).context("GLM target physical device")?;
+            let logical_rank = devices.logical_rank(self.exchange_device(rank)?)?;
             let mut census = Census {
-                prefix: format!("glm.target.gpu.{device}"),
+                prefix: format!("glm.target.gpu.{logical_rank}"),
                 receipts: Vec::new(),
+                devices, rank: logical_rank,
             };
             for (layer, buffer) in kv.iter().enumerate() {
                 census.buffer(

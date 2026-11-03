@@ -70,6 +70,38 @@ impl Location {
     };
 }
 
+/// Logical coordinator ranks in launch order, independent of CUDA ordinals.
+#[derive(Debug, Clone, Copy)]
+pub struct CoordinatorDevices<'a> {
+    physical: &'a [i32],
+}
+impl<'a> CoordinatorDevices<'a> {
+    pub fn new(physical: &'a [i32]) -> Result<Self, Refusal> {
+        if !(1..=2).contains(&physical.len())
+            || physical.iter().any(|&device| device < 0)
+            || physical.iter().collect::<BTreeSet<_>>().len() != physical.len()
+        {
+            return Err(Refusal::InvalidFact("distinct physical devices required for coordinator ranks".into()));
+        }
+        Ok(Self { physical })
+    }
+
+    pub fn logical_rank(self, physical: i32) -> Result<u8, Refusal> {
+        self.physical.iter().position(|&device| device == physical)
+            .map(|rank| rank as u8)
+            .ok_or_else(|| Refusal::InvalidFact(format!("physical device {physical} is outside coordinator ranks")))
+    }
+
+    pub fn physical_device(self, rank: u8) -> Result<i32, Refusal> {
+        self.physical.get(usize::from(rank)).copied()
+            .ok_or_else(|| Refusal::InvalidFact(format!("unknown coordinator rank {rank}")))
+    }
+
+    pub fn location(self, physical: i32) -> Result<Location, Refusal> {
+        Ok(Location::coordinator(self.logical_rank(physical)?))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operation {
     Serving,

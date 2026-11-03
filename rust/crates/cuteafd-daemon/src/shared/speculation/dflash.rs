@@ -982,6 +982,7 @@ fn draft_owner_events(
     audit: &[cuteafd_ffi::memory_ledger::AllocationEvent],
     receipts: &[cuteafd_loader::placement::planner::Receipt],
     device: i32,
+    devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
     phase: cuteafd_loader::placement::planner::Phase,
     namespace: &str,
 ) -> Result<Vec<cuteafd_loader::placement::planner::OwnerEvent>> {
@@ -997,7 +998,7 @@ fn draft_owner_events(
         let location = match record.key.space {
             Space::Device => {
                 ensure!(record.key.device == device, "draft owner allocated on wrong physical device");
-                Location::coordinator(u8::try_from(device)?)
+                devices.location(record.key.device)?
             }
             Space::Pinned => Location::PINNED,
             Space::Managed => anyhow::bail!("unexpected managed draft owner"),
@@ -1742,17 +1743,18 @@ impl<'a> DflashDrafter<'a> {
     /// The family appends these physical edges to its resolved-plan history;
     /// a drafter subrecipe alone never authorizes family capacity or Ready.
     pub(crate) fn gqa_allocation_events(&self, audit: &[cuteafd_ffi::memory_ledger::AllocationEvent],
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
         phase: cuteafd_loader::placement::planner::Phase)
         -> Result<Vec<cuteafd_loader::placement::planner::OwnerEvent>> {
         use cuteafd_loader::placement::planner::Phase;
-        let device = self.library.cuda_get_device()?;
-        let receipts = self.gqa_allocation_receipts(u8::try_from(device)?, phase >= Phase::Warmup)?;
-        draft_owner_events(audit, &receipts, device, phase, "draft.gqa")
+        let device = self.fused.buffer.device_id;
+        let receipts = self.gqa_allocation_receipts(devices, phase >= Phase::Warmup)?;
+        draft_owner_events(audit, &receipts, device, devices, phase, "draft.gqa")
     }
 
     /// Independent GQA census: read retained fields and native buffers, never
     /// manufacture physical receipts from the forecast descriptor inventory.
-    pub(crate) fn gqa_allocation_receipts(&self, gpu: u8, metadata: bool)
+    pub(crate) fn gqa_allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>, metadata: bool)
         -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Phase, Receipt};
@@ -1762,13 +1764,17 @@ impl<'a> DflashDrafter<'a> {
         };
         let c = &self.cfg;
         let (h, kv, attention) = (c.hidden, c.kv_width(), c.heads * c.head_dim);
+        let physical_device = self.fused.buffer.device_id;
+        let location = devices.location(physical_device)?;
+        let mut wrong_device = false;
         let mut receipts = Vec::new();
         let mut uploads = Vec::new();
         let mut add = |id: String, buffer: CuteafdDeviceBuffer, dtype: &str, shape: Vec<usize>, first| {
             if ["context_positions", "context_slots", "positions", "anchors", "ids", "tables"].contains(&id.as_str()) {
                 uploads.push((id.clone(), buffer));
             }
-            let mut allocation = Allocation::buffer(format!("draft.gqa.{id}"), Location::coordinator(gpu),
+            wrong_device |= buffer.device_id != physical_device;
+            let mut allocation = Allocation::buffer(format!("draft.gqa.{id}"), location,
                 buffer.bytes as u64, Lifetime { first, last: Phase::Growth }, Category::Drafter, "GQA DFlash owner");
             allocation.dtype = dtype.into();
             allocation.shape = shape.into_iter().map(|n| n as u64).collect();
@@ -1863,11 +1869,12 @@ impl<'a> DflashDrafter<'a> {
                     Category::Drafter, "GQA DFlash owner"), address: buffer.ptr as u64 });
             }
         }
+        ensure!(!wrong_device, "retained draft owner allocated on wrong physical device");
         Ok(receipts)
     }
 
     /// Independent typed census of retained fields, never the forecast owner list.
-    fn mla_allocation_receipts(&self, gpu: u8, metadata: bool)
+    fn mla_allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>, metadata: bool)
         -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Phase, Receipt};
@@ -1878,6 +1885,9 @@ impl<'a> DflashDrafter<'a> {
         let c = &self.cfg;
         let m = &context.cfg.mla;
         let life = Lifetime { first: Phase::Load, last: Phase::Growth };
+        let physical_device = self.fused.buffer.device_id;
+        let location = devices.location(physical_device)?;
+        let mut wrong_device = false;
         let mut receipts = Vec::new();
         let mut uploads = Vec::new();
         let mut add = |id: String, buffer: CuteafdDeviceBuffer, dtype: &str, shape: Vec<usize>| {
@@ -1885,7 +1895,8 @@ impl<'a> DflashDrafter<'a> {
                 "native_slots", "lengths", "query_offsets"].contains(&id.as_str()) || id.ends_with(".page_table") {
                 uploads.push((id.clone(), buffer));
             }
-            let mut allocation = Allocation::buffer(format!("draft.mla.{id}"), Location::coordinator(gpu),
+            wrong_device |= buffer.device_id != physical_device;
+            let mut allocation = Allocation::buffer(format!("draft.mla.{id}"), location,
                 buffer.bytes as u64, life, Category::Drafter, "MLA DFlash owner");
             allocation.dtype = dtype.into();
             allocation.shape = shape.into_iter().map(|n| n as u64).collect();
@@ -1998,6 +2009,7 @@ impl<'a> DflashDrafter<'a> {
                     address: buffer.ptr as u64 });
             }
         }
+        ensure!(!wrong_device, "retained draft owner allocated on wrong physical device");
         Ok(receipts)
     }
 
@@ -2005,11 +2017,14 @@ impl<'a> DflashDrafter<'a> {
         audit: &[cuteafd_ffi::memory_ledger::AllocationEvent]) -> Result<()> {
         use cuteafd_loader::placement::planner::{self, Phase};
         let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
-        let device = self.library.cuda_get_device()?;
-        let gpu = u8::try_from(device)?;
-        let receipts = self.mla_allocation_receipts(gpu, phase >= Phase::Warmup)?;
+        let device = self.fused.buffer.device_id;
+        // The legacy MLA bridge is one local logical rank, even on CUDA ordinal 1.
+        let physical_devices = [device];
+        let devices = planner::CoordinatorDevices::new(&physical_devices)?;
+        let gpu = devices.logical_rank(device)?;
+        let receipts = self.mla_allocation_receipts(devices, phase >= Phase::Warmup)?;
         let mut events = self.legacy_mla_events.borrow().clone();
-        events.extend(draft_owner_events(audit, &receipts, device, phase, "draft.mla")?);
+        events.extend(draft_owner_events(audit, &receipts, device, devices, phase, "draft.mla")?);
         planner::reconcile_legacy_mla_events(&context.layout.legacy_mla_facts(gpu), phase, &events)?;
         let mut retained = std::collections::BTreeMap::new();
         for event in &events {
@@ -3651,7 +3666,11 @@ mod checkpoint_header_tests {
                 let library = fixture.load()?;
                 fixture.quiet_events(&library, true)?;
                 fixture.immediate_copies(&library)?;
-                fixture.configure_memory(&library, 0, 8 << 30)?;
+                let device = i32::from(representation == GlmDraftRepresentation::Fp8Only);
+                library.cuda_set_device(device)?;
+                fixture.configure_memory(&library, device, 8 << 30)?;
+                let physical_devices = [device];
+                let devices = planner::CoordinatorDevices::new(&physical_devices)?;
                 let programs = library.programs()?.with_manifest(&manifest)?;
                 let layout = native.runtime_layout(representation, GlmDraftCapacity::new(2, 2, 8)?,
                     8192, 16384, 1, 2, cache)?;
@@ -3665,9 +3684,9 @@ mod checkpoint_header_tests {
                 assert!(planner::reconcile_legacy_mla_events(&facts, Phase::Warmup, &load).is_err());
                 let audit = AllocationAudit::start();
                 draft.prime_metadata()?;
-                let receipts = draft.mla_allocation_receipts(0, true)?;
+                let receipts = draft.mla_allocation_receipts(devices, true)?;
                 let mut events = load;
-                events.extend(draft_owner_events(&audit.events(), &receipts, 0, Phase::Warmup, "draft.mla")?);
+                events.extend(draft_owner_events(&audit.events(), &receipts, device, devices, Phase::Warmup, "draft.mla")?);
                 planner::reconcile_legacy_mla_events(&facts, Phase::Warmup, &events)?;
                 assert!(planner::reconcile_legacy_mla_events(&facts, Phase::Ready, &events).is_err());
                 let mut wrong = events.clone();
@@ -3734,7 +3753,11 @@ mod checkpoint_header_tests {
                     let library = fixture.load()?;
                     fixture.quiet_events(&library, true)?;
                     fixture.immediate_copies(&library)?;
-                    fixture.configure_memory(&library, 0, 8 << 30)?;
+                    let device = i32::from(representation == GlmDraftRepresentation::Fp8Only);
+                    library.cuda_set_device(device)?;
+                    fixture.configure_memory(&library, device, 8 << 30)?;
+                    let physical_devices = [device];
+                    let devices = planner::CoordinatorDevices::new(&physical_devices)?;
                     let layout = cfg.runtime_layout(representation, GlmDraftCapacity::new(2, 2, 8)?)?;
                     // Shared library store has its own admission, not another private drafter owner.
                     crate::shared::memory::budget::reserve_sync_h2d(&library, layout.sync_upload_bytes())?;
@@ -3760,7 +3783,7 @@ mod checkpoint_header_tests {
                     let draft = DflashDrafter::load(&library, &programs, &snapshot, std::fs::read(snapshot.join("model.safetensors"))?,
                         std::ptr::null_mut(), 2, 2, vec![0; 256], false, representation,
                         fp8_linear::Fp8Scales::Amax, arithmetic, cache)?;
-                    let mut events = draft.gqa_allocation_events(&audit.events(), Phase::Load)?;
+                    let mut events = draft.gqa_allocation_events(&audit.events(), devices, Phase::Load)?;
                     planner::reconcile_events(&plan, Phase::Load, &events, &[])?;
                     assert!(planner::reconcile_events(&plan, Phase::Warmup, &events, &[]).is_err());
                     let source_ids = events.iter().filter_map(|event| match event {
@@ -3771,9 +3794,9 @@ mod checkpoint_header_tests {
                     drop(audit);
                     let warmup = AllocationAudit::start();
                     *draft.workspace.borrow_mut() = Some(draft.workspace(2)?);
-                    events.extend(draft.gqa_allocation_events(&warmup.events(), Phase::Warmup)?);
+                    events.extend(draft.gqa_allocation_events(&warmup.events(), devices, Phase::Warmup)?);
                     planner::reconcile_events(&plan, Phase::Warmup, &events, &[])?;
-                    let receipts = draft.gqa_allocation_receipts(0, true)?;
+                    let receipts = draft.gqa_allocation_receipts(devices, true)?;
                     assert_eq!(receipts.len(), plan.facts.allocations.len());
                     assert!(receipts.iter().all(|r| !r.allocation.id.ends_with("taps.upload") && !r.allocation.id.ends_with("h.upload")));
                     let metadata = AllocationAudit::start();

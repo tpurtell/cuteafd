@@ -183,17 +183,16 @@ impl GlmWeights<'_> {
         embedding: &crate::shared::token_io::TokenEmbedding<'_>, physical_devices: &[i32])
         -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
         use cuteafd_core::memory_layout::Category;
-        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Receipt};
-        ensure!((1..=2).contains(&physical_devices.len()) && physical_devices.len() == peers.len() + 1
-                && physical_devices.iter().all(|&device| device >= 0)
-                && physical_devices.iter().collect::<std::collections::BTreeSet<_>>().len() == physical_devices.len(),
-            "GLM weight census requires distinct physical devices for every logical rank");
+        use cuteafd_loader::placement::planner::{Allocation, CoordinatorDevices, Lifetime, Location, Receipt};
+        let devices = CoordinatorDevices::new(physical_devices)?;
+        ensure!(physical_devices.len() == peers.len() + 1,
+            "GLM weight census requires a physical device for every logical rank");
         let mut receipts = Vec::new();
         let mut put = |rank: usize, id: String, buffer: CuteafdDeviceBuffer, category: Category| -> Result<()> {
-            ensure!(buffer.device_id == physical_devices[rank] && buffer.bytes > 0 && !buffer.ptr.is_null(),
+            ensure!(buffer.device_id == devices.physical_device(u8::try_from(rank)?)? && buffer.bytes > 0 && !buffer.ptr.is_null(),
                 "GLM weight owner {id} has an invalid extent or physical device");
             receipts.push(Receipt { allocation: Allocation::buffer(id,
-                Location::coordinator(u8::try_from(rank)?), buffer.bytes as u64,
+                devices.location(buffer.device_id)?, buffer.bytes as u64,
                 Lifetime::RESIDENT, category, "GLM target weights"), address: buffer.ptr as u64 });
             Ok(())
         };
