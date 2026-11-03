@@ -588,7 +588,7 @@ static int peer_copy(uint32_t kind, void *destination, const void *source,
         void *to = (char *)destination + row * destination_pitch;
         const void *from = (const char *)source + row * source_pitch;
         if (immediate_copies) memcpy(to, from, width);
-        else pending_uploads[pending_count++] = (struct upload){to, from, width};
+        else pending_uploads[pending_count++] = (struct upload){to, from, width, stream};
     }
     return 0;
 }
@@ -642,9 +642,6 @@ int cuteafd_cuda_event_create_blocking(void **out) {
     return cuteafd_cuda_event_create_ordering(out);
 }
 int cuteafd_cuda_event_create(void **out) {
-    return cuteafd_cuda_event_create_ordering(out);
-}
-int cuteafd_cuda_event_create_blocking(void **out) {
     return cuteafd_cuda_event_create_ordering(out);
 }
 
