@@ -121,6 +121,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
         "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
     let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
     let metadata = residency::MetadataInput::open(snapshot, selected)?;
+    #[cfg(test)]
+    let metadata = if uncached_census_enabled() { metadata.without_census_cache() } else { metadata };
     let set_id = metadata.identity.clone();
     let shared = shared_expert_resident(&metadata, &(cfg.first_moe_layer..cfg.layers).collect::<Vec<_>>(), gpu_count)?;
     let workspace_timer = super::DebugPhaseTimer::new("exlr8.workspace_manifest", 1);
@@ -153,8 +155,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let mut local_routed = 0u64;
     for layer in cfg.first_moe_layer..first_spark {
         for rank in 0..gpu_count {
-            local_routed = local_routed.checked_add(metadata.plan(
-                layer, gpu_count, rank, residency::ExpertSet::Routed)?.resident_bytes as u64)
+            local_routed = local_routed.checked_add(metadata.resident_bytes(
+                layer, gpu_count, rank, residency::ExpertSet::Routed)? as u64)
                 .context("EXLR8 local routed residency overflow")?;
         }
     }
@@ -260,7 +262,7 @@ pub fn routed_expert_costs(input: &residency::MetadataInput, layers: &[usize])
     served_routed_layers(input, layers)?;
     layers.iter().map(|&layer| {
         let resident = |world, rank| -> Result<Bytes2> {
-            Ok(Bytes2 { resident: u64::try_from(input.plan(layer, world, rank, ExpertSet::Routed)?.resident_bytes)?,
+            Ok(Bytes2 { resident: u64::try_from(input.resident_bytes(layer, world, rank, ExpertSet::Routed)?)?,
                 staging: 0 })
         };
         Ok(ExpertCost { whole: resident(1, 0)?, half: [resident(2, 0)?, resident(2, 1)?],
@@ -274,7 +276,7 @@ pub fn shared_expert_resident(input: &residency::MetadataInput, layers: &[usize]
     served_routed_layers(input, layers)?;
     ensure!(matches!(world, 1 | 2), "EXLR8 shared experts require one/two target ranks");
     (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
-        let bytes = u64::try_from(input.plan(layer, world, rank, residency::ExpertSet::Shared)?.resident_bytes)?;
+        let bytes = u64::try_from(input.resident_bytes(layer, world, rank, residency::ExpertSet::Shared)?)?;
         sum.checked_add(bytes).context("EXLR8 shared residency overflow")
     })).collect()
 }
@@ -301,7 +303,7 @@ fn spark_resident_bytes_of(input: &residency::MetadataInput, layers: &[usize], w
         && layers.last().copied() == extent.checked_sub(1)
         && layers.windows(2).all(|pair| pair[0] + 1 == pair[1]), "EXLR8 selected Spark suffix/rank geometry");
     (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
-        let bytes = input.plan(layer, world, rank, residency::ExpertSet::Routed)?.resident_bytes as u64;
+        let bytes = input.resident_bytes(layer, world, rank, residency::ExpertSet::Routed)? as u64;
         sum.checked_add(bytes).context("EXLR8 Spark suffix residency overflow")
     })).collect()
 }
@@ -1519,7 +1521,54 @@ mod tests {
 }
 
 #[cfg(test)]
+std::thread_local! { static UNCACHED_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+fn uncached_census_enabled() -> bool { UNCACHED_CENSUS.with(|enabled| enabled.get()) }
+
+#[cfg(test)]
 mod mounted_tests {
+    #[test]
+    #[ignore = "requires four saved GLM plans and their installed snapshots/PROGRAMS"]
+    fn memoized_census_preserves_four_saved_glm_plan_projections() {
+        use crate::plan::{ExpertPlacement, PlanInput, PlanOptions, layout::LayoutOptions};
+        let root = std::path::PathBuf::from(std::env::var_os("CUTEAFD_GLM_SAVED_PLANS").expect("CUTEAFD_GLM_SAVED_PLANS"));
+        let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_GLM_SAVED_PROGRAMS").expect("CUTEAFD_GLM_SAVED_PROGRAMS"));
+        struct Reset;
+        impl Drop for Reset { fn drop(&mut self) { super::UNCACHED_CENSUS.with(|flag| flag.set(false)); } }
+        let _reset = Reset;
+        for name in ["exlr8-min", "exlr8-max", "exl3-min", "exl3-max"] {
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join(format!("{name}.json"))).unwrap()).unwrap();
+            let input = PlanInput::open(std::path::Path::new(saved["snapshot"].as_str().unwrap())).unwrap();
+            let gpus = if name.ends_with("max") { 2 } else { 1 };
+            let options = PlanOptions {
+                placement: ExpertPlacement::Sparks { ranks: if gpus == 2 { 6 } else { 4 } },
+                attention_placement: Some(if gpus == 2 { crate::placement::AttentionPlacement::Context }
+                    else { crate::placement::AttentionPlacement::Heads }),
+                layout: Some(LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
+                    host_memory: Some((256 << 30, 256 << 30)), host_cache_bytes: Some(32 << 30),
+                    workspace_manifest: Some(programs.clone()), glm5_drafter_disabled: true, ..Default::default() }),
+                ..Default::default()
+            };
+            let plan = |uncached| {
+                super::UNCACHED_CENSUS.with(|flag| flag.set(uncached));
+                let start = std::time::Instant::now();
+                let report = if name.starts_with("exlr8") { input.exlr8_native_plan("up1", &options, "off").unwrap().report }
+                    else { input.plan(&options).unwrap() };
+                let elapsed = start.elapsed();
+                assert!(elapsed.as_secs() < 30, "{name}: {elapsed:?}");
+                println!("{name} uncached={uncached}: {elapsed:?}");
+                report
+            };
+            let cached = plan(false);
+            let uncached = plan(true);
+            assert_eq!(cached.memory_layout, uncached.memory_layout, "{name}");
+            assert_eq!(cached.bytes_by_owner, uncached.bytes_by_owner, "{name}");
+            assert_eq!(serde_json::to_value(&cached.memory_layout).unwrap(), saved["memory_layout"], "{name}");
+            assert_eq!(serde_json::to_value(&cached.bytes_by_owner).unwrap(), saved["bytes_by_owner"], "{name}");
+        }
+    }
+
     #[test]
     fn inspect_checkpoint_when_explicitly_supplied() {
         let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else {
