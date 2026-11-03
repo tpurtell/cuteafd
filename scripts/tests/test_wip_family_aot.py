@@ -344,6 +344,7 @@ def test_non_kimi_scope_does_not_enable_kimi_programs(tmp_path):
 def test_native_k6_architecture_tables_follow_existing_cmake_scope(tmp_path, kimi, glm, glmf, exlr8, families):
     cmake = ROOT / 'native/cmake/shared/dsv4_programs.cmake'
     source = tmp_path / 'CMakeLists.txt'
+    exlr8_families = ';'.join(family for family in families.split(',') if family in {'glm', 'glmf'})
     source.write_text('\n'.join([
         'cmake_minimum_required(VERSION 3.18)',
         'project(native_scope NONE)',
@@ -354,6 +355,7 @@ def test_native_k6_architecture_tables_follow_existing_cmake_scope(tmp_path, kim
         f'set(CUTEAFD_ENABLE_KIMIK3_AOT {"ON" if kimi else "OFF"})',
         f'set(CUTEAFD_ENABLE_GLM_AOT {"ON" if glm else "OFF"})',
         f'set(CUTEAFD_ENABLE_EXLR8_AOT {"ON" if exlr8 else "OFF"})',
+        f'set(CUTEAFD_EXLR8_FAMILIES "{exlr8_families}")',
         'add_custom_target(cuteafd_verify_sparkinfer_source)',
         f'include("{cmake}")',
         'file(WRITE "${CMAKE_BINARY_DIR}/scope.txt" "${CUTEAFD_PROGRAM_GEOMETRY}\\n${CUTEAFD_DSV4_EXPORT_ARGS}\\n")',
@@ -385,6 +387,7 @@ def test_glm_context_only_passes_only_supported_base_geometries(tmp_path, mode, 
         'set(CUTEAFD_GLM_GEOMETRIES "glm;glm2")', 'set(CUTEAFD_ENABLE_GLM_AOT ON)',
         f'set(CUTEAFD_ENABLE_KIMIK3_AOT {"ON" if kimi else "OFF"})',
         f'set(CUTEAFD_ENABLE_EXLR8_AOT {"ON" if exlr8 else "OFF"})',
+        'set(CUTEAFD_EXLR8_FAMILIES glm)',
         'add_custom_target(cuteafd_verify_sparkinfer_source)', f'include("{cmake}")',
         'file(WRITE "${CMAKE_BINARY_DIR}/args.txt" "${CUTEAFD_DSV4_EXPORT_ARGS}")',
     ]))
