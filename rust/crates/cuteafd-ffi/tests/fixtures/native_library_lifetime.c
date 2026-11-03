@@ -287,7 +287,8 @@ int cuteafd_alloc_host_buffer(size_t bytes, struct host_buffer *out) {
     out->ptr = malloc(bytes);
     if (!out->ptr) return 1;
     out->bytes = bytes;
-    out->flags = 1;
+    /* The production CUDA allocator and this fixture's alias export are mapped. */
+    out->flags = 1 | 4;
     event('A');
     return 0;
 }

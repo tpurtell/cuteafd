@@ -223,11 +223,14 @@ fn retained_link_composition_counts_fallback_egress_once() -> Result<()> {
             for rank in 0..ranks {
                 let send = HostAllocation::new(&library, span(send))?;
                 let recv = HostAllocation::new(&library, span(recv))?;
-                let numeric = |owner: &HostAllocation<'_>| SparkEndpointSpan {
-                    address: owner.buffer.ptr as u64, bytes: owner.buffer.bytes as u64,
-                    device_address: owner.buffer.ptr as u64, device, host_flags: owner.buffer.flags,
+                let numeric = |owner: &HostAllocation<'_>| -> Result<SparkEndpointSpan> {
+                    let alias = library.cuda_host_buffer_device_alias(owner.buffer)?;
+                    Ok(SparkEndpointSpan {
+                        address: owner.buffer.ptr as u64, bytes: owner.buffer.bytes as u64,
+                        device_address: alias.ptr as u64, device: alias.device_id, host_flags: owner.buffer.flags,
+                    })
                 };
-                snapshots.push(SparkEndpointSnapshot { rank, send: numeric(&send), recv: numeric(&recv) });
+                snapshots.push(SparkEndpointSnapshot { rank, send: numeric(&send)?, recv: numeric(&recv)? });
                 ring_owners.extend([send, recv]);
             }
             let endpoints = snapshots.iter().try_fold(Vec::new(), |mut owners, snapshot| -> Result<_> {
