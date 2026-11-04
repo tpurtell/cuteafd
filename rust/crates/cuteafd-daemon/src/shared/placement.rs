@@ -430,6 +430,48 @@ mod tests {
             rings: SparkRings { max_frame_bytes: 64 << 20, depth: 2, slot_bytes: 1 << 20, alignment: 4096 } }
     }
 
+    #[test]
+    fn coordinator_only_plan_rejects_compressed_nvfp4_weight_replies_at_admission() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_NVFP4_REPLY_ADMISSION_CHILD";
+        if let Ok(selection) = std::env::var(CHILD) {
+            use cuteafd_core::{spark_reply::{self, SparkReplyFormats}, SparkReplyFormat};
+            use cuteafd_loader::plan::testing::{glm5_config, nvfp4, write_snapshot};
+            let format: SparkReplyFormat = selection.split_once('-').unwrap().1.parse().unwrap();
+            spark_reply::set_requested(if selection.starts_with("prefill-") {
+                SparkReplyFormats { prefill: Some(format), decode: None }
+            } else { SparkReplyFormats { prefill: None, decode: Some(format) } }).unwrap();
+            let root = tempfile::tempdir()?;
+            let mut config = glm5_config();
+            config["quantization_config"] = serde_json::json!({
+                "quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16 });
+            let tensors = (0..256).flat_map(|expert| [
+                ("gate_proj", 2048, 6144), ("up_proj", 2048, 6144), ("down_proj", 6144, 2048),
+            ].into_iter().flat_map(move |(projection, n, k)|
+                nvfp4(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k))).collect::<Vec<_>>();
+            write_snapshot(root.path(), &config, &tensors, None);
+            let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+            assert_eq!(catalog.fp8().unwrap().format(), cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
+            let geometry = catalog.routed_experts().geometry()?;
+            let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 4, prefill_lanes: 1,
+                ..Default::default() };
+            let mut model = fixture_model();
+            for endpoint in &mut model.endpoints { endpoint.ingress = SparkIngress::Bf16; }
+            // No worker process is involved: coordinator admission must reject the selection itself.
+            let error = SparkAdmission::plan(root.path(), geometry, Some(&catalog), &working, 4, None, model)
+                .err().expect("compressed NVFP4-weight replies must fail coordinator admission");
+            assert!(format!("{error:#}").contains("only BF16 replies"), "{error:#}");
+            return Ok(());
+        }
+        // Reply selections are process-global; isolate each phase/codec from parallel tests.
+        for selection in ["prefill-fp8", "prefill-nvfp4", "decode-fp8", "decode-nvfp4"] {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "shared::placement::tests::coordinator_only_plan_rejects_compressed_nvfp4_weight_replies_at_admission", "--nocapture"])
+                .env(CHILD, selection).status()?;
+            ensure!(status.success(), "coordinator admission child failed for {selection}");
+        }
+        Ok(())
+    }
+
     fn check_reports(plan: &SparkAdmission) -> Result<()> {
         let reports = plan.assignments.iter().map(|assignment| {
             let mut report = idle_report(assignment.rank);
