@@ -38,6 +38,8 @@ pub(crate) fn apply_length_rule(policy: &mut cuteafd_core::DraftPolicy) {
     policy.set_survival_lengths(survival);
     policy.set_draft_mode(draft_mode());
     policy.set_row_cost(row_cost());
+    cuteafd_bench::context::set_resolved("per-layer-timing",
+        if binding::needs_timing(policy) { "on (perturbing)" } else { "off" });
 }
 
 /// How the simple rules price rows (`CUTEAFD_DRAFT_ROW_COST`, launcher key
@@ -53,7 +55,14 @@ pub(crate) fn row_cost() -> cuteafd_core::RowCost {
     })
 }
 
-/// The configured draft mode; an unknown value keeps the shared policy.
+/// Explicit device timing profiles, independent of observers and replay traces.
+pub(crate) fn timing_profile() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| ["CUTEAFD_DRAFT_TIMING", "CUTEAFD_PROTOCOL_V2_TCP_TIMING"]
+        .iter().any(|name| super::draft_policy::enabled(name)))
+}
+
+/// The configured draft mode; an unknown value keeps the simple policy.
 pub(crate) fn draft_mode() -> cuteafd_core::DraftMode {
     static MODE: std::sync::OnceLock<cuteafd_core::DraftMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {

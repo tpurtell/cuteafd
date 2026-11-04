@@ -88,6 +88,18 @@ mod tests {
     }
 
     #[test]
+    fn layer_timing_is_visible_on_cards_with_and_without_profiling() {
+        for value in ["off", "on (perturbing)"] {
+            let mut report = crate::sample::full_report();
+            report.server.configuration.settings.push(crate::report::Setting {
+                name: "per-layer-timing".into(), value: Some(value.into()), default: None, source: "resolved".into(),
+            });
+            let card = super::card::card_svg(&report);
+            assert!(card.contains(&format!("per-layer-timing={value}")), "{card}");
+        }
+    }
+
+    #[test]
     fn number_formats() {
         assert_eq!(super::grouped(2415.3), "2,415");
         assert_eq!(super::grouped(1234567.0), "1,234,567");

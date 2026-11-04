@@ -198,14 +198,20 @@ impl<'a> Admission<'a> {
         self.draft_allocated = true;
         allocate(layout)
     }
-    pub(crate) fn allocate_draft_marks(&mut self, device: Device<'a>) -> Result<Option<Rc<crate::shared::memory::device::Allocation<'a>>>> {
+    fn draft_mark_bytes(&self, device: i32) -> Result<usize> {
         let head = self.devices.len() - 1;
-        ensure!(device.id == self.devices[head] && !self.draft_marks_allocated, "Kimi draft mark allocation owner");
+        ensure!(device == self.devices[head] && !self.draft_marks_allocated, "Kimi draft mark allocation owner");
         let layout = self.draft.as_ref().context("Kimi draft marks without admitted draft")?;
         let bytes = layout.window_mark_bytes()?.checked_mul(usize::try_from(self.mark_selection.slots)?)
             .context("Kimi draft mark arena overflow")?;
         ensure!(self.placement.items[head].iter().filter(|item| item.group == DRAFT_MARKS)
-            .map(|item| item.bytes).collect::<Vec<_>>() == vec![bytes as u64], "Kimi draft mark charge differs from arena");
+            .map(|item| item.bytes).collect::<Vec<_>>() == if bytes == 0 { vec![] } else { vec![bytes as u64] },
+            "Kimi draft mark charge differs from arena");
+        Ok(bytes)
+    }
+
+    pub(crate) fn allocate_draft_marks(&mut self, device: Device<'a>) -> Result<Option<Rc<crate::shared::memory::device::Allocation<'a>>>> {
+        let bytes = self.draft_mark_bytes(device.id)?;
         self.draft_marks_allocated = true;
         (bytes > 0).then(|| crate::shared::memory::device::Allocation::new(device, bytes).map(Rc::new)).transpose()
     }
@@ -1128,6 +1134,11 @@ pub(super) mod tests {
     }
 
     fn draft_layout(slots: usize, sequences: usize, context: usize) -> MlaDraftRuntimeLayout {
+        draft_layout_with_cache(slots, sequences, context, cuteafd_core::MlaCacheFormat::Bf16)
+    }
+
+    fn draft_layout_with_cache(slots: usize, sequences: usize, context: usize,
+        cache: cuteafd_core::MlaCacheFormat) -> MlaDraftRuntimeLayout {
         use cuteafd_loader::{formats::dflash::MlaDflashConfig,
             families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation}};
         let config = serde_json::json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
@@ -1147,7 +1158,62 @@ pub(super) mod tests {
                 "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
                 "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
         MlaDflashConfig::from_json(&config).unwrap().runtime_layout(GlmDraftRepresentation::Fp8Only,
-            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), context, slots * context, 188, 2, cuteafd_core::MlaCacheFormat::Bf16).unwrap()
+            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), context, slots * context, 188, 2, cache).unwrap()
+    }
+
+    #[test]
+    fn tp1_four_onboard_draft_marks_match_omitted_zero_and_exact_positive_charges() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_core_snapshot(fixture.path(), false);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(fixture.path())?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let core = cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?;
+        for marks in [0, 1, 2] {
+            let mut i = inputs_for_ranks::<1>(&cfg);
+            i.core = core.clone();
+            i.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
+            i.rows = 2048; i.waves = 2; i.unit_rows = Some(1024); i.lanes = 1;
+            i.state_slots = 2; i.prefix_marks = marks; i.requested_pool = Some(16384);
+            i.lane_layouts = vec![[LaneLayout::for_ranks(&cfg, 2048, 1024, 8192,
+                super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }, 1)?]];
+            i.draft = Some(draft_layout_with_cache(2, 2, 8192, i.cache_format));
+            // Only checkpoint expert payload sizes are synthetic; the live shape,
+            // pool, slots, drafter and exact allocation check match the failed run.
+            i.rtx = Some(RtxInventory { package: Default::default(),
+                costs: cfg.dense.iter().map(|dense| vec![if *dense { Bytes2::default() }
+                    else { Bytes2 { resident: 1 << 20, staging: 4096 } }]).collect(),
+                workspace: 8192, layers: Onboard::Layers(4) });
+            let mut admitted = admit(i)?;
+            assert_eq!(admitted.placement.onboard_layers, 4);
+            assert_eq!(admitted.mark_selection.slots, marks as u64);
+            let bytes = admitted.draft_layout().unwrap().window_mark_bytes()? * marks;
+            let charges = admitted.placement.items[0].iter().filter(|item| item.group == DRAFT_MARKS)
+                .map(|item| item.bytes).collect::<Vec<_>>();
+            assert_eq!(charges, if marks == 0 { vec![] } else { vec![bytes as u64] });
+            assert_eq!(admitted.draft_mark_bytes(0)?, bytes);
+            assert!(admitted.draft_mark_bytes(1).is_err());
+            let original = admitted.placement.items[0].clone();
+            if marks == 0 {
+                let mut invalid = original[0].clone();
+                invalid.group = DRAFT_MARKS.into(); invalid.bytes = 0;
+                admitted.placement.items[0].push(invalid);
+                assert!(admitted.draft_mark_bytes(0).is_err());
+            } else {
+                let charge = admitted.placement.items[0].iter_mut().find(|item| item.group == DRAFT_MARKS).unwrap();
+                charge.bytes += 1;
+                assert!(admitted.draft_mark_bytes(0).is_err());
+                admitted.placement.items[0].retain(|item| item.group != DRAFT_MARKS);
+                assert!(admitted.draft_mark_bytes(0).is_err());
+                admitted.placement.items[0] = original.clone();
+                let duplicate = original.iter().find(|item| item.group == DRAFT_MARKS).unwrap().clone();
+                admitted.placement.items[0].push(duplicate);
+                assert!(admitted.draft_mark_bytes(0).is_err());
+            }
+            admitted.placement.items[0] = original;
+            admitted.draft_marks_allocated = true;
+            assert!(admitted.draft_mark_bytes(0).is_err());
+        }
+        Ok(())
     }
 
     #[test]

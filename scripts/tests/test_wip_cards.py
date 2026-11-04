@@ -561,7 +561,7 @@ def test_matched_seed_same_across_arms_new_per_pair(entry, tmp_path, monkeypatch
     jobs = json.loads((state / 'plan.json').read_text())['jobs']
     assert jobs[0]['nonce_seed'] == jobs[1]['nonce_seed']
     assert jobs[0]['nonce_seed'] != jobs[2]['nonce_seed']
-    assert all('observer' in job['entry'] for job in jobs)
+    assert all('console' not in job['probes'] and 'observer' not in job['entry'] for job in jobs)
 
 
 def test_matched_round_metrics_and_pair_hash_failure(tmp_path):
@@ -592,7 +592,7 @@ def test_matched_round_metrics_and_pair_hash_failure(tmp_path):
     assert all(row['status'] == 'pass' for row in rows)
 
 
-def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
+def test_matched_sweeps_verify_hashes_without_console_rounds(tmp_path):
     # #72: a prefill-only sweep (max_tokens 1) emits no decode rounds; its pairs
     # match by prompt token hash alone.
     def job(entry):
@@ -614,7 +614,11 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
     assert prefill['prompt_token_hashes'] == ['73b4ebf8f4958775'] and prefill['follow_up_prompts'] == 1
     assert prefill['arm_local_prompts'] == 1
     decode = cards.summarize_job(job(dict(name='d', profile='panels:', levels=[1, 16], set={}, sparks=[])), 0)
-    assert decode['status'] == 'failed' and 'per-request console rounds' in decode['error']
+    assert decode['status'] == 'pass' and decode['requests'] == []
+    missing_job = job(dict(name='missing', profile='panels:', levels=[1, 16], set={}, sparks=[]))
+    next((Path(missing_job['state']) / 'smoke' / 'logs').glob('*.coordinator.log')).write_text('')
+    missing = cards.summarize_job(missing_job, 0)
+    assert missing['status'] == 'failed' and 'no prompt token hashes' in missing['error']
     # Fidelity-only runs (no baseline) score through the probe endpoint and decode nothing either.
     def with_report(entry):
         made = job(entry)
@@ -623,9 +627,9 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
         return made
     fidelity = cards.summarize_job(with_report(dict(name='f', profile='panels:fidelity', baseline=False, set={}, sparks=[])), 0)
     assert 'per-request console rounds' not in (fidelity.get('error') or ''), fidelity.get('error')
-    # A fidelity panel beside the baseline still decodes, so it keeps the check.
+    # Decode and fidelity both match by admission hashes without a console.
     mixed = cards.summarize_job(with_report(dict(name='m', profile='panels:fidelity', set={}, sparks=[])), 0)
-    assert 'per-request console rounds' in (mixed.get('error') or '')
+    assert mixed['status'] == 'pass' and mixed['requests'] == []
 
 
 def _coordinator_log(deterministic, follow_up_tokens):
@@ -900,7 +904,7 @@ def test_explicit_nonce_overrides_auto_and_inherited(entry, tmp_path, monkeypatc
     assert cards.main() == 0
     jobs = json.loads((state / 'plan.json').read_text())['jobs']
     assert all(job['nonce_seed'] == 'explicit seed' for job in jobs)
-    assert all('observer' in job['entry'] and 'console' in job['probes'] for job in jobs)
+    assert all('observer' not in job['entry'] and 'console' not in job['probes'] for job in jobs)
     for job in jobs:
         dest = Path(job['state'])
         report = dest / 'reports' / 'one' / 'report.json'
@@ -3042,3 +3046,17 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
     monkeypatch.setattr(cards.subprocess, 'Popen', lambda cmd, **kw: SlowSampler(kw['stdout']))
     with pytest.raises(ValueError, match='memory probe produced no samples'):
         cards.observe(job)
+
+
+@pytest.mark.parametrize('profile,policy,expected', [('', 'simple', 'off'),
+    ('', 'shared', 'on (perturbing)'), ('draft-timing', 'simple', 'on (perturbing)'),
+    ('transport-timing', 'simple', 'on (perturbing)'), ('census', 'simple', 'off')])
+def test_layer_timing_reported_in_result_and_summary(entry, tmp_path, profile, policy, expected):
+    job = cards.generate(entry, 'a', dict(instance='a', slot='s'), tmp_path, tmp_path / 'key',
+                         {'PROFILE': profile, 'DRAFT_POLICY': policy}, set(), None, 1)
+    job['entry'].update(profile='panels:', baseline=False)
+    row = cards.summarize_job(job, 0)
+    assert row['instrumentation']['per_layer_timing'] == expected
+    cards.write_summary(tmp_path, [row], {'a': {}})
+    assert f'| {expected} |' in (tmp_path / 'summary.md').read_text()
+    assert json.loads((tmp_path / 'summary.json').read_text())['rows'][0]['instrumentation']['per_layer_timing'] == expected
