@@ -12,6 +12,22 @@ use cuteafd_loader::{families::{glm5::draft_representation::{block_dspark_paged_
     qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint};
 use std::time::{Duration, Instant};
 
+pub(super) fn load_drafter<'a>(engine: &DenseEngine<'a>, programs: &'a Programs<'a>, snapshot: &std::path::Path,
+    lanes: usize, mask: Vec<u8>) -> Result<DsparkDrafter<'a>> {
+    let device = engine.target_stream().device;
+    crate::shared::experts::rtx::dense::load_alone(snapshot, &[device], || {
+        let tensors = if crate::shared::experts::rtx::dense::is_recording() {
+            Default::default()
+        } else {
+            block_dspark::prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("draft loader panicked"))??
+        };
+        DsparkDrafter::load_paged(device.library, programs, snapshot, tensors,
+            engine.target_stream().raw, lanes, lanes, mask, GlmDraftRepresentation::Bf16Only,
+            Fp8Scales::Amax, Fp8Rows::W8a16, engine.cfg.max_context, engine.pool_tokens,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)
+    })
+}
+
 fn policy(layers: usize, block: usize) -> Result<DraftPolicy> {
     Ok(DraftPolicy::seeded(PolicyGeometry {
         layers: vec![LayerResource { class: None, slice_bytes: 0., group_rows: 1, timed: false }; layers],
@@ -152,12 +168,14 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
         Some(DrafterBytes { owned: residency.owned, weights: residency.weights, scratch: residency.scratch, ..Default::default() }), 1, None, args.kv_cache, false)?;
     let stream = engine.target_stream().raw;
-    let weights = block_dspark::prefetch(snapshot);
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
-    let drafter = DsparkDrafter::load_admitted(library, programs, snapshot,
-        weights.join().map_err(|_| anyhow::anyhow!("draft tensor loader panicked"))??,
-        stream, 1, 1, mask, GlmDraftRepresentation::Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16,
-        cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+    let drafter = crate::shared::experts::rtx::dense::load_alone(snapshot, &[engine.target_stream().device], || {
+        let tensors = if crate::shared::experts::rtx::dense::is_recording() { Default::default() }
+            else { block_dspark::prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("draft tensor loader panicked"))?? };
+        DsparkDrafter::load_admitted(library, programs, snapshot, tensors,
+            stream, 1, 1, mask, GlmDraftRepresentation::Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16,
+            cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)
+    })?;
     drafter.prepare_workspace()?;
     let mut last = vec![];
     let mut position = 0;

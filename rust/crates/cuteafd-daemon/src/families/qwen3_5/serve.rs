@@ -9,8 +9,8 @@ use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaAdmission, MediaKey
     prefix::{PrefixCache, PrefixConfig, PrefixFamily}};
 use cuteafd_ffi::NativeLibrary;
 use std::{cell::RefCell, path::Path, rc::Rc};
-use crate::shared::{fp8_linear::{Fp8Rows, Fp8Scales}, speculation::{
-    block_dspark::{self, DsparkDrafter}, dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS}}};
+use crate::shared::speculation::{
+    block_dspark::{self, DsparkDrafter}, dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS}};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 
 fn draft_geometry(layers: usize, slots: usize, rows: usize, width: usize) -> cuteafd_core::PolicyGeometry {
@@ -597,12 +597,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             let drafts = if let Some(snapshot) = &engine_args.draft {
                 let target = engine.borrow();
                 let config = block_dspark::DsparkConfig::read(snapshot)?;
-                let weights = block_dspark::prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("draft loader panicked"))??;
                 let mask = target.token_embedding().host_rows(&[config.mask_token])?;
-                let draft = Rc::new(DsparkDrafter::load_paged(&library, &programs, snapshot, weights, target.target_stream().raw,
-                    lanes, lanes, mask, cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
-                    Fp8Scales::Amax, Fp8Rows::W8a16, target.cfg.max_context, target.pool_tokens,
-                    cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?);
+                let draft = Rc::new(super::dspark::load_drafter(&target, &programs, snapshot, lanes, mask)?);
                 draft.prepare_workspace()?;
                 let depth = engine_args.draft_fixed.unwrap_or(config.drafts());
                 ensure!(depth <= config.drafts(), "--draft-fixed exceeds checkpoint draft block");
@@ -708,13 +704,8 @@ mod tests {
         let draft = {
             let target = engine.borrow();
             let cfg = block_dspark::DsparkConfig::read(&draft_snapshot)?;
-            let tensors = block_dspark::prefetch(&draft_snapshot).join()
-                .map_err(|_| anyhow::anyhow!("draft loader panicked"))??;
             let mask = target.token_embedding().host_rows(&[cfg.mask_token])?;
-            Rc::new(DsparkDrafter::load_paged(&library, &programs, &draft_snapshot, tensors, target.target_stream().raw,
-                4, 4, mask, cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
-                Fp8Scales::Amax, Fp8Rows::W8a16, target.cfg.max_context, target.pool_tokens,
-                cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?)
+            Rc::new(super::super::dspark::load_drafter(&target, &programs, &draft_snapshot, 4, mask)?)
         };
         draft.prepare_workspace()?;
         let family = DensePrefix::with_draft(&engine, Some(draft.clone()))?;

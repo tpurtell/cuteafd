@@ -163,8 +163,9 @@ impl<'a> DenseEngine<'a> {
         tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits, head_rows = buffers.head_rows, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format), layout = %placement.summary(), "dense Qwen admitted before weight/state allocation");
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
-        let (embedding, weights) = TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
-            || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format))?;
+        let (embedding, weights) = crate::shared::experts::rtx::dense::load_alone(
+            &checkpoint.snapshot, &[device], || TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
+                || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format)))?;
         let mut allocated = sizes.into_iter().map(|bytes| Allocation::new(device, alloc_bytes(bytes)))
             .collect::<Result<Vec<_>>>()?;
         let views: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
