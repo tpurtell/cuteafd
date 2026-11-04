@@ -618,6 +618,9 @@ pub(super) fn load_fp8<'a>(
     push: Option<&mut std::net::TcpStream>,
 ) -> Result<(Weights<'a>, usize)> {
     ensure!(!groups.is_empty(), "native expert worker has no resident groups");
+    for group in &groups {
+        super::super::fp8::validate_reply_formats(group.tensors.format(), cuteafd_core::spark_reply::requested())?;
+    }
     let mut totals = ExpertGroupBytes::default();
     let mut budgets = Vec::with_capacity(groups.len());
     for group in &groups {

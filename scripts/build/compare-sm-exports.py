@@ -409,7 +409,7 @@ def routed_package_layouts(package, geometry, base, role):
     return layouts
 
 
-def routed_core_variants(package, role):
+def routed_core_variants(package, role, weights):
     """Read the compared checkout's production policy, including old baselines."""
     path = Path(package.__file__)
     tree = ast.parse(path.read_text())
@@ -419,7 +419,8 @@ def routed_core_variants(package, role):
         return (False,)
     namespace = {}
     exec(compile(ast.Module(body=[policy], type_ignores=[]), str(path), "exec"), namespace)
-    variants = namespace["core_variants"](role)
+    select = namespace["core_variants"]
+    variants = select(role, weights) if len(policy.args.args) > 1 else select(role)
     if not variants or any(type(value) is not bool for value in variants) or len(set(variants)) != len(variants):
         raise ValueError(f"{path}: invalid production core-variant policy")
     return variants
@@ -463,7 +464,7 @@ def export_routed(extra, output):
         if segmented and not indirect:
             forms += [(package.SEGMENT_MAX_ROWS, form, True) for form in package.FORMS]
         forms = [(rows, form, addresses, core) for rows, form, addresses in forms
-                 for core in routed_core_variants(package, role)]
+                 for core in routed_core_variants(package, role, g.weights)]
         for rows, form, row_addresses, core_only in forms:
             stem = f"fp8moe_{geometry}_{layout.replace('-', '_')}_m{rows}" + ("" if form == "auto" else "_" + form)
             if row_addresses and not indirect:

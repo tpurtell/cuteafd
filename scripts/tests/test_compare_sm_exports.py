@@ -1159,23 +1159,27 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
 
 
 @pytest.mark.parametrize("role", ["spark", "coordinator"])
-def test_routed_core_policy_is_the_packages_source_policy(tmp_path, role):
+@pytest.mark.parametrize("weights", ["nvfp4", "fp8", "mxfp4", "bf16"])
+def test_routed_core_policy_is_the_packages_source_policy(tmp_path, role, weights):
     package = compare_sm.load_file("core_policy_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
-    assert compare_sm.routed_core_variants(package, role) == package.core_variants(role)
+    expected = (False, True) if role == "spark" and weights != "nvfp4" else (False,)
+    assert package.core_variants(role, weights) == expected
+    assert compare_sm.routed_core_variants(package, role, weights) == expected
     source = Path(package.__file__).read_text()
-    assert "for core in core_variants(args.role)" in source
+    assert "for core in core_variants(args.role, g.weights)" in source
     # A source comparison must follow a changed policy, not a cached candidate list.
     path = tmp_path / "package.py"
     path.write_text("def core_variants(role):\n    return (True,) if role == 'spark' else (False, True)\n")
-    assert compare_sm.routed_core_variants(SimpleNamespace(__file__=str(path)), role) == (
+    assert compare_sm.routed_core_variants(SimpleNamespace(__file__=str(path)), role, weights) == (
         (True,) if role == "spark" else (False, True))
 
 
 @pytest.mark.parametrize("wire", [False, True])
-def test_spark_routed_object_set_matches_production_including_core(tmp_path, monkeypatch, wire):
+@pytest.mark.parametrize("weights", ["nvfp4", "fp8", "mxfp4", "bf16"])
+def test_spark_routed_object_set_matches_production_including_core(tmp_path, monkeypatch, wire, weights):
     from contextlib import nullcontext
     package = compare_sm.load_file("core_set_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
-    geometry = SimpleNamespace(weights="fp8")
+    geometry = SimpleNamespace(weights=weights)
     calls = []
     def compile_program(g, **kwargs):
         calls.append(kwargs)
@@ -1189,8 +1193,14 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
     monkeypatch.setattr(package, "layout_geometry", lambda base, layout: (1, base))
     monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", package)
-    compare_sm.export_routed(["--geometry", "mimo", "--role", "spark", "--input", "wire" if wire else "bf16",
-        "--capacities", "16,4096", "--layouts", "tp1"], tmp_path)
+    args = ["--geometry", "mimo", "--role", "spark", "--input", "wire" if wire else "bf16",
+            "--capacities", "16,4096", "--layouts", "tp1"]
+    if wire and weights in ("nvfp4", "bf16"):
+        with pytest.raises(ValueError, match="requires BF16 input"):
+            compare_sm.export_routed(args, tmp_path)
+        assert not calls
+        return
+    compare_sm.export_routed(args, tmp_path)
     # Evaluate the actual production forms/exports AST: adding a production
     # recipe without carrying it into export_routed changes this expected set.
     tree = ast.parse(Path(package.__file__).read_text())
@@ -1210,7 +1220,7 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
     expected = {(rows, form, segmented, core) for rows, form, segmented, core in env["exports"]}
     actual = {(c["max_rows"], c["prefill"], c.get("row_addresses", False), c.get("core_only", False)) for c in calls}
     assert actual == expected
-    assert any(core for _, _, _, core in actual)
+    assert any(core for _, _, _, core in actual) == (weights != "nvfp4")
     records = json.loads((tmp_path / "routed.json").read_text())["programs"]
     assert len(records) == len(expected)
     assert all(r["name"].endswith("_core") == r.get("core_only", False) for r in records)

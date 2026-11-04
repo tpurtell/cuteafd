@@ -83,6 +83,9 @@ pub(crate) fn require_wire(world: SparkWorld, catalog: &OfficialV41Catalog) -> R
         ensure!((1..=8).contains(&world.topology().world_size()), "EXLR8 requires 1..=8 ranks");
         return Ok(());
     }
+    if let Some(tensors) = catalog.fp8() {
+        super::experts::fp8::validate_reply_formats(tensors.format(), cuteafd_core::spark_reply::requested())?;
+    }
     require_supported(world.ownership_topology(), catalog)?;
     if catalog.exl3().is_none() && catalog.fp8().is_none() {
         let geometry = catalog.routed_experts().geometry()?;

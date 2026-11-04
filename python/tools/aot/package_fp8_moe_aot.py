@@ -98,9 +98,9 @@ FORMS = ("auto", "w8a16", "w8a8")
 SEGMENT_MAX_ROWS = 4 * 4096
 
 
-def core_variants(role: str) -> tuple[bool, ...]:
-    """Spark replies can consume the existing route plane without MoeCombine."""
-    return (False, True) if role == "spark" else (False,)
+def core_variants(role: str, weights: str) -> tuple[bool, ...]:
+    """Deprecated NVFP4-weight packages retain only their BF16 reply path."""
+    return (False, True) if role == "spark" and weights != "nvfp4" else (False,)
 
 
 def digest(path: Path) -> str:
@@ -598,7 +598,7 @@ def build(args: argparse.Namespace) -> None:
             if args.role == "spark" and wire and g.weights in ("fp8", "mxfp4"):
                 exports += [(SEGMENT_MAX_ROWS, form, True) for form in FORMS]
             exports = [(c, f, s, core) for c, f, s in exports
-                       for core in core_variants(args.role)]
+                       for core in core_variants(args.role, g.weights)]
             for capacity, form, segmented, core_only in ([] if reused else exports):
                 stem = (f"fp8moe_{args.geometry}_w{g.slice}_m{capacity}"
                         f"{'' if form == 'auto' else '_' + form}{'_segments' if segmented else ''}{'_core' if core_only else ''}")

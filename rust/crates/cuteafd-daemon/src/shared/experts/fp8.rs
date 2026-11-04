@@ -21,6 +21,30 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use crate::shared::memory::weight_arena::ReadyArena;
 
+pub(crate) fn validate_reply_formats(format: ExpertFormat,
+    replies: cuteafd_core::spark_reply::SparkReplyFormats) -> Result<()> {
+    ensure!(format != ExpertFormat::Nvfp4 || !replies.can_compress(),
+        "NVFP4-weight Spark packages support only BF16 replies; compressed prefill/decode replies are unsupported; select bf16 for both reply formats");
+    Ok(())
+}
+
+#[test]
+fn nvfp4_weights_reject_compressed_reply_selection_at_startup() {
+    use cuteafd_core::{spark_reply::SparkReplyFormats, SparkReplyFormat::*};
+    use cuteafd_loader::formats::fp8_experts::ExpertFormat;
+    for prefill in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
+        for decode in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
+            let replies = SparkReplyFormats { prefill, decode };
+            let result = validate_reply_formats(ExpertFormat::Nvfp4, replies);
+            assert_eq!(result.is_err(), replies.can_compress());
+            if let Err(error) = result { assert!(error.to_string().contains("only BF16 replies")); }
+            for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Bf16] {
+                validate_reply_formats(format, replies).unwrap();
+            }
+        }
+    }
+}
+
 pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize],
     tp: usize, rank: usize, slicing: Slicing) -> Result<()> {
     let shape = tensors.shape();
