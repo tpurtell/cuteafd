@@ -295,6 +295,93 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires sealed dense Qwen target/drafter and CUTEAFD_PUSH_DUMP via golden-run --native-test"]
+    fn native_push_dumps_each_requested_batch() -> Result<()> {
+        use crate::shared::{golden_scores::push_regression as regression,
+            experts::rtx::push::PushPolicy, speculation::target::BlockVerifyTarget};
+        use std::path::PathBuf;
+        let _ = tracing_subscriber::fmt().with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
+        let path = |key| std::env::var_os(key).map(PathBuf::from).with_context(|| format!("push regression needs {key}"));
+        let snapshot = path("CUTEAFD_GOLDEN_SNAPSHOT")?;
+        let draft = path("CUTEAFD_DRAFT_SNAPSHOT")?;
+        let output = path("CUTEAFD_PUSH_DUMP")?;
+        ensure!(PushPolicy::for_snapshot(&snapshot)? == PushPolicy::Required
+            && PushPolicy::for_snapshot(&draft)? == PushPolicy::Required,
+            "native push regression requires target and drafter push namespaces");
+        let checkpoint = Checkpoint::open(&snapshot)?;
+        let cfg = cuteafd_loader::families::qwen3_5::Qwen35Checkpoint::read(&snapshot)?.config;
+        block_dspark::check_checkpoint(&draft, cfg.hidden, cfg.vocab, cfg.attention.len())?;
+        let draft_cfg = DsparkConfig::read(&draft)?;
+        let native = path("CUTEAFD_NATIVE_LIB")?;
+        let manifest = path("CUTEAFD_PROGRAM_MANIFEST")?;
+        // SAFETY: golden-run supplies the sealed library; all GPU owners drop first.
+        let library = unsafe { NativeLibrary::load(&native)? };
+        library.cuda_set_device(0)?;
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let config = serde_json::from_slice(&std::fs::read(draft.join("config.json"))?)?;
+        let (owned, scratch) = block_dspark_paged_resident_bytes(&config, 2, 2, library.sm_count()? as u64,
+            GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context,
+            16384, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+        let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(), Some(16384),
+            Some(DrafterBytes { owned, scratch, ..Default::default() }), 2, None,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, false)?;
+        let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
+        let drafter = load_drafter(&engine, &programs, &draft, 2, mask)?;
+        drafter.prepare_workspace()?;
+        for sequences in [1, 2] {
+            let prompts = regression::prompts(sequences);
+            let mut next_page = 0u32;
+            for (slot, prompt) in prompts.iter().enumerate() {
+                engine.reset_slot(slot)?;
+                let end = prompt.len() + draft_cfg.block + 16;
+                let pages = (next_page..next_page + end.div_ceil(64) as u32).collect::<Vec<_>>();
+                next_page += pages.len() as u32;
+                engine.bind_slot(slot, &pages)?;
+                drafter.reset_context(slot, 0)?;
+                drafter.admit_pages(slot, end)?;
+                for (index, chunk) in prompt.chunks(1024).enumerate() {
+                    engine.prefill_tapped(slot, chunk, 0, |layer, hidden| {
+                        if drafter.tap_index(layer).is_some() {
+                            // SAFETY: the target owns the post-block rows on the shared stream.
+                            drafter.tap_streams_at(layer, hidden.ptr, 1, 0, chunk.len(), 0)?;
+                        }
+                        Ok(())
+                    })?;
+                    drafter.update(&(0..chunk.len()).map(|tap_row| ContextRow {
+                        tap_row, slot, position: index * 1024 + tap_row }).collect::<Vec<_>>())?;
+                }
+            }
+            regression::draft_dump(&output, sequences, draft_cfg.block, cfg.vocab, || {
+                let stream = engine.target_stream();
+                let head = TargetHead::Launch(Box::new(|hidden, logits, rows, actual_stream| {
+                    ensure!(actual_stream == stream.raw, "draft head stream mismatch");
+                    engine.target_head(CuteafdDeviceBuffer { ptr: hidden.cast_mut(), bytes: rows * cfg.hidden * 2,
+                        device_id: 0, ..Default::default() }, CuteafdDeviceBuffer { ptr: logits.cast(),
+                        bytes: rows * cfg.vocab * 4, device_id: 0, ..Default::default() }, rows)?;
+                    Ok(())
+                }));
+                let requests = prompts.iter().enumerate().map(|(slot, prompt)| DraftSeq {
+                    slot, anchor: 42 + slot as u32, position: prompt.len(), valid_from: 0 }).collect::<Vec<_>>();
+                let proposals = drafter.draft_device(&requests, engine.token_embedding(), head)?;
+                Ok((proposals.into_iter().map(|draft| draft.tokens).collect(), drafter.last_logits(sequences)?))
+            })?;
+            let slots = (0..sequences).collect::<Vec<_>>();
+            let mark = engine.checkpoint(&slots)?;
+            let teacher = regression::teacher_rows();
+            let rows = prompts.iter().enumerate().flat_map(|(slot, prompt)| teacher.iter().enumerate()
+                .map(move |(offset, &token)| VerifyRow { slot, position: prompt.len() + offset, token: Some(token) }))
+                .collect::<Vec<_>>();
+            let values = engine.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?.logits.to_host(&library)?;
+            regression::target_dump(&output, sequences, cfg.vocab, &values)?;
+            engine.restore(&mark)?;
+            for slot in slots { drafter.discard_context(slot)?; engine.reset_slot(slot)?; }
+        }
+        Ok(())
+    }
+
     #[test]
     fn dense_draft_binding_uses_empty_route_geometry_and_checkpoint_vocabulary() {
         let policy = policy(64, 7).unwrap();
