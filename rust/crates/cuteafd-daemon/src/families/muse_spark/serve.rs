@@ -65,9 +65,6 @@ pub(crate) struct ServeArgs {
     /// Must cover the widest verify step; the default keeps decode and verify lossless.
     #[arg(long, default_value_t = cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)]
     pub expert_partial_bf16_max_rows: usize,
-    /// Partial format of segments above the cutoff: nvfp4 (E2M1, E4M3 per 16) or fp8 (E4M3, UE8M0 per 32).
-    #[arg(long, default_value = "nvfp4")]
-    pub expert_partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat,
     #[command(flatten)] pub prefix: crate::shared::prefix::PrefixArgs,
     #[command(flatten)] pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
@@ -150,6 +147,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
+    cuteafd_bench::context::set_family(cfg.family_id());
     let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
     let device_ids = args.devices();
     let gpus = device_ids.len();
@@ -170,7 +168,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
         spark_budget_bytes: args.spark_budget_bytes(),
         partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
-        partial_wide_format: args.expert_partial_wide_format,
+        partial_wide_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), true).into(),
         local: cuteafd_loader::placement::families::muse_spark::local_workspace(&catalog,
             Some(&args.manifest), gpus, args.prefill()?.unit_rows)?,
         drafter: args.draft.as_deref().map(|snapshot| -> Result<_> {
@@ -192,7 +190,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     let media = super::media::Ready::load(args, &library, built.media.as_ref().context("Muse media admission missing")?)?;
     let prefill = args.prefill()?;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(args.expert_partial_bf16_max_rows,
-        cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, args.expert_partial_wide_format)?;
+        cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), true).into())?;
     let sequences = usize::from(args.max_sequences);
     let spark = super::admission::spark_plan(&placement, prefill, cutoff, sequences, args.peers.len())?;
     let admission_plan = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
@@ -565,9 +563,9 @@ mod tests {
         assert!(defaults.vision_peers.is_empty() && defaults.audio_peers.is_empty());
         assert_eq!(defaults.spark_budget_bytes(), cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES);
         assert_eq!(defaults.expert_partial_bf16_max_rows, 64);
-        assert_eq!(defaults.expert_partial_wide_format, cuteafd_loader::families::muse_spark::replies::WideFormat::Nvfp4);
-        assert!(args(&["--peers", PEERS, "--expert-partial-wide-format", "fp8"]).is_ok());
-        assert!(args(&["--peers", PEERS, "--expert-partial-wide-format", "bf16"]).is_err());
+        assert_eq!(cuteafd_core::SparkReplyFormat::resolve(None, true), cuteafd_core::SparkReplyFormat::Nvfp4);
+        assert!(args(&["--peers", PEERS, "--spark-reply-format", "fp8"]).is_ok());
+        assert!(args(&["--peers", PEERS, "--spark-reply-format", "bf16"]).is_ok());
         args(&["--peers", PEERS, "--expert-partial-bf16-max-rows", "4096"])?.validate()?;
         let single = args(&["--peers", PEERS, "--device", "1"])?;
         single.validate()?;

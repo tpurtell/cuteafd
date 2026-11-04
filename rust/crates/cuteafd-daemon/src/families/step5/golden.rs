@@ -506,7 +506,7 @@ fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]
     let (world, config, format) = expert_admission(args, rows, layers)?;
     let warm = super::execution::bootstrap_request(rows, 17, &format, layers)?;
     // The widest wave sizes every rank's rings and the exchange staging.
-    let mut link = SparkLink::new(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2)?;
+    let mut link = SparkLink::new_waves(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2, 1, u32::try_from(rows)?)?;
     link.bootstrap(&warm)?;
     Ok(RefCell::new(link))
 }
@@ -853,9 +853,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         Staging::new_for_units(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize, 1, unit)?];
     let (world, config, format) = expert_admission(args, rows, layers)?;
     let transport = devices[0].own(|| {
-        let mut link = if waves > 1 {
-            SparkLink::new_waves(&library, world, &args.peers, unit as u32, config, H * 2, waves, unit as u32)?
-        } else { SparkLink::new(&library, world, &args.peers, unit as u32, config, H * 2)? };
+        let mut link = SparkLink::new_waves(&library, world, &args.peers, unit as u32,
+            config, H * 2, waves, unit as u32)?;
         link.enable_terminal_ownership(library.clone())?;
         link.bootstrap(&super::execution::bootstrap_request(unit, 17, &format, layers)?)?;
         Ok(link)

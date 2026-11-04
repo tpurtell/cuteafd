@@ -13,10 +13,10 @@ registry = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(registry)
 
 
-def header(path, name, *, pointers=8, scalar="float"):
+def header(path, name, *, pointers=8, scalars=("float",)):
     symbol = "cuteafd_" + name
     args = [symbol + "_Kernel_Module_t *module"] + [f"void *p{i}" for i in range(pointers)]
-    args += [scalar + " value", "cudaStream_t stream"]
+    args += [f"{kind} value{i}" for i, kind in enumerate(scalars)] + ["cudaStream_t stream"]
     path.write_text(f"""
 #pragma once
 #include <cuda_runtime.h>
@@ -35,14 +35,16 @@ def entry(directory, dim=64, programs=None, **kw):
 
 def test_registry_validates_and_binds_both_export_abis(tmp_path):
     for dim in [64, 72]:
-        header(tmp_path / f"vision_attention_d{dim}.h", f"vision_attention_d{dim}")
-    header(tmp_path / "vision_attention_d96_full.h", "vision_attention_d96_full", pointers=6)
-    header(tmp_path / "vision_axial_rotary.h", "vision_axial_rotary", pointers=6, scalar="int32_t")
+        header(tmp_path / f"vision_attention_d{dim}.h", f"vision_attention_d{dim}",
+               scalars=("float", "int32_t"))
+    header(tmp_path / "vision_attention_d96_full.h", "vision_attention_d96_full", pointers=6,
+           scalars=("float", "int32_t"))
+    header(tmp_path / "vision_axial_rotary.h", "vision_axial_rotary", pointers=6, scalars=("int32_t",))
     entries = [entry(tmp_path), entry(tmp_path, 72), entry(tmp_path, 96,
         programs=["vision_attention_d96_full", "vision_axial_rotary"])]
     text = registry.registry(entries)
-    assert '_mlir_cuteafd_vision_attention_d64_entry, 8, "f"' in text
-    assert '_mlir_cuteafd_vision_attention_d96_full_entry, 6, "f"' in text
+    assert '_mlir_cuteafd_vision_attention_d64_entry, 8, "fi"' in text
+    assert '_mlir_cuteafd_vision_attention_d96_full_entry, 6, "fi"' in text
     assert '_mlir_cuteafd_vision_axial_rotary_entry, 6, "i"' in text
     with pytest.raises(ValueError, match="duplicate"):
         registry.registry(entries + entries[:1])
@@ -112,12 +114,16 @@ constexpr int cudaErrorInvalidValue=1,cudaErrorInvalidDevice=2,cudaErrorMemoryAl
  cudaErrorInitializationError=4,cudaErrorInvalidResourceHandle=5;
 extern int device,unloads,fail_unload;
 inline int cudaGetDevice(int* d) {*d=device;return 0;}
+inline int cudaDeviceGetAttribute(int* v,int,int) {*v=50331648;return 0;}
+constexpr int cudaDevAttrL2CacheSize=104;
 inline int cudaLibraryUnload(void*) {++unloads;return fail_unload;}
 """)
     for dim in [64, 72]:
-        header(tmp_path / f"vision_attention_d{dim}.h", f"vision_attention_d{dim}")
-    header(tmp_path / "vision_attention_d96_full.h", "vision_attention_d96_full", pointers=6)
-    header(tmp_path / "vision_axial_rotary.h", "vision_axial_rotary", pointers=6, scalar="int32_t")
+        header(tmp_path / f"vision_attention_d{dim}.h", f"vision_attention_d{dim}",
+               scalars=("float", "int32_t"))
+    header(tmp_path / "vision_attention_d96_full.h", "vision_attention_d96_full", pointers=6,
+           scalars=("float", "int32_t"))
+    header(tmp_path / "vision_axial_rotary.h", "vision_axial_rotary", pointers=6, scalars=("int32_t",))
     modern = entry(tmp_path, 96, programs=["vision_attention_d96_full", "vision_axial_rotary"])
     modern["pointwise_group"] = "d96_f32"
     (tmp_path / "vision_owner_entries.h").write_text(registry.registry([entry(tmp_path), entry(tmp_path, 72), modern]))
@@ -129,7 +135,8 @@ inline int cudaLibraryUnload(void*) {++unloads;return fail_unload;}
 int device=0,unloads=0,fail_unload=0,init[2]{},loads[2]{},calls[2]{},fail=0;
 void initialize(void** a,int i) {++init[i];**static_cast<void***>(a[0])=reinterpret_cast<void*>(uintptr_t(i+1));*static_cast<int*>(a[1])=0;}
 void load(void** a,int i) {++loads[i];*static_cast<int*>(a[2])=fail;}
-void launch(void** a,int n,int i) {assert(n==11);assert(*static_cast<float*>(a[8])==0.5f);++calls[i];*static_cast<int*>(a[10])=0;}
+void launch(void** a,int n,int i) {assert(n==12);assert(*static_cast<float*>(a[8])==0.5f);
+ assert(*static_cast<int32_t*>(a[9])==50331648);++calls[i];*static_cast<int*>(a[11])=0;}
 #define FIX(D,I) \
 extern "C" void _mlir_cuteafd_vision_attention_d##D##_cuda_init(void** a){initialize(a,I);} \
 extern "C" void _mlir_cuteafd_vision_attention_d##D##_cuda_load_to_device(void** a){load(a,I);} \
@@ -139,7 +146,8 @@ FIX(72,1)
 extern "C" void _mlir_cuteafd_vision_attention_d96_full_cuda_init(void** a){initialize(a,0);}
 extern "C" void _mlir_cuteafd_vision_attention_d96_full_cuda_load_to_device(void** a){load(a,0);}
 extern "C" void _mlir_cuteafd_vision_attention_d96_full_entry(void** a,int n){
- assert(n==9);assert(*static_cast<float*>(a[6])==.5f);*static_cast<int*>(a[8])=0;}
+ assert(n==10);assert(*static_cast<float*>(a[6])==.5f);
+ assert(*static_cast<int32_t*>(a[7])==50331648);*static_cast<int*>(a[9])=0;}
 extern "C" void _mlir_cuteafd_vision_axial_rotary_cuda_init(void** a){initialize(a,0);}
 extern "C" void _mlir_cuteafd_vision_axial_rotary_cuda_load_to_device(void** a){load(a,0);}
 extern "C" void _mlir_cuteafd_vision_axial_rotary_entry(void** a,int n){

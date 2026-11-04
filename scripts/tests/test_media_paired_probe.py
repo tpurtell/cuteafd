@@ -57,7 +57,8 @@ def test_capture_retains_http_error_body(tmp_path, monkeypatch, family):
     assert not (args.out / "capture.json").exists()
 
 
-def test_audio_capture_uses_ordinary_source_and_probe_audio_echo(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["native", "reference"])
+def test_audio_capture_uses_ordinary_source_and_probe_audio_echo(tmp_path, monkeypatch, mode):
     import base64
     from types import SimpleNamespace
     span = {"start": 1, "len": 1, "kind": "audio", "key": "a" * 64,
@@ -77,6 +78,14 @@ def test_audio_capture_uses_ordinary_source_and_probe_audio_echo(tmp_path, monke
         "cached_tokens": 0, "score_path": "decode", "prompt_ids": window["tokens"],
         "audio": [echo.copy()], "rows": [{"position": 2, "finite": True}], "scored": 1},
         "server": {"model": "model", "family": "muse_spark"}}
+    features = tmp_path / "features"
+    features.mkdir()
+    metadata = {"sha256": module.hashlib.sha256(b"bf16").hexdigest(),
+        "fixture_sha256": span["fixture"]["sha256"], "samples": 1, "pcm_sha256": span["pcm_sha256"]}
+    (features / (span["key"] + ".json")).write_text(json.dumps(metadata))
+    (features / (span["key"] + ".bf16")).write_bytes(b"bf16")
+    if mode == "reference":
+        response["probe"]["provenance"] = reference_provenance(metadata, "muse_spark")
     def http(url, token, body=None, timeout=240):
         if body is None:
             return {"data": [{"id": "model", "capabilities": {"audio": True}}]}
@@ -90,7 +99,7 @@ def test_audio_capture_uses_ordinary_source_and_probe_audio_echo(tmp_path, monke
     monkeypatch.setattr(module, "http", http)
     dump = tmp_path / "host/audio00"
     args = SimpleNamespace(out=tmp_path / "out", url="http://localhost", bench_token=None,
-        mode="native", features=None, quick=False, media_root=tmp_path, host_dump=tmp_path / "host",
+        mode=mode, features=features if mode == "reference" else None, quick=False, media_root=tmp_path, host_dump=tmp_path / "host",
         server_dump=tmp_path / "server", timeout=10)
     def rows(*args):
         dump.mkdir(parents=True)
@@ -99,9 +108,39 @@ def test_audio_capture_uses_ordinary_source_and_probe_audio_echo(tmp_path, monke
     monkeypatch.setattr(module, "dump_rows", rows)
     module.capture(args)
     assert len(seen) == 1 and (args.out / "capture.json").exists()
+    if mode == "reference":
+        (features / (span["key"] + ".bf16")).write_bytes(b"wrong")
+        with pytest.raises(ValueError, match="hash/identity"):
+            module.check_record(window, response, "model", mode, features, "muse_spark")
+        (features / (span["key"] + ".bf16")).write_bytes(b"bf16")
+        response["probe"]["provenance"]["probe_only"] = False
+        with pytest.raises(ValueError, match="provenance"):
+            module.check_record(window, response, "model", mode, features, "muse_spark")
     response["probe"]["audio"][0]["pcm_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="echo"):
         module.check_record(window, response, "model", "native", family="muse_spark")
+
+
+@pytest.mark.parametrize("family", module.FAMILIES)
+def test_reference_record_requires_provenance_only_for_media(family):
+    window = {"tokens": [9, 2], "score_from": 1}
+    response = {"server": {"model": "model", "family": family}, "probe": {
+        "engine": family, "cold": True, "no_speculation": True, "cached_tokens": 0,
+        "score_path": "decode", "prompt_ids": window["tokens"], "scored": 1,
+        "rows": [{"position": 1, "finite": True}]}}
+    # A reference-arm text control never bypassed an encoder.
+    module.check_record(window, response, "model", "reference", family=family)
+    response["probe"]["provenance"] = {"mode": "reference_features", "probe_only": True,
+        "encoder_bypassed": True, "features": []}
+    with pytest.raises(ValueError, match="text control.*provenance"):
+        module.check_record(window, response, "model", "reference", family=family)
+    del response["probe"]["provenance"]
+    span = {"start": 0, "len": 1, "kind": "audio", "key": "a" * 64,
+        "samples": 1, "pcm_sha256": "b" * 64}
+    window["media"] = [span]
+    response["probe"]["audio"] = [{k: span[k] for k in ("start", "len", "key", "samples", "pcm_sha256")}]
+    with pytest.raises(ValueError, match="reference media.*missing.*provenance"):
+        module.check_record(window, response, "model", "reference", family=family)
 
 
 def test_mixed_record_checks_rebound_image_and_exact_audio_independently():
@@ -507,7 +546,8 @@ def test_native_only_official_golden_and_text_control(tmp_path, monkeypatch, row
         module.compare(args)
 
 
-def test_capture_text_control_without_media(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["native", "reference"])
+def test_capture_text_control_without_media(tmp_path, monkeypatch, mode):
     from types import SimpleNamespace
     window = {"id": "control", "tokens": [9, 2], "score_from": 1}
     panel = {"family": "mimo_v2", "checkpoint": "model", "set_sha256": "a" * 64,
@@ -531,7 +571,8 @@ def test_capture_text_control_without_media(tmp_path, monkeypatch):
             "rows": [{"position": 1, "finite": True}]}}
     monkeypatch.setattr(module, "http", http)
     args = SimpleNamespace(out=tmp_path / "out", url="http://localhost", bench_token=None,
-        mode="native", features=None, quick=False, media_root=tmp_path,
+        mode=mode, features=tmp_path / "unused-features" if mode == "reference" else None,
+        quick=False, media_root=tmp_path,
         host_dump=tmp_path / "host", server_dump=tmp_path / "server", timeout=10)
     module.capture(args)
     assert json.loads((args.out / "capture.json").read_text())["windows"][0]["id"] == "control"
@@ -655,3 +696,64 @@ def test_rebound_capture_requires_verified_input_and_admitted_encoder():
         broken = json.loads(json.dumps(response)); broken["probe"]["media"][0][field] = value
         with pytest.raises(ValueError, match="identity"):
             module.check_record(window, broken, "model", "native")
+
+
+def test_tower_only_compare_scores_each_input_and_rejects_tampering(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from safetensors.numpy import save_file
+    span = {"start": 0, "len": 1, "kind": "audio", "key": "a" * 64,
+        "samples": 1, "pcm_sha256": "b" * 64,
+        "fixture": {"path": "clip.wav", "sha256": "c" * 64}}
+    windows = [{"id": name, "tokens": [9, 2, 3], "roles": ["ctx", "gen", "gen"],
+        "score_from": 1, "media": [span]} for name in ("silence", "short", "long", "speech")]
+    panel = {"family": "muse_spark", "checkpoint": "model", "set_sha256": "d" * 64, "windows": windows}
+    monkeypatch.setattr(module, "load_panel", lambda a: panel)
+    features = tmp_path / "features"
+    features.mkdir()
+    payload = features / (span["key"] + ".bf16")
+    payload.write_bytes(b"bf16")
+    metadata = {"sha256": module.file_hash(payload), "fixture_sha256": span["fixture"]["sha256"],
+        "samples": 1, "pcm_sha256": span["pcm_sha256"]}
+    (features / (span["key"] + ".json")).write_text(json.dumps(metadata))
+    fields = ("start", "len", "key", "samples", "pcm_sha256")
+    for mode in ("native", "reference"):
+        root = tmp_path / mode
+        root.mkdir()
+        server = {"model": "model", "family": "muse_spark", "build": {"commit": "same", "image": mode}}
+        entries = []
+        for window in windows:
+            dump = root / window["id"]
+            dump.mkdir()
+            files, records = [], []
+            for pos in (1, 2):
+                path = dump / f"{pos}.safetensors"
+                logits = [0., -1.] if mode == "reference" or window["id"] != "silence" else [-1., 0.]
+                save_file({"log_probs": np.array(logits, dtype=np.float32)}, str(path))
+                files.append({"position": pos, "sha256": module.file_hash(path)})
+                records.append({"file": path.name, "tensor": "log_probs", "dtype": "F32", "byte_order": "little",
+                    "vocab_size": 2, "position": pos})
+            manifest = dump / "manifest.jsonl"
+            manifest.write_text("".join(json.dumps(r) + "\n" for r in records))
+            response = {"server": server, "probe": {"engine": "muse", "cold": True, "no_speculation": True,
+                "cached_tokens": 0, "score_path": "decode", "prompt_ids": window["tokens"],
+                "audio": [{k: span[k] for k in fields}], "scored": 2,
+                "rows": [{"position": pos, "finite": True} for pos in (1, 2)]}}
+            if mode == "reference":
+                response["probe"]["provenance"] = reference_provenance(metadata, "muse_spark")
+            path = root / (window["id"] + ".json")
+            path.write_text(json.dumps(response))
+            entries.append({"id": window["id"], "path": str(dump), "response_sha256": module.file_hash(path),
+                "manifest_sha256": module.file_hash(manifest), "files": files})
+        (root / "capture.json").write_text(json.dumps({"schema": "cuteafd.media.paired.capture/1", "mode": mode,
+            "checkpoint": "model", "set_sha256": panel["set_sha256"], "quick": False, "server": server, "windows": entries}))
+    args = SimpleNamespace(tower_only=True, native=tmp_path / "native", reference=tmp_path / "reference",
+        golden=None, golden_seal=None, features=features, expert_bpw=4, out=tmp_path / "result.json")
+    assert not module.compare(args)
+    result = json.loads(args.out.read_text())
+    assert [w["pass"] for w in result["windows"]] == [False, True, True, True]
+    assert result["windows"][0]["reference_native_kl"] == pytest.approx(np.tanh(.5))
+    assert result["windows"][0]["top1_agreement"] == 0
+    assert result["windows"][1]["top1_agreement"] == 1
+    payload.write_bytes(b"wrong")
+    with pytest.raises(ValueError, match="hash/identity"):
+        module.compare(args)

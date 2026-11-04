@@ -491,6 +491,13 @@ impl CoordinatorPush {
         Ok(push)
     }
 
+    /// Test-only: publish a plan dump's finished dense plans to the group's
+    /// coordinator rows, as `receive_with` does before the offers are sent.
+    #[cfg(test)]
+    pub(crate) fn install_dense(&mut self, plans: Vec<DensePlan>) {
+        *self.dense.lock().expect("coordinator dense slot") = Some(plans);
+    }
+
     /// Receives every coordinator GPU (two: each on its own thread) while
     /// `beside` runs on this thread. `dense`: each GPU's plan (published to the
     /// group driver before the offers) and destination (unaliased descriptors of

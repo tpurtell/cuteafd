@@ -272,9 +272,10 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
         self.media_binding.prepare(job, tokens, self.cfg.vocab_size, self.cfg.hidden, self.context)
     }
-    fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia, _cache: &mut EmbeddingCache,
-        _snapshot: &Path) -> Result<()> {
-        self.media_binding.coordinates(&prompt.tokens, media)
+    fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia, cache: &mut EmbeddingCache,
+        snapshot: &Path) -> Result<()> {
+        self.media_binding.coordinates(&prompt.tokens, media)?;
+        super::media::probe_features(prompt, media, cache, snapshot)
     }
     fn coordinates(&self, tokens: &[u32], _job: &NativeRequest, media: &RequestMedia) -> Result<()> {
         self.media_binding.coordinates(tokens, media)

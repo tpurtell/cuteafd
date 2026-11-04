@@ -208,7 +208,7 @@ def test_program_geometry_is_validated_at_configure_time(tmp_path, mode):
     else:
         assert result.returncode == 0, result.stdout + result.stderr
         expected = 'muse,muse2,expert_partial,dense_trellis_k6' if mode == 'muse' else 'expert_partial'
-        assert (build / 'geometry.txt').read_text() == expected
+        assert (build / 'geometry.txt').read_text() == expected + ',expert_reply'
 
 
 def test_seal_guard_is_forwarded_after_native_build():
@@ -454,7 +454,7 @@ def test_glm_context_only_passes_only_supported_base_geometries(tmp_path, mode, 
         expected += ['glm_stage', 'glm2_stage']
         if exlr8:
             expected += ['exlr8', 'exlr8_dense']
-        assert geometries == expected
+        assert geometries == expected + ['expert_reply']
 
 
 @pytest.mark.parametrize('ranks', [1, 2])

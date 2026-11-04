@@ -90,6 +90,28 @@ def test_pcm_dispatcher_shares_modules_across_devices_without_encode_mutex(tmp_p
     assert "program.launch(a,rows,stream)" in launch
 
 
+def test_propagation_mode_stops_at_second_patch_and_checks_every_boundary():
+    from types import SimpleNamespace as Node
+    block = lambda: Node(conv=object(), norm=object(), mlp=Node(
+        fc1=object(), activation_fn=object(), fc2=object()))
+    model = Node(layers=[Node(patch_embedder=Node(proj=object(), norm=object()),
+        conv_blocks=[block(), block()]) for _ in range(4)])
+    steps = gate.propagation_steps(model)
+    assert [op for _, op, _, _ in steps] == [0, 2] + [1, 2, 0, 3, 0, 4] * 2 + [0, 2]
+    assert [stage for _, op, _, stage in steps if op == 4] == [1, 2]
+    assert steps[-1][0] == "layers.1.patch_embedder.norm" and steps[-1][3] == 3
+    assert all(not name.startswith(("layers.2.", "layers.3.")) for name, *_ in steps)
+
+
+def test_signed_channel_error_keeps_bias_when_global_mean_cancels():
+    result = gate.signed_channel_errors([[1, -1], [3, -3]], [[2, -2], [2, -2]],
+        [[0, 0], [0, 0]])
+    assert result["native"]["mean_by_channel"] == [2, -2]
+    assert result["native"]["signed_mean"] == 0
+    assert result["native"]["channel_mean_rms"] == 2
+    assert result["official_bf16"]["channel_mean_max_abs"] == 2
+
+
 def test_pcm_feature_epsilon_uses_versioned_float_slot():
     assert gate.Spec.feature_norm_eps.offset == 12
     assert gate.Spec.weight_bytes.offset == 16

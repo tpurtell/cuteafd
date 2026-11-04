@@ -312,6 +312,30 @@ mod tests {
     }
 
     #[test]
+    fn muse_loaded_identity_is_published_through_the_serving_context() {
+        let config = cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
+            &cuteafd_loader::plan::testing::muse_spark_config()).unwrap();
+        config.release_geometry().unwrap();
+        assert_eq!(config.family_id(), "muse_spark");
+        struct RestoreContext(ServerContext);
+        impl Drop for RestoreContext {
+            fn drop(&mut self) { crate::context::set(self.0.clone()); }
+        }
+        let _restore = RestoreContext(crate::context::get());
+        crate::context::set(ServerContext { command: "serve-muse".into(), ..Default::default() });
+        assert!(crate::context::get().family.is_none());
+        crate::context::set_family(config.family_id());
+        let context = crate::context::get();
+        let report = server_info_from_context("served-muse-alias", &context, Hardware::default());
+        assert_eq!(report.family.as_deref(), Some("muse_spark"));
+        assert_eq!(report.executor.as_deref(), Some("serve-muse"));
+        let probe = crate::runner::probe_server("served-muse-alias", &context);
+        assert_eq!(probe["family"], "muse_spark");
+        assert_eq!(probe["executor"], "serve-muse");
+        assert_eq!(probe["model"], "served-muse-alias");
+    }
+
+    #[test]
     fn ml4_loaded_identity_uses_glm_executor_without_relabeling_the_checkpoint() {
         let config = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(
             &cuteafd_loader::plan::testing::mistral_large4_config()).unwrap();

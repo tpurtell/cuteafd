@@ -29,25 +29,22 @@ impl PartialFormat {
     }
 }
 
-/// The format of segments above the cutoff (`expert_partial_wide_format`):
+/// Internal partial-wire selection resolved from the shared Spark reply policy:
 /// NVFP4 by default; FP8 E4M3 per-32 selectable. The fidelity run decides the final default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WideFormat { #[default] Nvfp4, Fp8 }
+pub enum WideFormat { Bf16, #[default] Nvfp4, Fp8 }
 
 impl WideFormat {
     pub fn format(self) -> PartialFormat {
-        match self { Self::Nvfp4 => PartialFormat::Nvfp4, Self::Fp8 => PartialFormat::Fp8 }
+        match self { Self::Bf16 => PartialFormat::Bf16, Self::Nvfp4 => PartialFormat::Nvfp4, Self::Fp8 => PartialFormat::Fp8 }
     }
 }
 
-impl std::str::FromStr for WideFormat {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "nvfp4" => Ok(Self::Nvfp4),
-            "fp8" => Ok(Self::Fp8),
-            other => anyhow::bail!("expert_partial_wide_format is nvfp4 or fp8, not {other}"),
-        }
+impl From<cuteafd_core::SparkReplyFormat> for WideFormat {
+    fn from(format: cuteafd_core::SparkReplyFormat) -> Self {
+        match format { cuteafd_core::SparkReplyFormat::Bf16 => Self::Bf16,
+            cuteafd_core::SparkReplyFormat::Fp8 => Self::Fp8,
+            cuteafd_core::SparkReplyFormat::Nvfp4 => Self::Nvfp4 }
     }
 }
 
@@ -96,7 +93,7 @@ pub struct ReplyPlan {
 impl ReplyPlan {
     /// `segments`: each request's row count, in wave order (rows consecutive).
     pub fn new(cutoff: Cutoff, segments: &[usize]) -> Self {
-        let mut plan = Self { bf16_rows: Vec::new(), wide_rows: Vec::new(), wide: cutoff.wide().format() };
+        let mut plan = Self { bf16_rows: Vec::new(), wide_rows: Vec::new(), wide: match cutoff.wide() { WideFormat::Bf16 => PartialFormat::Nvfp4, wide => wide.format() } };
         let mut row = 0u32;
         for &rows in segments {
             let region = match cutoff.format(rows) {
@@ -198,8 +195,10 @@ mod tests {
         assert_eq!(PartialFormat::Fp8.row_bytes(4096), 4224);
         assert_eq!(max_rank_bytes(Cutoff::with_wide(64, 8, WideFormat::Fp8)?, 2752, 16, 8, 4096),
             8 * (960 * 8192 + 1792 * 4224));
-        assert_eq!("fp8".parse::<WideFormat>()?, WideFormat::Fp8);
-        assert!("bf16".parse::<WideFormat>().is_err());
+        assert_eq!(WideFormat::from(cuteafd_core::SparkReplyFormat::Fp8), WideFormat::Fp8);
+        let bf16 = ReplyPlan::new(Cutoff::with_wide(64, 8, WideFormat::Bf16)?, &[1, 65, 2752]);
+        assert_eq!(bf16.bf16_rows.len(), 2818);
+        assert!(bf16.wide_rows.is_empty());
         Ok(())
     }
 

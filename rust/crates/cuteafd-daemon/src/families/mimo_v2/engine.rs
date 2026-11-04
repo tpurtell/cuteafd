@@ -720,7 +720,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
         let Some(Experts::Spark { prefill: transport, .. }) = &e.experts else { anyhow::bail!("MiMo Spark wave has no transport") };
         let bf16 = e.expert_input.bf16(false);
         self.member_routes(0, w, &e.weights.layers[layer], unit.rows.len(), bf16)?;
-        e.wave_send(w, layer, unit.rows.len(), ExpertV2SourceKind::Prefill, bf16, transport.borrow_mut().exchange()?)
+        e.wave_send(w, layer, unit.rows.len(), ExpertV2SourceKind::Prefill, bf16, transport.borrow_mut().exchange()?, unit.reply_origins()?)
     }
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: crate::shared::spark_waves::WaveTicket) -> Result<()> {
         let e = self.engine;
@@ -2129,7 +2129,7 @@ impl<'a> MimoEngine<'a> {
                     // exchange worker; the next segment's land orders the reduce.
                     self.probe_ring(w, index, t)?;
                     pending = Some(self.wave_send(w, index, t, ExpertV2SourceKind::Decode, bf16_input,
-                        link.exchange()?)?);
+                        link.exchange()?, None)?);
                     if let Some(l2) = &self.l2 { l2.issue(self.library, index, self.stream)?; }
                 }
                 (Some(_), _) => self.moe_run(w, index, t, true)?,
@@ -2993,7 +2993,7 @@ impl<'a> MimoEngine<'a> {
                 self.probe_ring(w, index, t)?;
                 let mut link = transport.borrow_mut();
                 let exchange = link.exchange()?;
-                let wave = self.wave_send(w, index, t, kind, bf16_input, exchange)?;
+                let wave = self.wave_send(w, index, t, kind, bf16_input, exchange, None)?;
                 if let Some(l2) = self.l2.as_ref().filter(|_| decode) { l2.issue(self.library, index, self.stream)?; }
                 self.wave_land(w, t, exchange, wave, forward)
             }
@@ -3061,7 +3061,7 @@ impl<'a> MimoEngine<'a> {
     /// posts the request once they complete. This thread does not wait for
     /// the GPU. Complete with [`Self::wave_land`].
     fn wave_send(&self, w: &Workspace<'_>, index: usize, t: usize, kind: ExpertV2SourceKind, bf16_input: bool,
-        exchange: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        exchange: &mut crate::shared::spark_waves::Waves<'_>, origins: Option<crate::shared::prefill_pipeline::ReplyOrigins>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
             if bf16_input { h * 2 } else { h + h / 32 })?;
@@ -3071,7 +3071,11 @@ impl<'a> MimoEngine<'a> {
         // stream order; the copies read them before later stream work.
         unsafe {
             exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer, input.buffer], self.stream,
-                Box::new(move |routes, wire| mimo_request(routes, wire, index, t, h, topk, kind, bf16_input)))
+                Box::new(move |routes, wire| {
+                    let mut request = mimo_request(routes, wire, index, t, h, topk, kind, bf16_input)?;
+                    if let Some(origins) = origins { origins.apply(&mut request)?; }
+                    Ok(request)
+                }))
         }
     }
 

@@ -67,6 +67,7 @@ struct Owners {
 }
 
 struct Bindings<'e, 'a, 'c> {
+    unit: Option<&'e crate::shared::prefill_pipeline::Unit>,
     engine: &'e GlmfEngine<'a>,
     work: [&'e Workspace<'a>; 2],
     tables: [&'e StepTables; 2],
@@ -162,7 +163,7 @@ impl<'a> GlmfEngine<'a> {
             self.release_retired_graphs()?;
             if self.embedding.device_gather() { self.gather_streams(w, rows)?; }
         }
-        let mut bindings = [Bindings { engine: self, work: [w, w1], tables: [tables, tables1],
+        let mut bindings = [Bindings { unit: None, engine: self, work: [w, w1], tables: [tables, tables1],
             owners: self.layer_owners(), lane: 0, rows, graphed, on_layer, prepared: Cell::new(None),
             tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS),
                 rows.min(crate::shared::speculation::dflash::TAP_ROWS), 0) }];
@@ -175,11 +176,11 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn unit_binding<'s>(&'s self, work: [&'s Workspace<'a>; 2],
-        tables: &'s [StepTables; 2], unit: &crate::shared::prefill_pipeline::Unit,
+        tables: &'s [StepTables; 2], unit: &'s crate::shared::prefill_pipeline::Unit,
         total: usize, prepared: Option<usize>) -> Bindings<'s, 'a, 's> {
         let window = total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
         let from = unit.rows.start.max(window).min(unit.rows.end);
-        Bindings { engine: self, work, tables: [&tables[0], &tables[1]], owners: self.layer_owners(),
+        Bindings { unit: Some(unit), engine: self, work, tables: [&tables[0], &tables[1]], owners: self.layer_owners(),
             lane: unit.slot, rows: unit.rows.len(), graphed: false, on_layer: None,
             prepared: Cell::new(prepared), tap: (from - unit.rows.start, unit.rows.end - from,
                 from.saturating_sub(window)) }
@@ -403,7 +404,8 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             } else if let Some(Experts::Spark { transport, .. }) = e.routed_experts(index) {
                 ensure!(e.layer_waves.borrow()[self.lane].is_none(), "unconsumed per-layer Spark wave");
                 let mut transport = transport.borrow_mut();
-                let wave = e.spark_send(w, index, real, self.tables[0].decode, transport.exchange()?, || {
+                let wave = e.spark_send(w, index, real, self.tables[0].decode, transport.exchange()?,
+                    self.unit.map(|unit| unit.reply_origins()).transpose()?.flatten(), || {
                     e.ffn(w, layer, e.cfg.moe_intermediate, self.cap(), w.shared.buffer.ptr, rows)
                 })?;
                 e.layer_waves.borrow_mut()[self.lane] = Some(wave);

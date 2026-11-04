@@ -695,6 +695,18 @@ fn validate_response_shape(
     payload_bytes: usize,
 ) -> Result<()> {
     validate_flags(header.flags, "response")?;
+    let compressed = header.flags & (super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
+        | super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3);
+    if compressed != 0 {
+        let expected = if compressed & super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32 != 0 {
+            ExpertV2Dtype::Fp8E4m3Ue8m0K32
+        } else { ExpertV2Dtype::Nvfp4E2m1Fp8E4m3 };
+        if header.flags & super::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 == 0
+            || header.flags & super::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0
+            || header.output_dtype != expected {
+            bail!("ExpertProtocolV2 compressed combined response agreement differs from its output dtype/domain");
+        }
+    }
     header.validate_row_capacity_error()?;
     let row_indexed = response_row_indices_enabled(header.flags);
     if row_indexed != row_indices.is_some() {

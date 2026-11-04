@@ -14,7 +14,7 @@
 use crate::families::muse_spark::{core::CoreInventory, weight_layout::{GlobalLayout, LayerLayout}, MuseAttention,
     MuseSparkConfig};
 use crate::placement::*;
-use crate::serving_capacity::prefill_waves::PrefillPlan;
+use crate::serving_capacity::{prefill_waves::PrefillPlan, Exl3Epilogue};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
 
@@ -616,7 +616,10 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: &std::path::
             "Muse {layout} EXL3 capacity/geometry/tiers/output mismatch in {}", directory.display());
         Ok(value)
     }).collect::<Result<Vec<_>>>()?;
-    let workspace = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)
+    // The coordinator's onboarded TP2 lane runs the shared EXL3 lane builder,
+    // so this census keeps the weighted sum's owner for it; only the Spark
+    // worker (muse_owner_bytes) declares the partial-reply epilogue.
+    let workspace = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)
         .map_err(|error| anyhow::anyhow!("{error}"))? + compiled * shape.hidden as u64 * 4
         + 2 * rows * 4 + combine_tables_bytes(usize::try_from(rows)?) as u64;
     Ok((package, workspace))

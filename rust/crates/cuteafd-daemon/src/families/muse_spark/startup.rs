@@ -159,7 +159,7 @@ mod tests {
             }).transpose()?;
             let opts = LayoutOptions { host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
                 head_split: true, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
-                muse_partial_bf16_max_rows: cutoff_rows, muse_partial_wide_format: wide, draft_kv_cache: draft_kv,
+                muse_partial_bf16_max_rows: cutoff_rows, spark_reply_format: Some(match wide { WideFormat::Bf16 => cuteafd_core::SparkReplyFormat::Bf16, WideFormat::Fp8 => cuteafd_core::SparkReplyFormat::Fp8, WideFormat::Nvfp4 => cuteafd_core::SparkReplyFormat::Nvfp4 }), draft_kv_cache: draft_kv,
                 muse_drafter_snapshot: snapshot.as_ref().map(|d| d.path().to_path_buf()), ..Default::default() };
             let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
                 layout: Some(opts.clone()), ..Default::default() })?;
@@ -375,7 +375,7 @@ mod tests {
                 shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
             max_context: None, pool_tokens: None, onboard: Onboard::Auto,
             spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
-            partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_wide_format: opts.muse_partial_wide_format,
+            partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_wide_format: opts.resolved_spark_reply_format(true).into(),
             local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
             drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint, vision, audio, replicas)?) })?;
         assert_eq!(&live, planned);

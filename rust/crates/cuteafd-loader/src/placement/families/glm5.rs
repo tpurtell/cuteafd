@@ -7,7 +7,7 @@
 //! ([`GlmContext`]); owned attention follows the shared prefill wave policy.
 use crate::families::glm5::{names::Operand, GlmDsaConfig, GlmIndexer};
 use crate::placement::*;
-use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance};
+use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance, Exl3Epilogue};
 use cuteafd_core::memory_layout::{Basis, Category};
 
 pub mod admission;
@@ -995,7 +995,7 @@ pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41
         // Runtime separately attests ELF geometry and LUT hashes before execution.
         Ok(value)
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    let backend_workspace = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?
+    let backend_workspace = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?
         + max_rows * shape.hidden as u64 * 4;
     let mut experts = Vec::new();
     for layer in shape.first_layer..selected_layers {

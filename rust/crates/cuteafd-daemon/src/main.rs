@@ -261,20 +261,21 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
 
     let parse = |matches: clap::ArgMatches| {
+
         match Cli::from_arg_matches(&matches) {
             Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
                 cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
-                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }),
+                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cli.spark_reply_format),
             Err(error) => error.exit(),
         }
     };
-    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait) =
+    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply) =
         parse(Cli::command().get_matches());
     for replacement in cli::deprecated_budget_flags(std::env::args()) {
         eprintln!("warning: deprecated coordinator budget flag; use {replacement}");
     }
     // `serve` and `golden` pick the family and stand for its own command.
-    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy) = match command {
+    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
@@ -284,8 +285,9 @@ async fn run() -> Result<()> {
             None => return Ok(()),
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
-            initial_wait),
+            initial_wait, initial_reply),
     };
+    cuteafd_core::spark_reply::set_requested(family_reply.or(initial_reply)).map_err(anyhow::Error::msg)?;
     // Read by the coordinator and every Spark worker from the same key.
     cuteafd_transport::wait_policy::set_wait_policy(wait_policy)?;
     if let Some((_, options)) = matches.subcommand() {

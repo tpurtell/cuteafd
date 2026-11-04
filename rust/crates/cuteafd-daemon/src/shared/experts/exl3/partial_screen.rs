@@ -24,7 +24,7 @@
 //!    keep a sentinel);
 //! 5. the unflagged weighted reply is byte-identical with and without the
 //!    epilogue installed.
-use super::{execution::{Exl3Execution, Exl3InputFormat}, partial::PartialEpilogue, Exl3Weights};
+use super::{execution::{Exl3Epilogue, Exl3Execution, Exl3InputFormat}, partial::PartialEpilogue, Exl3Weights};
 use crate::shared::{experts::layer::ExpertLayer, memory::{DeviceAllocation, LoadStream}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -195,7 +195,8 @@ fn partial_reply_screen() -> Result<()> {
     library.cuda_set_device(0)?;
     let weights = Rc::new(vec![Exl3Weights::load(&library, &catalog,
         ExpertLayer::BackboneExl3Tp { layer: 0, rank: 0, world: 6 }, 30_000_000_000)?]);
-    let execution = unsafe { Exl3Execution::with_input_format(&library, weights, &package, Exl3InputFormat::Fp8K32)? };
+    let execution = unsafe { Exl3Execution::with_input_format(&library, weights, &package,
+        Exl3InputFormat::Fp8K32, Exl3Epilogue::PartialReplies)? };
     let capacity = 80;
     let pitch = WIDTH + WIDTH / 32;
     let mut screen = Screen { library: &library, execution,

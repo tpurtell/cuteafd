@@ -1,7 +1,7 @@
 //! Select expert storage and execution from the checkpoint format at startup.
 use super::*;
 use crate::shared::experts::execution::ExpertExecution;
-use crate::shared::experts::exl3::{worker::Exl3Worker, Exl3Weights};
+use crate::shared::experts::exl3::{execution::Exl3Epilogue, worker::Exl3Worker, Exl3Weights};
 use crate::shared::experts::fp8::{worker::Fp8Worker, Fp8Weights};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::OfficialV41Catalog;
@@ -179,6 +179,7 @@ impl<'a> Weights<'a> {
         extent: cuteafd_core::OwnerExtent,
         remaining: usize,
         modules: &mut super::modules::WarmModules<'a>,
+        epilogue: Exl3Epilogue,
     ) -> Result<Execution<'_, 'a>> {
         Ok(match self {
             Self::Exlr8(weights) => Execution::Exlr8(super::exlr8::Worker::new(library,
@@ -200,6 +201,7 @@ impl<'a> Weights<'a> {
                     config.capacity,
                     remaining,
                     config.exl3_schedule,
+                    epilogue,
                     modules.take_exl3()?,
                 )?;
                 Execution::Exl3(execution)
@@ -691,8 +693,9 @@ pub(super) fn load_exl3<'a>(
         config.exl3_schedule)?;
     config.validate_exl3_residency(catalog, &exl3_directory)?;
 
+    let epilogue = Exl3Epilogue::for_catalog(catalog);
     let workspace = spark_execution_workspace(config, |capacity, _, staging_rows, _| {
-        let device = Exl3Worker::plan(&exl3_directory, capacity, config.exl3_schedule)
+        let device = Exl3Worker::plan(&exl3_directory, capacity, config.exl3_schedule, epilogue)
             .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
         let staging = (staging_rows as usize).checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
             .context("EXL3 route staging overflow")?;

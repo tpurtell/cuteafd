@@ -625,7 +625,7 @@ fn host_transport_uses_resolved_small_and_large_card_slots_only() {
         let waves = report.prefill_waves.unwrap();
         let shape = crate::serving_capacity::prefill_waves::PrefillPlan { unit_rows, waves, span_rows: unit_rows * waves };
         let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(opts.muse_partial_bf16_max_rows,
-            crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.muse_partial_wide_format).unwrap();
+            crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.resolved_spark_reply_format(true).into()).unwrap();
         let expected = crate::placement::families::muse_spark::host_transport(&cfg, shape, cutoff, slots as usize, 6).unwrap();
         let host = report.host_ledger.as_ref().unwrap();
         for (name, bytes) in [("transport/rdma-rings", expected.rings), ("transport/egress", expected.egress),
@@ -635,4 +635,22 @@ fn host_transport_uses_resolved_small_and_large_card_slots_only() {
         assert!(host.items.iter().all(|item| !matches!(item.group.as_str(),
             "workspace/router" | "staging/tables-and-sync")));
     }
+}
+
+/// The family's epilogue declaration is what sizes the Spark workspace: Muse
+/// Spark replies per-expert partials, so its executors never allocate the
+/// weighted sum's token output, while every sum-epilogue family still does.
+#[test]
+fn routed_experts_declare_the_partial_reply_epilogue() {
+    use crate::serving_capacity::Exl3Epilogue;
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let catalog = input.expert_catalog().unwrap();
+    assert!(catalog.exl3().is_some());
+    let first = catalog.routed_experts().first_layer;
+    assert_eq!(first, all_layers()[0]);
+    assert!(catalog.per_expert_output_norm());
+    assert_eq!(Exl3Epilogue::for_catalog(catalog), Exl3Epilogue::PartialReplies);
+    assert!(!Exl3Epilogue::PartialReplies.allocates("output"));
+    assert!(Exl3Epilogue::Sum.allocates("output"));
 }

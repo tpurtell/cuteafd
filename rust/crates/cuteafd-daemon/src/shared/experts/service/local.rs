@@ -2,6 +2,7 @@
 use super::*;
 use cuteafd_transport::{LocalVerbsExpertConnection, ProtocolV2ExecutorResponseRef};
 use super::backend::{Execution, Weights};
+use crate::shared::experts::exl3::execution::Exl3Epilogue;
 use std::{
     net::TcpListener,
     sync::{
@@ -350,8 +351,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let baseline = cuteafd_ffi::memory_ledger::snapshot();
     census.sample("before_expert_modules", Some(&library))?;
     // Experts with a per-expert output norm reply per-expert partials through the
-    // shared epilogue programs, which the image's PROGRAMS.json carries.
-    let partial_replies = catalog.exl3().is_some() && catalog.per_expert_output_norm();
+    // shared epilogue programs, which the image's PROGRAMS.json carries. The same
+    // declaration sizes the worker: a partial-reply epilogue never allocates the
+    // weighted sum's token output owner.
+    let epilogue = Exl3Epilogue::for_catalog(&catalog);
+    let partial_replies = epilogue == Exl3Epilogue::PartialReplies;
     let programs = (|| -> Result<_> {
         if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || partial_replies {
             let path = config.library.parent().context("native library directory")?
@@ -417,7 +421,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let mut execution = {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope(
                     if index < owners.decode.len() { "experts/workspace/decode" } else { "experts/workspace/prefill" });
-                weights.execution(&library, &owner_config, extent.compiled, extent, budget, &mut modules)?
+                weights.execution(&library, &owner_config, extent.compiled, extent, budget, &mut modules,
+                    epilogue)?
             };
             execution.defer(usize::from(extent.buffered_units), extent.staging_rows as usize, extent.owner)?;
             if partial_replies {

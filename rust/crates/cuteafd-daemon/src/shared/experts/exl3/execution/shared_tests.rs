@@ -30,15 +30,16 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
         library.cuda_set_device(device)?;
         let weights = Rc::new(vec![Exl3Weights::load(&library, &catalog,
             if tp1 { ExpertLayer::BackboneFull { layer: 0 } } else { ExpertLayer::BackboneTp2 { layer: 0, rank: device as usize } }, 7_000_000_000)?]);
-        let arena = Exl3Workspace::new(&library, &directories)?;
+        let arena = Exl3Workspace::new(&library, &directories, Exl3Epilogue::Sum)?;
         let mut states = directories.iter().map(|path| unsafe {
-            Exl3Execution::with_shared_workspace(&library, weights.clone(), path, format, Some(arena.clone()))
+            Exl3Execution::with_shared_workspace(&library, weights.clone(), path, format,
+                Exl3Epilogue::Sum, Some(arena.clone()))
         }).collect::<Result<Vec<_>>>()?;
         let actual_bytes = arena.allocations.values().map(|a| a.buffer.bytes).sum::<usize>()
             + states.iter().map(|s| s.workspace_bytes()).sum::<usize>();
-        let planned = Exl3Workspace::plan(&directories, format)?;
+        let planned = Exl3Workspace::plan(&directories, format, Exl3Epilogue::Sum)?;
         ensure!(actual_bytes == planned, "shared allocation budget mismatch");
-        let old = directories.iter().map(|p| Exl3Execution::plan(p, format)).collect::<Result<Vec<_>>>()?
+        let old = directories.iter().map(|p| Exl3Execution::plan(p, format, Exl3Epilogue::Sum)).collect::<Result<Vec<_>>>()?
             .into_iter().sum::<usize>();
         ensure!(planned < old, "workspace sharing did not reduce storage");
         let inputs = [DeviceAllocation::new(&library, 4096*pitch)?,
@@ -58,7 +59,8 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
         let input_buffers = || std::array::from_fn(|i| inputs[i].buffer);
         let mut graphs = Vec::new();
         for (i, &capacity) in capacities.iter().enumerate() {
-            let mut private = unsafe { Exl3Execution::with_input_format(&library, weights.clone(), &directories[i], format)? };
+            let mut private = unsafe { Exl3Execution::with_input_format(&library, weights.clone(),
+                &directories[i], format, Exl3Epilogue::Sum)? };
             let output = unsafe { private.launch(input_buffers(), capacity, stream.raw)? };
             unsafe { library.cuda_stream_synchronize(stream.raw)?; }
             let expected = read(output)?;
@@ -95,7 +97,7 @@ fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_js
     use cuteafd_loader::placement::planner::{self, *};
     let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
     let layout = cuteafd_loader::serving_capacity::Exl3WorkspaceLayout::from_manifests(
-        manifests, true)?;
+        manifests, true, Exl3Epilogue::Sum)?;
     let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
         allocations: layout.allocations("expert.test", location, lifetime),
         deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
@@ -248,11 +250,12 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
         _arena: crate::shared::experts::exl3::ArenaOwner::Mount(arena), layout,
         budget: ExpertLoadBudget { resident_bytes:bytes,device_staging_bytes:0,pinned_host_bytes:0,read_scratch_bytes:0 },
     }]);
-    let workspace = Exl3Workspace::new(&library, &[directory.to_owned(), wide_directory])?;
+    let workspace = Exl3Workspace::new(&library, &[directory.to_owned(), wide_directory], Exl3Epilogue::Sum)?;
     let mut executions = Vec::new();
     for modules in lanes {
         // SAFETY: allocation-only CPU fixture; no queued work, launches or graphs.
-        executions.push(unsafe { Exl3Execution::with_modules(&library, weights.clone(), modules, Some(workspace.clone()))? });
+        executions.push(unsafe { Exl3Execution::with_modules(&library, weights.clone(), modules,
+            Exl3Epilogue::Sum, Some(workspace.clone()))? });
     }
     use cuteafd_loader::placement::planner::{Device, Domain, Lifetime, Location};
     let manifests = [meta.clone(), wide];

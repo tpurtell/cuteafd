@@ -94,6 +94,19 @@ def stage_metrics(actual, bf16, fp32):
                 passed=native_error <= 1.1 * max(official_error, floor))
 
 
+def signed_channel_errors(actual, bf16, fp32):
+    """Retain channel direction; RMS alone hides coherent bias on silence."""
+    import numpy as np
+    result = {}
+    for name, value in (("native", actual), ("official_bf16", bf16)):
+        delta = np.asarray(value, dtype=np.float64) - np.asarray(fp32, dtype=np.float64)
+        means = delta.reshape(-1, delta.shape[-1]).mean(axis=0)
+        result[name] = dict(mean_by_channel=means.tolist(), signed_mean=float(means.mean()),
+            channel_mean_rms=float(np.sqrt(np.mean(means * means))),
+            channel_mean_max_abs=float(np.abs(means).max()))
+    return result
+
+
 def check(code):
     if code:
         raise RuntimeError(f"native PCM status {code}")
@@ -118,6 +131,126 @@ def official_features(model, prepared, config, dtype, samples_per_token):
     return result.pooler_output.float().cpu()
 
 
+def propagation_steps(model):
+    """Only the first two blocks and the next patch; no full-tower replay."""
+    steps = []
+    for stage in range(2):
+        prefix = f"layers.{stage}"
+        patch = model.layers[stage].patch_embedder
+        steps.extend([(prefix + ".patch_embedder.proj", 0, patch.proj, stage * 3),
+                      (prefix + ".patch_embedder.norm", 2, patch.norm, stage * 3)])
+        if stage == 0:
+            for block, module in enumerate(model.layers[stage].conv_blocks):
+                prefix_block = prefix + f".conv_blocks.{block}"
+                steps.extend((prefix_block + "." + name, op, operation, block + 1)
+                    for name, op, operation in (("conv", 1, module.conv),
+                        ("norm", 2, module.norm), ("mlp.fc1", 0, module.mlp.fc1),
+                        ("mlp.activation_fn", 3, module.mlp.activation_fn),
+                        ("mlp.fc2", 0, module.mlp.fc2), ("residual", 4, None)))
+    return steps
+
+
+def diagnose_propagation(lib, model, prepared, native_stages):
+    """Separate local arithmetic error from inherited drift on one native chunk."""
+    import torch
+    import torch.nn.functional as F
+    model.to(dtype=torch.bfloat16)
+    support = C.c_void_p()
+    lib.cuteafd_pcm_support_create.argtypes = [C.POINTER(C.c_void_p)]
+    lib.cuteafd_pcm_support_launch.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_int,
+        C.POINTER(C.c_void_p), C.c_int, C.c_void_p]
+    lib.cuteafd_pcm_support_destroy.argtypes = [C.c_void_p]
+    check(lib.cuteafd_pcm_support_create(C.byref(support)))
+    # The owner runs at most 16 output tokens per chunk, including causal history.
+    samples = min(prepared.numel(), 16 * 1920)
+    oracle = prepared[:samples].to("cuda", torch.float32).view(1, -1, 1)
+    chains = {"native": oracle.bfloat16(), "official": oracle.bfloat16(), "fp32": oracle}
+    residuals, records, boundaries = {}, [], []
+
+    def reference(op, module, x, residual, fp32=False):
+        if fp32:
+            x = x.float()
+        if op == 0:
+            return F.linear(x, module.weight.to(x.dtype), module.bias.to(x.dtype))
+        if op == 1:
+            return F.conv1d(F.pad(x.transpose(1, 2), (6, 0)),
+                module.weight.to(x.dtype), module.bias.to(x.dtype), groups=x.shape[-1]).transpose(1, 2)
+        if op == 2:
+            f = x.float()
+            return (f * torch.pow(f.square().mean(-1, keepdim=True) + module.eps, -0.5)
+                    * module.weight.float()).to(x.dtype)
+        if op == 3:
+            return F.gelu(x, approximate="none")
+        return x + residual.to(x.dtype)
+
+    def native(op, module, x, residual):
+        x = x.bfloat16().contiguous()
+        width = x.shape[-1]
+        outputs = module.out_features if op == 0 else 0
+        out = torch.empty((*x.shape[:-1], outputs or width), device=x.device, dtype=x.dtype)
+        if op == 0:
+            operands = [x, module.weight, module.bias, out]
+        elif op == 1:
+            history = torch.zeros((1, width, 6), device=x.device, dtype=x.dtype)
+            operands = [x, module.weight, module.bias, history, out, history]
+        elif op == 2:
+            operands = [x] + [module.weight] * 5 + [out]
+        elif op == 3:
+            operands = [x, out]
+        else:
+            operands = [x, residual.bfloat16().contiguous(), out]
+        pointers = (C.c_void_p * len(operands))(*(value.data_ptr() for value in operands))
+        check(lib.cuteafd_pcm_support_launch(support, op, width, outputs, pointers,
+            x.numel() // width, torch.cuda.current_stream().cuda_stream))
+        torch.cuda.synchronize()
+        return out
+
+    try:
+        with torch.inference_mode():
+            for name, op, module, stage in propagation_steps(model):
+                if name.endswith("patch_embedder.proj"):
+                    patch = model.layers[stage // 3].patch_embedder.patch_size
+                    chains = {key: value.reshape(1, value.shape[1] // patch, -1)
+                              for key, value in chains.items()}
+                if op == 1:
+                    residuals = dict(chains)
+                x, official, fp32 = chains["native"], chains["official"], chains["fp32"]
+                actual = native(op, module, x, residuals.get("native"))
+                expected = reference(op, module, official, residuals.get("official"))
+                oracle_output = reference(op, module, fp32, residuals.get("fp32"), True)
+                same_native = reference(op, module, x, residuals.get("native"), True)
+                official_on_native = reference(op, module, x, residuals.get("native"))
+                same_official = reference(op, module, official, residuals.get("official"), True)
+                official_input_native = native(op, module, official, residuals.get("official"))
+                oracle_input_native = native(op, module, fp32, residuals.get("fp32"))
+                cpu = lambda value: value.detach().float().cpu()
+                local = stage_metrics(cpu(actual), cpu(official_on_native), cpu(same_native))
+                official_local = stage_metrics(cpu(official_input_native), cpu(expected), cpu(same_official))
+                cumulative = stage_metrics(cpu(actual), cpu(expected), cpu(oracle_output))
+                rms = lambda value: float(value.float().square().mean().sqrt())
+                inherited = same_native - oracle_output
+                local_error = actual.float() - same_native
+                records.append(dict(primitive=name, native_input_local=local,
+                    official_input_local=official_local, cumulative=cumulative,
+                    inherited_absolute_rms=rms(inherited),
+                    local_inherited_cross_mse=float((local_error * inherited).mean()),
+                    official_input_local_absolute_rms=rms(expected.float() - same_official),
+                    fp32_input_native_absolute_rms=rms(oracle_input_native.float() - oracle_output),
+                    signed_channel_errors=signed_channel_errors(cpu(actual), cpu(expected), cpu(oracle_output))))
+                chains = dict(native=actual, official=expected, fp32=oracle_output)
+                if op == 4 or name.endswith("patch_embedder.norm"):
+                    observed = native_stages[stage][:actual.shape[1]]
+                    replay = cpu(actual).squeeze(0)
+                    boundaries.append(dict(stage=stage, byte_exact=bool(torch.equal(replay, observed)),
+                        max_abs=float((replay - observed).abs().max())))
+        return dict(samples=samples, chunk_tokens=samples // 1920, primitives=records,
+                    native_observer_boundaries=boundaries,
+                    native_observers_exact=all(row["byte_exact"] for row in boundaries))
+    finally:
+        torch.cuda.synchronize()
+        check(lib.cuteafd_pcm_support_destroy(support))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
@@ -127,6 +260,8 @@ def main():
     parser.add_argument("--long-samples", type=int, default=24000 * 30)
     parser.add_argument("--diagnose-conv", action="store_true", help="report isolated BF16 convolution bias-rounding yardstick")
     parser.add_argument("--diagnose-ops", action="store_true", help="compare each shared primitive on official BF16 inputs")
+    parser.add_argument("--diagnose-propagation", action="store_true",
+        help="replay stage0 and stage1 patch on native/official/FP32 chains, retaining the cumulative gate")
     parser.add_argument("--strict-bf16-reduction", action="store_true", help="disable PyTorch reduced-precision BF16 GEMM reduction")
     parser.add_argument("--check-owner-lifetime", action="store_true", help="destroy overlapping owners, then unload and recreate the module set")
     args = parser.parse_args()
@@ -389,10 +524,16 @@ def main():
                 raise AssertionError(errors)
             check(status)
             stages = []
+            native_stages = {stage: torch.cat([x for _, x in sorted(chunks[stage])]) for stage in range(13)}
+            propagation = diagnose_propagation(lib, model, prepared, native_stages) if args.diagnose_propagation else None
+            if propagation is not None and not propagation["native_observers_exact"]:
+                raise AssertionError("propagation replay differs from native owner observers")
             for stage in range(13):
-                actual = torch.cat([x for _, x in sorted(chunks[stage])])
+                actual = native_stages[stage]
                 metric = stage_metrics(actual, official_stages[stage], fp32_stages[stage])
-                stages.append(dict(stage=stage, **metric))
+                stages.append(dict(stage=stage, **metric,
+                    signed_channel_errors=signed_channel_errors(actual, official_stages[stage], fp32_stages[stage])
+                        if args.diagnose_propagation else None))
                 report["cumulative_stage_yardstick_pass"] &= metric["passed"]
             final = torch.from_numpy(output).view(torch.bfloat16).float()
             feature_metrics = stage_metrics(final, bf16_features, fp32_features)
@@ -400,6 +541,7 @@ def main():
             linears = [metric for metric in primitive_metrics if "linear_path" in metric]
             report["clips"].append(dict(name=label, samples=len(pcm), tokens=tokens, spans_exact=True,
                 stages=stages, public_features=feature_metrics, primitives=primitive_metrics,
+                propagation=propagation,
                 per_op_native_not_worse=all(metric["native_not_worse"] for metric in primitive_metrics) if primitive_metrics else None,
                 per_op_fp32_yardstick_pass=all(metric["within_bf16_yardstick"] for metric in primitive_metrics) if primitive_metrics else None,
                 linear_fp32_yardstick_pass=all(metric["within_bf16_yardstick"] for metric in linears) if linears else None))

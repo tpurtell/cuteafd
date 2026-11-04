@@ -39,7 +39,7 @@ fn invalid(name: &str, what: &str) -> CacheGeometryError {
 }
 
 impl Exl3WorkspaceLayout {
-    pub fn from_manifests(manifests: &[Value], fp8_k32: bool) -> Result<Self, CacheGeometryError> {
+    pub fn from_manifests(manifests: &[Value], fp8_k32: bool, epilogue: Exl3Epilogue) -> Result<Self, CacheGeometryError> {
         if manifests.is_empty() {
             return Err(invalid("manifests", "no capacity specializations"));
         }
@@ -80,6 +80,7 @@ impl Exl3WorkspaceLayout {
                         .as_bool()
                         .ok_or_else(|| invalid(name, "missing initialization policy"))?,
                 };
+                if !epilogue.allocates(buffer.allocation) { continue; }
                 if name == buffer.allocation {
                     let bytes = buffer.bytes.max(16);
                     if buffer.zero {
@@ -226,8 +227,43 @@ impl Exl3WorkspaceLayout {
     }
 }
 
-pub fn exl3_workspace_bytes(manifests: &[Value], fp8_k32: bool) -> Result<u64, CacheGeometryError> {
-    Exl3WorkspaceLayout::from_manifests(manifests, fp8_k32)?.bytes()
+/// The routed-expert epilogue a family's runtime executes after the EXL3 core.
+///
+/// The weighted top-k sum is its own native object; it reads the executor's
+/// `output` owner. Families whose experts carry a per-expert output norm reply
+/// unweighted per-expert partials instead, launch the core only and never read
+/// that owner. Planner censuses and worker allocations must declare the same
+/// epilogue, or admission and allocation disagree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Exl3Epilogue {
+    /// Core then the weighted top-k sum into the token output.
+    #[default]
+    Sum,
+    /// Core only; the coordinator combines per-expert partial replies.
+    PartialReplies,
+}
+
+/// The weighted token sum's allocation owner.
+const OUTPUT_OWNER: &str = "output";
+
+impl Exl3Epilogue {
+    /// The epilogue the checkpoint's routed experts declare.
+    pub fn for_catalog(catalog: &crate::OfficialV41Catalog) -> Self {
+        if catalog.exl3().is_some() && catalog.per_expert_output_norm() {
+            Self::PartialReplies
+        } else {
+            Self::Sum
+        }
+    }
+    /// Whether `owner` is allocated for this epilogue.
+    pub fn allocates(self, owner: &str) -> bool {
+        self == Self::Sum || owner != OUTPUT_OWNER
+    }
+}
+
+pub fn exl3_workspace_bytes(manifests: &[Value], fp8_k32: bool, epilogue: Exl3Epilogue)
+    -> Result<u64, CacheGeometryError> {
+    Exl3WorkspaceLayout::from_manifests(manifests, fp8_k32, epilogue)?.bytes()
 }
 
 #[cfg(test)]
@@ -246,10 +282,10 @@ mod tests {
     #[test]
     fn aliases_share_scratch_but_capacity_state_and_wire_decode_stay_private() {
         let manifests = [manifest(1, 64), manifest(16, 1024)];
-        let layout = Exl3WorkspaceLayout::from_manifests(&manifests, true).unwrap();
+        let layout = Exl3WorkspaceLayout::from_manifests(&manifests, true, Exl3Epilogue::Sum).unwrap();
         assert_eq!(layout.bytes().unwrap(), 1024 + 2 * (16 + 16) + 17 * 8 * 2);
         assert_eq!(
-            exl3_workspace_bytes(&manifests, false).unwrap(),
+            exl3_workspace_bytes(&manifests, false, Exl3Epilogue::Sum).unwrap(),
             1024 + 2 * (16 + 16)
         );
         assert_eq!(layout.owners.len(), 7);
@@ -277,21 +313,40 @@ mod tests {
         let mut native_wire = manifests.clone();
         native_wire[1]["input_format"] = json!("e4m3_k32");
         assert_eq!(
-            exl3_workspace_bytes(&native_wire, true).unwrap(),
+            exl3_workspace_bytes(&native_wire, true, Exl3Epilogue::Sum).unwrap(),
             layout.bytes().unwrap() - 256
         );
         // A binding can use the maximum physical backing shared by capacities,
         // exactly as the execution constructor's bounds check permits.
         let mut larger_alias = manifests.clone();
         larger_alias[0]["buffers"]["alias"]["bytes"] = json!(512);
-        Exl3WorkspaceLayout::from_manifests(&larger_alias, true).unwrap();
+        Exl3WorkspaceLayout::from_manifests(&larger_alias, true, Exl3Epilogue::Sum).unwrap();
+    }
+
+    #[test]
+    fn partial_replies_omit_output_owner_and_bindings() {
+        let manifests = [manifest(1, 64), manifest(16, 1024)];
+        let mut output = manifests.clone();
+        for (manifest, bytes) in output.iter_mut().zip([64, 1024]) {
+            manifest["buffers"]["output"] = json!({"bytes": bytes, "allocation": "output",
+                "dtype": "bf16", "zero_on_create": false});
+            manifest["buffers"]["output_alias"] = json!({"bytes": 32, "allocation": "output",
+                "dtype": "bf16", "zero_on_create": false});
+        }
+        let baseline = Exl3WorkspaceLayout::from_manifests(&manifests, true, Exl3Epilogue::Sum).unwrap();
+        let partial = Exl3WorkspaceLayout::from_manifests(&output, true, Exl3Epilogue::PartialReplies).unwrap();
+        assert_eq!(partial, baseline);
+        let summed = Exl3WorkspaceLayout::from_manifests(&output, true, Exl3Epilogue::Sum).unwrap();
+        assert_eq!(summed.bytes().unwrap(), baseline.bytes().unwrap() + 1024);
+        assert_eq!(summed.owners.len(), baseline.owners.len() + 1);
+        assert_eq!(summed.bindings.len(), baseline.bindings.len() + 4);
     }
 
     #[test]
     fn malformed_capacity_owners_and_unbounded_bindings_refuse() {
         let originals = [manifest(1, 64), manifest(16, 1024)];
         let refuses = |manifests: &[Value]| {
-            assert!(Exl3WorkspaceLayout::from_manifests(manifests, true).is_err())
+            assert!(Exl3WorkspaceLayout::from_manifests(manifests, true, Exl3Epilogue::Sum).is_err())
         };
         refuses(&[]);
         refuses(&[originals[0].clone(), originals[0].clone()]);

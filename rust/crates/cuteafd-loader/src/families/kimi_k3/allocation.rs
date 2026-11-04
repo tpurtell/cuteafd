@@ -1,6 +1,7 @@
 //! CPU allocation layouts shared by Kimi checkpoint planning and native owners.
 use super::config::{KimiAttention, KimiK3Config};
 use crate::placement::{Demand, GraphSet, Lifetime};
+use crate::serving_capacity::Exl3Epilogue;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
 use std::collections::BTreeMap;
@@ -368,7 +369,7 @@ pub fn expert_workspace(package: &std::path::Path, rows: usize) -> Result<u64> {
             "Kimi TP2 expert workspace geometry/capacity mismatch");
         Ok(manifest)
     }).collect::<Result<Vec<_>>>()?;
-    Ok(crate::serving_capacity::exl3_workspace_bytes(&manifests, true)? + (rows * 3584 * 4) as u64)
+    Ok(crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)? + (rows * 3584 * 4) as u64)
 }
 
 pub fn expert_package(manifest: &std::path::Path) -> Result<std::path::PathBuf> {

@@ -53,6 +53,7 @@ fi
 # Extra routed-expert kernel families (FAMILY:ROLE list, e.g. dsv4f:spark),
 # validated by native/cmake/shared/expert_families.cmake. Empty keeps the V4.1 image.
 # Both builds take the same list; CMake keeps the entries for its architecture.
+v41_expert_aot=ON
 expert_families="${CUTEAFD_WIP_EXPERT_FAMILIES:-}"
 [[ "$role" != expert || ";$expert_families;" != *";glmfdense:"* ]] || { echo "CUTEAFD_WIP_EXPERT_FAMILIES: glmfdense is coordinator-only; remove it from the Spark expert scope" >&2; exit 2; }
 # Optional Spark siblings retain unquantized BF16 expert inputs. Empty keeps
@@ -286,7 +287,7 @@ cmake \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_WIP_VISION_ATTENTION_AOT:-ON}" \
   -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
-  -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
+  -DCUTEAFD_ENABLE_V41_EXPERT_AOT="$v41_expert_aot" \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
   -DCUTEAFD_GENERIC_SPARK_COUNTS="${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}" \
@@ -445,10 +446,12 @@ elif [[ -f "$output_dir/COMPILER_PROVENANCE.json" ]]; then
 fi
 # Generic-family tables must come from this build, not an earlier role/opt-in.
 # A native-cache hit restored the table with the rest of the native outputs.
+# Native V4.1 experts are always enabled by the CMake scope above;
+# generic EXL3/FP8 scopes and optional package flags use that same codec table.
 if ((${native_hit:-0})); then
   :
 elif [[ ( "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF};${CUTEAFD_WIP_KIMIK3_AOT:-OFF};${CUTEAFD_WIP_MUSE_AOT:-OFF};${CUTEAFD_WIP_ML4_AOT:-OFF}" == *ON* ) || "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON \
-    || ( "$role" == expert && ";${expert_families:-};" == *";muse:exl3-k"* ) ]]; then
+    || ( "$role" == expert && ( -n "${expert_families:-}${bf16_families:-}" || "${exl3_aot:-OFF}" == ON || "${nvfp4_aot:-OFF}" == ON || "${v41_expert_aot:-OFF}" == ON ) ) ]]; then
   install -m 0644 "$build_dir/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else
   printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"

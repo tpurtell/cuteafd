@@ -169,7 +169,43 @@ pub(crate) struct UnitSegment {
     pub head: bool,
 }
 
+/// Source metadata owned by a deferred Spark request builder.
+pub(crate) struct ReplyOrigins(Vec<(u64, u64, cuteafd_transport::ExpertV2SourceKind)>);
+impl ReplyOrigins {
+    pub(crate) fn apply(self, request: &mut cuteafd_transport::ExpertProtocolV2Request) -> anyhow::Result<()> {
+        anyhow::ensure!(request.rows.len() == self.0.len(), "packed Spark origin count differs from request rows");
+        for (row, (id, position, kind)) in request.rows.iter_mut().zip(self.0) {
+            row.source_request_id = id;
+            row.token_position = position;
+            row.source_kind = kind;
+        }
+        Ok(())
+    }
+}
+
 impl Unit {
+    /// Packed units carry their real members in every mode; leave singleton
+    /// descriptors unchanged. Worker math does not consume this metadata.
+    pub(crate) fn reply_origins(&self) -> anyhow::Result<Option<ReplyOrigins>> {
+        if self.segments.len() <= 1 { return Ok(None); }
+        self.packed_reply_origins().map(Some)
+    }
+
+    fn packed_reply_origins(&self) -> anyhow::Result<ReplyOrigins> {
+        let mut origins = Vec::with_capacity(self.rows.len());
+        for segment in &self.segments {
+            anyhow::ensure!(segment.rows.start == origins.len() && segment.rows.len() == segment.tokens.len(),
+                "packed Spark segments must be contiguous with matching token extents");
+            let id = u64::try_from(segment.sequence)?.checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("packed Spark source id overflow"))?;
+            for token in segment.tokens.clone() {
+                origins.push((id, u64::try_from(token)?, cuteafd_transport::ExpertV2SourceKind::Prefill));
+            }
+        }
+        anyhow::ensure!(origins.len() == self.rows.len(), "packed Spark segments do not cover the unit");
+        Ok(ReplyOrigins(origins))
+    }
+
     fn sequences(&self) -> Vec<usize> {
         if self.segments.is_empty() { vec![self.sequence] }
         else { self.segments.iter().map(|s| s.sequence).collect() }
@@ -502,6 +538,46 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::time::Duration;
+
+    #[test]
+    fn packed_reply_metadata_enforces_each_members_threshold() -> anyhow::Result<()> {
+        use cuteafd_core::SparkReplyFormat;
+        use cuteafd_transport::{ExpertProtocolV2Request, ExpertV2Dtype, ExpertV2SourceKind};
+        for first_rows in [64, 65] {
+            let rows = first_rows + 65;
+            let unit = Unit { index: 0, sequence: 7, segments: vec![
+                UnitSegment { sequence: 7, rows: 0..first_rows, tokens: 91..91 + first_rows,
+                    prompt_end: false, snapshot: false, head: false },
+                UnitSegment { sequence: 12, rows: first_rows..rows, tokens: 203..268,
+                    prompt_end: false, snapshot: false, head: false },
+            ], rows: 400..400 + rows, layers: 0..1, slot: 0, barrier: false };
+            let mut request = ExpertProtocolV2Request::new(1, 1, 0, 32, ExpertV2Dtype::Bf16,
+                (0..rows).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
+                    row_id: row as u64, source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
+                    token_position: row as u64, route_offset: 0, route_count: 0,
+                }).collect(), vec![], vec![0; rows * 64])?;
+            unit.reply_origins()?.unwrap().apply(&mut request)?;
+            for (row, descriptor) in request.rows.iter().enumerate() {
+                let (id, token) = if row < first_rows { (8, 91 + row) }
+                    else { (13, 203 + row - first_rows) };
+                assert_eq!((descriptor.source_request_id, descriptor.token_position, descriptor.source_kind),
+                    (id, token as u64, ExpertV2SourceKind::Prefill));
+            }
+            let decision = SparkReplyFormat::Nvfp4.combined(request.rows.iter().map(|row|
+                (row.source_request_id, row.source_kind == ExpertV2SourceKind::Prefill)));
+            assert_eq!(decision.format, if first_rows == 64 { SparkReplyFormat::Bf16 } else { SparkReplyFormat::Nvfp4 });
+            request.rows[0].source_kind = ExpertV2SourceKind::Decode;
+            assert_eq!(SparkReplyFormat::Nvfp4.combined(request.rows.iter().map(|row|
+                (row.source_request_id, row.source_kind == ExpertV2SourceKind::Prefill))).format, SparkReplyFormat::Bf16);
+            let mut singleton = unit.clone();
+            singleton.segments.clear();
+            assert!(singleton.reply_origins()?.is_none());
+            let mut invalid = unit.clone();
+            invalid.segments[1].rows.start += 1;
+            assert!(invalid.reply_origins().is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn cleanup_restores_state_on_body_errors_and_preserves_the_cause() {

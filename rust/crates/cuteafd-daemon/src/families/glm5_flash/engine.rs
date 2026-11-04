@@ -5247,7 +5247,7 @@ impl<'a> GlmfEngine<'a> {
                 // The compact reducer adds the shared expert plane to the rank partials.
                 let mut transport = transport.borrow_mut();
                 let exchange = transport.exchange()?;
-                let wave = self.spark_send(w, index, t, decode, exchange, shared)?;
+                let wave = self.spark_send(w, index, t, decode, exchange, None, shared)?;
                 return self.spark_land(w, t, exchange, wave);
             }
         }
@@ -5318,7 +5318,7 @@ impl<'a> GlmfEngine<'a> {
     /// and the ranks compute. This thread never waits for the GPU. Complete
     /// with [`Self::spark_land`].
     fn spark_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool,
-        exchange: &mut crate::shared::spark_waves::Waves<'_>, shared: impl FnOnce() -> Result<()>)
+        exchange: &mut crate::shared::spark_waves::Waves<'_>, origins: Option<crate::shared::prefill_pipeline::ReplyOrigins>, shared: impl FnOnce() -> Result<()>)
         -> Result<crate::shared::spark_waves::WaveTicket> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
@@ -5330,7 +5330,8 @@ impl<'a> GlmfEngine<'a> {
         let ticket = unsafe {
             exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer,
                 if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, Box::new(move |routes, wire| {
-                    let request = spark_request_bytes(h, topk, index, t, routes, wire, kind, bf16)?;
+                    let mut request = spark_request_bytes(h, topk, index, t, routes, wire, kind, bf16)?;
+                    if let Some(origins) = origins { origins.apply(&mut request)?; }
                     if audit {
                         let counts = audit_route_counts(&request.routes);
                         tracing::info!(layer = index, rows = t, distinct = counts.len(),

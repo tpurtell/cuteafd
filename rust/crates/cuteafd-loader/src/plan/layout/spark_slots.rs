@@ -3,6 +3,7 @@ use super::*;
 use anyhow::Context;
 use crate::formats::fp8_experts::ExpertFormat;
 use crate::placement::SparkWorkingSet;
+use crate::serving_capacity::Exl3Epilogue;
 
 /// Installed-package scratch census (#778, issuecomment-6401148082): every
 /// shipped FP8-family package's scratch at each export capacity. A typed owner
@@ -159,7 +160,7 @@ pub(crate) fn muse_owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent)
         .find(|manifest| manifest["capacity"].as_u64() == Some(u64::from(capacity)))
         .cloned().with_context(|| format!("Muse Spark TP{world} census has no m{capacity}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?;
+    let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::PartialReplies)?;
     let rows = u64::from(extent.capacity);
     let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
     let wire_routes = u64::from(geometry.hidden) * 33 / 32 + u64::from(geometry.topk) * 8;
@@ -188,7 +189,7 @@ pub(crate) fn ml4_owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent)
         .find(|manifest| manifest["capacity"].as_u64() == Some(u64::from(capacity)))
         .cloned().with_context(|| format!("Mistral Large 4 TP{world} census has no m{capacity}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?;
+    let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?;
     let wire_routes = u64::from(geometry.hidden) * 33 / 32 + u64::from(geometry.topk) * 8;
     Ok(cuteafd_core::OwnerBytes { scratch: retained, io: u64::from(extent.capacity) * wire_routes,
         pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
@@ -416,8 +417,8 @@ mod tests {
                 let compiled = *retained_set.last().unwrap();
                 let selected = manifests.iter().filter(|manifest| retained_set.contains(
                     &(manifest["capacity"].as_u64().unwrap() as u32))).cloned().collect::<Vec<_>>();
-                let retained = crate::serving_capacity::exl3_workspace_bytes(&selected, true)?;
-                let without_wire = crate::serving_capacity::exl3_workspace_bytes(&selected, false)?;
+                let retained = crate::serving_capacity::exl3_workspace_bytes(&selected, true, Exl3Epilogue::Sum)?;
+                let without_wire = crate::serving_capacity::exl3_workspace_bytes(&selected, false, Exl3Epilogue::Sum)?;
                 assert_eq!(retained - without_wire,
                     retained_set.iter().map(|&rows| u64::from(rows)).sum::<u64>() * 6144 * 2);
                 let owner = ml4_owner_bytes(world, extent(capacity, compiled))?;
@@ -619,7 +620,7 @@ mod tests {
                     "dtype": "i32", "zero_on_create": true}));
                 json!({"capacity": rows, "hidden": hidden, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
             }).collect::<Vec<_>>();
-            let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+            let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
             let wire_routes = 4096 * (hidden + hidden / 32 + 8 * topk);
             assert_eq!(retained + wire_routes, expected, "{family}");
             let geometry = cuteafd_core::ExpertGeometry { hidden: hidden as u32, topk: topk as u32,
@@ -721,10 +722,12 @@ mod tests {
     fn muse_census_keeps_each_worlds_own_retained_capacity_set() -> anyhow::Result<()> {
         // SM121 allocation witnesses, K4/K5 with the empty K5 tier. TP2/TP3
         // remain honest while refused; admitted worlds never pay their widths.
-        for (world, decode, prefill) in [(2, 26_120_876, 554_677_564),
-            (3, 23_663_276, 470_136_124), (4, 22_188_716, 419_411_260),
-            (5, 21_697_196, 402_502_972), (6, 21_205_676, 385_594_684),
-            (7, 20_714_156, 368_686_396), (8, 20_222_636, 351_778_108)] {
+        // Muse replies per-expert partials, so these are the witnesses without
+        // the weighted sum's output owner (m80 -655,360 B, m2752 -22,544,384 B).
+        for (world, decode, prefill) in [(2, 25_465_516, 532_133_180),
+            (3, 23_007_916, 447_591_740), (4, 21_533_356, 396_866_876),
+            (5, 21_041_836, 379_958_588), (6, 20_550_316, 363_050_300),
+            (7, 20_058_796, 346_142_012), (8, 19_567_276, 329_233_724)] {
             for (capacity, compiled, retained) in [(64, 80, decode), (2752, 2752, prefill)] {
                 let owner = muse_owner_bytes(world, extent(capacity, compiled))?;
                 assert_eq!(owner.scratch, retained + u64::from(capacity) * 16, "TP{world} m{compiled}");
@@ -759,10 +762,12 @@ mod tests {
                 let capacities = cuteafd_core::Exl3RowPolicy::Nearest.capacities(capacity as usize)?;
                 let compiled = *capacities.last().unwrap();
                 let retained_index = CENSUS_CAPACITIES.iter().position(|&rows| rows == compiled).unwrap();
-                let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=retained_index], true)?;
+                let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=retained_index], true,
+                    Exl3Epilogue::PartialReplies)?;
                 assert_eq!(muse_owner_bytes(world, extent(capacity, compiled))?.scratch,
                     retained + u64::from(capacity) * 16);
-                let without_wire = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=retained_index], false)?;
+                let without_wire = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=retained_index], false,
+                    Exl3Epilogue::PartialReplies)?;
                 let rows: u64 = capacities.iter().map(|&rows| u64::from(rows)).sum();
                 assert_eq!(retained - without_wire, rows * 4096 * 2);
             }

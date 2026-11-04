@@ -966,6 +966,26 @@ def test_arm_config_edits_apply_after_generation(entry, tmp_path, monkeypatch):
             assert settings['COORDINATOR_GPUS'] == '1' and 'COORDINATOR_GPU' not in settings
 
 
+@pytest.mark.parametrize('key', ['MEDIA_FEATURES_DIR', 'AUDIO_FEATURES_DIR'])
+def test_reference_feature_directory_is_an_isolated_arm_setting(entry, tmp_path, monkeypatch, key):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    features = tmp_path / 'sealed-features'
+    features.mkdir()
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--matrix', '--arm', 'native=b:s', '--arm', 'reference=c:s',
+        '--arm-wip', 'native=shared', '--arm-wip', 'reference=shared', '--state', str(state),
+        '--arm-set', f'reference:{key}={features}', '--dry-run'])
+    assert cards.main() == 0
+    for job in json.loads((state / 'plan.json').read_text())['jobs']:
+        settings = job['entry']['set']
+        assert cards.config(Path(job['state']) / 'base.config') == settings
+        if job['arm'] == 'reference':
+            assert settings[key] == str(features)
+        else:
+            assert key not in settings
+
+
 @pytest.mark.parametrize('extra,match', [
     (['--arm-set', 'foreign:MODEL_ID=x'], 'unknown override arm'),
     (['--arm-unset', 'foreign:MODEL_ID'], 'unknown override arm'),

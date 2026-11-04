@@ -56,6 +56,7 @@ pub(super) struct Worker<'w, 'a> {
     prefill: Option<Exlr8Execution<'a>>,
     weights: &'w [Exlr8Weights<'a>],
     library: &'a NativeLibrary,
+    reply_codec: super::super::reply::ReplyCodec<'a>,
     selected: usize,
     capacity: usize,
     executor_id: u64,
@@ -175,6 +176,7 @@ impl<'w, 'a> Worker<'w, 'a> {
             grouped_decode = grouped_decode.is_some(), decode_bytes, workspace,
             "EXLR8 decode dispatch admitted");
         Ok(Self { stream, execution, grouped_decode, grouped_from_row, prefill, weights, library,
+            reply_codec: super::super::reply::ReplyCodec::load(library)?,
             selected: 0, capacity: config.capacity as usize,
             executor_id: config.spark_world()?.topology().executor_id(config.rank)?, timing,
             deferred: false, pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
@@ -210,6 +212,9 @@ impl<'w, 'a> Worker<'w, 'a> {
         let rows = request.rows() as usize;
         let stage = self.pending.next_slot()?;
         let identity = (request.request_id(), request.layer(), rows as u32, executor_id);
+        let compressed = request.output_dtype() != ExpertV2Dtype::Bf16;
+        ensure!(!compressed || (mapped.is_some() && destination.is_some()),
+            "compressed replies require mapped request and response slots");
         let Some(mapped) = mapped else {
             // Host path: blocking uploads and downloads, drained per chunk.
             return self.execute_host(request, exchange, input_stride, output_stride, topk, identity);
@@ -243,9 +248,14 @@ impl<'w, 'a> Worker<'w, 'a> {
                 }
                 let output = super::super::exlr8::view(execution.output()?, 0, rows * output_stride)?;
                 if let Some(destination) = destination {
-                    let target = super::super::exlr8::view(destination, first * output_stride, output.bytes)?;
+                    let wire_stride = request.output_row_bytes()? as usize;
+                    let target = super::super::exlr8::view(destination, first * wire_stride, rows * wire_stride)?;
                     // SAFETY: the transport owns the destination until the response send completes.
-                    unsafe { library_copy(self.library, target, output, output.bytes, self.stream.raw)?; }
+                    unsafe {
+                        if compressed {
+                            self.reply_codec.quantize(request, output, target, rows, self.stream.raw)?;
+                        } else { library_copy(self.library, target, output, output.bytes, self.stream.raw)?; }
+                    }
                 }
             }
             if let Some(timing) = &self.timing {

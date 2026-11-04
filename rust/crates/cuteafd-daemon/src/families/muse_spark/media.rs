@@ -181,6 +181,107 @@ fn pcm_hash(pcm: &[f32]) -> String {
     format!("{:x}", hash.finalize())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AudioFeatureMetadata {
+    schema: String,
+    key: String,
+    kind: String,
+    samples: usize,
+    pcm_sha256: String,
+    shape: [usize; 2],
+    dtype: String,
+    sha256: String,
+    tower_dtype: String,
+    fixture_sha256: String,
+    snapshot_identity: serde_json::Value,
+}
+
+fn reference_identity(snapshot: &Path) -> Result<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    let mut identity = serde_json::json!({
+        "transformers": "5.22.1",
+        "modeling_muse_spark_sha256": "969ef27d0187c6f59dc2c8511449d739c790bc0adf4059d88e1d999f48b155d5",
+        "configuration_muse_spark_sha256": "9320c4cb5c89f5b42f2d8cb61d835ad92c3659d045429c84bf5e0a699dbdad1f",
+        "masking_utils_sha256": "931b92cf0deeb7a4925259a30c905bbf4d645fda88c6eebbc9e61770f5abaa89",
+        "reference_adapter_sha256": format!("{:x}", Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../python/reference/families/muse_spark/model.py")))),
+        "media_adapter_sha256": format!("{:x}", Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../python/reference/muse_spark_media.py")))),
+        "media_sources_sha256": {
+            "models/muse_spark/feature_extraction_muse_spark.py": "ea6791c32a840d3bfc62aa61b4193a6865dfa7d05d45068a462580feee76adcf",
+            "models/muse_spark/processing_muse_spark.py": "880a4f2328605018ccfbee7a7aef564d32781c308c34df0d145f8ce939e80d78",
+            "models/muse_glimmer/image_processing_muse_glimmer.py": "827b93a32e8a4b3c80c35395cc261f798a3af3b17665116b0b30d40906a960a9",
+            "image_processing_backends.py": "08ab5a408a11b96bc9401a5dc6254b4d4ecdec4f5502a44f452d16814eb46a49"
+        },
+        "snapshot_revision": snapshot.file_name().and_then(|s| s.to_str()).context("Muse snapshot revision")?,
+        "processor_device": "cpu", "resample": "LANCZOS",
+        "public_boundary": "MuseSparkModel.get_image_features/get_audio_features"
+    });
+    for (key, file) in [("config", "config.json"), ("processor", "processor_config.json"),
+        ("tokenizer", "tokenizer.json"), ("index", "model.safetensors.index.json")] {
+        identity[format!("{key}_sha256")] = format!("{:x}", Sha256::digest(std::fs::read(snapshot.join(file))?)).into();
+    }
+    Ok(identity)
+}
+
+pub(super) fn probe_features(prompt: &crate::shared::qwen::scheduler::Prompt, media: &mut RequestMedia,
+    cache: &mut cuteafd_engine::media::EmbeddingCache, snapshot: &Path) -> Result<()> {
+    let Some(probe) = prompt.job.probe.as_ref().filter(|p| p.spec.score_from.is_some() && !p.spec.audio.is_empty())
+        else { return Ok(()); };
+    let Some(root) = std::env::var_os("CUTEAFD_AUDIO_FEATURES_DIR") else { return Ok(()); };
+    ensure!(probe.spec.cold && probe.spec.no_speculation, "audio features require explicit cold/no_speculation");
+    apply_audio_features(&prompt.job, media, cache, Path::new(&root), &reference_identity(snapshot)?)
+}
+
+fn apply_audio_features(job: &NativeRequest, media: &mut RequestMedia,
+    cache: &mut cuteafd_engine::media::EmbeddingCache, root: &Path, identity: &serde_json::Value) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use crate::shared::probe::features::feature_payload;
+    use std::io::Read;
+    let probe = job.probe.as_ref().context("audio features require a probe")?;
+    ensure!(probe.spec.cold && probe.spec.no_speculation && probe.spec.score_from.is_some()
+        && !probe.spec.audio.is_empty() && probe.spec.media.is_empty(), "features require a cold audio scoring probe");
+    probe.spec.validate_audio_geometry(AudioTokenGeometry::PcmPatches { samples_per_token: 1920 })?;
+    let root = root.canonicalize()?;
+    let mut provenance = Vec::new();
+    for span in &probe.spec.audio {
+        let metadata_path = root.join(format!("{}.json", span.key)).canonicalize()?;
+        let payload_path = root.join(format!("{}.bf16", span.key)).canonicalize()?;
+        ensure!(metadata_path.starts_with(&root) && payload_path.starts_with(&root), "audio feature path escapes root");
+        let file = std::fs::File::open(metadata_path)?;
+        ensure!(file.metadata()?.len() <= 64 << 10, "audio feature metadata exceeds bound");
+        let mut raw = Vec::new(); file.take((64 << 10) + 1).read_to_end(&mut raw)?;
+        ensure!(raw.len() <= 64 << 10, "audio feature metadata exceeds bound");
+        let meta: AudioFeatureMetadata = serde_json::from_slice(&raw)?;
+        let mut actual_identity = meta.snapshot_identity.clone();
+        // Library packaging version is recorded, while all executed sources are hash-pinned.
+        let torchvision = actual_identity.as_object_mut().context("audio reference identity")?.remove("torchvision");
+        ensure!(torchvision.as_ref().and_then(serde_json::Value::as_str).is_some_and(|v| !v.is_empty())
+            && actual_identity == *identity, "audio reference source/snapshot identity differs");
+        ensure!(meta.schema == "cuteafd.media.features/1" && meta.kind == "audio" && meta.key == span.key
+            && meta.samples == span.samples && meta.pcm_sha256 == span.pcm_sha256
+            && meta.shape == [span.len, media.row_bytes() / 2] && meta.dtype == "bf16-le"
+            && matches!(meta.tower_dtype.as_str(), "bf16" | "fp32")
+            && cuteafd_api::openai::probe::sha256_hex(&meta.sha256)
+            && cuteafd_api::openai::probe::sha256_hex(&meta.fixture_sha256), "audio reference metadata differs");
+        let clip = job.audio.iter().find(|c| key_hex(c.key.into()) == span.key).context("feature span has no prepared audio")?;
+        ensure!(clip.pcm.len() == span.samples && clip.geometry.tokens == span.len && pcm_hash(&clip.pcm) == span.pcm_sha256,
+            "audio reference PCM identity differs");
+        let bytes = span.len.checked_mul(media.row_bytes()).context("audio feature extent")?;
+        let mut hash = Sha256::new();
+        hash.update(b"cuteafd.probe.audio_feature_override/1\0"); hash.update(span.key.as_bytes()); hash.update(&raw);
+        let override_key = cuteafd_core::AudioKey(hash.finalize().into());
+        let pin = cache.reserve(override_key, bytes)?;
+        let payload = feature_payload(&payload_path, bytes, &meta.sha256, pin.features())?;
+        let lease = cache.complete(override_key, payload)?;
+        media.attach_probe_override(clip.key, lease)?;
+        drop(pin);
+        provenance.push(serde_json::from_slice::<serde_json::Value>(&raw)?);
+    }
+    probe.provenance(serde_json::json!({"mode": "reference_features", "probe_only": true,
+        "encoder_bypassed": true, "features": provenance}));
+    Ok(())
+}
+
 pub(super) fn inventory(snapshot: &Path, vision: cuteafd_loader::plan::MediaMode,
     audio: cuteafd_loader::plan::MediaMode, replicas: usize)
     -> Result<cuteafd_loader::placement::families::muse_spark::MediaOptions> {
@@ -417,6 +518,49 @@ mod tests {
         assert!(run(bad).is_err());
         let mut bad = span; bad.identity.as_mut().unwrap().processor = "03".repeat(32);
         assert!(run(bad).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn audio_reference_injects_sealed_features_checks_provenance_and_refuses_changed_hash() -> Result<()> {
+        use std::sync::Arc;
+        use sha2::{Digest, Sha256};
+        use cuteafd_api::openai::probe::{Probe, ProbeAudio, ProbeSpec};
+        use cuteafd_loader::media::{EncoderId, audio::prepare_pcm_with_geometry};
+        let policy = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        let clip = Arc::new(prepare_pcm_with_geometry(vec![0.125], EncoderId([3; 32]), policy)?);
+        let tokens = vec![1, 11, 10, 12, 2];
+        let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), cold: true, no_speculation: true,
+            score_from: Some(4), audio: vec![ProbeAudio { start: 2, len: 1, key: key_hex(clip.key.into()),
+                samples: 1, pcm_sha256: pcm_hash(&clip.pcm) }], ..Default::default() });
+        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(),
+            literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(),
+            audio: vec![clip.clone()], max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(),
+            events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: Some(probe) };
+        let (prompt, mut media, _) = binding().prepare(job, tokens, 32, 2, 16)?;
+        let root = tempfile::tempdir()?;
+        let payload = [0x80, 0x3f, 0, 0x40];
+        let identity = serde_json::json!({"snapshot_revision": "test"});
+        let meta = serde_json::json!({"schema": "cuteafd.media.features/1", "key": key_hex(clip.key.into()),
+            "kind": "audio", "samples": 1, "pcm_sha256": pcm_hash(&clip.pcm), "shape": [1, 2],
+            "dtype": "bf16-le", "sha256": format!("{:x}", Sha256::digest(payload)), "tower_dtype": "bf16",
+            "fixture_sha256": "ab".repeat(32), "snapshot_identity": {"snapshot_revision": "test", "torchvision": "0.27"}});
+        let metadata = root.path().join(format!("{}.json", key_hex(clip.key.into())));
+        let binary = root.path().join(format!("{}.bf16", key_hex(clip.key.into())));
+        std::fs::write(&metadata, serde_json::to_vec(&meta)?)?;
+        std::fs::write(&binary, payload)?;
+        let mut cache = cuteafd_engine::media::EmbeddingCache::new(4);
+        apply_audio_features(&prompt.job, &mut media, &mut cache, root.path(), &identity)?;
+        assert_eq!(media.span_features(0).unwrap().as_ref(), payload);
+        assert!(!cache.contains(clip.key), "reference bytes must not warm the native audio key");
+        assert_eq!(prompt.job.probe.as_ref().unwrap().record().provenance,
+            Some(serde_json::json!({"mode": "reference_features", "probe_only": true,
+                "encoder_bypassed": true, "features": [meta.clone()]})));
+        std::fs::write(&binary, [0u8; 4])?;
+        assert!(apply_audio_features(&prompt.job, &mut media, &mut cache, root.path(), &identity).is_err());
+        std::fs::write(&binary, payload)?;
+        assert!(apply_audio_features(&prompt.job, &mut media, &mut cache, root.path(),
+            &serde_json::json!({"snapshot_revision": "wrong"})).is_err());
         Ok(())
     }
 

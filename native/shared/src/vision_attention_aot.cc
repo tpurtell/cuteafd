@@ -29,7 +29,7 @@ struct Entry {
 };
 Entry entries[] = {CUTEAFD_VISION_OWNER_ENTRIES};
 std::mutex mutex;
-struct Attention { Entry* entry; int device; };
+struct Attention { Entry* entry; int device; int32_t l2_bytes; };
 
 Entry* find(int dim, bool windowed, const char* pointwise) {
   for(auto& entry:entries)
@@ -97,7 +97,11 @@ extern "C" int32_t cuteafd_vision_attention_create_entry(int32_t dim,int32_t win
   auto* entry=find(dim,windowed!=0,pointwise);if(!entry)return cudaErrorInvalidValue;
   int device=-1,status=cudaGetDevice(&device);if(status)return status;
   if(device<0 || device>=MAX_DEVICES)return cudaErrorInvalidDevice;
-  auto* owner=new(std::nothrow)Attention{entry,device};if(!owner)return cudaErrorMemoryAllocation;
+  // The scheduler's L2 swizzle budget is launch data, never an export
+  // constant, so one image serves every card this owner runs on.
+  int l2_bytes=0;status=cudaDeviceGetAttribute(&l2_bytes,cudaDevAttrL2CacheSize,device);
+  if(status || l2_bytes<=0)return status ? status : cudaErrorInvalidValue;
+  auto* owner=new(std::nothrow)Attention{entry,device,l2_bytes};if(!owner)return cudaErrorMemoryAllocation;
   std::lock_guard<std::mutex> guard(mutex);
   status=load(*entry,device);
   if(status) { delete owner;return status; }
@@ -116,12 +120,14 @@ extern "C" int32_t cuteafd_vision_attention_launch(void* opaque,void* q,void* k,
   if(!opaque)return cudaErrorInitializationError;
   auto* owner=static_cast<Attention*>(opaque);auto& program=owner->entry->programs.front();
   // Legacy exports pass separate q/k lengths and an unused sink; shared
-  // varlen exports take the same live boundaries through one pointer.
-  if((program.pointers!=8 && program.pointers!=6) || std::strcmp(program.scalars,"f"))
+  // varlen exports take the same live boundaries through one pointer. Both
+  // take (softmax scale, device L2 bytes) after their pointers.
+  if((program.pointers!=8 && program.pointers!=6) || std::strcmp(program.scalars,"fi"))
     return cudaErrorInvalidValue;
   void* pointers[]={q,k,v,out,lse,cu,cu,nullptr};
-  uint32_t bits;std::memcpy(&bits,&scale,4);uint64_t scalar=bits;
-  return launch(owner,program,pointers,&scalar,stream);
+  uint32_t bits;std::memcpy(&bits,&scale,4);
+  uint64_t scalars[]={bits,static_cast<uint32_t>(owner->l2_bytes)};
+  return launch(owner,program,pointers,scalars,stream);
 }
 extern "C" int32_t cuteafd_vision_pointwise_launch(void* opaque,const char* name,void* const* pointers,
     const uint64_t* scalars,void* stream) {

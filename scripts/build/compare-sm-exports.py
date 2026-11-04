@@ -227,6 +227,7 @@ def jobs(scope):
                            ["--heads", str(heads), "--group", group]))
     result.append(("muse-tp-combine", "export_b12x_muse_aot.py", ["--group", "tp-combine"]))
     result.append(("expert-partial", "export_b12x_expert_partial_aot.py", []))
+    result.append(("expert-reply", "export_b12x_dsv4_aot.py", ["--geometry", "expert_reply"]))
     result.append(("muse-k6-dense", "export_b12x_dsv4_aot.py",
                    ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]))
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):

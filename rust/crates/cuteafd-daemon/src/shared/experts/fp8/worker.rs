@@ -20,6 +20,7 @@ pub(crate) struct Fp8Worker<'a> {
     library: &'a NativeLibrary,
     inputs: [DeviceAllocation<'a>; 3],
     output: DeviceAllocation<'a>,
+    reply_codec: super::super::reply::ReplyCodec<'a>,
     capacity: usize,
     layer: usize,
     executor_id: u64,
@@ -295,6 +296,7 @@ impl<'a> Fp8Worker<'a> {
             library,
             inputs,
             output,
+            reply_codec: super::super::reply::ReplyCodec::load(library)?,
             capacity,
             layer: 0,
             executor_id,
@@ -373,7 +375,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(request.layer() as usize == self.experts.layers[self.layer].layer,
             "request does not match the selected FP8 layer");
         ensure!(executor_id == self.executor_id, "FP8 response executor identity mismatch");
-        if self.deferred {
+        if self.deferred && request.output_dtype() == ExpertV2Dtype::Bf16 {
             if let (Some(input), Some(output)) = (hidden_view, destination) {
                 if self.stage(request, input, output, executor_id)? { return Ok(output) }
             }
@@ -416,9 +418,11 @@ impl<'a> Fp8Worker<'a> {
         // SAFETY: this unit retains its packed slot through the FIFO completion fence.
         unsafe { self.route_staging.upload(stage, 0, routes, self.inputs[1].buffer,
             self.inputs[2].buffer, self.stream.raw)?; }
-        let output = match destination {
+        let compressed = request.output_dtype() != ExpertV2Dtype::Bf16;
+        ensure!(!compressed || destination.is_some(), "compressed replies require a mapped response slot");
+        let output = match destination.filter(|_| !compressed) {
             Some(output) => output,
-            None => CuteafdDeviceBuffer { bytes, ..self.output.buffer },
+            None => self.output.buffer,
         };
         ensure!(output.bytes >= bytes, "FP8 response slot is too small");
         // SAFETY: inputs, output and the resident layer are live device memory of
@@ -433,6 +437,10 @@ impl<'a> Fp8Worker<'a> {
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
             }
             if let Some(timing) = &self.timing { timing.borrow().record(1, self.stream.raw)?; }
+            if compressed {
+                self.reply_codec.quantize(request, output,
+                    destination.context("missing compressed reply slot")?, request.rows() as usize, self.stream.raw)?;
+            }
             // The transport holds both mapped slots until this unit's fence,
             // independent of later work queued on the owner's stream.
             if self.deferred && destination.is_some() {

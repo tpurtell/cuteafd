@@ -101,8 +101,10 @@ class PackageProfileTests(unittest.TestCase):
             (896, 2048): (64, (64, 128, 64, 256)),
             (896, 4096): (64, (64, 128, 64, 256)),
             (768, 256): (32, (64, 256, 64, 256)),
+            (768, 1024): (64, (64, 256, 64, 256)),
             (640, 256): (64, (64, 128, 64, 256)),
             (640, 1024): (64, (64, 128, 64, 256)),
+            (640, 2048): (64, (64, 128, 64, 256)),
             (640, 2752): (64, (64, 128, 64, 256)),
             (640, 4096): (64, (64, 128, 64, 256))}
         for width in (512, 640, 768, 896, 1024, 1280, 1408, 2048):
@@ -465,17 +467,16 @@ class PackageProfileTests(unittest.TestCase):
             self.assertTrue(variant['ws_dynamic_tiles'])
 
     def test_step5_measured_spark_cells_do_not_extrapolate(self):
-        measured = {(256, 256), (384, 256), (384, 1024)}
+        measured = {(256, 256), (256, 4096), (384, 256), (384, 1024)}
         for width in (256, 384, 512):
             for rows in (1, 16, 80, 256, 1024, 2048, 2752, 4096):
                 with self.subTest(width=width, rows=rows):
                     cell = package.spark_ws_cell('step5', 'spark', width, rows)
                     if (width, rows) in measured:
-                        self.assertEqual(cell, dict(route_block=64, dynamic=True,
-                                                    tile=package.TILE_RTX_MIXED))
+                        tile = (64, 256, 64, 256) if (width, rows) == (256, 4096) else package.TILE_RTX_MIXED
+                        self.assertEqual(cell, dict(route_block=64, dynamic=True, tile=tile))
                         self.assertTrue(package.ws_dynamic_tiles('step5', 'spark', width, rows))
-                        self.assertEqual(package.ws_tile('step5', 'spark', width, rows),
-                                         package.TILE_RTX_MIXED)
+                        self.assertEqual(package.ws_tile('step5', 'spark', width, rows), tile)
                     else:
                         self.assertIsNone(cell)
                         self.assertFalse(package.ws_dynamic_tiles('step5', 'spark', width, rows))
@@ -796,6 +797,55 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(manifest['requested_layouts'], require)
             self.assertEqual(package.verify(output, 'fixture-revision'), manifest)
 
+    def test_spark_decode_cells_carry_the_measured_gb10_recipe(self):
+        """ML4/Muse/Step-5 TP6 decode: 128-wide tiles at two CTAs per SM, evict-first."""
+        cells = {
+            ('ml4', 'tp6-width1024', (4, 5)),
+            ('muse', 'tp6-width768', (4, 5)),
+            ('muse', 'tp6-width640', (4, 5)),
+            ('muse', 'tp6-compact-width768', (4, 5)),
+            ('step5', 'tp6-width256', (4, 6)),
+        }
+        recipe = dict(decode_schedule=package.PURE_EVICT_FIRST,
+                      tile=(64, 128, 64, 128), blocks_per_sm=2)
+        for geometry, profile, bits in cells:
+            for capacity in (1, 80):
+                with self.subTest(geometry=geometry, profile=profile, capacity=capacity):
+                    self.assertEqual(package.spark_decode_cell(
+                        geometry, 'spark', profile, capacity, list(bits)), recipe)
+                    self.assertEqual(package.default_decode_schedule(
+                        geometry, 'spark', profile, capacity, list(bits)), package.PURE_EVICT_FIRST)
+            # Prefill capacities, the other role, and every other bit pair keep the control.
+            for capacity in (16, 256, 1024, 4096):
+                self.assertIsNone(package.spark_decode_cell(geometry, 'spark', profile, capacity, list(bits)))
+                self.assertIsNone(package.default_decode_schedule(geometry, 'spark', profile, capacity,
+                                                                  list(bits)))
+            self.assertIsNone(package.spark_decode_cell(geometry, 'coordinator', profile, 1, list(bits)))
+            self.assertIsNone(package.default_decode_schedule(geometry, 'coordinator', profile, 1,
+                                                              list(bits)))
+            self.assertIsNone(package.spark_decode_cell(geometry, 'spark', profile, 1, [4, 4]))
+
+    def test_spark_decode_cells_export_and_reverify(self):
+        for geometry, bits, profile, compact in (('ml4', (4, 5), 'tp6-width1024', False),
+                                                 ('muse', (4, 5), 'tp6-width768', True),
+                                                 ('step5', (4, 6), 'tp6-width256', False)):
+            with self.subTest(geometry=geometry, profile=profile), tempfile.TemporaryDirectory() as temporary:
+                output, manifest, calls, _ = self.build_fixture(
+                    Path(temporary), 'spark', bits, geometry=geometry,
+                    capacities=(1, 80, 256), compact=compact, profiles=(profile,))
+                decode = [call for call in calls if call.args[3] in (1, 80)
+                          and call.kwargs.get('compact_weights', False) == compact]
+                self.assertTrue(decode)
+                for call in decode:
+                    self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                    self.assertEqual(call.kwargs['blocks_per_sm'], 2)
+                    self.assertEqual(call.kwargs['decode_schedule'], package.PURE_EVICT_FIRST)
+                # A prefill capacity at the same width keeps the cooperative control.
+                for call in calls:
+                    if call.args[3] == 256 and call.kwargs.get('compact_weights', False) == compact:
+                        self.assertNotEqual(call.kwargs.get('decode_schedule'), package.PURE_EVICT_FIRST)
+                self.assertEqual(package.verify(output, 'fixture-revision'), manifest)
+
     def test_requesting_a_layout_the_role_cannot_build_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(ValueError) as caught:
@@ -1107,7 +1157,7 @@ class PackageProfileTests(unittest.TestCase):
         selected = {
             768: {256, 2048, 2752, 4096},
             896: {256, 1024, 2752},
-            1024: {256, 2048, 2752},
+            1024: {256, 1024, 2048, 2752, 4096},
             1152: {256, 1024, 2752, 4096},
             1280: {256, 2752, 4096},
         }
@@ -1141,6 +1191,10 @@ class PackageProfileTests(unittest.TestCase):
                 if qualified:
                     self.assertEqual(call.kwargs['tile'], package.SPARK_WS_CELLS['ml4', width, capacity]['tile'])
                     self.assertEqual(call.kwargs['route_block'], 64)
+                elif package.spark_decode_cell('ml4', 'spark', f'tp6-width{width}', capacity, [4, 5]):
+                    # The measured decode cell: 128-wide tiles, two CTAs per SM.
+                    self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                    self.assertEqual(call.kwargs['blocks_per_sm'], 2)
                 else:
                     self.assertNotIn('tile', call.kwargs)
 

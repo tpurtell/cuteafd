@@ -10,6 +10,7 @@ use clap::Parser;
 use cuteafd_core::memory_layout::{Category, MemoryLayout};
 use cuteafd_loader::placement::{solve, Baseline, Onboard, OnboardSetting, Placement};
 use cuteafd_loader::plan::{layout::LayoutOptions, ExpertPlacement, PlanInput, PlanOptions};
+use cuteafd_loader::serving_capacity::Exl3Epilogue;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -186,7 +187,7 @@ fn layout_expert_workspace(case: &Case<'_>, catalog: &cuteafd_loader::OfficialV4
                 .map(|n| -> anyhow::Result<serde_json::Value> {
                     Ok(serde_json::from_slice(&std::fs::read(root.join(format!("m{n}/v41_exl3.json")))?)?)
                 }).collect::<anyhow::Result<Vec<_>>>()?;
-            Ok(cuteafd_loader::serving_capacity::exl3_workspace_bytes(&manifests, true)? + rows * shape.hidden as u64 * 2)
+            Ok(cuteafd_loader::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)? + rows * shape.hidden as u64 * 2)
         }
         None => Ok(cuteafd_loader::serving_capacity::deepseek_v4_native_workspace(shape.hidden as u64,
             shape.intermediate as u64, shape.experts as u64, shape.topk as u64, rows)?),

@@ -1395,10 +1395,15 @@ impl Opened {
             let capacity = endpoints[endpoint as usize].capacity;
             let label = format!("mimo/transport/endpoint-{endpoint}");
             let _owner = cuteafd_ffi::memory_ledger::owner(&label);
-            let mut link = crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
-                capacity, cuteafd_transport::TcpTransportConfig { timing,
-                    timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 },
-                self.cfg.hidden * 2, waves, capacity)?;
+            let config = cuteafd_transport::TcpTransportConfig { timing,
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
+            let mut link = if endpoint == 0 {
+                crate::shared::spark_intake::SparkLink::new(&self.library, spark_world, &peers,
+                    capacity, config, self.cfg.hidden * 2)?
+            } else {
+                crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
+                    capacity, config, self.cfg.hidden * 2, waves, capacity)?
+            };
             link.bind_model_endpoint(endpoint)?;
             link.enable_terminal_ownership(self.library.clone())?;
             // Bootstrap with this endpoint's widest request, never prefill on decode.
@@ -1406,8 +1411,12 @@ impl Opened {
             let actual = cuteafd_ffi::memory_ledger::snapshot()
                 .by_owner(cuteafd_ffi::memory_ledger::Space::Device, args.device)
                 .get(label.as_str()).copied().unwrap_or(0);
+            let codec_bytes = cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false)
+                .combined_scratch_bytes(self.cfg.hidden, capacity as usize, waves, endpoint != 0, false)
+                .context("MiMo reply codec scratch overflow")?;
             let planned = cuteafd_loader::serving_capacity::prefill_return_bytes(
-                waves as u64, capacity as u64, peers.len() as u64, self.cfg.hidden as u64);
+                waves as u64, capacity as u64, peers.len() as u64, self.cfg.hidden as u64)
+                .checked_add(codec_bytes as u64).context("MiMo return allocation overflow")?;
             anyhow::ensure!(actual as u64 == planned,
                 "MiMo {label}: allocated {actual} device bytes != planned {planned}");
             Ok(link)

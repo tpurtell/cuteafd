@@ -4,6 +4,7 @@
 //! TP2 halves, and the installed package's workspace arena. The package family
 //! comes from the routed geometry, so a family adds no onboarding code here.
 use super::{inventory, Bytes2, ExpertCost};
+use crate::serving_capacity::Exl3Epilogue;
 use anyhow::{ensure, Context, Result};
 
 /// Physical route/diagnostic storage of the shared paired executor. Backend
@@ -237,6 +238,6 @@ fn exl3_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::pa
             && value["experts"].as_u64() == Some(shape.experts as u64), "{stem} package geometry mismatch");
         Ok(value)
     }).collect::<Result<Vec<_>>>()?;
-    Ok(crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?
+    Ok(crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?
         + rows.max(1) * shape.hidden as u64 * if tp == 2 { 4 } else { 2 })
 }

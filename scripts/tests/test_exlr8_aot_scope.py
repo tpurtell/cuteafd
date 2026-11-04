@@ -168,10 +168,10 @@ def test_wip_artifacts_rejects_invalid_override(tmp_path):
 def test_spark_programs_manifest_is_installed_on_both_roles():
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     final = build[build.index('# Generic-family tables must come from this build'):]
-    condition = '\n'.join(final.split('\n')[4:6])
+    condition = final[final.index('elif [['):final.index(']]; then')]
     # EXLR8 on either role, and a Spark build whose expert scope has a partial-reply family.
     assert '|| "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON' in condition
-    assert '( "$role" == expert && ";${expert_families:-};" == *";muse:exl3-k"* )' in condition
+    assert '$role" == expert' in condition and 'expert_families' in condition and 'v41_expert_aot' in condition
 
 
 def test_cmake_spark_programs_are_the_union_of_the_enabled_spark_needs():
@@ -180,12 +180,12 @@ def test_cmake_spark_programs_are_the_union_of_the_enabled_spark_needs():
         < cmake.index('if(CUTEAFD_ENABLE_MUSE_AOT)') < cmake.index('if(CUTEAFD_ENABLE_EXLR8_AOT)\n  # Last')
     assert 'set(CUTEAFD_EXLR8_ROLE coordinator)' in cmake and 'set(CUTEAFD_EXLR8_ROLE spark)' in cmake
     # SM121 builds the Spark programs only (never a family table), and only when a Spark need asks.
-    assert ('MATCHES "^121" AND (CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS)\n'
+    assert ('MATCHES "^121" AND (CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)\n'
             '       AND NOT CUTEAFD_FAMILY_PROGRAMS') in cmake
     assert 'SM121 builds only the Spark programs' in cmake
     assert '--exlr8-family "${exlr8_families}")' in cmake
     top = (ROOT / 'native/CMakeLists.txt').read_text()
-    gate = 'CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS)'
+    gate = 'CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)'
     assert top.count(gate) == 2  # include + link
     assert 'set(CUTEAFD_PARTIAL_REPLY_FAMILIES muse)' in top
     assert 'CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)' in top  # SparkInfer AOT runtime
@@ -214,32 +214,32 @@ def _program_geometry(tmp_path, **flags):
 def test_spark_and_coordinator_program_geometry_by_scope(tmp_path):
     # EXLR8-only Spark build: exactly today's table.
     fields, _ = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='121', CUTEAFD_ENABLE_EXLR8_AOT='ON')
-    assert fields['GEOMETRY'] == 'exlr8' and fields['ROLE'] == 'spark'
+    assert fields['GEOMETRY'] == 'exlr8,expert_reply' and fields['ROLE'] == 'spark'
     # A partial-reply family's Spark build: the epilogue, alone or before EXLR8.
     fields, _ = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='121', CUTEAFD_PARTIAL_REPLY_PROGRAMS='ON')
-    assert fields['GEOMETRY'] == 'expert_partial'
+    assert fields['GEOMETRY'] == 'expert_partial,expert_reply'
     fields, _ = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='121', CUTEAFD_PARTIAL_REPLY_PROGRAMS='ON',
                                   CUTEAFD_ENABLE_EXLR8_AOT='ON')
-    assert fields['GEOMETRY'] == 'expert_partial,exlr8'
+    assert fields['GEOMETRY'] == 'expert_partial,exlr8,expert_reply'
     # Coordinator families never build on SM121.
     fields, error = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='121', CUTEAFD_ENABLE_MUSE_AOT='ON',
                                       CUTEAFD_PARTIAL_REPLY_PROGRAMS='ON')
     assert fields is None and 'SM121 builds only the Spark programs' in ' '.join(error.split())
     # Muse coordinator: its programs, the epilogue for onboarded layers, the K6 core once.
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_MUSE_AOT='ON')
-    assert fields['GEOMETRY'] == 'muse,muse2,expert_partial,dense_trellis_k6' and fields['DENSE'] == 'muse'
+    assert fields['GEOMETRY'] == 'muse,muse2,expert_partial,dense_trellis_k6,expert_reply' and fields['DENSE'] == 'muse'
     for other in ('CUTEAFD_ENABLE_GLM_AOT', 'CUTEAFD_ENABLE_GLMF_AOT', 'CUTEAFD_ENABLE_KIMIK3_AOT',
                   'CUTEAFD_ENABLE_ML4_AOT'):
         fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_MUSE_AOT='ON', **{other: 'ON'})
         assert fields['GEOMETRY'].split(',').count('dense_trellis_k6') == 1, (other, fields)
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_MUSE_AOT='ON', CUTEAFD_ENABLE_ML4_AOT='ON')
     assert fields['DENSE'] == 'muse;ml4'
-    assert fields['GEOMETRY'] == 'muse,muse2,expert_partial,dense_trellis_k6,ml4'
+    assert fields['GEOMETRY'] == 'muse,muse2,expert_partial,dense_trellis_k6,ml4,expert_reply'
     # Without Muse, existing coordinator tables are unchanged.
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_GLM_AOT='ON')
-    assert fields['GEOMETRY'] == 'glm,glm2,dense_trellis_k6,glm_stage,glm2_stage'
+    assert fields['GEOMETRY'] == 'glm,glm2,dense_trellis_k6,glm_stage,glm2_stage,expert_reply'
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_KIMIK3_AOT='ON', CUTEAFD_ENABLE_GLM_AOT='ON')
-    assert fields['GEOMETRY'] == 'glm,glm2,kimik3,dense_trellis_k6,kimi_split,glm_stage,glm2_stage'
+    assert fields['GEOMETRY'] == 'glm,glm2,kimik3,dense_trellis_k6,kimi_split,glm_stage,glm2_stage,expert_reply'
 
 
 def test_exporter_forwards_role_to_the_fork_and_appends_last():
@@ -452,7 +452,7 @@ def _spark_table(tmp_path, expert_families, exlr8):
     final = build[build.index('# Generic-family tables must come from this build'):]
     condition = final[final.index('elif [[') + len('elif [['):final.index(']]; then')]
     env = {'PATH': '/usr/bin:/bin', 'role': 'expert', 'expert_families': ';'.join(expert_families),
-           'CUTEAFD_WIP_EXLR8_AOT': 'ON' if exlr8 else 'OFF'}
+           'CUTEAFD_WIP_EXLR8_AOT': 'ON' if exlr8 else 'OFF', 'v41_expert_aot': 'OFF'}
     shell = subprocess.run(['bash', '-c', f'if [[ {condition} ]]; then echo install; else echo none; fi'],
                            env=env, capture_output=True, text=True, timeout=60)
     assert shell.returncode == 0, shell.stderr
@@ -463,8 +463,8 @@ def _spark_table(tmp_path, expert_families, exlr8):
 def test_spark_builds_without_a_spark_need_have_no_program_table(tmp_path):
     # Neither EXLR8 nor a partial-reply family: no table built, nothing installed.
     assert _spark_table(tmp_path, [], False) == (False, False, False)
-    assert _spark_table(tmp_path, ['glm:exl3-k45', 'glm:fp8'], False) == (False, False, False)
-    assert _spark_table(tmp_path, ['kimik3:exl3-k23'], False) == (False, False, False)
+    assert _spark_table(tmp_path, ['glm:exl3-k45', 'glm:fp8'], False) == (True, False, True)
+    assert _spark_table(tmp_path, ['kimik3:exl3-k23'], False) == (True, False, True)
     # Each Spark need alone builds and installs the table.
     assert _spark_table(tmp_path, [], True) == (True, False, True)
     assert _spark_table(tmp_path, ['muse:exl3-k45'], False) == (True, True, True)

@@ -118,6 +118,13 @@ impl SparkAdmission {
         self.start_with(peers, None)
     }
 
+    /// Test-only: the exact layer list and per-rank assignments the workers
+    /// are told, for plan dumps that rebuild the group's plans offline.
+    #[cfg(test)]
+    pub(crate) fn admitted(&self) -> (Vec<usize>, &[cuteafd_loader::placement::SparkAssignment]) {
+        (self.selection.layers(), &self.assignments)
+    }
+
     /// Whether this admission opens a push group (Spark experts on SparkNest).
     pub(crate) fn pushes(&self) -> bool { self.push_snapshot.is_some() }
 

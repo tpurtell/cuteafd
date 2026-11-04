@@ -52,6 +52,8 @@ pub const EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION: u32 = 1 << 11;
 /// region each row's descriptor names (BF16, or the request's wide format), and
 /// the coordinator combines them. A per-request capability; echoed in responses.
 pub const EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES: u32 = 1 << 20;
+/// Combined native replies: the same E4M3/UE8M0 K32 layout as partial FP8 replies.
+pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32: u32 = 1 << 21;
 const EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_SHIFT: u32 = 12;
 const EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK: u32 =
     0x0f << EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_SHIFT;
@@ -607,6 +609,7 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
             crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
                 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
+                | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
                 | EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3
@@ -619,7 +622,9 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
                 | EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES
         }
         "response" => {
-            EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES
+            EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
+                | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3
+                | EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
                 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
@@ -634,6 +639,8 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
     // never present in a response.
     if label == "request" && flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG != 0 {
         let native_allowed = crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
+            | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
+            | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3
             | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
             | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
         if flags & !native_allowed != 0 || flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 == 0 {
@@ -644,11 +651,11 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
     if unknown != 0 {
         bail!("ExpertProtocolV2 {label} has unknown flags 0x{unknown:08x}");
     }
-    if label == "request"
-        && response_fp8_e4m3_row_scaled_enabled(flags)
-        && response_nvfp4_e2m1_fp8_e4m3_enabled(flags)
-    {
-        bail!("ExpertProtocolV2 request selects multiple low-precision response dtypes");
+    let formats = flags & (EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED
+        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
+        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3);
+    if formats.count_ones() > 1 {
+        bail!("ExpertProtocolV2 {label} selects multiple low-precision response dtypes");
     }
     if label == "request" {
         if stream_plan_enabled(flags) && stream_data_enabled(flags) {
@@ -674,7 +681,7 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
         }
         if flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0 && (stream_plan_enabled(flags)
             || stream_data_enabled(flags) || spark_reduction_enabled(flags)
-            || response_fp8_e4m3_row_scaled_enabled(flags) || response_nvfp4_e2m1_fp8_e4m3_enabled(flags)) {
+            || formats != 0) {
             bail!("ExpertProtocolV2 partial replies are whole-row requests with their own reply formats");
         }
     }

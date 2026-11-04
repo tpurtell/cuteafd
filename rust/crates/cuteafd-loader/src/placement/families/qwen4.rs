@@ -3,6 +3,7 @@
 //! here. Startup graphs depend on the admitted pool, so resolve their shape
 //! before publishing the final placement, without taking another CUDA sample.
 use crate::families::qwen4::Qwen4Attention;
+use crate::serving_capacity::Exl3Epilogue;
 use crate::placement::*;
 use crate::serving_capacity::qwen_graphs::{qwen_admission, qwen_startup_graphs, QwenAdmissionInputs, QWEN_UNIT_ROWS};
 use cuteafd_core::memory_layout::{Basis, Category, ItemLifetime};
@@ -198,7 +199,7 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
                 && m["capacity"].as_u64() == Some(capacity), "Qwen MTP package geometry: {}", path.display());
             Ok(m)
         }).collect::<anyhow::Result<Vec<_>>>()?;
-        (resident, crate::serving_capacity::exl3_workspace_bytes(&manifests, true)? + rows * shape.hidden as u64 * 2)
+        (resident, crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)? + rows * shape.hidden as u64 * 2)
     } else {
         let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen MTP format unsupported"))?.for_layer(shape.layers)?;
         tensors.validate_layer(shape.layers)?;
@@ -263,7 +264,7 @@ pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
                     "Qwen EXL3 TP2 rank {rank} package geometry mismatch: {}", path.display());
                 Ok(value)
             }).collect::<anyhow::Result<Vec<_>>>()?;
-            crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?
+            crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?
         } else {
             let tensors = catalog.fp8().unwrap();
             let parent = package.parent().ok_or_else(|| anyhow::anyhow!("Qwen TP2 package has no parent"))?;

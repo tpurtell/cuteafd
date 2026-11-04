@@ -116,8 +116,21 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
     if mode == "native":
         if provenance is not None:
             raise ValueError("native arm unexpectedly reports feature override provenance")
+    elif not window.get("media"):
+        if provenance is not None:
+            raise ValueError("text control unexpectedly reports feature override provenance")
     else:
+        if provenance is None:
+            raise ValueError("reference media record is missing feature override provenance")
         metadata = [json.loads((features_root / (s["key"] + ".json")).read_text()) for s in window.get("media", [])]
+        for span, meta in zip(window.get("media", []), metadata):
+            if span.get("kind") == "audio":
+                payload = features_root / (span["key"] + ".bf16")
+                if (file_hash(payload) != meta.get("sha256")
+                        or meta.get("fixture_sha256") != span["fixture"]["sha256"]
+                        or meta.get("pcm_sha256") != span["pcm_sha256"]
+                        or meta.get("samples") != span["samples"]):
+                    raise ValueError("audio reference feature hash/identity differs")
         expected_provenance = {"mode": "reference_features", "probe_only": True,
                                "encoder_bypassed": True, "features": metadata}
         if family == "glm5_flash":
@@ -206,8 +219,6 @@ def capture(a):
                          "cold": True, "no_speculation": True, "score_path": "decode", "verify_rows": 1,
                          "top_k": 1, "dump_rows": str(a.server_dump / leaf)}}
         if audio:
-            if a.mode != "native":
-                raise ValueError("audio capture requires native mode and an official-feature LM golden")
             body["spec"]["audio"] = audio
             body["body"]["messages"][0]["content"] = [*audio_content, {"type": "text", "text": "media fidelity probe"}]
         try:
@@ -342,7 +353,99 @@ def report_provenance(captures, paired):
             if (any(value) if paired else bool(value))}
 
 
+def compare_towers(a):
+    """Isolate the encoder swap on one served LM, without a full-model golden."""
+    if a.reference is None or a.features is None:
+        raise ValueError("--tower-only needs --reference and --features")
+    if a.golden is not None or a.golden_seal is not None:
+        raise ValueError("--tower-only does not consume full-model goldens")
+    panel, bar = load_panel(a), fidelity_bar(a.expert_bpw)
+    captures = [json.loads((root / "capture.json").read_text()) for root in (a.native, a.reference)]
+    servers = json.loads(json.dumps([capture["server"] for capture in captures]))
+    for server in servers:
+        server.get("build", {}).pop("image", None)
+    if servers[0] != servers[1]:
+        raise ValueError("arms have different builds or non-encoder settings")
+    expected = {w["id"] for w in panel["windows"]}
+    maps, identities = [], []
+    for capture, mode in zip(captures, ("native", "reference")):
+        if (capture.get("schema") != "cuteafd.media.paired.capture/1" or capture.get("mode") != mode
+                or capture.get("set_sha256") != panel["set_sha256"]
+                or capture.get("checkpoint") != panel["checkpoint"] or capture.get("quick") is not False):
+            raise ValueError("tower capture identity/completeness differs")
+        entries = {w["id"]: w for w in capture["windows"]}
+        if set(entries) != expected or len(entries) != len(capture["windows"]):
+            raise ValueError("arms score different/incomplete windows")
+        binding = capture.get("input_binding")
+        identity_panel = panel
+        if binding is not None:
+            if (not digest_hex(binding.get("sha256"))
+                    or hashlib.sha256(canonical(binding["document"])).hexdigest() != binding["canonical_sha256"]):
+                raise ValueError("capture input binding provenance differs")
+            identity_panel, _ = bound_panel_document(panel, binding["document"])
+        maps.append(entries)
+        identities.append({w["id"]: w for w in identity_panel["windows"]})
+    summaries, vocab = [], None
+    for window in panel["windows"]:
+        arms = []
+        for root, entries, identity, mode, capture in zip((a.native, a.reference), maps, identities,
+                                                        ("native", "reference"), captures):
+            entry = entries[window["id"]]
+            response_path = root / (window["id"] + ".json")
+            if file_hash(response_path) != entry["response_sha256"]:
+                raise ValueError("capture response changed")
+            response = json.loads(response_path.read_text())
+            check_record(identity[window["id"]], response, panel["checkpoint"], mode, a.features, panel["family"])
+            if response["server"] != capture["server"]:
+                raise ValueError("capture server differs from manifest")
+            folder = Path(entry["path"])
+            manifest = folder / "manifest.jsonl"
+            if file_hash(manifest) != entry["manifest_sha256"]:
+                raise ValueError("dump manifest changed")
+            manifest_rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+            if not manifest_rows:
+                raise ValueError("empty tower scoring rows")
+            row_vocab = manifest_rows[0]["vocab_size"]
+            if type(row_vocab) is not int or row_vocab < 2 or any(r["vocab_size"] != row_vocab for r in manifest_rows):
+                raise ValueError("tower vocabulary differs")
+            if vocab is not None and vocab != row_vocab:
+                raise ValueError("tower vocabulary differs")
+            vocab = row_vocab
+            rows = dump_rows(folder, window, vocab)
+            hashes = {f["position"]: f["sha256"] for f in entry["files"]}
+            if set(hashes) != set(rows) or len(hashes) != len(entry["files"]):
+                raise ValueError("sealed file coverage differs")
+            if any(file_hash(path) != hashes[pos] for pos, path in rows.items()):
+                raise ValueError("dump row changed")
+            arms.append(rows)
+        values = []
+        for position in range(window["score_from"], len(window["tokens"])):
+            if window["roles"][position] != "gen":
+                raise ValueError("tower gate must score following assistant-generated rows")
+            native, reference = [log_probs(rows[position], vocab) for rows in arms]
+            values.append((float(np.dot(np.exp(reference), reference - native)),
+                           float(np.argmax(reference) == np.argmax(native))))
+        if not values:
+            raise ValueError("empty tower scoring rows")
+        kl, top1 = np.mean(values, axis=0)
+        summaries.append({"id": window["id"], "rows": len(values),
+            "reference_native_kl": float(kl), "top1_agreement": float(top1),
+            "pass": bool(kl <= bar["max_kl"] and top1 >= bar["min_top1"])})
+    if not summaries:
+        raise ValueError("empty tower panel")
+    result = {"schema": "cuteafd.media.tower-swap/1", "set_sha256": panel["set_sha256"],
+        "checkpoint": panel["checkpoint"], "path": "decode-shaped", "bar": bar, "windows": summaries,
+        "pass": all(w["pass"] for w in summaries),
+        "scope": "following-text encoder swap on the same served LM; not full-model fidelity",
+        **report_provenance(captures, paired=True)}
+    write_new(a.out, result)
+    print(json.dumps(result, indent=2))
+    return result["pass"]
+
+
 def compare(a):
+    if getattr(a, "tower_only", False):
+        return compare_towers(a)
     paired = a.reference is not None
     if paired != (a.features is not None):
         raise ValueError("--reference and --features must be supplied together")
@@ -519,8 +622,11 @@ def main():
     for flag in ("windows", "golden", "out"):
         seal_parser.add_argument("--" + flag, type=Path, required=True)
     compare_parser = actions.add_parser("compare")
-    for flag in ("windows", "golden", "golden-seal", "native", "out"):
+    for flag in ("windows", "native", "out"):
         compare_parser.add_argument("--" + flag, type=Path, required=True)
+    for flag in ("golden", "golden-seal"):
+        compare_parser.add_argument("--" + flag, type=Path)
+    compare_parser.add_argument("--tower-only", action="store_true", help="same-LM encoder-swap KL/top-1 without full-model goldens")
     compare_parser.add_argument("--reference", type=Path, help="optional reference-feature diagnostic arm")
     compare_parser.add_argument("--features", type=Path, help="sealed features for the reference arm")
     compare_parser.add_argument("--expert-bpw", type=float,
@@ -535,8 +641,11 @@ def main():
         capture(args)
     elif args.action == "seal":
         write_new(args.out, golden_seal(args.golden, load_panel(args)))
-    elif not compare(args):
-        raise SystemExit(3)
+    else:
+        if not args.tower_only and (args.golden is None or args.golden_seal is None):
+            parser.error("golden-backed compare requires --golden and --golden-seal")
+        if not compare(args):
+            raise SystemExit(3)
 
 
 if __name__ == "__main__":

@@ -291,8 +291,56 @@ priority3. Existing receive headroom is split equally into lossy buffer0 and
 lossless buffer1, with priority3 alone in buffer1. The mlx5 driver computes
 speed/MTU/cable XOFF and rejects insufficient headroom; no guessed thresholds or
 shared-memory expansion. Verify headroom/pause counts before loading models.
-These are runtime settings, not a new boot service; rollback/reapply after NIC
-reset rather than silently overwriting the saved original state.
+
+### Persist across reboot (TJ only)
+
+On fabrics running SparkNest's QoS, SparkNest owns the NIC policy; cuteafd's
+`apply` and `reapply` refuse its backed-up NICs, while `check` accepts the extra
+lossless class 2 and reports the owner. The boot unit below is for deployments
+without SparkNest-managed QoS.
+
+Raptor's 2026-10-31 reboot silently reset its NIC policy. After the first reviewed
+`apply`, install the script and enable the boot unit below; `persist` only prints
+instructions and a unit, installing nothing. Run the privileged commands as root
+on each host (schedule daemon-reload outside GPU runs):
+
+```bash
+# Coordinator: stage the unit from the reviewed checkout, then install as root.
+scripts/host/tune.sh fabric-lossless persist --role coordinator > fabric-lossless.service
+install -d -o root -g root -m 0755 /usr/local/lib/cuteafd
+install -o root -g root -m 0755 scripts/host/fabric-lossless.py /usr/local/lib/cuteafd/fabric-lossless.py
+install -o root -g root -m 0644 fabric-lossless.service /etc/systemd/system/cuteafd-fabric-lossless.service
+systemctl daemon-reload && systemctl enable --now cuteafd-fabric-lossless.service
+```
+
+For each Spark, stage the script and a `--role spark` unit, then run the same
+install commands as root there (use the staged paths):
+
+```bash
+scripts/host/tune.sh fabric-lossless persist --role spark > fabric-lossless.service
+for host in ostrich dodo emu kiwi rhea moa; do
+  scp scripts/host/fabric-lossless.py fabric-lossless.service "$host":/home/tj/.cache/cuteafd/fabric-lossless/
+done
+# On each Spark, as root:
+cd /home/tj/.cache/cuteafd/fabric-lossless
+install -d -o root -g root -m 0755 /usr/local/lib/cuteafd
+install -o root -g root -m 0755 fabric-lossless.py /usr/local/lib/cuteafd/fabric-lossless.py
+install -o root -g root -m 0644 fabric-lossless.service /etc/systemd/system/cuteafd-fabric-lossless.service
+systemctl daemon-reload && systemctl enable --now cuteafd-fabric-lossless.service
+```
+
+The root unit runs only the root-owned installed copy, never code under `/home`.
+`reapply` waits up to 60 s for the saved fabric ports and addresses. It requires
+pending original-state backups, does nothing if already applied, and reapplies
+only from the exact saved original state, without changing backups. Unknown
+states refuse with a per-field diff for operator review. Manual NIC-reset recovery
+uses `fabric-lossless reapply --role ROLE` too; unprivileged `--dry-run` reports
+permission denied if the root-only backups cannot be read, never guesses.
+Verify after boot with `scripts/host/tune.sh fabric-lossless check --role coordinator`
+(or `--role spark` on a Spark); the installed script also accepts `check --role ROLE`.
+Before deliberate rollback, disable this unit so a later boot cannot reapply.
+
+### Traffic marking and verification
 
 The engine always marks its RoCE QPs DSCP 26 (GRH traffic class 104) with SL 3,
 the byte's class selector, so priority-3 PFC also stops transmit QPs; startup

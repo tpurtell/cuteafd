@@ -26,6 +26,25 @@ use super::{
 };
 
 impl ExpertProtocolV2Request {
+    /// Select a combined reply only after every source row is known. Mixed
+    /// units fall back as a whole so decode and verify remain lossless.
+    pub fn select_combined_reply(&mut self, format: cuteafd_core::SparkReplyFormat)
+        -> Result<cuteafd_core::spark_reply::ReplyDecision> {
+        anyhow::ensure!(self.header.flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0,
+            "combined reply policy cannot replace a partial-region agreement");
+        let decision = format.combined(self.rows.iter().map(|row|
+            (row.source_request_id, row.source_kind == super::ExpertV2SourceKind::Prefill)));
+        self.header.flags &= !(super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
+            | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3);
+        self.header.flags |= match decision.format {
+            cuteafd_core::SparkReplyFormat::Bf16 => 0,
+            cuteafd_core::SparkReplyFormat::Fp8 => super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32,
+            cuteafd_core::SparkReplyFormat::Nvfp4 => EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3,
+        };
+        self.validate()?;
+        Ok(decision)
+    }
+
     pub fn new(
         request_id: u64,
         placement_version: u64,

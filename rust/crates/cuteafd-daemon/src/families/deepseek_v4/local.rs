@@ -10,7 +10,7 @@
 mod shared_tp2_tests;
 use crate::shared::experts::exl3::{
     aot_layout_directory,
-    execution::{Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace},
+    execution::{Exl3Epilogue, Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace},
     Exl3Weights,
 };
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
@@ -134,7 +134,7 @@ pub(crate) fn workspace_bytes(library: &NativeLibrary, native_lib: &Path, catalo
             .map(|c| directory.join(format!("m{c}"))).collect();
         Exl3ReductionPlan::new(&directories)?;
         for directory in &directories { require_exl3_manifest(directory)?; }
-        Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)? + max_rows * shape.hidden * 2
+        Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum)? + max_rows * shape.hidden * 2
     } else {
         let mut scratch = 0;
         let mut infos = Vec::new();
@@ -168,7 +168,7 @@ pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &Officia
             .map(|c| directory.join(format!("m{c}"))).collect();
         Exl3ReductionPlan::new(&directories)?;
         for directory in &directories { require_exl3_manifest(directory)?; }
-        Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)? + max_rows * shape.hidden * 2
+        Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum)? + max_rows * shape.hidden * 2
     } else {
         let mut scratch = 0;
         let mut infos = Vec::new();
@@ -317,7 +317,7 @@ impl<'a> LocalExperts<'a> {
         let shape = *catalog.routed_experts();
         validate_backbone(backbone, shape.first_layer, shape.layers)?;
         let Some((directories, _, _)) = Self::exl3_package(native_lib, catalog, max_rows)? else { return Ok(None) };
-        let workspace = Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
+        let workspace = Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum)?
             .checked_add(max_rows * shape.hidden * 2).context("local EXL3 workspace overflow")?;
         ensure!(budget > workspace, "local EXL3 experts need {workspace} workspace bytes, budget is {budget}");
         let weights_budget = budget - workspace;
@@ -360,7 +360,7 @@ impl<'a> LocalExperts<'a> {
         let output_bytes = max_rows * shape.hidden * 2;
         let reduction_plan = Exl3ReductionPlan::new(&directories)?;
         let weights = Rc::new(weights);
-        let arena = Exl3Workspace::new(library, &directories)?;
+        let arena = Exl3Workspace::new(library, &directories, Exl3Epilogue::Sum)?;
         let mut executions = Vec::with_capacity(capacities.len());
         for (&capacity, directory) in capacities.iter().zip(&directories) {
             // SAFETY: the package is the image's own verified artifact; every
@@ -368,7 +368,7 @@ impl<'a> LocalExperts<'a> {
             // stream, one launch at a time.
             let execution = unsafe {
                 Exl3Execution::with_shared_workspace(library, weights.clone(), directory,
-                    Exl3InputFormat::Fp8K32, Some(arena.clone()))?
+                    Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum, Some(arena.clone()))?
             };
             ensure!(execution.capacity() == capacity as usize && execution.output_element_bytes() == 4,
                 "coordinator EXL3 package must match capacity {capacity} with FP32 output");

@@ -53,6 +53,12 @@ def feature_norm_eps(cfg):
     return epsilon
 
 
+def axial_inv_freq():
+    """Match serving host powf and the official CPU FP32 tensor evaluation."""
+    import torch
+    return (1.0 / (10000 ** (torch.arange(0, 48, 2, dtype=torch.float32, device="cpu") / 48))).numpy()
+
+
 def pack_spec(cfg, tensors, max_tokens=4096):
     vision = cfg["vision_config"]
     for name, want in dict(hidden_size=1536, intermediate_size=8960, num_attention_heads=16,
@@ -120,7 +126,7 @@ def pack_spec(cfg, tensors, max_tokens=4096):
     chunks.append(bytes((-size) % 256))
     size += (-size) % 256
     spec.inv_freq = size
-    frequencies = 1.0 / np.power(np.float32(10000), np.arange(24, dtype=np.float32) / np.float32(24))
+    frequencies = axial_inv_freq()
     chunks.append(frequencies.astype(np.float32).tobytes())
     spec.weight_bytes = size + 96
     return spec, b"".join(chunks)
@@ -321,6 +327,9 @@ def run(args):
     spec, blob = pack_spec(cfg, tensors)
     modules = official_modules(args.snapshot, tensors, "cuda")
     official_rope = (modules[0].rotary_emb.inv_freq, modules[0].rotary_emb.original_inv_freq)
+    inverse_frequencies_exact = np.array_equal(axial_inv_freq(), official_rope[0].detach().cpu().numpy())
+    if not inverse_frequencies_exact:
+        raise AssertionError("native upload inverse frequencies differ from official FP32 metadata")
     bf16_rope_dtypes = rope_dtypes(modules)
     del tensors
     lib = C.CDLL(str(args.library))
@@ -339,6 +348,7 @@ def run(args):
     check(lib.cuteafd_vision_required(C.byref(spec), C.byref(required)))
     check(lib.cuteafd_vision_create(C.byref(spec), 0, required.weights + required.scratch + required.blas_workspace, C.byref(owner)))
     result = dict(device=torch.cuda.get_device_name(0), ledger=required.as_dict(), images={},
+        inverse_frequencies_exact=inverse_frequencies_exact,
         precision=dict(fp32_weights="checkpoint BF16 upcast", tf32=False,
             official_bf16_rope=bf16_rope_dtypes, official_fp32_rope=None,
             allow_bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction),

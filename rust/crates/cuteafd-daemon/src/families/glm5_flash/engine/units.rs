@@ -214,7 +214,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
             &self.steps[unit.index].0.spans())?;
         let transport = self.transport.as_mut().context("Spark unit without its transport worker")?;
         // The shared expert runs while the worker sends and the Sparks compute.
-        let wave = e.spark_send(w, index, unit.rows.len(), false, transport,
+        let wave = e.spark_send(w, index, unit.rows.len(), false, transport, unit.reply_origins()?,
             || e.ffn(w, layer, e.cfg.moe_intermediate, PREFILL_CAP, w.shared.buffer.ptr, rows))?;
         Ok(Ticket::Spark(wave))
     }

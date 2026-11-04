@@ -30,6 +30,10 @@ fn parse_idle_park(text: &str) -> std::result::Result<f64, String> {
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
+    /// Spark prefill expert replies; decode/verify and <=64-row requests stay BF16.
+    /// Omission keeps BF16 combined replies and Muse's NVFP4 partial replies.
+    #[arg(long, global = true, env = "CUTEAFD_SPARK_REPLY_FORMAT")]
+    pub(crate) spark_reply_format: Option<cuteafd_core::SparkReplyFormat>,
     #[arg(long, global = true, env = "VISION")]
     pub(crate) vision: Option<cuteafd_loader::plan::MediaMode>,
     #[arg(long, global = true, env = "AUDIO")]
@@ -475,9 +479,6 @@ pub(crate) struct PlanArgs {
     /// Muse Spark partial replies (serve-muse's flags): the per-request BF16 row cutoff.
     #[arg(long, default_value_t = cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)]
     pub(crate) expert_partial_bf16_max_rows: usize,
-    /// Muse Spark partial replies: the format of segments above the cutoff (nvfp4 or fp8).
-    #[arg(long, default_value = "nvfp4")]
-    pub(crate) expert_partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat,
     /// Explicit MiMo drafter context arena for --layout.
     #[arg(long)]
     pub(crate) draft_context_slots: Option<u64>,

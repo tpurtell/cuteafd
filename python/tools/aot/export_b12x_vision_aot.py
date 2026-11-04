@@ -90,11 +90,13 @@ def main():
                      v_ptr: cute.Pointer, o_ptr: cute.Pointer, lse_ptr: cute.Pointer,
                      cu_seqlens_q_ptr: cute.Pointer, cu_seqlens_k_ptr: cute.Pointer,
                      attention_sink_bias_ptr: cute.Pointer, softmax_scale: cutlass.Float32,
-                     current_stream: cuda.CUstream):
+                     l2_cache_size: cutlass.Int32, current_stream: cuda.CUstream):
             # The library launch annotates scale as Python float, unsupported by
             # export_to_c. This ABI-only adapter preserves its kernel arithmetic.
+            # l2_cache_size is the launcher's runtime cudaDevAttrL2CacheSize.
             self.launch(q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr, cu_seqlens_q_ptr,
-                        cu_seqlens_k_ptr, attention_sink_bias_ptr, softmax_scale, current_stream)
+                        cu_seqlens_k_ptr, attention_sink_bias_ptr, softmax_scale,
+                        l2_cache_size, current_stream)
 
     destination = args.output_dir
     destination.mkdir(parents=True, exist_ok=True)
@@ -122,7 +124,7 @@ def main():
         pointers += [make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4) for _ in range(2)]
         pointers += [make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4)]
         program = b12x_compile(VisionAttentionLaunch(dim, tile), *pointers,
-                               cutlass.Float32(1.0), cuda.CUstream(0))
+                               cutlass.Float32(1.0), cutlass.Int32(0), cuda.CUstream(0))
         program.export_to_c(str(destination), stem, symbol)
         header = (destination / (stem + ".h")).read_text()
         signature = re.search(r"static inline int32_t cute_dsl_" + symbol + r"_wrapper\(([^)]*)\)", header)
@@ -132,7 +134,7 @@ def main():
         expected = [symbol + "_Kernel_Module_t *module"]
         pointers = ["q_ptr", "k_ptr", "v_ptr", "o_ptr", "lse_ptr", "cu_seqlens_q_ptr", "cu_seqlens_k_ptr", "attention_sink_bias_ptr"]
         expected += ["void *" + name for name in pointers]
-        expected += ["float softmax_scale", "cudaStream_t current_stream"]
+        expected += ["float softmax_scale", "int32_t l2_cache_size", "cudaStream_t current_stream"]
         if re.sub(r"\s+", "", signature[1]) != re.sub(r"\s+", "", ",".join(expected)):
             raise ValueError("unexpected generated vision attention ABI: " + signature[1])
         artifacts = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
@@ -142,7 +144,9 @@ def main():
             capability=list(capability), geometry=dict(heads=HEADS, head_dim=dim,
             capacity=CAPACITY, tile_m=tile[0], tile_n=tile[1], causal=False),
             dtype="BF16", live_rows="cu_seqlens [0,n]; host validates n <= capacity",
-            lse_bytes=CAPACITY * HEADS * 4, abi=dict(pointers=pointers, f32=["softmax_scale"], stream="current_stream"),
+            lse_bytes=CAPACITY * HEADS * 4,
+            abi=dict(pointers=pointers, f32=["softmax_scale"], i32=["l2_cache_size"],
+                     stream="current_stream"),
             artifacts=artifacts)
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
         print(manifest_path, flush=True)

@@ -1155,7 +1155,7 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
                          "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
@@ -1165,7 +1165,7 @@ def main() -> None:
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and geometries not in (["exlr8"], ["expert_partial"])):
+    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and any(g not in ("exlr8", "expert_partial", "expert_reply") for g in geometries)):
         raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -1203,6 +1203,13 @@ def main() -> None:
             manifest["families"][name] = {"abi_version": 1}
             work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
                      for suffix, thunk, capacity in kimi_split_programs()]
+            continue
+        if name == "expert_reply":
+            from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
+            manifest["families"][name] = {"fp8_block": 32, "nvfp4_block": 16}
+            for suffix, quantize, stage in (("quantize", True, False), ("dequantize", False, False), ("stage", False, True)):
+                work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
+                             lambda q=quantize, s=stage: compile_expert_reply_aot(quantize=q, stage=s)))
             continue
         if name == "expert_partial":
             from export_b12x_expert_partial_aot import programs as partial_programs

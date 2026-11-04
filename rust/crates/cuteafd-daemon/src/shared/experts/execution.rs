@@ -146,6 +146,7 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     route_staging: Vec<crate::shared::memory::HostAllocation<'library>>,
     compact_reducer: Option<V41CompactReducer<'library>>,
     compact_output: Option<DeviceAllocation<'library>>,
+    reply_codec: Option<super::reply::ReplyCodec<'library>>,
     output: Option<DeviceAllocation<'library>>,
     pub(crate) shared: Option<DeviceAllocation<'library>>,
     slots: [*mut c_void; 44],
@@ -345,6 +346,7 @@ impl<'library> ExpertWeights<'library> {
         let small = prepare_small(grouped, budget.small_scratch_bytes)?;
         let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::named(library,
             budget.routing_bytes, "experts/workspace/route_staging" )).collect::<Result<Vec<_>>>()?;
+        let reply_codec = if compact_output_role(kernel.info().role) { Some(super::reply::ReplyCodec::load(library)?) } else { None };
         Ok(ExpertExecution {
             stream,
             _weights: self,
@@ -359,6 +361,7 @@ impl<'library> ExpertWeights<'library> {
             worker_timing: None,
             compact_reducer,
             compact_output,
+            reply_codec,
             scratch,
             hidden,
             ids,
@@ -939,7 +942,9 @@ impl ExpertExecution<'_, '_> {
                 timing.record(1, self.stream.raw)?;
             }
         }
-        let output = destination.unwrap_or(self
+        let compressed = request.output_dtype() != cuteafd_transport::ExpertV2Dtype::Bf16;
+        ensure!(!compressed || destination.is_some(), "compressed replies require a mapped response slot");
+        let output = destination.filter(|_| !compressed).unwrap_or(self
             .compact_output
             .as_ref()
             .context("missing compact output")?
@@ -956,6 +961,11 @@ impl ExpertExecution<'_, '_> {
                     reducer.compact(self.route_partials(request.rows())?.ptr.cast(),
                         output.ptr.cast(), request.rows(), self.stream.raw)?,
             }
+        }
+        if compressed {
+            // SAFETY: BF16 scratch and mapped destination live through the unit fence below.
+            unsafe { self.reply_codec.as_ref().context("missing reply codec")?.quantize(request,
+                output, destination.context("missing compressed destination")?, request.rows() as usize, self.stream.raw)?; }
         }
         if let Some(timing) = &self.timing {
             unsafe {

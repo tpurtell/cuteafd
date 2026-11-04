@@ -4,6 +4,7 @@
 //! its own adapter under `layout/` (`FamilyModel::placement`), solving the
 //! same placement request its runtime admits.
 use super::{Component, ExpertPlacement, Owner, PlanReport, Status};
+use crate::serving_capacity::Exl3Epilogue;
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout, Waste};
 
 pub(crate) mod deepseek_v4;
@@ -29,6 +30,8 @@ pub struct LayoutOptions {
     /// None sizes full-context KV for concurrency + 4, capped at min(32 GiB, 25% host RAM).
     /// Explicit bytes bypass both; Some(0) disables the host tier.
     pub host_cache_bytes: Option<u64>,
+    /// Shared requested reply policy. Omission preserves Muse NVFP4/combined BF16.
+    pub spark_reply_format: Option<cuteafd_core::SparkReplyFormat>,
     /// None selects min(8 GiB, 5% host total) when a supported media tower is loaded.
     pub media_cache_bytes: Option<u64>,
     /// Deterministic host/cgroup sample for offline inventory tests.
@@ -122,10 +125,8 @@ pub struct LayoutOptions {
     pub kimi_drafter_snapshot: Option<std::path::PathBuf>,
     /// Muse Spark's DFlash2 drafter (opt-in), charged from its own config on the head GPU.
     pub muse_drafter_snapshot: Option<std::path::PathBuf>,
-    /// Muse Spark's partial-reply cutoff and wide format (serve-muse's
-    /// `--expert-partial-bf16-max-rows` / `--expert-partial-wide-format`).
+    /// Muse Spark's lossless partial-reply cutoff (`--expert-partial-bf16-max-rows`).
     pub muse_partial_bf16_max_rows: usize,
-    pub muse_partial_wide_format: crate::families::muse_spark::replies::WideFormat,
     pub kimi_draft_fp8: bool,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
@@ -194,6 +195,10 @@ pub struct LayoutOptions {
 }
 
 impl LayoutOptions {
+    pub fn resolved_spark_reply_format(&self, partial: bool) -> cuteafd_core::SparkReplyFormat {
+        cuteafd_core::SparkReplyFormat::resolve(self.spark_reply_format, partial)
+    }
+
     pub fn resolved_concurrency(&self, family: &str) -> u64 {
         if self.concurrency > 0 { return self.concurrency; }
         match family {
@@ -240,6 +245,7 @@ impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
             host_cache_bytes: None,
+            spark_reply_format: cuteafd_core::spark_reply::requested(),
             media_cache_bytes: None,
             host_memory: None,
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
@@ -285,7 +291,6 @@ impl Default for LayoutOptions {
             kimi_drafter_snapshot: None,
             muse_drafter_snapshot: None,
             muse_partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-            muse_partial_wide_format: Default::default(),
             kimi_draft_fp8: false,
             mla_kv: Default::default(),
             headroom_bytes: 2 * GIB,
@@ -541,7 +546,7 @@ mod selected_spark_io_tests {
                 "dtype": "i32", "zero_on_create": true}));
             json!({"capacity": rows, "hidden": 2560, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
         }).collect::<Vec<_>>();
-        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
         let wire_routes = 4096 * (2560 + 2560 / 32 + 8 * 10);
         assert_eq!(retained + wire_routes, 674_287_636);
         for rows in [64, 2048, 2752, 4096] {
@@ -568,7 +573,7 @@ mod selected_spark_io_tests {
                 "dtype": "i32", "zero_on_create": true}));
             json!({"capacity": rows, "hidden": 4096, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
         }).collect::<Vec<_>>();
-        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
         assert_eq!(retained, 567_814_976);
         let slot = retained + 4096 * (4096 + 4096 / 32 + 8 * 8);
         assert_eq!(slot, 585_378_624);
@@ -597,7 +602,7 @@ mod selected_spark_io_tests {
                 "dtype": "i32", "zero_on_create": true}));
             json!({"capacity": rows, "hidden": 3584, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
         }).collect::<Vec<_>>();
-        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
         let slot = retained + 4096 * (3584 + 3584 / 32 + 8 * 16);
         assert_eq!(slot, 844_696_852);
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
@@ -1193,7 +1198,7 @@ pub(crate) fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyMod
     if manifests.iter().any(|m| m["hidden"].as_u64() != Some(model.spec().hidden as u64)
         || m["intermediate"].as_u64() != Some(moe.intermediate as u64)
         || m["experts"].as_u64() != Some(moe.experts as u64)) { return None; }
-    crate::serving_capacity::exl3_workspace_bytes(&manifests, true).ok()?
+    crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).ok()?
         .checked_add(maximum * model.spec().hidden as u64 * 2)
 }
 
@@ -1659,7 +1664,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             let prefill = crate::serving_capacity::prefill_waves::PrefillPlan { unit_rows, waves: options.prefill_waves,
                 span_rows: unit_rows * options.prefill_waves };
             let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(options.muse_partial_bf16_max_rows,
-                crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, options.muse_partial_wide_format)?;
+                crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, options.resolved_spark_reply_format(true).into())?;
             let sequences = usize::try_from(options.resolved_state_slots("muse_spark"))?;
             let host = crate::placement::families::muse_spark::host_transport(&cfg, prefill, cutoff, sequences, ranks)?;
             push(Category::Transport, "transport/rdma-rings", "registered", host.rings, Basis::Exact);

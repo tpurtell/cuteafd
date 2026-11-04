@@ -119,6 +119,19 @@ impl SparkWorld {
     }
 }
 
+const COMPRESSED_REPLY_FLAGS: u32 = crate::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
+    | crate::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3;
+const REPLY_FLAGS: u32 = EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
+    | crate::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES | COMPRESSED_REPLY_FLAGS;
+
+fn combined_output_dtype(flags: u32) -> ExpertV2Dtype {
+    if flags & crate::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3 != 0 {
+        ExpertV2Dtype::Nvfp4E2m1Fp8E4m3
+    } else if flags & crate::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32 != 0 {
+        ExpertV2Dtype::Fp8E4m3Ue8m0K32
+    } else { ExpertV2Dtype::Bf16 }
+}
+
 // Shared by wire parsing on workers and validation of owned coordinator requests.
 fn validate_canonical_body(
     header: &crate::ExpertProtocolV2RequestHeader,
@@ -153,8 +166,15 @@ fn validate_canonical_body(
                 .context("route count overflow")?,
         "native backbone needs top-k routes per token"
     );
+    let compressed = header.flags & COMPRESSED_REPLY_FLAGS != 0;
+    let mut prefill_rows = std::collections::BTreeMap::<u64, usize>::new();
     for row_index in 0..header.row_count {
         let row = row_at(row_index as usize)?;
+        if compressed {
+            ensure!(row.source_kind == crate::ExpertV2SourceKind::Prefill,
+                "compressed native replies require prefill rows, never decode or verify");
+            *prefill_rows.entry(row.source_request_id).or_default() += 1;
+        }
         ensure!(
             row.route_offset == row_index * geometry.topk && row.route_count == geometry.topk,
             "noncanonical native row route span"
@@ -182,6 +202,8 @@ fn validate_canonical_body(
             ids[slot] = route.expert_id;
         }
     }
+    ensure!(prefill_rows.values().all(|&rows| rows > 64),
+        "compressed native replies require more than 64 rows per source request");
     Ok(())
 }
 
@@ -196,7 +218,7 @@ fn validate_canonical(
     ensure!(matches!(response, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
         | crate::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES),
         "native request requires exactly one compact BF16 or per-expert partial response agreement");
-    ensure!(header.flags & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM | response) == 0,
+    ensure!(header.flags & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM | response | COMPRESSED_REPLY_FLAGS) == 0,
         "native complete batches cannot use legacy reduction/compression or stream flags");
     ensure!(cuteafd_core::expert_geometry().partial_replies()
         == (response == crate::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES),
@@ -227,7 +249,7 @@ fn validate_native_group(
         header.flags
             & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                | V41_NATIVE_GROUP_REQUEST_FLAG)
+                | V41_NATIVE_GROUP_REQUEST_FLAG | COMPRESSED_REPLY_FLAGS)
             == 0,
         "native group requests cannot use legacy reduction/compression or stream flags"
     );
@@ -336,10 +358,10 @@ impl<'a> BackboneRequest<'a> {
     pub fn hidden(&self) -> &'a [u8] {
         self.view.hidden_payload()
     }
-    fn output_dtype(&self) -> ExpertV2Dtype {
-        ExpertV2Dtype::Bf16
+    pub fn output_dtype(&self) -> ExpertV2Dtype {
+        combined_output_dtype(self.view.header.flags)
     }
-    fn output_row_bytes(&self) -> Result<u32> {
+    pub fn output_row_bytes(&self) -> Result<u32> {
         u32::try_from(
             self.output_dtype()
                 .row_bytes(cuteafd_core::expert_geometry().hidden as usize)?,
@@ -580,11 +602,10 @@ impl<'a> V41Tp4Planes<'a> {
             layer: h.layer_id,
             rows: h.row_count,
             executors: V41Executors::new(executors)?,
-            partial_flag: h.flags & (EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                | crate::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES),
-            output_dtype: ExpertV2Dtype::Bf16,
-            output_row_bytes: cuteafd_core::expert_geometry().hidden.checked_mul(2)
-                .context("native output row bytes overflow")?,
+            partial_flag: h.flags & REPLY_FLAGS,
+            output_dtype: combined_output_dtype(h.flags),
+            output_row_bytes: u32::try_from(combined_output_dtype(h.flags)
+                .row_bytes(cuteafd_core::expert_geometry().hidden as usize)?)?,
             partial_payload_bytes: None,
             planes: [None; cuteafd_core::MAX_SPARK_WORLD],
         })
@@ -608,8 +629,7 @@ impl<'a> V41Tp4Planes<'a> {
     }
     fn response_rank(&self, h: &ExpertProtocolV2ResponseHeader) -> Result<usize> {
         ensure!(
-            h.flags & (EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                | crate::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES) == self.partial_flag,
+            h.flags & REPLY_FLAGS == self.partial_flag,
             "native response partial domain differs from request agreement"
         );
         ensure!(
@@ -676,7 +696,7 @@ pub(crate) fn test_request(rows: u32) -> crate::ExpertProtocolV2Request { tests:
 mod tests {
     use super::*;
     use crate::{
-        EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED, ExpertProtocolV2Request,
+        EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32, ExpertProtocolV2Request,
         ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2SourceKind,
     };
     #[test]
@@ -920,6 +940,94 @@ mod tests {
         request
     }
     #[test]
+    fn combined_reply_formats_roundtrip_and_bind_the_agreement() -> Result<()> {
+        use cuteafd_core::SparkReplyFormat;
+        for (format, dtype, stride) in [
+            (SparkReplyFormat::Bf16, ExpertV2Dtype::Bf16, 10240),
+            (SparkReplyFormat::Fp8, ExpertV2Dtype::Fp8E4m3Ue8m0K32, 5280),
+            (SparkReplyFormat::Nvfp4, ExpertV2Dtype::Nvfp4E2m1Fp8E4m3, 2880),
+        ] {
+            let mut owned = request(65);
+            for row in &mut owned.rows {
+                row.source_kind = crate::ExpertV2SourceKind::Prefill;
+                row.source_request_id = 1;
+            }
+            assert_eq!(owned.select_combined_reply(format)?.format, format);
+            let encoded = owned.encode()?;
+            let native = BackboneRequest::parse(&encoded, 65)?;
+            assert_eq!(native.output_dtype(), dtype);
+            assert_eq!(native.output_row_bytes()?, stride);
+            let payload = vec![0; 65 * stride as usize];
+            let response = native.response(11, &payload)?;
+            let frame = response.to_owned()?.encode()?;
+            let mut planes = V41Tp4Planes::new_ranks(&native, &[11])?;
+            assert_eq!(planes.insert(&frame)?, 0);
+            let mut mismatch = owned.clone();
+            mismatch.select_combined_reply(if format == SparkReplyFormat::Bf16 {
+                SparkReplyFormat::Fp8
+            } else { SparkReplyFormat::Bf16 })?;
+            let other_frame = mismatch.encode()?;
+            let other = BackboneRequest::parse(&other_frame, 65)?;
+            assert!(V41Tp4Planes::new_ranks(&other, &[11])?.insert(&frame).is_err());
+            if format != SparkReplyFormat::Bf16 {
+                for kind in [crate::ExpertV2SourceKind::Decode, crate::ExpertV2SourceKind::MtpVerify] {
+                    let mut invalid = owned.clone();
+                    invalid.rows[0].source_kind = kind;
+                    assert!(BackboneRequest::parse(&invalid.encode()?, 65).is_err());
+                }
+                let mut invalid = owned.clone();
+                invalid.rows[0].source_request_id = 2;
+                assert!(BackboneRequest::parse(&invalid.encode()?, 65).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_group_reply_formats_roundtrip() -> Result<()> {
+        use cuteafd_core::SparkReplyFormat;
+        let topology = SparkTopology::NATIVE_TP2_EP2;
+        for format in [SparkReplyFormat::Bf16, SparkReplyFormat::Fp8, SparkReplyFormat::Nvfp4] {
+            let mut owned = request(65);
+            for row in &mut owned.rows {
+                row.source_kind = ExpertV2SourceKind::Prefill;
+                row.source_request_id = 1;
+            }
+            owned.with_native_group_owners(&vec![0; 384], topology)?;
+            owned.select_combined_reply(format)?;
+            let encoded = owned.encode()?;
+            let request = BackboneRequest::parse_native_group(&encoded, 65, topology)?;
+            let ranks = topology.executor_ids();
+            let payload = vec![0; request.plane_bytes()?];
+            let frames = ranks.iter().map(|executor|
+                request.response(*executor, &payload)?.to_owned()?.encode()).collect::<Result<Vec<_>>>()?;
+            let mut planes = V41Tp4Planes::new_ranks(&request, &ranks)?;
+            for (rank, frame) in frames.iter().enumerate() {
+                assert_eq!(planes.insert(frame)?, rank);
+            }
+            assert!(planes.complete());
+            let mut mismatch = owned.clone();
+            mismatch.select_combined_reply(if format == SparkReplyFormat::Bf16 {
+                SparkReplyFormat::Nvfp4
+            } else { SparkReplyFormat::Bf16 })?;
+            let other_encoded = mismatch.encode()?;
+            let other = BackboneRequest::parse_native_group(&other_encoded, 65, topology)?;
+            assert!(V41Tp4Planes::new_ranks(&other, &ranks)?.insert(&frames[0]).is_err());
+            if format != SparkReplyFormat::Bf16 {
+                for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::MtpVerify] {
+                    let mut invalid = owned.clone();
+                    invalid.rows[0].source_kind = kind;
+                    assert!(BackboneRequest::parse_native_group(&invalid.encode()?, 65, topology).is_err());
+                }
+                let mut invalid = owned.clone();
+                invalid.rows[0].source_request_id = 2;
+                assert!(BackboneRequest::parse_native_group(&invalid.encode()?, 65, topology).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fp8_k32_wire_roundtrip_preserves_rows_and_bf16_worker_rejects_it() {
         for rows in [1, 16, 80] {
             let base = request(rows);
@@ -1128,7 +1236,7 @@ mod tests {
                 1 => owned.routes[0].expert_id = 384,
                 2 => owned.routes[0].gate_weight = -0.5,
                 3 => owned.header.layer_id = 40,
-                4 => owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
+                4 => owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32,
                 6 => owned.header.flags = 0,
                 _ => {
                     owned.routes.pop();

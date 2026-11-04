@@ -28,6 +28,9 @@ pub(crate) mod weights;
 #[cfg(test)]
 pub(crate) mod reference;
 #[cfg(test)]
+#[path = "coordinator_golden_tests.rs"]
+mod coordinator_golden_tests;
+#[cfg(test)]
 mod reference_tests;
 #[cfg(test)]
 mod drafter_tests;

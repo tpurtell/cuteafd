@@ -1,6 +1,6 @@
 //! V4 expert residency and local-expert workspace without CUDA, the inputs
 //! `placement::families::deepseek_v4` charges (the solver is `placement::solve`).
-use super::CacheGeometryError;
+use super::{CacheGeometryError, Exl3Epilogue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V4ExpertCost {
@@ -105,7 +105,7 @@ pub fn deepseek_v4_tp2_workspace(catalog: &crate::OfficialV41Catalog,
             && value["experts"].as_u64() == Some(shape.experts as u64), "TP2 EXL3 workspace geometry mismatch");
         Ok(value)
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(super::exl3_workspace_bytes(&manifests, true)? + max_rows.max(1) * shape.hidden as u64 * 4)
+    Ok(super::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)? + max_rows.max(1) * shape.hidden as u64 * 4)
 }
 
 #[cfg(test)]

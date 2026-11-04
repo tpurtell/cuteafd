@@ -2293,7 +2293,7 @@ impl<'a> GlmEngine<'a> {
     /// shared expert queues behind them, and the worker builds and posts the
     /// request once the copies complete. This thread never waits for the GPU.
     fn moe_wave(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str,
-        transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        transport: &mut crate::shared::spark_waves::Waves<'_>, origins: Option<crate::shared::prefill_pipeline::ReplyOrigins>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
         self.route_sample(w, index, t, cap)?;
@@ -2302,7 +2302,11 @@ impl<'a> GlmEngine<'a> {
         let ticket = unsafe {
             transport.send(t, transport.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer,
                 if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream,
-                Box::new(move |routes, wire| expert_request_parts(routes, wire, index, t, h, topk, false, bf16)))?
+                Box::new(move |routes, wire| {
+                    let mut request = expert_request_parts(routes, wire, index, t, h, topk, false, bf16)?;
+                    if let Some(origins) = origins { origins.apply(&mut request)?; }
+                    Ok(request)
+                }))?
         };
         // The shared expert runs on the GPU while the worker sends and the Sparks compute.
         self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
@@ -3106,7 +3110,7 @@ where B: Fn(usize) -> Result<()>,
         }
         let w = self.workspaces[unit.index % self.waves];
         let rows = self.counts[unit.index];
-        self.engine.moe_wave(w, layer, &self.layers[layer], rows, self.cap, self.transport).map(UnitTicket::Spark)
+        self.engine.moe_wave(w, layer, &self.layers[layer], rows, self.cap, self.transport, unit.reply_origins()?).map(UnitTicket::Spark)
     }
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit,
         ticket: UnitTicket) -> Result<()> {

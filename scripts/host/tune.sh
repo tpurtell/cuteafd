@@ -28,7 +28,7 @@ ACTION_SET=0
 
 usage() {
     echo 'Usage: tune.sh [report|apply|persist] [--role coordinator|spark] [--dry-run]'
-    echo '       tune.sh fabric-lossless tools|apply|check|rollback --role coordinator|spark [--dry-run]'
+    echo '       tune.sh fabric-lossless tools|apply|reapply|persist|check|rollback --role coordinator|spark [--dry-run]'
     echo 'TUNE_SYSFS_ROOT substitutes /sys; fixtures put proc files under ROOT/proc.'
 }
 

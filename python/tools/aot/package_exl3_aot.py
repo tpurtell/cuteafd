@@ -439,15 +439,33 @@ SPARK_WS_CELLS = {
     ('muse', 896, 2048): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
     ('muse', 896, 4096): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
     ('muse', 768, 256): dict(route_block=32, dynamic=True, tile=(64, 256, 64, 256)),
+    # S4 duel round 0, GB10 2026-11-04, recorded layer-22 Muse routes, two
+    # layers, median of three: dynamic tiles win m1024 4776 -> 4678 us (1.021x,
+    # control spread 0.08%); m2048..m4096 tie within noise and keep the control.
+    ('muse', 768, 1024): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
     ('muse', 640, 256): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
     ('muse', 640, 1024): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    # S4 duel round 0, GB10 2026-11-04, recorded layer-22 Muse routes, two
+    # layers, median of three: m2048 wants the 256-wide FC2 N tile (the width
+    # default is 128/128 here because 640 % 256 != 0), 7709 -> 7468 us (1.032x,
+    # identical-control spread 1.3%; dynamic tiles at the default 128-wide N
+    # are 1.007x there). The neighbouring cells already carry this recipe and
+    # confirm it over their 128/128 default: m256 1.012x, m1024 1.024x, m2752
+    # 1.035x, m4096 1.010x.
+    ('muse', 640, 2048): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
     ('muse', 640, 2752): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
     ('muse', 640, 4096): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
     # ML4 K4/empty-K5, GB10 2026-11-01: exact synthetic-skew-qualified cells;
     # real-route confirmation pending. No extrapolation across rows or widths.
+    # S4 duel round 0, GB10 2026-11-04, recorded route histograms (layer 0),
+    # two layers, median of three: the static control loses to this recipe at
+    # the two cells that had no entry, m1024 6426 -> 6320 us (1.017x) and m4096
+    # 13580 -> 12904 us (1.052x), both bit-identical.
     ('ml4', 1024, 256): _WS_K3_PREROTATE,
+    ('ml4', 1024, 1024): _WS_K3_PREROTATE,
     ('ml4', 1024, 2048): _WS_K3_PREROTATE,
     ('ml4', 1024, 2752): _WS_K3_PREROTATE,
+    ('ml4', 1024, 4096): _WS_K3_PREROTATE,
     ('ml4', 1152, 256): _WS_S14,
     ('ml4', 1152, 1024): _WS_S14,
     ('ml4', 1152, 2752): _WS_S14,
@@ -466,6 +484,12 @@ SPARK_WS_CELLS = {
     # exact against each tier's control; K6 ties within measured noise pass.
     # Real-route confirmation is pending; other capacities keep their controls.
     ('step5', 256, 256): dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED),
+    # S4 duel round 0, GB10 2026-11-04, recorded route histograms (layer 0),
+    # K4/K6 tiers, two layers, median of five rounds: the 256-wide FC1 tile
+    # keeps the width-256 default and only the tile claims change, m4096
+    # 7170 -> 6945 us (1.032x, control spread 0.15%); m2752 ties (1.004x) and
+    # m1024/m2048 keep the static control.
+    ('step5', 256, 4096): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
     ('step5', 384, 256): dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED),
     ('step5', 384, 1024): dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED),
 }
@@ -713,6 +737,43 @@ DECODE_SCHEDULES = {
 PURE_EVICT_FIRST = 'l2=2,pf1=0,pf2=0,pdl=1'
 
 
+# Decode tile/occupancy of the Spark TP6 cells measured in the S4 selection
+# audit. GB10, one TP6 rank slice, real expert count and random top-k routes,
+# the shipping K4/empty-second-tier layout, two layers, three alternating
+# rounds of 20 replays, rows 1..80, bit-identical output at every screened row.
+# The b12x gb10 m80 recipe -- 64x128 tiles at two CTAs per SM plus the pure
+# evict-first L2 hint -- beats the cooperative default at both capacities the
+# worker uses (m1 for one row, m80 for 2-80 rows). ms default -> recipe
+# (ratio, rows 1 and 80): ML4 w1024 0.174/4.831 -> 0.168/4.693 (1.036/1.029x,
+# 1.071x at two rows); Muse w768 0.180/4.582 -> 0.170/4.538 (1.056/1.010x,
+# the hint alone 1.015x at eighty rows); Muse compact w768 0.189/4.814 ->
+# 0.162/4.605 (1.164/1.045x); Step-5 w256 0.073/2.181 -> 0.057/2.064
+# (1.279/1.057x). The hint alone is 1.015..1.059x. Muse w640 needs a 128-wide
+# tile (its 640-row FC1 projection cannot split into 256-wide N tiles), keeps
+# it, and gains 1.090/1.040x from the occupancy and hint (0.159/3.975 ->
+# 0.146/3.824 ms).
+SPARK_DECODE_CELLS = {
+    ('ml4', 'tp6-width1024', (4, 5)): dict(decode_schedule=PURE_EVICT_FIRST,
+                                          tile=(64, 128, 64, 128), blocks_per_sm=2),
+    ('muse', 'tp6-width768', (4, 5)): dict(decode_schedule=PURE_EVICT_FIRST,
+                                          tile=(64, 128, 64, 128), blocks_per_sm=2),
+    ('muse', 'tp6-width640', (4, 5)): dict(decode_schedule=PURE_EVICT_FIRST,
+                                          tile=(64, 128, 64, 128), blocks_per_sm=2),
+    ('muse', 'tp6-compact-width768', (4, 5)): dict(decode_schedule=PURE_EVICT_FIRST,
+                                                  tile=(64, 128, 64, 128), blocks_per_sm=2),
+    ('step5', 'tp6-width256', (4, 6)): dict(decode_schedule=PURE_EVICT_FIRST,
+                                           tile=(64, 128, 64, 128), blocks_per_sm=2),
+}
+
+
+def spark_decode_cell(geometry: str, role: str, profile: str, capacity: int,
+                      bits: list[int]) -> dict | None:
+    """Measured default decode recipe of a Spark TP6 cell; None keeps the control."""
+    if role != 'spark' or capacity not in (1, 80):
+        return None
+    return SPARK_DECODE_CELLS.get((geometry, profile, tuple(bits)))
+
+
 def default_decode_schedule(geometry: str, role: str, profile: str,
                             capacity: int, bits: list[int]) -> str | None:
     """Only measured cooperative profiles use the pure streaming hint.
@@ -724,7 +785,9 @@ def default_decode_schedule(geometry: str, role: str, profile: str,
     1.067..1.119x (.995..1.003), Qwen 1.019..1.083x (.989..1.002).
     RTX TP2 m1/m80: Flash median 1.015..1.144x (control .995..1.016),
     GLM median 1.014..1.037x (.999..1.005), finite normalized fixtures.
-    Tiles, occupancy and arithmetic unchanged.
+    Those hint-only arms leave tiles, occupancy and arithmetic unchanged. The
+    Spark TP6 cells of the S4 selection audit (`SPARK_DECODE_CELLS`) also pin
+    their tile and occupancy, so this reports their hint too.
     """
     measured = {
         ('glm', 'tp6-compact-width384', (4, 5)),
@@ -741,6 +804,8 @@ def default_decode_schedule(geometry: str, role: str, profile: str,
     measured_rtx = {('glm', 'rtx-tp2', (4, 5)), ('glmf', 'rtx-tp2', (3, 4))}
     if role == 'coordinator' and capacity in (1, 80) and identity in measured_rtx:
         return PURE_EVICT_FIRST
+    if (cell := spark_decode_cell(geometry, role, profile, capacity, bits)) is not None:
+        return cell['decode_schedule']
     return None
 
 
@@ -1098,9 +1163,15 @@ def build(args: argparse.Namespace) -> None:
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
                 default_options = options
+                if (cell := spark_decode_cell(geometry, args.role, profile, capacity,
+                                              args.bits)) is not None:
+                    # An operator's --tile override of this capacity still wins.
+                    default_options = {**options, **{
+                        key: value for key, value in cell.items()
+                        if key != 'decode_schedule' and not (key == 'tile' and requested is not None)}}
                 if (schedule_hint := default_decode_schedule(
                         geometry, args.role, profile, capacity, args.bits)) is not None:
-                    default_options = {**options, 'decode_schedule': schedule_hint}
+                    default_options = {**default_options, 'decode_schedule': schedule_hint}
                 exports = [(None, default_options)]
                 for schedule, schedule_options in ([] if compact else decode_schedule_variants(
                         geometry, args.role, profile, capacity)):

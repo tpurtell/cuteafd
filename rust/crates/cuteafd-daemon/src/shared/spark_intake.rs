@@ -385,6 +385,7 @@ pub(crate) struct SparkIntake<'a> {
     row_bytes: usize,
     /// One allocation per rank holding its whole reserve range.
     planes: Vec<IntakePlane<'a>>,
+    exchange_storage: RefCell<Option<std::rc::Rc<crate::shared::spark_waves::ExchangeStorage<'a>>>>,
     /// Admitted return slots (events, consumed fences).
     waves: usize,
     geometry: RefCell<SlotGeometry>,
@@ -511,7 +512,7 @@ impl<'a> SparkIntake<'a> {
         let copy_stream = library.cuda_stream_create()?;
         Ok(Self {
             library, mode, ranks, rows, row_bytes, planes, waves, geometry: RefCell::new(geometry),
-            state: IntakeState::new(waves), staging, copy_stream,
+            state: IntakeState::new(waves), staging, copy_stream, exchange_storage: RefCell::new(None),
             copied: library.cuda_event_create_ordering()?,
             consumed: (0..waves).map(|_| library.cuda_event_create_ordering()).collect::<Result<_>>()?,
             landed: (0..waves).map(|_| library.cuda_event_create_ordering()).collect::<Result<_>>()?,
@@ -856,9 +857,24 @@ impl<'a> SparkIntake<'a> {
 
     pub(crate) fn terminal_release_payloads(&self) -> Result<()> {
         self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.clear();
+        self.exchange_storage.borrow_mut().take();
         self.state.copies_pending.set(false);
         for pending in &self.state.consumed_pending { pending.set(false); }
         Ok(())
+    }
+
+    /// Called initially or after the link's reset proved consumer drainage.
+    pub(crate) fn exchange_storage(&self, geometry: &crate::shared::spark_waves::Intake)
+        -> Result<std::rc::Rc<crate::shared::spark_waves::ExchangeStorage<'a>>> {
+        let mut retained = self.exchange_storage.borrow_mut();
+        if let Some(storage) = retained.as_ref() {
+            ensure!(storage.matches(geometry), "exchange storage geometry changed across reset");
+            ensure!(std::rc::Rc::strong_count(storage) == 1, "previous exchange still owns its storage");
+            storage.reset_drained();
+        } else {
+            *retained = Some(std::rc::Rc::new(crate::shared::spark_waves::ExchangeStorage::new(self.library, geometry)?));
+        }
+        Ok(retained.as_ref().unwrap().clone())
     }
 
     /// Small waves upload on the compute stream itself (a cross-stream wait
@@ -1620,6 +1636,7 @@ pub(super) fn link_allocation_receipts(prefix: &str,
 
 /// A Spark transport and the intake its waves land in (dropped in that order).
 pub(crate) struct SparkLink<'a> {
+    prefill: bool,
     intake: std::rc::Rc<SparkIntake<'a>>,
     /// Bytes of the transport's egress buffer (0: none).
     egress_bytes: usize,
@@ -1653,7 +1670,9 @@ impl<'a> SparkLink<'a> {
     /// waves land in an intake of the process-wide [`choose_mode`].
     pub(crate) fn new(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr], capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
-        Self::new_waves(library, world, peers, capacity, config, row_bytes, 1, capacity)
+        let timing = config.timing;
+        let transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
+        Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, false, 1, capacity, timing)
     }
 
     /// A link admitting `waves` outstanding waves of up to `capacity` rows,
@@ -1668,7 +1687,7 @@ impl<'a> SparkLink<'a> {
         let timing = config.timing;
         let mut transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
         transport.set_max_waves(waves)?;
-        Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, waves, wave_rows, timing)
+        Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, true, waves, wave_rows, timing)
     }
 
     /// Return slots.
@@ -1686,7 +1705,7 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn from_transport(library: &'a NativeLibrary, transport: SparkExperts,
         row_bytes: usize, preference: IntakePreference, timing: bool) -> Result<Self> {
         let capacity = transport.capacity();
-        Self::with_egress_waves(library, transport, row_bytes, preference, false, 1, capacity, timing)
+        Self::with_egress_waves(library, transport, row_bytes, preference, false, false, 1, capacity, timing)
     }
 
     /// [`Self::from_transport`] with `waves` outstanding waves of `wave_rows`
@@ -1695,12 +1714,12 @@ impl<'a> SparkLink<'a> {
         row_bytes: usize, preference: IntakePreference, waves: usize, wave_rows: u32, timing: bool) -> Result<Self> {
         ensure!((1..=transport.capacity()).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
         transport.set_max_waves(waves)?;
-        Self::with_egress_waves(library, transport, row_bytes, preference, false, waves, wave_rows, timing)
+        Self::with_egress_waves(library, transport, row_bytes, preference, false, true, waves, wave_rows, timing)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn with_egress_waves(library: &'a NativeLibrary, mut transport: SparkExperts,
-        row_bytes: usize, preference: IntakePreference, enable_egress: bool, waves: usize, wave_rows: u32,
+        row_bytes: usize, preference: IntakePreference, enable_egress: bool, prefill: bool, waves: usize, wave_rows: u32,
         timing: bool) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let ranks = transport.world_size();
@@ -1716,7 +1735,7 @@ impl<'a> SparkLink<'a> {
         unsafe { intake.attach(&mut transport)? };
         log_transfer_plan(mode, ranks);
         let world = transport.world();
-        Ok(Self { intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
+        Ok(Self { prefill, intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
             terminal_library: None, terminal_released: false, exchange: None, transport: Some(transport),
             endpoint_snapshots: Vec::new(), unused_egress: None, staging_bytes: 0, bootstrap: None, timing, world, world_size: ranks, capacity })
     }
@@ -1798,7 +1817,7 @@ impl<'a> SparkLink<'a> {
         tracing::info!(slots, bytes, registered, "Spark exchange staging");
         let landing = transport.gpu_landing_ranks().iter().enumerate()
             .fold(0u8, |bits, (rank, &landed)| if landed { bits | 1 << rank } else { bits });
-        let geometry = crate::shared::spark_waves::Intake { ranks: intake.ranks(), row_bytes: intake.row_bytes(),
+        let geometry = crate::shared::spark_waves::Intake { prefill: self.prefill, ranks: intake.ranks(), row_bytes: intake.row_bytes(),
             ranges: intake.ranges(), geometry: intake.geometry(),
             landing: if intake.mode == IntakeMode::Gpu { landing } else { 0 }, placed: intake.placed(),
             next_slot: intake.dispatch_slot() };
@@ -1810,8 +1829,12 @@ impl<'a> SparkLink<'a> {
             Ok(snapshots) => snapshots,
             Err(error) => { self.transport = Some(transport); return Err(error); }
         };
+        let storage = match intake.exchange_storage(&geometry) {
+            Ok(storage) => storage,
+            Err(error) => { self.transport = Some(transport); return Err(error); }
+        };
         self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
-            arenas, self.timing)?);
+            arenas, self.timing, storage)?);
         self.endpoint_snapshots = endpoint_snapshots;
         self.unused_egress = unused_egress;
         Ok(())
@@ -1826,7 +1849,7 @@ impl<'a> SparkLink<'a> {
         device.run(|| {
             let exchange = self.exchange.as_ref().context("Spark link exchange not started (bootstrap first)")?;
             let intake = self.intake.allocation_receipts(&format!("{prefix}.intake"), devices, lifetime)?;
-            let waves = exchange.allocation_receipts(&format!("{prefix}.waves"), lifetime)?;
+            let waves = exchange.allocation_receipts(&format!("{prefix}.waves"), devices, lifetime)?;
             let endpoints = self.endpoint_allocation_receipts(&format!("{prefix}.endpoints"), devices, lifetime)?;
             link_allocation_receipts(prefix, intake, waves, endpoints, self.unused_egress, lifetime)
         })

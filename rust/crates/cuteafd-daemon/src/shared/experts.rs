@@ -4,6 +4,7 @@
 //! expert halves (`rtx`).
 
 pub(crate) mod execution;
+pub(crate) mod reply;
 pub(crate) mod exl3;
 pub(crate) mod exlr8;
 #[cfg(test)]

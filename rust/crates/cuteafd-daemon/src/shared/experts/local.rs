@@ -1,6 +1,6 @@
 //! One lane's local routed-expert scratch; both lanes share immutable weights.
 use super::exl3::{
-    execution::{Exl3Execution, Exl3InputFormat, Exl3Modules, Exl3ReductionPlan, Exl3Workspace},
+    execution::{Exl3Epilogue, Exl3Execution, Exl3InputFormat, Exl3Modules, Exl3ReductionPlan, Exl3Workspace},
     Exl3Weights,
 };
 use super::layer::{ExpertLayer, ExpertWeights};
@@ -247,6 +247,7 @@ impl<'a> LocalExpertWave<'a> {
         directory: &Path,
         capacity: u32,
         geometry: ExpertGeometry,
+        epilogue: Exl3Epilogue,
     ) -> Result<usize> {
         Self::require_geometry(geometry)?;
         let directories: Vec<_> = Self::exl3_capacities(capacity)?
@@ -254,7 +255,7 @@ impl<'a> LocalExpertWave<'a> {
             .map(|c| directory.join(format!("m{c}")))
             .collect();
         Exl3ReductionPlan::new(&directories)?;
-        Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
+        Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32, epilogue)?
             .checked_add(capacity as usize * geometry.row_bytes() as usize)
             .context("local EXL3 workspace overflow")
     }
@@ -266,9 +267,10 @@ impl<'a> LocalExpertWave<'a> {
         capacity: u32,
         budget: usize,
         geometry: ExpertGeometry,
+        epilogue: Exl3Epilogue,
     ) -> Result<Self> {
         // SAFETY: forwards the trusted native package and lane lifetime contract.
-        unsafe { Self::new_exl3_with_modules(library, weights, directory, capacity, budget, geometry, None) }
+        unsafe { Self::new_exl3_with_modules(library, weights, directory, capacity, budget, geometry, epilogue, None) }
     }
 
     /// # Safety
@@ -276,7 +278,7 @@ impl<'a> LocalExpertWave<'a> {
     pub(crate) unsafe fn new_exl3_with_modules(
         library: &'a NativeLibrary, weights: Rc<Vec<Exl3Weights<'a>>>,
         directory: &Path, capacity: u32, budget: usize, geometry: ExpertGeometry,
-        modules: Option<Vec<Exl3Modules<'a>>>,
+        epilogue: Exl3Epilogue, modules: Option<Vec<Exl3Modules<'a>>>,
     ) -> Result<Self> {
         Self::require_geometry(geometry)?;
         ensure!(
@@ -292,7 +294,7 @@ impl<'a> LocalExpertWave<'a> {
             );
         }
         ensure!(
-            Self::exl3_device_bytes(directory, capacity, geometry)? <= budget,
+            Self::exl3_device_bytes(directory, capacity, geometry, epilogue)? <= budget,
             "local EXL3 workspace exceeds budget"
         );
         let stream = LoadStream {
@@ -306,7 +308,7 @@ impl<'a> LocalExpertWave<'a> {
             .map(|c| directory.join(format!("m{c}")))
             .collect();
         let reduction_plan = Exl3ReductionPlan::new(&directories)?;
-        let arena = Exl3Workspace::new(library, &directories)?;
+        let arena = Exl3Workspace::new(library, &directories, epilogue)?;
         let modules = match modules {
             Some(modules) => modules,
             None => directories.iter().map(|path| {
@@ -318,7 +320,7 @@ impl<'a> LocalExpertWave<'a> {
         for (c, modules) in capacities.into_iter().zip(modules) {
             // SAFETY: each state owns its modules and serializes on the lane stream.
             let state = unsafe {
-                Exl3Execution::with_modules(library, weights.clone(), modules, Some(arena.clone()))?
+                Exl3Execution::with_modules(library, weights.clone(), modules, epilogue, Some(arena.clone()))?
             };
             ensure!(
                 state.capacity() == c as usize && state.output_element_bytes() == 4,
@@ -333,7 +335,7 @@ impl<'a> LocalExpertWave<'a> {
                     .map(|state| state.workspace_bytes())
                     .sum::<usize>()
                 + capacity as usize * geometry.row_bytes() as usize
-                == Self::exl3_device_bytes(directory, capacity, geometry)?,
+                == Self::exl3_device_bytes(directory, capacity, geometry, epilogue)?,
             "local EXL3 shared workspace plan mismatch"
         );
         Ok(Self {

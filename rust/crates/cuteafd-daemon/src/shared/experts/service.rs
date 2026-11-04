@@ -658,7 +658,7 @@ mod tests {
     #[test]
     #[ignore = "CPU-only mounted Kimi checkpoint/package planning; run alone with CUTEAFD_KIMI_EXL3_SNAPSHOT and CUTEAFD_KIMI_SPARK_PACKAGE"]
     fn mounted_kimi_all_spark_golden_demand() -> Result<()> {
-        use crate::shared::experts::exl3::{Exl3Weights, worker::Exl3Worker};
+        use crate::shared::experts::exl3::{execution::Exl3Epilogue, Exl3Weights, worker::Exl3Worker};
         cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
             .map_err(|_| anyhow::anyhow!("run Kimi demand test alone"))?;
         let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("Kimi snapshot")?);
@@ -683,7 +683,7 @@ mod tests {
                     model.endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
                         ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }];
                     let workspace = Exl3Worker::plan(&package.join(format!("tp6-rank{rank}")), capacity,
-                        Default::default())?;
+                        Default::default(), Exl3Epilogue::Sum)?;
                     let mut resident = 0;
                     let (mut staging, mut pinned, mut scratch) = (0, 0, 0);
                     for &layer in &layers {

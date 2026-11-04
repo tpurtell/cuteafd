@@ -3789,7 +3789,7 @@ impl<'a> Qwen4Engine<'a> {
                 if index < self.cfg.layers {
                     let mut link = transport.borrow_mut();
                     let exchange = link.exchange()?;
-                    let wave = self.wave_send(w, index, t, rows, decode, exchange)?;
+                    let wave = self.wave_send(w, index, t, rows, decode, exchange, None)?;
                     return self.wave_land(w, t, wave, exchange);
                 }
                 ensure!(index == self.cfg.layers, "unknown Qwen expert layer {index}");
@@ -3830,7 +3830,7 @@ impl<'a> Qwen4Engine<'a> {
     /// posts the request once the copies complete. This thread does not wait
     /// for the GPU. Complete with [`Self::wave_land`].
     fn wave_send(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool,
-        exchange: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        exchange: &mut crate::shared::spark_waves::Waves<'_>, origins: Option<crate::shared::prefill_pipeline::ReplyOrigins>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
@@ -3854,6 +3854,7 @@ impl<'a> Qwen4Engine<'a> {
                             route_count: topk as u32,
                         }).collect(),
                         routes, wire)?;
+                    if let Some(origins) = origins { origins.apply(&mut request)?; }
                     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
                     Ok(request)
                 }))?
@@ -3954,7 +3955,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for PackedHooks<'_, '_, '_, '
         let rows = Scalar::I32(unit.rows.len() as i32);
         self.engine.moe_front(self.w, index, &self.engine.weights.layers[index], unit.rows.len(), rows)?;
         self.engine.wave_send(self.w, index, unit.rows.len(), rows, false,
-            self.transport.as_mut().context("packed Spark exchange")?)
+            self.transport.as_mut().context("packed Spark exchange")?, unit.reply_origins()?)
     }
     fn land_experts(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket) -> Result<()> {
         self.engine.wave_land(self.w, unit.rows.len(), ticket, self.transport.as_mut().context("packed Spark exchange")?)?;
@@ -4069,7 +4070,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         let rows = Scalar::I32(unit.rows.len() as i32);
         self.engine.moe_front(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
         let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
-        self.engine.wave_send(self.w, layer, unit.rows.len(), rows, false, transport)
+        self.engine.wave_send(self.w, layer, unit.rows.len(), rows, false, transport, unit.reply_origins()?)
     }
 
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket)

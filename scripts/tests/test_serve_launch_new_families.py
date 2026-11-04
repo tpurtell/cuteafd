@@ -501,7 +501,7 @@ def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> 
     assert _flag(serve, "--prefix-cache-entries") == "20"
     assert _flag(serve, "--vision") == _flag(serve, "--audio") == "off"
     for absent in ("--max-context", "--pool-tokens", "--draft", "--mtp", "--kv-cache",
-                   "--prefill-packing", "--expert-partial-bf16-max-rows", "--expert-partial-wide-format"):
+                   "--prefill-packing", "--expert-partial-bf16-max-rows", "--spark-reply-format"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert len(workers) == 6 and all("--world 6 " in worker for worker in workers)
@@ -588,18 +588,18 @@ def test_muse_generic_media_plan_handoff(tmp_path: Path, vision: str, audio: str
 
 def test_muse_forwards_typed_keys_when_set(tmp_path: Path) -> None:
     result = _muse(tmp_path, "RTX_EXPERT_LAYERS=3\nPOOL_TOKENS=1048576\nMAX_CONTEXT_TOKENS=262144\n"
-                             "CONCURRENCY=8\nEXPERT_PARTIAL_BF16_MAX_ROWS=128\nEXPERT_PARTIAL_WIDE_FORMAT=fp8\n"
+                             "CONCURRENCY=8\nEXPERT_PARTIAL_BF16_MAX_ROWS=128\nSPARK_REPLY_FORMAT=fp8\n"
                              "SPARK_DEVICE_BUDGET_BYTES=107374182400\n")
     serve, plan = _line(result, "cuteafd serve-muse --snapshot"), _line(result, "cuteafd plan")
     # The planner admits the same partial-reply overrides the server runs with.
     assert _flag(plan, "--expert-partial-bf16-max-rows") == "128"
-    assert _flag(plan, "--expert-partial-wide-format") == "fp8"
+    assert _flag(plan, "--spark-reply-format") == "fp8"
     assert _flag(serve, "--rtx-expert-layers") == "3"
     assert _flag(serve, "--pool-tokens") == "1048576"
     assert _flag(serve, "--max-context") == "262144"
     assert _flag(serve, "--max-sequences") == "8"
     assert _flag(serve, "--expert-partial-bf16-max-rows") == "128"
-    assert _flag(serve, "--expert-partial-wide-format") == "fp8"
+    assert "CUTEAFD_SPARK_REPLY_FORMAT=fp8" in serve
     assert _flag(serve, "--spark-budget-gib") == "100.0"
 
 

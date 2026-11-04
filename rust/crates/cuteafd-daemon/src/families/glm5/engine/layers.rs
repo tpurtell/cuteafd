@@ -20,6 +20,7 @@ enum Transport<'t, 'l> {
 }
 
 struct Bindings<'e, 'a, 't, 'l, 'c> {
+    unit: Option<&'e crate::shared::prefill_pipeline::Unit>,
     engine: &'e GlmEngine<'a>,
     work: [&'e Workspace<'a>; 2],
     tables: &'e [StepTables; 2],
@@ -128,7 +129,7 @@ impl<'a> GlmEngine<'a> {
         experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         let owners = self.loaded_attention_owners();
-        let mut bindings = [Bindings { engine: self, work: [w, w1], tables, lane: 0,
+        let mut bindings = [Bindings { unit: None, engine: self, work: [w, w1], tables, lane: 0,
             transport: Transport::Serial(experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime))),
             owners, on_layer, tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS), rows.min(crate::shared::speculation::dflash::TAP_ROWS), 0) }];
         self.run_layer_pipeline(scope, LaneOrder::Independent, &mut bindings)?;
@@ -150,11 +151,11 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn unit_binding<'s, 't, 'l>(&'s self, work: [&'s Workspace<'a>; 2], tables: &'s [StepTables; 2],
-        unit: &crate::shared::prefill_pipeline::Unit, total: usize, transport: Transport<'t, 'l>)
+        unit: &'s crate::shared::prefill_pipeline::Unit, total: usize, transport: Transport<'t, 'l>)
         -> Bindings<'s, 'a, 't, 'l, 's> {
         let window = total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
         let from = unit.rows.start.max(window).min(unit.rows.end);
-        Bindings { engine: self, work, tables, lane: unit.slot, transport,
+        Bindings { unit: Some(unit), engine: self, work, tables, lane: unit.slot, transport,
             owners: self.loaded_attention_owners(), on_layer: None,
             tap: (from - unit.rows.start, unit.rows.end - from, from.saturating_sub(window)) }
     }
@@ -352,7 +353,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let (pending, ticket) = match &mut self.transport {
             Transport::Serial(Some((link, _))) => (PendingWave::Landed(e.moe_exchange(w, index, layer, real, cap, decode,
                 link.exchange()?)?), Ticket::Spark),
-            Transport::Continuous(waves) => (PendingWave::Dispatched(e.moe_wave(w, index, layer, real, cap, waves)?), Ticket::Lane),
+            Transport::Continuous(waves) => (PendingWave::Dispatched(e.moe_wave(w, index, layer, real, cap, waves, self.unit.map(|unit| unit.reply_origins()).transpose()?.flatten())?), Ticket::Lane),
             _ => anyhow::bail!("GLM MoE layer {index} needs Spark peers"),
         };
         execution.waves.borrow_mut()[self.lane] = Some(pending);

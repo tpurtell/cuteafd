@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.mark.parametrize('value', [None, 'ON', 'OFF', 'on', 'ON; touch /bad'])
 def test_wip_audio_aot_reaches_both_native_architectures(role, arch, value):
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
-    options = 'exl3_aot=' + script.split('exl3_aot=', 1)[1].split('[[ "$cuda_arch"', 1)[0]
+    options = 'v41_expert_aot=' + script.split('v41_expert_aot=', 1)[1].split('[[ "$cuda_arch"', 1)[0]
     cmake = 'cmake \\\n' + script.split('\ncmake \\\n', 1)[1].split('\ncmake --build', 1)[0]
     env = {key: val for key, val in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
     if value is not None:
@@ -203,6 +203,39 @@ def test_transformers_requires_include_bytes_inputs_and_confined_links(tmp_path)
         module.verify(source, lock)
 
 
+@pytest.mark.parametrize('scope', ['glm:exl3-k45', 'glm:fp8'])
+def test_expert_codec_scope_installs_nonempty_program_manifest(tmp_path, scope):
+    cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
+    logic = cmake[:cmake.index('set(CUTEAFD_DSV4_EXPORT_ARGS')]
+    configure = tmp_path / 'codec.cmake'
+    configure.write_text('set(CUTEAFD_CUDA_ARCHITECTURES 121)\n'
+        'set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)\n'
+        f'set(CUTEAFD_EXPERT_FAMILIES "{scope}")\n' + logic
+        + '\nmessage(STATUS "GEOMETRY=${CUTEAFD_PROGRAM_GEOMETRY}")\n')
+    result = subprocess.run(['cmake', '-P', str(configure)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert 'GEOMETRY=expert_reply' in result.stdout
+    build, output = tmp_path / 'build', tmp_path / 'output'
+    generated = build / 'native/dsv4_programs/dsv4_programs.json'
+    generated.parent.mkdir(parents=True)
+    generated.write_text(json.dumps(dict(schema=1, programs=[dict(name='expert_reply_quantize')])))
+    output.mkdir()
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    block = '# Generic-family tables' + script.split('# Generic-family tables', 1)[1].split(
+        '# Publish this build', 1)[0]
+    env = dict(PATH=os.environ['PATH'], role='expert', expert_families=scope,
+               build_dir=str(build), output_dir=str(output))
+    for hit in ['0', '1']:
+        result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block],
+            env={**env, 'native_hit': hit}, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        assert json.loads((output / 'PROGRAMS.json').read_text())['programs'] == [dict(name='expert_reply_quantize')]
+    generated.unlink()
+    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block],
+        env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+
+
 @pytest.mark.parametrize('role', ['coordinator', 'expert'])
 @pytest.mark.parametrize('enabled', [False, True])
 @pytest.mark.parametrize('family', ['GLMF', 'QWEN_DENSE'])
@@ -221,7 +254,7 @@ def test_wip_programs_stage_current_table_or_empty_even_after_previous_opt_in(tm
     (output / 'V41_EXPERT_WORKSPACES').mkdir()
     (output / 'PROGRAMS.json').write_text('stale table')
     env = {key: value for key, value in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
-    env.update(role=role, build_dir=str(build), output_dir=str(output))
+    env.update(role=role, build_dir=str(build), output_dir=str(output), v41_expert_aot='OFF')
     env[f'CUTEAFD_WIP_{family}_AOT'] = 'ON' if enabled else 'OFF'
     result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block], env=env,
                             capture_output=True, text=True, timeout=10)

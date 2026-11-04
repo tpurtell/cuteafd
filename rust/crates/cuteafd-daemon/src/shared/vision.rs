@@ -371,12 +371,16 @@ impl TowerSpec {
         }
         let frequencies = if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
         for i in 0..frequencies {
-            let value = 1.0f32 / 10000f32.powf(i as f32 / frequencies as f32);
+            let value = axial_frequency(i, frequencies);
             let start = self.native.inv_freq as usize + i * 4;
             weights[start..start + 4].copy_from_slice(&value.to_le_bytes());
         }
         Ok(weights)
     }
+}
+
+fn axial_frequency(index: usize, frequencies: usize) -> f32 {
+    1.0f32 / 10000f32.powf(index as f32 / frequencies as f32)
 }
 
 /// Matches the CPU reference's f64 rescale followed by f32 normalize, without FMA.
@@ -684,6 +688,14 @@ impl Drop for EncoderService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn muse_axial_frequencies_match_official_torch_cpu_bytes() {
+        let fixture = include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../../../scripts/tests/fixtures/muse-vision-inv-freq.txt"));
+        let expected = fixture.lines().map(|line| u32::from_str_radix(line, 16).unwrap()).collect::<Vec<_>>();
+        assert_eq!(expected.len(), 24);
+        assert_eq!((0..24).map(|i| super::axial_frequency(i, 24).to_bits()).collect::<Vec<_>>(), expected);
+    }
     use super::*;
 
     pub(super) fn assert_ctypes_spec(snapshot: &Path, family: &str, tower: &TowerSpec) {

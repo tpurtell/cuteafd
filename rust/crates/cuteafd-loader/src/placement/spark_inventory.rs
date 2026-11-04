@@ -1,5 +1,6 @@
 //! Spark owners: manifests describe execution, checkpoint selection describes weights.
 use crate::placement::SparkAssignment;
+use crate::serving_capacity::Exl3Epilogue;
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 use serde::Serialize;
 use serde_json::Value;
@@ -242,7 +243,7 @@ impl SparkExecutionInventory {
             width = Some(intermediate);
             sources.push(provenance(manifest, vec![rows], physical_sms)?);
         }
-        let arena = crate::serving_capacity::exl3_workspace_bytes(manifests, true)
+        let arena = crate::serving_capacity::exl3_workspace_bytes(manifests, true, Exl3Epilogue::Sum)
             .map_err(|e| invalid(e.to_string()))?;
         Ok(Self { compiled_capacity: compiled, live_capacity: live, retained_capacities: retained.into(),
             physical_sms, logical_intermediate: width.unwrap() as u32, stored_intermediate: width.unwrap() as u32,

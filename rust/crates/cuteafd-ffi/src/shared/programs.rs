@@ -330,6 +330,12 @@ impl<'a> Programs<'a> {
         Ok(Program { programs: self, index: *index, spec })
     }
 
+    pub fn bound(&self, name: &str, pointers: &[&str]) -> Result<BoundProgram<'a>> {
+        let program = self.program(name, pointers)?;
+        Ok(BoundProgram { _library: self.library, launch: self.launch,
+            index: program.index, spec: program.spec.clone() })
+    }
+
     pub fn library(&self) -> &'a NativeLibrary {
         self.library
     }
@@ -341,7 +347,34 @@ pub struct Program<'a> {
     spec: &'a ProgramSpec,
 }
 
-impl Program<'_> {
+/// A preloaded program whose native library, rather than the manifest reader,
+/// owns its lifetime. Useful for shared codecs retained by execution owners.
+pub struct BoundProgram<'a> {
+    _library: &'a NativeLibrary,
+    launch: LaunchFn,
+    index: u32,
+    spec: ProgramSpec,
+}
+impl BoundProgram<'_> {
+    /// # Safety
+    /// Pointers have the program's documented extents and outlive `stream`.
+    pub unsafe fn launch(&self, pointers: &[*mut c_void], scalars: &[Scalar], stream: *mut c_void) -> Result<()> {
+        ensure!(pointers.len() == self.spec.pointers.len(), "{}: pointer count", self.spec.name);
+        ensure!(scalars.len() == self.spec.scalar_kinds.len()
+            && scalars.iter().zip(&self.spec.scalar_kinds).all(|(s, k)| s.kind() == *k),
+            "{}: scalar kinds", self.spec.name);
+        let slots: Vec<u64> = scalars.iter().map(|s| s.slot()).collect();
+        // SAFETY: ABI counts/kinds checked above, extents guaranteed by caller.
+        let status = unsafe { (self.launch)(self.index, pointers.as_ptr(), slots.as_ptr(), stream) };
+        ensure!(status == 0, "{} launch failed with status {status}", self.spec.name);
+        Ok(())
+    }
+}
+impl<'a> Program<'a> {
+    pub fn bind(&self) -> BoundProgram<'a> {
+        BoundProgram { _library: self.programs.library, launch: self.programs.launch,
+            index: self.index, spec: self.spec.clone() }
+    }
     pub fn spec(&self) -> &ProgramSpec {
         self.spec
     }

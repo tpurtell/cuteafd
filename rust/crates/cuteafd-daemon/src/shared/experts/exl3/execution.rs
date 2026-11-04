@@ -2,6 +2,7 @@
 //! each launch only substitutes live inputs/row bounds and enqueues GPU work.
 use super::Exl3Weights;
 use crate::shared::memory::DeviceAllocation;
+pub(crate) use cuteafd_loader::serving_capacity::Exl3Epilogue;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Exl3Kernel, V41Exl3Routes};
 use serde::Deserialize;
@@ -296,13 +297,13 @@ impl<'a> Exl3Workspace<'a> {
     pub(crate) fn bytes(&self) -> usize {
         self.allocations.values().map(|allocation| allocation.buffer.bytes).sum()
     }
-    fn layout(directories: &[PathBuf]) -> Result<BTreeMap<String, (usize, String)>> {
+    fn layout(directories: &[PathBuf], epilogue: Exl3Epilogue) -> Result<BTreeMap<String, (usize, String)>> {
         ensure!(!directories.is_empty(), "empty EXL3 capacity workspace");
         let mut layout: BTreeMap<String, (usize, String)> = BTreeMap::new();
         for directory in directories {
             let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
             for (name, spec) in meta.buffers {
-                if name != spec.allocation || spec.zero_on_create { continue; }
+                if name != spec.allocation || spec.zero_on_create || !epilogue.allocates(&name) { continue; }
                 let entry = layout.entry(name).or_insert((0, spec.dtype.clone()));
                 ensure!(entry.1 == spec.dtype, "EXL3 shared scratch dtype mismatch");
                 entry.0 = entry.0.max(spec.bytes.max(16));
@@ -311,23 +312,48 @@ impl<'a> Exl3Workspace<'a> {
         Ok(layout)
     }
     /// Total allocation payload for all specializations sharing one lane arena.
-    pub(crate) fn plan(directories: &[PathBuf], format: Exl3InputFormat) -> Result<usize> {
+    pub(crate) fn plan(directories: &[PathBuf], format: Exl3InputFormat,
+        epilogue: Exl3Epilogue) -> Result<usize> {
         let manifests = directories.iter().map(|directory| -> Result<serde_json::Value> {
             Ok(serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?)
         }).collect::<Result<Vec<_>>>()?;
         Ok(usize::try_from(cuteafd_loader::serving_capacity::exl3_workspace_bytes(&manifests,
-            format == Exl3InputFormat::Fp8K32)?)?)
+            format == Exl3InputFormat::Fp8K32, epilogue)?)?)
     }
 
-    pub(crate) fn new(library: &'a NativeLibrary, directories: &[PathBuf]) -> Result<Rc<Self>> {
+    pub(crate) fn new(library: &'a NativeLibrary, directories: &[PathBuf],
+        epilogue: Exl3Epilogue) -> Result<Rc<Self>> {
         let mut allocations = BTreeMap::new();
         let mut dtypes = BTreeMap::new();
-        for (name, (bytes, dtype)) in Self::layout(directories)? {
+        for (name, (bytes, dtype)) in Self::layout(directories, epilogue)? {
             allocations.insert(name.clone(), DeviceAllocation::new(library, bytes)?);
             dtypes.insert(name, dtype);
         }
         Ok(Rc::new(Self { allocations, dtypes }))
     }
+}
+
+/// Bind the per-layer pointers an epilogue's objects read: the sum object is
+/// the only reader of the weighted-sum `output` owner, so a partial-reply
+/// family neither allocates nor binds it.
+fn layer_pointers(
+    epilogue: Exl3Epilogue,
+    pointers: &BTreeMap<String, CuteafdDeviceBuffer>,
+) -> Result<BTreeMap<String, CuteafdDeviceBuffer>> {
+    let mut bound = pointers.clone();
+    bound.insert(
+        "fc2_ptr".into(),
+        *pointers.get("fc2").context("missing EXL3 FC2 workspace")?,
+    );
+    if epilogue == Exl3Epilogue::Sum {
+        bound.insert(
+            "output_ptr".into(),
+            *pointers
+                .get("output")
+                .context("missing EXL3 output workspace")?,
+        );
+    }
+    Ok(bound)
 }
 
 struct Table {
@@ -395,9 +421,10 @@ impl Table {
 
 struct LayerBinding {
     core: Table,
-    sum: Table,
+    /// The weighted top-k sum; absent for partial-reply families.
+    sum: Option<Table>,
     expert_map: CuteafdDeviceBuffer,
-    output_slot: usize,
+    output_slot: Option<usize>,
     /// The core's FC2 workspace (rotated F16 down outputs) and the layer's
     /// down-projection svh: the partial-reply epilogue's sources.
     fc2: CuteafdDeviceBuffer,
@@ -513,7 +540,8 @@ pub(crate) struct Exl3Execution<'a> {
     layers: Vec<LayerBinding>,
     route_pointers: [*mut c_void; 7],
     route_bytes: [u64; 7],
-    output: CuteafdDeviceBuffer,
+    /// The weighted sum's token output; absent for partial-reply families.
+    output: Option<CuteafdDeviceBuffer>,
     output_element_bytes: usize,
     device: i32,
     hidden: usize,
@@ -546,8 +574,9 @@ impl<'a> Exl3Execution<'a> {
 
     /// Device allocation payload per lane, including aliases and optional wire
     /// reconstruction. Weight storage and CUDA module/driver reserve are separate.
-    pub(crate) fn plan(directory: &Path, format: Exl3InputFormat) -> Result<usize> {
-        Exl3Workspace::plan(&[directory.to_owned()], format)
+    pub(crate) fn plan(directory: &Path, format: Exl3InputFormat,
+        epilogue: Exl3Epilogue) -> Result<usize> {
+        Exl3Workspace::plan(&[directory.to_owned()], format, epilogue)
     }
 
     /// Trusted build artifacts only. Each owner is exclusive to one decode lane;
@@ -556,8 +585,9 @@ impl<'a> Exl3Execution<'a> {
         library: &'a NativeLibrary,
         weights: Rc<Vec<Exl3Weights<'a>>>,
         directory: &Path,
+        epilogue: Exl3Epilogue,
     ) -> Result<Self> {
-        Self::with_input_format(library, weights, directory, Exl3InputFormat::Bf16)
+        Self::with_input_format(library, weights, directory, Exl3InputFormat::Bf16, epilogue)
     }
 
     pub(crate) unsafe fn with_input_format(
@@ -565,8 +595,9 @@ impl<'a> Exl3Execution<'a> {
         weights: Rc<Vec<Exl3Weights<'a>>>,
         directory: &Path,
         format: Exl3InputFormat,
+        epilogue: Exl3Epilogue,
     ) -> Result<Self> {
-        Self::with_shared_workspace(library, weights, directory, format, None)
+        Self::with_shared_workspace(library, weights, directory, format, epilogue, None)
     }
 
     /// # Safety
@@ -577,12 +608,13 @@ impl<'a> Exl3Execution<'a> {
         weights: Rc<Vec<Exl3Weights<'a>>>,
         directory: &Path,
         format: Exl3InputFormat,
+        epilogue: Exl3Epilogue,
         shared: Option<Rc<Exl3Workspace<'a>>>,
     ) -> Result<Self> {
         // SAFETY: forwards the trusted-package contract; scratch remains lane-local.
         let modules = unsafe { Exl3Modules::load(library, directory, format)? };
         // SAFETY: the caller serializes all users of the shared workspace.
-        unsafe { Self::with_modules(library, weights, modules, shared) }
+        unsafe { Self::with_modules(library, weights, modules, epilogue, shared) }
     }
 
     /// # Safety
@@ -592,6 +624,7 @@ impl<'a> Exl3Execution<'a> {
         library: &'a NativeLibrary,
         weights: Rc<Vec<Exl3Weights<'a>>>,
         modules: Exl3Modules<'a>,
+        epilogue: Exl3Epilogue,
         shared: Option<Rc<Exl3Workspace<'a>>>,
     ) -> Result<Self> {
         ensure!(std::ptr::eq(library, modules.owner.device.library)
@@ -622,7 +655,7 @@ impl<'a> Exl3Execution<'a> {
         // Never resize to the current device's SM count: compiled grid barriers
         // retain export-time offsets, even when the bridge caps the launch grid.
         for (name, spec) in &meta.buffers {
-            if name != &spec.allocation {
+            if name != &spec.allocation || !epilogue.allocates(name) {
                 continue;
             }
             if let Some(arena) = shared.as_ref().filter(|_| !spec.zero_on_create) {
@@ -642,6 +675,7 @@ impl<'a> Exl3Execution<'a> {
         let allocations = pointers;
         let mut pointers = BTreeMap::new();
         for (name, spec) in &meta.buffers {
+            if !epilogue.allocates(&spec.allocation) { continue; }
             let mut buffer = *allocations
                 .get(&spec.allocation)
                 .context("missing EXL3 workspace allocation")?;
@@ -677,14 +711,7 @@ impl<'a> Exl3Execution<'a> {
             ] {
                 pointers.insert(target.into(), weight.buffer(source)?);
             }
-            for (target, source) in [("fc2_ptr", "fc2"), ("output_ptr", "output")] {
-                pointers.insert(
-                    target.into(),
-                    *pointers
-                        .get(source)
-                        .context("missing EXL3 output workspace")?,
-                );
-            }
+            let mut pointers = layer_pointers(epilogue, &pointers)?;
             let mut values = BTreeMap::from([
                 ("active_m".into(), 1),
                 (
@@ -720,19 +747,27 @@ impl<'a> Exl3Execution<'a> {
                     values.insert(format!("tier{tier}_{name}"), value as i32);
                 }
             }
+            // Only the object this epilogue runs is bound; a partial-reply
+            // family never builds the weighted sum or reads its output owner.
             ensure!(
-                meta.objects.len() == 2
-                    && meta.objects[0].label == "v41_exl3_core"
-                    && meta.objects[1].label == "v41_exl3_sum",
+                meta.objects.first().is_some_and(|object| object.label == "v41_exl3_core"),
                 "EXL3 object ordering mismatch"
             );
+            if epilogue == Exl3Epilogue::Sum {
+                ensure!(
+                    meta.objects.len() == 2 && meta.objects[1].label == "v41_exl3_sum",
+                    "EXL3 object ordering mismatch"
+                );
+            }
             let core = Table::build(&meta.objects[0], &pointers, &values)?;
-            let sum = Table::build(&meta.objects[1], &pointers, &values)?;
+            let sum = (epilogue == Exl3Epilogue::Sum)
+                .then(|| Table::build(&meta.objects[1], &pointers, &values))
+                .transpose()?;
             ensure!(
                 core.pointers.len() == info.core_pointers
                     && core.scalars.len() == info.core_scalars
-                    && sum.pointers.len() == info.sum_pointers
-                    && sum.scalars.len() == info.sum_scalars,
+                    && sum.as_ref().is_none_or(|sum| sum.pointers.len() == info.sum_pointers
+                        && sum.scalars.len() == info.sum_scalars),
                 "EXL3 native argument lengths disagree"
             );
             layers.push(LayerBinding {
@@ -742,11 +777,13 @@ impl<'a> Exl3Execution<'a> {
                 fc2: *pointers.get("fc2").context("missing EXL3 FC2 workspace")?,
                 svh: weight.buffer("down_svh")?,
                 local_experts: weight.layout.experts,
-                output_slot: meta.objects[1]
-                    .pointer_slots
-                    .iter()
-                    .position(|name| name == "output_ptr")
-                    .context("missing EXL3 output pointer slot")?,
+                output_slot: if epilogue == Exl3Epilogue::Sum {
+                    Some(meta.objects[1]
+                        .pointer_slots
+                        .iter()
+                        .position(|name| name == "output_ptr")
+                        .context("missing EXL3 output pointer slot")?)
+                } else { None },
             });
         }
         let mut route_pointers = [std::ptr::null_mut(); 7];
@@ -788,7 +825,7 @@ impl<'a> Exl3Execution<'a> {
             route_pointers,
             route_bytes,
             output_element_bytes: info.output_element_bytes,
-            output: *pointers.get("output").context("missing EXL3 output")?,
+            output: pointers.get("output").copied(),
             device,
             hidden: meta.hidden,
             capacity: meta.capacity,
@@ -937,7 +974,8 @@ impl<'a> Exl3Execution<'a> {
         rows: usize,
         stream: *mut c_void,
     ) -> Result<CuteafdDeviceBuffer> {
-        self.launch_layer_into(layer, inputs, rows, stream, self.output)
+        let output = self.output.context("EXL3 execution has no weighted token output")?;
+        self.launch_layer_into(layer, inputs, rows, stream, output)
     }
 
     /// # Safety
@@ -996,8 +1034,10 @@ impl<'a> Exl3Execution<'a> {
             routes.launch(&self.route_pointers, &self.route_bytes, rows as i32, stream)?;
         }
         binding.core.bind(&inputs, rows);
-        binding.sum.bind(&inputs, rows);
-        binding.sum.pointers[binding.output_slot] = output.ptr;
+        let output_slot = binding.output_slot.context("EXL3 execution has no weighted sum epilogue")?;
+        let sum = binding.sum.as_mut().context("EXL3 execution has no weighted sum epilogue")?;
+        sum.bind(&inputs, rows);
+        sum.pointers[output_slot] = output.ptr;
         // The packed core is a full-grid cooperative launch (SMs * blocks_per_sm):
         // fork b12x/moe/_shared/kernels/w4a16/mixed_trellis.py:973-978;
         // its grid barriers are at :1142/:1314. See stream-wait redesign #104.
@@ -1007,7 +1047,7 @@ impl<'a> Exl3Execution<'a> {
         self.modules.owner.kernel
             .launch_core(&binding.core.pointers, &binding.core.scalars, stream)?;
         self.modules.owner.kernel
-            .launch_sum(&binding.sum.pointers, &binding.sum.scalars, stream)?;
+            .launch_sum(&sum.pointers, &sum.scalars, stream)?;
         output.bytes = rows * self.hidden * self.output_element_bytes;
         Ok(output)
     }
@@ -1095,6 +1135,59 @@ mod tests {
             layout.buffers[0].initial_words.pop();
             assert!(Exl3Execution::validate_planned_residency(root.path(), &layout, geometry).is_err());
         }
+        Ok(())
+    }
+
+    /// Muse Spark's per-expert partial-reply epilogue launches the core only,
+    /// so neither the census nor the shared arena may allocate the weighted
+    /// sum's token output; every other owner stays byte-identical.
+    #[test]
+    fn workspace_layout_follows_the_familys_epilogue() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let manifest = |capacity: u64, output: u64| serde_json::json!({
+            "schema": "cuteafd.v41-exl3-aot.v1", "output_dtype": "bf16",
+            "sparkinfer_revision": "test", "hidden": 8, "intermediate": 16,
+            "experts": 1, "capacity": capacity, "top_k": 1, "bits": [4, 5],
+            "swiglu_limit": serde_json::Value::Null, "direct": false, "sms": 48,
+            "blocks_per_sm": 1, "objects": [],
+            "trellis_lut": {"file": "lut", "bytes": 32, "sha256": "test"},
+            "buffers": {
+                "scratch": {"bytes": output * 2, "allocation": "scratch",
+                    "dtype": "f16", "zero_on_create": false},
+                "output": {"bytes": output, "allocation": "output",
+                    "dtype": "bf16", "zero_on_create": false},
+                "state": {"bytes": 0, "allocation": "state",
+                    "dtype": "i32", "zero_on_create": true}}}).to_string();
+        for capacity in [1, 16] {
+            let directory = root.path().join(format!("m{capacity}"));
+            std::fs::create_dir(&directory)?;
+            std::fs::write(directory.join("v41_exl3.json"), manifest(capacity, capacity * 64))?;
+        }
+        let directories = vec![root.path().join("m1"), root.path().join("m16")];
+        let sum = Exl3Workspace::layout(&directories, Exl3Epilogue::Sum)?;
+        let partial = Exl3Workspace::layout(&directories, Exl3Epilogue::PartialReplies)?;
+        assert_eq!(sum.get("output").map(|entry| entry.0), Some(16 * 64));
+        assert!(!partial.contains_key("output"));
+        assert_eq!(sum.get("scratch"), partial.get("scratch"));
+        assert_eq!(Exl3Workspace::plan(&directories, Exl3InputFormat::Bf16, Exl3Epilogue::PartialReplies)? + 16 * 64,
+            Exl3Workspace::plan(&directories, Exl3InputFormat::Bf16, Exl3Epilogue::Sum)?);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_replies_never_bind_the_sum_output_owner() -> Result<()> {
+        let buffer = |bytes| CuteafdDeviceBuffer { bytes, ..Default::default() };
+        // A partial-reply workspace has no `output` allocation at all, as the
+        // Muse catalog produces: binding must still succeed for its layers.
+        let partial = BTreeMap::from([("fc2".to_string(), buffer(64))]);
+        let bound = layer_pointers(Exl3Epilogue::PartialReplies, &partial)?;
+        assert_eq!(bound.get("fc2_ptr").copied().map(|b| b.bytes), Some(64));
+        assert!(!bound.contains_key("output_ptr"));
+        let error = layer_pointers(Exl3Epilogue::Sum, &partial).unwrap_err().to_string();
+        assert!(error.contains("missing EXL3 output workspace"), "{error}");
+        let sum = BTreeMap::from([("fc2".to_string(), buffer(64)), ("output".to_string(), buffer(32))]);
+        let bound = layer_pointers(Exl3Epilogue::Sum, &sum)?;
+        assert_eq!(bound.get("output_ptr").copied().map(|b| b.bytes), Some(32));
         Ok(())
     }
 
@@ -1233,17 +1326,20 @@ mod tests {
         let directories = |policy: Exl3RowPolicy, rows| -> Result<Vec<PathBuf>> {
             Ok(policy.capacities(rows)?.iter().map(|c| root.path().join(format!("m{c}"))).collect())
         };
-        let ordinary = Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?, Exl3InputFormat::Fp8K32)?;
+        let ordinary = Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?,
+            Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum)?;
         for maximum in [2, 4, 9, 16] {
             let planned = directories(Exl3RowPolicy::GlmFlashK64, maximum)?;
             // Admission includes the shared arena and private state even though
             // the transport/input limit stays at the real declared maximum.
-            assert_eq!(Exl3Workspace::plan(&planned, Exl3InputFormat::Fp8K32)?, 7776);
+            assert_eq!(Exl3Workspace::plan(&planned, Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum)?, 7776);
             assert_eq!(ordinary, 8320);
         }
         std::fs::remove_file(root.path().join("m80/v41_exl3.json"))?;
-        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::GlmFlashK64, 16)?, Exl3InputFormat::Fp8K32).is_err());
-        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?, Exl3InputFormat::Fp8K32).is_err());
+        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::GlmFlashK64, 16)?,
+            Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum).is_err());
+        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?,
+            Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum).is_err());
         Ok(())
     }
 
