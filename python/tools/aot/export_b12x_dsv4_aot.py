@@ -1243,6 +1243,12 @@ def main() -> None:
                 work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
                              lambda q=quantize, s=stage: compile_expert_reply_aot(quantize=q, stage=s)))
             work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
+            from native_reply import compile_native_reply_aot
+            for width in (2560, 3584, 4096, 5120, 6144, 7168, 8192):
+                for format in (0, 1, 2):
+                    work.append((name, f"native_h{width}_{format}", "expert_reply",
+                                 {"max_rows": args.prefill_rows},
+                                 lambda w=width, f=format: compile_native_reply_aot(w, f)))
             work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},
                          compile_expert_reply_reduce_aot))
             continue

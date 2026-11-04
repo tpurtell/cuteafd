@@ -146,7 +146,7 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     route_staging: Vec<crate::shared::memory::HostAllocation<'library>>,
     compact_reducer: Option<V41CompactReducer<'library>>,
     compact_output: Option<DeviceAllocation<'library>>,
-    reply_codec: Option<super::reply::ReplyCodec<'library>>,
+    native_reply: Option<super::reply::NativeReply<'library>>,
     output: Option<DeviceAllocation<'library>>,
     pub(crate) shared: Option<DeviceAllocation<'library>>,
     slots: [*mut c_void; 44],
@@ -356,7 +356,7 @@ impl<'library> ExpertWeights<'library> {
         let small = prepare_small(grouped, budget.small_scratch_bytes)?;
         let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::named(library,
             budget.routing_bytes, "experts/workspace/route_staging" )).collect::<Result<Vec<_>>>()?;
-        let reply_codec = if compact_output_role(kernel.info().role) { Some(super::reply::ReplyCodec::load(library)?) } else { None };
+        let native_reply = if compact_output_role(kernel.info().role) { Some(super::reply::NativeReply::load(library)?) } else { None };
         let stream = if own_stream { Some(stream) } else { drop(stream); None };
         Ok(ExpertExecution {
             stream,
@@ -372,7 +372,7 @@ impl<'library> ExpertWeights<'library> {
             worker_timing: None,
             compact_reducer,
             compact_output,
-            reply_codec,
+            native_reply,
             scratch,
             hidden,
             ids,
@@ -998,23 +998,39 @@ impl ExpertExecution<'_, '_> {
             .as_ref()
             .context("missing compact output")?
             .buffer);
-        unsafe {
-            let reducer = self.compact_reducer.as_ref().context("missing compact reducer")?;
-            let (kernel, slots, _) = self.execution_state(request.rows())?;
-            match kernel.output_kind() {
-                cuteafd_ffi::V41ExpertOutputKind::Fp32Tokens =>
-                    reducer.compact_tokens(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream())?,
-                cuteafd_ffi::V41ExpertOutputKind::Bf16Routes =>
-                    reducer.compact_bf16_routes(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream())?,
-                cuteafd_ffi::V41ExpertOutputKind::Fp32Routes =>
-                    reducer.compact(self.route_partials(request.rows())?.ptr.cast(),
-                        output.ptr.cast(), request.rows(), self.stream())?,
-            }
-        }
         if compressed {
-            // SAFETY: BF16 scratch and mapped destination live through the unit fence below.
-            unsafe { self.reply_codec.as_ref().context("missing reply codec")?.quantize(request,
-                output, destination.context("missing compressed destination")?, request.rows() as usize, self.stream())?; }
+            let (kernel, slots, scratch) = self.execution_state(request.rows())?;
+            let kind = kernel.output_kind();
+            let (routes, element_bytes) = match kind {
+                cuteafd_ffi::V41ExpertOutputKind::Fp32Tokens => (1, 4),
+                cuteafd_ffi::V41ExpertOutputKind::Fp32Routes => (kernel.info().topk as usize, 4),
+                cuteafd_ffi::V41ExpertOutputKind::Bf16Routes => (kernel.info().topk as usize, 2),
+            };
+            let source = CuteafdDeviceBuffer {
+                ptr: slots[41],
+                bytes: request.rows() as usize * routes * cuteafd_core::expert_geometry().hidden as usize * element_bytes,
+                device_id: scratch.buffer.device_id,
+                flags: 0,
+            };
+            // SAFETY: raw native output and mapped destination remain live through
+            // this unit's fence. The fused launch replaces compact+quantize only.
+            unsafe { self.native_reply.as_ref().context("missing native reply")?.launch(
+                request, kind, source, destination.context("missing compressed destination")?, self.stream())?; }
+        } else {
+            // SAFETY: existing BF16 default keeps the original reducer and rounding.
+            unsafe {
+                let reducer = self.compact_reducer.as_ref().context("missing compact reducer")?;
+                let (kernel, slots, _) = self.execution_state(request.rows())?;
+                match kernel.output_kind() {
+                    cuteafd_ffi::V41ExpertOutputKind::Fp32Tokens =>
+                        reducer.compact_tokens(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream())?,
+                    cuteafd_ffi::V41ExpertOutputKind::Bf16Routes =>
+                        reducer.compact_bf16_routes(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream())?,
+                    cuteafd_ffi::V41ExpertOutputKind::Fp32Routes =>
+                        reducer.compact(self.route_partials(request.rows())?.ptr.cast(),
+                            output.ptr.cast(), request.rows(), self.stream())?,
+                }
+            }
         }
         if let Some(timing) = &self.timing {
             unsafe {

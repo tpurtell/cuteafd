@@ -62,6 +62,61 @@ impl<'a> Exl3Reply<'a> {
     }
 }
 
+/// Native source reduction and wire conversion share one launch. Programs are
+/// bound before any request or graph capture and retained by the worker.
+pub(crate) struct NativeReply<'a> {
+    fp8: BoundProgram<'a>,
+    nvfp4: BoundProgram<'a>,
+}
+impl<'a> NativeReply<'a> {
+    pub(crate) fn load(library: &'a NativeLibrary) -> Result<Self> {
+        let programs = library.programs()?;
+        let hidden = cuteafd_core::expert_geometry().hidden;
+        let program = |format| programs.bound(
+            &format!("expert_reply_native_h{hidden}_{format}"), &["source", "out"]);
+        Ok(Self { fp8: program(1)?, nvfp4: program(2)? })
+    }
+
+    /// # Safety
+    /// Source is the native kernel's token or token-major route plane; source,
+    /// destination and this program remain live through the owner unit fence.
+    pub(crate) unsafe fn launch(&self, request: &BackboneRequest<'_>,
+        kind: cuteafd_ffi::V41ExpertOutputKind, source: CuteafdDeviceBuffer,
+        output: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        let program = match request.output_dtype() {
+            ExpertV2Dtype::Fp8E4m3Ue8m0K32 => &self.fp8,
+            ExpertV2Dtype::Nvfp4E2m1Fp8E4m3 => &self.nvfp4,
+            _ => anyhow::bail!("native fused reply requires a compressed combined reply"),
+        };
+        let geometry = cuteafd_core::expert_geometry();
+        let rows = request.rows() as usize;
+        let (source_kind, routes, element_bytes) = match kind {
+            cuteafd_ffi::V41ExpertOutputKind::Fp32Tokens => (0, 1, 4),
+            cuteafd_ffi::V41ExpertOutputKind::Fp32Routes => (1, geometry.topk as usize, 4),
+            cuteafd_ffi::V41ExpertOutputKind::Bf16Routes => (2, geometry.topk as usize, 2),
+        };
+        ensure!(rows > 0 && request.partial_plan()?.is_none(),
+            "native fused reply requires whole combined rows");
+        let source_bytes = rows.checked_mul(geometry.hidden as usize)
+            .and_then(|n| n.checked_mul(routes)).and_then(|n| n.checked_mul(element_bytes))
+            .context("native reply source extent overflow")?;
+        let output_bytes = rows.checked_mul(request.output_row_bytes()? as usize)
+            .context("native reply output extent overflow")?;
+        ensure!(source.bytes >= source_bytes && output.bytes >= output_bytes,
+            "native fused reply extent mismatch");
+        for buffer in [source, output] {
+            ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % 16 == 0
+                && buffer.device_id == source.device_id,
+                "native fused reply buffer contract mismatch");
+        }
+        // SAFETY: caller retains the native plane and exclusive reply slot until
+        // completion; checked dimensions bound all reads and writes.
+        unsafe { program.launch(&[source.ptr, output.ptr],
+            &[Scalar::I32(i32::try_from(rows)?), Scalar::I32(i32::try_from(geometry.topk)?),
+                Scalar::I32(source_kind)], stream) }
+    }
+}
+
 pub(crate) struct ReplyCodec<'a> { program: BoundProgram<'a> }
 impl<'a> ReplyCodec<'a> {
     pub(crate) fn load(library: &'a NativeLibrary) -> Result<Self> {
