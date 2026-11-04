@@ -385,7 +385,12 @@ impl Step {
                     // remain live through the drain before status is inspected.
                     unsafe {
                         library.load_narrow_i64_i32(staged.as_ptr().cast(), dst.ptr, bytes / 8, alias.ptr, stream)?;
-                        library.cuda_stream_synchronize(stream)?;
+                        if let Err(error) = library.cuda_stream_synchronize(stream) {
+                            // The status is job-local: quarantine before it drops,
+                            // rather than waiting for Step::run's outer drain.
+                            library.quarantine_module_after_failed_drain();
+                            return Err(error);
+                        }
                     }
                     ensure!(status.bytes() == [0; 4], "checkpoint I64 router ID exceeds I32 range");
                 }
@@ -1057,6 +1062,35 @@ mod absorb_fp8_tests {
                 assert!(!library.is_quarantined_after_failed_drain(), "a drained range error is recoverable");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn i64_status_survives_a_first_drain_failure() -> Result<()> {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let mut source = HostAllocation::new(&library, 8)?;
+        source.bytes_mut().copy_from_slice(&1i64.to_le_bytes());
+        let output = crate::shared::memory::DeviceAllocation::new(&library, 4)?;
+        let step = Step { device: 0, rects: vec![Rect { name: "router".into(),
+            path: fixture.directory().join("unused"), base: 0, row_bytes: 8, rows: 0..1, cols: 0..8 }],
+            jobs: vec![Job::NarrowI64I32 { dst: output.buffer }] };
+        let mut kernels = LoadKernels::new(&library)?;
+        fixture.configure_pack(&library, 0, 1)?;
+        fixture.configure_drain_after(&library, 0)?;
+        let before = fixture.events()?.len();
+        let result = step.run(&mut kernels, &library, source.bytes(), std::ptr::null_mut(), &mut None);
+        assert!(result.is_err());
+        assert!(library.is_quarantined_after_failed_drain());
+        drop(output);
+        drop(source);
+        let events = fixture.events()?;
+        let events = &events[before..];
+        assert!(events.contains('A'), "the job allocated its mapped status: {events}");
+        assert_eq!(events.matches('S').count(), 2, "first drain and outer error drain: {events}");
+        assert!(!events.contains('F'), "neither status nor pinned source can be freed: {events}");
         Ok(())
     }
 
