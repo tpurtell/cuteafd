@@ -316,10 +316,12 @@ fn absolute(run: &Run) -> bool {
 /// Precision switches: the only settings a same-checkpoint pair may change. Scheduling,
 /// layout and unknown knobs stay fixed. GLM 5.3 Flash's kda-state (its KDA recurrent
 /// state's storage) and target-head (the target LM head's GEMM) change numerics only.
-/// CUTEAFD_SPARK_REPLY_FORMAT selects the Spark expert reply's wire encoding.
+/// CUTEAFD_SPARK_PREFILL_REPLY_FORMAT selects the Spark expert reply's wire encoding.
 const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-fp8", "fp8-prefill",
     "fp8-decode", "mtp-fp8-head", "kv-cache", "kv-format", "expert-input", "kda-state", "target-head",
-    "CUTEAFD_SPARK_REPLY_FORMAT"];
+    "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT", "CUTEAFD_SPARK_DECODE_REPLY_FORMAT",
+    "spark-prefill-reply-format", "spark-decode-reply-format",
+    "spark-prefill-reply-format-explicit", "spark-decode-reply-format-explicit"];
 
 /// Quant selection: settings a cross-checkpoint pair may also change, beside the precision
 /// switches. Exact names only; each one picks which weights serve, nothing else.
@@ -880,7 +882,7 @@ mod tests {
             "build": {"commit": "baseline"}, "settings": [
                 {"name": "split-device", "value": null},
                 {"name": "kda-output-shard", "value": "false"},
-                {"name": "CUTEAFD_SPARK_REPLY_FORMAT", "value": "bf16"}]});
+                {"name": "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT", "value": "bf16"}]});
         let mut candidate = baseline.clone();
         candidate.settings["build"]["commit"] = serde_json::json!("candidate");
         candidate.settings["settings"][0]["value"] = serde_json::json!("1");
@@ -892,7 +894,7 @@ mod tests {
         assert_eq!(evidence.differences[1].key, "split-device");
         assert_eq!(evidence.candidate, serde_json::to_value(&candidate).unwrap());
         assert_eq!(evidence.baseline, serde_json::to_value(&baseline).unwrap());
-        for name in ["kda-output-shard", "CUTEAFD_SPARK_REPLY_FORMAT", "draft-sequences", "unknown"] {
+        for name in ["kda-output-shard", "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT", "CUTEAFD_SPARK_DECODE_REPLY_FORMAT", "draft-sequences", "unknown"] {
             let mut bad = candidate.clone();
             bad.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({"name": name, "value": "different"}));
             assert!(compare(&bad).is_err(), "{name}");
@@ -1097,8 +1099,13 @@ mod tests {
         // The Spark reply format is a precision switch: a BF16/NVFP4 pair pairs.
         let (mut bf16, mut nvfp4) = (b.clone(), b.clone());
         for (run, value) in [(&mut bf16, "bf16"), (&mut nvfp4, "nvfp4")] {
-            run.settings["settings"].as_array_mut().unwrap()
-                .push(serde_json::json!({"name": "CUTEAFD_SPARK_REPLY_FORMAT", "value": value}));
+            for name in ["CUTEAFD_SPARK_PREFILL_REPLY_FORMAT", "CUTEAFD_SPARK_DECODE_REPLY_FORMAT",
+                "spark-prefill-reply-format", "spark-decode-reply-format"] {
+                run.settings["settings"].as_array_mut().unwrap()
+                    .push(serde_json::json!({"name": name, "value": value}));
+            }
+            run.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({
+                "name": "spark-decode-reply-format-explicit", "value": value != "bf16"}));
         }
         assert!(compare(&nvfp4, &bf16, 0.005, 0.005, 100, 1).unwrap().pass);
         // A same-checkpoint report carries no cross-checkpoint fields.

@@ -317,9 +317,9 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                     let prefill = cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan {
                         unit_rows: rows, waves, span_rows: rows * waves,
                     };
-                    let cutoff = Cutoff::with_wide(layout.muse_partial_bf16_max_rows,
+                    let cutoff = Cutoff::with_formats(layout.muse_partial_bf16_max_rows,
                         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-                        layout.resolved_spark_reply_format(true).into())?;
+                        layout.spark_reply_formats)?;
                     let transport = cuteafd_loader::placement::families::muse_spark::host_transport(
                         &cfg, prefill, cutoff, layout.resolved_state_slots("muse_spark") as usize, peers)?;
                     ("spark-intake", transport.intake)

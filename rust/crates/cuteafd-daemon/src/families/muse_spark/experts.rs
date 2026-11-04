@@ -23,7 +23,8 @@ pub(crate) fn combine_launches(plan: &cuteafd_loader::families::muse_spark::repl
     use cuteafd_loader::families::muse_spark::replies::PartialFormat;
     let wide = match plan.wide { PartialFormat::Bf16 => "tp_combine_bf16", PartialFormat::Nvfp4 => "tp_combine_nvfp4",
         PartialFormat::Fp8 => "tp_combine_fp8" };
-    [("tp_combine_bf16", plan.bf16_rows.len()), (wide, plan.wide_rows.len())]
+    [("tp_combine_bf16", plan.bf16_rows.len()), (wide, plan.wide_rows.len()),
+        (if plan.other() == PartialFormat::Fp8 { "tp_combine_fp8" } else { "tp_combine_nvfp4" }, plan.other_rows.len())]
         .into_iter().filter(|(_, rows)| *rows > 0).collect()
 }
 
@@ -31,8 +32,8 @@ pub(crate) fn combine_launches(plan: &cuteafd_loader::families::muse_spark::repl
 pub(crate) const MAX_RANKS: usize = cuteafd_loader::placement::families::muse_spark::MAX_COMBINE_RANKS;
 
 /// Device layout of one wave's combine operands, written in one upload: the
-/// BF16 and wide `rank_regions` tables (i64 device addresses, `MAX_RANKS`
-/// each), then the BF16 and wide row maps (`capacity` u32 each).
+/// BF16, wide and other compressed `rank_regions` tables (i64 device addresses, `MAX_RANKS`
+/// each), then the three region row maps (`capacity` u32 each).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CombineTables { pub capacity: usize }
 
@@ -40,10 +41,10 @@ impl CombineTables {
     pub(crate) const TABLE_BYTES: usize = MAX_RANKS * 8;
     /// The admitted extent (`shared::combine_tables_bytes`, charged where allocated).
     pub(crate) fn bytes(self) -> usize { cuteafd_loader::placement::families::muse_spark::combine_tables_bytes(self.capacity) }
-    /// Byte offsets of (bf16 table, wide table, bf16 map, wide map).
-    pub(crate) fn offsets(self) -> [usize; 4] {
-        let maps = 2 * Self::TABLE_BYTES;
-        [0, Self::TABLE_BYTES, maps, maps + self.capacity * 4]
+    /// Byte offsets of (bf16, wide, other) tables followed by their row maps.
+    pub(crate) fn offsets(self) -> [usize; 6] {
+        let maps = 3 * Self::TABLE_BYTES;
+        [0, Self::TABLE_BYTES, 2 * Self::TABLE_BYTES, maps, maps + self.capacity * 4, maps + 2 * self.capacity * 4]
     }
 
     /// The upload image of one wave: each rank's BF16 region base (its plane)
@@ -53,18 +54,20 @@ impl CombineTables {
     /// a multiple of the 256-byte region alignment.
     pub(crate) fn image(self, planes: &[u64], plan: &ReplyPlanView<'_>) -> Result<Vec<u8>> {
         ensure!((1..=MAX_RANKS).contains(&planes.len()), "Muse combine reads 1..={MAX_RANKS} rank planes");
-        let (bf16, wide) = (plan.bf16_rows, plan.wide_rows);
-        ensure!(bf16.len() + wide.len() <= self.capacity, "Muse combine wave exceeds its {}-row maps", self.capacity);
-        ensure!(plan.wide_at % 256 == 0, "Muse wide region offset {} is not region aligned", plan.wide_at);
+        let (bf16, wide, other) = (plan.bf16_rows, plan.wide_rows, plan.other_rows);
+        ensure!(bf16.len() + wide.len() + other.len() <= self.capacity, "Muse combine wave exceeds its {}-row maps", self.capacity);
+        ensure!(plan.wide_at % 256 == 0 && plan.other_at % 256 == 0, "Muse wide region offset {} is not region aligned", plan.wide_at);
         let mut out = vec![0u8; self.bytes()];
-        let [bf16_table, wide_table, bf16_map, wide_map] = self.offsets();
+        let [bf16_table, wide_table, other_table, bf16_map, wide_map, other_map] = self.offsets();
         for (rank, &base) in planes.iter().enumerate() {
             ensure!(base % 16 == 0 && base != 0, "Muse rank {rank} plane {base:#x} is not 16-byte aligned");
             out[bf16_table + rank * 8..][..8].copy_from_slice(&(base as i64).to_le_bytes());
             let wide_base = base.checked_add(plan.wide_at as u64).context("Muse wide region address")?;
             out[wide_table + rank * 8..][..8].copy_from_slice(&(wide_base as i64).to_le_bytes());
+            let other_base = base.checked_add(plan.other_at as u64).context("Muse other region address")?;
+            out[other_table + rank * 8..][..8].copy_from_slice(&(other_base as i64).to_le_bytes());
         }
-        for (at, rows) in [(bf16_map, bf16), (wide_map, wide)] {
+        for (at, rows) in [(bf16_map, bf16), (wide_map, wide), (other_map, other)] {
             for (i, &row) in rows.iter().enumerate() { out[at + i * 4..][..4].copy_from_slice(&row.to_le_bytes()); }
         }
         Ok(out)
@@ -76,6 +79,8 @@ impl CombineTables {
 pub(crate) struct ReplyPlanView<'p> {
     pub bf16_rows: &'p [u32],
     pub wide_rows: &'p [u32],
+    pub other_rows: &'p [u32],
+    pub other_at: usize,
     /// Byte offset of the wide region in every rank's payload.
     pub wide_at: usize,
 }
@@ -84,11 +89,13 @@ pub(crate) struct ReplyPlanView<'p> {
 /// region, (program stem, table offset, map offset, region rows).
 pub(crate) fn combine_plan(tables: CombineTables, plan: &cuteafd_loader::families::muse_spark::replies::ReplyPlan)
     -> Vec<(&'static str, usize, usize, usize)> {
-    let [bf16_table, wide_table, bf16_map, wide_map] = tables.offsets();
+    let [bf16_table, wide_table, other_table, bf16_map, wide_map, other_map] = tables.offsets();
     combine_launches(plan).into_iter().map(|(stem, rows)| if stem == "tp_combine_bf16" {
         (stem, bf16_table, bf16_map, rows)
-    } else {
+    } else if (stem == "tp_combine_fp8") == (plan.wide == cuteafd_loader::families::muse_spark::replies::PartialFormat::Fp8) {
         (stem, wide_table, wide_map, rows)
+    } else {
+        (stem, other_table, other_map, rows)
     }).collect()
 }
 
@@ -107,8 +114,9 @@ pub(crate) fn wire_plan(plan: &cuteafd_loader::families::muse_spark::replies::Re
     -> Result<cuteafd_transport::PartialReplyPlan> {
     use cuteafd_loader::families::muse_spark::replies::PartialFormat;
     use cuteafd_transport::{PartialReplyPlan, PartialWire};
-    let mut regions = vec![0u8; plan.bf16_rows.len() + plan.wide_rows.len()];
+    let mut regions = vec![0u8; plan.rows()];
     for &row in &plan.wide_rows { regions[row as usize] = 1; }
+    for &row in &plan.other_rows { regions[row as usize] = 2; }
     let wide = match plan.wide { PartialFormat::Nvfp4 => PartialWire::Nvfp4, PartialFormat::Fp8 => PartialWire::Fp8,
         PartialFormat::Bf16 => anyhow::bail!("Muse wide partial format cannot be BF16") };
     Ok(PartialReplyPlan { wide, regions })
@@ -128,7 +136,8 @@ pub(crate) fn wave_request(layer: usize, sequence: u64, kind: cuteafd_transport:
     ensure!(routes.len() == rows * TOPK && routes.iter().all(|r| r.expert_id < EXPERTS
         && r.gate_weight.is_finite() && r.gate_weight >= 0.0), "Muse Spark route outside E256/K8 or invalid weight");
     ensure!(wire.len() == rows * WIRE_ROW_BYTES, "Muse Spark wire rows differ from the wave");
-    let plan = ReplyPlan::new(cutoff, &segments.iter().map(|s| s.rows).collect::<Vec<_>>());
+    let plan = ReplyPlan::for_phase(cutoff, &segments.iter().map(|s| s.rows).collect::<Vec<_>>(),
+        kind == cuteafd_transport::ExpertV2SourceKind::Prefill);
     let partial = wire_plan(&plan)?;
     let mut descriptors = Vec::with_capacity(rows);
     for segment in segments {
@@ -217,14 +226,15 @@ mod tests {
         // The engine's offset is the wire's (`PartialReplyPlan::payload`).
         let mut regions = vec![0u8; 79];
         for &row in &plan.wide_rows { regions[row as usize] = 1; }
+        for &row in &plan.other_rows { regions[row as usize] = 2; }
         assert_eq!(cuteafd_transport::PartialReplyPlan { wide: cuteafd_transport::PartialWire::Nvfp4, regions }
             .payload(TOPK, WIDTH)?.1, wide_at);
-        let view = ReplyPlanView { bf16_rows: &plan.bf16_rows, wide_rows: &plan.wide_rows, wide_at };
+        let view = ReplyPlanView { bf16_rows: &plan.bf16_rows, wide_rows: &plan.wide_rows, wide_at, other_rows: &[], other_at: 0 };
         // Rank 2 below rank 0, gaps between (separate intake allocations).
         let planes = [0x7f00_0000_0000u64, 0x7f10_0000_0000, 0x7e00_0000_1000];
         let image = tables.image(&planes, &view)?;
         assert_eq!(image.len(), tables.bytes());
-        let [bf16_table, wide_table, bf16_map, wide_map] = tables.offsets();
+        let [bf16_table, wide_table, _other_table, bf16_map, wide_map, _other_map] = tables.offsets();
         let i64_at = |at: usize| i64::from_le_bytes(image[at..at + 8].try_into().unwrap());
         let u32_at = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
         for (rank, &plane) in planes.iter().enumerate() {
@@ -241,6 +251,74 @@ mod tests {
         assert!(tables.image(&planes, &ReplyPlanView { wide_at: wide_at + 16, ..view }).is_err());
         assert!(CombineTables { capacity: 64 }.image(&planes, &view).is_err());
         assert!(tables.image(&[0x1000; 9], &view).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn three_region_combines_use_their_own_tables_and_maps() -> Result<()> {
+        use cuteafd_loader::families::muse_spark::replies::{PartialFormat, ReplyPlan};
+        for wide in [PartialFormat::Nvfp4, PartialFormat::Fp8] {
+            let plan = ReplyPlan { bf16_rows: vec![1], wide_rows: vec![0, 3], other_rows: vec![2], wide };
+            let wire = wire_plan(&plan)?;
+            assert_eq!(wire.regions, [1, 0, 2, 1]);
+            let payload = wire.layout(TOPK, WIDTH)?;
+            assert_eq!(payload.total, plan.rank_bytes(TOPK, WIDTH));
+            let tables = CombineTables { capacity: 4 };
+            let planes = [0x1000, 0x1000_0000];
+            let image = tables.image(&planes, &ReplyPlanView { bf16_rows: &plan.bf16_rows,
+                wide_rows: &plan.wide_rows, other_rows: &plan.other_rows,
+                wide_at: payload.offsets[1], other_at: payload.offsets[2] })?;
+            let offsets = tables.offsets();
+            for region in 0..3 {
+                for (rank, plane) in planes.iter().enumerate() {
+                    let at = offsets[region] + rank * 8;
+                    assert_eq!(u64::from_le_bytes(image[at..at + 8].try_into()?), plane + payload.offsets[region] as u64);
+                }
+                let rows = [&plan.bf16_rows, &plan.wide_rows, &plan.other_rows][region];
+                for (i, &row) in rows.iter().enumerate() {
+                    let at = offsets[region + 3] + i * 4;
+                    assert_eq!(u32::from_le_bytes(image[at..at + 4].try_into()?), row);
+                }
+            }
+            let launches = combine_plan(tables, &plan);
+            assert_eq!(launches.len(), 3);
+            for (region, (_, table, map, rows)) in launches.iter().enumerate() {
+                assert_eq!((*table, *map), (offsets[region], offsets[region + 3]));
+                assert_eq!(*rows, [1, 2, 1][region]);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_phase_pair_reaches_the_partial_wire_without_small_row_fallback() -> Result<()> {
+        use cuteafd_core::{spark_reply::SparkReplyFormats, SparkReplyFormat::{Bf16, Fp8, Nvfp4}};
+        use cuteafd_loader::families::muse_spark::replies::Cutoff;
+        use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertV2SourceKind, PartialWire};
+        let segments = [WaveSegment { request: 11, rows: 1 }, WaveSegment { request: 12, rows: 8 }];
+        let rows = 9;
+        let routes = (0..rows * TOPK).map(|i| ExpertProtocolV2RouteEntry { row_index: (i / TOPK) as u32,
+            expert_id: (i % TOPK) as u32, gate_weight: 0.125 }).collect::<Vec<_>>();
+        let wire = bytes::Bytes::from(vec![0; rows * WIRE_ROW_BYTES]);
+        for prefill in [Bf16, Fp8, Nvfp4] {
+            for decode in [Bf16, Fp8, Nvfp4] {
+                let cutoff = Cutoff::with_formats(64, 8, SparkReplyFormats { prefill: Some(prefill), decode: Some(decode) })?;
+                for (kind, selected) in [(ExpertV2SourceKind::Prefill, prefill),
+                    (ExpertV2SourceKind::Decode, decode), (ExpertV2SourceKind::MtpVerify, decode)] {
+                    let request = wave_request(5, 3, kind, &segments, cutoff, routes.clone(), wire.clone())?;
+                    let plan = request.partial.as_ref().unwrap();
+                    let region = match selected {
+                        Bf16 => 0,
+                        Fp8 if plan.wide == PartialWire::Fp8 => 1,
+                        Nvfp4 if plan.wide == PartialWire::Nvfp4 => 1,
+                        _ => 2,
+                    };
+                    assert_eq!(plan.regions, vec![region; rows], "{prefill:?}/{decode:?} {kind:?}");
+                    assert_eq!(plan.layout(TOPK, WIDTH)?.total, rows * TOPK * selected.row_bytes(WIDTH).unwrap());
+                    assert_eq!(ExpertProtocolV2Request::decode(&request.encode()?)?, request);
+                }
+            }
+        }
         Ok(())
     }
 

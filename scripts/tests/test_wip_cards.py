@@ -1319,6 +1319,46 @@ def test_nsys_profile_frames_the_sweep_with_a_window(entry, tmp_path):
     assert 'window' not in plain['entry']
 
 
+def test_census_final_sample_hook_composes_with_profiler(entry, tmp_path):
+    job = cards.generate({**entry, 'levels': [1]}, 'a', dict(instance='p', slot='s'),
+                         tmp_path, tmp_path / 'key', {'PROFILE': 'census,nsys'}, set(), None, 1)
+    close = job['entry']['window']['close']
+    assert '--census-final-sample' in ' '.join(close['argv'])
+    assert 'stop --session=cuteafd-profile' in ' '.join(close['argv'])
+    assert close['required']
+    plain = cards.generate({**entry, 'levels': [1]}, 'b', dict(instance='q', slot='s'),
+                           tmp_path, tmp_path / 'key', {'PROFILE': 'census'}, set(), None, 1)
+    assert '--census-final-sample' in plain['entry']['window']['close']['argv']
+
+
+def test_census_marker_uses_server_clock_and_is_idempotent(tmp_path, monkeypatch):
+    job = {'state': str(tmp_path), 'entry': {'name': 'test'}}
+    log = tmp_path / 'smoke/logs/test.coordinator.log'
+    log.parent.mkdir(parents=True)
+    log.write_text('2026-11-04T12:00:01.000000Z INFO cuteafd::thermal: current={"queried_s":1.0}\n')
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    monkeypatch.setattr(cards, 'http', lambda url, path: {'now_s': 32.0, 'current': {'queried_s': 31.0}})
+    monkeypatch.setattr(cards.time, 'time', lambda: pytest.fail('client clock must not timestamp census marker'))
+    cards.census_final_sample(job)
+    cards.merge_census_marker(job)
+    cards.merge_census_marker(job)
+    text = log.read_text()
+    assert text.count('final server thermal sample') == 1
+    assert '2026-11-04T12:00:32.000000Z INFO cuteafd::bench_census:' in text
+    log.write_text('no server clock anchors\n')
+    with pytest.raises(ValueError, match='clock anchors'):
+        cards.merge_census_marker(job)
+
+
+@pytest.mark.parametrize('now', [True, -1, float('nan'), float('inf'), '32'])
+def test_census_final_sample_rejects_invalid_clock(tmp_path, monkeypatch, now):
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    monkeypatch.setattr(cards, 'http', lambda url, path: {'now_s': now})
+    with pytest.raises(ValueError, match='server clock'):
+        cards.census_final_sample({'state': str(tmp_path)})
+    assert not (tmp_path / 'census-final-thermal.json').exists()
+
+
 def test_session_name_matches_the_launcher():
     text = (ROOT / 'scripts/lib/release-common.sh').read_text()
     assert f'RELEASE_NSYS_SESSION={cards.NSYS_SESSION}\n' in text

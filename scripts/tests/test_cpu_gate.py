@@ -234,7 +234,7 @@ def test_default_and_full_select_the_same_named_tests_in_both_runners(tmp_path, 
         assert name in gate.FULL_TESTS
 
 
-def test_full_gate_records_missing_installed_planner_inputs_in_skipped_live_planners(tmp_path, monkeypatch):
+def test_full_gate_records_missing_installed_planner_inputs_separately(tmp_path, monkeypatch):
     source = tmp_path / 'source'
     (source / 'examples/configs').mkdir(parents=True)
     (source / 'scripts/bench').mkdir(parents=True)
@@ -277,7 +277,8 @@ def test_full_gate_records_missing_installed_planner_inputs_in_skipped_live_plan
     result = gate.cargo(source, tmp_path, SimpleNamespace(**vars(ARGS), full=True), env)
     assert result['status'] == 'pass'
     assert result['skipped_full_tests'] == []
-    assert result['skipped_live_planners'] == [
+    assert result['skipped_live_planners'] == []
+    assert result['skipped_installed_planners'] == [
         'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
         'installed_example_deployments_publish_executable_prefill_shapes',
     ]
@@ -285,6 +286,37 @@ def test_full_gate_records_missing_installed_planner_inputs_in_skipped_live_plan
         '--skip', 'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
         '--skip', 'installed_example_deployments_publish_executable_prefill_shapes',
     ]
+
+
+@pytest.mark.parametrize('nextest', [False, True])
+def test_failed_live_v4_provenance_is_not_reported_as_skipped(tmp_path, monkeypatch, nextest):
+    (tmp_path / 'logs').mkdir()
+    reason = ('stale V4 placement inputs: exported fork "125a8882" differs from tree '
+              '"78cfee4e"; regenerate inputs')
+    failed = ''.join(f'test {name} ... FAILED\n{reason}\n' for name in gate.LIVE_PLANNERS)
+    failed += 'test result: FAILED. 8 passed; 4 failed; 0 ignored\n'
+    calls = _fake(monkeypatch, [(0, BUILD_OK), (101, failed),
+                                (0, 'test result: ok. 2 passed; 0 failed; 0 ignored\n')])
+    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: list(gate.INSTALLED_PLANNERS))
+    if nextest:
+        monkeypatch.setattr(gate, 'nextest_for', lambda env: '/tools/cargo-nextest')
+        monkeypatch.setattr(gate, 'parse_nextest', lambda report: ([(8, 4, 0)], list(gate.LIVE_PLANNERS)))
+    result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**vars(ARGS), full=True), {})
+    assert result['status'] == 'failed' and result['failed'] == 4
+    assert set(result['failing']) == set(gate.LIVE_PLANNERS)
+    assert result['skipped_full_tests'] == result['skipped_live_planners'] == []
+    assert result['skipped_installed_planners'] == list(gate.INSTALLED_PLANNERS)
+    assert result['error'] == '4 failed; ' + reason
+    record = {'task': 't', 'verdict': 'failed', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
+    receipt = gate.render(record)
+    assert '| cargo | failed |' in receipt and reason in receipt
+    assert 'live V4 planner tests skipped' not in receipt
+    assert 'default tier' not in receipt and 'full tier' in receipt
+    assert 'installed-checkpoint planner tests skipped' in receipt
+    for name in gate.INSTALLED_PLANNERS:
+        assert name in receipt
+    for name in gate.LIVE_PLANNERS:
+        assert name not in ' '.join(calls[1])
 
 
 @pytest.mark.parametrize('full', [False, True])

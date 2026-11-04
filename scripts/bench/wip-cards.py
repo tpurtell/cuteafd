@@ -26,6 +26,8 @@ import argparse
 import base64
 import concurrent.futures
 import contextlib
+import datetime
+import math
 import functools
 import itertools
 import hashlib
@@ -464,6 +466,14 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     entry.update(name=label, config=str(base), set=values, gpus=gpus, sparks=hosts, run_args=run_args)
     job = dict(card=card, arm=arm_name, repeat=repeat, simulated=bool(simulated), state=str(dest), entry=entry, metadata=metadata, probes=probes, expected_pool=expected_pool, trace=bool(trace))
     hook = [sys.executable, str(Path(__file__).resolve())]
+    if 'census' in values.get('PROFILE', '').split(',') and (entry.get('levels') or entry.get('prefill_lengths')):
+        sample = dict(argv=hook + ['--census-final-sample', str(dest / 'job.json')], timeout_s=180, required=True)
+        window = entry.setdefault('window', dict(open=dict(argv=['true'], timeout_s=10, required=True)))
+        previous = window.get('close')
+        if previous:
+            sample['argv'] = window_argv([previous['argv'], sample['argv']])
+            sample['timeout_s'] += previous.get('timeout_s', 0)
+        window['close'] = sample
     timeout = int(entry.get('timeout_s', 900)) + int(entry.get('run_timeout_s', 900)) + 120
     if probes & {'memory', 'console'} or trace:
         entry['observer'] = dict(argv=hook + ['--observe', str(dest / 'job.json')], timeout_s=min(timeout, 7200),
@@ -873,6 +883,48 @@ def http(url, path, body=None):
             return json.load(response)
     except urllib.error.HTTPError as error:
         raise RuntimeError(f'HTTP {error.code}: {error.read().decode(errors="replace")}') from None
+
+
+def census_final_sample(job):
+    """Close census evidence on the server's report clock, outside timed work."""
+    sample = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/thermal')
+    validate_census_clock(sample['now_s'])
+    save(Path(job['state']) / 'census-final-thermal.json', sample)
+
+
+def validate_census_clock(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError('invalid census server clock')
+    return value
+
+
+def merge_census_marker(job):
+    """Translate server now_s through daemon clock anchors, never client time."""
+    dest = Path(job['state'])
+    sample = json.loads((dest / 'census-final-thermal.json').read_text())
+    now = validate_census_clock(sample['now_s'])
+    log = dest / 'smoke' / 'logs' / (job['entry']['name'] + '.coordinator.log')
+    text = log.read_text()
+    offsets = []
+    decoder = json.JSONDecoder()
+    for raw in text.splitlines():
+        line = ANSI.sub('', raw)
+        if 'cuteafd::thermal:' not in line or 'current=' not in line:
+            continue
+        stamp = datetime.datetime.fromisoformat(line.split()[0].replace('Z', '+00:00')).timestamp()
+        queried = validate_census_clock(decoder.raw_decode(line.split('current=', 1)[1])[0]['queried_s'])
+        if now < queried:
+            raise ValueError('final census sample precedes daemon thermal anchor')
+        offsets.append(stamp - queried)
+    if not offsets or max(offsets) - min(offsets) > .050:
+        raise ValueError('missing or inconsistent daemon thermal clock anchors')
+    stamp = datetime.datetime.fromtimestamp(statistics.median(offsets) + now, datetime.timezone.utc)
+    marker = (stamp.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+              + ' INFO cuteafd::bench_census: final server thermal sample'
+              + f' server_now_s={now} source=census-final-thermal.json\n')
+    if marker not in text:
+        with log.open('a') as output:
+            output.write('\n' + marker)
 
 
 def red_square():
@@ -1411,6 +1463,12 @@ def summarize_job(job, exit_code):
     dest = Path(job['state'])
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
     row.update(exit_code=exit_code, status='failed' if exit_code else 'pass')
+    if 'census' in job['entry'].get('set', {}).get('PROFILE', '').split(',') and (
+            job['entry'].get('levels') or job['entry'].get('prefill_lengths')):
+        try:
+            merge_census_marker(job)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            fail(row, f'final census evidence: {error}', 'measurement')
     if 'artifacts' in job: row['artifacts'] = job['artifacts']
     if 'launcher' in job: row['launcher'] = job['launcher']
     reports = list((dest / 'reports').glob('**/report.json'))
@@ -2440,7 +2498,11 @@ def main():
     parser.add_argument('--observe', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--precheck', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--preflight-job', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--census-final-sample', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.census_final_sample:
+        census_final_sample(json.loads(args.census_final_sample.read_text()))
+        return 0
     if not 0 < args.wait < float('inf'):
         parser.error('--wait must be finite and positive')
     if args.observe or args.precheck:

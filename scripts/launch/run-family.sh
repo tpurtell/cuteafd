@@ -226,7 +226,8 @@ HOST_ISA
 PROBE_DUMP_ROOT
 TARGET_HEAD
 SPARK_INTAKE
-SPARK_REPLY_FORMAT
+SPARK_PREFILL_REPLY_FORMAT
+SPARK_DECODE_REPLY_FORMAT
 HOST_WAIT
 IDLE_PARK_SECONDS
 CONSOLE_TEXT
@@ -283,7 +284,8 @@ DRAFT_ROW_COST
 SPECULATION_TRACE
 TARGET_HEAD
 SPARK_INTAKE
-SPARK_REPLY_FORMAT
+SPARK_PREFILL_REPLY_FORMAT
+SPARK_DECODE_REPLY_FORMAT
 HOST_WAIT
 IDLE_PARK_SECONDS
 CONSOLE_TEXT
@@ -562,7 +564,8 @@ SPARKINFER_EXL3
 SPECULATION_TRACE
 SPECULATOR
 SPARK_INTAKE
-SPARK_REPLY_FORMAT
+SPARK_PREFILL_REPLY_FORMAT
+SPARK_DECODE_REPLY_FORMAT
 HOST_WAIT
 IDLE_PARK_SECONDS
 TARGET_HEAD
@@ -706,8 +709,12 @@ intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
 console_text="$(get CONSOLE_TEXT on)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
-spark_reply_format="$(get SPARK_REPLY_FORMAT "")"
-case "$spark_reply_format" in ""|bf16|fp8|nvfp4) ;; *) release_die "SPARK_REPLY_FORMAT must be bf16, fp8 or nvfp4" ;; esac
+spark_prefill_reply_format="$(get SPARK_PREFILL_REPLY_FORMAT "")"
+spark_decode_reply_format="$(get SPARK_DECODE_REPLY_FORMAT "")"
+for phase in prefill decode; do
+  key="spark_${phase}_reply_format"
+  case "${!key}" in ""|bf16|fp8|nvfp4) ;; *) release_die "SPARK_${phase^^}_REPLY_FORMAT must be bf16, fp8 or nvfp4" ;; esac
+done
 fp8_prefill="$(get FP8_EXPERT_PREFILL auto)"
 case "$fp8_prefill" in auto|w8a8|w8a16) ;; *) echo "FP8_EXPERT_PREFILL must be auto, w8a8 or w8a16" >&2; exit 2 ;; esac
 attention_plan_rows="$(get ATTENTION_PLAN_ROWS auto)"
@@ -718,8 +725,11 @@ shared_env_args=(-e "HF_HOME=$container_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intak
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
   -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
-if [[ -n $spark_reply_format ]]; then
-  shared_env_args+=(-e "CUTEAFD_SPARK_REPLY_FORMAT=$spark_reply_format")
+if [[ -n $spark_prefill_reply_format ]]; then
+  shared_env_args+=(-e "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT=$spark_prefill_reply_format")
+fi
+if [[ -n $spark_decode_reply_format ]]; then
+  shared_env_args+=(-e "CUTEAFD_SPARK_DECODE_REPLY_FORMAT=$spark_decode_reply_format")
 fi
 if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
@@ -2898,7 +2908,8 @@ audio_encoder_hash=""
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi
-  [[ -z "$(get SPARK_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-reply-format "$(get SPARK_REPLY_FORMAT)")
+  [[ -z "$(get SPARK_PREFILL_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-prefill-reply-format "$(get SPARK_PREFILL_REPLY_FORMAT)")
+  [[ -z "$(get SPARK_DECODE_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-decode-reply-format "$(get SPARK_DECODE_REPLY_FORMAT)")
   if [[ "$family" == muse_spark ]]; then
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")

@@ -1,4 +1,5 @@
 use super::*;
+use cuteafd_core::SparkReplyFormat;
 use crate::placement::FfnMode;
 
 #[test]
@@ -58,13 +59,13 @@ fn request() -> Request {
         pool: Pin::Auto,
         onboard: Pin::Auto,
         prefill: Pin::Auto,
-        spark_reply_format: None,
+        spark_reply_formats: Default::default(),
         operation: Operation::Serving, resident_weight_limit: None,
     }
 }
 fn decisions(onboard: u64) -> Decisions {
     Decisions {
-        spark_reply_format: None,
+        spark_reply_formats: None,
         attention: vec![LayerMode::Whole {
             gpu: 0,
             ffn: FfnMode::Owner,
@@ -176,28 +177,41 @@ impl Recipe for Prepared {
 }
 
 #[test]
-fn immutable_reply_format_flows_to_decisions_and_explicit_conflicts_refuse() {
-    for resolved in [None, Some(SparkReplyFormat::Bf16), Some(SparkReplyFormat::Fp8),
-        Some(SparkReplyFormat::Nvfp4)] {
+fn immutable_reply_formats_flow_to_decisions_and_each_explicit_phase_conflicts() {
+    use SparkReplyFormat::{Bf16, Fp8, Nvfp4};
+    let mut contracts = vec![None];
+    for prefill in [Bf16, Fp8, Nvfp4] {
+        for decode in [Bf16, Fp8, Nvfp4] {
+            contracts.push(Some(SparkReplyFormats { prefill: Some(prefill), decode: Some(decode) }));
+        }
+    }
+    for resolved in contracts {
         let mut contract = Linear::new().prepare(&request()).unwrap();
-        contract.spark_reply_format = resolved;
+        contract.spark_reply_formats = resolved;
         let selected = vec![0; contract.variables.len()];
-        assert_eq!(contract.decisions(&selected).unwrap().spark_reply_format, resolved);
+        assert_eq!(contract.decisions(&selected).unwrap().spark_reply_formats, resolved);
         let recipe = Prepared(contract);
-        for requested in [None, Some(SparkReplyFormat::Bf16), Some(SparkReplyFormat::Fp8),
-            Some(SparkReplyFormat::Nvfp4)] {
-            let req = Request { spark_reply_format: requested, ..request() };
-            match solve(req.clone(), vec![budget(1 << 40)], &recipe) {
-                Ok(plan) => {
-                    assert!(requested.is_none() || requested == resolved);
-                    assert_eq!(plan.request.spark_reply_format, requested);
-                    assert_eq!(plan.decisions.spark_reply_format, resolved);
-                    let encoded = serde_json::to_value(&plan).unwrap();
-                    let decoded: ResolvedPlan = serde_json::from_value(encoded).unwrap();
-                    assert_eq!(decoded, plan);
+        for prefill in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
+            for decode in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
+                let requested = SparkReplyFormats { prefill, decode };
+                let conflict = [(prefill, resolved.and_then(|formats| formats.prefill)),
+                    (decode, resolved.and_then(|formats| formats.decode))]
+                    .into_iter().any(|(requested, resolved)| requested.is_some() && requested != resolved);
+                let req = Request { spark_reply_formats: requested, ..request() };
+                match solve(req, vec![budget(1 << 40)], &recipe) {
+                    Ok(plan) => {
+                        assert!(!conflict, "{requested:?} vs {resolved:?}");
+                        assert_eq!(plan.request.spark_reply_formats, requested);
+                        assert_eq!(plan.decisions.spark_reply_formats, resolved);
+                        let encoded = serde_json::to_value(&plan).unwrap();
+                        assert_eq!(encoded["request"]["spark_reply_formats"]["prefill"], serde_json::to_value(prefill).unwrap());
+                        assert_eq!(encoded["request"]["spark_reply_formats"]["decode"], serde_json::to_value(decode).unwrap());
+                        let decoded: ResolvedPlan = serde_json::from_value(encoded).unwrap();
+                        assert_eq!(decoded, plan);
+                    }
+                    Err(Refusal::PinConflict) => assert!(conflict, "{requested:?} vs {resolved:?}"),
+                    other => panic!("unexpected reply-format admission: {other:?}"),
                 }
-                Err(Refusal::PinConflict) => assert!(requested.is_some() && requested != resolved),
-                other => panic!("unexpected reply-format admission: {other:?}"),
             }
         }
     }

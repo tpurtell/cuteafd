@@ -74,7 +74,7 @@ pub struct MuseInputs<'a> {
     /// Rows a request may contribute to a step and still reply BF16 partials,
     /// and the format of wider segments.
     pub partial_bf16_max_rows: usize,
-    pub partial_wide_format: crate::families::muse_spark::replies::WideFormat,
+    pub partial_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     /// The coordinator EXL3 package for onboarded layers (`local_package`).
     pub local: LocalPackage,
     /// The DFlash2 drafter (`drafter_inventory`), charged on the head GPU.
@@ -271,7 +271,7 @@ pub fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> u64 {
 
 pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let MuseInputs { resident_weight_limit, cfg, core, catalog, gpus, spark_ranks, prefill, slots, mark_slots, context, automatic_context,
-        requested_pool, onboard, spark_budget_bytes, partial_bf16_max_rows, partial_wide_format, local,
+        requested_pool, onboard, spark_budget_bytes, partial_bf16_max_rows, partial_reply_formats, local,
         drafter, full_prefill_logits, fixed: runtime_fixed, startup } = inputs;
     let ranks = gpus.len();
     let (executor, modes) = executor(ranks)?;
@@ -379,7 +379,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         Basis::Exact).with_resident_weights(ResidentWeights(global.head_bytes() as u64)));
     // Spark partial replies land on the coordinator: per wave slot, every rank's
     // worst-case mix of BF16 (decode/verify segments) and NVFP4 (prefill) partials.
-    let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(partial_bf16_max_rows, 1, partial_wide_format)?;
+    let cutoff = crate::families::muse_spark::replies::Cutoff::with_formats(partial_bf16_max_rows, 1, partial_reply_formats)?;
     // The shared intake allocates rows x row_bytes per rank and slot; the row width
     // is the worst partial-reply mix spread over the unit (replies::intake_row_bytes).
     let (_, planes) = intake(cfg, prefill, cutoff, usize::try_from(slots)?, spark_ranks)?;
@@ -583,11 +583,11 @@ pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slot
         sequences: capacity.max_batch_sequences, block, head_dim: geometry.head_dim as usize })
 }
 
-/// The combine's rank tables the coordinator uploads per wave: a BF16 and a
-/// wide `rank_regions` table (`MAX_COMBINE_RANKS` i64 addresses each) and their
-/// two row maps (`capacity` u32 each).
+/// The combine's rank tables the coordinator uploads per wave: BF16, wide and other compressed
+/// `rank_regions` tables (`MAX_COMBINE_RANKS` i64 addresses each) and their
+/// three row maps (`capacity` u32 each).
 pub const MAX_COMBINE_RANKS: usize = 8;
-pub fn combine_tables_bytes(capacity: usize) -> usize { 2 * MAX_COMBINE_RANKS * 8 + 2 * capacity * 4 }
+pub fn combine_tables_bytes(capacity: usize) -> usize { 3 * MAX_COMBINE_RANKS * 8 + 3 * capacity * 4 }
 
 /// A missing coordinator EXL3 package (onboarding unavailable in this build).
 #[derive(Debug, thiserror::Error)]
@@ -599,8 +599,8 @@ pub struct MissingLocalPackage(pub String);
 /// allocates per GPU: every capacity specialization's buffers up to the
 /// compiled one (the shared `exl3_workspace_bytes`), plus the executor's F32
 /// token output (allocated by the shared executor; Muse reads the partial
-/// epilogue's planes instead), the partial epilogue's two row maps and the
-/// onboarded combine's tables (two 8-rank address tables, two row maps).
+/// epilogue's planes instead), the partial epilogue's three row maps and the
+/// onboarded combine's tables (three 8-rank address tables, three row maps).
 pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path, gpus: usize, rows: u64)
     -> Result<(std::path::PathBuf, u64)> {
     let exl3 = catalog.exl3().context("Muse onboarding needs EXL3 expert headers")?;
@@ -630,7 +630,7 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: &std::path::
     // worker (muse_owner_bytes) declares the partial-reply epilogue.
     let workspace = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)
         .map_err(|error| anyhow::anyhow!("{error}"))? + compiled * shape.hidden as u64 * 4
-        + 2 * rows * 4 + combine_tables_bytes(usize::try_from(rows)?) as u64;
+        + 3 * rows * 4 + combine_tables_bytes(usize::try_from(rows)?) as u64;
     Ok((package, workspace))
 }
 

@@ -204,10 +204,30 @@ fn family_of(command: &str) -> Option<&'static str> {
 /// Records a serve command's resolved options (value, default, source) for
 /// the benchmark; other commands record nothing.
 pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>) -> Result<()> {
-    if let Some(context) = serve_context(matches, coordinator_budget_gib)? {
+    if let Some(mut context) = serve_context(matches, coordinator_budget_gib)? {
+        let formats = cuteafd_core::spark_reply::requested();
+        let (prefill, decode) = reply_settings(&mut context, formats);
+        tracing::info!(%prefill, %decode, prefill_explicit = formats.prefill.is_some(),
+            decode_explicit = formats.decode.is_some(), "resolved Spark reply phase formats");
         cuteafd_bench::context::set(context);
     }
     Ok(())
+}
+
+fn reply_settings(context: &mut cuteafd_bench::context::ServerContext,
+    formats: cuteafd_core::spark_reply::SparkReplyFormats) -> (String, String) {
+    let partial = context.command == "serve-muse";
+    let (prefill, decode) = (formats.prefill(partial).to_string(), formats.decode().to_string());
+    for (name, value, default) in [
+        ("spark-prefill-reply-format", prefill.clone(), cuteafd_core::spark_reply::SparkReplyFormats::default().prefill(partial).to_string()),
+        ("spark-decode-reply-format", decode.clone(), "bf16".to_owned()),
+        ("spark-prefill-reply-format-explicit", formats.prefill.is_some().to_string(), "false".to_owned()),
+        ("spark-decode-reply-format-explicit", formats.decode.is_some().to_string(), "false".to_owned()),
+    ] {
+        context.settings.retain(|setting| setting.name != name);
+        context.settings.push(Setting { name: name.into(), value: Some(value), default: Some(default), source: "resolved".into() });
+    }
+    (prefill, decode)
 }
 
 /// The serve command's resolved settings, without publishing them. Tests read
@@ -293,6 +313,28 @@ fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    #[test]
+    fn cards_record_resolved_reply_pair_and_omission_separately() {
+        use cuteafd_core::{spark_reply::SparkReplyFormats, SparkReplyFormat::{Bf16, Fp8}};
+        for command in ["serve-muse", "serve-glm"] {
+            let mut context = cuteafd_bench::context::ServerContext { command: command.into(), ..Default::default() };
+            let omitted = SparkReplyFormats::default();
+            reply_settings(&mut context, omitted);
+            assert_eq!(context.settings[0].value.as_deref(), Some(if command == "serve-muse" { "nvfp4" } else { "bf16" }));
+            assert_eq!(context.settings[1].value.as_deref(), Some("bf16"));
+            assert!(context.settings[2..].iter().all(|setting| setting.value.as_deref() == Some("false")));
+            reply_settings(&mut context, SparkReplyFormats { prefill: None, decode: Some(Bf16) });
+            assert_eq!(context.settings[2].value.as_deref(), Some("false"));
+            assert_eq!(context.settings[3].value.as_deref(), Some("true"), "explicit default is not omission");
+            reply_settings(&mut context, SparkReplyFormats { prefill: Some(Fp8), decode: Some(Fp8) });
+            assert_eq!(context.settings.len(), 4, "one canonical record per resolved setting");
+            assert_eq!(context.settings[0].value.as_deref(), Some("fp8"));
+            assert_eq!(context.settings[1].value.as_deref(), Some("fp8"));
+            assert!(context.settings[2..].iter().all(|setting| setting.value.as_deref() == Some("true")));
+            assert!(context.settings.iter().all(|setting| setting.source == "resolved"));
+        }
+    }
 
     #[test]
     fn every_serve_family_command_has_a_placement_executor() {

@@ -123,9 +123,10 @@ pub(crate) struct NativeDraft<'a> {
     context_pending: Cell<bool>,
     window_marks: Option<Rc<Allocation<'a>>>,
     window_bytes: usize,
-    /// A K6 target head (no BF16 operand to borrow): the target rank's K6
-    /// programs and this drafter's own head scratch, used only on the bridge stream.
-    k6_head: Option<(Rc<super::device::NativePrograms<'a>>, crate::shared::dense_trellis::ProjectionScratch<'a>)>,
+    programs: &'a Programs<'a>,
+    /// The drafter owns a head program and scratch at its admitted row capacity;
+    /// only the immutable target head weights are shared with the target lane.
+    k6_head: Option<(crate::shared::dense_trellis::Projection<'a>, crate::shared::dense_trellis::ProjectionScratch<'a>)>,
     cache_format: cuteafd_core::MlaCacheFormat,
     marks: usize,
 }
@@ -167,7 +168,7 @@ impl<'a> NativeDraft<'a> {
         let marks = usize::try_from(admission.mark_selection.slots)?;
         let window_bytes = layout.window_mark_bytes()?;
         let window_marks = admission.allocate_draft_marks(streams[head].device)?;
-        Ok(Self { window_marks, window_bytes, k6_head: None, cache_format: layout.cache_format(), marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+        Ok(Self { window_marks, window_bytes, programs, k6_head: None, cache_format: layout.cache_format(), marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge, producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[head].device)?),
@@ -176,8 +177,8 @@ impl<'a> NativeDraft<'a> {
 
     pub(crate) fn cache_format(&self) -> cuteafd_core::MlaCacheFormat { self.cache_format }
 
-    /// `head_programs` are the head rank's native programs; with a K6 head the
-    /// drafter projects through them into its own admitted head scratch.
+    /// Validate the head rank, retaining a separate K6 program and scratch
+    /// sized at the drafter's own admitted capacity.
     pub(crate) fn bind_target(&mut self, target: [Rc<GlobalWeights<'a>>; 2],
         head_programs: Rc<super::device::NativePrograms<'a>>) -> Result<()> {
         self.bind_target_ranks(target.to_vec(), head_programs)
@@ -196,14 +197,19 @@ impl<'a> NativeDraft<'a> {
             ensure!(weight.shape == [cfg.vocab, cfg.hidden], "Kimi draft K6 target head geometry differs");
             ensure!(head_programs.device.id == self.target_streams[head].device.id,
                 "Kimi draft K6 head programs are not on the head rank");
-            let projection = head_programs.core.as_ref().context("K6 head programs not resolved")?.projection(weight)?;
-            let rows = self.owners.draft.max_batch_sequences() * cfg.block;
+            let rows = self.owners.draft.max_batch_sequences().checked_mul(cfg.block)
+                .context("Kimi draft head row capacity overflow")?;
+            let projection = self.target_streams[head].device.run(|| {
+                crate::shared::dense_trellis::Projection::load_geometry_bits(self.programs,
+                    cfg.hidden, cfg.vocab, 1, weight.bits, crate::shared::dense_trellis::codebook(weight),
+                    rows, cuteafd_ffi::dense_trellis::TrellisDType::F32)
+            })?;
             let scratch = {
                 let _scope = cuteafd_ffi::memory_ledger::scope("drafter/kimi K6 head scratch");
                 crate::shared::dense_trellis::ProjectionLayout::new(&projection.program, rows)?
                     .allocate(self.target_streams[head].device)?
             };
-            self.k6_head = Some((head_programs, scratch));
+            self.k6_head = Some((projection, scratch));
         } else {
             ensure!(target[head].buffer("head")?.bytes == cfg.vocab * cfg.hidden * 2,
                 "Kimi draft target head differs from admitted BF16 geometry");
@@ -385,9 +391,8 @@ impl<'a> NativeDraft<'a> {
                 }
             };
             let head = match &self.k6_head {
-                Some((programs, scratch)) => {
+                Some((projection, scratch)) => {
                     let weight = target[head].core_head.as_ref().context("Kimi draft K6 target head absent")?;
-                    let projection = programs.core.as_ref().context("K6 head programs not resolved")?.projection(weight)?;
                     let device = self.target_streams[head].device.id;
                     let (hidden, vocab) = (draft.cfg.hidden, draft.cfg.vocab);
                     TargetHead::Launch(Box::new(move |x, logits, rows, stream| {

@@ -127,8 +127,8 @@ impl ServeArgs {
                 "Muse {name} encoder revision cannot be empty");
         }
         ensure!(self.audio_peers.len() <= 1, "Muse audio admits one encoder owner");
-        // A request's widest step is a verify (anchor plus drafts, at most the 64-row
-        // rollback step); the cutoff must keep it BF16, so decode and verify stay lossless.
+        // Admission uses the cutoff to bound each decode/verify segment, so it
+        // must cover the widest step even when a phase encoding is explicit.
         cuteafd_loader::families::muse_spark::replies::Cutoff::new(self.expert_partial_bf16_max_rows,
             cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)?;
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
@@ -168,7 +168,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
         spark_budget_bytes: args.spark_budget_bytes(),
         partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
-        partial_wide_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), true).into(),
+        partial_reply_formats: cuteafd_core::spark_reply::requested(),
         local: cuteafd_loader::placement::families::muse_spark::local_workspace(&catalog,
             Some(&args.manifest), gpus, args.prefill()?.unit_rows)?,
         drafter: args.draft.as_deref().map(|snapshot| -> Result<_> {
@@ -189,8 +189,8 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
         "Muse Spark admitted TP experts with coordinator-combined partials");
     let media = super::media::Ready::load(args, &library, built.media.as_ref().context("Muse media admission missing")?)?;
     let prefill = args.prefill()?;
-    let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(args.expert_partial_bf16_max_rows,
-        cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), true).into())?;
+    let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_formats(args.expert_partial_bf16_max_rows,
+        cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
     let sequences = usize::from(args.max_sequences);
     let spark = super::admission::spark_plan(&placement, prefill, cutoff, sequences, args.peers.len())?;
     let admission_plan = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
@@ -568,8 +568,8 @@ mod tests {
         assert_eq!(defaults.spark_budget_bytes(), cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES);
         assert_eq!(defaults.expert_partial_bf16_max_rows, 64);
         assert_eq!(cuteafd_core::SparkReplyFormat::resolve(None, true), cuteafd_core::SparkReplyFormat::Nvfp4);
-        assert!(args(&["--peers", PEERS, "--spark-reply-format", "fp8"]).is_ok());
-        assert!(args(&["--peers", PEERS, "--spark-reply-format", "bf16"]).is_ok());
+        assert!(args(&["--peers", PEERS, "--spark-prefill-reply-format", "fp8"]).is_ok());
+        assert!(args(&["--peers", PEERS, "--spark-prefill-reply-format", "bf16"]).is_ok());
         args(&["--peers", PEERS, "--expert-partial-bf16-max-rows", "4096"])?.validate()?;
         let single = args(&["--peers", PEERS, "--device", "1"])?;
         single.validate()?;

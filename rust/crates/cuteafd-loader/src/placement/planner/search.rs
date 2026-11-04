@@ -696,8 +696,11 @@ pub fn solve(
     let started = std::time::Instant::now();
     let mut contract = recipe.prepare(&request)?;
     contract.resident_weight_limit = request.resident_weight_limit;
-    if request.spark_reply_format.is_some()
-        && request.spark_reply_format != contract.spark_reply_format
+    let requested = request.spark_reply_formats;
+    let resolved = contract.spark_reply_formats;
+    if [(requested.prefill, resolved.and_then(|formats| formats.prefill)),
+        (requested.decode, resolved.and_then(|formats| formats.decode))]
+        .into_iter().any(|(requested, resolved)| requested.is_some() && requested != resolved)
     {
         return Err(Refusal::PinConflict);
     }

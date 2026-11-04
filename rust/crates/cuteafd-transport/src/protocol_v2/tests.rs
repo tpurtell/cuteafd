@@ -1779,7 +1779,7 @@ fn mapped_request_padding_aligns_odd_rows_and_sparse_routes() -> Result<()> {
 
 #[test]
 fn partial_reply_regions_ride_in_reserved_fields_and_round_trip() -> Result<()> {
-    let regions = vec![0, 0, 1, 1, 1, 0];
+    let regions = vec![0, 2, 1, 1, 2, 0];
     let plain = request(6, ExpertV2SourceKind::Prefill)?;
     let partial = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: regions.clone() })?;
     assert_ne!(partial.header.flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES, 0);
@@ -1809,14 +1809,14 @@ fn malformed_partial_region_data_is_refused() -> Result<()> {
     let plain = request(4, ExpertV2SourceKind::Decode)?;
     // Wrong bit count, a bit that is neither 0 nor 1, an unknown wide format.
     assert!(plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0; 3] }).is_err());
-    assert!(plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 2, 0, 0] }).is_err());
+    assert!(plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 3, 0, 0] }).is_err());
     let partial = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0; 4] })?;
     let mut bytes = Vec::new();
     partial.encode_into(&mut bytes)?;
     let header_len = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN;
     let mut corrupt = bytes.clone();
-    corrupt[header_len + 10] = 2;
-    assert!(ExpertProtocolV2Request::decode(&corrupt).is_err(), "region bit 2");
+    corrupt[header_len + 10] = 3;
+    assert!(ExpertProtocolV2Request::decode(&corrupt).is_err(), "region 3");
     let mut corrupt = bytes.clone();
     corrupt[46] = 3;
     assert!(ExpertProtocolV2Request::decode(&corrupt).is_err(), "wide format 3");
@@ -1897,15 +1897,38 @@ fn partial_reply_payload_is_two_aligned_regions_with_stride_zero() -> Result<()>
 }
 
 #[test]
+fn all_three_partial_regions_have_disjoint_aligned_extents() -> Result<()> {
+    for wide in [PartialWire::Fp8, PartialWire::Nvfp4] {
+        let plan = PartialReplyPlan { wide, regions: vec![2, 0, 1, 2, 0, 1] };
+        let layout = plan.layout(3, 32)?;
+        assert_eq!(layout.bytes, [384, 6 * wide.record_bytes(32), 6 * wide.other().record_bytes(32)]);
+        assert_eq!(layout.offsets[0], 0);
+        for i in 1..3 {
+            assert_eq!(layout.offsets[i] % 256, 0);
+            assert!(layout.offsets[i] >= layout.offsets[i - 1] + layout.bytes[i - 1]);
+        }
+        assert_eq!(layout.total, layout.offsets[2] + layout.bytes[2]);
+        let only_other = PartialReplyPlan { wide, regions: vec![2] }.layout(3, 32)?;
+        assert_eq!(only_other.offsets, [0; 3]);
+        assert_eq!(only_other.total, 3 * wide.other().record_bytes(32));
+        assert!(plan.layout(usize::MAX, 32).is_err());
+        assert!(plan.layout(1, usize::MAX - 31).is_err());
+        assert!(plan.layout(0, 32).is_err());
+        assert!(plan.layout(1, 16).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn request_view_reads_and_validates_partial_regions() -> Result<()> {
     let plain = request(5, ExpertV2SourceKind::Prefill)?;
-    let partial = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![1, 0, 1, 1, 0] })?;
+    let partial = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![1, 0, 2, 1, 0] })?;
     let mut bytes = Vec::new();
     partial.encode_into(&mut bytes)?;
     let view = ExpertProtocolV2RequestView::parse(&bytes)?;
     assert!(view.partial_replies());
     assert_eq!(view.partial_plan()?, partial.partial);
-    assert_eq!((0..5).map(|r| view.row_region(r).unwrap()).collect::<Vec<_>>(), [1, 0, 1, 1, 0]);
+    assert_eq!((0..5).map(|r| view.row_region(r).unwrap()).collect::<Vec<_>>(), [1, 0, 2, 1, 0]);
     // The zero-copy view refuses what the owned decode refuses.
     let header_len = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN;
     let mut corrupt = bytes.clone();

@@ -181,8 +181,10 @@ impl ProjectionLayout {
     }
     pub(crate) fn new(program:&DenseTrellisDispatch<'_>,rows:usize)->Result<Self> {
         let p=program.policy();p.validate_rows(rows)?;
-        let layout=ProjectionScratchLayout::new(p.input,p.output,rows)?;
-        let w=program.workspace();
+        Self::with_workspace(p.input,p.output,rows,program.workspace())
+    }
+    fn with_workspace(input:usize,output:usize,rows:usize,w:cuteafd_ffi::dense_trellis::DenseTrellisWorkspace)->Result<Self> {
+        let layout=ProjectionScratchLayout::new(input,output,rows)?;
         ensure!([("rotated",w.rotated),("table",w.pointer_table),("scales",w.block_scales),
             ("accumulator",w.accumulator)].iter()
             .all(|(name,bytes)|layout.extents.get(name)==Some(bytes))
@@ -253,6 +255,52 @@ fn validate_retained_partial(source: Buffer, destination: Buffer, count: usize) 
 #[cfg(test)]
 mod retained_tests {
     use super::*;
+
+    fn draft_head_capacities(input:usize,output:usize,compiled_rows:usize)->Result<()> {
+        use cuteafd_ffi::dense_trellis::DenseTrellisGeometry;
+        let geometry=|rows| DenseTrellisGeometry { input,output,bits:6,side:1,rows,
+            input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::F32 };
+        let target=geometry(64).workspace()?;
+        for rows in [8,16,64] {
+            ensure!(rows<=compiled_rows,"sealed package cannot serve draft head rows");
+            let own=geometry(rows).workspace()?;
+            let layout=ProjectionLayout::with_workspace(input,output,rows,own)?;
+            assert_eq!(layout.extents,ProjectionScratchLayout::new(input,output,rows)?.extents);
+            if rows!=64 {
+                assert!(ProjectionLayout::with_workspace(input,output,rows,target).is_err());
+                assert!(layout.bytes()?<ProjectionScratchLayout::new(input,output,64)?.bytes()?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn draft_head_program_capacity_matches_its_private_scratch()->Result<()> {
+        // Kimi sealed PROGRAMS.json: N163840/K7168, package capacity 4096.
+        draft_head_capacities(7168,163840,4096)
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_PROGRAM_MANIFEST pointing to the sealed Kimi package; CPU only"]
+    fn sealed_draft_head_program_capacity_matches_its_private_scratch()->Result<()> {
+        let manifest:serde_json::Value=serde_json::from_slice(&std::fs::read(
+            std::env::var_os("CUTEAFD_PROGRAM_MANIFEST").context("sealed manifest path")?)?)?;
+        let policies=manifest["families"]["dense_trellis_k6"]["row_policies"].as_array().context("row policies")?;
+        for policy in policies.iter().filter(|p|p["shape"]=="lm_head") {
+            let name=format!("dense_trellis_k6_{}",policy["native_program"].as_str().context("head program")?);
+            let program=manifest["programs"].as_array().context("programs")?.iter()
+                .find(|p|p["name"]==name).context("sealed head program missing")?;
+            let input=policy["input_features"].as_u64().context("head input")? as usize;
+            let output=policy["output_features"].as_u64().context("head output")? as usize;
+            let capacity=program["capacity_rows"].as_u64().context("head capacity")? as usize;
+            assert_eq!(program["scratch_bytes_at_capacity"]["partial"].as_u64(),
+                Some((capacity*input.div_ceil(1024)*output*4) as u64));
+            draft_head_capacities(input,output,capacity)?;
+        }
+        ensure!(policies.iter().any(|p|p["shape"]=="lm_head"),"sealed package has no head");
+        Ok(())
+    }
+
     #[test]
     fn narrowing_requires_distinct_full_typed_storage() {
         let source = Buffer { ptr: 0x1000usize as *mut c_void, bytes: 64, device_id: 0, flags: 0 };

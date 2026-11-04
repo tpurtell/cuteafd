@@ -29,10 +29,13 @@ fn parse_idle_park(text: &str) -> std::result::Result<f64, String> {
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
-    /// Spark prefill expert replies; decode/verify and <=64-row requests stay BF16.
-    /// Omission keeps BF16 combined replies and Muse's NVFP4 partial replies.
-    #[arg(long, global = true, env = "CUTEAFD_SPARK_REPLY_FORMAT")]
-    pub(crate) spark_reply_format: Option<cuteafd_core::SparkReplyFormat>,
+    /// Spark prefill expert replies. Explicit selections apply even to small units.
+    /// Omission keeps BF16 combined replies and Muse's split NVFP4 partial replies.
+    #[arg(long, global = true, env = "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT")]
+    pub(crate) spark_prefill_reply_format: Option<cuteafd_core::SparkReplyFormat>,
+    /// Spark decode and speculative verify replies (BF16 when omitted).
+    #[arg(long, global = true, env = "CUTEAFD_SPARK_DECODE_REPLY_FORMAT")]
+    pub(crate) spark_decode_reply_format: Option<cuteafd_core::SparkReplyFormat>,
     #[arg(long, global = true, env = "VISION")]
     pub(crate) vision: Option<cuteafd_loader::plan::MediaMode>,
     #[arg(long, global = true, env = "AUDIO")]
@@ -685,6 +688,24 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reply_phase_flags_are_independent_global_selections() {
+        use clap::Parser;
+        use cuteafd_core::SparkReplyFormat;
+        for prefill in ["bf16", "fp8", "nvfp4"] {
+            for decode in ["bf16", "fp8", "nvfp4"] {
+                for argv in [vec!["cuteafd", "--spark-prefill-reply-format", prefill,
+                        "--spark-decode-reply-format", decode, "plan", "/model"],
+                    vec!["cuteafd", "plan", "/model", "--spark-prefill-reply-format", prefill,
+                        "--spark-decode-reply-format", decode]] {
+                    let cli = super::Cli::try_parse_from(argv).unwrap();
+                    assert_eq!(cli.spark_prefill_reply_format, Some(prefill.parse::<SparkReplyFormat>().unwrap()));
+                    assert_eq!(cli.spark_decode_reply_format, Some(decode.parse::<SparkReplyFormat>().unwrap()));
+                }
+            }
+        }
+    }
+
     #[test]
     fn retained_draft_kv_defaults_to_fp8_and_preserves_explicit_bf16() {
         use clap::Parser;

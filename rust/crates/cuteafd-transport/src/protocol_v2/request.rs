@@ -26,13 +26,12 @@ use super::{
 };
 
 impl ExpertProtocolV2Request {
-    /// Select a combined reply only after every source row is known. Mixed
-    /// units fall back as a whole so decode and verify remain lossless.
-    pub fn select_combined_reply(&mut self, format: cuteafd_core::SparkReplyFormat)
+    /// Select one reply format from the complete unit phase, without splitting it.
+    pub fn select_combined_reply(&mut self, formats: cuteafd_core::spark_reply::SparkReplyFormats)
         -> Result<cuteafd_core::spark_reply::ReplyDecision> {
         anyhow::ensure!(self.header.flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0,
             "combined reply policy cannot replace a partial-region agreement");
-        let decision = format.combined(self.rows.iter().map(|row|
+        let decision = formats.combined(self.rows.iter().map(|row|
             (row.source_request_id, row.source_kind == super::ExpertV2SourceKind::Prefill)));
         self.header.flags &= !(super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
             | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3);
@@ -512,8 +511,8 @@ impl ExpertProtocolV2Request {
                 let row = decode_row_descriptor(bytes, offset)?;
                 let region = decode_row_region(bytes, offset)?;
                 if let Some(plan) = &mut partial {
-                    if region > 1 {
-                        bail!("ExpertProtocolV2 partial region bit {region} is neither 0 nor 1");
+                    if region > 2 {
+                        bail!("ExpertProtocolV2 partial region {region} is outside 0..=2");
                     }
                     plan.regions.push(region as u8);
                 } else if region != 0 {

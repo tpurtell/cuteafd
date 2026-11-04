@@ -624,8 +624,8 @@ fn host_transport_uses_resolved_small_and_large_card_slots_only() {
         let unit_rows = report.prefill_unit_rows.unwrap();
         let waves = report.prefill_waves.unwrap();
         let shape = crate::serving_capacity::prefill_waves::PrefillPlan { unit_rows, waves, span_rows: unit_rows * waves };
-        let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(opts.muse_partial_bf16_max_rows,
-            crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.resolved_spark_reply_format(true).into()).unwrap();
+        let cutoff = crate::families::muse_spark::replies::Cutoff::with_formats(opts.muse_partial_bf16_max_rows,
+            crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.spark_reply_formats).unwrap();
         let expected = crate::placement::families::muse_spark::host_transport(&cfg, shape, cutoff, slots as usize, 6).unwrap();
         let host = report.host_ledger.as_ref().unwrap();
         for (name, bytes) in [("transport/rdma-rings", expected.rings), ("transport/egress", expected.egress),

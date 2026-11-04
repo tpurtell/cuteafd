@@ -153,7 +153,7 @@ mod tests {
             capacity: 64, vocab: 33, device_sampling: true}, prefix};
         let exact = serving.allocations().unwrap();
         assert_eq!(exact.len(), 26);
-        let contract = Contract {resident_weight_limit: None, spark_reply_format: None, phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,page_rows: 64, maximum_pages: 16, gpus: 1,
+        let contract = Contract {resident_weight_limit: None, spark_reply_formats: None, phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,page_rows: 64, maximum_pages: 16, gpus: 1,
             variables: vec![Variable::Prefill(vec![PrefillShape {rows: 64, waves: 1}]), Variable::Lanes(vec![1])],
             requires: vec![], components: serving.components(16).unwrap()};
         for pages in [1, 8, 16] {

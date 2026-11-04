@@ -44,7 +44,7 @@ pub(crate) fn own_bytes(cfg: &MuseSparkConfig, rows: usize) -> usize { rows * cf
 /// The execution loader and push planner use the same admitted arena remainder.
 fn budgets(cfg: &MuseSparkConfig, placement: &Placement, gpus: usize, rows: usize) -> Result<Vec<usize>> {
     let own = own_bytes(cfg, rows);
-    let fixed = 2 * rows * 4 + CombineTables { capacity: rows }.bytes();
+    let fixed = 3 * rows * 4 + CombineTables { capacity: rows }.bytes();
     let peaks = match gpus {
         2 => placement.tp2.context("Muse onboarded pair without a TP2 arena")?.peak_bytes.to_vec(),
         1 => vec![placement.expert_ranges.first().context("Muse onboarded GPU without an expert arena")?.peak_bytes],
@@ -127,7 +127,7 @@ impl OnboardedExperts<'_> {
         -> Result<()> {
         if self.written.as_deref() == Some(planes) { return Ok(()); }
         let rows: Vec<u32> = (0..u32::try_from(self.layout.capacity)?).collect();
-        let image = self.layout.image(planes, &super::experts::ReplyPlanView { bf16_rows: &rows, wide_rows: &[], wide_at: 0 })?;
+        let image = self.layout.image(planes, &super::experts::ReplyPlanView { bf16_rows: &rows, wide_rows: &[], wide_at: 0, other_rows: &[], other_at: 0 })?;
         // SAFETY: this GPU's fixed tables; every combine that reads them follows on `stream`.
         unsafe { library.copy_h2d_ordered(self.tables.buffer, &image, stream)?; }
         self.written = Some(planes.to_vec());
@@ -153,10 +153,10 @@ mod tests {
         let layout = CombineTables { capacity: 64 };
         let planes = [0x1000u64, 0x9000];
         let all: Vec<u32> = (0..64).collect();
-        let cached = layout.image(&planes, &ReplyPlanView { bf16_rows: &all, wide_rows: &[], wide_at: 0 })?;
-        let [bf16_table, _, bf16_map, _] = layout.offsets();
+        let cached = layout.image(&planes, &ReplyPlanView { bf16_rows: &all, wide_rows: &[], wide_at: 0, other_rows: &[], other_at: 0 })?;
+        let [bf16_table, _, _, bf16_map, _, _] = layout.offsets();
         for rows in [1usize, 7, 64] {
-            let wave = layout.image(&planes, &ReplyPlanView { bf16_rows: &all[..rows], wide_rows: &[], wide_at: 0 })?;
+            let wave = layout.image(&planes, &ReplyPlanView { bf16_rows: &all[..rows], wide_rows: &[], wide_at: 0, other_rows: &[], other_at: 0 })?;
             assert_eq!(cached[bf16_table..bf16_table + 2 * 8], wave[bf16_table..bf16_table + 2 * 8]);
             assert_eq!(cached[bf16_map..bf16_map + rows * 4], wave[bf16_map..bf16_map + rows * 4]);
         }
@@ -170,7 +170,8 @@ mod tests {
         for rows in [1usize, 5, 64] {
             let plan = cuteafd_transport::PartialReplyPlan { wide: cuteafd_transport::PartialWire::Nvfp4,
                 regions: vec![0; rows] };
-            let (bf16, wide) = crate::shared::experts::exl3::partial::row_maps(&plan);
+            let [bf16, wide, other] = crate::shared::experts::exl3::partial::row_maps(&plan);
+            assert!(other.is_empty());
             assert_eq!(bf16, (0..rows as u32).collect::<Vec<_>>());
             assert!(wide.is_empty());
         }

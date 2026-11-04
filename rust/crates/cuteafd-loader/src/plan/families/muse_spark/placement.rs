@@ -96,7 +96,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         onboard: opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto),
         spark_budget_bytes: opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES).min(opts.spark_bytes),
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows,
-        partial_wide_format: opts.resolved_spark_reply_format(true).into(),
+        partial_reply_formats: opts.spark_reply_formats,
         local: match crate::placement::families::muse_spark::local_workspace(catalog,
             opts.workspace_manifest.as_deref().filter(|path| path.is_file()), gpus, prefill.unit_rows) {
             Ok(workspace) => workspace,
@@ -206,8 +206,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         spark_ranks: ranks, prefill_lanes: LANES };
     let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
     // serve-muse's cutoff: the same overrides, the same widest verify step.
-    let cutoff = match crate::families::muse_spark::replies::Cutoff::with_wide(opts.muse_partial_bf16_max_rows,
-        crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.resolved_spark_reply_format(true).into()) {
+    let cutoff = match crate::families::muse_spark::replies::Cutoff::with_formats(opts.muse_partial_bf16_max_rows,
+        crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.spark_reply_formats) {
         Ok(cutoff) => cutoff,
         Err(error) => {
             report.refuse_placement(format!("Muse partial-reply cutoff refused: {error:#}"), "Use a cutoff of at least 64 rows.");

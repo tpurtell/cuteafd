@@ -482,9 +482,8 @@ def cargo(source, root, args, env):
                        env.get('HF_HOME') or str(Path(env.get('HOME', str(Path.home()))) / '.cache/huggingface'))
     skipped_full = [] if full else list(FULL_TESTS)
     skipped_live = list(LIVE_PLANNERS) if args.skip_live_planners else []
-    if full:
-        skipped_live.extend(list(INSTALLED_PLANNERS) if args.skip_live_planners else installed_planner_skips(source, env))
-    skipped = list(dict.fromkeys(skipped_full + skipped_live))
+    skipped_installed = (list(INSTALLED_PLANNERS) if args.skip_live_planners else installed_planner_skips(source, env)) if full else []
+    skipped = list(dict.fromkeys(skipped_full + skipped_live + skipped_installed))
     skips = [flag for name in skipped for flag in ('--skip', name)]
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
     if skips:
@@ -549,7 +548,8 @@ def cargo(source, root, args, env):
             test_s += seconds
     result.update(exit=code, test_s=round(test_s), log=str(test_log), passed=passed, failed=failed, ignored=ignored,
                   binaries=len(totals), failing=ids, full=full,
-                  skipped_full_tests=skipped_full, skipped_live_planners=skipped_live)
+                  skipped_full_tests=skipped_full, skipped_live_planners=skipped_live,
+                  skipped_installed_planners=skipped_installed)
     if code == 124:
         result.update(status='failed', error=f'timed out after {args.cargo_timeout} s')
     elif passed == 0:
@@ -558,6 +558,10 @@ def cargo(source, root, args, env):
         result.update(status='failed', error=f'{failed} failed' + ('' if failed or ids else f' (exit {code}, no failing ids parsed)'))
     else:
         result['status'] = 'pass'
+    if result['status'] == 'failed' and set(ids).intersection(LIVE_PLANNERS):
+        reasons = sorted(set(re.findall(r'stale V4 placement inputs:[^\n]*?regenerate inputs', text)))
+        if reasons:
+            result['error'] += '; ' + '; '.join(reasons)
     return result
 
 
@@ -691,6 +695,8 @@ def render(record):
         note = suite.get('error', '')
         if suite.get('skipped_live_planners'):
             note = (note + '; ' if note else '') + 'live V4 planner tests skipped (--skip-live-planners)'
+        if suite.get('skipped_installed_planners'):
+            note = (note + '; ' if note else '') + 'installed-checkpoint planner tests skipped: ' + ', '.join(suite['skipped_installed_planners'])
         if suite.get('skipped_full_tests'):
             note = (note + '; ' if note else '') + f"default tier: {len(suite['skipped_full_tests'])} full tests excluded; not a merge/release gate"
         elif suite.get('full'):

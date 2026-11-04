@@ -1114,7 +1114,7 @@ impl<'a> MimoEngine<'a> {
             let ledger = cuteafd_ffi::memory_ledger::snapshot();
             for (rank, gpu) in [self.device, device].into_iter().enumerate() {
                 let planned = cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-                    &self.cfg, 2, rank, rows, prefill_lanes, 0, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?.iter().map(|r| r.bytes).sum::<u64>();
+                    &self.cfg, 2, rank, rows, prefill_lanes, 0, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false))?.iter().map(|r| r.bytes).sum::<u64>();
                 let actual = ledger.by_owner(cuteafd_ffi::memory_ledger::Space::Device, gpu)
                     .get("mimo/transport/peer").copied().unwrap_or(0) as u64;
                 let diagnostics = if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1") {

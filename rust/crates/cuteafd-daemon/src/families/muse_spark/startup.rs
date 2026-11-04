@@ -50,7 +50,7 @@ pub(crate) struct Options<'a> {
     pub onboard: Onboard,
     pub spark_budget_bytes: u64,
     pub partial_bf16_max_rows: usize,
-    pub partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat,
+    pub partial_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     /// The coordinator EXL3 package state (`shared::local_workspace`).
     pub local: shared::LocalPackage,
     /// The DFlash2 drafter's charge (`shared::drafter_inventory`), when one serves.
@@ -82,7 +82,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
         mark_slots: options.mark_slots, context,
         automatic_context: options.max_context.is_none(), requested_pool: options.pool_tokens,
         onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes,
-        partial_bf16_max_rows: options.partial_bf16_max_rows, partial_wide_format: options.partial_wide_format,
+        partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
         local: options.local, drafter: options.drafter, fixed, startup: Vec::new() })?;
     if let Some(media) = &options.media { built.admit_media(media)?; }
     let placed = built.admitted_placement()?;
@@ -134,6 +134,7 @@ mod tests {
     fn plan_equals_serve_admission_for_every_override() -> Result<()> {
         use cuteafd_loader::families::muse_spark::replies::{Cutoff, WideFormat, DEFAULT_BF16_MAX_ROWS};
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        use cuteafd_core::{spark_reply::SparkReplyFormats, SparkReplyFormat::{Bf16, Fp8, Nvfp4}};
         let dir = tempfile::tempdir()?;
         testing::write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
         let input = testing::BudgetedPlanInput::open(dir.path())?;
@@ -145,14 +146,22 @@ mod tests {
         let image = dir.path().join("image");
         let path = testing::write_muse_exl3_capacities(&image);
         std::fs::write(&path, serde_json::to_vec(&manifest(gpus))?)?;
-        let cases = [(DEFAULT_BF16_MAX_ROWS, WideFormat::Nvfp4, None, Qwen4KvCache::Fp8),
+        let mut cases = [(DEFAULT_BF16_MAX_ROWS, WideFormat::Nvfp4, None, Qwen4KvCache::Fp8),
             (128, WideFormat::Nvfp4, None, Qwen4KvCache::Fp8), (512, WideFormat::Fp8, None, Qwen4KvCache::Fp8),
             (DEFAULT_BF16_MAX_ROWS, WideFormat::Fp8, Some("radixark.json"), Qwen4KvCache::Fp8),
             (DEFAULT_BF16_MAX_ROWS, WideFormat::Nvfp4, Some("radixark.json"), Qwen4KvCache::Bf16),
-            (128, WideFormat::Nvfp4, Some("nvidia.json"), Qwen4KvCache::Fp8)];
+            (128, WideFormat::Nvfp4, Some("nvidia.json"), Qwen4KvCache::Fp8)]
+            .into_iter().map(|(rows, wide, draft, kv)| (rows, SparkReplyFormats {
+                prefill: Some(match wide { WideFormat::Bf16 => Bf16, WideFormat::Fp8 => Fp8, WideFormat::Nvfp4 => Nvfp4 }),
+                decode: None }, draft, kv)).collect::<Vec<_>>();
+        for prefill in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
+            for decode in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
+                cases.push((DEFAULT_BF16_MAX_ROWS, SparkReplyFormats { prefill, decode }, None, Qwen4KvCache::Fp8));
+            }
+        }
         let mut host_rings = std::collections::BTreeSet::new();
-        for (cutoff_rows, wide, drafter, draft_kv) in cases {
-            let label = format!("cutoff {cutoff_rows} {wide:?} drafter {drafter:?} {draft_kv:?}");
+        for (cutoff_rows, formats, drafter, draft_kv) in cases {
+            let label = format!("cutoff {cutoff_rows} {formats:?} drafter {drafter:?} {draft_kv:?}");
             let snapshot = drafter.map(|name| -> Result<_> {
                 let dir = tempfile::tempdir()?;
                 std::fs::copy(drafters.join(name), dir.path().join("config.json"))?;
@@ -160,7 +169,7 @@ mod tests {
             }).transpose()?;
             let opts = LayoutOptions { host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
                 head_split: true, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
-                muse_partial_bf16_max_rows: cutoff_rows, spark_reply_format: Some(match wide { WideFormat::Bf16 => cuteafd_core::SparkReplyFormat::Bf16, WideFormat::Fp8 => cuteafd_core::SparkReplyFormat::Fp8, WideFormat::Nvfp4 => cuteafd_core::SparkReplyFormat::Nvfp4 }), draft_kv_cache: draft_kv,
+                muse_partial_bf16_max_rows: cutoff_rows, spark_reply_formats: formats, draft_kv_cache: draft_kv,
                 muse_drafter_snapshot: snapshot.as_ref().map(|d| d.path().to_path_buf()), ..Default::default() };
             let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
                 layout: Some(opts.clone()), ..Default::default() })?;
@@ -168,7 +177,7 @@ mod tests {
             let descriptor = cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::muse_spark::MUSE_SPARK);
             let prefill = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(sparks, descriptor, Default::default())?;
             // serve-muse's own derivations from the same flags.
-            let cutoff = Cutoff::with_wide(cutoff_rows, DEFAULT_BF16_MAX_ROWS, wide)?;
+            let cutoff = Cutoff::with_formats(cutoff_rows, DEFAULT_BF16_MAX_ROWS, opts.spark_reply_formats)?;
             let served_drafter = snapshot.as_ref().map(|d| -> Result<_> {
                 let config: serde_json::Value = serde_json::from_slice(&std::fs::read(d.path().join("config.json"))?)?;
                 let sms = cuteafd_loader::placement::ArchContext::for_device("sm_120", total).sms;
@@ -185,7 +194,7 @@ mod tests {
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
                 max_context: None, pool_tokens: None, onboard: Onboard::Auto,
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
-                partial_bf16_max_rows: cutoff_rows, partial_wide_format: wide,
+                partial_bf16_max_rows: cutoff_rows, partial_reply_formats: formats,
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: served_drafter, media: None })?;
             // Coordinator ledgers, item by item (then the whole placement).
@@ -207,7 +216,7 @@ mod tests {
             assert_eq!((bytes("transport/rdma-rings"), bytes("transport/egress"), bytes("spark-intake")),
                 (host.rings, host.egress, host.intake), "{label}");
             assert!(host.rings > 0 && host.egress > 0 && host.intake > 0, "{label}");
-            host_rings.insert((cutoff_rows, format!("{wide:?}"), host.rings));
+            host_rings.insert((cutoff_rows, format!("{formats:?}"), host.rings));
         }
         // The overrides move the transport (they are not ignored by either side).
         assert!(host_rings.iter().map(|(_, _, rings)| rings).collect::<std::collections::BTreeSet<_>>().len() > 1);
@@ -261,7 +270,7 @@ mod tests {
                 pool_tokens: None, onboard: Onboard::Auto,
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                 partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-                partial_wide_format: Default::default(),
+                partial_reply_formats: Default::default(),
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
                     cuteafd_loader::plan::MediaMode::Auto, cuteafd_loader::plan::MediaMode::Off, 1)?) })?;
@@ -304,7 +313,7 @@ mod tests {
                     max_context: None, pool_tokens: None, onboard: Onboard::Auto,
                     spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                     partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-                    partial_wide_format: Default::default(), local, drafter: None,
+                    partial_reply_formats: Default::default(), local, drafter: None,
                     media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
                         cuteafd_loader::plan::MediaMode::Auto, cuteafd_loader::plan::MediaMode::Off, 1)?)
                 }).err().expect("missing package refuses").to_string();
@@ -376,7 +385,7 @@ mod tests {
                 shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
             max_context: None, pool_tokens: None, onboard: Onboard::Auto,
             spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
-            partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_wide_format: opts.resolved_spark_reply_format(true).into(),
+            partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
             local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
             drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint, vision, audio, replicas)?) })?;
         assert_eq!(&live, planned);

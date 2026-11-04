@@ -147,6 +147,9 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
   Kernel changes go to `~/Developer/sparkinfer-glmrt` master, quantizer changes to
   `~/Developer/GPTQModel` main; push there first, then bump pin and lock here.
+  A fork or export-source bump regenerates and publishes V4 placement inputs
+  at the merged dev SHA, validated beforehand through
+  `CUTEAFD_V4_PLACEMENT_INPUTS` without switching `current`.
   Dev images are toolchain-only and pin-independent: a SparkInfer bump
   needs only a new WIP slot build. Rebuild them with
   `scripts/build/build-dev-images.sh` only when the toolchain changes;

@@ -250,8 +250,8 @@ mod tests {
             for (sources, eligible) in [
                 (vec![(2752, Prefill)], true),
                 (vec![(65, Prefill)], true),
-                (vec![(64, Prefill)], false),
-                (vec![(65, Prefill), (64, Prefill)], false),
+                (vec![(64, Prefill)], true),
+                (vec![(65, Prefill), (64, Prefill)], true),
                 (vec![(65, Prefill), (1, Decode)], false),
                 (vec![(65, Prefill), (1, MtpVerify)], false),
             ] {
@@ -270,7 +270,7 @@ mod tests {
                     bytes::Bytes::from(vec![0; rows * geometry.row_bytes() as usize]))?;
                 request.header.flags |= crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
                 let format = if eligible { selected } else { Bf16 };
-                assert_eq!(request.select_combined_reply(selected)?.format, format);
+                assert_eq!(request.select_combined_reply(cuteafd_core::spark_reply::SparkReplyFormats { prefill: Some(selected), decode: None })?.format, format);
                 let encoded = request.encode()?;
                 let worker = crate::expert::BackboneRequest::parse(&encoded, 2752)?;
                 assert!(spark_layers.contains(&worker.layer()) && !onboarded.contains(&worker.layer()));

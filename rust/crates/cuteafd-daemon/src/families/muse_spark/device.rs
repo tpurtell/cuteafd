@@ -401,7 +401,7 @@ impl RankDevice<'_, '_> {
         layout: super::experts::CombineTables,
         plan: &cuteafd_loader::families::muse_spark::replies::ReplyPlan) -> Result<()> {
         ensure!((1..=super::experts::MAX_RANKS).contains(&ranks) && tables.bytes >= layout.bytes()
-            && plan.bf16_rows.len() + plan.wide_rows.len() == rows, "Muse combine geometry");
+            && plan.rows() == rows, "Muse combine geometry");
         let norm = self.weights(layer)?.buffer("moe.post_expert_norm")?;
         let (weights, out) = (self.lane.rows("route_weights", rows)?, self.lane.rows("combined", rows)?);
         for (stem, table, map, region) in super::experts::combine_plan(layout, plan) {
@@ -512,7 +512,7 @@ impl RankDevice<'_, '_> {
         };
         onboarded.tables_for(self.library, &planes, self.stream)?;
         let reply = cuteafd_loader::families::muse_spark::replies::ReplyPlan { bf16_rows: (0..rows as u32).collect(),
-            wide_rows: Vec::new(), wide: cuteafd_loader::families::muse_spark::replies::PartialFormat::Nvfp4 };
+            wide_rows: Vec::new(), other_rows: Vec::new(), wide: cuteafd_loader::families::muse_spark::replies::PartialFormat::Nvfp4 };
         self.combine(layer, rows, planes.len(), onboarded.tables.buffer, onboarded.layout, &reply)?;
         self.trace(step, layer, &[("combined", self.cfg.expert_hidden * 2)])?;
         match peer {
