@@ -56,6 +56,29 @@ cuteafd_status_t ok() {
   return CUTEAFD_STATUS_OK;
 }
 
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+// Host memory takes relaxed ordering where the device supports it, letting the
+// NIC reorder its own PCIe accesses to this region instead of holding them in
+// order; the GPU dma-buf MR already registers this way. Some devices/providers
+// reject the flag, so fall back to ordered registration and say so once rather
+// than failing the run.
+ibv_mr* register_host_mr(ibv_pd* pd, void* ptr, size_t bytes, int access) {
+  ibv_mr* mr = ibv_reg_mr(pd, ptr, bytes, access | IBV_ACCESS_RELAXED_ORDERING);
+  if (mr != nullptr) {
+    return mr;
+  }
+  const int relaxed_errno = errno;
+  static std::atomic<bool> warned{false};
+  if (!warned.exchange(true)) {
+    std::fprintf(stderr,
+                 "warning: ibv_reg_mr with IBV_ACCESS_RELAXED_ORDERING failed (%s); "
+                 "using ordered host registration\n",
+                 relaxed_errno != 0 ? std::strerror(relaxed_errno) : "no errno");
+  }
+  return ibv_reg_mr(pd, ptr, bytes, access);
+}
+#endif
+
 cuteafd_status_t write_c_string(const std::string& value, char* out, size_t out_len) {
   if (out == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "output buffer is null");
@@ -2785,12 +2808,12 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(
     recv_buffer[idx] = 0;
   }
 
-  send_mr = ibv_reg_mr(pd, send_buffer, bytes, IBV_ACCESS_LOCAL_WRITE);
+  send_mr = register_host_mr(pd, send_buffer, bytes, IBV_ACCESS_LOCAL_WRITE);
   if (send_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr sender failed");
   }
-  recv_mr = ibv_reg_mr(pd, recv_buffer, bytes, IBV_ACCESS_LOCAL_WRITE);
+  recv_mr = register_host_mr(pd, recv_buffer, bytes, IBV_ACCESS_LOCAL_WRITE);
   if (recv_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr receiver failed");
@@ -3092,28 +3115,28 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
   std::memset(client_response_recv_buffer, 0, response_bytes);
 
   client_request_send_mr =
-      ibv_reg_mr(pd, client_request_send_buffer, request_bytes, IBV_ACCESS_LOCAL_WRITE);
+      register_host_mr(pd, client_request_send_buffer, request_bytes, IBV_ACCESS_LOCAL_WRITE);
   if (client_request_send_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                 "ibv_reg_mr client request send failed for ProtocolV2 loopback probe");
   }
   server_request_recv_mr =
-      ibv_reg_mr(pd, server_request_recv_buffer, request_bytes, IBV_ACCESS_LOCAL_WRITE);
+      register_host_mr(pd, server_request_recv_buffer, request_bytes, IBV_ACCESS_LOCAL_WRITE);
   if (server_request_recv_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                 "ibv_reg_mr server request recv failed for ProtocolV2 loopback probe");
   }
   server_response_send_mr =
-      ibv_reg_mr(pd, server_response_send_buffer, response_bytes, IBV_ACCESS_LOCAL_WRITE);
+      register_host_mr(pd, server_response_send_buffer, response_bytes, IBV_ACCESS_LOCAL_WRITE);
   if (server_response_send_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                 "ibv_reg_mr server response send failed for ProtocolV2 loopback probe");
   }
   client_response_recv_mr =
-      ibv_reg_mr(pd, client_response_recv_buffer, response_bytes, IBV_ACCESS_LOCAL_WRITE);
+      register_host_mr(pd, client_response_recv_buffer, response_bytes, IBV_ACCESS_LOCAL_WRITE);
   if (client_response_recv_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
@@ -3483,15 +3506,15 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
   std::memset(endpoint->recv_buffer, 0, recv_registered_span_bytes);
 
   endpoint->send_mr =
-      ibv_reg_mr(endpoint->pd, endpoint->send_buffer, send_registered_span_bytes,
-                 IBV_ACCESS_LOCAL_WRITE);
+      register_host_mr(endpoint->pd, endpoint->send_buffer, send_registered_span_bytes,
+                       IBV_ACCESS_LOCAL_WRITE);
   if (endpoint->send_mr == nullptr) {
     destroy_rdma_rc_endpoint(endpoint);
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr send buffer failed for RC endpoint");
   }
   endpoint->recv_mr =
-      ibv_reg_mr(endpoint->pd, endpoint->recv_buffer, recv_registered_span_bytes,
-                 IBV_ACCESS_LOCAL_WRITE);
+      register_host_mr(endpoint->pd, endpoint->recv_buffer, recv_registered_span_bytes,
+                       IBV_ACCESS_LOCAL_WRITE);
   if (endpoint->recv_mr == nullptr) {
     destroy_rdma_rc_endpoint(endpoint);
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr recv buffer failed for RC endpoint");
@@ -3646,8 +3669,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_expose_send_read(void* hand
     ibv_dereg_mr(endpoint->read_mr);
     endpoint->read_mr = nullptr;
   }
-  endpoint->read_mr = ibv_reg_mr(endpoint->pd, endpoint->send_buffer, bytes,
-                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+  endpoint->read_mr = register_host_mr(endpoint->pd, endpoint->send_buffer, bytes,
+                                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
   if (endpoint->read_mr == nullptr) {
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                 "ibv_reg_mr failed for the RC endpoint read exposure");
@@ -4051,8 +4074,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
   for (size_t index = 0; index < frame; ++index) {
     send[index] = static_cast<unsigned char>(index * 131 + 7);
   }
-  send_mr = ibv_reg_mr(pd, send, frame, IBV_ACCESS_LOCAL_WRITE);
-  recv_mr = ibv_reg_mr(pd, recv, frame, IBV_ACCESS_LOCAL_WRITE);
+  send_mr = register_host_mr(pd, send, frame, IBV_ACCESS_LOCAL_WRITE);
+  recv_mr = register_host_mr(pd, recv, frame, IBV_ACCESS_LOCAL_WRITE);
   ibv_qp_init_attr qp_attr = {};
   qp_attr.send_cq = cq;
   qp_attr.recv_cq = cq;
@@ -4665,7 +4688,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handl
   if (endpoint->regions.size() >= 64) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint has 64 regions already");
   }
-  ibv_mr* mr = ibv_reg_mr(endpoint->pd, ptr, bytes, IBV_ACCESS_LOCAL_WRITE);
+  ibv_mr* mr = register_host_mr(endpoint->pd, ptr, bytes, IBV_ACCESS_LOCAL_WRITE);
   if (mr == nullptr) {
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr failed for RC endpoint region");
   }
