@@ -351,6 +351,9 @@ pub struct PlanOptions {
     /// Weight bytes the coordinator GPU may hold (its own tensors, plus every
     /// routed expert in the local-only placement).
     pub coordinator_budget_bytes: u64,
+    /// Per-GPU storage ceiling for admission without a complete memory layout;
+    /// independent of the resident-weight cap above.
+    pub coordinator_gpu_budget_bytes: u64,
     /// Also lay out every device's memory (`plan --layout`).
     pub layout: Option<layout::LayoutOptions>,
 }
@@ -368,6 +371,7 @@ impl Default for PlanOptions {
             placement: ExpertPlacement::Sparks { ranks: 6 },
             spark_budget_bytes: None,
             coordinator_budget_bytes: 80 << 30,
+            coordinator_gpu_budget_bytes: crate::placement::inventory::PRO_TOTAL_BYTES,
             layout: None,
         }
     }
@@ -398,7 +402,11 @@ impl PlanOptions {
                 });
             }
         }
-        for (option, bytes) in [("Spark budget", self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)), ("coordinator budget", self.coordinator_budget_bytes)] {
+        for (option, bytes) in [
+            ("Spark budget", self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)),
+            ("coordinator weight budget", self.coordinator_budget_bytes),
+            ("coordinator GPU budget", self.coordinator_gpu_budget_bytes),
+        ] {
             if bytes == 0 {
                 return Err(PlanError::InvalidOption { option, reason: "must be positive".into() });
             }
@@ -1195,7 +1203,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     }
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
-        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
+        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_gpu_budget_bytes], spark_bytes: options.spark_budget(),
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };

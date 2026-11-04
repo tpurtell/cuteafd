@@ -61,6 +61,38 @@ fn global_resident_weight_flag_reaches_plan_admission() {
 }
 
 #[test]
+fn global_gpu_storage_flag_reaches_inventory_and_full_layout_admission() {
+    use cuteafd_loader::plan::testing;
+    let snapshot = tempfile::tempdir().unwrap();
+    testing::write_snapshot(snapshot.path(), &testing::mimo_flash_config(),
+        &testing::mimo_flash_tensors(), Some(1));
+    for layout in [false, true] {
+        for (gib, accepted) in [("95.5", true), ("2", false)] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
+            command.args(["--coordinator-gpu-budget-gib", gib,
+                "--coordinator-weight-budget-gib", "80", "plan"]).arg(snapshot.path())
+                .args(["--spark-ranks", "4", "--spark-budget-gib", "100", "--speculator", "off",
+                    "--context-tokens", "262144", "--concurrency", "8", "--prefill-rows", "2048",
+                    "--prefill-waves", "2", "--vision", "off", "--audio", "off", "--json", "--require-ready"]);
+            if layout { command.args(["--layout", "--rtx", "2"]); }
+            let output = command.env_remove("COORDINATOR_GPU_BUDGET_GIB")
+                .env("HF_HOME", snapshot.path()).output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|error| panic!("invalid plan JSON: {error}; {stderr}"));
+            assert_eq!(output.status.success(), accepted, "layout={layout}, {gib} GiB: {stderr}; {report}");
+            assert_eq!(report["placement_supported"], accepted, "{report}");
+            assert_eq!(report["memory_layout"].is_object(), layout, "{report}");
+            if !accepted {
+                assert!(stderr.contains("is not servable"), "{stderr}");
+                assert!(report["hints"].as_array().unwrap().iter().any(|h| h["what"].as_str()
+                    .is_some_and(|h| h.contains("MiMo placement") && (h.contains("mandatory") || h.contains("pool")))), "{report}");
+            }
+        }
+    }
+}
+
+#[test]
 fn plan_json_keeps_info_tracing_on_stderr() {
     let snapshot = tempfile::tempdir().unwrap();
     std::fs::write(snapshot.path().join("config.json"), br#"{"model_type":"unknown"}"#).unwrap();
