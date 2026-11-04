@@ -317,7 +317,10 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         layers,
         pool_overhead,
         fixed,
-        startup: Vec::new(),
+        // All dense destinations remain alive while transforms replay. Separate
+        // entries would check each allocation alone, not their simultaneous peak.
+        startup: inputs.weights.startup.device_phases(gpus)
+            .map_err(|_| PlacementError::Overflow("V4 dense loading phase"))?,
         movables,
         expert_workspace: inputs.expert_workspace,
         tp2_workspace,
@@ -395,7 +398,7 @@ mod default_tests {
         resident_weight_limit: None,
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
                     cfg: &cfg, weights: crate::families::deepseek_v4::resident::WeightInventory {
-                        c4_attention: Vec::new(), fixed: Vec::new() },
+                        c4_attention: Vec::new(), fixed: Vec::new(), startup: Default::default() },
                     cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned {
                         context_bytes: 0, loaded_bytes: 0 }); gpus], headroom_floor: 0,
                     spark_ranks: 6, sequences: 16, prefill_rows: 2752, prefill_waves: 3,
