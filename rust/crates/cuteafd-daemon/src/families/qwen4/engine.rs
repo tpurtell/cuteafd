@@ -210,34 +210,34 @@ impl LocalExl3<'_> {
     }
     /// Pushes the first window (layers from 0, and the MTP stage) in a push
     /// group of this GPU alone, as the first [`Self::ensure`] would load it
-    /// through the mount; on any fallback the window stays lazy and later
-    /// windows always reload through the mount. Returns whether it committed.
+    /// through the mount. Non-namespace windows stay lazy; a Required push
+    /// failure refuses startup. Later windows reload through the mount.
     pub(super) fn push_window(&self, snapshot: &std::path::Path, device: i32) -> Result<bool> {
         if self.resident.borrow().is_some() { return Ok(true); }
-        let backbone: Vec<_> = (0..self.window.min(self.layers)).collect();
-        let Some((selections, weights_budget)) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
-            &self.native_lib, self.catalog, usize::from(self.mtp), &backbone, self.max_rows, self.budget)?
-            else { return Ok(false) };
-        if selections.is_empty() { return Ok(false); }
-        let selected_layers = selections.iter().filter_map(|s| match s {
-            crate::shared::experts::layer::ExpertLayer::BackboneFull { layer } => Some(*layer), _ => None,
-        }).collect::<Vec<_>>();
-        self.admit_weights(&selected_layers)?;
+        use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy, WholeOwner};
+        let policy = PushPolicy::for_snapshot(snapshot)?;
         let started = std::time::Instant::now();
-        let experts = crate::shared::experts::rtx::push::CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
-            selections: selections.clone(), budget: weights_budget }] };
-        let push = match crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(snapshot, Some(self.catalog), 1,
-            Some(experts)) {
-            Ok(push) => push,
-            Err(error) => {
-                tracing::warn!(%error, "Qwen EXL3 expert window push unavailable; it loads through the mount");
-                return Ok(false);
-            }
-        };
+        let planned = policy.plan(|| {
+            let backbone: Vec<_> = (0..self.window.min(self.layers)).collect();
+            let (selections, weights_budget) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
+                &self.native_lib, self.catalog, usize::from(self.mtp), &backbone, self.max_rows, self.budget)?
+                .context("Qwen EXL3 expert window lacks a pushable package")?;
+            anyhow::ensure!(!selections.is_empty(), "Qwen EXL3 expert window has no selected layers");
+            let selected_layers = selections.iter().filter_map(|s| match s {
+                crate::shared::experts::layer::ExpertLayer::BackboneFull { layer } => Some(*layer), _ => None,
+            }).collect::<Vec<_>>();
+            self.admit_weights(&selected_layers)?;
+            let experts = CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
+                selections: selections.clone(), budget: weights_budget }] };
+            let push = CoordinatorPush::prepare_alone(snapshot, Some(self.catalog), 1, Some(experts))?;
+            Ok((push, selections))
+        }).context("Qwen EXL3 expert window push planning")?;
+        let Some((push, selections)) = planned else { return Ok(false) };
         let devices = vec![crate::shared::memory::device::Device { library: self.library, id: device }];
         let (pushed, ()) = push.receive_with::<crate::shared::experts::rtx::push::NoDense, _>(devices, Some(self.catalog),
             0, None, || ());
-        let Some(mut ranks) = pushed? else { return Ok(false) };
+        let mut ranks = policy.committed(pushed).context("Qwen EXL3 expert window push delivery")?
+            .context("Qwen required EXL3 expert window payload")?;
         let weights = ranks.pop().context("one coordinator rank")?.exl3()?;
         let local = crate::families::deepseek_v4::local::LocalExperts::from_exl3_weights(self.library, &self.native_lib,
             self.catalog, &selections, weights, self.max_rows)?.context("pushed EXL3 expert window")?;
