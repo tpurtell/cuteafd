@@ -412,6 +412,28 @@ mod tests {
     }
 
     #[test]
+    fn startup_keeps_host_owners_out_of_gpu_and_sums_retained_weights_with_scratch() {
+        use crate::shared::dense_read::STEP_BYTES;
+        let (cfg, tensors) = fixture();
+        for ranks in [1, 2] {
+            for dspark in [false, true] {
+                let weights = WeightInventory::from_headers(&cfg, ranks, dspark, &tensors).unwrap();
+                let modes = vec![if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } }
+                    else { LayerMode::HeadSplit }; cfg.n_layers];
+                let resident = weights.loaded_bytes(&modes, ranks).unwrap();
+                let phases = weights.startup.device_phases(ranks).unwrap();
+                assert_eq!(phases.len(), ranks);
+                for rank in 0..ranks {
+                    assert_eq!(phases[rank].bytes, resident[rank] + STEP_BYTES as u64);
+                }
+                assert_eq!(weights.startup.host.iter().filter(|item| item.name == "weight-push").count(), ranks);
+                assert!(weights.startup.host_bytes().unwrap() >= ranks as u64 * 128 * 1024 * 1024);
+                assert!(weights.startup.host.iter().any(|item| item.name == "staging/coordinator-dense-status" && item.bytes == 4));
+            }
+        }
+    }
+
+    #[test]
     fn inventory_rejects_aggregate_weight_overflow() {
         let (cfg, mut tensors) = fixture();
         tensors.iter_mut().find(|t| t.name == "layers.1.hc_attn_fn").unwrap().byte_length = u64::MAX - 1024;
@@ -449,6 +471,84 @@ mod tests {
 pub struct WeightInventory {
     pub c4_attention: Vec<ModeBytes>,
     pub fixed: Vec<crate::placement::Demand>,
+    pub startup: StartupInventory,
+}
+
+/// Loading-only owners; host mappings must never consume the GPU budget.
+#[derive(Debug, Clone, Default)]
+pub struct StartupInventory {
+    pub device: Vec<StartupItem>,
+    pub host: Vec<StartupItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupItem {
+    pub rank: usize,
+    pub name: &'static str,
+    pub bytes: u64,
+}
+
+impl StartupInventory {
+    fn from_operands(operands: &[ResidentOperand], ranks: usize) -> Result<Self> {
+        let mut inventory = Self::default();
+        for rank in 0..ranks {
+            let mut retained = 0u64;
+            let mut staged = 0u64;
+            let mut scratch = 0;
+            let mut status = 0;
+            for item in operands.iter().filter(|item| item.rank == rank) {
+                // Embedding is already subtracted from the admission baseline.
+                if item.group != "embedding" {
+                    retained = retained.checked_add(item.bytes).context("V4 startup weights overflow")?;
+                }
+                let source = if item.format == "fp8-mma-scale" {
+                    scratch = crate::shared::dense_read::STEP_BYTES as u64;
+                    item.bytes / 512
+                } else if item.operand == "gate.tid2eid" {
+                    status = 4;
+                    item.bytes.checked_mul(2).context("V4 startup IDs overflow")?
+                } else { 0 };
+                staged = staged.checked_add(source).context("V4 startup staging overflow")?;
+            }
+            inventory.device.extend([
+                StartupItem { rank, name: "weights/coordinator-dense", bytes: retained },
+                StartupItem { rank, name: "staging/coordinator-dense-device", bytes: scratch },
+            ]);
+            inventory.host.extend([
+                StartupItem { rank, name: "staging/coordinator-dense", bytes: staged },
+                StartupItem { rank, name: "staging/coordinator-dense-status", bytes: status },
+                StartupItem { rank, name: "weight-push", bytes:
+                    (cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES) as u64 },
+            ]);
+        }
+        Ok(inventory)
+    }
+
+    pub fn device_bytes(&self, rank: usize) -> Result<u64> {
+        self.device.iter().filter(|item| item.rank == rank).try_fold(0u64, |sum, item|
+            sum.checked_add(item.bytes).context("V4 startup device overflow"))
+    }
+
+    pub fn device_phases(&self, ranks: usize) -> Result<Vec<crate::placement::Demand>> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        (0..ranks).map(|rank| Ok(crate::placement::Demand::new(rank as u8, Category::Weights,
+            "V4 coordinator dense loading", self.device_bytes(rank)?, Basis::Exact))).collect()
+    }
+
+    pub fn host_bytes(&self) -> Result<u64> {
+        self.host.iter().try_fold(0u64, |sum, item|
+            sum.checked_add(item.bytes).context("V4 startup host overflow"))
+    }
+
+    pub fn notes(&self) -> Result<Vec<String>> {
+        let mut notes = self.device.iter().map(|item| format!(
+            "V4 startup device rtx{} {}: {} bytes (loading only)", item.rank, item.name, item.bytes))
+            .chain(self.host.iter().map(|item| format!(
+                "V4 startup host rank{} {}: {} bytes (loading only)", item.rank, item.name, item.bytes)))
+            .collect::<Vec<_>>();
+        notes.push(format!("V4 startup host bound: {} bytes; conservative staged source footprint, exact physical extents admitted at receive", self.host_bytes()?));
+        Ok(notes)
+    }
 }
 
 impl WeightInventory {
@@ -461,7 +561,7 @@ impl WeightInventory {
         let operands = resident_operands(cfg, &modes, ranks, dspark, tensors.iter().copied())?;
         let c4_attention = attention_costs(cfg, ranks, tensors)?;
         let mut groups = BTreeMap::<(usize, String), u64>::new();
-        for item in operands {
+        for item in &operands {
             if item.group == "embedding" || item.layer.is_some_and(|layer|
                 item.attention && cfg.compress_ratios[layer] == 4) { continue; }
             let bytes = groups.entry((item.rank, format!("V4 {} weights", item.group))).or_default();
@@ -470,7 +570,8 @@ impl WeightInventory {
         let fixed = groups.into_iter().map(|((gpu, group), bytes)|
             crate::placement::Demand::new(gpu as u8, Category::Weights, group, bytes, Basis::Exact)
                 .with_resident_weights(crate::placement::ResidentWeights(bytes))).collect();
-        Ok(Self { c4_attention, fixed })
+        let startup = StartupInventory::from_operands(&operands, ranks)?;
+        Ok(Self { c4_attention, fixed, startup })
     }
 
     /// Final uploaded non-embedding bytes for the selected owners. A post-load

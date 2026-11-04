@@ -100,7 +100,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let mut pool_tokens = 0;
     let mut local_layers = 0;
     let admitted = (|| -> anyhow::Result<_> {
-        let (mut request, reserves) = request(report, input, options, &devices[..ranks],
+        let (mut request, reserves, startup_notes) = request(report, input, options, &devices[..ranks],
             &shape, exl3_workspace, workspace)?;
         let mut placement = crate::placement::solve(&request)?;
         if report.encoder.is_none() {
@@ -131,10 +131,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 placement = crate::placement::solve(&request)?;
             }
         }
-        Ok((placement, reserves))
+        Ok((placement, reserves, startup_notes))
     })();
     match admitted {
-        Ok((placement, reserves)) => {
+        Ok((placement, reserves, startup_notes)) => {
+            notes.extend(startup_notes);
             report.solver_placement = Some(placement.clone());
             for (device, reserve) in devices.iter_mut().zip(&reserves) {
                 device.capacity_bytes = options.rtx_bytes[device.index as usize].saturating_sub(*reserve);
@@ -224,7 +225,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
 fn request(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutOptions,
     devices: &[DeviceLayout], shape: &Shape, exl3_workspace: Option<u64>,
     workspace: Option<Vec<crate::serving_capacity::V4WorkspaceRank>>)
-    -> anyhow::Result<(crate::placement::PlacementRequest, Vec<u64>)> {
+    -> anyhow::Result<(crate::placement::PlacementRequest, Vec<u64>, Vec<String>)> {
     let checkpoint = input.checkpoint();
     let cfg = DeepseekV4Config::read(&checkpoint.snapshot, shape.native_layers)?;
     let catalog = input.expert_catalog()?;
@@ -284,5 +285,5 @@ fn request(report: &PlanReport, input: &super::super::PlanInput, options: &Layou
         attention: report.requested_attention };
     let request = v4::request(&inputs)?;
     let reserves = request.inventory.gpus.iter().map(|g| g.headroom_bytes).collect();
-    Ok((request, reserves))
+    Ok((request, reserves, inputs.weights.startup.notes()?))
 }
