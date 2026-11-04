@@ -652,8 +652,9 @@ pub(crate) fn with_engine<T>(
         ensure!(split_device.is_none() || range.layers == 0,
             "TP1 backbone layers are forbidden under a head split");
         let layers: Vec<_> = (range.first..range.first + range.layers).collect();
-        let local = if skip { None } else { local::LocalExperts::load(&loaded.library, &args.native_lib,
-            &loaded.catalog, stages, &layers,
+        let local = if skip { None } else { local::LocalExperts::load_pushed(
+            crate::shared::memory::device::Device { library: &loaded.library, id: args.device },
+            &loaded.snapshot, &args.native_lib, &loaded.catalog, stages, &layers,
             max_rows, usize::try_from(range.peak_bytes)?, stream)? };
         ensure!(local.as_ref().map_or(&[][..], |l| l.layers()) == layers,
             "DeepSeek V4 TP1 allocation differs from admitted placement");
@@ -665,11 +666,35 @@ pub(crate) fn with_engine<T>(
                 Device { library: &loaded.library, id: split_device.context("TP2 needs a head split")? }];
             let layers: Vec<_> = (tp2.first..tp2.first + tp2.layers).collect();
             let budgets = [usize::try_from(tp2.peak_bytes[0])?, usize::try_from(tp2.peak_bytes[1])?];
+            use crate::shared::experts::rtx::{dense::DenseArena,
+                push::{CoordinatorExperts, CoordinatorPush, PushPolicy}, RtxSelectionPolicy};
+            let policy = PushPolicy::for_snapshot(&loaded.snapshot)?;
+            let push = policy.plan(|| CoordinatorPush::prepare_alone(&loaded.snapshot, Some(&loaded.catalog), 2,
+                Some(CoordinatorExperts::Tp2 { layers: layers.clone(), budgets: budgets.to_vec() })))?;
+            let pushed = if let Some(push) = push {
+                let (pushed, ()) = push.receive_with::<DenseArena<'_>, _>(devices.to_vec(), Some(&loaded.catalog), 0, None, || ());
+                policy.committed(pushed)?
+            } else { None };
             let ranks: [Box<dyn RtxExpertLayer>; 2] = if let Some(manifest) = loaded.catalog.exl3() {
                 let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
                     manifest.decoder_tiers(), "rtx-tp2");
-                Exl3Tp2::load_pair(devices, &loaded.catalog, &package, layers.clone(), max_rows, budgets)?
-                    .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
+                if let Some(pushed) = pushed {
+                    let weights = pushed.into_iter().map(|w| w.exl3()).collect::<Result<Vec<_>>>()?;
+                    let weights = weights.try_into().map_err(|_| anyhow::anyhow!("TP2 pushed rank count differs"))?;
+                    let owners = Exl3Tp2::pushed_pair_weights(devices, &loaded.catalog,
+                        cuteafd_core::expert_geometry(), [&package; 2], layers.clone(), max_rows, budgets,
+                        RtxSelectionPolicy::CanonicalDecode, weights)?;
+                    [Box::new(owners[0].execution()?), Box::new(owners[1].execution()?)]
+                } else {
+                    Exl3Tp2::load_pair(devices, &loaded.catalog, &package, layers.clone(), max_rows, budgets)?
+                        .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
+                }
+            } else if let Some(pushed) = pushed {
+                let weights = pushed.into_iter().map(|w| w.native()).collect::<Result<Vec<_>>>()?;
+                let weights = weights.try_into().map_err(|_| anyhow::anyhow!("TP2 pushed rank count differs"))?;
+                let owners = NativeTp2::pushed_pair_weights(devices, &loaded.catalog, layers.clone(), max_rows, budgets,
+                    RtxSelectionPolicy::CanonicalDecode, crate::shared::experts::rtx::native::NativeOutputPolicy::TokenSums, weights)?;
+                [Box::new(owners[0].execution()?), Box::new(owners[1].execution()?)]
             } else {
                 NativeTp2::load_pair(devices, &loaded.catalog, layers.clone(), max_rows, budgets)?
                     .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
