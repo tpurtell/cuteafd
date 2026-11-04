@@ -527,6 +527,7 @@ pub(crate) fn with_engine<T>(
                     decode_rows, prefill_rows, prefill.waves as usize)?)?.select(&peers)?;
         }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
+        crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/before-push")?;
         let started = Instant::now();
         let loader = weights::WeightLoader {
             library: &loaded.library, catalog: &loaded.catalog, programs: &programs, family: loaded.family, stream,
@@ -536,6 +537,7 @@ pub(crate) fn with_engine<T>(
         };
         let (embedding, (model, shares)) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
             embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model_modes(&loaded.cfg, args.dspark, &loaded_modes) })?;
+        crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-dense-push")?;
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
 
         // Measured cross-check uses the same frozen owner map and explicitly
@@ -618,6 +620,7 @@ pub(crate) fn with_engine<T>(
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
         }
+        crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-kv-pool")?;
         // Freeze the prefix quota and admit it together with every future table before
         // attach_context or workspace preparation can reserve ordered-upload staging.
         let host_config = admission::host_memory(&engine, args, prefix, context_extent)?;
@@ -655,6 +658,7 @@ pub(crate) fn with_engine<T>(
             ensure!(ranks.iter().all(|r| r.layers() == layers), "TP2 loaded layers differ from admitted placement");
             engine.install_tp2(ranks)?;
         }
+        crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-expert-push")?;
         // The auto reduction plan uses draft_block(), which is nonzero only after
         // the drafter's local stage experts are installed. Freeze it before capture.
         if context_mode.is_some() {
