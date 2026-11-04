@@ -98,7 +98,7 @@ fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_js
     let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
     let layout = cuteafd_loader::serving_capacity::Exl3WorkspaceLayout::from_manifests(
         manifests, true, Exl3Epilogue::Sum)?;
-    let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
+    let facts = Facts { resident_weights: vec![],phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
         allocations: layout.allocations("expert.test", location, lifetime),
         deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
     };
@@ -111,7 +111,7 @@ fn verify_workspace_receipts(states: &[Exl3Execution<'_>], manifests: &[serde_js
     let phases = planner::evaluate(&facts, &budgets)?;
     let plan = ResolvedPlan {
         request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-            prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving },
+            prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving , resident_weight_limit: None,},
         decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![vec![], vec![]],
             expert_homes: Default::default(), embedding: None,
             prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },

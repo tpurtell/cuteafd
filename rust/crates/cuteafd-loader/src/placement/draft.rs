@@ -180,8 +180,13 @@ impl crate::families::glm5::draft_representation::GlmDraftRuntimeLayout {
     /// capacity admission or a Ready-authorizing legacy bridge.
     pub fn gqa_facts(&self, gpu: u8, sms: u64, mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache)
         -> Result<super::planner::Facts, crate::families::glm5::draft_representation::GlmDraftStorageError> {
-        use super::planner::{Facts, Lifetime, Phase, Sequential};
-        let mut allocations = self.device_owners(sms, mode, kv_cache)?.iter().map(|owner| {
+        use super::planner::{Facts, Lifetime, Phase, ResidentWeight, Sequential};
+        let owners = self.device_owners(sms, mode, kv_cache)?;
+        let resident_weights = owners.iter().filter(|owner| owner.resident_weights.0 > 0)
+            .map(|owner| ResidentWeight { id: format!("draft.gqa.{}", owner.id),
+                location: super::planner::Location::coordinator(gpu), weights: owner.resident_weights })
+            .collect();
+        let mut allocations = owners.iter().map(|owner| {
             let load = owner.id.starts_with("weight.") || owner.id.starts_with("layer.")
                 || ["taps", "fused", "fused_norm", "context_positions", "context_slots", "context_kv", "fp8_scratch"]
                     .contains(&owner.id.as_str());
@@ -195,7 +200,7 @@ impl crate::families::glm5::draft_representation::GlmDraftRuntimeLayout {
         let members: Vec<_> = self.packing_sources().iter().map(|owner| owner.allocation(
             format!("draft.gqa.{}", owner.id), gpu,
             Lifetime { first: Phase::Load, last: Phase::Load }, "BF16 packing source")).collect();
-        Ok(Facts { phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], reservations: vec![], allowances: vec![],
+        Ok(Facts { resident_weights, phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], reservations: vec![], allowances: vec![],
             sequential: if members.is_empty() { vec![] } else {
                 vec![Sequential { id: "draft.gqa.packing".into(), members }]
             } })
@@ -208,8 +213,13 @@ impl crate::formats::dflash::MlaDraftRuntimeLayout {
     /// neither is a private drafter owner. Full Kimi migration deletes this API.
     pub fn legacy_mla_facts(&self, gpu: u8) -> super::planner::Facts {
         use crate::formats::dflash::MlaDraftLifetime;
-        use super::planner::{Facts, Lifetime, Phase, Sequential};
-        let allocations = self.owners().iter().filter(|o| !o.on_use).map(|owner| {
+        use super::planner::{Facts, Lifetime, Phase, ResidentWeight, Sequential};
+        let owners = self.owners();
+        let resident_weights = owners.iter().filter(|owner| !owner.on_use && owner.resident_weights.0 > 0)
+            .map(|owner| ResidentWeight { id: format!("draft.mla.{}", owner.id),
+                location: super::planner::Location::coordinator(gpu), weights: owner.resident_weights })
+            .collect();
+        let allocations = owners.iter().filter(|o| !o.on_use).map(|owner| {
             let first = match owner.lifetime {
                 MlaDraftLifetime::Runtime => Phase::Load,
                 MlaDraftLifetime::Library => Phase::Warmup,
@@ -220,7 +230,7 @@ impl crate::formats::dflash::MlaDraftRuntimeLayout {
         let members: Vec<_> = self.packing_sources().iter().map(|owner| owner.allocation(
             format!("draft.mla.{}", owner.id), gpu,
             Lifetime { first: Phase::Load, last: Phase::Load }, "BF16 packing source")).collect();
-        Facts { phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], reservations: vec![], allowances: vec![],
+        Facts { resident_weights, phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], reservations: vec![], allowances: vec![],
             sequential: if members.is_empty() { vec![] } else {
                 vec![Sequential { id: "draft.mla.packing".into(), members }]
             } }

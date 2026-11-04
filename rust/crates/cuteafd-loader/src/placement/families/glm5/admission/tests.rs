@@ -94,7 +94,7 @@ fn request() -> Request {
         onboard: Pin::Auto,
         prefill: Pin::Auto,
         spark_reply_format: None,
-        operation: Operation::Serving,
+        operation: Operation::Serving, resident_weight_limit: None,
     }
 }
 

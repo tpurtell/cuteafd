@@ -658,7 +658,7 @@ mod ownership_tests {
                         .map(|windows| DraftMarks::new(&library, windows, slots)).transpose()?;
                     let receipts = prefix_allocation_receipts(&scratch, marks.as_ref(), mapping)?;
                     let life = Lifetime { first: Phase::Warmup, last: Phase::Growth };
-                    let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET,
+                    let facts = Facts { resident_weights: vec![], phase_order: PhaseOrder::DRAFT_THEN_TARGET,
                         allocations: PrefixBuffers { device: mapping.logical_rank(physical)?,
                             draft_windows: windows.map(|n| n as u64), mark_slots: slots as u64 }.allocations(life)?,
                         deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
@@ -667,7 +667,7 @@ mod ownership_tests {
                         baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
                     let phases = planner::evaluate(&facts, &budgets)?;
                     let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64),
-                            onboard: Pin::Auto, prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving },
+                            onboard: Pin::Auto, prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving , resident_weight_limit: None,},
                         decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
                             embedding: None, prefill: PrefillShape {rows: 64, waves: 1}, lanes: 1 },
                         pool_tokens: 64, facts, budgets, phases };

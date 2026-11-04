@@ -2046,7 +2046,7 @@ mod tests {
                             IntakeMode::Gpu => SparkIntakeMode::Gpu, IntakeMode::Pinned => SparkIntakeMode::Pinned,
                             IntakeMode::Host => SparkIntakeMode::Host,
                         } };
-                    let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: spec.allocations("test.intake", Lifetime::TARGET)?,
+                    let facts = Facts { resident_weights: vec![],phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: spec.allocations("test.intake", Lifetime::TARGET)?,
                         deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
                     let budgets = vec![Budget { id: "CPU intake fixture".into(),
                         locations: vec![devices.location(device)?, Location::PINNED],
@@ -2054,7 +2054,7 @@ mod tests {
                         baseline: Baseline::Forecast {occupied: 0, source: "CPU fixture".into(), assumed: false} }];
                     let phases = planner::evaluate(&facts, &budgets)?;
                     let plan = ResolvedPlan { request: Request {context: 64, pool: Pin::Exact(64),
-                            onboard: Pin::Auto, prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving},
+                            onboard: Pin::Auto, prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving, resident_weight_limit: None,},
                         decisions: Decisions {spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
                             embedding: None, prefill: PrefillShape {rows: 64, waves: 1}, lanes: 1},
                         pool_tokens: 64, facts, budgets, phases };

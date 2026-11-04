@@ -64,6 +64,8 @@ pub(super) struct Compiled {
     phase_order: PhaseOrder,
     groups: Vec<Group>,
     rows: usize,
+    memory_rows: usize,
+    resident_weight_limit: Option<ResidentWeights>,
 }
 impl Compiled {
     pub(super) fn new(contract: &Contract, budgets: &[Budget]) -> Result<Self, Refusal> {
@@ -74,40 +76,37 @@ impl Compiled {
             }
         }
         let starts: Vec<_> = starts.into_iter().collect();
-        let rows = budgets.len() * contract.phase_order.phases().len();
+        let memory_rows = budgets.len() * contract.phase_order.phases().len();
+        let rows = memory_rows + contract.gpus;
         let mut groups = BTreeMap::<Activation, Vec<Vec<Cost>>>::new();
         for component in &contract.components {
-            let Some((location, lifetime, opaque)) = component.charge() else {
+            let (charged_rows, opaque) = if let ComponentKind::ResidentWeight(owner) = &component.kind {
+                let Device::Coordinator(gpu) = owner.location.device else { continue };
+                (vec![memory_rows + usize::from(gpu)], false)
+            } else if let Some((location, lifetime, opaque)) = component.charge() {
+                let budget = budgets.iter().position(|b| b.locations.contains(&location))
+                    .ok_or_else(|| Refusal::InvalidFact("component has no physical budget".into()))?;
+                let charged = contract.phase_order.phases().iter().enumerate()
+                    .filter(|(_, at)| lifetime.contains(**at, contract.phase_order))
+                    .map(|(phase, _)| budget * contract.phase_order.phases().len() + phase)
+                    .collect();
+                (charged, opaque)
+            } else {
                 continue;
             };
-            let budget = budgets
-                .iter()
-                .position(|b| b.locations.contains(&location))
-                .ok_or_else(|| Refusal::InvalidFact("component has no physical budget".into()))?;
             let costs = groups
                 .entry(component.activation.clone())
                 .or_insert_with(|| vec![vec![Cost::default(); rows]; starts.len() - 1]);
             for (index, &first) in starts[..starts.len() - 1].iter().enumerate() {
                 let piece = component.bytes.piece(first)?;
                 let bytes = component.bytes.at(first)?;
-                for (phase, at) in contract.phase_order.phases().iter().enumerate() {
-                    if !lifetime.contains(*at, contract.phase_order) {
-                        continue;
-                    }
-                    let cost = if opaque {
-                        Cost {
-                            opaque: bytes,
-                            opaque_slope: piece.bytes_per_page,
-                            ..Cost::default()
-                        }
-                    } else {
-                        Cost {
-                            owned: bytes,
-                            owned_slope: piece.bytes_per_page,
-                            ..Cost::default()
-                        }
-                    };
-                    costs[index][budget * contract.phase_order.phases().len() + phase].add(cost)?;
+                let cost = if opaque {
+                    Cost { opaque: bytes, opaque_slope: piece.bytes_per_page, ..Cost::default() }
+                } else {
+                    Cost { owned: bytes, owned_slope: piece.bytes_per_page, ..Cost::default() }
+                };
+                for &row in &charged_rows {
+                    costs[index][row].add(cost)?;
                 }
             }
         }
@@ -115,11 +114,38 @@ impl Compiled {
             starts,
             phase_order: contract.phase_order,
             rows,
+            memory_rows,
+            resident_weight_limit: contract.resident_weight_limit,
             groups: groups
                 .into_iter()
                 .map(|(activation, costs)| Group { activation, costs })
                 .collect(),
         })
+    }
+    fn available(&self, row: usize, budgets: &[Budget]) -> Result<u64, Refusal> {
+        if row < self.memory_rows {
+            budgets[row / self.phase_order.phases().len()].available()
+        } else {
+            Ok(self.resident_weight_limit.map_or(u64::MAX, |limit| limit.0))
+        }
+    }
+    fn capacity(&self, rows: &[u64], budgets: &[Budget]) -> Result<(), Refusal> {
+        for (row, &required) in rows.iter().enumerate() {
+            let available = self.available(row, budgets)?;
+            if required <= available { continue; }
+            return Err(if row < self.memory_rows {
+                Refusal::Capacity {
+                    budget: budgets[row / self.phase_order.phases().len()].id.clone(),
+                    phase: self.phase_order.phases()[row % self.phase_order.phases().len()],
+                    required, available, owners: vec![],
+                }
+            } else {
+                Refusal::ResidentWeightLimit {
+                    gpu: (row - self.memory_rows) as u8, required, limit: available,
+                }
+            });
+        }
+        Ok(())
     }
     fn costs(&self, selected: &[usize], piece: usize) -> Result<Vec<Cost>, Refusal> {
         let mut costs = vec![Cost::default(); self.rows];
@@ -144,6 +170,7 @@ impl Compiled {
         let piece = self.piece(pages);
         self.costs(selected, piece)?
             .into_iter()
+            .take(self.memory_rows)
             .enumerate()
             .map(|(row, cost)| {
                 let cost = cost.at(pages - self.starts[piece])?;
@@ -158,7 +185,13 @@ impl Compiled {
             })
             .collect()
     }
-    fn limit(
+    fn weights(&self, selected: &[usize], pages: u64) -> Result<Vec<ResidentWeights>, Refusal> {
+        let piece = self.piece(pages);
+        self.costs(selected, piece)?.into_iter().skip(self.memory_rows)
+            .map(|cost| Ok(ResidentWeights(cost.at(pages - self.starts[piece])?.required()?)))
+            .collect()
+    }
+    pub(super) fn limit(
         &self,
         budgets: &[Budget],
         selected: &[usize],
@@ -174,7 +207,7 @@ impl Compiled {
             }
             for (row, cost) in self.costs(selected, piece)?.into_iter().enumerate() {
                 let cost = cost.at(first - self.starts[piece])?;
-                let available = budgets[row / self.phase_order.phases().len()].available()?;
+                let available = self.available(row, budgets)?;
                 let required = cost.required()?;
                 if required > available {
                     last = 0;
@@ -249,7 +282,7 @@ impl Compiled {
                 }
             }
             for (row, cost) in result.into_iter().enumerate() {
-                let available = budgets[row / self.phase_order.phases().len()].available()?;
+                let available = self.available(row, budgets)?;
                 let required = cost.required()?;
                 if required > available {
                     last = 0;
@@ -321,22 +354,6 @@ fn add_bytes(destination: &mut [u64], bytes: &[u64]) -> Result<(), Refusal> {
         *sum = sum
             .checked_add(n)
             .ok_or(Refusal::Overflow("cost lower bound"))?;
-    }
-    Ok(())
-}
-fn capacity(rows: &[u64], budgets: &[Budget], order: PhaseOrder) -> Result<(), Refusal> {
-    for (row, &required) in rows.iter().enumerate() {
-        let budget = &budgets[row / order.phases().len()];
-        let available = budget.available()?;
-        if required > available {
-            return Err(Refusal::Capacity {
-                budget: budget.id.clone(),
-                phase: order.phases()[row % order.phases().len()],
-                required,
-                available,
-                owners: vec![],
-            });
-        }
     }
     Ok(())
 }
@@ -439,7 +456,7 @@ fn propagate(
         if !logical(contract, domains, exact) {
             return Err(Refusal::PinConflict);
         }
-        capacity(&costs.lower_bound(domains, lower, upper)?, budgets, contract.phase_order)?;
+        costs.capacity(&costs.lower_bound(domains, lower, upper)?, budgets)?;
         let before = domains.to_vec();
         for variable in 0..domains.len() {
             let mut retained = Vec::new();
@@ -448,9 +465,9 @@ fn propagate(
                 let mut forced = domains.to_vec();
                 forced[variable] = vec![option];
                 if logical(contract, &mut forced, exact) {
-                    match capacity(&costs.lower_bound(&forced, lower, upper)?, budgets, contract.phase_order) {
+                    match costs.capacity(&costs.lower_bound(&forced, lower, upper)?, budgets) {
                         Ok(()) => retained.push(option),
-                        Err(error @ Refusal::Capacity { .. }) => {
+                        Err(error @ (Refusal::Capacity { .. } | Refusal::ResidentWeightLimit { .. })) => {
                             capacity_failure.get_or_insert(error);
                         }
                         Err(error) => return Err(error),
@@ -505,7 +522,7 @@ fn selected(domains: &[Vec<usize>]) -> Vec<usize> {
     domains.iter().map(|d| d[0]).collect()
 }
 fn infeasible(error: &Refusal) -> bool {
-    matches!(error, Refusal::Capacity { .. } | Refusal::PinConflict)
+    matches!(error, Refusal::Capacity { .. } | Refusal::ResidentWeightLimit { .. } | Refusal::PinConflict)
 }
 
 struct Search<'a> {
@@ -534,10 +551,9 @@ impl Search<'_> {
         ) {
             Ok(()) => Ok(true),
             Err(error) if infeasible(&error) => {
-                // Never replace an observed capacity cause with a later logical
-                // dead end; all-auto resource failures must remain Capacity.
-                if matches!(error, Refusal::Capacity { .. })
-                    || !matches!(self.last, Refusal::Capacity { .. })
+                // Preserve a typed resource failure across later logical dead ends.
+                if matches!(error, Refusal::Capacity { .. } | Refusal::ResidentWeightLimit { .. })
+                    || !matches!(self.last, Refusal::Capacity { .. } | Refusal::ResidentWeightLimit { .. })
                 {
                     self.last = error;
                 }
@@ -678,7 +694,8 @@ pub fn solve(
     recipe: &impl Recipe,
 ) -> Result<ResolvedPlan, Refusal> {
     let started = std::time::Instant::now();
-    let contract = recipe.prepare(&request)?;
+    let mut contract = recipe.prepare(&request)?;
+    contract.resident_weight_limit = request.resident_weight_limit;
     if request.spark_reply_format.is_some()
         && request.spark_reply_format != contract.spark_reply_format
     {
@@ -688,7 +705,7 @@ pub fn solve(
     contract.validate_home_budgets(&budgets)?;
     // Validate physical budgets independently of conditional allocation choices.
     validate(
-        &Facts {
+        &Facts { resident_weights: vec![],
             phase_order: contract.phase_order,
             allocations: vec![],
             deferred: vec![],
@@ -784,6 +801,17 @@ pub fn solve(
     let decisions = contract.decisions(&selected)?;
     let facts = contract.facts(&selected, pages)?;
     let phases = evaluate(&facts, &budgets)?;
+    let weights = resident_weight_totals(&facts, contract.gpus)?;
+    if weights != costs.weights(&selected, pages)? {
+        return Err(Refusal::InvalidFact("component resource vectors differ from named resident weights".into()));
+    }
+    if let Some(limit) = request.resident_weight_limit {
+        for (gpu, required) in weights.iter().enumerate() {
+            if required.0 > limit.0 {
+                return Err(Refusal::ResidentWeightLimit { gpu: gpu as u8, required: required.0, limit: limit.0 });
+            }
+        }
+    }
     if phases != costs.phases(&budgets, &selected, pages)? {
         return Err(Refusal::InvalidFact(
             "component cost vectors differ from exact phase evaluator".into(),

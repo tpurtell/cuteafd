@@ -688,7 +688,7 @@ mod tests {
                             assert_eq!(owner.lifetime, Lifetime::TARGET);
                             assert!(owner.view.is_none());
                         }
-                        let mut contract = super::super::planner::Contract::fixed(64, 1, 2, Facts {
+                        let mut contract = super::super::planner::Contract::fixed(64, 1, 2, Facts { resident_weights: vec![],
                             phase_order: PhaseOrder::DRAFT_THEN_TARGET, allocations: owners.clone(), deferred: vec![],
                             sequential: vec![], reservations: vec![], allowances: vec![],
                         });

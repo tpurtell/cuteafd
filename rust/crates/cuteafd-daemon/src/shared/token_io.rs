@@ -1256,13 +1256,13 @@ mod tests {
                 for placement in [SelectPlacement::Device, SelectPlacement::Host] {
                     let owners = SelectorOwners {location, capacity, vocab: 33,
                         device_sampling: placement == SelectPlacement::Device}.allocations("selector", life)?;
-                    let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,allocations: owners, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![]};
+                    let facts = Facts { resident_weights: vec![],phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,allocations: owners, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![]};
                     let budgets = vec![Budget {id: "CPU fixture".into(), locations: vec![location, Location::PINNED],
                         physical_bytes: total as u64, logical_bytes: total as u64, headroom: 0,
                         baseline: Baseline::Forecast {occupied: 0, source: "CPU fixture".into(), assumed: false}}];
                     let phases = planner::evaluate(&facts, &budgets)?;
                     let plan = ResolvedPlan {request: Request {context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                            prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving},
+                            prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving, resident_weight_limit: None,},
                         decisions: Decisions {spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
                             embedding: None, prefill: PrefillShape {rows: 64, waves: 1}, lanes: 1},
                         pool_tokens: 64, facts, budgets, phases};

@@ -2516,7 +2516,7 @@ mod tests {
             owners: vec![Case { when: vec![], value: components.clone() }],
         };
         let mut request = Request { context: inputs.max_context, pool: Pin::Auto,
-            onboard: Pin::Exact(0), prefill: Pin::Exact(shape), spark_reply_format: None, operation: Operation::Serving };
+            onboard: Pin::Exact(0), prefill: Pin::Exact(shape), spark_reply_format: None, operation: Operation::Serving , resident_weight_limit: None,};
         assert!(matches!(planner::solve(request.clone(), budgets.clone(), &recipe(inputs.max_context)),
             Err(Refusal::Capacity { .. })), "the unchanged 1M request must not silently clamp");
 

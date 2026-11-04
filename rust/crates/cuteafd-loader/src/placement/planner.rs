@@ -1,6 +1,6 @@
 //! Pure, phase-aware allocation planning. Recipes describe one legal candidate;
 //! policy, exact pins and allocation reconciliation belong here, not in families.
-use super::LayerMode;
+use super::{LayerMode, ResidentWeights};
 use cuteafd_core::{SparkReplyFormat, memory_layout::{Basis, Category, Item}};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -161,6 +161,8 @@ pub struct Request {
     pub onboard: Pin<u64>,
     pub prefill: Pin<PrefillShape>,
     pub operation: Operation,
+    /// Retained checkpoint weights per coordinator, independent of memory budgets.
+    pub resident_weight_limit: Option<ResidentWeights>,
     /// An explicit format must match the immutable family contract.
     pub spark_reply_format: Option<SparkReplyFormat>,
 }
@@ -371,9 +373,24 @@ pub struct Reservation {
     pub source: String,
 }
 
+/// One retained physical weight owner, not an allocation or a baseline delta.
+/// Aliases use their backing owner's fact; already-loaded owners still appear.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidentWeight {
+    pub id: String,
+    pub location: Location,
+    pub weights: ResidentWeights,
+}
+impl ResidentWeight {
+    pub fn from_allocation(allocation: &Allocation, weights: ResidentWeights) -> Self {
+        Self { id: allocation.id.clone(), location: allocation.location, weights }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
     pub phase_order: PhaseOrder,
+    pub resident_weights: Vec<ResidentWeight>,
     pub allocations: Vec<Allocation>,
     /// Reserved by a later owner port; never evidence that it was allocated.
     pub deferred: Vec<Allocation>,
@@ -473,6 +490,8 @@ pub enum Refusal {
         available: u64,
         owners: Vec<String>,
     },
+    #[error("rtx{gpu} resident weights need {required} bytes, over the {limit} byte weight budget")]
+    ResidentWeightLimit { gpu: u8, required: u64, limit: u64 },
     #[error("planner arithmetic overflow: {0}")]
     Overflow(&'static str),
     #[error("allocation reconciliation: {0:?}")]
@@ -517,6 +536,7 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
             .allowances
             .iter()
             .any(|a| !locations.contains(&a.location))
+        || facts.resident_weights.iter().any(|w| !locations.contains(&w.location))
         || facts.reservations.iter().any(|r| !locations.contains(&r.location))
     {
         return Err(Refusal::InvalidFact(
@@ -584,6 +604,20 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
             }
         }
     }
+    let mut weight_ids = BTreeSet::new();
+    for owner in &facts.resident_weights {
+        if owner.id.is_empty() || !weight_ids.insert(&owner.id)
+            || !matches!(owner.location,
+                Location { device: Device::Coordinator(_) | Device::Spark(_), domain: Domain::Device | Domain::Managed }
+                | Location { device: Device::Host, domain: Domain::Host | Domain::Pinned })
+            || ids.get(&owner.id).is_some_and(|allocation|
+                allocation.view.is_some() || allocation.location != owner.location
+                    || owner.weights.0 > allocation.bytes)
+            || facts.sequential.iter().flat_map(|group| &group.members).any(|a| a.id == owner.id)
+        {
+            return Err(Refusal::InvalidFact(format!("invalid resident weight {}", owner.id)));
+        }
+    }
     let mut reservation_ids = BTreeSet::new();
     for reservation in &facts.reservations {
         if reservation.id.is_empty() || !reservation_ids.insert(&reservation.id)
@@ -602,6 +636,19 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
         }
     }
     Ok(())
+}
+
+fn resident_weight_totals(facts: &Facts, gpus: usize) -> Result<Vec<ResidentWeights>, Refusal> {
+    let mut totals = vec![ResidentWeights::default(); gpus];
+    for owner in &facts.resident_weights {
+        if let Device::Coordinator(gpu) = owner.location.device {
+            let total = totals.get_mut(usize::from(gpu))
+                .ok_or_else(|| Refusal::InvalidFact(format!("unknown resident weight coordinator {gpu}")))?;
+            total.0 = total.0.checked_add(owner.weights.0)
+                .ok_or(Refusal::Overflow("resident weights"))?;
+        }
+    }
+    Ok(totals)
 }
 
 pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, Refusal> {

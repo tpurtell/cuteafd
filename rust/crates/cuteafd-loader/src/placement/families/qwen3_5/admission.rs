@@ -324,6 +324,7 @@ impl DenseFacts<'_> {
     /// page-dependent extents are changed when the winning plan is materialized.
     fn owner_templates(&self, pool: u64) -> Result<Facts, Refusal> {
         let mut allocations = Vec::new();
+        let mut resident_weights = Vec::new();
         let mut add = |id: String, location, bytes, lifetime, category, group: &str| {
             if bytes > 0 {
                 allocations.push(Allocation::buffer(
@@ -333,6 +334,8 @@ impl DenseFacts<'_> {
         };
         let gpu = Location::coordinator(0);
         for operand in &self.weights.allocations {
+            resident_weights.push(ResidentWeight { id: format!("weights.{}", operand.id), location: gpu,
+                weights: crate::placement::ResidentWeights(operand.bytes) });
             add(
                 format!("weights.{}", operand.id),
                 gpu,
@@ -342,6 +345,8 @@ impl DenseFacts<'_> {
                 "native dense weights",
             );
         }
+        resident_weights.push(ResidentWeight { id: "weights.embedding".into(), location: gpu,
+            weights: crate::placement::ResidentWeights(self.weights.embedding) });
         add(
             "weights.embedding".into(),
             gpu,
@@ -618,6 +623,9 @@ impl DenseFacts<'_> {
                 }
                 .into();
                 allocation.shape = owner.shape.into_iter().map(|n| n as u64).collect();
+                if owner.resident_weights.0 > 0 {
+                    resident_weights.push(ResidentWeight::from_allocation(&allocation, owner.resident_weights));
+                }
                 allocations.push(allocation);
             }
         }
@@ -625,8 +633,13 @@ impl DenseFacts<'_> {
             let layout = layout.with_pool_tokens(usize::try_from(pool).map_err(|_| Refusal::Overflow("block pool"))?)
                 .map_err(|e| Refusal::InvalidFact(e.to_string()))?;
             let life = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
-            allocations.extend(layout.owners.iter().filter(|o| !o.on_use).map(|owner|
-                owner.allocation(format!("draft.block.{}", owner.id), 0, life, "block dSpark owner")));
+            allocations.extend(layout.owners.iter().filter(|o| !o.on_use).map(|owner| {
+                let allocation = owner.allocation(format!("draft.block.{}", owner.id), 0, life, "block dSpark owner");
+                if owner.resident_weights.0 > 0 {
+                    resident_weights.push(ResidentWeight::from_allocation(&allocation, owner.resident_weights));
+                }
+                allocation
+            }));
             if !layout.packing_sources.is_empty() {
                 sequential.push(Sequential { id: "draft.block.packing".into(),
                     members: layout.packing_sources.iter().map(|owner| owner.allocation(
@@ -660,7 +673,7 @@ impl DenseFacts<'_> {
                 assumed: true });
         }
         allowances.retain(|allowance| allowance.bytes > 0);
-        Ok(Facts {
+        Ok(Facts { resident_weights,
             phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
             allocations,
             deferred: vec![],

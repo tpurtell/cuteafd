@@ -275,13 +275,11 @@ impl WeightInventory {
         Ok(self
             .owners
             .iter()
-            .map(|owner| {
-                Component::allocation(
-                    owner.allocation.clone(),
-                    ByteCurve::fixed(owner.allocation.bytes, maximum_pages),
-                    false,
-                    maximum_pages,
-                )
+            .flat_map(|owner| {
+                let bytes = ByteCurve::fixed(owner.allocation.bytes, maximum_pages);
+                [Component::allocation(owner.allocation.clone(), bytes.clone(), false, maximum_pages),
+                    Component::resident_weight(crate::placement::planner::ResidentWeight::from_allocation(
+                        &owner.allocation, crate::placement::ResidentWeights(owner.allocation.bytes)), bytes)]
             })
             .collect())
     }

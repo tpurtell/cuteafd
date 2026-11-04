@@ -4968,14 +4968,14 @@ mod persistent_tests {
                     recv: span((2 + 2 * rank as u64) << 30, recv_ring)}).collect::<Vec<_>>();
                 let receipts = snapshots.iter().map(|snapshot| snapshot.allocation_receipts("link", device, devices, Lifetime::TARGET))
                     .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
-                let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,allocations: SparkEndpointOwners {ranks, geometry, endpoint, rings}
+                let facts = Facts { resident_weights: vec![],phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,allocations: SparkEndpointOwners {ranks, geometry, endpoint, rings}
                     .allocations("link", Lifetime::TARGET)?, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![]};
                 let budgets = vec![Budget {id: "numeric endpoint fixture".into(), locations: vec![Location::PINNED],
                     physical_bytes: 16 << 30, logical_bytes: 16 << 30, headroom: 0,
                     baseline: Baseline::Forecast {occupied: 0, source: "CPU metadata fixture".into(), assumed: false}}];
                 let phases = planner::evaluate(&facts, &budgets)?;
                 let plan = ResolvedPlan {request: Request {context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                    prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving}, decisions: Decisions {spark_reply_format: None, attention: vec![],
+                    prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving, resident_weight_limit: None,}, decisions: Decisions {spark_reply_format: None, attention: vec![],
                     onboard_layers: vec![], expert_homes: Default::default(), embedding: None,
                     prefill: PrefillShape {rows: 64, waves: 1}, lanes: 1}, pool_tokens: 64, facts, budgets, phases};
                 planner::reconcile(&plan, Phase::Ready, &receipts)?;

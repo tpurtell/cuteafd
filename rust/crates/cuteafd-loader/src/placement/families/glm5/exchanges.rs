@@ -206,7 +206,7 @@ mod tests {
             64,
             buffers.maximum_pages,
             2,
-            Facts {
+            Facts { resident_weights: vec![],
                 phase_order: crate::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
                 allocations: vec![],
                 deferred: vec![],

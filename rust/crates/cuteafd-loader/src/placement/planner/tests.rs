@@ -44,7 +44,7 @@ fn allocation(id: &str, bytes: u64) -> Allocation {
     )
 }
 fn facts(allocations: Vec<Allocation>) -> Facts {
-    Facts {
+    Facts { resident_weights: vec![],
         phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
         allocations,
         deferred: vec![],
@@ -59,7 +59,7 @@ fn request() -> Request {
         onboard: Pin::Auto,
         prefill: Pin::Auto,
         spark_reply_format: None,
-        operation: Operation::Serving,
+        operation: Operation::Serving, resident_weight_limit: None,
     }
 }
 fn decisions(onboard: u64) -> Decisions {
@@ -2201,4 +2201,119 @@ fn family_phase_order_validates_lifetimes_views_and_serialized_phase_lists() {
     invalid[2] = Phase::PostTargetKv;
     assert!(PhaseOrder::try_from(invalid).is_err());
     assert!(serde_json::from_value::<PhaseOrder>(serde_json::to_value(invalid).unwrap()).is_err());
+}
+
+
+fn resource(id: &str, gpu: u8, bytes: u64, maximum: u64) -> Component {
+    Component::resident_weight(ResidentWeight { id: id.into(), location: Location::coordinator(gpu),
+        weights: ResidentWeights(bytes) }, ByteCurve::fixed(bytes, maximum))
+}
+fn capped(limit: u64) -> Request {
+    Request { resident_weight_limit: Some(ResidentWeights(limit)), ..request() }
+}
+fn gpu_budget(gpu: u8, bytes: u64) -> Budget {
+    Budget { id: format!("rtx{gpu}"), locations: vec![Location::coordinator(gpu)], ..budget(bytes) }
+}
+
+#[test]
+fn analytical_weight_cap_counts_loaded_owners_without_allocation_or_category_inference() {
+    let mut contract = Linear::new().prepare(&request()).unwrap();
+    contract.components.push(resource("loaded.target", 0, 80, contract.maximum_pages));
+    let accepted = solve(capped(80), vec![budget(1 << 30)], &Prepared(contract.clone())).unwrap();
+    assert_eq!(accepted.pool_tokens, 2 << 20);
+    assert_eq!(accepted.phases, solve(request(), vec![budget(1 << 30)], &Prepared(contract.clone())).unwrap().phases);
+    assert_eq!(accepted.facts.resident_weights[0].id, "loaded.target");
+    assert!(!accepted.facts.allocations.iter().any(|a| a.id == "loaded.target"));
+    assert!(matches!(solve(capped(79), vec![budget(1 << 30)], &Prepared(contract)),
+        Err(Refusal::ResidentWeightLimit { gpu: 0, required: 80, limit: 79 })));
+
+    let mut contract = Linear::new().prepare(&request()).unwrap();
+    let mut owner = allocation("display.weight", 64);
+    owner.category = Category::Weights;
+    contract.components.push(Component::allocation(owner, ByteCurve::fixed(64, contract.maximum_pages), false, contract.maximum_pages));
+    assert!(solve(capped(0), vec![budget(1 << 30)], &Prepared(contract)).is_ok());
+}
+
+#[test]
+fn analytical_weight_cap_prunes_conditional_peer_cost_before_home_selection() {
+    let mut contract = Linear::new().prepare(&request()).unwrap();
+    contract.gpus = 2;
+    contract.variables.push(Variable::Embedding(vec![EmbeddingHome::Device(0), EmbeddingHome::Device(1)]));
+    let home = contract.variables.len() - 1;
+    contract.components.push(resource("loaded.peer", 1, 75, contract.maximum_pages));
+    for (option, gpu, bytes) in [(0, 1, 6), (1, 0, 6)] {
+        let mut owner = resource("mixed.draft.weight", gpu, bytes, contract.maximum_pages);
+        owner.activation = Activation::choice(home, option);
+        contract.components.push(owner);
+    }
+    let budgets = vec![gpu_budget(0, 1 << 30), gpu_budget(1, 1 << 30)];
+    let plan = solve(capped(80), budgets, &Prepared(contract)).unwrap();
+    assert_eq!(plan.decisions.embedding, Some(EmbeddingHome::Device(1)));
+    assert_eq!(resident_weight_totals(&plan.facts, 2).unwrap(), [ResidentWeights(6), ResidentWeights(75)]);
+}
+
+#[test]
+fn analytical_weight_cap_stops_tp2_onboarding_without_reducing_pool_or_mandatory_draft() {
+    let mut contract = Linear { onboard: 2, ..Linear::new() }.prepare(&request()).unwrap();
+    contract.gpus = 2;
+    let variable = contract.variables.len() - 1;
+    if let Variable::Onboard { destination, .. } = &mut contract.variables[variable] { *destination = vec![0, 1]; }
+    contract.components.push(resource("target.0", 0, 60, contract.maximum_pages));
+    contract.components.push(resource("target.1", 1, 60, contract.maximum_pages));
+    contract.components.push(resource("tp1.draft", 0, 10, contract.maximum_pages));
+    for layer in 0..2 {
+        for (gpu, bytes) in [(0, 4), (1, 12)] {
+            let mut owner = resource(&format!("expert.{layer}.rank.{gpu}"), gpu, bytes, contract.maximum_pages);
+            owner.activation = Activation { clauses: (layer + 1..=2).map(|option| vec![Choice { variable, option }]).collect() };
+            contract.components.push(owner);
+        }
+    }
+    let budgets = vec![gpu_budget(0, 1 << 30), gpu_budget(1, 1 << 30)];
+    let plan = solve(capped(80), budgets.clone(), &Prepared(contract.clone())).unwrap();
+    assert_eq!(plan.pool_tokens, 2 << 20);
+    assert_eq!(plan.decisions.onboard_layers, [vec![0], vec![0]]);
+    assert_eq!(resident_weight_totals(&plan.facts, 2).unwrap(), [ResidentWeights(74), ResidentWeights(72)]);
+    assert!(matches!(solve(Request { onboard: Pin::Exact(2), ..capped(80) }, budgets, &Prepared(contract)),
+        Err(Refusal::ResidentWeightLimit { gpu: 1, required: 84, limit: 80 })));
+}
+
+#[test]
+fn analytical_weight_cap_prices_every_finite_piece_and_exact_bound() {
+    let mut contract = Linear { maximum: 64 * 12, ..Linear::new() }.prepare(&request()).unwrap();
+    let mut owner = resource("piecewise.weight", 0, 100, 12);
+    owner.bytes = ByteCurve(vec![
+        BytePiece { first: 1, last: 3, bytes_at_first: 100, bytes_per_page: 0 },
+        BytePiece { first: 4, last: 8, bytes_at_first: 10, bytes_per_page: 10 },
+        BytePiece { first: 9, last: 12, bytes_at_first: 100, bytes_per_page: 0 },
+    ]);
+    contract.components.push(owner);
+    let plan = solve(capped(35), vec![budget(1 << 30)], &Prepared(contract.clone())).unwrap();
+    assert_eq!(plan.pool_tokens, 6 * 64);
+    assert_eq!(plan.facts.resident_weights[0].weights, ResidentWeights(30));
+    let costs = search::Compiled::new(&Contract { resident_weight_limit: Some(ResidentWeights(35)), ..contract.clone() }, &[budget(1 << 30)]).unwrap();
+    assert_eq!(costs.limit(&[budget(1 << 30)], &[0, 0, 0], 1, 12).unwrap(), Some(6));
+    assert!(matches!(solve(Request { pool: Pin::Exact(7 * 64), ..capped(35) }, vec![budget(1 << 30)], &Prepared(contract)),
+        Err(Refusal::ResidentWeightLimit { gpu: 0, required: 40, limit: 35 })));
+}
+
+#[test]
+fn analytical_weight_cap_rejects_alias_duplicate_unknown_home_and_overflow() {
+    let base = Linear::new().prepare(&request()).unwrap();
+    let mut duplicate = base.clone();
+    duplicate.components.push(resource("loaded", 0, 1, base.maximum_pages));
+    duplicate.components.push(resource("loaded", 0, 1, base.maximum_pages));
+    assert!(matches!(solve(capped(0), vec![budget(1 << 30)], &Prepared(duplicate)), Err(Refusal::InvalidFact(_))));
+    let mut alias = base.clone();
+    let mut view = allocation("alias", 64);
+    view.view = Some(View { backing: "kv".into(), offset: 0 });
+    alias.components.push(Component::allocation(view, ByteCurve::fixed(64, base.maximum_pages), false, base.maximum_pages));
+    alias.components.push(resource("alias", 0, 1, base.maximum_pages));
+    assert!(matches!(solve(capped(0), vec![budget(1 << 30)], &Prepared(alias)), Err(Refusal::InvalidFact(_))));
+    let mut unknown = base.clone();
+    unknown.components.push(resource("unknown", 1, 1, base.maximum_pages));
+    assert!(matches!(solve(capped(0), vec![budget(1 << 30)], &Prepared(unknown)), Err(Refusal::InvalidFact(_))));
+    let mut overflow = base;
+    overflow.components.push(resource("loaded.a", 0, u64::MAX, overflow.maximum_pages));
+    overflow.components.push(resource("loaded.b", 0, 1, overflow.maximum_pages));
+    assert!(matches!(solve(request(), vec![budget(1 << 30)], &Prepared(overflow)), Err(Refusal::Overflow(_))));
 }

@@ -229,7 +229,7 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
 fn retained_weight_plan(inventory: &cuteafd_loader::placement::families::glm5::weights::WeightInventory)
     -> Result<cuteafd_loader::placement::planner::ResolvedPlan> {
     use cuteafd_loader::placement::planner::{self, *};
-    let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET, allocations: inventory.owners.iter().map(|o| o.allocation.clone()).collect(),
+    let facts = Facts { resident_weights: vec![],phase_order: cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET, allocations: inventory.owners.iter().map(|o| o.allocation.clone()).collect(),
         deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
     let budgets: Vec<_> = (0..inventory.ranks).map(|rank| Location::coordinator(rank as u8))
         .chain([Location::PINNED]).enumerate().map(|(index, location)| Budget {
@@ -239,7 +239,7 @@ fn retained_weight_plan(inventory: &cuteafd_loader::placement::families::glm5::w
         }).collect();
     let prefill = PrefillShape { rows: 128, waves: 1 };
     Ok(ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-            prefill: Pin::Exact(prefill), spark_reply_format: None, operation: Operation::Serving },
+            prefill: Pin::Exact(prefill), spark_reply_format: None, operation: Operation::Serving , resident_weight_limit: None,},
         decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
             embedding: None, prefill, lanes: 1 }, pool_tokens: 64,
         phases: planner::evaluate(&facts, &budgets)?, budgets, facts })

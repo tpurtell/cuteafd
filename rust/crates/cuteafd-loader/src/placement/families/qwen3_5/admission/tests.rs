@@ -68,7 +68,7 @@ fn request() -> Request {
         onboard: Pin::Auto,
         prefill: Pin::Auto,
         spark_reply_format: None,
-        operation: Operation::Serving,
+        operation: Operation::Serving, resident_weight_limit: None,
     }
 }
 fn fixture() -> (Qwen35Config, NativeWeights, NativeBuffers) {
@@ -499,7 +499,7 @@ fn malformed_native_inventory_and_operation_fail_before_admission() {
         admit(
             Request {
                 spark_reply_format: None,
-                operation: Operation::Scoring,
+                operation: Operation::Scoring, resident_weight_limit: None,
                 ..request()
             },
             budgets(),
@@ -720,5 +720,32 @@ fn host_selector_and_disabled_prefix_have_no_sampler_or_chunk_owners() {
             .allocations
             .iter()
             .any(|a| a.id.starts_with("host.prefix.") || a.id.starts_with("selector.sampler.")));
+    }
+}
+
+
+#[test]
+fn dense_native_weight_resource_includes_draft_weights_not_pool_or_runtime() {
+    use crate::placement::ResidentWeights;
+    let (cfg, weights, buffers) = fixture();
+    let bf16 = block_layout(false);
+    let fp8 = block_layout(true);
+    let target = weights.embedding + weights.allocations.iter().map(|owner| owner.bytes).sum::<u64>();
+    for draft in [None, Some(&bf16), Some(&fp8)] {
+        let mut recipe = facts(&cfg, &weights, &buffers);
+        recipe.drafter = draft.map(DenseDraft::Block);
+        let draft_weights = draft.map(|layout| layout.resident_weights().unwrap().0).unwrap_or(0);
+        let total = target + draft_weights;
+        assert!(total > 0);
+        for pool in [64, 262144] {
+            let inventory = recipe.owner_templates(pool).unwrap();
+            assert_eq!(inventory.resident_weights.iter().map(|owner| owner.weights.0).sum::<u64>(), total);
+            assert!(inventory.resident_weights.iter().all(|owner| inventory.allocations.iter()
+                .any(|allocation| allocation.id == owner.id && allocation.bytes == owner.weights.0)));
+        }
+        let accepted = admit(Request { resident_weight_limit: Some(ResidentWeights(total)), ..request() }, budgets(), recipe).unwrap();
+        assert_eq!(accepted.pool_tokens, 262144);
+        assert!(matches!(admit(Request { resident_weight_limit: Some(ResidentWeights(total - 1)), ..request() }, budgets(), recipe),
+            Err(Refusal::ResidentWeightLimit { gpu: 0, required, limit }) if required == total && limit == total - 1));
     }
 }

@@ -1390,7 +1390,7 @@ mod tests {
                     draft.prepare_workspace()?;
                     let receipts = draft.allocation_receipts(0)?;
                     let life = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
-                    let mut facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: layout.owners.iter().filter(|o| !o.on_use)
+                    let mut facts = Facts { resident_weights: vec![],phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: layout.owners.iter().filter(|o| !o.on_use)
                         .map(|o| o.allocation(format!("draft.block.{}", o.id), 0, life, "block dSpark owner"))
                         .collect(), deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
                     if !layout.packing_sources.is_empty() {
@@ -1404,7 +1404,7 @@ mod tests {
                             baseline: Baseline::Forecast { occupied: 0, source: "CPU fake DSO".into(), assumed: false } })
                         .collect::<Vec<_>>();
                     let plan = ResolvedPlan { request: Request { context: 256, pool: Pin::Exact(512),
-                        onboard: Pin::Auto, prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving },
+                        onboard: Pin::Auto, prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving , resident_weight_limit: None,},
                         decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![vec![]],
                             expert_homes: Default::default(), embedding: None,
                             prefill: PrefillShape { rows: 4096, waves: 1 }, lanes: 1 }, pool_tokens: 512,

@@ -34,6 +34,13 @@ impl Activation {
             .iter()
             .any(|clause| clause.iter().all(|c| domains[c.variable] == [c.option]))
     }
+    fn overlaps(&self, other: &Self) -> bool {
+        self.clauses.iter().any(|left| other.clauses.iter().any(|right| {
+            let mut choices = BTreeMap::new();
+            left.iter().chain(right).all(|choice| choices.insert(choice.variable, choice.option)
+                .is_none_or(|old| old == choice.option))
+        }))
+    }
     pub(super) fn local_variable(&self) -> Option<usize> {
         let variable = self.clauses.first()?.first()?.variable;
         self.clauses
@@ -172,6 +179,8 @@ pub enum ComponentKind {
     Sequential(Sequential),
     Reservation(Reservation),
     Allowance(Allowance),
+    /// Weight residency can outlive or precede the future allocation ledger.
+    ResidentWeight(ResidentWeight),
 }
 #[derive(Debug, Clone)]
 pub struct Component {
@@ -206,6 +215,14 @@ impl Component {
             },
         }
     }
+    pub fn resident_weight(owner: ResidentWeight, bytes: ByteCurve) -> Self {
+        Self {
+            activation: Activation::always(),
+            bytes,
+            kind: ComponentKind::ResidentWeight(owner),
+        }
+    }
+
     /// Raw byte buffers keep their sole shape dimension equal to their extent.
     pub fn byte_extent(&mut self, bytes: ByteCurve) -> Result<(), Refusal> {
         let ComponentKind::Allocation {
@@ -235,6 +252,7 @@ impl Component {
                 .map(|a| (a.location, a.lifetime, false)),
             ComponentKind::Reservation(r) => Some((r.location, r.lifetime, false)),
             ComponentKind::Allowance(a) => Some((a.location, a.lifetime, true)),
+            ComponentKind::ResidentWeight(_) => None,
         }
     }
 }
@@ -244,6 +262,7 @@ pub struct Contract {
     pub phase_order: PhaseOrder,
     /// Family-resolved once, before components price the selected reply storage.
     pub spark_reply_format: Option<SparkReplyFormat>,
+    pub resident_weight_limit: Option<ResidentWeights>,
     pub page_rows: u64,
     pub maximum_pages: u64,
     pub gpus: usize,
@@ -288,9 +307,14 @@ impl Contract {
             bytes: ByteCurve::fixed(a.bytes, maximum_pages),
             kind: ComponentKind::Allowance(a),
         }));
+        components.extend(facts.resident_weights.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.weights.0, maximum_pages);
+            Component::resident_weight(owner, bytes)
+        }));
         Self {
             phase_order: facts.phase_order,
             spark_reply_format: None,
+            resident_weight_limit: None,
             page_rows,
             maximum_pages,
             gpus,
@@ -312,7 +336,7 @@ impl Contract {
     }
     pub fn facts(&self, selected: &[usize], pages: u64) -> Result<Facts, Refusal> {
         self.decisions(selected)?;
-        let mut result = Facts {
+        let mut result = Facts { resident_weights: vec![],
             phase_order: self.phase_order,
             allocations: vec![],
             deferred: vec![],
@@ -324,7 +348,7 @@ impl Contract {
                 continue;
             }
             let bytes = component.bytes.at(pages)?;
-            if bytes == 0 {
+            if bytes == 0 && !matches!(component.kind, ComponentKind::ResidentWeight(_)) {
                 continue;
             }
             match &component.kind {
@@ -366,6 +390,11 @@ impl Contract {
                     let mut allowance = template.clone();
                     allowance.bytes = bytes;
                     result.allowances.push(allowance);
+                }
+                ComponentKind::ResidentWeight(template) => {
+                    let mut owner = template.clone();
+                    owner.weights = ResidentWeights(bytes);
+                    result.resident_weights.push(owner);
                 }
             }
         }
@@ -451,6 +480,13 @@ impl Contract {
     }
     pub(super) fn validate_home_budgets(&self, budgets: &[Budget]) -> Result<(), Refusal> {
         let covered = |location| budgets.iter().any(|budget| budget.locations.contains(&location));
+        for component in &self.components {
+            if let ComponentKind::ResidentWeight(owner) = &component.kind {
+                if !covered(owner.location) {
+                    return Err(Refusal::InvalidFact(format!("resident weight {} has no physical budget", owner.id)));
+                }
+            }
+        }
         for variable in &self.variables {
             match variable {
                 Variable::Embedding(values) => {
@@ -586,8 +622,18 @@ impl Contract {
                 !self.phase_order.at_or_before(life.first, life.last)) {
                 return Err(Refusal::InvalidFact("component lifetime contradicts family phase order".into()));
             }
+            if let ComponentKind::ResidentWeight(owner) = &component.kind {
+                if owner.id.is_empty() || matches!(owner.location.device,
+                    Device::Coordinator(gpu) if usize::from(gpu) >= self.gpus)
+                    || !matches!(owner.location,
+                        Location { device: Device::Coordinator(_) | Device::Spark(_), domain: Domain::Device | Domain::Managed }
+                        | Location { device: Device::Host, domain: Domain::Host | Domain::Pinned })
+                {
+                    return Err(Refusal::InvalidFact(format!("invalid resident weight {}", owner.id)));
+                }
+            }
             if let ComponentKind::Reservation(reservation) = &component.kind {
-                let facts = Facts { phase_order: self.phase_order, allocations: vec![], deferred: vec![],
+                let facts = Facts { resident_weights: vec![], phase_order: self.phase_order, allocations: vec![], deferred: vec![],
                     sequential: vec![], reservations: vec![reservation.clone()], allowances: vec![] };
                 validate_owners(&facts)?;
             }
@@ -600,6 +646,30 @@ impl Contract {
             if let ComponentKind::Allocation { shape, offset, .. } = &component.kind {
                 for curve in shape.iter().chain(offset) {
                     curve.validate(self.maximum_pages)?;
+                }
+            }
+        }
+        let mut allocations = BTreeMap::<&str, Vec<&Component>>::new();
+        for component in &self.components {
+            if let ComponentKind::Allocation { template, .. } = &component.kind {
+                allocations.entry(&template.id).or_default().push(component);
+            }
+        }
+        let mut weights = BTreeMap::<&str, Vec<&Component>>::new();
+        for component in &self.components {
+            let ComponentKind::ResidentWeight(owner) = &component.kind else { continue };
+            let peers = weights.entry(&owner.id).or_default();
+            if peers.iter().any(|other| component.activation.overlaps(&other.activation)) {
+                return Err(Refusal::InvalidFact(format!("overlapping resident weight {}", owner.id)));
+            }
+            peers.push(component);
+            for other in allocations.get(owner.id.as_str()).into_iter().flatten() {
+                if let ComponentKind::Allocation { template, .. } = &other.kind {
+                    if component.activation.overlaps(&other.activation)
+                        && (template.view.is_some() || template.location != owner.location)
+                    {
+                        return Err(Refusal::InvalidFact(format!("resident weight {} is not a physical backing", owner.id)));
+                    }
                 }
             }
         }

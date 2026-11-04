@@ -437,7 +437,7 @@ mod tests {
             allocation: spec("draft.weight", 64, draft_life, "draft weights"),
             address: 4096,
         };
-        let facts = Facts {
+        let facts = Facts { resident_weights: vec![],
             phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
             allocations: vec![target.allocation.clone(), draft.allocation.clone()],
             deferred: vec![],
@@ -469,7 +469,7 @@ mod tests {
                 onboard: Pin::Auto,
                 prefill: Pin::Auto,
                 spark_reply_format: None,
-                operation: Operation::Serving,
+                operation: Operation::Serving, resident_weight_limit: None,
             },
             decisions: Decisions {
                 spark_reply_format: None,
@@ -668,7 +668,7 @@ mod tests {
                     headroom: 0,
                 },
             ];
-            let facts = Facts {
+            let facts = Facts { resident_weights: vec![],
                 phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
                 allocations: owners,
                 deferred: vec![],
@@ -682,7 +682,7 @@ mod tests {
                     onboard: Pin::Auto,
                     prefill: Pin::Auto,
                     spark_reply_format: None,
-                    operation: Operation::Serving,
+                    operation: Operation::Serving, resident_weight_limit: None,
                 },
                 decisions: Decisions {
                     spark_reply_format: None,

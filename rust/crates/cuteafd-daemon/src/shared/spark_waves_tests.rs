@@ -89,14 +89,14 @@ fn retained_wave_storage_matches_independent_contract() -> Result<()> {
             let spec = SparkWaveOwners { ranks, waves: slots, pinned, staging: if registered {
                 SparkWaveStaging::Registered { slot_bytes: slot_bytes as u64 }
             } else { SparkWaveStaging::Standalone { slot_bytes: slot_bytes as u64 } } };
-            let facts = Facts {phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: spec.allocations("test.wave", Lifetime::TARGET)?,
+            let facts = Facts { resident_weights: vec![],phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: spec.allocations("test.wave", Lifetime::TARGET)?,
                 deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
             let budgets = vec![Budget { id: "wave fixture pinned".into(), locations: vec![Location::PINNED],
                 physical_bytes: 128 << 20, logical_bytes: 128 << 20, headroom: 0,
                 baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
             let phases = planner::evaluate(&facts, &budgets)?;
             let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                    prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving },
+                    prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving , resident_weight_limit: None,},
                 decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
                     embedding: None, prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
                 pool_tokens: 64, facts, budgets, phases };
@@ -280,14 +280,14 @@ fn retained_link_composition_counts_fallback_egress_once() -> Result<()> {
                     rings: SparkRings { max_frame_bytes: 1 << 24, depth: 2, slot_bytes: 256, alignment: 64 } },
                 unused_egress_bytes: (topology == 2).then_some((256 * slots) as u64),
             };
-            let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET,
+            let facts = Facts { resident_weights: vec![], phase_order: PhaseOrder::DRAFT_THEN_TARGET,
                 allocations: spec.allocations("test.link", Lifetime::TARGET)?, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
             let budgets = vec![Budget { id: "CPU link owners".into(), locations: vec![devices.location(device)?, Location::PINNED],
                 physical_bytes: 512 << 20, logical_bytes: 512 << 20, headroom: 0,
                 baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
             let phases = planner::evaluate(&facts, &budgets)?;
             let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                    prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving }, decisions: Decisions { spark_reply_format: None, attention: vec![],
+                    prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving , resident_weight_limit: None,}, decisions: Decisions { spark_reply_format: None, attention: vec![],
                     onboard_layers: vec![], expert_homes: Default::default(), embedding: None,
                     prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 }, pool_tokens: 64, facts, budgets, phases };
             // Actual allocation subset; numeric ring snapshots are not real RDMA endpoints.
