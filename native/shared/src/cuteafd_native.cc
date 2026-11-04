@@ -921,6 +921,34 @@ extern "C" cuteafd_status_t cuteafd_copy_device_rows_async(
 #endif
 }
 
+extern "C" cuteafd_status_t cuteafd_cuda_dmabuf_allocation_granularity(size_t* out) {
+  if (out == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "dma-buf allocation granularity output is null");
+  }
+#if CUTEAFD_NATIVE_ENABLE_CUDA && CUTEAFD_NATIVE_ENABLE_RDMA
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess || cudaFree(nullptr) != cudaSuccess) {
+    return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "no current CUDA device for dma-buf allocation");
+  }
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = device;
+  const CUresult result = cuMemGetAllocationGranularity(out, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
+  if (result != CUDA_SUCCESS || *out == 0) {
+    return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cannot query device dma-buf allocation granularity (CUDA " +
+        std::to_string(static_cast<int>(result)) + ")");
+  }
+  const long page = sysconf(_SC_PAGESIZE);
+  if (page <= 0 || *out % static_cast<size_t>(page) != 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "device dma-buf granularity is not a host-page multiple");
+  }
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "dma-buf allocation granularity requires CUDA");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out) {
   if (out == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "device buffer output pointer is null");

@@ -1679,6 +1679,7 @@ native_symbols! {
     cuteafd_cuda_enable_peer: unsafe extern "C" fn(i32) -> CuteafdStatus,
     cuteafd_copy_peer_async: unsafe extern "C" fn(CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize, *mut c_void) -> CuteafdStatus,
     cuteafd_copy_device_rows_async: unsafe extern "C" fn(CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize, usize, usize, usize, *mut c_void) -> CuteafdStatus,
+    cuteafd_cuda_dmabuf_allocation_granularity: unsafe extern "C" fn(*mut usize) -> CuteafdStatus,
     cuteafd_alloc_device_buffer: AllocDeviceBufferFn,
     cuteafd_alloc_managed_device_buffer: AllocManagedDeviceBufferFn,
     cuteafd_free_device_buffer: FreeDeviceBufferFn,
@@ -2530,6 +2531,16 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_copy_device_rows_async", unsafe {
             call(dst, src, width, rows, dst_pitch, src_pitch, stream)
         })
+    }
+
+    pub fn dmabuf_allocation_granularity(&self) -> Result<usize> {
+        let call = self.cuteafd_cuda_dmabuf_allocation_granularity()?;
+        let mut bytes = 0;
+        // SAFETY: native writes one size_t while this DSO remains loaded.
+        let status = unsafe { call(&mut bytes) };
+        self.status_to_result("cuteafd_cuda_dmabuf_allocation_granularity", status)?;
+        anyhow::ensure!(bytes > 0, "device dma-buf allocation granularity is zero");
+        Ok(bytes)
     }
 
     pub fn alloc_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {

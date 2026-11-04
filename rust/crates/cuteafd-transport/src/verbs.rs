@@ -4043,15 +4043,15 @@ impl VerbsHostMappedRdmaRing {
             "benchmark header and payload must fit the slot");
         let mut fallback = None;
         if device {
-            // 64 KiB accommodates both Spark's 64 KiB and raptor's 4 KiB pages.
-            let alignment = 65536usize;
-            let span = self.layout.registered_span_bytes.checked_next_multiple_of(alignment)
+            // Export one whole allocation, not an interior suballocation. CUDA's
+            // recommended granularity also avoids small-allocation pooling on GB10.
+            let alignment = self.endpoint.library.dmabuf_allocation_granularity()?;
+            let bytes = self.layout.registered_span_bytes.checked_next_multiple_of(alignment)
                 .context("device SEND ring alignment overflow")?;
-            let bytes = span.checked_add(alignment).context("device SEND ring size overflow")?;
             let mut raw = self.endpoint.library.alloc_device_buffer(bytes)?;
-            let aligned = (raw.ptr as usize).next_multiple_of(alignment);
-            // Padding leaves `span` bytes within the live raw allocation.
-            let view = CuteafdDeviceBuffer { ptr: aligned as *mut c_void, bytes: span, ..raw };
+            let view = raw;
+            tracing::info!(allocation_bytes = bytes, allocation_granularity = alignment,
+                "allocated whole device SEND ring");
             // SAFETY: this ring retains raw storage through endpoint destruction.
             let registered = unsafe { self.endpoint.library.rdma_rc_endpoint_register_device_region(
                 self.endpoint.info.handle, view.ptr, view.bytes) };
