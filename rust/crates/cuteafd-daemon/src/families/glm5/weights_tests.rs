@@ -518,6 +518,7 @@ fn row_reader_concatenates_bf16_and_drains_fp8_temporaries_before_reuse() -> Res
     let fixture_dso = Fixture::build()?;
     let library = fixture_dso.load()?;
     for device in 0..2 { fixture_dso.configure_memory(&library, device, 1 << 34)?; }
+    let mut dequantizations = 0;
     for kind in ["bf16", "mixed", "fp8", "head"] {
         let root = tempfile::tempdir_in(fixture_dso.directory())?;
         let (mut config, tensors) = fixture::glm5_compact_weights();
@@ -584,7 +585,6 @@ fn row_reader_concatenates_bf16_and_drains_fp8_temporaries_before_reuse() -> Res
             assert_eq!(inventory.row_loading.heap_payload_bytes, (raw + grid) as u64);
             assert_eq!(inventory.row_loading.sync_upload_bytes, upload as u64);
             let audit = AllocationAudit::start();
-            let before_dequant = fixture_dso.events()?.bytes().filter(|&c| c == b'B').count();
             let mut backing = None;
             for _ in 0..2 {
                 let out = loader.rows(&names)?;
@@ -609,8 +609,8 @@ fn row_reader_concatenates_bf16_and_drains_fp8_temporaries_before_reuse() -> Res
             }
             // The fixture dequantizer is a no-op: only BF16 bytes and actual
             // scratch ownership are validated, never FP8 numerical output.
-            assert_eq!(fixture_dso.events()?.bytes().filter(|&c| c == b'B').count() - before_dequant,
-                2 * fp8_members);
+            dequantizations += 2 * fp8_members;
+            assert_eq!(fixture_dso.events()?.bytes().filter(|&c| c == b'B').count(), dequantizations);
             assert_eq!(library.release_sync_h2d_staging()?, upload);
             let mut device_live = BTreeMap::new();
             let (mut device_peak, mut pinned_peak, mut pinned_live) = (0, 0, None);
