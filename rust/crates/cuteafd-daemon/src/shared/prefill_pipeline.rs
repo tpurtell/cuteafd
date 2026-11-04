@@ -568,11 +568,11 @@ mod tests {
                 assert_eq!((descriptor.source_request_id, descriptor.token_position, descriptor.source_kind),
                     (id, token as u64, ExpertV2SourceKind::Prefill));
             }
-            let decision = SparkReplyFormat::Nvfp4.combined(request.rows.iter().map(|row|
+            let decision = cuteafd_core::spark_reply::SparkReplyFormats { prefill: Some(SparkReplyFormat::Nvfp4), decode: None }.combined(request.rows.iter().map(|row|
                 (row.source_request_id, row.source_kind == ExpertV2SourceKind::Prefill)));
-            assert_eq!(decision.format, if first_rows == 64 { SparkReplyFormat::Bf16 } else { SparkReplyFormat::Nvfp4 });
+            assert_eq!(decision.format, SparkReplyFormat::Nvfp4);
             request.rows[0].source_kind = ExpertV2SourceKind::Decode;
-            assert_eq!(SparkReplyFormat::Nvfp4.combined(request.rows.iter().map(|row|
+            assert_eq!(cuteafd_core::spark_reply::SparkReplyFormats { prefill: Some(SparkReplyFormat::Nvfp4), decode: None }.combined(request.rows.iter().map(|row|
                 (row.source_request_id, row.source_kind == ExpertV2SourceKind::Prefill))).format, SparkReplyFormat::Bf16);
             let mut singleton = unit.clone();
             singleton.segments.clear();

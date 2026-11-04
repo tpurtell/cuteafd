@@ -35,6 +35,7 @@ pub(crate) struct RingCheck {
 
 pub(crate) struct RoundProbe<'a> {
     collect_routes: bool,
+    collect_timing: bool,
     clock: LayerClock<'a>,
     routes: RoundRoutes,
     /// Pinned `[layer][row][slot]` u32 ids, packed to this round's row stride.
@@ -71,6 +72,7 @@ impl<'a> RoundProbe<'a> {
         library.cuda_zero_bytes(device_ring.buffer, bytes)?;
         let last_owned = dense.iter().rposition(|&dense| !dense);
         Ok(Self { collect_routes: super::binding::configured_needs_routes(),
+            collect_timing: super::binding::configured_needs_timing(),
             clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring,
             device_ring, last_owned, downloaded: false, capacity,
             topk, ringed: vec![false; layers], staged: vec![false; layers], dense,
@@ -80,7 +82,7 @@ impl<'a> RoundProbe<'a> {
 
     /// Start a verify step of `rows` rows.
     pub fn begin(&mut self, rows: usize) {
-        if !self.collect_routes { self.pending = true; return; }
+        if !self.collect_routes && !self.collect_timing { self.pending = true; return; }
         self.routes.begin(rows);
         for (layer, &dense) in self.dense.iter().enumerate() {
             if dense { let _ = self.routes.dense(layer); }
@@ -103,7 +105,7 @@ impl<'a> RoundProbe<'a> {
 
     /// Whether a layer's ids go through the ring: every local layer, and
     /// Spark layers too under the ring check.
-    pub fn wants_ring(&self, spark: bool) -> bool { self.active && (!spark || self.check) }
+    pub fn wants_ring(&self, spark: bool) -> bool { self.active && self.collect_routes && (!spark || self.check) }
 
     /// Mark the end of `layer` on `stream`.
     ///
@@ -112,8 +114,8 @@ impl<'a> RoundProbe<'a> {
     pub unsafe fn mark(&mut self, layer: usize, stream: *mut c_void) -> Result<()> {
         if self.active {
             // SAFETY: forwarded from the caller; no read of this round's marks is in flight.
-            unsafe { self.clock.mark(layer, stream, false) };
-            if Some(layer) == self.last_owned && self.ringed.iter().any(|&queued| queued) {
+            if self.collect_timing { unsafe { self.clock.mark(layer, stream, false) }; }
+            if self.collect_routes && Some(layer) == self.last_owned && self.ringed.iter().any(|&queued| queued) {
                 // SAFETY: all owner-local D2D writes precede this download on the same stream;
                 // the pinned ring remains owned until the existing verifier sync and finish.
                 unsafe { self.device_ring.library.copy_d2h_host_buffer_async(
@@ -130,7 +132,7 @@ impl<'a> RoundProbe<'a> {
     /// # Safety
     /// `stream` is live on this probe's device and ordered after the input transfer.
     pub unsafe fn mark_entry(&mut self, layer: usize, stream: *mut c_void) {
-        if self.active {
+        if self.active && self.collect_timing {
             // SAFETY: the caller guarantees the event and stream ownership/order.
             unsafe { self.clock.mark_entry(layer, stream, false); }
         }
@@ -138,7 +140,7 @@ impl<'a> RoundProbe<'a> {
 
     /// A Spark layer's staged ids: `rows * topk` little-endian u32 in row order.
     pub fn staged(&mut self, layer: usize, bytes: &[u8]) {
-        if !self.active || self.error.is_some() { return; }
+        if !self.active || !self.collect_routes || self.error.is_some() { return; }
         match self.routes.push_bytes(layer, bytes, ROUTE_MASK) {
             Ok(()) => self.staged[layer] = true,
             Err(error) => self.error = Some(error),
@@ -153,7 +155,7 @@ impl<'a> RoundProbe<'a> {
     /// engine's live stream; the ring is read only after the step's sync.
     pub unsafe fn ring(&mut self, library: &NativeLibrary, layer: usize, ids: CuteafdDeviceBuffer, rows: usize,
         stream: *mut c_void) -> Result<()> {
-        if !self.active || layer >= self.ringed.len() || rows > self.capacity { return Ok(()); }
+        if !self.active || !self.collect_routes || layer >= self.ringed.len() || rows > self.capacity { return Ok(()); }
         let bytes = rows * self.topk * 4;
         let offset = layer * rows * self.topk * 4;
         let arena = self.device_ring.buffer;
@@ -176,7 +178,9 @@ impl<'a> RoundProbe<'a> {
         let _timing = super::clock::HostSpan::new(super::clock::HostStage::Routes);
         self.active = false;
         if !std::mem::take(&mut self.pending) { return None; }
-        if !self.collect_routes { return Some((&self.routes, Vec::new())); }
+        if !self.collect_routes {
+            return Some((&self.routes, if self.collect_timing { self.clock.read() } else { Vec::new() }));
+        }
         if self.ringed.iter().any(|&queued| queued) && !self.downloaded {
             tracing::debug!("draft policy route arena was not downloaded before verifier sync");
             return None;
@@ -230,6 +234,44 @@ fn settle(routes: &mut RoundRoutes, ring: &[u8], capacity: usize, topk: usize, r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timing_only_probe_records_events_without_copying_routes() -> Result<()> {
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let ids = DeviceAllocation::new(&library, 4)?;
+        library.copy_h2d(ids.buffer, &7u32.to_le_bytes())?;
+        let mut probe = RoundProbe::new(&library, vec![false; 2], 1, 1)?;
+        probe.collect_timing = true;
+        for routes in [false, true] {
+            probe.collect_routes = routes;
+            probe.begin(1);
+            assert_eq!(probe.wants_ring(false), routes);
+            let before = fixture.events()?;
+            // SAFETY: the CPU fixture owns the buffers/events and accepts a synthetic stream.
+            unsafe {
+                probe.mark_entry(0, std::ptr::null_mut());
+                for layer in 0..2 {
+                    probe.ring(&library, layer, ids.buffer, 1, std::ptr::null_mut())?;
+                    probe.mark(layer, std::ptr::null_mut())?;
+                }
+            }
+            probe.staged(0, &7u32.to_le_bytes());
+            assert_eq!(probe.staged[0], routes);
+            probe.end();
+            let (observed, times) = probe.finish().expect("valid capture");
+            assert!(times.iter().any(Option::is_some));
+            if routes { assert_eq!(observed.flat(), &[7, 7]); }
+            let after = fixture.events()?;
+            let calls = &after[before.len()..];
+            assert_eq!(calls.matches('R').count(), 3);
+            assert_eq!(calls.matches('S').count(), 0, "probe timing must be asynchronous");
+            assert_eq!(calls.matches('C').count(), if routes { 2 } else { 0 });
+            assert_eq!(calls.matches('J').count(), usize::from(routes));
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]

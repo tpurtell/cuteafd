@@ -151,12 +151,21 @@ pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Res
     Ok(())
 }
 
-/// Trace capture retains complete resources even when selection does not use them.
+/// Replay traces retain routes, but do not request per-layer GPU timing.
+pub(crate) fn needs_timing(policy: &DraftPolicy) -> bool {
+    policy.needs_routes() || super::timing_profile()
+}
+
+/// Trace capture retains complete routes even when selection does not use them.
 pub(crate) fn needs_routes(policy: &DraftPolicy) -> bool {
     policy.needs_routes() || replay_trace().is_some()
 }
 
 /// Probes are allocated before some families bind their policy.
+pub(crate) fn configured_needs_timing() -> bool {
+    super::draft_mode() == cuteafd_core::DraftMode::Shared || super::timing_profile()
+}
+
 pub(crate) fn configured_needs_routes() -> bool {
     super::draft_mode() == cuteafd_core::DraftMode::Shared || replay_trace().is_some()
 }
@@ -216,7 +225,7 @@ pub(crate) fn simple_reliability(policy: &DraftPolicy) -> serde_json::Value {
 
 /// Opt-in complete observation capture, including dSpark head evidence. The
 /// selector-only confidence trace does not cover that serving path.
-fn replay_trace() -> Option<&'static crate::shared::speculation_trace::Trace> {
+pub(crate) fn replay_trace() -> Option<&'static crate::shared::speculation_trace::Trace> {
     use std::sync::OnceLock;
     static TRACE: OnceLock<Option<crate::shared::speculation_trace::Trace>> = OnceLock::new();
     TRACE.get_or_init(|| {

@@ -41,12 +41,12 @@ fn bf16_to_f32(bits: u16) -> f32 { f32::from_bits((bits as u32) << 16) }
 /// deterministic, decodable payloads inside the sparse fixture shard.
 fn fill_layer0(dir: &Path) -> Result<()> {
     let shard = dir.join("model-00001.safetensors");
-    let bytes = std::fs::read(&shard).map(|b| b[..8].to_vec())?;
-    let header_len = u64::from_le_bytes(bytes[..8].try_into()?) as usize;
     let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&shard)?;
-    let mut header = vec![0u8; header_len];
     use std::io::Read;
-    file.seek(SeekFrom::Start(8))?;
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)?;
+    let header_len = u64::from_le_bytes(prefix) as usize;
+    let mut header = vec![0u8; header_len];
     file.read_exact(&mut header)?;
     let header: serde_json::Value = serde_json::from_slice(&header)?;
     let base = 8 + header_len as u64;
@@ -88,6 +88,7 @@ fn fill_layer0(dir: &Path) -> Result<()> {
 struct Screen<'a> {
     library: &'a NativeLibrary,
     execution: Exl3Execution<'a>,
+    weighted_execution: Exl3Execution<'a>,
     epilogue: PartialEpilogue<'a>,
     inputs: [DeviceAllocation<'a>; 3],
     slot: DeviceAllocation<'a>,
@@ -124,7 +125,7 @@ impl Screen<'_> {
     /// The weighted reply (unchanged path): BF16 [rows, WIDTH].
     fn weighted(&mut self, rows: &[usize]) -> Result<Vec<u8>> {
         self.stage(rows)?;
-        let out = unsafe { self.execution.launch_layer(0, self.inputs(), rows.len(), self.stream.raw)? };
+        let out = unsafe { self.weighted_execution.launch_layer(0, self.inputs(), rows.len(), self.stream.raw)? };
         unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
         self.read(out, rows.len() * WIDTH * 2)
     }
@@ -195,11 +196,14 @@ fn partial_reply_screen() -> Result<()> {
     library.cuda_set_device(0)?;
     let weights = Rc::new(vec![Exl3Weights::load(&library, &catalog,
         ExpertLayer::BackboneExl3Tp { layer: 0, rank: 0, world: 6 }, 30_000_000_000)?]);
+    // Partial-only admission omits sum scratch and token output; the reference owns its own Sum arena.
+    let weighted_execution = unsafe { Exl3Execution::with_input_format(&library, weights.clone(), &package,
+        Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum)? };
     let execution = unsafe { Exl3Execution::with_input_format(&library, weights, &package,
         Exl3InputFormat::Fp8K32, Exl3Epilogue::PartialReplies)? };
     let capacity = 80;
     let pitch = WIDTH + WIDTH / 32;
-    let mut screen = Screen { library: &library, execution,
+    let mut screen = Screen { library: &library, execution, weighted_execution,
         epilogue: PartialEpilogue::load(&library, &programs, capacity)?,
         inputs: [DeviceAllocation::new(&library, capacity * pitch)?, DeviceAllocation::new(&library, capacity * TOPK * 4)?,
             DeviceAllocation::new(&library, capacity * TOPK * 4)?],
@@ -306,6 +310,21 @@ fn partial_reply_screen() -> Result<()> {
         ensure!(sum_error < 1.0 / 64.0, "{wide:?}: weighted sum of partials differs from the weighted reply ({sum_error})");
         eprintln!("{wide:?}: rows invariant; wide/BF16 worst step ratio {worst:.3} over {normal_blocks}/{live_blocks} \
             normal-scale blocks (peak {peak:e}); weighted-sum rel {sum_error:.4}");
+    }
+    // Every format can coexist in one payload without changing any row's bytes.
+    for wide in [PartialWire::Nvfp4, PartialWire::Fp8] {
+        let regions: Vec<u8> = (0..wave.len()).map(|i| (i % 3) as u8).collect();
+        let (payload, plan) = screen.partial(&wave, wide, regions.clone())?;
+        let layout = plan.layout(TOPK, WIDTH)?;
+        for (i, &row) in wave.iter().enumerate() {
+            let region = regions[i] as usize;
+            let record = match region { 0 => WIDTH * 2, 1 => wide.record_bytes(WIDTH),
+                _ => wide.other().record_bytes(WIDTH) };
+            let before = regions[..i].iter().filter(|&&r| r as usize == region).count();
+            let (alone, _) = screen.partial(&[row], wide, vec![region as u8])?;
+            ensure!(region_row(&payload, layout.offsets[region], before, record) == &alone[..TOPK * record],
+                "{wide:?}: row {row} region {region} differs in a three-region wave");
+        }
     }
     // Gate 4: zero-row regions write nothing (all-BF16 leaves the wide area at its sentinel).
     let (payload, plan) = screen.partial(&wave, PartialWire::Nvfp4, vec![0; wave.len()])?;

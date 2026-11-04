@@ -1,5 +1,4 @@
-//! Spark reply policy. Combined units never compress a decode/verify row or
-//! a request contributing at most 64 rows, including inside a wider unit.
+//! Independent Spark prefill and decode/verify reply selections.
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
@@ -12,16 +11,59 @@ pub enum SparkReplyFormat {
     Nvfp4,
 }
 
-static REQUESTED: std::sync::OnceLock<Option<SparkReplyFormat>> = std::sync::OnceLock::new();
-
-/// Common CLI selection, fixed before model planning or allocation.
-pub fn set_requested(format: Option<SparkReplyFormat>) -> Result<(), &'static str> {
-    REQUESTED
-        .set(format)
-        .map_err(|_| "Spark reply format was already initialized")
+/// Explicit selections remain optional so omission retains each family's defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparkReplyFormats {
+    pub prefill: Option<SparkReplyFormat>,
+    pub decode: Option<SparkReplyFormat>,
 }
-pub fn requested() -> Option<SparkReplyFormat> {
-    REQUESTED.get().copied().flatten()
+
+static REQUESTED: std::sync::OnceLock<SparkReplyFormats> = std::sync::OnceLock::new();
+
+/// Common CLI selections, fixed before model planning or allocation.
+pub fn set_requested(formats: SparkReplyFormats) -> Result<(), &'static str> {
+    REQUESTED.set(formats).map_err(|_| "Spark reply formats were already initialized")
+}
+pub fn requested() -> SparkReplyFormats {
+    REQUESTED.get().copied().unwrap_or_default()
+}
+
+impl SparkReplyFormats {
+    pub fn prefill(self, partial: bool) -> SparkReplyFormat {
+        SparkReplyFormat::resolve(self.prefill, partial)
+    }
+
+    pub fn decode(self) -> SparkReplyFormat {
+        self.decode.unwrap_or_default()
+    }
+
+    pub fn can_compress(self) -> bool {
+        self.prefill(false) != SparkReplyFormat::Bf16 || self.decode() != SparkReplyFormat::Bf16
+    }
+
+    /// `(request id, is prefill)` per row. A mixed unit uses the decode
+    /// selection without changing scheduler packing. Only omitted prefill
+    /// selections retain the per-request small-row BF16 fallback.
+    pub fn combined(self, rows: impl IntoIterator<Item = (u64, bool)>) -> ReplyDecision {
+        let mut counts = BTreeMap::<u64, usize>::new();
+        let mut prefill_rows = 0;
+        let mut non_prefill = false;
+        for (id, prefill) in rows {
+            prefill_rows += usize::from(prefill);
+            non_prefill |= !prefill;
+            *counts.entry(id).or_default() += 1;
+        }
+        let format = if counts.is_empty() {
+            SparkReplyFormat::Bf16
+        } else if non_prefill {
+            self.decode()
+        } else if self.prefill.is_none() && counts.values().any(|&n| n <= 64) {
+            SparkReplyFormat::Bf16
+        } else {
+            self.prefill(false)
+        };
+        ReplyDecision { format, prefill_rows, mixed: non_prefill && prefill_rows > 0 }
+    }
 }
 
 impl SparkReplyFormat {
@@ -46,37 +88,13 @@ impl SparkReplyFormat {
         })
     }
 
-    /// `(request id, is prefill)` for every row. An ineligible request makes
-    /// the whole combined unit BF16; the returned counts explain that fallback.
-    pub fn combined(self, rows: impl IntoIterator<Item = (u64, bool)>) -> ReplyDecision {
-        let mut counts = BTreeMap::<u64, (usize, bool)>::new();
-        let mut prefill_rows = 0;
-        let mut non_prefill = false;
-        for (id, prefill) in rows {
-            prefill_rows += usize::from(prefill);
-            non_prefill |= !prefill;
-            let entry = counts.entry(id).or_insert((0, true));
-            entry.0 += 1;
-            entry.1 &= prefill;
-        }
-        let eligible = !counts.is_empty() && counts.values().all(|&(n, p)| p && n > 64);
-        ReplyDecision {
-            format: if eligible { self } else { Self::Bf16 },
-            prefill_rows,
-            mixed_fallback_rows: if self != Self::Bf16 && non_prefill {
-                prefill_rows
-            } else {
-                0
-            },
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplyDecision {
     pub format: SparkReplyFormat,
     pub prefill_rows: usize,
-    pub mixed_fallback_rows: usize,
+    pub mixed: bool,
 }
 
 impl fmt::Display for SparkReplyFormat {
@@ -104,32 +122,37 @@ impl FromStr for SparkReplyFormat {
 mod tests {
     use super::*;
     #[test]
-    fn combined_policy_is_per_request_and_lossless_for_speculation() {
-        for format in [
-            SparkReplyFormat::Bf16,
-            SparkReplyFormat::Fp8,
-            SparkReplyFormat::Nvfp4,
-        ] {
-            assert_eq!(format.combined((0..65).map(|_| (1, true))).format, format);
-            assert_eq!(
-                format.combined((0..64).map(|_| (1, true))).format,
-                SparkReplyFormat::Bf16
-            );
-            assert_eq!(
-                format.combined((0..128).map(|r| (r / 64, true))).format,
-                SparkReplyFormat::Bf16
-            );
-            let mixed = format.combined((0..130).map(|r| (r / 65, r < 65)));
-            assert_eq!(mixed.format, SparkReplyFormat::Bf16);
-            assert_eq!(mixed.prefill_rows, 65);
-            assert_eq!(
-                mixed.mixed_fallback_rows,
-                if format == SparkReplyFormat::Bf16 {
-                    0
-                } else {
-                    65
+    fn all_nine_pairs_follow_the_unit_phase_at_every_width() {
+        use SparkReplyFormat::*;
+        for prefill in [Bf16, Fp8, Nvfp4] {
+            for decode in [Bf16, Fp8, Nvfp4] {
+                let policy = SparkReplyFormats { prefill: Some(prefill), decode: Some(decode) };
+                for n in [1, 8, 64, 65, 2752] {
+                    assert_eq!(policy.combined((0..n).map(|_| (1, true))).format, prefill);
+                    assert_eq!(policy.combined((0..n).map(|_| (1, false))).format, decode);
                 }
-            );
+                let mixed = policy.combined([(1, true), (2, false)]);
+                assert_eq!(mixed.format, decode);
+                assert!(mixed.mixed);
+                assert_eq!(mixed.prefill_rows, 1);
+                assert_eq!(policy.combined([(1, true), (2, true)]).format, prefill);
+                assert!(!policy.combined([(1, false)]).mixed);
+                assert_eq!(policy.combined([]).format, Bf16);
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_phase_defaults_do_not_leak_between_selections() {
+        use SparkReplyFormat::*;
+        let omitted = SparkReplyFormats::default();
+        assert_eq!((omitted.prefill(false), omitted.prefill(true), omitted.decode()), (Bf16, Nvfp4, Bf16));
+        for n in [1, 64, 65] {
+            assert_eq!(omitted.combined((0..n).map(|_| (1, true))).format, Bf16);
+            assert_eq!(SparkReplyFormats { decode: Some(Fp8), ..omitted }
+                .combined((0..n).map(|_| (1, true))).format, Bf16);
+            assert_eq!(SparkReplyFormats { prefill: Some(Fp8), ..omitted }
+                .combined((0..n).map(|_| (1, false))).format, Bf16);
         }
     }
     #[test]

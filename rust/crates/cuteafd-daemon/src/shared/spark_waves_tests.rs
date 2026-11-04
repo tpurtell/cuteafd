@@ -1006,9 +1006,69 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
 #[test]
 #[ignore = "requires a GPU and native codec exports; run alone (--exact)"]
 fn gpu_compressed_close_retains_reducer_and_reset_reuses_storage() -> Result<()> {
-    cuteafd_core::spark_reply::set_requested(Some(cuteafd_core::SparkReplyFormat::Nvfp4))
+    cuteafd_core::spark_reply::set_requested(cuteafd_core::spark_reply::SparkReplyFormats {
+        prefill: Some(cuteafd_core::SparkReplyFormat::Nvfp4), decode: Some(cuteafd_core::SparkReplyFormat::Nvfp4) })
         .map_err(anyhow::Error::msg)?;
     terminal_close_with_codec(true)
+}
+
+#[test]
+#[ignore = "requires a GPU and native codec exports; run alone (--exact)"]
+fn gpu_decode_reduction_captured_before_first_wave_reads_replay_format() -> Result<()> {
+    use crate::shared::memory::DeviceAllocation;
+    use cuteafd_core::{SparkReplyFormat::Fp8, spark_reply::SparkReplyFormats};
+    cuteafd_core::spark_reply::set_requested(SparkReplyFormats { prefill: None, decode: Some(Fp8) })
+        .map_err(anyhow::Error::msg)?;
+    let path = library_path()?;
+    // SAFETY: the opt-in path names the matching built native library.
+    let library = Arc::new(unsafe { NativeLibrary::load(&path)? });
+    let (hidden, rows, ranks) = (5120usize, 8usize, 2usize);
+    let row_bytes = hidden * 2;
+    let planes = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
+    let ranges = planes.iter().map(|plane| plane.buffer).collect::<Vec<_>>();
+    let words = Arc::new(std::sync::OnceLock::new());
+    let echo = EchoWorld::new(library.clone(), ranks, row_bytes, 3,
+        ranges.iter().map(|range| range.ptr as usize).collect(), Vec::new(), words.clone(), Duration::ZERO,
+        Duration::ZERO, 1, rows * row_bytes)?;
+    let intake = Intake { prefill: false, ranks, row_bytes, ranges,
+        geometry: crate::shared::wave_geometry::SlotGeometry::new(1, rows)?, landing: 3, placed: true, next_slot: 0 };
+    let storage = std::rc::Rc::new(ExchangeStorage::new(&library, &intake)?);
+    let layout = RouteStaging::new(rows, 6, row_bytes)?;
+    let exchange = Waves::start(&library, intake, echo, Vec::new(), vec![StagingArena::new(layout.bytes)?], false, storage)?;
+    let binding = exchange.reduction(0);
+    assert!(binding.fused.is_some(), "decode format is bound before any host-observed wave");
+    let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
+    let output = DeviceAllocation::new(&library, rows * row_bytes)?;
+    // Warm module loading before capture. The mode defaults to BF16.
+    for plane in &planes { library.copy_h2d(plane.buffer, &vec![0; rows * row_bytes])?; }
+    // SAFETY: all planes, mode, output and stream survive the captured graph and drainage.
+    let graph = unsafe {
+        binding.launch(&library, std::ptr::null(), output.buffer.ptr.cast(), rows, stream.raw())?;
+        library.cuda_stream_synchronize(stream.raw())?;
+        library.cuda_graph_begin_capture(stream.raw())?;
+        binding.launch(&library, std::ptr::null(), output.buffer.ptr.cast(), rows, stream.raw())?;
+        let raw = library.cuda_graph_end_capture(stream.raw())?;
+        crate::shared::decode_graph::GraphOwner::new(&library, library.cuda_get_device()?, raw, binding)?
+    };
+    for mode in [0u32, 1, 2, 0, 2, 1] {
+        let payload: Vec<u8> = match mode {
+            0 => (0..rows * hidden).flat_map(|_| 0x3f80u16.to_le_bytes()).collect(),
+            1 => (0..rows).flat_map(|_| [vec![0x38; hidden], vec![127; hidden / 32]].concat()).collect(),
+            _ => (0..rows).flat_map(|_| [vec![0x22; hidden / 2], vec![0x38; hidden / 16]].concat()).collect(),
+        };
+        for plane in &planes { library.copy_h2d(plane.buffer, &payload)?; }
+        exchange.words.store(Counter::ReplyFormat(0), mode);
+        // SAFETY: graph and all captured resources remain live; mode/planes were published before replay.
+        unsafe { library.cuda_graph_launch(graph.raw, stream.raw())?; }
+        // SAFETY: this live stream has no concurrent writers.
+        unsafe { library.cuda_stream_synchronize(stream.raw())?; }
+        let mut actual = vec![0; rows * row_bytes];
+        library.copy_d2h(&mut actual, output.buffer)?;
+        assert!(actual.chunks_exact(2).all(|b| b == 0x4000u16.to_le_bytes()), "replay mode {mode}");
+    }
+    drop(graph);
+    exchange.stop::<EchoWorld>()?;
+    Ok(())
 }
 
 fn terminal_close_with_codec(compressed: bool) -> Result<()> {
@@ -1247,8 +1307,8 @@ fn ring_backend(ring: Ring, slots: usize) -> (Native<Ring>, Vec<u8>, Vec<u8>) {
     let pulls_at = Pulls { base: (pulls.as_mut_ptr() as usize).next_multiple_of(16) };
     let ranks = ring.ranks;
     let row_bytes = ring.row_bytes;
-    (Native { transport: ring, reply_format: cuteafd_core::SparkReplyFormat::Bf16, reply_payloads: vec![0; slots],
-        prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, timing: false, arenas: Vec::new(), words, pulls: pulls_at, slots, ranks, row_bytes, landing: 0,
+    (Native { transport: ring, reply_formats: cuteafd_core::spark_reply::SparkReplyFormats::default(), reply_payloads: vec![0; slots],
+        prefill_rows: 0, compressed_prefill_rows: 0, mixed_decode_rows: 0, timing: false, arenas: Vec::new(), words, pulls: pulls_at, slots, ranks, row_bytes, landing: 0,
         placed: true, receiving: (0..ranks).map(|_| (0, Vec::new(), Vec::new())).collect(), retained: VecDeque::new() },
         control, pulls)
 }
@@ -1753,12 +1813,13 @@ fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<(
         ("mimo-flash", 4096), ("mimo-pro", 6144), ("kimi", 3584),
         ("qwen", 2560), ("step5", 4096), ("ml4", 6144)] {
     let row_bytes = hidden * 2;
-    for selected in [Bf16, Fp8, Nvfp4] {
+    for (selected, decode) in [Bf16, Fp8, Nvfp4].into_iter()
+        .flat_map(|prefill| [Bf16, Fp8, Nvfp4].map(|decode| (prefill, decode))) {
         for landing in [0, (1 << ranks) - 1] {
             let (mut backend, _control, _pulls) = ring_backend(Ring::new(ranks, slots, slot_rows, row_bytes), slots);
-            backend.reply_format = selected;
+            backend.reply_formats = cuteafd_core::spark_reply::SparkReplyFormats { prefill: Some(selected), decode: Some(decode) };
             backend.landing = landing;
-            for (index, (sources, eligible)) in cases.iter().enumerate() {
+            for (index, (sources, _eligible)) in cases.iter().enumerate() {
                 let origins: Vec<_> = sources.iter().enumerate().flat_map(|(id, &(rows, kind))|
                     std::iter::repeat_n((id as u64 + 1, kind), rows)).collect();
                 let rows = origins.len();
@@ -1770,7 +1831,7 @@ fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<(
                         row_index: row, expert_id: 0, gate_weight: 1.0 }).collect(),
                     bytes::Bytes::from(vec![0; rows * row_bytes]))?;
                 let before = request.encode()?;
-                let actual = if *eligible { selected } else { Bf16 };
+                let actual = if sources.iter().all(|(_, kind)| *kind == Prefill) { selected } else { decode };
                 let payload_bytes = rows * actual.row_bytes(hidden).unwrap();
                 backend.transport.payload_bytes = Some(payload_bytes);
                 let sequence = index as u32 + 1;
@@ -1809,7 +1870,7 @@ fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<(
                 }
             }
             assert_eq!(backend.compressed_prefill_rows,
-                if selected == Bf16 { 0 } else { 195 }, "{family} {selected}");
+                (if selected == Bf16 { 0 } else { 516 }) + if decode == Bf16 { 0 } else { 130 }, "{family} {selected}");
         }
     }
     }
@@ -1862,16 +1923,10 @@ fn compact_wave_keeps_wire_bytes_and_reserved_landing_offsets() -> Result<()> {
 }
 
 #[test]
-fn bf16_units_under_compressed_settings_dispatch_zero_reply_decode_launches() {
+fn omitted_phase_settings_keep_all_combined_replies_bf16() {
     use cuteafd_transport::ExpertV2SourceKind::{Decode, MtpVerify, Prefill};
-    for available in [false, true] {
-        for (rows, kind) in [(1, Decode), (96, Decode), (192, MtpVerify), (64, Prefill)] {
-            assert!(!compressed_reduction(single_reply_eligible(rows, kind), available));
-        }
-        assert_eq!(compressed_reduction(single_reply_eligible(65, Prefill), available), available);
-        for rows in [vec![(1, true); 64].into_iter().chain(vec![(2, true); 65]).collect::<Vec<_>>(),
-            vec![(1, true); 65].into_iter().chain(vec![(2, false); 96]).collect()] {
-            assert!(!compressed_reduction(combined_reply_eligible(rows), available));
-        }
+    for (rows, kind) in [(1, Decode), (96, Decode), (192, MtpVerify), (64, Prefill), (65, Prefill)] {
+        assert!(!single_reply_eligible(rows, kind));
     }
+    assert!(!combined_reply_eligible([(1, true), (2, false)]));
 }

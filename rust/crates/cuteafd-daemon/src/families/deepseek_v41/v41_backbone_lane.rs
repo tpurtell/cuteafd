@@ -613,8 +613,23 @@ async fn complete_ffn<T>(
 pub(crate) struct Capture {
     /// Route ids per layer (router ring, staged ids): the priced policy and the replay trace.
     pub routes: bool,
-    /// Per-layer CUDA-event times and the FFN stage split (implied by `routes`).
+    /// Per-layer CUDA-event times and the FFN stage split, independent of routes.
     pub timing: bool,
+}
+
+impl Capture {
+    /// # Safety
+    /// `stream` is live on the clock's device and its previous marks have no readers.
+    unsafe fn record(self, clock: &mut LayerClock<'_>, layer: usize, stream: *mut std::ffi::c_void,
+        entry: bool) {
+        if !self.timing { return; }
+        let drain = !crate::shared::memory::chain::active();
+        // SAFETY: forwarded from the caller; unchained streams must remain idle for rebinding.
+        unsafe {
+            if entry { clock.mark_entry(layer, stream, drain); }
+            else { clock.mark(layer, stream, drain); }
+        }
+    }
 }
 
 /// One per-GPU prefill reserve, shared by host slots. HC, projection and router
@@ -1265,13 +1280,11 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.capture_timing = false;
         self.router.set_ring_capture(false);
     }
-    /// Before a pass: route ids only for the priced policy or the replay
-    /// trace; timing also while a console viewer is connected (its layer and
-    /// expert-stage panels). Always clears the previous pass's marks, so an
+    /// Before a pass: route ids for pricing or replay, timing only for pricing
+    /// or explicit profiling. Always clears the previous pass's marks, so an
     /// untimed pass reports no layer times rather than stale ones.
     pub fn set_capture(&mut self, capture: Capture) {
         let Capture { routes, timing } = capture;
-        let timing = timing || routes;
         self.capture_routes = routes;
         self.capture_timing = timing;
         self.router.set_ring_capture(routes);
@@ -1305,18 +1318,14 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn layer_clock(&self) -> &LayerClock<'a> { &self.layer_clock }
     /// Mark the arrival of the current layer's input from the other GPU.
     pub(crate) fn record_layer_entry(&mut self) {
-        if !self.capture_timing { return; }
-        let stream = self.block.finish_stream();
-        // SAFETY: the FFN-finish stream is live on this lane's device; marks
-        // are read only after the pass completes. Unchained passes drained
-        // this stream and later rebinds require it idle, so wait at once.
-        unsafe { self.layer_clock.mark_entry(self.layer, stream, !crate::shared::memory::chain::active()); }
+        let capture = Capture { routes: self.capture_routes, timing: self.capture_timing };
+        // SAFETY: this lane owns the live finish stream and the pass's unread clock.
+        unsafe { capture.record(&mut self.layer_clock, self.layer, self.block.finish_stream(), true); }
     }
     fn record_layer_finish(&mut self) {
-        if !self.capture_timing { return; }
-        let stream = self.block.finish_stream();
+        let capture = Capture { routes: self.capture_routes, timing: self.capture_timing };
         // SAFETY: as `record_layer_entry`.
-        unsafe { self.layer_clock.mark(self.layer, stream, !crate::shared::memory::chain::active()); }
+        unsafe { capture.record(&mut self.layer_clock, self.layer, self.block.finish_stream(), false); }
     }
     pub fn route_capture_enabled(&self) -> bool { self.capture_routes }
     pub fn install_attention_plan(&mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
@@ -1391,6 +1400,39 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
 mod tests {
     use super::*;
     use cuteafd_loader::read_official_v41_catalog;
+
+    #[test]
+    fn replay_capture_never_drains_layer_events_without_profiling() -> Result<()> {
+        use crate::families::deepseek_v41::v41_native_serve::speculative::round_capture;
+        use cuteafd_core::{DraftMode, DraftPolicy, PolicySeed};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let mut clock = LayerClock::new(&library, 2)?;
+        let mut policy = DraftPolicy::new(cuteafd_core::PolicyGeometry {
+            layers: vec![cuteafd_core::LayerResource { class: Some(0), slice_bytes: 1024., group_rows: 16, timed: true }; 2],
+            experts: 384, topk: 6, max_requests: 16, max_positions: 7, widths: vec![7],
+            classes: vec![cuteafd_core::ResourceClass::rtx()], group_rows_by_rows: Vec::new(), regimes: 2,
+        }, PolicySeed::weak(7), false)?;
+        policy.set_draft_mode(DraftMode::Simple);
+        for profiling in [false, true] {
+            clock.reset();
+            let before = fixture.events()?;
+            let capture = round_capture(Some(&policy), true, true, profiling);
+            assert!(capture.routes);
+            // SAFETY: the CPU fixture accepts a synthetic stream and owns all events.
+            unsafe {
+                capture.record(&mut clock, 0, std::ptr::null_mut(), true);
+                capture.record(&mut clock, 0, std::ptr::null_mut(), false);
+                capture.record(&mut clock, 1, std::ptr::null_mut(), false);
+            }
+            let after = fixture.events()?;
+            let calls = &after[before.len()..];
+            assert_eq!(calls.matches('R').count(), if profiling { 3 } else { 0 });
+            assert_eq!(calls.matches('S').count(), if profiling { 3 } else { 0 });
+            assert_eq!(clock.read().iter().any(Option::is_some), profiling);
+        }
+        Ok(())
+    }
 
     #[test]
     fn l2_plan_prefetches_the_next_layer_only_on_the_gpu_holding_both() {

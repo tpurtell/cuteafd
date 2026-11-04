@@ -1128,7 +1128,7 @@ impl Opened {
         let inputs = glm::GlmInputs {
             loaded_weights: reserved_weights.iter().copied().map(cuteafd_loader::placement::ResidentWeights).collect(),
             drafter_weights,
-        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
+        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
             spark_ranks, native_experts: native, native_workspace, native_dense: native_dense_charge.clone(), native_head: core.as_ref().is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: args.skip_routed_experts,
             prefill_rows: args.prefill_rows as u64,
             prefill_lanes: prefill_lanes as u64,

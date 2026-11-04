@@ -165,7 +165,8 @@ impl SparkExperts for MuseSparkPath<'_> {
         ensure!(self.in_flight.len() < self.waves, "Muse Spark path has {} waves in flight", self.waves);
         let sequence = self.sequence.checked_add(1).context("Muse Spark request sequence overflow")?;
         let (segments, kind, cutoff) = (step.segments.clone(), step.kind, self.cutoff);
-        let plan = ReplyPlan::new(cutoff, &segments.iter().map(|s| s.rows).collect::<Vec<_>>());
+        let plan = ReplyPlan::for_phase(cutoff, &segments.iter().map(|s| s.rows).collect::<Vec<_>>(),
+            kind == ExpertV2SourceKind::Prefill);
         let payload = wire_plan(&plan)?.payload(TOPK, WIDTH)?.3;
         let layout = RouteStaging::new(rows, TOPK, WIRE_ROW_BYTES)?;
         let stream = self.stream.raw;
@@ -200,9 +201,10 @@ impl SparkExperts for MuseSparkPath<'_> {
             let planes = exchange.partial_reply_addresses(slot)?;
             // The wire layout (`PartialReplyPlan::payload`): the BF16 region, then the
             // wide region at the next region-aligned offset.
-            let wide_at = wire_plan(&plan)?.payload(TOPK, WIDTH)?.1;
+            let payload = wire_plan(&plan)?.layout(TOPK, WIDTH)?;
             let image = layout.image(&planes, &ReplyPlanView { bf16_rows: &plan.bf16_rows,
-                wide_rows: &plan.wide_rows, wide_at })?;
+                wide_rows: &plan.wide_rows, wide_at: payload.offsets[1],
+                other_rows: &plan.other_rows, other_at: payload.offsets[2] })?;
             // SAFETY: the slot's fixed tables on this stream's device; the ordered
             // upload waits for its own previous copy (not compute) and the combine
             // that reads it follows on this stream.

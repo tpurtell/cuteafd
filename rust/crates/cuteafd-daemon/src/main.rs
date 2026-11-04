@@ -265,7 +265,8 @@ async fn run() -> Result<()> {
         match Cli::from_arg_matches(&matches) {
             Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
                 cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
-                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cli.spark_reply_format,
+                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
+                        prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
                 cli.coordinator_weight_budget_gib),
             Err(error) => error.exit(),
         }
@@ -288,8 +289,11 @@ async fn run() -> Result<()> {
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
             initial_wait, initial_reply, initial_weight_budget),
     };
-    cuteafd_core::spark_reply::set_requested(family_reply.or(initial_reply)).map_err(anyhow::Error::msg)?;
-    // Read by the coordinator and every Spark worker from the same key.
+    cuteafd_core::spark_reply::set_requested(cuteafd_core::spark_reply::SparkReplyFormats {
+        prefill: family_reply.prefill.or(initial_reply.prefill),
+        decode: family_reply.decode.or(initial_reply.decode),
+    }).map_err(anyhow::Error::msg)?;
+    // Read by the coordinator and every Spark worker from the same keys.
     cuteafd_transport::wait_policy::set_wait_policy(wait_policy)?;
     if let Some((_, options)) = matches.subcommand() {
         if let Ok(Some(path)) = options.try_get_one::<std::path::PathBuf>("native_lib") {

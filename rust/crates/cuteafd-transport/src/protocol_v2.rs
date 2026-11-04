@@ -372,12 +372,15 @@ impl PartialWire {
         match value { 1 => Ok(Self::Nvfp4), 2 => Ok(Self::Fp8),
             other => bail!("ExpertProtocolV2 partial wide format {other} is neither nvfp4 (1) nor fp8 (2)") }
     }
+    pub fn other(self) -> Self {
+        match self { Self::Nvfp4 => Self::Fp8, Self::Fp8 => Self::Nvfp4 }
+    }
     pub fn record_bytes(self, width: usize) -> usize {
         match self { Self::Nvfp4 => width / 2 + width / 16, Self::Fp8 => width + width / 32 }
     }
 }
 
-/// Region of every request row (0: BF16, 1: wide), computed by the coordinator
+/// Region of every request row (0: BF16, 1: wide, 2: the other compressed format), computed by the coordinator
 /// and carried in each row descriptor; the worker never derives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartialReplyPlan {
@@ -420,30 +423,49 @@ impl PartialReplyPlan {
         if self.regions.len() != rows {
             bail!("ExpertProtocolV2 partial plan has {} region bits for {rows} rows", self.regions.len());
         }
-        if let Some(bad) = self.regions.iter().find(|&&r| r > 1) {
-            bail!("ExpertProtocolV2 partial region bit {bad} is neither 0 (BF16) nor 1 (wide)");
+        if let Some(bad) = self.regions.iter().find(|&&r| r > 2) {
+            bail!("ExpertProtocolV2 partial region {bad} is outside 0 (BF16), 1 (wide), 2 (other compressed)");
         }
         Ok(())
     }
 
-    /// (BF16 rows, wide rows).
-    pub fn counts(&self) -> (usize, usize) {
-        let wide = self.regions.iter().filter(|&&r| r == 1).count();
-        (self.regions.len() - wide, wide)
+    /// Each non-empty region starts at a 256-byte boundary. Empty regions do
+    /// not extend the payload. The format of region 2 is `wide.other()`.
+    pub fn layout(&self, topk: usize, width: usize) -> Result<PartialReplyLayout> {
+        self.validate(self.regions.len())?;
+        anyhow::ensure!(topk > 0 && width > 0 && width % 32 == 0, "invalid partial reply geometry");
+        let records = [width.checked_mul(2).context("partial BF16 record overflow")?,
+            self.wide.record_bytes(width), self.wide.other().record_bytes(width)];
+        let mut offsets = [0; 3];
+        let mut bytes = [0; 3];
+        let mut total = 0usize;
+        for region in 0..3 {
+            offsets[region] = total.checked_add(EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN - 1)
+                .context("partial alignment overflow")? / EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN
+                * EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN;
+            bytes[region] = self.regions.iter().filter(|&&r| r as usize == region).count()
+                .checked_mul(topk).and_then(|n| n.checked_mul(records[region]))
+                .context("partial region overflow")?;
+            if bytes[region] != 0 {
+                total = offsets[region].checked_add(bytes[region]).context("partial payload overflow")?;
+            }
+        }
+        Ok(PartialReplyLayout { offsets, bytes, total })
     }
 
-    /// Reply payload: the BF16 region then the wide region, each 256-byte aligned.
-    /// `(bf16 bytes, wide offset, wide bytes, total)`.
+    /// The first two regions and the complete payload extent. Call `layout`
+    /// for all three offsets; existing two-region consumers use this summary.
     pub fn payload(&self, topk: usize, width: usize) -> Result<(usize, usize, usize, usize)> {
-        let (bf16_rows, wide_rows) = self.counts();
-        let bf16 = bf16_rows.checked_mul(topk).and_then(|n| n.checked_mul(width * 2))
-            .context("partial BF16 region overflow")?;
-        let wide_at = bf16.next_multiple_of(EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN);
-        let wide = wide_rows.checked_mul(topk).and_then(|n| n.checked_mul(self.wide.record_bytes(width)))
-            .context("partial wide region overflow")?;
-        let total = if wide == 0 { bf16 } else { wide_at.checked_add(wide).context("partial payload overflow")? };
-        Ok((bf16, wide_at, wide, total))
+        let layout = self.layout(topk, width)?;
+        Ok((layout.bytes[0], layout.offsets[1], layout.bytes[1], layout.total))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialReplyLayout {
+    pub offsets: [usize; 3],
+    pub bytes: [usize; 3],
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]

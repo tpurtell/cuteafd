@@ -164,9 +164,9 @@ pub(crate) fn muse_owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent)
     let rows = u64::from(extent.capacity);
     let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
     let wire_routes = u64::from(geometry.hidden) * 33 / 32 + u64::from(geometry.topk) * 8;
-    // One device and one pinned pair of u32 maps per owner. The pinned maps
+    // One device and one pinned set of three u32 maps per owner. The pinned maps
     // are singleton storage, not per-unit staging: do not multiply by waves.
-    Ok(cuteafd_core::OwnerBytes { scratch: retained + rows * 16, io: rows * wire_routes,
+    Ok(cuteafd_core::OwnerBytes { scratch: retained + rows * 24, io: rows * wire_routes,
         pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
 }
 
@@ -733,7 +733,7 @@ mod tests {
             (7, 20_058_796, 346_142_012), (8, 19_567_276, 329_233_724)] {
             for (capacity, compiled, retained) in [(64, 80, decode), (2752, 2752, prefill)] {
                 let owner = muse_owner_bytes(world, extent(capacity, compiled))?;
-                assert_eq!(owner.scratch, retained + u64::from(capacity) * 16, "TP{world} m{compiled}");
+                assert_eq!(owner.scratch, retained + u64::from(capacity) * 24, "TP{world} m{compiled}");
                 assert_eq!(owner.io, u64::from(capacity) * (4096 + 128 + 64));
                 assert_eq!(owner.pinned_staging, u64::from(capacity) * 64);
             }
@@ -768,7 +768,7 @@ mod tests {
                 let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=retained_index], true,
                     Exl3Epilogue::PartialReplies)?;
                 assert_eq!(muse_owner_bytes(world, extent(capacity, compiled))?.scratch,
-                    retained + u64::from(capacity) * 16);
+                    retained + u64::from(capacity) * 24);
                 let without_wire = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=retained_index], false,
                     Exl3Epilogue::PartialReplies)?;
                 let rows: u64 = capacities.iter().map(|&rows| u64::from(rows)).sum();

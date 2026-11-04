@@ -419,7 +419,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let wave_bytes = NativeTp4Wave::device_bytes_for(decode_rows, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
     let mut deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
-        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(decode_rows), u64::from(capacity), spark_ranks, slots, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?)?;
+        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(decode_rows), u64::from(capacity), spark_ranks, slots, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false))?)?;
     deferred.extend(loaded_weights);
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.

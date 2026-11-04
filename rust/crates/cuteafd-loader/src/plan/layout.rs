@@ -31,7 +31,7 @@ pub struct LayoutOptions {
     /// Explicit bytes bypass both; Some(0) disables the host tier.
     pub host_cache_bytes: Option<u64>,
     /// Shared requested reply policy. Omission preserves Muse NVFP4/combined BF16.
-    pub spark_reply_format: Option<cuteafd_core::SparkReplyFormat>,
+    pub spark_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     /// None selects min(8 GiB, 5% host total) when a supported media tower is loaded.
     pub media_cache_bytes: Option<u64>,
     /// Deterministic host/cgroup sample for offline inventory tests.
@@ -196,7 +196,7 @@ pub struct LayoutOptions {
 
 impl LayoutOptions {
     pub fn resolved_spark_reply_format(&self, partial: bool) -> cuteafd_core::SparkReplyFormat {
-        cuteafd_core::SparkReplyFormat::resolve(self.spark_reply_format, partial)
+        self.spark_reply_formats.prefill(partial)
     }
 
     pub fn resolved_concurrency(&self, family: &str) -> u64 {
@@ -241,7 +241,7 @@ impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
             host_cache_bytes: None,
-            spark_reply_format: cuteafd_core::spark_reply::requested(),
+            spark_reply_formats: cuteafd_core::spark_reply::requested(),
             media_cache_bytes: None,
             host_memory: None,
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
@@ -1644,8 +1644,8 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
             let unit_rows = options.prefill_unit_rows.context("Muse host transport without a unit")?;
             let prefill = crate::serving_capacity::prefill_waves::PrefillPlan { unit_rows, waves: options.prefill_waves,
                 span_rows: unit_rows * options.prefill_waves };
-            let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(options.muse_partial_bf16_max_rows,
-                crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, options.resolved_spark_reply_format(true).into())?;
+            let cutoff = crate::families::muse_spark::replies::Cutoff::with_formats(options.muse_partial_bf16_max_rows,
+                crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, options.spark_reply_formats)?;
             let sequences = usize::try_from(options.resolved_state_slots("muse_spark"))?;
             let host = crate::placement::families::muse_spark::host_transport(&cfg, prefill, cutoff, sequences, ranks)?;
             push(Category::Transport, "transport/rdma-rings", "registered", host.rings, Basis::Exact);

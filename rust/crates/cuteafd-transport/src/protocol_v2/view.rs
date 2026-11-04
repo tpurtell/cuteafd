@@ -149,7 +149,7 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
         self.header.flags & super::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0
     }
 
-    /// Row `index`'s partial-reply region (0 BF16, 1 wide; 0 without the flag).
+    /// Row `index`'s partial-reply region (0 BF16, 1 wide, 2 other compressed; 0 without the flag).
     pub fn row_region(&self, index: usize) -> Result<u16> {
         let offset = index.checked_mul(super::EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN)
             .context("row region offset overflow")?;
@@ -370,8 +370,8 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
             let row = self.row(row_index)?;
             let region = self.row_region(row_index)?;
             if partial {
-                if region > 1 {
-                    bail!("ExpertProtocolV2 partial region bit {region} is neither 0 nor 1");
+                if region > 2 {
+                    bail!("ExpertProtocolV2 partial region {region} is outside 0..=2");
                 }
             } else if region != 0 {
                 bail!("ExpertProtocolV2 request without partial replies carries partial region data");

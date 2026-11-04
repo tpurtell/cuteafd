@@ -105,7 +105,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         pool_tokens: None, onboard: Onboard::Auto,
         spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
         partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-        partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat::Nvfp4,
+        partial_reply_formats: Default::default(),
         local: shared::local_workspace(&catalog, Some(&manifest_path), GPUS, prefill.unit_rows)?,
         drafter, media: Some(super::media::inventory(&snapshot, MediaMode::Off, MediaMode::Off, 1)?) })?;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(

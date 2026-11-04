@@ -110,17 +110,14 @@ fn validate_payload(payload_bytes: usize, capacity: usize) -> Result<()> {
     Ok(())
 }
 
-/// Eligibility is format-independent and known before asynchronous request staging.
+/// Compression selection is known from the phase policy before asynchronous staging.
 pub(crate) fn combined_reply_eligible(rows: impl IntoIterator<Item = (u64, bool)>) -> bool {
-    use cuteafd_core::SparkReplyFormat;
-    SparkReplyFormat::Fp8.combined(rows).format != SparkReplyFormat::Bf16
+    cuteafd_core::spark_reply::requested().combined(rows).format != cuteafd_core::SparkReplyFormat::Bf16
 }
 
 pub(crate) fn single_reply_eligible(rows: usize, kind: cuteafd_transport::ExpertV2SourceKind) -> bool {
     combined_reply_eligible((0..rows).map(|_| (1, kind == cuteafd_transport::ExpertV2SourceKind::Prefill)))
 }
-
-fn compressed_reduction(eligible: bool, available: bool) -> bool { eligible && available }
 
 /// Slot-owned reply reduction binding, never a raw-BF16 plane view. The
 /// owner retains the planes and mode word through stream/graph drainage.
@@ -172,7 +169,6 @@ pub(crate) struct WaveTicket {
     slot: usize,
     rows: usize,
     payload_bytes: usize,
-    combined_reply: bool,
 }
 
 impl WaveTicket {
@@ -721,11 +717,11 @@ struct Retained<F> {
 /// the pull descriptors, the retained reply frames and the control counters.
 struct Native<T: Transport> {
     transport: T,
-    reply_format: cuteafd_core::SparkReplyFormat,
+    reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     reply_payloads: Vec<usize>,
     prefill_rows: u64,
     compressed_prefill_rows: u64,
-    mixed_fallback_rows: u64,
+    mixed_decode_rows: u64,
     timing: bool,
     arenas: Vec<StagingArena>,
     words: Words,
@@ -787,27 +783,39 @@ impl<T: Transport> Backend for Native<T> {
             ensure!(expected == actual, "Spark host reply eligibility differs from built request");
         }
         let mut payload_bytes = job.payload_bytes;
-        if self.reply_format != cuteafd_core::SparkReplyFormat::Bf16
-            && request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0 {
-            let decision = request.select_combined_reply(self.reply_format)?;
-            self.prefill_rows += decision.prefill_rows as u64;
-            self.mixed_fallback_rows += decision.mixed_fallback_rows as u64;
-            if decision.format != cuteafd_core::SparkReplyFormat::Bf16 {
-                self.compressed_prefill_rows += decision.prefill_rows as u64;
+        self.words.store(Counter::ReplyFormat(job.slot), 0);
+        let combined = request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0;
+        if combined {
+            let explicit = self.reply_formats.prefill.is_some() || self.reply_formats.decode.is_some();
+            let decision = if explicit { request.select_combined_reply(self.reply_formats)? } else {
+                self.reply_formats.combined(request.rows.iter().map(|row|
+                    (row.source_request_id, row.source_kind == cuteafd_transport::ExpertV2SourceKind::Prefill)))
+            };
+            static MIXED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if decision.mixed && !MIXED_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(format = %decision.format,
+                    "mixed-phase Spark unit uses decode reply selection (once per launch)");
             }
-            payload_bytes = job.rows * decision.format.row_bytes(request.header.hidden_dim as usize)
-                .context("invalid combined reply width")?;
-            self.words.store(Counter::ReplyFormat(job.slot), match decision.format {
-                cuteafd_core::SparkReplyFormat::Bf16 => 0,
-                cuteafd_core::SparkReplyFormat::Fp8 => 1,
-                cuteafd_core::SparkReplyFormat::Nvfp4 => 2,
-            });
-            if decision.prefill_rows != 0 {
-                tracing::info!(target: "cuteafd::spark_reply", sequence = job.sequence, format = %decision.format,
-                    prefill_rows = self.prefill_rows, compressed_prefill_rows = self.compressed_prefill_rows,
-                    mixed_fallback_rows = self.mixed_fallback_rows,
-                    mixed_fallback_fraction = self.mixed_fallback_rows as f64 / self.prefill_rows as f64,
-                    "Spark reply prefill rows (cumulative per link)");
+            if explicit {
+                self.prefill_rows += decision.prefill_rows as u64;
+                self.mixed_decode_rows += if decision.mixed { decision.prefill_rows as u64 } else { 0 };
+                if decision.format != cuteafd_core::SparkReplyFormat::Bf16 {
+                    self.compressed_prefill_rows += decision.prefill_rows as u64;
+                }
+                payload_bytes = job.rows * decision.format.row_bytes(request.header.hidden_dim as usize)
+                    .context("invalid combined reply width")?;
+                self.words.store(Counter::ReplyFormat(job.slot), match decision.format {
+                    cuteafd_core::SparkReplyFormat::Bf16 => 0,
+                    cuteafd_core::SparkReplyFormat::Fp8 => 1,
+                    cuteafd_core::SparkReplyFormat::Nvfp4 => 2,
+                });
+                if decision.prefill_rows != 0 {
+                    tracing::info!(target: "cuteafd::spark_reply", sequence = job.sequence, format = %decision.format,
+                        prefill_rows = self.prefill_rows, compressed_prefill_rows = self.compressed_prefill_rows,
+                        mixed_decode_rows = self.mixed_decode_rows,
+                        mixed_decode_fraction = self.mixed_decode_rows as f64 / self.prefill_rows as f64,
+                        "Spark reply prefill rows (cumulative per link)");
+                }
             }
         }
         self.reply_payloads[job.slot] = payload_bytes;
@@ -929,9 +937,8 @@ pub(crate) struct Intake {
 
 impl Intake {
     fn reply_format(&self) -> cuteafd_core::SparkReplyFormat {
-        if self.prefill {
-            cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false)
-        } else { cuteafd_core::SparkReplyFormat::Bf16 }
+        let formats = cuteafd_core::spark_reply::requested();
+        if self.prefill { formats.prefill(false) } else { formats.decode() }
     }
 
     fn pinned(&self) -> u8 {
@@ -1012,8 +1019,8 @@ impl<'a> ExchangeStorage<'a> {
     }
 }
 
-fn combined_codec_enabled(intake: &Intake, format: cuteafd_core::SparkReplyFormat) -> bool {
-    intake.prefill && format != cuteafd_core::SparkReplyFormat::Bf16
+fn combined_codec_enabled(_intake: &Intake, format: cuteafd_core::SparkReplyFormat) -> bool {
+    (format != cuteafd_core::SparkReplyFormat::Bf16 || cuteafd_core::spark_reply::requested().can_compress())
         && !cuteafd_core::expert_geometry().partial_replies()
 }
 
@@ -1039,7 +1046,6 @@ pub(crate) struct Waves<'a> {
     layouts: Vec<Option<RouteStaging>>,
     /// Per slot: landed and not yet marked consumed.
     unread: Vec<bool>,
-    compressed: Vec<bool>,
     /// Per slot: waves consumed from it (the worker posts the slot's next
     /// wave once `consumed[slot]` reaches this).
     uses: Vec<u32>,
@@ -1087,8 +1093,8 @@ impl<'a> Waves<'a> {
         let reply_format = intake.reply_format();
         ensure!(storage.reply_reduce.is_some() == combined_codec_enabled(&intake, reply_format),
             "reply reducer does not match physical link policy");
-        let mut native = Native { transport, reply_format, reply_payloads: vec![0; slots],
-            prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, timing, arenas: arenas.clone(), words,
+        let mut native = Native { transport, reply_formats: cuteafd_core::spark_reply::requested(), reply_payloads: vec![0; slots],
+            prefill_rows: 0, compressed_prefill_rows: 0, mixed_decode_rows: 0, timing, arenas: arenas.clone(), words,
             pulls: pulls.unwrap_or(Pulls { base: 0 }), slots, ranks: intake.ranks, row_bytes: intake.row_bytes,
             landing: intake.landing, placed: intake.placed,
             receiving: (0..intake.ranks).map(|_| (0, Vec::new(), Vec::new())).collect(), retained: VecDeque::new() };
@@ -1112,7 +1118,7 @@ impl<'a> Waves<'a> {
         })?;
         Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _storage: storage, words, arenas, arena_alias,
             pulls, pinned, ranges: intake.ranges, layouts: vec![None; slots],
-            unread: vec![false; slots], compressed: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
+            unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
             next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, sequence: 0,
             outstanding: VecDeque::new(), grouping })
     }
@@ -1137,12 +1143,6 @@ impl<'a> Waves<'a> {
 
     fn submit(&mut self, rows: usize, payload_bytes: usize, source: Source, stage: Option<(*mut c_void, RouteStaging,
         [CuteafdDeviceBuffer; 3])>) -> Result<WaveTicket> {
-        let combined_reply = match &source {
-            Source::Staged { combined_reply, .. } => *combined_reply,
-            Source::Built(request) => request.header.flags & cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES == 0
-                && combined_reply_eligible(request.rows.iter().map(|row|
-                (row.source_request_id, row.source_kind == cuteafd_transport::ExpertV2SourceKind::Prefill))),
-        };
         let cut = self.geometry.cut();
         ensure!(self.outstanding.len() < cut.waves, WaveError::Admission(self.outstanding.len()));
         ensure!(rows > 0 && rows <= cut.rows, WaveError::Rows { rows, capacity: cut.rows });
@@ -1196,7 +1196,7 @@ impl<'a> Waves<'a> {
         self.sequence = sequence;
         self.outstanding.push_back((sequence, slot, 0));
         self.next_slot = (slot + 1) % cut.waves;
-        Ok(WaveTicket { sequence, slot, rows, payload_bytes, combined_reply })
+        Ok(WaveTicket { sequence, slot, rows, payload_bytes })
     }
 
     /// Queues a `rows`-row wave with exactly `payload_bytes` per rank into the next return slot: its route ids, gate
@@ -1251,7 +1251,6 @@ impl<'a> Waves<'a> {
             // SAFETY: as `pull`'s contract; behind the `landed` wait.
             unsafe { self.pull(ticket.sequence, slot, ticket.payload_bytes, rest, false, stream)? };
         }
-        self.compressed[slot] = compressed_reduction(ticket.combined_reply, self._storage.reply_reduce.is_some());
         self.unread[slot] = true;
         Ok(())
     }
@@ -1330,7 +1329,9 @@ impl<'a> Waves<'a> {
         for (pointer, plane) in planes.iter_mut().zip(self.slot_planes(slot)) { *pointer = plane.ptr.cast(); }
         ReplyReduction { planes, ranks: self.ranks as u32,
             hidden: cuteafd_core::expert_geometry().hidden as usize, capacity: self.geometry.cut().rows,
-            fused: self.compressed[slot].then(|| self._storage.reply_reduce.as_ref().unwrap().clone()),
+            // Bind from immutable launch capability, not the last host-observed
+            // wave: graph replays read each wave's device-visible mode word.
+            fused: self._storage.reply_reduce.clone(),
             mode: self.words.ptr(Counter::ReplyFormat(slot)) }
     }
 

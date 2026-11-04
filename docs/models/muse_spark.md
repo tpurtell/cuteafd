@@ -50,11 +50,12 @@ every routed (row, slot), and the coordinator's combine
 The combine reads every rank's reply in place through an `i64` table of
 region addresses (`rank_regions`).
 
-Replies are BF16 for a step's narrow segments (up to
-`--expert-partial-bf16-max-rows`, 64 by default: decode and verify stay
-lossless) and NVFP4 by default (or FP8/BF16 via the shared `--spark-reply-format`) for wider
-prefill segments. Each endpoint's frame is sized from the admitted worst
-reply (NVFP4 91.5 MiB, FP8 117.8 MiB per frame).
+With the phase keys omitted, replies are BF16 for narrow prefill segments
+(up to `--expert-partial-bf16-max-rows`, 64 by default) and NVFP4 for wider
+prefill segments; decode and verify stay BF16. The independent shared
+`--spark-prefill-reply-format` and `--spark-decode-reply-format` selections
+accept BF16, FP8 or NVFP4 and apply explicitly at every row count. Each
+endpoint's frame is sized from the admitted worst reply across both phases.
 
 **RTX onboarding** is on by default: an onboarded layer runs its experts on
 the coordinator from the image's EXL3 package (`exl3-muse-k<tiers>/rtx-tp2`

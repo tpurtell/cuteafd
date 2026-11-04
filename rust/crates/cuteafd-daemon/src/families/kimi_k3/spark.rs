@@ -77,7 +77,7 @@ impl<'a> RoutedLane<'a> {
         ensure!((1..=8).contains(&ranks), "Kimi routed exchange requires 1..8 real Spark ranks");
         let owner = placement.items.len().checked_sub(1).context("Kimi Spark intake has no physical owner")?;
         let charge = admitted_demand_on(waves, unit, local.lane_index(), ranks, owner,
-            cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?;
+            cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false))?;
         let charges = placement.items[owner].iter().filter(|item| item.group == charge.group).collect::<Vec<_>>();
         ensure!(charges.len() == 1 && charges[0].category == charge.category
             && charges[0].basis == charge.basis && charges[0].bytes == charge.bytes,
