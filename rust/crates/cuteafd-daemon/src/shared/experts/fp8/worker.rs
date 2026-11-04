@@ -539,11 +539,15 @@ impl<'a> Fp8Worker<'a> {
 mod tests {
     use super::*;
 
+    // Fixture allocations share device 7 in the process-wide memory ledger.
+    static FIXTURE_LEDGER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn native_slots_own_distinct_capacity_sized_scratch_and_charge_workspace_once() -> Result<()> {
         use cuteafd_ffi::{fp8_moe::Fp8MoeModule, memory_ledger::{self, Space},
             native_library_lifetime_fixture::Fixture};
+        let _ledger = FIXTURE_LEDGER.lock().unwrap_or_else(|error| error.into_inner());
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
         fixture.quiet_events(&library, true)?;
@@ -625,6 +629,7 @@ mod tests {
             ExpertProtocolV2RowDescriptor, ExpertProtocolV2RouteEntry, ExpertV2SourceKind,
             ProtocolV2RequestDevicePayload, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32,
             EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3};
+        let _ledger = FIXTURE_LEDGER.lock().unwrap_or_else(|error| error.into_inner());
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
         library.cuda_set_device(7)?;
@@ -776,6 +781,7 @@ mod tests {
         use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RequestView,
             ExpertProtocolV2RowDescriptor, ExpertProtocolV2RouteEntry, ExpertV2SourceKind,
             ProtocolV2RequestDevicePayload, expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+        let _ledger = FIXTURE_LEDGER.lock().unwrap_or_else(|error| error.into_inner());
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
         fixture.quiet_events(&library, true)?;
