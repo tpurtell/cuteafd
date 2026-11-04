@@ -164,6 +164,8 @@ pub struct GlmfInputs<'a> {
     pub tp2_workspace: [u64; 2],
     /// SM-independent draft weights and owned activations; embedding stays host mapped.
     pub drafter_bytes: u64,
+    /// Retained checkpoint weights only, excluding the owned activation/cache payload.
+    pub drafter_weights: ResidentWeights,
     /// Linear and attention scratch on each candidate GPU, sized by physical SM count.
     pub drafter_scratch: Vec<u64>,
     /// Present only when the GPU1 DFlash2 executor is requested. dSpark stays local.
@@ -193,7 +195,7 @@ pub fn replicated_mla_bytes(cfg: &GlmNextConfig, index: cache::GlmfIndexCache,
 /// Shared checkpoint-derived inventory; linear/attention scratch follows the chosen GPU.
 pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: usize,
     sms: &[u64], representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
-    mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, Vec<u64>), crate::families::glm5::draft_representation::GlmDraftStorageError> {
+    mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(MovablePart, Vec<u64>), crate::families::glm5::draft_representation::GlmDraftStorageError> {
     use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftStorageError};
     if ![1, 2].contains(&sms.len()) {
         return Err(GlmDraftStorageError::Unsupported("GLM Flash draft candidate inventory needs one or two GPUs"));
@@ -201,13 +203,14 @@ pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: us
     let mut owned = None;
     let mut scratch = Vec::with_capacity(sms.len());
     for &sms in sms {
-        let (bytes, workspace) = draft_resident_bytes_with_mode(config, slots, sequences, sms, representation, mode, kv_cache)?;
-        if owned.is_some_and(|previous| previous != bytes) {
+        let residency = draft_resident_bytes_with_mode(config, slots, sequences, sms, representation, mode, kv_cache)?;
+        let part = MovablePart::new(Bytes2 { resident: residency.owned, staging: 0 }, residency.weights);
+        if owned.is_some_and(|previous| previous != part) {
             return Err(GlmDraftStorageError::Unsupported("GLM Flash owned draft bytes depend on SM count"));
         }
-        bytes.checked_add(workspace).ok_or(GlmDraftStorageError::Overflow)?;
-        owned = Some(bytes);
-        scratch.push(workspace);
+        residency.owned.checked_add(residency.scratch).ok_or(GlmDraftStorageError::Overflow)?;
+        owned = Some(part);
+        scratch.push(residency.scratch);
     }
     Ok((owned.unwrap(), scratch))
 }
@@ -294,7 +297,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     }
     let movables = if i.drafter_bytes == 0 { vec![] } else {
         let mut drafter = draft::DrafterDemand::local(MovableId::Drafter,
-            vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }], 0);
+            vec![MovablePart::new(Bytes2 { resident: i.drafter_bytes, staging: 0 }, i.drafter_weights)], 0);
         drafter.per_home = i.drafter_scratch.iter().enumerate().filter(|(_, &bytes)| bytes > 0)
             .map(|(rank, &bytes)| MovableDemands { placement_gpu: rank as u8, demands: vec![Demand::new(rank as u8,
                 Category::Workspace, "DFlash linear/attention scratch", bytes, Basis::Formula)] }).collect();
@@ -394,6 +397,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     fixed.extend(workspace.iter().cloned());
     let fixed = working.demands(&fixed).cloned().collect();
     Ok(PlacementRequest {
+        resident_weight_limit: None,
         // The family resolves the mode before admission (its index cache depends on it: compact
         // under context, keys under heads), so two GPUs pin it.
         attention_placement: (ranks == 2).then_some(i.attention.mode),
@@ -715,7 +719,7 @@ mod tests {
             experts: cfg.dense.iter().filter(|&&dense| !dense).map(|_| ExpertCost {
                 whole: Bytes2 { resident: 2 << 30, staging: 0 },
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true }).collect(),
-            expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30,
+            expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30, drafter_weights: ResidentWeights(2 << 30),
             drafter_scratch: vec![0; ranks], drafter_bridge: None, requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
         }
     }
@@ -1107,8 +1111,10 @@ mod tests {
                 for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
                     let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], representation, mode, format).unwrap();
                     for (rank, sms) in [188, 170].into_iter().enumerate() {
-                        assert_eq!((owned, scratch[rank]), draft_resident_bytes_with_mode(&draft_config(), 8, 8,
-                            sms, representation, mode, format).unwrap());
+                        let expected = draft_resident_bytes_with_mode(&draft_config(), 8, 8,
+                            sms, representation, mode, format).unwrap();
+                        assert_eq!((owned.memory.resident, owned.resident_weights, scratch[rank]),
+                            (expected.owned, expected.weights, expected.scratch));
                     }
                     let attention: Vec<_> = [188, 170].into_iter().map(|sms|
                         cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
@@ -1122,14 +1128,15 @@ mod tests {
         let old_attention = 8 * 8 * 17 * 64 * 130 * 4;
         let attention: Vec<_> = [188, 170].into_iter().map(|sms|
             cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
-        assert_eq!(owned, 1_835_700_096 - old_attention);
+        assert_eq!(owned.memory.resident, 1_835_700_096 - old_attention);
         // The shared fc arena adds 128 rows * (20480 / 256) K tiles * 4 B.
         let row_max_bytes = 128 * 80 * 4;
         assert_eq!(scratch, [30_491_648 + row_max_bytes + attention[0],
             28_394_496 + row_max_bytes + attention[1]]);
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
-        input.drafter_bytes = owned;
+        input.drafter_bytes = owned.memory.resident;
+        input.drafter_weights = owned.resident_weights;
         input.drafter_scratch = scratch;
         let req = request(&input).unwrap();
         assert_eq!(req.movables[0].allowed, [0]);
@@ -1139,7 +1146,7 @@ mod tests {
              (1, 1, Category::Workspace, 28_394_496 + row_max_bytes + attention[1], Basis::Formula)]);
         let actual = solve(&req).unwrap();
         assert_eq!(actual.movables, [(MovableId::Drafter, 0)]);
-        assert_eq!(actual.items[0].iter().filter(|d| d.category == Category::Drafter).map(|d| d.bytes).sum::<u64>(), owned);
+        assert_eq!(actual.items[0].iter().filter(|d| d.category == Category::Drafter).map(|d| d.bytes).sum::<u64>(), owned.memory.resident);
         assert_eq!(actual.items[0].iter().find(|d| d.group == "DFlash linear/attention scratch").unwrap().bytes,
             30_491_648 + row_max_bytes + attention[0]);
         assert!(actual.items[1].iter().all(|d| d.category != Category::Drafter && d.group != "DFlash linear/attention scratch"));
@@ -1205,7 +1212,8 @@ mod tests {
         let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
-        input.drafter_bytes = owned;
+        input.drafter_bytes = owned.memory.resident;
+        input.drafter_weights = owned.resident_weights;
         input.drafter_scratch = scratch;
         let req = request(&input).unwrap();
         assert_eq!(req.movables[0].allowed, [0]);
@@ -1220,7 +1228,8 @@ mod tests {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
-        input.drafter_bytes = owned;
+        input.drafter_bytes = owned.memory.resident;
+        input.drafter_weights = owned.resident_weights;
         input.drafter_scratch = scratch;
         input.drafter_bridge = drafter_bridge_inventory(&config, 8, 8).unwrap();
         let mut req = request(&input).unwrap();
@@ -1236,7 +1245,7 @@ mod tests {
             let actual = solve(&req).unwrap();
             assert_eq!(actual.movables, [(MovableId::Drafter, home)]);
             let owner = &actual.items[home as usize];
-            assert_eq!(owner.iter().filter(|d| d.group == "Drafter").map(|d| d.bytes).sum::<u64>(), owned);
+            assert_eq!(owner.iter().filter(|d| d.group == "Drafter").map(|d| d.bytes).sum::<u64>(), owned.memory.resident);
             for rank in 0..2 {
                 let bridge = actual.items[rank].iter().filter(|d| d.group.starts_with("DFlash bridge"))
                     .map(|d| d.bytes).sum::<u64>();
@@ -1261,7 +1270,8 @@ mod tests {
             planned.resident[1 - expected_home as usize].weights += 6 << 30;
             let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170],
                 GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
-            planned.drafter_bytes = owned;
+            planned.drafter_bytes = owned.memory.resident;
+            planned.drafter_weights = owned.resident_weights;
             planned.drafter_scratch = scratch;
             planned.drafter_bridge = drafter_bridge_inventory(&draft_config(), 8, 8).unwrap();
             let (p, pg, pw) = solve_working_set_with_graphs(&planned, 262_144, false, 188, true).unwrap();
@@ -1284,7 +1294,7 @@ mod tests {
             for rank in 0..2 {
                 let bytes = |placed: &Placement, group: &str| placed.items[rank].iter()
                     .filter(|item| item.group == group).map(|item| item.bytes).sum::<u64>();
-                assert_eq!(bytes(&p, "Drafter"), if rank == expected_home as usize { owned } else { 0 });
+                assert_eq!(bytes(&p, "Drafter"), if rank == expected_home as usize { owned.memory.resident } else { 0 });
                 for demand in &bridge.demands {
                     if demand.gpu as usize != rank { continue; }
                     let expected = if expected_home == 1 { demand.bytes } else { 0 };

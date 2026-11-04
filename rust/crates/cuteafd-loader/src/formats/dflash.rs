@@ -61,6 +61,7 @@ pub struct MlaDraftOwner {
     pub id: String,
     pub domain: MlaDraftDomain,
     pub bytes: usize,
+    pub resident_weights: crate::placement::ResidentWeights,
     pub alignment: usize,
     pub dtype: MlaDraftDtype,
     pub shape: Vec<usize>,
@@ -79,8 +80,13 @@ impl MlaDraftOwner {
         if shape.is_empty() || shape.contains(&0) { return Err(unsupported("draft owner has an empty shape")); }
         let bytes = shape.iter().try_fold(width, |n: usize, &d| n.checked_mul(d))
             .ok_or_else(|| unsupported("draft owner byte extent overflow"))?.max(minimum_bytes);
-        Ok(Self { id: id.into(), domain, dtype, shape, bytes, alignment: 1,
+        Ok(Self { id: id.into(), domain, dtype, shape, bytes, resident_weights: crate::placement::ResidentWeights::default(), alignment: 1,
             lifetime: MlaDraftLifetime::Runtime, shared_key: None, staging_for: None, on_use: false })
+    }
+
+    pub fn weight(mut self) -> Self {
+        self.resident_weights = crate::placement::ResidentWeights(self.bytes as u64);
+        self
     }
 }
 
@@ -361,7 +367,8 @@ impl MlaDraftRuntimeLayout {
         let owned = self.owners.iter()
             .filter(|owner| owner.domain == MlaDraftDomain::Device && !owner.on_use)
             .map(|owner| Demand::new(gpu, Category::Drafter,
-                format!("MLA DFlash {}", owner.id), owner.bytes as u64, Basis::Formula)).collect();
+                format!("MLA DFlash {}", owner.id), owner.bytes as u64, Basis::Formula)
+                .with_resident_weights(owner.resident_weights)).collect();
         let staging = self.weights.max_load_staging;
         let peak = self.resident_bytes()?.checked_add(staging)
             .ok_or_else(|| unsupported("MLA draft startup peak overflow"))?;
@@ -938,12 +945,12 @@ impl MlaDflashConfig {
                     return Err(unsupported("MLA draft FP8 GEMMs require N multiples of 16 and K multiples of 128"));
                 }
                 let values = source.bytes / 2;
-                owners.push(MlaDraftOwner::new(format!("{id}.values"), MlaDraftDomain::Device, Bytes, vec![values], 0)?);
+                owners.push(MlaDraftOwner::new(format!("{id}.values"), MlaDraftDomain::Device, Bytes, vec![values], 0)?.weight());
                 owners.push(MlaDraftOwner::new(format!("{id}.scales"), MlaDraftDomain::Device, F32,
-                    vec![shape[0], shape[1] / 128], 0)?);
+                    vec![shape[0], shape[1] / 128], 0)?.weight());
                 sources.push(MlaDraftOwner { dtype: Bytes, shape: vec![source.bytes], ..source });
             } else {
-                owners.push(MlaDraftOwner { id, ..source });
+                owners.push(MlaDraftOwner { id, ..source }.weight());
             }
             Ok(())
         };
@@ -1129,7 +1136,7 @@ impl MlaDflashConfig {
             let bytes = dimensions.iter().try_fold(width, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| unsupported("mtp_dspark arena multiplication overflow"))?.max(256);
             owners.push(MlaDraftOwner { id: name.clone(), domain: MlaDraftDomain::Device, bytes,
-                alignment: 256, dtype, shape: dimensions.to_vec(), lifetime: MlaDraftLifetime::Runtime,
+                resident_weights: crate::placement::ResidentWeights::default(), alignment: 256, dtype, shape: dimensions.to_vec(), lifetime: MlaDraftLifetime::Runtime,
                 shared_key: None, staging_for: None, on_use: false });
             buffers.push(MlaDraftBuffer { name, bytes });
             Ok(())
@@ -1162,7 +1169,7 @@ impl MlaDflashConfig {
             let bytes = weight.shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| unsupported("mtp_dspark weight destination overflow"))?.max(256);
             owners.push(MlaDraftOwner { id: weight.owner.clone(), domain: MlaDraftDomain::Device, bytes,
-                alignment: 256, dtype: Bf16, shape: weight.shape.clone(), lifetime: MlaDraftLifetime::Runtime,
+                resident_weights: crate::placement::ResidentWeights(bytes as u64), alignment: 256, dtype: Bf16, shape: weight.shape.clone(), lifetime: MlaDraftLifetime::Runtime,
                 shared_key: None, staging_for: None, on_use: false });
         }
         // Ordered uploads keep one pinned backing per destination until library teardown.
@@ -1172,18 +1179,18 @@ impl MlaDflashConfig {
         let staging: Vec<_> = owners.iter().filter(|o| metadata.contains(&o.id.as_str())
             || o.id.ends_with(".page_table") || matches!(o.id.as_str(), "h" | "taps"))
             .map(|o| MlaDraftOwner { id: format!("host.ordered.{}", o.id), domain: MlaDraftDomain::HostPinned,
-                bytes: o.bytes, alignment: 1, dtype: Bytes, shape: vec![o.bytes], lifetime: MlaDraftLifetime::Library,
+                bytes: o.bytes, resident_weights: crate::placement::ResidentWeights::default(), alignment: 1, dtype: Bytes, shape: vec![o.bytes], lifetime: MlaDraftLifetime::Library,
                 shared_key: Some(format!("ordered-h2d/{}", o.id)), staging_for: Some(o.id.clone()),
                 on_use: matches!(o.id.as_str(), "h" | "taps") }).collect();
         owners.extend(staging);
         owners.push(MlaDraftOwner { id: "host.landing".into(), domain: MlaDraftDomain::HostPinned,
-            bytes: seq * self.drafts() * 4, alignment: 1, dtype: U32, shape: vec![seq, self.drafts()],
+            bytes: seq * self.drafts() * 4, resident_weights: crate::placement::ResidentWeights::default(), alignment: 1, dtype: U32, shape: vec![seq, self.drafts()],
             lifetime: MlaDraftLifetime::Runtime, shared_key: None, staging_for: None, on_use: false });
         let largest_upload = owners.iter().filter(|o| o.domain == MlaDraftDomain::Device
             && (o.id.starts_with("weight.") || o.id == "inverse_frequencies"))
             .map(|o| o.bytes).max().unwrap_or(0);
         owners.push(MlaDraftOwner { id: "host.sync_h2d".into(), domain: MlaDraftDomain::HostPinned,
-            bytes: largest_upload, alignment: 1, dtype: Bytes, shape: vec![largest_upload],
+            bytes: largest_upload, resident_weights: crate::placement::ResidentWeights::default(), alignment: 1, dtype: Bytes, shape: vec![largest_upload],
             lifetime: MlaDraftLifetime::Library, shared_key: Some("library/sync-h2d".into()),
             staging_for: None, on_use: false });
         let destination_bytes = owners.iter().filter(|o| o.id.starts_with("weight."))

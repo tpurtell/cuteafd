@@ -788,7 +788,8 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     let mut pool = PoolPolicy::resolve(&i.gpus.map(|gpu| gpu.capacity_bytes), context as u64,
         i.requested_pool, MLA_PAGE_ROWS as u64, true);
     pool.ceiling = pool.target.max(pool.requested.unwrap_or(0));
-    Ok(PlacementRequest { inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
+    Ok(PlacementRequest {
+        resident_weight_limit: None, inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool, layers, pool_overhead: vec![0; 2], pool_bounded: i.pool_bounded, fixed, startup, movables,
         expert_workspace: 0, tp2_workspace: [0; 2], onboard: Onboard::Layers(0), expert_gpus: 0, minimum_expert_layers: 0,

@@ -8,7 +8,7 @@
 //! into the solver's [`Movable`]; the solver picks the home (pool first) and
 //! the runtime reads it back with [`home`]. Planner and runtime build the same
 //! demand, so the ledger names the drafter identically on both sides.
-use super::{Bytes2, Demand, Movable, MovableDemands, MovableId, Placement, PlacementError};
+use super::{Bytes2, Demand, Movable, MovableDemands, MovableId, MovablePart, Placement, PlacementError, ResidentWeights};
 
 /// Controls a device-driven draft bridge owns on each GPU: four zero-payload
 /// receive slots (256 B each), the control block and the abort word. No
@@ -66,7 +66,7 @@ pub struct DrafterDemand {
     pub id: MovableId,
     /// Loaded in order wherever the drafter lives; staging is transient.
     /// Charged as one `Drafter` (or arena) item on the home.
-    pub parts: Vec<Bytes2>,
+    pub parts: Vec<MovablePart>,
     /// Named allocations that follow the home (their `gpu` is rewritten to
     /// each candidate home), for families whose ledger itemizes the drafter.
     pub owned: Vec<Demand>,
@@ -83,7 +83,7 @@ pub struct DrafterDemand {
 
 impl DrafterDemand {
     /// A drafter that always lives beside the target head.
-    pub fn local(id: MovableId, parts: Vec<Bytes2>, target_gpu: u8) -> Self {
+    pub fn local(id: MovableId, parts: Vec<MovablePart>, target_gpu: u8) -> Self {
         Self { id, parts, owned: Vec::new(), expert_arena: id == MovableId::DsparkExperts, target_gpu,
             per_home: Vec::new(), bridge: None }
     }
@@ -234,9 +234,11 @@ pub(crate) fn as_fixed(mut request: super::PlacementRequest) -> super::Placement
     use cuteafd_core::memory_layout::{Basis, Category};
     for movable in std::mem::take(&mut request.movables) {
         let home = movable.allowed[0];
-        let total: u64 = movable.parts.iter().map(|p| p.resident).sum();
-        if total > 0 {
-            request.fixed.push(Demand::new(home, Category::Drafter, format!("{:?}", movable.id), total, Basis::Exact));
+        let total: u64 = movable.parts.iter().map(|p| p.memory.resident).sum();
+        let weights = movable.parts.iter().try_fold(ResidentWeights::default(), |sum, p| sum.checked_add(p.resident_weights)).unwrap();
+        if total > 0 || weights.0 > 0 {
+            request.fixed.push(Demand::new(home, Category::Drafter, format!("{:?}", movable.id), total, Basis::Exact)
+                .with_resident_weights(weights));
         }
         if let Some(own) = movable.conditional.into_iter().find(|c| c.placement_gpu == home) {
             request.fixed.extend(own.demands);
@@ -367,19 +369,19 @@ mod tests {
 
     #[test]
     fn local_drafter_is_pinned_to_the_target_and_dormant_homes_stay_keyed() {
-        let mut d = DrafterDemand::local(MovableId::Drafter, vec![Bytes2 { resident: 10, staging: 0 }], 0);
+        let mut d = DrafterDemand::local(MovableId::Drafter, vec![MovablePart::new(Bytes2 { resident: 10, staging: 0 }, ResidentWeights(10))], 0);
         d.per_home = vec![scratch(0, 3), scratch(1, 4)];
         let m = d.movable(2).unwrap();
         assert_eq!(m.allowed, [0]);
         assert_eq!(m.conditional.iter().map(|c| c.placement_gpu).collect::<Vec<_>>(), [0, 1]);
         assert!(!m.expert_arena);
-        let v4 = DrafterDemand::local(MovableId::DsparkExperts, vec![Bytes2 { resident: 5, staging: 2 }], 0).movable(2).unwrap();
+        let v4 = DrafterDemand::local(MovableId::DsparkExperts, vec![MovablePart::new(Bytes2 { resident: 5, staging: 2 }, ResidentWeights(5))], 0).movable(2).unwrap();
         assert_eq!((v4.allowed, v4.expert_arena, v4.conditional.len()), (vec![0], true, 0));
     }
 
     #[test]
     fn bridge_opens_the_other_gpu_and_precedes_its_scratch() {
-        let mut d = DrafterDemand::local(MovableId::Drafter, vec![Bytes2 { resident: 10, staging: 0 }], 0);
+        let mut d = DrafterDemand::local(MovableId::Drafter, vec![MovablePart::new(Bytes2 { resident: 10, staging: 0 }, ResidentWeights(10))], 0);
         d.per_home = vec![scratch(1, 4)];
         d.bridge = Some(vec![Demand::new(0, Category::Drafter, "bridge", 7, Basis::Formula)]);
         let m = d.movable(2).unwrap();
@@ -425,7 +427,7 @@ mod tests {
                 "DFlash linear/attention scratch", bytes, Basis::Formula)); }
             (!demands.is_empty()).then_some(MovableDemands { placement_gpu: rank as u8, demands })
         }).collect();
-        Movable { id: MovableId::Drafter, parts: vec![Bytes2 { resident: bytes, staging: 0 }],
+        Movable { id: MovableId::Drafter, parts: vec![MovablePart::new(Bytes2 { resident: bytes, staging: 0 }, ResidentWeights(bytes))],
             allowed: if bridge.is_some() { vec![0, 1] } else { vec![0] }, expert_arena: false, conditional }
     }
 
@@ -437,7 +439,7 @@ mod tests {
         for scratch in [vec![0u64], vec![5], vec![0, 0], vec![5, 0], vec![0, 6], vec![5, 6]] {
             for with_bridge in [false, true] {
                 if with_bridge && scratch.len() != 2 { continue; }
-                let mut d = DrafterDemand::local(MovableId::Drafter, vec![Bytes2 { resident: 100, staging: 0 }], 0);
+                let mut d = DrafterDemand::local(MovableId::Drafter, vec![MovablePart::new(Bytes2 { resident: 100, staging: 0 }, ResidentWeights(100))], 0);
                 d.per_home = scratch.iter().enumerate().filter(|(_, &b)| b > 0).map(|(rank, &b)| MovableDemands {
                     placement_gpu: rank as u8, demands: vec![Demand::new(rank as u8, Category::Workspace,
                         "DFlash linear/attention scratch", b, Basis::Formula)] }).collect();
@@ -446,7 +448,7 @@ mod tests {
                     "scratch {scratch:?} bridge {with_bridge}");
             }
         }
-        let parts = vec![Bytes2 { resident: 7, staging: 3 }, Bytes2 { resident: 8, staging: 4 }];
+        let parts = vec![MovablePart::new(Bytes2 { resident: 7, staging: 3 }, ResidentWeights(7)), MovablePart::new(Bytes2 { resident: 8, staging: 4 }, ResidentWeights(8))];
         for gpus in [1, 2] {
             assert_eq!(DrafterDemand::local(MovableId::DsparkExperts, parts.clone(), 0).movable(gpus).unwrap(),
                 Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true, conditional: vec![], parts: parts.clone() });

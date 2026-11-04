@@ -1254,9 +1254,10 @@ impl<'a> DflashDrafter<'a> {
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
         let layout = cfg.runtime_layout(representation, capacity)?;
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-        let (resident_bytes, scratch_bytes) = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
+        let residency = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
             &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8, kv_cache)?;
-        tracing::info!(resident_bytes, scratch_bytes, kv_cache = %kv_cache, "DFlash shared readiness inventory");
+        tracing::info!(resident_bytes = residency.owned, scratch_bytes = residency.scratch,
+            resident_weight_bytes = residency.weights.0, kv_cache = %kv_cache, "DFlash shared readiness inventory");
         ensure!(mask_row.len() == cfg.hidden * 2, "DFlash BF16 mask row has wrong hidden width");
         let path = snapshot.join("model.safetensors");
         let checkpoint = Checkpoint {

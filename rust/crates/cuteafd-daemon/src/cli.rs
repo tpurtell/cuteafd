@@ -378,7 +378,8 @@ pub(crate) struct PlanArgs {
     /// Immutable GLM/Qwen attention scratch override.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub(crate) attention_plan_rows: Option<usize>,
-    /// External drafter GiB on the last GPU for --layout (DFlash).
+    /// Checkpoint-resident drafter WEIGHT GiB for --layout, counted against the
+    /// weight cap; no runtime storage is inferred. Actual drafter headers must agree.
     #[arg(long, default_value_t = 0.0)]
     pub(crate) drafter_gib: f64,
     /// Families on the shared placement solver (V4): `auto` (pool first),

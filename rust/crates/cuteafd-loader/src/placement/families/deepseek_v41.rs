@@ -483,6 +483,7 @@ pub fn request(
     let gpus = inventory.gpus.len();
     assert!(experts.len() <= 40, "V4.1 has exactly 40 backbone layers");
     PlacementRequest {
+        resident_weight_limit: None,
         inventory,
         attention_placement: Some(if gpus == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads }),
         context_buffers: ContextBuffers::default(),

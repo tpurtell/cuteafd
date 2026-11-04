@@ -266,6 +266,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     // Reuse pool-first TP2 onboarding, constrained by the Spark suffix budget.
     let onboard = opts.resolve_onboard(cfg.dense.iter().filter(|dense| !**dense).count()).unwrap_or(Onboard::Auto);
     let mut request = PlacementRequest {
+        resident_weight_limit: None,
         inventory: Inventory { gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, bytes)| GpuBudget { capacity_bytes: *bytes,
             headroom_bytes: opts.headroom_bytes, baseline: baseline[rank] }).collect(),
             spark_ranks: ranks, peer_access: true },

@@ -106,7 +106,7 @@ pub struct LayoutOptions {
     /// An automatic pool under a fixed onboard stops at its target instead of
     /// growing to all free memory (it still shrinks to fit, down to its floor).
     pub pool_ceiling_at_target: bool,
-    /// External drafter resident bytes on the lead GPU (DFlash), if any.
+    /// Explicit checkpoint-resident drafter weights; no inferred runtime storage.
     pub drafter_bytes: u64,
     pub dense_qwen_drafter_snapshot: Option<std::path::PathBuf>,
     pub dense_qwen_mtp: bool,

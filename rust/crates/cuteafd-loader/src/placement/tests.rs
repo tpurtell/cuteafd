@@ -8,6 +8,7 @@ const UNIT: u64 = 4 << 20;
 /// layers (2M tokens: 8192 units, 32 GiB).
 fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboard) -> PlacementRequest {
     PlacementRequest {
+        resident_weight_limit: None,
         attention_placement: None,
         context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0,
@@ -41,6 +42,131 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
 /// V4 as `deepseek_v4::request` builds it without the C4 context programs: heads or GPU0 only.
 const V4_HEADS: ExecutorModes = ExecutorModes { modes: &[LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
     attention: AttentionPlacement::Heads, ..families::DEEPSEEK_V4 };
+
+#[test]
+fn resident_weight_cap_counts_loaded_facts_independently_of_allocation_and_category() {
+    let mut req = request(1, 64 * GIB, 0, 4, Onboard::Auto);
+    req.resident_weight_limit = Some(ResidentWeights(10 * GIB));
+    req.fixed.push(Demand::new(0, Category::Workspace, "already loaded checkpoint", 0, Basis::Exact)
+        .with_resident_weights(ResidentWeights(10 * GIB)));
+    req.fixed.push(Demand::new(0, Category::Weights, "runtime allocation, not a weight fact", GIB, Basis::Exact));
+    let placed = solve(&req).unwrap();
+    assert_eq!(placed.pool_tokens, 2 << 20);
+    req.fixed.push(Demand::new(0, Category::Drafter, "loaded draft weight", 0, Basis::Exact)
+        .with_resident_weights(ResidentWeights(1)));
+    assert_eq!(solve(&req), Err(PlacementError::ResidentWeightLimit {
+        gpu: 0, required: 10 * GIB + 1, limit: 10 * GIB,
+    }));
+    assert_eq!(solve_frozen(&req, &placed), Err(PlacementError::ResidentWeightLimit {
+        gpu: 0, required: 10 * GIB + 1, limit: 10 * GIB,
+    }));
+}
+
+#[test]
+fn resident_weight_cap_stops_optional_experts_without_shrinking_pool() {
+    let mut req = request(1, 64 * GIB, 10, 4, Onboard::Auto);
+    req.fixed.push(Demand::new(0, Category::Weights, "target weights", 2 * GIB, Basis::Exact)
+        .with_resident_weights(ResidentWeights(2 * GIB)));
+    req.movables.push(Movable { id: MovableId::Drafter, allowed: vec![0], expert_arena: false,
+        conditional: vec![], parts: vec![MovablePart::new(
+            Bytes2 { resident: 5 * GIB, staging: 0 }, ResidentWeights(3 * GIB))] });
+    req.expert_workspace = 2 * GIB;
+    for layer in &mut req.layers { layer.experts.as_mut().unwrap().whole.staging = GIB; }
+    let uncapped = solve(&req).unwrap();
+    req.resident_weight_limit = Some(ResidentWeights(7 * GIB));
+    let capped = solve(&req).unwrap();
+    assert_eq!(capped.pool_tokens, uncapped.pool_tokens);
+    assert_eq!(capped.onboard_layers, 2);
+    assert!(uncapped.onboard_layers > capped.onboard_layers);
+    req.minimum_expert_layers = 3;
+    assert_eq!(solve(&req), Err(PlacementError::ResidentWeightLimit {
+        gpu: 0, required: 8 * GIB, limit: 7 * GIB,
+    }));
+    req.minimum_expert_layers = 0;
+    req.onboard = Onboard::Layers(3);
+    assert!(matches!(solve(&req), Err(PlacementError::ResidentWeightLimit { .. })));
+    req.onboard = Onboard::Auto;
+    req.inventory.spark_ranks = 0;
+    assert!(matches!(solve(&req), Err(PlacementError::ResidentWeightLimit { .. })));
+}
+
+#[test]
+fn resident_weight_cap_filters_ordinary_movable_homes_before_choice() {
+    let mut req = request(2, 64 * GIB, 0, 4, Onboard::Auto);
+    req.inventory.gpus[1].baseline = Baseline::Measured { free_bytes: 60 * GIB };
+    req.resident_weight_limit = Some(ResidentWeights(10 * GIB));
+    req.fixed.push(Demand::new(0, Category::Weights, "loaded target", 0, Basis::Exact)
+        .with_resident_weights(ResidentWeights(9 * GIB)));
+    req.movables.push(Movable { id: MovableId::Drafter, allowed: vec![0, 1], expert_arena: false,
+        conditional: vec![], parts: vec![MovablePart::new(
+            Bytes2 { resident: 4 * GIB, staging: 0 }, ResidentWeights(2 * GIB))] });
+    assert_eq!(solve(&req).unwrap().movables, [(MovableId::Drafter, 1)]);
+    req.fixed.push(Demand::new(1, Category::Weights, "second loaded target", 0, Basis::Exact)
+        .with_resident_weights(ResidentWeights(9 * GIB)));
+    assert!(matches!(solve(&req), Err(PlacementError::ResidentWeightLimit { .. })));
+}
+
+#[test]
+fn resident_weight_cap_checks_conditional_peer_facts_and_preserves_rehoming() {
+    let mut req = request(2, 64 * GIB, 0, 4, Onboard::Auto);
+    req.resident_weight_limit = Some(ResidentWeights(10 * GIB));
+    req.fixed.push(Demand::new(0, Category::Weights, "loaded target", 0, Basis::Exact)
+        .with_resident_weights(ResidentWeights(9 * GIB)));
+    let owner = Demand::new(0, Category::Drafter, "draft weight", GIB, Basis::Exact)
+        .with_resident_weights(ResidentWeights(GIB));
+    assert_eq!(owner.clone().on(1).resident_weights, ResidentWeights(GIB));
+    let peer = Demand::new(0, Category::Drafter, "peer checkpoint operand", 0, Basis::Exact)
+        .with_resident_weights(ResidentWeights(2 * GIB));
+    let mut draft = draft::DrafterDemand::itemized(vec![owner], 0);
+    draft.bridge = Some(vec![peer]);
+    req.movables.push(draft.movable(2).unwrap());
+    assert_eq!(solve(&req).unwrap().movables, [(MovableId::Drafter, 0)]);
+    req.movables[0].allowed = vec![1];
+    assert_eq!(solve(&req), Err(PlacementError::ResidentWeightLimit {
+        gpu: 0, required: 11 * GIB, limit: 10 * GIB,
+    }));
+}
+
+#[test]
+fn resident_weight_cap_adds_tp1_draft_and_actual_tp2_rank_halves() {
+    let mut req = tp2_request([64 * GIB; 2], Onboard::Auto);
+    req.layers.truncate(6);
+    req.resident_weight_limit = Some(ResidentWeights(10 * GIB));
+    req.fixed.push(Demand::new(0, Category::Weights, "rank zero target", 0, Basis::Exact)
+        .with_resident_weights(ResidentWeights(8 * GIB)));
+    req.fixed.push(Demand::new(1, Category::Weights, "rank one target", 0, Basis::Exact)
+        .with_resident_weights(ResidentWeights(7 * GIB)));
+    req.movables.push(Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true,
+        conditional: vec![], parts: vec![MovablePart::new(
+            Bytes2 { resident: GIB, staging: 2 * GIB }, ResidentWeights(GIB))] });
+    for layer in &mut req.layers {
+        layer.experts.as_mut().unwrap().half = [
+            Bytes2 { resident: GIB / 2, staging: GIB },
+            Bytes2 { resident: 3 * GIB / 2, staging: GIB },
+        ];
+    }
+    let placed = solve(&req).unwrap();
+    assert_eq!(placed.onboard_layers, 2);
+    assert_eq!(placed.pool_tokens, 2 << 20);
+    assert_eq!(placed.tp2.unwrap().layers, 2);
+    req.onboard = Onboard::Layers(3);
+    assert!(matches!(solve(&req), Err(PlacementError::ResidentWeightLimit { .. })));
+}
+
+#[test]
+fn resident_weight_cap_preserves_accepted_layout_and_reports_overflow() {
+    let req = tp2_request([44 * GIB; 2], Onboard::Auto);
+    let original = solve(&req).unwrap();
+    let mut capped = req;
+    capped.resident_weight_limit = Some(ResidentWeights::DEFAULT_LIMIT);
+    assert_eq!(solve(&capped).unwrap(), original);
+    let mut req = request(1, 64 * GIB, 0, 4, Onboard::Auto);
+    for bytes in [u64::MAX, 1] {
+        req.fixed.push(Demand::new(0, Category::Drafter, "loaded weight", 0, Basis::Exact)
+            .with_resident_weights(ResidentWeights(bytes)));
+    }
+    assert_eq!(solve(&req), Err(PlacementError::Overflow("resident weights")));
+}
 
 #[test]
 fn v4_defaults_to_pool_first() {
@@ -183,14 +309,14 @@ fn explicit_pool_is_strict_and_movables_share_the_arena() {
     assert!(matches!(solve(&req), Err(PlacementError::PoolDoesNotFit { requested: 4194304, .. })));
     req.pool.requested = Some(1 << 20);
     req.movables.push(Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true, conditional: vec![],
-        parts: vec![Bytes2 { resident: 2 * GIB, staging: GIB / 4 }; 3] });
+        parts: vec![MovablePart::new(Bytes2 { resident: 2 * GIB, staging: GIB / 4 }, ResidentWeights(2 * GIB)); 3] });
     let placement = solve(&req).unwrap();
     assert_eq!(placement.pool_tokens, 1 << 20);
     assert_eq!(placement.movables, [(MovableId::DsparkExperts, 0)]);
     // GPU0 holds the 6 GiB of stage experts in its arena: 6 fewer layers.
     assert_eq!(placement.expert_ranges[0].layers + 6, placement.expert_ranges[1].layers);
     // A movable that cannot fit at all is a refusal naming its GPU.
-    req.movables[0].parts = vec![Bytes2 { resident: 50 * GIB, staging: 0 }];
+    req.movables[0].parts = vec![MovablePart::new(Bytes2 { resident: 50 * GIB, staging: 0 }, ResidentWeights(50 * GIB))];
     assert!(matches!(solve(&req), Err(PlacementError::Mandatory { gpu: 0, .. })));
 }
 
@@ -477,7 +603,7 @@ fn v4_payload_is_charged_only_when_the_tp2_arena_opens() {
 fn tp2_keeps_dspark_tp1_arena_separate() {
     let mut req = tp2_request([44 * GIB; 2], Onboard::Auto);
     req.movables.push(Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true, conditional: vec![],
-        parts: vec![Bytes2 { resident: 2 * GIB, staging: GIB / 4 }; 3] });
+        parts: vec![MovablePart::new(Bytes2 { resident: 2 * GIB, staging: GIB / 4 }, ResidentWeights(2 * GIB)); 3] });
     let p = solve(&req).unwrap();
     assert_eq!(p.movables, [(MovableId::DsparkExperts, 0)]);
     assert_eq!(p.expert_ranges[0].peak_bytes, 6 * GIB + GIB / 2);
@@ -1027,7 +1153,7 @@ fn contiguous_layer_switch_keeps_groups_and_breaks_equal_bytes_by_pool() {
 
 fn conditional_request() -> PlacementRequest {
     let mut req = request(2, 44 * GIB, 0, 4, Onboard::Auto);
-    req.movables.push(Movable { id: MovableId::Drafter, parts: vec![Bytes2 { resident: 3 * GIB, staging: 0 }],
+    req.movables.push(Movable { id: MovableId::Drafter, parts: vec![MovablePart::new(Bytes2 { resident: 3 * GIB, staging: 0 }, ResidentWeights(3 * GIB))],
         allowed: vec![0, 1], expert_arena: false, conditional: vec![MovableDemands { placement_gpu: 1,
             demands: vec![Demand::new(0, Category::Workspace, "bridge", GIB, Basis::Formula),
                 Demand::new(1, Category::Transport, "controls", 256, Basis::Exact)] }] });
@@ -1122,7 +1248,7 @@ fn conditional_movable_bridge_pressure_falls_back_before_pool_admission() {
     req.movables[0].conditional[0].demands[0].bytes = 45 * GIB;
     assert!(matches!(solve(&req), Err(PlacementError::Mandatory { gpu: 0, what }) if what.contains("bridge")));
     req.movables[0].allowed = vec![0, 1];
-    req.movables[0].parts[0].resident = 61 * GIB;
+    req.movables[0].parts[0].memory.resident = 61 * GIB;
     assert!(matches!(solve(&req), Err(PlacementError::Mandatory { .. })));
 }
 
@@ -1151,7 +1277,7 @@ fn conditional_movable_preserves_arena_peak_and_strict_pool() {
     let mut req = conditional_request();
     req.movables[0].allowed = vec![1];
     req.movables[0].expert_arena = true;
-    req.movables[0].parts = vec![Bytes2 { resident: 3 * GIB, staging: GIB }];
+    req.movables[0].parts = vec![MovablePart::new(Bytes2 { resident: 3 * GIB, staging: GIB }, ResidentWeights(3 * GIB))];
     req.pool.requested = Some(2 << 20);
     let placed = solve(&req).unwrap();
     assert_eq!(placed.pool_tokens, 2 << 20);
@@ -1166,7 +1292,7 @@ fn conditional_movable_selected_device_scratch_and_planned_measured_agree() {
     let mut req = conditional_request();
     // Synthetic per-SM scratch: common residency plus SM170 minimum, then
     // the exact selected-device delta (real families supply their own formula).
-    req.movables[0].parts[0].resident += 170 * 1024;
+    req.movables[0].parts[0].memory.resident += 170 * 1024;
     req.movables[0].conditional.insert(0, MovableDemands { placement_gpu: 0,
         demands: vec![Demand::new(0, Category::Workspace, "SM188 scratch delta", (188 - 170) * 1024, Basis::Formula)] });
     req.movables[0].conditional[1].demands.push(Demand::new(1, Category::Workspace,
@@ -1763,7 +1889,7 @@ fn owner_candidates_admit_pinned_and_conditional_draft_costs_before_pool() {
     req.pool.ceiling = 128 << 20;
     req.movables.push(Movable {
         id: MovableId::Drafter, allowed: vec![1], expert_arena: false,
-        parts: vec![Bytes2 { resident: 8 * GIB, staging: 0 }], conditional: vec![],
+        parts: vec![MovablePart::new(Bytes2 { resident: 8 * GIB, staging: 0 }, ResidentWeights(8 * GIB))], conditional: vec![],
     });
     let pinned = solve(&req).unwrap();
     assert_eq!(owner_cut(&req), 3);
@@ -1793,7 +1919,7 @@ fn owner_candidates_find_fit_that_balanced_boundary_refuses() {
     req.pool.requested = Some(2 << 20);
     req.pool.floor = 2 << 20;
     req.movables.push(Movable { id: MovableId::Drafter, allowed: vec![0], expert_arena: false,
-        parts: vec![Bytes2 { resident: 13 * GIB, staging: 0 }], conditional: vec![] });
+        parts: vec![MovablePart::new(Bytes2 { resident: 13 * GIB, staging: 0 }, ResidentWeights(13 * GIB))], conditional: vec![] });
     let solved = solve(&req).unwrap();
     assert_eq!(owner_cut(&req), 1);
     let mut balanced = solved.clone();

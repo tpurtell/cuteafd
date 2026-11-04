@@ -675,6 +675,7 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                 trial_pool.target = tokens;
             }
             let request = PlacementRequest {
+        resident_weight_limit: None,
                 inventory: inputs.inventory.clone(),
                 attention_placement: None,
                 context_buffers: ContextBuffers::default(),

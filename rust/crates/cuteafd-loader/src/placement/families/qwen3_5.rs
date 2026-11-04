@@ -57,13 +57,14 @@ impl NativeMtpLayout {
         let mut loading_host_bytes = inventory.loading_host_bytes;
         let mut sync_upload_bytes = inventory.allocations.iter().map(|a| a.upload_bytes).max().unwrap_or(0);
         let mut owners = Vec::new();
-        let mut add = |id: String, domain, dtype, shape: Vec<usize>, bytes| {
-            owners.push(MlaDraftOwner { id, domain, dtype, shape, bytes, alignment: 1,
+        let mut add = |id: String, domain, dtype, shape: Vec<usize>, bytes, weight: bool| {
+            owners.push(MlaDraftOwner { id, domain, dtype, shape, bytes,
+                resident_weights: ResidentWeights(if weight { bytes as u64 } else { 0 }), alignment: 1,
                 lifetime: Life::Runtime, shared_key: None, staging_for: None, on_use: false });
         };
         for operand in inventory.allocations {
             let bytes = usize::try_from(operand.bytes)?;
-            add(format!("draft.mtp.layer.{}", operand.id), Domain::Device, Dtype::Bytes, vec![bytes], bytes);
+            add(format!("draft.mtp.layer.{}", operand.id), Domain::Device, Dtype::Bytes, vec![bytes], bytes, true);
         }
         for (id, name, shape) in [
             ("fc", "fc", vec![cfg.hidden, cfg.hidden.checked_mul(2).context("MTP FC shape overflow")?]),
@@ -77,7 +78,7 @@ impl NativeMtpLayout {
             sync_upload_bytes = sync_upload_bytes.max(value.byte_length);
             loading_host_bytes = loading_host_bytes.max(value.byte_length);
             let bytes = usize::try_from(value.byte_length.max(256))?;
-            add(format!("draft.mtp.{id}"), Domain::Device, Dtype::Bytes, vec![bytes], bytes);
+            add(format!("draft.mtp.{id}"), Domain::Device, Dtype::Bytes, vec![bytes], bytes, true);
         }
         let record_bytes = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
         let hidden_bytes = cfg.hidden.checked_mul(2).context("MTP hidden extent overflow")?;
@@ -89,18 +90,18 @@ impl NativeMtpLayout {
             ("logits", Dtype::F32, vec![VERIFY_ROWS, cfg.vocab], 4),
         ] {
             let bytes = shape.iter().try_fold(width, |bytes, &n| bytes.checked_mul(n)).context("MTP plane extent overflow")?;
-            add(format!("draft.mtp.{id}"), Domain::Device, dtype, shape, bytes);
+            add(format!("draft.mtp.{id}"), Domain::Device, dtype, shape, bytes, false);
         }
-        add("draft.mtp.kv".into(), Domain::Device, Dtype::Bytes, vec![kv_bytes], kv_bytes);
+        add("draft.mtp.kv".into(), Domain::Device, Dtype::Bytes, vec![kv_bytes], kv_bytes, false);
         add("draft.mtp.sidecars".into(), Domain::Device, Dtype::Bf16,
-            vec![pool_tokens / PAGE_ROWS as usize, cfg.hidden], sidecar_bytes);
+            vec![pool_tokens / PAGE_ROWS as usize, cfg.hidden], sidecar_bytes, false);
         if usage.selector {
-            add("draft.mtp.selector.output".into(), Domain::Device, Dtype::Bytes, vec![12], 12);
-            add("draft.mtp.selector.landing".into(), Domain::HostPinned, Dtype::Bytes, vec![12], 12);
+            add("draft.mtp.selector.output".into(), Domain::Device, Dtype::Bytes, vec![12], 12, false);
+            add("draft.mtp.selector.landing".into(), Domain::HostPinned, Dtype::Bytes, vec![12], 12, false);
         }
         if usage.diagnostic_input {
             let bytes = VERIFY_ROWS.checked_mul(hidden_bytes).context("MTP diagnostic extent overflow")?;
-            add("draft.mtp.diagnostic.input".into(), Domain::Device, Dtype::Bf16, vec![VERIFY_ROWS, cfg.hidden], bytes);
+            add("draft.mtp.diagnostic.input".into(), Domain::Device, Dtype::Bf16, vec![VERIFY_ROWS, cfg.hidden], bytes, false);
         }
         Ok(Self { owners, sync_upload_bytes, loading_host_bytes, record_bytes, hidden_bytes })
     }

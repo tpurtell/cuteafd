@@ -209,6 +209,12 @@ impl BlockDraftLayout {
                 .ok_or_else(|| DsparkConfigError::Unsupported("dSpark owner sum overflow".into())))
     }
 
+    pub fn resident_weights(&self) -> Result<crate::placement::ResidentWeights, DsparkConfigError> {
+        self.owners.iter().try_fold(crate::placement::ResidentWeights::default(), |sum, owner|
+            sum.checked_add(owner.resident_weights)
+                .map_err(|_| DsparkConfigError::Unsupported("dSpark resident-weight sum overflow".into())))
+    }
+
     pub fn scratch_bytes(&self) -> Result<u64, DsparkConfigError> {
         self.owners.iter().filter(|o| matches!(o.id.as_str(), "fp8_scratch" | "attention_workspace"))
             .try_fold(0u64, |sum, o| sum.checked_add(o.bytes as u64)
@@ -325,10 +331,10 @@ impl BlockDsparkConfig {
             sync_upload_bytes = sync_upload_bytes.max(upload.unwrap_or(payload));
             if matrix && fp8 {
                 if shape.len() != 2 || shape[0] % 16 != 0 || shape[1] % 128 != 0 { return Err(invalid()); }
-                owners.push(MlaDraftOwner::new(format!("{id}.values"), Domain::Device, Dtype::Bytes, vec![payload / 2], 0)?);
-                owners.push(MlaDraftOwner::new(format!("{id}.scales"), Domain::Device, Dtype::F32, vec![shape[0], shape[1] / 128], 0)?);
+                owners.push(MlaDraftOwner::new(format!("{id}.values"), Domain::Device, Dtype::Bytes, vec![payload / 2], 0)?.weight());
+                owners.push(MlaDraftOwner::new(format!("{id}.scales"), Domain::Device, Dtype::F32, vec![shape[0], shape[1] / 128], 0)?.weight());
                 packing_sources.push(MlaDraftOwner { dtype: Dtype::Bytes, shape: vec![source.bytes], ..source });
-            } else { owners.push(MlaDraftOwner { id, ..source }); }
+            } else { owners.push(MlaDraftOwner { id, ..source }.weight()); }
             Ok(())
         };
         for layer in 0..self.layers {

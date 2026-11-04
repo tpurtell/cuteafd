@@ -42,6 +42,8 @@ pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, K
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlacementRequest {
     pub inventory: Inventory,
+    /// Independent per-coordinator resident-weight ceiling, including drafters.
+    pub resident_weight_limit: Option<ResidentWeights>,
     /// None selects the family default and permits memory-driven mode flips.
     pub attention_placement: Option<AttentionPlacement>,
     pub context_buffers: ContextBuffers,
@@ -215,6 +217,7 @@ pub struct LayerExtraDemand {
     pub category: Category,
     pub group: String,
     pub bytes: u64,
+    pub resident_weights: ResidentWeights,
     pub residency: LayerResidency,
     pub basis: Basis,
 }
@@ -222,7 +225,11 @@ pub struct LayerExtraDemand {
 impl LayerExtraDemand {
     pub fn new(category: Category, group: impl Into<String>, bytes: u64,
         residency: LayerResidency, basis: Basis) -> Self {
-        Self { category, group: group.into(), bytes, residency, basis }
+        Self { category, group: group.into(), bytes, resident_weights: ResidentWeights::default(), residency, basis }
+    }
+
+    pub fn with_resident_weights(self, resident_weights: ResidentWeights) -> Self {
+        Self { resident_weights, ..self }
     }
 
     pub(crate) fn on_gpu(&self, mode: LayerMode, gpu: usize) -> bool {
@@ -363,19 +370,52 @@ impl BoundedDemand {
     }
 }
 
+/// Weight residency is independent of future allocation bytes and CUDA baselines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidentWeights(pub u64);
+
+impl ResidentWeights {
+    pub const DEFAULT_LIMIT: Self = Self(80 << 30);
+
+    pub fn checked_add(self, other: Self) -> Result<Self, PlacementError> {
+        self.0.checked_add(other.0).map(Self)
+            .ok_or(PlacementError::Overflow("resident weights"))
+    }
+}
+
+/// An opaque mandatory owner can mix weights and runtime storage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MovablePart {
+    pub memory: Bytes2,
+    pub resident_weights: ResidentWeights,
+}
+
+impl MovablePart {
+    pub fn new(memory: Bytes2, resident_weights: ResidentWeights) -> Self {
+        Self { memory, resident_weights }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Demand {
     pub gpu: u8,
     pub category: Category,
     pub group: String,
     pub bytes: u64,
+    /// Includes already-loaded weights even when `bytes` is zero.
+    pub resident_weights: ResidentWeights,
     pub basis: Basis,
     pub lifetime: ItemLifetime,
 }
 
 impl Demand {
     pub fn new(gpu: u8, category: Category, group: impl Into<String>, bytes: u64, basis: Basis) -> Self {
-        Self { gpu, category, group: group.into(), bytes, basis, lifetime: ItemLifetime::ReadyResident }
+        Self { gpu, category, group: group.into(), bytes, resident_weights: ResidentWeights::default(),
+            basis, lifetime: ItemLifetime::ReadyResident }
+    }
+
+    pub fn with_resident_weights(self, resident_weights: ResidentWeights) -> Self {
+        Self { resident_weights, ..self }
     }
 
     pub fn with_lifetime(self, lifetime: ItemLifetime) -> Self { Self { lifetime, ..self } }
@@ -402,7 +442,7 @@ pub enum MovableId {
 pub struct Movable {
     pub id: MovableId,
     /// Loaded in order; each part's staging is transient.
-    pub parts: Vec<Bytes2>,
+    pub parts: Vec<MovablePart>,
     /// Allowed GPUs; most free bytes for ordinary movables, best remaining
     /// pool capacity for candidates with conditional demands.
     pub allowed: Vec<u8>,
@@ -670,6 +710,8 @@ pub enum PlacementError {
     PoolDoesNotFit { requested: u64, fit: u64, limits: PoolLimits },
     #[error("{family} drafter was placed on rtx{gpu}, where this build has no executor for it")]
     DrafterHome { family: &'static str, gpu: u8 },
+    #[error("rtx{gpu} resident weights need {required} bytes, over the {limit} byte weight budget")]
+    ResidentWeightLimit { gpu: u8, required: u64, limit: u64 },
     #[error("startup phase {phase} needs {required} bytes on rtx{gpu}, but only {available} bytes are free")]
     StartupPeak { gpu: u8, phase: String, required: u64, available: u64 },
     #[error("KV pool and mandatory {what} do not fit on rtx{gpu}")]

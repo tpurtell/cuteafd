@@ -413,6 +413,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let pool = PoolPolicy::resolve(&capacities, context, requested_pool, PAGE_ROWS, false)
         .with_automatic_context(automatic_context);
     let mut request = PlacementRequest {
+        resident_weight_limit: None,
         inventory: Inventory { gpus, spark_ranks, peer_access: pair },
         attention_placement: pair.then_some(AttentionPlacement::Heads), context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0, pool, layers, pool_overhead: vec![0; ranks], pool_bounded: Vec::new(), fixed,
@@ -523,6 +524,7 @@ impl LocalPackage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuseDrafter {
     pub owned: u64,
+    pub weights: ResidentWeights,
     pub scratch: u64,
     pub head_scratch: u64,
     /// The draft batch's input ids and the policy probe's device route ring
@@ -536,8 +538,8 @@ pub struct MuseDrafter {
 
 impl MuseDrafter {
     fn demand(&self, head: u8) -> crate::placement::draft::DrafterDemand {
-        crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![Bytes2 {
-            resident: self.owned + self.scratch + self.head_scratch + self.runtime, staging: 0 }], head)
+        crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![MovablePart::new(Bytes2 {
+            resident: self.owned + self.scratch + self.head_scratch + self.runtime, staging: 0 }, self.weights)], head)
     }
 }
 
@@ -562,7 +564,7 @@ pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slot
          the target head's", cfg.softcap, cfg.output_multiplier);
     let block = usize::try_from(block)?;
     let capacity = GlmDraftCapacity::new(slots, sequences, block).map_err(|error| anyhow::anyhow!("{error}"))?;
-    let (owned, scratch) = draft_resident_bytes_with_mode(config, capacity.context_slots, capacity.max_batch_sequences,
+    let residency = draft_resident_bytes_with_mode(config, capacity.context_slots, capacity.max_batch_sequences,
         sms, GlmDraftRepresentation::Bf16Only, 2, kv_cache).map_err(|error| anyhow::anyhow!("Muse drafter: {error}"))?;
     // Stored-width F32 rows of the K6 head and the trimmed F32 rows, per draft row.
     ensure!(stored >= cfg.vocab_size, "Muse head stored width below the vocabulary");
@@ -570,7 +572,8 @@ pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slot
     let head_scratch = u64::try_from(rows * (stored + cfg.vocab_size) * 4)?;
     let probe = (cfg.layers * crate::families::muse_spark::lane::HEAD_ROWS * cfg.topk * 4) as u64;
     let runtime = u64::try_from(rows * 4)? + probe;
-    Ok(MuseDrafter { owned, scratch, head_scratch, runtime, context_slots: capacity.context_slots,
+    Ok(MuseDrafter { owned: residency.owned, weights: residency.weights, scratch: residency.scratch,
+        head_scratch, runtime, context_slots: capacity.context_slots,
         sequences: capacity.max_batch_sequences, block, head_dim: geometry.head_dim as usize })
 }
 

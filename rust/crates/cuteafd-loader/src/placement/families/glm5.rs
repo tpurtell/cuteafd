@@ -537,6 +537,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
     } else { Vec::new() };
     let cards: Vec<_> = inputs.gpus.iter().map(|g| g.0).collect();
     Ok(PlacementRequest {
+        resident_weight_limit: None,
         pool_bounded: Vec::new(),
         attention_placement: None,
         layers_first_gpu: 0,
@@ -767,9 +768,9 @@ pub fn drafter_bytes(snapshot: &std::path::Path, slots: usize, sequences: usize,
     sms: u64, bf16: bool, kv_cache: crate::families::qwen4::Qwen4KvCache) -> anyhow::Result<u64> {
     use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftRepresentation};
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
-    let (owned, scratch) = draft_resident_bytes_with_mode(&config, slots, sequences, sms,
+    let residency = draft_resident_bytes_with_mode(&config, slots, sequences, sms,
         if bf16 { GlmDraftRepresentation::Bf16Only } else { GlmDraftRepresentation::Fp8Only }, 0, kv_cache)?;
-    owned.checked_add(scratch).ok_or_else(|| anyhow::anyhow!("GLM draft storage overflow"))
+    residency.owned.checked_add(residency.scratch).ok_or_else(|| anyhow::anyhow!("GLM draft storage overflow"))
 }
 
 /// Largest transient BF16 source retained while packing one draft projection.

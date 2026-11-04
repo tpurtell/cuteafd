@@ -286,7 +286,9 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     // dSpark reads the head GPU's taps every step, so it stays beside the head (no bridge).
     let movables = if inputs.draft.is_empty() { Vec::new() } else {
         vec![crate::placement::draft::DrafterDemand::local(MovableId::DsparkExperts,
-            inputs.draft.iter().map(|c| Bytes2 { resident: c.resident_bytes, staging: c.staging_bytes }).collect(), 0)
+            inputs.draft.iter().map(|c| MovablePart::new(
+                Bytes2 { resident: c.resident_bytes, staging: c.staging_bytes },
+                ResidentWeights(c.resident_bytes))).collect(), 0)
             .movable(gpus)?]
     };
     let payload = crate::serving_capacity::deepseek_v4_tp2_payload_bytes(inputs.cfg.dim as u64,
@@ -298,6 +300,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     }
     let geometry_unit = 256;
     Ok(PlacementRequest {
+        resident_weight_limit: None,
         pool_bounded: Vec::new(),
         attention_placement: inputs.attention,
         layers_first_gpu: 0,

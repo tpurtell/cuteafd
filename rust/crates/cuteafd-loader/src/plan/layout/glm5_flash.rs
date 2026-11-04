@@ -180,10 +180,10 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(total, None).sms) as u64).collect();
         // Explicit fixture totals remain opaque: do not add inferred scratch on top.
         let mut draft_rows = None;
-        let (draft, drafter_scratch, drafter_bridge) = if options.glmf_drafter_disabled { (0, vec![0; ranks], None) }
-            else if options.drafter_bytes > 0 {
+        let (draft, drafter_weights, drafter_scratch, drafter_bridge) = if options.glmf_drafter_disabled { (0, placement::ResidentWeights::default(), vec![0; ranks], None) }
+            else if options.drafter_bytes > 0 && options.glmf_drafter_snapshot.is_none() {
                 anyhow::ensure!(!native, "native K6 drafter head requires its actual DFlash2 config, not a bytes-only override");
-                (options.drafter_bytes, vec![0; ranks], None)
+                (options.drafter_bytes, placement::ResidentWeights(options.drafter_bytes), vec![0; ranks], None)
             } else {
             let path = options.glmf_drafter_snapshot.clone().or_else(|| {
                 let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| "/mnt/sparknest/hf-home".into());
@@ -201,7 +201,10 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2, options.draft_kv_cache)?;
             let bridge = if ranks == 2 && glmf::remote_dflash_requested() {
                 glmf::drafter_bridge_inventory(&config, slots, batch)? } else { None };
-            (bytes, scratch, bridge)
+            anyhow::ensure!(options.drafter_bytes == 0 || options.drafter_bytes == bytes.resident_weights.0,
+                "drafter weight override {} differs from checkpoint-resident weights {}",
+                options.drafter_bytes, bytes.resident_weights.0);
+            (bytes.memory.resident, bytes.resident_weights, scratch, bridge)
         };
         let core_charge = if native && exlr8.is_none() {
             let owners = (attention.mode == placement::AttentionPlacement::Layers).then(|| {
@@ -285,7 +288,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             resident, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
-            drafter_bytes: draft, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
+            drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
             full_prefill_logits: if options.full_prefill_logits && exlr8.is_none() && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
         let (placed, _, working) = glmf::solve_attention_working_set_with_graphs(&inputs,
             alternate_resident.as_deref(), target, options.context_tokens == 0,

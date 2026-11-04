@@ -3288,7 +3288,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                 GlmfStepShape { spark: false, ..shape }, decode, prefill),
             graphs: placement::GraphSet::budget(&[64 << 20; 2]), experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
-            drafter_bytes: 0, drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
+            drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
         let (placed, graphs, working) = glmf::solve_attention_working_set_with_graphs(&input, None,
             2 << 20, false, 188, true).unwrap();
@@ -3763,20 +3763,28 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
         let (owned, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
             &[170,188],GlmDraftRepresentation::Fp8Only,2, draft_kv_cache).unwrap();
         let natural = run(&options);
-        assert_eq!(bytes(&natural,0,Category::Drafter), owned);
+        assert_eq!(bytes(&natural,0,Category::Drafter), owned.memory.resident);
         assert_eq!(bytes(&natural,0,Category::Workspace), scratch[0]);
         assert_eq!(bytes(&natural,1,Category::Workspace), 0);
         options.physical_sms = Some(188);
         let simulated = run(&options);
-        assert_eq!(bytes(&simulated,0,Category::Drafter), owned);
+        assert_eq!(bytes(&simulated,0,Category::Drafter), owned.memory.resident);
         assert_eq!(bytes(&simulated,0,Category::Workspace), scratch[1]);
-        options.drafter_bytes = owned + scratch[1];
-        // An explicit total must work even when no checkpoint can be read.
-        options.glmf_drafter_snapshot = Some(draft.path().join("absent"));
+        options.drafter_bytes = owned.resident_weights.0;
+        let matched = run(&options);
+        assert_eq!(matched, simulated, "matching weight facts must not replace real runtime owners");
+        options.drafter_bytes += 1;
+        let mismatch = plan(dir.path(), &PlanOptions { layout: Some(options.clone()),
+            attention_placement: Some(AttentionPlacement::Heads), ..sparks(4) }).unwrap();
+        assert!(!mismatch.placement_supported);
+        assert!(render(&mismatch).contains("drafter weight override"));
+        options.drafter_bytes = owned.resident_weights.0;
+        // A bytes-only override is explicitly weights, with no inferred runtime.
+        options.glmf_drafter_snapshot = None;
         let explicit = run(&options);
         assert_eq!(bytes(&explicit,0,Category::Drafter), options.drafter_bytes);
         assert_eq!(bytes(&explicit,0,Category::Workspace), 0);
-        assert_eq!(explicit.pool_tokens, simulated.pool_tokens);
+        assert!(explicit.pool_tokens >= simulated.pool_tokens);
         options.glmf_drafter_disabled = true;
         let disabled = run(&options);
         assert_eq!(bytes(&disabled,0,Category::Drafter), 0);

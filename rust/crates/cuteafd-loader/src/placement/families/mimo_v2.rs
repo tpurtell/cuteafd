@@ -489,6 +489,7 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
             .max(inputs.headroom_floor),
     }).collect();
     Ok(PlacementRequest {
+        resident_weight_limit: None,
         pool_bounded: Vec::new(),
         inventory: Inventory { gpus, spark_ranks: inputs.spark_ranks, peer_access: ranks == 2 },
         pool,
