@@ -117,11 +117,16 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         if let Some(globals) = &globals {
             fixed.push(globals[usize::from(gpu)].demand().expect("validated global extent"));
         } else {
-        fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", residency.split / 2, Basis::Exact));
+        let split = residency.split / 2;
+        fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", split, Basis::Exact)
+            .with_resident_weights(ResidentWeights(split)));
+        let replicated = residency.replicated - model.frontends[1 - gpu as usize];
         fixed.push(Demand::new(gpu, Category::Weights, "text weights replicated (KDA low-rank A, routers, latent proj, norms)",
-            residency.replicated - model.frontends[1 - gpu as usize], Basis::Exact));
+            replicated, Basis::Exact).with_resident_weights(ResidentWeights(replicated)));
+        let frontend = if gpu == 0 { embedding } else { head };
         fixed.push(Demand::new(gpu, if gpu == 0 { Category::Embedding } else { Category::Weights },
-            if gpu == 0 { "token embedding" } else { "lm head" }, if gpu == 0 { embedding } else { head }, Basis::Exact));
+            if gpu == 0 { "token embedding" } else { "lm head" }, frontend, Basis::Exact)
+            .with_resident_weights(ResidentWeights(frontend)));
         }
         fixed.push(Demand::new(gpu, Category::Kv, format!("KDA FP32 state + BF16 conv, {slots} slots, 48 heads"), state, Basis::Formula));
     }
@@ -244,9 +249,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             let mut attention = [0; 2];
             for rank in 0..2 {
                 attention[rank] = split[rank].attention_bytes()? as u64;
+                let fixed_weights = split[rank].bytes()? as u64 - attention[rank];
                 fixed.push(Demand::new(rank as u8, Category::Weights,
                     format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
-                    split[rank].bytes()? as u64 - attention[rank], Basis::Exact));
+                    fixed_weights, Basis::Exact).with_resident_weights(ResidentWeights(fixed_weights)));
             }
             weights = ModeBytes { split: attention, whole: if mla {
                 LayerLayout::pair_with_core(cfg, layer, MODES[1], core)?[0].attention_bytes()? as u64
@@ -266,7 +272,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     // Reuse pool-first TP2 onboarding, constrained by the Spark suffix budget.
     let onboard = opts.resolve_onboard(cfg.dense.iter().filter(|dense| !**dense).count()).unwrap_or(Onboard::Auto);
     let mut request = PlacementRequest {
-        resident_weight_limit: None,
+        resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)),
         inventory: Inventory { gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, bytes)| GpuBudget { capacity_bytes: *bytes,
             headroom_bytes: opts.headroom_bytes, baseline: baseline[rank] }).collect(),
             spark_ranks: ranks, peer_access: true },

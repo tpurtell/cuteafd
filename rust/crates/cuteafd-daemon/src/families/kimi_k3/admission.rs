@@ -41,6 +41,7 @@ pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Resu
 /// page tables; global weights, token IO and state banks add their own demands.
 pub(crate) struct Inputs<'a> {
     pub cfg: &'a KimiK3Config,
+    pub resident_weight_limit: ResidentWeights,
     pub cache_format: cuteafd_core::MlaCacheFormat,
     pub core: cuteafd_loader::families::kimi_k3::core::CoreInventory,
     pub gpus: [GpuBudget; 2],
@@ -770,8 +771,9 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         for rank in 0..2 {
             let attention = split[rank].attention_bytes()?;
             split_attention[rank] = attention as u64;
+            let weights = (split[rank].bytes()? - attention) as u64;
             fixed.push(Demand::new(rank as u8, Category::Weights, format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
-                (split[rank].bytes()? - attention) as u64, Basis::Exact));
+                weights, Basis::Exact).with_resident_weights(ResidentWeights(weights)));
         }
         let mla = cfg.attention[layer] == KimiAttention::Mla;
         let whole = if mla { LayerLayout::pair_with_core(cfg, layer, MODES[1], &i.core)?[0].attention_bytes()? as u64 } else { 0 };
@@ -789,7 +791,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         i.requested_pool, MLA_PAGE_ROWS as u64, true);
     pool.ceiling = pool.target.max(pool.requested.unwrap_or(0));
     Ok(PlacementRequest {
-        resident_weight_limit: None, inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
+        resident_weight_limit: Some(i.resident_weight_limit), inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool, layers, pool_overhead: vec![0; 2], pool_bounded: i.pool_bounded, fixed, startup, movables,
         expert_workspace: 0, tp2_workspace: [0; 2], onboard: Onboard::Layers(0), expert_gpus: 0, minimum_expert_layers: 0,
@@ -964,7 +966,7 @@ pub(super) mod tests {
     }
 
     pub(in crate::families::kimi_k3) fn inputs(cfg: &KimiK3Config) -> Inputs<'_> {
-        Inputs { cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
+        Inputs { cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2], devices: [0, 1], peer_access: true, spark_ranks: 6,
             attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::new(
@@ -1156,6 +1158,65 @@ pub(super) mod tests {
         i.lane_layouts[1][1] = LaneLayout::new(&full, i.rows, test_unit(i.rows, i.waves, i.unit_rows), 524_288,
             super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
         assert!(request(i).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn plan_command_and_live_admission_enforce_the_same_resident_weight_cap() -> Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::plan::testing;
+        let snapshot = tempfile::tempdir()?;
+        testing::write_kimi_snapshot(snapshot.path(), true);
+        let package = tempfile::tempdir()?;
+        let manifest_path = testing::write_kimi_installed_inventory(package.path(), false);
+        let manifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let config = serde_json::from_slice(&std::fs::read(snapshot.path().join("config.json"))?)?;
+        let cfg = KimiK3Config::from_hf(&config)?;
+        let expected = (0..cfg.layers).try_fold(GlobalLayout::pair(&cfg)?[0].bytes()? as u64,
+            |sum, layer| -> Result<_> {
+                sum.checked_add(LayerLayout::pair(&cfg, layer, LayerMode::HeadSplit)?[0].bytes()? as u64)
+                    .context("native rank-zero resident weights overflow")
+            })?;
+        for (gib, accepted) in [(80u64, true), (1, false)] {
+            let cli = crate::cli::Cli::try_parse_from([
+                "cuteafd".into(), "plan".into(), snapshot.path().as_os_str().to_owned(),
+                "--layout".into(), "--rtx".into(), "2".into(), "--spark-ranks".into(), "6".into(),
+                "--workspace-manifest".into(), manifest_path.as_os_str().to_owned(),
+                "--coordinator-weight-budget-gib".into(), gib.to_string().into(),
+                "--attention-placement".into(), "heads".into(), "--rtx-expert-layers".into(), "0".into(),
+                "--context-tokens".into(), "262144".into(), "--pool-tokens".into(), "262144".into(),
+                "--concurrency".into(), "2".into(), "--prefix-slots".into(), "0".into(),
+                "--host-cache-bytes".into(), "0".into(), "--prefill-rows".into(), "2048".into(),
+                "--prefill-waves".into(), "2".into(), "--kv-cache".into(), "bf16".into(),
+                "--speculator".into(), "off".into(), "--vision".into(), "off".into(),
+                "--audio".into(), "off".into(), "--require-ready".into(),
+            ])?;
+            let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan command") };
+            args.coordinator_weight_budget_gib = cli.coordinator_weight_budget_gib.context("global cap")?;
+            let planned = crate::commands::plan::run_plan(args);
+            let mut i = inputs(&cfg);
+            i.resident_weight_limit = ResidentWeights(gib << 30);
+            i.attention = Some(AttentionPlacement::Heads);
+            i.requested_pool = Some(262144);
+            i.prefix_marks = 0;
+            i.lanes = 1;
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows,
+                test_unit(i.rows, i.waves, i.unit_rows), 262144,
+                super::super::device::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
+            let admitted = admit(i);
+            if accepted {
+                planned?;
+                assert_eq!(admitted?.placement.pool_tokens, 262144);
+            } else {
+                let live_error = admitted.err().context("live admission must refuse the cap")?;
+                let mut typed = live_error.downcast_ref::<PlacementError>().context("typed live refusal")?;
+                while let PlacementError::OwnerCandidates { source, .. }
+                    | PlacementError::PrefixMarks { source, .. } = typed { typed = source; }
+                assert_eq!(*typed, PlacementError::ResidentWeightLimit { gpu: 0, required: expected, limit: gib << 30 });
+                let plan_error = planned.expect_err("plan command must refuse the same cap");
+                assert!(plan_error.to_string().contains(&typed.to_string()), "{plan_error:#}; {live_error:#}");
+            }
+        }
         Ok(())
     }
 

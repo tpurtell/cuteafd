@@ -1,6 +1,19 @@
 //! Checked byte and reservation inputs shared by native startup admission.
 use anyhow::{Context, Result, ensure};
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, sync::OnceLock};
+use cuteafd_loader::placement::ResidentWeights;
+
+static RESIDENT_WEIGHT_LIMIT: OnceLock<ResidentWeights> = OnceLock::new();
+
+pub(crate) fn set_resident_weight_limit(limit: ResidentWeights) -> Result<()> {
+    ensure!(limit.0 > 0, "coordinator resident-weight limit must be positive");
+    RESIDENT_WEIGHT_LIMIT.set(limit)
+        .map_err(|_| anyhow::anyhow!("coordinator resident-weight limit is already installed"))
+}
+
+pub(crate) fn resident_weight_limit() -> ResidentWeights {
+    RESIDENT_WEIGHT_LIMIT.get().copied().unwrap_or(ResidentWeights::DEFAULT_LIMIT)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ByteSize(pub usize);

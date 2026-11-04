@@ -7,7 +7,7 @@ fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
         ("--coordinator-gpu-budget-gib", None),
         ("--rtx-budget-gib", Some("--coordinator-gpu-budget-gib")),
         ("--rtx-gib", Some("--coordinator-gpu-budget-gib")),
-        ("--coordinator-budget-gib", Some("--coordinator-weight-budget-gib")),
+        ("--coordinator-weight-budget-gib", None),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
             .args(["plan", "/budget-cli-missing-snapshot", "--layout", flag, "31.8"])
@@ -24,6 +24,38 @@ fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
             assert!(warnings[0].contains(replacement), "{stderr}");
         } else {
             assert!(warnings.is_empty(), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn global_resident_weight_flag_reaches_plan_admission() {
+    use cuteafd_loader::plan::testing;
+    let snapshot = tempfile::tempdir().unwrap();
+    testing::write_kimi_snapshot(snapshot.path(), true);
+    let package = tempfile::tempdir().unwrap();
+    let manifest = testing::write_kimi_installed_inventory(package.path(), false);
+    for (gib, accepted) in [("80", true), ("1", false)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+            .args(["--coordinator-weight-budget-gib", gib, "plan"])
+            .arg(snapshot.path()).arg("--workspace-manifest").arg(&manifest)
+            .args(["--layout", "--rtx", "2", "--spark-ranks", "6", "--speculator", "off",
+                "--attention-placement", "heads", "--rtx-expert-layers", "0", "--context-tokens", "262144",
+                "--pool-tokens", "262144", "--concurrency", "2", "--prefix-slots", "0",
+                "--host-cache-bytes", "0", "--prefill-rows", "2048", "--prefill-waves", "2",
+                "--vision", "off", "--audio", "off", "--json", "--require-ready"])
+            .env_remove("COORDINATOR_GPU_BUDGET_GIB")
+            .env("HF_HOME", snapshot.path()).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("invalid plan JSON: {error}; {stderr}"));
+        assert_eq!(output.status.success(), accepted, "{gib} GiB: {stderr}");
+        if accepted {
+            assert_eq!(report["fits"], true, "{report}");
+            assert_eq!(report["memory_layout"]["pool_tokens"], 262144);
+        } else {
+            assert_eq!(report["fits"], false, "{report}");
+            assert!(stderr.contains("resident weights need") && stderr.contains("1073741824 byte weight budget"), "{stderr}");
         }
     }
 }

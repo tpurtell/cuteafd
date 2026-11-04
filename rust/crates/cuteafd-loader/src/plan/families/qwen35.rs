@@ -214,7 +214,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         pool: options.pool_tokens.map_or(planner::Pin::Auto, planner::Pin::Exact), onboard,
         prefill: planner::Pin::Exact(planner::PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }),
         spark_reply_format: None,
-        resident_weight_limit: None, operation: if options.full_prefill_logits { planner::Operation::Scoring } else { planner::Operation::Serving } };
+        resident_weight_limit: Some(placement::ResidentWeights(options.weight_budget_bytes)), operation: if options.full_prefill_logits { planner::Operation::Scoring } else { planner::Operation::Serving } };
     let record_bytes = options.dense_qwen_kv.record_bytes(cfg.kv_heads, cfg.head_dim) as u64;
     let serving = placement::families::qwen3_5::ServingFacts::new(cfg, &buffers, record_bytes,
         drafter.map(DenseDraft::page_bytes).transpose()?.unwrap_or(0),

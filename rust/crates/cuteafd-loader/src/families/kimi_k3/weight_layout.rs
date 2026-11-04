@@ -1,7 +1,7 @@
 //! Packed device weight extents shared by checkpoint admission and runtime owners.
 use crate::formats::trellis_core::CoreWeightLayout;
 use super::{config::{KimiAttention, KimiK3Config}, core::CoreInventory, kda};
-use crate::{placement::{Demand, LayerMode}, formats::dense_trellis::TrellisSide};
+use crate::{placement::{Demand, LayerMode, ResidentWeights}, formats::dense_trellis::TrellisSide};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
 use std::collections::BTreeMap;
@@ -60,7 +60,9 @@ impl GlobalLayout {
     }
 
     pub fn demand(&self) -> Result<Demand> {
-        Ok(Demand::new(self.rank as u8, Category::Weights, "Kimi global weights", self.bytes()? as u64, Basis::Exact))
+        let bytes = self.bytes()? as u64;
+        Ok(Demand::new(self.rank as u8, Category::Weights, "Kimi global weights", bytes, Basis::Exact)
+            .with_resident_weights(ResidentWeights(bytes)))
     }
 
 }

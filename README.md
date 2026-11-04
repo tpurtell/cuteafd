@@ -287,8 +287,8 @@ restores the saved originals. Details: [Host tuning](docs/host-tuning.md).
    workspaces and Spark ranks. `--coordinator-gpu-budget-gib 31.8` sets the
    logical per-GPU ceiling for plan, serve and golden (plan defaults to 95.5
    GiB). Plan's separate `--coordinator-weight-budget-gib` caps only weights
-   (default 80 GiB). The old `--rtx-budget-gib`, `--rtx-gib` and
-   `--coordinator-budget-gib` spellings remain deprecated aliases.
+   (default 80 GiB). The old `--rtx-budget-gib` and `--rtx-gib` spellings
+   remain deprecated aliases for the total-memory ceiling.
    V4 Flash/Pro workspace formulas use the
    matching image manifest (`--workspace-manifest PROGRAMS.json`). The
    image also supplies EXL3 allocation manifests; when exporting metadata,

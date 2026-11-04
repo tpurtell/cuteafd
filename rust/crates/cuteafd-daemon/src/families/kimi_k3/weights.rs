@@ -49,7 +49,9 @@ impl GlobalLayout {
     }
 
     pub(crate) fn demand(&self) -> Result<Demand> {
-        Ok(Demand::new(self.rank as u8, Category::Weights, "Kimi global weights", self.bytes()? as u64, Basis::Exact))
+        let bytes = self.bytes()? as u64;
+        Ok(Demand::new(self.rank as u8, Category::Weights, "Kimi global weights", bytes, Basis::Exact)
+            .with_resident_weights(cuteafd_loader::placement::ResidentWeights(bytes)))
     }
 
     pub(crate) fn pack(&self, cfg: &KimiK3Config, mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<PackedGlobal> {
@@ -539,6 +541,7 @@ mod tests {
             assert_eq!(demand.category, Category::Weights);
             assert_eq!(demand.basis, Basis::Exact);
             assert_eq!(demand.bytes, layout.bytes()? as u64);
+            assert_eq!(demand.resident_weights.0, demand.bytes);
             if rank == 1 {
                 let scores = packed.operands["output.score"].chunks_exact(4)
                     .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>();

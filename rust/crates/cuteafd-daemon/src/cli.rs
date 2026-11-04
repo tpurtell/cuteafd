@@ -10,7 +10,6 @@ pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<
     for arg in args {
         let replacement = match arg.as_ref().split('=').next().unwrap_or("") {
             "--rtx-budget-gib" | "--rtx-gib" => Some("--coordinator-gpu-budget-gib"),
-            "--coordinator-budget-gib" => Some("--coordinator-weight-budget-gib"),
             _ => None,
         };
         if let Some(replacement) = replacement {
@@ -48,6 +47,10 @@ pub(crate) struct Cli {
     /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
     #[arg(long, global = true, aliases = ["rtx-budget-gib", "rtx-gib"])]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,
+    /// Retained checkpoint weights per coordinator GPU, including drafter
+    /// weights (default 80 GiB); independent of KV, workspace and total memory.
+    #[arg(long, global = true)]
+    pub(crate) coordinator_weight_budget_gib: Option<f64>,
     /// How host threads wait while serving: `block` (default: each
     /// critical-path wait spins 10 ms, then sleeps; the Spark exchange worker
     /// spins as long, then paces its polling; a less loaded machine) or `spin` (spins throughout,
@@ -250,9 +253,8 @@ pub(crate) struct PlanArgs {
     /// default, 100 GiB for most; Kimi K3 108 GiB).
     #[arg(long)]
     pub(crate) spark_budget_gib: Option<f64>,
-    /// Weight budget of the coordinator GPU, GiB (its own tensors, plus every
-    /// routed expert with --spark-ranks 0).
-    #[arg(long, alias = "coordinator-budget-gib", default_value_t = 80.0)]
+    /// Resolved global resident-weight ceiling, including drafter weights.
+    #[arg(skip = 80.0)]
     pub(crate) coordinator_weight_budget_gib: f64,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,

@@ -156,6 +156,28 @@ mod tests {
     }
 
     #[test]
+    fn resident_weight_budget_survives_generic_family_forwarding() {
+        use clap::Parser;
+        for (command, kind) in [("serve", Kind::Serve), ("golden", Kind::Golden)] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "--coordinator-weight-budget-gib", "73",
+                command, "--family", "kimi_k3", "--snapshot", "/m"]).unwrap();
+            let initial = cli.coordinator_weight_budget_gib;
+            let args = match cli.command {
+                crate::cli::Commands::Serve(args) | crate::cli::Commands::Golden(args) => args,
+                _ => panic!("generic family command"),
+            };
+            let mut forwarded = argv(kind, args).unwrap().unwrap();
+            forwarded.extend(["--native-lib".into(), "/lib.so".into()]);
+            if command == "golden" { forwarded.extend(["--golden".into(), "/g".into()]); }
+            let family = crate::cli::Cli::try_parse_from(forwarded.clone()).unwrap();
+            assert_eq!(family.coordinator_weight_budget_gib.or(initial), Some(73.0));
+            forwarded.extend(["--coordinator-weight-budget-gib".into(), "71".into()]);
+            let family = crate::cli::Cli::try_parse_from(forwarded).unwrap();
+            assert_eq!(family.coordinator_weight_budget_gib.or(initial), Some(71.0));
+        }
+    }
+
+    #[test]
     fn snapshot_is_found_in_either_spelling() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(snapshot_arg(&a(&["--port", "1", "--snapshot", "/x"])), Some("/x"));

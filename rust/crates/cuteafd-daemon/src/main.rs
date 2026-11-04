@@ -265,17 +265,18 @@ async fn run() -> Result<()> {
         match Cli::from_arg_matches(&matches) {
             Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
                 cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
-                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cli.spark_reply_format),
+                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cli.spark_reply_format,
+                cli.coordinator_weight_budget_gib),
             Err(error) => error.exit(),
         }
     };
-    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply) =
+    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply, initial_weight_budget) =
         parse(Cli::command().get_matches());
     for replacement in cli::deprecated_budget_flags(std::env::args()) {
         eprintln!("warning: deprecated coordinator budget flag; use {replacement}");
     }
     // `serve` and `golden` pick the family and stand for its own command.
-    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply) = match command {
+    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply, family_weight_budget) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
@@ -285,7 +286,7 @@ async fn run() -> Result<()> {
             None => return Ok(()),
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
-            initial_wait, initial_reply),
+            initial_wait, initial_reply, initial_weight_budget),
     };
     cuteafd_core::spark_reply::set_requested(family_reply.or(initial_reply)).map_err(anyhow::Error::msg)?;
     // Read by the coordinator and every Spark worker from the same key.
@@ -324,6 +325,13 @@ async fn run() -> Result<()> {
     cuteafd_api::openai::media::set_preparation_policy(
         family_image_cap.or(initial_image_cap).unwrap_or(4096) as usize,
         family_fetch.or(initial_fetch).unwrap_or(cuteafd_api::openai::media::ImageUrlFetch::Public))?;
+    let weight_budget_gib = family_weight_budget.or(initial_weight_budget);
+    if let Commands::Plan(args) = &mut command {
+        args.coordinator_weight_budget_gib = weight_budget_gib.unwrap_or(80.0);
+    } else if let Some(gib) = weight_budget_gib {
+        let bytes = cuteafd_loader::plan::budget_bytes("--coordinator-weight-budget-gib", gib)?;
+        shared::memory::budget::set_resident_weight_limit(cuteafd_loader::placement::ResidentWeights(bytes))?;
+    }
     let coordinator_budget_gib = family_budget.or(initial_budget);
     if let Commands::Plan(args) = &mut command {
         args.coordinator_gpu_budget_gib = coordinator_budget_gib;
