@@ -560,6 +560,10 @@ mod tests {
         let peers = env("CUTEAFD_GOLDEN_PEERS")?.split(',').map(str::parse)
             .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         ensure!(peers.len() == 6, "Kimi push regression requires six real Spark ranks");
+        use crate::shared::experts::rtx::push::PushPolicy;
+        ensure!(PushPolicy::for_snapshot(&snapshot)? == PushPolicy::Required
+            && PushPolicy::for_snapshot(&drafter)? == PushPolicy::Required,
+            "Kimi push regression requires target and drafter in a push namespace");
         let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)?;
         let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
         cfg.release_geometry()?;
