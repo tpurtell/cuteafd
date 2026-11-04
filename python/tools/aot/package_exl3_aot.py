@@ -443,18 +443,18 @@ SPARK_WS_CELLS = {
     # layers, median of three: dynamic tiles win m1024 4776 -> 4678 us (1.021x,
     # control spread 0.08%); m2048..m4096 tie within noise and keep the control.
     ('muse', 768, 1024): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
-    ('muse', 640, 256): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
-    ('muse', 640, 1024): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
-    # S4 duel round 0, GB10 2026-11-04, recorded layer-22 Muse routes, two
-    # layers, median of three: m2048 wants the 256-wide FC2 N tile (the width
-    # default is 128/128 here because 640 % 256 != 0), 7709 -> 7468 us (1.032x,
-    # identical-control spread 1.3%; dynamic tiles at the default 128-wide N
-    # are 1.007x there). The neighbouring cells already carry this recipe and
-    # confirm it over their 128/128 default: m256 1.012x, m1024 1.024x, m2752
-    # 1.035x, m4096 1.010x.
-    ('muse', 640, 2048): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
-    ('muse', 640, 2752): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
-    ('muse', 640, 4096): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    # S4 duel round 1, GB10 2026-11-04, recorded Muse routes (layers 2/22/44),
+    # two layers, median of three interleaved rounds with identical control:
+    # non-divisible 256-wide FC1 tile (640 = 2 x 256 + 128 masked tail,
+    # tailskip + 5-stage BC ring + split-window BC arrival) wins every cell
+    # over the 128-wide FC1 baseline, bit-identical across all 1..capacity
+    # prefix rows: m256 (rb32) 1.009-1.038x on recorded routes, m1024
+    # 1.104-1.138x, m2048 1.146-1.168x, m2752 1.161-1.180x, m4096 1.151-1.193x.
+    ('muse', 640, 256): dict(route_block=32, dynamic=True, tile=(64, 256, 64, 256)),
+    ('muse', 640, 1024): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('muse', 640, 2048): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('muse', 640, 2752): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('muse', 640, 4096): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
     # ML4 K4/empty-K5, GB10 2026-11-01: exact synthetic-skew-qualified cells;
     # real-route confirmation pending. No extrapolation across rows or widths.
     # S4 duel round 0, GB10 2026-11-04, recorded route histograms (layer 0),
