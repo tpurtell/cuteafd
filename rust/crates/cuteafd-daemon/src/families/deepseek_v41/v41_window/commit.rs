@@ -74,7 +74,7 @@ impl<'a> WindowWave<'_, 'a> {
     }
     unsafe fn enqueue_commit_on(&mut self, state: &WindowState<'_>, accepted: &[u32],
         external: Option<*mut c_void>) -> Result<Option<BatchedWindowCommit>> {
-        let (lib, raw) = (self.stream().library, self.storage.commit_stream.raw);
+        let (lib, raw) = (self.stream().library, self.commit_stream.raw);
         let (values, scales, device_destinations) = (self.values(), self.scales(), self.destinations());
         ensure!(self.pending_commit.is_none(), "window commit already pending");
         if let Some(configured)=&state.replica {
@@ -182,7 +182,7 @@ impl<'a> WindowWave<'_, 'a> {
     pub fn poll_commit(&self) -> Result<bool> {
         let Some(pending) = &self.pending_commit else { return Ok(true) };
         // SAFETY: a pending commit retains the selected stream and its storage.
-        unsafe { self.stream().library.cuda_stream_query(pending.external.unwrap_or(self.storage.commit_stream.raw)) }
+        unsafe { self.stream().library.cuda_stream_query(pending.external.unwrap_or(self.commit_stream.raw)) }
     }
     pub(super) fn validate_pending_commit(&self, state: &WindowState<'_>) -> Result<&Prepared> {
         let pending = self.pending_commit.as_ref().context("window commit absent")?;
@@ -213,7 +213,7 @@ impl<'a> WindowWave<'_, 'a> {
             // this pass's own and is reused only after the unit's drained commit.
             let completed = if crate::shared::memory::chain::deferred() {
                 // SAFETY: this storage owns the commit stream through the chain's drain.
-                unsafe { crate::shared::memory::chain::finish(self.stream().library, self.storage.commit_stream.raw) }
+                unsafe { crate::shared::memory::chain::finish(self.stream().library, self.commit_stream.raw) }
             } else { self.synchronize() };
             if let Err(error) = launched.and(completed) {
                 self.abort_commit(state)?;
@@ -422,8 +422,9 @@ mod tests {
         let other_pass = weights[0].on_storage(WindowStorage::new(&lib, rows, rows, &[0, 1])?)?;
         assert!(std::ptr::eq(waves[0].stream(), waves[1].stream()));
         assert_ne!(waves[0].stream().raw, other_pass.stream().raw);
-        assert_ne!(storage.stream.raw, storage.commit_stream.raw);
-        assert_ne!(storage.commit_stream.raw, other_pass.storage.commit_stream.raw);
+        assert_ne!(storage.stream.raw, waves[0].commit_stream.raw);
+        assert_ne!(waves[0].commit_stream.raw, waves[1].commit_stream.raw);
+        assert_ne!(waves[0].commit_stream.raw, other_pass.commit_stream.raw);
         let mut references = weights.iter().map(|weights| weights.wave(rows as u32, usize::MAX))
             .collect::<Result<Vec<_>>>()?;
         for round in 0..3 {
@@ -471,7 +472,10 @@ mod tests {
             lib.copy_h2d(source.buffer, &input)?;
             Ok(source)
         }).collect::<Result<Vec<_>>>()?;
-        let gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&lib, storage.commit_stream.raw)? };
+        let gates = waves.iter().map(|wave| {
+            // SAFETY: every gate is released before its wave-owned stream drains.
+            unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&lib, wave.commit_stream.raw) }
+        }).collect::<Result<Vec<_>>>()?;
         for layer in 0..2 {
             let chunk = WindowChunk { lease: actual_leases[layer], position: 12, tokens: rows as u32 };
             let prepared = waves[layer].prepare(&actual[layer], &[chunk])?;
@@ -491,7 +495,7 @@ mod tests {
         }
         assert!(!waves[0].poll_commit()?);
         assert!(!waves[1].poll_commit()?);
-        drop(gate);
+        drop(gates);
         for layer in 0..2 {
             waves[layer].synchronize()?;
             waves[layer].commit(&mut actual[layer], &[rows as u32])?;
