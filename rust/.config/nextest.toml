@@ -14,3 +14,5 @@ fail-fast = false
 [profile.cpu-gate-full.junit]
 path = "junit.xml"
 report-skipped = "all"
+# Preserve per-plan timing evidence from successful installed inventories.
+store-success-output = true

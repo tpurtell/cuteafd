@@ -32,7 +32,7 @@ def _fake(monkeypatch, outputs):
         Path(log_path).write_text(text)
         return code, 1.0
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
-    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: [])
+    monkeypatch.setattr(gate, 'python_for', lambda source: Path('/gate-venv/bin/python'))
     monkeypatch.setattr(gate, 'run_logged', run_logged)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: '')
     return calls
@@ -197,9 +197,9 @@ def test_live_planner_skip_is_explicit_and_recorded(tmp_path, monkeypatch):
     result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**{**vars(ARGS), 'skip_live_planners': True}), {})
     test_cmd = calls[1]
     assert test_cmd[-1] == '--exact' and test_cmd.count('--skip') == len(set(gate.FULL_TESTS) | set(gate.LIVE_PLANNERS))
-    assert result['skipped_live_planners'] == list(gate.LIVE_PLANNERS)
+    assert result['skipped_live_planners'] == list((*gate.LIVE_PLANNERS, *gate.INSTALLED_PLANNERS))
     record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
-    assert 'live V4 planner tests skipped' in gate.render(record)
+    assert 'live planner tests skipped' in gate.render(record)
 
 
 @pytest.mark.parametrize('full', [False, True])
@@ -234,58 +234,32 @@ def test_default_and_full_select_the_same_named_tests_in_both_runners(tmp_path, 
         assert name in gate.FULL_TESTS
 
 
-def test_full_gate_records_missing_installed_planner_inputs_separately(tmp_path, monkeypatch):
-    source = tmp_path / 'source'
-    (source / 'examples/configs').mkdir(parents=True)
-    (source / 'scripts/bench').mkdir(parents=True)
-    (source / 'examples/configs/glm53-exlr8-min.config').write_text(
-        'MODEL_ID=org/glm-exlr8\nMODEL_REVISION=rev-exlr8\nRTX_GPUS=1\n')
-    (source / 'examples/configs/glm53-exlr8-max.config').write_text(
-        'MODEL_ID=org/glm-exlr8\nMODEL_REVISION=rev-exlr8\nRTX_GPUS=2\n')
-    (source / 'examples/configs/other-min.config').write_text(
-        'MODEL_ID=org/other-model\nMODEL_REVISION=rev-other\nRTX_GPUS=1\n')
-    (source / 'scripts/bench/release-smoke-v4.json').write_text(json.dumps({
-        'entries': [{'name': 'other-min', 'config': 'examples/configs/other-min.config', 'sparks': []}]
-    }))
-    hf_home = tmp_path / 'hf'
-    programs = tmp_path / 'PROGRAMS.json'
-    env = {'HOME': str(tmp_path), 'CUTEAFD_DEPLOYMENT_TEST_HF_HOME': str(hf_home),
-           'CUTEAFD_DEPLOYMENT_TEST_PROGRAMS': str(programs)}
-    # Zero checkpoints and missing PROGRAMS: all three installed-checkpoint planners are skipped.
-    assert gate.installed_planner_skips(source, env) == list(gate.INSTALLED_PLANNERS)
-    # Install only the GLM EXLR8 checkpoint + PROGRAMS (mixed inventory): only the EXLR8 test is runnable.
-    (hf_home / 'hub/models--org--glm-exlr8/snapshots/rev-exlr8').mkdir(parents=True)
-    programs.write_text('{"schema":1,"programs":[]}\n')
-    assert gate.installed_planner_skips(source, env) == [
-        'installed_example_deployments_publish_executable_prefill_shapes',
-        'installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers',
-    ]
-    # Install the remaining checkpoint, then remove PROGRAMS: the header-only matrix test is runnable,
-    # while the two planner/launcher tests that require PROGRAMS are recorded as skipped.
-    (hf_home / 'hub/models--org--other-model/snapshots/rev-other').mkdir(parents=True)
-    assert gate.installed_planner_skips(source, env) == []
-    programs.unlink()
-    assert gate.installed_planner_skips(source, env) == [
-        'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
-        'installed_example_deployments_publish_executable_prefill_shapes',
-    ]
+@pytest.mark.parametrize('nextest', [False, True])
+@pytest.mark.parametrize('installed', [False, True])
+def test_full_gate_runs_installed_planners_without_inventory_prechecks(tmp_path, monkeypatch, nextest, installed):
     (tmp_path / 'logs').mkdir()
-    ok = 'test result: ok. 1 passed; 0 failed; 0 ignored\n'
-    real_skips = gate.installed_planner_skips
-    calls = _fake(monkeypatch, [(0, BUILD_OK), (0, ok)])
-    monkeypatch.setattr(gate, 'installed_planner_skips', real_skips)
-    result = gate.cargo(source, tmp_path, SimpleNamespace(**vars(ARGS), full=True), env)
-    assert result['status'] == 'pass'
-    assert result['skipped_full_tests'] == []
-    assert result['skipped_live_planners'] == []
-    assert result['skipped_installed_planners'] == [
-        'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
-        'installed_example_deployments_publish_executable_prefill_shapes',
-    ]
-    assert calls[1][calls[1].index('--') + 1:-1] == [
-        '--skip', 'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
-        '--skip', 'installed_example_deployments_publish_executable_prefill_shapes',
-    ]
+    hf_home, programs = tmp_path / 'hf', tmp_path / 'PROGRAMS.json'
+    if installed:
+        hf_home.mkdir()
+        programs.write_text('{"programs":[]}')
+    summary = ('test result: ok. 3 passed; 0 failed; 0 ignored\n' if installed else
+               ''.join(f'test {name} ... FAILED\nrequired input missing\n' for name in gate.INSTALLED_PLANNERS)
+               + 'test result: FAILED. 0 passed; 3 failed; 0 ignored\n')
+    calls = _fake(monkeypatch, [(0, BUILD_OK), (0 if installed else 101, summary),
+                              (0, 'test result: ok. 1 passed; 0 failed; 0 ignored\n')])
+    if nextest:
+        monkeypatch.setattr(gate, 'nextest_for', lambda env: '/tools/cargo-nextest')
+        monkeypatch.setattr(gate, 'parse_nextest', lambda report:
+            ([(3, 0, 0)], []) if installed else ([(0, 3, 0)], list(gate.INSTALLED_PLANNERS)))
+    result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**vars(ARGS), full=True), {
+        'CUTEAFD_DEPLOYMENT_TEST_HF_HOME': str(hf_home), 'CUTEAFD_DEPLOYMENT_TEST_PROGRAMS': str(programs)})
+    assert result['status'] == ('pass' if installed else 'failed')
+    assert result['skipped_full_tests'] == result['skipped_live_planners'] == []
+    assert set(result['failing']) == (set() if installed else set(gate.INSTALLED_PLANNERS))
+    assert '--skip' not in calls[1] and '-E' not in calls[1]
+    receipt = gate.render({'task': 't', 'verdict': result['status'], 'head': 'a' * 40,
+                           'dirty': False, 'suites': [result]})
+    assert 'planner tests skipped' not in receipt
 
 
 @pytest.mark.parametrize('nextest', [False, True])
@@ -297,7 +271,6 @@ def test_failed_live_v4_provenance_is_not_reported_as_skipped(tmp_path, monkeypa
     failed += 'test result: FAILED. 8 passed; 4 failed; 0 ignored\n'
     calls = _fake(monkeypatch, [(0, BUILD_OK), (101, failed),
                                 (0, 'test result: ok. 2 passed; 0 failed; 0 ignored\n')])
-    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: list(gate.INSTALLED_PLANNERS))
     if nextest:
         monkeypatch.setattr(gate, 'nextest_for', lambda env: '/tools/cargo-nextest')
         monkeypatch.setattr(gate, 'parse_nextest', lambda report: ([(8, 4, 0)], list(gate.LIVE_PLANNERS)))
@@ -305,16 +278,13 @@ def test_failed_live_v4_provenance_is_not_reported_as_skipped(tmp_path, monkeypa
     assert result['status'] == 'failed' and result['failed'] == 4
     assert set(result['failing']) == set(gate.LIVE_PLANNERS)
     assert result['skipped_full_tests'] == result['skipped_live_planners'] == []
-    assert result['skipped_installed_planners'] == list(gate.INSTALLED_PLANNERS)
     assert result['error'] == '4 failed; ' + reason
     record = {'task': 't', 'verdict': 'failed', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
     receipt = gate.render(record)
     assert '| cargo | failed |' in receipt and reason in receipt
-    assert 'live V4 planner tests skipped' not in receipt
+    assert 'live planner tests skipped' not in receipt
     assert 'default tier' not in receipt and 'full tier' in receipt
-    assert 'installed-checkpoint planner tests skipped' in receipt
-    for name in gate.INSTALLED_PLANNERS:
-        assert name in receipt
+    assert 'installed-checkpoint planner tests skipped' not in receipt
     for name in gate.LIVE_PLANNERS:
         assert name not in ' '.join(calls[1])
 
@@ -331,7 +301,7 @@ def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monke
                               'test result: ok. 1 passed; 0 failed; 0 ignored\n')
         return 0, 1.
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
-    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: [])
+    monkeypatch.setattr(gate, 'python_for', lambda source: Path('/gate-venv/bin/python'))
     monkeypatch.setattr(gate, 'run_logged', run_logged)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **kwargs: '')
     env = {'HOME': str(tmp_path)}
@@ -346,6 +316,8 @@ def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monke
     assert result['status'] == 'pass'
     assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME') == (expected if full or inventory == 'override' else None)
     assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS') == env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS')
+    assert calls[1].get('CUTEAFD_TEST_PYTHON') == ('/gate-venv/bin/python' if full else None)
+    assert 'CUTEAFD_TEST_PYTHON' not in env
     assert ('CUTEAFD_DEPLOYMENT_TEST_HF_HOME' in env) == (inventory == 'override')
 
 
@@ -683,7 +655,6 @@ def test_gate_scrubs_inherited_compiler_cache_env_and_records_names(tmp_path, mo
     monkeypatch.setattr(gate, 'prepare', lambda source, root, owned=False: None)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: 'deadbeef' if 'rev-parse' in cmd else '')
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
-    monkeypatch.setattr(gate, 'installed_planner_skips', lambda source, env: [])
     monkeypatch.setattr(gate, 'python_for', lambda source: Path('/usr/bin/python3'))
     monkeypatch.setattr(gate, 'run_logged', run_logged)
     args = SimpleNamespace(**vars(ARGS), cargo=True, scripts=True, benches=False, jobs=1)

@@ -8,12 +8,10 @@ both run, otherwise given entirely to the requested suite. Default excludes
 measured full-plan/cache and live V4 tests; --full restores them and is required for
 dev merges and releases. This includes the installed-example deployment-to-
 release_prefill_shape sweep: HF_HOME (or ~/.cache/huggingface) is the default
-inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing checkpoints skip.
-The sweep discovers PROGRAMS.json in /opt/cuteafd/share, ~/.local/share/cuteafd,
-or the live V4 fixture's ~/.cache/cuteafd/builds/v3-p4/c1/artifacts (in that order).
-CUTEAFD_DEPLOYMENT_TEST_PROGRAMS overrides discovery, retaining adjacent capacity
-manifests. Configs requiring an absent PROGRAMS file skip with an explicit counted
-reason; planner failures with present inputs still fail.
+inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing required inputs
+fail, including pinned checkpoint revisions and the published placement-inputs
+PROGRAMS.json with adjacent expert metadata. CUTEAFD_DEPLOYMENT_TEST_PROGRAMS
+overrides manifest discovery; the gate only reads exports, never builds them.
 Receipts name every exclusion. --slow separately
 adds the explicit ignored CPU soaks and is also required at release cuts. Install cargo-nextest
 without root into the persistent architecture Cargo home (see AGENTS.md).
@@ -38,10 +36,9 @@ The verdict comes from the parsed test summaries, never from an exit code
 alone: a suite passes only when its summaries report more than zero tests and
 no failures. Failing test ids are listed per suite. --base REV runs the same
 gate on a detached worktree of REV and reports only the ids that are new in
-this checkout. --skip-live-planners skips the slow live-inventory V4 planner
-tests (real checkpoints + manifests) and records that choice. Unlike the optional
-installed-example sweep, V4 live tests fail when their required inputs are missing.
-Their compiler provenance must match the checkout's SparkInfer pin.
+this checkout. --skip-live-planners explicitly excludes both live V4 and installed
+checkpoint planners and records that choice. Missing or stale compiler inputs
+fail the requested full gate; provenance must match the fork and export sources.
 
 Writes NAME/cpu-gate.json and NAME/cpu-gate.md; exit 0 only when every
 requested suite passed (or, with --base, introduced no new failing ids).
@@ -80,7 +77,7 @@ LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime
 INSTALLED_PLANNERS = (
     'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
     'installed_example_deployments_publish_executable_prefill_shapes',
-    'installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers',
+    'installed_release_matrix_recipe_ids_parse_from_checkpoint_headers',
 )
 # Actual >60s IDs from the 081a00072 full gate, plus installed-checkpoint planners.
 FULL_TESTS = (
@@ -392,61 +389,6 @@ def cargo_build_succeeded(path):
     return finished == [True] and not errors
 
 
-def _config_kv(path):
-    return dict(line.split('=', 1) for line in path.read_text().splitlines() if '=' in line)
-
-
-def _snapshot_installed(hf_home, model_id, revision=None):
-    if hf_home is None or not hf_home.is_dir():
-        return False
-    snapshots = hf_home / 'hub' / f"models--{model_id.replace('/', '--')}" / 'snapshots'
-    if not snapshots.is_dir():
-        return False
-    return (snapshots / revision).is_dir() if revision else any(snapshots.iterdir())
-
-
-def _programs_installed(env):
-    override = env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS')
-    if override is not None:
-        return bool(override) and Path(override).exists()
-    home = Path(env.get('HOME') or Path.home())
-    return any(path.exists() for path in (
-        Path('/opt/cuteafd/share/PROGRAMS.json'),
-        home / '.local/share/cuteafd/PROGRAMS.json',
-        home / '.cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json',
-    ))
-
-
-def installed_planner_skips(source, env):
-    """Installed-checkpoint tests in budget_cli.rs whose required HF_HOME, PROGRAMS.json
-    or checkpoint snapshots are absent."""
-    root = source if (source / 'examples/configs').is_dir() else REPO
-    raw_hf = env.get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME')
-    hf_home = Path(raw_hf) if raw_hf else None
-    has_programs = _programs_installed(env)
-    skipped = []
-    exlr8_configs = [_config_kv(root / f'examples/configs/glm53-exlr8-{name}.config') for name in ('min', 'max')]
-    if not has_programs or not all(_snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION'))
-                                   for cfg in exlr8_configs):
-        skipped.append('installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget')
-    example_configs = [_config_kv(path) for path in sorted((root / 'examples/configs').glob('*.config'))]
-    if not has_programs or not example_configs or not all(
-            _snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION')) for cfg in example_configs):
-        skipped.append('installed_example_deployments_publish_executable_prefill_shapes')
-    matrix = json.loads((root / 'scripts/bench/release-smoke-v4.json').read_text()).get('entries', [])
-    matrix_configs = []
-    for entry in matrix:
-        cfg = _config_kv(root / entry['config'])
-        for key, value in (entry.get('set') or {}).items():
-            if isinstance(value, str):
-                cfg[key] = value
-        matrix_configs.append(cfg)
-    if not matrix_configs or not all(
-            _snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION')) for cfg in matrix_configs):
-        skipped.append('installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers')
-    return skipped
-
-
 def scrub_compiler_cache_env(env):
     """Remove inherited compiler-launcher and cache variables so Cargo and script suites
     never share read-only kache outputs or inherit ambient launcher overrides."""
@@ -477,13 +419,15 @@ def cargo(source, root, args, env):
         return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
                 f'exit {code}; missing or unsuccessful build-finished event')}
     full = getattr(args, 'full', False)
+    if full and not args.skip_live_planners:
+        # Installed launcher checks import the same pytest helpers as the script suite.
+        env['CUTEAFD_TEST_PYTHON'] = str(python_for(source))
     if full:
         env.setdefault('CUTEAFD_DEPLOYMENT_TEST_HF_HOME',
                        env.get('HF_HOME') or str(Path(env.get('HOME', str(Path.home()))) / '.cache/huggingface'))
     skipped_full = [] if full else list(FULL_TESTS)
-    skipped_live = list(LIVE_PLANNERS) if args.skip_live_planners else []
-    skipped_installed = (list(INSTALLED_PLANNERS) if args.skip_live_planners else installed_planner_skips(source, env)) if full else []
-    skipped = list(dict.fromkeys(skipped_full + skipped_live + skipped_installed))
+    skipped_live = list((*LIVE_PLANNERS, *INSTALLED_PLANNERS)) if args.skip_live_planners else []
+    skipped = list(dict.fromkeys(skipped_full + skipped_live))
     skips = [flag for name in skipped for flag in ('--skip', name)]
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
     if skips:
@@ -548,8 +492,7 @@ def cargo(source, root, args, env):
             test_s += seconds
     result.update(exit=code, test_s=round(test_s), log=str(test_log), passed=passed, failed=failed, ignored=ignored,
                   binaries=len(totals), failing=ids, full=full,
-                  skipped_full_tests=skipped_full, skipped_live_planners=skipped_live,
-                  skipped_installed_planners=skipped_installed)
+                  skipped_full_tests=skipped_full, skipped_live_planners=skipped_live)
     if code == 124:
         result.update(status='failed', error=f'timed out after {args.cargo_timeout} s')
     elif passed == 0:
@@ -694,9 +637,7 @@ def render(record):
     for suite in record['suites']:
         note = suite.get('error', '')
         if suite.get('skipped_live_planners'):
-            note = (note + '; ' if note else '') + 'live V4 planner tests skipped (--skip-live-planners)'
-        if suite.get('skipped_installed_planners'):
-            note = (note + '; ' if note else '') + 'installed-checkpoint planner tests skipped: ' + ', '.join(suite['skipped_installed_planners'])
+            note = (note + '; ' if note else '') + 'live planner tests skipped (--skip-live-planners)'
         if suite.get('skipped_full_tests'):
             note = (note + '; ' if note else '') + f"default tier: {len(suite['skipped_full_tests'])} full tests excluded; not a merge/release gate"
         elif suite.get('full'):
@@ -727,7 +668,7 @@ def main():
     parser.add_argument('--cargo', action='store_true')
     parser.add_argument('--scripts', action='store_true')
     parser.add_argument('--benches', action='store_true', help='release host-cost bounds (BENCHES), recorded as their own suite')
-    parser.add_argument('--skip-live-planners', action='store_true', help='skip the live-inventory V4 planner tests (recorded)')
+    parser.add_argument('--skip-live-planners', action='store_true', help='skip live V4 and installed-checkpoint planners (explicitly recorded)')
     parser.add_argument('--base', metavar='REV', help='also gate REV in a detached worktree; fail only on new failing ids')
     parser.add_argument('--source', type=Path, default=REPO, help='checkout to gate (default: this one)')
     parser.add_argument('--keep', action='store_true', help='keep tmp/ and the Cargo targets after the run (default: delete)')

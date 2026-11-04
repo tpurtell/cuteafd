@@ -341,7 +341,12 @@ impl Drop for Stream<'_> {
 
 pub(crate) struct Event<'a> { pub device: Device<'a>, pub raw: *mut c_void }
 impl<'a> Event<'a> {
+    /// An ordering edge without timestamp collection.
     pub fn new(device: Device<'a>) -> Result<Self> {
+        Ok(Self { device, raw: device.run(|| device.library.cuda_event_create_ordering())? })
+    }
+    /// A timestamp for an explicitly measured elapsed-time pair.
+    pub fn timing(device: Device<'a>) -> Result<Self> {
         Ok(Self { device, raw: device.run(|| device.library.cuda_event_create())? })
     }
     pub fn record(&mut self, producer: &Stream<'a>) -> Result<()> {
@@ -440,8 +445,7 @@ impl<'a> PeerTransfer<'a> {
             "peer transfer requires distinct devices from one library");
         destination.run(|| destination.library.cuda_enable_peer(source.id))?;
         let stream = Stream::new(destination)?;
-        let ready = Event { device: source,
-            raw: source.run(|| source.library.cuda_event_create())? };
+        let ready = Event::new(source)?;
         let sm = Some(destination.run(|| destination.library.v41_peer_copy())?);
         Ok(Self { destination: stream, ready, sm })
     }
@@ -526,6 +530,33 @@ impl<'a> PeerTransfer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and one CUDA GPU"]
+    fn ordering_events_wait_without_timestamps_and_timing_events_measure() -> Result<()> {
+        // SAFETY: the opt-in path names the matching built native library.
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        lib.cuda_set_device(0)?;
+        let device = Device { library: &lib, id: 0 };
+        let producer = Stream::new(device)?;
+        let consumer = Stream::new(device)?;
+        let mut ordered = Event::new(device)?;
+        let mut start = Event::timing(device)?;
+        let mut end = Event::timing(device)?;
+        start.record(&producer)?;
+        ordered.record(&producer)?;
+        // SAFETY: the recorded event and both streams survive consumer drainage.
+        unsafe { lib.cuda_stream_wait_event(consumer.raw, ordered.raw)?; }
+        end.record(&consumer)?;
+        consumer.drain()?;
+        // SAFETY: both timestamps completed through the consumer's ordering wait.
+        let elapsed = unsafe { lib.cuda_event_elapsed_ms(start.raw, end.raw)? };
+        assert!(elapsed.is_finite() && elapsed >= 0.0);
+        // SAFETY: both events completed, but the default event has no timestamp.
+        assert!(unsafe { lib.cuda_event_elapsed_ms(ordered.raw, end.raw) }.is_err());
+        assert_eq!(lib.cuda_get_device()?, 0);
+        Ok(())
+    }
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs"]
     fn device_scoped_futures_restore_poll_and_cancellation_context() -> Result<()> {

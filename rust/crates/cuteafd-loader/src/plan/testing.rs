@@ -1644,6 +1644,74 @@ fn v4_placement_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
     Ok(Value::Object(files))
 }
 
+fn placement_input_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
+    use sha2::{Digest, Sha256};
+    let mut files = v4_placement_source_hashes(root)?;
+    let mut paths = ["scripts/build/export-placement-inputs.py", "scripts/build/release-scope.py",
+        "scripts/lib/wip_aot_scopes.py"].map(|path| root.join(path)).to_vec();
+    let matrix: Value = serde_json::from_slice(&fs::read(root.join("benchmarks/current-matrix.json"))?)?;
+    let retired = matrix["retired"].as_array().ok_or_else(|| anyhow::anyhow!("missing retired config list"))?
+        .iter().filter_map(|entry| entry["config"].as_str()).collect::<std::collections::BTreeSet<_>>();
+    let mut live = Vec::new();
+    for entry in fs::read_dir(root.join("examples/configs"))? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "config") {
+            let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
+            if !retired.contains(relative.as_str()) {
+                live.push(relative);
+                paths.push(path);
+            }
+        }
+    }
+    live.sort();
+    files.as_object_mut().unwrap().insert("installed_live_configs".into(),
+        Value::String(format!("{:x}", Sha256::digest(live.join("\n").as_bytes()))));
+    for path in paths {
+        files.as_object_mut().unwrap().insert(path.strip_prefix(root)?.to_string_lossy().into_owned(),
+            Value::String(format!("{:x}", Sha256::digest(fs::read(path)?))));
+    }
+    Ok(files)
+}
+
+/// Installed planners consume a published CPU export, never an ambient WIP slot.
+/// Explicit manifest overrides receive the same pin/source/checksum validation.
+pub fn validate_placement_inputs(manifest: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use sha2::{Digest, Sha256};
+    let regenerate = "regenerate with scripts/build/cuteafd-dev.sh cpu -- python3 scripts/build/export-placement-inputs.py --output <NVMe>/placement-inputs/<sha> --staging <NVMe>/placement-inputs/staging-<sha>";
+    (|| -> anyhow::Result<()> {
+        anyhow::ensure!(manifest.is_file(), "required PROGRAMS.json missing: {}", manifest.display());
+        let root = manifest.parent().context("PROGRAMS.json parent")?;
+        let metadata: Value = serde_json::from_slice(&fs::read(root.join("INPUTS.json"))
+            .with_context(|| format!("missing placement provenance {}", root.join("INPUTS.json").display()))?)?;
+        let lock: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../../../third_party/sparkinfer.lock.json")))?;
+        anyhow::ensure!(metadata["schema"] == 1 && metadata["engine_commit"].as_str().is_some_and(|sha| sha.len() == 40),
+            "invalid placement input provenance");
+        anyhow::ensure!(metadata["sparkinfer_revision"] == lock["revision"]
+            && metadata["source_tree_sha256"] == lock["source_tree_sha256"], "stale placement inputs: fork pin mismatch");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        anyhow::ensure!(metadata["engine_sources_sha256"] == placement_input_source_hashes(&source)?,
+            "stale placement inputs: export source fingerprints differ");
+        let exports = metadata["exports"].as_array().context("missing placement worker provenance")?;
+        anyhow::ensure!(!exports.is_empty() && exports.iter().all(|export|
+            export["sparkinfer_revision"] == lock["revision"]
+            && export["source_tree_sha256"] == lock["source_tree_sha256"]
+            && export["cuda_initialized"] == false), "placement worker provenance mismatch");
+        let files = metadata["files"].as_object().context("missing placement file inventory")?;
+        let name = manifest.file_name().context("PROGRAMS.json filename")?.to_str().context("manifest UTF-8 filename")?;
+        anyhow::ensure!(files.contains_key(name), "PROGRAMS.json missing from placement provenance");
+        for (path, expected) in files {
+            anyhow::ensure!(std::path::Path::new(path).components().all(|part|
+                matches!(part, std::path::Component::Normal(_))), "invalid placement input path {path}");
+            let actual = format!("{:x}", Sha256::digest(fs::read(root.join(path))
+                .with_context(|| format!("missing placement input {path}"))?));
+            anyhow::ensure!(expected.as_str() == Some(&actual), "placement input checksum mismatch: {path}");
+        }
+        Ok(())
+    })().with_context(|| format!("placement inputs at {}; {regenerate}", manifest.display()))
+}
+
 fn validate_v4_placement_sources(metadata: &Value, root: &std::path::Path) -> anyhow::Result<()> {
     anyhow::ensure!(metadata["engine_sources_sha256"] == v4_placement_source_hashes(root)?,
         "stale V4 placement inputs: engine export sources changed; regenerate inputs");
@@ -1719,6 +1787,71 @@ mod v4_input_tests {
         let metadata = json!({"engine_sources_sha256": v4_placement_source_hashes(root.path()).unwrap()});
         fs::remove_file(added).unwrap();
         assert!(validate_v4_placement_sources(&metadata, root.path()).is_err());
+    }
+
+    #[test]
+    fn placement_fingerprints_ignore_retired_contents_but_track_live_revision_and_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for relative in ["python/tools/aot", "python/tools/lib", "scripts/build", "scripts/lib",
+            "examples/configs", "benchmarks"] {
+            fs::create_dir_all(root.join(relative)).unwrap();
+        }
+        for relative in ["scripts/build/compare-sm-exports.py", "scripts/build/export-placement-inputs.py",
+            "scripts/build/release-scope.py", "scripts/lib/wip_aot_scopes.py",
+            "examples/configs/live.config", "examples/configs/retired.config"] {
+            fs::write(root.join(relative), "original").unwrap();
+        }
+        let matrix = root.join("benchmarks/current-matrix.json");
+        let retired = json!([{"config": "examples/configs/retired.config"}]);
+        fs::write(&matrix, json!({"retired": retired, "cells": [{"report": "old"}]}).to_string()).unwrap();
+        let before = placement_input_source_hashes(root).unwrap();
+        assert!(before.get("examples/configs/retired.config").is_none());
+        fs::write(root.join("examples/configs/retired.config"), "retired edit").unwrap();
+        fs::write(&matrix, json!({"retired": retired, "cells": [{"report": "new"}]}).to_string()).unwrap();
+        assert_eq!(placement_input_source_hashes(root).unwrap(), before);
+        fs::write(root.join("examples/configs/live.config"), "MODEL_REVISION=changed").unwrap();
+        assert_ne!(placement_input_source_hashes(root).unwrap(), before);
+        fs::write(root.join("examples/configs/live.config"), "original").unwrap();
+        fs::write(&matrix, json!({"retired": [], "cells": []}).to_string()).unwrap();
+        assert_ne!(placement_input_source_hashes(root).unwrap()["installed_live_configs"], before["installed_live_configs"]);
+    }
+
+    #[test]
+    fn published_placement_inputs_fail_closed_for_missing_stale_and_modified_files() {
+        use sha2::{Digest, Sha256};
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("PROGRAMS.json");
+        let metadata_path = directory.path().join("INPUTS.json");
+        assert!(format!("{:#}", validate_placement_inputs(&manifest).unwrap_err()).contains("PROGRAMS.json missing"));
+        fs::write(&manifest, r#"{"programs":[]}"#).unwrap();
+        assert!(format!("{:#}", validate_placement_inputs(&manifest).unwrap_err()).contains("missing placement provenance"));
+        let lock: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../../../third_party/sparkinfer.lock.json"))).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let valid = json!({"schema": 1, "engine_commit": "a".repeat(40),
+            "sparkinfer_revision": lock["revision"], "source_tree_sha256": lock["source_tree_sha256"],
+            "engine_sources_sha256": placement_input_source_hashes(&root).unwrap(),
+            "exports": [{"sparkinfer_revision": lock["revision"],
+                "source_tree_sha256": lock["source_tree_sha256"], "cuda_initialized": false}],
+            "files": {"PROGRAMS.json": format!("{:x}", Sha256::digest(fs::read(&manifest).unwrap()))}});
+        fs::write(&metadata_path, valid.to_string()).unwrap();
+        validate_placement_inputs(&manifest).unwrap();
+        for (field, value, expected) in [
+            ("sparkinfer_revision", json!("wrong"), "fork pin mismatch"),
+            ("engine_sources_sha256", json!({}), "source fingerprints differ"),
+            ("exports", json!([]), "worker provenance mismatch"),
+            ("files", json!({}), "PROGRAMS.json missing from placement provenance"),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            fs::write(&metadata_path, invalid.to_string()).unwrap();
+            let error = format!("{:#}", validate_placement_inputs(&manifest).unwrap_err());
+            assert!(error.contains(expected) && error.contains("export-placement-inputs.py"), "{error}");
+        }
+        fs::write(&metadata_path, valid.to_string()).unwrap();
+        fs::write(&manifest, "modified").unwrap();
+        assert!(format!("{:#}", validate_placement_inputs(&manifest).unwrap_err()).contains("checksum mismatch"));
     }
 
     #[test]

@@ -22,8 +22,8 @@ fn gpu_reply_copy_engine_bandwidth() -> Result<()> {
     for (i, byte) in host.bytes_mut().iter_mut().enumerate() { *byte = (i % 251) as u8; }
     let output = DeviceAllocation::new(&library, BYTES)?;
     let streams = (0..RANKS).map(|_| Stream::new(device)).collect::<Result<Vec<_>>>()?;
-    let mut start = Event::new(device)?;
-    let mut end = Event::new(device)?;
+    let mut start = Event::timing(device)?;
+    let mut end = Event::timing(device)?;
     let mut done = (0..RANKS).map(|_| Event::new(device)).collect::<Result<Vec<_>>>()?;
     for (name, copies, stream_count) in [("one", 1, 1), ("six_serial", RANKS, 1), ("six_streams", RANKS, RANKS)] {
         let chunk = BYTES / copies;

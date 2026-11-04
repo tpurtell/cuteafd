@@ -206,9 +206,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let lane_streams: [_; RANKS] = devices.iter().map(|&device| Stream::new(device).map(Rc::new))
         .collect::<Result<Vec<_>>>()?.try_into().map_err(|_| anyhow::anyhow!("Kimi lane stream count"))?;
     let draft_layout = admitted.draft_layout().cloned();
+    let recorder = crate::shared::experts::rtx::dense::Recorder::start(
+        crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&checkpoint.snapshot)?
+            == crate::shared::experts::rtx::push::PushPolicy::Required)?;
     let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
         super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout)).transpose()?;
-    let engine = Engine::load_admitted(library, streams, lane_streams, draft, admitted, checkpoint, native, peer, hops,
+    let draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
+    let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, checkpoint, native, peer, hops,
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules)?;
     if let Some(set) = graph_set {
         let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;

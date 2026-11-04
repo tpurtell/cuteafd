@@ -312,8 +312,8 @@ impl<'a> Exl3Worker<'a> {
                 id: library.cuda_get_device()?,
             };
             Some([
-                crate::shared::memory::device::Event::new(device)?,
-                crate::shared::memory::device::Event::new(device)?,
+                crate::shared::memory::device::Event::timing(device)?,
+                crate::shared::memory::device::Event::timing(device)?,
             ])
         } else {
             None

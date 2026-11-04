@@ -1164,6 +1164,7 @@ impl Opened {
         let loader = weights::GlmLoader { library: &self.library, catalog: dense_catalog, stream, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect(), push: None };
+        let push_policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&self.snapshot)?;
         let mut coordinator_push = None;
         let mut native_push = None;
         let native_push_experts = || -> Result<_> {
@@ -1183,14 +1184,10 @@ impl Opened {
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working.spark,
                 peers.len(), None, spark_model(self.cfg.family_id(), SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
                 args.exlr8_manifest.as_deref())?;
-            // The coordinator GPUs' EXL3 TP2 halves join the Spark push group as
-            // two more ranks; planning failure leaves them on the mount.
-            // The coordinator GPUs' EXL3 TP2 halves and dense operands join the
-            // Spark push group as two more ranks, planned from headers before
-            // membership: a planning error offers no coordinator ranks (the
-            // coordinator loads by mount, the Sparks still push).
+            // Plan coordinator membership before offers; a Required failure
+            // refuses startup rather than silently reading through the mount.
             let ranks = match (&tp2_range, local.as_ref().map(|l| &l.format)) {
-                (Some(range), Some(glm::GlmLocalFormat::Exl3)) if admission.coordinator_pushes() => (|| -> Result<_> {
+                (Some(range), Some(glm::GlmLocalFormat::Exl3)) if admission.coordinator_pushes() => push_policy.plan(|| {
                     let local = local.as_ref().context("TP2 local inventory")?;
                     let workspace = crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
                         &local.package, self.cfg.hidden, max_rows)?;
@@ -1213,7 +1210,7 @@ impl Opened {
                     let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&self.snapshot,
                         Some(&self.catalog), 2, Some(crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: range.clone().collect(), budgets: budgets.to_vec() }))?;
                     Ok((prepared, (embedding, model, drafter, records, deferred, dense)))
-                })().map_err(|error| tracing::info!(%error, "coordinator TP2 push unavailable; mount")).ok(),
+                }).context("GLM coordinator dense push planning")?,
                 _ => None,
             };
             let ranks = ranks.map(|((push, streams, ranks), planned)| {
@@ -1224,11 +1221,15 @@ impl Opened {
             // coordinator rank. Onboarded experts have no post-push mount loader.
             let ranks = match (ranks, &native_records) {
                 (None, Some(_)) if admission.coordinator_pushes() => {
-                    let experts = native_push_experts()?;
-                    let (push, streams, ranks) = crate::shared::experts::rtx::push::CoordinatorPush::prepare(
-                        &self.snapshot, Some(&self.catalog), devices.len(), experts)?;
-                    native_push = Some((push, peers.len()));
-                    Some((streams, ranks))
+                    let planned = push_policy.plan(|| {
+                        let experts = native_push_experts()?;
+                        crate::shared::experts::rtx::push::CoordinatorPush::prepare(
+                            &self.snapshot, Some(&self.catalog), devices.len(), experts)
+                    }).context("GLM native coordinator push planning")?;
+                    planned.map(|(push, streams, ranks)| {
+                        native_push = Some((push, peers.len()));
+                        (streams, ranks)
+                    })
                 }
                 (ranks, _) => ranks,
             };
@@ -1237,9 +1238,11 @@ impl Opened {
         // All selected routed layers may be onboarded in a partial model.
         // Idle Spark peers acknowledge identity while these destinations push alone.
         if native_records.is_some() && native_push.is_none() {
-            let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(
-                &self.snapshot, Some(&self.catalog), devices.len(), native_push_experts()?)?;
-            native_push = Some((push, 0));
+            native_push = push_policy.plan(|| {
+                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(
+                    &self.snapshot, Some(&self.catalog), devices.len(), native_push_experts()?)?;
+                Ok((push, 0))
+            }).context("GLM native coordinator push planning")?;
         }
         if coordinator_push.is_none() && native_push.is_none() {
             draft_file = args.draft.as_deref().map(dflash::prefetch);
@@ -1288,12 +1291,9 @@ impl Opened {
                 // receive both, then run the transforms of landed bytes.
                 let devices = tp2_devices()?;
                 let (pushed, ()) = push.receive_with(devices.to_vec(), Some(&self.catalog), sparks, Some(Ok(dense)), || ());
-                let pushed = pushed?;
+                let pushed = push_policy.committed(pushed).context("GLM coordinator dense push delivery")?;
                 let rank_stream = |device: i32| if device == args.device { stream }
                     else { peer_stream.map_or(stream, |(_, s)| s) };
-                if pushed.is_none() {
-                    crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
-                }
                 for job in &deferred {
                     crate::shared::memory::device::Device { library: &self.library, id: job.device }
                         .run(|| job.run(&self.library, rank_stream(job.device)))?;
@@ -1558,7 +1558,7 @@ impl Opened {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn load_native<'s>(&'s self, args: &EngineArgs, records: &[cuteafd_loader::plan::exlr8::dense::DenseRecord],
         per_rank: &[dense_weights::NativeDenseRecords], layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
-        loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, peer_stream: Option<(i32, *mut c_void)>,
+        loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, _peer_stream: Option<(i32, *mut c_void)>,
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>)
@@ -1584,7 +1584,6 @@ impl Opened {
         let vocabulary = std::rc::Rc::new(vocabulary);
         let source = self.native_embed_source()?;
         let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&self.library, source, vocabulary.clone())?;
-        let rank_stream = |device: i32| if device == args.device { stream } else { peer_stream.map_or(stream, |(_, s)| s) };
         let mut planned_drafter = None;
         let ((model, shares), pushed) = match push {
             Some((push, sparks)) => {
@@ -1598,10 +1597,8 @@ impl Opened {
                 let planned = crate::shared::experts::rtx::dense::plan_records(&self.snapshot, records.clone(),
                     &dense_devices, sparks);
                 let (pushed, ()) = push.receive_with(dense_devices, Some(&self.catalog), sparks, Some(planned), || ());
-                let pushed = pushed?;
-                if pushed.is_none() {
-                    crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
-                }
+                let pushed = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&self.snapshot)?
+                    .committed(pushed).context("GLM native coordinator push delivery")?;
                 tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
                     "GLM native dense operands landed");
                 (model, pushed)

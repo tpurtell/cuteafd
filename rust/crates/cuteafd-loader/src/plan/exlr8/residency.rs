@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 type Result<T> = std::result::Result<T, ResidencyError>;
 
@@ -43,6 +43,20 @@ pub struct MetadataInput {
     pub(super) config: serde_json::Value,
     manifest: SelectedManifest,
     pub(crate) identity: String,
+    census: Mutex<BTreeMap<usize, LayerCensus>>,
+    #[cfg(test)]
+    uncached_census: bool,
+}
+
+#[derive(Default)]
+struct LayerSources {
+    index: Option<(Header, Vec<u8>)>,
+    weights: BTreeMap<usize, (PathBuf, Header)>,
+}
+
+struct LayerCensus {
+    routed: Vec<Vec<usize>>,
+    shared: Vec<Vec<usize>>,
 }
 impl MetadataInput {
     pub fn open(snapshot: &Path, selected: &str) -> anyhow::Result<Self> {
@@ -59,11 +73,37 @@ impl MetadataInput {
         ensure!(manifest.set_id.len() == 64 && manifest.set_id.bytes().all(|c| c.is_ascii_hexdigit()),
             "invalid EXLR8 set_id");
         Ok(Self { snapshot: snapshot.into(), selected: selected.into(), config: read_json(&snapshot.join("config.json"))?,
-            manifest, identity: format!("{:x}", Sha256::digest(&bytes)) })
+            manifest, identity: format!("{:x}", Sha256::digest(&bytes)), census: Mutex::default(),
+            #[cfg(test)] uncached_census: false })
     }
 
     pub fn plan(&self, layer: usize, world: usize, rank: usize, set: ExpertSet) -> Result<Residency> {
-        Residency::plan_inner(self, layer, world, rank, set).map_err(Into::into)
+        Residency::plan_inner(self, layer, world, rank, set, &mut LayerSources::default()).map_err(Into::into)
+    }
+
+    /// Scalar admission facts live only for this selected manifest's plan. Runtime
+    /// arena construction uses `plan`, which always revalidates its sources.
+    pub(crate) fn resident_bytes(&self, layer: usize, world: usize, rank: usize, set: ExpertSet) -> Result<usize> {
+        if !(1..=8).contains(&world) || rank >= world {
+            return Err(anyhow::anyhow!("expected TP1..8 and rank below world").into());
+        }
+        #[cfg(test)]
+        if self.uncached_census { return Ok(self.plan(layer, world, rank, set)?.resident_bytes); }
+        let mut census = self.census.lock().map_err(|_| ResidencyError(anyhow::anyhow!("EXLR8 census lock poisoned")))?;
+        if !census.contains_key(&layer) {
+            let mut sources = LayerSources::default();
+            let routed = Residency::plan_inner(self, layer, 1, 0, ExpertSet::Routed, &mut sources)?;
+            let shared = Residency::plan_inner(self, layer, 1, 0, ExpertSet::Shared, &mut sources)?;
+            census.insert(layer, LayerCensus { routed: routed.rank_bytes(routed.experts)?, shared: shared.rank_bytes(routed.experts)? });
+        }
+        let layer = &census[&layer];
+        Ok(match set { ExpertSet::Routed => &layer.routed, ExpertSet::Shared => &layer.shared }[world - 1][rank])
+    }
+
+    #[cfg(test)]
+    pub(super) fn without_census_cache(mut self) -> Self {
+        self.uncached_census = true;
+        self
     }
 
     /// Cross-check optional published rank slices against canonical residency.
@@ -392,6 +432,7 @@ impl Residency {
         world: usize,
         rank: usize,
         set: ExpertSet,
+        sources: &mut LayerSources,
     ) -> anyhow::Result<Self> {
         ensure!(
             (1..=8).contains(&world) && rank < world,
@@ -429,11 +470,13 @@ impl Residency {
             "geometry exceeds K1 signed indexing"
         );
         let index_path = snapshot.join(format!("experts/exlr8-layer-{layer:03}.index.safetensors"));
-        let index = Header::open(&index_path)?;
-        index.validate()?;
-        ensure!(index.bytes <= 64 << 20, "oversized EXLR8 index");
-        // Read index tables once, not one open/pread per selected descriptor.
-        let index_bytes = std::fs::read(&index_path)?;
+        if sources.index.is_none() {
+            let index = Header::open(&index_path)?;
+            index.validate()?;
+            ensure!(index.bytes <= 64 << 20, "oversized EXLR8 index");
+            sources.index = Some((index, std::fs::read(&index_path)?));
+        }
+        let (index, index_bytes) = sources.index.as_ref().unwrap();
         let metadata = &index.value["__metadata__"];
         ensure!(
             metadata["layer"]
@@ -491,7 +534,7 @@ impl Residency {
                  .context("unit map overflow")?)?]
         } else { [0; 2] };
         let mut blocks = BTreeMap::new();
-        let mut weight_headers = BTreeMap::new();
+        let weight_headers = &mut sources.weights;
         let mut loads = Vec::new();
         let mut payload_bytes = 0usize;
         for e in 0..experts {
@@ -677,6 +720,29 @@ impl Residency {
             payload_bytes,
             staging_bytes,
         })
+    }
+
+    /// Project the validated whole-layer unit order onto every supported TP
+    /// world. Descriptor tables remain whole; only payload/scale ownership rotates.
+    fn rank_bytes(&self, routed_experts: usize) -> anyhow::Result<Vec<Vec<usize>>> {
+        ensure!(self.world == 1 && self.rank == 0, "EXLR8 census requires a whole layer");
+        let tables = self.loads.first().context("EXLR8 census has no units")?.destination[0];
+        (1..=8).map(|world| {
+            let mut cursors = vec![tables; world];
+            let mut blocks = BTreeSet::new();
+            for unit in &self.loads {
+                let identity = if self.set == ExpertSet::Shared { routed_experts } else { unit.expert };
+                let rank = owner(self.units, identity, unit.unit, self.layer, world);
+                let cursor = &mut cursors[rank];
+                reserve(cursor, unit.source[0].bytes)?;
+                reserve(cursor, unit.source[1].bytes)?;
+                if blocks.insert((rank, unit.expert, unit.projection, unit.bits)) {
+                    reserve(cursor, unit.source[2].bytes)?;
+                }
+            }
+            for cursor in &mut cursors { reserve(cursor, 0)?; }
+            Ok(cursors)
+        }).collect()
     }
 
     /// Same rotated ownership used by payload selection, built before allocation.
@@ -911,6 +977,37 @@ mod tests {
             let count = input.cross_check_index_slices().unwrap();
             assert!(count > 0, "expected published slices for {manifest}");
             println!("{manifest}: {count} published rank slices agree with canonical residency");
+        }
+    }
+
+    #[test]
+    fn scalar_census_matches_every_fresh_arena_and_keeps_validation_local() {
+        for padded in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            fixture(root.path(), padded);
+            let input = MetadataInput::open(root.path(), "mixed").unwrap();
+            for world in 1..=8 {
+                for rank in 0..world {
+                    for set in [ExpertSet::Routed, ExpertSet::Shared] {
+                        let fresh = input.plan(3, world, rank, set).unwrap();
+                        assert_eq!(input.resident_bytes(3, world, rank, set).unwrap(), fresh.resident_bytes,
+                            "padded={padded}, world={world}, rank={rank}, set={set:?}");
+                    }
+                }
+            }
+            assert_eq!(input.census.lock().unwrap().len(), 1);
+            for (world, rank) in [(0, 0), (9, 0), (2, 2)] {
+                assert!(input.resident_bytes(3, world, rank, ExpertSet::Routed).is_err());
+            }
+            assert!(input.resident_bytes(2, 1, 0, ExpertSet::Routed).is_err());
+            let before = input.resident_bytes(3, 2, 1, ExpertSet::Routed).unwrap();
+            let path = root.path().join("experts/exlr8-layer-003.k2.safetensors");
+            std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(8).unwrap();
+            assert_eq!(input.resident_bytes(3, 2, 1, ExpertSet::Routed).unwrap(), before);
+            assert!(input.plan(3, 2, 1, ExpertSet::Routed).is_err());
+            let fresh = MetadataInput::open(root.path(), "mixed").unwrap();
+            assert!(fresh.resident_bytes(3, 2, 1, ExpertSet::Routed).is_err());
+            assert!(fresh.census.lock().unwrap().is_empty());
         }
     }
 

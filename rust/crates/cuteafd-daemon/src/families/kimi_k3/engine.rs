@@ -156,6 +156,7 @@ impl<'a> Engine<'a> {
         exchange_streams: [Rc<Stream<'a>>; RANKS],
         lane_streams: [Rc<Stream<'a>>; RANKS],
         mut draft: Option<super::draft::NativeDraft<'a>>,
+        draft_records: crate::shared::experts::rtx::dense::Records,
         mut admission: super::admission::Admission<'a>,
         checkpoint: &cuteafd_loader::plan::Checkpoint,
         programs: [std::rc::Rc<super::device::NativePrograms<'a>>; RANKS],
@@ -200,7 +201,7 @@ impl<'a> Engine<'a> {
         // Dense operands and TP2 halves land inside the Spark load (pushed as
         // coordinator ranks when the group pushes, else through the mount).
         let (pending, expert_weights, weights) = admission.start_and_load(spark, &peers, devices, checkpoint, &catalog,
-            exchange_streams.each_ref().map(|stream| stream.raw))?;
+            exchange_streams.each_ref().map(|stream| stream.raw), draft_records)?;
         let lanes = usize::try_from(plan.spec().lanes)?;
         let allocated = (0..lanes).map(|lane| (0..RANKS).map(|rank|
             admission.allocate_lane_on(devices[rank], rank, lane, lane_streams[rank].clone()))

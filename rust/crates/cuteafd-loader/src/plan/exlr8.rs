@@ -143,6 +143,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     }
     let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
     let metadata = residency::MetadataInput::open(snapshot, selected)?;
+    #[cfg(test)]
+    let metadata = if uncached_census_enabled() { metadata.without_census_cache() } else { metadata };
     let set_id = metadata.identity.clone();
     let shared = shared_expert_resident(&metadata, &(first_moe_layer..layers).collect::<Vec<_>>(), gpu_count)?;
     let programs = read_json(resolved_layout.workspace_manifest.as_deref()
@@ -181,8 +183,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let mut local_routed = 0u64;
     for layer in first_moe_layer..first_spark {
         for rank in 0..gpu_count {
-            local_routed = local_routed.checked_add(metadata.plan(
-                layer, gpu_count, rank, residency::ExpertSet::Routed)?.resident_bytes as u64)
+            local_routed = local_routed.checked_add(metadata.resident_bytes(
+                layer, gpu_count, rank, residency::ExpertSet::Routed)? as u64)
                 .context("EXLR8 local routed residency overflow")?;
         }
     }
@@ -287,7 +289,7 @@ pub fn routed_expert_costs(input: &residency::MetadataInput, layers: &[usize])
     served_routed_layers(input, layers)?;
     layers.iter().map(|&layer| {
         let resident = |world, rank| -> Result<Bytes2> {
-            Ok(Bytes2 { resident: u64::try_from(input.plan(layer, world, rank, ExpertSet::Routed)?.resident_bytes)?,
+            Ok(Bytes2 { resident: u64::try_from(input.resident_bytes(layer, world, rank, ExpertSet::Routed)?)?,
                 staging: 0 })
         };
         Ok(ExpertCost { whole: resident(1, 0)?, half: [resident(2, 0)?, resident(2, 1)?],
@@ -300,7 +302,7 @@ pub fn shared_expert_resident(input: &residency::MetadataInput, layers: &[usize]
     served_routed_layers(input, layers)?;
     ensure!(matches!(world, 1 | 2), "EXLR8 shared experts require one/two target ranks");
     (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
-        let bytes = u64::try_from(input.plan(layer, world, rank, residency::ExpertSet::Shared)?.resident_bytes)?;
+        let bytes = u64::try_from(input.resident_bytes(layer, world, rank, residency::ExpertSet::Shared)?)?;
         sum.checked_add(bytes).context("EXLR8 shared residency overflow")
     })).collect()
 }
@@ -326,7 +328,7 @@ fn spark_resident_bytes_of(input: &residency::MetadataInput, layers: &[usize], w
         && layers.last().copied() == extent.checked_sub(1)
         && layers.windows(2).all(|pair| pair[0] + 1 == pair[1]), "EXLR8 selected Spark suffix/rank geometry");
     (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
-        let bytes = input.plan(layer, world, rank, residency::ExpertSet::Routed)?.resident_bytes as u64;
+        let bytes = input.resident_bytes(layer, world, rank, residency::ExpertSet::Routed)? as u64;
         sum.checked_add(bytes).context("EXLR8 Spark suffix residency overflow")
     })).collect()
 }
@@ -1529,7 +1531,63 @@ mod tests {
 }
 
 #[cfg(test)]
+std::thread_local! { static UNCACHED_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+fn uncached_census_enabled() -> bool { UNCACHED_CENSUS.with(|enabled| enabled.get()) }
+
+#[cfg(test)]
 mod mounted_tests {
+    #[test]
+    #[ignore = "requires installed GLM EXLR8 snapshot, published PROGRAMS and parity output directory"]
+    fn memoized_census_preserves_current_min_max_plan_json_bytes() {
+        use crate::plan::{ExpertPlacement, PlanInput, PlanOptions, layout::LayoutOptions};
+        let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT").expect("CUTEAFD_EXLR8_TEST_SNAPSHOT"));
+        let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").expect("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"));
+        crate::plan::testing::validate_placement_inputs(&programs).unwrap();
+        let output = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_PARITY_OUTPUT").expect("CUTEAFD_EXLR8_PARITY_OUTPUT"));
+        std::fs::create_dir_all(&output).unwrap();
+        struct Reset;
+        impl Drop for Reset { fn drop(&mut self) { super::UNCACHED_CENSUS.with(|flag| flag.set(false)); } }
+        let _reset = Reset;
+        for name in ["exlr8-min", "exlr8-max"] {
+            let gpus = if name.ends_with("max") { 2 } else { 1 };
+            let options = PlanOptions {
+                placement: ExpertPlacement::Sparks { ranks: if gpus == 2 { 6 } else { 4 } },
+                attention_placement: Some(if gpus == 2 { crate::placement::AttentionPlacement::Context }
+                    else { crate::placement::AttentionPlacement::Heads }),
+                layout: Some(LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
+                    host_memory: Some((256 << 30, 256 << 30)), host_cache_bytes: Some(32 << 30),
+                    workspace_manifest: Some(programs.clone()), glm5_drafter_disabled: true, ..Default::default() }),
+                ..Default::default()
+            };
+            let plan = |uncached| {
+                super::UNCACHED_CENSUS.with(|flag| flag.set(uncached));
+                let start = std::time::Instant::now();
+                let input = PlanInput::open(&snapshot).unwrap();
+                let native = input.exlr8_native_plan("up1", &options, "off").unwrap();
+                let elapsed = start.elapsed();
+                assert!(elapsed < std::time::Duration::from_secs(30), "{name}: {elapsed:?}");
+                println!("{name} uncached={uncached} wall_seconds={:.6}", elapsed.as_secs_f64());
+                // Match the complete `cuteafd plan --json` payload, not a layout projection.
+                let bytes = serde_json::to_vec_pretty(&native.report).unwrap();
+                let deployment_options = crate::plan::deployment::DeploymentOptions {
+                    rtx_gpus: gpus, speculator: "off".into(), ..Default::default()
+                };
+                let deployment = crate::plan::deployment::DeploymentSpec::from_exlr8(&native, &deployment_options).unwrap();
+                let deployment_bytes = serde_json::to_vec_pretty(&deployment).unwrap();
+                let arm = if uncached { "uncached" } else { "memoized" };
+                std::fs::write(output.join(format!("{name}-{arm}.json")), &bytes).unwrap();
+                std::fs::write(output.join(format!("{name}-{arm}-deployment.json")), &deployment_bytes).unwrap();
+                (bytes, deployment_bytes)
+            };
+            let cached = plan(false);
+            let uncached = plan(true);
+            assert!(cached.0 == uncached.0, "{name}: complete native plan JSON bytes differ");
+            assert!(cached.1 == uncached.1, "{name}: complete launcher deployment JSON bytes differ");
+        }
+    }
+
     #[test]
     fn inspect_checkpoint_when_explicitly_supplied() {
         let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else {

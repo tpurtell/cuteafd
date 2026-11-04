@@ -111,22 +111,33 @@ fn native_operands(prefix: &str, attention: HybridAttention, format: DenseFormat
     out
 }
 
-fn packed_native_layout(tensors: &[(Vec<u8>, DType, Vec<usize>)], storage: Storage) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+fn validate_native_matrices<'t>(tensors: impl IntoIterator<Item = (&'t DType, &'t [usize], u64)>,
+    storage: Storage) -> Result<()> {
     let mut cols = None;
-    for (bytes, dtype, shape) in tensors {
+    for (dtype, shape, bytes) in tensors {
         ensure!(shape.len() == 2 && shape[0] > 0 && shape[1] > 0, "native projection requires nonempty matrices");
         ensure!(cols.is_none_or(|previous| previous == shape[1]), "native packed matrix columns differ");
         cols = Some(shape[1]);
-        let elements = shape[0].checked_mul(shape[1]).context("native matrix size overflow")?;
         let width = match (storage, dtype) {
             (Storage::Fp8, DType::F8E4M3) => 1,
             (Storage::Scales, DType::Bf16) => 2,
             (Storage::Scales, DType::F32) => 4,
             _ => anyhow::bail!("native matrix dtype disagrees with operand storage"),
         };
-        ensure!(bytes.len() == elements.checked_mul(width).context("native matrix byte size overflow")?,
-            "native matrix payload disagrees with shape");
+        let size = shape[0].checked_mul(shape[1]).and_then(|n| n.checked_mul(width))
+            .context("native matrix byte size overflow")?;
+        ensure!(u64::try_from(size)? == bytes, "native matrix payload disagrees with shape");
+    }
+    ensure!(cols.is_some(), "empty native matrix packing");
+    Ok(())
+}
+
+#[cfg(test)]
+fn packed_native_layout(tensors: &[(Vec<u8>, DType, Vec<usize>)], storage: Storage) -> Result<Vec<u8>> {
+    validate_native_matrices(tensors.iter().map(|(bytes, dtype, shape)|
+        (dtype, shape.as_slice(), bytes.len() as u64)), storage)?;
+    let mut out = Vec::new();
+    for (bytes, dtype, _) in tensors {
         if storage == Storage::Scales && *dtype == DType::Bf16 {
             out.extend(bytes.chunks_exact(2).flat_map(|v|
                 (u32::from(u16::from_le_bytes([v[0], v[1]])) << 16).to_le_bytes()));
@@ -177,13 +188,12 @@ impl<'a> WeightReader<'a> {
                     Storage::Bf16 => self.bf16(&spec.tensors[0])?,
                     Storage::F32 => self.f32(&spec.tensors[0])?,
                     Storage::Fp8 | Storage::Scales => {
-                        let tensors = spec.tensors.iter().map(|name| self.raw(name)).collect::<Result<Vec<_>>>()?;
-                        self.upload(&packed_native_layout(&tensors, spec.storage)?)?
-                    }
-                    Storage::NativeNorm => {
-                        let (bytes, _, _) = self.raw(&spec.tensors[0])?;
-                        self.upload(&bytes)?
-                    }
+                        let headers = spec.tensors.iter().map(|name| self.tensor(name)).collect::<Result<Vec<_>>>()?;
+                        validate_native_matrices(headers.iter().map(|tensor|
+                            (&tensor.meta.dtype, tensor.meta.shape.as_slice(), tensor.meta.byte_length)), spec.storage)?;
+                        self.native(&spec.tensors, spec.storage == Storage::Scales)?
+                    },
+                    Storage::NativeNorm => self.native(&spec.tensors, false)?,
                 };
             Ok((spec.name, weight))
         }).collect::<Result<_>>()?;

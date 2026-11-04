@@ -1399,3 +1399,155 @@ def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp
                 assert args[args.index('--max-context') + 1] == str(context)
     with pytest.raises(ValueError, match='not empty'):
         compare_sm.v4_placement_inputs(target, tmp_path / 'staging2', 1, 1)
+
+
+@pytest.mark.parametrize("mismatch", [None, "worker", "sources"])
+def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, monkeypatch, mismatch):
+    publisher = compare_sm.load_file("test_placement_inputs", ROOT / "scripts/build/export-placement-inputs.py")
+    real_load = publisher.compare.load_file
+    filesystem = SimpleNamespace(check_path=lambda path: None)
+    monkeypatch.setattr(publisher.compare, 'load_file', lambda name, path:
+        filesystem if name == 'placement_filesystem' else real_load(name, path))
+    jobs = [("programs", "export_b12x_dsv4_aot.py", []),
+            ("exl3/exl3-glm-k45", "package_exl3_aot.py", []),
+            ("fp8/fp8-mimop", "package_fp8_moe_aot.py", [])]
+    monkeypatch.setattr(publisher, 'export_jobs', lambda: jobs)
+    calls = []
+
+    def compile_export(command, **kwargs):
+        payload = json.loads(command[-1])
+        calls.append(payload)
+        output = Path(payload['output'])
+        lock = json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())
+        (output / 'comparison-context.json').write_text(json.dumps({
+            'cuda_initialized': mismatch == 'worker', 'sparkinfer_revision': lock['revision'],
+            'source_tree_sha256': lock['source_tree_sha256'], 'sms': 188, 'capability': [12, 0],
+            'exporter': payload['exporter'], 'args': payload['args'],
+            'exporter_sha256': publisher.compare.sha((ROOT / 'python/tools/aot' / payload['exporter']).read_bytes()),
+            'comparison_script_sha256': publisher.compare.sha((ROOT / 'scripts/build/compare-sm-exports.py').read_bytes()),
+            'export_sources_sha256': {str(path.relative_to(ROOT)): publisher.compare.sha(path.read_bytes())
+                for path in sorted((ROOT / 'python/tools/aot').glob('*.py'))}}))
+        if payload['exporter'] == 'package_exl3_aot.py':
+            directory = output / 'rtx-tp2/m2752'
+            directory.mkdir(parents=True)
+            (directory / 'v41_exl3.json').write_text('{"scratch":123,"compiler":true}')
+        elif payload['exporter'] == 'package_fp8_moe_aot.py':
+            (output / 'routed.json').write_text(json.dumps({'programs': [
+                {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 123},
+                {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 456},
+                {'layout': 'tp2', 'capacity': 4096, 'scratch_bytes': 789}]}))
+        else:
+            (output / 'dsv4_programs.json').write_text('{"compiler":true}')
+    monkeypatch.setattr(publisher.subprocess, 'run', compile_export)
+    monkeypatch.setattr(publisher.subprocess, 'check_output', lambda *a, **kw: 'a' * 40)
+    if mismatch == 'sources':
+        original = publisher.source_hashes
+        captures = []
+        def changed():
+            captures.append(True)
+            return original() if len(captures) == 1 else {}
+        monkeypatch.setattr(publisher, 'source_hashes', changed)
+    target, staging = tmp_path / 'published', tmp_path / 'staging'
+    if mismatch:
+        with pytest.raises(ValueError, match='provenance mismatch' if mismatch == 'worker' else 'sources changed'):
+            publisher.publish(target, staging, 1, 1)
+        assert not (target / 'INPUTS.json').exists()
+        return
+    publisher.publish(target, staging, 1, 1)
+    metadata = json.loads((target / 'INPUTS.json').read_text())
+    assert metadata['engine_commit'] == 'a' * 40
+    assert metadata['engine_sources_sha256'] == publisher.source_hashes()
+    assert len(calls) == len(metadata['exports']) == 3
+    assert (target / 'PROGRAMS.json').read_bytes() == (staging / 'programs/dsv4_programs.json').read_bytes()
+    assert (target / 'exl3/exl3-glm-k45/rtx-tp2/m2752/v41_exl3.json').read_bytes() == b'{"scratch":123,"compiler":true}'
+    fp8 = json.loads((target / 'fp8/fp8-mimop/manifest.json').read_text())
+    assert fp8['layouts']['tp1']['capacities'] == [{'capacity': 2752, 'scratch_bytes': 456}]
+    assert fp8['layouts']['tp2']['capacities'] == [{'capacity': 4096, 'scratch_bytes': 789}]
+    for path, checksum in metadata['files'].items():
+        assert publisher.compare.sha((target / path).read_bytes()) == checksum
+    assert not list(target.rglob('*.o'))
+    reused = tmp_path / 'republished'
+    publisher.publish(reused, staging, 1, 1, target)
+    assert len(calls) == 3  # Re-publication never invokes a compiler.
+    assert json.loads((reused / 'INPUTS.json').read_text())['files'] == metadata['files']
+    legacy = json.loads((target / 'INPUTS.json').read_text())
+    retired = json.loads((ROOT / 'benchmarks/current-matrix.json').read_text())['retired'][0]['config']
+    legacy['engine_sources_sha256'][retired] = 'old-retired-content'
+    (target / 'INPUTS.json').write_text(json.dumps(legacy))
+    publisher.publish(tmp_path / 'legacy-republished', staging, 1, 1, target)
+    assert len(calls) == 3
+    live = publisher.live_configs()[0]
+    legacy['engine_sources_sha256'][live] = 'changed-live-content'
+    (target / 'INPUTS.json').write_text(json.dumps(legacy))
+    with pytest.raises(ValueError, match='compiler source provenance mismatch'):
+        publisher.publish(tmp_path / 'bad-live-source', staging, 1, 1, target)
+    (target / 'INPUTS.json').write_text(json.dumps(metadata))
+    context = staging / 'programs/comparison-context.json'
+    original = context.read_text()
+    invalid = json.loads(original)
+    invalid['args'] = ['wrong-selection']
+    context.write_text(json.dumps(invalid))
+    with pytest.raises(ValueError, match='worker provenance mismatch'):
+        publisher.publish(tmp_path / 'bad-worker', staging, 1, 1, target)
+    context.write_text(original)
+    (staging / 'programs/dsv4_programs.json').write_text('{"tampered":true}')
+    with pytest.raises(ValueError, match='output checksum mismatch'):
+        publisher.publish(tmp_path / 'bad-output', staging, 1, 1, target)
+    with pytest.raises(ValueError, match='not empty'):
+        publisher.publish(target, tmp_path / 'other-staging', 1, 1)
+
+
+def test_installed_placement_export_jobs_cover_live_native_families_and_packages():
+    publisher = compare_sm.load_file("test_placement_jobs", ROOT / "scripts/build/export-placement-inputs.py")
+    jobs = publisher.export_jobs()
+    names = {name for name, _, _ in jobs}
+    assert {'exl3/exl3-glm-k45', 'exl3/exl3-glmf-k34', 'exl3/exl3-kimik3-k23',
+            'exl3/exl3-step5-k46', 'exl3/exl3-muse-k45', 'exl3/exl3-ml4-k45',
+            'exl3/exl3-qwen4-k45', 'fp8/fp8-step5-bf16-weights', 'fp8/fp8-step5',
+            'fp8/fp8-mimop', 'fp8/fp8-mimof'} <= names
+    assert not any('nvfp4' in name for name in names)
+    args = jobs[0][2]
+    geometry = set(args[args.index('--geometry') + 1].split(','))
+    assert {'flash', 'pro', 'glm', 'glmf', 'muse', 'ml4', 'qwen35', 'qwen38',
+            'step5', 'kimik3', 'exlr8', 'exlr8_dense', 'dense_trellis_k6'} <= geometry
+    assert args[args.index('--exlr8-role') + 1] == 'coordinator'
+    assert len(names) == len(jobs)
+
+
+def test_placement_fingerprints_only_live_config_contents(tmp_path, monkeypatch):
+    publisher = compare_sm.load_file('test_live_placement_hashes', ROOT / 'scripts/build/export-placement-inputs.py')
+    for relative in ('scripts/build/export-placement-inputs.py', 'scripts/build/release-scope.py',
+                     'scripts/lib/wip_aot_scopes.py', 'examples/configs/live.config',
+                     'examples/configs/retired.config', 'benchmarks/current-matrix.json'):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('original')
+    matrix = tmp_path / 'benchmarks/current-matrix.json'
+    retired = [{'config': 'examples/configs/retired.config'}]
+    matrix.write_text(json.dumps({'retired': retired, 'cells': [{'report': 'old'}]}))
+    monkeypatch.setattr(publisher, 'ROOT', tmp_path)
+    monkeypatch.setattr(publisher.compare, 'v4_placement_sources', lambda: {})
+    before = publisher.source_hashes()
+    assert 'examples/configs/retired.config' not in before
+    (tmp_path / 'examples/configs/retired.config').write_text('retired edit')
+    matrix.write_text(json.dumps({'retired': retired, 'cells': [{'report': 'new'}]}))
+    assert publisher.source_hashes() == before
+    (tmp_path / 'examples/configs/live.config').write_text('MODEL_REVISION=changed')
+    assert publisher.source_hashes() != before
+    (tmp_path / 'examples/configs/live.config').write_text('original')
+    matrix.write_text(json.dumps({'retired': [], 'cells': []}))
+    assert publisher.source_hashes()['installed_live_configs'] != before['installed_live_configs']
+
+
+def test_placement_selection_ignores_card_publication_but_tracks_retirement(tmp_path):
+    publisher = compare_sm.load_file('test_live_placement_selection', ROOT / 'scripts/build/export-placement-inputs.py')
+    (tmp_path / 'examples/configs').mkdir(parents=True)
+    (tmp_path / 'benchmarks').mkdir()
+    (tmp_path / 'examples/configs/live.config').write_text('MODEL_ID=test/live\nMODEL_REVISION=pinned\n')
+    matrix = tmp_path / 'benchmarks/current-matrix.json'
+    matrix.write_text(json.dumps({'retired': [], 'cells': [{'report': 'old'}]}))
+    before = publisher.live_configs(tmp_path)
+    matrix.write_text(json.dumps({'retired': [], 'cells': [{'report': 'new', 'status': 'current'}]}))
+    assert publisher.live_configs(tmp_path) == before
+    matrix.write_text(json.dumps({'retired': [{'config': 'examples/configs/live.config'}], 'cells': []}))
+    assert publisher.live_configs(tmp_path) == []

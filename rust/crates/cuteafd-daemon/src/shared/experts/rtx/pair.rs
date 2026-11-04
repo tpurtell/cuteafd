@@ -948,8 +948,8 @@ impl<'a> OwnerPair<'a> {
                 timing: timing
                     .then(|| {
                         Ok::<_, anyhow::Error>([
-                            Event::new(devices[rank])?,
-                            Event::new(devices[rank])?,
+                            Event::timing(devices[rank])?,
+                            Event::timing(devices[rank])?,
                         ])
                     })
                     .transpose()?,

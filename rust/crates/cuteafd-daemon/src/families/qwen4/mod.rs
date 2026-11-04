@@ -629,9 +629,10 @@ impl Opened {
         let admitted_target = admission::single_weights(args, &self.checkpoint, &self.cfg, layers, with_mtp)?;
         // The coordinator's dense records push in a group of this GPU alone when
         // the checkpoint is SparkNest's; records are planned from headers first,
-        // and any failure loads them through the mount.
+        // and Required planning or delivery failures refuse startup.
+        let push_policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&args.snapshot)?;
         let device = crate::shared::memory::device::Device { library: &self.library, id: self.library.cuda_get_device()? };
-        let planned = (|| -> Result<_> {
+        let planned = push_policy.plan(|| {
             let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
             let planning = weights::Qwen4Loader { dense: load.clone(), ..loader.clone() };
             let model = {
@@ -645,19 +646,18 @@ impl Opened {
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(), &[device], 0)?;
             let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(&args.snapshot, None, 1, None)?;
             Ok((push, model, records, dense))
-        })().map_err(|error| tracing::warn!(%error, "Qwen coordinator dense push unavailable; mount")).ok();
+        }).context("Qwen coordinator dense push planning")?;
         let (embedding, model) = match planned {
             Some((push, model, records, dense)) => {
                 let split = crate::shared::memory::load_timing::Split::start();
                 let (pushed, embedding) = push.receive_with(vec![device], None, 0, Some(Ok(dense)), ||
                     crate::shared::token_io::TokenEmbedding::load(&self.library, source, args.token_io.embed_placement,
                         || Ok(())));
-                let pushed = pushed?;
+                let pushed = push_policy.committed(pushed).context("Qwen coordinator dense push delivery")?;
                 let (embedding, ()) = embedding?;
-                if pushed.is_none() {
-                    crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, |_| stream)?;
-                }
-                split.log(if pushed.is_some() { "qwen4 dense push" } else { "qwen4 dense mount fill" });
+                tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(),
+                    "Qwen coordinator dense operands landed");
+                split.log("qwen4 dense push");
                 (embedding, model)
             }
             None => crate::shared::token_io::TokenEmbedding::load(&self.library, source, args.token_io.embed_placement,

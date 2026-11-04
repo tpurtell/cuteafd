@@ -1029,6 +1029,18 @@ impl<'a> DsparkDrafter<'a> {
         Ok(out)
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_logits(&self, sequences: usize) -> Result<Vec<f32>> {
+        let slot = self.workspace.borrow();
+        let w = slot.as_ref().context("no draft step ran")?;
+        let bytes = sequences.checked_mul(self.cfg.block).and_then(|n| n.checked_mul(self.cfg.vocab))
+            .and_then(|n| n.checked_mul(4)).context("draft logit readback overflow")?;
+        ensure!(sequences > 0 && bytes <= w.logits.buffer.bytes, "draft logit readback exceeds arena");
+        let mut host = vec![0; bytes];
+        self.library.copy_d2h(&mut host, CuteafdDeviceBuffer { bytes, ..w.logits.buffer })?;
+        Ok(host.chunks_exact(4).map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect())
+    }
+
     /// Copies BF16 tap rows (host, [n, taps * hidden]) into the tap buffer.
     pub fn put_taps(&self, rows: &[u8]) -> Result<()> {
         self.put(&self.taps, rows)

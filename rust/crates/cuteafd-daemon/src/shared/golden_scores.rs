@@ -1,4 +1,75 @@
 //! CPU scoring for independently exported, explicitly selected golden rows.
+
+#[cfg(test)]
+pub(crate) mod push_regression {
+    use anyhow::{ensure, Result};
+    use std::path::Path;
+
+    pub(crate) fn prompts(sequences: usize) -> Vec<Vec<u32>> {
+        (0..sequences).map(|slot| (0..2067 + slot * 19)
+            .map(|i| 1000 + ((i * 37 + slot * 113) % 4096) as u32).collect()).collect()
+    }
+
+    pub(crate) fn teacher_rows() -> Vec<u32> { (42..50).collect() }
+
+    fn bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    fn check_logits(values: &[f32], rows: usize, vocab: usize) -> Result<()> {
+        ensure!(vocab > 0 && rows.checked_mul(vocab) == Some(values.len())
+            && values.iter().all(|value| value.is_finite()),
+            "push regression logits are incomplete or nonfinite");
+        Ok(())
+    }
+
+    pub(crate) fn draft_dump(output: &Path, sequences: usize, width: usize, logit_width: usize, vocab: usize,
+        mut propose: impl FnMut() -> Result<(Vec<Vec<u32>>, Vec<f32>)>) -> Result<()> {
+        // Some drafters retain an anchor head row as well as their emitted rows.
+        ensure!(sequences > 0 && width > 0 && logit_width > 0, "empty push regression draft shape");
+        let (tokens, logits) = propose()?;
+        ensure!(tokens.len() == sequences && tokens.iter().all(|row| row.len() == width
+            && row.iter().all(|&token| (token as usize) < vocab)),
+            "push regression draft outputs differ from requested shape");
+        check_logits(&logits, sequences * logit_width, vocab)?;
+        let (replayed, replay_logits) = propose()?;
+        ensure!(tokens == replayed && bytes(&logits) == bytes(&replay_logits),
+            "push regression draft replay differs within one version");
+        std::fs::create_dir_all(output)?;
+        std::fs::write(output.join(format!("drafts-{sequences}.txt")),
+            tokens.iter().map(|row| format!("{row:?}\n")).collect::<String>())?;
+        std::fs::write(output.join(format!("draft-logits-{sequences}.bin")), bytes(&logits))?;
+        Ok(())
+    }
+
+    pub(crate) fn target_dump(output: &Path, sequences: usize, vocab: usize, values: &[f32]) -> Result<()> {
+        check_logits(values, sequences * teacher_rows().len(), vocab)?;
+        std::fs::create_dir_all(output)?;
+        std::fs::write(output.join(format!("logits-{sequences}.bin")), bytes(values))?;
+        Ok(())
+    }
+
+    #[test]
+    fn dumps_are_exact_and_reject_changed_replay_and_nonfinite_rows() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let expected = vec![0., 1., 2., 3.];
+        draft_dump(dir.path(), 1, 2, 2, 2, || Ok((vec![vec![0, 1]], expected.clone())))?;
+        assert_eq!(std::fs::read(dir.path().join("draft-logits-1.bin"))?, bytes(&expected));
+        let mut calls = 0;
+        assert!(draft_dump(dir.path(), 1, 2, 2, 2, || {
+            calls += 1;
+            Ok((vec![vec![0, 1]], vec![calls as f32; 4]))
+        }).is_err());
+        draft_dump(dir.path(), 1, 1, 2, 2, || Ok((vec![vec![1]], expected.clone())))?;
+        assert!(draft_dump(dir.path(), 1, 1, 1, 2,
+            || Ok((vec![vec![1]], expected.clone()))).is_err());
+        assert!(target_dump(dir.path(), 1, 2, &[f32::NAN; 16]).is_err());
+        assert!(target_dump(dir.path(), 2, 2, &[0.; 16]).is_err());
+        let prompts = prompts(2);
+        assert_eq!((prompts[0].len(), prompts[1].len()), (2067, 2086));
+        Ok(())
+    }
+}
 use anyhow::{ensure, Result};
 
 pub(crate) fn select_scored_rows(logits: &[f32], positions: &[usize], vocab: usize) -> Result<Vec<f32>> {

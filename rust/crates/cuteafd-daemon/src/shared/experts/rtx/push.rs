@@ -10,6 +10,28 @@ use crate::shared::memory::{push_consumer::PushDestination, push_coordinator::Co
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{push_load::builder::CheckedPlan, OfficialV41Catalog, V41Exl3Layer};
 
+/// Load admitted dense owners through a standalone coordinator group, or the
+/// ordinary mount outside a push namespace. Owners stay live until group commit.
+pub(crate) fn load_alone<'a, T>(snapshot: &std::path::Path,
+    devices: &[crate::shared::memory::device::Device<'a>],
+    load: impl FnOnce() -> Result<T>) -> Result<T> {
+    use super::dense;
+    let policy = PushPolicy::for_snapshot(snapshot)?;
+    if policy == PushPolicy::Mount { return load(); }
+    let (owners, push, dense, operands, steps) = policy.plan(|| {
+        let (owners, records) = dense::recording(load)?;
+        let (operands, steps) = (records.operands.len(), records.steps.len());
+        let dense = dense::plan_records(snapshot, records, devices, 0)?;
+        let push = CoordinatorPush::prepare_alone(snapshot, None, devices.len(), None)?;
+        Ok((owners, push, dense, operands, steps))
+    }).context("standalone coordinator dense push planning")?
+        .context("required dense group was not planned")?;
+    let (delivered, ()) = push.receive_with(devices.to_vec(), None, 0, Some(Ok(dense)), || ());
+    let delivered = policy.committed(delivered).context("standalone coordinator dense push delivery")?;
+    tracing::info!(pushed = delivered.is_some(), operands, steps, "standalone coordinator dense operands landed");
+    Ok(owners)
+}
+
 /// A coordinator rank's logical space: its dense operands (a family-provided
 /// destination) in `[0, base)`, then the TP2 expert arena (device bytes, then
 /// its host validation tail) from `base`, then the dense destination's staged

@@ -316,6 +316,52 @@ mod tests {
     }
 
     #[test]
+    fn kimi_mla_drafter_joins_target_namespace_at_one_and_two_coordinator_ranks() -> Result<()> {
+        use cuteafd_loader::formats::{dflash::MlaDflashConfig, mla::MlaGeometry,
+            block_dspark::DsparkRotaryPlan};
+        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 128, heads: 2,
+            q_rank: 128, kv_rank: 128, nope: 64, rope: 64, value: 64 },
+            intermediate: 128, eps: 1e-5, block: 8, group: 16, selector_rank: 256,
+            selector_top_k: 16, taps: vec![0, 1], vocab: 32, mask_token: 0,
+            max_context: 8192, windows: vec![Some(4096), Some(4096), Some(4096), Some(4096), None],
+            rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2, markov_rank: 0 };
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("hf-home/hub/models--target/snapshots/a");
+        let draft = root.path().join("hf-home/hub/models--lightseekorg--kimi-k3-dflash2/snapshots/b");
+        write_drafter(&target)?;
+        std::fs::create_dir_all(&draft)?;
+        let shapes = cfg.tensor_shapes();
+        let tensors = shapes.iter().map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>();
+        write_safetensors(&draft.join("model.safetensors"), &tensors);
+        let source = Source::open(&draft)?;
+        source.rect("fc.weight", &[128, 256])?;
+        let expected = shapes.iter().map(|(_, shape)| shape.iter().product::<usize>() * 2).sum::<usize>();
+        for ranks in [1, 2] {
+            let device = ranks as i32 - 1;
+            let mut operands = shapes.iter().map(|(name, shape)| -> Result<_> {
+                let rect = source.rect(name, shape)?;
+                Ok(Operand { device, bytes: rect.bytes(), lands: vec![(rect.clone(), 0)],
+                    buffer: CuteafdDeviceBuffer { bytes: rect.bytes(), device_id: device, ..Default::default() } })
+            }).collect::<Result<Vec<_>>>()?;
+            let target_source = Source::open(&target)?;
+            let rect = target_source.rect("norm.weight", &[128])?;
+            let target_bytes = rect.bytes();
+            operands.push(Operand { device, bytes: target_bytes, lands: vec![(rect, 0)],
+                buffer: CuteafdDeviceBuffer { bytes: target_bytes, device_id: device, ..Default::default() } });
+            let layout = RankLayout::new(operands, Vec::new(), device)?;
+            let plan = layout.checked(root.path(), 6 + ranks, 6 + ranks - 1)?;
+            assert_eq!(plan.plan.files.len(), 2);
+            assert!(plan.plan.files.iter().any(|file| file.contains("models--lightseekorg--kimi-k3-dflash2/")));
+            assert!(plan.plan.files.iter().any(|file| file.contains("models--target/")));
+            assert!(plan.plan.entries.iter().all(|entry| entry.rank as usize == 6 + ranks - 1));
+            assert_eq!(plan.totals.rank_bytes[6 + ranks - 1], (expected + target_bytes) as u64);
+            assert!(layout.checked(&target, 6 + ranks, 6 + ranks - 1).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fp8_concat_steps_cover_disjoint_tiles_without_bf16_residency() -> Result<()> {
         let cols = 128;
         let per = STEP_BYTES / (cols * 2);

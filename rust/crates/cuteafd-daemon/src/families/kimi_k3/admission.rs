@@ -258,14 +258,14 @@ impl<'a> Admission<'a> {
     }
 
     /// Starts the Spark admission and loads every coordinator weight inside it:
-    /// the dense operands (shared records) and the admitted TP2 expert halves
-    /// join the Spark push group as two coordinator ranks when the admission
-    /// pushes, planned from headers before membership (a planning error offers
-    /// no coordinator ranks: the Sparks still push, the coordinator mounts).
+    /// the dense operands, drafter and admitted expert slices join the same
+    /// Spark push group, planned from headers before membership. Required
+    /// push planning/delivery errors never fall back to the mount.
     /// Returns the pending admission with the loaded owners.
     pub(crate) fn start_and_load<const RANKS: usize>(&mut self, spark: crate::shared::placement::SparkAdmission,
         peers: &[std::net::SocketAddr], devices: [Device<'a>; RANKS], checkpoint: &cuteafd_loader::plan::Checkpoint,
-        catalog: &cuteafd_loader::OfficialV41Catalog, streams: [*mut std::ffi::c_void; RANKS])
+        catalog: &cuteafd_loader::OfficialV41Catalog, streams: [*mut std::ffi::c_void; RANKS],
+        draft_records: crate::shared::experts::rtx::dense::Records)
         -> Result<(crate::shared::placement::PendingSparkAdmission,
             Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>>, LoadedWeights<'a>)> {
         use crate::shared::experts::rtx::{dense::{self, DenseLoad}, push::{CoordinatorExperts, CoordinatorPush}};
@@ -284,7 +284,8 @@ impl<'a> Admission<'a> {
         let planned = policy.plan(|| -> Result<_> {
             ensure!(spark.coordinator_pushes(), "Kimi Spark admission did not select required push");
             let owners = self.record(&devices, checkpoint, &load, &streams)?;
-            let records = load.sink.as_ref().context("push sink")?.take_all();
+            let mut records = draft_records;
+            records.extend(load.sink.as_ref().context("push sink")?.take_all());
             let (landed, operands, staged, steps, largest, finishes) = records.summary();
             tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
                 "Kimi coordinator dense records planned");
