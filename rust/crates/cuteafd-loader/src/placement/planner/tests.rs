@@ -2220,8 +2220,9 @@ fn analytical_weight_cap_counts_loaded_owners_without_allocation_or_category_inf
     let mut contract = Linear::new().prepare(&request()).unwrap();
     contract.components.push(resource("loaded.target", 0, 80, contract.maximum_pages));
     let accepted = solve(capped(80), vec![budget(1 << 30)], &Prepared(contract.clone())).unwrap();
-    assert_eq!(accepted.pool_tokens, 2 << 20);
-    assert_eq!(accepted.phases, solve(request(), vec![budget(1 << 30)], &Prepared(contract.clone())).unwrap().phases);
+    let uncapped = solve(request(), vec![budget(1 << 30)], &Prepared(contract.clone())).unwrap();
+    assert_eq!(accepted.pool_tokens, uncapped.pool_tokens);
+    assert_eq!(accepted.phases, uncapped.phases);
     assert_eq!(accepted.facts.resident_weights[0].id, "loaded.target");
     assert!(!accepted.facts.allocations.iter().any(|a| a.id == "loaded.target"));
     assert!(matches!(solve(capped(79), vec![budget(1 << 30)], &Prepared(contract)),
@@ -2270,7 +2271,8 @@ fn analytical_weight_cap_stops_tp2_onboarding_without_reducing_pool_or_mandatory
     }
     let budgets = vec![gpu_budget(0, 1 << 30), gpu_budget(1, 1 << 30)];
     let plan = solve(capped(80), budgets.clone(), &Prepared(contract.clone())).unwrap();
-    assert_eq!(plan.pool_tokens, 2 << 20);
+    let uncapped = solve(request(), budgets.clone(), &Prepared(contract.clone())).unwrap();
+    assert_eq!(plan.pool_tokens, uncapped.pool_tokens);
     assert_eq!(plan.decisions.onboard_layers, [vec![0], vec![0]]);
     assert_eq!(resident_weight_totals(&plan.facts, 2).unwrap(), [ResidentWeights(74), ResidentWeights(72)]);
     assert!(matches!(solve(Request { onboard: Pin::Exact(2), ..capped(80) }, budgets, &Prepared(contract)),
