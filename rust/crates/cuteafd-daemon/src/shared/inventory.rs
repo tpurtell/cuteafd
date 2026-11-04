@@ -153,9 +153,34 @@ mod phase_tests {
     }
 }
 
+fn host_high_water_bytes(status: &str) -> Result<u64> {
+    let mut fields = status.lines().find_map(|line| line.strip_prefix("VmHWM:"))
+        .context("process status has no VmHWM")?.split_whitespace();
+    let kib = fields.next().context("VmHWM has no value")?.parse::<u64>()?;
+    anyhow::ensure!(fields.next() == Some("kB") && fields.next().is_none(), "invalid VmHWM units");
+    kib.checked_mul(1024).context("VmHWM bytes overflow")
+}
+
+#[cfg(test)]
+mod startup_probe_tests {
+    #[test]
+    fn host_high_water_uses_kernel_kib_units_and_rejects_bad_status() {
+        assert_eq!(super::host_high_water_bytes("Name:\tcuteafd\nVmHWM:\t1234 kB\nVmRSS:\t1 kB\n").unwrap(), 1_263_616);
+        for status in ["", "VmHWM: 1 B", "VmHWM: -1 kB", "VmHWM: 18446744073709551615 kB"] {
+            assert!(super::host_high_water_bytes(status).is_err());
+        }
+    }
+}
+
 /// Opt-in startup attribution only; never sample on the request hot path.
 pub(crate) fn startup_probe(library: &NativeLibrary, devices: &[i32], stage: &str) -> Result<()> {
     if std::env::var("CUTEAFD_STARTUP_MEMORY_PROBE").as_deref() != Ok("1") { return Ok(()); }
+    if stage.ends_with("/ready") {
+        let host_vm_hwm_bytes = host_high_water_bytes(&std::fs::read_to_string("/proc/self/status")?)?;
+        tracing::info!(target: "cuteafd::placement", stage, host_vm_hwm_bytes,
+            host_memory_scope = "process resident high-water from /proc/self/status; not push staging alone",
+            "startup host memory probe");
+    }
     let current = library.cuda_get_device()?;
     let result = (|| -> Result<()> {
         for &device in devices {
