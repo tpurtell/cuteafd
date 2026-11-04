@@ -292,7 +292,7 @@ mod tests {
                     }
                     placements.push(placement);
                 }
-                regression::draft_dump(&output, sequences, width, loaded.cfg.vocab_size, || {
+                regression::draft_dump(&output, sequences, width, width, loaded.cfg.vocab_size, || {
                     let requests = placements.iter().enumerate().map(|(slot, placement)| DraftRequest {
                         placement, token: 42 + slot as u32 }).collect::<Vec<_>>();
                     let inputs = requests.iter().flat_map(|request| std::iter::once(request.token)
