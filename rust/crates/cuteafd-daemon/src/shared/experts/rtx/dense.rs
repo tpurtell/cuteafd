@@ -25,27 +25,6 @@ use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::push_load::builder::{Builder, CheckedPlan, Destination, Source};
 use std::ffi::c_void;
 
-/// Load admitted dense owners through a standalone coordinator group, or the
-/// ordinary mount outside a push namespace. Owners stay live until group commit.
-pub(crate) fn load_alone<'a, T>(snapshot: &std::path::Path, devices: &[Device<'a>],
-    load: impl FnOnce() -> Result<T>) -> Result<T> {
-    use super::push::{CoordinatorPush, PushPolicy};
-    let policy = PushPolicy::for_snapshot(snapshot)?;
-    if policy == PushPolicy::Mount { return load(); }
-    let (owners, push, dense, operands, steps) = policy.plan(|| {
-        let (owners, records) = recording(load)?;
-        let (operands, steps) = (records.operands.len(), records.steps.len());
-        let dense = plan_records(snapshot, records, devices, 0)?;
-        let push = CoordinatorPush::prepare_alone(snapshot, None, devices.len(), None)?;
-        Ok((owners, push, dense, operands, steps))
-    }).context("standalone coordinator dense push planning")?
-        .context("required dense group was not planned")?;
-    let (delivered, ()) = push.receive_with(devices.to_vec(), None, 0, Some(Ok(dense)), || ());
-    let delivered = policy.committed(delivered).context("standalone coordinator dense push delivery")?;
-    tracing::info!(pushed = delivered.is_some(), operands, steps, "standalone coordinator dense operands landed");
-    Ok(owners)
-}
-
 /// `rect`'s rows as plan entries landing at `offset` of rank `rank`.
 pub(crate) fn append(rect: &Rect, builder: &mut Builder, rank: u32, offset: u64) -> Result<()> {
     let source = Source { path: rect.path.clone(), offset: rect.base,

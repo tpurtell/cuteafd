@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 pub(super) fn load_drafter<'a>(engine: &DenseEngine<'a>, programs: &'a Programs<'a>, snapshot: &std::path::Path,
     lanes: usize, mask: Vec<u8>) -> Result<DsparkDrafter<'a>> {
     let device = engine.target_stream().device;
-    crate::shared::experts::rtx::dense::load_alone(snapshot, &[device], || {
+    crate::shared::experts::rtx::push::load_alone(snapshot, &[device], || {
         let tensors = if crate::shared::experts::rtx::dense::is_recording() {
             Default::default()
         } else {
@@ -169,7 +169,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
         Some(DrafterBytes { owned: residency.owned, weights: residency.weights, scratch: residency.scratch, ..Default::default() }), 1, None, args.kv_cache, false)?;
     let stream = engine.target_stream().raw;
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
-    let drafter = crate::shared::experts::rtx::dense::load_alone(snapshot, &[engine.target_stream().device], || {
+    let drafter = crate::shared::experts::rtx::push::load_alone(snapshot, &[engine.target_stream().device], || {
         let tensors = if crate::shared::experts::rtx::dense::is_recording() { Default::default() }
             else { block_dspark::prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("draft tensor loader panicked"))?? };
         DsparkDrafter::load_admitted(library, programs, snapshot, tensors,

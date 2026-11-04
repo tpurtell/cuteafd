@@ -303,7 +303,7 @@ impl<'a> MtpCache<'a> {
     pub(crate) fn load(engine: &DenseEngine<'a>, reader: &WeightReader<'a>, admission: Admission) -> Result<Self> {
         ensure!(engine.planes.scratch.bytes >= admission.programs.scratch_bytes,
             "MTP scratch exceeds shared target admission");
-        let mtp = crate::shared::experts::rtx::dense::load_alone(&reader.checkpoint.snapshot,
+        let mtp = crate::shared::experts::rtx::push::load_alone(&reader.checkpoint.snapshot,
             &[engine.stream.device], || Mtp::load(engine, reader, admission.format,
                 admission.programs, admission.fixed))?;
         Ok(Self(std::cell::RefCell::new(mtp)))
