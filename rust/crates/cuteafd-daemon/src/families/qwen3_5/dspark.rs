@@ -313,7 +313,12 @@ mod tests {
                 scratch: residency.scratch, ..Default::default() }), 2, None,
             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, false)?;
         let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
-        let drafter = load_drafter(&engine, &programs, &draft, 2, mask)?;
+        let tensors = block_dspark::prefetch(&draft).join()
+            .map_err(|_| anyhow::anyhow!("draft tensor loader panicked"))??;
+        let drafter = DsparkDrafter::load_paged(&library, &programs, &draft, tensors,
+            engine.target_stream().raw, 2, 2, mask, GlmDraftRepresentation::Bf16Only,
+            Fp8Scales::Amax, Fp8Rows::W8a16, cfg.max_context, engine.pool_tokens,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         drafter.prepare_workspace()?;
         for sequences in [1, 2] {
             let prompts = regression::prompts(sequences);
