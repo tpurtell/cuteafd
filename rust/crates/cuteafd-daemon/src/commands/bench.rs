@@ -292,6 +292,9 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     settings.retain(|setting| setting.name != "attention-placement");
     settings.push(Setting { name: "attention-placement".into(), value: Some(mode.to_string()),
         default: Some(executor.attention_default().to_string()), source: "resolved".into() });
+    settings.push(Setting { name: "per-layer-timing".into(),
+        value: Some(if crate::shared::draft::timing_profile() { "on (perturbing)" } else { "off" }.into()),
+        default: None, source: "resolved".into() });
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
     Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),

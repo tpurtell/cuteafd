@@ -1822,8 +1822,17 @@ impl<'a> Qwen4Engine<'a> {
         let mut probes = self.draft_probes.borrow_mut();
         if probes.is_empty() { return None; }
         if !probes[0].collects_routes() {
-            for probe in probes.iter_mut() { probe.finish()?; }
-            return Some(observe(&crate::shared::draft::routes::RoundRoutes::new(0, 0), &[]));
+            let mut times = Vec::new();
+            for (owner, probe) in probes.iter_mut().enumerate() {
+                let _scope = probe.device.enter().ok()?;
+                let (_, elapsed) = probe.finish()?;
+                if elapsed.is_empty() { continue; }
+                times.resize(self.cfg.layers, None);
+                for (index, _) in self.state_map.layers.iter().enumerate().filter(|(_, layer)| layer.owner == owner) {
+                    times[index] = elapsed[index];
+                }
+            }
+            return Some(observe(&crate::shared::draft::routes::RoundRoutes::new(0, 0), &times));
         }
         if probes.len() == 1 {
             let probe = &mut probes[0];

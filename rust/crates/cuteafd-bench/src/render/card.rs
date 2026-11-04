@@ -13,7 +13,7 @@ pub const HEIGHT: f64 = 675.0;
 // Approximate performance impact, highest first. Stable sorting preserves
 // configuration order within each tier; measured power-cap evidence is prepended.
 const CHIP_PRIORITY: &[&[&str]] = &[
-    &["POWER-CAPPED"],
+    &["POWER-CAPPED", "per-layer-timing"],
     &["draft", "dspark", "speculat", "mtp", "CUTEAFD_DRAFT_"],
     &["prefill-", "CUTEAFD_PREFILL_"],
     &["max-sequences", "concurrency", "pool-tokens"],
