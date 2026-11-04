@@ -603,6 +603,7 @@ mod tests {
         Ok(())
     }
 
+    /// Immediate mapped BF16 replies read the mapped input in place, skipping its copy.
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn three_queued_prefill_units_preserve_distinct_routes_inputs_and_replies() -> Result<()> {
@@ -808,9 +809,9 @@ mod tests {
             assert_eq!(response.header.request_id, 91 + unit as u64);
             assert!(!worker.unit_ready()?);
             if unit == 0 && !segmented {
-                // Input/routes have arrived; the first expert read is still queued.
-                // Submit unit 1's different routes before allowing that read to run.
-                fixture.advance_queued_experts(&library, 3)?;
+                // The mapped input is read in place; only the two route copies
+                // precede the expert read. Submit different routes before that read.
+                fixture.advance_queued_experts(&library, 2)?;
                 assert!(!worker.unit_ready()?);
             }
         }
