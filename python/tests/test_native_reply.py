@@ -17,7 +17,7 @@ def reply_programs():
     from native_reply import compile_native_reply_aot
     from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
     from b12x._lib.runtime_control import kernel_resolution_guard
-    native = C.CDLL(os.environ["CUTEAFD_NATIVE_LIBRARY"])
+    native = C.CDLL(os.environ["CUTEAFD_NATIVE_LIB"])
     native.cuteafd_set_expert_hidden.argtypes = [C.c_uint32]
     native.cuteafd_set_expert_hidden.restype = C.c_int32
     functions = []

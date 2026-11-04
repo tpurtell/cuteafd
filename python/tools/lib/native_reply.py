@@ -4,17 +4,20 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float32, Int32, Int64
+import _pinned_sparkinfer  # noqa: F401
 from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
 from b12x.integration.cuteafd.pointwise import _view, _add
-from b12x.moe._shared.kernels.w4a16.kernel import W4A16TopKSumKernel
+from b12x.moe._shared.kernels.w4a16.reply_store import ReplyStore
 
 
-class NativeReply(W4A16TopKSumKernel):
+class NativeReply:
     def __init__(self, width, format):
         assert width > 0 and width % 128 == 0
         assert format in (0, 1, 2)
         self.hidden_size = width
         self.reply_format = format
+        if format:
+            self.store = ReplyStore(width, format)
         self.reply_row_bytes = (width * 2 if format == 0 else
                                 width + width // 32 if format == 1 else
                                 width // 2 + width // 16)
@@ -60,8 +63,8 @@ class NativeReply(W4A16TopKSumKernel):
                 dst[Int64(row) * h + Int64(col) + Int64(j)] = BFloat16(values[j])
         else:
             # This shared store performs the same BF16 rounding as compact+codec.
-            self._quantize_and_store_reply_slab(_view(out), Int32(row), Int32(slab),
-                col, lane, values[0], values[1], values[2], values[3])
+            self.store.store(_view(out), Int32(row), Int32(slab), lane,
+                values[0], values[1], values[2], values[3])
 
 
 def compile_native_reply_aot(width, format):

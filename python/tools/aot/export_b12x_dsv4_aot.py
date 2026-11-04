@@ -1244,11 +1244,20 @@ def main() -> None:
                              lambda q=quantize, s=stage: compile_expert_reply_aot(quantize=q, stage=s)))
             work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
             from native_reply import compile_native_reply_aot
-            for width in (2560, 3584, 4096, 5120, 6144, 7168, 8192):
-                for format in (0, 1, 2):
+            for width in (2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192):
+                for format in (1, 2):
                     work.append((name, f"native_h{width}_{format}", "expert_reply",
                                  {"max_rows": args.prefill_rows},
                                  lambda w=width, f=format: compile_native_reply_aot(w, f)))
+            from b12x.integration.cuteafd.expert_reply import compile_fp8_reply_aot
+            from b12x.integration.cuteafd.fp8_moe import GEOMETRIES as FP8_GEOMETRIES
+            for width, topk in sorted({(g.hidden, g.top_k) for g in FP8_GEOMETRIES.values()}):
+                for format in (1, 2):
+                    for segmented in (False, True):
+                        suffix = f"fp8_h{width}_k{topk}_{format}" + ("_segmented" if segmented else "")
+                        work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
+                            lambda w=width, k=topk, f=format, s=segmented:
+                                compile_fp8_reply_aot(hidden=w, top_k=k, format=f, row_addresses=s)))
             work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},
                          compile_expert_reply_reduce_aot))
             continue
