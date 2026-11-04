@@ -804,6 +804,23 @@ impl NativeLibrary {
         unsafe { narrow.launch(src, dst, n, stream) }
     }
 
+    /// Checked I64 -> I32 conversion; `invalid` is zero on entry and becomes
+    /// one when a source value is out of range. Inspect only after draining.
+    ///
+    /// # Safety
+    /// `src` holds `n` I64, `dst` holds `n` I32, and `invalid` is a device-visible
+    /// U32; all are aligned, disjoint, and live through completion on `stream`.
+    pub unsafe fn load_narrow_i64_i32(&self, src: *const c_void, dst: *mut c_void,
+        n: usize, invalid: *mut c_void, stream: *mut c_void) -> Result<()> {
+        type Narrow = unsafe extern "C" fn(*const c_void, *mut c_void, i64, *mut c_void, *mut c_void) -> i32;
+        // SAFETY: the symbol has this stable shared native ABI.
+        let narrow = *unsafe { self.lib.get::<Narrow>(b"cuteafd_load_narrow_i64_i32") }?;
+        // SAFETY: typed live storage is guaranteed by the caller.
+        let status = unsafe { narrow(src, dst, i64::try_from(n)?, invalid, stream) };
+        ensure!(status == 0, "I64 load narrowing launch failed with {status}");
+        Ok(())
+    }
+
     /// `n` BF16 pairs `a[i]`, `b[i]` (device-visible) promoted to F32 and
     /// multiplied once into `dst` (F32) on the current device.
     ///

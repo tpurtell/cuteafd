@@ -18,6 +18,12 @@
 
 namespace cuteafd_load_quant {
 
+CUTEAFD_LQ_FN bool narrow_i64(int64_t value, int32_t* output) {
+  if (value < INT32_MIN || value > INT32_MAX) return false;
+  *output = int32_t(value);
+  return true;
+}
+
 enum Layout : int32_t { kBlock = 0, kRow128 = 1, kChannel = 2 };
 enum Rule : int32_t { kAmax = 0, kPow2 = 1, kBest = 2 };
 

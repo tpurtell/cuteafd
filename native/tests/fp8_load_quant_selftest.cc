@@ -22,6 +22,14 @@ static T take(const std::vector<uint8_t>& bytes, size_t& at) {
 }
 
 int main(int argc, char** argv) {
+  for (int64_t value : {int64_t(INT32_MIN), int64_t(-1), int64_t(0), int64_t(INT32_MAX)}) {
+    int32_t output = 7;
+    if (!lq::narrow_i64(value, &output) || int64_t(output) != value) return 1;
+  }
+  for (int64_t value : {INT64_MIN, int64_t(INT32_MIN) - 1, int64_t(INT32_MAX) + 1, INT64_MAX}) {
+    int32_t output = 7;
+    if (lq::narrow_i64(value, &output) || output != 7) return 1;
+  }
   // The wire rounds each partial, not their sum; ties use the shared RNE rule.
   if (lq::narrow_f32(0x3f808000u) != 0x3f80 || lq::narrow_f32(0x3f818000u) != 0x3f82
       || lq::f32_bits(lq::partial_add_bf16_f32(lq::narrow_f32(0x3f808000u), 0xbf80)) != 0) {

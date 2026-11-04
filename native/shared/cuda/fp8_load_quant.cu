@@ -90,6 +90,10 @@ __global__ void narrow_kernel(const uint32_t* src, uint16_t* dst, int64_t n) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x)
     dst[i] = lq::narrow_f32(src[i]);
 }
+__global__ void narrow_i64_kernel(const int64_t* src, int32_t* dst, int64_t n, uint32_t* invalid) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x)
+    if (!lq::narrow_i64(src[i], dst + i)) atomicExch(invalid, 1u);
+}
 __global__ void partial_add_kernel(const uint16_t* a, const uint16_t* b, float* dst, int64_t n) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x)
     dst[i] = lq::partial_add_bf16_f32(a[i], b[i]);
@@ -150,6 +154,15 @@ extern "C" int32_t cuteafd_load_narrow_f32_bf16(const void* src, void* dst, int6
   if (n < 1 || n > INT64_MAX - 255 || sms < 1) return cudaErrorInvalidValue;
   narrow_kernel<<<grid_for(n, sms), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const uint32_t*>(src), static_cast<uint16_t*>(dst), n);
+  return cudaGetLastError();
+}
+
+// The caller zeroes the device-visible status word and checks it after draining.
+extern "C" int32_t cuteafd_load_narrow_i64_i32(const void* src, void* dst, int64_t n,
+                                               uint32_t* invalid, void* stream) {
+  if (!src || !dst || !invalid || n < 1 || n > INT64_MAX - 255) return cudaErrorInvalidValue;
+  narrow_i64_kernel<<<grid_for(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const int64_t*>(src), static_cast<int32_t*>(dst), n, invalid);
   return cudaGetLastError();
 }
 

@@ -534,8 +534,13 @@ pub(crate) fn with_engine<T>(
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect(),
         };
-        let (embedding, (model, shares)) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
-            embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model_modes(&loaded.cfg, args.dspark, &loaded_modes) })?;
+        let dense_devices = devices.iter().map(|&id| crate::shared::memory::device::Device {
+            library: loaded.library.as_ref(), id }).collect::<Vec<_>>();
+        let (embedding, (model, shares)) = crate::shared::experts::rtx::push::load_alone(
+            &loaded.snapshot, &dense_devices, || crate::shared::token_io::TokenEmbedding::load(&loaded.library,
+                embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement,
+                || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                    loader.model_modes(&loaded.cfg, args.dspark, &loaded_modes) }))?;
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
 
         // Measured cross-check uses the same frozen owner map and explicitly
