@@ -345,6 +345,33 @@ def test_cpu_dev_shell_mounts_opt_in_target_and_cache(tmp_path):
     assert "cuteafd_compiler_cache_setup" in result.stdout
 
 
+def test_cpu_dev_shell_mounts_baseline_source_read_only(tmp_path):
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    docker = binary / "docker"
+    docker.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    docker.chmod(0o755)
+    baseline = tmp_path / "baseline"
+    (baseline / "third_party").mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CUTEAFD_KACHE")}
+    env.update(PATH=str(binary) + os.pathsep + env["PATH"], CUTEAFD_DEV_BASELINE_SOURCE=str(baseline))
+    run = lambda: subprocess.run(["bash", str(ROOT / "scripts/build/cuteafd-dev.sh"), "cpu", "--", "true"],
+                                 env=env, text=True, capture_output=True)
+    # Not an engine checkout with a pinned SparkInfer tree: refused before docker runs.
+    result = run()
+    assert result.returncode == 2
+    assert "pinned SparkInfer tree" in result.stderr
+    assert "cuteafd-coordinator-dev" not in result.stdout
+    (baseline / "third_party/sparkinfer.lock.json").write_text("{}")
+    result = run()
+    assert result.returncode == 0, result.stderr
+    real = baseline.resolve()
+    assert f"type=bind,src={real},dst={real},readonly" in result.stdout.splitlines()
+    assert f"CUTEAFD_DEV_BASELINE_SOURCE={real}" in result.stdout.splitlines()
+    env.pop("CUTEAFD_DEV_BASELINE_SOURCE")
+    assert str(real) not in run().stdout
+
+
 def test_provenance_records_fallback_and_hash(tmp_path):
     import hashlib
     import json

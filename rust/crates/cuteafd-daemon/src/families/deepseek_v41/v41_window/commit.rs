@@ -27,7 +27,7 @@ pub(super) struct PendingCommit {
     prepared: Prepared,
     ends: Vec<u64>,
     accepted: Vec<u32>,
-    /// A batched multi-layer store runs on this stream instead of the wave's.
+    /// A batched multi-layer store runs here instead of the storage's commit stream.
     external: Option<*mut c_void>,
     _reservation: WriteReservation,
 }
@@ -62,7 +62,7 @@ impl<'a> WindowWave<'_, 'a> {
     /// Host-side part of enqueue_commit for a batched multi-layer store: the
     /// caller launches one store for every layer on `stream`, and this wave's
     /// completion is then observed on that stream. Replicated windows keep the
-    /// per-layer path (their publication is ordered on the wave's stream).
+    /// per-layer path (their publication is ordered on the commit stream).
     /// # Safety
     /// Same contract as enqueue_commit; the caller enqueues the store on `stream`
     /// before any poll/commit and drains `stream` before releasing this state.
@@ -74,7 +74,7 @@ impl<'a> WindowWave<'_, 'a> {
     }
     unsafe fn enqueue_commit_on(&mut self, state: &WindowState<'_>, accepted: &[u32],
         external: Option<*mut c_void>) -> Result<Option<BatchedWindowCommit>> {
-        let (lib, raw) = (self.stream().library, self.stream().raw);
+        let (lib, raw) = (self.stream().library, self.storage.commit_stream.raw);
         let (values, scales, device_destinations) = (self.values(), self.scales(), self.destinations());
         ensure!(self.pending_commit.is_none(), "window commit already pending");
         if let Some(configured)=&state.replica {
@@ -130,6 +130,12 @@ impl<'a> WindowWave<'_, 'a> {
         self.pending_commit = Some(PendingCommit { prepared: p, ends, accepted: accepted.to_vec(),
             external, _reservation: WriteReservation { flags: state.writing.clone(), mask } });
         if batched.is_some() { return Ok(batched); }
+        // SAFETY: the wave owns both events and keeps its proposal planes alive;
+        // the commit stream must not read them before their producer completes.
+        unsafe {
+            lib.cuda_event_record(self.produced.raw, self.stream().raw)?;
+            lib.cuda_stream_wait_event(raw, self.produced.raw)?;
+        }
         // The H2D source: the commit staging written above (raw view, so the
         // closure below can borrow the wave).
         let host = self.commit_host().buffer;
@@ -166,6 +172,7 @@ impl<'a> WindowWave<'_, 'a> {
                         Ok(())
                     })?;
                 }
+                lib.cuda_event_record(self.committed.raw, raw)?;
             }
             Ok(())
         })().map(|()| None)
@@ -174,7 +181,8 @@ impl<'a> WindowWave<'_, 'a> {
     pub(crate) fn has_replica(&self) -> bool { self.replica.is_some() }
     pub fn poll_commit(&self) -> Result<bool> {
         let Some(pending) = &self.pending_commit else { return Ok(true) };
-        unsafe { self.stream().library.cuda_stream_query(pending.external.unwrap_or(self.stream().raw)) }
+        // SAFETY: a pending commit retains the selected stream and its storage.
+        unsafe { self.stream().library.cuda_stream_query(pending.external.unwrap_or(self.storage.commit_stream.raw)) }
     }
     pub(super) fn validate_pending_commit(&self, state: &WindowState<'_>) -> Result<&Prepared> {
         let pending = self.pending_commit.as_ref().context("window commit absent")?;
@@ -204,7 +212,8 @@ impl<'a> WindowWave<'_, 'a> {
             // next unit through its publication event). Its host staging is
             // this pass's own and is reused only after the unit's drained commit.
             let completed = if crate::shared::memory::chain::deferred() {
-                unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw) }
+                // SAFETY: this storage owns the commit stream through the chain's drain.
+                unsafe { crate::shared::memory::chain::finish(self.stream().library, self.storage.commit_stream.raw) }
             } else { self.synchronize() };
             if let Err(error) = launched.and(completed) {
                 self.abort_commit(state)?;
@@ -388,6 +397,129 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_CACHE_COMMIT_MODEL and CUDA"]
+    fn decode_layers_share_stream_and_keep_graphs_and_passes_independent() -> Result<()> {
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let model = std::env::var("CUTEAFD_CACHE_COMMIT_MODEL")?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model))?;
+        let weights = [0, 1].map(|layer| WindowWeights::load(&lib, &catalog, layer,
+            WindowWeights::device_bytes(&lib, &catalog, layer)?, 1024 * 1024))
+            .into_iter().collect::<Result<Vec<_>>>()?;
+        let rows = 4usize;
+        let storage = WindowStorage::new(&lib, rows, rows, &[0, 1])?;
+        let states = || (0..2).map(|layer| WindowState::new(&lib, layer, 1, usize::MAX))
+            .collect::<Result<Vec<_>>>();
+        let mut actual = states()?;
+        let mut expected = states()?;
+        let actual_leases = actual.iter_mut().map(|state| state.begin_request(0, 11))
+            .collect::<Result<Vec<_>>>()?;
+        let expected_leases = expected.iter_mut().map(|state| state.begin_request(0, 11))
+            .collect::<Result<Vec<_>>>()?;
+        // Waves drain before their state, including on gated assertion failures.
+        let mut waves = weights.iter().map(|weights| weights.on_storage(storage.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let other_pass = weights[0].on_storage(WindowStorage::new(&lib, rows, rows, &[0, 1])?)?;
+        assert!(std::ptr::eq(waves[0].stream(), waves[1].stream()));
+        assert_ne!(waves[0].stream().raw, other_pass.stream().raw);
+        assert_ne!(storage.stream.raw, storage.commit_stream.raw);
+        assert_ne!(storage.commit_stream.raw, other_pass.storage.commit_stream.raw);
+        let mut references = weights.iter().map(|weights| weights.wave(rows as u32, usize::MAX))
+            .collect::<Result<Vec<_>>>()?;
+        for round in 0..3 {
+            for layer in 0..2 {
+                let input: Vec<_> = (0..rows * 5120).flat_map(|i| {
+                    let value = (((i * 7 + layer * 11 + round * 13) % 23) as f32 / 23.0 - 0.3).to_bits();
+                    ((value >> 16) as u16).to_ne_bytes()
+                }).collect();
+                lib.copy_h2d(waves[layer].input(), &input)?;
+                lib.copy_h2d(references[layer].input(), &input)?;
+                let chunk = |lease| WindowChunk { lease, position: (round * rows) as u64, tokens: rows as u32 };
+                // Capture once per layer on the shared stream; later rounds replay
+                // those distinct graphs without replacing storage or bindings.
+                if round == 0 {
+                    unsafe { waves[layer].capture(&actual[layer], &[chunk(actual_leases[layer])])?; }
+                }
+                unsafe {
+                    waves[layer].replay(&actual[layer], &[chunk(actual_leases[layer])])?;
+                    references[layer].execute(&expected[layer], &[chunk(expected_leases[layer])])?;
+                }
+                waves[layer].commit(&mut actual[layer], &[rows as u32])?;
+                references[layer].commit(&mut expected[layer], &[rows as u32])?;
+                assert_eq!(waves[layer].graphs.len(), 1);
+                let read = |state: &WindowState<'_>, lease| -> Result<Vec<u8>> {
+                    let view = state.view(lease)?;
+                    let count = (round + 1) * rows;
+                    let mut bytes = vec![0; count * 528];
+                    lib.copy_d2h(&mut bytes[..count * 512], slice(view.values, 0, count * 512))?;
+                    lib.copy_d2h(&mut bytes[count * 512..], slice(view.scales, 0, count * 16))?;
+                    Ok(bytes)
+                };
+                assert_eq!(read(&actual[layer], actual_leases[layer])?,
+                    read(&expected[layer], expected_leases[layer])?, "layer {layer}, round {round}");
+            }
+        }
+        assert_ne!(waves[0].current_graph().unwrap().0, waves[1].current_graph().unwrap().0);
+        // Holding stores must not stall another layer's producer on the shared
+        // compute stream. Both stores still wait for their own proposal writes.
+        let inputs = (0..2).map(|layer| -> Result<_> {
+            let input: Vec<_> = (0..rows * 5120).flat_map(|i| {
+                let value = (((i * 7 + layer * 11 + 2 * 13) % 23) as f32 / 23.0 - 0.3).to_bits();
+                ((value >> 16) as u16).to_ne_bytes()
+            }).collect();
+            let source = DeviceAllocation::new(&lib, input.len())?;
+            lib.copy_h2d(source.buffer, &input)?;
+            Ok(source)
+        }).collect::<Result<Vec<_>>>()?;
+        let gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&lib, storage.commit_stream.raw)? };
+        for layer in 0..2 {
+            let chunk = WindowChunk { lease: actual_leases[layer], position: 12, tokens: rows as u32 };
+            let prepared = waves[layer].prepare(&actual[layer], &[chunk])?;
+            // SAFETY: these preloaded inputs outlive the gated production.
+            unsafe { lib.copy_d2d_async(waves[layer].input(), inputs[layer].buffer,
+                rows * 10240, storage.stream.raw)?; }
+            waves[layer].upload(&prepared)?;
+            unsafe { waves[layer].enqueue(prepared.rows)?; }
+            waves[layer].ready = Some(prepared);
+            unsafe { waves[layer].enqueue_commit(&actual[layer], &[rows as u32])?; }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // SAFETY: the live producer must complete independently of gated stores.
+        while !unsafe { lib.cuda_stream_query(storage.stream.raw)? } {
+            ensure!(std::time::Instant::now() < deadline, "window producer waited for an unrelated layer's store");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!waves[0].poll_commit()?);
+        assert!(!waves[1].poll_commit()?);
+        drop(gate);
+        for layer in 0..2 {
+            waves[layer].synchronize()?;
+            waves[layer].commit(&mut actual[layer], &[rows as u32])?;
+            // Shared scratch still holds layer 1's input; rebuild each layer's
+            // final-round input before running the independent eager reference.
+            let input: Vec<_> = (0..rows * 5120).flat_map(|i| {
+                let value = (((i * 7 + layer * 11 + 2 * 13) % 23) as f32 / 23.0 - 0.3).to_bits();
+                ((value >> 16) as u16).to_ne_bytes()
+            }).collect();
+            lib.copy_h2d(references[layer].input(), &input)?;
+            unsafe { references[layer].execute(&expected[layer], &[WindowChunk {
+                lease: expected_leases[layer], position: 12, tokens: rows as u32,
+            }])?; }
+            references[layer].commit(&mut expected[layer], &[rows as u32])?;
+            let read = |state: &WindowState<'_>, lease| -> Result<Vec<u8>> {
+                let view = state.view(lease)?;
+                let mut bytes = vec![0; 16 * 528];
+                lib.copy_d2h(&mut bytes[..16 * 512], slice(view.values, 0, 16 * 512))?;
+                lib.copy_d2h(&mut bytes[16 * 512..], slice(view.scales, 0, 16 * 16))?;
+                Ok(bytes)
+            };
+            assert_eq!(read(&actual[layer], actual_leases[layer])?, read(&expected[layer], expected_leases[layer])?);
+        }
+        drop(waves.remove(0));
+        waves[0].synchronize()?;
+        assert_eq!(waves[0].graphs.len(), 1);
+        Ok(())
+    }
     /// row_window contract, window storage: two units (slots 0 and 1) on one
     /// shared storage, windows 0..13 and 16..29 of a 48-row reserve, produce
     /// and commit layer 0. The gate holds the shared stream after unit A wrote
@@ -436,7 +568,7 @@ mod tests {
             lib.copy_h2d(buffer.buffer, &host)?;
             Ok(buffer)
         }).into_iter().collect::<Result<Vec<_>>>()?;
-        let storage = WindowStorage::new(&lib, reserve, unit, &[0], true)?;
+        let storage = WindowStorage::new(&lib, reserve, unit, &[0])?;
         crate::families::deepseek_v41::v41_window::PRIVATE_STREAM.with(|private| private.set(!ordered));
         let built = (|| -> Result<Vec<_>> { Ok(vec![weights.on_storage(storage.clone())?, weights.on_storage(storage.clone())?]) })();
         crate::families::deepseek_v41::v41_window::PRIVATE_STREAM.with(|private| private.set(false));

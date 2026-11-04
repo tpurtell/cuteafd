@@ -336,7 +336,7 @@ impl<'a> ProducerStorage<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, rows: usize, unit: usize) -> Result<Self> {
         Ok(Self {
             windows: crate::families::deepseek_v41::v41_window::WindowStorage::new(library, rows, unit,
-                &(0..40).collect::<Vec<_>>(), true)?,
+                &(0..40).collect::<Vec<_>>())?,
             // One compressor storage for the four source layers: one stream
             // orders every slot's productions, scratch is shared (WP2 contract).
             sources: vec![crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
@@ -536,9 +536,9 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
             Self::workspace_bytes(weights.library, capacity)? <= budget,
             "cache producer workspace exceeds budget"
         );
-        // A private pass: its layers share scratch, each wave keeps its own stream.
+        // A private pass: its layers share scratch and one producer stream.
         let windows = crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.library,
-            capacity as usize, capacity as usize, &(0..40).collect::<Vec<_>>(), false)?;
+            capacity as usize, capacity as usize, &(0..40).collect::<Vec<_>>())?;
         let sources = SOURCES.iter().map(|&layer| crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
             weights.library, capacity as usize, capacity as usize, &[layer])).collect::<Result<Vec<_>>>()?;
         Self::on_storage(weights, ProducerStorage { windows, sources, batch_rows: capacity as usize })

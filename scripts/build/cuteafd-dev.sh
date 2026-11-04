@@ -105,6 +105,20 @@ if [[ -n "${CUTEAFD_DEV_ARTIFACTS:-}" ]]; then
   docker_args+=(--mount "type=bind,src=$artifacts,dst=$artifacts,readonly"
                 -e CUTEAFD_DEV_ARTIFACTS="$artifacts")
 fi
+# A second engine checkout for baseline comparisons (compare-sm-exports.py
+# --baseline-source): mounted read-only at the same absolute path, with its Git
+# metadata, so its pinned SparkInfer tree verifies against its own lock file.
+if [[ -n "${CUTEAFD_DEV_BASELINE_SOURCE:-}" ]]; then
+  [[ -f "$CUTEAFD_DEV_BASELINE_SOURCE/third_party/sparkinfer.lock.json" ]] \
+    || { echo "CUTEAFD_DEV_BASELINE_SOURCE is not an engine checkout with a pinned SparkInfer tree: $CUTEAFD_DEV_BASELINE_SOURCE" >&2; exit 2; }
+  baseline_source="$(cd "$CUTEAFD_DEV_BASELINE_SOURCE" && pwd -P)"
+  docker_args+=(--mount "type=bind,src=$baseline_source,dst=$baseline_source,readonly"
+                -e CUTEAFD_DEV_BASELINE_SOURCE="$baseline_source")
+  if baseline_git="$(git -C "$baseline_source" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+      && [[ "$baseline_git" != "$baseline_source/.git" ]]; then
+    docker_args+=(-v "$baseline_git:$baseline_git:ro")
+  fi
+fi
 # Memory cap for the whole container (e.g. 16g), so a test on a shared Spark's
 # unified memory cannot crowd out the host's services; swap is capped equally.
 if [[ -n "${CUTEAFD_DEV_MEMORY:-}" ]]; then

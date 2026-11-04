@@ -227,7 +227,9 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   `scripts/build/cuteafd-dev.sh cpu -- COMMAND` runs CPU-only with the canonical
   `/workspace/cuteafd` source mount and passes optional cache mounts/setup. Container
   targets use `CUTEAFD_DEV_TARGET_DIR=$HOME/.cache/cuteafd/builds/<task>/target`
-  (guarded NVMe bind mount); do not use an image-layer target cache as a substitute. Prefer canonical CPU gates
+  (guarded NVMe bind mount); do not use an image-layer target cache as a substitute.
+  `CUTEAFD_DEV_BASELINE_SOURCE=<engine checkout>` mounts a second pinned checkout read-only
+  at its own path for `compare-sm-exports.py --baseline-source`. Prefer canonical CPU gates
   for cross-worktree hits; never normalize `CARGO_MANIFEST_DIR` away (it is a real runtime input).
   Opt-in artifacts carry `COMPILER_PROVENANCE.json`: source commit/dirty, toolchain,
   actual cache mode/fallback, flags/remapping and binary SHA256. Vanilla hashes may

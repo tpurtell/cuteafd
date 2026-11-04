@@ -19,7 +19,7 @@ impl<'a> PlacedProducerStorage<'a> {
         for gpu in 0..2 {
             if !windows[gpu].is_empty() {
                 storage.windows[gpu] = Some(device(gpu).own(|| crate::families::deepseek_v41::v41_window::WindowStorage::new(
-                    library, rows, unit, &windows[gpu], true))?);
+                    library, rows, unit, &windows[gpu]))?);
             }
             if !sources[gpu].is_empty() {
                 storage.sources[gpu] = Some(device(gpu).own(|| crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
@@ -387,7 +387,7 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
                     let shared = match &storage[gpu] {
                         Some(shared) => shared.clone(),
                         None => crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.device.library,
-                            capacity as usize, capacity as usize, &layers[gpu], false)?,
+                            capacity as usize, capacity as usize, &layers[gpu])?,
                     };
                     storage[gpu] = Some(shared.clone());
                     weights.on_storage(shared)
