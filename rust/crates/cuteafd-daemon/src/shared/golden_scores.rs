@@ -23,14 +23,15 @@ pub(crate) mod push_regression {
         Ok(())
     }
 
-    pub(crate) fn draft_dump(output: &Path, sequences: usize, width: usize, vocab: usize,
+    pub(crate) fn draft_dump(output: &Path, sequences: usize, width: usize, logit_width: usize, vocab: usize,
         mut propose: impl FnMut() -> Result<(Vec<Vec<u32>>, Vec<f32>)>) -> Result<()> {
-        ensure!(sequences > 0 && width > 0, "empty push regression draft shape");
+        // Some drafters retain an anchor head row as well as their emitted rows.
+        ensure!(sequences > 0 && width > 0 && logit_width > 0, "empty push regression draft shape");
         let (tokens, logits) = propose()?;
         ensure!(tokens.len() == sequences && tokens.iter().all(|row| row.len() == width
             && row.iter().all(|&token| (token as usize) < vocab)),
             "push regression draft outputs differ from requested shape");
-        check_logits(&logits, sequences * width, vocab)?;
+        check_logits(&logits, sequences * logit_width, vocab)?;
         let (replayed, replay_logits) = propose()?;
         ensure!(tokens == replayed && bytes(&logits) == bytes(&replay_logits),
             "push regression draft replay differs within one version");
@@ -52,13 +53,16 @@ pub(crate) mod push_regression {
     fn dumps_are_exact_and_reject_changed_replay_and_nonfinite_rows() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let expected = vec![0., 1., 2., 3.];
-        draft_dump(dir.path(), 1, 2, 2, || Ok((vec![vec![0, 1]], expected.clone())))?;
+        draft_dump(dir.path(), 1, 2, 2, 2, || Ok((vec![vec![0, 1]], expected.clone())))?;
         assert_eq!(std::fs::read(dir.path().join("draft-logits-1.bin"))?, bytes(&expected));
         let mut calls = 0;
-        assert!(draft_dump(dir.path(), 1, 2, 2, || {
+        assert!(draft_dump(dir.path(), 1, 2, 2, 2, || {
             calls += 1;
             Ok((vec![vec![0, 1]], vec![calls as f32; 4]))
         }).is_err());
+        draft_dump(dir.path(), 1, 1, 2, 2, || Ok((vec![vec![1]], expected.clone())))?;
+        assert!(draft_dump(dir.path(), 1, 1, 1, 2,
+            || Ok((vec![vec![1]], expected.clone()))).is_err());
         assert!(target_dump(dir.path(), 1, 2, &[f32::NAN; 16]).is_err());
         assert!(target_dump(dir.path(), 2, 2, &[0.; 16]).is_err());
         let prompts = prompts(2);

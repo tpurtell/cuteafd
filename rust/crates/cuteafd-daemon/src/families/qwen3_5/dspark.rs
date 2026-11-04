@@ -322,10 +322,11 @@ mod tests {
         library.cuda_set_device(0)?;
         let programs = library.programs()?.with_manifest(&manifest)?;
         let config = serde_json::from_slice(&std::fs::read(draft.join("config.json"))?)?;
+        let pool_tokens = cfg.max_context.max(16384).next_multiple_of(64);
         let (owned, scratch) = block_dspark_paged_resident_bytes(&config, 2, 2, library.sm_count()? as u64,
             GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context,
-            16384, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
-        let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(), Some(16384),
+            pool_tokens, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+        let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(), Some(pool_tokens as u64),
             Some(DrafterBytes { owned, scratch, ..Default::default() }), 2, None,
             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, false)?;
         let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
@@ -354,7 +355,7 @@ mod tests {
                         tap_row, slot, position: index * 1024 + tap_row }).collect::<Vec<_>>())?;
                 }
             }
-            regression::draft_dump(&output, sequences, draft_cfg.block, cfg.vocab, || {
+            regression::draft_dump(&output, sequences, draft_cfg.block, draft_cfg.block, cfg.vocab, || {
                 let stream = engine.target_stream();
                 let head = TargetHead::Launch(Box::new(|hidden, logits, rows, actual_stream| {
                     ensure!(actual_stream == stream.raw, "draft head stream mismatch");
