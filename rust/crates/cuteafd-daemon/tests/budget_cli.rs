@@ -39,8 +39,8 @@ fn global_resident_weight_flag_reaches_plan_admission() {
         let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
             .args(["--coordinator-weight-budget-gib", gib, "plan"])
             .arg(snapshot.path()).arg("--workspace-manifest").arg(&manifest)
-            .args(["--layout", "--rtx", "2", "--spark-ranks", "6", "--speculator", "off",
-                "--attention-placement", "heads", "--rtx-expert-layers", "0", "--context-tokens", "262144",
+            .args(["--layout", "--rtx", "2", "--spark-ranks", "6", "--spark-budget-gib", "256",
+                "--speculator", "off", "--attention-placement", "heads", "--rtx-expert-layers", "0", "--context-tokens", "262144",
                 "--pool-tokens", "262144", "--concurrency", "2", "--prefix-slots", "0",
                 "--host-cache-bytes", "0", "--prefill-rows", "2048", "--prefill-waves", "2",
                 "--vision", "off", "--audio", "off", "--json", "--require-ready"])

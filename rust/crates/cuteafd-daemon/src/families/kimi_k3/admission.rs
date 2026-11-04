@@ -1177,11 +1177,13 @@ pub(super) mod tests {
                 sum.checked_add(LayerLayout::pair(&cfg, layer, LayerMode::HeadSplit)?[0].bytes()? as u64)
                     .context("native rank-zero resident weights overflow")
             })?;
+        // Isolate resident weights from the shipped Spark reserve estimate.
         for (gib, accepted) in [(80u64, true), (1, false)] {
             let cli = crate::cli::Cli::try_parse_from([
                 "cuteafd".into(), "plan".into(), snapshot.path().as_os_str().to_owned(),
                 "--layout".into(), "--rtx".into(), "2".into(), "--spark-ranks".into(), "6".into(),
                 "--workspace-manifest".into(), manifest_path.as_os_str().to_owned(),
+                "--spark-budget-gib".into(), "256".into(),
                 "--coordinator-weight-budget-gib".into(), gib.to_string().into(),
                 "--attention-placement".into(), "heads".into(), "--rtx-expert-layers".into(), "0".into(),
                 "--context-tokens".into(), "262144".into(), "--pool-tokens".into(), "262144".into(),
@@ -1193,6 +1195,8 @@ pub(super) mod tests {
             ])?;
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan command") };
             args.coordinator_weight_budget_gib = cli.coordinator_weight_budget_gib.context("global cap")?;
+            args.vision = cli.vision.context("global vision mode")?;
+            args.audio = cli.audio.context("global audio mode")?;
             let planned = crate::commands::plan::run_plan(args);
             let mut i = inputs(&cfg);
             i.resident_weight_limit = ResidentWeights(gib << 30);
