@@ -354,6 +354,7 @@ fn warmup_upload_is_one_exact_successor_per_selected_shape_not_per_rank() {
 fn warmup_upload_requires_an_independent_sufficient_host_budget() {
     let cfg = cfg();
     let mut recipe = recipe(&cfg);
+    recipe.embedding = vec![EmbeddingHome::Device(0)];
     recipe.experts = None;
     recipe.targets.clear();
     recipe.hooks.clear();
