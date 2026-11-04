@@ -530,7 +530,7 @@ pub(crate) fn with_engine<T>(
         if crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&loaded.snapshot)?
             != crate::shared::experts::rtx::push::PushPolicy::Mount {
             use crate::shared::{experts::rtx::dense::HostStaging, memory::push_coordinator::CoordinatorExpertPlan};
-            let startup = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
+            let mut startup = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
                 &loaded.cfg, devices.len(), args.dspark, loaded.catalog.tensors().iter().map(|t| &t.metadata))?.startup;
             let host = (0..devices.len()).map(|rank| {
                 let bytes = |name| startup.host.iter().find(|item| item.rank == rank && item.name == name)
@@ -542,7 +542,12 @@ pub(crate) fn with_engine<T>(
             let peak = CoordinatorExpertPlan::admit_host(&vec![None; devices.len()], &host,
                 cuteafd_ffi::push_ring::DEFAULT_SLOTS, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, available)?;
             ensure!(peak as u64 == startup.host_bytes()?, "V4 startup host inventory disagrees with admission");
-            tracing::info!(plan_host_bound_bytes = peak, "V4 conservative dense startup host bound admitted before allocation");
+            startup.add_experts(&loaded.catalog, stages, &placement)?;
+            let bound = startup.host_bytes()?;
+            ensure!(bound <= available, "V4 dense and expert startup need {bound} host bytes, available {available}");
+            for note in startup.notes()? { tracing::info!("{note}"); }
+            tracing::info!(plan_host_bound_bytes = bound, dense_host_bound_bytes = peak,
+                "V4 conservative dense and expert startup host bound admitted before allocation");
         }
         let started = Instant::now();
         let loader = weights::WeightLoader {
