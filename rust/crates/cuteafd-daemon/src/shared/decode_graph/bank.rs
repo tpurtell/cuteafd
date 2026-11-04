@@ -37,6 +37,7 @@ pub(crate) struct GraphBank<K, E> {
     seen: HashSet<K>,
     policy: GraphPolicy,
     startup: Option<HashSet<K>>,
+    startup_sealed: bool,
     clock: u64,
     stats: GraphStats,
     measured_bytes: u64,
@@ -51,9 +52,39 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     }
 
     pub fn with_policy(policy: GraphPolicy) -> Self {
-        Self { entries: HashMap::new(), seen: HashSet::new(), policy, startup: None,
+        Self { entries: HashMap::new(), seen: HashSet::new(), policy, startup: None, startup_sealed: false,
             clock: 0, stats: GraphStats::default(), measured_bytes: 0, measured: 0,
             frozen: None, retired: Vec::new() }
+    }
+
+    /// Declare the planner's exact inventory before owner-local capture begins.
+    /// Until sealed, only declared keys may capture; after sealing every miss is
+    /// eager, including a retired hot key. Capture permission is never inferred
+    /// from an empty slot on a live request.
+    pub fn declare_startup(&mut self, keys: &[K]) -> anyhow::Result<()> {
+        anyhow::ensure!(self.entries.is_empty() && self.startup.is_none(), "graph bank already warmed");
+        let expected: HashSet<K> = keys.iter().cloned().collect();
+        anyhow::ensure!(expected.len() == keys.len(), "duplicate startup graph key");
+        self.policy = GraphPolicy::FixedStartup;
+        self.startup = Some(expected);
+        Ok(())
+    }
+
+    pub fn startup_declared(&self) -> bool { self.startup.is_some() }
+
+    pub fn capture_allowed(&self, key: &K) -> bool {
+        !self.startup_sealed && self.startup.as_ref().map_or(
+            self.policy != GraphPolicy::FixedStartup, |keys| keys.contains(key))
+    }
+
+    /// Validate the declared inventory against actual retained executables.
+    pub fn finish_startup(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.startup_sealed, "startup graph bank already sealed");
+        let expected = self.startup.as_ref().ok_or_else(|| anyhow::anyhow!("startup graph inventory undeclared"))?;
+        anyhow::ensure!(self.entries.len() == expected.len()
+            && expected.iter().all(|key| self.contains(key)), "startup graph inventory differs from captured bank");
+        self.startup_sealed = true;
+        Ok(())
     }
 
     /// Warm exactly the planner's key set. Duplicate keys, missing captures or
@@ -69,6 +100,8 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         anyhow::ensure!(self.entries.len() == expected.len()
             && expected.iter().all(|key| self.contains(key)), "startup graph inventory differs from captured bank");
         self.startup = Some(expected);
+        self.policy = GraphPolicy::FixedStartup;
+        self.startup_sealed = true;
         Ok(())
     }
 
@@ -80,13 +113,15 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         anyhow::ensure!(self.entries.len() == expected.len()
             && expected.iter().all(|key| self.contains(key)), "startup graph inventory differs from captured bank");
         self.startup = Some(expected);
+        self.policy = GraphPolicy::FixedStartup;
+        self.startup_sealed = true;
         Ok(())
     }
 
     pub fn enqueue(&mut self, key: &K) -> (GraphDecision, Option<&E>) {
         let decision = if self.entries.contains_key(key) { GraphDecision::Replay }
-            else if self.policy == GraphPolicy::FixedStartup { GraphDecision::Eager }
-            else { GraphDecision::Capture };
+            else if self.capture_allowed(key) { GraphDecision::Capture }
+            else { GraphDecision::Eager };
         if decision == GraphDecision::Eager {
             self.stats.eager_runs += 1;
             let count = self.stats.eager_runs;
@@ -235,6 +270,80 @@ mod tests {
         assert!(bank.seal_startup(&[]).is_err());
         bank.seal_startup(&[1]).unwrap();
     }
+    #[test]
+    fn declared_inventory_only_admits_hot_keys_until_sealed() {
+        let mut bank = GraphBank::new(Some(1));
+        bank.declare_startup(&[1, 2]).unwrap();
+        assert_eq!(bank.enqueue(&1), (GraphDecision::Capture, None));
+        assert_eq!(bank.enqueue(&3), (GraphDecision::Eager, None));
+        bank.insert(1, 10, None);
+        assert!(bank.finish_startup().is_err());
+        bank.insert(2, 20, None);
+        bank.finish_startup().unwrap();
+        assert_eq!(bank.enqueue(&1), (GraphDecision::Replay, Some(&10)));
+        assert_eq!(bank.enqueue(&3), (GraphDecision::Eager, None));
+        bank.retire(&1);
+        assert_eq!(bank.enqueue(&1), (GraphDecision::Eager, None));
+        assert!(!bank.capture_allowed(&2));
+        assert!(bank.finish_startup().is_err());
+        assert!(bank.declare_startup(&[1, 2]).is_err());
+    }
+
+    #[test]
+    fn sealed_prefill_inventory_retains_alternating_tails_and_rejects_cold_shapes() {
+        let mut bank = GraphBank::new(Some(1));
+        let keys: Vec<_> = (0..40).flat_map(|layer| (1..=64).map(move |rows| (layer, rows))).collect();
+        bank.declare_startup(&keys).unwrap();
+        for &key in &keys { bank.insert(key, key, None); }
+        bank.finish_startup().unwrap();
+        for rows in [54, 52, 54, 52, 56, 53, 2752, 579, 4, 128, 65] {
+            for layer in 0..40 {
+                let key = (layer, rows);
+                if rows <= 64 {
+                    assert_eq!(bank.enqueue(&key), (GraphDecision::Replay, Some(&key)));
+                } else {
+                    assert_eq!(bank.enqueue(&key), (GraphDecision::Eager, None));
+                }
+                assert!(!bank.capture_allowed(&key));
+            }
+        }
+        assert_eq!(bank.len(), keys.len());
+        assert_eq!(bank.retired_len(), 0);
+        assert_eq!(bank.stats().captures, keys.len() as u64);
+        assert_eq!(bank.stats().recaptures, 0);
+        assert_eq!(bank.stats().evictions, 0);
+    }
+
+    #[test]
+    fn sealed_empty_prefill_inventory_never_captures_arbitrary_tails() {
+        let mut bank = GraphBank::<(usize, usize), usize>::new(None);
+        bank.declare_startup(&[]).unwrap();
+        bank.finish_startup().unwrap();
+        for rows in (1..=128).chain([301, 552, 808, 810, 2723, 2752]) {
+            for layer in 0..40 {
+                let key = (layer, rows);
+                assert_eq!(bank.enqueue(&key), (GraphDecision::Eager, None));
+                assert!(!bank.capture_allowed(&key));
+            }
+        }
+        assert_eq!(bank.len(), 0);
+        assert_eq!(bank.stats().captures, 0);
+        assert_eq!(bank.stats().evictions, 0);
+    }
+
+    #[test]
+    fn sealed_family_warmup_disallows_live_capture() {
+        let mut bank = GraphBank::new(None);
+        bank.insert(1, 10, None);
+        bank.seal_startup(&[1]).unwrap();
+        bank.set_budget(Some(0));
+        assert_eq!(bank.enqueue(&2), (GraphDecision::Eager, None));
+        assert!(!bank.capture_allowed(&1));
+        let mut duplicate: GraphBank<u32, u32> = GraphBank::new(None);
+        assert!(duplicate.declare_startup(&[1, 1]).is_err());
+        assert_eq!(duplicate.enqueue(&1), (GraphDecision::Capture, None));
+    }
+
     #[test]
     fn retirement_keeps_owners_when_stream_drain_fails() {
         let mut bank = GraphBank::new(Some(20));

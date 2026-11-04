@@ -76,17 +76,27 @@ type BatchLaunch = unsafe extern "C" fn(
     *const u16, *const f32, *const u64, *const i32, *mut u16, i32,
     *const RawView, *mut c_void, *const u64, *mut f32, i32, i32,
 ) -> i32;
-/// Host-validated row descriptors. They do not own any referenced allocations.
-pub struct V41SparseBatch {
-    views: Vec<RawView>,
+/// Fixed launch geometry, not validated request descriptors or a cache lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V41SparseBatchRecipe {
+    rows: usize,
     compressed: i32,
     aot: bool,
     heads: usize,
 }
+impl V41SparseBatchRecipe {
+    /// Include in captured graph identity alongside exact rows and stable owners.
+    pub fn backend_key(&self) -> usize { usize::from(self.aot) | (usize::from(self.heads == 32) << 1) }
+}
+/// Host-validated row descriptors. They do not own any referenced allocations.
+pub struct V41SparseBatch {
+    views: Vec<RawView>,
+    recipe: V41SparseBatchRecipe,
+}
 impl V41SparseBatch {
     /// Include in captured graph identity: device descriptors may change their
     /// alignment/format eligibility between replays without changing shape.
-    pub fn backend_key(&self) -> usize { usize::from(self.aot) | (usize::from(self.heads == 32) << 1) }
+    pub fn backend_key(&self) -> usize { self.recipe.backend_key() }
     pub fn bytes(&self) -> &[u8] {
         // repr(C), 120 bytes with no padding, all fields initialized by checked_view.
         unsafe { std::slice::from_raw_parts(self.views.as_ptr().cast(), self.views.len() * 120) }
@@ -355,7 +365,21 @@ impl V41SparseAttention<'_> {
             ensure!(parts == recipe.parts, "sparse attention plan split differs");
             planned_backend(plan, rows, self.heads, compressed != 0, self.batch_aot_launch.is_some(), aligned)?
         } else { self.batch_aot_launch.is_some() && compressed == 2 && aligned };
-        Ok(V41SparseBatch { views, compressed, aot, heads: self.heads })
+        Ok(V41SparseBatch { views, recipe: V41SparseBatchRecipe { rows, compressed, aot, heads: self.heads } })
+    }
+
+    /// Describe a startup graph without constructing request descriptors or leases.
+    /// `aligned` describes the eventual bound KV planes as well as split scratch;
+    /// every replay must still use prepare_batch_planned to validate real requests.
+    pub fn startup_batch_recipe(
+        &self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
+        rows: usize, compressed: bool, aligned: bool,
+    ) -> Result<V41SparseBatchRecipe> {
+        let aot = planned_backend(plan, rows, self.heads, compressed,
+            self.batch_aot_launch.is_some(), aligned)?;
+        ensure!(if aot { self.batch_aot_launch.is_some() } else { self.batch_launch.is_some() },
+            "native library lacks selected sparse batch attention");
+        Ok(V41SparseBatchRecipe { rows, compressed: if compressed { 2 } else { 0 }, aot, heads: self.heads })
     }
     /// # Safety
     /// All buffers and dimensions must match prepare_batch; upload batch.bytes()
@@ -368,15 +392,38 @@ impl V41SparseAttention<'_> {
         output: CuteafdDeviceBuffer, descriptors: CuteafdDeviceBuffer,
         bounds: CuteafdDeviceBuffer, scratch: CuteafdDeviceBuffer, stream: *mut c_void,
     ) -> Result<()> {
-        ensure!(batch.heads == self.heads, "sparse batch head geometry differs from prepared kernel");
-        let launch = if batch.aot { self.batch_aot_launch } else { self.batch_launch }
-            .context("native library lacks selected sparse batch attention")?;
-        let status = unsafe { launch(query.ptr.cast(), sink.ptr.cast(), metadata.ptr.cast(),
-            selected.map_or(std::ptr::null(), |b| b.ptr.cast()), output.ptr.cast(), batch.views.len() as i32,
-            descriptors.ptr.cast(), stream, bounds.ptr.cast(), scratch.ptr.cast(),
-            if batch.compressed != 0 { 10 } else { 2 }, batch.compressed) };
-        ensure!(status == 0, "native sparse batch status {status}");
-        Ok(())
+        // SAFETY: the caller uploaded the validated descriptors and retains their owners.
+        unsafe { self.launch_batch_recipe(&batch.recipe, query, sink, metadata, selected,
+            output, descriptors, bounds, scratch, stream) }
+    }
+
+    /// Record the same launch as launch_batch without executing a synthetic request.
+    /// # Safety
+    /// `stream` must be in capture mode; never call this to execute uninitialized
+    /// descriptor storage. All planes must have the recipe's capacity/device and
+    /// remain alive through graph destruction. Before EVERY replay, validate live
+    /// requests with prepare_batch_planned, require matching recipe/backend, and
+    /// upload descriptors, bounds, metadata and selections outside the graph.
+    pub unsafe fn record_startup_batch(
+        &self, recipe: &V41SparseBatchRecipe, query: CuteafdDeviceBuffer, sink: CuteafdDeviceBuffer,
+        metadata: CuteafdDeviceBuffer, selected: Option<CuteafdDeviceBuffer>,
+        output: CuteafdDeviceBuffer, descriptors: CuteafdDeviceBuffer,
+        bounds: CuteafdDeviceBuffer, scratch: CuteafdDeviceBuffer, stream: *mut c_void,
+    ) -> Result<()> {
+        // SAFETY: the caller guarantees capture-only recording and stable device planes.
+        unsafe { self.launch_batch_recipe(recipe, query, sink, metadata, selected,
+            output, descriptors, bounds, scratch, stream) }
+    }
+
+    unsafe fn launch_batch_recipe(
+        &self, recipe: &V41SparseBatchRecipe, query: CuteafdDeviceBuffer, sink: CuteafdDeviceBuffer,
+        metadata: CuteafdDeviceBuffer, selected: Option<CuteafdDeviceBuffer>,
+        output: CuteafdDeviceBuffer, descriptors: CuteafdDeviceBuffer,
+        bounds: CuteafdDeviceBuffer, scratch: CuteafdDeviceBuffer, stream: *mut c_void,
+    ) -> Result<()> {
+        // SAFETY: both entry points require live stable planes and correctly ordered uploads or capture.
+        unsafe { dispatch_batch_recipe(self.heads, self.batch_launch, self.batch_aot_launch, recipe,
+            query, sink, metadata, selected, output, descriptors, bounds, scratch, stream) }
     }
 
     /// # Safety
@@ -463,12 +510,83 @@ impl V41SparseAttention<'_> {
     }
 }
 
+unsafe fn dispatch_batch_recipe(
+    heads: usize, native: Option<BatchLaunch>, aot: Option<BatchLaunch>,
+    recipe: &V41SparseBatchRecipe, query: CuteafdDeviceBuffer, sink: CuteafdDeviceBuffer,
+    metadata: CuteafdDeviceBuffer, selected: Option<CuteafdDeviceBuffer>,
+    output: CuteafdDeviceBuffer, descriptors: CuteafdDeviceBuffer,
+    bounds: CuteafdDeviceBuffer, scratch: CuteafdDeviceBuffer, stream: *mut c_void,
+) -> Result<()> {
+    ensure!(recipe.heads == heads, "sparse batch head geometry differs from prepared kernel");
+    ensure!(selected.is_some() == (recipe.compressed != 0), "sparse batch selection differs from recipe");
+    let launch = if recipe.aot { aot } else { native }
+        .context("native library lacks selected sparse batch attention")?;
+    // SAFETY: the enclosing launch/capture API requires stable, correctly sized planes.
+    let status = unsafe { launch(query.ptr.cast(), sink.ptr.cast(), metadata.ptr.cast(),
+        selected.map_or(std::ptr::null(), |b| b.ptr.cast()), output.ptr.cast(), recipe.rows as i32,
+        descriptors.ptr.cast(), stream, bounds.ptr.cast(), scratch.ptr.cast(),
+        if recipe.compressed != 0 { 10 } else { 2 }, recipe.compressed) };
+    ensure!(status == 0, "native sparse batch status {status}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn buffer(bytes: usize) -> CuteafdDeviceBuffer {
         CuteafdDeviceBuffer { ptr: 0x1000usize as *mut c_void, bytes, device_id: 0, flags: 0 }
+    }
+
+    thread_local! {
+        static BATCH_CALLS: std::cell::RefCell<Vec<Vec<usize>>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    unsafe extern "C" fn record_batch(
+        query: *const u16, sink: *const f32, metadata: *const u64, selected: *const i32,
+        output: *mut u16, rows: i32, descriptors: *const RawView, stream: *mut c_void,
+        bounds: *const u64, scratch: *mut f32, parts: i32, compressed: i32,
+    ) -> i32 {
+        BATCH_CALLS.with(|calls| calls.borrow_mut().push(vec![query as usize, sink as usize,
+            metadata as usize, selected as usize, output as usize, rows as usize,
+            descriptors as usize, stream as usize, bounds as usize, scratch as usize,
+            parts as usize, compressed as usize]));
+        0
+    }
+    #[test]
+    fn startup_and_validated_batch_share_exact_native_dispatch() -> Result<()> {
+        for heads in [32, 64] { for rows in 1..=64 { for compressed in [0, 2] {
+            let recipe = V41SparseBatchRecipe { rows, compressed, aot: compressed == 2, heads };
+            // No descriptors are dereferenced: startup records stable device pointers only.
+            let batch = V41SparseBatch { views: Vec::new(), recipe };
+            let selected = (compressed != 0).then(|| buffer(rows * 2048));
+            BATCH_CALLS.with(|calls| calls.borrow_mut().clear());
+            for same_recipe in [&recipe, &batch.recipe] {
+                // SAFETY: the mock records arguments only; it never accesses device storage.
+                unsafe { dispatch_batch_recipe(heads, Some(record_batch), Some(record_batch), same_recipe,
+                    buffer(rows * heads * 1024), buffer(heads * 4), buffer(rows * 80), selected,
+                    buffer(rows * heads * 1024), buffer(rows * 120), buffer(rows * 8),
+                    buffer(rows * 10 * heads * 514 * 4), std::ptr::null_mut())?; }
+            }
+            BATCH_CALLS.with(|calls| {
+                let calls = calls.borrow();
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0], calls[1]);
+                assert_eq!(calls[0][5], rows);
+                assert_eq!(calls[0][10], if compressed == 0 { 2 } else { 10 });
+                assert_eq!(calls[0][11], compressed as usize);
+            });
+            // Backend/geometry failures must not silently choose another kernel.
+            // SAFETY: every selected mock only records arguments.
+            unsafe {
+                assert!(dispatch_batch_recipe(96, Some(record_batch), Some(record_batch), &recipe,
+                    buffer(1), buffer(1), buffer(1), selected, buffer(1), buffer(1), buffer(1), buffer(1),
+                    std::ptr::null_mut()).is_err());
+                assert!(dispatch_batch_recipe(heads, None, None, &recipe,
+                    buffer(1), buffer(1), buffer(1), selected, buffer(1), buffer(1), buffer(1), buffer(1),
+                    std::ptr::null_mut()).is_err());
+            }
+        }}}
+        Ok(())
     }
 
     #[test]
@@ -528,7 +646,9 @@ mod tests {
         assert!(V41SparseAttention::scratch_bytes_for_heads(64, 11, 32).is_err());
         let mut keys = Vec::new();
         for heads in [64, 32] { for aot in [false, true] {
-            let batch = V41SparseBatch { views: Vec::new(), compressed: 2, aot, heads };
+            let recipe = V41SparseBatchRecipe { rows: 1, compressed: 2, aot, heads };
+            let batch = V41SparseBatch { views: Vec::new(), recipe };
+            assert_eq!(batch.backend_key(), recipe.backend_key());
             keys.push(batch.backend_key());
         }}
         assert_eq!(keys, [0, 1, 2, 3]);

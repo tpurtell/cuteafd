@@ -13,6 +13,7 @@ use std::rc::Rc;
 pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
+    let startup_prototype = super::graph_startup_prototype(&args)?;
     // `all` becomes the expert inventory's exact count inside admission; this
     // load-time floor only asserts that one routed layer stays resident.
     let minimum_expert_layers = match args.rtx_expert_layers {
@@ -587,6 +588,28 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     for (slot, _) in &mut prefill_slots.slots { slot.configure_cache_replicas(requests.cache())?; }
     requests.use_engine_pages()?;
     memory_checkpoint("allocated KV cache")?;
+    if startup_prototype {
+        let memory = || -> Result<Vec<usize>> {
+            devices.iter().map(|device| device.run(|| lib.cuda_memory_info().map(|(free, _)| free)))
+                .collect()
+        };
+        let before = memory()?;
+        let capture_started = Instant::now();
+        pass.capture_startup(requests.cache())?;
+        second.capture_startup(requests.cache())?;
+        for (slot, _) in &mut prefill_slots.slots { slot.capture_startup_prefill(requests.cache())?; }
+        if let Some(draft) = &mut draft {
+            let device = draft.device;
+            device.run(|| draft.get_mut().capture_startup())?;
+        }
+        let after = memory()?;
+        let growth: Vec<_> = before.iter().zip(&after).map(|(&before, &after)| before.saturating_sub(after)).collect();
+        tracing::info!(capture_ms=capture_started.elapsed().as_millis(), free_before_bytes=?before,
+            free_after_bytes=?after, allocator_growth_bytes=?growth, target_passes=2,
+            exact_rows=cuteafd_core::V41_VERIFY_ROWS, index_width=512,
+            "diagnostic fixed startup graph prototype recorded and sealed");
+        memory_checkpoint("startup graphs sealed")?;
+    }
     crate::shared::memory_report::release_load_staging(&lib)?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;

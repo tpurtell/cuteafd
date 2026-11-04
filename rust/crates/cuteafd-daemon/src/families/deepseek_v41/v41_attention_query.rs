@@ -416,20 +416,41 @@ impl AttentionQueryWave<'_, '_> {
         self.tokens.clear();
         unsafe { self.capture_ready(rows) }
     }
+    pub(crate) fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
+        self.storage.stream.require_complete()?;
+        ensure!(self.ready.is_none() && self.binding.is_none(), "query startup requires an idle owner");
+        let (full, prefix) = if self.weights.split_query_b { (&[][..], keys) } else { (keys, &[][..]) };
+        self.graphs.declare_startup(full)?;
+        self.tp2_prefix_graphs.declare_startup(prefix)
+    }
+    pub(crate) fn capture_startup(&mut self, rows: u32) -> Result<()> {
+        self.validate(rows)?;
+        self.storage.stream.require_complete()?;
+        // SAFETY: capture records only this owner's stable buffers and bound
+        // weights. It does not execute kernels or publish a query binding.
+        unsafe { self.capture_ready_kind(rows, self.weights.split_query_b) }
+    }
+    pub(crate) fn finish_startup(&mut self) -> Result<()> {
+        self.graphs.finish_startup()?;
+        self.tp2_prefix_graphs.finish_startup()
+    }
     /// Capture only after the input producer and warmup have completed.
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
+        unsafe { self.capture_ready_kind(rows, false) }
+    }
+    unsafe fn capture_ready_kind(&mut self, rows: u32, prefix: bool) -> Result<()> {
         unsafe {
             self.storage.stream
                 .library
                 .cuda_graph_begin_capture(self.storage.stream.raw)?;
         }
-        let launched = unsafe { self.enqueue(rows) };
+        let launched = unsafe { if prefix { self.enqueue_rank(rows) } else { self.enqueue(rows) } };
         let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
+                let graphs = if prefix { &mut self.tp2_prefix_graphs } else { &mut self.graphs };
                 if let Err(error) = unsafe {
-                    self.graphs
-                        .insert(self.weights.layer, self.weights, rows, graph)
+                    graphs.insert(self.weights.layer, self.weights, rows, graph)
                 } {
                     unsafe {
                         self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
@@ -508,7 +529,9 @@ impl AttentionQueryWave<'_, '_> {
             // The normalized input is complete here; cache producers fork from it.
             unsafe { crate::shared::memory::chain::mark_fork(self.storage.stream.library, self.storage.stream.raw)?; }
             let rows = tokens.len() as u32;
-            if self.window.is_windowed() || !super::graph_policy::captures_shape(rows) {
+            if self.window.is_windowed() || !super::graph_policy::captures_shape(rows)
+                || (self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none()
+                    && !self.graphs.capture_allowed(self.weights.layer, rows)) {
                 unsafe { self.execute(rows)?; }
                 return Ok(());
             }
@@ -569,7 +592,9 @@ impl AttentionQueryWave<'_, '_> {
         if graph.is_none() {
             // Eager output is complete; capture only records the next execution.
             // Replaying now would duplicate work whenever a shape was evicted.
-            if !self.window.is_windowed() && super::graph_policy::captures_shape(rows) && !crate::shared::decode_graph::census::eager("layer_row") {
+            if !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+                && self.graphs.capture_allowed(self.weights.layer, rows)
+                && !crate::shared::decode_graph::census::eager("layer_row") {
                 unsafe { self.capture_ready(rows)?; }
             }
         }
@@ -629,6 +654,7 @@ impl AttentionQueryWave<'_, '_> {
             }).await?;
         }
         if !self.window.is_windowed() && graph.is_none() && super::graph_policy::captures_shape(rows)
+            && self.tp2_prefix_graphs.capture_allowed(self.weights.layer, rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
             unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
             let queued=unsafe { self.enqueue_rank(rows) };

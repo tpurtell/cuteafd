@@ -124,7 +124,8 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         gathered: &EngramDeviceView,
     ) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
-        if self.window.is_windowed() || !crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32) {
+        if self.window.is_windowed() || !crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32)
+            || (self.graphs.get(gathered.rows).is_none() && !self.graphs.capture_allowed(gathered.rows)) {
             return unsafe { self.execute(residual, gathered) };
         }
         if self.graphs.get(gathered.rows).is_none() {
@@ -344,6 +345,18 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         self.synchronize()?;
         unsafe { self.capture_ready(gathered.rows) }
     }
+    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+        ensure!(self.ready_rows.is_none() && !self.window.is_windowed(), "Engram startup requires an idle owner");
+        self.storage.stream.require_complete()?;
+        self.graphs.declare_startup(rows)?;
+        for &row in rows {
+            ensure!(row <= self.capacity, "Engram startup row exceeds capacity");
+            // SAFETY: recording owned gate buffers does not execute kernels,
+            // gather table rows, or publish residuals or request state.
+            unsafe { self.capture_ready(row)?; }
+        }
+        self.graphs.finish_startup()
+    }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
         self.ready_rows = None;
         ensure!(!self.window.is_windowed(), "windowed gate cannot capture");
@@ -414,6 +427,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         if cold && !self.window.is_windowed() && crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32)
+            && self.graphs.capture_allowed(gathered.rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
             // The cold shape already ran eagerly above: record the graph for
             // later calls without a second launch (hunt C #3). Only when the

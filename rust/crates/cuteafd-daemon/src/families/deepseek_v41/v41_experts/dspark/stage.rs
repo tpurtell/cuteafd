@@ -1,7 +1,7 @@
 //! One complete attention/mHC/FFN draft stage, captured on its expert stream.
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkAttentionWave, DsparkFfn, DsparkWeights, HcSublayer};
-use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
+use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowGeometry, WindowLease, WindowRead};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::ffi::c_void;
@@ -115,11 +115,16 @@ impl<'a> DsparkStage<'_, 'a> {
         requests: usize,
         stream: *mut c_void,
     ) -> Result<()> {
+        unsafe { self.enqueue_geometry(&read.geometry(), requests, stream) }
+    }
+    pub(super) unsafe fn enqueue_geometry(
+        &mut self, read: &WindowGeometry, requests: usize, stream: *mut c_void,
+    ) -> Result<()> {
         let rows = requests as u32 * self.width as u32;
         unsafe {
             self.boundary
                 .enqueue_begin(rows as usize, Some(self.attention.input()), stream)?;
-            self.attention.enqueue_on(read, requests as u32, stream)?;
+            self.attention.enqueue_geometry(read, requests as u32, stream)?;
             self.boundary
                 .enqueue_finish(Some(self.attention.output_storage()), stream)?;
             let source = self.boundary.output_storage();

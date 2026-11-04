@@ -61,6 +61,62 @@ pub(crate) struct IndexLane<'w, 'a> {
     invalid: bool,
 }
 impl<'w, 'a> IndexLane<'w, 'a> {
+    pub(crate) fn startup_selections(&self) -> Vec<Option<cuteafd_ffi::CuteafdDeviceBuffer>> {
+        (0..40).map(|layer| {
+            if layer < 2 { None }
+            else if layer < 24 { Some(self.source.startup_outputs().0) }
+            else { self.reindex.as_ref().map(|wave| wave.startup_outputs().0) }
+        }).collect()
+    }
+    pub(crate) fn capture_startup(&mut self, rows: &[usize],
+        mut source: impl FnMut(usize, usize) -> Result<crate::families::deepseek_v41::v41_compressor::IndexScoreGeometry>) -> Result<()> {
+        ensure!(!self.invalid && self.ready.is_none(), "startup index lane requires idle owner");
+        let layers: Vec<_> = (0..LAYERS.len()).filter(|&i|
+            self.device.is_none_or(|gpu| self.weights.weights[i].device.id == gpu)).collect();
+        let keys: Vec<_> = layers.iter().flat_map(|&i| rows.iter()
+            .map(move |&row| (LAYERS[i], row as u32))).collect();
+        let original = self.next;
+        let result = (|| -> Result<()> {
+            self.query.declare_startup(&keys)?;
+            let mut source_keys = Vec::new();
+            let mut follower_keys = Vec::new();
+            let shared = self.source.startup_outputs().1;
+            for &i in &layers {
+                self.query.rebind(&self.weights.weights[i])?;
+                for &row in rows {
+                    let query = self.query.startup_geometry(row)?;
+                    let geometry = source(if LAYERS[i] >= 20 { 20 } else { LAYERS[i] }, row)?;
+                    if LAYERS[i] > 20 {
+                        follower_keys.push(self.reindex.as_ref().context("startup follower absent")?
+                            .startup_key(&query, geometry, Some(shared), row)?);
+                    } else { source_keys.push(self.source.startup_key(&query, geometry, None, row)?); }
+                }
+            }
+            self.source.declare_startup(&source_keys)?;
+            if let Some(follower) = &mut self.reindex { follower.declare_startup(&follower_keys)?; }
+            for &i in &layers {
+                self.query.rebind(&self.weights.weights[i])?;
+                for &row in rows {
+                    self.query.capture_startup(row as u32)?;
+                    let query = self.query.startup_geometry(row)?;
+                    let geometry = source(if LAYERS[i] >= 20 { 20 } else { LAYERS[i] }, row)?;
+                    // SAFETY: closure supplies real stable source planes; recording never publishes a query.
+                    unsafe {
+                        if LAYERS[i] > 20 {
+                            self.reindex.as_mut().context("startup follower absent")?
+                                .capture_startup(&query, geometry, Some(shared), row)?;
+                        } else { self.source.capture_startup(&query, geometry, None, row)?; }
+                    }
+                }
+            }
+            self.query.finish_startup()?;
+            self.source.finish_startup()?;
+            if let Some(follower) = &mut self.reindex { follower.finish_startup()?; }
+            Ok(())
+        })();
+        let restored = if original < LAYERS.len() { self.query.rebind(&self.weights.weights[original]) } else { Ok(()) };
+        result.and(restored)
+    }
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<[usize; 3]> {
         Ok([
             IndexQueryWave::device_bytes(library, capacity)?,

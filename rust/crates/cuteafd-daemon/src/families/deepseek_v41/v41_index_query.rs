@@ -165,6 +165,13 @@ impl Drop for IndexQueryStorage<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct IndexQueryGeometry {
+    pub layer: usize,
+    pub packed: CuteafdDeviceBuffer,
+    pub scales: CuteafdDeviceBuffer,
+    pub head_weights: CuteafdDeviceBuffer,
+}
 pub(crate) struct IndexQueryOutput<'a> {
     origin: Option<QueryBinding>,
     tokens: &'a [u64],
@@ -175,6 +182,10 @@ pub(crate) struct IndexQueryOutput<'a> {
     _owner: PhantomData<&'a ()>,
 }
 impl IndexQueryOutput<'_> {
+    pub(crate) fn geometry(&self) -> IndexQueryGeometry {
+        IndexQueryGeometry { layer: self.layer, packed: self.packed, scales: self.scales,
+            head_weights: self.head_weights }
+    }
     pub fn origin(&self) -> Option<QueryBinding> {
         self.origin
     }
@@ -214,6 +225,15 @@ impl<'w, 'a> IndexQueryWave<'w, 'a> {
     }
 }
 impl IndexQueryWave<'_, '_> {
+    pub(crate) fn startup_geometry(&self, rows: usize) -> Result<IndexQueryGeometry> {
+        ensure!(rows > 0 && rows <= self.capacity as usize && !self.window.is_windowed()
+            && self.pending.is_none() && self.ready.is_none(), "startup index query geometry requires idle full owner");
+        let sized = |mut b: CuteafdDeviceBuffer, stride| { b.bytes = rows * stride; b };
+        Ok(IndexQueryGeometry { layer: self.weights.layer,
+            packed: sized(self.storage.packed.buffer, 2048),
+            scales: sized(self.storage.scales.buffer, 128),
+            head_weights: sized(self.storage.head_weights.buffer, 64) })
+    }
     #[cfg(test)]
     pub(super) fn scratch_stream(&self) -> *mut std::ffi::c_void { self.storage.stream.raw }
     pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
@@ -345,6 +365,19 @@ impl IndexQueryWave<'_, '_> {
         self.tokens.clear();
         unsafe { self.capture_ready(rows) }
     }
+    pub(crate) fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
+        self.storage.stream.require_complete()?;
+        ensure!(self.pending.is_none() && self.ready.is_none(), "index query startup requires an idle owner");
+        self.graphs.declare_startup(keys)
+    }
+    pub(crate) fn capture_startup(&mut self, rows: u32) -> Result<()> {
+        self.validate(rows)?;
+        self.storage.stream.require_complete()?;
+        // SAFETY: capture records only owned addresses and the rebound weight
+        // owner, without executing or publishing a query/proposal snapshot.
+        unsafe { self.capture_ready(rows) }
+    }
+    pub(crate) fn finish_startup(&mut self) -> Result<()> { self.graphs.finish_startup() }
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
         unsafe {
             self.storage.stream
@@ -429,7 +462,9 @@ impl IndexQueryWave<'_, '_> {
             self.storage.stream.library.copy_d2d(dst, src, src.bytes)?;
         }
         let rows = query.rows as u32;
-        if !super::graph_policy::captures_shape(rows) {
+        if !super::graph_policy::captures_shape(rows)
+            || (self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none()
+                && !self.graphs.capture_allowed(self.weights.layer, rows)) {
             unsafe { self.execute(rows)?; }
             self.origin = Some(binding);
             self.tokens.extend_from_slice(tokens);
@@ -464,6 +499,7 @@ impl IndexQueryWave<'_, '_> {
         let rows = query.rows as u32;
         let graph = if self.window.is_windowed() { None } else { self.graphs.get_shape(self.weights.layer, self.weights, rows) };
         self.pending = Some((rows, binding, !self.window.is_windowed() && graph.is_none() && super::graph_policy::captures_shape(rows)
+            && self.graphs.capture_allowed(self.weights.layer, rows)
             && !crate::shared::decode_graph::census::eager("layer_row")));
         let result = (|| -> Result<()> { unsafe {
             crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;

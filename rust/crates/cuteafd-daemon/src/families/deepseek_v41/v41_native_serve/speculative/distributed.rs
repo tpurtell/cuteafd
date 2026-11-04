@@ -5,6 +5,12 @@ use crate::shared::memory::device::{Device, DeviceOwner};
 use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
 impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
+    pub(crate) fn capture_startup(&mut self) -> Result<()> {
+        ensure!(self.requests.is_empty() && self.pending.iter().all(Option::is_none),
+            "draft startup requires no admitted requests");
+        for chain in &mut self.chains { chain.capture_startup(self.windows.each_ref())?; }
+        Ok(())
+    }
     /// The returned owner scopes destruction to GPU1. Synchronous runtime methods
     /// select their execution device internally and restore it before returning;
     /// no device scope survives a scheduler yield.
@@ -76,6 +82,9 @@ mod tests {
         let mut actual = DraftRuntime::with_distributed_requests(devices, &weights, &embedding,
             [&shards[0], &shards[1]], 80, 16)?;
         let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, 16))?;
+        devices[1].run(|| actual.get_mut().capture_startup())?;
+        assert!(actual.requests.is_empty());
+        assert!(actual.pending.iter().all(Option::is_none));
         devices[1].run(|| {
             let geometry = policy::remote_geometry(5);
             actual.bind_policy(geometry.clone())?; reference.bind_policy(geometry)?;

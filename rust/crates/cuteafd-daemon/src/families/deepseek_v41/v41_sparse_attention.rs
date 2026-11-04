@@ -255,7 +255,89 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         Ok(())
     }
     fn graph_count(&self, layer: usize) -> usize { self.graphs.count(|(l, _)| *l == layer) }
+    pub(crate) fn declare_startup(&mut self, keys: &[(usize, Vec<usize>)]) -> Result<()> {
+        ensure!((self.decode || keys.is_empty()) && !self.window.is_windowed() && self.cold.is_none(),
+            "sparse startup requires an idle owner and decode recipes or an empty eager inventory");
+        self.storage.stream.require_complete()?;
+        self.graphs.declare_startup(keys)
+    }
+    pub(crate) fn finish_startup(&mut self) -> Result<()> {
+        ensure!(self.cold.is_none(), "cannot seal sparse bank with pending capture");
+        self.storage.stream.require_complete()?;
+        self.graphs.finish_startup()
+    }
+
+    pub(crate) fn startup_key(&self, layer: usize, rows: usize, sink: CuteafdDeviceBuffer,
+        selected: Option<CuteafdDeviceBuffer>, aligned: bool, tail: Option<&dyn AttentionGraphTail>) -> Result<(usize, Vec<usize>)> {
+        ensure!(layer < 40 && rows <= self.batch_rows && self.window.admits(rows),
+            "sparse startup shape exceeds owned storage");
+        let plan = self.attention_plan.context("sparse startup requires an admitted reduction plan")?;
+        let recipe = self.storage.kernel.startup_batch_recipe(plan, rows, layer >= 2, aligned)?;
+        ensure!(selected.is_some() == (layer >= 2), "sparse startup selection differs from layer");
+        for (buffer, bytes) in std::iter::once((sink, HEADS * 4))
+            .chain(selected.map(|buffer| (buffer, rows * 2048))) {
+            ensure!(!buffer.ptr.is_null() && buffer.bytes >= bytes
+                && buffer.device_id == self.storage.query.buffer.device_id,
+                "sparse startup binding device or capacity differs");
+        }
+        let mut fingerprint = vec![usize::MAX, layer, rows, sink.ptr as usize,
+            selected.map_or(0, |buffer| buffer.ptr as usize), recipe.backend_key()];
+        if let Some(tail) = tail {
+            fingerprint.push(usize::MAX - 1);
+            fingerprint.extend(tail.identity());
+        }
+        Ok((layer, fingerprint))
+    }
+
+    /// # Safety
+    /// Stable selection, sink, tail weights and tail buffers must outlive this
+    /// bank. The tail must already have capture-only host phase prepared; it must
+    /// not upload request data or publish/commit state. Restore that host phase
+    /// after this call, including errors. No recorded device work executes here.
+    pub(crate) unsafe fn capture_startup(&mut self, layer: usize, rows: usize,
+        sink: CuteafdDeviceBuffer, selected: Option<CuteafdDeviceBuffer>, aligned: bool,
+        mut tail: Option<&mut dyn AttentionGraphTail>) -> Result<()> {
+        ensure!(self.decode && !self.window.is_windowed() && self.cold.is_none(),
+            "sparse startup requires an idle full decode owner");
+        self.storage.stream.require_complete()?;
+        let key = self.startup_key(layer, rows, sink, selected, aligned,
+            tail.as_ref().map(|tail| &**tail as &dyn AttentionGraphTail))?;
+        ensure!(self.graphs.capture_allowed(&key), "sparse startup capture outside declared inventory");
+        ensure!(!self.graphs.contains(&key), "sparse startup key already captured");
+        let plan = self.attention_plan.context("sparse startup reduction plan absent")?;
+        let recipe = self.storage.kernel.startup_batch_recipe(plan, rows, layer >= 2, aligned)?;
+        // SAFETY: this owner is drained and the caller retains every bound plane.
+        unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
+        let queued = (|| unsafe {
+            self.storage.kernel.record_startup_batch(&recipe, self.storage.query.buffer, sink,
+                self.storage.metadata.buffer, selected, self.storage.output.buffer, self.storage.descriptors.buffer,
+                self.storage.replay_begins.buffer, self.storage.split_scratch.buffer, self.storage.stream.raw)?;
+            if let Some(tail) = tail.as_deref_mut() {
+                tail.enqueue(&QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, rows * HEADS * 1024),
+                    layer, rows }, self.storage.stream.raw)?;
+            }
+            Ok(())
+        })();
+        // End capture even if a tail failed, so the owner is not left capturing.
+        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
+        match (queued, captured) {
+            (Ok(()), Ok(graph)) => {
+                if let Err(error) = self.insert_graph(key.0, key.1, graph) {
+                    unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
+                    return Err(error);
+                }
+                Ok(())
+            }
+            (Err(error), Ok(graph)) => {
+                unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
+                Err(error)
+            }
+            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+        }
+    }
     fn insert_graph(&mut self, layer: usize, fingerprint: Vec<usize>, graph: *mut c_void) -> Result<()> {
+        ensure!(self.graphs.capture_allowed(&(layer, fingerprint.clone())),
+            "sparse graph capture outside startup inventory or after seal");
         let device = self.storage.stream.library.cuda_get_device()?;
         // SAFETY: the lane guard retains all captured cache/selection/tail storage.
         let owner = unsafe { GraphOwner::new(self.storage.stream.library, device, graph, ())? };
@@ -726,6 +808,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         }
         let fixed_limit = super::graph_policy::fixed_binding_limit();
         if cached.is_none() && (self.window.is_windowed() || !super::graph_policy::captures_shape(rows as u32)
+            || !self.graphs.capture_allowed(&key)
             || fixed_limit.is_some_and(|limit| self.graph_count(layer) >= limit)
             || exact_small_shape(batch.is_some(), rows, self.batch_rows)) {
             // Exact fingerprints can include launch recipes beyond row count.

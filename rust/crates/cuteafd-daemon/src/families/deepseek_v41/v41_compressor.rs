@@ -525,6 +525,25 @@ impl IndexBinding {
         self.lease.owner == other.lease.owner
     }
 }
+/// Stable score-launch allocation geometry, independent of request snapshots.
+#[derive(Clone, Copy)]
+pub(crate) struct IndexScoreGeometry {
+    pub packed: CuteafdDeviceBuffer,
+    pub scales: CuteafdDeviceBuffer,
+    pub pool_pages: CuteafdDeviceBuffer,
+    pub pool_rows: CuteafdDeviceBuffer,
+    pub proposal_packed: CuteafdDeviceBuffer,
+    pub proposal_scales: CuteafdDeviceBuffer,
+    pub capacity: usize,
+}
+impl IndexScoreGeometry {
+    pub(crate) fn binding(self) -> [usize; 10] {
+        [self.packed.ptr as usize, self.scales.ptr as usize, self.pool_pages.ptr as usize,
+            self.pool_rows.ptr as usize, self.pool_pages.bytes, self.pool_rows.bytes,
+            self.packed.bytes, self.proposal_packed.ptr as usize, self.proposal_scales.ptr as usize,
+            self.capacity]
+    }
+}
 /// Borrowed accepted-history and current-wave index view. Consumers must drain
 /// before releasing these borrows. No proposed rows are published to the cache.
 pub(crate) struct IndexProposal<'a> {
@@ -548,6 +567,11 @@ pub(crate) struct IndexProposal<'a> {
     _wave: std::marker::PhantomData<&'a ()>,
 }
 impl IndexProposal<'_> {
+    pub(crate) fn score_geometry(&self) -> IndexScoreGeometry {
+        IndexScoreGeometry { packed: self.cache.packed, scales: self.cache.scales,
+            pool_pages: self.cache.pool_pages, pool_rows: self.cache.pool_rows,
+            proposal_packed: self.packed, proposal_scales: self.scales, capacity: self.capacity }
+    }
     /// # Safety
     /// Producer writes are complete or ordered before the replica's stream.
     /// Retain both plane owners until all peer consumers drain.
@@ -663,6 +687,19 @@ impl<'a> CompressorWave<'_, 'a> {
     fn planes(&self) -> &CompressorPlanes<'a> { &self.storage.planes[self.plane] }
     fn kv_values(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().kv_values.buffer, V41Kv::COMPRESSED_VALUE_BYTES) }
     fn kv_scales(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().kv_scales.buffer, V41Kv::COMPRESSED_SCALE_BYTES) }
+    pub(crate) fn startup_index_geometry(&self, state: &CompressorState<'_>, rows: usize) -> Result<IndexScoreGeometry> {
+        ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none()
+            && !self.window.is_windowed() && rows > 0 && rows <= self.capacity
+            && state.layer == self.weights.layer, "startup index source geometry requires idle matching owner");
+        let cache = state.source_cache().view(0, 0);
+        let mut proposal_packed = self.index_packed();
+        let mut proposal_scales = self.index_scales();
+        proposal_packed.bytes = rows * 64;
+        proposal_scales.bytes = rows * 4;
+        Ok(IndexScoreGeometry { packed: cache.packed, scales: cache.scales,
+            pool_pages: cache.pool_pages, pool_rows: cache.pool_rows,
+            proposal_packed, proposal_scales, capacity: rows })
+    }
     fn index_packed(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().index_packed.buffer, 64) }
     fn index_scales(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().index_scales.buffer, 4) }
     fn cache_destinations(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().cache_destinations.buffer, 8) }
@@ -941,6 +978,35 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         }
         Ok(())
     }
+    pub(crate) fn capture_startup(&mut self, state: &CompressorState<'_>, rows: &[usize]) -> Result<()> {
+        ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none()
+            && !self.window.is_windowed() && state.layer == self.weights.layer,
+            "compressor startup requires an idle matching owner");
+        self.stream().require_complete()?;
+        let keys: Vec<_> = rows.iter().map(|&row| (row, state.owner)).collect();
+        self.retained_graphs.declare_startup(&keys)?;
+        for &row in rows {
+            ensure!(row > 0 && row <= self.capacity, "compressor startup row exceeds capacity");
+            let library = self.stream().library;
+            let stream = self.stream().raw;
+            // SAFETY: the real admitted state pins ratio-two pending buffers.
+            // Capture records proposal kernels only, without execution/commit.
+            unsafe { library.cuda_graph_begin_capture(stream)?; }
+            let queued = unsafe { self.enqueue(state, row) };
+            let captured = unsafe { library.cuda_graph_end_capture(stream) };
+            match (queued, captured) {
+                (Ok(()), Ok(graph)) => self.insert_graph(graph, row, state.owner)?,
+                (Err(error), Ok(graph)) => {
+                    unsafe { library.cuda_graph_exec_destroy(graph)?; }
+                    return Err(error);
+                }
+                (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
+            }
+        }
+        self.retained_graphs.finish_startup()?;
+        self.graph = None;
+        Ok(())
+    }
     /// # Safety
     /// Query and admitted state slots stay alive and immutable until poll_query
     /// completes or abort_query drains. Peer work may use only disjoint slots.
@@ -953,7 +1019,9 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))), "queued cache query differs");
         let forced_eager = crate::shared::decode_graph::census::eager("layer_row")
-            || !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed();
+            || !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed()
+            || (!self.retained_graphs.contains(&(prepared.rows, state.owner))
+                && !self.retained_graphs.capture_allowed(&(prepared.rows, state.owner)));
         if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
         let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
@@ -1031,7 +1099,9 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 c.position..c.position + u64::from(c.tokens))),
             "compressor query layer, rows or positions differ");
         // Windowed units run eagerly: graphs bake row-0 plane pointers.
-        let uncaptured = !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed();
+        let uncaptured = !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed()
+            || (!self.retained_graphs.contains(&(prepared.rows, state.owner))
+                && !self.retained_graphs.capture_allowed(&(prepared.rows, state.owner)));
         if crate::shared::memory::chain::active() && self.pending_query.is_none()
             && (uncaptured || self.graph.is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner)) {
             // Order the producer on the chain (forked from the query's

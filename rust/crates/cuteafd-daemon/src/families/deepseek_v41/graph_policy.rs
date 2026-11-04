@@ -211,6 +211,59 @@ mod tests {
     }
 
     #[test]
+    fn cuda_sealed_prefill_tails_replay_and_cold_shapes_match_eager() -> Result<()> {
+        let Some(path) = std::env::var_os("CUTEAFD_LAYER_GRAPH_TEST_LIBRARY") else {
+            eprintln!("skip CUDA sealed prefill test: library unset");
+            return Ok(());
+        };
+        // SAFETY: the fixture pins its library, buffers and stream until drained.
+        let library = unsafe { NativeLibrary::load(path)? };
+        let bytes = 2752 * 4;
+        let weights = DeviceAllocation::new(&library, bytes)?;
+        let output = DeviceAllocation::new(&library, bytes)?;
+        let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
+        let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS);
+        bank.declare_startup(&[(0, 52), (0, 54)])?;
+        for rows in [52, 54] {
+            // SAFETY: records only real pinned allocations, without execution.
+            unsafe {
+                library.cuda_graph_begin_capture(stream.raw)?;
+                library.copy_d2d_async(output.buffer, weights.buffer, rows * 4, stream.raw)?;
+                let graph = library.cuda_graph_end_capture(stream.raw)?;
+                bank.insert(0, &weights, rows as u32, graph)?;
+            }
+        }
+        bank.finish_startup()?;
+        let handles = [bank.get_shape(0, &weights, 52), bank.get_shape(0, &weights, 54)];
+        for (cycle, rows) in [54, 52, 54, 52, 128, 2752, 53, 52].into_iter().enumerate() {
+            let input = vec![(cycle + 1) as u8; bytes];
+            let mut expected = vec![0xee; bytes];
+            expected[..rows * 4].copy_from_slice(&input[..rows * 4]);
+            library.copy_h2d(weights.buffer, &input)?;
+            library.copy_h2d(output.buffer, &vec![0xee; bytes])?;
+            assert!(!bank.capture_allowed(0, rows as u32));
+            // SAFETY: every prior iteration drained before reusing this storage.
+            unsafe {
+                if let Some((graph, _)) = bank.get_shape(0, &weights, rows as u32) {
+                    library.cuda_graph_launch(graph, stream.raw)?;
+                } else {
+                    library.copy_d2d_async(output.buffer, weights.buffer, rows * 4, stream.raw)?;
+                }
+                library.cuda_stream_synchronize(stream.raw)?;
+            }
+            let mut actual = vec![0; bytes];
+            library.copy_d2h(&mut actual, output.buffer)?;
+            assert_eq!(actual, expected);
+            assert_eq!([bank.get_shape(0, &weights, 52), bank.get_shape(0, &weights, 54)], handles);
+            assert_eq!(bank.len(), 2);
+        }
+        // SAFETY: all fixture launches drained before bank destruction.
+        unsafe { bank.clear()?; }
+        assert!(!bank.capture_allowed(0, 52));
+        Ok(())
+    }
+
+    #[test]
     fn cuda_layer_graphs_reuse_storage_and_retain_exact_weight_bindings() -> Result<()> {
         let Some(path) = std::env::var_os("CUTEAFD_LAYER_GRAPH_TEST_LIBRARY") else {
             eprintln!("skip CUDA layer graph test: CUTEAFD_LAYER_GRAPH_TEST_LIBRARY unset");

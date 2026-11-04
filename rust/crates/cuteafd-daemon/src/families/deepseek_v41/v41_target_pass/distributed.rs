@@ -74,6 +74,50 @@ impl Drop for ReservedPassGuard<'_, '_, '_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
+    pub(crate) fn capture_startup_prefill(&mut self,
+        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {
+        ensure!(self.state == State::Idle, "startup prefill capture requires idle target pass");
+        let resources = &mut self.resources;
+        // Arbitrary restored tails have no safe padding mask. Keep prefill
+        // sealed eager rather than spending three owners' graph memory on them.
+        let rows = [];
+        bank.capture_startup_producers(&mut resources.execution.producers.windows,
+            &mut resources.execution.producers.sources, &rows)?;
+        for index in resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| index.get_mut().capture_startup(&rows, |layer, row|
+                resources.execution.startup_source(bank, layer, row)))?;
+        }
+        for lane in &mut resources.lanes {
+            let device = lane.device;
+            device.run(|| lane.get_mut().capture_startup_prefill())?;
+        }
+        resources.engram.capture_startup(&rows)?;
+        resources.head.capture_startup(&rows)
+    }
+    pub(crate) fn capture_startup(&mut self,
+        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {
+        ensure!(self.state == State::Idle, "startup graph capture requires idle target pass");
+        let rows: Vec<_> = (1..=cuteafd_core::V41_VERIFY_ROWS).collect();
+        let resources = &mut self.resources;
+        bank.capture_startup_producers(&mut resources.execution.producers.windows,
+            &mut resources.execution.producers.sources, &rows)?;
+        for gpu in 0..2 {
+            let index = resources.indices[gpu].as_mut().context("startup index lane absent")?;
+            let device = index.device;
+            device.run(|| index.get_mut().capture_startup(&rows, |layer, row|
+                resources.execution.startup_source(bank, layer, row)))?;
+            let selections = index.startup_selections();
+            let sinks = resources.execution.startup_sinks();
+            let lane = &mut resources.lanes[gpu];
+            let device = lane.device;
+            // Admitted CUDA planes have native allocation alignment; live views
+            // are validated again before every replay.
+            device.run(|| lane.get_mut().capture_startup(sinks, &selections, true))?;
+        }
+        resources.engram.capture_startup(&rows)?;
+        resources.head.capture_startup(&rows)
+    }
     pub fn bind_execution_plan(&mut self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
         use cuteafd_loader::placement::{HopKind, HopPoint, LayerExecutionPlan};
         let plan = LayerExecutionPlan::new(placement,

@@ -106,6 +106,16 @@ impl Drop for PlacedPreparedLayer<'_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedExecution<'w, 'a> {
+    pub(crate) fn startup_sinks(&self) -> &[cuteafd_ffi::CuteafdDeviceBuffer; 40] { &self.weights.sink_views }
+    pub(crate) fn startup_source(&self, bank: &BackboneCache<'a>, layer: usize, rows: usize)
+        -> Result<crate::families::deepseek_v41::v41_compressor::IndexScoreGeometry> {
+        let index = [2, 8, 14, 20].iter().position(|&source| source == layer)
+            .context("startup index source absent")?;
+        let wave = &self.producers.sources[index];
+        let state = &bank.sources()[index];
+        ensure!(wave.device.id == state.device.id, "startup index source device differs");
+        wave.get().startup_index_geometry(state.get(), rows)
+    }
     /// As [`super::BackboneExecution::abort_queries`], on each producer's GPU.
     pub(crate) fn abort_queries(&mut self) -> Result<()> {
         self.produced = None;

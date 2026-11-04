@@ -75,6 +75,16 @@ extern "C" int32_t cuteafd_load_narrow_f32_bf16(const void* src, void* dst, int6
   return 0;
 }
 
+extern "C" int32_t cuteafd_load_narrow_i64_i32(const void* src, void* dst, int64_t n,
+                                               uint32_t* invalid, void* stream) {
+  (void)stream;
+  if (!src || !dst || !invalid || n < 1) return 1;
+  for (int64_t i = 0; i < n; ++i)
+    if (!cuteafd_load_quant::narrow_i64(static_cast<const int64_t*>(src)[i], static_cast<int32_t*>(dst) + i))
+      *invalid = 1;
+  return 0;
+}
+
 extern "C" int32_t cuteafd_bf16_f32_add_async(const uint16_t* rank0, const uint16_t* rank1,
                                               float* dst, size_t n, int32_t sms, void* stream) {
   (void)stream;

@@ -105,6 +105,10 @@ pub(crate) struct Operand {
 pub(crate) enum Job {
     /// Staged bytes `at..at + bytes` copied unchanged to `dst`.
     Upload { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// Raw UE8M0 block grid expanded by the family's existing AOT program.
+    BlockFp8Scales { family: &'static str, n_blocks: usize, k_blocks: usize, dst: CuteafdDeviceBuffer },
+    /// Staged I64 IDs narrowed on GPU, with checked range status.
+    NarrowI64I32 { dst: CuteafdDeviceBuffer },
     /// BF16 gate parameters converted by the checkpoint's host coefficient
     /// contract (no device transcendental rounding changes).
     ResidualGate { temperature: f32, alpha: CuteafdDeviceBuffer, beta: CuteafdDeviceBuffer },
@@ -354,6 +358,41 @@ impl Step {
                     ensure!(at + bytes <= staged.len() && bytes <= dst.bytes, "upload outside its step");
                     load_timing::upload(bytes, || library.copy_h2d(CuteafdDeviceBuffer { bytes, ..dst },
                         &staged[at..at + bytes]))?;
+                }
+                Job::BlockFp8Scales { family, n_blocks, k_blocks, dst } => {
+                    let bytes = n_blocks.checked_mul(k_blocks).context("block scale grid overflow")?;
+                    ensure!(bytes == self.bytes() && bytes.checked_mul(512).is_some_and(|size| size <= dst.bytes),
+                        "block scale expansion outside its operands");
+                    let source = device_copy(scratch)?;
+                    let programs = library.programs()?;
+                    let program = programs.program(&format!("{family}_block_fp8_scale_prep"), &["scale", "scale_mma"])?;
+                    // SAFETY: the bounded source and expanded destination are live
+                    // on this device until the completion drain below.
+                    unsafe {
+                        program.launch(&[source.cast_mut().cast(), dst.ptr],
+                            &[cuteafd_ffi::programs::Scalar::I32(i32::try_from(n_blocks)?),
+                              cuteafd_ffi::programs::Scalar::I32(i32::try_from(k_blocks)?)], stream)?;
+                        library.cuda_stream_synchronize(stream)?;
+                    }
+                }
+                Job::NarrowI64I32 { dst } => {
+                    let bytes = self.bytes();
+                    ensure!(bytes > 0 && bytes % 8 == 0 && dst.bytes >= bytes / 2,
+                        "I64 narrowing outside its operands");
+                    let status = HostAllocation::named(library, 4, "staging/coordinator-dense-status")?;
+                    let alias = library.cuda_host_buffer_device_alias(status.buffer)?;
+                    // SAFETY: pinned staging, aligned status and I32 destination
+                    // remain live through the drain before status is inspected.
+                    unsafe {
+                        library.load_narrow_i64_i32(staged.as_ptr().cast(), dst.ptr, bytes / 8, alias.ptr, stream)?;
+                        if let Err(error) = library.cuda_stream_synchronize(stream) {
+                            // The status is job-local: quarantine before it drops,
+                            // rather than waiting for Step::run's outer drain.
+                            library.quarantine_module_after_failed_drain();
+                            return Err(error);
+                        }
+                    }
+                    ensure!(status.bytes() == [0; 4], "checkpoint I64 router ID exceeds I32 range");
                 }
                 Job::NarrowF32Bf16 { at, bytes, dst } => {
                     ensure!(at + bytes <= staged.len() && bytes % 4 == 0 && dst.bytes >= bytes / 2,
@@ -988,6 +1027,72 @@ mod window_tests {
 mod absorb_fp8_tests {
     use super::*;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn checked_i64_ids_replay_exactly_and_reject_overflow() -> Result<()> {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let path = dir.path().join("router.bin");
+        for values in [vec![i64::from(i32::MIN), -1, 0, i64::from(i32::MAX)],
+            vec![i64::from(i32::MAX) + 1], vec![i64::from(i32::MIN) - 1]] {
+            let valid = values.iter().all(|&value| i32::try_from(value).is_ok());
+            std::fs::write(&path, values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>())?;
+            let output = crate::shared::memory::DeviceAllocation::new(&library, values.len() * 4)?;
+            let rect = Rect { name: "router".into(), path: path.clone(), base: 0,
+                row_bytes: 8, rows: 0..values.len(), cols: 0..8 };
+            let step = Step { device: 0, rects: vec![rect], jobs: vec![Job::NarrowI64I32 { dst: output.buffer }] };
+            let (_, records) = recording(|| DenseLoad::mount(&library).step(step, std::ptr::null_mut()))?;
+            assert_eq!(records.steps.len(), 1);
+            let layout = super::super::RankLayout::new(records.operands, records.steps, 0)?;
+            assert_eq!(layout.host_staging.table_bytes, 4);
+            let replay = super::super::testing::replay(device, layout, dir.path(), 1, 0);
+            if valid {
+                replay?;
+                let mut actual = vec![0; values.len() * 4];
+                library.copy_d2h(&mut actual, output.buffer)?;
+                let expected = values.iter().flat_map(|&value| i32::try_from(value).unwrap().to_le_bytes()).collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            } else {
+                assert!(format!("{:#}", replay.unwrap_err()).contains("I64 router ID exceeds I32 range"));
+                assert!(!library.is_quarantined_after_failed_drain(), "a drained range error is recoverable");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn i64_status_survives_a_first_drain_failure() -> Result<()> {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let mut source = HostAllocation::new(&library, 8)?;
+        source.bytes_mut().copy_from_slice(&1i64.to_le_bytes());
+        let output = crate::shared::memory::DeviceAllocation::new(&library, 4)?;
+        let step = Step { device: 0, rects: vec![Rect { name: "router".into(),
+            path: fixture.directory().join("unused"), base: 0, row_bytes: 8, rows: 0..1, cols: 0..8 }],
+            jobs: vec![Job::NarrowI64I32 { dst: output.buffer }] };
+        let mut kernels = LoadKernels::new(&library)?;
+        fixture.configure_pack(&library, 0, 1)?;
+        fixture.configure_drain_after(&library, 0)?;
+        let before = fixture.events()?.len();
+        let result = step.run(&mut kernels, &library, source.bytes(), std::ptr::null_mut(), &mut None);
+        assert!(result.is_err());
+        assert!(library.is_quarantined_after_failed_drain());
+        drop(output);
+        drop(source);
+        let events = fixture.events()?;
+        let events = &events[before..];
+        assert!(events.contains('A'), "the job allocated its mapped status: {events}");
+        assert_eq!(events.matches('S').count(), 2, "first drain and outer error drain: {events}");
+        assert!(!events.contains('F'), "neither status nor pinned source can be freed: {events}");
+        Ok(())
+    }
 
     /// GLM 5.3 head geometry (448 rows per head spans 3.5 grid blocks), the
     /// second of two ranks, staged through the mount: every byte and scale

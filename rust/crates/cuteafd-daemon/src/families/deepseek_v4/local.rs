@@ -108,6 +108,13 @@ fn validate_backbone(layers: &[usize], first: usize, end: usize) -> Result<()> {
     Ok(())
 }
 
+fn native_local_inventory(shape_layers: usize, draft_stages: usize, backbone: &[usize]) -> Result<Vec<ExpertLayer>> {
+    let stages = (0..draft_stages).map(|stage| shape_layers.checked_add(stage)
+        .map(|layer| ExpertLayer::BackboneFull { layer }).context("local draft expert layer overflow"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(stages.into_iter().chain(backbone.iter().map(|&layer| ExpertLayer::BackboneFull { layer })).collect())
+}
+
 fn resident_index(layers: &[usize], layer: usize) -> Result<usize> {
     layers.binary_search(&layer).map_err(|_| anyhow::anyhow!("local expert layer {layer} is not resident in {layers:?}"))
 }
@@ -212,6 +219,40 @@ pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &Officia
 impl<'a> LocalExperts<'a> {
     pub fn resident_weights(&self) -> usize { self.resident_weights }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_pushed(device: crate::shared::memory::device::Device<'a>,
+        snapshot: &Path, native_lib: &Path, catalog: &OfficialV41Catalog, draft_stages: usize,
+        backbone: &[usize], max_rows: usize, budget: usize, stream: *mut c_void) -> Result<Option<Self>> {
+        use crate::shared::experts::rtx::{dense::DenseArena, push::{CoordinatorExperts, CoordinatorPush, PushPolicy, WholeOwner}};
+        let policy = PushPolicy::for_snapshot(snapshot)?;
+        if policy == PushPolicy::Mount {
+            return Self::load(device.library, native_lib, catalog, draft_stages, backbone, max_rows, budget, stream);
+        }
+        if backbone.is_empty() && draft_stages == 0 { return Ok(None); }
+        let (selections, push) = policy.plan(|| {
+            let selected = plan(device.library, native_lib, catalog, draft_stages, backbone, max_rows, budget)?;
+            ensure!(selected.layers == backbone, "local push selection differs from admitted backbone");
+            let exl3 = catalog.exl3().is_some();
+            let shape = *catalog.routed_experts();
+            let selections = if exl3 {
+                (0..draft_stages).map(|stage| ExpertLayer::Dspark { stage })
+                    .chain(backbone.iter().map(|&layer| ExpertLayer::BackboneFull { layer })).collect::<Vec<_>>()
+            } else { native_local_inventory(shape.layers, draft_stages, backbone)? };
+            let owners = vec![WholeOwner { rank: 0, selections: selections.clone(), budget: selected.resident_weights }];
+            let experts = if exl3 { CoordinatorExperts::Whole { owners } } else { CoordinatorExperts::Native { owners } };
+            Ok((selections, CoordinatorPush::prepare_alone(snapshot, Some(catalog), 1, Some(experts))?))
+        })?.context("required local expert push was not planned")?;
+        let (pushed, ()) = push.receive_with::<DenseArena<'a>, _>(vec![device], Some(catalog), 0, None, || ());
+        let mut pushed = policy.committed(pushed)?.context("local expert group not committed")?;
+        ensure!(pushed.len() == 1, "local expert push rank count differs");
+        device.run(|| if catalog.exl3().is_some() {
+            Self::from_exl3_weights(device.library, native_lib, catalog, &selections, pushed.remove(0).exl3()?, max_rows)
+        } else {
+            Self::from_native_weights(device.library, catalog, draft_stages, backbone, pushed.remove(0).native()?,
+                max_rows, budget, stream)
+        })
+    }
+
     /// Loads draft stages first, then an exact ordered backbone inventory while
     /// complete layers fit. Callers validate the returned inventory against admission.
     #[allow(clippy::too_many_arguments)]
@@ -225,22 +266,41 @@ impl<'a> LocalExperts<'a> {
         budget: usize,
         stream: *mut c_void,
     ) -> Result<Option<Self>> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("local-experts");
         let shape = *catalog.routed_experts();
         validate_backbone(backbone, shape.first_layer, shape.layers)?;
-        if backbone.is_empty() && draft_stages == 0 {
-            return Ok(None);
-        }
-        let capacities = capacities(max_rows);
+        if backbone.is_empty() && draft_stages == 0 { return Ok(None); }
         if catalog.exl3().is_some() {
             return Self::load_exl3(library, native_lib, catalog, draft_stages, backbone, max_rows, budget);
         }
+        Self::native(library, catalog, draft_stages, backbone, max_rows, budget, stream, None)
+    }
+
+    pub(crate) fn from_native_weights(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        draft_stages: usize, backbone: &[usize], weights: Vec<ExpertWeights<'a>>,
+        max_rows: usize, budget: usize, stream: *mut c_void) -> Result<Option<Self>> {
+        let shape = *catalog.routed_experts();
+        validate_backbone(backbone, shape.first_layer, shape.layers)?;
+        let expected = native_local_inventory(shape.layers, draft_stages, backbone)?;
+        ensure!(weights.iter().map(|w| w.layer).eq(expected), "committed native local experts differ from admission");
+        if weights.is_empty() { return Ok(None); }
+        Self::native(library, catalog, draft_stages, backbone, max_rows, budget, stream, Some(weights))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn native(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        draft_stages: usize, backbone: &[usize], max_rows: usize, budget: usize,
+        stream: *mut c_void, pushed: Option<Vec<ExpertWeights<'a>>>) -> Result<Option<Self>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("local-experts");
+        let shape = *catalog.routed_experts();
+        let capacities = capacities(max_rows);
+        let mut pushed = pushed.map(Vec::into_iter);
         let mut states = Vec::new();
         let mut scratch_bytes = 0usize;
         for &capacity in &capacities {
             let kernel = match library.v41_local_expert_kernel(capacity) {
                 Ok(kernel) => kernel,
                 Err(error) => {
+                    ensure!(pushed.is_none(), "committed native experts lack their execution kernel: {error:#}");
                     tracing::warn!("no coordinator expert kernels for this geometry ({error:#}); \
                         build with CUTEAFD_*_EXPERT_FAMILIES=<family>:rtx_backbone to keep layers local");
                     return Ok(None);
@@ -258,20 +318,30 @@ impl<'a> LocalExperts<'a> {
         let mut stages = Vec::new();
         for stage in 0..draft_stages {
             let layer = ExpertLayer::BackboneFull { layer: shape.layers + stage };
-            let weights = ExpertWeights::load(library, catalog, layer, remaining)
-                .with_context(|| format!("dSpark stage {stage} experts with {remaining} bytes left"))?;
-            remaining -= weights.budget().resident_bytes;
+            let weights = match &mut pushed {
+                Some(weights) => weights.next().context("committed dSpark stage absent")?,
+                None => ExpertWeights::load(library, catalog, layer, remaining)
+                    .with_context(|| format!("dSpark stage {stage} experts with {remaining} bytes left"))?,
+            };
+            ensure!(weights.budget().resident_bytes == ExpertWeights::plan(library, catalog, layer)?.resident_bytes,
+                "committed dSpark resident bytes differ from admission");
+            remaining = remaining.checked_sub(weights.budget().resident_bytes)
+                .context("dSpark committed weights exceed local budget")?;
             stages.push(weights);
         }
         let mut layers = Vec::new();
         for &layer in backbone {
             let plan = ExpertWeights::plan(library, catalog, ExpertLayer::BackboneFull { layer })?;
-            if plan.peak_device_bytes()? > remaining {
-                break;
-            }
-            let weights = ExpertWeights::load(library, catalog, ExpertLayer::BackboneFull { layer }, remaining)
-                .with_context(|| format!("coordinator expert layer {layer} with {remaining} bytes left"))?;
-            remaining -= weights.budget().resident_bytes;
+            if pushed.is_none() && plan.peak_device_bytes()? > remaining { break; }
+            let weights = match &mut pushed {
+                Some(weights) => weights.next().context("committed backbone layer absent")?,
+                None => ExpertWeights::load(library, catalog, ExpertLayer::BackboneFull { layer }, remaining)
+                    .with_context(|| format!("coordinator expert layer {layer} with {remaining} bytes left"))?,
+            };
+            ensure!(weights.budget().resident_bytes == plan.resident_bytes,
+                "committed backbone resident bytes differ from admission");
+            remaining = remaining.checked_sub(weights.budget().resident_bytes)
+                .context("committed backbone weights exceed local budget")?;
             tracing::debug!(layer, resident = weights.budget().resident_bytes, remaining, "coordinator expert layer resident");
             layers.push(weights);
         }
@@ -543,6 +613,19 @@ impl<'a> LocalExperts<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_push_inventory_keeps_draft_stages_before_exact_backbone() -> Result<()> {
+        use ExpertLayer::BackboneFull;
+        assert_eq!(native_local_inventory(43, 3, &[2, 5])?, vec![
+            BackboneFull { layer: 43 }, BackboneFull { layer: 44 }, BackboneFull { layer: 45 },
+            BackboneFull { layer: 2 }, BackboneFull { layer: 5 }]);
+        assert_eq!(native_local_inventory(43, 1, &[])?, vec![BackboneFull { layer: 43 }]);
+        assert_eq!(native_local_inventory(43, 0, &[5])?, vec![BackboneFull { layer: 5 }]);
+        assert!(native_local_inventory(43, 0, &[])?.is_empty());
+        assert!(native_local_inventory(usize::MAX, 2, &[]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn sparse_backbone_inventory_preserves_absolute_ids_and_stage_namespace() -> Result<()> {

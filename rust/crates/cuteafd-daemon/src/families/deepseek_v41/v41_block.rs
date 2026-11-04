@@ -11,6 +11,7 @@ pub(crate) use encoder_suffix::EncoderSuffix;
 #[derive(Clone, Copy)]
 enum Phase {
     Idle,
+    StartupAttention(usize),
     Prepared(QueryBinding, usize, bool),
     Attention(QueryBinding, usize),
     QueuedFfn(QueryBinding, usize),
@@ -123,6 +124,34 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
         })();
         if result.is_err() { self.reset(); }
         result
+    }
+    /// Bind drained startup storage without constructing a completed query.
+    pub(crate) fn rebind_startup(
+        &mut self,
+        weights: &'w crate::families::deepseek_v41::v41_backbone_hc::BackboneHcWeights<'a>,
+    ) -> Result<()> {
+        ensure!(matches!(self.phase, Phase::Idle) && self.tokens.is_empty(),
+            "startup mHC rebind requires an idle block");
+        let [attention, ffn] = weights.prepare_bindings(&self.attention, &self.ffn)?;
+        // SAFETY: startup has no submitted consumers; both bindings were drained.
+        unsafe {
+            self.attention.install_binding(attention);
+            self.ffn.install_binding(ffn);
+        }
+        self.layer = weights.layer();
+        Ok(())
+    }
+    /// # Safety
+    /// Only a capture-only tail may follow. No work is executed or published;
+    /// reset must run after capture on both success and error.
+    pub(crate) unsafe fn prepare_startup_ffn(&mut self, rows: usize) -> Result<()> {
+        ensure!(matches!(self.phase, Phase::Idle) && self.tokens.is_empty(),
+            "startup FFN requires an idle block");
+        // SAFETY: this changes host phase only; the recorded graph is not run.
+        unsafe { self.attention.graph_begin_state(rows)?; }
+        self.ffn.invalidate();
+        self.phase = Phase::StartupAttention(rows);
+        Ok(())
     }
     /// Rebind an idle lane to decoder layer 20 and restore retained encoder rows.
     pub fn initialize_decoder(&mut self, decoder: &'w crate::families::deepseek_v41::v41_backbone_hc::BackboneHcWeights<'a>,
@@ -501,6 +530,29 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
             && !projected.ptr.is_null() && projected.bytes == rows * 10240,
             "queued block attention result differs");
         self.phase = Phase::QueuedFfn(binding, rows);
+        // SAFETY: runtime identity and projection geometry were checked above.
+        unsafe { self.enqueue_ffn_geometry(rows, projected, stream) }
+    }
+    /// # Safety
+    /// Stream is capturing, never executing this uninitialized startup storage.
+    /// The owner must be reset after capture, including errors.
+    pub(crate) unsafe fn record_startup_ffn(
+        &mut self, rows: usize, projected: CuteafdDeviceBuffer,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<CuteafdDeviceBuffer> {
+        ensure!(matches!(self.phase, Phase::StartupAttention(n) if n == rows)
+            && projected.device_id == self.inputs()[0].device_id
+            && !projected.ptr.is_null() && projected.bytes == rows * 10240,
+            "startup FFN geometry differs");
+        // SAFETY: the startup caller retains stable storage and never runs it.
+        unsafe { self.enqueue_ffn_geometry(rows, projected, stream) }
+    }
+    unsafe fn enqueue_ffn_geometry(
+        &mut self, rows: usize, projected: CuteafdDeviceBuffer,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<CuteafdDeviceBuffer> {
+        // SAFETY: either a validated live query or a capture-only owner supplies
+        // these same stable planes. Both paths record exactly these operations.
         unsafe { self.attention.enqueue_finish(Some(projected), stream)?; }
         for ((dst, src), bytes) in self.ffn.inputs().into_iter()
             .zip(self.attention.output_storage()).zip([rows * 40960, rows * 16]) {

@@ -5,9 +5,9 @@ use anyhow::Result;
 /// Each GPU's dense plan and destination, ranks `sparks..`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn plan_ranks<'a>(snapshot: &std::path::Path, records: coordinator_dense::Records,
-    devices: [Device<'a>; 2], sparks: usize)
+    devices: &[Device<'a>], sparks: usize)
     -> Result<(Vec<crate::shared::experts::rtx::push::DensePlan>, Vec<coordinator_dense::DenseArena<'a>>)> {
-    coordinator_dense::plan_records(snapshot, records, &devices, sparks)
+    coordinator_dense::plan_records(snapshot, records, devices, sparks)
 }
 
 #[cfg(test)]

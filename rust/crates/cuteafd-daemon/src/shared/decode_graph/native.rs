@@ -29,11 +29,23 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
         std::ptr::eq(owner.pins, weights).then_some((owner.raw, rows))
     }
     pub fn enable_small_shapes(&mut self) { self.retain_small = true; }
+    pub fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
+        ensure!(keys.iter().all(|&(layer, rows)| layer < 40 && (1..=self.decode_rows).contains(&rows)),
+            "startup layer graph key exceeds decode geometry");
+        self.bank.declare_startup(keys)?;
+        self.retain_small = true;
+        Ok(())
+    }
+    pub fn finish_startup(&mut self) -> Result<()> { self.bank.finish_startup() }
+    pub fn capture_allowed(&self, layer: usize, rows: u32) -> bool {
+        self.bank.capture_allowed(&(layer, rows))
+    }
     /// # Safety
     /// All launches using the containing wave's storage have drained. The caller
     /// retains that storage until clear. On failure caller still owns graph.
     pub unsafe fn insert(&mut self, layer: usize, weights: &'w W, rows: u32, graph: *mut c_void) -> Result<()> {
         ensure!(layer < 40 && (1..=4096).contains(&rows) && !graph.is_null(), "invalid layer graph binding");
+        ensure!(self.capture_allowed(layer, rows), "layer graph capture outside startup inventory or after seal");
         let different_owner = self.bank.count(|(l, _)| *l == layer) > 0
             && self.current[layer].and_then(|r| self.bank.get(&(layer, r)))
                 .is_some_and(|owner| !std::ptr::eq(owner.pins, weights));
@@ -94,6 +106,13 @@ impl<'a> RowGraphs<'a> {
         Self { library, bank: GraphBank::new(None), decode_rows, site }
     }
     pub fn get(&self, rows: usize) -> Option<*mut c_void> { self.bank.get(&rows).map(|owner| owner.raw) }
+    pub fn declare_startup(&mut self, rows: &[usize]) -> Result<()> {
+        ensure!(rows.iter().all(|r| (1..=self.decode_rows).contains(r)),
+            "startup row graph key exceeds decode geometry");
+        self.bank.declare_startup(rows)
+    }
+    pub fn finish_startup(&mut self) -> Result<()> { self.bank.finish_startup() }
+    pub fn capture_allowed(&self, rows: usize) -> bool { self.bank.capture_allowed(&rows) }
     /// # Safety
     /// All launches on this wave's storage drained. The wave retains weights,
     /// workspace, geometry and buffers until clear, then drops them afterward.
@@ -105,6 +124,7 @@ impl<'a> RowGraphs<'a> {
     }
     pub unsafe fn insert(&mut self, rows: usize, graph: *mut c_void) -> Result<()> {
         ensure!((1..=4096).contains(&rows) && !graph.is_null(), "invalid row graph binding");
+        ensure!(self.capture_allowed(rows), "row graph capture outside startup inventory or after seal");
         let device = self.library.cuda_get_device()?;
         // SAFETY: the containing wave owns and pins every captured allocation.
         let owner = unsafe { GraphOwner::new(self.library, device, graph, ())? };

@@ -97,6 +97,17 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_draft_logits(&self, sequences: usize) -> Result<Vec<f32>> {
+        let slot = self.decode_workspace.borrow();
+        let w = slot.as_ref().context("no V4 draft step ran")?;
+        let bytes = sequences.checked_mul(self.draft_block()).and_then(|n| n.checked_mul(self.cfg.vocab_size))
+            .and_then(|n| n.checked_mul(4)).context("V4 draft logit readback overflow")?;
+        ensure!(bytes > 0 && bytes <= w.vocab_logits.buffer.bytes, "V4 draft logit readback exceeds arena");
+        Ok(self.download(&w.vocab_logits, bytes)?.chunks_exact(4)
+            .map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect())
+    }
+
     /// Proposes `draft_block()` tokens after each request's next token.
     /// `inputs` holds the block's input tokens per request: the token, then
     /// the noise token (embedded on the device).
@@ -238,6 +249,67 @@ impl<'a> Engine<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires sealed V4 checkpoint, real Spark peers and CUTEAFD_PUSH_DUMP via golden-run --native-test"]
+    fn native_push_dumps_each_requested_batch() -> Result<()> {
+        use crate::families::deepseek_v4::{self as family, pool::PoolAllocator};
+        use crate::shared::{golden_scores::push_regression as regression, experts::rtx::push::PushPolicy};
+        use clap::Parser;
+        use std::path::PathBuf;
+        let _ = tracing_subscriber::fmt().with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
+        #[derive(Parser)]
+        struct Args { #[command(flatten)] engine: family::EngineArgs }
+        let env = |key| std::env::var(key).with_context(|| format!("V4 push regression needs {key}"));
+        let snapshot = env("CUTEAFD_GOLDEN_SNAPSHOT")?;
+        let output = PathBuf::from(env("CUTEAFD_PUSH_DUMP")?);
+        ensure!(PushPolicy::for_snapshot(std::path::Path::new(&snapshot))? == PushPolicy::Required,
+            "V4 push regression requires a push namespace");
+        let peers = env("CUTEAFD_GOLDEN_PEERS")?;
+        ensure!(!peers.is_empty(), "V4 push regression needs real Spark peers");
+        let mut argv = vec!["v4-push-regression".into(), "--snapshot".into(), snapshot,
+            "--peers".into(), peers, "--native-lib".into(), env("CUTEAFD_NATIVE_LIB")?,
+            "--manifest".into(), env("CUTEAFD_PROGRAM_MANIFEST")?, "--dspark".into(),
+            "--max-sequences".into(), "2".into(), "--pool-tokens".into(), "16384".into()];
+        for (key, flag) in [("CUTEAFD_TEST_RTX_EXPERT_LAYERS", "--rtx-expert-layers"),
+            ("CUTEAFD_TEST_SPLIT_DEVICE", "--split-device")] {
+            if let Ok(value) = std::env::var(key) { argv.extend([flag.into(), value]); }
+        }
+        let args = Args::try_parse_from(argv)?.engine;
+        let loaded = family::load(&args)?;
+        family::with_engine(&loaded, &args, None, |_| Ok(0), |engine, transports, runtime, _| {
+            let mut pool = PoolAllocator::for_engine(engine)?;
+            let width = engine.draft_block();
+            ensure!(width > 0, "V4 push regression needs resident draft stages");
+            for sequences in [1, 2] {
+                let prompts = regression::prompts(sequences);
+                let mut placements = Vec::new();
+                for prompt in &prompts {
+                    let mut placement = pool.admit(prompt.len() + width + 16)?;
+                    for chunk in prompt.chunks(engine.prefill_capacity().min(1024)) {
+                        engine.prefill(&mut placement, chunk, transports, runtime, 0, None)?;
+                    }
+                    placements.push(placement);
+                }
+                regression::draft_dump(&output, sequences, width, width, loaded.cfg.vocab_size, || {
+                    let requests = placements.iter().enumerate().map(|(slot, placement)| DraftRequest {
+                        placement, token: 42 + slot as u32 }).collect::<Vec<_>>();
+                    let inputs = requests.iter().flat_map(|request| std::iter::once(request.token)
+                        .chain(std::iter::repeat_n(loaded.cfg.dspark_noise_token_id as u32, width - 1)))
+                        .collect::<Vec<_>>();
+                    Ok((engine.draft(&requests, &inputs)?, engine.last_draft_logits(sequences)?))
+                })?;
+                let teacher = regression::teacher_rows();
+                let mut batch = placements.iter_mut().map(|placement| (placement, teacher.as_slice())).collect::<Vec<_>>();
+                let values = engine.verify(&mut batch, transports, runtime)?;
+                regression::target_dump(&output, sequences, loaded.cfg.vocab_size, &values)?;
+                engine.drain_state()?;
+                for placement in placements { pool.release(placement); }
+            }
+            Ok(())
+        })
+    }
 
     #[test]
     fn checked_draft_extent_accepts_only_installed_widths_and_live_rows() {

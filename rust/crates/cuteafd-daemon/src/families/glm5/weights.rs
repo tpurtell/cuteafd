@@ -762,11 +762,13 @@ impl<'a> GlmLoader<'a> {
     /// heads a head split gives it); one rank keeps the whole vector.
     fn head_vector(&self, ranks: usize, name: &str) -> Result<Vec<DeviceAllocation<'a>>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
-        let (bytes, dtype, shape) = self.raw(name)?;
-        ensure!(dtype == DType::Bf16 && shape.len() == 1 && shape[0] % ranks == 0,
-            "{name}: expected a BF16 [heads] vector over {ranks} GPUs, found {dtype:?} {shape:?}");
-        let part = bytes.len() / ranks;
-        (0..ranks).map(|rank| self.on_rank(rank, |_| self.upload(&bytes[rank * part..][..part]))).collect()
+        let meta = &self.catalog.tensor(name)?.metadata;
+        ensure!(ranks > 0 && meta.dtype == DType::Bf16 && meta.shape.len() == 1 && meta.shape[0] % ranks == 0,
+            "{name}: expected a BF16 [heads] vector over {ranks} GPUs, found {:?} {:?}", meta.dtype, meta.shape);
+        (0..ranks).map(|rank| {
+            let (land, bytes) = landing::col_share(self.catalog, name, ranks, rank)?;
+            self.on_rank(rank, |_| self.landed(&[land], bytes))
+        }).collect()
     }
 
     fn replicated(&self, ranks: usize, read: impl FnOnce() -> Result<Vec<u8>>) -> Result<Vec<DeviceAllocation<'a>>> {

@@ -243,10 +243,18 @@ def _write_export(directory: Path, role: str) -> Path:
     return path
 
 
-def test_manifest_writer_accepts_tp6_and_rejects_a_wrong_extent(tmp_path: Path) -> None:
-    role = "tp6"
+@pytest.mark.parametrize("role,width,wrong_width", [
+    ("tp2", 1152, 200),
+    ("tp3", 768, 200),
+    ("tp6", 384, 200),
+    ("tp8", 288, 200),
+    ("tp8", 288, 384),
+])
+def test_manifest_writer_accepts_native_width_and_rejects_a_wrong_extent(
+    tmp_path: Path, role: str, width: int, wrong_width: int,
+) -> None:
     export_dir = tmp_path / f"v41_spark_{role}_experts"
-    _write_export(export_dir, "spark_tp6")
+    _write_export(export_dir, f"spark_{role}")
     output = tmp_path / "V41_EXPERT_TP_AOT.json"
     # The writer requires the built library whenever a role is requested; a stub
     # file exercises the hash/validation path without any native build.
@@ -264,15 +272,15 @@ def test_manifest_writer_accepts_tp6_and_rejects_a_wrong_extent(tmp_path: Path) 
     result = invoke()
     assert result.returncode == 0, result.stderr
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert document["spark_tp_roles"] == ["tp6"]
-    assert document["manifests"]["tp6"]["spark_tp_degree"] == 6
-    assert document["manifests"]["tp6"]["geometry"]["intermediate"] == 384
-    assert document["manifests"]["tp6"]["geometry"]["kernel_intermediate"] == 384
+    assert document["spark_tp_roles"] == [role]
+    assert document["manifests"][role]["spark_tp_degree"] == int(role.removeprefix("tp"))
+    assert document["manifests"][role]["geometry"]["intermediate"] == width
+    assert document["manifests"][role]["geometry"]["kernel_intermediate"] == width
 
-    # A geometry that disagrees with the official 384 must fail closed.
+    # Reject both malformed K32 extents and stale H128 padding.
     manifest_path = export_dir / "v41_experts.json"
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    payload["geometry"]["kernel_intermediate"] = 640
+    payload["geometry"]["kernel_intermediate"] = wrong_width
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
     failed = invoke()
     assert failed.returncode == 2

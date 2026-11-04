@@ -74,7 +74,11 @@ impl<'w, 'a> Normalize<'w, 'a> {
         } })();
         let drained = self.stream.wait().await;
         queued.and(drained)?;
-        if self.graphs.get(rows).is_none() && !crate::shared::decode_graph::census::eager("head") {
+        self.capture_ready(rows)
+    }
+    fn capture_ready(&mut self, rows: usize) -> Result<()> {
+        if self.graphs.get(rows).is_none() && self.graphs.capture_allowed(rows)
+            && !crate::shared::decode_graph::census::eager("head") {
             let lib = self.weights.library;
             unsafe { lib.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued = unsafe { self.enqueue(rows) };
@@ -138,6 +142,19 @@ pub(crate) struct DistributedTargetHead<'w, 'a> {
     greedy: Vec<(u32, f32)>,
 }
 impl<'w, 'a> DistributedTargetHead<'w, 'a> {
+    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+        ensure!(self.binding.is_none() && self.selected.is_empty(), "target head startup requires an idle owner");
+        ensure!(rows.iter().all(|&row| row <= self.capacity), "target head startup row exceeds capacity");
+        let device = self.normalize.device;
+        device.run(|| {
+            let norm = self.normalize.get_mut();
+            norm.stream.require_complete()?;
+            norm.graphs.declare_startup(rows)?;
+            for &row in rows { norm.capture_ready(row)?; }
+            norm.graphs.finish_startup()
+        })?;
+        self.vocabulary.capture_startup(rows)
+    }
     pub fn device_bytes(capacity: usize, split: usize) -> Result<[usize; 2]> {
         let mut bytes = DistributedVocabularyWave::device_bytes(capacity, split)?;
         bytes[1] += capacity * INPUT_STRIDES.iter().sum::<usize>()

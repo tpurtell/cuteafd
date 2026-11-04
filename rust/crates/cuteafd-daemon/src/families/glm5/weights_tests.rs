@@ -11,6 +11,41 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::FileExt;
 
 #[test]
+fn query_head_vectors_plan_contiguous_push_slices_tp1_tp2_tp4() -> Result<()> {
+    use crate::shared::experts::rtx::dense::append;
+    use cuteafd_loader::push_load::builder::Builder;
+    let root = tempfile::tempdir()?;
+    let mut config = fixture::glm5_config();
+    config["n_routed_experts"] = serde_json::json!(1);
+    config["num_experts_per_tok"] = serde_json::json!(1);
+    let mut tensors = fixture::glm5_tensors(|name, n, k| fixture::fp8(name, n, k, None));
+    let names = ["model.layers.0.self_attn.query_scale_s", "model.layers.0.self_attn.query_scale_b"];
+    tensors.extend(names.iter().map(|name| fixture::t(*name, "BF16", &[64])));
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    for name in names {
+        let tensor = catalog.tensor(name)?;
+        let expected: Vec<_> = (0..128).map(|i| i as u8).collect();
+        std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+            .write_all_at(&expected, tensor.metadata.byte_offset)?;
+        for ranks in [1, 2, 4] {
+            let mut builder = Builder::new(root.path(), vec![128 / ranks as u64; ranks]);
+            for rank in 0..ranks {
+                let (land, bytes) = landing::col_share(&catalog, name, ranks, rank)?;
+                assert_eq!(bytes, 128 / ranks);
+                assert_eq!(land.rows, 0..1);
+                assert_eq!(land.cols, rank * bytes..(rank + 1) * bytes);
+                let (rect, _) = land.rect(&catalog)?;
+                append(&rect, &mut builder, rank as u32, 0)?;
+                assert_eq!(landing::read(&catalog, &[land], bytes)?, expected[rank * bytes..(rank + 1) * bytes]);
+            }
+            builder.finish()?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn tp2_peer_router_names_match_installed_checkpoint_headers() -> Result<()> {
     let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));

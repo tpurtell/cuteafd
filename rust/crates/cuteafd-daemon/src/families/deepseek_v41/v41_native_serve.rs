@@ -333,12 +333,46 @@ mod planned_peer_tests {
     }
 }
 
+fn parse_graph_startup_prototype(value: Option<&std::ffi::OsStr>) -> Result<bool> {
+    match value.map(std::ffi::OsStr::to_str) {
+        None | Some(Some("0")) => Ok(false),
+        Some(Some("1")) => Ok(true),
+        _ => anyhow::bail!("CUTEAFD_DIAG_GRAPH_STARTUP_PROTOTYPE must be 0 or 1 (unset means off)"),
+    }
+}
+fn graph_startup_prototype(args: &crate::cli::NativeServeArgs) -> Result<bool> {
+    let value = std::env::var_os("CUTEAFD_DIAG_GRAPH_STARTUP_PROTOTYPE");
+    let enabled = parse_graph_startup_prototype(value.as_deref())?;
+    ensure!(!enabled || (args.rtx_gpus == 2 && !args.tp2_attention
+        && !args.tp2_query_projection && !args.tp2_output_projection),
+        "CUTEAFD_DIAG_GRAPH_STARTUP_PROTOTYPE requires two RTX GPUs with unsplit target attention/query/output");
+    Ok(enabled)
+}
+#[cfg(test)]
+mod graph_startup_tests {
+    use super::parse_graph_startup_prototype;
+    use std::ffi::OsStr;
+    #[test]
+    fn prototype_switch_is_strict_and_default_off() {
+        assert!(!parse_graph_startup_prototype(None).unwrap());
+        assert!(!parse_graph_startup_prototype(Some(OsStr::new("0"))).unwrap());
+        assert!(parse_graph_startup_prototype(Some(OsStr::new("1"))).unwrap());
+        for value in ["", "true", "false", "2", " 1", "1 "] {
+            assert!(parse_graph_startup_prototype(Some(OsStr::new(value))).is_err());
+        }
+        #[cfg(unix)] {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(parse_graph_startup_prototype(Some(OsStr::from_bytes(&[0xff]))).is_err());
+        }
+    }
+}
 fn worker(
     args: crate::cli::NativeServeArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
+    graph_startup_prototype(&args)?;
     ensure!(!args.tp2_dspark_experts || (args.rtx_gpus==2 && args.dspark),
         "--tp2-dspark-experts requires --rtx-gpus 2 and --dspark");
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");

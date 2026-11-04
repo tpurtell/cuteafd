@@ -1,7 +1,7 @@
 //! Draft transformer chain with optional shared embedding and terminal heads.
 use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner};
 use super::{DsparkStage, DsparkTerminal, DsparkWeights};
-use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
+use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowGeometry, WindowLease, WindowRead};
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::{ensure, Context, Result};
@@ -160,6 +160,31 @@ impl DsparkChain<'_, '_> {
         self.terminal.as_mut().context("dSpark chain has no terminal")?
             .stage_sampling(rngs, temperatures)
     }
+    pub(crate) fn capture_startup(&mut self, windows: [&DsparkWindow<'_>; 3]) -> Result<()> {
+        ensure!(self.pending.is_none() && self.ready.is_none(), "draft startup requires idle owner");
+        self.synchronize()?;
+        let geometry = windows.map(DsparkWindow::startup_geometry);
+        ensure!(geometry.iter().all(|g| g.ring.device_id == self.tokens.buffer.device_id),
+            "draft startup ring device differs");
+        let counts = self.tokens.buffer.bytes / 4;
+        let widths: Vec<_> = [5, 7].into_iter().filter(|&w| w <= self.maximum).collect();
+        let keys: Vec<_> = widths.iter().flat_map(|&w| (1..=counts).map(move |count| (count, w))).collect();
+        self.graphs.declare_startup(&keys)?;
+        let original = self.width;
+        let recorded = (|| -> Result<()> {
+            for width in widths {
+                self.set_width(width)?;
+                for count in 1..=counts {
+                    // SAFETY: real ring/weight owners stay pinned; capture only
+                    // records commands and never reads uninitialized metadata.
+                    unsafe { self.capture_geometry(&geometry, count)?; }
+                }
+            }
+            self.graphs.finish_startup()
+        })();
+        let restored = self.set_width(original);
+        recorded.and(restored)
+    }
     pub fn has_graph(&self, count: usize) -> bool { self.graphs.contains(&(count, self.width)) }
     pub fn width(&self) -> usize { self.width }
     /// Select the draft width (5 or 7, within the loaded maximum) for the next
@@ -290,6 +315,9 @@ impl DsparkChain<'_, '_> {
         Ok(())
     }
     unsafe fn enqueue(&mut self, reads: &[WindowRead; 3], requests: usize) -> Result<()> {
+        unsafe { self.enqueue_geometry(&reads.each_ref().map(WindowRead::geometry), requests) }
+    }
+    unsafe fn enqueue_geometry(&mut self, reads: &[WindowGeometry; 3], requests: usize) -> Result<()> {
         let forward = self.timing.begin_retained("forward", "forward", None, requests * self.width, self.stream.raw)?;
         if let Some(embedding) = self.embedding {
             let output = self.inputs();
@@ -325,7 +353,7 @@ impl DsparkChain<'_, '_> {
             }
             let layer = self.timing.begin_retained("forward", "layer", Some(stage), requests * self.width, self.stream.raw)?;
             unsafe {
-                self.stages[stage].enqueue_on(&reads[stage], requests, self.stream.raw)?;
+                self.stages[stage].enqueue_geometry(&reads[stage], requests, self.stream.raw)?;
             }
             self.timing.end_retained(layer, self.stream.raw)?;
         }
@@ -393,12 +421,16 @@ impl DsparkChain<'_, '_> {
     }
     /// Warmup completed; never suspend while capturing.
     unsafe fn capture_ready(&mut self, reads: &[WindowRead; 3], count: usize) -> Result<()> {
+        unsafe { self.capture_geometry(&reads.each_ref().map(WindowRead::geometry), count) }
+    }
+    unsafe fn capture_geometry(&mut self, reads: &[WindowGeometry; 3], count: usize) -> Result<()> {
+        ensure!(self.graphs.capture_allowed(&(count, self.width)), "draft capture forbidden after startup");
         unsafe {
             self.stream
                 .library
                 .cuda_graph_begin_capture(self.stream.raw)?;
         }
-        let launched = unsafe { self.enqueue(reads, count) };
+        let launched = unsafe { self.enqueue_geometry(reads, count) };
         let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         self.invalidate();
         match (launched, captured) {

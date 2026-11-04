@@ -39,6 +39,12 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
             ready: None, pending: None,
         })
     }
+    pub(crate) fn capture_startup(&mut self, windows: [&DsparkWindow<'_>; 3]) -> Result<()> {
+        ensure!(self.pending.is_none() && self.ready.is_none(), "distributed draft startup requires idle owner");
+        let device = self.chain.device;
+        device.run(|| self.chain.get_mut().capture_startup(windows))?;
+        self.terminal.capture_startup(self.chain.tokens.buffer.bytes / 4, self.chain.maximum)
+    }
     pub fn width(&self) -> usize { self.chain.width }
     pub fn set_width(&mut self, width: usize) -> Result<()> {
         ensure!(self.pending.is_none(), "distributed draft still pending");
@@ -92,7 +98,7 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
         if let Some(captured) = chain.graphs.get(&(count, chain.width)) {
             ensure!(captured.pins == reads.each_ref().map(|read| read.owner), "distributed draft capture owner differs");
         }
-        let pending = PendingDraft { count, reads, warming: !chain.has_graph(count) && !crate::shared::decode_graph::census::eager("dspark"), armed: true,
+        let pending = PendingDraft { count, reads, warming: !chain.has_graph(count) && chain.graphs.capture_allowed(&(count, chain.width)) && !crate::shared::decode_graph::census::eager("dspark"), armed: true,
             library: chain.stream.library, stream: chain.stream.raw,
             peers: chain.stages.each_ref().map(DsparkStage::peer_stream) };
         // The local guard drains partial submission failures under GPU1 before

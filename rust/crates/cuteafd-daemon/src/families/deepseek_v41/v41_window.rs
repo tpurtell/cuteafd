@@ -681,6 +681,35 @@ impl WindowWave<'_, '_> {
         }
         Ok(())
     }
+    pub(crate) fn capture_startup(&mut self, state: &WindowState<'_>, rows: &[usize]) -> Result<()> {
+        ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none()
+            && !self.window.is_windowed() && state.layer == self.weights.layer,
+            "window startup requires an idle matching owner");
+        self.stream().require_complete()?;
+        let keys: Vec<_> = rows.iter().map(|&row| (row, state.owner)).collect();
+        self.graphs.declare_startup(&keys)?;
+        for &row in rows {
+            ensure!(row > 0 && row <= self.capacity, "window startup row exceeds capacity");
+            let library = self.stream().library;
+            let stream = self.stream().raw;
+            // SAFETY: capture records the exact proposal operations on owned
+            // buffers; it neither executes them nor commits cache storage.
+            unsafe { library.cuda_graph_begin_capture(stream)?; }
+            let queued = unsafe { self.enqueue(row) };
+            let captured = unsafe { library.cuda_graph_end_capture(stream) };
+            match (queued, captured) {
+                (Ok(()), Ok(graph)) => self.insert_graph(row, state.owner, graph)?,
+                (Err(error), Ok(graph)) => {
+                    unsafe { library.cuda_graph_exec_destroy(graph)?; }
+                    return Err(error);
+                }
+                (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
+            }
+        }
+        self.graphs.finish_startup()?;
+        self.graph = None;
+        Ok(())
+    }
     /// # Safety
     /// Query and admitted state slots stay alive and immutable until poll_query
     /// completes or abort_query drains. Peer work may use only disjoint slots.
@@ -693,7 +722,9 @@ impl WindowWave<'_, '_> {
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))), "queued cache query differs");
         let forced_eager = crate::shared::decode_graph::census::eager("window")
-            || !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed();
+            || !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed()
+            || (!self.graphs.contains(&(prepared.rows, state.owner))
+                && !self.graphs.capture_allowed(&(prepared.rows, state.owner)));
         if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
         let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
@@ -782,7 +813,9 @@ impl WindowWave<'_, '_> {
                     self.storage.input.buffer, query.hidden, query.hidden.bytes, self.stream().raw,
                 )?;
             }
-            if !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed() {
+            if !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed()
+                || (!self.graphs.contains(&(prepared.rows, state.owner))
+                    && !self.graphs.capture_allowed(&(prepared.rows, state.owner))) {
                 // An uncached prefill tail or a windowed unit (graphs bake
                 // row-0 plane pointers): run it once eagerly, never capture it.
                 // Launch and return: the chain orders consumers (outside a

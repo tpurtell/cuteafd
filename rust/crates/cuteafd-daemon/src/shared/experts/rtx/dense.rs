@@ -191,6 +191,7 @@ impl RankLayout {
                     // BF16 -> F32 input, coefficient pairs, then two output vectors.
                     Job::ResidualGate { .. } => step.bytes().checked_mul(10)
                         .context("residual coefficient host scratch overflow")?,
+                    Job::NarrowI64I32 { .. } => 4,
                     Job::ScaleCodes { .. } => crate::shared::fp8_load_quant::scale_code_table_bytes(1)?,
                     _ => 0,
                 };

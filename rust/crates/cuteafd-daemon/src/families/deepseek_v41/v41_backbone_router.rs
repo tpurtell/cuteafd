@@ -593,6 +593,33 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         }
         unsafe { self.capture_ready(rows) }
     }
+    pub(crate) fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
+        self.stream().require_complete()?;
+        self.graphs.declare_startup(keys)?;
+        self.other_graphs.declare_startup(keys)
+    }
+    pub(crate) fn capture_startup(&mut self, rows: u32) -> Result<()> {
+        self.validate(rows)?;
+        self.stream().require_complete()?;
+        // SAFETY: capture records stable owned buffers and borrowed weights;
+        // no kernel executes and no routes are published during startup.
+        let local = !self.full_request;
+        let result = (|| -> Result<()> {
+            // Runtime swaps banks when expert placement changes the handoff mode.
+            for mode in [local, !local] {
+                self.set_local_mode(mode)?;
+                // SAFETY: both banks record the same stable owner-local enqueue.
+                unsafe { self.capture_ready(rows)?; }
+            }
+            Ok(())
+        })();
+        let restored = self.set_local_mode(local);
+        result.and(restored)
+    }
+    pub(crate) fn finish_startup(&mut self) -> Result<()> {
+        self.graphs.finish_startup()?;
+        self.other_graphs.finish_startup()
+    }
     // Warmup has completed. Capture never yields with the stream in capture mode.
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
         self.invalidate();
@@ -752,7 +779,9 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     /// Same initialized finite hidden and binary-mask contract as execute.
     pub unsafe fn execute_captured(&mut self, rows: u32) -> Result<RouterOutput<'_>> {
         self.invalidate();
-        if self.window.is_windowed() || !super::graph_policy::captures_shape(rows) {
+        if self.window.is_windowed() || !super::graph_policy::captures_shape(rows)
+            || (self.graphs.get_shape(self.layer, self.weights, rows).is_none()
+                && !self.graphs.capture_allowed(self.layer, rows)) {
             return unsafe { self.execute(rows) };
         }
         if self
@@ -810,11 +839,13 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         // to follow its eager run, so it chains like a replay instead of
         // stalling the issuing thread on every layer.
         let captures = !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+            && self.graphs.capture_allowed(self.layer, rows)
             && !crate::shared::decode_graph::census::eager("layer_row");
         // SAFETY: this wave retains all queued input and output storage.
         unsafe { crate::shared::memory::chain::finish_or_wait(self.stream(),
             (!cold || !captures) && device_read).await?; }
         if cold && !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+            && self.graphs.capture_allowed(self.layer, rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result

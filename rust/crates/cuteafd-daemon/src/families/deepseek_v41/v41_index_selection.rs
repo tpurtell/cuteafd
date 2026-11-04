@@ -1,7 +1,7 @@
 //! Bounded, captured index selection and snapshot-checked candidate sharing.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
-use crate::families::deepseek_v41::v41_compressor::{IndexBinding, IndexProposal};
-use crate::families::deepseek_v41::v41_index_query::IndexQueryOutput;
+use crate::families::deepseek_v41::v41_compressor::{IndexBinding, IndexProposal, IndexScoreGeometry};
+use crate::families::deepseek_v41::v41_index_query::{IndexQueryOutput, IndexQueryGeometry};
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LayerStaging, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
@@ -83,6 +83,17 @@ fn extend_score_groups(groups: &mut Vec<ScoreGroup>, request: usize, rows: usize
     }
     let offset = groups.last().map_or(0, |last| last.offset + last.rows);
     groups.push(ScoreGroup { request, offset, rows, binding });
+}
+
+fn selection_fingerprint(query: &IndexQueryGeometry, groups: &[ScoreGroup],
+    shared: Option<CuteafdDeviceBuffer>, rows: usize, tiles: usize, width: usize,
+    use_candidates: bool) -> Result<Vec<usize>> {
+    let mut key = vec![query.layer, rows, query.packed.ptr as usize,
+        query.scales.ptr as usize, query.head_weights.ptr as usize];
+    for group in groups { key.push(group.rows); key.extend(group.binding); }
+    if query.layer > 20 { key.push(shared.context("candidate blocks missing")?.ptr as usize); }
+    key.extend([width, usize::from(use_candidates), if query.layer > 20 { 1 } else { tiles }]);
+    Ok(key)
 }
 
 pub(crate) struct SelectionRequest<'a> {
@@ -350,13 +361,69 @@ impl<'a> IndexSelectionWave<'a> {
     }
     /// Invalidate published selections without discarding immutable launch shapes.
     pub fn restart(&mut self) -> Result<()> {
-        if !self.retain_decode_graphs && super::graph_policy::fixed_binding_limit().is_none() {
+        if !self.graphs.startup_declared() && !self.retain_decode_graphs && super::graph_policy::fixed_binding_limit().is_none() {
             return self.clear_graph();
         }
         ensure!(!self.in_flight, "index selection pending");
         self.storage.stream.require_complete()?;
         self.ready = None;
         Ok(())
+    }
+    pub(crate) fn startup_outputs(&self) -> (CuteafdDeviceBuffer, CuteafdDeviceBuffer) {
+        (self.b(9), self.b(12))
+    }
+    pub(crate) fn startup_key(&self, query: &IndexQueryGeometry, source: IndexScoreGeometry,
+        shared: Option<CuteafdDeviceBuffer>, rows: usize) -> Result<Vec<usize>> {
+        ensure!(rows > 0 && rows <= self.capacity && !self.window.is_windowed()
+            && query.packed.bytes == rows * 2048 && query.scales.bytes == rows * 128
+            && query.head_weights.bytes == rows * 64 && source.capacity == rows,
+            "startup index geometry differs");
+        let mut groups = Vec::new();
+        extend_score_groups(&mut groups, 0, rows, source.binding());
+        selection_fingerprint(query, &groups, shared, rows, 1, DECODE_WIDTH_BUCKET, false)
+    }
+    pub(crate) fn declare_startup(&mut self, keys: &[Vec<usize>]) -> Result<()> {
+        ensure!(!self.in_flight && self.ready.is_none(), "startup index selection requires idle owner");
+        self.storage.stream.require_complete()?;
+        self.retain_decode_graphs = true;
+        self.graphs.declare_startup(keys)
+    }
+    /// Record stable allocation geometry, never proposal/snapshot identities.
+    /// # Safety
+    /// Inputs are real admitted owner allocations and remain pinned until all
+    /// graphs retire. Recording must never execute their uninitialized contents.
+    pub(crate) unsafe fn capture_startup(&mut self, query: &IndexQueryGeometry,
+        source: IndexScoreGeometry, shared: Option<CuteafdDeviceBuffer>, rows: usize) -> Result<()> {
+        let key = self.startup_key(query, source, shared, rows)?;
+        ensure!(!self.in_flight && self.ready.is_none() && self.graphs.capture_allowed(&key)
+            && self.graphs.get(&key).is_none(), "startup index key unavailable");
+        self.storage.stream.require_complete()?;
+        let mut groups = Vec::new();
+        extend_score_groups(&mut groups, 0, rows, source.binding());
+        // SAFETY: only commands are recorded; real metadata is uploaded before replay.
+        unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
+        let recorded = unsafe { self.enqueue(query, &[source], &groups, shared, rows, 1, DECODE_WIDTH_BUCKET, false) };
+        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
+        match (recorded, captured) {
+            (Ok(()), Ok(graph)) => {
+                if let Err(error) = self.insert_graph(graph, key) {
+                    // SAFETY: insertion failed before taking executable ownership.
+                    unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
+                    return Err(error);
+                }
+                Ok(())
+            }
+            (Err(error), Ok(graph)) => {
+                // SAFETY: graph was recorded but never launched or published.
+                unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
+                Err(error)
+            }
+            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+        }
+    }
+    pub(crate) fn finish_startup(&mut self) -> Result<()> {
+        self.graph = None;
+        self.graphs.finish_startup()
     }
     fn select_graph(&mut self, fingerprint: &[usize]) -> Result<bool> {
         // Eight indexed layers share this owner; source identities remain exact.
@@ -369,6 +436,13 @@ impl<'a> IndexSelectionWave<'a> {
         let fixed_limit = policy.map(|(_, limit)| limit);
         let key = fingerprint.to_vec();
         let cached = self.graphs.get(&key).map(|owner| owner.raw);
+        if self.graphs.startup_declared() {
+            ensure!(!self.in_flight, "index selection pending");
+            self.storage.stream.require_complete()?;
+            self.ready = None;
+            self.graph = self.graphs.launch(&key).map(|owner| (owner.raw, key.clone()));
+            return Ok(cached.is_some() || self.graphs.capture_allowed(&key));
+        }
         if let Some(limit) = fixed_limit {
             ensure!(!self.in_flight, "index selection pending");
             self.storage.stream.require_complete()?;
@@ -402,6 +476,7 @@ impl<'a> IndexSelectionWave<'a> {
         Ok(true)
     }
     fn insert_graph(&mut self, graph: *mut c_void, fingerprint: Vec<usize>) -> Result<()> {
+        ensure!(self.graphs.capture_allowed(&fingerprint), "index graph capture forbidden after startup");
         let device = self.storage.stream.library.cuda_get_device()?;
         // SAFETY: request/cache proposals and wave storage remain pinned by the lane.
         let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(self.storage.stream.library, device, graph, ())? };
@@ -434,10 +509,10 @@ impl<'a> IndexSelectionWave<'a> {
     }
     unsafe fn enqueue(
         &self,
-        query: &IndexQueryOutput<'_>,
-        requests: &[SelectionRequest<'_>],
+        query: &IndexQueryGeometry,
+        sources: &[IndexScoreGeometry],
         groups: &[ScoreGroup],
-        shared: Option<&IndexSelectionOutput<'_>>,
+        shared: Option<CuteafdDeviceBuffer>,
         rows: usize,
         tiles: usize,
         width: usize,
@@ -451,10 +526,7 @@ impl<'a> IndexSelectionWave<'a> {
             unsafe {
                 if follower {
                     self.storage.candidates.expand(
-                        shared
-                            .context("candidate source missing")?
-                            .blocks
-                            .context("candidate blocks missing")?,
+                        shared.context("candidate blocks missing")?,
                         self.b(1),
                         self.b(3),
                         rows,
@@ -472,28 +544,28 @@ impl<'a> IndexSelectionWave<'a> {
                 }
                 for group in groups {
                     let (offset, n) = (group.offset, group.rows);
-                    let p = requests[group.request].proposal;
-                    let slots = p.cache.pool_rows.bytes / 8;
-                    let stride = p.cache.pool_pages.bytes / (slots * 4);
+                    let p = sources[group.request];
+                    let slots = p.pool_rows.bytes / 8;
+                    let stride = p.pool_pages.bytes / (slots * 4);
                     self.storage.score.execute_overlay(
                         slice(query.packed, offset * 2048, n * 2048),
                         slice(query.scales, offset * 128, n * 128),
                         slice(query.head_weights, offset * 64, n * 64),
-                        p.cache.packed,
-                        p.cache.scales,
-                        p.cache.pool_pages,
-                        p.cache.pool_rows,
+                        p.packed,
+                        p.scales,
+                        p.pool_pages,
+                        p.pool_rows,
                         slice(self.b(0), offset * 48, n * 48),
                         slice(self.b(3), offset * width * 8, n * width * 8),
                         slice(self.b(4), offset * width * 4, n * width * 4),
-                        p.packed,
-                        p.scales,
+                        p.proposal_packed,
+                        p.proposal_scales,
                         p.capacity,
                         n,
                         width,
                         slots,
                         stride,
-                        p.cache.packed.bytes / 64,
+                        p.packed.bytes / 64,
                         stream,
                     )?;
                 }
@@ -618,13 +690,8 @@ impl<'a> IndexSelectionWave<'a> {
         let expected_source = if query.layer >= 20 { 20 } else { query.layer };
         let mut bindings = Vec::with_capacity(rows);
         let mut max_length = 0u64;
-        let mut fingerprint = vec![
-            query.layer,
-            rows,
-            query.packed.ptr as usize,
-            query.scales.ptr as usize,
-            query.head_weights.ptr as usize,
-        ];
+        let geometry = query.geometry();
+        let sources: Vec<_> = requests.iter().map(|r| r.proposal.score_geometry()).collect();
         let mut metadata = Vec::with_capacity(rows);
         let mut groups = Vec::new();
         for (i, r) in requests.iter().enumerate() {
@@ -653,18 +720,7 @@ impl<'a> IndexSelectionWave<'a> {
             ensure!(p.cache.pool_rows.bytes > 0 && p.cache.slot < p.cache.pool_rows.bytes / 8
                 && p.cache.pool_pages.bytes == (p.cache.pool_rows.bytes / 8) * p.cache.device_pages.bytes,
                 "index pool table geometry differs");
-            extend_score_groups(&mut groups, i, r.positions.len(), [
-                p.cache.packed.ptr as usize,
-                p.cache.scales.ptr as usize,
-                p.cache.pool_pages.ptr as usize,
-                p.cache.pool_rows.ptr as usize,
-                p.cache.pool_pages.bytes,
-                p.cache.pool_rows.bytes,
-                p.cache.packed.bytes,
-                p.packed.ptr as usize,
-                p.scales.ptr as usize,
-                p.capacity,
-            ]);
+            extend_score_groups(&mut groups, i, r.positions.len(), sources[i].binding());
             for &position in r.positions {
                 let mut m = p.metadata(position)?;
                 m[0] = p.cache.slot as u64;
@@ -675,10 +731,6 @@ impl<'a> IndexSelectionWave<'a> {
         }
         // Request partitions and slots live in per-row metadata, not executable
         // geometry. Only distinct proposal/table owners require another launch.
-        for group in &groups {
-            fingerprint.push(group.rows);
-            fingerprint.extend(group.binding);
-        }
         if query.origin().is_some() {
             ensure!(
                 bindings
@@ -694,7 +746,6 @@ impl<'a> IndexSelectionWave<'a> {
                 s.layer == 20 && s.rows == rows && s.bindings == bindings && s.blocks.is_some(),
                 "candidate source snapshot or row order differs"
             );
-            fingerprint.push(s.blocks.unwrap().ptr as usize);
         } else {
             ensure!(
                 shared.is_none(),
@@ -706,8 +757,8 @@ impl<'a> IndexSelectionWave<'a> {
         let width = tile_width(max_length as usize, DECODE_WIDTH_BUCKET);
         let use_candidates = query.layer > 20 && max_length > WIDTH as u64;
         let tiles = (max_length as usize).div_ceil(width).max(1);
-        fingerprint.extend([width, usize::from(use_candidates)]);
-        fingerprint.push(if query.layer > 20 { 1 } else { tiles });
+        let shared_blocks = shared.and_then(|s| s.blocks);
+        let fingerprint = selection_fingerprint(&geometry, &groups, shared_blocks, rows, tiles, width, use_candidates)?;
         let (host, staging) = self.staging.region(query.layer);
         stage_metadata(staging, &metadata)?;
         // Prefill tails (and any other uncached large shape) bind eagerly.
@@ -738,7 +789,7 @@ impl<'a> IndexSelectionWave<'a> {
                     .cuda_graph_begin_capture(self.storage.stream.raw)?;
             }
             let launched = unsafe {
-                self.enqueue(query, requests, &groups, shared, rows, tiles, width, use_candidates)
+                self.enqueue(&geometry, &sources, &groups, shared_blocks, rows, tiles, width, use_candidates)
             };
             let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
             match (launched, captured) {
@@ -746,7 +797,11 @@ impl<'a> IndexSelectionWave<'a> {
                     if super::graph_policy::fixed_binding_limit().is_some() {
                         self.record_fixed_capture(&fingerprint);
                     }
-                    self.insert_graph(g, fingerprint)?;
+                    if let Err(error) = self.insert_graph(g, fingerprint) {
+                        // SAFETY: insertion failed before taking executable ownership.
+                        unsafe { self.storage.stream.library.cuda_graph_exec_destroy(g)?; }
+                        return Err(error);
+                    }
                 },
                 (Err(e), Ok(g)) => {
                     unsafe {
@@ -761,7 +816,7 @@ impl<'a> IndexSelectionWave<'a> {
             if capture {
                 let g = self.graph.as_ref().context("selection graph missing")?.0;
                 self.storage.stream.library.cuda_graph_launch(g, self.storage.stream.raw)
-            } else { self.enqueue(query, requests, &groups, shared, rows, tiles, width, use_candidates) }
+            } else { self.enqueue(&geometry, &sources, &groups, shared_blocks, rows, tiles, width, use_candidates) }
         };
         let launched = if crate::shared::decode_graph::census::enabled() {
             unsafe { self.storage.stream.library.cuda_graph_census_call(self.storage.stream.raw, c"index", rows, capture,
@@ -1004,6 +1059,34 @@ impl Drop for IndexSelectionWave<'_> {
 mod graph_tests {
     use super::*;
 
+    #[test]
+    fn startup_index_geometry_matches_partitioned_runtime_fingerprint() -> Result<()> {
+        let buffer = |address, bytes| CuteafdDeviceBuffer {
+            ptr: address as *mut c_void, bytes, device_id: 0, flags: 0 };
+        for layer in [2, 8, 14, 20, 24, 28, 32, 36] {
+            for rows in 1..=cuteafd_core::V41_VERIFY_ROWS {
+                let query = IndexQueryGeometry { layer, packed: buffer(0x1000, rows * 2048),
+                    scales: buffer(0x2000, rows * 128), head_weights: buffer(0x3000, rows * 64) };
+                let source = IndexScoreGeometry { packed: buffer(0x4000, 65536), scales: buffer(0x5000, 4096),
+                    pool_pages: buffer(0x6000, 1024), pool_rows: buffer(0x7000, 64),
+                    proposal_packed: buffer(0x8000, rows * 64), proposal_scales: buffer(0x9000, rows * 4), capacity: rows };
+                let shared = (layer > 20).then(|| buffer(0xa000, rows * 8192));
+                let mut runtime = Vec::new();
+                for request in 0..rows { extend_score_groups(&mut runtime, request, 1, source.binding()); }
+                let mut startup = Vec::new();
+                extend_score_groups(&mut startup, 0, rows, source.binding());
+                assert_eq!(startup, runtime);
+                let actual = selection_fingerprint(&query, &runtime, shared, rows, 1, 512, false)?;
+                let mut legacy = vec![layer, rows, 0x1000, 0x2000, 0x3000, rows];
+                legacy.extend(source.binding());
+                if layer > 20 { legacy.push(0xa000); }
+                legacy.extend([512, 0, 1]);
+                assert_eq!(actual, legacy);
+                assert_eq!(actual, selection_fingerprint(&query, &startup, shared, rows, 1, 512, false)?);
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn reserve_growth_retains_source_and_follower_selections() -> Result<()> {
         for unit in [1, 16, 80, 4096] {
@@ -1284,6 +1367,42 @@ mod graph_tests {
             assert!(wave.graphs.len() <= 2);
         }
         assert_eq!(wave.fixed_captures.len(), 2);
+        wave.clear_graph()?;
+        let hot = vec![2, 4, input.ptr as usize, output.ptr as usize, 0];
+        wave.declare_startup(std::slice::from_ref(&hot))?;
+        // SAFETY: only a copy is recorded; both allocations remain owned by wave.
+        let graph = unsafe {
+            library.cuda_graph_begin_capture(wave.storage.stream.raw)?;
+            library.copy_d2d_async(output, input, 16, wave.storage.stream.raw)?;
+            library.cuda_graph_end_capture(wave.storage.stream.raw)?
+        };
+        wave.insert_graph(graph, hot.clone())?;
+        wave.finish_startup()?;
+        // Deliberately exceed the legacy cap: sealed misses must neither evict
+        // the declared hot executable nor request another capture.
+        for key in 0..MAX_RETAINED_DECODE_GRAPHS + 3 {
+            wave.restart()?;
+            let fingerprint = vec![2, 4, input.ptr as usize, output.ptr as usize, key];
+            let replay = wave.select_graph_with_policy(&fingerprint, None)?;
+            assert_eq!(replay, key == 0);
+            let value = (key % 251 + 1) as u8;
+            library.copy_h2d(input, &vec![value; 320])?;
+            library.copy_h2d(output, &[0; 320])?;
+            // SAFETY: exact same copy/shape on hot replay and cold eager path.
+            unsafe {
+                if replay { library.cuda_graph_launch(wave.graph.as_ref().unwrap().0, wave.storage.stream.raw)?; }
+                else { library.copy_d2d_async(output, input, 16, wave.storage.stream.raw)?; }
+            }
+            wave.synchronize()?;
+            let mut actual = vec![0; 320];
+            library.copy_d2h(&mut actual, output)?;
+            assert_eq!(&actual[..16], &[value; 16]);
+            assert!(actual[16..].iter().all(|&x| x == 0));
+            assert_eq!(wave.graphs.len(), 1);
+            assert_eq!(wave.graphs.get(&hot).unwrap().raw, graph);
+        }
+        assert!(wave.select_graph_with_policy(&hot, None)?);
+        assert_eq!(wave.graph.as_ref().unwrap().0, graph);
         wave.clear_graph()?;
         Ok(())
     }

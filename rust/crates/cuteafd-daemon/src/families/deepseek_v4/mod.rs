@@ -527,6 +527,29 @@ pub(crate) fn with_engine<T>(
                     decode_rows, prefill_rows, prefill.waves as usize)?)?.select(&peers)?;
         }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
+        if crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&loaded.snapshot)?
+            != crate::shared::experts::rtx::push::PushPolicy::Mount {
+            use crate::shared::{experts::rtx::dense::HostStaging, memory::push_coordinator::CoordinatorExpertPlan};
+            let mut startup = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
+                &loaded.cfg, devices.len(), args.dspark, loaded.catalog.tensors().iter().map(|t| &t.metadata))?.startup;
+            let host = (0..devices.len()).map(|rank| {
+                let bytes = |name| startup.host.iter().find(|item| item.rank == rank && item.name == name)
+                    .map_or(0, |item| item.bytes);
+                Ok(HostStaging { staging_bytes: usize::try_from(bytes("staging/coordinator-dense"))?,
+                    table_bytes: usize::try_from(bytes("staging/coordinator-dense-status"))?, largest_step: 0 })
+            }).collect::<Result<Vec<_>>>()?;
+            let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+            let peak = CoordinatorExpertPlan::admit_host(&vec![None; devices.len()], &host,
+                cuteafd_ffi::push_ring::DEFAULT_SLOTS, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, available)?;
+            ensure!(peak as u64 == startup.host_bytes()?, "V4 startup host inventory disagrees with admission");
+            startup.add_experts(&loaded.catalog, stages, &placement)?;
+            let bound = startup.host_bytes()?;
+            ensure!(bound <= available, "V4 dense and expert startup need {bound} host bytes, available {available}");
+            for note in startup.notes()? { tracing::info!("{note}"); }
+            tracing::info!(plan_host_bound_bytes = bound, dense_host_bound_bytes = peak,
+                "V4 conservative dense and expert startup host bound admitted before allocation");
+        }
+        crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/before-push")?;
         let started = Instant::now();
         let loader = weights::WeightLoader {
             library: &loaded.library, catalog: &loaded.catalog, programs: &programs, family: loaded.family, stream,
@@ -534,8 +557,14 @@ pub(crate) fn with_engine<T>(
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect(),
         };
-        let (embedding, (model, shares)) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
-            embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model_modes(&loaded.cfg, args.dspark, &loaded_modes) })?;
+        let dense_devices = devices.iter().map(|&id| crate::shared::memory::device::Device {
+            library: loaded.library.as_ref(), id }).collect::<Vec<_>>();
+        let (embedding, (model, shares)) = crate::shared::experts::rtx::push::load_alone(
+            &loaded.snapshot, &dense_devices, || crate::shared::token_io::TokenEmbedding::load(&loaded.library,
+                embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement,
+                || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                    loader.model_modes(&loaded.cfg, args.dspark, &loaded_modes) }))?;
+        crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-dense-push")?;
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
 
         // Measured cross-check uses the same frozen owner map and explicitly
@@ -618,6 +647,7 @@ pub(crate) fn with_engine<T>(
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
         }
+        crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-kv-pool")?;
         // Freeze the prefix quota and admit it together with every future table before
         // attach_context or workspace preparation can reserve ordered-upload staging.
         let host_config = admission::host_memory(&engine, args, prefix, context_extent)?;
@@ -630,8 +660,9 @@ pub(crate) fn with_engine<T>(
         ensure!(split_device.is_none() || range.layers == 0,
             "TP1 backbone layers are forbidden under a head split");
         let layers: Vec<_> = (range.first..range.first + range.layers).collect();
-        let local = if skip { None } else { local::LocalExperts::load(&loaded.library, &args.native_lib,
-            &loaded.catalog, stages, &layers,
+        let local = if skip { None } else { local::LocalExperts::load_pushed(
+            crate::shared::memory::device::Device { library: &loaded.library, id: args.device },
+            &loaded.snapshot, &args.native_lib, &loaded.catalog, stages, &layers,
             max_rows, usize::try_from(range.peak_bytes)?, stream)? };
         ensure!(local.as_ref().map_or(&[][..], |l| l.layers()) == layers,
             "DeepSeek V4 TP1 allocation differs from admitted placement");
@@ -643,11 +674,35 @@ pub(crate) fn with_engine<T>(
                 Device { library: &loaded.library, id: split_device.context("TP2 needs a head split")? }];
             let layers: Vec<_> = (tp2.first..tp2.first + tp2.layers).collect();
             let budgets = [usize::try_from(tp2.peak_bytes[0])?, usize::try_from(tp2.peak_bytes[1])?];
+            use crate::shared::experts::rtx::{dense::DenseArena,
+                push::{CoordinatorExperts, CoordinatorPush, PushPolicy}, RtxSelectionPolicy};
+            let policy = PushPolicy::for_snapshot(&loaded.snapshot)?;
+            let push = policy.plan(|| CoordinatorPush::prepare_alone(&loaded.snapshot, Some(&loaded.catalog), 2,
+                Some(CoordinatorExperts::Tp2 { layers: layers.clone(), budgets: budgets.to_vec() })))?;
+            let pushed = if let Some(push) = push {
+                let (pushed, ()) = push.receive_with::<DenseArena<'_>, _>(devices.to_vec(), Some(&loaded.catalog), 0, None, || ());
+                policy.committed(pushed)?
+            } else { None };
             let ranks: [Box<dyn RtxExpertLayer>; 2] = if let Some(manifest) = loaded.catalog.exl3() {
                 let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
                     manifest.decoder_tiers(), "rtx-tp2");
-                Exl3Tp2::load_pair(devices, &loaded.catalog, &package, layers.clone(), max_rows, budgets)?
-                    .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
+                if let Some(pushed) = pushed {
+                    let weights = pushed.into_iter().map(|w| w.exl3()).collect::<Result<Vec<_>>>()?;
+                    let weights = weights.try_into().map_err(|_| anyhow::anyhow!("TP2 pushed rank count differs"))?;
+                    let owners = Exl3Tp2::pushed_pair_weights(devices, &loaded.catalog,
+                        cuteafd_core::expert_geometry(), [&package; 2], layers.clone(), max_rows, budgets,
+                        RtxSelectionPolicy::CanonicalDecode, weights)?;
+                    [Box::new(owners[0].execution()?), Box::new(owners[1].execution()?)]
+                } else {
+                    Exl3Tp2::load_pair(devices, &loaded.catalog, &package, layers.clone(), max_rows, budgets)?
+                        .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
+                }
+            } else if let Some(pushed) = pushed {
+                let weights = pushed.into_iter().map(|w| w.native()).collect::<Result<Vec<_>>>()?;
+                let weights = weights.try_into().map_err(|_| anyhow::anyhow!("TP2 pushed rank count differs"))?;
+                let owners = NativeTp2::pushed_pair_weights(devices, &loaded.catalog, layers.clone(), max_rows, budgets,
+                    RtxSelectionPolicy::CanonicalDecode, crate::shared::experts::rtx::native::NativeOutputPolicy::TokenSums, weights)?;
+                [Box::new(owners[0].execution()?), Box::new(owners[1].execution()?)]
             } else {
                 NativeTp2::load_pair(devices, &loaded.catalog, layers.clone(), max_rows, budgets)?
                     .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
@@ -655,6 +710,7 @@ pub(crate) fn with_engine<T>(
             ensure!(ranks.iter().all(|r| r.layers() == layers), "TP2 loaded layers differ from admitted placement");
             engine.install_tp2(ranks)?;
         }
+        crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-expert-push")?;
         // The auto reduction plan uses draft_block(), which is nonzero only after
         // the drafter's local stage experts are installed. Freeze it before capture.
         if context_mode.is_some() {

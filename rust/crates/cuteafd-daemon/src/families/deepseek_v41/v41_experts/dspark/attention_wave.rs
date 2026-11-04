@@ -1,7 +1,7 @@
 //! One-stream draft attention with generation-checked committed cache reads.
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkAttentionOutput, DsparkProjection, DsparkWeights, ProjectionKind};
-use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
+use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowGeometry, WindowLease, WindowRead};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41DsparkAttention};
@@ -189,6 +189,11 @@ impl DsparkAttentionWave<'_, '_> {
         read: &WindowRead,
         requests: u32,
         stream: *mut c_void,
+    ) -> Result<()> {
+        unsafe { self.enqueue_geometry(&read.geometry(), requests, stream) }
+    }
+    pub(super) unsafe fn enqueue_geometry(
+        &mut self, read: &WindowGeometry, requests: u32, stream: *mut c_void,
     ) -> Result<()> {
         let rows = requests * self.width as u32;
         unsafe {

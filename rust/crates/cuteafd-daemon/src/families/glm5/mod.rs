@@ -1177,6 +1177,40 @@ impl Opened {
                     layers: range.clone().collect(), budgets: budgets.to_vec() })
             }).transpose()
         };
+        let dense_devices = devices.iter().map(|&id| crate::shared::memory::device::Device {
+            library: &self.library, id }).collect::<Vec<_>>();
+        let dense_push_experts = || -> Result<_> {
+            tp2_range.as_ref().map(|range| -> Result<_> {
+                let local = local.as_ref().context("TP2 local inventory")?;
+                let workspace = match local.format {
+                    glm::GlmLocalFormat::Exl3 => crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
+                        &local.package, self.cfg.hidden, max_rows)?,
+                    glm::GlmLocalFormat::Nvfp4 { .. } => crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(
+                        self.catalog.fp8().context("NVFP4 tensors")?, &local.package, 0, max_rows)?.workspace_bytes,
+                    glm::GlmLocalFormat::Exlr8 => anyhow::bail!("EXLR8 experts require native dense planning"),
+                };
+                Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 {
+                    layers: range.clone().collect(),
+                    budgets: tp2_budgets()?.map(|b| b.saturating_sub(workspace)).to_vec() })
+            }).transpose()
+        };
+        let mut plan_dense = |sparks: usize| -> Result<_> {
+            let sink = std::rc::Rc::new(landing::PushSink::default());
+            let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
+            let ((embedding, model, drafter), mut records) = crate::shared::experts::rtx::dense::recording(|| {
+                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library,
+                    self.embed_source()?, args.token_io.embed_placement, || {
+                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                        planning.model(&self.cfg, layers, owners.as_deref(), native)
+                    })?;
+                let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file)?;
+                Ok((embedding, model, drafter))
+            })?;
+            let (operands, deferred) = sink.take();
+            records.operands.extend(operands);
+            let dense = push::plan_ranks(&self.snapshot, records.clone(), &dense_devices, sparks)?;
+            Ok((embedding, model, drafter, records, deferred, dense))
+        };
         let admission = if let Some(peers) = args.peers.as_deref() {
             let peers = peers.split(',').map(str::parse)
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
@@ -1186,33 +1220,15 @@ impl Opened {
                 args.exlr8_manifest.as_deref())?;
             // Plan coordinator membership before offers; a Required failure
             // refuses startup rather than silently reading through the mount.
-            let ranks = match (&tp2_range, local.as_ref().map(|l| &l.format)) {
-                (Some(range), Some(glm::GlmLocalFormat::Exl3)) if admission.coordinator_pushes() => push_policy.plan(|| {
-                    let local = local.as_ref().context("TP2 local inventory")?;
-                    let workspace = crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
-                        &local.package, self.cfg.hidden, max_rows)?;
-                    let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
-                    let devices = tp2_devices()?;
-                    let sink = std::rc::Rc::new(landing::PushSink::default());
-                    let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
-                    let ((embedding, model, drafter), mut records) = crate::shared::experts::rtx::dense::recording(|| {
-                        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library,
-                            self.embed_source()?, args.token_io.embed_placement, || {
-                                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                                planning.model(&self.cfg, layers, owners.as_deref(), native)
-                            })?;
-                        let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file)?;
-                        Ok((embedding, model, drafter))
-                    })?;
-                    let (operands, deferred) = sink.take();
-                    records.operands.extend(operands);
-                    let dense = push::plan_ranks(&self.snapshot, records.clone(), devices, peers.len())?;
-                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&self.snapshot,
-                        Some(&self.catalog), 2, Some(crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: range.clone().collect(), budgets: budgets.to_vec() }))?;
-                    Ok((prepared, (embedding, model, drafter, records, deferred, dense)))
-                }).context("GLM coordinator dense push planning")?,
-                _ => None,
-            };
+            let ranks = if !native && admission.coordinator_pushes() {
+                push_policy.plan(|| {
+                    let experts = dense_push_experts()?;
+                    let planned = plan_dense(peers.len())?;
+                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(
+                        &self.snapshot, Some(&self.catalog), devices.len(), experts)?;
+                    Ok((prepared, planned))
+                }).context("GLM coordinator dense push planning")?
+            } else { None };
             let ranks = ranks.map(|((push, streams, ranks), planned)| {
                 coordinator_push = Some((push, peers.len(), planned));
                 (streams, ranks)
@@ -1235,6 +1251,16 @@ impl Opened {
             };
             Some(admission.start_with(&peers, ranks)?)
         } else { None };
+        // Dense-only TP1/TP2 ranks push even without onboarded experts or active Sparks.
+        if !native && coordinator_push.is_none() {
+            coordinator_push = push_policy.plan(|| {
+                let experts = dense_push_experts()?;
+                let planned = plan_dense(0)?;
+                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(
+                    &self.snapshot, Some(&self.catalog), devices.len(), experts)?;
+                Ok((push, 0, planned))
+            }).context("GLM coordinator dense push planning")?;
+        }
         // All selected routed layers may be onboarded in a partial model.
         // Idle Spark peers acknowledge identity while these destinations push alone.
         if native_records.is_some() && native_push.is_none() {
@@ -1272,10 +1298,16 @@ impl Opened {
                         pushed.context("onboarded EXLR8 experts require a committed push group")?
                             .into_iter().map(|r| r.exlr8()).collect::<Result<Vec<_>>>()?
                             .try_into().map_err(|_| anyhow::anyhow!("two EXLR8 coordinator GPUs"))?)?),
-                glm::GlmLocalFormat::Nvfp4 { .. } => crate::shared::experts::rtx::Tp2Weights::Fp8(
-                    crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::load_pair(devices,
+                glm::GlmLocalFormat::Nvfp4 { .. } => crate::shared::experts::rtx::Tp2Weights::Fp8(match pushed {
+                    Some(pushed) => crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::pushed_pair(devices,
                         self.catalog.fp8().context("NVFP4 tensors")?, &local.package,
-                        range.collect(), max_rows, budgets)?),
+                        range.collect(), max_rows, budgets,
+                        pushed.into_iter().map(|rank| rank.fp8()).collect::<Result<Vec<_>>>()?
+                            .try_into().map_err(|_| anyhow::anyhow!("two NVFP4 coordinator GPUs"))?)?,
+                    None => crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::load_pair(devices,
+                        self.catalog.fp8().context("NVFP4 tensors")?, &local.package,
+                        range.collect(), max_rows, budgets)?,
+                }),
             })
         };
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
@@ -1287,10 +1319,8 @@ impl Opened {
                 return Ok((loaded.0, (loaded.1, tp2)));
             }
             let (embedding, model, pushed) = if let Some((push, sparks, (embedding, model, drafter, records, deferred, dense))) = coordinator_push.take() {
-                // The planned dense operands join the same ranks as the TP2 halves:
-                // receive both, then run the transforms of landed bytes.
-                let devices = tp2_devices()?;
-                let (pushed, ()) = push.receive_with(devices.to_vec(), Some(&self.catalog), sparks, Some(Ok(dense)), || ());
+                // Dense operands and any expert halves commit before either is used.
+                let (pushed, ()) = push.receive_with(dense_devices.clone(), Some(&self.catalog), sparks, Some(Ok(dense)), || ());
                 let pushed = push_policy.committed(pushed).context("GLM coordinator dense push delivery")?;
                 let rank_stream = |device: i32| if device == args.device { stream }
                     else { peer_stream.map_or(stream, |(_, s)| s) };

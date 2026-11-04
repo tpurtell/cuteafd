@@ -183,6 +183,38 @@ impl Drop for Tp2FfnGraphs<'_,'_> {
     }
 }
 
+fn attention_tail_identity(projection: &AttentionOutputWave<'_, '_>, block: &BackboneBlockWave<'_, '_>,
+    split_output: bool) -> Vec<usize> {
+    let mut identity = projection.chain_graph_identity().to_vec();
+    identity.extend(block.chain_graph_identity());
+    identity.push(usize::from(split_output));
+    identity
+}
+
+struct StartupAttentionTail<'s, 'w, 'a> {
+    projection: &'s mut AttentionOutputWave<'w, 'a>,
+    block: &'s mut BackboneBlockWave<'w, 'a>,
+}
+impl crate::families::deepseek_v41::v41_sparse_attention::AttentionGraphTail for StartupAttentionTail<'_, '_, '_> {
+    fn identity(&self) -> Vec<usize> { attention_tail_identity(self.projection, self.block, false) }
+    unsafe fn prepare(&mut self, _: *mut std::ffi::c_void) -> Result<()> {
+        anyhow::bail!("startup tail must not prepare live request metadata")
+    }
+    unsafe fn enqueue(&mut self, attention: &crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention,
+        stream: *mut std::ffi::c_void) -> Result<()> {
+        // SAFETY: the caller is recording stable storage, never executing it.
+        let projected = unsafe { self.projection.enqueue_chain_graph(attention, stream)? };
+        unsafe { self.block.record_startup_ffn(attention.rows, projected, stream)?; }
+        Ok(())
+    }
+    unsafe fn restore_warmup(&mut self) -> Result<()> {
+        anyhow::bail!("startup tail cannot execute a warmup")
+    }
+    unsafe fn replay_state(&mut self) -> Result<()> {
+        anyhow::bail!("startup tail cannot publish replay state")
+    }
+}
+
 struct AttentionTail<'s, 'w, 'a> {
     projection: &'s mut AttentionOutputWave<'w, 'a>,
     block: &'s mut BackboneBlockWave<'w, 'a>,
@@ -192,8 +224,7 @@ struct AttentionTail<'s, 'w, 'a> {
 }
 impl crate::families::deepseek_v41::v41_sparse_attention::AttentionGraphTail for AttentionTail<'_, '_, '_> {
     fn identity(&self) -> Vec<usize> {
-        let mut identity = self.projection.chain_graph_identity().to_vec();
-        identity.extend(self.block.chain_graph_identity()); identity.push(usize::from(self.split_output)); identity
+        attention_tail_identity(self.projection, self.block, self.split_output)
     }
     unsafe fn prepare(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
         unsafe { self.projection.prepare_chain_graph(self.tokens, stream) }
@@ -726,6 +757,91 @@ pub(crate) struct BackboneLane<'w, 'a> {
 }
 
 impl<'w, 'a> BackboneLane<'w, 'a> {
+    fn rebind_startup(&mut self, layer: usize) -> Result<()> {
+        ensure!(self.phase == Phase::Idle && !self.window.is_windowed(),
+            "startup rebind requires an idle full lane");
+        let weights = self.weights.layers.get(layer).context("startup layer absent")?;
+        ensure!(weights.device.id == self.block.inputs()[0].device_id,
+            "startup layer belongs to another device");
+        self.query.rebind(&weights.query)?;
+        self.projection.rebind(&weights.projection)?;
+        if let Some(shared) = &mut self.shared {
+            shared.rebind(weights.shared.as_ref().context("startup shared weights absent")?)?;
+        }
+        self.router.rebind(&weights.router)?;
+        self.block.rebind_startup(&weights.hc)?;
+        self.layer = layer;
+        Ok(())
+    }
+    /// Record exact target rows on this device without running a synthetic query.
+    /// Bindings come from the real admitted cache/index owners and must remain
+    /// stable until this lane's graph bank is destroyed.
+    pub(crate) fn capture_startup(
+        &mut self, sinks: &[CuteafdDeviceBuffer], selections: &[Option<CuteafdDeviceBuffer>],
+        aligned: bool,
+    ) -> Result<()> {
+        self.capture_startup_kind(sinks, selections, aligned, true)
+    }
+    /// Prefill keeps its own sparse arithmetic eager: decode reduction recipes
+    /// are not prefill recipes. Empty inventories keep arbitrary tails eager.
+    pub(crate) fn capture_startup_prefill(&mut self) -> Result<()> {
+        self.capture_startup_kind(&[], &[], false, false)
+    }
+    fn capture_startup_kind(
+        &mut self, sinks: &[CuteafdDeviceBuffer], selections: &[Option<CuteafdDeviceBuffer>],
+        aligned: bool, decode: bool,
+    ) -> Result<()> {
+        ensure!(self.phase == Phase::Idle && !self.window.is_windowed()
+            && self.dual_sparse.is_none() && self.tp2_query.is_none() && self.tp2_output.is_none()
+            && !self.weights.split_query_b && !self.weights.split_output_b,
+            "startup prototype requires idle unsplit target lanes");
+        let rows = if decode { cuteafd_core::V41_VERIFY_ROWS } else { 0 };
+        ensure!(self.capacity >= rows && (!decode || (sinks.len() == 40 && selections.len() == 40)),
+            "startup target capacity or bindings differ");
+        let device = self.block.inputs()[0].device_id;
+        let layers: Vec<usize> = self.weights.layers.iter().enumerate()
+            .filter_map(|(layer, weights)| (weights.device.id == device).then_some(layer)).collect();
+        let keys: Vec<(usize, u32)> = layers.iter().flat_map(|&layer|
+            (1..=rows).map(move |rows| (layer, rows as u32))).collect();
+        let original = self.layer;
+        self.set_attention_decode(decode);
+        let result = (|| -> Result<()> {
+            self.query.declare_startup(&keys)?;
+            self.router.declare_startup(&keys)?;
+            let mut sparse_keys = Vec::with_capacity(keys.len());
+            for &layer in layers.iter().filter(|_| decode) {
+                self.rebind_startup(layer)?;
+                let tail = StartupAttentionTail { projection: &mut self.projection, block: &mut self.block };
+                let sparse = self.sparse.as_ref().context("startup sparse owner absent")?;
+                for rows in 1..=rows {
+                    sparse_keys.push(sparse.startup_key(layer, rows, sinks[layer], selections[layer], aligned, Some(&tail))?);
+                }
+            }
+            self.sparse.as_mut().context("startup sparse owner absent")?.declare_startup(&sparse_keys)?;
+            for &layer in &layers {
+                self.rebind_startup(layer)?;
+                for rows in 1..=rows {
+                    self.query.capture_startup(rows as u32)?;
+                    self.router.capture_startup(rows as u32)?;
+                    if !decode { continue; }
+                    // SAFETY: only host phase is armed; sparse capture records
+                    // stable geometry and never executes its descriptor storage.
+                    unsafe { self.block.prepare_startup_ffn(rows)?; }
+                    let mut tail = StartupAttentionTail { projection: &mut self.projection, block: &mut self.block };
+                    let captured = unsafe { self.sparse.as_mut().context("startup sparse owner absent")?
+                        .capture_startup(layer, rows, sinks[layer], selections[layer], aligned, Some(&mut tail)) };
+                    self.block.reset();
+                    captured?;
+                }
+            }
+            self.query.finish_startup()?;
+            self.router.finish_startup()?;
+            self.sparse.as_mut().context("startup sparse owner absent")?.finish_startup()
+        })();
+        self.block.reset();
+        let restored = self.rebind_startup(original);
+        result.and(restored)
+    }
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<[usize; 6]> {
         ensure!(
             (1..=4096).contains(&capacity),

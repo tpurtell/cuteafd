@@ -224,15 +224,7 @@ impl DsparkTerminal<'_, '_> {
         })
     }
     pub(super) fn validate_sampling(&self, requests: usize) -> Result<()> {
-        ensure!(
-            requests > 0 && requests <= self.capacity,
-            "terminal requests exceed capacity"
-        );
-        ensure!(
-            self.sampling_requests == Some(requests),
-            "sampling state does not match live requests"
-        );
-        Ok(())
+        validate_sampling_state(self.capacity, self.sampling_requests, requests)
     }
     unsafe fn enqueue(&self, requests: usize) -> Result<()> {
         unsafe { self.enqueue_on(requests, self.stream.raw) }
@@ -252,6 +244,12 @@ impl DsparkTerminal<'_, '_> {
     }
     unsafe fn enqueue_normalize_on(&self, requests: usize, stream: *mut c_void) -> Result<()> {
         self.validate_sampling(requests)?;
+        // SAFETY: runtime validation above establishes live sampling state.
+        unsafe { self.enqueue_normalize_geometry(requests, stream) }
+    }
+    /// Record the same commands without requiring or publishing sampling state.
+    unsafe fn enqueue_normalize_geometry(&self, requests: usize, stream: *mut c_void) -> Result<()> {
+        validate_geometry(self.capacity, requests)?;
         let span = self.timing.begin_retained("normalize", "terminal_norm", None, requests * self.width, stream)?;
         let library = self.stream.library;
         unsafe {
@@ -278,6 +276,12 @@ impl DsparkTerminal<'_, '_> {
     }
     unsafe fn enqueue_sampling_on(&self, requests: usize, stream: *mut c_void) -> Result<()> {
         self.validate_sampling(requests)?;
+        // SAFETY: runtime validation above establishes live sampling state.
+        unsafe { self.enqueue_sampling_geometry(requests, stream) }
+    }
+    /// Capture records accesses to the real RNG storage; it never consumes RNG.
+    unsafe fn enqueue_sampling_geometry(&self, requests: usize, stream: *mut c_void) -> Result<()> {
+        validate_geometry(self.capacity, requests)?;
         let library = self.stream.library;
         let row_bytes = requests * 129280 * 4;
         let span = self.timing.begin_retained("sample", "selector", None, requests * self.width, stream)?;
@@ -425,6 +429,31 @@ impl DsparkTerminal<'_, '_> {
         ])
     }
 }
+fn validate_geometry(capacity: usize, requests: usize) -> Result<()> {
+    ensure!(requests > 0 && requests <= capacity, "terminal requests exceed capacity");
+    Ok(())
+}
+
+fn validate_sampling_state(capacity: usize, staged: Option<usize>, requests: usize) -> Result<()> {
+    validate_geometry(capacity, requests)?;
+    ensure!(staged == Some(requests), "sampling state does not match live requests");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_sampling_validation_rejects_unstaged_or_mismatched_requests() {
+        assert!(validate_geometry(8, 3).is_ok());
+        for (staged, requests) in [(None, 3), (Some(2), 3), (Some(0), 0), (Some(9), 9)] {
+            assert!(validate_sampling_state(8, staged, requests).is_err());
+        }
+        assert!(validate_sampling_state(8, Some(3), 3).is_ok());
+    }
+}
+
 impl Drop for DsparkTerminal<'_, '_> {
     fn drop(&mut self) {
         fatal_drain(self.synchronize(), "dSpark terminal");

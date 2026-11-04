@@ -17,6 +17,8 @@
 extern "C" int32_t cuteafd_fp8_load_quant(const void* jobs, int32_t count, void* stream);
 extern "C" int32_t cuteafd_fp8_load_quant_abi(uint64_t* job_bytes, uint64_t* segment_bytes, uint64_t* max_cols);
 extern "C" int32_t cuteafd_load_widen_bf16_f32(const void* src, void* dst, int64_t n, void* stream);
+extern "C" int32_t cuteafd_load_narrow_i64_i32(const void* src, void* dst, int64_t n,
+                                               uint32_t* invalid, void* stream);
 extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv, int64_t h0, int64_t heads,
                                            int64_t nope, int64_t v, int64_t lat, void* stream);
 extern "C" int32_t cuteafd_load_kvb_split_fp8(const void* kv_b, const void* grid, void* uk, void* uk_scale, void* uv,
@@ -61,6 +63,24 @@ int transforms() {
   CHECK(cudaMemcpy(got.data(), wide, n * 4, cudaMemcpyDeviceToHost));
   for (int64_t i = 0; i < n; ++i)
     if (got[i] != lq::widen_bf16(src[i])) { std::fprintf(stderr, "widen differs at %lld\n", (long long)i); return 1; }
+  int64_t* ids = nullptr;
+  int32_t* narrowed = nullptr;
+  uint32_t* invalid = nullptr;
+  CHECK(cudaHostAlloc(&ids, 6 * sizeof(int64_t), cudaHostAllocPortable | cudaHostAllocMapped));
+  CHECK(cudaHostAlloc(&invalid, sizeof(uint32_t), cudaHostAllocPortable | cudaHostAllocMapped));
+  CHECK(cudaMalloc(&narrowed, 6 * sizeof(int32_t)));
+  const int64_t values[] = {INT32_MIN, -1, 0, INT32_MAX, int64_t(INT32_MIN) - 1, int64_t(INT32_MAX) + 1};
+  std::copy(values, values + 6, ids);
+  for (int count : {4, 6}) {
+    *invalid = 0;
+    CHECK(cudaError_t(cuteafd_load_narrow_i64_i32(ids, narrowed, count, invalid, nullptr)));
+    CHECK(cudaDeviceSynchronize());
+    if (*invalid != uint32_t(count == 6)) return 1;
+    int32_t result[4];
+    CHECK(cudaMemcpy(result, narrowed, sizeof(result), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < 4; ++i) if (int64_t(result[i]) != values[i]) return 1;
+  }
+  CHECK(cudaFree(narrowed)); CHECK(cudaFreeHost(ids)); CHECK(cudaFreeHost(invalid));
   const int64_t heads = 8, nope = 192, v = 128, lat = 512;
   uint16_t* kv_b = nullptr;
   CHECK(cudaHostAlloc(&kv_b, heads * (nope + v) * lat * 2, cudaHostAllocPortable | cudaHostAllocMapped));

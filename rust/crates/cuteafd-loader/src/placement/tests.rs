@@ -340,6 +340,24 @@ fn experts_stay_on_gpu0_when_the_peer_cannot_run_them() {
 }
 
 #[test]
+fn v4_dense_startup_retains_weights_beside_step_scratch() {
+    use crate::families::deepseek_v4::resident::{StartupInventory, StartupItem};
+    let scratch = crate::shared::dense_read::STEP_BYTES as u64;
+    let startup = StartupInventory { device: vec![
+        StartupItem { rank: 0, name: "weights/coordinator-dense", bytes: 12 * GIB },
+        StartupItem { rank: 0, name: "staging/coordinator-dense-device", bytes: scratch },
+    ], host: vec![StartupItem { rank: 0, name: "weight-push", bytes: 128 * 1024 * 1024 }] };
+    let mut req = request(1, 12 * GIB + scratch - 1, 40, 4, Onboard::Layers(0));
+    req.startup = startup.device_phases(1).unwrap();
+    assert!(matches!(solve(&req), Err(PlacementError::StartupPeak { required, available, .. })
+        if required == 12 * GIB + scratch && available == required - 1));
+    req.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 12 * GIB + scratch };
+    let after = solve(&req).unwrap();
+    req.startup.clear();
+    assert_eq!(solve(&req).unwrap().items, after.items);
+}
+
+#[test]
 fn startup_phases_are_independent_and_not_retained_with_the_pool() {
     use cuteafd_core::memory_layout::{Basis, Category};
     let mut req = request(1, 12 * GIB, 40, 4, Onboard::Layers(0));

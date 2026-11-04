@@ -226,6 +226,22 @@ impl<'a> BackboneCache<'a> {
         }
         Ok(bank)
     }
+    pub(crate) fn capture_startup_producers(&self, windows: &mut [DeviceOwner<'a, WindowWave<'_, 'a>>],
+        sources: &mut [DeviceOwner<'a, CompressorWave<'_, 'a>>], rows: &[usize]) -> Result<()> {
+        ensure!(windows.len() == self.windows.len() && sources.len() == self.sources.len(),
+            "startup producer owner count differs");
+        for (wave, state) in windows.iter_mut().zip(&self.windows) {
+            ensure!(wave.device.id == state.device.id, "startup window device differs");
+            let device = wave.device;
+            device.run(|| wave.get_mut().capture_startup(state.get(), rows))?;
+        }
+        for (wave, state) in sources.iter_mut().zip(&self.sources) {
+            ensure!(wave.device.id == state.device.id, "startup compressor device differs");
+            let device = wave.device;
+            device.run(|| wave.get_mut().capture_startup(state.get(), rows))?;
+        }
+        Ok(())
+    }
     /// Bind fresh producer workspaces to this bank's optional replica owners.
     /// Called separately for each independent lane, before any production.
     pub fn configure_producer_replicas(&self,windows:&mut [DeviceOwner<'a,WindowWave<'_, 'a>>],

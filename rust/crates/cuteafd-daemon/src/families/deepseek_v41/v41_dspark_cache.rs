@@ -38,6 +38,18 @@ pub(crate) struct WindowView {
     pub valid_rows: usize,
     pub committed_end: u64,
 }
+/// Stable ring geometry only; carries no request, lease or read reservation.
+#[derive(Clone, Copy)]
+pub(crate) struct WindowGeometry {
+    pub owner: u64,
+    pub ring: CuteafdDeviceBuffer,
+    pub slots: u32,
+}
+impl WindowRead {
+    pub(crate) fn geometry(&self) -> WindowGeometry {
+        WindowGeometry { owner: self.owner, ring: self.ring, slots: self.slots }
+    }
+}
 pub(crate) struct WindowRead {
     pub owner: u64,
     pub ring: CuteafdDeviceBuffer,
@@ -121,6 +133,9 @@ pub(crate) struct DsparkWindow<'a> {
     owner: u64,
 }
 impl<'a> DsparkWindow<'a> {
+    pub(crate) fn startup_geometry(&self) -> WindowGeometry {
+        WindowGeometry { owner: self.owner, ring: self.ring.buffer, slots: self.slot_count as u32 }
+    }
     pub fn device(&self) -> crate::shared::memory::device::Device<'a> {
         crate::shared::memory::device::Device { library: self.stream.library, id: self.ring.buffer.device_id }
     }

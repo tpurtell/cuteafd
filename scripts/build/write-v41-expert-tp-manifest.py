@@ -8,7 +8,7 @@ role export has been validated against the build that produced it:
 * the export manifest declares ``schema == 1`` and ``capability == [12, 1]``;
 * its geometry matches the official checkpoint (experts 384, hidden 5120,
   intermediate 1152 for tp2 / 768 for tp3 / 384 for tp6 / 288 for tp8, topk 6);
-  tp8 stores 384 columns, while other roles need no kernel padding;
+  stored widths come from the exporter's shared native Spark artifact policy;
 * its non-empty ``variants`` cover the authoritative V4.1 target capacities;
 * every file named in ``artifact_sha256`` exists in the role export directory
   and hashes to the declared value, so a stale or partial JSON cannot be
@@ -40,8 +40,14 @@ import shutil
 import subprocess
 import sys
 
-ROLE_TP_DEGREE = {"tp2": 2, "tp3": 3, "tp6": 6, "tp8": 8}
-ROLE_INTERMEDIATE = {"tp2": 1152, "tp3": 768, "tp6": 384, "tp8": 288}
+_package_spec = importlib.util.spec_from_file_location(
+    "manifest_spark_packages", Path(__file__).resolve().parents[2] / "python/tools/lib/spark_packages.py")
+_packages = importlib.util.module_from_spec(_package_spec)
+_package_spec.loader.exec_module(_packages)
+NATIVE_ARTIFACTS = _packages.native_spark_artifacts("v41")
+ROLE_ARTIFACT = {f"tp{world}": artifact for world, artifacts in NATIVE_ARTIFACTS.items()
+                 for artifact in artifacts if artifact.name == f"spark_tp{world}"}
+ROLE_TP_DEGREE = {role: int(role.removeprefix("tp")) for role in ROLE_ARTIFACT}
 ROLE_INFO_SYMBOL = {
     "tp2": "cuteafd_v41_spark_tp2_expert_info",
     "tp3": "cuteafd_v41_spark_tp3_expert_info",
@@ -82,19 +88,13 @@ def parse_roles(value: str) -> list[str]:
     roles = [entry for entry in value.split(";") if entry]
     if len(set(roles)) != len(roles):
         fail(f"duplicate Spark TP role in {value!r}")
-    spec = importlib.util.spec_from_file_location(
-        "manifest_spark_packages", Path(__file__).resolve().parents[2] / "python/tools/lib/spark_packages.py")
-    packages = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(packages)
-    artifacts = packages.native_spark_artifacts("v41")
-    allowed = {f"tp{world}" for world in artifacts if world != 4}
+    allowed = {f"tp{world}" for world in NATIVE_ARTIFACTS if world != 4}
     for role in roles:
         if role not in allowed:
             fail(f"unsupported Spark TP role {role!r}; expected {', '.join(sorted(allowed))}")
     # Match CMake's v41_spark_tp_experts.cmake selection from the same
     # native_spark_artifacts inventory; adjacent-width packages have own manifests.
-    return [role for role in roles if any(
-        artifact.name == f"spark_{role}" for artifact in artifacts[int(role.removeprefix("tp"))])]
+    return [role for role in roles if role in ROLE_ARTIFACT]
 
 
 def dynamic_symbols(library: Path) -> tuple[set[str], str]:
@@ -139,12 +139,12 @@ def validate_role_export(role: str, manifest_path: Path, export_dir: Path, *, nv
     geometry = payload.get("geometry")
     if not isinstance(geometry, dict):
         fail(f"{manifest_path}: missing geometry")
-    expected_intermediate = ROLE_INTERMEDIATE[role]
+    artifact = ROLE_ARTIFACT[role]
     expected_geometry = {
         "experts": EXPECTED_EXPERTS,
         "hidden": EXPECTED_HIDDEN,
-        "intermediate": expected_intermediate,
-        "kernel_intermediate": (expected_intermediate + 127) // 128 * 128,
+        "intermediate": artifact.logical,
+        "kernel_intermediate": artifact.stored,
         "topk": EXPECTED_TOPK,
     }
     for key, expected in expected_geometry.items():

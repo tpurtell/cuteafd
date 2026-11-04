@@ -79,7 +79,8 @@ impl<'w, 'a> Rank<'w, 'a> {
     }
     unsafe fn capture_ready(&mut self, rows: usize, greedy: bool) -> Result<()> {
         let mode = usize::from(greedy);
-        if self.graphs[mode].get(rows).is_none() && !crate::shared::decode_graph::census::eager("head") {
+        if self.graphs[mode].get(rows).is_none() && self.graphs[mode].capture_allowed(rows)
+            && !crate::shared::decode_graph::census::eager("head") {
             let lib = self.stream.library;
             unsafe { lib.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued = unsafe { self.enqueue(rows, greedy) };
@@ -138,6 +139,29 @@ pub(crate) struct DistributedVocabularyWave<'w, 'a> {
     copy_pending: bool,
 }
 impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
+    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+        ensure!(self.ready.is_none() && self.pending_logits.is_none() && !self.copy_pending,
+            "vocabulary startup requires an idle owner");
+        for rank in &mut self.ranks {
+            let device = rank.device;
+            device.run(|| {
+                let rank = rank.get_mut();
+                rank.stream.require_complete()?;
+                for mode in 0..2 {
+                    rank.graphs[mode].declare_startup(rows)?;
+                    for &row in rows {
+                        ensure!(row <= rank.capacity, "vocabulary startup row exceeds capacity");
+                        // SAFETY: capture records the exact projection/argmax
+                        // operations without executing or publishing logits.
+                        unsafe { rank.capture_ready(row, mode == 1)?; }
+                    }
+                    rank.graphs[mode].finish_startup()?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
     pub fn device_bytes(capacity: usize, split: usize) -> Result<[usize; 2]> {
         ensure!((1..=cuteafd_core::V41_VOCAB_ROWS).contains(&capacity) && (1..129280).contains(&split), "invalid distributed vocabulary geometry");
         Ok([V41VocabularyProjection::WORKSPACE_BYTES + capacity * (10240 + split * 4 + 8),
