@@ -18,11 +18,34 @@ pub enum KernelFamily { Glm, GlmFlash }
 pub enum KernelKind {
     Decode, Routed, Shared, GroupedDecode, GroupedA16, GroupedA8,
     Group, SharedGroup, GroupedGroup,
+    RoutedCore, ReplyFp8, ReplyNvfp4, GroupedA16ReplyFp8, GroupedA8ReplyFp8,
+    GroupedDecodeReplyFp8, GroupedA16ReplyNvfp4, GroupedA8ReplyNvfp4, GroupedDecodeReplyNvfp4,
 }
 
 impl KernelKind {
+    /// Reply producers preserve their BF16 sibling's compute and scratch ABI.
+    pub fn arithmetic_kind(self) -> Self {
+        match self {
+            Self::RoutedCore => Self::Routed,
+            Self::GroupedA16ReplyFp8 | Self::GroupedA16ReplyNvfp4 => Self::GroupedA16,
+            Self::GroupedA8ReplyFp8 | Self::GroupedA8ReplyNvfp4 => Self::GroupedA8,
+            Self::GroupedDecodeReplyFp8 | Self::GroupedDecodeReplyNvfp4 => Self::GroupedDecode,
+            _ => self,
+        }
+    }
+
+    pub fn reply_format(self) -> Option<u64> {
+        match self {
+            Self::ReplyFp8 | Self::GroupedA16ReplyFp8 | Self::GroupedA8ReplyFp8 | Self::GroupedDecodeReplyFp8 => Some(1),
+            Self::ReplyNvfp4 | Self::GroupedA16ReplyNvfp4 | Self::GroupedA8ReplyNvfp4 | Self::GroupedDecodeReplyNvfp4 => Some(2),
+            _ => None,
+        }
+    }
+
+    pub fn is_reply_epilogue(self) -> bool { matches!(self, Self::ReplyFp8 | Self::ReplyNvfp4) }
+
     pub fn is_grouped(self) -> bool {
-        matches!(self, Self::GroupedDecode | Self::GroupedA16 | Self::GroupedA8)
+        matches!(self.arithmetic_kind(), Self::GroupedDecode | Self::GroupedA16 | Self::GroupedA8)
     }
 
     pub fn is_glue(self) -> bool {
@@ -57,6 +80,24 @@ impl KernelFamily {
 
     pub fn program(self, kind: KernelKind) -> &'static str {
         match (self, kind) {
+            (Self::Glm, KernelKind::RoutedCore) => "exlr8_a16_serving_core",
+            (Self::Glm, KernelKind::ReplyFp8) => "exlr8_reply_1",
+            (Self::Glm, KernelKind::ReplyNvfp4) => "exlr8_reply_2",
+            (Self::Glm, KernelKind::GroupedA16ReplyFp8) => "exlr8_a16_grouped_reply1",
+            (Self::Glm, KernelKind::GroupedA8ReplyFp8) => "exlr8_a8_grouped_reply1",
+            (Self::Glm, KernelKind::GroupedDecodeReplyFp8) => "exlr8_a16_grouped64_reply1",
+            (Self::Glm, KernelKind::GroupedA16ReplyNvfp4) => "exlr8_a16_grouped_reply2",
+            (Self::Glm, KernelKind::GroupedA8ReplyNvfp4) => "exlr8_a8_grouped_reply2",
+            (Self::Glm, KernelKind::GroupedDecodeReplyNvfp4) => "exlr8_a16_grouped64_reply2",
+            (Self::GlmFlash, KernelKind::RoutedCore) => "exlr8_glmf_a16_serving_core",
+            (Self::GlmFlash, KernelKind::ReplyFp8) => "exlr8_glmf_reply_1",
+            (Self::GlmFlash, KernelKind::ReplyNvfp4) => "exlr8_glmf_reply_2",
+            (Self::GlmFlash, KernelKind::GroupedA16ReplyFp8) => "exlr8_glmf_a16_grouped_reply1",
+            (Self::GlmFlash, KernelKind::GroupedA8ReplyFp8) => "exlr8_glmf_a8_grouped_reply1",
+            (Self::GlmFlash, KernelKind::GroupedDecodeReplyFp8) => "exlr8_glmf_a16_grouped64_reply1",
+            (Self::GlmFlash, KernelKind::GroupedA16ReplyNvfp4) => "exlr8_glmf_a16_grouped_reply2",
+            (Self::GlmFlash, KernelKind::GroupedA8ReplyNvfp4) => "exlr8_glmf_a8_grouped_reply2",
+            (Self::GlmFlash, KernelKind::GroupedDecodeReplyNvfp4) => "exlr8_glmf_a16_grouped64_reply2",
             (Self::Glm, KernelKind::Decode) => "exlr8_a16_decode",
             (Self::Glm, KernelKind::Routed) => "exlr8_a16_serving",
             (Self::Glm, KernelKind::Shared) => "exlr8_shared_a16_serving",
@@ -86,6 +127,15 @@ impl KernelFamily {
             (Self::Glm, suffix)
         } else { return Err(invalid("unknown EXLR8 family")); };
         let kind = match suffix {
+            "a16_serving_core" => KernelKind::RoutedCore,
+            "reply_1" => KernelKind::ReplyFp8,
+            "reply_2" => KernelKind::ReplyNvfp4,
+            "a16_grouped_reply1" => KernelKind::GroupedA16ReplyFp8,
+            "a8_grouped_reply1" => KernelKind::GroupedA8ReplyFp8,
+            "a16_grouped64_reply1" => KernelKind::GroupedDecodeReplyFp8,
+            "a16_grouped_reply2" => KernelKind::GroupedA16ReplyNvfp4,
+            "a8_grouped_reply2" => KernelKind::GroupedA8ReplyNvfp4,
+            "a16_grouped64_reply2" => KernelKind::GroupedDecodeReplyNvfp4,
             "a16_decode" => KernelKind::Decode,
             "a16_serving" => KernelKind::Routed,
             "shared_a16_serving" => KernelKind::Shared,
@@ -97,6 +147,16 @@ impl KernelFamily {
             "grouped_group" => KernelKind::GroupedGroup,
             _ => return Err(invalid("unknown EXLR8 program kind")),
         };
+        if (kind == KernelKind::RoutedCore && spec.geometry["core_only"] != true)
+            || (kind != KernelKind::RoutedCore && spec.geometry.get("core_only").is_some()) {
+            return Err(invalid("core_only requires its named core export"));
+        }
+        if !kind.is_reply_epilogue() && spec.geometry.get("reply_format").and_then(|v| v.as_u64()) != kind.reply_format() {
+            return Err(invalid("compressed producer name and reply_format disagree"));
+        }
+        if kind.reply_format().is_none() && spec.geometry.get("reply_format").is_some() {
+            return Err(invalid("reply_format requires a named compressed producer"));
+        }
         Ok((family, kind))
     }
 
@@ -123,12 +183,13 @@ pub const COMPACT_GROUP_ROWS: usize = 16;
 /// Read the route-slot stride from the named export ABI, never a missing-field default.
 pub fn group_rows(spec: &ProgramSpec) -> Result<usize, ManifestError> {
     let (_, kind) = KernelFamily::of(spec)?;
-    let (abi, capacity, grouped) = match kind {
+    let (abi, capacity, grouped) = match kind.arithmetic_kind() {
         KernelKind::Decode | KernelKind::Routed | KernelKind::Shared => (3, 64, false),
         KernelKind::GroupedDecode => (3, 64, true),
         KernelKind::GroupedA16 | KernelKind::GroupedA8 => (3, 4096, true),
         KernelKind::Group | KernelKind::SharedGroup => (2, 64, false),
         KernelKind::GroupedGroup => (2, 4096, true),
+        _ => return Err(invalid("reply epilogue has no grouping scratch ABI")),
     };
     if spec.geometry["abi_version"].as_u64() != Some(abi)
         || spec.geometry["max_rows"].as_u64() != Some(capacity)
@@ -158,6 +219,7 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
             .ok_or_else(|| invalid(format!("missing or invalid geometry.{name}")))
     };
     let (family, kind) = KernelFamily::of(spec)?;
+    let kind = kind.arithmetic_kind();
     let shared = kind == KernelKind::Shared;
     family.validate_compute(spec, shared)?;
     let grouped_a8 = kind == KernelKind::GroupedA8;
@@ -274,7 +336,11 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
 }
 
 pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), ManifestError> {
+    if spec.name.ends_with("_reply_1") || spec.name.ends_with("_reply_2") {
+        return validate_reply_entry(spec, entry);
+    }
     let (_, kind) = KernelFamily::of(spec)?;
+    let kind = kind.arithmetic_kind();
     if kind.is_glue() {
         return validate_glue(spec, entry);
     }
@@ -316,6 +382,15 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
         shapes.extend(["[E]".into(), format!("[E,{u}]")]);
         dtypes.extend(["int32", "int32"]);
     }
+    if let Some(format) = spec.geometry.get("reply_format") {
+        let stride = match format.as_u64() {
+            Some(1) => h + h / 32,
+            Some(2) => h / 2 + h / 16,
+            _ => return Err(invalid("unknown EXLR8 reply format")),
+        };
+        shapes[11] = format!("[rows,{stride}]");
+        dtypes[11] = "uint8";
+    }
     let pointers = entry["pointers"]
         .as_array()
         .ok_or_else(|| invalid("pointer descriptors missing"))?;
@@ -345,6 +420,40 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
             .any(|(k, v)| v.as_u64() != spec.scratch.get(k).copied())
     {
         return Err(invalid("invalid scratch fields"));
+    }
+    Ok(())
+}
+
+fn validate_reply_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), ManifestError> {
+    let (family, format) = match spec.name.as_str() {
+        "exlr8_reply_1" => (KernelFamily::Glm, 1),
+        "exlr8_reply_2" => (KernelFamily::Glm, 2),
+        "exlr8_glmf_reply_1" => (KernelFamily::GlmFlash, 1),
+        "exlr8_glmf_reply_2" => (KernelFamily::GlmFlash, 2),
+        _ => return Err(invalid("unknown EXLR8 reply epilogue")),
+    };
+    let g = family.geometry();
+    let stride = if format == 1 { g.hidden + g.hidden / 32 } else { g.hidden / 2 + g.hidden / 16 };
+    let names = ["route_group_lane", "route_weights", "fc2", "signs_out", "output", "group_count"];
+    let shapes = [format!("[rows,{}]", g.top_k), format!("[rows,{}]", g.top_k), "[fc2_scratch]".into(),
+        format!("[{}]", g.hidden), format!("[rows,{stride}]"), "[1]".into()];
+    let types = ["int32", "float32", "float32", "int8", "uint8", "int32"];
+    let pointers = entry["pointers"].as_array().ok_or_else(|| invalid("reply pointer descriptors missing"))?;
+    let scalars = entry["scalars"].as_array().ok_or_else(|| invalid("reply scalar descriptors missing"))?;
+    if spec.capacity_rows != 64 || entry["capacity_rows"] != 64 || spec.scalar_kinds != b"ii"
+        || !spec.scratch.is_empty() || entry.get("card_plans").is_some()
+        || entry["scratch_bytes_at_capacity"].as_object().is_none_or(|s| !s.is_empty())
+        || spec.geometry["hidden"].as_u64() != Some(g.hidden as u64)
+        || spec.geometry["top_k"].as_u64() != Some(g.top_k as u64)
+        || spec.geometry["format"] != format || spec.geometry["row_bytes"].as_u64() != Some(stride as u64)
+        || spec.geometry["variant"] != "k1_k23_coalesced"
+        || !spec.pointers.iter().map(String::as_str).eq(names)
+        || pointers.len() != names.len() || pointers.iter().enumerate().any(|(i, p)|
+            p["name"] != names[i] || p["shape"].as_str() != Some(shapes[i].as_str()) || p["dtype"] != types[i]
+                || p["role"] != if i == 4 { "out" } else { "in" })
+        || scalars.len() != 2 || scalars.iter().zip(["rows", "cta_limit"]).any(|(s, name)|
+            s["name"] != name || s["type"] != "int32") {
+        return Err(invalid("EXLR8 reply epilogue contract mismatch"));
     }
     Ok(())
 }
@@ -673,6 +782,80 @@ mod tests {
             let g = family.geometry();
             assert_eq!(KernelFamily::from_geometry(g.hidden, g.units, g.top_k, g.experts).unwrap(), family);
             assert!(KernelFamily::from_geometry(g.hidden, g.units, 1, g.experts).is_err());
+        }
+    }
+
+    #[test]
+    fn reply_producer_names_require_matching_numerical_metadata() {
+        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
+            let prefix = if family == KernelFamily::Glm { "exlr8" } else { "exlr8_glmf" };
+            let mut s = spec();
+            s.name = format!("{prefix}_a16_serving_core");
+            assert!(KernelFamily::of(&s).is_err());
+            s.geometry["core_only"] = serde_json::json!(true);
+            assert_eq!(KernelFamily::of(&s).unwrap(), (family, KernelKind::RoutedCore));
+            s.name = format!("{prefix}_a16_serving");
+            assert!(KernelFamily::of(&s).is_err());
+            s.geometry.as_object_mut().unwrap().remove("core_only");
+            for (base, kind) in [("a16_grouped", KernelKind::GroupedA16),
+                ("a8_grouped", KernelKind::GroupedA8), ("a16_grouped64", KernelKind::GroupedDecode)] {
+                for format in [1, 2] {
+                    s.name = format!("{prefix}_{base}_reply{format}");
+                    s.geometry["reply_format"] = serde_json::json!(format);
+                    let resolved = KernelFamily::of(&s).unwrap();
+                    assert_eq!(resolved.0, family);
+                    assert_eq!(resolved.1.arithmetic_kind(), kind);
+                    assert_eq!(resolved.1.reply_format(), Some(format));
+                    s.geometry["reply_format"] = serde_json::json!(3 - format);
+                    assert!(KernelFamily::of(&s).is_err());
+                    s.name = format!("{prefix}_{base}");
+                    assert!(KernelFamily::of(&s).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reply_epilogues_validate_both_families_and_wire_formats() {
+        for (prefix, hidden) in [("exlr8", 6144), ("exlr8_glmf", 4096)] {
+            for format in [1, 2] {
+                let stride = if format == 1 { hidden * 33 / 32 } else { hidden * 9 / 16 };
+                let descriptors = [
+                    ("route_group_lane", "int32", "[rows,8]".into()),
+                    ("route_weights", "float32", "[rows,8]".into()),
+                    ("fc2", "float32", "[fc2_scratch]".into()),
+                    ("signs_out", "int8", format!("[{hidden}]")),
+                    ("output", "uint8", format!("[rows,{stride}]")),
+                    ("group_count", "int32", "[1]".into()),
+                ];
+                let s = ProgramSpec { name: format!("{prefix}_reply_{format}"),
+                    pointers: descriptors.iter().map(|d| d.0.into()).collect(),
+                    scalar_kinds: b"ii".to_vec(), capacity_rows: 64, scratch: HashMap::new(),
+                    geometry: serde_json::json!({"hidden":hidden,"top_k":8,"format":format,
+                        "row_bytes":stride,"variant":"k1_k23_coalesced"}) };
+                let e = serde_json::json!({"capacity_rows":64,"scratch_bytes_at_capacity":{},
+                    "pointers":descriptors.iter().enumerate().map(|(i, (name, dtype, shape))|
+                        serde_json::json!({"name":name,"dtype":dtype,"shape":shape,
+                            "role":if i == 4 { "out" } else { "in" }})).collect::<Vec<_>>(),
+                    "scalars":[{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}]});
+                validate_entry(&s, &e).unwrap();
+                for key in ["name", "dtype", "shape", "role"] {
+                    let mut bad = e.clone();
+                    bad["pointers"][4][key] = serde_json::json!("wrong");
+                    assert!(validate_entry(&s, &bad).is_err(), "{prefix}:{format}:{key}");
+                }
+                for key in ["hidden", "top_k", "format", "row_bytes", "variant"] {
+                    let mut bad = s.clone();
+                    bad.geometry.as_object_mut().unwrap().remove(key);
+                    assert!(validate_entry(&bad, &e).is_err(), "{prefix}:{format}:{key}");
+                }
+                let mut bad = e.clone();
+                bad["scratch_bytes_at_capacity"] = serde_json::json!({"new":1024});
+                assert!(validate_entry(&s, &bad).is_err());
+                let mut bad = e.clone();
+                bad["scalars"][1]["type"] = serde_json::json!("int64");
+                assert!(validate_entry(&s, &bad).is_err());
+            }
         }
     }
 

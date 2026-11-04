@@ -251,9 +251,10 @@ def jobs(scope):
                    ["--geometry", "mimop", "--capacities", CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"]))
     geometry_worlds = load_file("spark_packages", ROOT / "python/tools/lib/spark_packages.py").geometry_worlds
-    for geometry in ("mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "step5", "step5_bf16"):
+    for geometry in (geometry for geometry in ROUTED_GEOMETRIES if not geometry.startswith("glmfdense")):
         layouts = ",".join(f"tp{world}" for world in geometry_worlds(geometry))
-        for input_format in (("bf16",) if geometry == "step5_bf16" else ("wire", "bf16")):
+        bf16_only = geometry.endswith(("_bf16", "_nvfp4", "_nvfp4a4"))
+        for input_format in (("bf16",) if bf16_only else ("wire", "bf16")):
             result.append((f"routed-{geometry}-spark-{input_format}", "package_fp8_moe_aot.py",
                            ["--geometry", geometry, "--capacities", CAPACITIES,
                             "--layouts", layouts, "--exact-slices", "--role", "spark",
@@ -408,6 +409,22 @@ def routed_package_layouts(package, geometry, base, role):
     return layouts
 
 
+def routed_core_variants(package, role):
+    """Read the compared checkout's production policy, including old baselines."""
+    path = Path(package.__file__)
+    tree = ast.parse(path.read_text())
+    policy = next((node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name == "core_variants"), None)
+    if policy is None:
+        return (False,)
+    namespace = {}
+    exec(compile(ast.Module(body=[policy], type_ignores=[]), str(path), "exec"), namespace)
+    variants = namespace["core_variants"](role)
+    if not variants or any(type(value) is not bool for value in variants) or len(set(variants)) != len(variants):
+        raise ValueError(f"{path}: invalid production core-variant policy")
+    return variants
+
+
 def export_routed(extra, output):
     """Use the package's exact compiler/form policy without linking its DSOs."""
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
@@ -445,19 +462,25 @@ def export_routed(extra, output):
         forms += [(rows, form, indirect) for rows in capacities for form in prefill_forms(g, rows, wire)]
         if segmented and not indirect:
             forms += [(package.SEGMENT_MAX_ROWS, form, True) for form in package.FORMS]
-        for rows, form, row_addresses in forms:
+        forms = [(rows, form, addresses, core) for rows, form, addresses in forms
+                 for core in routed_core_variants(package, role)]
+        for rows, form, row_addresses, core_only in forms:
             stem = f"fp8moe_{geometry}_{layout.replace('-', '_')}_m{rows}" + ("" if form == "auto" else "_" + form)
             if row_addresses and not indirect:
                 stem += "_segments"
+            if core_only:
+                stem += "_core"
             with exportable_compilation():
                 program = compile_fp8_moe_aot(g, route="stream" if row_addresses else "auto",
                     max_rows=package.SEGMENT_MAX_ROWS if row_addresses else rows, wire=wire, prefill=form,
-                    **({"row_addresses": True} if row_addresses else {}))
+                    **({"row_addresses": True} if row_addresses else {}),
+                    **({"core_only": True} if core_only else {}))
             program.export_to_c(str(output), stem, "cuteafd_" + stem)
             checked = validate_exported_header(program, output / f"{stem}.h", "cuteafd_" + stem)
             if checked["argument_count"] != package.POINTERS + 2:
                 raise ValueError(f"{stem}: unexpected routed expert ABI")
             records.append({"name": stem, "layout": layout, "capacity": rows, "form": form, "abi": checked,
+                            **({"core_only": True} if core_only else {}),
                             "scratch_bytes": (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form)
                                               if row_addresses else fp8_moe_scratch_bytes(g, "auto", rows, wire, form))})
             print(f"exported {stem}", flush=True)

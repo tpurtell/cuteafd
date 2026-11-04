@@ -163,6 +163,50 @@ int cuteafd_fp8moe_launch_segments(void *ctx, void **ptrs, int rows, void *strea
 }
 void cuteafd_fp8moe_destroy(void *ctx) { free(ctx); }
 
+/* Dispatch-only fused-reply stand-ins: verify core/epilogue ordering and the
+ * shared scratch views, not CUDA numerics (those have separate device gates). */
+int cuteafd_fp8moe_reply_layout(uint32_t capacity, uint32_t form, uint32_t rows,
+        uint32_t segmented, uint64_t *out, uint32_t count) {
+    (void)form; (void)segmented;
+    if (!rows || rows > capacity || count != 4) return 1;
+    out[0] = 1; out[1] = 0;
+    out[2] = ((uint64_t)rows * fp8_words[4] * 4 + 1023) / 1024 * 1024;
+    out[3] = (uint64_t)rows * fp8_words[4] * fp8_words[1] * 2;
+    return 0;
+}
+static int reply_core(void **ptrs, int rows, int segmented) {
+    uint64_t layout[4];
+    if (rows < 1 || cuteafd_fp8moe_reply_layout((uint32_t)rows, 0,
+            (uint32_t)rows, (uint32_t)segmented, layout, 4)) return 1;
+    *(uint32_t *)((char *)ptrs[10] + layout[2]) = 0x1166;
+    event(segmented ? 's' : 'c');
+    return 0;
+}
+int cuteafd_fp8moe_launch_core(void *ctx, uint32_t capacity, void **ptrs, int rows, void *stream) {
+    (void)ctx; (void)capacity; (void)stream;
+    return reply_core(ptrs, rows, 0);
+}
+int cuteafd_fp8moe_launch_segments_core(void *ctx, void **ptrs, int rows, void *stream) {
+    (void)ctx; (void)stream;
+    return reply_core(ptrs, rows, 1);
+}
+struct fixture_program_info { char name[64]; uint32_t pointers, scalars; char kinds[16]; };
+uint32_t cuteafd_dsv4_program_count(void) { return 4; }
+int cuteafd_dsv4_program_info(uint32_t i, struct fixture_program_info *out) {
+    if (i >= 4) return 1;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->name, sizeof(out->name), "expert_reply_fp8_h%u_k%u_%u%s",
+        fp8_words[1], fp8_words[4], i % 2 + 1, i >= 2 ? "_segmented" : "");
+    out->pointers = 4; out->scalars = 1; out->kinds[0] = 'i'; return 0;
+}
+int cuteafd_dsv4_program_load(uint32_t i) { return i >= 4; }
+int cuteafd_dsv4_program_launch(uint32_t i, void **ptrs, const uint64_t *scalars, void *stream) {
+    (void)stream;
+    if (i >= 4 || !scalars[0] || *(uint32_t *)ptrs[0] != 0x1166) return 1;
+    event((char)('1' + i));
+    return 0;
+}
+
 int cuteafd_alloc_host_buffer(size_t bytes, struct host_buffer *out) {
     out->ptr = malloc(bytes);
     if (!out->ptr) return 1;

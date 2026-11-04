@@ -133,6 +133,7 @@ impl Fp8MoeInfo {
 
 type Launch = unsafe extern "C" fn(*mut c_void, u32, *const *mut c_void, i32, *mut c_void) -> i32;
 type LaunchSegments = unsafe extern "C" fn(*mut c_void, *const *mut c_void, i32, *mut c_void) -> i32;
+type ReplyLayout = unsafe extern "C" fn(u32, u32, u32, u32, *mut u64, u32) -> i32;
 type SegmentInfo = unsafe extern "C" fn(u32, *mut u32, *mut u32, *mut u32) -> i32;
 type Destroy = unsafe extern "C" fn(*mut c_void);
 type Scratch = unsafe extern "C" fn(u32, *mut u64) -> i32;
@@ -203,6 +204,9 @@ pub struct Fp8MoeModule {
     scratch: Vec<usize>,
     launch: Launch,
     launch_segments: LaunchSegments,
+    launch_core: Launch,
+    launch_segments_core: LaunchSegments,
+    reply_layout: ReplyLayout,
     segments: Vec<Fp8MoeSegment>,
     destroy: Destroy,
     set_options: Option<SetOptions>,
@@ -376,6 +380,9 @@ impl Fp8MoeModule {
         let create = *library.get::<unsafe extern "C" fn(*mut *mut c_void) -> i32>(b"cuteafd_fp8moe_create")?;
         let launch = *library.get::<Launch>(b"cuteafd_fp8moe_launch")?;
         let launch_segments = *library.get::<LaunchSegments>(b"cuteafd_fp8moe_launch_segments")?;
+        let launch_core = *library.get::<Launch>(b"cuteafd_fp8moe_launch_core")?;
+        let launch_segments_core = *library.get::<LaunchSegments>(b"cuteafd_fp8moe_launch_segments_core")?;
+        let reply_layout = *library.get::<ReplyLayout>(b"cuteafd_fp8moe_reply_layout")?;
         let destroy = *library.get::<Destroy>(b"cuteafd_fp8moe_destroy")?;
         // Packages built before the W8A16 fallback forms have no options.
         let set_options = library.get::<SetOptions>(b"cuteafd_fp8moe_set_options").ok().map(|f| *f);
@@ -386,7 +393,7 @@ impl Fp8MoeModule {
         let status = create(&mut context);
         ensure!(status == 0, "FP8 expert package initialization failed with CUDA status {status}");
         let context = NonNull::new(context).context("FP8 expert package returned a null context")?;
-        Ok(Self { _library: library, context, info, scratch, launch, launch_segments, segments, destroy, set_options,
+        Ok(Self { _library: library, context, info, scratch, launch, launch_segments, launch_core, launch_segments_core, reply_layout, segments, destroy, set_options,
             weight_read_group, arithmetic_route, prefill: Fp8MoePrefill::Auto, _owner_thread: PhantomData })
     }
 
@@ -486,6 +493,50 @@ impl Fp8MoeModule {
         let status = unsafe { (self.launch_segments)(self.context.as_ptr(), pointers.as_ptr(),
             i32::try_from(rows)?, stream) };
         ensure!(status == 0, "FP8 segmented launch failed ({status})");
+        Ok(())
+    }
+
+    /// Existing BF16 route plane and pair-position map inside admitted scratch.
+    pub fn reply_sources(&self, scratch: crate::CuteafdDeviceBuffer, rows: usize, segmented: bool)
+        -> Result<(crate::CuteafdDeviceBuffer, crate::CuteafdDeviceBuffer)> {
+        let capacity = if segmented { self.segment_recipe().map(|s| s.maximum_rows as usize) }
+            else { self.info.capacity_for(rows) }.context("FP8 reply rows exceed installed capacity")?;
+        let mut words = [0u64; 4];
+        // SAFETY: static package query writes only the supplied four words.
+        let status = unsafe { (self.reply_layout)(capacity.try_into()?, self.prefill.option(), rows.try_into()?,
+            u32::from(segmented), words.as_mut_ptr(), 4) };
+        ensure!(status == 0 && words[0] == 1 && rows > 0, "FP8 reply layout query failed ({status})");
+        let view = |offset: u64, bytes: usize| -> Result<crate::CuteafdDeviceBuffer> {
+            let offset = usize::try_from(offset)?;
+            ensure!(!scratch.ptr.is_null() && offset % 16 == 0
+                && offset.checked_add(bytes).is_some_and(|end| end <= scratch.bytes),
+                "FP8 reply source outside admitted scratch");
+            Ok(crate::CuteafdDeviceBuffer { ptr: scratch.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..scratch })
+        };
+        let pairs = rows.checked_mul(self.info.topk).context("FP8 reply routes overflow")?;
+        let expected = pairs.checked_mul(self.info.hidden).and_then(|n| n.checked_mul(2))
+            .context("FP8 reply source overflow")?;
+        let y_bytes = usize::try_from(words[3])?;
+        ensure!(y_bytes >= expected && y_bytes % (self.info.hidden * 2) == 0, "FP8 reply plane extent mismatch");
+        Ok((view(words[2], y_bytes)?, view(words[1], pairs.checked_mul(4).context("FP8 reply positions overflow")?)?))
+    }
+
+    /// # Safety
+    /// As `launch`; the caller consumes the route plane before scratch reuse.
+    pub unsafe fn launch_core(&self, pointers: &[*mut c_void; FP8_MOE_POINTERS], rows: usize,
+        segmented: bool, stream: *mut c_void) -> Result<()> {
+        let status = if segmented {
+            let recipe = self.segment_recipe().context("package has no selected segmented recipe")?;
+            ensure!(rows > 0 && rows <= recipe.maximum_rows as usize, "segmented core rows exceed extent");
+            // SAFETY: caller retains every operand through the consuming epilogue.
+            unsafe { (self.launch_segments_core)(self.context.as_ptr(), pointers.as_ptr(), rows.try_into()?, stream) }
+        } else {
+            let capacity = self.info.capacity_for(rows).context("FP8 core rows exceed capacity")?;
+            ensure!(rows > 0, "FP8 core rows must be positive");
+            // SAFETY: same retained operands and capacity contract as the ordinary launch.
+            unsafe { (self.launch_core)(self.context.as_ptr(), capacity.try_into()?, pointers.as_ptr(), rows.try_into()?, stream) }
+        };
+        ensure!(status == 0, "FP8 core launch failed ({status})");
         Ok(())
     }
 

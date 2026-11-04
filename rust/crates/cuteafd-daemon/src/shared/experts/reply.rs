@@ -1,4 +1,4 @@
-//! Combined-reply producers: fused EXL3 sum or a codec over an existing BF16
+//! Combined-reply producers: reduction and conversion into registered wire
 //! output. Transport retains the packed destination through its unit fence.
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::{BoundProgram, Scalar}, CuteafdDeviceBuffer, NativeLibrary};
@@ -117,33 +117,40 @@ impl<'a> NativeReply<'a> {
     }
 }
 
-pub(crate) struct ReplyCodec<'a> { program: BoundProgram<'a> }
-impl<'a> ReplyCodec<'a> {
+/// Shared FP8/MXFP4/NVFP4 producer epilogue over the original BF16 route plane.
+pub(crate) struct Fp8Reply<'a> { programs: [BoundProgram<'a>; 4] }
+impl<'a> Fp8Reply<'a> {
     pub(crate) fn load(library: &'a NativeLibrary) -> Result<Self> {
         let programs = library.programs()?;
-        Ok(Self { program: programs.bound("expert_reply_quantize", &["source", "out", "mode"])? })
+        let geometry = cuteafd_core::expert_geometry();
+        let bind = |format, segmented| programs.bound(&format!("expert_reply_fp8_h{}_k{}_{format}{}",
+            geometry.hidden, geometry.topk, if segmented { "_segmented" } else { "" }),
+            &["y", "pair_pos", "weights", "out"]);
+        Ok(Self { programs: [bind(1, false)?, bind(2, false)?, bind(1, true)?, bind(2, true)?] })
     }
+
     /// # Safety
-    /// Source is BF16 `[rows, hidden]`; output is an exclusive chunk of the request's wire
-    /// plane. Both remain live until this owner stream passes its unit fence.
-    pub(crate) unsafe fn quantize(&self, request: &BackboneRequest<'_>, source: CuteafdDeviceBuffer,
-        output: CuteafdDeviceBuffer, rows: usize, stream: *mut c_void) -> Result<()> {
-        let format = match request.output_dtype() {
-            ExpertV2Dtype::Bf16 => return Ok(()),
-            ExpertV2Dtype::Fp8E4m3Ue8m0K32 => 1,
-            ExpertV2Dtype::Nvfp4E2m1Fp8E4m3 => 2,
-            _ => anyhow::bail!("unsupported combined expert reply dtype"),
+    /// The owner retains sources/routes and every addressed output row until its
+    /// unit fences. Descriptor copies precede this launch on the same stream.
+    pub(crate) unsafe fn launch(&self, dtype: ExpertV2Dtype, sources: (CuteafdDeviceBuffer, CuteafdDeviceBuffer),
+        weights: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer, rows: usize, segmented: bool,
+        stream: *mut c_void) -> Result<()> {
+        let (index, stride) = match dtype {
+            ExpertV2Dtype::Fp8E4m3Ue8m0K32 => (0, cuteafd_core::expert_geometry().hidden as usize * 33 / 32),
+            ExpertV2Dtype::Nvfp4E2m1Fp8E4m3 => (1, cuteafd_core::expert_geometry().hidden as usize * 9 / 16),
+            _ => anyhow::bail!("FP8 fused reply requires compressed output"),
         };
-        let hidden = cuteafd_core::expert_geometry().hidden;
-        ensure!(rows > 0 && rows <= request.rows() as usize, "expert reply codec chunk rows exceed request");
-        let source_bytes = rows.checked_mul(hidden as usize).and_then(|n| n.checked_mul(2))
-            .context("expert reply source extent overflow")?;
-        let output_bytes = rows.checked_mul(request.output_row_bytes()? as usize)
-            .context("expert reply output extent overflow")?;
-        ensure!(source.bytes >= source_bytes && output.bytes >= output_bytes, "expert reply codec extent mismatch");
-        // SAFETY: caller's source/destination contract; constant format means mode is not read.
-        unsafe { self.program.launch(&[source.ptr, output.ptr, std::ptr::null_mut()],
-            &[Scalar::I32(i32::try_from(rows)?), Scalar::I32(i32::try_from(hidden)?),
-                Scalar::I32(format)], stream) }
+        let routes = rows.checked_mul(cuteafd_core::expert_geometry().topk as usize)
+            .and_then(|n| n.checked_mul(4)).context("FP8 reply routes overflow")?;
+        ensure!(rows > 0 && sources.1.bytes >= routes && weights.bytes >= routes
+            && output.bytes >= rows.checked_mul(if segmented { 8 } else { stride }).context("FP8 reply extent overflow")?,
+            "FP8 fused reply extent mismatch");
+        for buffer in [sources.0, sources.1, weights, output] {
+            ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % 4 == 0
+                && buffer.device_id == sources.0.device_id, "FP8 fused reply buffer mismatch");
+        }
+        // SAFETY: checked extents plus caller's retained row addresses and route-plane contract.
+        unsafe { self.programs[index + if segmented { 2 } else { 0 }].launch(
+            &[sources.0.ptr, sources.1.ptr, weights.ptr, output.ptr], &[Scalar::I32(rows.try_into()?)], stream) }
     }
 }

@@ -20,7 +20,7 @@ pub(crate) struct Fp8Worker<'a> {
     library: &'a NativeLibrary,
     inputs: [DeviceAllocation<'a>; 3],
     output: DeviceAllocation<'a>,
-    reply_codec: super::super::reply::ReplyCodec<'a>,
+    reply: super::super::reply::Fp8Reply<'a>,
     capacity: usize,
     layer: usize,
     executor_id: u64,
@@ -49,6 +49,7 @@ struct StagedUnit {
     source_address: usize,
     input: CuteafdDeviceBuffer,
     output: CuteafdDeviceBuffer,
+    dtype: ExpertV2Dtype,
 }
 struct Segments<'a> {
     copied: Vec<crate::shared::memory::device::Event<'a>>,
@@ -155,8 +156,14 @@ impl<'a> Fp8Worker<'a> {
         // receive/send slots, routes, weights and admitted scratch remain live.
         unsafe {
             if let Some(timing) = &self.timing { timing.borrow().record(0, self.stream.raw)?; }
-            if segments.staged.len() == 1 {
-                let unit = &segments.staged[0];
+            let unit = &segments.staged[0];
+            if unit.dtype != ExpertV2Dtype::Bf16 {
+                let segmented = segments.staged.len() > 1;
+                let input = if segmented { segments.device[0].buffer } else { unit.input };
+                let output = if segmented { segments.device[3].buffer } else { unit.output };
+                self.experts.run_reply(&self.reply, layer, rows, [input, segments.device[1].buffer,
+                    segments.device[2].buffer, output], false, segmented, unit.dtype, self.stream.raw)?;
+            } else if segments.staged.len() == 1 {
                 self.experts.run(layer, rows, unit.input.ptr, segments.device[1].buffer.ptr,
                     segments.device[2].buffer.ptr, unit.output.ptr, self.stream.raw)?;
             } else {
@@ -176,6 +183,8 @@ impl<'a> Fp8Worker<'a> {
     fn stage(&mut self, request: &BackboneRequest<'_>, input: CuteafdDeviceBuffer,
         output: CuteafdDeviceBuffer, executor_id: u64) -> Result<bool> {
         let rows = request.rows() as usize;
+        ensure!(request.output_dtype() == ExpertV2Dtype::Bf16 || request.partial_plan()?.is_none(),
+            "fused FP8 reply requires whole combined rows");
         let compatible = self.segments.as_ref().is_some_and(|segments| rows <= segments.unit_rows)
             && request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32).is_ok();
         if !compatible {
@@ -188,7 +197,7 @@ impl<'a> Fp8Worker<'a> {
             self.flush_staged()?;
         }
         if self.segments.as_ref().is_some_and(|segments| segments.staged.first()
-            .is_some_and(|unit| unit.layer != self.layer)) {
+            .is_some_and(|unit| unit.layer != self.layer || unit.dtype != request.output_dtype())) {
             tracing::debug!(target: "cuteafd::spark_coalesce", reason = "different_layer", "Spark staged boundary");
             self.flush_staged()?;
         }
@@ -205,14 +214,15 @@ impl<'a> Fp8Worker<'a> {
         let stride = self.experts.module.info().wire_row_bytes();
         ensure!((input.ptr as usize) % 16 == 0 && (output.ptr as usize) % 16 == 0 && stride % 16 == 0,
             "segmented mapped rows require 16-byte aligned input/output payloads and input stride");
-        ensure!(input.bytes >= rows * stride && output.bytes >= rows * self.experts.module.info().hidden * 2,
+        let output_stride = request.output_row_bytes()? as usize;
+        ensure!(input.bytes >= rows * stride && output.bytes >= rows * output_stride,
             "staged mapped row extent is too small");
         let source_address = input.ptr as usize;
         let resident = device_part(self.inputs[0].buffer,
             segments.input_offset + slot * segments.unit_rows * stride, rows * stride)?;
         for row in 0..rows {
             let input_address = (resident.ptr as usize).checked_add(row * stride).context("input row address overflow")?;
-            let output_address = (output.ptr as usize).checked_add(row * self.experts.module.info().hidden * 2)
+            let output_address = (output.ptr as usize).checked_add(row * output_stride)
                 .context("output row address overflow")?;
             bytes[row * 8..row * 8 + 8].copy_from_slice(&(input_address as u64).to_le_bytes());
             let at = segments.unit_rows * 8 + row * 8;
@@ -220,7 +230,7 @@ impl<'a> Fp8Worker<'a> {
         }
         ensure!(self.pending.reserve()? == slot, "staged slot reservation changed");
         segments.staged.push(StagedUnit { slot, layer: self.layer, source_address,
-            identity: (request.request_id(), request.layer(), request.rows(), executor_id), input: resident, output });
+            identity: (request.request_id(), request.layer(), request.rows(), executor_id), input: resident, output, dtype: request.output_dtype() });
         let copy = self.copy_stream.as_ref().unwrap().raw;
         // SAFETY: the reserved unit retains its mapped source, device slice and
         // event. Copy is host-triggered now, with no wait on future compute.
@@ -296,7 +306,7 @@ impl<'a> Fp8Worker<'a> {
             library,
             inputs,
             output,
-            reply_codec: super::super::reply::ReplyCodec::load(library)?,
+            reply: super::super::reply::Fp8Reply::load(library)?,
             capacity,
             layer: 0,
             executor_id,
@@ -375,7 +385,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(request.layer() as usize == self.experts.layers[self.layer].layer,
             "request does not match the selected FP8 layer");
         ensure!(executor_id == self.executor_id, "FP8 response executor identity mismatch");
-        if self.deferred && request.output_dtype() == ExpertV2Dtype::Bf16 {
+        if self.deferred {
             if let (Some(input), Some(output)) = (hidden_view, destination) {
                 if self.stage(request, input, output, executor_id)? { return Ok(output) }
             }
@@ -428,16 +438,23 @@ impl<'a> Fp8Worker<'a> {
             self.inputs[2].buffer, self.stream.raw)?; }
         let compressed = request.output_dtype() != ExpertV2Dtype::Bf16;
         ensure!(!compressed || destination.is_some(), "compressed replies require a mapped response slot");
-        let output = match destination.filter(|_| !compressed) {
+        let output = match destination {
             Some(output) => output,
             None => self.output.buffer,
         };
-        ensure!(output.bytes >= bytes, "FP8 response slot is too small");
+        ensure!(output.bytes >= if compressed { rows * request.output_row_bytes()? as usize } else { bytes },
+            "FP8 response slot is too small");
         // SAFETY: inputs, output and the resident layer are live device memory of
         // the documented extents; the stream is synchronized below.
         unsafe {
             if let Some(timing) = &self.timing { timing.borrow().record(0, self.stream.raw)?; }
-            if bf16 {
+            if compressed {
+                ensure!(request.partial_plan()?.is_none(), "FP8 fused reply requires combined rows");
+                self.experts.run_reply(&self.reply, self.layer, rows,
+                    [CuteafdDeviceBuffer { ptr: hidden, bytes: hidden_bytes, ..self.inputs[0].buffer },
+                     self.inputs[1].buffer, self.inputs[2].buffer, output], bf16, false,
+                    request.output_dtype(), self.stream.raw)?;
+            } else if bf16 {
                 self.experts.run_bf16(self.layer, rows, hidden, self.inputs[1].buffer.ptr,
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
             } else {
@@ -445,10 +462,6 @@ impl<'a> Fp8Worker<'a> {
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
             }
             if let Some(timing) = &self.timing { timing.borrow().record(1, self.stream.raw)?; }
-            if compressed {
-                self.reply_codec.quantize(request, output,
-                    destination.context("missing compressed reply slot")?, request.rows() as usize, self.stream.raw)?;
-            }
             // The transport holds both mapped slots until this unit's fence,
             // independent of later work queued on the owner's stream.
             if self.deferred && destination.is_some() {
@@ -598,6 +611,110 @@ mod tests {
                 assert_eq!(memory_ledger::snapshot().total(Space::Device, 7) - baseline, 512);
                 drop(weights);
                 assert_eq!(memory_ledger::snapshot().total(Space::Device, 7), baseline);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn selected_compressed_replies_dispatch_core_then_epilogue_including_staged_pairs() -> Result<()> {
+        use crate::shared::memory::HostAllocation;
+        use cuteafd_ffi::{fp8_moe::Fp8MoeModule, native_library_lifetime_fixture::Fixture};
+        use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RequestView,
+            ExpertProtocolV2RowDescriptor, ExpertProtocolV2RouteEntry, ExpertV2SourceKind,
+            ProtocolV2RequestDevicePayload, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32,
+            EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3};
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        library.cuda_set_device(7)?;
+        fixture.configure_memory(&library, 7, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        std::fs::hard_link(fixture.directory().join("liblifetime_fixture.so"),
+            fixture.directory().join("libcuteafd_fp8moe.so"))?;
+        let geometry = cuteafd_core::expert_geometry();
+        let words = [5 | 1 << 8 | 1 << 16 | 1 << 24, geometry.hidden,
+            128, geometry.experts, geometry.topk, 256, 2, 7, 0,
+            2, 16, 4096, 0, 0, 0, 0];
+        let scratch_bytes = (1 << 20) + 2 * 769 * geometry.topk as u64 * geometry.hidden as u64 * 2;
+        fixture.configure_fp8(&library, &words, &[scratch_bytes, scratch_bytes, 0, 0, 0, 0])?;
+        fixture.configure_fp8_segments(&library)?;
+        // SAFETY: this test built the CPU-only ABI and owns its buffers below.
+        let module = unsafe { Fp8MoeModule::load(fixture.directory())? };
+        let source_scratch = DeviceAllocation::new(&library, 1 << 20)?;
+        let (y, positions) = module.reply_sources(source_scratch.buffer, 2, false)?;
+        assert_eq!(y.bytes, 2 * geometry.topk as usize * geometry.hidden as usize * 2);
+        assert_eq!(positions.bytes, 2 * geometry.topk as usize * 4);
+        for rows in [0, 4097] { assert!(module.reply_sources(source_scratch.buffer, rows, false).is_err()); }
+        assert!(module.reply_sources(CuteafdDeviceBuffer { bytes: 1024, ..source_scratch.buffer }, 2, false).is_err());
+        assert!(module.reply_sources(CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), ..source_scratch.buffer }, 2, false).is_err());
+        let weights = Rc::new(Fp8Weights {
+            layers: vec![super::super::Fp8Layer { layer: 3,
+                slice: cuteafd_core::SparkSlice { unit_map: None, layer: 3, first: 0,
+                    width: 128, stored_width: 128, tiers: vec![], projection_counts: vec![] },
+                regions: vec![None, None, None, None, None, None] }],
+            module, bf16_module: None, tp: 2, rank: 0, weight_read_bytes: 256,
+        });
+        for (format, flag) in [EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32,
+            EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3].into_iter().enumerate() {
+            for staged in [false, true] {
+                let extent = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
+                    capacity: 4096, compiled: 4096, staging_rows: 769, buffered_units: 3 };
+                let mut worker = Fp8Worker::with_extent(&library, weights.clone(), 4096, None,
+                    staged.then_some(extent))?;
+                if staged {
+                    worker.prepare_segments(extent)?;
+                    worker.defer(3, 769, cuteafd_core::ExecutionOwner::Prefill)?;
+                }
+                let rows = if staged { 769 } else { 2 };
+                let mut exchange = HostExpertExchange::new(4096)?;
+                let mut frames = Vec::new();
+                let mut replies = Vec::new();
+                let before = fixture.events()?.len();
+                for unit in 0..if staged { 2 } else { 1 } {
+                    let mut owned = ExpertProtocolV2Request::new(91 + unit, 17, 3, geometry.hidden,
+                        ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+                        (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row as u64,
+                            source_kind: ExpertV2SourceKind::Prefill, source_request_id: unit,
+                            token_position: row as u64, route_offset: row * geometry.topk,
+                            route_count: geometry.topk }).collect(),
+                        (0..rows * geometry.topk).map(|route| ExpertProtocolV2RouteEntry {
+                            row_index: route / geometry.topk, expert_id: route % geometry.experts,
+                            gate_weight: 0.25 }).collect(),
+                        vec![7; rows as usize * geometry.hidden as usize * 33 / 32])?;
+                    owned.header.flags |= flag
+                        | cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+                    let encoded = owned.encode()?;
+                    let mut frame = HostAllocation::new(&library, encoded.len())?;
+                    frame.bytes_mut().copy_from_slice(&encoded);
+                    let request = BackboneRequest::parse(frame.bytes(), 4096)?;
+                    let view = ExpertProtocolV2RequestView::parse(frame.bytes())?;
+                    let reply = HostAllocation::new(&library,
+                        EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + request.plane_bytes()?)?;
+                    let alias = library.cuda_host_buffer_device_alias(frame.buffer)?;
+                    let mapped = ProtocolV2RequestDevicePayload {
+                        hidden_payload: CuteafdDeviceBuffer {
+                            ptr: view.hidden_payload().as_ptr().cast_mut().cast(),
+                            bytes: view.hidden_payload().len(), ..alias }, execution_lane: 0,
+                        response_slot: Some(library.cuda_host_buffer_device_alias(reply.buffer)?) };
+                    // SAFETY: frame and reply owners survive the explicit drain below.
+                    unsafe { worker.execute_mapped_payload(&request, worker.executor_id, &mut exchange, mapped)?; }
+                    frames.push(frame);
+                    replies.push(reply);
+                }
+                worker.flush_staged()?;
+                worker.synchronize()?;
+                let events = fixture.events()?;
+                let dispatch: String = events[before..].chars()
+                    .filter(|c| matches!(c, 'c' | 's' | '1'..='4')).collect();
+                assert_eq!(dispatch, format!("{}{}", if staged { 's' } else { 'c' },
+                    char::from(b'1' + format as u8 + if staged { 2 } else { 0 })));
+                if staged {
+                    assert_eq!(worker.segments.as_ref().unwrap().flushes, 1);
+                    while !worker.pending.is_empty() { assert!(worker.unit_ready()?); worker.complete()?; }
+                }
+                drop(worker);
+                drop((frames, replies));
             }
         }
         Ok(())

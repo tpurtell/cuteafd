@@ -56,7 +56,6 @@ pub(super) struct Worker<'w, 'a> {
     prefill: Option<Exlr8Execution<'a>>,
     weights: &'w [Exlr8Weights<'a>],
     library: &'a NativeLibrary,
-    reply_codec: super::super::reply::ReplyCodec<'a>,
     selected: usize,
     capacity: usize,
     executor_id: u64,
@@ -176,7 +175,6 @@ impl<'w, 'a> Worker<'w, 'a> {
             grouped_decode = grouped_decode.is_some(), decode_bytes, workspace,
             "EXLR8 decode dispatch admitted");
         Ok(Self { stream, execution, grouped_decode, grouped_from_row, prefill, weights, library,
-            reply_codec: super::super::reply::ReplyCodec::load(library)?,
             selected: 0, capacity: config.capacity as usize,
             executor_id: config.spark_world()?.topology().executor_id(config.rank)?, timing,
             deferred: false, pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
@@ -244,17 +242,22 @@ impl<'w, 'a> Worker<'w, 'a> {
                     library_copy(self.library, execution.input()?, hidden, hidden.bytes, self.stream.raw)?;
                     self.route_staging.upload(stage, first * topk, routes,
                         execution.ids()?, execution.route_weights()?, self.stream.raw)?;
-                    execution.run(&self.weights[self.selected], rows, self.stream.raw)?;
+                    if compressed {
+                        ensure!(request.partial_plan()?.is_none(), "EXLR8 fused reply requires combined rows");
+                        let stride = request.output_row_bytes()? as usize;
+                        let target = super::super::exlr8::view(destination.context("missing compressed EXLR8 slot")?,
+                            first * stride, rows * stride)?;
+                        execution.run_reply(&self.weights[self.selected], rows, request.output_dtype(), target, self.stream.raw)?;
+                    } else { execution.run(&self.weights[self.selected], rows, self.stream.raw)?; }
                 }
+                if compressed { continue; }
                 let output = super::super::exlr8::view(execution.output()?, 0, rows * output_stride)?;
                 if let Some(destination) = destination {
                     let wire_stride = request.output_row_bytes()? as usize;
                     let target = super::super::exlr8::view(destination, first * wire_stride, rows * wire_stride)?;
                     // SAFETY: the transport owns the destination until the response send completes.
                     unsafe {
-                        if compressed {
-                            self.reply_codec.quantize(request, output, target, rows, self.stream.raw)?;
-                        } else { library_copy(self.library, target, output, output.bytes, self.stream.raw)?; }
+                        library_copy(self.library, target, output, output.bytes, self.stream.raw)?;
                     }
                 }
             }

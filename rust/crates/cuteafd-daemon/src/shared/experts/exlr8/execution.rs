@@ -167,6 +167,9 @@ impl Workspace {
 pub(crate) struct Exlr8Execution<'a> {
     group: Program<'a>,
     k1: Program<'a>,
+    reply: Option<[Program<'a>; 2]>,
+    reply_core: Option<Program<'a>>,
+    reply_epilogue: Option<[Program<'a>; 2]>,
     // Private, fixed storage: no request can resize or replace captured pointers.
     arena: DeviceAllocation<'a>,
     layout: Workspace,
@@ -303,6 +306,26 @@ impl<'a> Exlr8Execution<'a> {
     ) -> Result<Self> {
         let (k1_name, group_name) = program_names(family, set, variant, activations);
         let k1 = programs.program(k1_name, &pointers(set, variant))?;
+        let prefix = match family { KernelFamily::Glm => "exlr8", KernelFamily::GlmFlash => "exlr8_glmf" };
+        let (reply, reply_core, reply_epilogue) = if set == ExpertSet::Routed {
+            if variant == Variant::DecodeCompact {
+                let core = programs.program(&format!("{prefix}_a16_serving_core"), &pointers(set, variant))?;
+                ensure!(core.spec().scratch == k1.spec().scratch && core.spec().scalar_kinds == k1.spec().scalar_kinds,
+                    "EXLR8 core scratch or scalar ABI differs from BF16 producer");
+                let bind = |format| programs.program(&format!("{prefix}_reply_{format}"),
+                    &["route_group_lane", "route_weights", "fc2", "signs_out", "output", "group_count"]);
+                (None, Some(core), Some([bind(1)?, bind(2)?]))
+            } else {
+                let bind = |format| -> Result<Program<'a>> {
+                    let program = programs.program(&format!("{k1_name}_reply{format}"), &pointers(set, variant))?;
+                    ensure!(program.spec().scratch == k1.spec().scratch
+                        && program.spec().scalar_kinds == k1.spec().scalar_kinds,
+                        "EXLR8 compressed producer changed scratch or scalar ABI");
+                    Ok(program)
+                };
+                (Some([bind(1)?, bind(2)?]), None, None)
+            }
+        } else { (None, None, None) };
         let group = programs.program(
             group_name,
             &[
@@ -352,6 +375,7 @@ impl<'a> Exlr8Execution<'a> {
         Ok(Self {
             group,
             k1,
+            reply, reply_core, reply_epilogue,
             arena,
             layout,
             routing: RoutingLifetime::default(),
@@ -407,6 +431,30 @@ impl<'a> Exlr8Execution<'a> {
         rows: usize,
         stream: *mut c_void,
     ) -> Result<()> {
+        // SAFETY: inherited retained workspace/weights contract; BF16 keeps its original producer.
+        unsafe { self.run_to(weights, rows, None, stream) }
+    }
+
+    /// # Safety
+    /// As `run`, with an exclusive registered reply slot retained through the unit fence.
+    pub(crate) unsafe fn run_reply(&self, weights: &Exlr8Weights<'_>, rows: usize,
+        dtype: cuteafd_transport::ExpertV2Dtype, output: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        let hidden = self.layout.hidden;
+        let (index, stride) = match dtype {
+            cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 => (0, hidden + hidden / 32),
+            cuteafd_transport::ExpertV2Dtype::Nvfp4E2m1Fp8E4m3 => (1, hidden / 2 + hidden / 16),
+            _ => anyhow::bail!("EXLR8 fused reply requires compressed output"),
+        };
+        ensure!(self.set == ExpertSet::Routed && !output.ptr.is_null() && output.ptr as usize % 16 == 0
+            && output.device_id == self.arena.buffer.device_id
+            && output.bytes >= rows.checked_mul(stride).context("EXLR8 reply extent overflow")?,
+            "EXLR8 fused reply buffer mismatch");
+        // SAFETY: checked exclusive output, same retained sources as the BF16 path.
+        unsafe { self.run_to(weights, rows, Some((index, output)), stream) }
+    }
+
+    unsafe fn run_to(&self, weights: &Exlr8Weights<'_>, rows: usize,
+        reply: Option<(usize, CuteafdDeviceBuffer)>, stream: *mut c_void) -> Result<()> {
         ensure!(
             rows > 0 && rows <= self.layout.rows,
             "EXLR8 live rows exceed admission"
@@ -461,8 +509,19 @@ impl<'a> Exlr8Execution<'a> {
                 &[Scalar::I32(rows as i32), Scalar::I32(self.group_cta_limit)],
                 stream,
             )?;
-            self.k1.launch(&operands[..if self.layout.unit_tables { 15 } else { 13 }],
+            let producer = if let Some((index, output)) = reply {
+                operands[11] = output.ptr;
+                match &self.reply {
+                    Some(programs) => &programs[index],
+                    None => self.reply_core.as_ref().context("missing EXLR8 reply core")?,
+                }
+            } else { &self.k1 };
+            producer.launch(&operands[..if self.layout.unit_tables { 15 } else { 13 }],
                 &scalars[..if self.layout.unit_tables { 4 } else { 2 }], stream)?;
+            if let (Some((index, output)), Some(epilogues)) = (reply, &self.reply_epilogue) {
+                epilogues[index].launch(&[p(6), p(2), fc2.ptr, weights.signs(true)?.ptr, output.ptr, p(7)],
+                    &scalars[..2], stream)?;
+            }
         }
         Ok(())
     }

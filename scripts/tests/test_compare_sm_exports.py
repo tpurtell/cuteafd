@@ -69,6 +69,22 @@ def test_draft_bf16_group_matches_exported_shapes():
         assert job[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "qwen38", "--only", expected])
 
 
+def test_spark_routed_groups_cover_all_shipped_weight_geometries_with_valid_inputs():
+    groups = {name: args for name, _, args in compare_sm.jobs("all")}
+    for geometry in compare_sm.ROUTED_GEOMETRIES:
+        if geometry.startswith("glmfdense"):
+            assert not any(name.startswith(f"routed-{geometry}-spark-") for name in groups)
+            continue
+        bf16_only = geometry.endswith(("_bf16", "_nvfp4", "_nvfp4a4"))
+        for input_format in ("bf16", "wire"):
+            name = f"routed-{geometry}-spark-{input_format}"
+            assert (name in groups) == (input_format == "bf16" or not bf16_only)
+            if name in groups:
+                args = groups[name]
+                assert args[args.index("--role") + 1] == "spark"
+                assert args[args.index("--input") + 1] == input_format
+
+
 def test_pro_native_tp3_has_equal_k32_geometry_without_v41_identity():
     path = ROOT / "python/tools/aot/export_b12x_slices_aot.py"
     tree = ast.parse(path.read_text())
@@ -1128,9 +1144,11 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     ))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
     monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", SimpleNamespace(
+        __file__=str(tmp_path / "baseline-package.py"),
         layout_geometry=lambda base, layout: (1, base), POINTERS=11, SEGMENT_MAX_ROWS=16384,
         input_kind=lambda role, weights, requested: requested or ("wire" if role == "spark" else "bf16"),
     ))
+    (tmp_path / "baseline-package.py").write_text("# baseline without core variants\n")
     args = ["--geometry", "mimo", "--capacities", "2752"]
     compare_sm.export_routed(args + (["--row-addresses"] if indirect else []), tmp_path)
     assert calls == [(geometry, "stream" if indirect else "auto", 16384 if indirect else 2752,
@@ -1138,6 +1156,64 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     records = json.loads((tmp_path / "routed.json").read_text())["programs"]
     assert len(records) == 1
     assert records[0]["scratch_bytes"] == (128 if indirect else 64)
+
+
+@pytest.mark.parametrize("role", ["spark", "coordinator"])
+def test_routed_core_policy_is_the_packages_source_policy(tmp_path, role):
+    package = compare_sm.load_file("core_policy_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
+    assert compare_sm.routed_core_variants(package, role) == package.core_variants(role)
+    source = Path(package.__file__).read_text()
+    assert "for core in core_variants(args.role)" in source
+    # A source comparison must follow a changed policy, not a cached candidate list.
+    path = tmp_path / "package.py"
+    path.write_text("def core_variants(role):\n    return (True,) if role == 'spark' else (False, True)\n")
+    assert compare_sm.routed_core_variants(SimpleNamespace(__file__=str(path)), role) == (
+        (True,) if role == "spark" else (False, True))
+
+
+@pytest.mark.parametrize("wire", [False, True])
+def test_spark_routed_object_set_matches_production_including_core(tmp_path, monkeypatch, wire):
+    from contextlib import nullcontext
+    package = compare_sm.load_file("core_set_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
+    geometry = SimpleNamespace(weights="fp8")
+    calls = []
+    def compile_program(g, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(export_to_c=lambda *args: None)
+    forms = lambda g, rows, wire: ["w8a16"] if rows > 16 else []
+    module = SimpleNamespace(GEOMETRIES={"mimo": geometry}, compile_fp8_moe_aot=compile_program,
+        fp8_moe_scratch_bytes=lambda *args: 64, fp8_moe_segment_scratch_bytes=lambda *args: 128,
+        prefill_forms=forms)
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(
+        exportable_compilation=nullcontext, validate_exported_header=lambda *args: {"argument_count": 13}))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
+    monkeypatch.setattr(package, "layout_geometry", lambda base, layout: (1, base))
+    monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", package)
+    compare_sm.export_routed(["--geometry", "mimo", "--role", "spark", "--input", "wire" if wire else "bf16",
+        "--capacities", "16,4096", "--layouts", "tp1"], tmp_path)
+    # Evaluate the actual production forms/exports AST: adding a production
+    # recipe without carrying it into export_routed changes this expected set.
+    tree = ast.parse(Path(package.__file__).read_text())
+    build = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build")
+    loop = next(n for n in ast.walk(build) if isinstance(n, ast.For)
+                and isinstance(n.target, ast.Name) and n.target.id == "layout"
+                and any(isinstance(statement, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == "forms"
+                                for target in statement.targets) for statement in n.body))
+    begin = next(i for i, n in enumerate(loop.body) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "forms" for t in n.targets))
+    end = next(i for i, n in enumerate(loop.body) if isinstance(n, ast.For)
+               and isinstance(n.target, ast.Tuple) and len(n.target.elts) == 4)
+    env = {**vars(package), "capacities": [16, 4096], "prefill_forms": forms, "g": geometry, "wire": wire,
+           "args": SimpleNamespace(role="spark")}
+    exec(compile(ast.Module(body=loop.body[begin:end], type_ignores=[]), "production_recipes", "exec"), env)
+    expected = {(rows, form, segmented, core) for rows, form, segmented, core in env["exports"]}
+    actual = {(c["max_rows"], c["prefill"], c.get("row_addresses", False), c.get("core_only", False)) for c in calls}
+    assert actual == expected
+    assert any(core for _, _, _, core in actual)
+    records = json.loads((tmp_path / "routed.json").read_text())["programs"]
+    assert len(records) == len(expected)
+    assert all(r["name"].endswith("_core") == r.get("core_only", False) for r in records)
 
 
 def test_default_source_root_resolves_worktree_alias_and_preserves_override(tmp_path, monkeypatch):

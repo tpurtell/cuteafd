@@ -64,11 +64,24 @@ fn validate_exlr8(manifest: &serde_json::Value, names: &BTreeSet<&str>, role: &s
         for kind in required {
             let name = family.program(kind);
             ensure!(recorded.contains(name), "EXLR8 {scope} checkpoint requires program {name}");
-            let spec = spec(name)?;
-            let entry = manifest["programs"].as_array().context("manifest programs")?.iter()
-                .find(|entry| entry["name"] == name).context("required EXLR8 program entry")?;
-            cuteafd_ffi::exlr8::validate_entry(&spec, entry)?;
         }
+        // Set equality proves inventory agreement, not that additional exports
+        // satisfy the runtime ABI. Validate every recorded entry as serving does.
+        validate_recorded_entries(manifest, &recorded, &spec)?;
+    }
+    Ok(())
+}
+
+fn validate_recorded_entries(manifest: &serde_json::Value, recorded: &BTreeSet<&str>,
+    spec: impl Fn(&str) -> Result<cuteafd_ffi::programs::ProgramSpec>) -> Result<()> {
+    let entries = manifest["programs"].as_array().context("manifest programs")?;
+    for &name in recorded {
+        let spec = spec(name)?;
+        ensure!(spec.name == name, "EXLR8 program spec name mismatch for {name}");
+        let mut matching = entries.iter().filter(|entry| entry["name"] == name);
+        let entry = matching.next().context("recorded EXLR8 program entry missing")?;
+        ensure!(matching.next().is_none(), "duplicate EXLR8 program entry {name}");
+        cuteafd_ffi::exlr8::validate_entry(&spec, entry)?;
     }
     Ok(())
 }
@@ -86,6 +99,25 @@ mod tests {
             "exlr8_dense_fp8_row_lm_head", "glm_norm"];
         let experts: Vec<_> = expert_programs(names.into_iter()).into_iter().collect();
         assert_eq!(experts, ["exlr8_a16_serving", "exlr8_shared_group"]);
+    }
+
+    #[test]
+    fn additional_recorded_exports_are_validated_even_when_inventory_sets_match() {
+        use cuteafd_ffi::programs::ProgramSpec;
+        use std::cell::RefCell;
+        for prefix in ["exlr8", "exlr8_glmf"] {
+            let name = format!("{prefix}_a16_serving_core");
+            let manifest = serde_json::json!({"programs":[{"name":name}]});
+            let names = BTreeSet::from([name.as_str()]);
+            let seen = RefCell::new(Vec::new());
+            let error = validate_recorded_entries(&manifest, &names, |requested| {
+                seen.borrow_mut().push(requested.to_owned());
+                Ok(ProgramSpec { name: requested.into(), pointers: Vec::new(), scalar_kinds: Vec::new(),
+                    capacity_rows: 64, geometry: serde_json::json!({}), scratch: Default::default() })
+            }).unwrap_err();
+            assert_eq!(*seen.borrow(), [name]);
+            assert!(error.to_string().contains("core_only"), "{error}");
+        }
     }
 
     #[test]

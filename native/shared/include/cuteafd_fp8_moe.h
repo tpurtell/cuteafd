@@ -52,6 +52,16 @@ int32_t cuteafd_fp8moe_segment_scratch_bytes(uint32_t rows, uint64_t* bytes);
 // Same operands, except x/out are uint64 row-address tables. Populate them on
 // stream before launch and retain all addressed rows until completion.
 int32_t cuteafd_fp8moe_launch_segments(void* context, void* const* pointers, int32_t rows, void* stream);
+// Core variants omit only MoeCombine, preserving all arithmetic and scratch.
+int32_t cuteafd_fp8moe_launch_core(void* context, uint32_t capacity, void* const* pointers,
+                                  int32_t rows, void* stream);
+int32_t cuteafd_fp8moe_launch_segments_core(void* context, void* const* pointers,
+                                           int32_t rows, void* stream);
+// Static query using the launch form fallback; segmented is 0 or 1. Four u64
+// words: layout version (1), pair_pos offset, BF16 y offset, y extent in bytes.
+// Offsets refer to the existing scratch, with live rows and planned metadata.
+int32_t cuteafd_fp8moe_reply_layout(uint32_t capacity, uint32_t form, uint32_t rows,
+                                   uint32_t segmented, uint64_t* words, uint32_t count);
 void cuteafd_fp8moe_destroy(void* context);
 // options: the large-row form of FP8 programs. 0 the package default (wire rows
 // W8A8: block-scaled E4M3 x E4M3 gate/up; BF16 rows W8A16, exact), 1 W8A16 (the

@@ -220,6 +220,19 @@ def test_capacity_scratch_reserves_largest_retained_form_like_runtime_abi():
     assert "kPrograms[i].scratch > *bytes" in source
 
 
+@pytest.mark.parametrize("change", [
+    {"end_rows": 0}, {"end_rows": 81}, {"end_rows": 79},
+    {"route": 0}, {"metadata_bytes": 0}, {"metadata_bytes": 1025}, {"a4_split": 2},
+])
+def test_bridge_rejects_invalid_core_scratch_layout(change):
+    layout = {"end_rows": 80, "route": 3, "metadata_bytes": 2048, "a4_split": 0, **change}
+    program = {"stem": "mock", "capacity": 80, "scratch": 65536, "form": "auto",
+               "entry": "mock_launch", "core_only": True, "segmented": False,
+               "act_row_bytes": 2048, "reply_layouts": [layout]}
+    with pytest.raises(ValueError, match="reply scratch"):
+        package_tool.bridge_source([program], [0] * 16)
+
+
 @pytest.mark.parametrize("geometry", [
     "mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "step5_bf16",
     "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
@@ -278,8 +291,11 @@ static void mock_launch(void** args, int) {{
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(route_source), "exec"), env)
     decode = env["_Route"]()
     decode.route = "decode"
+    grouped_prefill = geometry == "step5_bf16"
+    prefill = env["_Route"]() if grouped_prefill else env["_StreamRoute"]()
+    prefill.route = "prefill"
     routes = env["arithmetic_routes"](SimpleNamespace(route="auto", threshold=37,
-        decode=decode, prefill=env["_StreamRoute"]()), "nvfp4" if "nvfp4" in geometry else "mxfp4", 80)
+        decode=decode, prefill=prefill), "nvfp4" if "nvfp4" in geometry else "mxfp4", 80)
     programs = [{"stem": stem, "capacity": 80, "scratch": 65536, "form": "auto", "entry": "mock_launch",
           "arithmetic_routes": routes,
           "weight_read_grouping": ({"contract": "conservative_route_upper_bound",
@@ -290,6 +306,21 @@ static void mock_launch(void** args, int) {{
     if segmented:
         programs.append({**programs[0], "capacity": 16384, "segmented": True,
                          "minimum_rows": 769, "act_row_bytes": 2048})
+    core_programs = []
+    align = lambda n: (n + 1023) // 1024 * 1024
+    for p in programs:
+        segment = p.get("segmented", False)
+        ends = [p["capacity"]] if segment or "nvfp4" in geometry else [37, 80]
+        layouts = []
+        for end in ends:
+            route = 3 if segment or "nvfp4" in geometry else (2 if grouped_prefill else 3) if end > 37 else 1
+            bound = p["capacity"] * 8
+            tiles = (bound + 127) // 128 + min(384, bound) if route == 3 else (
+                (bound + 63) // 64 + min(384, bound) if route == 2 else 1)
+            layouts.append(dict(end_rows=end, route=route,
+                metadata_bytes=align(4 * (4 + 3 * 384 + tiles)), a4_split=0))
+        core_programs.append({**p, "core_only": True, "reply_layouts": layouts, "act_row_bytes": 2048})
+    programs += core_programs
     source = package_tool.bridge_source(programs,
         [5 | (5 if geometry == "step5_bf16" else 4 if "nvfp4" in geometry else 1) << 8 | 1 << 16 | 1 << 24, 6144, 1024, 384, 8, 2048, 2, 1, 0, 1, 80, 0, 0, 0, 0, 0])
     (tmp_path / "bridge.cc").write_text(source)
@@ -335,10 +366,51 @@ static void mock_launch(void** args, int) {{
         for rows in (1, 37, 38, 80):
             assert lib.cuteafd_fp8moe_arithmetic_route(80, form, rows, ctypes.byref(route), ctypes.byref(end)) == 0
             assert (route.value, end.value) == ((0, 80) if "nvfp4" in geometry else
-                (1, 37) if rows <= 37 else (3, 80))
+                (1, 37) if rows <= 37 else (2 if grouped_prefill else 3, 80))
         # Rows 37 and 38 share a traffic group, but select different arithmetic.
         for rows in (0, 81):
             assert lib.cuteafd_fp8moe_arithmetic_route(80, form, rows, ctypes.byref(route), ctypes.byref(end)) != 0
+    # Execute the fork's pure scratch formula, not a second copy of the bridge
+    # arithmetic. Only route selection is synthetic in this mocked package.
+    layout_env = {"Fp8MoeGeometry": SimpleNamespace,
+                  "_resolve": lambda route, *args: route,
+                  "_mxfp4_down_a8": lambda *args: False}
+    helper_sources = {
+        "fp8_moe.py": {"_ALIGN", "TILE_M", "_align", "_grouped_rows", "_regions",
+                       "fp8_moe_reply_layout", "nvfp4_a4_fused"},
+        "_fp8_moe_stream.py": {"STREAM_TILE_M", "stream_max_tiles"},
+        "_fp8_moe_kernels.py": {"META_HEAD", "meta_words"},
+        "_mxfp4_down_a8_plan.py": {"mxfp8_down_row_bytes"},
+    }
+    for filename, names in helper_sources.items():
+        source_tree = ast.parse((route_source.parent / filename).read_text())
+        nodes = [n for n in source_tree.body if
+                 isinstance(n, ast.FunctionDef) and n.name in names or
+                 isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name) and n.targets[0].id in names]
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), filename, "exec"), layout_env)
+    layout_geometry = SimpleNamespace(hidden=6144, slice=1024, experts=384, top_k=8,
+        activations="a4" if "nvfp4" in geometry else "a16", weights="fp8", kind="fp8")
+    query = lib.cuteafd_fp8moe_reply_layout
+    query.argtypes = [ctypes.c_uint] * 4 + [ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint]
+    words = (ctypes.c_uint64 * 4)()
+    for form in (0, 1, 2):
+        for rows in (1, 17, 37, 38, 80):
+            assert query(80, form, rows, 0, words, 4) == 0
+            pairs = rows * 8
+            selected = "stream" if "nvfp4" in geometry else (
+                "prefill" if grouped_prefill else "stream") if rows > 37 else "decode"
+            expected = layout_env["fp8_moe_reply_layout"](layout_geometry,
+                route=selected, rows=rows, max_rows=80)
+            plane_rows = layout_env["_grouped_rows"](layout_geometry, selected, rows) if selected == "prefill" else pairs
+            assert list(words) == [1, expected["pair_pos_offset"], expected["y_offset"], plane_rows * 6144 * 2]
+    for capacity, form, rows, indirect, count in [(80, 0, 0, 0, 4), (80, 0, 81, 0, 4),
+        (80, 3, 1, 0, 4), (80, 0, 1, 2, 4), (80, 0, 1, 0, 3), (81, 0, 1, 0, 4)]:
+        assert query(capacity, form, rows, indirect, words, count) != 0
+    if segmented:
+        assert query(16384, 2, 8256, 1, words, 4) == 0
+        assert words[3] == 8256 * 8 * 6144 * 2
+    else:
+        assert query(16384, 0, 1, 1, words, 4) != 0
     assert lib.mock_initialized() == 0  # The contract query must not initialize CUDA.
     contexts = []
     for rank in (0, 1):
@@ -346,7 +418,7 @@ static void mock_launch(void** args, int) {{
         context = ctypes.c_void_p()
         assert lib.cuteafd_fp8moe_create(ctypes.byref(context)) == 0
         contexts.append(context)
-    program_count = 2 if segmented else 1
+    program_count = 4 if segmented else 2
     assert lib.mock_initialized() == program_count
     pointers = (ctypes.c_void_p * 11)(*([1] * 11))
     for rank in (0, 1):
@@ -356,6 +428,10 @@ static void mock_launch(void** args, int) {{
         ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_void_p]
     assert (lib.cuteafd_fp8moe_launch_segments(contexts[1], pointers, 8256, None) == 0) == segmented
     assert lib.cuteafd_fp8moe_launch(contexts[1], 16384, pointers, 8256, None) != 0
+    lib.cuteafd_fp8moe_launch_core.argtypes = lib.cuteafd_fp8moe_launch.argtypes
+    lib.cuteafd_fp8moe_launch_segments_core.argtypes = lib.cuteafd_fp8moe_launch_segments.argtypes
+    assert lib.cuteafd_fp8moe_launch_core(contexts[1], 80, pointers, 80, None) == 0
+    assert (lib.cuteafd_fp8moe_launch_segments_core(contexts[1], pointers, 8256, None) == 0) == segmented
     for index in range(11):
         pointers[index] = None
         status = lib.cuteafd_fp8moe_launch(contexts[1], 80, pointers, 80, None)

@@ -98,6 +98,11 @@ FORMS = ("auto", "w8a16", "w8a8")
 SEGMENT_MAX_ROWS = 4 * 4096
 
 
+def core_variants(role: str) -> tuple[bool, ...]:
+    """Spark replies can consume the existing route plane without MoeCombine."""
+    return (False, True) if role == "spark" else (False,)
+
+
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -117,12 +122,30 @@ def capacity_scratch(programs: list[dict]) -> list[dict]:
 def bridge_source(programs: list[dict], info: list[int]) -> str:
     includes = "\n".join(f'#include "{p["stem"]}.h"' for p in programs)
     rows = ",\n".join(
-        f'  {{{p["capacity"]}u, {p["scratch"]}ull, {FORMS.index(p["form"])}u, {int(p.get("segmented", False))}u, {p.get("minimum_rows", 0)}u, {p.get("act_row_bytes", 0)}u, _mlir_cuteafd_{p["stem"]}_cuda_init, '
+        f'  {{{p["capacity"]}u, {p["scratch"]}ull, {FORMS.index(p["form"])}u, {int(p.get("segmented", False))}u, {p.get("minimum_rows", 0)}u, {p.get("act_row_bytes", 0)}u, {int(p.get("core_only", False))}u, _mlir_cuteafd_{p["stem"]}_cuda_init, '
         f'_mlir_cuteafd_{p["stem"]}_cuda_load_to_device, {p["entry"]}}}' for p in programs)
+    layout_rows = []
+    for p in programs:
+        if not p.get("core_only", False):
+            continue
+        previous = 0
+        for layout in p["reply_layouts"]:
+            end, route, metadata = layout["end_rows"], layout["route"], layout["metadata_bytes"]
+            if (not previous < end <= p["capacity"] or route not in (1, 2, 3)
+                    or metadata <= 0 or metadata % 1024 or layout["a4_split"] not in (0, 1)
+                    or (p.get("segmented", False) and route != 3)):
+                raise ValueError("invalid installed reply scratch layout")
+            layout_rows.append(f'  {{{p["capacity"]}u, {FORMS.index(p["form"])}u, {int(p.get("segmented", False))}u, '
+                f'{end}u, {route}u, {metadata}ull, '
+                f'{p["act_row_bytes"]}u, {layout["a4_split"]}u}}')
+            previous = end
+        if previous != p["capacity"]:
+            raise ValueError("installed reply scratch layouts do not cover capacity")
+    layout_table = ",\n".join(layout_rows) or "  {}"
     route_rows = []
     grouping_rows = []
     for p in programs:
-        if p.get("segmented", False):
+        if p.get("segmented", False) or p.get("core_only", False):
             continue
         previous = 0
         for segment in p["arithmetic_routes"]:
@@ -163,7 +186,7 @@ struct Program {{
   uint32_t capacity;
   uint64_t scratch;
   uint32_t form;  // 0 the default program, 1 its W8A16 form, 2 its W8A8 form
-  uint32_t segmented, minimum_rows, act_row_bytes;
+  uint32_t segmented, minimum_rows, act_row_bytes, core_only;
   ModuleFn initialize;
   ModuleFn load;
   LaunchFn launch;
@@ -181,6 +204,11 @@ struct ArithmeticRoute {{ uint32_t capacity, form, end_rows, route_id; }};
 const ArithmeticRoute kArithmeticRoutes[] = {{
 {route_table}
 }};
+struct ReplyLayout {{ uint32_t capacity, form, segmented, end_rows, route;
+  uint64_t metadata_bytes; uint32_t act_row_bytes, a4_split; }};
+const ReplyLayout kReplyLayouts[] = {{
+{layout_table}
+}};
 struct Context {{
   uint32_t form;
 }};
@@ -197,10 +225,11 @@ void unload_libraries() {{
 }};
 // The capacity's program in the requested form; the default program when the
 // capacity has no such form (the forms are the same program there).
-const Program* find(uint32_t capacity, uint32_t form, bool segmented = false) {{
+const Program* find(uint32_t capacity, uint32_t form, bool segmented = false, bool core_only = false) {{
   const Program* fallback = nullptr;
   for (uint32_t i = 0; i < kCount; ++i) {{
-    if (kPrograms[i].capacity != capacity || bool(kPrograms[i].segmented) != segmented) continue;
+    if (kPrograms[i].capacity != capacity || bool(kPrograms[i].segmented) != segmented
+        || bool(kPrograms[i].core_only) != core_only) continue;
     if (kPrograms[i].form == form) return &kPrograms[i];
     if (!kPrograms[i].form) fallback = &kPrograms[i];
   }}
@@ -286,6 +315,38 @@ extern "C" int32_t cuteafd_fp8moe_segment_scratch_bytes(uint32_t rows, uint64_t*
   return *bytes ? cudaSuccess : cudaErrorInvalidValue;
 }}
 
+// Offsets name the existing core scratch; no token output or new allocation.
+extern "C" int32_t cuteafd_fp8moe_reply_layout(uint32_t capacity, uint32_t form, uint32_t rows,
+                                               uint32_t segmented, uint64_t* words, uint32_t count) {{
+  if (form > 2u || segmented > 1u || !rows || rows > capacity || !words || count < 4u)
+    return cudaErrorInvalidValue;
+  const Program* program = find(capacity, form, bool(segmented), true);
+  if (!program) return cudaErrorInvalidValue;
+  auto align = [](uint64_t n) {{ return (n + 1023u) / 1024u * 1024u; }};
+  const uint64_t pairs = uint64_t(rows) * kInfo[4];
+  const uint64_t groups = pairs < kInfo[3] ? pairs : kInfo[3];
+  for (const auto& l : kReplyLayouts) {{
+    if (l.capacity != capacity || l.form != program->form || l.segmented != segmented || rows > l.end_rows) continue;
+    const uint64_t grouped = l.route == 1u ? pairs : 64u * ((pairs + 63u) / 64u + groups);
+    const uint64_t tiles = (pairs + 127u) / 128u + groups;
+    const uint64_t metadata = l.route == 1u ? 4u * (4u + 3u * kInfo[3] + 1u) : l.metadata_bytes;
+    const uint64_t pair_pos = align(metadata) + align(4u * (l.route == 3u ? pairs : grouped));
+    uint64_t y = pair_pos + align(4u * pairs);
+    if (l.route == 3u) {{
+      const uint64_t padded = tiles * 128u;
+      if (((kInfo[0] >> 8) & 0xffu) == 4u) {{
+        y += align(padded * kInfo[1] / 2u) + align(padded * kInfo[1] / 16u)
+            + 2u * align(l.a4_split ? pairs * kInfo[2] * 2u : 0u)
+            + align(padded * kInfo[2] / 2u) + align(padded * kInfo[2] / 16u);
+      }} else y += align(padded * l.act_row_bytes);
+    }}
+    words[0] = 1u; words[1] = pair_pos; words[2] = y;
+    words[3] = (l.route == 3u ? pairs : grouped) * kInfo[1] * 2u;
+    return cudaSuccess;
+  }}
+  return cudaErrorInvalidValue;
+}}
+
 extern "C" int32_t cuteafd_fp8moe_set_options(void* context, uint32_t options) {{
   auto* ctx = static_cast<Context*>(context);
   if (!ctx || options > 2u) return cudaErrorInvalidValue;
@@ -331,9 +392,9 @@ extern "C" int32_t cuteafd_fp8moe_create(void** context) {{
 }}
 
 static int32_t launch(void* context, uint32_t capacity, void* const* pointers, int32_t rows,
-                      void* stream, bool segmented) {{
+                      void* stream, bool segmented, bool core_only = false) {{
   if (!context) return cudaErrorInvalidValue;
-  const Program* program = find(capacity, static_cast<Context*>(context)->form, segmented);
+  const Program* program = find(capacity, static_cast<Context*>(context)->form, segmented, core_only);
   if (!program || !pointers || rows < 1 || uint32_t(rows) > capacity) return cudaErrorInvalidValue;
   void* values[{POINTERS}];
   void* arguments[{POINTERS} + 3];
@@ -354,6 +415,14 @@ static int32_t launch(void* context, uint32_t capacity, void* const* pointers, i
 extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void* const* pointers,
                                          int32_t rows, void* stream) {{
   return launch(context, capacity, pointers, rows, stream, false);
+}}
+extern "C" int32_t cuteafd_fp8moe_launch_core(void* context, uint32_t capacity, void* const* pointers,
+                                              int32_t rows, void* stream) {{
+  return launch(context, capacity, pointers, rows, stream, false, true);
+}}
+extern "C" int32_t cuteafd_fp8moe_launch_segments_core(void* context, void* const* pointers,
+                                                       int32_t rows, void* stream) {{
+  return launch(context, {SEGMENT_MAX_ROWS}u, pointers, rows, stream, true, true);
 }}
 extern "C" int32_t cuteafd_fp8moe_launch_segments(void* context, void* const* pointers,
                                                   int32_t rows, void* stream) {{
@@ -459,7 +528,7 @@ def build(args: argparse.Namespace) -> None:
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.fp8_moe import (
         GEOMETRIES, compile_fp8_moe_aot, fp8_moe_scratch_bytes, prefill_forms,
-        fp8_moe_segment_scratch_bytes, auto_large_rows,
+        fp8_moe_segment_scratch_bytes, auto_large_rows, fp8_moe_reply_layout, nvfp4_a4_fused,
     )
 
     props = torch.cuda.get_device_properties(0)
@@ -528,12 +597,14 @@ def build(args: argparse.Namespace) -> None:
             exports = [(c, form, False) for c, form in forms]
             if args.role == "spark" and wire and g.weights in ("fp8", "mxfp4"):
                 exports += [(SEGMENT_MAX_ROWS, form, True) for form in FORMS]
-            for capacity, form, segmented in ([] if reused else exports):
+            exports = [(c, f, s, core) for c, f, s in exports
+                       for core in core_variants(args.role)]
+            for capacity, form, segmented, core_only in ([] if reused else exports):
                 stem = (f"fp8moe_{args.geometry}_w{g.slice}_m{capacity}"
-                        f"{'' if form == 'auto' else '_' + form}{'_segments' if segmented else ''}")
+                        f"{'' if form == 'auto' else '_' + form}{'_segments' if segmented else ''}{'_core' if core_only else ''}")
                 with exportable_compilation():
                     program = compile_fp8_moe_aot(g, route="stream" if segmented else "auto",
-                                                  max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented)
+                                                  max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented, core_only=core_only)
                 program.export_to_c(str(raw), stem, "cuteafd_" + stem)
                 checked = validate_exported_header(program, raw / f"{stem}.h", "cuteafd_" + stem)
                 if checked["argument_count"] != POINTERS + 2:
@@ -541,12 +612,26 @@ def build(args: argparse.Namespace) -> None:
                 programs.append({"stem": stem, "capacity": capacity, "entry": checked["symbol"], "form": form,
                                  "scratch": (fp8_moe_segment_scratch_bytes(g, capacity, capacity, form) if segmented
                                              else fp8_moe_scratch_bytes(g, "auto", capacity, wire, form)),
-                                 "segmented": segmented,
+                                 "segmented": segmented, "core_only": core_only,
                                  "minimum_rows": auto_large_rows(wire, g.kind, form) + 1 if segmented else 0,
                                  "act_row_bytes": ((g.slice + g.slice // 32 + 15) // 16 * 16
                                                    if program.geometry["mxfp4_down_a8"] else 2 * g.slice),
                                  "weight_read_grouping": program.geometry["weight_read_grouping"],
                                  "arithmetic_routes": program.geometry["arithmetic_routes"]})
+                if core_only:
+                    reply_layouts = []
+                    ends = ([capacity] if segmented else
+                            [v["end_rows"] for v in program.geometry["arithmetic_routes"]])
+                    for end in ends:
+                        reply_layout = fp8_moe_reply_layout(g, route="stream" if segmented else "auto",
+                            rows=end, max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented)
+                        # pair_row is the first region following the metadata reservation.
+                        pair_rows = (end * g.top_k if reply_layout["route"] in ("decode", "stream") else
+                                     64 * ((end * g.top_k + 63) // 64 + min(g.experts, end * g.top_k)))
+                        metadata = reply_layout["pair_pos_offset"] - (4 * pair_rows + 1023) // 1024 * 1024
+                        reply_layouts.append(dict(end_rows=end, route={"decode": 1, "prefill": 2, "stream": 3}[reply_layout["route"]],
+                            metadata_bytes=metadata, a4_split=int(not nvfp4_a4_fused())))
+                    programs[-1]["reply_layouts"] = reply_layouts
                 print(f"exported {stem} (scratch {programs[-1]['scratch']} B)", flush=True)
             if reused:
                 programs, object_root = reused
@@ -565,13 +650,13 @@ def build(args: argparse.Namespace) -> None:
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
                 "weights": g.weights, "activation": g.activation, "projection": g.projection, "abi_version": ABI_VERSION,
                 "arithmetic_routes": [{"capacity": p["capacity"], "form": p["form"],
-                                        "segments": p["arithmetic_routes"]} for p in programs],
+                                        "segments": p["arithmetic_routes"]} for p in programs if not p.get("core_only", False)],
                 "weight_read_grouping": [{"capacity": p["capacity"], "form": p["form"],
-                                          **p["weight_read_grouping"]} for p in programs if not p["segmented"]],
+                                          **p["weight_read_grouping"]} for p in programs if not p["segmented"] and not p.get("core_only", False)],
                 "segments": [{k: p[k] for k in ("capacity", "form", "minimum_rows", "act_row_bytes")}
-                             for p in programs if p["segmented"]],
+                             for p in programs if p["segmented"] and not p.get("core_only", False)],
                 "capacities": capacity_scratch(programs),
-                "prefill_forms": {form: [p["capacity"] for p in programs if p["form"] == form and not p["segmented"]]
+                "prefill_forms": {form: [p["capacity"] for p in programs if p["form"] == form and not p["segmented"] and not p.get("core_only", False)]
                                   for form in FORMS[1:]}}
         manifest["files"] = {str(p.relative_to(stage)): {"bytes": p.stat().st_size, "sha256": digest(p)}
                              for p in sorted(stage.rglob("*")) if p.is_file()}

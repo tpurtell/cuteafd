@@ -832,6 +832,27 @@ impl<'a, W: std::borrow::Borrow<Fp8Weights<'a>>> Fp8Experts<'a, W> {
             self.scratch.buffer.ptr], rows, stream) }
     }
 
+    /// Execute the same selected arithmetic without its BF16 token combine.
+    /// # Safety
+    /// All inputs and the exclusive output remain live through the epilogue fence.
+    pub(crate) unsafe fn run_reply(&self, reply: &super::reply::Fp8Reply<'_>, index: usize,
+        rows: usize, pointers: [cuteafd_ffi::CuteafdDeviceBuffer; 4], bf16: bool, segmented: bool,
+        dtype: cuteafd_transport::ExpertV2Dtype, stream: *mut c_void) -> Result<()> {
+        let module = if bf16 && self.wire_input() {
+            self.bf16_module.as_ref().context("missing BF16-input reply package")?
+        } else { &self.module };
+        let sources = module.reply_sources(self.scratch.buffer, rows, segmented)?;
+        let [input, ids, weights, output] = pointers;
+        let [w1, s1, w3, s3, w2, s2] = self.layers.get(index).context("reply layer outside weights")?.pointers();
+        // SAFETY: same retained scratch/weights as run; the consuming epilogue
+        // immediately follows the core on this owner stream, before scratch reuse.
+        unsafe {
+            module.launch_core(&[input.ptr, ids.ptr, weights.ptr, w1, s1, w3, s3, w2, s2, output.ptr,
+                self.scratch.buffer.ptr], rows, segmented, stream)?;
+            reply.launch(dtype, sources, weights, output, rows, segmented, stream)
+        }
+    }
+
     /// `run` over BF16 input rows through the BF16-input package.
     ///
     /// # Safety

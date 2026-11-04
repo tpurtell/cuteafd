@@ -70,15 +70,29 @@ def test_serving_and_glue_export_inventory():
     variant = serving_default()
     assert variant == "k1_k23_coalesced"
     namespace = {"compile_exlr8_group_aot": lambda **kwargs: kwargs, "compile_exlr8_a16_aot": lambda **kwargs: kwargs,
-                 "DEFAULT_SERVING_VARIANT": variant}
+                 "compile_exlr8_reply_aot": lambda **kwargs: kwargs, "DEFAULT_SERVING_VARIANT": variant}
     # Drop the local CUDA-dependent import; constructing the lambdas compiles nothing.
     builder.body = [node for node in builder.body if not isinstance(node, ast.ImportFrom)]
     exec(compile(ast.Module(body=[builder], type_ignores=[]), "exlr8_inventory", "exec"), namespace)
     inventory = namespace["exlr8_export_programs"]
     spark = inventory("spark")
+    reply_names = ["a16_serving_core", "reply_1", "reply_2",
+                   "a16_grouped_reply1", "a8_grouped_reply1", "a16_grouped64_reply1",
+                   "a16_grouped_reply2", "a8_grouped_reply2", "a16_grouped64_reply2"]
     assert [p[0] for p in spark] == [
         "a16_serving", "group", "a16_grouped", "a8_grouped", "grouped_group",
-        "a16_grouped64"]
+        "a16_grouped64", *reply_names]
+    by_name = {p[0]: p for p in spark}
+    assert by_name["a16_serving_core"][3]() == {**spark[0][3](), "core_only": True}
+    for format in (1, 2):
+        epilogue = by_name[f"reply_{format}"][3]()
+        assert epilogue["format"] == format and epilogue["variant"] == variant
+        for activation in ("a16", "a8"):
+            producer = by_name[f"{activation}_grouped_reply{format}"][3]()
+            assert producer["grouped"] is True and producer["activations"] == activation
+            assert producer["reply_format"] == format
+        grouped_reply = by_name[f"a16_grouped64_reply{format}"][3]()
+        assert grouped_reply["fc2_partials"] == "f32" and grouped_reply["reply_format"] == format
     a16_grouped = dict(spark[2][2])
     a8_grouped = dict(spark[3][2])
     assert a16_grouped == {"max_rows": 4096} and a8_grouped == {"max_rows": 4096, "activations": "a8"}
@@ -101,7 +115,7 @@ def test_serving_and_glue_export_inventory():
     coordinator = inventory("coordinator")
     assert [p[0] for p in coordinator] == [
         "a16_serving", "group", "shared_a16_serving", "shared_group",
-        "a16_grouped", "a8_grouped", "grouped_group", "a16_grouped64"]
+        "a16_grouped", "a8_grouped", "grouped_group", "a16_grouped64", *reply_names]
     routed_coordinator = [p for p in coordinator if not p[0].startswith("shared_")]
     assert [p[:3] for p in routed_coordinator] == [p[:3] for p in spark]
     assert [p[3]() for p in routed_coordinator] == [p[3]() for p in spark]
