@@ -71,33 +71,39 @@ pub(crate) struct WeightLoader<'a, 'p> {
     pub peers: Vec<crate::shared::peer_split::RankDevice>,
 }
 
+fn native_rectangle(name: &str, path: std::path::PathBuf, base: u64, shape: &[usize], bytes: usize,
+    kind: Share, rank: usize, ranks: usize) -> Result<Rect> {
+    ensure!(ranks > 0 && rank < ranks, "{name}: invalid native rank");
+    // Row sharing slices the leading dimension, including a per-head sink vector.
+    let rows = shape.first().copied().unwrap_or(1);
+    ensure!(rows > 0 && bytes % rows == 0, "{name}: invalid native row extent");
+    let row_bytes = bytes / rows;
+    let (rows, cols) = match kind {
+        Share::All => (0..rows, 0..row_bytes),
+        Share::Rows => {
+            ensure!(!shape.is_empty() && rows % ranks == 0, "{name}: rows do not split over ranks");
+            let part = rows / ranks;
+            (rank * part..(rank + 1) * part, 0..row_bytes)
+        }
+        Share::Cols => {
+            ensure!(shape.len() == 2 && shape[1] % ranks == 0
+                && bytes == shape[0] * shape[1], "{name}: invalid byte column split");
+            let width = row_bytes / ranks;
+            (0..rows, rank * width..(rank + 1) * width)
+        }
+    };
+    ensure!(!rows.is_empty() && !cols.is_empty(), "{name}: empty native source");
+    Ok(Rect { name: name.into(), path, base, row_bytes, rows, cols })
+}
+
 impl<'a> WeightLoader<'a, '_> {
     fn rectangles(&self, names: &[String], kind: Share, rank: usize) -> Result<Vec<Rect>> {
         names.iter().map(|name| {
             cuteafd_ffi::memory_ledger::tensor(name);
             let tensor = self.catalog.tensor(name)?;
             let meta = &tensor.metadata;
-            let rows = if meta.shape.len() >= 2 { meta.shape[0] } else { 1 };
-            let bytes = usize::try_from(meta.byte_length)?;
-            ensure!(rows > 0 && bytes % rows == 0, "{name}: invalid native row extent");
-            let row_bytes = bytes / rows;
-            let (rows, cols) = match kind {
-                Share::All => (0..rows, 0..row_bytes),
-                Share::Rows => {
-                    ensure!(rows % self.ranks() == 0, "{name}: rows do not split over ranks");
-                    let part = rows / self.ranks();
-                    (rank * part..(rank + 1) * part, 0..row_bytes)
-                }
-                Share::Cols => {
-                    ensure!(meta.shape.len() == 2 && meta.shape[1] % self.ranks() == 0
-                        && bytes == meta.shape[0] * meta.shape[1], "{name}: invalid byte column split");
-                    let width = row_bytes / self.ranks();
-                    (0..rows, rank * width..(rank + 1) * width)
-                }
-            };
-            ensure!(!rows.is_empty() && !cols.is_empty(), "{name}: empty native source");
-            Ok(Rect { name: name.clone(), path: self.catalog.snapshot().join(&tensor.shard),
-                base: meta.byte_offset, row_bytes, rows, cols })
+            native_rectangle(name, self.catalog.snapshot().join(&tensor.shard), meta.byte_offset,
+                &meta.shape, usize::try_from(meta.byte_length)?, kind, rank, self.ranks())
         }).collect()
     }
 
@@ -351,6 +357,53 @@ impl<'a> WeightLoader<'a, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v4_layer_vector_push_plans_match_mount_slices_tp1_tp2_tp4() -> Result<()> {
+        use crate::shared::experts::rtx::dense::append;
+        use cuteafd_loader::push_load::builder::Builder;
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("layer.safetensors");
+        let bytes: Vec<_> = (0..256).map(|i| i as u8).collect();
+        std::fs::write(&path, &bytes)?;
+        for ranks in [1, 2, 4] {
+            for attention_split in [false, true] {
+                for operand in ["attn_sink", "attn.norm", "q_norm", "kv_norm", "ffn.norm",
+                    "attn.scale", "ffn.scale", "main_norm", "index_norm", "gate.bias"] {
+                    let name = format!("layers.0.{operand}");
+                    let kind = share(operand, attention_split, true);
+                    let part = if kind == Share::Rows { 64 / ranks } else { 64 };
+                    let mut builder = Builder::new(root.path(), vec![(part * 4) as u64; ranks]);
+                    for rank in 0..ranks {
+                        let rect = native_rectangle(&name, path.clone(), 0, &[64], bytes.len(), kind, rank, ranks)?;
+                        assert_eq!(rect.rows, if kind == Share::Rows { rank * part..(rank + 1) * part }
+                            else { 0..64 }, "{name}");
+                        assert_eq!(rect.row_bytes, 4);
+                        append(&rect, &mut builder, rank as u32, 0)?;
+                    }
+                    let checked = builder.finish()?;
+                    let mut landed = vec![vec![0; part * 4]; ranks];
+                    for entry in &checked.plan.entries {
+                        let pattern = &checked.plan.patterns[entry.pattern as usize];
+                        for (source, destination) in pattern.runs() {
+                            let source = (entry.src_base + source) as usize;
+                            let destination = (entry.dst_base + destination) as usize;
+                            landed[entry.rank as usize][destination..destination + pattern.run as usize]
+                                .copy_from_slice(&bytes[source..source + pattern.run as usize]);
+                        }
+                    }
+                    for (rank, actual) in landed.iter().enumerate() {
+                        let first = if kind == Share::Rows { rank * part * 4 } else { 0 };
+                        assert_eq!(actual, &bytes[first..first + part * 4], "{name} rank {rank}/{ranks}");
+                    }
+                }
+            }
+        }
+        assert!(native_rectangle("sink", path.clone(), 0, &[63], 252, Share::Rows, 0, 2).is_err());
+        assert!(native_rectangle("sink", path.clone(), 0, &[64], 256, Share::Rows, 2, 2).is_err());
+        assert!(native_rectangle("scale", path, 0, &[], 4, Share::Rows, 0, 2).is_err());
+        Ok(())
+    }
 
     #[test]
     fn v4_owned_attention_does_not_unsplit_shared_ffn_weights() {
