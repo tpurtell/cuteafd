@@ -509,6 +509,155 @@ fn bf16_kv_b_absorption_preserves_bytes_and_reuses_one_upload_slice() -> Result<
     Ok(())
 }
 
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn row_reader_concatenates_bf16_and_drains_fp8_temporaries_before_reuse() -> Result<()> {
+    use std::collections::BTreeMap;
+    use cuteafd_ffi::memory_ledger::{AllocationAudit, AllocationEvent, Space};
+    use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::EmbeddingHome};
+    let fixture_dso = Fixture::build()?;
+    let library = fixture_dso.load()?;
+    for device in 0..2 { fixture_dso.configure_memory(&library, device, 1 << 34)?; }
+    for kind in ["bf16", "mixed", "fp8", "head"] {
+        let root = tempfile::tempdir_in(fixture_dso.directory())?;
+        let (mut config, tensors) = fixture::glm5_compact_weights();
+        if kind == "head" { config["vocab_size"] = serde_json::json!(1024); }
+        let tensors = tensors.into_iter().filter(|t| kind != "bf16" || !t.0.ends_with("_scale_inv"))
+            .flat_map(|(name, dtype, mut shape)| {
+                if kind == "head" && name == "lm_head.weight" {
+                    return fixture::fp8("lm_head", 1024, 256, None);
+                }
+                if kind == "head" && name == "model.embed_tokens.weight" { shape[0] = 1024; }
+                if kind == "fp8" && name == "model.layers.0.self_attn.indexer.weights_proj.weight" {
+                    return fixture::fp8("model.layers.0.self_attn.indexer.weights_proj", 2, 256, None);
+                }
+                vec![(name, if kind == "bf16" && dtype == "F8_E4M3" { "BF16" } else { dtype }, shape)]
+            }).collect::<Vec<_>>();
+        fixture::write_snapshot(root.path(), &config, &tensors, None);
+        fill(root.path())?;
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(root.path(), false, false)?;
+        let names = if kind == "head" { vec!["lm_head.weight".to_owned()] } else {
+            vec!["model.layers.0.self_attn.indexer.wk.weight".to_owned(),
+                "model.layers.0.self_attn.indexer.weights_proj.weight".to_owned()]
+        };
+        let read = |name: &str| -> Result<Vec<u8>> {
+            let tensor = catalog.tensor(name)?;
+            let mut bytes = vec![0u8; usize::try_from(tensor.metadata.byte_length)?];
+            std::fs::File::open(root.path().join(&tensor.shard))?
+                .read_exact_at(&mut bytes, tensor.metadata.byte_offset)?;
+            Ok(bytes)
+        };
+        let mut raw = 0;
+        let mut grid = 0;
+        let mut upload = 0;
+        let mut out_bytes = 0;
+        let mut scratch_peak = 0;
+        let mut device_sizes = Vec::new();
+        let mut fp8_members = 0;
+        for name in &names {
+            let meta = &catalog.tensor(name)?.metadata;
+            let bytes = usize::try_from(meta.byte_length)?;
+            raw += bytes;
+            upload = upload.max(bytes);
+            out_bytes += meta.shape[0] * meta.shape[1] * 2;
+            if meta.dtype == DType::F8E4M3 {
+                let scales = read(&landing::block_grid(&catalog, name))?.len();
+                grid = grid.max(scales);
+                upload = upload.max(scales);
+                let pair = [bytes.max(256), scales.max(256)];
+                scratch_peak = scratch_peak.max(pair.iter().sum::<usize>());
+                device_sizes.extend(pair);
+                fp8_members += 1;
+            }
+        }
+        device_sizes.push(out_bytes);
+        device_sizes.sort_unstable();
+        for (ranks, first) in [(1, 0), (1, 1), (2, 0), (2, 1)] {
+            assert_eq!(library.sync_h2d_staging_buffer()?.bytes, 0);
+            library.cuda_set_device(first)?;
+            let loader = GlmLoader { library: &library, catalog: &catalog, stream: std::ptr::null_mut(),
+                device: first, peers: (ranks == 2).then_some(crate::shared::peer_split::RankDevice {
+                    device: 1 - first, stream: std::ptr::null_mut() }).into_iter().collect(), push: None };
+            let inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, 2,
+                None, kind == "bf16", false, EmbeddingHome::HostPinned)?;
+            assert_eq!(inventory.row_loading.heap_payload_bytes, (raw + grid) as u64);
+            assert_eq!(inventory.row_loading.sync_upload_bytes, upload as u64);
+            let audit = AllocationAudit::start();
+            let before_dequant = fixture_dso.events()?.bytes().filter(|&c| c == b'B').count();
+            let mut backing = None;
+            for _ in 0..2 {
+                let out = loader.rows(&names)?;
+                let current = library.sync_h2d_staging_buffer()?;
+                assert_eq!(current.bytes, upload);
+                if let Some(ptr) = backing { assert_eq!(current.ptr, ptr); }
+                backing = Some(current.ptr);
+                let live = cuteafd_ffi::memory_ledger::allocations().into_iter()
+                    .filter(|r| r.key.space == Space::Device && r.key.device == first).collect::<Vec<_>>();
+                assert_eq!(live.len(), 1, "FP8 temporaries must drain and free before rows returns");
+                assert_eq!((live[0].address, live[0].bytes), (out.buffer.ptr as usize, out_bytes));
+                let mut actual = vec![0u8; out_bytes];
+                library.copy_d2h(&mut actual, out.buffer)?;
+                let mut at = 0;
+                for name in &names {
+                    let meta = &catalog.tensor(name)?.metadata;
+                    let length = meta.shape[0] * meta.shape[1] * 2;
+                    if meta.dtype == DType::Bf16 { assert_eq!(actual[at..at + length], read(name)?); }
+                    at += length;
+                }
+                drop(out);
+            }
+            // The fixture dequantizer is a no-op: only BF16 bytes and actual
+            // scratch ownership are validated, never FP8 numerical output.
+            assert_eq!(fixture_dso.events()?.bytes().filter(|&c| c == b'B').count() - before_dequant,
+                2 * fp8_members);
+            assert_eq!(library.release_sync_h2d_staging()?, upload);
+            let mut device_live = BTreeMap::new();
+            let (mut device_peak, mut pinned_peak, mut pinned_live) = (0, 0, None);
+            let (mut allocated, mut pinned_allocations) = (Vec::new(), 0);
+            for event in audit.events() {
+                let record = match event { AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) => r };
+                match record.key.space {
+                    Space::Device => {
+                        assert_eq!(record.key.device, first);
+                        match event {
+                            AllocationEvent::Allocated(r) => {
+                                assert!(device_live.insert(r.address, r.bytes).is_none());
+                                allocated.push(r.bytes);
+                                device_peak = device_peak.max(device_live.values().sum::<usize>());
+                            }
+                            AllocationEvent::Freed(r) => assert_eq!(device_live.remove(&r.address), Some(r.bytes)),
+                        }
+                    }
+                    Space::Pinned => {
+                        assert_eq!(record.key.scope, "staging/sync-h2d");
+                        match event {
+                            AllocationEvent::Allocated(r) => {
+                                assert!(pinned_live.replace((r.address, r.bytes)).is_none());
+                                pinned_peak = pinned_peak.max(r.bytes);
+                                pinned_allocations += 1;
+                            }
+                            AllocationEvent::Freed(r) => assert_eq!(pinned_live.take(), Some((r.address, r.bytes))),
+                        }
+                    }
+                    other => panic!("unexpected row-reader memory space {other:?}"),
+                }
+            }
+            let mut expected = device_sizes.repeat(2);
+            allocated.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(allocated, expected);
+            assert!(device_live.is_empty() && pinned_live.is_none());
+            assert_eq!(device_peak, out_bytes + scratch_peak);
+            assert_eq!(pinned_peak, upload);
+            assert_eq!(pinned_allocations, 1);
+            eprintln!("Row reader subset: kind={kind}, ranks={ranks}, first={first}, pinned_peak={pinned_peak} B, device_peak={device_peak} B; payload allowance={} B (unmeasured ordinary heap)",
+                inventory.row_loading.heap_payload_bytes);
+        }
+    }
+    Ok(())
+}
+
 fn vocabulary_manifest() -> serde_json::Value {
     use serde_json::json;
     let pointer = |name, dtype, shape, role| json!({"name":name,"dtype":dtype,"shape":shape,"role":role});

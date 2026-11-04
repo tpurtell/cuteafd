@@ -1,4 +1,4 @@
-//! Header-native weights and serialized K6/BF16 KV-B loading subsets.
+//! Header-native weights and serialized K6/KV-B/row-reader loading subsets.
 //! Other loading temporaries and serving arenas join separately; this inventory
 //! alone cannot authorize family Ready.
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer, core::CoreInventory};
@@ -71,12 +71,61 @@ impl KvBLoading {
     }
 }
 
+/// The BF16 row reader holds all raw members while one FP8 member's raw
+/// block grid and device dequantization pair are live. Device owners join later.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RowLoading {
+    pub heap_payload_bytes: u64,
+    pub sync_upload_bytes: u64,
+}
+
+impl RowLoading {
+    fn include(&mut self, headers: &Headers<'_>, names: &[String]) -> Result<()> {
+        ensure!(!names.is_empty(), "empty GLM BF16 row source");
+        let mut source = 0;
+        let mut grid = 0;
+        let mut upload = 0;
+        let mut columns = None;
+        for name in names {
+            let header = headers.get(name)?;
+            let [n, k] = headers.matrix(name)?;
+            ensure!(columns.is_none_or(|columns| columns == k),
+                "GLM BF16 row sources differ in columns");
+            columns = Some(k);
+            let width = match header.dtype {
+                DType::Bf16 => 2,
+                DType::F8E4M3 => 1,
+                _ => anyhow::bail!("unsupported GLM BF16 row source {name}"),
+            };
+            ensure!(header.byte_length == product(&[n, k, width])?,
+                "GLM BF16 row source byte extent {name}");
+            source = sum([source, header.byte_length])?;
+            upload = upload.max(header.byte_length);
+            if header.dtype == DType::F8E4M3 {
+                let scale = headers.get(&format!("{name}_scale_inv"))?;
+                let shape = [n.div_ceil(128), k.div_ceil(128)];
+                ensure!(scale.dtype == DType::F32
+                    && scale.shape == shape.map(|n| n as usize)
+                    && scale.byte_length == product(&[shape[0], shape[1], 4])?,
+                    "GLM BF16 row source scale grid {name}");
+                grid = grid.max(scale.byte_length);
+                upload = upload.max(scale.byte_length);
+            }
+        }
+        let heap = sum([source, grid])?;
+        self.heap_payload_bytes = self.heap_payload_bytes.max(heap);
+        self.sync_upload_bytes = self.sync_upload_bytes.max(upload);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WeightInventory {
     pub ranks: usize,
     pub owners: Vec<WeightOwner>,
     pub core_loading: CoreLoading,
     pub kv_b_loading: KvBLoading,
+    pub row_loading: RowLoading,
 }
 
 impl WeightInventory {
@@ -86,7 +135,8 @@ impl WeightInventory {
         if maximum_pages == 0 {
             return Err(Refusal::InvalidFact("empty GLM load page domain".into()));
         }
-        let bytes = self.core_loading.heap_payload_bytes.max(self.kv_b_loading.heap_payload_bytes);
+        let bytes = self.core_loading.heap_payload_bytes
+            .max(self.kv_b_loading.heap_payload_bytes).max(self.row_loading.heap_payload_bytes);
         if bytes == 0 {
             return Ok(Vec::new());
         }
@@ -97,7 +147,7 @@ impl WeightInventory {
                 location: Location::HOST,
                 bytes,
                 lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
-                source: "GLM serialized target payload heap subset: max(K6 full four-member source including marker + local packed payload/suh/svh, BF16 KV-B source + full uk/uv outputs + largest single-rank upload slice); ordinary Rust heap, unmeasured assumption; excludes allocator/metadata/thread overhead, other target operations, concurrent draft prefetch and embedding filler".into(),
+                source: "GLM serialized target payload heap subset: max(K6 full four-member source including marker + local packed payload/suh/svh, BF16 KV-B source + full uk/uv outputs + largest single-rank upload slice, BF16 row reader all raw members + largest one-member FP32 grid); ordinary Rust heap, unmeasured assumption; excludes allocator/metadata/thread overhead, retained thread-local staging, device dequantization temporaries, other target operations, concurrent draft prefetch and embedding filler".into(),
                 assumed: true,
             }),
         }])
@@ -295,6 +345,7 @@ impl WeightInventory {
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
             kv_b_loading: KvBLoading::default(),
+            row_loading: RowLoading::default(),
         };
         for layer in 0..layers {
             let root = format!("model.layers.{layer}");
@@ -314,6 +365,14 @@ impl WeightInventory {
             let bf16 = core_attention || native_bf16 && headers.all_bf16(&attention)?;
             let layouts =
                 core.layer_weights(&cfg, layer, ranks, owners.map(|owners| owners[layer]))?;
+            if cfg.indexers[layer] == GlmIndexer::Full {
+                out.row_loading.include(&headers, &[
+                    cfg.weight(layer, crate::families::glm5::names::Operand::IndexK)
+                        .context("GLM indexer row source")?,
+                    cfg.weight(layer, crate::families::glm5::names::Operand::IndexWeights)
+                        .context("GLM indexer row weights")?,
+                ])?;
+            }
             if bf16 {
                 let name = format!("{attn}.kv_b_proj.weight");
                 let header = headers.get(&name)?;
@@ -575,6 +634,9 @@ impl WeightInventory {
             out.core(0, "core.head", "lm_head", &layout, projection.source_bytes)?;
         } else {
             let head = headers.get("lm_head.weight")?;
+            if head.dtype == DType::F8E4M3 {
+                out.row_loading.include(&headers, &["lm_head.weight".into()])?;
+            }
             let bytes = if head.dtype == DType::F8E4M3 {
                 product(&[
                     headers.matrix("lm_head.weight")?[0],
@@ -611,6 +673,7 @@ impl WeightInventory {
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
             kv_b_loading: KvBLoading::default(),
+            row_loading: RowLoading::default(),
         };
         out.extend_native(selection, layers, &plans.iter().collect::<Vec<_>>())?;
         Ok(out)
@@ -633,6 +696,7 @@ impl WeightInventory {
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
             kv_b_loading: KvBLoading::default(),
+            row_loading: RowLoading::default(),
         };
         let mut embedding = false;
         for (rank, plan) in plans.iter().enumerate() {

@@ -235,7 +235,8 @@ fn core_load_payload_peak_adds_full_source_to_one_local_pack_not_ranks_or_layers
     let plain = ordinary(&config, &tensors, 2, None, false, EmbeddingHome::Device(0));
     assert_eq!(plain.core_loading, CoreLoading::default());
     assert_eq!(plain.kv_b_loading, KvBLoading::default());
-    assert!(plain.loading_components(16).unwrap().is_empty());
+    assert_eq!(plain.row_loading.heap_payload_bytes, 128 * 256 + 2 * 256 * 2 + 8);
+    assert_eq!(plain.loading_components(16).unwrap().len(), 1);
     assert!(plain.loading_components(0).is_err());
 }
 
@@ -302,6 +303,122 @@ fn bf16_kv_b_loading_refuses_bad_geometry_and_overflow_without_partial_update() 
     let checkpoint = Checkpoint::open(root.path()).unwrap();
     assert!(WeightInventory::from_checkpoint(&checkpoint, 2, 2, None,
         false, false, EmbeddingHome::Device(0)).is_err());
+}
+
+#[test]
+fn row_reader_heap_holds_all_members_and_one_grid_without_rank_multiplication() {
+    let (config, tensors) = testing::glm5_compact_weights();
+    for ranks in [1, 2] {
+        let choices = if ranks == 1 { vec![None] } else {
+            vec![None, Some([0, 1]), Some([1, 0])]
+        };
+        for owners in choices {
+            let mixed = ordinary(&config, &tensors, ranks,
+                owners.as_ref().map(|o| o.as_slice()), false, EmbeddingHome::HostPinned);
+            assert_eq!(mixed.row_loading, RowLoading {
+                heap_payload_bytes: 128 * 256 + 2 * 256 * 2 + 8,
+                sync_upload_bytes: 128 * 256,
+            });
+            let components = mixed.loading_components(16).unwrap();
+            let ComponentKind::Allowance(allowance) = &components[0].kind else { panic!("heap is not exact") };
+            assert_eq!(allowance.bytes, mixed.row_loading.heap_payload_bytes);
+            assert!(allowance.assumed && allowance.source.contains("all raw members")
+                && allowance.source.contains("retained thread-local staging")
+                && allowance.source.contains("device dequantization temporaries"));
+
+            let bf16 = tensors.iter().filter(|t| !t.0.ends_with("_scale_inv"))
+                .map(|(name, dtype, shape)| (name.clone(),
+                    if *dtype == "F8_E4M3" { "BF16" } else { *dtype }, shape.clone()))
+                .collect::<Vec<_>>();
+            let bf16 = ordinary(&config, &bf16, ranks,
+                owners.as_ref().map(|o| o.as_slice()), true, EmbeddingHome::HostPinned);
+            assert_eq!(bf16.row_loading, RowLoading {
+                heap_payload_bytes: (128 + 2) * 256 * 2,
+                sync_upload_bytes: 128 * 256 * 2,
+            });
+        }
+    }
+
+    let both_fp8 = tensors.iter().flat_map(|(name, dtype, shape)| {
+        if name == "model.layers.0.self_attn.indexer.weights_proj.weight" {
+            testing::fp8("model.layers.0.self_attn.indexer.weights_proj", 2, 256, None)
+        } else { vec![(name.clone(), *dtype, shape.clone())] }
+    }).collect::<Vec<_>>();
+    let inventory = ordinary(&config, &both_fp8, 2, None, false, EmbeddingHome::HostPinned);
+    assert_eq!(inventory.row_loading, RowLoading {
+        heap_payload_bytes: (128 + 2) * 256 + 8,
+        sync_upload_bytes: 128 * 256,
+    });
+
+    // The unsplit FP8 head uses the same row reader and can set both maxima.
+    let mut config = config;
+    config["vocab_size"] = serde_json::json!(1024);
+    let tensors = tensors.into_iter().flat_map(|(name, dtype, mut shape)| {
+        if name == "lm_head.weight" { return testing::fp8("lm_head", 1024, 256, None); }
+        if name == "model.embed_tokens.weight" { shape[0] = 1024; }
+        vec![(name, dtype, shape)]
+    }).collect::<Vec<_>>();
+    for ranks in [1, 2] {
+        let inventory = ordinary(&config, &tensors, ranks, None, false, EmbeddingHome::HostPinned);
+        assert_eq!(inventory.row_loading, RowLoading {
+            heap_payload_bytes: 1024 * 256 + 8 * 2 * 4,
+            sync_upload_bytes: 1024 * 256,
+        });
+        let root = tempfile::tempdir().unwrap();
+        write_snapshot(root.path(), &config, &tensors, None);
+        let checkpoint = Checkpoint::open(root.path()).unwrap();
+        let head_only = WeightInventory::from_checkpoint(&checkpoint, ranks, 0,
+            None, false, false, EmbeddingHome::HostPinned).unwrap();
+        assert_eq!(head_only.row_loading, inventory.row_loading);
+    }
+}
+
+#[test]
+fn row_reader_refuses_bad_members_and_scales_without_partial_update() {
+    let (config, tensors) = testing::glm5_compact_weights();
+    let root = tempfile::tempdir().unwrap();
+    write_snapshot(root.path(), &config, &tensors, None);
+    let checkpoint = Checkpoint::open(root.path()).unwrap();
+    let source = "model.layers.0.self_attn.indexer.wk.weight";
+    let names = [source.to_owned(), "model.layers.0.self_attn.indexer.weights_proj.weight".into()];
+    for bad in 0..10 {
+        let mut tensors = checkpoint.tensors.clone();
+        let name = match bad {
+            0..=2 | 8..=9 => source,
+            7 => names[1].as_str(),
+            _ => "model.layers.0.self_attn.indexer.wk.weight_scale_inv",
+        };
+        let meta = &mut tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta;
+        match bad {
+            0 => meta.dtype = DType::F32,
+            1 => meta.shape.pop().map(|_| ()).unwrap(),
+            2 => meta.byte_length -= 1,
+            3 => meta.dtype = DType::Bf16,
+            4 => meta.shape[0] += 1,
+            5 => meta.byte_length -= 1,
+            6 => tensors.retain(|t| t.meta.name != name),
+            7 => { meta.shape[1] /= 2; meta.byte_length /= 2; }
+            8 => { meta.dtype = DType::Bf16; meta.shape = vec![usize::MAX, 2]; }
+            // Each member fits, but the coexisting raw-source sum overflows.
+            9 => {
+                let rows = u64::MAX / (256 * 2);
+                meta.dtype = DType::Bf16;
+                meta.shape = vec![rows as usize, 256];
+                meta.byte_length = rows * 256 * 2;
+            }
+            _ => unreachable!(),
+        }
+        let headers = Headers(tensors.iter().map(|t| (t.meta.name.as_str(), &t.meta)).collect());
+        let before = RowLoading { heap_payload_bytes: 17, sync_upload_bytes: 13 };
+        let mut actual = before.clone();
+        assert!(actual.include(&headers, &names).is_err(), "mutation {bad}");
+        assert_eq!(actual, before);
+    }
+    let headers = Headers(checkpoint.tensors.iter().map(|t| (t.meta.name.as_str(), &t.meta)).collect());
+    let mut loading = RowLoading::default();
+    assert!(loading.include(&headers, &[]).is_err());
+    assert!(loading.include(&headers, &[names[0].clone(), "missing".into()]).is_err());
+    assert_eq!(loading, RowLoading::default());
 }
 
 #[test]

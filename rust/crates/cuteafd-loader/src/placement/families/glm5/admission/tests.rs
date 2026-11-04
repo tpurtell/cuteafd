@@ -198,6 +198,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
                 ranks: 2,
                 core_loading: super::super::weights::CoreLoading::default(),
                 kv_b_loading: super::super::weights::KvBLoading::default(),
+                row_loading: super::super::weights::RowLoading::default(),
                 owners: vec![super::super::weights::WeightOwner {
                     allocation: Allocation::buffer(
                         "glm.weights.embedding",
@@ -384,6 +385,10 @@ fn serialized_heap_max_follows_weight_case_and_adds_concurrent_prefetch() {
             heap_payload_bytes: 6144,
             sync_upload_bytes: 512,
         };
+        case.value.row_loading = super::super::weights::RowLoading {
+            heap_payload_bytes: 7168,
+            sync_upload_bytes: 256,
+        };
     }
     // The current loader reads the whole sparse file, including header and any
     // unused tensor payload. This is not an installed checkpoint measurement.
@@ -407,7 +412,7 @@ fn serialized_heap_max_follows_weight_case_and_adds_concurrent_prefetch() {
         let phases = planner::evaluate(&facts, &budgets).unwrap();
         let opaque = |phase| phases.iter().find(|p| p.budget == "physical.2" && p.phase == phase)
             .unwrap().opaque;
-        assert_eq!(opaque(Phase::Load), file_bytes + (4096 * (embedding as u64 + 1)).max(6144));
+        assert_eq!(opaque(Phase::Load), file_bytes + (4096 * (embedding as u64 + 1)).max(7168));
         assert_eq!(opaque(Phase::DraftLoad), file_bytes);
         assert!(facts.allowances.iter().any(|a| a.bytes == file_bytes
             && a.source.contains("metadata.len()") && a.source.contains("unmeasured")
