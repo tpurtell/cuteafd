@@ -545,6 +545,102 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires sealed Kimi target/drafter, six Spark workers and CUTEAFD_KIMI_PUSH_DUMP via golden-run"]
+    fn native_mla_push_dumps_each_requested_batch() -> Result<()> {
+        use crate::shared::qwen::scheduler::{self, Backend};
+        use cuteafd_engine::{media::RequestMedia, prefix::{PrefixFamily, RefPagePool}};
+        use super::super::{backend::{DraftState, KimiBackend}, prefix::Placement, startup};
+        use std::sync::Arc;
+        let env = |key| std::env::var(key).with_context(|| format!("Kimi push regression needs {key}"));
+        let snapshot = PathBuf::from(env("CUTEAFD_GOLDEN_SNAPSHOT")?);
+        let drafter = PathBuf::from(env("CUTEAFD_KIMI_DRAFT_SNAPSHOT")?);
+        let output = PathBuf::from(env("CUTEAFD_KIMI_PUSH_DUMP")?);
+        let native = PathBuf::from(env("CUTEAFD_NATIVE_LIB")?);
+        let manifest = PathBuf::from(env("CUTEAFD_PROGRAM_MANIFEST")?);
+        let peers = env("CUTEAFD_GOLDEN_PEERS")?.split(',').map(str::parse)
+            .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+        ensure!(peers.len() == 6, "Kimi push regression requires six real Spark ranks");
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)?;
+        let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
+        cfg.release_geometry()?;
+        let (local_layers, hosted_layers) = native_hosted_tail(&cfg.dense,
+            &env("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
+        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+            .map_err(|_| anyhow::anyhow!("Kimi push regression requires an isolated test process"))?;
+        startup::preflight(&manifest, &native)?;
+        // SAFETY: golden-run supplies the sealed library; all borrowers drop before it.
+        let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&native)? });
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let cache_format = cuteafd_core::MlaCacheFormat::Fp8;
+        let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
+            cache_format, devices: [0], native_lib: &native, peers,
+            rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
+            spark_budget_gib: Some(110.), rows: 2048, waves: 2, prefill_rows: Some(1024),
+            slots: 2, marks: 0, max_context: 8192, pool_tokens: Some(16384), graphs: false,
+            ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: Some(hosted_layers),
+            draft: Some(Options { snapshot: drafter, fp8: true, cache_format }), verify_rows: 0,
+        })?;
+        let engine = &loaded.engine;
+        let backend = KimiBackend::new(engine)?;
+        let family = engine.prefix_family()?;
+        let layout = family.layout();
+        let mut pool = RefPagePool::new(layout.pages, layout.page_rows);
+        let draft = engine.native_draft().context("Kimi push regression needs MLA DFlash")?;
+        ensure!(draft.max_batch_sequences() >= 2, "Kimi push regression needs two admitted draft slots");
+        std::fs::create_dir_all(&output)?;
+        let prefix_error = |error: cuteafd_engine::prefix::BoxError| anyhow::anyhow!("{error}");
+        for sequences in [1, 2] {
+            let prompts = (0..sequences).map(|slot| (0..2067 + slot * 19)
+                .map(|i| 1000 + ((i * 37 + slot * 113) % 4096) as u32).collect::<Vec<_>>()).collect::<Vec<_>>();
+            let mut placements = Vec::new();
+            let mut states = Vec::new();
+            for (slot, prompt) in prompts.iter().enumerate() {
+                let capacity = (prompt.len() + 16).div_ceil(layout.page_rows) * layout.page_rows;
+                let mut placement = Placement { units: pool.alloc(capacity / layout.page_rows)?, slot, len: 0, state_len: 0 };
+                family.bind(&mut placement).map_err(prefix_error)?;
+                family.admit_draft_pages(&mut placement, capacity).map_err(prefix_error)?;
+                backend.bind_request(&mut placement, (), RequestMedia::new(Vec::new(), cfg.hidden, prompt.len())?, prompt, 0)?;
+                let mut state = DraftState::default();
+                for (index, chunk) in prompt.chunks(1024).enumerate() {
+                    backend.prefill_device(&mut placement, chunk, 1, &pool)?;
+                    backend.prefill_draft(&placement, index * 1024, chunk, Some(42 + slot as u32), &mut state)?;
+                }
+                ensure!(draft.frontier(slot)? == (0, prompt.len()), "missing Kimi draft context slot {slot}");
+                placements.push(placement);
+                states.push(state);
+            }
+            let propose = |states: &mut [DraftState]| -> Result<Vec<Vec<u32>>> {
+                let mut batch = placements.iter().zip(states).map(|(placement, seq)| scheduler::DraftSeq {
+                    placement, seq, depth: draft.drafts() }).collect::<Vec<_>>();
+                backend.draft(&mut batch, &mut scheduler::DraftTiming::default())
+            };
+            let proposals = propose(&mut states)?;
+            ensure!(proposals.len() == sequences && proposals.iter().all(|tokens| tokens.len() == draft.drafts()),
+                "missing requested Kimi draft outputs");
+            ensure!(proposals == propose(&mut states)?, "Kimi draft replay differs within one version");
+            std::fs::write(output.join(format!("drafts-{sequences}.txt")),
+                proposals.iter().map(|tokens| format!("{tokens:?}\n")).collect::<String>())?;
+            // Fixed teacher-forced rows keep target comparison independent of draft agreement.
+            let rows = (42..50).collect::<Vec<u32>>();
+            let mut batch = placements.iter_mut().map(|placement| (placement, rows.as_slice())).collect::<Vec<_>>();
+            let logits = backend.verify_device(&mut batch, true, &pool)?.context("Kimi verify logits absent")?;
+            library.cuda_set_device(0)?;
+            let values = logits.to_host(&library)?;
+            ensure!(values.len() == sequences * rows.len() * cfg.vocab_size && values.iter().all(|value| value.is_finite()),
+                "Kimi target dump is incomplete or nonfinite");
+            std::fs::write(output.join(format!("logits-{sequences}.bin")),
+                values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>())?;
+            for placement in &mut placements {
+                backend.cancel(placement)?;
+                family.drain().map_err(prefix_error)?;
+                family.discard(placement).map_err(prefix_error)?;
+                pool.release(&placement.units);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires sealed Kimi target, MLA drafter and six real Spark workers via golden-run --native-test"]
     fn native_mla_restored_cold_matches_fresh_and_uncached_target() -> Result<()> {
         use crate::shared::qwen::scheduler::{self, Backend};
