@@ -14,7 +14,7 @@ pub(crate) use execution::{grouped_decode_from_row, Exlr8Execution};
 #[cfg(test)]
 pub(crate) use execution::owner_manifest;
 #[cfg(test)]
-pub(crate) use shared::owner_tests::shared_residency;
+pub(crate) use shared::owner_tests::{retained_shared_experts_match_independent_contract, shared_residency};
 pub(crate) use shared::{NativeExperts, NativePlan};
 
 pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;

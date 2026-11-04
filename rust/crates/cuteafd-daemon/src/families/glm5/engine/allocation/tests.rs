@@ -18,6 +18,34 @@ use cuteafd_loader::{
     plan::exlr8::dense::scratch::LinearScratchLayout,
 };
 
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn retained_shared_experts_and_hooks_match_independent_contract() -> Result<()> {
+    use cuteafd_ffi::exlr8::KernelFamily;
+    for (family, flash) in [(KernelFamily::Glm, false), (KernelFamily::GlmFlash, true)] {
+        crate::shared::experts::exlr8::retained_shared_experts_match_independent_contract(family, flash)?;
+        let manifest = crate::shared::experts::exlr8::owner_manifest(family);
+        let layout = cuteafd_loader::plan::exlr8::shared_workspace_layout(&manifest, family)?;
+        let lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
+        for rank in 0..2u8 {
+            let hooks = HookBuffers { device: rank, maximum_pages: 1, native: None, core: None,
+                shared_workspace: Some(layout.clone()) };
+            let mut contract = Contract::fixed(64, 1, 2, Facts { resident_weights: vec![],
+                phase_order: PhaseOrder::DRAFT_THEN_TARGET, allocations: vec![], deferred: vec![],
+                sequential: vec![], reservations: vec![], allowances: vec![] });
+            contract.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]),
+                Variable::Lanes(vec![1])];
+            contract.components = hooks.components()?;
+            let expected = ["decode", "prefill"].into_iter().map(|kind|
+                layout.allocations(&format!("glm.target.gpu.{rank}.{kind}.native.shared"),
+                    Location::coordinator(rank), lifetime)).collect::<Result<Vec<_>>>()?
+                .into_iter().flatten().collect::<Vec<_>>();
+            assert_eq!(contract.facts(&[0, 0], 1)?.allocations, expected);
+        }
+    }
+    Ok(())
+}
+
 fn native_layout(cfg: &GlmDsaConfig, rows: usize) -> Result<ScratchLayout> {
     ScratchLayout::new(
         cfg,

@@ -351,6 +351,35 @@ fn warmup_upload_is_one_exact_successor_per_selected_shape_not_per_rank() {
 }
 
 #[test]
+fn warmup_upload_requires_an_independent_sufficient_host_budget() {
+    let cfg = cfg();
+    let mut recipe = recipe(&cfg);
+    recipe.experts = None;
+    recipe.targets.clear();
+    recipe.hooks.clear();
+    recipe.exchanges.clear();
+    recipe.weights.clear();
+    recipe.owners.clear();
+    let req = Request { prefill: Pin::Exact(recipe.prefill[0]), ..request() };
+    let mut room = budgets();
+    room.retain(|budget| !budget.locations.contains(&Location::PINNED));
+    assert!(matches!(planner::solve(req.clone(), room, &recipe),
+        Err(Refusal::InvalidFact(detail)) if detail == "component has no physical budget"));
+    let required = super::super::buffers::sync_h2d_successor(recipe.prefill[0]).unwrap().bytes;
+    let mut room = budgets();
+    room[2].physical_bytes = required - 1;
+    room[2].logical_bytes = required - 1;
+    assert!(matches!(planner::solve(req.clone(), room.clone(), &recipe),
+        Err(Refusal::Capacity { budget, phase: Phase::Warmup, required: actual, available, .. })
+            if budget == "physical.2" && actual == required && available == required - 1));
+    room[2].physical_bytes = required;
+    room[2].logical_bytes = required;
+    let plan = planner::solve(req.clone(), room, &recipe).unwrap();
+    assert_eq!(plan.request, req);
+    assert_eq!(plan.pool_tokens, 4096);
+}
+
+#[test]
 fn dflash_prefetch_refuses_missing_empty_nonfile_and_zero_pool_extent() {
     let root = tempfile::tempdir().unwrap();
     assert!(DflashPrefetch::from_snapshot(root.path()).is_err());

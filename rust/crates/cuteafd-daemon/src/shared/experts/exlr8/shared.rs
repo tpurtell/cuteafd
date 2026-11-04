@@ -237,7 +237,7 @@ impl<'a> NativeExperts<'a> {
 pub(super) mod owner_tests {
     use super::*;
     use cuteafd_ffi::{memory_ledger, native_library_lifetime_fixture::Fixture};
-    use cuteafd_loader::{placement::{families::glm5::hooks::HookBuffers, planner::{self, *}},
+    use cuteafd_loader::{placement::planner::{self, *},
         plan::exlr8::{residency::WeightLayout, shared_workspace_layout}};
     use std::collections::BTreeMap;
 
@@ -259,96 +259,91 @@ pub(super) mod owner_tests {
             resident_bytes: bytes, payload_bytes: 0, staging_bytes: 0 }
     }
 
-    #[test]
-    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
-    fn retained_shared_experts_and_hooks_match_independent_contract() -> Result<()> {
+    pub(crate) fn retained_shared_experts_match_independent_contract(
+        family: KernelFamily, flash: bool,
+    ) -> Result<()> {
         let fixture = Fixture::build()?;
-        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
-            let library = fixture.load()?;
-            fixture.quiet_events(&library, true)?;
-            fixture.immediate_copies(&library)?;
-            fixture.exlr8_programs(&library, family == KernelFamily::GlmFlash)?;
-            let manifest = super::super::owner_manifest(family);
-            let path = fixture.directory().join("PROGRAMS.json");
-            std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
-            let programs = library.programs()?.with_manifest(&path)?;
-            let workspace = shared_workspace_layout(&manifest, family)?;
-            for physical in [1, 0] { fixture.configure_memory(&library, physical, 128 << 20)?; }
-            for physical in [vec![1], vec![1, 0]] {
-                let devices = CoordinatorDevices::new(&physical)?;
-                for (rank, &device) in physical.iter().enumerate() {
-                    library.cuda_set_device(device)?;
-                    let tag = format!("shared/{family:?}/{}/{rank}", physical.len());
-                    let _owner = memory_ledger::owner(&tag);
-                    let layouts = (3..5).map(|layer| shared_residency(family, layer, physical.len(), rank))
-                        .collect::<Vec<_>>();
-                    let mut native = NativeExperts::load(&library,
-                        NativePlan::allocation_fixture(family, layouts.clone(), workspace.bytes))?;
-                    let executions = [native.execution(&library, &programs)?, native.execution(&library, &programs)?];
-                    fixture.finish_ordered_uploads(&library)?;
-                    assert!(library.release_sync_h2d_staging()? > 0);
-                    let location = Location::coordinator(rank as u8);
-                    let mut allocations = WeightLayout::from_residencies("test.shared", &layouts.iter().collect::<Vec<_>>(),
-                        WeightArenaTopology::PerLayer, location, Lifetime::RESIDENT)?.allocations;
-                    let hooks = HookBuffers { device: rank as u8, maximum_pages: 1, native: None, core: None,
-                        shared_workspace: Some(workspace.clone()) };
-                    let mut contract = Contract::fixed(64, 1, 1, Facts { resident_weights: vec![],phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations: vec![], deferred: vec![],
-                        sequential: vec![], reservations: vec![], allowances: vec![] });
-                    contract.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]),
-                        Variable::Lanes(vec![1])];
-                    contract.components = hooks.components()?;
-                    allocations.extend(contract.facts(&[0, 0], 1)?.allocations);
-                    let facts = Facts { resident_weights: vec![],phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
-                    let budgets = vec![Budget { id: "CPU shared fixture".into(), locations: vec![location],
-                        physical_bytes: 128 << 20, logical_bytes: 128 << 20, headroom: 0,
-                        baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
-                    let phases = planner::evaluate(&facts, &budgets)?;
-                    let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
-                            prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving , resident_weight_limit: None,},
-                        decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
-                            embedding: None, prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
-                        pool_tokens: 64, facts, budgets, phases };
-                    let mut receipts = native.weight_receipts("test.shared", devices, Lifetime::RESIDENT)?;
-                    for (kind, execution) in ["decode", "prefill"].into_iter().zip(&executions) {
-                        receipts.extend(execution.workspace_receipts(&format!("glm.target.gpu.{rank}.{kind}.native.shared"),
-                            location, device, Lifetime { first: Phase::Warmup, last: Phase::Growth })?);
-                    }
-                    planner::reconcile(&plan, Phase::Ready, &receipts)?;
-                    assert!(native.weight_receipts("", devices, Lifetime::RESIDENT).is_err());
-                    assert!(native.weight_receipts("test.shared", CoordinatorDevices::new(&[7])?, Lifetime::RESIDENT).is_err());
-                    if physical.len() == 2 {
-                        assert!(native.weight_receipts("test.shared", CoordinatorDevices::new(&[0, 1])?, Lifetime::RESIDENT).is_err());
-                    }
-                    for defect in 0..8 {
-                        let layout = native.weights[0].layout.clone();
-                        let original_first = native.first;
-                        let original_device = native.weights[0].buffer.device_id;
-                        match defect {
-                            0 => native.first += 1,
-                            1 => native.weights[0].layout.layer += 1,
-                            2 => native.weights[0].layout.rank += 1,
-                            3 => native.weights[0].layout.world = 3,
-                            4 => native.weights[0].layout.set = ExpertSet::Routed,
-                            5 => native.weights[0].layout.hidden += 1,
-                            6 => native.weights[0].buffer.device_id = 7,
-                            7 => native.weights[0].layout.experts = 2,
-                            _ => unreachable!(),
-                        }
-                        assert!(native.weight_receipts("test.shared", devices, Lifetime::RESIDENT).is_err(), "defect {defect}");
-                        native.first = original_first;
-                        native.weights[0].buffer.device_id = original_device;
-                        native.weights[0].layout = layout;
-                    }
-                    let expected = receipts.iter().filter(|r| r.allocation.view.is_none())
-                        .map(|r| (r.address as usize, r.allocation.bytes as usize)).collect::<BTreeMap<_, _>>();
-                    let actual = memory_ledger::allocations().into_iter().filter(|r| r.key.owner == Some(tag.as_str()))
-                        .map(|r| (r.address, r.bytes)).collect::<BTreeMap<_, _>>();
-                    assert_eq!(actual, expected, "every shared weight/hook allocation must appear once");
-                    drop(executions);
-                    drop(native);
-                    assert!(memory_ledger::allocations().iter().all(|r| r.key.owner != Some(tag.as_str())));
-                    assert_eq!(library.cuda_memory_info()?, (128 << 20, 128 << 20));
+        let library = fixture.load()?;
+        fixture.quiet_events(&library, true)?;
+        fixture.immediate_copies(&library)?;
+        fixture.exlr8_programs(&library, flash)?;
+        let manifest = super::super::owner_manifest(family);
+        let path = fixture.directory().join("PROGRAMS.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        let programs = library.programs()?.with_manifest(&path)?;
+        let workspace = shared_workspace_layout(&manifest, family)?;
+        for physical in [1, 0] { fixture.configure_memory(&library, physical, 128 << 20)?; }
+        for physical in [vec![1], vec![1, 0]] {
+            let devices = CoordinatorDevices::new(&physical)?;
+            for (rank, &device) in physical.iter().enumerate() {
+                library.cuda_set_device(device)?;
+                let tag = format!("shared/{family:?}/{}/{rank}", physical.len());
+                let _owner = memory_ledger::owner(&tag);
+                let layouts = (3..5).map(|layer| shared_residency(family, layer, physical.len(), rank))
+                    .collect::<Vec<_>>();
+                let mut native = NativeExperts::load(&library,
+                    NativePlan::allocation_fixture(family, layouts.clone(), workspace.bytes))?;
+                let executions = [native.execution(&library, &programs)?, native.execution(&library, &programs)?];
+                fixture.finish_ordered_uploads(&library)?;
+                assert!(library.release_sync_h2d_staging()? > 0);
+                let location = Location::coordinator(rank as u8);
+                let mut allocations = WeightLayout::from_residencies("test.shared", &layouts.iter().collect::<Vec<_>>(),
+                    WeightArenaTopology::PerLayer, location, Lifetime::RESIDENT)?.allocations;
+                let workspace_lifetime = Lifetime { first: Phase::Warmup, last: Phase::Growth };
+                for kind in ["decode", "prefill"] {
+                    allocations.extend(workspace.allocations(&format!("test.shared.{rank}.{kind}"),
+                        location, workspace_lifetime)?);
                 }
+                let facts = Facts { resident_weights: vec![],phase_order: cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT, allocations, deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] };
+                let budgets = vec![Budget { id: "CPU shared fixture".into(), locations: vec![location],
+                    physical_bytes: 128 << 20, logical_bytes: 128 << 20, headroom: 0,
+                    baseline: Baseline::Forecast { occupied: 0, source: "CPU fixture".into(), assumed: false } }];
+                let phases = planner::evaluate(&facts, &budgets)?;
+                let plan = ResolvedPlan { request: Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+                        prefill: Pin::Auto, spark_reply_format: None, operation: Operation::Serving , resident_weight_limit: None,},
+                    decisions: Decisions { spark_reply_format: None, attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+                        embedding: None, prefill: PrefillShape { rows: 64, waves: 1 }, lanes: 1 },
+                    pool_tokens: 64, facts, budgets, phases };
+                let mut receipts = native.weight_receipts("test.shared", devices, Lifetime::RESIDENT)?;
+                for (kind, execution) in ["decode", "prefill"].into_iter().zip(&executions) {
+                    receipts.extend(execution.workspace_receipts(&format!("test.shared.{rank}.{kind}"),
+                        location, device, Lifetime { first: Phase::Warmup, last: Phase::Growth })?);
+                }
+                planner::reconcile(&plan, Phase::Ready, &receipts)?;
+                assert!(native.weight_receipts("", devices, Lifetime::RESIDENT).is_err());
+                assert!(native.weight_receipts("test.shared", CoordinatorDevices::new(&[7])?, Lifetime::RESIDENT).is_err());
+                if physical.len() == 2 {
+                    assert!(native.weight_receipts("test.shared", CoordinatorDevices::new(&[0, 1])?, Lifetime::RESIDENT).is_err());
+                }
+                for defect in 0..8 {
+                    let layout = native.weights[0].layout.clone();
+                    let original_first = native.first;
+                    let original_device = native.weights[0].buffer.device_id;
+                    match defect {
+                        0 => native.first += 1,
+                        1 => native.weights[0].layout.layer += 1,
+                        2 => native.weights[0].layout.rank += 1,
+                        3 => native.weights[0].layout.world = 3,
+                        4 => native.weights[0].layout.set = ExpertSet::Routed,
+                        5 => native.weights[0].layout.hidden += 1,
+                        6 => native.weights[0].buffer.device_id = 7,
+                        7 => native.weights[0].layout.experts = 2,
+                        _ => unreachable!(),
+                    }
+                    assert!(native.weight_receipts("test.shared", devices, Lifetime::RESIDENT).is_err(), "defect {defect}");
+                    native.first = original_first;
+                    native.weights[0].buffer.device_id = original_device;
+                    native.weights[0].layout = layout;
+                }
+                let expected = receipts.iter().filter(|r| r.allocation.view.is_none())
+                    .map(|r| (r.address as usize, r.allocation.bytes as usize)).collect::<BTreeMap<_, _>>();
+                let actual = memory_ledger::allocations().into_iter().filter(|r| r.key.owner == Some(tag.as_str()))
+                    .map(|r| (r.address, r.bytes)).collect::<BTreeMap<_, _>>();
+                assert_eq!(actual, expected, "every shared weight/hook allocation must appear once");
+                drop(executions);
+                drop(native);
+                assert!(memory_ledger::allocations().iter().all(|r| r.key.owner != Some(tag.as_str())));
+                assert_eq!(library.cuda_memory_info()?, (128 << 20, 128 << 20));
             }
         }
         Ok(())

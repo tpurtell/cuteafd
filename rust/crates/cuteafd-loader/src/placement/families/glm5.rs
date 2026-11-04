@@ -2507,6 +2507,10 @@ mod tests {
                 unit, Lifetime::TARGET, Category::Kv, "issue #1120 records and page tables"),
                 ByteCurve::linear(unit, unit, maximum_pages), false, maximum_pages));
         }
+        budgets.push(Budget { id: "issue1120.pinned".into(), locations: vec![Location::PINNED],
+            physical_bytes: 1 << 20, logical_bytes: 1 << 20, headroom: 0,
+            baseline: Baseline::Forecast { occupied: 0,
+                source: "issue #1120 independent pinned upload fixture".into(), assumed: true } });
         let recipe = |context| GlmRecipe {
             cfg: inputs.cfg, context, page_tokens: PAGE_ROWS, maximum_pages,
             attention: attention.clone(), gpus: 2, spark_links: true, prefill: vec![shape],
@@ -2517,8 +2521,9 @@ mod tests {
         };
         let mut request = Request { context: inputs.max_context, pool: Pin::Auto,
             onboard: Pin::Exact(0), prefill: Pin::Exact(shape), spark_reply_format: None, operation: Operation::Serving , resident_weight_limit: None,};
-        assert!(matches!(planner::solve(request.clone(), budgets.clone(), &recipe(inputs.max_context)),
-            Err(Refusal::Capacity { .. })), "the unchanged 1M request must not silently clamp");
+        let full_context = planner::solve(request.clone(), budgets.clone(), &recipe(inputs.max_context));
+        assert!(matches!(&full_context, Err(Refusal::Capacity { .. })),
+            "the unchanged 1M request must not silently clamp: {full_context:?}");
 
         request.context = context;
         let recipe = recipe(context);
