@@ -558,6 +558,7 @@ mod tests {
         let snapshot = PathBuf::from(env("CUTEAFD_GOLDEN_SNAPSHOT")?);
         let drafter = PathBuf::from(env("CUTEAFD_KIMI_DRAFT_SNAPSHOT")?);
         let output = PathBuf::from(env("CUTEAFD_KIMI_PUSH_DUMP")?);
+        use crate::shared::golden_scores::push_regression as regression;
         let native = PathBuf::from(env("CUTEAFD_NATIVE_LIB")?);
         let manifest = PathBuf::from(env("CUTEAFD_PROGRAM_MANIFEST")?);
         let peers = env("CUTEAFD_GOLDEN_PEERS")?.split(',').map(str::parse)
@@ -597,8 +598,7 @@ mod tests {
         std::fs::create_dir_all(&output)?;
         let prefix_error = |error: cuteafd_engine::prefix::BoxError| anyhow::anyhow!("{error}");
         for sequences in [1, 2] {
-            let prompts = (0..sequences).map(|slot| (0..2067 + slot * 19)
-                .map(|i| 1000 + ((i * 37 + slot * 113) % 4096) as u32).collect::<Vec<_>>()).collect::<Vec<_>>();
+            let prompts = regression::prompts(sequences);
             let mut placements = Vec::new();
             let mut states = Vec::new();
             for (slot, prompt) in prompts.iter().enumerate() {
@@ -621,22 +621,15 @@ mod tests {
                     placement, seq, depth: draft.drafts() }).collect::<Vec<_>>();
                 backend.draft(&mut batch, &mut scheduler::DraftTiming::default())
             };
-            let proposals = propose(&mut states)?;
-            ensure!(proposals.len() == sequences && proposals.iter().all(|tokens| tokens.len() == draft.drafts()),
-                "missing requested Kimi draft outputs");
-            ensure!(proposals == propose(&mut states)?, "Kimi draft replay differs within one version");
-            std::fs::write(output.join(format!("drafts-{sequences}.txt")),
-                proposals.iter().map(|tokens| format!("{tokens:?}\n")).collect::<String>())?;
+            regression::draft_dump(&output, sequences, draft.drafts(), draft.common().cfg.block,
+                cfg.vocab_size, || Ok((propose(&mut states)?, draft.common().last_logits(sequences)?)))?;
             // Fixed teacher-forced rows keep target comparison independent of draft agreement.
-            let rows = (42..50).collect::<Vec<u32>>();
+            let rows = regression::teacher_rows();
             let mut batch = placements.iter_mut().map(|placement| (placement, rows.as_slice())).collect::<Vec<_>>();
             let logits = backend.verify_device(&mut batch, true, &pool)?.context("Kimi verify logits absent")?;
             library.cuda_set_device(0)?;
             let values = logits.to_host(&library)?;
-            ensure!(values.len() == sequences * rows.len() * cfg.vocab_size && values.iter().all(|value| value.is_finite()),
-                "Kimi target dump is incomplete or nonfinite");
-            std::fs::write(output.join(format!("logits-{sequences}.bin")),
-                values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>())?;
+            regression::target_dump(&output, sequences, cfg.vocab_size, &values)?;
             for placement in &mut placements {
                 backend.cancel(placement)?;
                 family.drain().map_err(prefix_error)?;
