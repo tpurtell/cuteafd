@@ -168,7 +168,9 @@ mod tests {
             };
             let mut forwarded = argv(kind, args).unwrap().unwrap();
             forwarded.extend(["--native-lib".into(), "/lib.so".into()]);
-            if command == "golden" { forwarded.extend(["--golden".into(), "/g".into()]); }
+            if command == "golden" {
+                forwarded.extend(["--nll", "--golden", "/g", "--save-logits", "/out"].map(String::from));
+            }
             let family = crate::cli::Cli::try_parse_from(forwarded.clone()).unwrap();
             assert_eq!(family.coordinator_weight_budget_gib.or(initial), Some(73.0));
             forwarded.extend(["--coordinator-weight-budget-gib".into(), "71".into()]);
