@@ -30,7 +30,7 @@ def reply_programs():
     return torch, compile_native_reply_aot, compile_expert_reply_aot, functions, native, kernel_resolution_guard
 
 
-@pytest.mark.parametrize("width", [4096, 5120, 7168])
+@pytest.mark.parametrize("width", [2048, 3072, 4096, 5120, 6144, 7168])
 @pytest.mark.parametrize("format", [0, 1, 2])
 @pytest.mark.parametrize("kind", [0, 1, 2])
 def test_native_fused_reply_matches_legacy_bytes_and_graph(reply_programs, width, format, kind):
