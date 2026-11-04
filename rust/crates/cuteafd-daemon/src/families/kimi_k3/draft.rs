@@ -547,6 +547,9 @@ mod tests {
     #[test]
     #[ignore = "requires sealed Kimi target/drafter, six Spark workers and CUTEAFD_KIMI_PUSH_DUMP via golden-run"]
     fn native_mla_push_dumps_each_requested_batch() -> Result<()> {
+        let _ = tracing_subscriber::fmt().with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer().try_init();
         use crate::shared::qwen::scheduler::{self, Backend};
         use cuteafd_engine::{media::RequestMedia, prefix::{PrefixFamily, RefPagePool}};
         use super::super::{backend::{DraftState, KimiBackend}, prefix::Placement, startup};
