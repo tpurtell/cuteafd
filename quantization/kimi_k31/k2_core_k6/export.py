@@ -222,7 +222,7 @@ def finalize_export(source, selection, head_replacements, export, identity, evid
 def _model_card(identity):
     return f'''---
 license: other
-license_name: kimi-k3.1
+license_name: kimi-k3.1-pro
 license_link: https://huggingface.co/{BASE_REPO}/blob/{BASE_REVISION}/LICENSE
 base_model: {BASE_REPO}
 datasets:
