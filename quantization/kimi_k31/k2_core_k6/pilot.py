@@ -37,6 +37,7 @@ def code_identity(repo=REPO):
     """Only immutable numerical sources; launcher/publication changes are administrative."""
     paths = ['quantization/kimi_k3/prepare_corpus.py',
              'quantization/kimi_k31/k2_core_k6/pilot.py',
+             'quantization/mistral_large4/core_k6/numerical.py',
              'python/reference/families/kimi_k3/model.py',
              'python/reference/families/kimi_k3/k31.py',
              'python/reference/shape_invariant.py',
@@ -49,15 +50,15 @@ def code_identity(repo=REPO):
 
 
 def select_records(calibration, heldout, calibration_tokens=128, heldout_tokens=64):
-    """Two actual, disjoint prompt prefixes; no padding or synthetic activations."""
+    """Two actual disjoint prompt tails, avoiding the shared template preamble."""
     if (type(calibration_tokens) is not int or type(heldout_tokens) is not int
             or min(calibration_tokens, heldout_tokens) <= 0):
         raise ValueError('pilot token counts must be positive integers')
     left, right = calibration[0], heldout[0]
     if left['id'] == right['id']:
         raise ValueError('pilot calibration and heldout overlap')
-    return (dict(id=left['id'], input_ids=left['input_ids'][:calibration_tokens]),
-            dict(id=right['id'], input_ids=right['input_ids'][:heldout_tokens]))
+    return (dict(id=left['id'], input_ids=left['input_ids'][-calibration_tokens:]),
+            dict(id=right['id'], input_ids=right['input_ids'][-heldout_tokens:]))
 
 
 def validate_qualification(report):
@@ -127,7 +128,7 @@ def main(argv=None):
             str(REPO / 'third_party/gptqmodel'), 'rev-parse', 'HEAD'], text=True).strip(),
         packages={name: importlib.metadata.version(name) for name in ('torch', 'transformers', 'safetensors')},
         calibration=calibration, heldout=heldout,
-        input_witness='embedding-input-format-and-native-staging-not-causal-layer3-calibration')
+        input_witness='prompt-tail-embedding-format-and-native-staging-not-causal-layer3-calibration')
     if identity['packages']['transformers'] != '4.57.6':
         raise ValueError('K3.1 reference requires transformers==4.57.6')
     if args.preflight:
@@ -137,7 +138,8 @@ def main(argv=None):
     import torch
     from torch.nn import functional as F
     from safetensors.torch import load_file
-    from gptqmodel.utils import kimi_k31 as numerical
+    from mistral_large4.core_k6.numerical import fork_module
+    numerical = fork_module('utils.kimi_k31')
     from gptqmodel.utils.kimi_k3 import situ
     from kimi_k3.uniform_k2.run import quantize_projection
     args.root.mkdir(parents=True, exist_ok=True)
