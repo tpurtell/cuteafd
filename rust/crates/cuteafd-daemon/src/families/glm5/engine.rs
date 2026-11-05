@@ -1399,6 +1399,11 @@ impl<'a> GlmEngine<'a> {
         tables.pad_rows(self.pages, bucket);
     }
 
+    fn uses_decode_graphs(&self, decode: bool, logit_rows: usize, hooked: bool) -> bool {
+        self.layer_execution.is_none() && decode_graph_eligible(decode, logit_rows, hooked,
+            self.weights.layers.len() == self.cfg.layers, self.pending_media.borrow().is_some())
+    }
+
     /// Captures every decode graph serving can replay: one padded step per
     /// (row bucket, table width) over the scratch page (one real row goes to
     /// the Sparks), so no request captures. Returns the graph count.
@@ -1447,7 +1452,7 @@ impl<'a> GlmEngine<'a> {
             self.on(1, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
         }
         let shared_graphs = self.shared_graphs.borrow().len();
-        let expected_shared = if owned.is_some() || self.skip.is_some() { 0 } else {
+        let expected_shared = if !self.uses_decode_graphs(true, 1, false) || self.skip.is_some() { 0 } else {
             let buckets: std::collections::BTreeSet<_> = shapes.iter().map(|shape| shape.rows).collect();
             buckets.len() * self.weights.layers.iter().enumerate()
                 .filter(|(index, layer)| !layer.dense && !self.local_layer(*index)).count()
@@ -1510,8 +1515,7 @@ impl<'a> GlmEngine<'a> {
                 t, logit_rows, &mut experts, on_layer);
         }
         // Captured gathers overwrite embeddings; only calls with actual image rows inject eagerly.
-        if decode_graph_eligible(tables.decode, logit_rows, on_layer.is_some(),
-            layers.len() == self.cfg.layers, self.pending_media.borrow().is_some()) {
+        if self.uses_decode_graphs(tables.decode, logit_rows, on_layer.is_some()) {
             // The first captured segment gathers the rows from the staged ids;
             // the last runs the head and the greedy selection.
             let gather = self.embedding.device_gather();
@@ -1802,7 +1806,9 @@ impl<'a> GlmEngine<'a> {
     /// Decode layers as captured graph segments: each replays the previous
     /// layer's reduce + residual norm, this layer's attention and
     /// post-attention norm, and the dense FFN or the MoE front (router,
-    /// select, wire rows); the Spark exchange runs between segments.
+    /// select, wire rows). Remote MoE layers send the live rows, replay a
+    /// separate shared FFN + retained-core meet graph at the padded row bucket
+    /// while the Sparks compute, then land the reply between layer segments.
     ///
     /// Under a head split each segment exchanges with rank 1's segment of the
     /// same layer (captured on rank 1's stream); rank 1's next segment is
@@ -2192,6 +2198,7 @@ impl<'a> GlmEngine<'a> {
     fn moe_exchange(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
         transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<usize> {
         let ticket = self.moe_send(w, index, t, cap, decode, transport)?;
+        // The shared expert runs while the Sparks compute the routed experts.
         self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
         self.moe_land(index, decode, transport, ticket)
     }

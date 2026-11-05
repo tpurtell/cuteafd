@@ -379,11 +379,13 @@ pub fn glm_decode_graph_allowance(context: usize, layers: usize) -> Result<u64, 
     let shapes: usize = glm_decode_table_widths(context, context.div_ceil(GLM_PAGE_ROWS)).iter()
         .map(|&width| glm_decode_row_buckets(width).len()).sum();
     let bytes = product("GLM decode graphs", &[shapes as u64, layers as u64 + 1, 187_000])?;
-    // Estimated upper bound: one separate shared FFN graph per layer/short row
-    // bucket on rank zero. Dense/local layers need none; ranks share this bound.
-    let shared = product("GLM shared decode graphs", &[GLM_SHORT_ROW_BUCKETS.len() as u64,
-        layers as u64, 187_000])?;
-    Ok(sum("GLM decode graph margin", &[bytes, shared, 64 << 20])?.max(3 << 30))
+    Ok(sum("GLM decode graph margin", &[bytes, 64 << 20])?.max(3 << 30))
+}
+
+/// Estimated rank-zero-only bound: one shared FFN graph per layer/short row
+/// bucket. Dense/local layers need none; this bounds every remote placement.
+pub fn glm_shared_decode_graph_allowance(layers: usize) -> Result<u64, CacheGeometryError> {
+    product("GLM shared decode graphs", &[GLM_SHORT_ROW_BUCKETS.len() as u64, layers as u64, 187_000])
 }
 
 /// GLM keeps the complete latent/index pools on every head-split GPU.
@@ -921,15 +923,12 @@ mod tests {
     fn glm_graph_allowance_bounds_measured_captures_and_scales() {
         let old = glm_decode_graph_allowance(131_072, 78).unwrap();
         let new = glm_decode_graph_allowance(1_048_576, 78).unwrap();
-        assert!(old >= 3 << 30);
-        assert!(new >= old);
+        assert_eq!(old, 3 << 30);
+        assert_eq!(new, 3 << 30);
         assert!(old >= 2_575_302_656);
-        // Table-independent shared graphs add at most 24 buckets per layer.
-        let shapes: usize = glm_decode_table_widths(1_048_576, 1_048_576 / GLM_PAGE_ROWS).iter()
-            .map(|&width| glm_decode_row_buckets(width).len()).sum();
-        let expected = ((shapes * 79 + GLM_SHORT_ROW_BUCKETS.len() * 78) as u64 * 187_000
-            + (64 << 20)).max(3 << 30);
-        assert_eq!(new, expected);
+        // Shared executables are a separate rank-zero-only admission term.
+        assert_eq!(glm_shared_decode_graph_allowance(78).unwrap(), 24 * 78 * 187_000);
+        assert_eq!(glm_shared_decode_graph_allowance(0).unwrap(), 0);
         assert!(glm_decode_graph_allowance(1_048_576, 100).unwrap() > new);
         assert!(glm_decode_graph_allowance(0, 78).unwrap() >= 3 << 30);
     }

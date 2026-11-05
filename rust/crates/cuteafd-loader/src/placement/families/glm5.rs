@@ -7,7 +7,7 @@
 //! ([`GlmContext`]); owned attention follows the shared prefill wave policy.
 use crate::families::glm5::{names::Operand, GlmDsaConfig, GlmIndexer};
 use crate::placement::*;
-use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance, Exl3Epilogue};
+use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance, glm_shared_decode_graph_allowance, Exl3Epilogue};
 use cuteafd_core::memory_layout::{Basis, Category};
 
 pub mod admission;
@@ -449,6 +449,12 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 "native dense scratch and prefill staging", bytes, Basis::Formula)));
         }
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime, "decode graph allowance", graphs, Basis::Estimated)));
+        if rank == 0 {
+            let shared_graphs = glm_shared_decode_graph_allowance(inputs.layers)
+                .map_err(|_| PlacementError::Overflow("GLM shared graphs"))?;
+            rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime,
+                "shared decode graph allowance", shared_graphs, Basis::Estimated)));
+        }
         if let Some(&bytes) = inputs.pending_code.get(rank).filter(|&&bytes| bytes > 0) {
             rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime, "pending loaded code", bytes, Basis::Formula)));
         }
@@ -667,7 +673,7 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
         configure_attention(&mut req, attention)?;
         let owned = if attention == Some(AttentionPlacement::Layers) {
             let owners = attention_owners(branch.cfg, branch.layers)?;
-            req.fixed.retain(|d| d.group != "decode graph allowance");
+            req.fixed.retain(|d| !matches!(d.group.as_str(), "decode graph allowance" | "shared decode graph allowance"));
             let head_rows = (DECODE_ROWS + branch.prefill_rows * branch.prefill_lanes) * branch.cfg.heads as u64 / 2;
             for gpu in 0..2 {
                 req.fixed.push(Demand::new(gpu, Category::Workspace, "whole attention rows",
@@ -2464,6 +2470,17 @@ mod tests {
     }
 
     #[test]
+    fn shared_decode_graph_allowance_is_rank_zero_only() {
+        let cfg = config();
+        let i = inputs(&cfg, &[96 * GIB; 2]);
+        let req = request(&i).unwrap();
+        let shared: Vec<_> = req.fixed.iter().filter(|d| d.group == "shared decode graph allowance").collect();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].gpu, 0);
+        assert_eq!(shared[0].bytes, glm_shared_decode_graph_allowance(i.layers).unwrap());
+    }
+
+    #[test]
     fn whole_attention_colocates_indexers_and_charges_one_logical_kv_copy() {
         let cfg = config();
         let owners = attention_owners(&cfg, cfg.layers).unwrap();
@@ -2478,7 +2495,8 @@ mod tests {
         let startup = crate::serving_capacity::glm_graphs::glm_owned_startup_graphs(
             i.max_context as usize, (i.max_context as usize).div_ceil(PAGE_ROWS as usize), &owners, &tp2).unwrap();
         for rank in 0..2 {
-            assert!(!placed.items[rank].iter().any(|item| item.group == "decode graph allowance"));
+            assert!(!placed.items[rank].iter().any(|item|
+                matches!(item.group.as_str(), "decode graph allowance" | "shared decode graph allowance")));
             for item in startup.inventory.items(rank) {
                 assert!(placed.items[rank].contains(&item), "missing {item:?}");
             }
