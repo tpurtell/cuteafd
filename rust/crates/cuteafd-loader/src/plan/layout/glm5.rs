@@ -798,7 +798,9 @@ mod tests {
                 for (rank, device) in layout.devices.iter().enumerate() {
                     let physical = DensePlan::for_rank_owned(&records, gpus, rank, &owners).unwrap();
                     let shared = metadata.plan(1, gpus, rank, ExpertSet::Shared).unwrap();
-                    let expected = physical.resident_bytes as u64 + shared.resident_bytes as u64;
+                    // TokenEmbedding::row_fp8 retains its 256-byte table placeholder on rank 0.
+                    let expected = physical.resident_bytes as u64 + shared.resident_bytes as u64
+                        + if rank == 0 { 256 } else { 0 };
                     assert_eq!(device.items.iter().filter(|item| matches!(item.category, Category::Weights | Category::Embedding))
                         .map(|item| item.bytes).sum::<u64>(), expected);
                     let backbone = selection.backbone(&records, cfg.layers).unwrap();
@@ -1012,6 +1014,14 @@ mod tests {
                 Ok::<_, anyhow::Error>(report.phase_ledger.unwrap())
             };
             let base = plan(&options).unwrap();
+            let peak = base.phases.iter().filter(|row| row.budget == "coordinator host RAM")
+                .map(|row| row.owned + row.opaque).max().unwrap();
+            let total = options.host_memory.unwrap().0;
+            let free = peak + (8 << 30).max(total / 10);
+            plan(&LayoutOptions { host_memory: Some((total, free)), ..options.clone() }).unwrap();
+            let error = plan(&LayoutOptions { host_memory: Some((total, free - 1)), ..options.clone() }).unwrap_err();
+            assert!(matches!(error.downcast_ref::<Refusal>(), Some(Refusal::Capacity { budget, .. })
+                if budget == "coordinator host RAM"), "{error:#}");
             let quota = 1 << 30;
             let prefix = plan(&LayoutOptions { host_cache_bytes: Some(quota), ..options.clone() }).unwrap();
             for phase in [Phase::Ready, Phase::Growth] {
