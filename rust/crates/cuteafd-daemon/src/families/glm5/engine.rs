@@ -1894,7 +1894,13 @@ impl<'a> GlmEngine<'a> {
                     }
                     Ok(())
                 } else {
-                    self.moe_front(w, layer, t)
+                    self.moe_front(w, layer, t)?;
+                    if !self.local_layer(index) && self.skip.is_none() {
+                        // Capture padded rows like rank 1; only the live prefix is
+                        // sent to Sparks. Scratch rows never enter request state.
+                        self.shared_on(0, index, w, layer, rows, "m64")?;
+                    }
+                    Ok(())
                 }
             };
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
@@ -1941,7 +1947,8 @@ impl<'a> GlmEngine<'a> {
                     let (transport, _) = experts.as_mut()
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
                     let waves = transport.exchange()?;
-                    self.moe_exchange(w, index, layer, tables.exchange_rows, "m64", true, waves)?;
+                    let ticket = self.moe_send(w, index, tables.exchange_rows, "m64", true, waves)?;
+                    self.moe_land(index, true, waves, ticket)?;
                     Previous::Planes(waves.ranks())
                 }
             };
@@ -2167,6 +2174,13 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn moe_exchange(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
         transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<usize> {
+        let ticket = self.moe_send(w, index, t, cap, decode, transport)?;
+        self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
+        self.moe_land(index, decode, transport, ticket)
+    }
+
+    fn moe_send(&self, w: &Workspace<'_>, index: usize, t: usize, cap: &str, decode: bool,
+        transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         ensure!(transport.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", transport.ranks());
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
@@ -2180,8 +2194,11 @@ impl<'a> GlmEngine<'a> {
                 Box::new(move |routes, wire| expert_request_parts(routes, wire, index, t, h, topk, decode, bf16)))?
         };
         self.exchange_host.borrow_mut()[0] += timer.elapsed().as_secs_f64();
-        // The shared expert runs on the GPU while the worker posts and the Sparks compute.
-        self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
+        Ok(ticket)
+    }
+
+    fn moe_land(&self, index: usize, decode: bool, transport: &mut crate::shared::spark_waves::Waves<'_>,
+        ticket: crate::shared::spark_waves::WaveTicket) -> Result<usize> {
         if decode {
             self.prefetch(index)?;
         }
@@ -3361,6 +3378,29 @@ mod native_decode_order_tests {
     }
 
     #[test]
+    fn rank0_remote_shared_is_captured_at_the_padded_graph_shape() {
+        let source = include_str!("engine.rs");
+        let decode = source.split("fn decode_layers(").nth(1).unwrap()
+            .split("fn peer_segment(").next().unwrap();
+        let shared = decode.find("self.shared_on(0, index, w, layer, rows, \"m64\")?").unwrap();
+        let replay = decode.find("self.replay_on(0, key, segment)?").unwrap();
+        let send = decode.find("self.moe_send(w, index, tables.exchange_rows,").unwrap();
+        assert!(shared < replay && replay < send);
+        assert_eq!(decode.matches("self.shared_on(0,").count(), 1);
+        assert!(decode[..shared].contains("!self.local_layer(index) && self.skip.is_none()"));
+        assert!(!decode.contains("self.moe_exchange("), "captured shared must not run twice");
+        let send_body = source.split("fn moe_send(").nth(1).unwrap().split("fn moe_land(").next().unwrap();
+        assert!(!send_body.contains("self.shared_on("));
+        // Real row counts sharing a graph bucket must not become capture constants.
+        for width in [16, 128, 1024] {
+            for real in 1..=64 {
+                let bucket = super::glm_decode_row_bucket(real, width).unwrap();
+                assert!(bucket >= real);
+            }
+        }
+    }
+
+    #[test]
     fn native_shared_meet_precedes_next_peer_instantiation() {
         // The real watchdog was rank1 L51's meet while instantiating peer L52.
         let old = schedule(true, 10, true, Some(52));
@@ -3385,7 +3425,7 @@ mod native_decode_order_tests {
         let decode = source.split("fn decode_layers(").nth(1).unwrap().split("fn peer_segment(").next().unwrap();
         assert!(decode.contains("!layer.dense && !self.tp2_layer(index)\n                && Self::core_split(layer, \"down\")"));
         let before = decode.find("if !defer_peer { peer_next()?; }").unwrap();
-        let exchange = decode.find("self.moe_exchange(").unwrap();
+        let exchange = decode.find("self.moe_send(").unwrap();
         let skip = decode.find("self.moe_skip(").unwrap();
         let after = decode.find("if defer_peer { peer_next()?; }").unwrap();
         assert!(before < exchange && exchange < after && before < skip && skip < after);
