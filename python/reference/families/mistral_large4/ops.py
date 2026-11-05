@@ -143,11 +143,23 @@ def indexer_scores(x: torch.Tensor, positions: torch.Tensor, cos: torch.Tensor, 
     if rope:
         q = torch.cat([rope_interleave(q[..., :rope_dim], cos, sin), q[..., rope_dim:]], -1)
         k = torch.cat([rope_interleave(k[..., :rope_dim], cos, sin), k[..., rope_dim:]], -1)
-    scores = torch.relu(torch.einsum("qhd,kd->qhk", q.float(), k[:, 0].float()) * head_dim ** -0.5)
-    weights = (x.to(w_weights.dtype) @ w_weights.t()).float() * heads ** -0.5
-    index = torch.einsum("qh,qhk->qk", weights, scores)
+    weights = (x.to(w_weights.dtype) @ w_weights.t()).float()
+    index = indexer_score_reduction(q, k[:, 0], weights)
     causal = torch.ones(rows, rows, dtype=torch.bool, device=x.device).tril()
     return index.masked_fill(~causal, float("-inf"))
+
+
+def indexer_score_reduction(query: torch.Tensor, key: torch.Tensor,
+                            head_weights: torch.Tensor) -> torch.Tensor:
+    """Shared ML4/Kimi DSA: weighted ReLU dot products, FP32, without a mask.
+
+    Query [rows, heads, dim], shared keys [keys, dim], raw per-head weights
+    [rows, heads]. Families own their projections, positional transforms and mask.
+    """
+    heads, head_dim = query.shape[-2:]
+    scores = torch.relu(torch.einsum("qhd,kd->qhk", query.float(), key.float()) * head_dim ** -0.5)
+    weights = head_weights.float() * heads ** -0.5
+    return torch.einsum("qh,qhk->qk", weights, scores)
 
 
 def index_topk(scores: torch.Tensor, slots: int) -> torch.Tensor:

@@ -216,15 +216,16 @@ def test_dense_root_wording_is_unchanged_and_v41_root_comes_from_the_manifest():
     assert (arithmetic, source) == ('Official inference/model.py block by block.', 'official inference/model.py')
 
 
-def test_sealed_f32_arithmetic_supplies_precision_without_mutating_panel():
+@pytest.mark.parametrize('root', [packager.KIMI_F32_ROOT, packager.KIMI_K31_F32_ROOT])
+def test_sealed_f32_arithmetic_supplies_precision_without_mutating_panel(root):
     import copy
     panel = {'reference_snapshot': {}}
     original = copy.deepcopy(panel)
-    meta = {'root_arithmetic': copy.deepcopy(packager.KIMI_F32_ROOT)}
+    meta = {'root_arithmetic': copy.deepcopy(root)}
     precision, arithmetic, source = packager.root_description(meta, panel)
     assert precision == 'root (native MXFP4 experts and shipped BF16/F32 dense tensors, computed in F32)'
-    assert arithmetic == packager.KIMI_F32_ROOT['arithmetic']
-    assert source == packager.KIMI_F32_ROOT['source']
+    assert arithmetic == root['arithmetic']
+    assert source == root['source']
     assert panel == original
     for key in ('arithmetic', 'source'):
         changed = copy.deepcopy(meta)
@@ -233,6 +234,81 @@ def test_sealed_f32_arithmetic_supplies_precision_without_mutating_panel():
             packager.root_description(changed, panel)
     with pytest.raises(ValueError, match='missing reference precision'):
         packager.root_description({'root_arithmetic': {'arithmetic': 'unknown', 'source': 'unknown'}}, panel)
+
+
+def test_source_pin_trees_accept_flat_and_nested_and_fail_closed():
+    import copy
+    flat = {'revision': 'a' * 40, 'model_sha256': 'b' * 64,
+            'transformers': '4.57.6', 'checkpoint': 'moonshotai/Kimi-K3'}
+    assert packager.validate_source_pins(flat) == flat
+    nested = {'base': flat, 'upstream': {'revision': 'c' * 40, 'files': {'decoder.py': 'd' * 64}}}
+    assert packager.validate_source_pins(nested) == nested
+    assert packager.validate_source_pins(nested, copy.deepcopy(nested)) == nested
+    for changed in (dict(nested, base={}), dict(nested, base={'revision': 'e' * 40}),
+                    dict(nested, upstream={'revision': 'f' * 40, 'files': {'decoder.py': 'd' * 64}}),
+                    dict(nested, unknown=['a' * 40]), dict(nested, unknown=7)):
+        with pytest.raises(ValueError, match='source pin'):
+            packager.validate_source_pins(changed, nested)
+    for value in ('arbitrary descriptive text', [], 1, None):
+        with pytest.raises(ValueError, match='source pin'):
+            packager.validate_source_pins({'unknown': value})
+
+
+def test_published_minimax_flat_pins_are_unchanged():
+    published = {
+        'cache_programs_sha256': '254a333163abe9332ef223eafff55c0f21c80d40035e4ad002adf8d9694d74bd',
+        'fidelity_windows_sha256': 'c3e7ee1805ecd5ec34d1df7a278852d99f92ef1fa440a63aeb0c7aaf72353d21',
+        'golden_sha256': '7b4ec6125c90dce48bc86134e93f81589943c9bcdc8c35cf9a2b1fb5e4b6d9f4',
+        'model_sha256': 'a0d896d8a4102675008f1e08d9f798cd5bce18bba360993701fe075f171c7f8d',
+        'revision': '54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e',
+        'shape_invariant_sha256': '248de2ac87d65d1a44ba06261afafea159a77708d8a52615911251742e77e14f',
+        'transformers_revision': '6b6792ff3b1a434913dc59659d4461acc9c3a51a',
+        'transformers_sources_sha256': '36cc69a80fef409a0339d16b9285d96214aa8021901d1a71007735121fc2437d',
+        'vllm_revision': '2d40c0609fd672e845ddfef0324ab6d8dd616af4',
+        'vllm_sources_sha256': '2fa9e9653084bb940af5f615e297a35390729c098ee54e695614ec50109b2793'}
+    # Source pins from immutable 87e0e905 / minimax-m3_1-flash-v1_20261105_own-text-native.
+    assert packager.validate_source_pins(published) == published
+
+
+def test_k31_finalizer_reconstructs_source_identity_and_rejects_tampering(tmp_path, monkeypatch):
+    import copy
+    import hashlib
+    import sys
+    from families.kimi_k3 import k31, model
+    spec = importlib.util.spec_from_file_location('finalizer', ROOT / 'scripts/bench/finalize-fidelity-dataset.py')
+    finalizer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(finalizer)
+    runtime = {name: 'a' * 64 for name in ('fla_source_sha256', 'transformers_source_sha256',
+                                          'compressed_tensors_source_sha256')}
+    snapshot = tmp_path / k31.REVISION
+    snapshot.mkdir()
+    (snapshot / 'config.json').write_text(json.dumps({'model_type': 'kimi_k31'}))
+    monkeypatch.setattr(model, 'source_identity', lambda path: {'revision': model.REVISION})
+    pins = k31.source_identity(snapshot)
+    pins.update(runtime)
+    files = {'reference_adapter_sha256': ROOT / 'python/reference/families/kimi_k3/model.py',
+             'reference_runner_sha256': ROOT / 'python/reference/families/kimi_k3/golden.py',
+             'indexer_ops_sha256': ROOT / 'python/reference/families/mistral_large4/ops.py',
+             'shape_invariant_sha256': ROOT / 'python/reference/shape_invariant.py'}
+    pins.update({name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()})
+    meta = {'source_pin': pins, 'source_identity_provider': 'families.kimi_k3.k31'}
+    expected = finalizer.expected_source_pins(meta)
+    assert expected == pins
+    assert packager.validate_source_pins(pins, expected) == pins
+    with pytest.raises(ValueError, match='source pin'):
+        packager.validate_source_pins(pins)
+    bad = copy.deepcopy(meta)
+    bad['source_pin']['upstream']['vllm']['files']['vllm/models/kimi_k3/nvidia/dsa.py'] = 'f' * 64
+    source = tmp_path / 'source'
+    (source / 'golden').mkdir(parents=True)
+    (source / 'golden/meta.json').write_text(json.dumps(bad))
+    validator = type('Validator', (), {'validate_reference_only': staticmethod(lambda *a, **k: {'passed': True})})()
+    monkeypatch.setattr(finalizer, 'load_tool', lambda name: validator if name == 'validate-fidelity-dataset' else packager)
+    monkeypatch.setattr(sys, 'argv', ['finalize', '--source', str(source), '--out', str(tmp_path / 'out'),
+        '--tokenizer', str(snapshot / 'tokenizer_config.json'), '--license', str(ROOT / 'LICENSE'), '--config', 'test'])
+    with pytest.raises(ValueError, match='source pin identity differs'):
+        finalizer.main()
+    assert not (tmp_path / 'out').exists()
 
 
 def test_reference_role_metrics_and_card_explain_aggregate_nll():

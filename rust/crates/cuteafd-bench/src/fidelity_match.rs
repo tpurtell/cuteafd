@@ -47,6 +47,8 @@ pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("meta-models/Muse-Spark-Open-816B-A42B", &["meta-models/Muse-Spark-Open-816B-A42B"]),
     ("mistralai/Mistral-Large-4-1T-A52B", &["mistralai/Mistral-Large-4-1T-A52B"]),
     ("MiniMaxAI/MiniMax-M3.1-Flash", &["MiniMaxAI/MiniMax-M3.1-Flash"]),
+    // PUBLICATIONS and immutable dataset constants follow the completed additive upload.
+    ("moonshotai/Kimi-K3.1-Pro", &["moonshotai/Kimi-K3.1-Pro"]),
 ];
 
 pub fn official_root(model: &str) -> Option<&'static str> {
@@ -341,6 +343,17 @@ mod tests {
             (root, dataset::KIMI_K3_REVISION, dataset::KIMI_K3_CONFIG));
         assert_eq!(r.resolved_chain, vec![vec!["test/kimi-quant".to_string(), root.to_string()]]);
         assert!(resolve_in("someone/Kimi-K3-NVFP4", None, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn kimi_k31_root_is_distinct_and_unpublished_until_immutable_pins_exist() {
+        let root = "moonshotai/Kimi-K3.1-Pro";
+        assert_eq!(official_root(root), Some(root));
+        assert!(official(root).is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        add(tmp.path(), root, "base_model: moonshotai/Kimi-K3");
+        assert!(resolve_in(root, None, tmp.path()).is_err());
+        assert_eq!(official("moonshotai/Kimi-K3").unwrap().config, dataset::KIMI_K3_CONFIG);
     }
 
     #[test]

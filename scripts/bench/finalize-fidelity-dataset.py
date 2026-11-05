@@ -76,6 +76,24 @@ def load_tool(name):
     return module
 
 
+def expected_source_pins(meta):
+    """Load the identity provider recorded by the sealed golden, never a family alias."""
+    import importlib
+    import re
+    provider = meta.get('source_identity_provider')
+    if provider is None:
+        return None
+    if not isinstance(provider, str) or not re.fullmatch(r'families(?:\.[A-Za-z_]\w*)+', provider):
+        raise ValueError('invalid reference source identity provider')
+    module = importlib.import_module(provider)
+    identity = getattr(module, 'expected_source_identity', None)
+    if identity is None:
+        return None
+    runtime = {key: value for key, value in meta['source_pin'].items()
+               if key.endswith('_source_sha256')}
+    return identity(runtime)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('source', 'out', 'tokenizer', 'license'):
@@ -88,7 +106,11 @@ def main():
     result = validator.validate_reference_only(args.source, seal=args.seal)
     (args.source / 'reference-validation.json').write_text(json.dumps(result, indent=2) + '\n')
     packager = load_tool('package-reference-only-fidelity')
-    index = packager.package(args.source, args.out, args.config, args.tokenizer, args.license, args.identity_proof)
+    meta = json.loads((args.source / 'golden/meta.json').read_bytes())
+    expected = expected_source_pins(meta)
+    packager.validate_source_pins(meta['source_pin'], expected)
+    index = packager.package(args.source, args.out, args.config, args.tokenizer, args.license, args.identity_proof,
+                             expected_source_pins=expected)
     config = args.out / args.config
     manifest = json.loads((config / 'manifest.json').read_text())
     for path in config.rglob('*'):

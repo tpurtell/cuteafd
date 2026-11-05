@@ -22,10 +22,13 @@ def native(tmp_path):
         "tokenizer_class": "FixtureTokenizer", "auto_map": {
             "AutoTokenizer": ["tokenization_fixture.FixtureTokenizer", None]}}))
     (snapshot / "vocab.model").write_text("fixture byte vocabulary")
-    (snapshot / "render_fixture.py").write_text('''def render(messages, add_generation_prompt):
+    (snapshot / "render_fixture.py").write_text('''import json
+
+def render(messages, add_generation_prompt):
     return "".join(m["role"] + ":" + (m.get("reasoning_content") or "") +
-                   (m.get("content") or "") + "|" for m in messages) + (
-                       "assistant:" if add_generation_prompt else "")
+                   (m.get("content") or "") +
+                   (json.dumps(m["tool_calls"], sort_keys=True) if m.get("tool_calls") else "") +
+                   "|" for m in messages) + ("assistant:" if add_generation_prompt else "")
 ''')
     (snapshot / "tokenization_fixture.py").write_text('''from transformers import PreTrainedTokenizer
 from .render_fixture import render
@@ -104,6 +107,36 @@ def test_native_fixture_roundtrips_shipped_python_chat(native):
     assert token_ids(tokenizer, "fixture") == tokenizer.encode("fixture")
     assert renderer.identity["tokenizer_files"] == tokenizer_identity(native)["tokenizer_files"]
     assert renderer.identity["chat_template_kind"] == "checkpoint_python"
+
+
+def test_native_conversation_preserves_reasoning_tools_and_trailing_context(native):
+    pytest.importorskip("transformers")
+    from fidelity_generation import normalized_messages
+    tokenizer = load_tokenizer(native / "vocab.model", chat=True)
+    renderer = ChatRenderer(tokenizer)
+    call = {"id": "call0", "type": "function", "function": {
+        "name": "read_file", "arguments": '{"path":"README.md"}'}}
+    messages = [{"role": "user", "content": "Read README"},
+                {"role": "assistant", "reasoning_content": "Need contents;", "content": "",
+                 "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "call0", "content": "repository text"},
+                {"role": "assistant", "reasoning_content": "Now answer;", "content": "Summary"}]
+    body = {"messages": messages, "tools": [{"type": "function", "function": {"name": "read_file"}}]}
+    trailing = messages + [{"role": "user", "content": "source text " * 20}]
+    ids = renderer.conversation_ids(body, trailing)
+    expected = tokenizer.apply_chat_template(normalized_messages(trailing), tools=body["tools"],
+                                             tokenize=True, add_generation_prompt=False)
+    assert ids == expected
+    prefix = renderer.conversation_ids(body, messages)
+    assert ids[:len(prefix)] == prefix
+    split = prefix + ids[len(prefix):len(prefix) + 64]
+    assert token_ids(tokenizer, tokenizer.decode(split)) == split
+    assert "Need contents;" in tokenizer.decode(ids) and "read_file" in tokenizer.decode(ids)
+    assert isinstance(call["function"]["arguments"], str)
+    original = tokenizer.decode
+    tokenizer.decode = lambda *args, **kwargs: original(*args, **kwargs) + "changed"
+    with pytest.raises(ValueError, match="losslessly"):
+        renderer.conversation_ids(body, trailing)
 
 
 def test_official_checkpoint_encoder_is_used_without_a_jinja_template(tmp_path):

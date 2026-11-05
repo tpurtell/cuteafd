@@ -22,6 +22,9 @@ SOURCE_PINS = {
 
 def source_identity(snapshot):
     snapshot = Path(snapshot)
+    from . import k31
+    if snapshot.name == k31.REVISION:
+        return k31.source_identity(snapshot)
     if snapshot.name != REVISION:
         raise ValueError("Kimi reference requires the pinned official checkpoint")
     actual = {name: hashlib.sha256((snapshot / name).read_bytes()).hexdigest()
@@ -33,6 +36,9 @@ def source_identity(snapshot):
 
 
 def load_official(snapshot):
+    from . import k31
+    if Path(snapshot).name == k31.REVISION:
+        return k31.load_official(snapshot)
     source_identity(snapshot)
     name = "_fidelity_kimi_k3_checkpoint"
     package = types.ModuleType(name)

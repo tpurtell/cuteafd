@@ -46,6 +46,35 @@ def contained(root, relative):
     return result
 
 
+def validate_source_pins(pins, expected=None):
+    """Validate pin trees; descriptive leaves require an exact reference-code identity."""
+    from collections.abc import Mapping
+    def visit(value, wanted, path):
+        if isinstance(value, Mapping):
+            if not value or any(not isinstance(key, str) or not key for key in value):
+                raise ValueError('invalid source pin mapping')
+            if wanted is not None and (not isinstance(wanted, Mapping) or value.keys() != wanted.keys()):
+                raise ValueError('source pin identity differs: ' + path)
+            for key, child in value.items():
+                visit(child, wanted[key] if wanted is not None else None, path + '.' + key)
+            return
+        if not isinstance(value, str) or not value:
+            raise ValueError('invalid source pin leaf: ' + path)
+        if wanted is not None:
+            if not isinstance(wanted, str) or value != wanted:
+                raise ValueError('source pin identity differs: ' + path)
+            return
+        if not (re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', value)
+                or re.fullmatch(r'\d+\.\d+\.\d+', value)
+                or path.rsplit('.', 1)[-1] == 'checkpoint'
+                and re.fullmatch(r'[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*', value)):
+            raise ValueError('invalid source pin leaf: ' + path)
+    if not isinstance(pins, Mapping):
+        raise ValueError('invalid source pin mapping')
+    visit(pins, expected, 'source_pin')
+    return pins
+
+
 def compact_tensors(full, window):
     """Match existing publication storage, including F16 boundary-tie ordering."""
     n, vocab = full.shape
@@ -194,6 +223,9 @@ KIMI_F32_ROOT = {
     'source': 'official checkpoint Python decoder; exact E2M1/E8M0 group-32 MXFP4 decoded directly to F32',
 }
 KIMI_F32_PRECISION = 'native MXFP4 experts and shipped BF16/F32 dense tensors, computed in F32'
+KIMI_K31_F32_ROOT = {**KIMI_F32_ROOT, 'source': (
+    'hash-checked official K3 decoder plus isolated K3.1 DSA adapter, cross-checked against pinned vLLM and SGLang; '
+    'F32 indexer does not emulate serving E4M3/UE8M0 QDQ; original/fixed-row comparison shares the DSA adapter')}
 
 
 # Exact sealed root arithmetic written by a family golden -> the root precision it computes.
@@ -213,6 +245,7 @@ def golden_root(family):
 
 ROOT_PRECISIONS = [
     (lambda: KIMI_F32_ROOT, KIMI_F32_PRECISION),
+    (lambda: KIMI_K31_F32_ROOT, KIMI_F32_PRECISION),
     (lambda: V41_ROOT, V41_PRECISION),
     (lambda: golden_root('muse_spark'), 'BF16 checkpoint (F32 computation)'),
     (lambda: golden_root('mistral_large4'), 'official FP8 block-128 (no vendor BF16 master), computed in F32'),
@@ -296,7 +329,7 @@ def identity_note(path, set_id):
                           'roles and score geometry and differs only in recipe metadata.')
 
 
-def package(source, out, config, tokenizer_path, license_path, identity=None):
+def package(source, out, config, tokenizer_path, license_path, identity=None, *, expected_source_pins=None):
     if out.exists() or not config or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.' for c in config) or config in ('.', '..'):
         raise ValueError('output must be fresh and config must be a safe component')
     read = lambda name: json.loads(contained(source, name).read_text())
@@ -329,14 +362,9 @@ def package(source, out, config, tokenizer_path, license_path, identity=None):
             or proof.get('fixed_rows') != 128 or proof.get('set_sha256') != set_id
             or proof.get('snapshot_identity') != meta['snapshot_identity']):
         raise ValueError('invalid reference prefix qualification')
-    for key, value in meta['source_pin'].items():
-        # Identity strings beside the hashes: the pinned library version and the root's HF id.
-        if key == 'transformers' and isinstance(value, str) and re.fullmatch(r'\d+\.\d+\.\d+', value):
-            continue
-        if key == 'checkpoint' and value == meta['checkpoint']:
-            continue
-        if not isinstance(value, str) or len(value) not in (40, 64) or any(c not in '0123456789abcdef' for c in value):
-            raise ValueError('invalid source pin')
+    validate_source_pins(meta['source_pin'], expected_source_pins)
+    if meta['source_pin'].get('checkpoint', meta['checkpoint']) != meta['checkpoint']:
+        raise ValueError('source pin checkpoint differs')
     if rows['dtype'] != '<f2' or rows['kind'] != 'log_softmax':
         raise ValueError('unsupported oracle rows')
     tokenizer = load_tokenizer(tokenizer_path)
@@ -380,6 +408,8 @@ def package(source, out, config, tokenizer_path, license_path, identity=None):
         print(f'packaged {config}/{wid}', flush=True)
     provenance = {k: meta[k] for k in ('snapshot_identity', 'source_pin', 'platform', 'tokenizers', 'torch',
                                       'transformers', 'attention', 'mtp', 'use_cache')}
+    if meta.get('source_identity_provider'):
+        provenance['source_identity_provider'] = meta['source_identity_provider']
     # Layer-major goldens record their checks as arithmetic/expert storage/official forward.
     provenance['gates'] = meta['gates'] if 'gates' in meta else {
         k: meta[k] for k in ('arithmetic', 'expert_storage', 'official_forward', 'fixed_rows') if k in meta}
