@@ -173,13 +173,19 @@ pub(crate) fn layer_homes(layers: impl IntoIterator<Item = (bool, bool, usize)>,
     read_bytes: impl Fn(usize) -> Result<usize>) -> Result<Vec<LayerHome>> {
     layers.into_iter().enumerate().map(|(layer, (dense, local, tp))| {
         if dense { return Ok(LayerHome::Dense); }
-        ensure!(tp > 0, "layer {layer} has no installed expert ranks");
-        let slice_bytes = match exl3 {
-            Some(manifest) => exl3_slice_bytes(manifest, layer, tp)?,
-            None => read_bytes(layer)? as f64,
-        };
+        let slice_bytes = layer_slice_bytes(exl3, layer, tp, || read_bytes(layer))?;
         Ok(if local { LayerHome::Local { slice_bytes } } else { LayerHome::Remote { slice_bytes } })
     }).collect()
+}
+
+/// Keep EXL3 pricing manifest-first, including TP2 owners without FP8 metadata.
+pub(crate) fn layer_slice_bytes(exl3: Option<&cuteafd_loader::V41Exl3Manifest>, layer: usize,
+    tp: usize, read_bytes: impl FnOnce() -> Result<usize>) -> Result<f64> {
+    ensure!(tp > 0, "layer {layer} has no installed expert ranks");
+    match exl3 {
+        Some(manifest) => exl3_slice_bytes(manifest, layer, tp),
+        None => Ok(read_bytes()? as f64),
+    }
 }
 
 /// GLM Flash's policy geometry from each layer's home, the router's expert
@@ -851,7 +857,7 @@ mod tests {
     #[test]
     fn glm_and_qwen_layer_prices_remain_bit_identical() -> Result<()> {
         use cuteafd_loader::plan::testing;
-        for family in ["glm", "qwen"] {
+        for family in ["glm", "glmf", "qwen"] {
             let fixture = tempfile::tempdir()?;
             let (config, tensors, first, layers, hidden, intermediate, experts) = if family == "glm" {
                 let mut config = testing::glm5_config();
@@ -864,6 +870,17 @@ mod tests {
                     }
                 }
                 (config, tensors, 1, 2, 6144, 2048, 256)
+            } else if family == "glmf" {
+                let mut config = testing::glm5_flash_config(2);
+                config["quantization_config"] = testing::exl3_compact(4);
+                let mut tensors = Vec::new();
+                for expert in 0..288 {
+                    for (projection, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096),
+                        ("down_proj", 4096, 2048)] {
+                        tensors.extend(testing::exl3(&format!("model.language_model.layers.1.mlp.experts.{expert}.{projection}"), n, k, 4));
+                    }
+                }
+                (config, tensors, 1, 2, 4096, 2048, 288)
             } else {
                 let (tensors, _) = testing::qwen4_exl3(2, 4);
                 (testing::qwen4_config(2), tensors, 0, 2, 2560, 640, 512)
@@ -876,6 +893,9 @@ mod tests {
                         catalog.exl3(), |_| panic!("EXL3 must not query installed FP8 descriptors"))?;
                     let width = (intermediate / 128usize).div_ceil(tp) * 128;
                     let bytes = (3 * (hidden * width * 4 / 8 + hidden * 2 + width * 2)) as f64;
+                    assert_eq!(layer_slice_bytes(catalog.exl3(), first, tp,
+                        || anyhow::bail!("expert backend does not publish installed read-byte metadata"))?, bytes,
+                        "{family} TP{tp} must price the manifest before querying native owners");
                     for (layer, home) in homes.iter().enumerate() {
                         let previous = if layer < first { LayerHome::Dense }
                             else if local { LayerHome::Local { slice_bytes: bytes } }
@@ -894,6 +914,10 @@ mod tests {
                 }
             }
         }
+        let error = layer_slice_bytes(None, 1, 2,
+            || anyhow::bail!("missing installed TP2 descriptor")).unwrap_err();
+        assert_eq!(error.to_string(), "missing installed TP2 descriptor");
+        assert!(layer_slice_bytes(None, 1, 0, || panic!("invalid TP descriptor")).is_err());
         assert!(layer_homes([(false, false, 0)], None, |_| Ok(1)).is_err());
         assert_eq!(layer_homes([(true, false, 0)], None, |_| panic!("dense descriptor"))?, [LayerHome::Dense]);
         Ok(())

@@ -2390,28 +2390,26 @@ impl<'a> GlmfEngine<'a> {
             };
             ensure!(tp > 0, "GLM Flash layer {layer} has no installed expert ranks");
             let catalog = catalog.context("GLM Flash routed expert catalog missing")?;
-            let slice_bytes = if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
-                let left = tp2.ranks[0].borrow();
-                let right = tp2.ranks[1].borrow();
-                tp2_weight_read_bytes([left.as_ref(), right.as_ref()])? as f64
-            } else if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
-                match self.routed_experts(layer) {
-                    Some(Experts::LocalNative(local)) => local.borrow().weight_read_bytes()? as f64,
-                    Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)? as f64,
-                    _ => anyhow::bail!("GLM Flash layer {layer} has no installed native byte descriptor"),
-                }
-            } else { match (catalog.fp8(), catalog.exl3()) {
-                (Some(_), _) => {
-                    let bytes = match self.routed_experts(layer) {
-                        Some(Experts::Local(local)) => local.experts.borrow().weight_read_bytes(),
-                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)?,
+            let slice_bytes = resource::layer_slice_bytes(catalog.exl3(), layer, tp, || {
+                if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
+                    let left = tp2.ranks[0].borrow();
+                    let right = tp2.ranks[1].borrow();
+                    tp2_weight_read_bytes([left.as_ref(), right.as_ref()])
+                } else if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+                    match self.routed_experts(layer) {
+                        Some(Experts::LocalNative(local)) => local.borrow().weight_read_bytes(),
+                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer),
+                        _ => anyhow::bail!("GLM Flash layer {layer} has no installed native byte descriptor"),
+                    }
+                } else {
+                    anyhow::ensure!(catalog.fp8().is_some(), "GLM Flash routed expert format cannot be priced");
+                    match self.routed_experts(layer) {
+                        Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_bytes()),
+                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer),
                         _ => anyhow::bail!("GLM Flash layer {layer} has no installed FP8-family byte descriptor"),
-                    };
-                    bytes as f64
+                    }
                 }
-                (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, layer, tp)?,
-                _ => anyhow::bail!("GLM Flash routed expert format cannot be priced"),
-            }};
+            })?;
             Ok(if matches!(self.routed_experts(layer), Some(Experts::Spark { .. })) && !self.tp2_layer(layer) {
                 LayerHome::Remote { slice_bytes }
             } else { LayerHome::Local { slice_bytes } })
