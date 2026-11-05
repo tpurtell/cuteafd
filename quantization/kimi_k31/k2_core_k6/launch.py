@@ -97,7 +97,9 @@ def main():
         [*common, '--resume'], container=container, helper=helper, qualification=args.qualification_report)
     environment = {key: os.environ[key] for key in
         ('PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LD_LIBRARY_PATH') if key in os.environ}
-    environment['HF_HOME'] = '/mnt/sparknest/hf-home'
+    # Preserve the user's credential directory; its hub is a SparkNest symlink.
+    # The publisher explicitly hardlinks into its separate NVMe cache.
+    environment['HF_HOME'] = os.environ.get('HF_HOME', str(Path.home() / '.cache/huggingface'))
     environment['HF_MODULES_CACHE'] = str(root.parent / 'kernel-cache/hf-modules')
     path = attempts / (stamp + '.json')
     atomic_json(path, dict(root=str(root), command=command, resume_command=resume_command,
