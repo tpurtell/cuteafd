@@ -809,8 +809,10 @@ mod tests {
                         64, 1024, false).unwrap();
                     let hooks = device.items.iter().filter(|item| item.group == "GLM target hooks")
                         .map(|item| item.bytes).sum::<u64>();
-                    assert_eq!(hooks, crate::families::glm5::native::scratch_bytes(&scratch).unwrap()
-                        + 2 * workspace.bytes as u64);
+                    assert_eq!(hooks, crate::families::glm5::native::scratch_bytes(&scratch).unwrap());
+                    let shared_arenas = device.items.iter().filter(|item| item.group == "EXLR8 expert workspace")
+                        .map(|item| item.bytes).sum::<u64>();
+                    assert_eq!(shared_arenas, 2 * workspace.bytes as u64);
                     assert_eq!(device.items, placement.items[rank]);
                     assert!(device.used_bytes() <= device.capacity_bytes);
                 }
