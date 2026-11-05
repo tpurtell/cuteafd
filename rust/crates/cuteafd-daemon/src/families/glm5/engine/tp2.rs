@@ -180,7 +180,10 @@ impl<'a> GlmEngine<'a> {
             graphs: || {
                 for rank in 0..self.ranks() {
                     self.on(rank, || {
-                        if rank == 0 { self.graphs.borrow_mut().clear(); }
+                        if rank == 0 {
+                            self.graphs.borrow_mut().clear();
+                            self.shared_graphs.borrow_mut().clear();
+                        }
                         else { self.peer()?.graphs.borrow_mut().clear(); }
                         Ok(())
                     })?;

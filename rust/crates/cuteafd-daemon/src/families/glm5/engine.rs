@@ -551,6 +551,7 @@ pub(crate) struct GlmEngine<'a> {
     /// routes and routed+shared output of the steps it verifies.
     pub(crate) width_taps: RefCell<Option<Vec<WidthTap>>>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    shared_graphs: RefCell<std::collections::HashMap<(usize, usize), GraphExec<'a>>>,
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
     graph_misses: Cell<u64>,
@@ -704,7 +705,7 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), shared_graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
 
     pub(crate) fn bind_core(&mut self, admission: Option<cuteafd_loader::families::glm5::core::CoreCharges>) -> Result<()> {
@@ -1445,11 +1446,20 @@ impl<'a> GlmEngine<'a> {
             let stream = self.stream_of(1);
             self.on(1, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
         }
-        let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
+        let shared_graphs = self.shared_graphs.borrow().len();
+        let expected_shared = if owned.is_some() || self.skip.is_some() { 0 } else {
+            let buckets: std::collections::BTreeSet<_> = shapes.iter().map(|shape| shape.rows).collect();
+            buckets.len() * self.weights.layers.iter().enumerate()
+                .filter(|(index, layer)| !layer.dense && !self.local_layer(*index)).count()
+        };
+        ensure!(shared_graphs == expected_shared,
+            "GLM shared captured {shared_graphs} graphs, expected {expected_shared}");
+        let graphs = self.graphs.borrow().len() + shared_graphs
+            + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
         let bytes: Vec<i64> = (0..self.ranks()).map(|rank| Ok(before[rank] - free(rank)?)).collect::<Result<_>>()?;
         self.graphs_warming.set(false);
         self.graphs_warmed.set(true);
-        tracing::info!(graphs, ?bytes, widths = ?self.table_width_buckets(), rows = ?ROW_BUCKETS,
+        tracing::info!(graphs, shared_graphs, ?bytes, widths = ?self.table_width_buckets(), rows = ?ROW_BUCKETS,
             long_rows = ?cuteafd_loader::serving_capacity::GLM_LONG_ROW_BUCKETS,
             elapsed_ms = started.elapsed().as_millis() as u64, "GLM decode graphs captured at startup");
         Ok(graphs)
@@ -1894,13 +1904,7 @@ impl<'a> GlmEngine<'a> {
                     }
                     Ok(())
                 } else {
-                    self.moe_front(w, layer, t)?;
-                    if !self.local_layer(index) && self.skip.is_none() {
-                        // Capture padded rows like rank 1; only the live prefix is
-                        // sent to Sparks. Scratch rows never enter request state.
-                        self.shared_on(0, index, w, layer, rows, "m64")?;
-                    }
-                    Ok(())
+                    self.moe_front(w, layer, t)
                 }
             };
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
@@ -1948,6 +1952,8 @@ impl<'a> GlmEngine<'a> {
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
                     let waves = transport.exchange()?;
                     let ticket = self.moe_send(w, index, tables.exchange_rows, "m64", true, waves)?;
+                    // Padded shared rows are scratch; staging sends only the live prefix.
+                    self.replay_shared(index, t, || self.shared_on(0, index, w, layer, rows, "m64"))?;
                     self.moe_land(index, true, waves, ticket)?;
                     Previous::Planes(waves.ranks())
                 }
@@ -2023,11 +2029,22 @@ impl<'a> GlmEngine<'a> {
 
     /// [`Self::replay`] on rank `rank`'s stream (its own graphs).
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
-        self.require_live()?;
         let graphs = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.graphs,
             _ => &self.graphs,
         };
+        self.replay_graph(rank, key, graphs, segment)
+    }
+
+    /// Shared work is table-independent and stays behind request staging so
+    /// Spark execution overlaps the shared FFN and its retained-core meet.
+    fn replay_shared(&self, layer: usize, rows: usize, segment: impl Fn() -> Result<()>) -> Result<()> {
+        self.replay_graph(0, (layer, rows), &self.shared_graphs, segment)
+    }
+
+    fn replay_graph<K: std::fmt::Debug + Eq + std::hash::Hash>(&self, rank: usize, key: K,
+        graphs: &RefCell<std::collections::HashMap<K, GraphExec<'a>>>, segment: impl Fn() -> Result<()>) -> Result<()> {
+        self.require_live()?;
         let stream = self.stream_of(rank);
         if let Some(graph) = graphs.borrow().get(&key) {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
@@ -3382,13 +3399,19 @@ mod native_decode_order_tests {
         let source = include_str!("engine.rs");
         let decode = source.split("fn decode_layers(").nth(1).unwrap()
             .split("fn peer_segment(").next().unwrap();
-        let shared = decode.find("self.shared_on(0, index, w, layer, rows, \"m64\")?").unwrap();
         let replay = decode.find("self.replay_on(0, key, segment)?").unwrap();
         let send = decode.find("self.moe_send(w, index, tables.exchange_rows,").unwrap();
-        assert!(shared < replay && replay < send);
+        let shared = decode.find("self.replay_shared(index, t, || self.shared_on(0, index, w, layer, rows, \"m64\"))?").unwrap();
+        let land = decode.find("self.moe_land(index, true, waves, ticket)?").unwrap();
+        assert!(replay < send && send < shared && shared < land,
+            "request staging must precede shared capture/replay to overlap Spark execution");
+        assert!(!decode[..replay].contains("self.shared_on(0,"));
         assert_eq!(decode.matches("self.shared_on(0,").count(), 1);
-        assert!(decode[..shared].contains("!self.local_layer(index) && self.skip.is_none()"));
         assert!(!decode.contains("self.moe_exchange("), "captured shared must not run twice");
+        let helper = source.split("fn replay_shared(").nth(1).unwrap().split("fn replay_graph<").next().unwrap();
+        assert!(helper.contains("self.replay_graph(0, (layer, rows), &self.shared_graphs, segment)"));
+        assert!(!helper.contains("exchange_rows"), "shared graph keys use only padded rows and layer");
+        assert_eq!(super::glm_decode_row_bucket(17, 16).unwrap(), 20);
         let send_body = source.split("fn moe_send(").nth(1).unwrap().split("fn moe_land(").next().unwrap();
         assert!(!send_body.contains("self.shared_on("));
         // Real row counts sharing a graph bucket must not become capture constants.
@@ -3426,9 +3449,10 @@ mod native_decode_order_tests {
         assert!(decode.contains("!layer.dense && !self.tp2_layer(index)\n                && Self::core_split(layer, \"down\")"));
         let before = decode.find("if !defer_peer { peer_next()?; }").unwrap();
         let exchange = decode.find("self.moe_send(").unwrap();
+        let shared = decode.find("self.replay_shared(").unwrap();
         let skip = decode.find("self.moe_skip(").unwrap();
         let after = decode.find("if defer_peer { peer_next()?; }").unwrap();
-        assert!(before < exchange && exchange < after && before < skip && skip < after);
+        assert!(before < exchange && exchange < shared && shared < after && before < skip && skip < after);
     }
 }
 
