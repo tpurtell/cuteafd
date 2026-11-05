@@ -257,7 +257,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     append_spark_devices(&mut memory, layout, &residents);
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
-    {
+    if family.id() != "glm5" {
         let _timer = super::PhaseTimer::new(&input.phases.admission, &[]);
         super::layout::charge_host(&mut report, layout, input, true)?;
     }
