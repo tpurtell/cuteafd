@@ -161,11 +161,11 @@ pub fn glm_admission_programs() -> Value {
         json!({"name":"exlr8_shared_group", "capacity_rows":64,
             "geometry":{"abi_version":2,"experts":1,"top_k":1,"max_groups":4,"max_rows":64,
                 "hidden":6144,"input_format":"bf16","input_row_bytes":12288,"ctas_per_sm":4,"ingress_warps":8},
-            "pointers":[("ids","int32","[rows,1]","in"), ("x","bfloat16","[rows,6144]","in"),
+            "pointers":([("ids","int32","[rows,1]","in"), ("x","bfloat16","[rows,6144]","in"),
                 ("signs_in","int8","[6144]","in"), ("group_expert","int32","[4]","out"),
                 ("route_slots","int32","[4,16]","out"), ("route_group_lane","int32","[rows,1]","out"),
                 ("group_count","int32","[1]","out"), ("activation","float16","[rows,6144]","out")]
-                .into_iter().map(|(name,dtype,shape,role)| json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>(),
+                .into_iter().map(|(name,dtype,shape,role)| json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>()),
             "scalars":[{"type":"int32"},{"type":"int32"}],"scratch_bytes_at_capacity":{}}),
     ]);
     manifest
