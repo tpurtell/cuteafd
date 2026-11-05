@@ -41,6 +41,7 @@ from kimi_k3.core_k6.run import (
 )
 from kimi_k3.core_k6.storage import StageStore
 from .recipe import BASE_REPO, BASE_REVISION, TARGET_REPO, inventory, selected_modules
+from .quality import QualityCheckpoints, LIMIT, BASELINE_REVISION
 
 GIB = 1024 ** 3
 RECIPE = dict(core_bits=6, expert_bits=2, seed=787, sigma_reg=.025,
@@ -53,6 +54,8 @@ RECIPE = dict(core_bits=6, expert_bits=2, seed=787, sigma_reg=.025,
     replay='serialized-exl3-fp16-scales-reconstructed-BF16',
     frontier='prefix-sum-and-complete-attention-residual-bank',
     dsa='shared-reference-eval-batch1-no-cache-f32-indexer')
+RECIPE['k6_training_error_alarm'] = dict(limit=LIMIT, baseline_revision=BASELINE_REVISION,
+                                       domain='regularized-Hessian-training-not-heldout')
 
 
 class Progress(CoreProgress):
@@ -114,6 +117,12 @@ class Engine(CoreEngine):
         super().__init__(source, records, root, export, identity, core, progress,
                          device=device, numerical=numerical)
         self.all_selection = selection
+
+    def _checkpoints(self, layer):
+        name = 'head' if layer == 'head' else f'layer-{layer:03d}'
+        directory = self.root / 'head/projections' if layer == 'head' else self.root / f'layers/{layer:03d}/projections'
+        return QualityCheckpoints(directory, self.root / 'evidence' / name, self.identity,
+                                  self.selection, self.progress, device=self.device, numerical=self.math)
 
     def _capture_routes(self, block, store):
         directory = self.root / f'layers/{block.layer_idx:03d}/routes'
