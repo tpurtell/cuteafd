@@ -1,5 +1,50 @@
 # CuteAFD plan
 
+## Kimi K3.1 Pro K2 experts and K6 core (maxq, 2026-11-06)
+
+TJ authorized one causal pass and direct publication to
+`wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-Core-K6`, with a short representative
+pilot instead of four complete layers. Worktree:
+`~/Developer/cute-worktrees/kimi-k31-quant`, branch `quant/kimi-k31-k2-core-k6`.
+Implementation: `quantization/kimi_k31/k2_core_k6/`. Use the merged fidelity
+reference for DSA; no second attention implementation. The pinned native
+source is `moonshotai/Kimi-K3.1-Pro@6d0a0202956796543364d666ab19c6ad1a494ee1`.
+All source files are local through SparkNest. Main checkout/venv and existing
+GPTQModel worktrees remain untouched; a private uv HF4 overlay borrows Torch
+read-only and pins Transformers 4.57.6.
+
+Inventory: 247,296 K2 expert matrices, 926 K6 core matrices; 1,822 retained
+tensors. Expected output: 94 shards, 994,710 tensors, 731,632,865,912 payload
+bytes. The full native panel is freshly rendered with K3.1's tokenizer:
+1,426 prompts / 1,201,086 tokens. The recipe remains standard MCG, seed 787,
+sigma 0.025, automatic scales, exact native MXFP4-to-BF16 expert decoding.
+Dense and routed covariance use bounded K128 FP32 products and an FP64 outer
+sum. Native DSA indexers execute in F32 and remain byte-identical in the export.
+Core entry projections precede K2 expert quantization; latent-up calibration
+sees the finished serialized K2 experts before the successor layer replays.
+
+Run/token/pilot state: `~/.cache/cuteafd/quantization/kimi-k31-k2-core-k6/`;
+output: `~/.cache/huggingface/cuteafd-exports/Kimi-K3.1-Pro-EXL3-K2-Core-K6/`.
+Use task `launch.py --source-snapshot PATH --tokens PATH --root PATH --export
+PATH --qualification-report PATH --publish`; recovery adds `--resume`.
+Durable user services take only raptor's fair-queued maxq lock and stop their
+owned container before releasing it. GPU allocation limit 86 GiB, container
+RAM 88 GiB, disk reserve 64 GiB. Admission reserves the complete output plus
+three maximal residual banks and bounded current-layer staging. Old banks,
+route spools and packed candidates retire only after the exported shard and
+successor frontier are durable. Resume rejects changed numerical identities.
+
+K6 new and resumed projections stop before replay if their calibrated training
+error exceeds 1e-3; diagnostics retain the pinned same-tensor K3 baseline.
+This alarm is explicitly a training metric, not heldout/full-model qualification.
+The small pilot covers native/staged KDA+dense and DSA, a padded K6 matrix,
+and one routed expert's serialized gate/up/down. Its layer-3 embedding witness
+is not production calibration. Full-panel causal production remains unchanged.
+The panel's longest prompt is 1,966 tokens, below DSA top-k 2,048; reference
+CPU tests separately cover pruning/ties. Independent final CPU header, metadata,
+native-byte and complete diagnostic audits precede upload; Hub checksums reuse
+assembly receipts. Full-model fidelity and serving work stay with the orchestrator.
+
 One attention/FFN-disaggregated engine for the open-weights MoE models that
 soar on consumer Blackwell: strong RTX PRO 6000 head(s) for attention, dense
 projections, routing, shared experts, sampling and speculation; a pool of DGX
