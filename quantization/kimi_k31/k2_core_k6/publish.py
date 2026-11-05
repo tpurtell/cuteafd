@@ -11,6 +11,7 @@ from kimi_k3.uniform_k2.storage import atomic_json, file_identity, verify_receip
 from step5.core_k6.publish import (_audit_remote, _cache_snapshot, _field, _hardlink_snapshot,
     _manifest_digest, _metadata_digests, LOCAL_HUB_CACHE)
 from .export import receipt_path, shard_name
+from .finalize import audit_completed_export
 from .recipe import MODULE_COUNT, SHARD_COUNT, TARGET_PAYLOAD_BYTES, TARGET_REPO, TARGET_TENSOR_COUNT
 
 IGNORE_PATTERNS = ["*-receipt.json", ".cache/**", "**/.cache/**", "*.partial", ".json-*"]
@@ -82,6 +83,10 @@ def publish(export, root, repo_id):
         raise ValueError("publication roots must be regular directories")
     export, root = export.resolve(), root.resolve()
     identity = _complete_plan(export, root, repo_id)
+    # Independent CPU reload must pass before creating the remote repository
+    # or sending any upload bytes. This reads headers and small native assets,
+    # while committed producer checksums attest weight payloads without rehash.
+    audit_completed_export(root)
     files = _collect_local(export, identity)
     LOCAL_HUB_CACHE.mkdir(parents=True, exist_ok=True)
     if LOCAL_HUB_CACHE.is_symlink() or export.stat().st_dev != LOCAL_HUB_CACHE.stat().st_dev:
