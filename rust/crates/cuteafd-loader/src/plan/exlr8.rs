@@ -133,7 +133,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let family = super::family::detect(checkpoint).context("EXLR8 family is not recognized")?;
     let (world, gpu_count, attention, mut resolved_layout) = native_options(selected, options, speculator, family.id())?;
     let model = family.open(checkpoint)?;
-    let (layers, first_moe_layer, kernels) = native::family_geometry(&checkpoint.config)?;
+    let (layers, first_moe_layer, _) = native::family_geometry(&checkpoint.config)?;
     let snapshot = &checkpoint.snapshot;
     let mut report = super::empty_report(input, options)?;
     report.family = Some(family.id().into());
@@ -164,7 +164,6 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
         layers, &plans, resolved_layout.exlr8_prefill_pin, resolved_layout.exlr8_prefill_activations)?;
     ensure!(activations == resolved_layout.exlr8_prefill_activations,
         "EXLR8 resolved activation differs from requested layout charge");
-    let workspace = shared_workspace(&programs, kernels)?;
     let facts = native::DenseFacts::new(records, selection, layers, shared)?;
     drop(catalog_timer);
     let (memory, placement) = {
@@ -175,8 +174,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             let placement = report.solver_placement.clone().context("Flash EXLR8 native placement was refused")?;
             (memory, placement)
         } else {
-            super::layout::glm5::native_layout_with_metadata(checkpoint, &resolved_layout, &facts.shared_bytes,
-                workspace, world, &programs, Some(selected), Some(&metadata), Some(attention))?
+            super::layout::glm5::native_layout_with_metadata(checkpoint, &resolved_layout,
+                world, &programs, selected, Some(&metadata), Some(attention), Some(&mut report))?
         }
     };
     let layout = &resolved_layout;

@@ -30,18 +30,7 @@ pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 /// Each peer carries one rank plane; rank count multiplies retained intake/rings,
 /// never this frame bound. Keep the ordinary transport default as the floor.
 pub fn native_frame_budget(geometry: cuteafd_core::ExpertGeometry, capacity: u32) -> Result<usize> {
-    let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None,
-        capacity, ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None };
-    let (request, response) = endpoint.wire_bytes(geometry)
-        .context("invalid native frame capacity or geometry")?;
-    let debug_bytes = crate::EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN
-        - crate::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
-    // Partial-reply geometries: one unchunked SEND of every routed BF16 record at most.
-    let partial = geometry.partial_reply_bound(capacity).map_or(Some(0), |bytes|
-        bytes.checked_add(crate::EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN))
-        .context("native partial frame budget overflow")?;
-    Ok(request.max(response).checked_add(debug_bytes)
-        .context("native frame budget overflow")?.max(partial).max(crate::DEFAULT_MAX_FRAME_BYTES))
+    geometry.native_frame_budget(capacity).context("invalid native frame capacity or geometry")
 }
 
 fn validate_frame_budget(capacity: u32, max_frame_bytes: usize) -> Result<()> {

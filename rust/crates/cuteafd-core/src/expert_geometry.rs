@@ -329,6 +329,20 @@ impl ExpertGeometry {
         Some((request, response))
     }
 
+    /// Native frames include indexed BF16 replies and the largest partial plane.
+    /// Keep the transport's ordinary 64 MiB frame floor.
+    pub fn native_frame_budget(&self, capacity: u32) -> Option<usize> {
+        let endpoint = SparkEndpoint { capacity, ingress: SparkIngress::Bf16,
+            ring_depth: None, partial_reply_bytes: None };
+        let (request, response) = endpoint.wire_bytes(*self)?;
+        let debug_delta = PARTIAL_RESPONSE_HEADER_BYTES - 96;
+        let partial = match self.partial_reply_bound(capacity) {
+            Some(bytes) => bytes.checked_add(PARTIAL_RESPONSE_HEADER_BYTES)?,
+            None => 0,
+        };
+        Some(request.max(response).checked_add(debug_delta)?.max(partial).max(64 << 20))
+    }
+
     /// Persistent request/response mapped rings, shared by admission and planning.
     pub fn compact_ring_bytes(&self, capacity: u32, max_frame: usize, depth: usize,
         slot: usize, alignment: usize, endpoints: usize, bf16: bool) -> Option<usize> {
