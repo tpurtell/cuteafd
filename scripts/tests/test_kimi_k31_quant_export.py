@@ -122,3 +122,30 @@ def test_reviewed_recipe_totals_and_native_indexer():
     assert recipe.TARGET_PAYLOAD_BYTES == 731632865912
     assert "language_model.model.layers.3.self_attn.indexer.wq_b.weight" in specs
     assert "language_model.model.layers.3.self_attn.indexer.wq_b" not in selected
+
+
+def test_publication_requires_matching_complete_producer(tmp_path, monkeypatch):
+    from kimi_k31.k2_core_k6 import publish
+    monkeypatch.setattr(publish, "SHARD_COUNT", 1)
+    monkeypatch.setattr(publish, "TARGET_TENSOR_COUNT", 2)
+    monkeypatch.setattr(publish, "TARGET_PAYLOAD_BYTES", 256)
+    monkeypatch.setattr(publish, "MODULE_COUNT", 1)
+    monkeypatch.setattr(publish, "shard_name", lambda i: "tiny.safetensors")
+    root, output = tmp_path / "run", tmp_path / "export"
+    root.mkdir()
+    output.mkdir()
+    identity = {"producer": "immutable"}
+    plan = dict(identity=identity, root=str(root), export=str(output), publication_repo=publish.TARGET_REPO)
+    (root / "plan.json").write_text(json.dumps(plan))
+    complete = dict(identity=identity, summary=dict(shards=1, tensors=2, payload_bytes=256, quantized_projections=1))
+    (root / "quantization-complete.json").write_text(json.dumps(complete))
+    (output / "model.safetensors.index.json").write_text(json.dumps(dict(metadata=dict(total_size=256),
+        weight_map={"a": "tiny.safetensors", "b": "tiny.safetensors"})))
+    (output / "quantization-provenance.json").write_text(json.dumps(identity))
+    assert publish._complete_plan(output, root, publish.TARGET_REPO) == identity
+    complete["identity"] = {"producer": "obsolete"}
+    (root / "quantization-complete.json").write_text(json.dumps(complete))
+    with pytest.raises(ValueError, match="producer"):
+        publish._complete_plan(output, root, publish.TARGET_REPO)
+    with pytest.raises(ValueError, match="target"):
+        publish._complete_plan(output, root, "wrong/repository")
