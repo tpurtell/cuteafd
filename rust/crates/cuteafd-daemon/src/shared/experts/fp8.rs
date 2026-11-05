@@ -284,10 +284,17 @@ impl<'a> Fp8Layer<'a> {
 
     fn loaded_slice(tensors: &Fp8ExpertTensors, layer: usize, tp: usize, rank: usize,
         slicing: Slicing) -> Result<cuteafd_core::SparkSlice> {
-        let (first, width) = tensors.rank_range_with(tp, rank, slicing)?;
-        Ok(cuteafd_core::SparkSlice { unit_map: Some(tensors.unit_map(tp, rank, slicing)?.fingerprint()), layer: u32::try_from(layer)?, first: u32::try_from(first)?,
-            width: u32::try_from(width)?, stored_width: u32::try_from(tensors.rank_width(tp, rank, slicing)?)?,
-            tiers: vec![], projection_counts: vec![] })
+        // The unit-map seal includes the absolute layer, even for contiguous TP2.
+        crate::shared::memory::push_fp8::slice(tensors, layer, tp, rank, slicing)
+    }
+
+    fn validate_ownership(&self, tensors: &Fp8ExpertTensors, layer: usize, tp: usize,
+        rank: usize, slicing: Slicing) -> Result<()> {
+        let expected = Self::loaded_slice(tensors, layer, tp, rank, slicing)?;
+        ensure!(self.layer == layer && self.slice == expected,
+            "pushed FP8-family layer {layer} ownership differs from admission: tp={tp} rank={rank} slicing={slicing:?} pushed={:?} expected={expected:?}",
+            self.slice);
+        Ok(())
     }
 
     /// Device bytes of one layer's slice.
@@ -484,9 +491,7 @@ impl<'a> Fp8Weights<'a> {
         let slicing = tensors.slicing_for_directory(directory, tp);
         ensure!(pushed.len() == layers.len(), "pushed FP8-family inventory length differs from admission");
         for (weight, &layer) in pushed.iter().zip(layers) {
-            let expected = Fp8Layer::loaded_slice(tensors, layer, tp, rank, slicing)?;
-            ensure!(weight.layer == layer && weight.slice == expected,
-                "pushed FP8-family layer {layer} ownership differs from admission");
+            weight.validate_ownership(tensors, layer, tp, rank, slicing)?;
         }
         weights.layers = pushed;
         let expected = Fp8Layer::bytes_for(tensors, tp, rank, slicing)?.checked_mul(layers.len())
@@ -927,6 +932,69 @@ mod tests {
     use super::{resident_admission, validate_bf16_package};
     use clap::Parser;
     use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
+
+    #[test]
+    fn native_multilayer_push_admission_uses_each_absolute_layer() -> anyhow::Result<()> {
+        use super::Fp8Layer;
+        use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Slicing};
+        use cuteafd_loader::plan::testing::{fp8, mxfp4, nvfp4, t, write_snapshot};
+        use crate::shared::memory::push_fp8::RankPlan;
+
+        // MiMo Pro's real onboarded geometry, plus every native storage family.
+        for format in [ExpertFormat::Mxfp4, ExpertFormat::Fp8Block128,
+            ExpertFormat::Nvfp4, ExpertFormat::Bf16] {
+            let root = tempfile::tempdir()?;
+            let (experts, hidden, intermediate) = if format == ExpertFormat::Mxfp4 {
+                (384, 6144, 2048)
+            } else { (64, 256, 512) };
+            let layers = [1, 2, 5];
+            let mut headers = Vec::new();
+            for layer in layers {
+                for expert in 0..experts {
+                    for (projection, n, k) in [("gate", intermediate, hidden),
+                        ("up", intermediate, hidden), ("down", hidden, intermediate)] {
+                        let name = format!("model.layers.{layer}.mlp.experts.{expert}.{projection}_proj");
+                        headers.extend(match format {
+                            ExpertFormat::Mxfp4 => mxfp4(&name, n, k),
+                            ExpertFormat::Fp8Block128 => fp8(&name, n, k, None),
+                            ExpertFormat::Nvfp4 => nvfp4(&name, n, k),
+                            ExpertFormat::Bf16 => vec![t(format!("{name}.weight"), "BF16", &[n, k])],
+                        });
+                    }
+                }
+            }
+            write_snapshot(root.path(), &serde_json::json!({}), &headers, None);
+            let tensors = Fp8ExpertTensors::read(root.path(), cuteafd_loader::RoutedExpertShape {
+                layers: 6, first_layer: 1, experts, topk: 8, hidden, intermediate,
+                draft_stages: 0, draft_experts: 0 })?.for_coordinator().for_layer_metadata(layers[0])?;
+            for tp in [1, 2] {
+                for rank in 0..tp {
+                    let slicing = tensors.slicing_for_directory(std::path::Path::new("tp2"), tp);
+                    let selected = layers.map(|layer| (layer, slicing));
+                    let plan = RankPlan::from_tensors(&tensors, &selected, tp, rank, usize::MAX)?;
+                    for planned in &plan.layers {
+                        // Only ownership metadata is needed: no CUDA or checkpoint payload reads.
+                        let mut pushed = Fp8Layer { layer: planned.layer, slice: planned.slice.clone(), regions: vec![] };
+                        let expected = Fp8Layer::loaded_slice(&tensors, planned.layer, tp, rank, slicing)?;
+                        eprintln!("{format:?} tp={tp} rank={rank} slicing={slicing:?} pushed={:?} expected={expected:?}", pushed.slice);
+                        pushed.validate_ownership(&tensors, planned.layer, tp, rank, slicing)?;
+                        assert_eq!(planned.planes.iter().map(|plane| plane.len()).sum::<usize>(),
+                            Fp8Layer::bytes_for(&tensors, tp, rank, slicing)?);
+                        if planned.layer != layers[0] {
+                            pushed.slice.unit_map = Some(tensors.unit_map(tp, rank, slicing)?.fingerprint());
+                            let error = pushed.validate_ownership(&tensors, planned.layer, tp, rank, slicing).unwrap_err();
+                            let message = error.to_string();
+                            for field in ["pushed=", "expected=", "slicing=", "tp=", "rank="] {
+                                assert!(message.contains(field), "{message}");
+                            }
+                        }
+                    }
+                    assert!(matches!(slicing, Slicing::Blocks(128)));
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn native_bf16_load_contract_rejects_wrong_storage_rounding_limit_and_input() {
