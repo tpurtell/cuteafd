@@ -149,3 +149,80 @@ def test_publication_requires_matching_complete_producer(tmp_path, monkeypatch):
         publish._complete_plan(output, root, publish.TARGET_REPO)
     with pytest.raises(ValueError, match="target"):
         publish._complete_plan(output, root, "wrong/repository")
+
+
+def metadata_fixture(tmp_path):
+    source_dir, output = tmp_path / "source", tmp_path / "export"
+    source_dir.mkdir()
+    output.mkdir()
+    (source_dir / "LICENSE").write_text("original license bytes\n")
+    (output / "LICENSE").write_bytes((source_dir / "LICENSE").read_bytes())
+    identity = {"producer": "immutable"}
+    geometry = dict(in_features=128, out_features=128, stored_out_features=128, bits=6)
+    selected = {"layer.core": geometry}
+    declaration = dict(quant_method="exl3", format="exl3", checkpoint_format="exl3", bits=2., core_bits=6.,
+                       per_module_metadata="quantize_config.json:tensor_storage")
+    source_doc = dict(model_type="kimi_k31", text_config=dict(hidden_size=128))
+    config = dict(source_doc, quantization_config=declaration,
+                  text_config=dict(source_doc["text_config"], quantization_config=declaration))
+    (output / "config.json").write_text(json.dumps(config))
+    weight_map = {n: "tiny.safetensors" for n in recipe.packed_specs("layer.core", geometry)}
+    (output / "model.safetensors.index.json").write_text(json.dumps(dict(metadata=dict(total_size=1234), weight_map=weight_map)))
+    tensor_storage = {"layer.core": dict(quant_format="exl3", bits_per_weight=6,
+        mcg_multiplier=recipe.MCG_MULTIPLIER, **{k: geometry[k] for k in ("in_features", "out_features", "stored_out_features")},
+        stored_tensors={n: dict(shape=shape, torch_dtype={"I16": "int16", "F16": "float16", "I32": "int32"}[dtype])
+                        for n, (dtype, shape) in recipe.packed_specs("layer.core", geometry).items()})}
+    quant = dict(method="exl3", **declaration, codebook="mcg", out_scales="auto", group_size=-1, desc_act=False,
+                 meta=dict(quantization_provenance=identity), tensor_storage=tensor_storage,
+                 module_include=[r"^language_model\.model\.layers\.[0-9]+\.block_sparse_moe\.experts\.[0-9]+\.w[123]$",
+                                 r"^layer\.core$"])
+    (output / "quantize_config.json").write_text(json.dumps(quant))
+    (output / "quantization-provenance.json").write_text(json.dumps(identity))
+    (output / "README.md").write_text(f"---\nlicense: other\nlicense_name: kimi-k3.1-pro\nbase_model: {recipe.BASE_REPO}\n---\n")
+    errors = output / "quantization-errors"
+    errors.mkdir()
+    record = dict(module="layer.core", logical_shape=[128, 128],
+                  metrics=dict(quantizer_path="hessian_ldlq", hessian_metric_status="ok", hessian_weighted_relative_error=.001))
+    (errors / "layer-000.jsonl").write_text(json.dumps(record) + "\n")
+    (errors / "index.json").write_text(json.dumps(dict(records=1, bundles={"layer-000.jsonl": 1})))
+    source = SimpleNamespace(snapshot=source_dir, config=source_doc)
+    return source, selected, output, identity, weight_map
+
+
+def test_final_metadata_audit_checks_native_assets_and_one_pass_metadata(tmp_path):
+    from kimi_k31.k2_core_k6.finalize import audit_metadata
+    source, selected, output, identity, weight_map = metadata_fixture(tmp_path)
+    assert audit_metadata(source, selected, output, identity, weight_map, 1234) == dict(
+        native_assets=1, diagnostic_records=1, diagnostic_bundles=1)
+    (output / "LICENSE").write_text("changed license bytes\n")
+    with pytest.raises(ValueError, match="asset"):
+        audit_metadata(source, selected, output, identity, weight_map, 1234)
+    (output / "LICENSE").write_bytes((source.snapshot / "LICENSE").read_bytes())
+    quant_path = output / "quantize_config.json"
+    quant = json.loads(quant_path.read_text())
+    quant["base_k2_provenance"] = "obsolete"
+    quant_path.write_text(json.dumps(quant))
+    with pytest.raises(ValueError, match="one-pass"):
+        audit_metadata(source, selected, output, identity, weight_map, 1234)
+
+
+def test_final_metadata_audit_rejects_header_index_mismatch(tmp_path):
+    from kimi_k31.k2_core_k6.finalize import audit_metadata
+    source, selected, output, identity, weight_map = metadata_fixture(tmp_path)
+    weight_map = dict(weight_map, unexpected="tiny.safetensors")
+    with pytest.raises(ValueError, match="index"):
+        audit_metadata(source, selected, output, identity, weight_map, 1234)
+
+
+def test_publication_stops_at_independent_audit_before_upload(tmp_path, monkeypatch):
+    from kimi_k31.k2_core_k6 import publish
+    monkeypatch.setattr(publish, "_complete_plan", lambda *args: {"producer": "test"})
+    calls = []
+    def audit(root):
+        calls.append("audit")
+        raise ValueError("independent audit rejected")
+    monkeypatch.setattr(publish, "audit_completed_export", audit)
+    monkeypatch.setattr(publish, "_collect_local", lambda *args: calls.append("collect"))
+    with pytest.raises(ValueError, match="independent audit"):
+        publish.publish(tmp_path / "export", tmp_path / "run", publish.TARGET_REPO)
+    assert calls == ["audit"]
