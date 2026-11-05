@@ -50,8 +50,8 @@ def test_pilot_prefixes_keep_disjoint_record_identity():
     cal = [dict(id='cal', input_ids=list(range(300)))]
     held = [dict(id='held', input_ids=list(range(200)))]
     left, right = pilot.select_records(cal, held)
-    assert left == dict(id='cal', input_ids=list(range(128)))
-    assert right == dict(id='held', input_ids=list(range(64)))
+    assert left == dict(id='cal', input_ids=list(range(172, 300)))
+    assert right == dict(id='held', input_ids=list(range(136, 200)))
     assert len(cal[0]['input_ids']) == 300
     with pytest.raises(ValueError, match='overlap'):
         pilot.select_records(cal, cal)
