@@ -2171,6 +2171,9 @@ impl<'a> GlmEngine<'a> {
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
         self.route_sample(w, index, t, cap)?;
+        // Complete the shared-core hop before mapped-host staging occupies this
+        // stream. Shared scratch does not alias the routes or expert input rows.
+        self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
         let timer = std::time::Instant::now();
         // SAFETY: ids, weights and wire rows hold this layer's `t` rows in
         // stream order; the copies read them before later stream work.
@@ -2180,8 +2183,6 @@ impl<'a> GlmEngine<'a> {
                 Box::new(move |routes, wire| expert_request_parts(routes, wire, index, t, h, topk, decode, bf16)))?
         };
         self.exchange_host.borrow_mut()[0] += timer.elapsed().as_secs_f64();
-        // The shared expert runs on the GPU while the worker posts and the Sparks compute.
-        self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
         if decode {
             self.prefetch(index)?;
         }
@@ -2285,15 +2286,16 @@ impl<'a> GlmEngine<'a> {
         self.shared_on(0, layer_index, w, layer, Scalar::I32(t as i32), cap)
     }
 
-    /// A prefill unit's wave on the link's transport worker: the routes and
-    /// wire rows copy into the wave slot's pinned staging on the stream, the
-    /// shared expert queues behind them, and the worker builds and posts the
-    /// request once the copies complete. This thread never waits for the GPU.
+    /// A prefill unit's wave on the link's transport worker: the shared expert
+    /// and its peer hop precede the routes and wire rows copying into pinned
+    /// staging. The worker posts once the copies complete; this thread never
+    /// waits for the GPU.
     fn moe_wave(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str,
         transport: &mut crate::shared::spark_waves::Waves<'_>, origins: Option<crate::shared::prefill_pipeline::ReplyOrigins>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
         self.route_sample(w, index, t, cap)?;
+        self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
         // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
@@ -2307,8 +2309,6 @@ impl<'a> GlmEngine<'a> {
                     Ok(request)
                 }))?
         };
-        // The shared expert runs on the GPU while the worker sends and the Sparks compute.
-        self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
         Ok(ticket)
     }
 
@@ -3394,6 +3394,20 @@ mod native_decode_order_tests {
 
 #[cfg(test)]
 mod prefill_unit_tests {
+    #[test]
+    fn shared_core_hop_precedes_mapped_host_staging_on_both_routes() {
+        let source = include_str!("engine.rs");
+        for name in ["moe_exchange", "moe_wave"] {
+            let body = source.split(&format!("fn {name}(")).nth(1).unwrap()
+                .split("\n    }\n").next().unwrap();
+            let sample = body.find("self.route_sample(").unwrap();
+            let shared = body.find("self.shared_on(0,").unwrap();
+            let send = body.find("transport.send(").unwrap();
+            assert!(sample < shared && shared < send, "{name} must stage after the shared hop");
+            assert_eq!(body.matches("self.shared_on(0,").count(), 1);
+        }
+    }
+
     #[test]
     fn serial_prefill_never_uses_decode_transport_or_eager_host_staging() {
         let source = include_str!("engine.rs");
