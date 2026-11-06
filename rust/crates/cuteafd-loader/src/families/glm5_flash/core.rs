@@ -215,6 +215,31 @@ mod tests {
     use crate::{plan::checkpoint::CheckpointTensor, SafetensorsTensorMetadata};
     use cuteafd_core::DType;
 
+    #[test]
+    fn native_attention_tp_layouts_do_not_inherit_trellis_rotations() -> Result<()> {
+        let (cfg, _) = fixture();
+        let mut inventory = CoreInventory::default();
+        for fp8 in [false,true] {
+            for (leaf,shape,split) in [("q_b_proj",[16384,1536],CoreSplit::Output),
+                ("o_proj",[4096,16384],CoreSplit::Input)] {
+                inventory.native.insert(format!("{PREFIX}3.self_attn.{leaf}"),NativeProjection {shape,fp8,split});
+            }
+            let layouts = inventory.layer_native(&cfg,3,2,None)?;
+            for rank in 0..2 {
+                assert_eq!(layouts[rank]["self_attn.q_b_proj"].shape,[8192,1536]);
+                assert_eq!(layouts[rank]["self_attn.o_proj"].shape,[4096,8192]);
+                assert_eq!(layouts[rank]["self_attn.o_proj"].rank,rank);
+                let layout = &layouts[rank]["self_attn.o_proj"];
+                assert_eq!(layout.bytes()?,if fp8 { 4096*8192 + 32*64*4 } else { 4096*8192*2 });
+            }
+            let owned = inventory.layer_native(&cfg,3,2,Some(1))?;
+            assert!(owned[0].is_empty());
+            assert_eq!(owned[1]["self_attn.o_proj"].shape,[4096,16384]);
+            assert_eq!(owned[1]["self_attn.o_proj"].rank,0);
+        }
+        Ok(())
+    }
+
     fn fixture() -> (GlmNextConfig, Checkpoint) {
         let mut config = crate::plan::testing::glm5_flash_config(45);
         config["text_config"]["vocab_size"] = serde_json::json!(154880);

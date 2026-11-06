@@ -1509,6 +1509,68 @@ mod tests {
     use crate::shared::peer_split::{slice_2d, Axis};
 
     #[test]
+    fn selected_attention_records_preserve_tp_slices_and_fp8_recipe() -> anyhow::Result<()> {
+        use super::{attention_records, AttentionRecord};
+        use cuteafd_loader::{plan::checkpoint::{SelectedProjection, ProjectionStorage, AttentionMode,
+            CheckpointTensor}, SafetensorsTensorMetadata, families::glm5_flash::core::{NativeLayout, CoreSplit}};
+        use cuteafd_ffi::CuteafdDeviceBuffer;
+        use cuteafd_core::DType;
+        use crate::shared::experts::rtx::dense::Job;
+        let buffer = |bytes| CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), bytes, device_id: 0, flags: 0 };
+        for split in [CoreSplit::Input, CoreSplit::Output] {
+            for rank in 0..2 {
+                for dtype in [DType::Bf16, DType::F8E4M3] {
+                    for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+                        let stem = "model.language_model.layers.3.self_attn.o_proj";
+                        let fp8 = dtype == DType::F8E4M3 || mode == AttentionMode::Fp8Compact;
+                        let shape = if split == CoreSplit::Input { [256, 512] } else { [512, 256] };
+                        let tensor = |name: String, dtype: DType, shape: Vec<usize>, width| CheckpointTensor {
+                            shard: "selected.safetensors".into(), meta: SafetensorsTensorMetadata {
+                                name, dtype, byte_offset: 100, byte_length: shape.iter().product::<usize>() as u64*width,
+                                shape } };
+                        let mut tensors = vec![tensor(format!("{stem}.weight"), dtype.clone(), shape.to_vec(),
+                            if dtype == DType::Bf16 { 2 } else { 1 })];
+                        if dtype == DType::F8E4M3 { tensors.push(tensor(format!("{stem}.weight_scale_inv"),
+                            DType::F32, vec![shape[0]/128,shape[1]/128],4)); }
+                        let selected = SelectedProjection { storage: ProjectionStorage::Native {
+                            dtype: dtype.clone(), shape: shape.to_vec() }, tensors, source_bytes: 0 };
+                        let layout = NativeLayout { stem: stem.into(), shape: [256,256], fp8, rank, ranks: 2, split };
+                        let records = attention_records(std::path::Path::new("/selected"), &selected, mode, &layout,
+                            Fp8Scales::Pow2, buffer(256*256*2), fp8.then(|| buffer(256)),)?;
+                        let expected_rows = if split == CoreSplit::Output { rank*256..(rank+1)*256 } else { 0..256 };
+                        let expected_col = if split == CoreSplit::Input { rank*256 } else { 0 };
+                        if dtype == DType::Bf16 && fp8 {
+                            assert_eq!(records.len(),1);
+                            let AttentionRecord::Step(step) = &records[0] else { panic!("missing quant step") };
+                            assert_eq!(step.rects[0].rows,expected_rows);
+                            assert_eq!(step.rects[0].cols,expected_col*2..(expected_col+256)*2);
+                            let Job::Quant { rule, layout, pitch, col0, cols, target, .. } = &step.jobs[0]
+                                else { panic!("missing quant job") };
+                            assert_eq!(*rule,Fp8Scales::Amax);
+                            assert_eq!(*layout,crate::shared::fp8_load_quant::Layout::Block);
+                            assert_eq!((*pitch,*col0,*cols),(256,0,256));
+                            assert_eq!(target.q_stride,256);
+                        } else {
+                            assert_eq!(records.len(),if fp8 { 2 } else { 1 });
+                            let AttentionRecord::Operand(operand) = &records[0] else { panic!("unexpected transform") };
+                            let width = if fp8 { 1 } else { 2 };
+                            assert_eq!(operand.lands[0].0.rows,expected_rows.clone());
+                            assert_eq!(operand.lands[0].0.cols,expected_col*width..(expected_col+256)*width);
+                            assert_eq!(operand.lands[0].0.path,std::path::Path::new("/selected/selected.safetensors"));
+                            if fp8 {
+                                let AttentionRecord::Operand(scales) = &records[1] else { panic!("scale transform") };
+                                assert_eq!(scales.lands[0].0.rows,expected_rows.start/128..expected_rows.end/128);
+                                assert_eq!(scales.lands[0].0.cols,expected_col/128*4..(expected_col+256)/128*4);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn split_reads_bf16_blocks_without_a_companion_or_scale_tensors() {
         use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
         use cuteafd_loader::SafetensorsTensorMetadata;

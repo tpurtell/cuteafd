@@ -96,12 +96,12 @@ def test_ml4_context_fc_exports_the_canonical_bf16_projection(exporter, monkeypa
 @pytest.mark.parametrize("intermediates", [(12288, 2048), (6144, 1024)])
 @pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (128, 4096), (64, 64)])
 def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, intermediates, decode_rows, prefill_rows):
-    geometry = types.SimpleNamespace(dense_inter=intermediates[0], moe_inter=intermediates[1])
+    geometry = types.SimpleNamespace(**{**vars(GEOMETRY), "dense_inter": intermediates[0], "moe_inter": intermediates[1]})
     programs = exporter.glmf_stage_programs(geometry, decode_rows, prefill_rows)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
     caps = decode_caps | {prefill_rows}
-    assert len(calls) == len(programs) == 11 * len(caps)
+    assert len(calls) == len(programs) == 17 * len(caps)
     existing = []
     for rows in sorted(caps):
         existing.extend([f"kda_core_m{rows}", *[f"{stage}_m{rows}" for stage in ("rank_norm", "absorb", "values")],
@@ -109,7 +109,17 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
     for rows in sorted(caps):
         existing.extend([f"kda_projected_m{rows}", f"absorb_fp8_m{rows}", f"values_fp8_m{rows}"])
     existing.extend(f"index_projected_c_m{rows}" for rows in sorted(caps))
-    assert list(calls) == existing + [f"index_projected_keys_m{rows}" for rows in sorted(caps)]
+    existing += [f"index_projected_keys_m{rows}" for rows in sorted(caps)]
+    shapes = sorted({(1536, 16384), (16384, 4096), (4096, 8192), (8192, 4096),
+                     (4096, 1536), (4096, 512)})
+    added = [f"fp8_linear_k{k}_n{n}_m{rows}" for rows in sorted(caps) for k, n in shapes]
+    assert list(calls) == existing + added
+    for rows in caps:
+        for k, n in shapes:
+            op, params, call = calls[f"fp8_linear_k{k}_n{n}_m{rows}"]
+            assert op == "attention_projection"
+            assert params == dict(input_features=k, output_features=n, max_rows=rows, decode=rows in decode_caps)
+            assert call == ("glmf_split", "compile_glmf_fp8_linear_aot", (), params)
     for rows in caps:
         op, params, (module, compiler, args, kwargs) = calls[f"kda_core_m{rows}"]
         assert (op, module, compiler) == ("kda_core", "glmf_split", "compile_glmf_kda_core_aot")
@@ -201,7 +211,7 @@ def test_flash_wide_native_stages_preserve_narrow_catalog(exporter):
     wide = exporter.glmf_stage_programs(GEOMETRY, 128, 4096)
     describe = lambda programs: {name: (op, params, thunk()) for name, op, params, thunk in programs}
     narrow, wide = describe(narrow), describe(wide)
-    assert len(narrow) == 22 and len(wide) == 33
+    assert len(narrow) == 34 and len(wide) == 51
     assert {name: wide[name] for name in narrow} == narrow
     assert all(name.endswith("_m128") for name in wide.keys() - narrow.keys())
     assert "g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)" in EXPORTER.read_text()
