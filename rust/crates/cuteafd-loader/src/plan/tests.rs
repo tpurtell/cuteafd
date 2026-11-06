@@ -5608,9 +5608,16 @@ fn glm_auto_pool_and_count_admission_preserve_one_recipe() {
         unset.memory_layout.as_ref().unwrap().pool_tokens);
     assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
     zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let input = PlanInput::open(dir.path()).unwrap();
+    assert!(input.family_model().unwrap().contract_admission());
     let direct = plan(dir.path(), &zero).unwrap();
     let counted = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
     assert!(!counted.wip_launchable());
+    assert!(!direct.placement_supported);
+    assert!(direct.host_ledger.is_none());
+    assert!(counted.host_ledger.is_none());
+    assert!(counted.prefill_reserve_rows.is_none());
+    assert_eq!(serde_json::to_value(&direct.hints[0]).unwrap(), serde_json::to_value(&counted.hints[0]).unwrap());
     assert_eq!(direct.prefill_unit_rows, counted.prefill_unit_rows);
     for hint in &direct.hints {
         assert!(counted.hints.iter().any(|other| other.what == hint.what));

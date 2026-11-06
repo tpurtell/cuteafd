@@ -355,6 +355,8 @@ fn spec(cfg: &Ml4Config, checkpoint: &Checkpoint) -> Result<ModelSpec> {
 }
 
 impl FamilyModel for Model {
+    fn contract_admission(&self) -> bool { true }
+
     fn spec(&self) -> &ModelSpec { &self.spec }
 
 

@@ -58,6 +58,9 @@ pub trait FamilyModel: Send + Sync {
     /// Validate checkpoint-only execution requirements before checking the tensor contract.
     fn configure(&mut self) -> Result<(), ConfigError> { Ok(()) }
 
+    /// One contract owns host admission and prefill selection, including refusals.
+    fn contract_admission(&self) -> bool { false }
+
     /// Placement accounts for executable runtime owners, not only checkpoint inventory.
     fn native_serving_admission(&self) -> bool { false }
 
