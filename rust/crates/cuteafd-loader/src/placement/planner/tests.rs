@@ -75,6 +75,7 @@ fn decisions(onboard: u64) -> Decisions {
         expert_homes: (0..onboard as usize).map(|layer|
             (layer, ExpertDestination::Coordinator { gpus: vec![0] })).collect(),
         embedding: None,
+        draft_home: None,
         prefill: PrefillShape {
             rows: 4096,
             waves: 1,
@@ -672,6 +673,41 @@ fn home_contract() -> (Contract, Vec<Budget>) {
     host.locations = vec![Location::PINNED];
     budgets.push(host);
     (contract, budgets)
+}
+
+#[test]
+fn draft_home_is_selected_jointly_with_pool_and_per_gpu_headroom() {
+    let mut contract = Linear::new().prepare(&request()).unwrap();
+    contract.gpus = 2;
+    let mut peer = allocation("peer.kv", 64);
+    peer.location = Location::coordinator(1);
+    let curve = ByteCurve::linear(64, 64, contract.maximum_pages);
+    let mut component = Component::allocation(peer, curve.clone(), false, contract.maximum_pages);
+    component.byte_extent(curve).unwrap();
+    contract.components.push(component);
+    let variable = contract.variables.len();
+    contract.variables.push(Variable::DraftHome(vec![0, 1]));
+    for (option, gpu) in [0, 1].into_iter().enumerate() {
+        let mut owner = allocation("draft", 64);
+        owner.location = Location::coordinator(gpu);
+        let mut component = Component::allocation(owner, ByteCurve::fixed(64, contract.maximum_pages), false, contract.maximum_pages);
+        component.activation = Activation::choice(variable, option);
+        contract.components.push(component);
+    }
+    let budgets = two_gpus(100, 1000);
+    let selected = solve(request(), budgets.clone(), &Prepared(contract.clone())).unwrap();
+    assert_eq!(selected.decisions.draft_home, Some(1));
+    let equal = solve(request(), two_gpus(1000, 1000), &Prepared(contract.clone())).unwrap();
+    assert_eq!(equal.decisions.draft_home, Some(0));
+    for values in [vec![], vec![2], vec![0, 0]] {
+        let mut invalid = contract.clone();
+        invalid.variables[variable] = Variable::DraftHome(values);
+        assert!(solve(request(), budgets.clone(), &Prepared(invalid)).is_err());
+    }
+    let mut duplicate = contract.clone();
+    duplicate.variables.push(Variable::DraftHome(vec![0]));
+    assert!(matches!(solve(request(), budgets, &Prepared(duplicate)), Err(Refusal::InvalidFact(_))));
+    assert!(matches!(solve(request(), vec![budget(1000)], &Prepared(contract)), Err(Refusal::InvalidFact(_))));
 }
 
 #[test]

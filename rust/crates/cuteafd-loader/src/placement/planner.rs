@@ -317,6 +317,7 @@ pub struct Decisions {
     pub onboard_layers: Vec<Vec<usize>>,
     pub expert_homes: BTreeMap<usize, ExpertDestination>,
     pub embedding: Option<EmbeddingHome>,
+    pub draft_home: Option<u8>,
     pub encoder: Option<usize>,
     pub prefill: PrefillShape,
     pub lanes: u64,

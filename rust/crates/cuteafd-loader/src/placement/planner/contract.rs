@@ -59,6 +59,8 @@ pub enum Variable {
     Prefill(Vec<PrefillShape>),
     Lanes(Vec<u64>),
     Embedding(Vec<EmbeddingHome>),
+    /// Ordered coordinator homes for one drafter; lower index is preferred.
+    DraftHome(Vec<u8>),
     /// Ordered optional bundled-encoder candidates; lower index is preferred.
     Encoder(Vec<usize>),
     /// Fallback rank set for this routed group, after the selected ordered
@@ -84,6 +86,7 @@ impl Variable {
             Self::Prefill(values) => values.len(),
             Self::Lanes(values) => values.len(),
             Self::Embedding(values) => values.len(),
+            Self::DraftHome(values) => values.len(),
             Self::Encoder(values) => values.len(),
             Self::ExpertHome { rank_sets, .. } => rank_sets.len(),
             Self::Onboard { counts, .. } => counts.len(),
@@ -419,6 +422,7 @@ impl Contract {
         let mut expert_homes = BTreeMap::new();
         let mut remote_homes = BTreeMap::new();
         let mut embedding = None;
+        let mut draft_home = None;
         let mut encoder = None;
         for (variable, &option) in self.variables.iter().zip(selected) {
             match variable {
@@ -434,6 +438,11 @@ impl Contract {
                 Variable::Embedding(values) => {
                     if embedding.replace(values[option]).is_some() {
                         return Err(Refusal::InvalidFact("duplicate embedding domain".into()));
+                    }
+                }
+                Variable::DraftHome(values) => {
+                    if draft_home.replace(values[option]).is_some() {
+                        return Err(Refusal::InvalidFact("duplicate draft home domain".into()));
                     }
                 }
                 Variable::Encoder(values) => {
@@ -482,6 +491,7 @@ impl Contract {
             onboard_layers,
             expert_homes,
             embedding,
+            draft_home,
             encoder,
             prefill: prefill
                 .ok_or_else(|| Refusal::InvalidFact("missing prefill domain".into()))?,
@@ -502,6 +512,11 @@ impl Contract {
                 Variable::Embedding(values) => {
                     if values.iter().any(|home| !covered(home.location())) {
                         return Err(Refusal::InvalidFact("embedding home has no physical budget".into()));
+                    }
+                }
+                Variable::DraftHome(values) => {
+                    if values.iter().any(|&gpu| !covered(Location::coordinator(gpu))) {
+                        return Err(Refusal::InvalidFact("draft home has no physical budget".into()));
                     }
                 }
                 Variable::ExpertHome { rank_sets, .. } => {
@@ -536,6 +551,7 @@ impl Contract {
         let mut remote_layers = BTreeSet::new();
         let (mut prefill, mut lanes, mut embedding) = (0, 0, 0);
         let mut encoder = false;
+        let mut draft_home = false;
         for variable in &self.variables {
             if variable.len() == 0 {
                 return Err(Refusal::Unsupported);
@@ -571,6 +587,13 @@ impl Contract {
                     }) {
                         return Err(Refusal::InvalidFact("invalid embedding domain".into()));
                     }
+                }
+                Variable::DraftHome(values) => {
+                    if draft_home || values.iter().enumerate().any(|(index, &gpu)|
+                        usize::from(gpu) >= self.gpus || values[..index].contains(&gpu)) {
+                        return Err(Refusal::InvalidFact("invalid draft home domain".into()));
+                    }
+                    draft_home = true;
                 }
                 Variable::Encoder(values) => {
                     if encoder || values.iter().copied().ne(0..values.len()) {
