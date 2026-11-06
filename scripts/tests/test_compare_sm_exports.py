@@ -69,6 +69,23 @@ def test_draft_bf16_group_matches_exported_shapes():
         assert job[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "qwen38", "--only", expected])
 
 
+def test_hqa_bf16_group_covers_only_five_shapes():
+    shapes = ((1536, 8192), (1536, 16384), (4096, 4096), (8192, 4096), (16384, 4096))
+    exporter = compare_sm.load_file("test_hqa_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    assert set(shapes) <= exporter.draft_bf16_shapes().keys()
+    for scope in ("all", "suspects"):
+        job, = (job for job in compare_sm.jobs(scope) if job[0] == "draft-bf16-hqa")
+        assert job[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "qwen38", "--only",
+                          ",".join(f"k{k}_n{n}" for k, n in shapes)])
+
+
+def test_hqa_tiles_require_targeted_group(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["compare-sm-exports.py", "--groups", "draft-bf16",
+                                     "--draft-bf16-tiles", str(tmp_path / "tiles.json")])
+    with pytest.raises(SystemExit, match="2"):
+        compare_sm.main()
+
+
 def test_kimi_context_group_covers_both_tiles_formats_and_shared_primitives():
     job, = (job for job in compare_sm.jobs("all") if job[0] == "context-split-kimik3")
     stems = [f"mla_partial{cache}_h{begin}_t{tile}_m64"
