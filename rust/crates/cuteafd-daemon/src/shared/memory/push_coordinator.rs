@@ -150,6 +150,17 @@ impl CoordinatorExpertPlan {
             .context("coordinator host admission overflow")
     }
 
+    /// Source and index metadata carried into the published EXLR8 owners.
+    pub fn retained_host_bytes(&self) -> Result<usize> {
+        self.exlr8.iter().try_fold(0usize, |bytes, residency|
+            bytes.checked_add(residency.host_bytes()).context("EXLR8 retained host overflow"))
+    }
+
+    pub fn transient_host_bytes(&self) -> Result<usize> {
+        self.host_bytes()?.checked_sub(self.retained_host_bytes()?)
+            .context("coordinator retained host exceeds total")
+    }
+
     /// Expert-owned host storage, independent of the family DenseArena and ring.
     pub fn host_bytes(&self) -> Result<usize> {
         let scales = self.scales.host_peak()?;

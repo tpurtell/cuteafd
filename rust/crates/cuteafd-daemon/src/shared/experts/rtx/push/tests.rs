@@ -1433,3 +1433,34 @@ fn combined_exlr8_tp2_rank_is_mount_exact_and_drains_on_rejection() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn admitted_push_host_checks_never_resample_capacity() -> Result<()> {
+    use cuteafd_loader::push_load::PushHostEnvelope;
+    let admitted = PushHostEnvelope::new(vec![2048, 4096], vec![8192, 16384], 128, 1 << 20)?;
+    let actual = PushHostEnvelope::new(vec![1024, 4096], vec![4096, 16384], 128, 1 << 20)?;
+    // The same pure envelope check is called by prepare and by receive before
+    // offers. No host-memory sampler exists on this admitted execution branch.
+    super::validate_push_host(Some(&admitted), &actual)?;
+    super::validate_push_host(Some(&admitted), &actual)?;
+    let mut excessive = actual.clone();
+    excessive.dense_bytes[1] += 1;
+    let error = super::validate_push_host(Some(&admitted), &excessive).unwrap_err();
+    assert!(matches!(error.downcast_ref::<cuteafd_loader::placement::planner::Refusal>(),
+        Some(cuteafd_loader::placement::planner::Refusal::Capacity { .. })));
+    let owners = admitted.allocations("push")?;
+    assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), admitted.bytes()?);
+    assert!(owners.iter().all(|owner| owner.lifetime.first == cuteafd_loader::placement::planner::Phase::Load
+        && owner.lifetime.last == cuteafd_loader::placement::planner::Phase::Load));
+    let source = include_str!("../push.rs");
+    let sample = "mapped_preload::host_memory()";
+    assert_eq!(source.matches(sample).count(), 1, "only the unported adapter may sample");
+    for method in ["fn prepare_with_host(", "fn receive_with<"] {
+        let body = source.split(method).nth(1).expect("execution method exists");
+        assert!(body.contains("validate_push_host(host_envelope.as_ref(), &actual)?"));
+    }
+    let admitted_branch = source.split("fn validate_push_host(").nth(1).unwrap()
+        .split("/// Temporary adapter").next().unwrap();
+    assert!(admitted_branch.contains("Some(admitted) => Ok(admitted.validate_usage(actual)?)"));
+    Ok(())
+}

@@ -8,7 +8,7 @@ mod policy;
 pub(crate) use policy::{PushPolicy, PushStartupError};
 use crate::shared::memory::{push_consumer::PushDestination, push_coordinator::CoordinatorExpertPlan};
 use anyhow::{ensure, Context, Result};
-use cuteafd_loader::{push_load::builder::CheckedPlan, OfficialV41Catalog, V41Exl3Layer};
+use cuteafd_loader::{push_load::{builder::CheckedPlan, PushHostEnvelope}, OfficialV41Catalog, V41Exl3Layer};
 
 /// Load admitted dense owners through a standalone coordinator group, or the
 /// ordinary mount outside a push namespace. Owners stay live until group commit.
@@ -357,6 +357,15 @@ pub(crate) enum CoordinatorExperts {
 }
 
 impl CoordinatorExperts {
+    /// Header-only host owners for a candidate, before its complete recipe is
+    /// solved. `dense` is the caller's header-derived per-rank staging bound.
+    pub(crate) fn host_envelope(&self, catalog: &OfficialV41Catalog, gpus: usize,
+        dense: &[super::dense::HostStaging]) -> Result<PushHostEnvelope> {
+        self.validate_ranks(gpus)?;
+        let plans = (0..gpus).map(|gpu| self.plan(catalog, gpu)).collect::<Result<Vec<_>>>()?;
+        push_host_envelope(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), dense)
+    }
+
     fn validate_ranks(&self, gpus: usize) -> Result<()> {
         match self {
             Self::Tp2 { budgets, .. } => ensure!(gpus == 2 && budgets.len() == gpus,
@@ -422,6 +431,35 @@ pub(crate) struct CoordinatorPush {
     driver: Option<AloneDriver>,
     /// The SparkNest push endpoint the ranks join (and an alone driver creates on).
     socket: Option<String>,
+    host_envelope: Option<PushHostEnvelope>,
+}
+
+/// Header-only inventory; no capacity sampling and no allocation.
+pub(crate) fn push_host_envelope(plans: &[Option<&CoordinatorExpertPlan>],
+    dense: &[super::dense::HostStaging]) -> Result<PushHostEnvelope> {
+    ensure!(dense.is_empty() || dense.len() == plans.len(), "push dense host rank identity");
+    Ok(PushHostEnvelope::with_retained(plans.iter().map(|plan| plan.map_or(Ok(0), |p| p.transient_host_bytes())
+        .and_then(|bytes| Ok(u64::try_from(bytes)?))).collect::<Result<Vec<_>>>()?,
+        (0..plans.len()).map(|rank| dense.get(rank).map_or(Ok(0), |p| p.bytes())
+            .and_then(|bytes| Ok(u64::try_from(bytes)?))).collect::<Result<Vec<_>>>()?,
+        plans.iter().map(|plan| plan.map_or(Ok(0), |p| p.retained_host_bytes())
+            .and_then(|bytes| Ok(u64::try_from(bytes)?))).collect::<Result<Vec<_>>>()?,
+        cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?)
+}
+
+fn validate_push_host(admitted: Option<&PushHostEnvelope>, actual: &PushHostEnvelope) -> Result<()> {
+    match admitted {
+        Some(admitted) => Ok(admitted.validate_usage(actual)?),
+        None => legacy_push_host_admission(actual),
+    }
+}
+
+/// Temporary adapter for callers not yet using complete process recipes.
+fn legacy_push_host_admission(actual: &PushHostEnvelope) -> Result<()> {
+    let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+    ensure!(actual.bytes()? <= available,
+        "coordinator push host owners need {} bytes, available {available}", actual.bytes()?);
+    Ok(())
 }
 
 /// The push group driver of coordinator ranks alone, on its own thread; joined
@@ -460,6 +498,19 @@ impl CoordinatorPush {
     pub(crate) fn prepare(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
         experts: Option<CoordinatorExperts>)
         -> Result<(Self, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
+        Self::prepare_with_host(snapshot, catalog, gpus, experts, None)
+    }
+
+    /// Ported callers pass the exact envelope already charged by their recipe.
+    pub(crate) fn prepare_admitted(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>,
+        gpus: usize, experts: Option<CoordinatorExperts>, envelope: PushHostEnvelope)
+        -> Result<(Self, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
+        Self::prepare_with_host(snapshot, catalog, gpus, experts, Some(envelope))
+    }
+
+    fn prepare_with_host(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
+        experts: Option<CoordinatorExperts>, host_envelope: Option<PushHostEnvelope>)
+        -> Result<(Self, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
         ensure!((1..=2).contains(&gpus), "one or two coordinator GPUs");
         let (_, host) = cuteafd_loader::push_load::namespace(snapshot)?;
         let plans = match &experts {
@@ -470,10 +521,9 @@ impl CoordinatorPush {
             }
             None => (0..gpus).map(|_| None).collect(),
         };
-        let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-        let host_peak = CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], cuteafd_ffi::push_ring::DEFAULT_SLOTS,
-            cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, available)?;
-        tracing::info!(gpus, host_peak_bytes = host_peak, "coordinator push host memory admitted");
+        let actual = push_host_envelope(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[])?;
+        validate_push_host(host_envelope.as_ref(), &actual)?;
+        tracing::info!(gpus, host_peak_bytes = actual.bytes()?, "coordinator push host envelope validated");
         let (mut driver, mut ranks) = (Vec::new(), Vec::new());
         for _ in 0..gpus {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -507,7 +557,7 @@ impl CoordinatorPush {
         });
         let ranks_spec = crate::shared::memory::push_exl3::CoordinatorRanks { ranks: gpus, append };
         Ok((Self { gpus: plans.into_iter().zip(ranks).collect(), host, snapshot: snapshot.to_path_buf(), dense,
-            driver: None, socket: None }, driver, ranks_spec))
+            driver: None, socket: None, host_envelope }, driver, ranks_spec))
     }
 
     /// [`Self::prepare`] for a launch without Spark peers: the coordinator GPUs
@@ -523,8 +573,18 @@ impl CoordinatorPush {
     /// [`Self::prepare_alone`] on push endpoint `socket` (None: the configured one).
     pub(crate) fn prepare_alone_at(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
         experts: Option<CoordinatorExperts>, socket: Option<String>) -> Result<Self> {
+        Self::prepare_alone_with_host(snapshot, catalog, gpus, experts, socket, None)
+    }
+
+    pub(crate) fn prepare_alone_admitted(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>,
+        gpus: usize, experts: Option<CoordinatorExperts>, envelope: PushHostEnvelope) -> Result<Self> {
+        Self::prepare_alone_with_host(snapshot, catalog, gpus, experts, None, Some(envelope))
+    }
+
+    fn prepare_alone_with_host(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
+        experts: Option<CoordinatorExperts>, socket: Option<String>, host_envelope: Option<PushHostEnvelope>) -> Result<Self> {
         let has_experts = experts.is_some();
-        let (mut push, streams, ranks) = Self::prepare(snapshot, catalog, gpus, experts)?;
+        let (mut push, streams, ranks) = Self::prepare_with_host(snapshot, catalog, gpus, experts, host_envelope)?;
         push.socket = socket.clone();
         let cancel = streams.iter().map(std::net::TcpStream::try_clone).collect::<std::io::Result<Vec<_>>>()?;
         let snapshot = snapshot.to_path_buf();
@@ -560,7 +620,7 @@ impl CoordinatorPush {
         dense: Option<Result<(Vec<DensePlan>, Vec<D>)>>, beside: impl FnOnce() -> U)
         -> (Result<Option<Vec<PushedExperts<'a>>>>, U) {
         use cuteafd_ffi::push_ring::{DEFAULT_SLOTS, DEFAULT_SLOT_BYTES};
-        let Self { gpus, host, snapshot, dense: slot, driver, socket } = self;
+        let Self { gpus, host, snapshot, dense: slot, driver, socket, host_envelope } = self;
         if devices.len() != gpus.len() || dense.as_ref().is_some_and(|d| d.as_ref()
             .is_ok_and(|(p, d)| p.len() != gpus.len() || d.len() != gpus.len())) {
             return (Err(anyhow::anyhow!("coordinator push GPUs differ from their plans")), beside());
@@ -575,9 +635,11 @@ impl CoordinatorPush {
             let staging = dense.as_ref().and_then(|d| d.as_ref().ok())
                 .map(|(plans, _)| plans.iter().map(|p| p.host_staging).collect::<Vec<_>>()).unwrap_or_default();
             let plans = gpus.iter().map(|(plan, _)| plan.as_ref()).collect::<Vec<_>>();
-            let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-            let peak = CoordinatorExpertPlan::admit_host(&plans, &staging, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, available)?;
-            tracing::info!(host_peak_bytes = peak, "coordinator push complete host peak admitted before offers");
+            let actual = push_host_envelope(&plans, &staging)?;
+            validate_push_host(host_envelope.as_ref(), &actual)?;
+            tracing::info!(host_peak_bytes = actual.bytes()?, expert_bytes = ?actual.expert_bytes,
+                dense_bytes = ?actual.dense_bytes, retained_bytes = ?actual.retained_bytes,
+                "coordinator push complete host envelope validated before offers");
             Ok(())
         })();
         let declined = admission.is_err();
