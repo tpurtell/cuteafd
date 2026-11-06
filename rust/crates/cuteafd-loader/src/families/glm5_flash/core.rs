@@ -107,6 +107,12 @@ impl CoreInventory {
             for (name, shape) in expected(cfg) {
                 let stem = name.strip_suffix(".weight").unwrap();
                 if !stem.contains(".self_attn.") || !checkpoint.contains_tensor(&name) { continue; }
+                // Only mixed groups use the projected stage path. Wholly native
+                // groups retain their fused layout (including grouped KDA heads).
+                let group = stem.rsplit_once('.').unwrap().0;
+                if !inventory.projections.keys().any(|name| name.rsplit_once('.').is_some_and(|(parent, _)| parent == group)) {
+                    continue;
+                }
                 let selected = checkpoint.projection(stem)?;
                 let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape: actual } = selected.storage else { continue; };
                 ensure!(actual == shape, "{stem}: native attention shape {actual:?}, expected {shape:?}");
