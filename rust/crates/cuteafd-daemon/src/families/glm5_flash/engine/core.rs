@@ -17,6 +17,11 @@ fn ffn_key(layer: &GlmfLayer<'_>, projection: &str) -> String {
     format!("mlp.{}{projection}_proj", if layer.dense { "" } else { "shared_experts." })
 }
 pub(super) fn native_ffn(layer: &GlmfLayer<'_>) -> bool { layer.core.contains_key(&ffn_key(layer, "down")) }
+pub(super) fn stage_attention(layer: &GlmfLayer<'_>) -> bool {
+    !layer.attention_native.is_empty() || layer.core.contains_key(match layer.attention {
+        GlmNextAttention::Kda => "self_attn.q_proj", GlmNextAttention::Mla => "self_attn.q_a_proj",
+    })
+}
 fn native_attention(layer: &GlmfLayer<'_>) -> bool {
     layer.core.get("self_attn.o_proj").is_some_and(|w|
         w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)
@@ -164,6 +169,17 @@ impl<'a> GlmfEngine<'a> {
     }
     fn core_linear(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, name: &str,
         input: Buffer, output: Buffer, rows: usize, plane: usize) -> Result<()> {
+        if let Some(weights) = layer.attention_native.get(name) {
+            let [n,k] = weights.layout.shape;
+            ensure!(input.bytes >= rows*k*2 && output.bytes >= rows*n*2, "Flash native projection operand extent");
+            return self.on(rank, || {
+                ensure!(!weights.layout.fp8, "Flash standalone block-FP8 projection not yet bound");
+                // SAFETY: selected rank slice and retained stage buffers cover the
+                // checked BF16 geometry and remain live throughout graph replay.
+                unsafe { self.library.linear_bf16(input.ptr, weights.values.buffer.ptr, output.ptr,
+                    rows, k, n, self.stream_of(rank)) }
+            });
+        }
         let weights = layer.core.get(name).with_context(|| format!("Flash K6 missing {name}"))?;
         let core = self.core_rank(rank)?;
         let projection = core.projections.get(&key(weights)).context("Flash K6 unbound geometry")?;

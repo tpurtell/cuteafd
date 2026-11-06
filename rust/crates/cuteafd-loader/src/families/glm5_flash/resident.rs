@@ -93,6 +93,8 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
         if cfg.attention[layer] == GlmNextAttention::Mla { mla_owner ^= 1; }
         let native = core.layer_weights(cfg, layer, ranks, owned.then_some(owner as u8)
             .filter(|_| cfg.attention[layer] == GlmNextAttention::Mla)).map_err(|e| e.to_string())?;
+        let native_attention = core.layer_native(cfg, layer, ranks, owned.then_some(owner as u8)
+            .filter(|_| cfg.attention[layer] == GlmNextAttention::Mla)).map_err(|e| e.to_string())?;
         let p = format!("model.language_model.layers.{layer}");
         let a = |s: &str| format!("{p}.self_attn.{s}");
         let one = |s: &str| -> Result<u64, String> { Ok(tensor(s)?.meta.byte_length.max(256)) };
@@ -101,7 +103,8 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
             Ok((n * 4 / if split { ranks as u64 } else { 1 }).max(256))
         };
         for rank in 0..ranks {
-            let mut bytes = 0;
+            let mut bytes = native_attention[rank].values().try_fold(0u64, |bytes, layout|
+                layout.bytes().map(|n| bytes + n)).map_err(|e| e.to_string())?;
             for site in ["attn", "ffn"] {
                 for suffix in ["fn", "scale", "base"] { bytes += f32(&[format!("{p}.hc_{site}_{suffix}")], false)?; }
             }

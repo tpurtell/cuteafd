@@ -3,7 +3,7 @@
 use super::{GlmNextAttention, GlmNextConfig};
 use crate::{formats::trellis_core::{read_projections, CoreContract, CoreWeightLayout}, plan::Checkpoint};
 pub use crate::formats::trellis_core::{CoreProjection, CoreSplit};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
 const PREFIX: &str = "model.language_model.layers.";
@@ -67,7 +67,30 @@ pub fn expected(cfg: &GlmNextConfig) -> BTreeMap<String, Vec<usize>> {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct CoreInventory { pub projections: BTreeMap<String, CoreProjection> }
+pub struct CoreInventory {
+    pub projections: BTreeMap<String, CoreProjection>,
+    pub native: BTreeMap<String, NativeProjection>,
+}
+
+/// Unrotated selected-view attention with the same logical TP axes as K6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeProjection { pub shape: [usize; 2], pub fp8: bool, pub split: CoreSplit }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeLayout {
+    pub stem: String, pub shape: [usize; 2], pub fp8: bool,
+    pub rank: usize, pub ranks: usize, pub split: CoreSplit,
+}
+impl NativeLayout {
+    pub fn bytes(&self) -> Result<u64> {
+        let [n, k] = self.shape;
+        let values = n.checked_mul(k).and_then(|n| n.checked_mul(if self.fp8 { 1 } else { 2 }))
+            .context("Flash native projection extent overflow")?.max(256);
+        let scales = if self.fp8 { n.div_ceil(128).checked_mul(k.div_ceil(128)).and_then(|n| n.checked_mul(4))
+            .context("Flash native scale extent overflow")?.max(256) } else { 0 };
+        Ok(values.checked_add(scales).context("Flash native projection byte overflow")? as u64)
+    }
+}
 
 impl CoreInventory {
     pub fn from_checkpoint(cfg: &GlmNextConfig, checkpoint: &Checkpoint) -> Result<Self> {
@@ -77,7 +100,31 @@ impl CoreInventory {
                 && !leaf.contains(".experts."));
         let projections = read_projections(checkpoint, &expected(cfg), selected,
             |stem| split(cfg, stem).map(|split| CoreContract { split, bits: 6, padded_outputs: false }))?;
-        let inventory = Self { projections };
+        let mut inventory = Self { projections, native: BTreeMap::new() };
+        // A selected view can replace individual attention operands. Legacy
+        // checkpoints retain their existing fused conversion policy.
+        if checkpoint.view.is_some() {
+            for (name, shape) in expected(cfg) {
+                let stem = name.strip_suffix(".weight").unwrap();
+                if !stem.contains(".self_attn.") || !checkpoint.contains_tensor(&name) { continue; }
+                let selected = checkpoint.projection(stem)?;
+                let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape: actual } = selected.storage else { continue; };
+                ensure!(actual == shape, "{stem}: native attention shape {actual:?}, expected {shape:?}");
+                ensure!(matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
+                    "{stem}: native attention requires BF16 or E4M3, found {dtype:?}");
+                let fp8 = dtype == cuteafd_core::DType::F8E4M3
+                    || checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact;
+                if dtype == cuteafd_core::DType::F8E4M3 {
+                    let scale = selected.tensors.iter().find(|t| t.meta.name == format!("{name}_scale_inv"))
+                        .with_context(|| format!("{stem}: missing native block scales"))?;
+                    ensure!(scale.meta.dtype == cuteafd_core::DType::F32
+                        && scale.meta.shape == [shape[0].div_ceil(128), shape[1].div_ceil(128)],
+                        "{stem}: native FP8 requires F32 128x128 block scales");
+                }
+                inventory.native.insert(stem.into(), NativeProjection { shape: [shape[0], shape[1]], fp8,
+                    split: split(cfg, stem).context("Flash native attention split")? });
+            }
+        }
         for layer in 0..cfg.layers {
             let root = format!("{PREFIX}{layer}");
             let attention = attention_leaves(cfg.attention[layer]);
@@ -86,7 +133,11 @@ impl CoreInventory {
                 (mlp, &["gate_proj", "up_proj", "down_proj"][..])] {
                 let present = leaves.iter().filter(|leaf|
                     inventory.projections.contains_key(&format!("{root}.{module}.{leaf}"))).count();
-                ensure!(present == 0 || present == leaves.len(),
+                let complete = leaves.iter().all(|leaf| {
+                    let stem = format!("{root}.{module}.{leaf}");
+                    inventory.projections.contains_key(&stem) || inventory.native.contains_key(&stem)
+                });
+                ensure!(present == 0 || present == leaves.len() || (module == "self_attn" && complete),
                     "{root}.{module}: incomplete native GLM Flash operator group");
             }
         }
@@ -97,14 +148,40 @@ impl CoreInventory {
     pub fn scratch_mask(&self, cfg: &GlmNextConfig, layers: usize) -> crate::serving_capacity::GlmfCoreScratch {
         let has = |layer, leaf| self.projections.contains_key(&format!("{PREFIX}{layer}.{leaf}"));
         crate::serving_capacity::GlmfCoreScratch {
-            kda: (0..layers).filter(|&l| cfg.attention[l] == GlmNextAttention::Kda).all(|l| has(l, "self_attn.q_proj")),
-            mla: (0..layers).filter(|&l| cfg.attention[l] == GlmNextAttention::Mla).all(|l| has(l, "self_attn.q_a_proj")),
+            kda: (0..layers).filter(|&l| cfg.attention[l] == GlmNextAttention::Kda).all(|l| attention_leaves(cfg.attention[l]).iter().all(|leaf| has(l, &format!("self_attn.{leaf}")))),
+            mla: (0..layers).filter(|&l| cfg.attention[l] == GlmNextAttention::Mla).all(|l| attention_leaves(cfg.attention[l]).iter().all(|leaf| has(l, &format!("self_attn.{leaf}")))),
             ffn: (0..layers).all(|l| has(l, if cfg.dense[l] { "mlp.down_proj" } else { "mlp.shared_experts.down_proj" })),
         }
     }
 
     pub fn get_weight(&self, name: &str) -> Option<&CoreProjection> {
         self.projections.get(name.strip_suffix(".weight").unwrap_or(name))
+    }
+
+    pub fn layer_native(&self, cfg: &GlmNextConfig, layer: usize, ranks: usize, owner: Option<u8>)
+        -> Result<Vec<BTreeMap<String, NativeLayout>>> {
+        ensure!(layer < cfg.layers && matches!(ranks, 1 | 2)
+            && owner.is_none_or(|gpu| ranks == 2 && usize::from(gpu) < ranks
+                && cfg.attention[layer] == GlmNextAttention::Mla), "Flash native ownership");
+        let root = format!("{PREFIX}{layer}.");
+        let mut layouts = vec![BTreeMap::new(); ranks];
+        for (stem, projection) in self.native.range(root.clone()..) {
+            let Some(leaf) = stem.strip_prefix(&root) else { break; };
+            let world = if owner.is_some() || projection.split == CoreSplit::Whole { 1 } else { ranks };
+            let [mut n, mut k] = projection.shape;
+            match projection.split {
+                CoreSplit::Input => { ensure!(k % world == 0, "{stem}: input split"); k /= world; }
+                CoreSplit::Output => { ensure!(n % world == 0, "{stem}: output split"); n /= world; }
+                CoreSplit::Whole => {}
+            }
+            ensure!(!projection.fp8 || n % 128 == 0 && k % 128 == 0, "{stem}: partial FP8 scale block");
+            for (rank, layouts) in layouts.iter_mut().enumerate() {
+                if owner.is_some_and(|gpu| usize::from(gpu) != rank) { continue; }
+                layouts.insert(leaf.into(), NativeLayout { stem: stem.clone(), shape: [n, k], fp8: projection.fp8,
+                    rank: if world == 1 { 0 } else { rank }, ranks: world, split: projection.split });
+            }
+        }
+        Ok(layouts)
     }
 
     /// Whole MLA follows its selected owner. KDA and FFNs retain their TP split.

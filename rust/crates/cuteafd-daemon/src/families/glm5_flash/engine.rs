@@ -934,9 +934,11 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             cfg,
             native: GlmfCoreScratch {
                 kda: layers.iter().filter(|l| l.attention == GlmNextAttention::Kda)
-                    .all(|l| l.core.contains_key("self_attn.q_proj") || native::is_native(l)),
+                    .all(|l| ["q_proj", "k_proj", "v_proj", "o_proj"].iter()
+                        .all(|leaf| l.core.contains_key(&format!("self_attn.{leaf}"))) || native::is_native(l)),
                 mla: layers.iter().filter(|l| l.attention == GlmNextAttention::Mla && l.attention_share.present())
-                    .all(|l| l.core.contains_key("self_attn.q_a_proj") || native::is_native(l)),
+                    .all(|l| ["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"].iter()
+                        .all(|leaf| l.core.contains_key(&format!("self_attn.{leaf}"))) || native::is_native(l)),
                 ffn: layers.iter().all(|l| core::native_ffn(l) || native::is_native(l)),
             },
             scratch: GlmfScratchOptions { split, kda_w8: layers.iter().any(|layer| layer.has("w_in_fp8")),
@@ -2301,7 +2303,7 @@ impl<'a> GlmfEngine<'a> {
                     ensure!(projections.iter().all(|name| layer.native_projections.contains_key(name))
                         && shares[rank].present(), "native attention projections differ from admission at layer {index} rank {rank}");
                 }
-                let native = layer.core.contains_key("self_attn.o_proj");
+                let native = core::stage_attention(layer);
                 let operands: &[&str] = match layer.attention {
                     GlmNextAttention::Mla if checkpoint_native => &["q_a_norm", "kv_a_norm", "w_uk_fp8", "w_uk_scale",
                         "w_uv_fp8", "w_uv_scale", "k_norm_w", "k_norm_b", "ape", "index_gate"],
@@ -2321,7 +2323,9 @@ impl<'a> GlmfEngine<'a> {
                         GlmNextAttention::Mla => &["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"],
                     };
                     ensure!(shares[rank].present() && leaves.iter().all(|leaf|
-                        layer.core.contains_key(&format!("self_attn.{leaf}"))), "Flash K6 attention group incomplete");
+                        layer.core.contains_key(&format!("self_attn.{leaf}"))
+                            || layer.attention_native.contains_key(&format!("self_attn.{leaf}"))),
+                        "Flash selected attention group incomplete");
                 }
                 if shares[rank].present() { weights.push(rank as u8); }
                 match layer.attention {
@@ -4712,7 +4716,7 @@ impl<'a> GlmfEngine<'a> {
         let out_bytes = if self.precise_attention(layer) { 4 } else { 2 };
         let rows_at = [row_at(&w.x, first, h * 2), row_at(&w.kda_slots, first, 4), row_at(&w.seq_first, first, 4),
             w.delta.buffer.ptr.wrapping_byte_add(first * h * out_bytes)];
-        if layer.core.contains_key("self_attn.q_proj") {
+        if core::stage_attention(layer) {
             ensure!(self.kda_state == KdaState::F32, "native Flash K6 requires the F32 KDA stage package");
             return self.core_kda(rank, w, layer, rows, first, cap, spec, [conv_state, state, replay]);
         }
@@ -4869,7 +4873,7 @@ impl<'a> GlmfEngine<'a> {
         decode: bool, cache: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
         if native::is_native(layer) { return self.native_mla_producer(rank, w, layer, rows, cap, cache); }
         let cache = cache.ptr;
-        if layer.core.contains_key("self_attn.q_a_proj") {
+        if core::stage_attention(layer) {
             return self.core_mla_producer(rank, w, layer, rows, cap, cache);
         }
         // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
@@ -4939,7 +4943,7 @@ impl<'a> GlmfEngine<'a> {
     fn mla_output(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, cap: &str, rows: Scalar, decode: bool)
         -> Result<()> {
         if native::is_native(layer) { return self.native_mla_output(rank, w, layer, rows, cap); }
-        if layer.core.contains_key("self_attn.o_proj") {
+        if core::stage_attention(layer) {
             return self.core_mla_output(rank, w, layer, rows, cap);
         }
         let fp8 = decode || self.fp8_prefill.mla;
@@ -5068,7 +5072,7 @@ impl<'a> GlmfEngine<'a> {
         }
         self.mla_output(rank, w, layer, cap, rows, decode)?;
         if let Some(dir) = trace {
-            let values = if layer.core.contains_key("self_attn.o_proj") {
+            let values = if core::stage_attention(layer) {
                 w.core.as_ref().context("native MLA trace without stage buffers")?.stage("values")?
             } else { w.scratch.buffer };
             std::fs::write(dir.join("mla_values.bin"), self.download_buffer(values,
