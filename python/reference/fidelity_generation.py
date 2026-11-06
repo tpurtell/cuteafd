@@ -113,7 +113,17 @@ class ChatRenderer:
         rendered = copy.deepcopy(body)
         rendered["messages"] = messages
         if self.native:
-            raise ValueError("recipe v2 trailing context needs a Jinja template or checkpoint encoder")
+            options = self.template_options(rendered)
+            conversation = normalized_messages(messages)
+            ids = list(self.tokenizer.apply_chat_template(
+                conversation, tools=body.get("tools"), tokenize=True,
+                add_generation_prompt=False, **options))
+            text = self.tokenizer.apply_chat_template(
+                conversation, tools=body.get("tools"), tokenize=False,
+                add_generation_prompt=False, **options)
+            if self.tokenizer.decode(ids) != text:
+                raise ValueError("conversation does not re-tokenize losslessly")
+            return ids
         if self.encoder:
             text = self.render(rendered)
             ids = token_ids(self.tokenizer, text)
@@ -338,7 +348,7 @@ class APIClient(TextGenerator):
 
     def rendering_body(self, request):
         rendered = copy.deepcopy(request)
-        if self.family == "kimi_k3" and not (request.get("reasoning_effort")
+        if self.family in ("kimi_k3", "kimi_k31") and not (request.get("reasoning_effort")
                 or (request.get("reasoning") or {}).get("effort")):
             # Official K3 API docs and native template both default to max.
             rendered["reasoning_effort"] = "max"
@@ -396,7 +406,7 @@ class APIClient(TextGenerator):
         return self.result(rendered_body, generated, visible_message, {
             **self.identity, "date": record["date"], "provider": raw.get("provider"),
             "rendered_reasoning": {"template_options": self.renderer.template_options(rendered_body),
-                "source": "documented Kimi K3 provider default max" if self.family == "kimi_k3"
+                "source": "documented Kimi K3 provider default max" if self.family in ("kimi_k3", "kimi_k31")
                     and rendered_body != record["binding"]["request"] else "cached wire request"},
             "response_model": raw.get("model"), "response_id": raw.get("id"),
             "usage": raw.get("usage"), "finish_reason": choice.get("finish_reason"),

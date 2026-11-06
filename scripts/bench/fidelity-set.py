@@ -27,7 +27,7 @@ from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash
 from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 from fidelity_generation import token_ids
 
-FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5", "kimi_k3",
+FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5", "kimi_k3", "kimi_k31",
             "muse_spark", "mistral_large4", "minimax_m3")
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",

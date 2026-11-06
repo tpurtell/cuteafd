@@ -234,7 +234,10 @@ def test_official_noise_streams_native_b2_and_resumes(tmp_path, monkeypatch, req
     request.addfinalizer(lambda: torch.set_rng_state(original_rng))
     for backend, name in ((torch.backends.cuda.matmul, "allow_tf32"), (torch.backends.cudnn, "allow_tf32"),
                           (torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction")):
-        monkeypatch.setattr(backend, name, getattr(backend, name))
+        # Torch backend pseudo-module classes expose C++ flags outside __dict__.
+        # pytest treats a missing class-local descriptor as a new attr and deletes it.
+        value = getattr(backend, name)
+        request.addfinalizer(lambda backend=backend, name=name, value=value: setattr(backend, name, value))
     from families.kimi_k3.diagnostic import diagnose_official_noise
     for name in ("fla", "transformers", "compressed_tensors"):
         module = types.ModuleType(name)
@@ -556,8 +559,9 @@ def test_strict_f32_configures_torch_and_explicit_kda_dot(monkeypatch, request):
     dtype, precision = torch.get_default_dtype(), torch.get_float32_matmul_precision()
     request.addfinalizer(lambda: torch.set_default_dtype(dtype))
     request.addfinalizer(lambda: torch.set_float32_matmul_precision(precision))
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", torch.backends.cuda.matmul.allow_tf32)
-    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", torch.backends.cudnn.allow_tf32)
+    for backend in (torch.backends.cuda.matmul, torch.backends.cudnn):
+        value = backend.allow_tf32
+        request.addfinalizer(lambda backend=backend, value=value: setattr(backend, "allow_tf32", value))
     monkeypatch.setattr(knobs.language, "fp32_default", knobs.language.fp32_default)
     monkeypatch.setattr(intra, "SOLVE_TRIL_DOT_PRECISION", intra.SOLVE_TRIL_DOT_PRECISION)
     for name in ("TRITON_F32_DEFAULT", "FLA_TRIL_PRECISION"):

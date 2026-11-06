@@ -513,7 +513,7 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
             source["revision"] == manifest["root_checkpoint"]["revision"]
                 && ["model_py_sha256", "kernel_torch_sha256", "golden_sha256", "inference_config_sha256"]
                     .iter().all(|key| hash(&source[key], 64))
-        } else if manifest["family"] == "kimi_k3" {
+        } else if manifest["family"] == "kimi_k3" || manifest["family"] == "kimi_k31" {
             let padding = &provenance["gates"]["kda_a_log_zero_padding"];
             // The native 93-layer decoder has 69 KDA layers with 32 unused F32 heads.
             let expected: std::collections::BTreeSet<_> = (0..92).filter(|i| i % 4 != 3)
@@ -528,13 +528,31 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                         && entry["tail_bitwise_zero"] == true
                         && entry["tail_sha256"] == digest(&[0u8; 32 * 4]))
                 });
-            manifest["root_checkpoint"]["id"] == "moonshotai/Kimi-K3"
+            let k31 = manifest["family"] == "kimi_k31";
+            let decoder = if k31 { &source["base_decoder"] } else { source };
+            let decoder_valid = ["configuration_kimi_k3_sha256", "modeling_kimi_k3_sha256", "modeling_kimi_linear_sha256"]
+                .iter().all(|key| hash(&decoder[key], 64));
+            let dsa_valid = !k31 || {
+                let upstream = &source["upstream"];
+                source["checkpoint"] == "moonshotai/Kimi-K3.1-Pro"
+                    && source["revision"] == "6d0a0202956796543364d666ab19c6ad1a494ee1"
+                    && decoder["checkpoint"] == "moonshotai/Kimi-K3"
+                    && decoder["revision"] == "f831ab66814297da540d832a5235f8e904f29d06"
+                    && provenance["transformers"] == "4.57.6"
+                    && ["dsa_adapter_sha256", "indexer_ops_sha256", "shape_invariant_sha256"]
+                        .iter().all(|key| hash(&source[key], 64))
+                    && [("vllm", "4414f472fb1dd5722b6468c2057943a8c45f83dc", 2),
+                        ("sglang", "1305b1830a1285fdfa9e4f6dbe40f51563d5576e", 3)]
+                        .iter().all(|(name, revision, count)| upstream[*name]["revision"] == *revision
+                            && upstream[*name]["files"].as_object().is_some_and(|files|
+                                files.len() == *count && files.values().all(|value| hash(value, 64))))
+            };
+            manifest["root_checkpoint"]["id"] == if k31 { "moonshotai/Kimi-K3.1-Pro" } else { "moonshotai/Kimi-K3" }
                 && source["revision"] == manifest["root_checkpoint"]["revision"]
-                && ["configuration_kimi_k3_sha256", "modeling_kimi_k3_sha256", "modeling_kimi_linear_sha256",
-                    "reference_adapter_sha256", "reference_runner_sha256", "fla_source_sha256",
+                && ["reference_adapter_sha256", "reference_runner_sha256", "fla_source_sha256",
                     "transformers_source_sha256", "compressed_tensors_source_sha256"]
                     .iter().all(|key| hash(&source[key], 64))
-                && padding_valid
+                && decoder_valid && dsa_valid && padding_valid
         } else if manifest["family"] == "minimax_m3" {
             manifest["root_checkpoint"]["id"] == "MiniMaxAI/MiniMax-M3.1-Flash"
                 && source["revision"] == manifest["root_checkpoint"]["revision"]
@@ -691,6 +709,47 @@ mod tests {
             assert!(!reference.windows.is_empty());
             eprintln!("loaded {}: {label}", manifest["config"]);
         }
+    }
+
+    #[test]
+    fn kimi_k31_qualification_requires_its_root_sources_and_dependencies() {
+        let (mut qualification, mut manifest) = kimi_reference_qualification();
+        let root = "moonshotai/Kimi-K3.1-Pro";
+        let revision = "6d0a0202956796543364d666ab19c6ad1a494ee1";
+        manifest["family"] = json!("kimi_k31");
+        manifest["root_checkpoint"] = json!({"id":root, "revision":revision});
+        for path in ["reference_provenance", "prefix_qualification"] {
+            qualification[path]["snapshot_identity"]["checkpoint"] = json!(root);
+            qualification[path]["snapshot_identity"]["snapshot_revision"] = json!(revision);
+        }
+        qualification["reference_provenance"]["transformers"] = json!("4.57.6");
+        let source = &mut qualification["reference_provenance"]["source_pin"];
+        let mut base = source.clone();
+        base["checkpoint"] = json!("moonshotai/Kimi-K3");
+        base["revision"] = json!("f831ab66814297da540d832a5235f8e904f29d06");
+        source["base_decoder"] = base;
+        source["checkpoint"] = json!(root);
+        source["revision"] = json!(revision);
+        for key in ["dsa_adapter_sha256", "indexer_ops_sha256", "shape_invariant_sha256"] {
+            source[key] = json!("d".repeat(64));
+        }
+        for (name, rev, count) in [("vllm", "4414f472fb1dd5722b6468c2057943a8c45f83dc", 2),
+            ("sglang", "1305b1830a1285fdfa9e4f6dbe40f51563d5576e", 3)] {
+            let files: serde_json::Map<_, _> = (0..count).map(|i| (format!("file{i}"), json!("e".repeat(64)))).collect();
+            source["upstream"][name] = json!({"revision":rev, "files":files});
+        }
+        assert!(qualification_label(&qualification, &manifest).is_ok());
+        for path in ["/reference_provenance/source_pin/dsa_adapter_sha256",
+            "/reference_provenance/source_pin/indexer_ops_sha256",
+            "/reference_provenance/source_pin/base_decoder/modeling_kimi_linear_sha256",
+            "/reference_provenance/source_pin/upstream/vllm/revision",
+            "/reference_provenance/transformers"] {
+            let mut bad = qualification.clone();
+            *bad.pointer_mut(path).unwrap() = json!("invalid");
+            assert!(qualification_label(&bad, &manifest).is_err(), "{path}");
+        }
+        manifest["root_checkpoint"]["id"] = json!("moonshotai/Kimi-K3");
+        assert!(qualification_label(&qualification, &manifest).is_err());
     }
 
     #[test]

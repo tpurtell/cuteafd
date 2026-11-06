@@ -43,6 +43,8 @@ CONTRACT = dict(renderer="checkpoint-segmented-chat-v1", thinking=True,
                 batch_size=1, padding=False, truncation=False, sorting=False,
                 packing=False, attention_mask="all-ones")
 DEFAULT_CORPUS = Path.home() / ".cache/cuteafd/quantization/kimi-k3-exl3-k2/corpus"
+K31_REPO = "moonshotai/Kimi-K3.1-Pro"
+K31_REVISION = "6d0a0202956796543364d666ab19c6ad1a494ee1"
 
 
 def canonical(value):
@@ -59,7 +61,7 @@ def ids_sha256(ids):
     return hashlib.sha256(canonical(list(ids))).hexdigest()
 
 
-def download_corpus(root=DEFAULT_CORPUS):
+def download_corpus(root=DEFAULT_CORPUS, *, allow_download=True):
     """Download only the small pinned panel payloads; reject altered caches."""
     root = Path(root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -69,6 +71,8 @@ def download_corpus(root=DEFAULT_CORPUS):
             if sha256_file(target) != expected:
                 raise ValueError(f"cached dataset hash differs: {target}")
             continue
+        if not allow_download:
+            raise ValueError(f"missing pinned dataset payload: {target}; obtain via SparkNest")
         url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/{REVISION}/{name}"
         fd, partial = tempfile.mkstemp(prefix=name + ".", dir=root)
         try:
@@ -181,6 +185,33 @@ def tokenizer_probes(tokenizer, *, chat_kwargs=None):
     return result
 
 
+def source_contract(source_snapshot):
+    """Accept K3 or the reviewed K3.1 release; both use the same corpus format."""
+    root = Path(source_snapshot).expanduser().resolve()
+    model_type = json.loads((root / "config.json").read_text()).get("model_type")
+    if model_type == "kimi_k31":
+        if root.name != K31_REVISION:
+            raise ValueError("source is not the pinned Kimi K3.1 release")
+        return dict(repo_id=K31_REPO, model_type=model_type, revision=K31_REVISION)
+    if model_type != "kimi_k3":
+        raise ValueError("source snapshot is not Kimi K3 or pinned K3.1")
+    return dict(repo_id="moonshotai/Kimi-K3", model_type=model_type, revision=root.name)
+
+
+def require_source(root, source_snapshot):
+    """Prevent a K3 or another tokenizer's valid panel from seeding K3.1."""
+    source_snapshot = Path(source_snapshot).expanduser().resolve()
+    expected = source_contract(source_snapshot)
+    manifest = json.loads((Path(root) / "manifest.json").read_text())
+    source = manifest.get("source", {})
+    if (source.get("revision") != expected["revision"]
+            or source.get("files") != {name: sha256_file(source_snapshot / name) for name in SOURCE_FILES}
+            or (expected["model_type"] == "kimi_k31"
+                and any(source.get(key) != value for key, value in expected.items()))):
+        raise ValueError("prepared corpus source/tokenizer differs from the requested checkpoint")
+    return manifest
+
+
 def prepare_corpus(source_snapshot, output, corpus=DEFAULT_CORPUS):
     import torch
     from safetensors.torch import save_file
@@ -189,10 +220,12 @@ def prepare_corpus(source_snapshot, output, corpus=DEFAULT_CORPUS):
     source_snapshot, output = Path(source_snapshot).expanduser().resolve(), Path(output).expanduser().resolve()
     if output.exists():
         raise ValueError(f"output exists; use a new directory: {output}")
-    rows, provenance = read_panel(download_corpus(corpus))
+    identity = source_contract(source_snapshot)
+    # New K3.1 jobs must obtain data through the managed store. The historical
+    # K3 entry point retains its compatibility download behavior.
+    rows, provenance = read_panel(download_corpus(corpus,
+        allow_download=identity["model_type"] != "kimi_k31"))
     source_identity = {name: sha256_file(source_snapshot / name) for name in SOURCE_FILES}
-    if json.loads((source_snapshot / "config.json").read_text()).get("model_type") != "kimi_k3":
-        raise ValueError("source snapshot is not Kimi K3")
     tokenizer = AutoTokenizer.from_pretrained(source_snapshot, trust_remote_code=True, local_files_only=True)
     if type(tokenizer).__name__ != "TikTokenTokenizer":
         raise ValueError("source did not load its native Kimi tokenizer")
@@ -203,8 +236,7 @@ def prepare_corpus(source_snapshot, output, corpus=DEFAULT_CORPUS):
     manifest = dict(schema=SCHEMA, status="passed", contract=CONTRACT,
                     dataset=dict(repo_id=REPO_ID, revision=REVISION, files=PAYLOAD_SHA256),
                     historical_selection=provenance["selection"],
-                    source=dict(snapshot=str(source_snapshot), revision=source_snapshot.name,
-                                files=source_identity),
+                    source=dict(snapshot=str(source_snapshot), **identity, files=source_identity),
                     software=software_identity(), tokenizer=dict(class_name=type(tokenizer).__name__,
                     vocab_size=len(tokenizer), special_tokens_map=tokenizer.special_tokens_map),
                     probes=tokenizer_probes(tokenizer), splits={})
