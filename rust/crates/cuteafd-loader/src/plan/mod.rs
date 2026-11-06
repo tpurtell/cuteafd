@@ -649,8 +649,12 @@ struct ComponentCensus {
 
 impl PlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
+        Self::open_view(&checkpoint::CheckpointView::select(snapshot, checkpoint::AttentionMode::Hqa)?)
+    }
+
+    pub fn open_view(view: &checkpoint::CheckpointView) -> anyhow::Result<Self> {
         let start = Instant::now();
-        let (checkpoint, validation) = Checkpoint::open_with_header_validation(snapshot)?;
+        let (checkpoint, validation) = Checkpoint::open_view_with_header_validation(view)?;
         Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(), manifests: ManifestCache::default(),
             open_time: start.elapsed(), open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
             native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),

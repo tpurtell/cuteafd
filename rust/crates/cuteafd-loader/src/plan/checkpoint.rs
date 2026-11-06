@@ -217,8 +217,12 @@ impl Checkpoint {
     }
 
     pub(crate) fn open_with_header_validation(snapshot: &Path) -> Result<(Self, Result<(), String>)> {
+        Self::open_view_with_header_validation(&CheckpointView::select(snapshot, AttentionMode::Hqa)?)
+    }
+
+    pub(crate) fn open_view_with_header_validation(view: &CheckpointView) -> Result<(Self, Result<(), String>)> {
         let mut validation = Ok(());
-        let checkpoint = Self::open_filtered_validated(snapshot, None, |_| true, Some(&mut validation))?;
+        let checkpoint = Self::open_view_filtered(view, None, |_| true, Some(&mut validation))?;
         Ok((checkpoint, validation))
     }
 

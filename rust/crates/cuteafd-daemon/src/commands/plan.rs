@@ -274,11 +274,12 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         "--exlr8-manifest requires an EXLR8 checkpoint");
     anyhow::ensure!(args.exlr8_prefill_activations.is_none(),
         "--exlr8-prefill-activations requires an EXLR8 checkpoint");
+    let view = args.attention.select(&snapshot)?;
     let role_inventory = args.files || args.fetch || args.role.is_some();
-    let input = if role_inventory { None } else { Some(cuteafd_loader::plan::PlanInput::open(&snapshot)?) };
+    let input = if role_inventory { None } else { Some(cuteafd_loader::plan::PlanInput::open_view(&view)?) };
     let inventory;
     let checkpoint = if let Some(input) = &input { input.checkpoint() } else {
-        inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
+        inventory = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
         &inventory
     };
     let family = cuteafd_loader::plan::family::detect(checkpoint).map_or("", |family| family.id());

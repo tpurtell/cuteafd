@@ -210,8 +210,32 @@ pub(crate) fn exlr8_prefill_activations_parser()
         .map(|name| name.parse().expect("clap admits only the listed values"))
 }
 
+/// Model-lifetime attention bundle shared by planner, serve and golden commands.
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct AttentionArgs {
+    /// Load the parent's compact attention bundle instead of default native HQA attention.
+    #[arg(long, conflicts_with = "fp8_compact_attention", env = "CUTEAFD_COMPACT_ATTENTION")]
+    pub compact_attention: bool,
+    /// Load default HQA attention and quantize its BF16 projections to FP8 during load/push.
+    #[arg(long, conflicts_with = "compact_attention", env = "CUTEAFD_FP8_COMPACT_ATTENTION")]
+    pub fp8_compact_attention: bool,
+}
+impl AttentionArgs {
+    pub fn mode(&self) -> cuteafd_loader::plan::checkpoint::AttentionMode {
+        use cuteafd_loader::plan::checkpoint::AttentionMode;
+        if self.compact_attention { AttentionMode::Compact }
+        else if self.fp8_compact_attention { AttentionMode::Fp8Compact }
+        else { AttentionMode::Hqa }
+    }
+    pub fn select(&self, snapshot: &std::path::Path) -> anyhow::Result<cuteafd_loader::plan::checkpoint::CheckpointView> {
+        cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot, self.mode())
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    #[command(flatten)]
+    pub attention: AttentionArgs,
     /// Published EXLR8 manifest name (defaults to bit325).
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,

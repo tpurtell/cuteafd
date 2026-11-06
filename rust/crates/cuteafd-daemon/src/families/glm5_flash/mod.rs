@@ -59,6 +59,8 @@ use std::time::Instant;
 /// What every GLM 5.3 Flash command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    #[command(flatten)]
+    pub attention: crate::cli::AttentionArgs,
     /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
@@ -1670,8 +1672,9 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     } else { ensure!(args.exlr8_manifest.is_none(), "--exlr8-manifest requires a native EXLR8 checkpoint"); }
     let args = &resolved;
     check_options(args)?;
-    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
-    let cfg = GlmNextConfig::read(&args.snapshot)?;
+    let view = args.attention.select(&args.snapshot)?;
+    let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
+    let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
     cuteafd_bench::context::set_family(cfg.family_id());
     native::validate_headers(format, || {
         header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
@@ -1702,7 +1705,9 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     cuteafd_core::set_expert_geometry(geometry).map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
     let experts = if args.layers.unwrap_or(cfg.layers) > cfg.dense.iter().take_while(|&&d| d).count() {
         let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
-        let mut catalog = cuteafd_loader::read_expert_catalog(source)?;
+        let mut catalog = if source == args.snapshot {
+            cuteafd_loader::read_expert_catalog_view(&view)?
+        } else { cuteafd_loader::read_expert_catalog(source)? };
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
         ensure!(catalog.fp8().is_some() || catalog.exl3().is_some()
             || catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8,
@@ -1748,7 +1753,7 @@ impl Opened {
         attention: engine::GlmfAttention) -> Result<Option<cuteafd_loader::families::glm5_flash::core_admission::CoreCharges>> {
         use cuteafd_loader::families::glm5_flash::{core::CoreInventory, core_admission::CoreCharges, GlmNextAttention};
         if self.native { return Ok(None); }
-        let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
+        let headers = Checkpoint::coordinator_view(&args.attention.select(&args.snapshot)?, false, false)?;
         let core = CoreInventory::from_checkpoint(&self.cfg, &headers)?;
         if core.projections.is_empty() { return Ok(None); }
         ensure!(args.kda_state == engine::KdaState::F32, "native K6 requires F32 KDA state programs");
@@ -1818,7 +1823,7 @@ impl Opened {
                 split, rank as u8, arch, Some(&program_set));
             code.pending(sample.context_bytes, arch.context_bytes)
         }).collect();
-        let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
+        let headers = Checkpoint::coordinator_view(&args.attention.select(&args.snapshot)?, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
             fp8_head: args.fp8_head, output_shard: args.kda_output_shard };
         let resident = if let Some(native) = native_admission { native.resident.clone() } else {
@@ -2566,7 +2571,7 @@ impl Opened {
         let single = model.check_single_residency(args.kda_fp8, args.fp8_head)?;
         // Header-only resident inventory uses the actual loader flags, not launcher defaults.
         if native_admission.is_none() && args.kda_nvfp4_gate.is_none() {
-            let headers = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+            let headers = cuteafd_loader::plan::Checkpoint::coordinator_view(&args.attention.select(&args.snapshot)?, false, false)?;
             let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights_placed(
                 &headers, &self.cfg, layers, 1 + usize::from(peer_stream.is_some()),
                 cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {

@@ -322,14 +322,26 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
     headers: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>,
     tiers: &[usize],
 ) -> Result<V41Exl3Manifest> {
-    let config = read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    read_deepseek_v4_exl3_manifest_view(
+        &crate::plan::checkpoint::CheckpointView::select(snapshot, crate::plan::checkpoint::AttentionMode::Hqa)?,
+        backbone, headers, tiers)
+}
+
+pub(crate) fn read_deepseek_v4_exl3_manifest_view<'a>(
+    view: &crate::plan::checkpoint::CheckpointView,
+    backbone: crate::RoutedExpertShape,
+    headers: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>,
+    tiers: &[usize],
+) -> Result<V41Exl3Manifest> {
+    let snapshot = view.snapshot();
+    let config = view.config()?;
     let headers = headers.into_iter().collect::<Vec<_>>();
     let derived = derive_storage_map(headers.iter().copied())?;
     // MTP starts after every target layer, which can exceed the routed bound
     // (Step-5's last target layer is dense).
     let target_layers = config.get("text_config").unwrap_or(&config)["num_hidden_layers"].as_u64()
         .map_or(backbone.layers, |layers| (layers as usize).max(backbone.layers));
-    let source = check_storage_maps(snapshot, &config, &derived, target_layers, &headers)?;
+    let source = check_storage_maps_view(view, &config, &derived, target_layers, &headers)?;
     let compact = &config["quantization_config"];
     crate::formats::exl3_contract::check_native_quantization_config(compact)?;
     if compact.get("native_quantization_config").is_some() {
@@ -342,12 +354,14 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
 /// GPTQModel `quantize_config.json` (and its `quantization_config.json`
 /// copy), an exllamav3 `quantization_config.json`, or none (the compact
 /// `config.json` block alone).
-fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap, backbone_layers: usize,
-    headers: &[&SafetensorsTensorMetadata]) -> Result<Exl3StorageSource> {
+fn check_storage_maps_view(view: &crate::plan::checkpoint::CheckpointView, config: &Value,
+    derived: &Exl3StorageMap, backbone_layers: usize, headers: &[&SafetensorsTensorMetadata])
+    -> Result<Exl3StorageSource> {
     let compact = config.get("quantization_config").context("config.json has no quantization_config")?;
     use sha2::{Digest, Sha256};
     let mut source = None;
-    let paths = ["quantize_config.json", "quantization_config.json"].map(|file| snapshot.join(file));
+    let paths = view.quant_names().iter().filter(|name| name.as_str() != "hf_quant_config.json")
+        .map(|file| view.snapshot().join(file)).collect::<Vec<_>>();
     let present = paths.iter().filter(|path| path.is_file()).collect::<Vec<_>>();
     let first = present.first().map(|path| read_bytes(path, MAX_MANIFEST_BYTES)).transpose()?;
     if let [left, right] = present.as_slice() {
