@@ -953,17 +953,17 @@ mod tests {
         }];
         let policy = CapacityPolicy {
             max_context_tokens: Some(32),
-            pool_tokens: Some(63),
+            pool_tokens: Some(69),
             ..CapacityPolicy::default()
         };
         let report: serde_json::Value =
             serde_json::from_str(&reservation_report(&profile, &memory, policy).unwrap()).unwrap();
-        assert_eq!(report["requested_pool_tokens"], 64);
+        assert_eq!(report["requested_pool_tokens"], 72);
         let device = &report["devices"][0];
-        assert_eq!(device["engine_budget_bytes"], 8700);
+        assert_eq!(device["engine_budget_bytes"], 9000);
         assert_eq!(device["fixed_bytes"], 5524);
-        assert_eq!(device["requested_pool_bytes"], 3200);
-        assert_eq!(device["complete_requested_bytes"], 8724);
+        assert_eq!(device["requested_pool_bytes"], 3600);
+        assert_eq!(device["complete_requested_bytes"], 9124);
         assert_eq!(device["fixed_categories"]["draft"], 1000);
         assert_eq!(device["fixed_categories"]["prefill"], 2000);
         assert!(

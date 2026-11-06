@@ -4167,7 +4167,7 @@ fn mimo_small_card_auto_embedding_and_full_context() {
     let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert!(!base.devices[0].by_category().contains_key(&Category::Embedding));
     assert_eq!(base.devices[0].capacity_bytes,
-        (32u64 << 30) - (64 << 20));
+        (32u64 << 30) - options.layout.as_ref().unwrap().headroom_bytes);
     assert!(base.pool_tokens >= 1_048_576, "{}", base.render());
     assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
     options.layout.as_mut().unwrap().force_gpu_embedding = true;

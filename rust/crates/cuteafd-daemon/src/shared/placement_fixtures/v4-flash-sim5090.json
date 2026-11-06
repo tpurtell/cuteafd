@@ -18,7 +18,7 @@
  "source_revision": "224926ab55058a43c2bcc0f170267360aa41c0ad",
  "historical_pool_tokens": 830976,
  "historical_report": "benchmarks/deepseek_v4/2026-10-09-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-rc3-sim5090/report.json",
- "note": "44e533146 shared prefill page lists and 488dc75c6 dispatch-specific scratch/egress accounting intentionally returned space; current pool is a CPU planner-shape expectation, not a fresh hardware measurement. Raw admission samples remain unchanged.",
- "pool_tokens": 1048576,
+ "note": "44e533146 shared prefill page lists and 488dc75c6 dispatch-specific scratch/egress accounting intentionally returned space; applying the uniform explicit 3 GiB runtime reserve instead of the old 2.9 GiB small-card floor reduces the replay pool from 1048576 to 1035008. Current pool is a CPU planner-shape expectation, not a fresh hardware measurement. Raw admission samples remain unchanged.",
+ "pool_tokens": 1035008,
  "onboard_layers": 0
 }
