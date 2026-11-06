@@ -243,15 +243,16 @@ pub(crate) fn check_gptqmodel_manifest(
     ensure!(compact.get("quant_method") == Some(&Value::from("exl3")), "config must declare EXL3 quantization");
     for (key, value) in compact {
         if key == "per_module_metadata" {
-            ensure!(value == "quantize_config.json:tensor_storage",
-                "EXL3 per_module_metadata must name quantize_config.json:tensor_storage, not {value}");
+            ensure!(matches!(value.as_str(), Some("quantize_config.json:tensor_storage" | "quantize_config.compact-attention.json:tensor_storage")),
+                "EXL3 per_module_metadata must name the selected quantization tensor_storage, not {value}");
             continue;
         }
         ensure!(manifest.get(key) == Some(value), "compact/full EXL3 metadata disagree at {key}");
     }
     if let Some(pointer) = manifest.get("per_module_metadata") {
-        ensure!(pointer == "quantize_config.json:tensor_storage",
-            "EXL3 per_module_metadata must name quantize_config.json:tensor_storage, not {pointer}");
+        ensure!(matches!(pointer.as_str(), Some("quantize_config.json:tensor_storage" | "quantize_config.compact-attention.json:tensor_storage"))
+            && compact.get("per_module_metadata").is_none_or(|value| value == pointer),
+            "EXL3 per_module_metadata must name the selected quantization tensor_storage, not {pointer}");
     }
     Ok(())
 }

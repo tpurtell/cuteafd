@@ -120,6 +120,7 @@ the launcher derives from them.
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
+| `ATTENTION_MODE` | `hqa` | `hqa`, `compact`, `fp8-compact` | GLM Flash: default native HQA bundle, parent compact bundle, or deterministic load/push FP8 attention. Selected for the model lifetime. |
 | `ATTENTION_PLACEMENT` | `auto` | `auto`, `context`, `layers`, `heads` | Per-family defaults and refusals are in the table below. |
 | `ATTENTION_PLAN_ROWS` | `auto` | `auto`, positive int | Decode/verify reduction plan rows. |
 | `MAX_CONTEXT_TOKENS` | `1048576` | 1–1048576 | Context cap. |
@@ -376,6 +377,7 @@ accept/refuse behaviour. `✓` means the family's config validation accepts it;
 | `GLM5_FLASH_HEADROOM_GIB` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_GRAPH_BUDGET_MIB` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Attention and KV** | | | | | | | | | | |
+| `ATTENTION_MODE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |

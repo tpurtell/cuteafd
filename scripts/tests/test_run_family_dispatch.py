@@ -88,6 +88,33 @@ def test_glm_native_attention_reaches_plan_and_coordinator(tmp_path, gpus, atten
     assert f"CUTEAFD_ATTENTION_PLACEMENT={attention}" in coordinators[0]
 
 
+@pytest.mark.parametrize("mode,flag", [("hqa", None), ("compact", "--compact-attention"),
+                                        ("fp8-compact", "--fp8-compact-attention")])
+def test_attention_bundle_reaches_plan_coordinator_and_workers(tmp_path, mode, flag):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 45, "first_k_dense_replace": 3}
+    keys = (f"ATTENTION_MODE={mode}\nSPARK_COUNT=4\nRTX_GPUS=2\n"
+            "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    result = _family_launch_result(tmp_path, config, "test/hqa-flash", keys)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    for command in ["cuteafd plan", "cuteafd serve-glmf --snapshot", "cuteafd expertd-native"]:
+        selected = [line for line in lines if command in line]
+        assert selected, result.stderr
+        for line in selected:
+            if flag:
+                assert flag in line
+            else:
+                assert "--compact-attention" not in line and "--fp8-compact-attention" not in line
+
+
+@pytest.mark.parametrize("mode", ["compact", "fp8-compact", "unknown"])
+def test_attention_bundle_refuses_unsupported_modes_and_families(tmp_path, mode):
+    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa"}, "test/no-hqa",
+                                  f"ATTENTION_MODE={mode}\nSPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    assert result.returncode != 0
+    assert "ATTENTION_MODE" in result.stderr
+
+
 @pytest.mark.parametrize("activations", [None, "a16", "a8"])
 @pytest.mark.parametrize("wip", [False, True])
 def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, activations, wip):

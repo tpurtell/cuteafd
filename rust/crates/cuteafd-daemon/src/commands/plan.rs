@@ -231,7 +231,8 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
-    if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
+    let view = args.attention.select(&snapshot)?;
+    if view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Hqa && cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         if args.spark_range {
             return Err(PlanError::InvalidOption { option: "--spark-range", reason:
                 "EXLR8 range geometry requires its native manifest planner".into() }.into());
@@ -275,13 +276,14 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     anyhow::ensure!(args.exlr8_prefill_activations.is_none(),
         "--exlr8-prefill-activations requires an EXLR8 checkpoint");
     let role_inventory = args.files || args.fetch || args.role.is_some();
-    let input = if role_inventory { None } else { Some(cuteafd_loader::plan::PlanInput::open(&snapshot)?) };
+    let input = if role_inventory { None } else { Some(cuteafd_loader::plan::PlanInput::open_view(&view)?) };
     let inventory;
     let checkpoint = if let Some(input) = &input { input.checkpoint() } else {
-        inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
+        inventory = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
         &inventory
     };
     let family = cuteafd_loader::plan::family::detect(checkpoint).map_or("", |family| family.id());
+    args.attention.validate_family(family)?;
     validate_glmf_precision(&args, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
@@ -316,7 +318,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if v41 { layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?; }
     }
     if args.files || args.fetch || args.role.is_some() {
-        use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
+        use cuteafd_loader::plan::files::{manifest_roles_view, ReadRole};
         let args = file_args(args, &snapshot)?;
         let placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
         let parse = |name: &str| {
@@ -341,7 +343,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             } else {
                 let manifests = hosts.iter().map(|(host, names)| {
                     let roles = complete_roles(names.iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?);
-                    let mut manifest = manifest_roles(&snapshot, &roles)?;
+                    let mut manifest = manifest_roles_view(&view, &roles)?;
                     attach_snapshots(&mut manifest, &roles, &args)?;
                     Ok((host.clone(), manifest))
                 }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
@@ -371,7 +373,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             vec![parse(args.role.as_deref().unwrap_or("coordinator"))?]
         };
         let roles = complete_roles(roles);
-        let mut manifest = manifest_roles(&snapshot, &roles)?;
+        let mut manifest = manifest_roles_view(&view, &roles)?;
         attach_snapshots(&mut manifest, &roles, &args)?;
         if args.fetch {
             transfer(&snapshot, &manifest, &args)?;
@@ -383,7 +385,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             }
         } else {
             let mut headers = 0;
-            for role in &roles { headers += cuteafd_loader::plan::files::open_role(&snapshot, *role)?.tensors.len(); }
+            for role in &roles { headers += cuteafd_loader::plan::files::open_role_view(&view, *role)?.tensors.len(); }
             if args.json { println!("{}", serde_json::to_string_pretty(&manifest)?); }
             else { println!("role {} HEADERS READY: {headers} tensor headers, {} required files",
                 manifest.role, manifest.files.len()); }
@@ -510,7 +512,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
 /// Never execute a shell configuration while constructing a file inventory.
 fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs> {
     use cuteafd_loader::plan::MediaMode;
-    let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(snapshot)?;
+    let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory_view(&args.attention.select(snapshot)?)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).context("unsupported checkpoint family")?.id();
     let cfg = launch_config(args.config.as_deref())?;
     if let Some(model) = cfg.get("MODEL_ID") {
@@ -957,6 +959,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            attention: Default::default(),
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             expert_partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
             exlr8_manifest: None,

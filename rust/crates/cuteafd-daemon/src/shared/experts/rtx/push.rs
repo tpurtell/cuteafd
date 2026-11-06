@@ -573,16 +573,23 @@ impl CoordinatorPush {
     /// [`Self::prepare_alone`] on push endpoint `socket` (None: the configured one).
     pub(crate) fn prepare_alone_at(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
         experts: Option<CoordinatorExperts>, socket: Option<String>) -> Result<Self> {
-        Self::prepare_alone_with_host(snapshot, catalog, gpus, experts, socket, None)
+        Self::prepare_alone_with_host(snapshot, catalog, gpus, experts, socket, None, None)
     }
 
     pub(crate) fn prepare_alone_admitted(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>,
         gpus: usize, experts: Option<CoordinatorExperts>, envelope: PushHostEnvelope) -> Result<Self> {
-        Self::prepare_alone_with_host(snapshot, catalog, gpus, experts, None, Some(envelope))
+        Self::prepare_alone_with_host(snapshot, catalog, gpus, experts, None, Some(envelope), None)
+    }
+
+    pub(crate) fn prepare_alone_view_admitted(view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        catalog: Option<&OfficialV41Catalog>, gpus: usize, experts: Option<CoordinatorExperts>,
+        envelope: PushHostEnvelope) -> Result<Self> {
+        Self::prepare_alone_with_host(view.snapshot(), catalog, gpus, experts, None, Some(envelope), Some(view.clone()))
     }
 
     fn prepare_alone_with_host(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
-        experts: Option<CoordinatorExperts>, socket: Option<String>, host_envelope: Option<PushHostEnvelope>) -> Result<Self> {
+        experts: Option<CoordinatorExperts>, socket: Option<String>, host_envelope: Option<PushHostEnvelope>,
+        view: Option<cuteafd_loader::plan::checkpoint::CheckpointView>) -> Result<Self> {
         let has_experts = experts.is_some();
         let (mut push, streams, ranks) = Self::prepare_with_host(snapshot, catalog, gpus, experts, host_envelope)?;
         push.socket = socket.clone();
@@ -592,7 +599,10 @@ impl CoordinatorPush {
             let mut streams = streams;
             cuteafd_transport::worker_selection::push::coordinate(&mut streams, |offers| {
                 // As the Spark driver: the expert catalog is reopened on this thread.
-                let catalog = has_experts.then(|| cuteafd_loader::read_expert_catalog(&snapshot)).transpose()?;
+                let catalog = has_experts.then(|| match &view {
+                    Some(view) => cuteafd_loader::read_expert_catalog_view(view),
+                    None => cuteafd_loader::read_expert_catalog(&snapshot),
+                }).transpose()?;
                 crate::shared::memory::push_exl3::prepare_coordinator(&snapshot, catalog.as_ref(), offers, &ranks,
                     &client(socket.clone())?)
             })
