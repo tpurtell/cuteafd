@@ -459,6 +459,7 @@ fn propagate(
         costs.capacity(&costs.lower_bound(domains, lower, upper)?, budgets)?;
         let before = domains.to_vec();
         for variable in 0..domains.len() {
+            if domains[variable].len() == 1 { continue; }
             let mut retained = Vec::new();
             let mut capacity_failure = None;
             for &option in &domains[variable] {

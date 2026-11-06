@@ -2457,3 +2457,40 @@ fn encoder_priority_follows_pool_and_onboarding_before_slack() {
     assert_eq!(tighter.pool_tokens, 128, "pool wins over optional encoder");
     assert_eq!(tighter.decisions.encoder, Some(1));
 }
+
+#[test]
+fn many_singletons_preserve_branching_winner_and_typed_refusals() {
+    let request = Request { pool: Pin::Exact(128), ..request() };
+    let compact = Linear { maximum: 256, onboard: 2, fixed: 0 }.prepare(&request).unwrap();
+    let mut padded = compact.clone();
+    for layer in 1..64 {
+        padded.variables.push(Variable::Attention { layer,
+            values: vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] });
+    }
+    for capacity in [128, 192, 256] {
+        let expected = solve(request.clone(), vec![budget(capacity)], &Prepared(compact.clone())).unwrap();
+        let actual = solve(request.clone(), vec![budget(capacity)], &Prepared(padded.clone())).unwrap();
+        assert_eq!(actual.pool_tokens, 128);
+        assert_eq!(actual.decisions.onboard_layers, expected.decisions.onboard_layers);
+        assert_eq!(actual.decisions.onboard_layers[0].len(), ((capacity - 128) / 64) as usize);
+        assert_eq!(actual.decisions.attention.len(), 64);
+        assert_eq!(actual.facts, expected.facts);
+        assert_eq!(actual.phases, expected.phases);
+    }
+    let expected = solve(request.clone(), vec![budget(127)], &Prepared(compact)).unwrap_err();
+    let actual = solve(request.clone(), vec![budget(127)], &Prepared(padded)).unwrap_err();
+    assert_eq!(actual, expected);
+    assert!(matches!(actual, Refusal::Capacity { .. }));
+}
+
+#[test]
+fn infeasible_singletons_are_refused_without_an_option_probe() {
+    let request = Request { pool: Pin::Exact(64), ..request() };
+    let mut contract = Linear { maximum: 64, ..Linear::new() }.prepare(&request).unwrap();
+    for layer in 1..64 {
+        contract.variables.push(Variable::Attention { layer,
+            values: vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] });
+    }
+    let refusal = solve(request.clone(), vec![budget(63)], &Prepared(contract)).unwrap_err();
+    assert!(matches!(refusal, Refusal::Capacity { required: 64, available: 63, .. }));
+}
