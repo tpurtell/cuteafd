@@ -276,7 +276,7 @@ mod tests {
         let record: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("official.json"))?)?;
         let cfg = MuseSparkConfig::from_hf(&record["config"])?;
         let headers = cuteafd_loader::read_safetensors_metadata(&root.join("model.safetensors"))?;
-        let mut checkpoint = Checkpoint { snapshot: root, config: record["config"].clone(), quantize_config: None,
+        let mut checkpoint = Checkpoint { view: None, snapshot: root, config: record["config"].clone(), quantize_config: None,
             weight_map: headers.iter().map(|m| (m.name.clone(), "model.safetensors".into())).collect(),
             tensors: headers.into_iter().map(|meta| CheckpointTensor { shard: "model.safetensors".into(), meta }).collect(),
             missing_shards: vec![], shard_bytes: 0 };

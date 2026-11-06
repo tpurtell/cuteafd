@@ -545,7 +545,7 @@ mod tests {
     fn native_fp8_header_inventory_charges_scales_and_keeps_bf16_gates() -> Result<()> {
         use crate::plan::checkpoint::{Checkpoint, CheckpointTensor};
         let cfg = cfg();
-        let mut checkpoint = Checkpoint { snapshot: Default::default(), config: serde_json::json!({}),
+        let mut checkpoint = Checkpoint { view: None, snapshot: Default::default(), config: serde_json::json!({}),
             quantize_config: None, weight_map: Default::default(), tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
         let mut add = |name: String, dtype, shape: Vec<usize>, byte_length| checkpoint.tensors.push(CheckpointTensor {
             shard: "model.safetensors".into(), meta: crate::SafetensorsTensorMetadata {

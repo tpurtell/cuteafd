@@ -520,7 +520,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join("weights.safetensors"), [9, 8, 7, 0x80, 0x3f, 0, 0x40])?;
         let name = "language_model.model.norm.weight";
-        let mut checkpoint = Checkpoint { snapshot: directory.path().into(), config: serde_json::json!({}),
+        let mut checkpoint = Checkpoint { view: None, snapshot: directory.path().into(), config: serde_json::json!({}),
             quantize_config: None, weight_map: BTreeMap::from([(name.into(), "weights.safetensors".into())]),
             tensors: vec![CheckpointTensor { shard: "weights.safetensors".into(),
                 meta: cuteafd_loader::SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,

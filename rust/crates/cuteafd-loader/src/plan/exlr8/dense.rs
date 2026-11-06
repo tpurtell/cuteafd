@@ -279,7 +279,7 @@ fn inventory_candidates(snapshot: &Path) -> Result<Vec<(PathBuf, Header)>> {
 pub(super) fn inventory_headers(snapshot: &Path) -> Result<Vec<(PathBuf, Header, bool)>> {
     use crate::plan::{checkpoint::Checkpoint, family, Component};
     // Construct only the configuration view: opening the checkpoint inventory here recurses.
-    let checkpoint = Checkpoint { snapshot: snapshot.into(), config: super::read_json(&snapshot.join("config.json"))?,
+    let checkpoint = Checkpoint { view: None, snapshot: snapshot.into(), config: super::read_json(&snapshot.join("config.json"))?,
         quantize_config: None, weight_map: Default::default(), tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
     let family = family::detect(&checkpoint).context("unsupported EXLR8 dense family")?;
     let model = family.open(&checkpoint).map_err(anyhow::Error::new)?;

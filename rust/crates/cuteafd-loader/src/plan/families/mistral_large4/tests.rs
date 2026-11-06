@@ -423,7 +423,7 @@ fn published_resident_owners_exclude_host_lerope_alpha() {
     use crate::plan::checkpoint::{Checkpoint, CheckpointTensor};
     let (dir, config, headers) = published_native_fixture();
     let mut checkpoint = Checkpoint {
-        snapshot: dir.path().into(), config, quantize_config: None,
+        view: None, snapshot: dir.path().into(), config, quantize_config: None,
         weight_map: headers.iter().map(|h| (h.name.clone(), "published.safetensors".into())).collect(),
         tensors: headers.into_iter().map(|meta| CheckpointTensor {
             shard: "published.safetensors".into(), meta,

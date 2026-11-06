@@ -5527,7 +5527,7 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
         let config = checkpoint::read_json(&snapshot.join("config.json"))?;
         // Configuration geometry needs names to discover native stages, not tensor payloads/headers.
         let index = checkpoint::read_json(&snapshot.join("model.safetensors.index.json"))?;
-        let checkpoint = Checkpoint { snapshot, config, quantize_config: None,
+        let checkpoint = Checkpoint { view: None, snapshot, config, quantize_config: None,
             weight_map: serde_json::from_value(index["weight_map"].clone())?, tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
         let family = family::detect(&checkpoint).context("recognized family")?;
         let model = family.open(&checkpoint)?;

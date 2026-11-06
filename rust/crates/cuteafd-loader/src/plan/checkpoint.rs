@@ -9,6 +9,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub mod identity;
+pub mod view;
+pub use view::{AttentionMode, CheckpointView};
 
 /// Storage discovery is shared by inventories, catalogs and bootstrap identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +27,10 @@ pub fn index_name(snapshot: &Path) -> Result<String> {
     let path = snapshot.join("config.json");
     if !path.is_file() { return Ok(HF_INDEX.into()); }
     let config = read_json(&path)?;
+    index_name_from_config(&config)
+}
+
+fn index_name_from_config(config: &Value) -> Result<String> {
     match config.get("transformers_weights") {
         None | Some(Value::Null) => Ok(HF_INDEX.into()),
         Some(Value::String(name)) => {
@@ -80,6 +86,8 @@ pub struct CheckpointTensor {
 
 #[derive(Debug)]
 pub struct Checkpoint {
+    /// Immutable selection propagated to catalogs, push records and identities.
+    pub view: Option<CheckpointView>,
     pub snapshot: PathBuf,
     /// `config.json`, verbatim.
     pub config: Value,
@@ -96,10 +104,9 @@ pub struct Checkpoint {
 
 pub(crate) fn validate_index_headers(shard: &str, names: &BTreeSet<&str>,
     headers: &[SafetensorsTensorMetadata]) -> Result<()> {
-    ensure!(headers.len() == names.len(), "index/header tensor count mismatch in {shard}");
-    for tensor in headers {
-        ensure!(names.contains(tensor.name.as_str()),
-            "tensor {} appears in unexpected shard {shard}", tensor.name);
+    let present: BTreeSet<_> = headers.iter().map(|tensor| tensor.name.as_str()).collect();
+    for name in names {
+        ensure!(present.contains(name), "indexed tensor {name} missing from shard {shard} header");
     }
     Ok(())
 }
@@ -108,12 +115,62 @@ pub fn read_json(path: &Path) -> Result<Value> {
     Ok(crate::read_json_file(path)?)
 }
 
+/// Storage of one projection in the selected index, before optional conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionStorage {
+    Native { dtype: cuteafd_core::DType, shape: Vec<usize> },
+    Exl3,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedProjection {
+    pub storage: ProjectionStorage,
+    /// Only active indexed tensors; includes native scales or EXL3 buffers.
+    pub tensors: Vec<CheckpointTensor>,
+    pub source_bytes: u64,
+}
+
 impl Checkpoint {
+    pub fn attention_mode(&self) -> AttentionMode {
+        self.view.as_ref().map_or(AttentionMode::Hqa, CheckpointView::mode)
+    }
+
+    /// Per-projection classification shared by runtime and push planning.
+    /// Call on a role-opened checkpoint so all selected projection headers exist.
+    pub fn projection(&self, stem: &str) -> Result<SelectedProjection> {
+        let prefix = format!("{stem}.");
+        let tensors: Vec<_> = self.tensors.iter().filter(|tensor|
+            tensor.meta.name.starts_with(&prefix)
+                && !tensor.meta.name[prefix.len()..].contains('.')
+                && self.contains_tensor(&tensor.meta.name)).cloned().collect();
+        let weight = tensors.iter().find(|tensor| tensor.meta.name == format!("{stem}.weight"));
+        let trellis = tensors.iter().any(|tensor| tensor.meta.name == format!("{stem}.trellis"));
+        ensure!(!(weight.is_some() && trellis), "{stem}: checkpoint contains both native and EXL3 storage");
+        let storage = if trellis { ProjectionStorage::Exl3 } else {
+            let weight = weight.with_context(|| format!("{stem}: selected projection headers missing"))?;
+            ProjectionStorage::Native { dtype: weight.meta.dtype.clone(), shape: weight.meta.shape.clone() }
+        };
+        let source_bytes = tensors.iter().try_fold(0u64, |sum, tensor| sum.checked_add(tensor.meta.byte_length)
+            .context("projection source bytes overflow"))?;
+        Ok(SelectedProjection { storage, tensors, source_bytes })
+    }
+
     /// Reads the configuration, the index (or a single `model.safetensors`) and
     /// every shard header. Missing shards are recorded rather than fatal so a
     /// partially downloaded checkpoint can still be planned.
     pub fn open(snapshot: &Path) -> Result<Self> {
         Self::open_filtered(snapshot, None, |_| true)
+    }
+
+    pub fn open_view(view: &CheckpointView) -> Result<Self> {
+        Self::open_view_filtered(view, None, |_| true, None)
+    }
+
+    pub fn coordinator_view(view: &CheckpointView, local_experts: bool, speculator: bool) -> Result<Self> {
+        let inventory = Self::inventory_view(view)?;
+        let role = super::files::ReadRole::Coordinator { local_experts, speculator };
+        let names = super::files::required_tensors(&inventory, role)?;
+        Self::open_view_filtered(view, Some(&role.label()), |name| names.contains(name), None)
     }
 
     /// Coordinator ownership uses the planner's family classification, not
@@ -125,7 +182,12 @@ impl Checkpoint {
     /// Reads the index/configuration plus scale-free declared-A4 weight headers
     /// to distinguish unquantized modules from incomplete packed storage.
     pub fn inventory(snapshot: &Path) -> Result<Self> {
-        let mut checkpoint = Self::open_filtered(snapshot, None, |_| false)?;
+        Self::inventory_view(&CheckpointView::select(snapshot, AttentionMode::Hqa)?)
+    }
+
+    pub fn inventory_view(view: &CheckpointView) -> Result<Self> {
+        let snapshot = view.snapshot();
+        let mut checkpoint = Self::open_view_filtered(view, None, |_| false, None)?;
         let mut unscaled = BTreeMap::<String, BTreeSet<String>>::new();
         for (name, shard) in &checkpoint.weight_map {
             let Some(module) = name.strip_suffix(".weight") else { continue };
@@ -165,18 +227,25 @@ impl Checkpoint {
     }
 
     fn open_filtered_validated(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool,
+        validation: Option<&mut Result<(), String>>) -> Result<Self> {
+        let view = CheckpointView::select(snapshot, AttentionMode::Hqa)?;
+        Self::open_view_filtered(&view, role, needed, validation)
+    }
+
+    fn open_view_filtered(view: &CheckpointView, role: Option<&str>, needed: impl Fn(&str) -> bool,
         mut validation: Option<&mut Result<(), String>>) -> Result<Self> {
-        let config = read_json(&snapshot.join("config.json"))?;
-        if CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
+        let snapshot = view.snapshot();
+        let config = view.config()?;
+        if view.mode() == AttentionMode::Hqa && CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
             return super::exlr8::inventory(snapshot, config, needed);
         }
-        let quantize_config = ["quantize_config.json", "quantization_config.json", "hf_quant_config.json"]
+        let quantize_config = view.quant_names()
             .iter()
             .map(|name| snapshot.join(name))
             .find(|path| path.is_file())
             .map(|path| crate::formats::exl3_storage::read_storage_metadata(&path, MAX_JSON_BYTES, None))
             .transpose()?;
-        let index_path = index_path(snapshot)?;
+        let index_path = view.index_path();
         let weight_map: BTreeMap<String, String> = if index_path.is_file() {
             #[derive(serde::Deserialize)]
             struct Index { weight_map: BTreeMap<String, String> }
@@ -253,6 +322,7 @@ impl Checkpoint {
         }
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         Ok(Self {
+            view: Some(view.clone()),
             snapshot: snapshot.to_path_buf(),
             config,
             quantize_config,
@@ -590,7 +660,7 @@ mod sliced_tests {
         // NVIDIA GLM-5.3-Flash-NVFP4 layer 45 is BF16 [2048,4096],
         // absent from both ignore lists despite the class-wide Linear declaration.
         let stem = "model.language_model.layers.45.mlp.experts.65.gate_proj";
-        let mut checkpoint = Checkpoint { snapshot:PathBuf::new(), config:Value::Null,
+        let mut checkpoint = Checkpoint { view: None, snapshot:PathBuf::new(), config:Value::Null,
             quantize_config:None, weight_map:BTreeMap::new(), tensors:Vec::new(),
             missing_shards:Vec::new(), shard_bytes:0 };
         checkpoint.config = json!({"text_config":{"num_hidden_layers":45,"num_nextn_predict_layers":1},
@@ -729,7 +799,7 @@ mod sliced_tests {
             t("a.weight", "BF16", &[2]), t("z.weight", "BF16", &[2]), t("extra.weight", "BF16", &[2])]);
         write_safetensors(&dir.path().join("z.safetensors"), &[t("z.weight", "BF16", &[2])]);
         let (_, validation) = Checkpoint::open_with_header_validation(dir.path()).unwrap();
-        assert!(validation.unwrap_err().contains("index/header tensor count mismatch"));
+        assert!(validation.is_ok());
         let checkpoint = Checkpoint::open_for_role(dir.path(), "coordinator", |_| true).unwrap();
         assert_eq!(checkpoint.tensors.iter().map(|tensor| (tensor.meta.name.as_str(), tensor.shard.as_str()))
             .collect::<Vec<_>>(), [("a.weight", "a.safetensors"), ("z.weight", "z.safetensors")]);
@@ -762,7 +832,7 @@ mod embedding_tests {
         let t = |name: &str, offset| CheckpointTensor { shard: "model.safetensors".into(),
             meta: SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
                 shape: vec![64, 128], byte_offset: offset, byte_length: 16384 } };
-        Checkpoint { snapshot: Default::default(), config: super::super::testing::glm5_config(),
+        Checkpoint { view: None, snapshot: Default::default(), config: super::super::testing::glm5_config(),
             quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
             tensors: vec![t("model.embed_tokens.weight", 0), t("lm_head.weight", 16384)] }
     }

@@ -1274,7 +1274,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path,
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
         crate::plan::checkpoint::validate_index_headers(shard, &names, &metadata)?;
-        for tensor in metadata {
+        for tensor in metadata.into_iter().filter(|tensor| names.contains(tensor.name.as_str())) {
             let placement = match expect(&tensor.name) {
                 Some((dtype, shape)) => {
                     ensure!(
@@ -1342,7 +1342,7 @@ fn read_index_headers(
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
         crate::plan::checkpoint::validate_index_headers(shard, &names, &metadata)?;
-        for tensor in metadata {
+        for tensor in metadata.into_iter().filter(|tensor| names.contains(tensor.name.as_str())) {
             headers.push((shard.to_string(), tensor));
         }
     }

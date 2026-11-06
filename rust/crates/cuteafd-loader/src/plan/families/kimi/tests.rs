@@ -26,14 +26,14 @@ fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBu
 }
 
 #[test]
-fn shared_catalog_rejects_the_same_unindexed_headers_as_standalone() {
+fn shared_catalog_rejects_the_same_missing_indexed_headers_as_standalone() {
     let dir = snapshot(false);
     let path = dir.path().join("model-00000.safetensors");
     testing::write_safetensors(&path, &[t("unindexed.weight", "BF16", &[2])]);
     let input = PlanInput::open(dir.path()).unwrap();
     let cached = format!("{:#}", input.expert_catalog().unwrap_err());
     let standalone = format!("{:#}", crate::read_expert_catalog(dir.path()).unwrap_err());
-    assert!(cached.contains("index/header tensor count mismatch"), "{cached}");
+    assert!(cached.contains("missing from shard"), "{cached}");
     assert_eq!(cached, standalone);
 }
 

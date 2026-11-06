@@ -163,7 +163,7 @@ mod tests {
                     byte_length: width * shape.iter().product::<usize>() as u64, shape } });
             }
         }
-        let checkpoint = Checkpoint { snapshot: Default::default(), config, quantize_config: None,
+        let checkpoint = Checkpoint { view: None, snapshot: Default::default(), config, quantize_config: None,
             weight_map: tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect(), tensors,
             missing_shards: Vec::new(), shard_bytes: 0 };
         (cfg, checkpoint)

@@ -448,7 +448,7 @@ mod source_format_tests {
                 meta: SafetensorsTensorMetadata { name:name.into(), dtype, shape, byte_offset:0, byte_length:0 } });
         }
         tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
-        let checkpoint = Checkpoint { snapshot:"/missing".into(), config:serde_json::json!({}),
+        let checkpoint = Checkpoint { view: None, snapshot:"/missing".into(), config:serde_json::json!({}),
             quantize_config:None, weight_map: Default::default(), tensors, missing_shards:Vec::new(), shard_bytes:0 };
         (args, checkpoint, cfg)
     }
@@ -479,7 +479,7 @@ mod source_format_tests {
         }).collect();
         tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
         let cfg = MimoV2Config::from_hf(&value["target_config"]).unwrap();
-        let checkpoint = Checkpoint { snapshot:directory.path().into(), config:value["target_config"].clone(),
+        let checkpoint = Checkpoint { view: None, snapshot:directory.path().into(), config:value["target_config"].clone(),
             quantize_config:None, weight_map: Default::default(), tensors, missing_shards:Vec::new(), shard_bytes:0 };
         (directory, args, checkpoint, cfg)
     }

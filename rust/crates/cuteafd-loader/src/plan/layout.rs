@@ -696,7 +696,7 @@ mod draft_prefix_tests {
     #[test]
     fn shared_shape_preserves_admitted_span_instead_of_unit_width() -> anyhow::Result<()> {
         use crate::plan::{empty_report, testing, Checkpoint, Family, PlanOptions};
-        let checkpoint = Checkpoint { snapshot: std::path::PathBuf::new(),
+        let checkpoint = Checkpoint { view: None, snapshot: std::path::PathBuf::new(),
             config: testing::glm5_flash_config(2), quantize_config: None,
             weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
         let model = crate::plan::families::glm::GLM5_FLASH.open(&checkpoint)?;

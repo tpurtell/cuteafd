@@ -236,7 +236,7 @@ mod tests {
 
     fn checkpoint(tensors: Vec<crate::plan::checkpoint::CheckpointTensor>) -> Checkpoint {
         Checkpoint {
-            snapshot: Default::default(), quantize_config: None, weight_map: Default::default(),
+            view: None, snapshot: Default::default(), quantize_config: None, weight_map: Default::default(),
             missing_shards: vec![], shard_bytes: 0,
             config: serde_json::json!({"num_hidden_layers":40,"hidden_size":5120}), tensors,
         }
@@ -413,7 +413,7 @@ mod tests {
             },
         };
         let checkpoint = Checkpoint {
-            snapshot: Default::default(), quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
+            view: None, snapshot: Default::default(), quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
             config: serde_json::json!({"num_hidden_layers":40,"hidden_size":5120}),
             tensors: vec![tensor("embed.weight", DType::Bf16, 100, 200),
                 tensor("head.weight", DType::Bf16, 100, 200),

@@ -462,7 +462,7 @@ pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) ->
         }
     }
     tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
-    Ok(Checkpoint { snapshot: snapshot.to_path_buf(), config, quantize_config: None,
+    Ok(Checkpoint { view: None, snapshot: snapshot.to_path_buf(), config, quantize_config: None,
         weight_map, tensors, missing_shards: Vec::new(), shard_bytes })
 }
 

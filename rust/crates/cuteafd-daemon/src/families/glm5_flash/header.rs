@@ -169,7 +169,7 @@ mod tests {
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         (
             Checkpoint {
-                snapshot: "/unused".into(),
+                view: None, snapshot: "/unused".into(),
                 config: serde_json::Value::Null,
                 quantize_config: None, weight_map: Default::default(),
                 tensors,

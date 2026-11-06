@@ -211,7 +211,7 @@ mod tests {
             .into_iter().map(|(name, shape)| CheckpointTensor { shard: "fixture".into(),
                 meta: crate::SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
                     byte_length: shape.iter().product::<usize>() as u64 * 2, shape, byte_offset: 0 } }).collect();
-        let checkpoint = Checkpoint { snapshot: "fixture".into(), config, quantize_config: None,
+        let checkpoint = Checkpoint { view: None, snapshot: "fixture".into(), config, quantize_config: None,
             weight_map: Default::default(), tensors, missing_shards: vec![], shard_bytes: 0 };
         // Zero target layers isolates the head representation and ownership contract.
         let single = resident_weights(&checkpoint, &cfg, 0, 1, Default::default()).unwrap();

@@ -18,7 +18,7 @@ fn checkpoint(fixture: &Fixture, tensors: &[(&str, DType, &[usize])]) -> Result<
     }
     std::fs::write(fixture.directory().join("weights.bin"), payload)?;
     headers.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
-    Ok(Checkpoint { snapshot: fixture.directory().into(), config: serde_json::Value::Null,
+    Ok(Checkpoint { view: None, snapshot: fixture.directory().into(), config: serde_json::Value::Null,
         quantize_config: None, weight_map: Default::default(), tensors: headers, missing_shards: vec![], shard_bytes: 0 })
 }
 

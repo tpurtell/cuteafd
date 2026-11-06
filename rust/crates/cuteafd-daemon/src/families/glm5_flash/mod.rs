@@ -736,7 +736,7 @@ mod draft_cli_tests {
                 offset += byte_length;
                 tensor
             }).collect();
-        let mut checkpoint = Checkpoint { snapshot: "fixture".into(), config, quantize_config: None,
+        let mut checkpoint = Checkpoint { view: None, snapshot: "fixture".into(), config, quantize_config: None,
             weight_map: Default::default(), tensors, missing_shards: vec![], shard_bytes: 0 };
         for ranks in [1, 2] {
             for fp8_head in [false, true] {

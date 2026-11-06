@@ -443,7 +443,7 @@ mod tests {
         }
         let mut config = crate::plan::testing::glm5_config();
         config["vocab_size"] = serde_json::json!(cfg.vocab_size);
-        Checkpoint {snapshot:Default::default(),config,quantize_config:None,
+        Checkpoint {view: None, snapshot:Default::default(),config,quantize_config:None,
             weight_map:tensors.iter().map(|t|(t.meta.name.clone(),t.shard.clone())).collect(),tensors,
             missing_shards:Vec::new(),shard_bytes:0}
     }

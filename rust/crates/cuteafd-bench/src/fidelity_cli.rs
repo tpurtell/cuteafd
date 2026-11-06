@@ -262,7 +262,7 @@ fn discovered_prefill_logits_at(status: &Value, hf_home: &std::path::Path) -> Re
     let config = read_json(&path)
         .with_context(|| format!("fidelity family discovery: cannot read {} (server advertised {})",
             path.display(), advertised.display()))?;
-    let checkpoint = Checkpoint { snapshot, config, quantize_config: None,
+    let checkpoint = Checkpoint { view: None, snapshot, config, quantize_config: None,
         weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
     let detected = family::registry().iter().find(|f| f.detect(&checkpoint))
         .context("fidelity family discovery: snapshot has no registered family")?;
@@ -610,7 +610,7 @@ mod tests {
         let model = "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6";
         let relative = "models--wrldsuksgo2mars--Muse-Spark-Open-EXL3-K4-Core-K6/snapshots/89998fb177acd9a862ac8bd4fb79bfd50e940c97";
         let snapshot = home.join("hub").join(relative);
-        let checkpoint = Checkpoint { snapshot: snapshot.clone(), config: read_json(&snapshot.join("config.json")).unwrap(),
+        let checkpoint = Checkpoint { view: None, snapshot: snapshot.clone(), config: read_json(&snapshot.join("config.json")).unwrap(),
             quantize_config: None, weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
         let detected = family::registry().iter().find(|f| f.detect(&checkpoint)).unwrap();
         assert_eq!(detected.id(), "muse_spark");

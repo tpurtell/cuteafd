@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn planner_equals_daemon_owned_and_head_split_host_layout() -> Result<()> {
         use cuteafd_loader::{plan::{checkpoint::Checkpoint, family}, serving_capacity::{CacheOptions, KvPlacement}};
-        let checkpoint = Checkpoint { snapshot: Default::default(),
+        let checkpoint = Checkpoint { view: None, snapshot: Default::default(),
             config: cuteafd_loader::plan::testing::kimi_k3_config(), quantize_config: None,
             weight_map: cuteafd_loader::plan::testing::kimi_k3_tensors(false).into_iter()
                 .map(|(name, ..)| (name, "fixture.safetensors".into())).collect(),

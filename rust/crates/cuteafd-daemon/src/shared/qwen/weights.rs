@@ -268,7 +268,7 @@ mod tests {
         use cuteafd_loader::SafetensorsTensorMetadata;
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("weights.bin"), [9, 9, 0, 63, 128, 63, 7])?;
-        let checkpoint = Checkpoint { snapshot: dir.path().into(), config: serde_json::json!({}),
+        let checkpoint = Checkpoint { view: None, snapshot: dir.path().into(), config: serde_json::json!({}),
             quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 7,
             tensors: vec![CheckpointTensor { shard: "weights.bin".into(), meta: SafetensorsTensorMetadata {
                 name: "weight".into(), dtype: DType::Bf16, shape: vec![1, 2], byte_offset: 2, byte_length: 4,
