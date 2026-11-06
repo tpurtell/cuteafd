@@ -351,6 +351,144 @@ int main() {
     subprocess.run([str(executable)], check=True, capture_output=True)
 
 
+def test_compiled_graph_capture_prepares_blas_before_capture_without_changing_stream(tmp_path):
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("C++ compiler unavailable")
+    linear = (ROOT / "native/shared/cuda/linear.cu").read_text()
+    native = (ROOT / "native/shared/src/cuteafd_native.cc").read_text()
+    helper = "cuteafd_status_t cublas_handle(" + linear.split(
+        "cuteafd_status_t cublas_handle(", 1)[1].split(
+        "cuteafd_status_t validate_linear_args", 1)[0]
+    prepare = 'extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_handle()' + linear.split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_handle()', 1)[1].split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_graph_update_linear_bf16_node', 1)[0]
+    capture = 'extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(' + native.split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(', 1)[1].split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture(', 1)[0]
+    # Exercise the real GEMM handle/stream binding, excluding only its CUDA bias kernel.
+    launch = "cuteafd_status_t launch_linear_bf16_cublas(" + linear.split(
+        "cuteafd_status_t launch_linear_bf16_cublas(", 1)[1].split(
+        "  if (bias != nullptr) {", 1)[0] + "  (void)bias; return 0;\n}\n"
+    mock = r'''
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <thread>
+#include <unordered_map>
+#define CUTEAFD_NATIVE_ENABLE_CUDA 1
+using cuteafd_status_t = int;
+using cudaError_t = int;
+using cublasStatus_t = int;
+using cudaStream_t = void*;
+struct Handle { int device; std::thread::id thread; void* stream; };
+using cublasHandle_t = Handle*;
+constexpr int CUTEAFD_STATUS_OK = 0, CUTEAFD_STATUS_INVALID_ARGUMENT = 1;
+constexpr int CUTEAFD_STATUS_INTERNAL_ERROR = 2, cudaSuccess = 0;
+constexpr int CUBLAS_STATUS_SUCCESS = 0, cudaStreamCaptureModeThreadLocal = 1;
+constexpr int CUBLAS_OP_T = 0, CUBLAS_OP_N = 1, CUDA_R_16BF = 0;
+constexpr int CUBLAS_COMPUTE_32F = 0, CUBLAS_GEMM_DEFAULT_TENSOR_OP = 0;
+static thread_local int device = 0, device_error = 0;
+static thread_local bool capturing = false;
+static int creates = 0, begins = 0, bindings = 0, gemms = 0;
+static int create_error = 0, capture_error = 0;
+static Handle handles[16];
+static cublasHandle_t last_gemm = nullptr;
+int cudaGetDevice(int* out) { *out = device; return device_error; }
+int cublasCreate(cublasHandle_t* out) {
+  assert(!capturing);
+  ++creates;
+  if (create_error) return create_error;
+  handles[creates] = {device, std::this_thread::get_id(), nullptr};
+  *out = &handles[creates];
+  return 0;
+}
+int cublasSetStream(cublasHandle_t handle, void* stream) {
+  assert(handle->device == device && handle->thread == std::this_thread::get_id());
+  ++bindings; handle->stream = stream; return 0;
+}
+template<class... Args> int cublasGemmEx(cublasHandle_t handle, Args...) {
+  ++gemms; last_gemm = handle; return 0;
+}
+int cudaStreamBeginCapture(void* stream, int mode) {
+  assert(stream && mode == cudaStreamCaptureModeThreadLocal && !capturing);
+  bool ready = false;
+  for (const auto& handle : handles)
+    ready |= handle.thread == std::this_thread::get_id() && handle.device == device;
+  assert(ready);
+  ++begins;
+  capturing = capture_error == 0;
+  return capture_error;
+}
+int status_from_cuda(int status) { return status; }
+int status_from_cublas(int status) { return status; }
+void log_blas_handle_created(const char*) {}
+int fail(int status, const char*) { return status; }
+int fail_cuda(int status, const char*, int) { return status; }
+int ok() { return 0; }
+int validate_linear_bf16_args(const uint16_t*, const uint16_t*, uint16_t*,
+                              size_t, size_t, size_t) { return 0; }
+'''
+    main = r'''
+int main() {
+  void* capture_stream = reinterpret_cast<void*>(uintptr_t(0x10));
+  void* eager_stream = reinterpret_cast<void*>(uintptr_t(0x20));
+  uint16_t buffer = 0;
+  auto gemm = [&](void* stream) {
+    assert(launch_linear_bf16_cublas(&buffer, &buffer, nullptr, &buffer,
+                                   1, 1, 1, stream) == 0);
+    assert(last_gemm->stream == stream);
+  };
+  assert(cuteafd_cuda_graph_begin_capture(nullptr) == 1 && creates == 0);
+  device_error = 19;
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 19 && begins == 0);
+  device_error = 0; create_error = 7;
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 7 && begins == 0);
+  create_error = 0;
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0);
+  assert(creates == 2 && bindings == 0);
+  gemm(capture_stream);
+  const auto first = last_gemm;
+  capturing = false;
+  gemm(eager_stream);
+  const int bound = bindings;
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0);
+  assert(first->stream == eager_stream && bindings == bound && creates == 2);
+  gemm(capture_stream);
+  capturing = false;
+  gemm(eager_stream);
+  device = 1;
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 3);
+  gemm(capture_stream);
+  assert(last_gemm != first && last_gemm->device == 1);
+  capturing = false;
+  device = 0;
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 3);
+  capturing = false;
+  std::thread worker([&] {
+    assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 4);
+    gemm(capture_stream);
+    assert(last_gemm != first && last_gemm->device == 0);
+    capturing = false;
+  });
+  worker.join();
+  capture_error = 71;
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == CUTEAFD_STATUS_INTERNAL_ERROR);
+  assert(!capturing && creates == 4 && begins == 6 && gemms == 6);
+  assert(first->stream == eager_stream);
+}
+'''
+    fixture = tmp_path / "capture_blas.cc"
+    fixture.write_text(mock + helper + prepare + capture + launch + main)
+    executable = tmp_path / "capture_blas"
+    built = subprocess.run([compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
+                            str(fixture), "-o", str(executable)], capture_output=True, text=True)
+    assert built.returncode == 0, built.stderr
+    ran = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert ran.returncode == 0, ran.stderr
+
+
 def test_inventory_signature_matches_installed_toolkit_without_cuda_initialization(tmp_path):
     header = Path("/usr/local/cuda/include/crt/host_runtime.h")
     compiler = shutil.which("g++")

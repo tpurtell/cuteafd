@@ -520,7 +520,23 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         native = v41_source()
         generic = (ROOT / 'scripts/launch/run-family.sh').read_text()
         self.assertIn('--embedding-placement "$EMBEDDING"', native)
-        self.assertIn('family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")', generic)
+        from test_run_family_dispatch import _family_launch_result
+        for extra_args, expected in [((), 'gpu'), (('--embedding-placement', 'host'), 'host')]:
+            with self.subTest(embedding=expected), tempfile.TemporaryDirectory() as temporary:
+                launched = _family_launch_result(
+                    Path(temporary),
+                    {'model_type': 'glm_moe_dsa', 'num_hidden_layers': 4,
+                     'first_k_dense_replace': 3},
+                    'test/embedding',
+                    'EXLR8_MANIFEST=up1\nSPARK_COUNT=4\nRTX_GPUS=1\n'
+                    'SPECULATOR=off\nVISION=off\nAUDIO=off\n',
+                    extra_args=extra_args)
+                self.assertEqual(launched.returncode, 0, launched.stderr)
+                commands = [shlex.split(line) for line in launched.stderr.splitlines()
+                            if 'cuteafd serve-glm --snapshot' in line]
+                self.assertTrue(commands, launched.stderr)
+                for argv in commands:
+                    self.assertEqual(argv[argv.index('--embedding-placement') + 1], expected)
         self.assertIn('cfg_overrides[EMBEDDING]="$embedding_override"', generic)
 
     def test_small_card_embedding_default_and_explicit_overrides(self) -> None:

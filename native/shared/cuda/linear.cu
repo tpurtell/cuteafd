@@ -1255,6 +1255,12 @@ cuteafd_status_t launch_matmul_bf16_strided_batched_cublas(
 
 }  // namespace
 
+// Internal capture preparation; GEMMs retain their own per-call stream binding.
+extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_handle() {
+  cublasHandle_t handle = nullptr;
+  return cublas_handle(&handle);
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_graph_update_linear_bf16_node(
     void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index, cuteafd_device_buffer_t input,
     cuteafd_device_buffer_t weight, const cuteafd_device_buffer_t* bias,

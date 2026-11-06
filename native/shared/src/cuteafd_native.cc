@@ -21,6 +21,8 @@
 #if CUTEAFD_NATIVE_ENABLE_CUDA
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+
+extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_handle();
 #endif
 
 #if CUTEAFD_NATIVE_ENABLE_RDMA
@@ -1615,6 +1617,11 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(void* cuda_stream) 
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph capture stream is null");
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
+  // Lazy cuBLAS initialization allocates CUDA state and cannot run in capture.
+  const cuteafd_status_t blas_status = cuteafd_cuda_prepare_cublas_handle();
+  if (blas_status != CUTEAFD_STATUS_OK) {
+    return fail(blas_status, "cuBLAS handle preparation before graph capture failed");
+  }
   // Runtime graph slots are owned per host thread. Thread-local capture avoids
   // invalidating a graph capture when unrelated test/request threads enqueue
   // CUDA work on their own streams.
