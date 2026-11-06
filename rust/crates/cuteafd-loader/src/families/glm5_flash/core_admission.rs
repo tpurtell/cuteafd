@@ -76,18 +76,18 @@ impl CoreCharges {
             && owners.is_none_or(|o| ranks == 2 && o.len() == layers), "Flash K6 admission geometry");
         let owned = owned_mla(cfg, layers, ranks, owners.is_some());
         let mut bodies = vec![Vec::new(); ranks];
-        let mut native_names = [BTreeSet::new(), BTreeSet::new()];
+        let mut native_names = vec![[BTreeSet::new(), BTreeSet::new()]; ranks];
         for layer in 0..layers {
             let owner = owners.and_then(|o| (cfg.attention[layer] == super::GlmNextAttention::Mla).then_some(o[layer]));
             for (rank, weights) in core.layer_weights(cfg, layer, ranks, owner)?.into_iter().enumerate() {
                 bodies[rank].extend(weights.into_values());
             }
-            for weights in core.layer_native(cfg, layer, ranks, owner)? {
+            for (rank, weights) in core.layer_native(cfg, layer, ranks, owner)?.into_iter().enumerate() {
                 for weight in weights.values().filter(|w| w.fp8) {
                     let prefix = if ranks == 1 || owner.is_some() { "glmf_stage" } else { "glmf2_stage" };
                     for (index, caps) in [vec![64, decode_rows], vec![4096]].into_iter().enumerate() {
                         for cap in caps {
-                            native_names[index].insert(fp8_projection_name(prefix, weight.shape, cap));
+                            native_names[rank][index].insert(fp8_projection_name(prefix, weight.shape, cap));
                         }
                     }
                 }
@@ -109,10 +109,10 @@ impl CoreCharges {
             ensure!(matches.len() == 1, "Flash K6 requires one {name}");
             Ok(matches[0]["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0).try_into()?)
         };
-        let scratch = |decode: bool| -> Result<usize> {
+        let scratch = |rank: usize, decode: bool| -> Result<usize> {
             let mut bytes = 0;
             for name in route_stage_names(cfg, ranks, owned, decode, decode_rows).iter()
-                .chain(native_names[usize::from(!decode)].iter()) {
+                .chain(native_names[rank][usize::from(!decode)].iter()) {
                 bytes = bytes.max(lookup(name)?);
             }
             Ok(bytes)
@@ -124,7 +124,7 @@ impl CoreCharges {
                 }
             }
         }
-        for name in native_names.iter().flatten() { lookup(name)?; programs.insert(name.clone()); }
+        for name in native_names.iter().flatten().flatten() { lookup(name)?; programs.insert(name.clone()); }
         let projection = |body: &[CoreWeightLayout], rows| -> Result<Option<ProjectionScratchLayout>> {
             let mut result: Option<ProjectionScratchLayout> = None;
             for w in body {
@@ -142,8 +142,8 @@ impl CoreCharges {
         for (rank, body) in bodies.into_iter().enumerate() {
             layouts.push(CoreRankLayout {
                 stages: if body.is_empty() { None } else { Some([
-                    CoreStageLayout::new(cfg, decode_rows, ranks, owned, scratch(true)?)?,
-                    CoreStageLayout::new(cfg, unit, ranks, owned, scratch(false)?)?]) },
+                    CoreStageLayout::new(cfg, decode_rows, ranks, owned, scratch(rank, true)?)?,
+                    CoreStageLayout::new(cfg, unit, ranks, owned, scratch(rank, false)?)?]) },
                 decode: projection(&body, decode_rows)?, prefill: projection(&body, unit)?,
                 target_head: if rank == 0 { head_scratch(decode_rows)? } else { None },
                 draft_head: if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None },

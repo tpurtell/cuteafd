@@ -222,6 +222,52 @@ mod tests {
     use cuteafd_core::DType;
 
     #[test]
+    fn selected_mixed_attention_preserves_fused_scratch_and_owner_specific_fp8_receipts() -> Result<()> {
+        use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+        use super::super::core_admission::{CoreCharges, fp8_projection_name};
+        let (cfg, mut checkpoint) = fixture();
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&checkpoint.config)?)?;
+        for leaf in ["q_b_proj", "o_proj"] {
+            let stem = format!("{PREFIX}3.self_attn.{leaf}");
+            checkpoint.tensors.retain(|t| !t.meta.name.starts_with(&format!("{stem}.")));
+            let name = format!("{stem}.weight");
+            let shape = expected(&cfg).remove(&name).unwrap();
+            checkpoint.tensors.push(CheckpointTensor { shard: "native.safetensors".into(),
+                meta: SafetensorsTensorMetadata { name, dtype: DType::Bf16, byte_offset: 0,
+                    byte_length: shape.iter().product::<usize>() as u64 * 2, shape } });
+        }
+        checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
+        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+            checkpoint.view = Some(CheckpointView::select(dir.path(), mode)?);
+            let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+            assert_eq!(core.projections.len(), 314);
+            assert_eq!(core.native.len(), 2);
+            assert_eq!(core.native.values().all(|p| p.fp8), mode == AttentionMode::Fp8Compact);
+            assert!(!core.scratch_mask(&cfg, cfg.layers).mla);
+            let mut manifest = executable_package(&cfg, &core)?;
+            if mode == AttentionMode::Fp8Compact {
+                for layout in core.layer_native(&cfg, 3, 2, Some(0))?[0].values() {
+                    for cap in [64, 4096] {
+                        manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({
+                            "name": fp8_projection_name("glmf_stage", layout.shape, cap),
+                            "scratch_bytes_at_capacity": {"scratch": 16384} }));
+                    }
+                }
+            }
+            let charges = CoreCharges::from_package(&cfg, &core, cfg.layers, 2,
+                Some(&vec![0; cfg.layers]), 4096, 3, 64, None, false, &manifest)?;
+            for rank in 0..2 {
+                let expected = if rank == 0 && mode == AttentionMode::Fp8Compact { 16384 } else { 4096 };
+                for stage in charges.ranks[rank].stages.as_ref().unwrap() {
+                    assert_eq!(stage.extents["scratch"], expected);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn native_attention_tp_layouts_do_not_inherit_trellis_rotations() -> Result<()> {
         let (cfg, _) = fixture();
         let mut inventory = CoreInventory::default();
