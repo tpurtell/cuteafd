@@ -740,7 +740,7 @@ mod tests {
         assert!(matches!(
             resolve_capacity(
                 CapacityPolicy::default(),
-                &profile(vec![device(0, GIB, 95 * GIB)]),
+                &profile(vec![device(0, GIB, 96 * GIB + 1)]),
                 &[hardware(0, 0)]
             ),
             Err(CapacityError::ReservationsExceeded { device: 0, .. })

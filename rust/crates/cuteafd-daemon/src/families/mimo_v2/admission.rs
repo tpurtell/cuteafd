@@ -635,7 +635,6 @@ fn reservation_report(
         devices.push(serde_json::json!({
             "device": costs.device, "total_bytes": sample.total_bytes,
             "non_engine_bytes": non_engine, "engine_budget_bytes": budget,
-            "minimum_free_bytes": minimum_free,
             "fixed_categories": fixed, "fixed_bytes": fixed_bytes,
             "requested_pool_bytes": pool_bytes,
             "complete_requested_bytes": fixed_bytes.checked_add(pool_bytes).context("MiMo complete requested bytes overflow")?,

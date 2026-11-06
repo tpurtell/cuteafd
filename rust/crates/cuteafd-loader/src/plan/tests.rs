@@ -2959,7 +2959,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             // Default headroom is independent of the separately charged workspaces and code.
             let code = crate::placement::loaded_code("dsv4f", "*", false, 0).unwrap().bytes;
             assert_eq!(total - device.capacity_bytes, crate::serving_capacity::deepseek_v4_headroom_bytes(
-                total, 10 << 30, steps.bytes + code, graph));
+                10 << 30, steps.bytes + code, graph));
         }
     }
 }
