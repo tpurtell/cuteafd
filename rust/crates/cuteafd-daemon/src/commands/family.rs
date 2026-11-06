@@ -58,7 +58,13 @@ fn snapshot_arg(args: &[String]) -> Option<&str> {
 
 /// The family id of the checkpoint at `snapshot`.
 pub(crate) fn detect(snapshot: &Path) -> Result<&'static str> {
-    let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)
+    detect_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?)
+}
+
+fn detect_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<&'static str> {
+    let snapshot = view.snapshot();
+    let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(view)
         .with_context(|| format!("reading {}", snapshot.display()))?;
     let family = cuteafd_loader::plan::family::detect(&checkpoint)
         .with_context(|| format!("{}: no supported family (run `cuteafd plan` on it)", snapshot.display()))?;
@@ -68,10 +74,18 @@ pub(crate) fn detect(snapshot: &Path) -> Result<&'static str> {
 /// The argv of the family command this `serve`/`golden` invocation stands for,
 /// or None after printing help.
 pub(crate) fn argv(kind: Kind, args: FamilyArgs) -> Result<Option<Vec<String>>> {
+    let attention = crate::cli::AttentionArgs {
+        compact_attention: args.args.iter().any(|arg| arg == "--compact-attention")
+            || std::env::var("CUTEAFD_COMPACT_ATTENTION").is_ok_and(|value| value == "true"),
+        fp8_compact_attention: args.args.iter().any(|arg| arg == "--fp8-compact-attention")
+            || std::env::var("CUTEAFD_FP8_COMPACT_ATTENTION").is_ok_and(|value| value == "true"),
+    };
+    anyhow::ensure!(!(attention.compact_attention && attention.fp8_compact_attention),
+        "--compact-attention conflicts with --fp8-compact-attention");
     let wants_help = args.args.iter().any(|a| a == "--help" || a == "-h");
     let family = match (&args.family, snapshot_arg(&args.args)) {
         (Some(family), _) => family.clone(),
-        (None, Some(snapshot)) => detect(Path::new(snapshot))?.to_string(),
+        (None, Some(snapshot)) => detect_view(&attention.select(Path::new(snapshot))?)?.to_string(),
         (None, None) if wants_help || args.args.is_empty() => {
             let mut cli = crate::cli::Cli::command();
             cli.find_subcommand_mut(kind.name()).expect("subcommand").print_long_help()?;
@@ -93,6 +107,7 @@ pub(crate) fn argv(kind: Kind, args: FamilyArgs) -> Result<Option<Vec<String>>> 
         bail!("unknown family {family}; known: {}",
             FAMILIES.iter().map(|(id, ..)| *id).collect::<Vec<_>>().join(", "));
     };
+    attention.validate_family(&family)?;
     let command = match kind {
         Kind::Serve => serve,
         Kind::Golden => golden.with_context(|| format!("family {family} has no golden comparison"))?,

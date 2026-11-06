@@ -38,8 +38,15 @@ impl WorkerIdentity {
 
     pub fn from_snapshot_manifest(snapshot: &Path, geometry: cuteafd_core::ExpertGeometry,
         selected: crate::expert::SparkWorld, manifest: Option<&str>) -> Result<Self> {
+        Self::from_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+            cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, geometry, selected, manifest)
+    }
+
+    pub fn from_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        geometry: cuteafd_core::ExpertGeometry, selected: crate::expert::SparkWorld,
+        manifest: Option<&str>) -> Result<Self> {
         let world = selected.topology().world_size();
-        let identity = cuteafd_loader::plan::checkpoint::identity::CheckpointIdentity::from_snapshot(snapshot, manifest)?;
+        let identity = cuteafd_loader::plan::checkpoint::identity::CheckpointIdentity::from_view(view, manifest)?;
         Ok(Self { checkpoint: identity.fingerprint, manifest: identity.manifest,
             geometry: [geometry.hidden, geometry.experts, geometry.topk, geometry.intermediate, geometry.layers],
             world: u32::try_from(world)?, topology: [selected.topology().tp(), selected.topology().ep()],

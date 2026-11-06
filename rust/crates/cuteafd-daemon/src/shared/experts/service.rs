@@ -68,6 +68,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         );
     }
     let config = NativeExpertServiceConfig {
+        attention: args.attention,
         library: args.native_lib,
         exl3_aot_dir: args.exl3_aot_dir,
         exl3_schedule: args.exl3_schedule,
@@ -96,6 +97,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
 
 #[derive(Clone)]
 pub(crate) struct NativeExpertServiceConfig {
+    pub attention: crate::cli::AttentionArgs,
     pub encoder: Option<crate::shared::vision::worker::EncoderWorkerConfig>,
     pub audio_encoder: Option<crate::shared::vision::worker::AudioWorkerConfig>,
     pub library: PathBuf,
@@ -586,6 +588,7 @@ mod tests {
 
     fn config(world: usize, rank: usize, topology: Option<SparkTopology>) -> NativeExpertServiceConfig {
         NativeExpertServiceConfig {
+            attention: Default::default(),
             library: PathBuf::from("/native.so"),
             exl3_aot_dir: None,
             exl3_schedule: Default::default(),

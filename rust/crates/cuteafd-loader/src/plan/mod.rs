@@ -686,7 +686,10 @@ impl PlanInput {
             if let Some(validation) = &self.header_validation {
                 crate::families::deepseek_v41::v41_catalog::expert_catalog_from_checkpoint(&self.checkpoint, validation)
             } else {
-                crate::read_expert_catalog(&self.checkpoint.snapshot)
+                match &self.checkpoint.view {
+                    Some(view) => crate::read_expert_catalog_view(view),
+                    None => crate::read_expert_catalog(&self.checkpoint.snapshot),
+                }
             }
         }) {
             Ok(catalog) => Ok(catalog),

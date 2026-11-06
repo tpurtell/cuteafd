@@ -1659,7 +1659,10 @@ impl Opened {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
-    let format = cuteafd_loader::plan::checkpoint::CheckpointFormat::detect(&args.snapshot)?;
+    let view = args.attention.select(&args.snapshot)?;
+    let format = if view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Compact {
+        cuteafd_loader::plan::checkpoint::CheckpointFormat::HfIndexed
+    } else { cuteafd_loader::plan::checkpoint::CheckpointFormat::detect(&args.snapshot)? };
     let native = format == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
     let mut resolved = args.clone();
     if native {
@@ -1672,7 +1675,6 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     } else { ensure!(args.exlr8_manifest.is_none(), "--exlr8-manifest requires a native EXLR8 checkpoint"); }
     let args = &resolved;
     check_options(args)?;
-    let view = args.attention.select(&args.snapshot)?;
     let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
     cuteafd_bench::context::set_family(cfg.family_id());
@@ -1707,7 +1709,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
         let mut catalog = if source == args.snapshot {
             cuteafd_loader::read_expert_catalog_view(&view)?
-        } else { cuteafd_loader::read_expert_catalog(source)? };
+        } else { cuteafd_loader::read_expert_catalog_view(&args.attention.select(source)?)? };
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
         ensure!(catalog.fp8().is_some() || catalog.exl3().is_some()
             || catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8,
@@ -2411,7 +2413,8 @@ impl Opened {
             let model = cuteafd_transport::worker_selection::ModelAdmission::new(
                 vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress, partial_reply_bytes: None }],
                 crate::shared::placement::spark_rings(64 << 20)?, executions)?;
-            let admission = crate::shared::placement::SparkAdmission::plan_manifest(source, geometry, self.experts.as_ref(),
+            let source_view = args.attention.select(source)?;
+            let admission = crate::shared::placement::SparkAdmission::plan_view(&source_view, geometry, self.experts.as_ref(),
                 &working, peers.len(), None, model, args.exlr8_manifest.as_deref())?;
             let native_ranks = if native_admission.is_some() {
                 push_policy.plan(|| {
@@ -2443,8 +2446,8 @@ impl Opened {
             if native_admission.is_some() {
                 native_push = push_policy.plan(|| {
                     let planned = plan_native(0)?;
-                    let push = CoordinatorPush::prepare_alone_admitted(
-                        &args.snapshot, self.experts.as_ref(), gpus, native_push_experts()?,
+                    let push = CoordinatorPush::prepare_alone_view_admitted(
+                        &args.attention.select(&args.snapshot)?, self.experts.as_ref(), gpus, native_push_experts()?,
                         admitted_push_host.clone().context("Flash push host receipt")?)?;
                     Ok((push, 0, planned))
                 })?;
@@ -2453,7 +2456,7 @@ impl Opened {
                 coordinator_push = push_policy.plan(|| {
                     let experts = expert_plan()?;
                     let planned = plan_dense(0)?;
-                    let push = CoordinatorPush::prepare_alone_admitted(&args.snapshot, self.experts.as_ref(), gpus, experts,
+                    let push = CoordinatorPush::prepare_alone_view_admitted(&args.attention.select(&args.snapshot)?, self.experts.as_ref(), gpus, experts,
                         admitted_push_host.clone().context("Flash push host receipt")?)?;
                     Ok((push, 0, devices.clone(), planned))
                 })?;

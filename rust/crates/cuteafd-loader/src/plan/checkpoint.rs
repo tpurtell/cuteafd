@@ -4,8 +4,6 @@ use crate::{catalog::MAX_JSON_BYTES, read_safetensors_metadata, SafetensorsTenso
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub mod identity;
@@ -212,6 +210,10 @@ impl Checkpoint {
 
     /// A runtime role declares the tensors it reads before any shard is opened.
     /// Every selected index entry must have a readable, matching header.
+    pub fn open_view_for_role(view: &CheckpointView, role: &str, needed: impl Fn(&str) -> bool) -> Result<Self> {
+        Self::open_view_filtered(view, Some(role), needed, None)
+    }
+
     pub fn open_for_role(snapshot: &Path, role: &str, needed: impl Fn(&str) -> bool) -> Result<Self> {
         Self::open_filtered(snapshot, Some(role), needed)
     }
@@ -243,25 +245,10 @@ impl Checkpoint {
         if view.mode() == AttentionMode::Hqa && CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
             return super::exlr8::inventory(snapshot, config, needed);
         }
-        let quantize_config = view.quant_names()
-            .iter()
-            .map(|name| snapshot.join(name))
-            .find(|path| path.is_file())
-            .map(|path| crate::formats::exl3_storage::read_storage_metadata(&path, MAX_JSON_BYTES, None))
-            .transpose()?;
+        let quantize_config = view.quantize_config();
         let index_path = view.index_path();
-        let weight_map: BTreeMap<String, String> = if index_path.is_file() {
-            #[derive(serde::Deserialize)]
-            struct Index { weight_map: BTreeMap<String, String> }
-            let file = File::open(&index_path)?;
-            let size = file.metadata()?.len();
-            ensure!(size <= MAX_JSON_BYTES, "index exceeds metadata size limit");
-            // Slice parsing avoids serde_json's per-byte Read adapter on large indexes.
-            let mut bytes = Vec::with_capacity(usize::try_from(size)?);
-            file.take(MAX_JSON_BYTES + 1).read_to_end(&mut bytes)?;
-            ensure!(bytes.len() as u64 <= MAX_JSON_BYTES, "index exceeds metadata size limit");
-            let index: Index = serde_json::from_slice(&bytes).context("decoding weight_map")?;
-            index.weight_map
+        let weight_map: BTreeMap<String, String> = if let Some(index) = view.weight_map() {
+            index.clone()
         } else {
             let single = snapshot.join("model.safetensors");
             ensure!(

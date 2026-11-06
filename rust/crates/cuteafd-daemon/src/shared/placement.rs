@@ -23,6 +23,7 @@ pub(crate) struct SparkAdmission {
     assignments: Vec<SparkAssignment>,
     push_snapshot: Option<std::path::PathBuf>,
     push_manifest: Option<String>,
+    view: cuteafd_loader::plan::checkpoint::CheckpointView,
 }
 
 impl SparkAdmission {
@@ -37,9 +38,18 @@ impl SparkAdmission {
         catalog: Option<&cuteafd_loader::OfficialV41Catalog>, working: &SparkWorkingSet,
         world: usize, topology: Option<SparkTopology>, model: ModelAdmission,
         manifest: Option<&str>) -> Result<Self> {
+        Self::plan_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+            cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, geometry, catalog, working,
+            world, topology, model, manifest)
+    }
+
+    pub(crate) fn plan_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView, geometry: ExpertGeometry,
+        catalog: Option<&cuteafd_loader::OfficialV41Catalog>, working: &SparkWorkingSet,
+        world: usize, topology: Option<SparkTopology>, model: ModelAdmission, manifest: Option<&str>) -> Result<Self> {
+        let snapshot = view.snapshot();
         ensure!(working.spark_layers.is_empty() || working.spark_ranks == world,
             "Spark admission working-set world differs from launched peers");
-        let identity = WorkerIdentity::from_snapshot_manifest(snapshot, geometry,
+        let identity = WorkerIdentity::from_view(view, geometry,
             crate::shared::spark_topology::world(topology, world)?, manifest)?;
         let selection = WorkerSelection::new(identity, &working.spark_layers)?.with_model(model.clone())?;
         // Idle workers still acknowledge the identity, but need no storage package.
@@ -76,7 +86,7 @@ impl SparkAdmission {
                 "Spark admission catalog geometry differs from coordinator");
             crate::shared::spark_topology::require_supported(topology, catalog)?;
             let tp = topology.map_or(world, |topology| topology.tp() as usize);
-            let headers = cuteafd_loader::plan::files::open_role(snapshot,
+            let headers = cuteafd_loader::plan::files::open_role_view(view,
                 cuteafd_loader::plan::files::ReadRole::Spark { rank: 0, world: tp })?;
             let recipe = cuteafd_loader::plan::experts::checkpoint_spark_recipe(&headers, tp, &working.spark_layers)?;
             (0..world).map(|rank| {
@@ -103,7 +113,7 @@ impl SparkAdmission {
             Some(snapshot.to_path_buf())
         } else { None };
         let selection = if push_snapshot.is_some() { selection.with_push_weights() } else { selection };
-        Ok(Self { selection, assignments, push_snapshot, push_manifest: manifest.map(str::to_owned) })
+        Ok(Self { selection, assignments, push_snapshot, push_manifest: manifest.map(str::to_owned), view: view.clone() })
     }
 
     fn reconcile(&self, reports: &[ModelAdmissionResponse]) -> Result<()> {
@@ -148,6 +158,7 @@ impl SparkAdmission {
             let assignments = self.assignments.clone();
             let layers = self.selection.layers();
             let manifest = self.push_manifest.clone();
+            let view = self.view.clone();
             let cancel = pending.cancellation_streams()?;
             let (streams, ranks) = match coordinator {
                 Some((streams, ranks)) => (streams, Some(ranks)),
@@ -157,7 +168,7 @@ impl SparkAdmission {
                 let mut pending = pending;
                 pending.push_weights(streams, |offers| {
                     let started = std::time::Instant::now();
-                    let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+                    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
                     tracing::info!(elapsed_ms = started.elapsed().as_millis(),
                         "Spark push admission catalog opened");
                     if let Some(manifest) = manifest.as_deref() {

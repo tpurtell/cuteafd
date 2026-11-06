@@ -131,7 +131,7 @@ mod selection_tests {
         let geometry = cuteafd_core::ExpertGeometry::MIMO_V26_PRO;
         let identity = WorkerIdentity::from_snapshot(dir.path(), geometry, cuteafd_transport::expert::SparkWorld::canonical(6).unwrap()).unwrap();
         // Every backend consumes the same exact selected IDs within checkpoint bounds.
-        let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
+        let mut config = NativeExpertServiceConfig { attention: Default::default(), encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
             snapshot: dir.path().into(), exlr8_manifest: None, exlr8_prefill_activations: Default::default(), rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
             rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_roles: false, bf16_ingress: false };
@@ -245,12 +245,15 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     );
     // The checkpoint fixes the process expert geometry before the native
     // library loads, so its helpers and every wire size agree with it.
-    let inventory = cuteafd_loader::plan::Checkpoint::inventory(&config.snapshot)?;
-    let v41 = cuteafd_loader::plan::family::detect(&inventory).is_some_and(|family| family.id() == "deepseek_v41");
+    let view = config.attention.select(&config.snapshot)?;
+    let inventory = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
+    let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
+    config.attention.validate_family(family)?;
+    let v41 = family == "deepseek_v41";
     let mut catalog = if v41 {
         cuteafd_loader::read_official_v41_spark_catalog(&config.snapshot, config.rank, config.world)?
     } else {
-        cuteafd_loader::read_expert_catalog(&config.snapshot)?
+        cuteafd_loader::read_expert_catalog_view(&view)?
     };
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     crate::shared::spark_topology::require_wire(config.spark_world()?, &catalog)?;
@@ -303,8 +306,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             }
         };
         let selected = (|| -> Result<_> {
-            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot_manifest(
-                &config.snapshot, geometry, config.spark_world()?, config.exlr8_manifest.as_deref())?;
+            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_view(
+                &view, geometry, config.spark_world()?, config.exlr8_manifest.as_deref())?;
             selection.validate_for(&identity)?;
             admit_worker_selection(&mut config, &selection, &catalog)?;
             Ok(selection)

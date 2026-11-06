@@ -1463,6 +1463,17 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   readlink -f "$dir/snapshots/$rev"
 }
+attention_mode="$(get ATTENTION_MODE hqa)"
+attention_mode_args=()
+case "$attention_mode" in
+  hqa) ;;
+  compact|fp8-compact)
+    [[ "$family" == glm5_flash ]] || release_die "unsupported ATTENTION_MODE=$attention_mode for $family; only glm5_flash supports alternate attention bundles"
+    if [[ "$attention_mode" == compact ]]; then attention_mode_args=(--compact-attention)
+    else attention_mode_args=(--fp8-compact-attention); fi
+    spark_worker_args+=" ${attention_mode_args[*]}" ;;
+  *) release_die "ATTENTION_MODE must be hqa, compact or fp8-compact" ;;
+esac
 exlr8_manifest="$(get EXLR8_MANIFEST)"
 exlr8_prefill_activations="$(get EXLR8_PREFILL_ACTIVATIONS)"
 if [[ -n "$exlr8_prefill_activations" ]]; then
@@ -1620,7 +1631,7 @@ decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
-family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")
+family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${attention_mode_args[@]}")
 # Loop abort (boot-time only): unset keeps the daemon's shipped defaults.
 for pair in 'LOOP_ABORT_RUN:--loop-abort-run' 'LOOP_ABORT_COPIES:--loop-abort-copies' \
   'LOOP_FAST_SPAN:--loop-fast-span' 'LOOP_FAST_COPIES:--loop-fast-copies'; do
@@ -2491,7 +2502,7 @@ audio_encoder_hash=""
   # Keep checkpoint paths unchanged inside the full namespace mount.
   plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
-    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
+    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${attention_mode_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$checkpoint_family"
   RELEASE_RECLAIM_ARGS=()

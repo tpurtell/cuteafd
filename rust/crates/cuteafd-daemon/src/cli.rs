@@ -227,6 +227,11 @@ impl AttentionArgs {
         else if self.fp8_compact_attention { AttentionMode::Fp8Compact }
         else { AttentionMode::Hqa }
     }
+    pub fn validate_family(&self, family: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(self.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Hqa || family == "glm5_flash",
+            "alternate attention modes are unsupported for {family}; only glm5_flash is implemented");
+        Ok(())
+    }
     pub fn select(&self, snapshot: &std::path::Path) -> anyhow::Result<cuteafd_loader::plan::checkpoint::CheckpointView> {
         cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot, self.mode())
     }
@@ -562,6 +567,8 @@ pub(crate) struct DoctorArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeExpertDaemonArgs {
+    #[command(flatten)]
+    pub attention: AttentionArgs,
     /// Load the checkpoint vision tower in this expert process.
     #[arg(long, conflicts_with = "encoder_only")]
     pub(crate) encoder: bool,
