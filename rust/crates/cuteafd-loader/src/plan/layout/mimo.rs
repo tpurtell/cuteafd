@@ -514,7 +514,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         else { EmbeddingHome::Device(0) };
     let budgets = admission::production_budgets(
         &options.rtx_bytes[..ranks].iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
-        &(0..ranks).map(|rank| admission::device_headroom(options.rtx_bytes[rank], rank,
+        &(0..ranks).map(|rank| admission::device_headroom(rank,
             probe, options.headroom_bytes)).collect::<Vec<_>>(),
         devices.iter().map(|device| Baseline::Forecast { occupied: device.used_bytes(),
             source: "retained checkpoint and media owners before the shared MiMo contract".into(),
@@ -540,7 +540,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
             // free space left by returning before its storage was described.
             for (rank, device) in devices.iter_mut().enumerate() {
                 device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(
-                    admission::device_headroom(options.rtx_bytes[rank], rank, probe, options.headroom_bytes));
+                    admission::device_headroom(rank, probe, options.headroom_bytes));
                 for cost in &profiles.steady.devices[rank].reservations {
                     device.items.push(Item::new(reservation_category(&cost.name),
                         crate::placement::families::mimo_v2::reservation_group(&cost.name), "", cost.bytes, Basis::Formula));
@@ -556,7 +556,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let working = admitted.spark;
     for (rank, device) in devices.iter_mut().enumerate() {
         device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(
-            admission::device_headroom(options.rtx_bytes[rank], rank, probe, options.headroom_bytes));
+            admission::device_headroom(rank, probe, options.headroom_bytes));
         device.items.extend(placement.items[rank].iter().cloned());
         device.kv_tokens = placement.pool_tokens;
     }
@@ -711,7 +711,7 @@ mod tests {
             profile.steady.devices[0].reservations.push(cuteafd_core::serving_capacity::MemoryReservation {
                 name: "runtime.cublas_first_gemm".into(), bytes: cublas,
             });
-            let policy = CapacityPolicy { concurrency: 4, small_card_headroom: true,
+            let policy = CapacityPolicy { concurrency: 4,
                 target_pool_tokens: if total <= 32 * GIB { 1 << 20 } else { 2 << 20 },
                 max_context_tokens: Some(1 << 20), ..Default::default() };
             let admitted = resolve_capacity_with_startup_peaks(policy, &profile.steady,
@@ -721,7 +721,7 @@ mod tests {
                 items: vec![Item::new(Category::Runtime, "context+modules", "", baseline + cublas, Basis::Exact)], kv_tokens: 0 }];
             let pool = apply(&input, &opts, &mut devices, 2, 4096, 4, 1 << 20, None).unwrap().pool_tokens;
             assert_eq!(pool, admitted.allocated_gpu_kv_tokens, "recorded total {total}");
-            assert_eq!(devices[0].capacity_bytes, total - headroom_bytes(total, true));
+            assert_eq!(devices[0].capacity_bytes, total - (64 << 20));
         }
     }
 

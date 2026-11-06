@@ -216,7 +216,7 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         let workspace = inputs.workspace.as_ref().and_then(|w| w.get(rank)).map(|w| w.fixed_device_bytes)
             .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake + probe;
         let headroom = if inputs.workspace.is_some() {
-            deepseek_v4_headroom_bytes(inputs.gpus[rank].0, inputs.reserve_bytes,
+            deepseek_v4_headroom_bytes(inputs.reserve_bytes,
                 workspace + exchange + inputs.code_bytes.get(rank).copied().unwrap_or(0), GRAPH_BYTES[role])
         } else {
             inputs.reserve_bytes.saturating_sub(workspace + exchange + GRAPH_BYTES[role]).max(3 << 30)

@@ -113,9 +113,9 @@ mod spark_tests {
     }
 }
 
-pub(super) fn graph_reserve_bytes(total: usize, dual_gpu: Option<usize>) -> usize {
+pub(super) fn graph_reserve_bytes(dual_gpu: Option<usize>) -> usize {
     assert!(dual_gpu.is_none_or(|gpu| gpu < 2));
-    families::deepseek_v41::graph_reserve(total as u64, if dual_gpu.is_some() { 2 } else { 1 })
+    families::deepseek_v41::graph_reserve( if dual_gpu.is_some() { 2 } else { 1 })
         as usize
 }
 
@@ -515,21 +515,11 @@ pub(super) fn resolve_with_owners(
                 total > 0 && free <= total,
                 "invalid GPU {gpu} memory sample"
             );
-            let mut ceiling = args
+            let ceiling = args
                 .memory_reservation
                 .map(|r| r.bytes(total))
                 .transpose()?
                 .unwrap_or(total);
-            let small = total <= 32usize << 30;
-            if small {
-                ceiling = ceiling.min(cuteafd_core::serving_capacity::admission_ceiling(
-                    total as u64,
-                    97,
-                    cuteafd_core::serving_capacity::small_card_headroom_bytes(total as u64),
-                )? as usize);
-            } else if automatic {
-                ceiling = ceiling.min((total as u128 * 97 / 100) as usize);
-            }
             ceilings.push(ceiling);
             let headroom = total - ceiling;
             Ok(GpuBudget {
@@ -568,7 +558,7 @@ pub(super) fn resolve_with_owners(
     pool.ceiling = pool.requested.unwrap_or(pool.target).div_ceil(512) * 512;
     let mut fixed = owners.to_vec();
     for gpu in 0..ranks {
-        fixed.extend(families::deepseek_v41::growth_demands(memory[gpu].1 as u64, ranks,
+        fixed.extend(families::deepseek_v41::growth_demands(ranks,
             automatic, gpu as u8));
         if deferred[gpu] > 0 {
             fixed.push(Demand::new(
@@ -1120,9 +1110,9 @@ mod admission_tests {
                 .enumerate()
                 .map(|(gpu, &bytes)| {
                     let reserve = total - ceiling
-                        + families::deepseek_v41::runtime_reserve(total as u64, ranks, false)
+                        + families::deepseek_v41::runtime_reserve(ranks, false)
                             as usize
-                        + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
+                        + graph_reserve_bytes((ranks == 2).then_some(gpu));
                     (bytes + reserve + deferred[gpu] as usize, total)
                 })
                 .collect::<Vec<_>>();
@@ -1208,11 +1198,10 @@ mod admission_tests {
 
     #[test]
     fn graph_reserves_and_small_card_logical_target_remain_distinct() -> Result<()> {
-        assert_eq!(graph_reserve_bytes(96usize << 30, None), 3264 << 20);
+        assert_eq!(graph_reserve_bytes(None), 3264 << 20);
         for rank in [0, 1] {
-            assert_eq!(graph_reserve_bytes(96usize << 30, Some(rank)), 1472 << 20);
+            assert_eq!(graph_reserve_bytes(Some(rank)), 1472 << 20);
         }
-        assert_eq!(graph_reserve_bytes(32usize << 30, None), 2048 << 20);
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),

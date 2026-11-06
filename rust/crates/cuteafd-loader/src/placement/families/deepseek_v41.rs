@@ -4,28 +4,23 @@ pub mod owners;
 pub mod resident;
 
 /// Existing lazy-capture envelope, separate from qualified ready residency.
-/// Small cards previously hid this same growth allowance in the CUDA sample.
-pub fn graph_reserve(total: u64, ranks: usize) -> u64 {
-    if total <= 32 << 30 { 2048 << 20 } else if ranks == 1 { 3264 << 20 } else { 1472 << 20 }
+/// The per-layout envelope applies to every card capacity.
+pub fn graph_reserve(ranks: usize) -> u64 {
+    if ranks == 1 { 3264 << 20 } else { 1472 << 20 }
 }
 
-pub fn runtime_reserve(total: u64, ranks: usize, automatic: bool) -> u64 {
-    if total <= 32 << 30 { 0 } else if automatic { 3 << 30 }
+pub fn runtime_reserve(ranks: usize, automatic: bool) -> u64 {
+    if automatic { 3 << 30 }
     else if ranks == 1 { 2 << 30 } else { 800 << 20 }
 }
 
 /// Future owners beside the pool; none of these bytes is live at ready.
-pub fn growth_demands(total: u64, ranks: usize, automatic: bool, gpu: u8) -> Vec<Demand> {
-    let mut demands = vec![GraphSet::budget(&[graph_reserve(total, ranks)]).demand(0).on(gpu)];
-    let runtime = runtime_reserve(total, ranks, automatic);
+pub fn growth_demands(ranks: usize, automatic: bool, gpu: u8) -> Vec<Demand> {
+    let mut demands = vec![GraphSet::budget(&[graph_reserve(ranks)]).demand(0).on(gpu)];
+    let runtime = runtime_reserve(ranks, automatic);
     if runtime > 0 {
         demands.push(Demand::new(gpu, cuteafd_core::memory_layout::Category::Reserved,
             "runtime growth", runtime, cuteafd_core::memory_layout::Basis::Calibrated)
-            .with_lifetime(ItemLifetime::PostReadyReserve));
-    }
-    if total <= 32 << 30 {
-        demands.push(Demand::new(gpu, cuteafd_core::memory_layout::Category::Reserved,
-            "memory sample margin", 32 << 20, cuteafd_core::memory_layout::Basis::Calibrated)
             .with_lifetime(ItemLifetime::PostReadyReserve));
     }
     demands
@@ -606,17 +601,16 @@ mod tests {
 
     #[test]
     fn growth_owners_are_post_ready_reserves_on_every_card_and_policy() {
-        for total in [32 << 30, 96 << 30] {
+        for _total in [32u64 << 30, 96u64 << 30] {
             for ranks in [1, 2] {
                 for automatic in [false, true] {
                     for gpu in 0..ranks {
-                        let demands = growth_demands(total, ranks, automatic, gpu as u8);
+                        let demands = growth_demands(ranks, automatic, gpu as u8);
                         assert!(demands.iter().all(|d| d.gpu == gpu as u8
                             && d.lifetime == ItemLifetime::PostReadyReserve
                             && d.item().lifetime == ItemLifetime::PostReadyReserve));
                         assert_eq!(demands.iter().map(|d| d.bytes).sum::<u64>(),
-                            graph_reserve(total, ranks) + runtime_reserve(total, ranks, automatic)
-                                + if total <= 32 << 30 { 32 << 20 } else { 0 });
+                            graph_reserve(ranks) + runtime_reserve(ranks, automatic));
                     }
                 }
             }

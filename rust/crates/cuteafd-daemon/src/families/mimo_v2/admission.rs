@@ -234,7 +234,6 @@ fn preflight_shape(
 ) -> Result<Preflight> {
     use cuteafd_core::serving_capacity::{
         CapacityPolicy, DeviceMemory,
-        small_card_headroom_bytes,
     };
     use cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE;
     use cuteafd_loader::families::mimo_v2::capacity::{
@@ -500,7 +499,6 @@ fn preflight_shape(
         spark_profiles.steady.pool_unit_rows, spark_ranks == 0);
     let policy = CapacityPolicy {
         concurrency: u32::try_from(concurrency)?,
-        small_card_headroom: true,
         target_pool_tokens: maximum_pool_tokens,
         max_context_tokens: Some(args.max_context as u64),
         pool_tokens: Some(maximum_pool_tokens),
@@ -509,11 +507,6 @@ fn preflight_shape(
     let report = reservation_report(&spark_profiles.steady, &memory, policy)?;
     let intake_probe_bytes = cuteafd_loader::families::mimo_v2::admission::spark_intake_probe_bytes(
         spark_ranks > 0, std::env::var("CUTEAFD_SPARK_INTAKE").ok().as_deref())?;
-    for sample in &memory {
-        debug_assert_eq!(cuteafd_loader::families::mimo_v2::admission::headroom_bytes(sample.total_bytes, false),
-            sample.total_bytes - cuteafd_core::serving_capacity::admission_ceiling(sample.total_bytes, 97,
-                small_card_headroom_bytes(sample.total_bytes))?);
-    }
     let prefill = PrefillShape {
         rows: args.prefill_rows.max(64) as u64,
         waves: transport_lanes as u64,
@@ -530,7 +523,7 @@ fn preflight_shape(
     let budgets = contract::production_budgets(
         &memory.iter().map(|sample| (sample.total_bytes, sample.total_bytes)).collect::<Vec<_>>(),
         &(0..memory.len()).map(|rank| contract::device_headroom(
-            memory[rank].total_bytes, rank, intake_probe_bytes, 0)).collect::<Vec<_>>(),
+            rank, intake_probe_bytes, 0)).collect::<Vec<_>>(),
         memory.iter().map(|sample| Baseline::Sampled {
             free: sample.baseline_free_bytes, phase: Phase::Load,
             source: "measured post-module free memory".into() }).collect(),
@@ -619,12 +612,7 @@ fn reservation_report(
             .total_bytes
             .checked_sub(sample.baseline_free_bytes)
             .context("invalid physical GPU memory sample")?;
-        let minimum_free = if policy.small_card_headroom {
-            cuteafd_core::serving_capacity::small_card_headroom_bytes(sample.total_bytes)
-        } else { 0 };
-        let budget = cuteafd_core::serving_capacity::admission_ceiling(
-            sample.total_bytes, policy.gpu_occupancy_percent, minimum_free)?
-            .saturating_sub(non_engine);
+        let budget = sample.total_bytes.saturating_sub(non_engine);
         let mut fixed = std::collections::BTreeMap::<&str, u64>::new();
         for cost in &costs.reservations {
             let category = cost

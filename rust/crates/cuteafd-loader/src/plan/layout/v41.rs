@@ -139,10 +139,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut inventory = Inventory { gpus: Vec::new(), spark_ranks, peer_access: ranks == 2 };
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {
         let arch = ArchContext::coordinator(total, None);
-        let ceiling = if total <= 32 * GIB {
-            cuteafd_core::serving_capacity::admission_ceiling(total, 97,
-                cuteafd_core::serving_capacity::small_card_headroom_bytes(total))?
-        } else if automatic { (u128::from(total) * 97 / 100) as u64 } else { total };
+        let ceiling = total;
         let context = arch.context_bytes + arch.cublas_bytes;
         inventory.gpus.push(GpuBudget { capacity_bytes: total, headroom_bytes: total - ceiling,
             baseline: Baseline::Planned { context_bytes: context, loaded_bytes: NATIVE_CODE_ESTIMATE } });
@@ -150,7 +147,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         devices[gpu].items.clear();
         devices[gpu].items.push(Item::new(Category::Runtime, "CUDA context and cuBLAS", "SM120 architecture inventory", context, Basis::Calibrated));
         devices[gpu].items.push(Item::new(Category::Runtime, "native LoadedCode estimate", "unqualified native code/ready graph residency", NATIVE_CODE_ESTIMATE, Basis::Estimated));
-        fixed.extend(v41::growth_demands(total, ranks, automatic, gpu as u8));
+        fixed.extend(v41::growth_demands(ranks, automatic, gpu as u8));
     }
     let onboard = if spark_ranks == 0 { Onboard::Layers(catalog.routed_experts().routed_layers()) } else {
         options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto)

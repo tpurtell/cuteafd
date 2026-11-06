@@ -106,7 +106,7 @@ impl ReadyVision {
         let admitted = ledger.total_bytes();
         let loaded = (|| -> Result<_> {
         let (free, total) = library.cuda_memory_info()?;
-        cuteafd_core::serving_capacity::admit_device_reservations(95,
+        cuteafd_core::serving_capacity::admit_device_reservations(
             cuteafd_core::serving_capacity::DeviceMemory { device: gpu as u32,
                 total_bytes: total as u64, baseline_free_bytes: free as u64 },
             &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(), bytes: admitted }])?;

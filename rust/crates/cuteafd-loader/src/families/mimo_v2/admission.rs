@@ -327,12 +327,6 @@ pub fn peer_slot_bytes(rows: usize, waves: usize, hidden: usize) -> Result<Vec<u
     Ok(std::iter::repeat_n(decode, 4).chain(std::iter::repeat_n(prefill, 4 * waves)).collect())
 }
 
-/// The 97% occupancy ceiling and Spark's drained 64 MiB startup probe.
-pub fn headroom_bytes(total: u64, spark_probe: bool) -> u64 {
-    (total - total * 97 / 100 + if spark_probe { 64 << 20 } else { 0 })
-        .max(cuteafd_core::serving_capacity::small_card_headroom_bytes(total))
-}
-
 pub fn spark_intake_probe_bytes(spark: bool, configured: Option<&str>) -> Result<u64> {
     if !spark { return Ok(0); }
     match configured {

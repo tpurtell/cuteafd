@@ -4130,8 +4130,7 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     options.layout.as_mut().unwrap().rtx_bytes[0] =
         probe.devices[0].used_bytes()
             - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
-            + bytes + options.layout.as_ref().unwrap().headroom_bytes
-                .max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
+            + bytes + options.layout.as_ref().unwrap().headroom_bytes.max(64 << 20);
     let gpu_report = plan(dir.path(), &options).unwrap();
     assert!(!gpu_report.fits, "the GPU plan cannot reach the context floor");
     assert_eq!(gpu_report.memory_layout.as_ref().unwrap().devices[1].by_category()
@@ -4168,7 +4167,7 @@ fn mimo_small_card_auto_embedding_and_full_context() {
     let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert!(!base.devices[0].by_category().contains_key(&Category::Embedding));
     assert_eq!(base.devices[0].capacity_bytes,
-        (32u64 << 30) - cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
+        (32u64 << 30) - (64 << 20));
     assert!(base.pool_tokens >= 1_048_576, "{}", base.render());
     assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
     options.layout.as_mut().unwrap().force_gpu_embedding = true;
@@ -4309,9 +4308,9 @@ fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle
 }
 
 #[test]
-fn v41_small_card_graph_envelope_preserves_pro_allowance() {
+fn v41_graph_envelope_is_independent_of_card_capacity() {
     let dir = strict_v41_snapshot(false);
-    for (gib, expected) in [(32, 2u64 << 30), (96, 3264u64 << 20)] {
+    for (gib, expected) in [(32, 3264u64 << 20), (96, 3264u64 << 20)] {
         let options = PlanOptions {
             layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib << 30], prefill_rows: 256, onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                 pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
@@ -4326,14 +4325,14 @@ fn v41_small_card_graph_envelope_preserves_pro_allowance() {
 }
 
 #[test]
-fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
+fn v41_auto_layout_uses_physical_capacity_and_disabled_prefix_arenas() {
     use cuteafd_core::memory_layout::Category;
     let dir = strict_v41_snapshot(false);
     let mut options = sparks(4);
     options.layout = Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30], pool_tokens: Some(0),
         prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert_eq!(automatic.devices[0].capacity_bytes, (96u64 << 30) * 97 / 100);
+    assert_eq!(automatic.devices[0].capacity_bytes, 96u64 << 30);
     assert_eq!(automatic.devices[0].items.iter().find(|i| i.group == "runtime growth").unwrap().bytes, 3 << 30);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
