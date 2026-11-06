@@ -134,6 +134,29 @@ fn unsupported(check: &mut Check) {
     check.summary = "this engine does not run benchmark probes yet".into();
 }
 
+fn decode_content(run: &mut Run<'_>) -> Result<()> {
+    let client = run.client;
+    for (i, (content, prompt)) in CONTENT.iter().enumerate() {
+        run.step(0.04 + 0.08 * i as f64, &format!("C1 decode · {content}"));
+        let fabric_mark = client.fabric_mark();
+        let before = common::draft_counters(client);
+        let chat = client.chat(plain(client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
+            .with_context(|| format!("{content} decode"))?;
+        let after = common::draft_counters(client);
+        if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/{content}/c1"), true) {
+            run.baseline.fabric.push(phase);
+        }
+        if *content == "code" {
+            run.baseline.card.concurrency.push(concurrent_rate(vec![common::Timed { sent: 0.0, chat: chat.clone() }],
+                run.baseline.card.warmup_s.unwrap_or_default(), "code"));
+        }
+        run.baseline.card.decode.push(ContentRate { content: content.to_string(), tok_s: chat.timing.decode_tok_s(),
+            runs: vec![chat.timing], acceptance: common::acceptance(before, after) });
+        run.publish();
+    }
+    Ok(())
+}
+
 pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str, fingerprint: &str,
     max_context: u64, max_output: u64) -> Result<Baseline> {
     let started = Instant::now();
@@ -159,23 +182,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     }
     client.chat(plain(client, &format!("[{}] {}", nonce(), CONTENT[0].1), 32), None).context("warm-up decode")?;
     run.baseline.card.warmup_s = Some(warmup.elapsed().as_secs_f64());
-    // C1 decode per content type.
-    for (i, (content, prompt)) in CONTENT.iter().enumerate() {
-        run.step(0.04 + 0.08 * i as f64, &format!("C1 decode · {content}"));
-        let fabric_mark = client.fabric_mark();
-        let chat = client.chat(plain(client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
-            .with_context(|| format!("{content} decode"))?;
-        if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/{content}/c1"), true) {
-            run.baseline.fabric.push(phase);
-        }
-        if *content == "code" {
-            run.baseline.card.concurrency.push(concurrent_rate(vec![common::Timed { sent: 0.0, chat: chat.clone() }],
-                run.baseline.card.warmup_s.unwrap_or_default(), "code"));
-        }
-        run.baseline.card.decode.push(ContentRate { content: content.to_string(), tok_s: chat.timing.decode_tok_s(),
-            runs: vec![chat.timing], acceptance: None });
-        run.publish();
-    }
+    decode_content(&mut run)?;
     // One untimed warm wave per width primes graphs, tables and first-use workspaces.
     let levels = concurrent_levels(info);
     anyhow::ensure!(!levels.is_empty(), "server admits no concurrent sequences");
@@ -1016,6 +1023,67 @@ pub fn describe(timing: &StreamTiming) -> String {
 mod tests {
     use super::*;
     use crate::report::Check;
+
+    fn content_acceptance_fixture(counters: bool) -> Vec<ContentRate> {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, atomic::AtomicBool};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for step in 0..9 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let headers = String::from_utf8(request).unwrap();
+                let chat = step % 3 == 1;
+                assert!(headers.starts_with(if chat { "POST /v1/chat/completions " } else { "GET /v1/stats " }));
+                let length = headers.lines().find_map(|line| line.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).unwrap();
+                let response = if chat {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["max_tokens"], DECODE_TOKENS);
+                    assert!(body["messages"][0]["content"].as_str().unwrap().contains(CONTENT[step / 3].1));
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n".to_string()
+                } else if counters {
+                    let completed = step / 3 + usize::from(step % 3 == 2);
+                    json!({"totals": {"drafted_tokens": 100 + 8 * completed,
+                        "accepted_drafts": 20 + 6 * completed}}).to_string()
+                } else { "{}".into() };
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    if chat { "text/event-stream" } else { "application/json" }, response.len(), response).unwrap();
+            }
+        });
+        let client = Client::new(&base, None, Arc::new(AtomicBool::new(false)));
+        let mut run = Run { client: &client, info: &ServerInfo::default(), progress: &Progress::default(),
+            max_context: 32768, baseline: Baseline::default() };
+        decode_content(&mut run).unwrap();
+        server.join().unwrap();
+        assert_eq!(run.baseline.card.decode.len(), CONTENT.len());
+        run.baseline.card.decode
+    }
+
+    #[test]
+    fn content_acceptance_records_each_timed_request_counter_delta() {
+        for rate in content_acceptance_fixture(true) {
+            assert_eq!(rate.acceptance, Some(0.75));
+            assert_eq!(serde_json::to_value(&rate).unwrap()["acceptance"], 0.75);
+        }
+    }
+
+    #[test]
+    fn content_acceptance_is_absent_without_server_counters() {
+        for rate in content_acceptance_fixture(false) {
+            assert_eq!(rate.acceptance, None);
+        }
+    }
 
     #[test]
     fn media_cache_fixture_rejects_ambiguous_or_missing_inputs() {
