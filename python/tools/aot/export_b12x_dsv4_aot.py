@@ -111,14 +111,16 @@ def draft_bf16_shapes():
     for h in (2048, 4096, 5120, 6144):
         result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
     result.setdefault((30720, 6144), []).append("ml4-context-fc")
+    for n in (8192, 16384):
+        result.setdefault((1536, n), []).append("hqa-query")
     return result
 
 
-def compile_draft_bf16_projection(k, n):
+def compile_draft_bf16_projection(k, n, tiles=((16, 1, 4, 16, 64, 6),)):
     import torch
     from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
-    tiles = ((16, 1, 4, 16, 64, 6),)
+    tiles = tuple(tuple(entry) for entry in tiles)
     launch = TmaBf16Projection(n, k, tiles_by_rows=tiles)
     return compile_program(launch, name="draft_bf16_projection", operands=(
         Operand("x", torch.bfloat16, f"[rows,{k}]"),
@@ -1195,12 +1197,18 @@ def main() -> None:
     parser.add_argument("--prefill-rows", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=DEFAULT_MAX_CONTEXT)
     parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
+    parser.add_argument("--draft-bf16-tiles", type=Path,
+                        help="diagnostic JSON mapping K,N to projection tiles_by_rows")
     parser.add_argument("--context-split-only", action="store_true",
                         help="export K1 primitives for flash/pro/glm/glmf/kimik3, no engine wiring")
     parser.add_argument("--context-split", choices=("off", "on", "only"), default="off",
                         help="token-split attention primitives for flash/pro/glm/glmf/kimik3: on appends them after "
                              "every other program (existing stems unchanged); only exports nothing else")
     args = parser.parse_args()
+    draft_tiles = json.loads(args.draft_bf16_tiles.read_text()) if args.draft_bf16_tiles else {}
+    if not isinstance(draft_tiles, dict) or any(
+            key not in {f"{k},{n}" for k, n in draft_bf16_shapes()} for key in draft_tiles):
+        parser.error("--draft-bf16-tiles must map known K,N shapes to row-tile tables")
     if args.context_split_only:
         args.context_split = "only"
     args.context_split_only = args.context_split == "only"
@@ -1456,7 +1464,8 @@ def main() -> None:
     # Append shared drafter exports after all existing objects: table indices stay stable.
     if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2")):
         work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 2048},
-                  lambda k=k, n=n: compile_draft_bf16_projection(k, n))
+                  lambda k=k, n=n: compile_draft_bf16_projection(
+                      k, n, draft_tiles.get(f"{k},{n}", ((16, 1, 4, 16, 64, 6),))))
                  for k, n in sorted(draft_bf16_shapes())]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:

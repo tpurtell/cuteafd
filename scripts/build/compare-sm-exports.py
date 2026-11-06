@@ -116,7 +116,10 @@ def dense_geometry_jobs():
 
 
 def jobs(scope):
-    result = []
+    result = [("draft-bf16-hqa", "export_b12x_dsv4_aot.py",
+               ["--geometry", "qwen38", "--only", ",".join(
+                   f"k{k}_n{n}" for k, n in ((1536, 8192), (1536, 16384),
+                       (4096, 4096), (8192, 4096), (16384, 4096)))])]
     drafter = load_file("compare_draft_bf16", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
     result.append(("draft-bf16", "export_b12x_dsv4_aot.py",
                    ["--geometry", "qwen38", "--only", ",".join(
@@ -1016,6 +1019,8 @@ def main():
     parser.add_argument("--scope", choices=("suspects", "all"), default="all")
     parser.add_argument("--groups", help="comma-separated job names; --list prints available names")
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--draft-bf16-tiles", type=Path,
+                        help="candidate tile JSON for the draft-bf16-hqa group only")
     parser.add_argument("--output-dir", type=Path, default=Path.home() / ".cache/cuteafd/builds/plat1-sm120/sm-exports")
     parser.add_argument("--compare-only", action="store_true")
     parser.add_argument("--baseline-source", type=Path,
@@ -1054,6 +1059,11 @@ def main():
         if unknown:
             parser.error(f"unknown groups: {sorted(unknown)}")
         selected_jobs = [job for job in selected_jobs if job[0] in selected]
+    if args.draft_bf16_tiles:
+        if {job[0] for job in selected_jobs} != {"draft-bf16-hqa"}:
+            parser.error("--draft-bf16-tiles requires --groups draft-bf16-hqa")
+        if not args.draft_bf16_tiles.is_file():
+            parser.error("--draft-bf16-tiles must name an existing file")
     selected_jobs = [(name, exporter, [*extra, "--role", args.role]
                       if exporter == "package_exl3_aot.py" else extra)
                      for name, exporter, extra in selected_jobs]
@@ -1083,6 +1093,8 @@ def main():
                 raise ValueError(f"output is not empty: {directory}; use --compare-only or a fresh output root")
             directory.mkdir(parents=True, exist_ok=True)
             context_args = list(extra)
+            if args.draft_bf16_tiles and (not baseline_source or source == ROOT):
+                context_args += ["--draft-bf16-tiles", str(args.draft_bf16_tiles.resolve())]
             if baseline_source and exporter in ("package_fp8_moe_aot.py", "package_exl3_aot.py"):
                 if "--layouts" in context_args:
                     index = context_args.index("--layouts")
