@@ -264,6 +264,13 @@ impl<'a> NativeVocabulary<'a> {
         Self::load_inner(library, programs, plan, library.cuda_get_device()?, None)
     }
 
+    /// Consume an already-admitted vocabulary owner without sampling memory.
+    pub(crate) fn load_prepared(library: &'a NativeLibrary, programs: &'a Programs<'a>,
+        plan: VocabularyPlan, staging_bytes: u64, embedding_device: i32) -> Result<Option<Self>> {
+        ensure!(plan.staging_bytes() as u64 == staging_bytes, "native vocabulary staging differs from admission");
+        Self::load_inner(library, programs, plan, embedding_device, None)
+    }
+
     fn load_inner(library: &'a NativeLibrary, programs: &'a Programs<'a>, plan: VocabularyPlan,
         embedding_device: i32, available: Option<(usize, usize, usize)>) -> Result<Option<Self>> {
         use crate::shared::memory::device::Device;

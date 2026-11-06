@@ -3281,7 +3281,7 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
             glmf_step_scratch(&lookup, &cfg, Default::default(), 64, true).unwrap(),
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
         let steps = gpu.items.iter().find(|i| i.category == Category::Workspace && i.group == "steps").unwrap();
-        assert_eq!((steps.bytes, steps.basis), (engine, Basis::Formula),
+        assert_eq!((steps.bytes, steps.basis), (engine, Basis::Exact),
             "the step workspaces and every lane's intake planes");
     }
     // A 32 GiB plan must use the selected precision, including state and marks.
@@ -3439,22 +3439,19 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
             drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
-        let (placed, graphs, working) = glmf::solve_attention_working_set_with_graphs(&input, None,
-            2 << 20, false, 188, true).unwrap();
+        let mut process = glmf::admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        process.serving(&input, 0, 0, 0, 0).unwrap();
+        process.spark_link(&input, checkpoint.spark_input_is_bf16()).unwrap();
+        let selected = glmf::admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
+        let (placed, working) = (&selected.placement, &selected.working);
         assert_eq!(working.rtx_layers.len(), expected_rtx);
         assert_eq!(placed.onboard_layers, expected_rtx);
         let spark = !working.spark_layers.is_empty();
         assert_eq!((working.spark_ranks, working.prefill_lanes), if spark { (4, lanes) } else { (0, lanes) });
-        let mut admitted = input.clone();
-        admitted.graphs = graphs;
-        let home = glmf::embedding_home(&placed) as usize;
-        let embedding_bytes = admitted.resident.iter().map(|rank| rank.embedding).sum();
-        for rank in &mut admitted.resident { rank.embedding = 0; }
-        admitted.resident[home].embedding = embedding_bytes;
-        let request = glmf::request_for_working_set(&admitted, &working).unwrap();
-        assert_eq!(request.inventory.spark_ranks, working.spark_ranks);
-        assert_eq!(request.hops.lanes, working.prefill_lanes);
-        if expected_rtx == 0 { assert_eq!(request.tp2_workspace, [0; 2]); }
+        assert_eq!(selected.solved.decisions.prefill.waves, working.prefill_lanes);
+        if expected_rtx == 0 {
+            assert!(!selected.solved.facts.allocations.iter().any(|owner| owner.group == "RTX expert arena"));
+        }
         if peers == 0 {
             let rank_weights: Vec<_> = input.resident.iter().enumerate().map(|(rank, resident)|
                 resident.embedding + resident.weights
@@ -3504,12 +3501,12 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         for rank in 0..2 {
             // Plan ledger is exactly the selected request's solver ledger, not configured-peer rows.
             let plan_rows: Vec<_> = memory.devices[rank].items.iter().filter(|item| item.group != "context+modules").collect();
-            assert_eq!(plan_rows, placed.items[rank].iter().collect::<Vec<_>>());
+            assert_eq!(plan_rows, placed.items[rank].iter().filter(|item| item.group != "context+modules").collect::<Vec<_>>());
             let selected_shape = GlmfStepShape { lead: rank == 0, spark: rank == 0 && spark,
                 local_experts: false, tp2_experts: expected_rtx > 0, ..shape };
             let allocated = glmf_step_workspaces(&cfg, working.prefill_lanes as usize, 4096, 64,
                 &selected_shape, decode, prefill).device_bytes();
-            let charged = |group: &str| request.fixed.iter().filter(|d| d.gpu as usize == rank && d.group == group)
+            let charged = |group: &str| placed.items[rank].iter().filter(|d| d.group == group)
                 .map(|d| d.bytes).sum::<u64>();
             assert_eq!(charged("steps"), allocated);
             assert_eq!(charged("peer exchange"), crate::serving_capacity::glmf_graphs::peer_exchange_bytes(
@@ -3517,9 +3514,24 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             let slots = 2 * working.prefill_lanes;
             assert_eq!(charged("route exchange"), if expected_rtx == 0 { 0 } else {
                 slots * (4096 * 8 * 8) + ((slots + 1) * 16).max(256) });
-            assert_eq!(charged("Spark intake"), if rank == 0 && spark { 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
-                working.prefill_lanes * 4096 * cfg.hidden as u64 * 2).unwrap() } else { 0 });
-            assert!(request.fixed.iter().filter(|d| d.gpu as usize == rank && d.category == Category::Workspace)
+            let link = placement::PreparedSparkLink::endpoint("glmf.spark", 0, placement::SparkEndpointOwners {
+                ranks: peers, geometry: cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32,
+                    experts: cfg.experts as u32, topk: cfg.topk as u32,
+                    intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 },
+                endpoint: cuteafd_core::SparkEndpoint { capacity: 4096,
+                    ingress: if checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
+                        else { cuteafd_core::SparkIngress::Fp8K32 }, ring_depth: None, partial_reply_bytes: None },
+                rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+                    slot_bytes: 8 << 20, alignment: 4096 } }, working.prefill_lanes as usize,
+                true, true, placement::SparkIntakeCandidates::Probed,
+                cuteafd_core::SparkReplyFormat::Bf16, placement::planner::Lifetime::TARGET);
+            let charged_link = selected.solved.facts.allowances.iter().filter(|owner|
+                owner.location == placement::planner::Location::coordinator(rank as u8)
+                    && owner.source.starts_with("glmf.spark:")).map(|owner| owner.bytes).sum::<u64>();
+            assert_eq!(charged_link, if rank == 0 && spark {
+                link.unwrap().envelope()[&placement::planner::Location::coordinator(0)]
+            } else { 0 });
+            assert!(placed.items[rank].iter().filter(|d| d.category == Category::Workspace)
                 .map(|d| d.bytes).sum::<u64>() > 0);
         }
     }
@@ -3535,7 +3547,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
 fn glm5_flash_layout_charges_the_wide_decode_rows() {
     use crate::families::glm5_flash::GlmNextConfig;
     use crate::serving_capacity::{glm_flash_kda_replay_bytes_rows, glm_flash_rank_cache_geometry_rows,
-        glmf_manifest_scratch, glmf_selector_bytes, glmf_step_scratch, glmf_step_workspaces, GlmfIndexCache,
+        glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces, GlmfIndexCache,
         GlmfStepShape};
     use cuteafd_core::memory_layout::{Basis, Category};
     let mut config = glm5_flash_config(2);
@@ -3590,7 +3602,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let engine = glmf_step_workspaces(&cfg, 3, 2752, rows, &shape,
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, true).unwrap(),
             glmf_step_scratch(&lookup, &cfg, Default::default(), 2752, false).unwrap()).device_bytes();
-        assert_eq!(item(report, "steps"), Some((Category::Workspace, engine, Basis::Formula)), "{rows} rows");
+        assert_eq!(item(report, "steps"), Some((Category::Workspace, engine, Basis::Exact)), "{rows} rows");
         // The engine's caches: 2 layers (one KDA, one MLA) of records and commit tables of `rows` rows.
         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
         let rank = &geometry.ranks[0];
@@ -3600,10 +3612,14 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
     // 128 rows: +64,606,464 B of decode workspace, the wide selector, one KDA layer's 64 more record rows.
     let steps = |report| item(report, "steps").unwrap().1;
     assert_eq!(steps(&broad) - steps(&narrow), 64_606_464);
-    assert_eq!(item(&narrow, "wide decode selector"), None);
-    assert_eq!(item(&broad, "wide decode selector"),
-        Some((Category::Workspace, glmf_selector_bytes(128, 154_880) - glmf_selector_bytes(64, 154_880), Basis::Formula)));
-    assert_eq!(item(&broad, "wide decode selector").unwrap().1, 3_209_984);
+    for (report, rows) in [(&narrow, 64usize), (&broad, 128)] {
+        assert_eq!(item(report, "token selector"), Some((Category::Workspace, rows as u64 * 12, Basis::Exact)));
+        let expected = cuteafd_core::target_sampler_allocations(rows, cfg.vocab_size).unwrap()
+            .into_iter().filter(|owner| !owner.pinned).map(|owner| owner.bytes as u64).sum::<u64>();
+        let actual = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
+            .filter(|owner| owner.group == "target sampler").map(|owner| owner.bytes).sum::<u64>();
+        assert_eq!(actual, expected, "full physical sampler at {rows} rows");
+    }
     let state = |report| item(report, "state").unwrap().1;
     assert_eq!(state(&broad) - state(&narrow), 9_453_568 + 768);
     // A build without the wide programs, and a head split, cannot run 128 rows.
@@ -3644,7 +3660,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let engine = glmf_step_workspaces(&cfg, 3, 2752, rows, &shape,
             glmf_step_scratch(&lookup, &cfg, scratch_options, rows, true).unwrap(),
             glmf_step_scratch(&lookup, &cfg, scratch_options, 2752, false).unwrap()).device_bytes();
-        assert_eq!(item(&report, "steps"), Some((Category::Workspace, engine, Basis::Formula)));
+        assert_eq!(item(&report, "steps"), Some((Category::Workspace, engine, Basis::Exact)));
     }
     // A prefill lane narrower than a verify step (`--prefill-rows 64 --decode-rows 128`): every lane's
     // intake planes hold the widest step's rows, as the engine's Spark transports do; lanes of 4,096
@@ -3661,7 +3677,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
         let intake = crate::serving_capacity::prefill_return_bytes(3, intake_rows, 4, 4096);
         assert_eq!(intake, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(3 * intake_rows * 4096 * 2).unwrap());
-        assert_eq!(item(&lane(rows, decode_rows), "steps"), Some((Category::Workspace, engine, Basis::Formula)),
+        assert_eq!(item(&lane(rows, decode_rows), "steps"), Some((Category::Workspace, engine, Basis::Exact)),
             "{rows} prefill rows, {decode_rows} decode rows");
     }
     // 128 rows past a 64-row lane: the wide decode workspace and 64 more intake rows per lane and Spark.
@@ -3683,7 +3699,7 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
                     for shared in [false, true] {
                         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
                             rtx_bytes: vec![24 << 30; gpus], context_tokens: 131_072,
-                            target_pool_tokens: 16_777_216, glmf_index: index, glmf_decode_rows: rows, glmf_pool_marks: pool_marks,
+                            glmf_index: index, glmf_decode_rows: rows, glmf_pool_marks: pool_marks,
                             glmf_shared_replay: shared, state_slots: Some(8), ..Default::default()
                         }), attention_placement: Some(AttentionPlacement::Heads), ..sparks(2) };
                         let report = plan(dir.path(), &options).unwrap();
@@ -3696,12 +3712,14 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
                         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, cfg.layers, gpus,
                             served_index, 4, rows).unwrap();
                         let unit = geometry.logical_unit_rows;
-                        let mut served_pool = 16_777_216;
+                        let mut served_pool = crate::placement::PoolPolicy::resolve(&vec![24 << 30; gpus],
+                            131_072, None, 256, false).target;
                         for (device, rank) in memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
                             .zip(&geometry.ranks) {
-                            let records = device.items.iter().find(|i| i.category == Category::Kv && i.group == "records")
+                            let records = device.items.iter().find(|i| i.category == Category::Kv && i.group == "KV pool")
                                 .unwrap().bytes;
-                            let bytes = rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes;
+                            let bytes = rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes
+                                + rank.glmf_pool_mark_backing_unit_bytes(pool_marks);
                             assert_eq!(records, memory.pool_tokens.div_ceil(unit) * bytes);
                             let available = (device.free_bytes() + records as i64).max(0) as u64;
                             served_pool = served_pool.min(available / bytes * unit);
@@ -3802,7 +3820,7 @@ fn glm5_flash_spark_count_refusal_preserves_pool_and_replay_constraints() {
     assert!(!split.fits && !split.placement_supported);
     let reasons = split.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; ");
     assert!(reasons.contains("--replay-records shared needs one coordinator GPU"), "{reasons}");
-    assert!(reasons.contains("--pool-tokens"), "{reasons}");
+    assert!(reasons.contains("GLM Flash pool-first placement"), "{reasons}");
     assert!(!reasons.contains("checkpoint tensors or required package artifacts unavailable"), "{reasons}");
     let oversized = plan_spark_count(dir.path(), &options(1, 1 << 40), 4, Some(4)).unwrap();
     assert!(!oversized.fits && !oversized.placement_supported);
@@ -4125,7 +4143,7 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     // Leave only one table's worth of KV room, below this small fixture's target cap.
     options.layout.as_mut().unwrap().rtx_bytes[0] =
         probe.devices[0].used_bytes()
-            - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
+            - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "KV pool").map(|i| i.bytes).sum::<u64>()
             + bytes + options.layout.as_ref().unwrap().headroom_bytes
                 .max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
     let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -5079,13 +5097,13 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
     assert!(auto.fits && auto.placement_supported, "{}", render(&auto));
     assert_eq!(auto.vision, MediaMode::Auto);
     assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Off);
-    assert!(auto.encoder.as_ref().unwrap().reason.contains("pool floor"));
+    assert!(auto.encoder.as_ref().unwrap().reason.contains("pool"));
     assert_eq!(auto.memory_layout.as_ref().unwrap().pool_tokens, off.memory_layout.as_ref().unwrap().pool_tokens);
     assert!(auto.memory_layout.as_ref().unwrap().devices.iter().flat_map(|device| &device.items)
         .all(|item| !item.group.starts_with("vision ")));
     let strict = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..constrained }).unwrap();
     assert!(!strict.fits && !strict.placement_supported, "{}", render(&strict));
-    assert!(strict.hints.iter().any(|hint| hint.what.contains("floor")), "{:?}", strict.hints);
+    assert!(strict.hints.iter().any(|hint| hint.what.contains("pool-first placement")), "{:?}", strict.hints);
 }
 
 #[test]

@@ -274,19 +274,31 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             return Ok(());
         }
     };
-    let (mut vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
-        Ok(vision) => vision,
+    args.serving_encoder = match super::media::ReadyVision::plan(&args, vision, remote.as_ref()) {
+        Ok(encoder) => encoder,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
-    let media_push = vision.as_mut().map(|vision| std::mem::take(&mut vision.push)).unwrap_or_default();
-    let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
-    let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision|
-        (vision.encoder, vision.cache_bytes));
-    let health = encoder.health_handle();
-    let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
+    let bytes = if args.serving_encoder.is_some() {
+        let (total, _) = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+        usize::try_from(media_cache_bytes.unwrap_or((8 << 30).min(total / 20)))?
+    } else { 0 };
+    args.serving_prefix = Some(prefix.clone());
+    args.serving_media_bytes = bytes as u64;
+    let prepared = std::cell::RefCell::new(None);
     let mut ready = Some(ready);
-    let result = opened.with_engine_media(&args, media_push.records(), |engine| {
+    let result = opened.with_engine_media(&args, || {
+        let vision = super::media::ReadyVision::load(&args, &opened.library, vision, bytes, remote)?;
+        let records = vision.as_ref().map(|vision| vision.push.records()).unwrap_or_default();
+        *prepared.borrow_mut() = vision;
+        Ok(records)
+    }, |engine| {
+        let mut vision = prepared.borrow_mut().take();
+        let media_push = vision.as_mut().map(|vision| std::mem::take(&mut vision.push)).unwrap_or_default();
         media_push.commit()?;
+        let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
+        let encoder = vision.map_or(super::media::Encoder::Off, |vision| vision.encoder);
+        let health = encoder.health_handle();
+        let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
         anyhow::ensure!(engine.has_expert_homes(), "serve-glmf needs an admitted home for every routed layer");
         anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
@@ -306,7 +318,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             })
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| (args.max_context, preparer.map(|p| (p, health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| (args.max_context, None)).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }
@@ -706,7 +718,7 @@ mod media_tests {
 /// its marks in pool units or in the mark arena `arena`, sized by its rule over the engine's own
 /// marks: the `engine.mark_slots` the KV admission reserved ([`super::prefix::ArenaMarks::slots_on`]).
 fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, arena): (PrefixMarks,
-    super::prefix::ArenaMarks), concurrency: usize) -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+    super::prefix::ArenaMarks), _concurrency: usize) -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
         engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
@@ -714,7 +726,7 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, a
     let family = GlmfPrefix::new(engine, marks, |mark| arena.slots(mark))?;
     anyhow::ensure!(family.slots() == engine.mark_slots, "the prefix mark arena holds {} marks of {} B, the KV \
         admission reserved {}", family.slots(), family.mark_bytes(), engine.mark_slots);
-    let host = args.host_config(family.layout(), engine.max_context, concurrency)?.map(|config|
+    let host = engine.admitted_host.clone().map(|config|
         CudaCopyEngine::registered_with_owners(engine.library, &family.buffers(), family.arena_owners())
             .map(|copy| (config, copy))).transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);

@@ -4,6 +4,8 @@ use crate::serving_capacity::{self as cache, glmf_graphs};
 use crate::placement::*;
 use cuteafd_core::memory_layout::{Basis, Category};
 
+pub mod admission;
+
 /// Two-GPU attention placement of GLM Flash's MLA layers and the `context` programs' scratch.
 /// `context` (PLAN.md "v3 attention placement without latent replication", GLM Flash DSA):
 /// projections head-split, every 256-token allocation unit of the MLA records and pool keys on
@@ -301,8 +303,7 @@ pub fn step_workspace_demands(cfg: &GlmNextConfig, lanes: usize, prefill_rows: u
     }).collect()
 }
 
-/// Immutable physical facts for one admission. Composed once from the inputs and
-/// consumed by both `request_for_working_set` and the shared planner recipe.
+/// Checkpoint and executor facts, before selection of an expert working set.
 pub struct GlmfFacts {
     pub geometry: cache::FamilyCacheGeometry,
     pub layers: Vec<LayerDemand>,
@@ -316,6 +317,13 @@ pub struct GlmfFacts {
 
 pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
     let ranks = i.gpus.len();
+    if !(1..=2).contains(&ranks) || i.layers == 0 || i.layers > i.cfg.layers
+        || i.cfg.dense.len() < i.layers || i.cfg.attention.len() < i.layers
+        || i.resident.len() != ranks || i.graphs.ranks.len() != ranks
+        || i.pending_code.len() != ranks || i.drafter_scratch.len() != ranks
+        || ![2, 4].contains(&i.partial_bytes) || i.attention.first_owner as usize >= ranks {
+        return Err(PlacementError::Inventory("GLM Flash rank/layer inventory"));
+    }
     let prefill_lanes = admitted_prefill_waves(i.attention.mode, i.prefill_lanes)?;
     let geometry = cache::glm_flash_placed_cache_geometry_rows(i.cfg, i.layers, ranks, i.index,
         i.kda_state_bytes, i.decode_rows, i.attention.mode, i.attention.first_owner as usize)
@@ -412,93 +420,6 @@ pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
     Ok(GlmfFacts { geometry, layers, fixed, pool_overhead, pool_bounded, routed, expert_gpus })
 }
 
-/// Explicit-count request (Spark-only validation profile for automatic policies).
-/// Automatic callers use `solve_working_set_with_graphs`, not the generic solver directly.
-pub fn request(i: &GlmfInputs<'_>) -> Result<PlacementRequest, PlacementError> {
-    let routed = i.cfg.dense.iter().take(i.layers).filter(|&&dense| !dense).count();
-    let n = if i.spark_ranks == 0 { routed } else { i.onboard.layers(routed).unwrap_or(0) };
-    request_for_working_set(i, &GlmfWorkingSet::candidate(i, n)?)
-}
-
-pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> Result<PlacementRequest, PlacementError> {
-    let ranks = i.gpus.len();
-    if ![1, 2].contains(&ranks) || i.layers == 0 || i.layers > i.cfg.layers
-        || i.resident.len() != ranks || i.graphs.ranks.len() != ranks
-        || i.pending_code.len() != ranks || ![2, 4].contains(&i.partial_bytes) {
-        return Err(PlacementError::Inventory("GLM Flash rank/layer inventory"));
-    }
-    for profile in [&i.workspace, &i.local_workspace] {
-        if profile.iter().any(|row| row.demand.gpu as usize >= ranks) || (0..ranks).any(|rank|
-            !profile.iter().any(|row| row.demand.gpu as usize == rank && row.component == GlmfComponent::Always)) {
-            return Err(PlacementError::Inventory("GLM Flash step buffer inventory"));
-        }
-    }
-    if *working != GlmfWorkingSet::candidate(i, working.rtx_layers.len())? {
-        return Err(PlacementError::Inventory("GLM Flash selected working set inventory"));
-    }
-    if i.drafter_scratch.len() != ranks || (i.drafter_bytes == 0 && i.drafter_scratch.iter().any(|&bytes| bytes != 0)) {
-        return Err(PlacementError::Inventory("GLM Flash draft scratch inventory"));
-    }
-    for &scratch in &i.drafter_scratch {
-        i.drafter_bytes.checked_add(scratch).ok_or(PlacementError::Overflow("GLM Flash draft inventory"))?;
-    }
-    if i.drafter_bridge.as_ref().is_some_and(|bridge| ranks != 2 || i.drafter_bytes == 0
-        || bridge.placement_gpu != 1 || bridge.demands.iter().any(|d| d.gpu > 1)) {
-        return Err(PlacementError::Inventory("GLM Flash remote draft candidate"));
-    }
-    let movables = if i.drafter_bytes == 0 { vec![] } else {
-        let mut drafter = draft::DrafterDemand::local(MovableId::Drafter,
-            vec![MovablePart::new(Bytes2 { resident: i.drafter_bytes, staging: 0 }, i.drafter_weights)], 0);
-        drafter.per_home = i.drafter_scratch.iter().enumerate().filter(|(_, &bytes)| bytes > 0)
-            .map(|(rank, &bytes)| MovableDemands { placement_gpu: rank as u8, demands: vec![Demand::new(rank as u8,
-                Category::Workspace, "DFlash linear/attention scratch", bytes, Basis::Formula)] }).collect();
-        drafter.bridge = i.drafter_bridge.as_ref().map(|b| b.demands.clone());
-        vec![drafter.movable(ranks)?]
-    };
-    if ranks == 2 && i.decode_rows != cache::GLMF_DECODE_ROWS {
-        return Err(PlacementError::Inventory("GLM Flash head split needs 64 decode rows"));
-    }
-    if i.attention.mode == AttentionPlacement::Context && i.pool_marks {
-        return Err(PlacementError::Inventory("GLM Flash context prefix marks need an arena"));
-    }
-    if i.shared_replay && (ranks != 1 || working.spark_ranks == 0) {
-        return Err(PlacementError::Inventory("GLM Flash --replay-records shared needs one coordinator GPU and Spark experts (independent of --pool-tokens)"));
-    }
-    let facts = facts(i)?;
-    let geometry = &facts.geometry;
-    let layers = facts.layers.clone();
-    let mut fixed: Vec<GlmfBufferDemand> = facts.fixed.clone();
-    let workspace = if working.spark_ranks == 0 { &i.local_workspace } else { &i.workspace };
-    fixed.extend(workspace.iter().cloned());
-    let fixed = working.demands(&fixed).cloned().collect();
-    Ok(PlacementRequest {
-        resident_weight_limit: i.resident_weight_limit,
-        // The family resolves the mode before admission (its index cache depends on it: compact
-        // under context, keys under heads), so two GPUs pin it.
-        attention_placement: (ranks == 2).then_some(i.attention.mode),
-        context_buffers: context_buffers(i.cfg, i.max_context, i.prefill_rows, working.prefill_lanes, i.attention),
-        layers_first_gpu: i.attention.first_owner,
-        inventory: Inventory { gpus: i.gpus.iter().map(|&(capacity_bytes, baseline)| GpuBudget {
-            capacity_bytes, headroom_bytes: i.headroom_bytes, baseline }).collect(), spark_ranks: working.spark_ranks, peer_access: ranks == 2 },
-        pool: PoolPolicy::resolve(&i.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), i.max_context,
-            i.requested_pool, geometry.logical_unit_rows, working.spark_ranks == 0).with_automatic_context(i.automatic_context),
-        pool_bounded: facts.pool_bounded,
-        layers, pool_overhead: facts.pool_overhead, fixed,
-        startup: Vec::new(),
-        movables,
-        expert_workspace: if working.includes(GlmfComponent::RtxExperts) { i.expert_workspace } else { 0 },
-        tp2_workspace: if working.includes(GlmfComponent::RtxExperts) { i.tp2_workspace } else { [0; 2] },
-        onboard: if i.spark_ranks == 0 { i.onboard } else { Onboard::Layers(working.rtx_layers.len()) },
-        minimum_expert_layers: 0,
-        expert_gpus: facts.expert_gpus,
-        policy: LayerPolicy { default: if ranks == 2 { vec![LayerMode::HeadSplit] } else {
-            vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }, by_kind: vec![],
-            ownership: LayerOwnership::Alternating, ..LayerPolicy::default() },
-        hops: HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 4 * i.cfg.hidden as u64 * 2, rows: i.prefill_rows.max(i.decode_rows),
-            lanes: working.prefill_lanes, entry_gpu: 0, head_gpu: 0, terminal: if ranks == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } }, executor: super::GLM5_FLASH,
-    })
-}
-
 /// Exact header-only layer residency: the shared RTX onboarding costs.
 pub use crate::placement::rtx_onboard::expert_costs;
 
@@ -542,95 +463,12 @@ impl GlmfWorkingSetExt for GlmfWorkingSet {
     }
 }
 
-pub fn solve_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: bool,
-    sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet), PlacementError> {
-    solve_working_set_with_graphs(i, target, automatic_context, sms, rtx_experts)
-        .map(|(placed, graphs, _)| (placed, graphs))
-}
-
-/// Choose Whole MLA ownership with the same admission used for expert homes and
-/// movable drafts. The alternate inventory changes only the first MLA owner;
-/// ties retain the original owner instead of depending on enumeration order.
-pub fn solve_attention_working_set_with_graphs(i: &GlmfInputs<'_>,
-    alternate_resident: Option<&[GlmfResidentRank]>, target: u64, automatic_context: bool,
-    sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
-    let original = solve_attention_owner_with_graphs(i, alternate_resident, target, automatic_context, sms, rtx_experts);
-    if i.gpus.len() != 2 || i.resident.len() != 2 || i.resident[0].embedding == 0
-        || i.resident[1].embedding != 0 || alternate_resident.is_some_and(|resident| resident.len() != 2) {
-        return original;
-    }
-    // Price both homes with all weights, graphs, draft scratch and experts in
-    // place. Pre-weight free memory alone misses asymmetric runtime costs.
-    let mut alternate = i.clone();
-    alternate.resident[1].embedding = alternate.resident[0].embedding;
-    alternate.resident[0].embedding = 0;
-    let alternate_resident = alternate_resident.map(|resident| {
-        let mut resident = resident.to_vec();
-        resident[1].embedding = resident[0].embedding;
-        resident[0].embedding = 0;
-        resident
-    });
-    let candidate = solve_attention_owner_with_graphs(&alternate, alternate_resident.as_deref(),
-        target, automatic_context, sms, rtx_experts);
-    select_attention_working_set(original, candidate)
-}
-
 /// The fixed embedding demand is also the executor's immutable table home.
 /// Host-mapped tables have no device demand and retain the entry GPU's alias.
 pub fn embedding_home(placed: &Placement) -> u8 {
     placed.items.iter().position(|items| items.iter().any(|item|
         item.category == Category::Embedding && item.group == "embedding" && item.bytes > 0))
         .unwrap_or(0) as u8
-}
-
-fn solve_attention_owner_with_graphs(i: &GlmfInputs<'_>,
-    alternate_resident: Option<&[GlmfResidentRank]>, target: u64, automatic_context: bool,
-    sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
-    let Some(resident) = alternate_resident else {
-        return solve_working_set_with_graphs(i, target, automatic_context, sms, rtx_experts);
-    };
-    if i.attention.mode != AttentionPlacement::Layers || i.gpus.len() != 2
-        || i.attention.first_owner > 1 || i.resident.len() != 2 || resident.len() != 2 {
-        return Err(PlacementError::Inventory("GLM Flash alternate MLA ownership inventory"));
-    }
-    let original = solve_working_set_with_graphs(i, target, automatic_context, sms, rtx_experts);
-    let mut alternate = i.clone();
-    alternate.attention.first_owner ^= 1;
-    alternate.resident = resident.to_vec();
-    let candidate = solve_working_set_with_graphs(&alternate, target, automatic_context, sms, rtx_experts);
-    select_attention_working_set(original, candidate)
-}
-
-fn attention_owner_score(placed: &Placement) -> Result<((u64, u64), u64), PlacementError> {
-    let policy = (placed.pool_tokens, placed.onboard_layers as u64);
-    // GLM Flash admission uses 256-token pool units, including bounded demands'
-    // private reserved units. Match BoundedDemand::bytes rather than max_units.
-    let units = placed.pool_tokens.div_ceil(256);
-    let headroom = placed.pool_limits.0.iter().map(|rank| {
-        let used = rank.demands.iter().try_fold(0u64, |used, demand| {
-            units.saturating_add(demand.offset_units).min(demand.cap_units)
-                .checked_mul(demand.bytes_per_unit).and_then(|bytes| used.checked_add(bytes))
-                .ok_or(PlacementError::Overflow("GLM Flash owner pool headroom"))
-        })?;
-        rank.available_bytes.checked_sub(used)
-            .ok_or(PlacementError::Inventory("GLM Flash owner pool demands exceed admission"))
-    }).collect::<Result<Vec<_>, PlacementError>>()?.into_iter().min().unwrap_or(0);
-    Ok((policy, headroom))
-}
-
-fn select_attention_working_set(
-    original: Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError>,
-    candidate: Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError>)
-    -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
-    match (original, candidate) {
-        (Ok(original), Ok(candidate)) => if attention_owner_score(&candidate.0)?
-            > attention_owner_score(&original.0)? {
-            Ok(candidate)
-        } else { Ok(original) },
-        (Ok(original), Err(_)) => Ok(original),
-        (Err(_), Ok(candidate)) => Ok(candidate),
-        (Err(error), Err(_)) => Err(error),
-    }
 }
 
 /// The selected first MLA owner is already recorded by the immutable layer plan.
@@ -643,99 +481,7 @@ pub fn placed_attention(attention: GlmfAttention, placed: &Placement) -> GlmfAtt
     GlmfAttention { first_owner, ..attention }
 }
 
-/// Evaluate every executable RTX prefix/Spark suffix with its own fixed costs.
-/// Spark presence never feeds back into a later solve: the empty set is one
-/// closed-form candidate. Graph-geometry shrinking stays local to each candidate.
-pub fn solve_working_set_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: bool,
-    sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
-    let mut resolved = i.clone();
-    resolved.automatic_context = automatic_context;
-    let i = &resolved;
-    request(i)?;
-    let mut graph_cache = std::collections::BTreeMap::new();
-    if i.spark_ranks == 0 {
-        let working = GlmfWorkingSet::candidate(i, i.experts.len())?;
-        let cap = i.onboard.layers(i.experts.len()).is_none().then_some(target.max(i.max_context));
-        let (placed, graphs) = solve_profile_with_graphs(i, target, automatic_context, sms, rtx_experts,
-            cap, None, &working, &mut graph_cache)?;
-        working.validate(&placed)?;
-        return Ok((placed, graphs, working));
-    }
-    let routed: Vec<_> = (0..i.layers).filter(|&layer| !i.cfg.dense[layer]).collect();
-    let counts: Vec<_> = match i.onboard.layers(routed.len()) {
-        Some(n) => vec![n],
-        None if !rtx_experts => vec![0],
-        None => (0..=routed.len()).collect(),
-    };
-    let cap = i.onboard.layers(routed.len()).is_none().then_some(target.max(i.max_context));
-    let mut best: Option<((u64, u64), Placement, GraphSet, GlmfWorkingSet)> = None;
-    let mut refusal = None;
-    for n in counts {
-        let working = GlmfWorkingSet::candidate(i, n)?;
-        let mut branch = i.clone();
-        branch.onboard = Onboard::Layers(n);
-        let floor = match i.onboard {
-            Onboard::Auto if working.spark_ranks > 0 && i.requested_pool.is_none() => Some(0),
-            _ => None,
-        };
-        match solve_profile_with_graphs(&branch, target, automatic_context, sms, rtx_experts,
-            cap, floor, &working, &mut graph_cache) {
-            Ok((placed, graphs)) => {
-                working.validate(&placed)?;
-                let score = (placed.pool_tokens, n as u64);
-                if best.as_ref().is_none_or(|(previous, ..)| score > *previous) {
-                    best = Some((score, placed, graphs, working));
-                }
-            }
-            Err(error) => { if refusal.is_none() { refusal = Some(error); } }
-        }
-    }
-    if let Some((_, placed, graphs, working)) = best { return Ok((placed, graphs, working)); }
-    Err(refusal.unwrap_or(PlacementError::Inventory("GLM Flash has no executable Spark working set")))
-}
 
-/// Rebuild startup graphs at a fixed expert candidate's admitted pool. The
-/// optional cap preserves the automatic pool's ceiling while exact onboard
-/// counts retain their existing fill-to-capacity policy.
-fn solve_profile_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: bool,
-    sms: usize, rtx_experts: bool, cap: Option<u64>, floor: Option<u64>,
-    working: &GlmfWorkingSet, graph_cache: &mut std::collections::BTreeMap<(usize, usize), GraphSet>)
-    -> Result<(Placement, GraphSet), PlacementError> {
-    let configure = |req: &mut PlacementRequest| {
-        if !rtx_experts { req.expert_gpus = 0; }
-        if let Some(cap) = cap { req.pool.ceiling = req.pool.ceiling.min(cap); }
-        if let Some(floor) = floor { req.pool.floor = floor; }
-    };
-    let mut candidate = i.requested_pool.unwrap_or(target.max(i.max_context));
-    if i.requested_pool.is_none() && (i.onboard.layers(i.experts.len()).is_some() || i.spark_ranks == 0) {
-        let mut req = request_for_working_set(i, working)?;
-        configure(&mut req);
-        candidate = solve(&req)?.pool_tokens;
-    }
-    super::super::settle_pool((candidate, ()), |candidate, _| {
-        let mut trial = i.clone();
-        if i.graphs.lifetime == Lifetime::Startup {
-            let context = glmf_graphs::admitted_graph_context(i.max_context as usize, candidate as usize, automatic_context);
-            trial.graphs = graph_cache.entry((context, candidate as usize)).or_insert_with(||
-                startup_graphs(i.cfg, i.layers, context, candidate as usize, i.sequences as usize,
-                    i.speculation, i.gpus.len(), i.decode_rows as usize, sms)).clone();
-            if i.local_tp2_exl3 && working.spark_ranks == 0 {
-                calibrate_local_tp2_graphs(&mut trial.graphs);
-            }
-        }
-        let mut req = request_for_working_set(&trial, working)?;
-        req.pool.target = req.pool.target.max(target).min(candidate);
-        req.pool.ceiling = candidate;
-        configure(&mut req);
-        let placed = solve(&req)?;
-        let tokens = if i.requested_pool.is_some() || i.graphs.lifetime != Lifetime::Startup {
-            candidate
-        } else { placed.pool_tokens };
-        Ok::<_, PlacementError>((tokens, (), (placed, trial.graphs)))
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize, sequences: usize,
     speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> GraphSet {
     let counts = glmf_graphs::serving_graph_counts(context, pool, cfg.dense_context(), sequences.min(decode_rows), speculation,
@@ -748,6 +494,64 @@ pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: 
         GraphRank { executables: count, bytes: measured + margin, margin }
     }).collect();
     GraphSet { ranks, shapes: counts[0] / (layers + 1) as u64, lifetime: Lifetime::Startup }
+}
+
+/// Estimated maximum-pool bound: only power-of-two stride/width transitions
+/// and the dense/long transition can introduce a new graph geometry. This
+/// avoids walking every pool unit or materializing executable shape keys.
+#[allow(clippy::too_many_arguments)]
+pub fn startup_graph_bound(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize,
+    sequences: usize, speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> GraphSet {
+    let pages = pool.div_ceil(glmf_graphs::PAGE_ROWS);
+    let pools = pages / glmf_graphs::UNIT_PAGES;
+    let limit = context.div_ceil(glmf_graphs::UNIT_ROWS).min(pools);
+    let mut boundaries = vec![1, limit];
+    let mut power = 1usize;
+    while power <= limit {
+        boundaries.push(power);
+        boundaries.push(power.saturating_add(1).min(limit));
+        let Some(next) = power.checked_mul(2) else { break };
+        power = next;
+    }
+    boundaries.push(cfg.dense_context().div_ceil(glmf_graphs::UNIT_ROWS).min(limit));
+    boundaries.push(cfg.dense_context().saturating_add(1).div_ceil(glmf_graphs::UNIT_ROWS).min(limit));
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let (table_pages, table_pools) = cache::glmf_table_pages(context as u64);
+    let table = (table_pages as usize, table_pools as usize);
+    let mut geometries = Vec::new();
+    for units in boundaries.into_iter().filter(|&units| units > 0 && units <= limit) {
+        let capacity = (units * glmf_graphs::UNIT_ROWS).min(context);
+        let mut width = 1;
+        while width / 2 * glmf_graphs::UNIT_ROWS < capacity {
+            let low = if width == 1 { 1 } else { width / 2 * glmf_graphs::UNIT_ROWS + 1 };
+            let high = (width * glmf_graphs::UNIT_ROWS).min(capacity);
+            for long in [false, true] {
+                if (!long && low <= high.min(cfg.dense_context()))
+                    || (long && low.max(cfg.dense_context() + 1) <= high) {
+                    let live = units.min(high.max(131_072).div_ceil(glmf_graphs::UNIT_ROWS).next_power_of_two());
+                    let (page_stride, pool_stride) = glmf_graphs::decode_strides(
+                        live * glmf_graphs::UNIT_PAGES, live, (pages, pools), table);
+                    let key = glmf_graphs::GraphGeometry::keyed(width.min(pool_stride), page_stride, pool_stride, long);
+                    if !geometries.contains(&key) { geometries.push(key); }
+                }
+            }
+            width *= 2;
+        }
+    }
+    let buckets = glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms));
+    let plain = buckets.bucket(sequences.min(decode_rows).clamp(16, 64), false);
+    let rows = buckets.plain.iter().filter(|&&rows| rows <= plain).count()
+        + if speculation { buckets.spec.len() } else { 0 };
+    let shapes = (geometries.len() * rows) as u64;
+    let ranks = (0..gpus).map(|rank| {
+        let executables = shapes * (layers + usize::from(rank == 0)) as u64;
+        let measured = glmf_graphs::measured_graph_bytes(executables, if gpus == 1 { 0 } else { rank + 1 });
+        let margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
+            .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
+        GraphRank { executables, bytes: measured + margin, margin }
+    }).collect();
+    GraphSet { ranks, shapes, lifetime: Lifetime::Startup }
 }
 
 /// P6 staged capture after every expert capacity was primed, not legacy Spark-route graphs.
@@ -819,6 +623,146 @@ mod tests {
         }
     }
 
+    fn contract(input: &GlmfInputs<'_>) -> Result<admission::AdmittedGlmf, planner::Refusal> {
+        admission::prepare(input, 188, true, admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30))?.admit()
+    }
+
+    fn admitted_case(input: &GlmfInputs<'_>, automatic_context: bool, sms: usize,
+        rtx_experts: bool, alternate: Option<&[GlmfResidentRank]>)
+        -> Result<(Placement, GraphSet, GlmfWorkingSet), planner::Refusal> {
+        let mut input = input.clone();
+        input.automatic_context = automatic_context;
+        let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        process.alternate_resident = alternate.map(<[GlmfResidentRank]>::to_vec);
+        let selected = admission::prepare(&input, sms, rtx_experts, process)?.admit()?;
+        Ok((selected.placement, selected.graphs, selected.working))
+    }
+
+    fn sampled<'a>(input: &GlmfInputs<'a>) -> GlmfInputs<'a> {
+        let mut input = input.clone();
+        for (capacity, baseline) in &mut input.gpus {
+            let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
+            *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
+        }
+        input
+    }
+
+    #[test]
+    fn contract_graph_bound_covers_exact_selected_shapes_without_pool_walk() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        for context in [2048, 2051, 4096, 65_536, 131_072, 262_144, 1_048_576] {
+            for pool in [256, 4096, 32_768, 131_072, 262_144, 1_360_896, 2_097_152] {
+                let bound = startup_graph_bound(&cfg, cfg.layers, context, pool, 16, true, 2, 64, 188);
+                let exact = startup_graphs(&cfg, cfg.layers, context, pool, 16, true, 2, 64, 188);
+                assert_eq!(bound.shapes, exact.shapes, "context={context}, pool={pool}");
+                assert_eq!(bound.ranks, exact.ranks);
+            }
+        }
+    }
+
+    #[test]
+    fn contract_zero_and_unset_preserve_exact_geometry_and_first_refusal() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.graphs = GraphSet::budget(&[64 << 20; 2]);
+        let unset = contract(&input).unwrap();
+        input.requested_pool = Some(0);
+        let zero = contract(&input).unwrap();
+        assert_eq!(unset.solved.pool_tokens, zero.solved.pool_tokens);
+        assert_eq!(unset.solved.decisions, zero.solved.decisions);
+        assert_eq!(unset.solved.facts.allocations, zero.solved.facts.allocations);
+        input.requested_pool = Some(1 << 40);
+        let first = contract(&input).err().unwrap().to_string();
+        assert_eq!(first, contract(&input).err().unwrap().to_string());
+        assert!(!first.contains("reserve does not fit"));
+    }
+
+    #[test]
+    fn contract_graph_exact_substitution_preserves_ready_and_growth_phases() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for local in [false, true] {
+            let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+            input.local_tp2_exl3 = local;
+            input.spark_ranks = 0;
+            input.requested_pool = Some(262_144);
+            let admitted = contract(&input).unwrap();
+            for gpu in 0..2 {
+                let ready = admitted.solved.facts.allocations.iter()
+                    .find(|owner| owner.id == format!("glmf.graphs.{gpu}.ready")).unwrap();
+                let growth = admitted.solved.facts.allocations.iter()
+                    .find(|owner| owner.id == format!("glmf.graphs.{gpu}.growth")).unwrap();
+                assert_eq!(ready.bytes + growth.bytes, admitted.graphs.bytes(gpu));
+                assert_eq!(growth.bytes, admitted.graphs.ranks[gpu].margin);
+                assert_eq!(ready.lifetime.first, planner::Phase::Warmup);
+                assert_eq!(growth.lifetime.first, planner::Phase::Growth);
+            }
+            assert_eq!(admitted.solved.phases,
+                planner::evaluate(&admitted.solved.facts, &admitted.solved.budgets).unwrap());
+        }
+    }
+
+    #[test]
+    fn contract_malformed_process_and_family_facts_are_typed_refusals() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        for host in [(0, 0), (100, 101)] {
+            assert!(matches!(admission::prepare(&input, 188, true,
+                admission::ProcessOwners::new(host, 0)), Err(planner::Refusal::InvalidFact(_))));
+        }
+        input.drafter_scratch.pop();
+        assert!(matches!(contract(&input), Err(planner::Refusal::InvalidFact(_))));
+        input.drafter_scratch.push(0);
+        input.graphs.ranks[0].margin = input.graphs.ranks[0].bytes + 1;
+        assert!(matches!(contract(&input), Err(planner::Refusal::InvalidFact(_))));
+    }
+
+    #[test]
+    fn contract_encoder_owners_and_host_pinned_capacity_are_joint() {
+        use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.graphs = GraphSet::budget(&[64 << 20; 2]);
+        input.requested_pool = Some(262_144);
+        let encoder = |kind| EncoderPlacement { kind, weights: 123456, scratch: 654321,
+            replicas: vec![], reason: "test physical owner".into(), shortfall: 0 };
+        for kind in [EncoderKind::Off, EncoderKind::Rtx { gpu: 1 }, EncoderKind::Spark { rank: 2 }] {
+            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            process.encoders = vec![encoder(kind.clone())];
+            process.media_cache_bytes = 7654321;
+            let admitted = admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
+            let media = admitted.solved.facts.allocations.iter().find(|owner| owner.id == "glmf.media.cache");
+            assert_eq!(media.map(|owner| owner.bytes), (kind != EncoderKind::Off).then_some(7654321));
+            if kind == EncoderKind::Off {
+                assert!(!admitted.solved.facts.allocations.iter().any(|owner| owner.id.starts_with("glmf.encoder.")));
+            } else {
+                let owners = admitted.solved.facts.allocations.iter().filter(|owner| owner.id.starts_with("glmf.encoder."))
+                    .collect::<Vec<_>>();
+                assert_eq!(owners.len(), 2);
+                assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), 123456 + 654321);
+                let expected = if matches!(kind, EncoderKind::Rtx { .. }) { planner::Location::coordinator(1) }
+                    else { planner::Location { device: planner::Device::Spark(2), domain: planner::Domain::Managed } };
+                assert!(owners.iter().all(|owner| owner.location == expected && owner.lifetime == planner::Lifetime::RESIDENT));
+                if matches!(kind, EncoderKind::Spark { .. }) { assert!(!admitted.working.spark_layers.is_empty()); }
+            }
+        }
+        for kind in [EncoderKind::Rtx { gpu: 2 }, EncoderKind::Spark { rank: 4 }] {
+            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            process.encoders = vec![encoder(kind)];
+            assert!(matches!(admission::prepare(&input, 188, true, process), Err(planner::Refusal::InvalidFact(_))));
+        }
+        input.onboard = Onboard::Layers(input.experts.len());
+        let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        process.encoders = vec![encoder(EncoderKind::Spark { rank: 0 })];
+        assert!(admission::prepare(&input, 188, true, process).and_then(|prepared| prepared.admit()).is_err());
+        let mut process = admission::ProcessOwners::new((1 << 30, 1 << 30), 0);
+        for (id, location) in [("host", planner::Location::HOST), ("pinned", planner::Location::PINNED)] {
+            process.allocations.push(planner::Allocation::buffer(id, location, 600 << 20,
+                planner::Lifetime::RESIDENT, Category::Staging, id));
+        }
+        let refusal = admission::prepare(&input, 188, true, process).unwrap().admit().err().unwrap();
+        assert!(refusal.to_string().contains("coordinator host RAM"), "{refusal}");
+    }
+
     #[test]
     fn kda_only_pool_backing_is_named_and_limits_automatic_capacity() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
@@ -828,46 +772,28 @@ mod tests {
                 ..Default::default() };
             input.index = cache::GlmfIndexCache::Compact;
             input.pool_marks = true;
-            let mut req = request(&input).unwrap();
-            let geometry = cache::glm_flash_placed_cache_geometry_rows(&cfg, 2, 2, input.index, 4, 64,
-                AttentionPlacement::Layers, first as usize).unwrap();
-            let bytes = geometry.ranks[1 - first as usize].retained_mark_bytes;
-            assert_eq!(req.pool_bounded.len(), 1);
-            let backing = &req.pool_bounded[0];
-            assert_eq!((backing.gpu, backing.bytes_per_unit), (1 - first, bytes));
-            assert!(backing.group.contains(&format!("{bytes} bytes/unit")));
-            assert_eq!(backing.bytes(17).unwrap(), 17 * bytes);
-            let reserved = req.fixed.iter().find(|d| d.gpu == 1 - first && d.group == "reserved units").unwrap();
-            assert_eq!(reserved.bytes, bytes + 4);
-            // Keep the owned cache geometry pinned while probing its exact byte limit.
-            req.pool.floor = 256;
-            req.pool.target = 2 << 20;
-            req.pool.ceiling = 2 << 20;
-            // Leave exactly 64 units on the KDA-only owner, far below the
-            // 8192-unit ceiling. Its next complete state mark must not fit.
-            let probe = solve(&req).unwrap();
+            input.onboard = Onboard::Layers(0);
+            input.drafter_bytes = 0;
+            input.resident.iter_mut().for_each(|rank| rank.embedding = 0);
+            input.graphs = GraphSet::budget(&[64 << 20; 2]);
+            input.automatic_context = true;
             let owner = (1 - first) as usize;
-            let rank = &probe.pool_limits.0[owner];
-            let unit_bytes = rank.demands.iter().map(|d| d.bytes_per_unit).sum::<u64>();
-            let budget = 64 * unit_bytes;
-            let free = req.inventory.gpus[owner].available() - (rank.available_bytes - budget);
-            req.inventory.gpus[owner].baseline = Baseline::Measured { free_bytes: free + req.inventory.gpus[owner].headroom_bytes };
-            let bounded = solve(&req).unwrap();
-            let limit = &bounded.pool_limits.0[owner];
-            assert_eq!(bounded.pool_tokens, 64 * 256);
-            assert_eq!(limit.max_units, 64);
-            assert_eq!(limit.available_bytes, budget);
-            assert!(65 * unit_bytes > limit.available_bytes);
-            assert!(bounded.pool_limits.0[first as usize].max_units > 64);
-            assert!(limit.demands.iter().any(|d| d.group.contains("KDA-only pool marks")
-                && d.bytes_per_unit == bytes));
-            req.pool_bounded.clear();
-            let unbounded = solve(&req).unwrap();
-            assert!(bounded.pool_tokens < unbounded.pool_tokens);
-            assert!(bounded.items[(1 - first) as usize].iter().any(|d|
-                d.group.contains("KDA-only pool marks") && d.bytes == bytes * bounded.pool_tokens / 256));
+            let marked = contract(&input).unwrap();
+            let pool = marked.solved.facts.allocations.iter()
+                .find(|allocation| allocation.id == format!("glmf.pool.{owner}")).unwrap();
+            let units = marked.solved.pool_tokens / 256;
+            let per_unit = pool.bytes / units;
+            let used = marked.solved.phases.iter().find(|phase| phase.phase == planner::Phase::Growth
+                && phase.budget == format!("rtx{owner}")).unwrap().owned;
+            let runtime = marked.solved.facts.allocations.iter()
+                .find(|allocation| allocation.id == format!("glmf.runtime.{owner}")).unwrap().bytes;
+            let fixed = used - pool.bytes - runtime;
+            input.gpus[owner].1 = Baseline::Measured {
+                free_bytes: fixed + 64 * per_unit + input.headroom_bytes };
+            let bounded = contract(&input).unwrap();
+            assert_eq!(bounded.placement.pool_tokens, 64 * 256);
             input.pool_marks = false;
-            assert!(request(&input).unwrap().pool_bounded.is_empty());
+            assert!(contract(&input).unwrap().placement.pool_tokens > bounded.placement.pool_tokens);
         }
     }
 
@@ -910,55 +836,17 @@ mod tests {
 
     #[test]
     fn planner_equals_runtime_glm5_flash() {
-        let mut config = crate::plan::testing::glm5_flash_config(45);
-        config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
-            if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
-        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         for (ranks, capacity) in [(1, 32 << 30), (1, inventory::PRO_TOTAL_BYTES), (2, inventory::PRO_TOTAL_BYTES)] {
-            let planned = inputs(&cfg, ranks, capacity);
-            let planned_request = request(&planned).unwrap();
-            assert_eq!(planned_request.layers.iter().filter(|l| l.kind == AttentionClass::Dsa).count(), 11);
-            let target = planned_request.pool.target;
-            let (p, admitted_graphs) = solve_with_graphs(&planned, target, true, 188, true).unwrap();
-            let mut measured = planned.clone();
-            for rank in 0..ranks {
-                let context = ArchContext::coordinator(capacity, None).context_bytes;
-                let code = loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap();
-                let sample = context + code.bytes / 3;
-                measured.gpus[rank].1 = Baseline::Measured { free_bytes: capacity - sample };
-                measured.pending_code[rank] = code.pending(sample, context);
-            }
-            let (r, measured_graphs) = solve_with_graphs(&measured, target, true, 188, true).unwrap();
-            assert_eq!(admitted_graphs.ranks, measured_graphs.ranks);
-            assert_eq!(p.pool_tokens, r.pool_tokens);
-            assert_eq!(p.onboard_layers, r.onboard_layers);
-            assert_eq!(p.layers, r.layers);
-            assert_eq!(p.tp2, r.tp2);
-            for rank in 0..ranks {
-                let bytes = |placed: &Placement, group: &str| placed.items[rank].iter()
-                    .filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
-                for group in ["graphs", inventory::GRAPH_GROWTH, "records"] {
-                    assert_eq!(bytes(&p, group), bytes(&r, group));
-                }
-                assert_eq!(bytes(&p, "graphs"), admitted_graphs.at_ready(rank));
-                assert_eq!(bytes(&p, inventory::GRAPH_GROWTH), admitted_graphs.growth(rank));
-                for placed in [&p, &r] {
-                    for item in placed.items[rank].iter().filter(|item|
-                        item.group == "graphs" || item.group == inventory::GRAPH_GROWTH) {
-                        assert_eq!(item.lifetime, if item.group == "graphs" {
-                            cuteafd_core::memory_layout::ItemLifetime::ReadyResident
-                        } else { cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve });
-                    }
-                }
-                let charged = |placed: &Placement| placed.items[rank].iter().map(|i| i.bytes).sum::<u64>();
-                let baseline = |input: &GlmfInputs<'_>| capacity - GpuBudget {
-                    capacity_bytes: capacity, headroom_bytes: 0, baseline: input.gpus[rank].1 }.available();
-                assert_eq!(baseline(&planned) + charged(&p), baseline(&measured) + charged(&r));
-            }
-            if ranks == 2 {
-                assert!(p.tp2.is_some());
-                assert!(!p.layers.iter().any(|l| matches!(l.experts, ExpertHome::RtxWhole { .. })));
-            }
+            let mut planned = inputs(&cfg, ranks, capacity);
+            planned.automatic_context = true;
+            let p = contract(&planned).unwrap();
+            let r = contract(&sampled(&planned)).unwrap();
+            assert_eq!(p.solved.pool_tokens, r.solved.pool_tokens);
+            assert_eq!(p.solved.decisions, r.solved.decisions);
+            assert_eq!(p.solved.facts.allocations, r.solved.facts.allocations);
+            assert_eq!(p.graphs, r.graphs);
+            assert_eq!(p.working, r.working);
         }
     }
 
@@ -978,7 +866,7 @@ mod tests {
             planned.requested_pool = Some(2 << 20);
             planned.graphs = GraphSet::budget(&[64 << 20; 2]);
             let target = 2 << 20;
-            let (p, pg, working) = solve_working_set_with_graphs(&planned, target, false, 188, true).unwrap();
+            let (p, pg, working) = admitted_case(&planned, false, 188, true, None).unwrap();
             assert_eq!(p.onboard_layers, expected);
             let spark = expected < planned.experts.len();
             assert_eq!(working.spark_ranks, if spark { 4 } else { 0 });
@@ -991,7 +879,7 @@ mod tests {
                 measured.gpus[rank].1 = Baseline::Measured { free_bytes: measured.gpus[rank].0 - sampled };
                 measured.pending_code[rank] += context_bytes - sampled;
             }
-            let (r, rg, runtime_working) = solve_working_set_with_graphs(&measured, target, false, 188, true).unwrap();
+            let (r, rg, runtime_working) = admitted_case(&measured, false, 188, true, None).unwrap();
             assert_eq!(pg, rg);
             assert_eq!(working, runtime_working);
             assert_eq!((p.pool_tokens, &p.layers, p.tp2), (r.pool_tokens, &r.layers, r.tp2));
@@ -1000,11 +888,8 @@ mod tests {
             assert_eq!(group(&p, 0, "Spark intake"), if spark { 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(2 * 4096 * cfg.hidden as u64 * 2).unwrap() } else { 0 });
             for rank in 0..2 {
                 assert_eq!(group(&p, rank, "steps"), if spark { planned.workspace[rank].demand.bytes } else { planned.local_workspace[rank].demand.bytes });
-                let total = |input: &GlmfInputs<'_>, placed: &Placement| input.gpus[rank].0 - GpuBudget {
-                    capacity_bytes: input.gpus[rank].0, headroom_bytes: 0, baseline: input.gpus[rank].1 }.available()
-                    + placed.items[rank].iter().map(|d| d.bytes).sum::<u64>();
-                assert!(total(&planned, &p).abs_diff(total(&measured, &r)) <= 64 << 20);
-                assert_eq!(total(&planned, &p), total(&measured, &r));
+                let total = |placed: &Placement| placed.items[rank].iter().map(|d| d.bytes).sum::<u64>();
+                assert_eq!(total(&p), total(&r));
             }
         }
     }
@@ -1019,8 +904,8 @@ mod tests {
             for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
                     cuteafd_core::SparkReplyFormat::Nvfp4] {
                 input.spark_reply_format = format;
-                let request = request(&input).unwrap();
-                let intake = request.fixed.iter().filter(|d| d.group == "Spark intake")
+                let selected = contract(&input).unwrap();
+                let intake = selected.placement.items.iter().flatten().filter(|d| d.group == "Spark intake")
                     .map(|d| d.bytes).sum::<u64>();
                 let rows = input.prefill_lanes * input.prefill_rows;
                 assert_eq!(intake, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
@@ -1036,13 +921,13 @@ mod tests {
         input.graphs = GraphSet::budget(&[64 << 20; 2]);
         input.requested_pool = Some(2 << 20);
         input.workspace = workspace_fixture(2, 100 << 30);
-        let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+        let (placed, _, working) = admitted_case(&input, false, 188, true, None).unwrap();
         assert_eq!(placed.onboard_layers, input.experts.len());
         assert!(working.spark_layers.is_empty());
         assert_eq!((working.spark_ranks, working.prefill_lanes), (0, 2));
         assert!(placed.items[0].iter().all(|d| d.group != "Spark intake"));
         input.onboard = Onboard::Layers(1);
-        assert!(solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).is_err());
+        assert!(admitted_case(&input, false, 188, true, None).is_err());
     }
 
     #[test]
@@ -1055,7 +940,7 @@ mod tests {
         input.graphs = GraphSet::budget(&[64 << 20; 2]);
         for pool in [None, Some(2 << 20)] {
             input.requested_pool = pool;
-            let (placed, graphs, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+            let (placed, graphs, working) = admitted_case(&input, false, 188, true, None).unwrap();
             assert_eq!(placed.pool_tokens, 2 << 20);
             assert_eq!(placed.onboard_layers, input.experts.len());
             assert!(placed.layers.iter().enumerate().filter(|(layer, _)| !cfg.dense[*layer])
@@ -1065,7 +950,7 @@ mod tests {
                 let Baseline::Planned { context_bytes, loaded_bytes } = input.gpus[rank].1 else { unreachable!() };
                 sampled.gpus[rank].1 = Baseline::Measured { free_bytes: sampled.gpus[rank].0 - context_bytes - loaded_bytes };
             }
-            let (runtime, runtime_graphs, runtime_working) = solve_working_set_with_graphs(&sampled, 2 << 20, false, 188, true).unwrap();
+            let (runtime, runtime_graphs, runtime_working) = admitted_case(&sampled, false, 188, true, None).unwrap();
             assert_eq!((placed.pool_tokens, &placed.layers, placed.tp2), (runtime.pool_tokens, &runtime.layers, runtime.tp2));
             assert_eq!(graphs, runtime_graphs);
             assert_eq!(working, runtime_working);
@@ -1106,8 +991,8 @@ mod tests {
             let Baseline::Planned { context_bytes, loaded_bytes } = planned.gpus[rank].1 else { unreachable!() };
             runtime.gpus[rank].1 = Baseline::Measured { free_bytes: capacity - context_bytes - loaded_bytes };
         }
-        let (plan, pg, pw) = solve_working_set_with_graphs(&planned, 2 << 20, true, 188, true).unwrap();
-        let (live, lg, lw) = solve_working_set_with_graphs(&runtime, 2 << 20, true, 188, true).unwrap();
+        let (plan, pg, pw) = admitted_case(&planned, true, 188, true, None).unwrap();
+        let (live, lg, lw) = admitted_case(&runtime, true, 188, true, None).unwrap();
         assert_eq!(plan.pool_tokens, live.pool_tokens);
         assert_eq!(plan.items, live.items);
         assert_eq!(plan.layers, live.layers);
@@ -1125,15 +1010,16 @@ mod tests {
             input.requested_pool = Some(2 << 20);
             for lanes in [1, 2] {
                 input.prefill_lanes = lanes;
-                let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+                let (placed, _, working) = admitted_case(&input, false, 188, true, None).unwrap();
                 assert_eq!((working.spark_ranks, working.prefill_lanes), (0, lanes));
                 assert_eq!(working.rtx_layers, vec![1, 2, 3]);
                 assert!(working.spark_layers.is_empty());
                 working.validate(&placed).unwrap();
-                let request = request_for_working_set(&input, &working).unwrap();
-                assert_eq!(request.hops.lanes, lanes);
+                input.onboard = Onboard::Layers(working.rtx_layers.len());
+                let selected = contract(&input).unwrap();
+                assert_eq!(selected.working.prefill_lanes, lanes);
                 for rank in 0..ranks {
-                    let charged = |name: &str| request.fixed.iter().filter(|d| d.gpu as usize == rank && d.group == name)
+                    let charged = |name: &str| selected.placement.items[rank].iter().filter(|d| d.group == name)
                         .map(|d| d.bytes).sum::<u64>();
                     assert_eq!(charged("Spark intake"), 0);
                     assert_eq!(charged("steps"), input.local_workspace[rank].demand.bytes);
@@ -1150,14 +1036,14 @@ mod tests {
     fn abort_words_follow_exchange_ownership_on_each_rank() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
         for ranks in [1, 2] {
-            let input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
+            let mut input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
             for onboard in [0, 1, 3] {
                 let working = GlmfWorkingSet::candidate(&input, onboard).unwrap();
-                let request = request_for_working_set(&input, &working).unwrap();
+                input.onboard = Onboard::Layers(working.rtx_layers.len());
+                let selected = contract(&input).unwrap();
                 for rank in 0..ranks {
-                    let bytes = |group: &str| request.fixed.iter()
-                        .filter(|d| d.gpu as usize == rank && d.group == group)
-                        .map(|d| { assert_eq!(d.basis, Basis::Formula); d.bytes }).sum::<u64>();
+                    let bytes = |group: &str| selected.placement.items[rank].iter()
+                        .filter(|d| d.group == group).map(|d| d.bytes).sum::<u64>();
                     assert_eq!(bytes("peer abort word"), if ranks == 2 { 256 } else { 0 });
                     assert_eq!(bytes("route abort word"), if ranks == 2 && onboard > 0 { 256 } else { 0 });
                 }
@@ -1177,7 +1063,8 @@ mod tests {
         }
         for n in [0, 1, 3] {
             let working: crate::placement::SparkWorkingSet = GlmfWorkingSet::candidate(&input, n).unwrap();
-            let request = request_for_working_set(&input, &working).unwrap();
+            input.onboard = Onboard::Layers(working.rtx_layers.len());
+                let selected = contract(&input).unwrap();
             assert_eq!(working.selected_ranks().count(), if n == input.experts.len() { 0 } else { input.spark_ranks });
             let rows = cache::glmf_expert_rows(input.prefill_rows, input.decode_rows) as u32;
             let pinned = working.coordinator_staging(cuteafd_core::ExpertGeometry::GLM5_FLASH, rows, false).unwrap();
@@ -1186,12 +1073,12 @@ mod tests {
             });
             for (component, group) in [(GlmfComponent::RtxExperts, "RTX test buffer"),
                 (GlmfComponent::SparkExperts, "Spark test buffer")] {
-                assert_eq!(request.fixed.iter().any(|d| d.group == group), working.includes(component));
+                assert_eq!(selected.placement.items.iter().flatten().any(|d| d.group == group), working.includes(component));
             }
             let mut forged = working;
             forged.prefill_lanes += 1;
-            assert!(matches!(request_for_working_set(&input, &forged),
-                Err(PlacementError::Inventory("GLM Flash selected working set inventory"))));
+            assert_ne!(forged, selected.working);
+            assert!(forged.validate(&selected.placement).is_ok());
         }
     }
 
@@ -1202,7 +1089,7 @@ mod tests {
         input.graphs = GraphSet::budget(&[64 << 20; 2]);
         for (onboard, expected) in [(Onboard::Layers(0), 0), (Onboard::Layers(2), 2), (Onboard::Layers(3), 3)] {
             input.onboard = onboard;
-            let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+            let (placed, _, working) = admitted_case(&input, false, 188, true, None).unwrap();
             assert_eq!(placed.onboard_layers, expected);
             assert_eq!(working.spark_layers.len(), input.experts.len() - expected);
         }
@@ -1214,11 +1101,11 @@ mod tests {
         let mut input = inputs(&cfg, 1, 32 << 30);
         input.max_context = 4 << 20;
         input.graphs = GraphSet::budget(&[64 << 20]);
-        let (placed, _, working) = solve_working_set_with_graphs(&input, 4 << 20, true, 170, true).unwrap();
+        let (placed, _, working) = admitted_case(&input, true, 170, true, None).unwrap();
         assert!(placed.pool_tokens < input.max_context);
         assert_eq!(working.spark_ranks, 4);
         input.requested_pool = Some(4 << 20);
-        assert!(solve_working_set_with_graphs(&input, 4 << 20, true, 170, true).is_err());
+        assert!(admitted_case(&input, true, 170, true, None).is_err());
     }
 
     #[test]
@@ -1231,7 +1118,7 @@ mod tests {
             input.requested_pool = Some(2 << 20);
             for n in 0..=2 {
                 input.onboard = Onboard::Layers(n);
-                let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+                let (placed, _, working) = admitted_case(&input, false, 188, true, None).unwrap();
                 assert_eq!(placed.onboard_layers, n);
                 assert_eq!(working.rtx_layers, [1, 3][..n]);
                 assert_eq!(working.spark_layers, [1, 3][n..]);
@@ -1247,7 +1134,7 @@ mod tests {
                 assert!(missing.validate(&placed).is_err());
             }
             input.onboard = Onboard::Auto;
-            let (placed, _, working) = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+            let (placed, _, working) = admitted_case(&input, false, 188, true, None).unwrap();
             assert_eq!(placed.onboard_layers, 2);
             assert_eq!(working.rtx_layers, [1, 3]);
             assert!(working.spark_layers.is_empty());
@@ -1290,41 +1177,15 @@ mod tests {
         input.drafter_bytes = owned.memory.resident;
         input.drafter_weights = owned.resident_weights;
         input.drafter_scratch = scratch;
-        let req = request(&input).unwrap();
-        assert_eq!(req.movables[0].allowed, [0]);
-        assert_eq!(req.movables[0].conditional.iter().map(|c| (c.placement_gpu, c.demands[0].gpu,
-            c.demands[0].category, c.demands[0].bytes, c.demands[0].basis)).collect::<Vec<_>>(),
-            [(0, 0, Category::Workspace, 30_491_648 + row_max_bytes + attention[0], Basis::Formula),
-             (1, 1, Category::Workspace, 28_394_496 + row_max_bytes + attention[1], Basis::Formula)]);
-        let actual = solve(&req).unwrap();
+        let actual = contract(&input).unwrap().placement;
         assert_eq!(actual.movables, [(MovableId::Drafter, 0)]);
-        assert_eq!(actual.items[0].iter().filter(|d| d.category == Category::Drafter).map(|d| d.bytes).sum::<u64>(), owned.memory.resident);
+        assert_eq!(actual.items[0].iter().filter(|d| d.group == "DFlash").map(|d| d.bytes).sum::<u64>(), owned.memory.resident);
         assert_eq!(actual.items[0].iter().find(|d| d.group == "DFlash linear/attention scratch").unwrap().bytes,
             30_491_648 + row_max_bytes + attention[0]);
-        assert!(actual.items[1].iter().all(|d| d.category != Category::Drafter && d.group != "DFlash linear/attention scratch"));
-        let mut previous = req.clone();
-        for candidate in &mut previous.movables[0].conditional {
-            candidate.demands[0].bytes -= row_max_bytes;
-        }
-        let before = solve(&previous).unwrap();
-        assert_eq!(actual.pool_tokens, before.pool_tokens);
-        assert_eq!(actual.layers, before.layers);
-        let charged = |placed: &Placement, rank: usize| placed.items[rank].iter().map(|d| d.bytes).sum::<u64>();
-        assert_eq!(charged(&actual, 0) - charged(&before, 0), row_max_bytes);
-        assert_eq!(charged(&actual, 1), charged(&before, 1));
-        // At a full GPU0 budget, only one rounded KV allocation unit is lost.
-        previous.movables[0].allowed = vec![0];
-        previous.inventory.gpus[0].headroom_bytes += previous.inventory.gpus[0].available() - charged(&before, 0);
-        let mut constrained = previous.clone();
-        constrained.movables[0].conditional[0].demands[0].bytes += row_max_bytes;
-        let before = solve(&previous).unwrap();
-        let after = solve(&constrained).unwrap();
-        assert_eq!(before.pool_tokens - after.pool_tokens, req.pool.unit_rows);
-        assert_eq!(before.layers, after.layers);
-        // Splitting the ledger categories must not change the old GPU0 total or pool/layer decision.
+        assert!(actual.items[1].iter().all(|d| d.group != "DFlash" && d.group != "DFlash linear/attention scratch"));
         input.drafter_bytes += input.drafter_scratch[0];
         input.drafter_scratch.fill(0);
-        let lumped = solve(&request(&input).unwrap()).unwrap();
+        let lumped = contract(&input).unwrap().placement;
         assert_eq!(actual.pool_tokens, lumped.pool_tokens);
         assert_eq!(actual.layers, lumped.layers);
         for rank in 0..2 {
@@ -1342,12 +1203,12 @@ mod tests {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.drafter_scratch = vec![256];
-        assert!(matches!(request(&input), Err(PlacementError::Inventory("GLM Flash draft scratch inventory"))));
+        assert!(matches!(contract(&input), Err(planner::Refusal::InvalidFact(_))));
         input.drafter_scratch = vec![256, 0];
         input.drafter_bytes = 0;
-        assert!(matches!(request(&input), Err(PlacementError::Inventory("GLM Flash draft scratch inventory"))));
+        assert!(matches!(contract(&input), Err(planner::Refusal::InvalidFact(_))));
         input.drafter_bytes = u64::MAX;
-        assert!(matches!(request(&input), Err(PlacementError::Overflow("GLM Flash draft inventory"))));
+        assert!(contract(&input).is_err());
     }
 
     #[test]
@@ -1367,10 +1228,10 @@ mod tests {
         input.drafter_bytes = owned.memory.resident;
         input.drafter_weights = owned.resident_weights;
         input.drafter_scratch = scratch;
-        let req = request(&input).unwrap();
-        assert_eq!(req.movables[0].allowed, [0]);
-        assert!(req.movables[0].conditional.iter().flat_map(|c| &c.demands).all(|d| d.category == Category::Workspace));
-        assert_eq!(solve(&req).unwrap().movables, [(MovableId::Drafter, 0)]);
+        let selected = contract(&input).unwrap();
+        assert_eq!(selected.placement.movables, [(MovableId::Drafter, 0)]);
+        assert_eq!(selected.placement.items[0].iter().find(|item| item.group == "DFlash linear/attention scratch").unwrap().category,
+            Category::Workspace);
     }
 
     #[test]
@@ -1384,28 +1245,23 @@ mod tests {
         input.drafter_weights = owned.resident_weights;
         input.drafter_scratch = scratch;
         input.drafter_bridge = drafter_bridge_inventory(&config, 8, 8).unwrap();
-        let mut req = request(&input).unwrap();
-        assert_eq!(req.movables[0].allowed, [0, 1]);
-        assert_eq!(req.movables[0].conditional.iter().map(|c| c.placement_gpu).collect::<Vec<_>>(), [0, 1]);
-        let candidate = req.movables[0].conditional[1].clone();
-        assert_eq!(candidate.demands.iter().filter(|d| d.group == "DFlash linear/attention scratch")
-            .map(|d| (d.gpu, d.bytes)).collect::<Vec<_>>(), [(1, input.drafter_scratch[1])]);
-        assert_eq!(candidate.demands.iter().filter(|d| d.group == "DFlash bridge logits")
-            .map(|d| (d.gpu, d.bytes)).collect::<Vec<_>>(), [(0, 8 * 8 * 154_880 * 4)]);
         for home in [0, 1] {
-            req.movables[0].allowed = vec![home];
-            let actual = solve(&req).unwrap();
+            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            // Domains and component activations must be prepared together, so bias
+            // the complete physical inventory rather than rewriting a solved home.
+            input.resident[(1 - home) as usize].weights += 16 << 30;
+            process.allocations.clear();
+            let actual = admission::prepare(&input, 188, true, process).unwrap().admit().unwrap().placement;
             assert_eq!(actual.movables, [(MovableId::Drafter, home)]);
-            let owner = &actual.items[home as usize];
-            assert_eq!(owner.iter().filter(|d| d.group == "Drafter").map(|d| d.bytes).sum::<u64>(), owned.memory.resident);
+            assert_eq!(actual.items[home as usize].iter().filter(|d| d.group == "DFlash").map(|d| d.bytes).sum::<u64>(), owned.memory.resident);
             for rank in 0..2 {
                 let bridge = actual.items[rank].iter().filter(|d| d.group.starts_with("DFlash bridge"))
                     .map(|d| d.bytes).sum::<u64>();
-                let expected = if home == 1 { candidate.demands.iter().filter(|d| d.gpu as usize == rank
-                    && d.group.starts_with("DFlash bridge")).map(|d| d.bytes).sum() } else { 0 };
+                let expected = if home == 1 { input.drafter_bridge.as_ref().unwrap().demands.iter()
+                    .filter(|d| d.gpu as usize == rank).map(|d| d.bytes).sum() } else { 0 };
                 assert_eq!(bridge, expected);
-                if rank != home as usize { assert!(actual.items[rank].iter().all(|d| d.group != "Drafter")); }
             }
+            input.resident[(1 - home) as usize].weights -= 16 << 30;
         }
     }
 
@@ -1426,7 +1282,7 @@ mod tests {
             planned.drafter_weights = owned.resident_weights;
             planned.drafter_scratch = scratch;
             planned.drafter_bridge = drafter_bridge_inventory(&draft_config(), 8, 8).unwrap();
-            let (p, pg, pw) = solve_working_set_with_graphs(&planned, 262_144, false, 188, true).unwrap();
+            let (p, pg, pw) = admitted_case(&planned, false, 188, true, None).unwrap();
             assert_eq!(p.movables, [(MovableId::Drafter, expected_home)]);
             let mut measured = planned.clone();
             for rank in 0..2 {
@@ -1438,7 +1294,7 @@ mod tests {
                 measured.gpus[rank].1 = Baseline::Measured { free_bytes: raw_free + prepared_controls };
                 measured.pending_code[rank] = context_bytes - sampled_code;
             }
-            let (r, rg, rw) = solve_working_set_with_graphs(&measured, 262_144, false, 188, true).unwrap();
+            let (r, rg, rw) = admitted_case(&measured, false, 188, true, None).unwrap();
             assert_eq!((pg, pw), (rg, rw));
             assert_eq!((&p.movables, p.pool_tokens, &p.layers, p.tp2),
                 (&r.movables, r.pool_tokens, &r.layers, r.tp2));
@@ -1446,7 +1302,7 @@ mod tests {
             for rank in 0..2 {
                 let bytes = |placed: &Placement, group: &str| placed.items[rank].iter()
                     .filter(|item| item.group == group).map(|item| item.bytes).sum::<u64>();
-                assert_eq!(bytes(&p, "Drafter"), if rank == expected_home as usize { owned.memory.resident } else { 0 });
+                assert_eq!(bytes(&p, "DFlash"), if rank == expected_home as usize { owned.memory.resident } else { 0 });
                 for demand in &bridge.demands {
                     if demand.gpu as usize != rank { continue; }
                     let expected = if expected_home == 1 { demand.bytes } else { 0 };
@@ -1455,10 +1311,8 @@ mod tests {
                 }
                 assert_eq!(bytes(&p, "DFlash linear/attention scratch"),
                     if rank == expected_home as usize { planned.drafter_scratch[rank] } else { 0 });
-                let total = |input: &GlmfInputs<'_>, placed: &Placement| input.gpus[rank].0 - GpuBudget {
-                    capacity_bytes: input.gpus[rank].0, headroom_bytes: 0, baseline: input.gpus[rank].1 }.available()
-                    + placed.items[rank].iter().map(|item| item.bytes).sum::<u64>();
-                assert_eq!(total(&planned, &p), total(&measured, &r));
+                let total = |placed: &Placement| placed.items[rank].iter().map(|item| item.bytes).sum::<u64>();
+                assert_eq!(total(&p), total(&r));
             }
         }
     }
@@ -1470,7 +1324,7 @@ mod tests {
             let mut input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
             input.drafter_bridge = drafter_bridge_inventory(&draft_config(), 8, 8).unwrap();
             if ranks == 2 { input.drafter_bytes = 0; }
-            assert!(matches!(request(&input), Err(PlacementError::Inventory("GLM Flash remote draft candidate"))));
+            assert!(matches!(contract(&input), Err(planner::Refusal::InvalidFact(_))));
         }
         assert!(drafter_bridge_inventory(&draft_config(), 0, 1).is_err());
         assert!(drafter_bridge_inventory(&draft_config(), 8, 9).is_err());
@@ -1519,17 +1373,9 @@ mod tests {
     #[test]
     fn remote_dflash_bridge_stays_dormant_for_gpu0_only_drafter() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
-        let mut req = request(&inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES)).unwrap();
-        assert_eq!(req.movables[0].allowed, [0]);
-        assert!(req.movables[0].conditional.is_empty());
-        let expected = solve(&req).unwrap();
-        req.movables[0].conditional.push(remote_dflash_bridge_demands(cfg.hidden as u64,
-            cfg.vocab_size as u64, 6, 128).unwrap());
-        let actual = solve(&req).unwrap();
-        assert_eq!(actual.items, expected.items);
-        assert_eq!(actual.movables, expected.movables);
-        assert_eq!(actual.pool_tokens, expected.pool_tokens);
-        assert_eq!(actual.layers, expected.layers);
+        let input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        let actual = contract(&input).unwrap().placement;
+        assert_eq!(actual.movables, [(MovableId::Drafter, 0)]);
         assert!(actual.items.iter().flatten().all(|d| !d.group.starts_with("DFlash bridge")));
     }
 
@@ -1622,7 +1468,7 @@ mod tests {
     fn glm5_flash_graph_inventory_rebuilds_at_the_smaller_pool() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         let input = inputs(&cfg, 1, 32 << 30);
-        let (placed, graphs) = solve_with_graphs(&input, 1 << 20, true, 170, true).unwrap();
+        let (placed, graphs) = admitted_case(&input, true, 170, true, None).map(|(placed, graphs, _)| (placed, graphs)).unwrap();
         assert!(placed.pool_tokens < 1 << 20);
         let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
         let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
@@ -1638,7 +1484,7 @@ mod tests {
             input.drafter_bytes = drafter;
             input.speculation = speculation;
             input.sequences = 128;
-            let (placed, graphs) = solve_with_graphs(&input, 2 << 20, true, 188, true).unwrap();
+            let (placed, graphs) = admitted_case(&input, true, 188, true, None).map(|(placed, graphs, _)| (placed, graphs)).unwrap();
             let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
             let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
                 64, speculation, 1, 64, 188);
@@ -1651,7 +1497,7 @@ mod tests {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         let mut input = inputs(&cfg, 1, inventory::PRO_TOTAL_BYTES);
         input.onboard = Onboard::Layers(1);
-        let (placed, graphs) = solve_with_graphs(&input, 2 << 20, true, 188, true).unwrap();
+        let (placed, graphs) = admitted_case(&input, true, 188, true, None).map(|(placed, graphs, _)| (placed, graphs)).unwrap();
         assert_eq!(placed.onboard_layers, 1);
         let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
         let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
@@ -1700,15 +1546,14 @@ mod tests {
             // Synthetic experts isolate cache storage while retaining the real
             // working-set, TP2, graph and per-layer hop admission arithmetic.
             for expert in &mut input.experts { expert.whole = Bytes2::default(); expert.half = [Bytes2::default(); 2]; }
-            let heads = solve(&request(&input).unwrap()).unwrap();
+            let heads = contract(&input).map(|a| a.placement).unwrap();
             let heads_bytes = replicated_mla_bytes(&cfg, input.index, &heads).unwrap();
             assert_eq!(heads_bytes, 11 * (256 * (528 + 512) + 64 * 132) * (2 << 20) / 256);
             for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
                 input.index = cache::GlmfIndexCache::Compact;
                 input.attention.mode = mode;
-                let req = request(&input).unwrap();
-                assert_eq!(solve(&req).unwrap().attention_placement, mode);
-                let placed = solve(&req).unwrap();
+                let placed = contract(&input).unwrap().placement;
+                assert_eq!(placed.attention_placement, mode);
                 assert_eq!(placed.pool_tokens, 2 << 20);
                 assert_eq!(replicated_mla_bytes(&cfg, input.index, &placed).unwrap(), 0);
                 assert!(placed.layers.iter().zip(&cfg.attention).filter(|(_, kind)| **kind == GlmNextAttention::Kda)
@@ -1721,30 +1566,18 @@ mod tests {
                     assert_eq!(mla, (0..11).map(|i| LayerMode::Whole { gpu: (i % 2) as u8,
                         ffn: FfnMode::Split }).collect::<Vec<_>>());
                 }
-                let record_bytes: u64 = placed.items.iter().flatten().filter(|i| i.group == "records").map(|i| i.bytes).sum();
-                assert_eq!(record_bytes, (11 * (256 * 528 + 64 * 132) + 8) * (2 << 20) / 256);
-                let mut measured = req.clone();
-                for gpu in &mut measured.inventory.gpus {
-                    let Baseline::Planned { context_bytes, loaded_bytes } = gpu.baseline else { unreachable!() };
-                    gpu.baseline = Baseline::Measured { free_bytes: gpu.capacity_bytes - context_bytes - loaded_bytes };
-                }
-                let runtime = solve(&measured).unwrap();
+                let geometry = facts(&input).unwrap().geometry;
+                let pool_bytes: u64 = placed.items.iter().flatten().filter(|item| item.group == "KV pool")
+                    .map(|item| item.bytes).sum();
+                assert_eq!(pool_bytes, geometry.ranks.iter().map(|rank|
+                    (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes) * ((2 << 20) / 256))
+                    .sum::<u64>());
+                let runtime = contract(&sampled(&input)).unwrap().placement;
                 assert_eq!(placed.items, runtime.items);
                 assert_eq!(placed.layers, runtime.layers);
                 assert_eq!(placed.pool_tokens, runtime.pool_tokens);
             }
         }
-    }
-
-    fn owner_candidate(input: &GlmfInputs<'_>, measured: bool) -> (Placement, GraphSet, GlmfWorkingSet) {
-        let mut req = request(input).unwrap();
-        if measured {
-            for gpu in &mut req.inventory.gpus {
-                let Baseline::Planned { context_bytes, loaded_bytes } = gpu.baseline else { unreachable!() };
-                gpu.baseline = Baseline::Measured { free_bytes: gpu.capacity_bytes - context_bytes - loaded_bytes };
-            }
-        }
-        (solve(&req).unwrap(), input.graphs.clone(), GlmfWorkingSet::candidate(input, input.experts.len()).unwrap())
     }
 
     #[test]
@@ -1775,31 +1608,21 @@ mod tests {
             alternate.attention.first_owner = 1;
             alternate.resident = resident_weights_placed(&checkpoint, &cfg, cfg.layers, 2,
                 input.representation, AttentionPlacement::Layers, 1).unwrap();
-            let planned = select_attention_working_set(Ok(owner_candidate(&input, false)),
-                Ok(owner_candidate(&alternate, false))).unwrap();
-            let measured = select_attention_working_set(Ok(owner_candidate(&input, true)),
-                Ok(owner_candidate(&alternate, true))).unwrap();
-            assert_eq!(placed_attention(input.attention, &planned.0).first_owner, expected);
-            assert_eq!(planned.0.items, measured.0.items);
-            assert_eq!(planned.0.layers, measured.0.layers);
-            assert_eq!(planned.0.pool_tokens, 2 << 20);
-            assert_eq!(planned.0.movables, [(MovableId::Drafter, 0)]);
-            let selected = solve_attention_working_set_with_graphs(&input, Some(&alternate.resident),
-                2 << 20, false, 188, true).unwrap();
+            let selected = admitted_case(&input, false, 188, true, Some(&alternate.resident)).unwrap();
             assert_eq!(placed_attention(input.attention, &selected.0).first_owner, expected);
-            assert!(attention_owner_score(&selected.0).unwrap()
-                >= attention_owner_score(&planned.0).unwrap());
+            assert_eq!(placed_attention(input.attention, &selected.0).first_owner, expected);
+            assert_eq!(selected.0.pool_tokens, 2 << 20);
+            assert_eq!(selected.0.movables, [(MovableId::Drafter, 0)]);
             let mut measured_input = input.clone();
             for (capacity, baseline) in &mut measured_input.gpus {
                 let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
                 *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
             }
-            let runtime = solve_attention_working_set_with_graphs(&measured_input, Some(&alternate.resident),
-                2 << 20, false, 188, true).unwrap();
+            let runtime = admitted_case(&measured_input, false, 188, true, Some(&alternate.resident)).unwrap();
             assert_eq!(selected.0, runtime.0);
             let resident = if expected == 0 { &input.resident } else { &alternate.resident };
             for rank in 0..2 {
-                let bytes: u64 = planned.0.items[rank].iter().filter(|i| i.group == "target weights")
+                let bytes: u64 = selected.0.items[rank].iter().filter(|i| i.group == "target weights")
                     .map(|i| i.bytes).sum();
                 assert_eq!(bytes, resident[rank].weights);
             }
@@ -1820,8 +1643,7 @@ mod tests {
                 let busy = 1 - expected;
                 let Baseline::Planned { loaded_bytes, .. } = &mut input.gpus[busy].1 else { unreachable!() };
                 *loaded_bytes += 8 << 30;
-                let (planned, _, _) = solve_attention_working_set_with_graphs(&input, None,
-                    2 << 20, false, 188, true).unwrap();
+                let (planned, _, _) = admitted_case(&input, false, 188, true, None).unwrap();
                 assert_eq!(embedding_home(&planned), expected as u8);
                 assert_eq!(planned.movables, [(MovableId::Drafter, 0)]);
                 let bytes = input.resident[0].embedding;
@@ -1835,18 +1657,10 @@ mod tests {
                     let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
                     *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
                 }
-                let (runtime, _, _) = solve_attention_working_set_with_graphs(&sampled, None,
-                    2 << 20, false, 188, true).unwrap();
+                let (runtime, _, _) = admitted_case(&sampled, false, 188, true, None).unwrap();
                 assert_eq!(runtime, planned);
-                if expected == 1 {
-                    let baseline = solve_attention_owner_with_graphs(&input, None,
-                        2 << 20, false, 188, true).unwrap().0;
-                    assert!(attention_owner_score(&planned).unwrap()
-                        > attention_owner_score(&baseline).unwrap());
-                }
                 input.resident[0].embedding = 0;
-                let host = solve_attention_working_set_with_graphs(&input, None,
-                    2 << 20, false, 188, true).unwrap().0;
+                let host = admitted_case(&input, false, 188, true, None).unwrap().0;
                 assert_eq!(embedding_home(&host), 0);
                 assert!(host.items.iter().flatten().filter(|item| item.category == Category::Embedding)
                     .all(|item| item.bytes == 0));
@@ -1860,62 +1674,35 @@ mod tests {
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.spark_ranks = 0;
         input.attention = GlmfAttention { mode: AttentionPlacement::Layers, first_owner: 1, ..Default::default() };
-        let original = owner_candidate(&input, false);
-        let mut alternate = original.clone();
-        for layer in &mut alternate.0.layers {
-            if let LayerMode::Whole { gpu, ffn: FfnMode::Split } = &mut layer.mode { *gpu ^= 1; }
-        }
-        let selected = select_attention_working_set(Ok(original.clone()), Ok(alternate.clone())).unwrap();
-        assert_eq!(placed_attention(input.attention, &selected.0).first_owner, 1);
-        assert_eq!(select_attention_working_set(Err(PlacementError::Inventory("original")),
-            Ok(alternate.clone())).unwrap().0.layers, alternate.0.layers);
-        assert_eq!(select_attention_working_set(Ok(original.clone()),
-            Err(PlacementError::Inventory("alternate"))).unwrap().0.layers, original.0.layers);
-        assert_eq!(select_attention_working_set(Err(PlacementError::Inventory("original")),
-            Err(PlacementError::Inventory("alternate"))).unwrap_err(), PlacementError::Inventory("original"));
-        let mut placed = original.0;
-        placed.pool_tokens = 4 * 256;
-        placed.onboard_layers = 2;
-        placed.pool_limits = PoolLimits(vec![PoolRankLimit { gpu: 0, available_bytes: 1000, max_units: 100,
-            demands: vec![PoolUnitDemand { group: "bounded".into(), bytes_per_unit: 10,
-                offset_units: 3, cap_units: 6 }] }]);
-        assert_eq!(attention_owner_score(&placed).unwrap(), ((1024, 2), 940));
-        let mut more_experts = placed.clone();
-        more_experts.pool_tokens = 3 * 256;
-        more_experts.onboard_layers = 3;
-        more_experts.pool_limits.0[0].available_bytes = 900;
-        assert!(attention_owner_score(&placed).unwrap()
-            > attention_owner_score(&more_experts).unwrap());
-        placed.pool_limits.0[0].available_bytes = 59;
-        assert!(attention_owner_score(&placed).is_err());
+        input.index = cache::GlmfIndexCache::Compact;
+        input.requested_pool = Some(262_144);
+        input.graphs = GraphSet::budget(&[64 << 20; 2]);
+        let a = admitted_case(&input, false, 188, true, Some(&input.resident)).unwrap();
+        let b = admitted_case(&input, false, 188, true, Some(&input.resident)).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.0.pool_tokens, 262_144);
+        assert_eq!(a.0.onboard_layers, input.experts.len());
     }
 
     #[test]
     fn owner_inventory_is_optional_for_heads_and_context_and_invalid_elsewhere() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
-        for mode in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+        for mode in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
             let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
             input.attention.mode = mode;
             input.index = if mode == AttentionPlacement::Heads { cache::GlmfIndexCache::Keys }
                 else { cache::GlmfIndexCache::Compact };
-            let original = solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
-            let placed = solve_attention_working_set_with_graphs(&input, None, 2 << 20, false, 188, true).unwrap();
-            let mut peer = input.clone();
-            peer.resident[1].embedding = peer.resident[0].embedding;
-            peer.resident[0].embedding = 0;
-            let candidate = solve_working_set_with_graphs(&peer, 2 << 20, false, 188, true).unwrap();
-            let expected = select_attention_working_set(Ok(original), Ok(candidate)).unwrap();
-            assert_eq!(expected.0, placed.0);
-            assert_eq!(placed_attention(input.attention, &placed.0), input.attention);
-            assert!(matches!(solve_attention_working_set_with_graphs(&input, Some(&input.resident),
-                2 << 20, false, 188, true), Err(PlacementError::Inventory(_))));
-        }
-        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
-        input.attention.mode = AttentionPlacement::Layers;
-        for count in [0, 1, 3] {
-            let malformed = vec![input.resident[0].clone(); count];
-            assert!(matches!(solve_attention_working_set_with_graphs(&input, Some(&malformed),
-                2 << 20, false, 188, true), Err(PlacementError::Inventory(_))));
+            let original = admitted_case(&input, false, 188, true, None).unwrap();
+            assert_eq!(placed_attention(input.attention, &original.0), input.attention);
+            if mode != AttentionPlacement::Layers {
+                assert!(matches!(admitted_case(&input, false, 188, true, Some(&input.resident)),
+                    Err(planner::Refusal::InvalidFact(_))));
+            }
+            for count in [0, 1, 3] {
+                let malformed = vec![input.resident[0].clone(); count];
+                assert!(matches!(admitted_case(&input, false, 188, true, Some(&malformed)),
+                    Err(planner::Refusal::InvalidFact(_))));
+            }
         }
     }
 
@@ -1943,8 +1730,7 @@ mod tests {
             input.index = cache::GlmfIndexCache::Compact;
             input.resident = resident_weights_placed(&checkpoint, &cfg, cfg.layers, 2,
                 input.representation, AttentionPlacement::Layers, first_owner as usize).unwrap();
-            let planner = request(&input).unwrap();
-            let placed = solve(&planner).unwrap();
+            let placed = contract(&input).unwrap().placement;
             for rank in 0..2 {
                 let charged: u64 = placed.items[rank].iter()
                     .filter(|item| item.group == "target weights").map(|item| item.bytes).sum();
@@ -1953,12 +1739,7 @@ mod tests {
                 assert!(!placed.items[rank].iter().any(|item| item.group == "router replica"),
                     "routers are part of target weights, never an extra demand");
             }
-            let mut runtime = planner.clone();
-            for gpu in &mut runtime.inventory.gpus {
-                let Baseline::Planned { context_bytes, loaded_bytes } = gpu.baseline else { unreachable!() };
-                gpu.baseline = Baseline::Measured { free_bytes: gpu.capacity_bytes - context_bytes - loaded_bytes };
-            }
-            let admitted = solve(&runtime).unwrap();
+            let admitted = contract(&sampled(&input)).unwrap().placement;
             assert_eq!(placed.items, admitted.items);
             assert_eq!(placed.layers, admitted.layers);
             assert_eq!(placed.pool_tokens, admitted.pool_tokens);
@@ -2030,7 +1811,7 @@ mod tests {
         for programs in [programs, None] {
             let mut i = inputs(&cfg_heads, 2, inventory::PRO_TOTAL_BYTES);
             i.attention = resolve_attention(Some(Heads), 2, programs).unwrap();
-            let placed = solve(&request(&i).unwrap()).unwrap();
+            let placed = contract(&i).map(|a| a.placement).unwrap();
             assert_eq!(placed.attention_placement, Heads);
             assert!(placed.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
             if let Some(expected) = &reference { assert_eq!(&placed, expected); }
@@ -2038,7 +1819,7 @@ mod tests {
             i.attention = resolve_attention(None, 2, programs).unwrap();
             i.index = if i.attention.mode == Context { cache::GlmfIndexCache::Compact }
                 else { cache::GlmfIndexCache::Keys };
-            let placed = solve(&request(&i).unwrap()).unwrap();
+            let placed = contract(&i).map(|a| a.placement).unwrap();
             assert_eq!(placed.attention_placement, if programs.is_some() { Context } else { Layers });
         }
         // Explicit layers does not need the context programs.
@@ -2046,12 +1827,14 @@ mod tests {
             assert_eq!(resolve_attention(Some(Layers), 2, programs).unwrap().mode, Layers);
         }
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
-        let mut req = request(&inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES)).unwrap();
-        assert!(req.layers.iter().filter(|l| l.kind == AttentionClass::Kda).all(|l| l.kv_unit.unit_bytes_context.is_none()));
-        assert!(req.layers.iter().filter(|l| l.kind == AttentionClass::Dsa).all(|l| l.kv_unit.unit_bytes_context.is_some()));
-        assert_eq!(solve(&req).unwrap().attention_placement, Heads);
-        req.attention_placement = Some(Layers);
-        let placed = solve(&req).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        let geometry = facts(&input).unwrap();
+        assert!(geometry.layers.iter().filter(|l| l.kind == AttentionClass::Kda).all(|l| l.kv_unit.unit_bytes_context.is_none()));
+        assert!(geometry.layers.iter().filter(|l| l.kind == AttentionClass::Dsa).all(|l| l.kv_unit.unit_bytes_context.is_some()));
+        assert_eq!(contract(&input).unwrap().placement.attention_placement, Heads);
+        input.attention.mode = Layers;
+        input.index = cache::GlmfIndexCache::Compact;
+        let placed = contract(&input).unwrap().placement;
         assert_eq!(placed.attention_placement, Layers);
         assert!(placed.layers.iter().zip(&cfg.attention).all(|(layer, kind)|
             if *kind == GlmNextAttention::Kda { layer.mode == LayerMode::HeadSplit } else {
@@ -2070,7 +1853,7 @@ mod tests {
         }
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let one = inputs(&cfg, 1, inventory::PRO_TOTAL_BYTES);
-        let placed = solve(&request(&one).unwrap()).unwrap();
+        let placed = contract(&one).map(|a| a.placement).unwrap();
         assert!(placed.layers.iter().all(|layer| layer.mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }));
         executor.check(&placed).unwrap();
     }
@@ -2080,9 +1863,9 @@ mod tests {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         for expert in &mut input.experts { expert.tp2 = false; }
-        let placed = solve(&request(&input).unwrap()).unwrap();
+        let placed = contract(&input).map(|a| a.placement).unwrap();
         assert_eq!(placed.onboard_layers, 0);
         input.onboard = Onboard::Layers(1);
-        assert!(solve(&request(&input).unwrap()).is_err());
+        assert!(contract(&input).map(|a| a.placement).is_err());
     }
 }

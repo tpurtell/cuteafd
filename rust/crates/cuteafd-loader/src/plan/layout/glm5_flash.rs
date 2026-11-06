@@ -23,8 +23,6 @@ pub(crate) fn native_layout(report: &mut PlanReport, model: &dyn super::super::F
 fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions,
     exlr8: Option<(&crate::plan::exlr8::native::DenseFacts, &crate::plan::exlr8::residency::MetadataInput)>) -> MemoryLayout {
-    let auto_vision_retry = (report.spark_ranks == 0 && report.vision == super::super::MediaMode::Auto)
-        .then(|| (report.clone(), options.clone()));
     let prefill = match resolve_prefill(input, report, options, report.spark_ranks,
         crate::serving_capacity::prefill_waves::PrefillLimits {
             max_waves: if report.spark_ranks == 0 { 1 }
@@ -36,21 +34,14 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         Err(error) => return unsupported_prefill(report, error),
     };
     let shape = Shape::resolve(input, report, model, options, ShapePolicy::manifest_bounded());
-    let (manifest, rows, sequences, context, weight_budget) = (shape.manifest.as_deref(), shape.prefill_rows,
-        shape.concurrency, shape.context_tokens, options.weight_budget_bytes);
+    let (manifest, rows, sequences, context) = (shape.manifest.as_deref(), shape.prefill_rows,
+        shape.concurrency, shape.context_tokens);
     let checkpoint = input.checkpoint();
     let mut notes = vec![format!("resolved context {context} tokens")];
     let ranks = if options.head_split && options.rtx_bytes.len() >= 2 { 2 } else { 1 };
     let mut devices: Vec<_> = options.rtx_bytes.iter().take(ranks).enumerate().map(|(rank, &bytes)| DeviceLayout {
         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes.saturating_sub(options.headroom_bytes), worker_budget_bytes: 0,
         items: vec![], kv_tokens: 0 }).collect();
-    // Serving loads RTX media before sampling admission memory. Reserve the
-    // same tower first so embedding-home selection sees that occupied memory.
-    let early_encoder = report.spark_ranks == 0 || matches!(report.vision, super::super::MediaMode::Rtx(_));
-    if early_encoder {
-        resolve_encoder(report, &glm_flash_towers(report, checkpoint), &mut devices, &mut [],
-            &vec![0; ranks], options, &mut notes);
-    }
     let mut pool = 0;
     let mut waste = Vec::new();
     let admitted = (|| -> anyhow::Result<(placement::Placement, glmf::GlmfWorkingSet)> {
@@ -92,7 +83,10 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             manifest.map(|m| glmf::manifest_context_for_cards(
                 m, cfg.heads, &[sms as usize], attention_plan)).transpose()?.flatten()
         } else { None };
-        let attention = glmf::resolve_attention(report.requested_attention, ranks, context_programs)?;
+        let requested_attention = if options.glmf_pool_marks && options.prefix_entries("glm5_flash") > 0
+            && report.requested_attention.is_none() && ranks == 2 { Some(placement::AttentionPlacement::Heads) }
+            else { report.requested_attention };
+        let attention = glmf::resolve_attention(requested_attention, ranks, context_programs)?;
         if report.requested_attention.is_none() && ranks == 2 && context_programs.is_none() {
             notes.push(format!("auto attention fallback: layers; missing context programs: {}",
                 glmf::context_program_list()));
@@ -148,13 +142,6 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             resident[0].embedding = 0;
             notes.push("embedding placement: host (single pinned mapped copy)".into());
         }
-        let alternate_resident = (attention.mode == placement::AttentionPlacement::Layers).then(|| {
-            let mut ranks = if exlr8.is_some() { native_resident(1 - attention.first_owner as usize)? }
-                else { resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
-                    attention.mode, 1 - attention.first_owner as usize).map_err(anyhow::Error::msg)? };
-            if host_embedding { ranks[0].embedding = 0; }
-            Ok::<_, anyhow::Error>(ranks)
-        }).transpose()?;
         let catalog = input.expert_catalog()?;
         let shape = catalog.routed_experts();
         let onboard = options.resolve_onboard(shape.routed_layers())
@@ -292,17 +279,12 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             } else {
                 devices[rank].items.push(runtime);
             }
-            let loaded_bytes = devices[rank].items.iter().filter(|item| item.group.starts_with("vision "))
-                .map(|item| item.bytes).sum();
-            baselines.push((total, Baseline::Planned { context_bytes: code, loaded_bytes }));
+            baselines.push((total, Baseline::Planned { context_bytes: code, loaded_bytes: 0 }));
         }
         let automatic_target = placement::PoolPolicy::resolve(&options.rtx_bytes[..ranks], context, None, 256, spark_ranks == 0).target;
-        let target = options.pool_tokens.filter(|&n| n > 0).unwrap_or_else(||
-            if options.target_pool_tokens == cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS {
-                automatic_target
-            } else { options.target_pool_tokens.max(context) });
+        let target = options.pool_tokens.filter(|&n| n > 0).unwrap_or(automatic_target);
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
-            .unwrap_or_else(|| glmf::startup_graphs(&cfg, cfg.layers, context as usize, target as usize,
+            .unwrap_or_else(|| glmf::startup_graph_bound(&cfg, cfg.layers, context as usize, target as usize,
                 sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
         let inputs = glmf::GlmfInputs {
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
@@ -315,16 +297,82 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
             full_prefill_logits: if options.full_prefill_logits && exlr8.is_none() && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
-        let (placed, _, working) = glmf::solve_attention_working_set_with_graphs(&inputs,
-            alternate_resident.as_deref(), target, options.context_tokens == 0,
-            options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms) as usize,
-            available.is_some())?;
-        let chosen_attention = glmf::placed_attention(attention, &placed);
-        let chosen_resident = if chosen_attention.first_owner == attention.first_owner { &inputs.resident }
-            else { alternate_resident.as_ref().expect("solved alternate MLA inventory") };
-        if chosen_attention.mode == placement::AttentionPlacement::Layers {
-            notes.push(format!("first MLA owner: rtx{}", chosen_attention.first_owner));
+        let host = options.host_memory.map(Ok)
+            .unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+        let mut process = glmf::admission::ProcessOwners::new(host, (8 << 30).max(host.0 / 10));
+        if ranks == 2 && attention.mode == placement::AttentionPlacement::Layers && !native {
+            let mut alternate = resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks,
+                representation, attention.mode, (attention.first_owner ^ 1) as usize).map_err(anyhow::Error::msg)?;
+            if host_embedding { for rank in &mut alternate { rank.embedding = 0; } }
+            process.alternate_resident = Some(alternate);
         }
+        let geometry = glmf::admission::host_geometry(&inputs)?;
+        let quota = if options.prefix_entries("glm5_flash") == 0 || options.host_cache_bytes == Some(0) { 0 }
+            else { geometry.resolve(options.host_cache_bytes, context, sequences, host.0, geometry.chunk_bytes())
+                .context("invalid Flash host prefix geometry")? };
+        let embedding = if host_embedding { checkpoint.tensors.iter()
+            .filter(|t| t.meta.name == "model.language_model.embed_tokens.weight")
+            .map(|t| t.meta.byte_length).sum() } else { 0 };
+        use crate::plan::encoder::{self, EncoderGpuBudget, EncoderHardware, EncoderKind,
+            EncoderPlacement, EncoderRequest, EncoderSparkBudget};
+        let towers = glm_flash_towers(report, checkpoint);
+        let (weights, scratch) = match towers.vision {
+            Ok(bytes) => bytes,
+            Err(_) if report.vision == crate::plan::MediaMode::Off => (0, 0),
+            Err(reason) => anyhow::bail!("Flash vision tower unavailable: {reason}"),
+        };
+        let hardware = EncoderHardware { v41: false,
+            gpus: options.rtx_bytes[..ranks].iter().map(|&total| EncoderGpuBudget {
+                free_bytes: total.saturating_sub(options.headroom_bytes), kv_target_bytes: 0 }).collect(),
+            sparks: (0..spark_ranks).map(|rank| EncoderSparkBudget { rank, host: format!("spark{rank}"),
+                idle: false, expert_bytes: 0, free_bytes: options.spark_allocation_budget_bytes.unwrap_or(121 << 30) }).collect() };
+        process.encoders = encoder::candidates(&EncoderRequest { mode: report.vision, weights, scratch,
+            copies: options.vision_replicas }, &hardware);
+        if report.vision == crate::plan::MediaMode::Auto && weights > 0 {
+            process.encoders.push(EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
+                replicas: vec![], reason: "no admitted native tower without reducing the pool".into(), shortfall: 0 });
+        }
+        anyhow::ensure!(!process.encoders.is_empty(), "requested Flash encoder has no executable owner");
+        process.media_cache_bytes = options.media_cache_bytes.unwrap_or((8 << 30).min(host.0 / 20));
+        process.serving(&inputs, quota, geometry.chunk_bytes().min(quota), embedding, 0)?;
+        process.spark_link(&inputs, checkpoint.spark_input_is_bf16())?;
+        process.push_host = glmf::admission::push_host_envelope(checkpoint, &cfg, ranks, Some(&catalog), exlr8)?;
+        if let Some((facts, metadata)) = exlr8 {
+            use crate::plan::exlr8::{dense::{DensePlan, DenseRole}, residency::ExpertSet};
+            let owners = whole_mla(attention.first_owner as usize);
+            let records = facts.records.iter().filter(|r| matches!(facts.selection.role(&r.tensor, cfg.layers),
+                Ok(DenseRole::Vocabulary(_)))).cloned().collect::<Vec<_>>();
+            let vocabulary = DensePlan::for_rank(&records, ranks, 0)?;
+            let records = facts.selection.backbone(&facts.records, cfg.layers)?;
+            let body = (0..ranks).map(|rank| DensePlan::for_rank_owned(&records, ranks, rank, &owners))
+                .collect::<Result<Vec<_>, _>>()?;
+            let shared = (0..ranks).map(|rank| (0..cfg.layers).filter(|&layer| !cfg.dense[layer])
+                .map(|layer| metadata.plan(layer, ranks, rank, ExpertSet::Shared))
+                .collect::<Result<Vec<_>, _>>()).collect::<Result<Vec<_>, _>>()?;
+            process.native_load = Some(glmf::admission::NativeLoad::from_plans(&body, &vocabulary, &shared)?);
+        }
+        let selected = glmf::admission::prepare(&inputs, sms as usize, available.is_some(), process)?.admit()?;
+        report.encoder = selected.encoder.clone();
+        if report.encoder.as_ref().is_some_and(|encoder| encoder.kind == EncoderKind::Off) {
+            if let Some(component) = report.components.iter_mut().find(|component|
+                component.component == Component::Vision && component.status != Status::Unused) {
+                report.disabled_media_bytes += component.bytes;
+                component.bytes = 0;
+                component.status = Status::Disabled;
+            }
+        }
+        if report.audio != crate::plan::MediaMode::Off {
+            let reason = towers.audio.err().unwrap_or_else(|| "Flash audio encoder unavailable".into());
+            report.placement_supported = false;
+            report.hints.push(crate::plan::Hint { what: format!("audio tower unavailable: {reason}"),
+                how: "Use --audio off or add the bundled tensors/exporter".into() });
+            report.audio_encoder = Some(EncoderPlacement { kind: EncoderKind::Off, weights: 0,
+                scratch: 0, replicas: vec![], shortfall: 0, reason });
+        }
+        report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&selected.solved));
+        report.host_budget_bytes = quota;
+        notes.push(format!("unused graph bound by GPU: {:?} bytes", selected.graph_slack));
+        let (placed, working) = (selected.placement, selected.working);
         let replicas = glmf::replicated_mla_bytes(&cfg, inputs.index, &placed)?;
         if replicas > 0 {
             waste.push(Waste { device: "rtx1".into(), what: "KV records replicated on both GPUs (MLA latent and index)".into(), bytes: replicas });
@@ -333,24 +381,6 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             working.spark_ranks, working.prefill_lanes, working.spark_layers));
         Ok((placed, working))
     })();
-    if matches!(admitted.as_ref().err().and_then(|error| error.downcast_ref::<placement::PlacementError>()),
-        Some(placement::PlacementError::BelowFloor { .. }))
-        && report.encoder.as_ref().is_some_and(|encoder| matches!(encoder.kind,
-            crate::plan::encoder::EncoderKind::Rtx { .. })) {
-        if let Some((original, original_options)) = auto_vision_retry {
-            // Auto media is optional: preserve the text-serving floor when the
-            // precharged tower prevents admission. Explicit RTX requests stay strict.
-            *report = original;
-            *options = original_options;
-            report.vision = super::super::MediaMode::Off;
-            let mut result = layout_with_native(report, model, input, options, exlr8);
-            report.vision = super::super::MediaMode::Auto;
-            let reason = "auto vision disabled to preserve the GLM Flash KV pool floor";
-            if let Some(encoder) = &mut report.encoder { encoder.reason = reason.into(); }
-            result.notes.push(reason.into());
-            return result;
-        }
-    }
     let mut selected = None;
     match admitted {
         Ok((placed, working)) => {
@@ -358,7 +388,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             pool = placed.pool_tokens;
             selected = Some(working);
             for (device, items) in devices.iter_mut().zip(&placed.items) {
-                device.items.extend(items.iter().cloned()); device.kv_tokens = pool;
+                device.items = items.clone(); device.kv_tokens = pool;
             }
             notes.push(format!("placement: {}", placed.summary()));
         }
@@ -413,12 +443,16 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             devices.push(device);
         }
     }
-    // Media placement is still the shared planner path, outside the coordinator solver port.
-    let mut sparks = devices.split_off(ranks);
-    if !early_encoder {
-        resolve_encoder(report, &glm_flash_towers(report, checkpoint), &mut devices, &mut sparks, &vec![0; ranks], options, &mut notes);
+    if let Some(encoder) = &report.encoder {
+        for rank in encoder.spark_ranks() {
+            if let Some(device) = devices.iter_mut().find(|device|
+                device.kind == DeviceKind::Spark && device.index as usize == rank) {
+                device.items.push(Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact));
+                device.items.push(Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula));
+            }
+        }
+        notes.push(format!("joint encoder {:?}: {} bytes admitted", encoder.kind, encoder.admitted_bytes()));
     }
-    devices.extend(sparks);
     MemoryLayout { devices, pool_tokens: pool, waste, notes }
 }
 

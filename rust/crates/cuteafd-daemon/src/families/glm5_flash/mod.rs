@@ -307,6 +307,12 @@ pub(crate) struct EngineArgs {
     /// Serving-only policy used to reserve the complete graph set before KV allocation.
     #[arg(skip)]
     pub serving_graph_policy: Option<(usize, bool)>,
+    #[arg(skip)]
+    pub serving_prefix: Option<crate::shared::prefix::PrefixArgs>,
+    #[arg(skip)]
+    pub serving_media_bytes: u64,
+    #[arg(skip)]
+    pub serving_encoder: Option<cuteafd_loader::plan::encoder::EncoderPlacement>,
 }
 
 /// `--decode-rows`: the decode programs' 64 rows, or the wide programs' 128.
@@ -1767,10 +1773,13 @@ impl Opened {
     #[allow(clippy::too_many_arguments)]
     fn admit(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
         index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool,
-        prepared_draft: Option<&crate::shared::draft::remote::Prepared<'_>>, attention: engine::GlmfAttention,
+        remote_draft: bool, attention: engine::GlmfAttention,
         native_admission: Option<&native::Admission>)
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
-            cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
+            cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet,
+            Option<cuteafd_hostcache::config::Config>,
+            Option<cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad>,
+            Option<cuteafd_loader::push_load::PushHostEnvelope>)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
         use cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation;
         use cuteafd_loader::serving_capacity::{glmf_core_step_scratch, glmf_table_pages,
@@ -1802,20 +1811,19 @@ impl Opened {
             program_set.names.extend(core.programs.iter().cloned());
             program_set.names.sort(); program_set.names.dedup();
         }
-        let pending_code = devices.iter().enumerate().map(|(rank, &device)|
-            crate::shared::inventory::pending_code(&self.library, device, rank, split,
-                if core_charge.is_some() { "glmf-k6" } else { "glmf" }, code_package, &program_set))
-            .collect::<Result<Vec<_>>>()?;
+        let pending_code = inventory.gpus.iter().enumerate().map(|(rank, sample)| {
+            let arch = placement::ArchContext::for_device(&sample.arch, sample.total_bytes);
+            let code = placement::inventory::loaded_code_allowance(
+                if core_charge.is_some() { "glmf-k6" } else { "glmf" }, code_package,
+                split, rank as u8, arch, Some(&program_set));
+            code.pending(sample.context_bytes, arch.context_bytes)
+        }).collect();
         let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
             fp8_head: args.fp8_head, output_shard: args.kda_output_shard };
         let resident = if let Some(native) = native_admission { native.resident.clone() } else {
             runtime_resident_weights(&headers, &self.cfg, layers, devices.len(), representation,
                 args.token_io.embed_placement, attention)? };
-        let alternate_resident = (!self.native && attention.mode == placement::AttentionPlacement::Layers).then(||
-            runtime_resident_weights(&headers, &self.cfg, layers, devices.len(), representation,
-                args.token_io.embed_placement, engine::GlmfAttention { first_owner: 1 - attention.first_owner, ..attention }))
-            .transpose()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         let lanes = usize::try_from(admission::admitted_prefill_waves(attention.mode, args.prefill_waves as u64)?)?;
         let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
@@ -1897,14 +1905,14 @@ impl Opened {
             let (bytes, scratch) = admission::drafter_inventory(&config, slots, batch, &draft_sms,
                 cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
                 args.draft_linear.code() as u8, args.draft_kv_cache)?;
-            let bridge = if prepared_draft.is_some() { admission::drafter_bridge_inventory(&config, slots, batch)? }
+            let bridge = if remote_draft { admission::drafter_bridge_inventory(&config, slots, batch)? }
                 else { None };
             Ok((bytes.memory.resident, bytes.resident_weights, scratch, bridge))
         }).transpose()?.unwrap_or_else(|| (0, placement::ResidentWeights::default(), vec![0; devices.len()], None));
         let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
         let pool = if args.pool_tokens > 0 { args.pool_tokens } else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize };
         let graphs = if args.startup_graphs() {
-            admission::startup_graphs(&self.cfg, layers, args.max_context, pool,
+            admission::startup_graph_bound(&self.cfg, layers, args.max_context, pool,
                 sequences, speculation, devices.len(), args.decode_rows, sms)
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let routed = self.cfg.dense.iter().filter(|dense| !**dense).count();
@@ -1912,7 +1920,7 @@ impl Opened {
         let inputs = admission::GlmfInputs {
             resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
-                free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),
+                free_bytes: gpu.free_bytes })).collect(),
             pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
             prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
             partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64,
@@ -1921,24 +1929,54 @@ impl Opened {
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
             representation, resident, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
-            full_prefill_logits: 0 };
-        let target = placement::PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
-            args.max_context as u64, inputs.requested_pool, 256, spark_ranks == 0).target;
-        let (placement, graphs, working) = admission::solve_attention_working_set_with_graphs(&inputs,
-            alternate_resident.as_deref(), target, automatic_context, sms, true)?;
+            full_prefill_logits: if shape.full_prefill_logits {
+                cuteafd_loader::plan::layout::full_prefill_logits_bytes("glm5_flash", args.prefill_rows as u64,
+                    self.cfg.vocab_size as u64)
+            } else { 0 } };
+        let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+        let headroom = args.serving_prefix.as_ref().map_or(8 << 30, |prefix| prefix.host_cache_headroom_bytes).max(host.0 / 10);
+        let mut process = admission::admission::ProcessOwners::new(host, headroom);
+        if split && attention.mode == placement::AttentionPlacement::Layers && native_admission.is_none()
+            && core_charge.is_none() {
+            process.alternate_resident = Some(runtime_resident_weights(&headers, &self.cfg, layers, devices.len(),
+                representation, args.token_io.embed_placement,
+                engine::GlmfAttention { first_owner: attention.first_owner ^ 1, ..attention })?);
+        }
+        let geometry = admission::admission::host_geometry(&inputs)?;
+        let host_config = args.serving_prefix.as_ref().map(|prefix| {
+            use cuteafd_engine::prefix::{FamilyLayout, MarkStore, PageOwners};
+            prefix.resolve_host_config(FamilyLayout { page_rows: 256, pages: 0,
+                page_bytes: usize::try_from(geometry.page_bytes)?, mark_bytes: usize::try_from(geometry.mark_bytes)?,
+                draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: MarkStore::Arena,
+                page_owners: if attention.mode == placement::AttentionPlacement::Context { PageOwners::Parity } else { PageOwners::Uniform } },
+                args.max_context, sequences)
+        }).transpose()?.flatten();
+        let host_embedding = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host {
+            headers.tensors.iter().find(|tensor| tensor.meta.name == "model.language_model.embed_tokens.weight")
+                .context("host embedding tensor missing")?.meta.byte_length
+        } else { 0 };
+        process.encoders = args.serving_encoder.iter().cloned().collect();
+        process.media_cache_bytes = args.serving_media_bytes;
+        process.serving(&inputs, host_config.as_ref().map_or(0, |c| c.bytes),
+            host_config.as_ref().map_or(0, |c| c.chunk_bytes), host_embedding, 0)?;
+        process.spark_link(&inputs, self.checkpoint.spark_input_is_bf16())?;
+        process.native_load = native_admission.map(|native| native.load_owners(&self.cfg)).transpose()?;
+        process.push_host = admission::admission::push_host_envelope(&headers, &self.cfg, devices.len(),
+            self.experts.as_ref(),
+            native_admission.map(|native| (&native.facts, &native.metadata)))?;
+        let admitted = admission::admission::prepare(&inputs, sms, true, process)?.admit()?;
+        tracing::info!(graph_slack = ?admitted.graph_slack, phases = ?admitted.solved.phases,
+            "GLM Flash admitted exact physical owners");
+        let (placement, graphs, working) = (admitted.placement, admitted.graphs, admitted.working);
         let attention = admission::placed_attention(attention, &placement);
         ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0 || *id == placement::MovableId::Drafter),
             "GLM Flash placement has no matching movable executor");
         placement::draft::require_home(&placement, "GLM Flash",
-            if prepared_draft.is_some() { &[0, 1] } else { &[0] })?;
+            if remote_draft { &[0, 1] } else { &[0] })?;
         tracing::info!(placement = %placement.summary(), spark_ranks = working.spark_ranks,
             prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers,
             attention_first_owner = attention.first_owner, "GLM Flash admission before weights");
         let devices: Vec<_> = placement.items.iter().zip(&inventory.gpus).enumerate().map(|(rank, (items, gpu))| {
-            let mut items = items.clone();
-            items.push(cuteafd_core::memory_layout::Item::new(
-                cuteafd_core::memory_layout::Category::Runtime, "sampled context+modules", "",
-                gpu.context_bytes, cuteafd_core::memory_layout::Basis::Calibrated));
             serde_json::json!({"kind": "rtx", "index": rank, "device": gpu.device, "items": items})
         }).collect();
         tracing::info!(target: "cuteafd::placement", plan = %serde_json::json!({
@@ -1949,7 +1987,7 @@ impl Opened {
             "layer_modes": placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>(),
         }), "GLM Flash startup plan");
         cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
-        Ok((placement, graphs, working))
+        Ok((placement, graphs, working, host_config, admitted.native_load, admitted.push_host))
     }
 
     /// Builds the engine and hands it to `body`. Either KV admission keeps the prefix marks of
@@ -1957,10 +1995,10 @@ impl Opened {
     /// the engine serves (`engine.mark_slots`).
     pub fn with_engine<'s, T>(&'s self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
-        self.with_engine_media(args, Default::default(), body)
+        self.with_engine_media(args, || Ok(Default::default()), body)
     }
     pub(super) fn with_engine_media<'s, T>(&'s self, args: &EngineArgs,
-        media: crate::shared::experts::rtx::dense::Records,
+        prepare_media: impl FnOnce() -> Result<crate::shared::experts::rtx::dense::Records>,
         body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>) -> Result<T> {
         // A head split whose GPUs lack peer access serves from --device alone, decided before any load or
         // admission. The arena is counted after both decisions (below), on the layout this engine serves:
@@ -2142,21 +2180,10 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect(), dense: std::rc::Rc::new(weights::DenseLoad::mount(&self.library)) };
-        let mut prepared_draft = match (split_device, args.draft.as_ref()) {
-            (Some(_), Some(path)) if cuteafd_loader::placement::families::glm5_flash::remote_dflash_requested()
-                && !dspark::is_dspark(path)? => {
-                let (device, peer_stream) = peer_stream.context("remote draft needs the peer target stream")?;
-                let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
-                let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
-                    args.draft_context_slots, args.draft_sequences)?;
-                let draft = crate::shared::speculation::dflash::DflashConfig::read(path)?;
-                Some(crate::shared::draft::remote::Prepared::new(&self.library,
-                    crate::shared::peer_split::RankDevice { device: args.device, stream },
-                    crate::shared::peer_split::RankDevice { device, stream: peer_stream },
-                    0, remote_dflash::IDENTITY, crate::shared::draft::remote::decode_extent(
-                        capacity.block_rows, draft.hidden, draft.vocab, 0)?)?)
-            },
-            _ => None,
+        let remote_draft = match (split_device, args.draft.as_ref()) {
+            (Some(_), Some(path)) => cuteafd_loader::placement::families::glm5_flash::remote_dflash_requested()
+                && !dspark::is_dspark(path)?,
+            _ => false,
         };
         let native_admission = self.native.then(|| {
             let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
@@ -2168,8 +2195,9 @@ impl Opened {
             cuteafd_loader::plan::families::glm::GLM5_FLASH.exlr8_execution()
                 .check(1 + usize::from(split_device.is_some()), false)?;
         }
-        let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
-            split_device, automatic_context, prepared_draft.as_ref(), attention, native_admission.as_ref())?;
+        let (placement, admitted_graphs, working, admitted_host, admitted_native_load, admitted_push_host) = self.admit(args, &programs, layers, index_cache, mark_slots,
+            split_device, automatic_context, remote_draft, attention, native_admission.as_ref())?;
+        let media = prepare_media()?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
         if native_admission.is_some() {
             use cuteafd_loader::plan::family::Family;
@@ -2181,7 +2209,20 @@ impl Opened {
             "GLM Flash admission placed {} attention, the engine serves {}",
             placement.attention_placement, attention.mode);
         let draft_gpu = cuteafd_loader::placement::draft::home(&placement).unwrap_or(0);
-        if draft_gpu == 0 { drop(prepared_draft.take()); }
+        let mut prepared_draft = if draft_gpu == 1 {
+            ensure!(remote_draft, "remote drafter was not declared before admission");
+            let path = args.draft.as_ref().context("admitted remote draft checkpoint")?;
+            let (device, peer_stream) = peer_stream.context("remote draft needs the peer target stream")?;
+            let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+            let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
+                args.draft_context_slots, args.draft_sequences)?;
+            let draft = crate::shared::speculation::dflash::DflashConfig::read(path)?;
+            Some(crate::shared::draft::remote::Prepared::new(&self.library,
+                crate::shared::peer_split::RankDevice { device: args.device, stream },
+                crate::shared::peer_split::RankDevice { device, stream: peer_stream },
+                0, remote_dflash::IDENTITY, crate::shared::draft::remote::decode_extent(
+                    capacity.block_rows, draft.hidden, draft.vocab, 0)?)?)
+        } else { None };
         probe("admission-programs")?;
         let mut selected_args = args.clone();
         selected_args.prefill_waves = usize::try_from(working.prefill_lanes)?;
@@ -2334,8 +2375,10 @@ impl Opened {
         let plan_native = |sparks: usize| -> Result<_> {
             let native = native_admission.as_ref().context("native Flash admission")?;
             let (owners, mut records) = crate::shared::experts::rtx::dense::recording(|| {
-                let loaded = native.load(&self.library, &programs, &loader, &self.cfg, &execution, embedding_device.id)?;
-                let shared = native.load_shared(args, &self.cfg, &self.library, &programs)?;
+                let loaded = native.load(&self.library, &programs, &loader, &self.cfg, &execution, embedding_device.id,
+                    admitted_native_load.as_ref().context("native load envelope missing")?)?;
+                let shared = native.load_shared(args, &self.cfg, &self.library, &programs,
+                    admitted_native_load.as_ref().context("native load envelope missing")?)?;
                 Ok((loaded, shared))
             })?;
             records.extend(media.clone());
@@ -2368,8 +2411,9 @@ impl Opened {
                 push_policy.plan(|| {
                     ensure!(admission.coordinator_pushes(), "native Flash Spark admission did not select required push");
                     let planned = plan_native(peers.len())?;
-                    let (push, streams, ranks) = CoordinatorPush::prepare(
-                        &args.snapshot, self.experts.as_ref(), gpus, native_push_experts()?)?;
+                    let (push, streams, ranks) = CoordinatorPush::prepare_admitted(
+                        &args.snapshot, self.experts.as_ref(), gpus, native_push_experts()?,
+                        admitted_push_host.clone().context("Flash push host receipt")?)?;
                     native_push = Some((push, peers.len(), planned));
                     Ok((streams, ranks))
                 })?
@@ -2379,7 +2423,8 @@ impl Opened {
                     ensure!(admission.coordinator_pushes(), "GLM Flash Spark admission did not select required push");
                     let experts = expert_plan()?;
                     let planned = plan_dense(peers.len())?;
-                    let prepared = CoordinatorPush::prepare(&args.snapshot, self.experts.as_ref(), gpus, experts)?;
+                    let prepared = CoordinatorPush::prepare_admitted(&args.snapshot, self.experts.as_ref(), gpus, experts,
+                        admitted_push_host.clone().context("Flash push host receipt")?)?;
                     Ok((prepared, planned))
                 })?
             } else { None };
@@ -2392,8 +2437,9 @@ impl Opened {
             if native_admission.is_some() {
                 native_push = push_policy.plan(|| {
                     let planned = plan_native(0)?;
-                    let push = CoordinatorPush::prepare_alone(
-                        &args.snapshot, self.experts.as_ref(), gpus, native_push_experts()?)?;
+                    let push = CoordinatorPush::prepare_alone_admitted(
+                        &args.snapshot, self.experts.as_ref(), gpus, native_push_experts()?,
+                        admitted_push_host.clone().context("Flash push host receipt")?)?;
                     Ok((push, 0, planned))
                 })?;
             }
@@ -2401,7 +2447,8 @@ impl Opened {
                 coordinator_push = push_policy.plan(|| {
                     let experts = expert_plan()?;
                     let planned = plan_dense(0)?;
-                    let push = CoordinatorPush::prepare_alone(&args.snapshot, self.experts.as_ref(), gpus, experts)?;
+                    let push = CoordinatorPush::prepare_alone_admitted(&args.snapshot, self.experts.as_ref(), gpus, experts,
+                        admitted_push_host.clone().context("Flash push host receipt")?)?;
                     Ok((push, 0, devices.clone(), planned))
                 })?;
             }
@@ -2464,8 +2511,10 @@ impl Opened {
                         split.log("glm5_flash native dense push");
                         (pushed, owners)
                     }
-                    None => (None, (native.load(&self.library, &programs, &loader, &self.cfg, &execution, embedding_device.id)?,
-                        native.load_shared(args, &self.cfg, &self.library, &programs)?)),
+                    None => (None, (native.load(&self.library, &programs, &loader, &self.cfg, &execution, embedding_device.id,
+                    admitted_native_load.as_ref().context("native load envelope missing")?)?,
+                        native.load_shared(args, &self.cfg, &self.library, &programs,
+                    admitted_native_load.as_ref().context("native load envelope missing")?)?)),
                 };
                 native_shared = Some(shared);
                 if !local_layers.is_empty() {
@@ -2565,6 +2614,7 @@ impl Opened {
             max_context, args.prefill_rows, args.prefill_waves, args.prefill_span_rows, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool,
             &execution, step_experts)?;
+        engine.admitted_host = admitted_host;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();

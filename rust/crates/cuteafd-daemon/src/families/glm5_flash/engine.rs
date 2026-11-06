@@ -1490,6 +1490,7 @@ pub(crate) struct GlmfEngine<'a> {
     pub embedding: TokenEmbedding<'a>,
     /// The serving loop's token selector when start-up made it before the KV pool.
     selector: RefCell<Option<TokenSelector<'a>>>,
+    pub(super) admitted_host: Option<cuteafd_hostcache::config::Config>,
 }
 
 /// Which prefill projections run W8A8 block-FP8 GEMMs (E4M3 activations per
@@ -1831,7 +1832,7 @@ impl<'a> GlmfEngine<'a> {
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false, mark_slots: 0,
             kda_prefill_expanded: false, kda_state, l2: None, target_head: TargetHeadRoute::Tensor, embedding,
-            selector: RefCell::new(None) })
+            selector: RefCell::new(None), admitted_host: None })
     }
 
     /// Decode graphs captured lazily as steps arrive, at their exact rows, instead of the startup set

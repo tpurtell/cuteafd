@@ -62,14 +62,39 @@ pub(super) struct ReadyVision {
     pub cache_bytes: usize,
 }
 impl ReadyVision {
-    pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode, prefix: &crate::shared::prefix::PrefixArgs,
-        cache_bytes: Option<u64>, remote: Option<RemoteVision>) -> Result<(Option<Self>, crate::shared::prefix::PrefixArgs)> {
-        let Some(config) = vision_config(mode, &args.snapshot)? else { return Ok((None, prefix.clone())); };
+    pub fn plan(args: &super::EngineArgs, mode: MediaMode, remote: Option<&RemoteVision>)
+        -> Result<Option<cuteafd_loader::plan::encoder::EncoderPlacement>> {
+        use cuteafd_loader::plan::encoder::{EncoderKind, EncoderPlacement};
+        if vision_config(mode, &args.snapshot)?.is_none() { return Ok(None); }
+        let spec = crate::shared::vision::TowerSpec::glm_flash(&args.snapshot, 4096)?;
+        let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
+        let (kind, replicas) = if let Some(remote) = remote {
+            let peers = args.peers.as_deref().context("remote Flash encoder needs active Spark workers")?
+                .split(',').map(|peer| peer.parse::<std::net::SocketAddr>()).collect::<std::result::Result<Vec<_>, _>>()?;
+            let ranks = remote.addresses.iter().map(|address| peers.iter().position(|peer| peer.ip() == address.ip())
+                .context("remote Flash encoder is not an admitted expert worker"))
+                .collect::<Result<Vec<_>>>()?;
+            (EncoderKind::Spark { rank: ranks[0] }, ranks[1..].to_vec())
+        } else {
+            anyhow::ensure!(!matches!(mode, MediaMode::Spark(_)), "Spark vision requires planner-resolved peers");
+            let device = local_vision_gpu(mode, args.device, args.split_device)?;
+            let rank = std::iter::once(args.device).chain(args.split_device).position(|gpu| gpu == device)
+                .context("Flash vision device is outside the target topology")?;
+            (EncoderKind::Rtx { gpu: rank }, vec![])
+        };
+        Ok(Some(EncoderPlacement { kind, weights: ledger.weights,
+            scratch: ledger.scratch.checked_add(ledger.blas_workspace).context("Flash vision ledger overflow")?,
+            replicas, reason: "launcher-resolved bundled encoder".into(), shortfall: 0 }))
+    }
+
+    pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
+        cache_bytes: usize, remote: Option<RemoteVision>) -> Result<Option<Self>> {
+        let Some(config) = vision_config(mode, &args.snapshot)? else { return Ok(None); };
+        let admitted = args.serving_encoder.as_ref().context("Flash vision lacks admitted physical owners")?;
         let processor = ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::GlmFlash)?;
         // Header-only on the coordinator: remote tower payload stays on its Spark.
         let spec = crate::shared::vision::TowerSpec::glm_flash(&args.snapshot, 4096)?;
         let width = config["text_config"]["hidden_size"].as_u64().context("GLM Flash hidden_size")? as usize;
-        let (prefix, cache_bytes) = prefix.with_media_headroom(cache_bytes)?;
         if let Some(remote) = remote {
             anyhow::ensure!(matches!(mode, MediaMode::Auto | MediaMode::Spark(_)),
                 "--vision-peers requires Spark/auto vision placement");
@@ -84,7 +109,9 @@ impl ReadyVision {
             let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,
                 std::time::Duration::from_secs(60))?;
             tracing::info!(cache_bytes, "GLM Flash remote vision encoder ready");
-            return Ok((Some(Self { push: Default::default(), encoder: Encoder::Remote(encoder), preparer, cache_bytes }), prefix));
+            anyhow::ensure!(matches!(admitted.kind, cuteafd_loader::plan::encoder::EncoderKind::Spark { .. }),
+                "remote Flash vision differs from admitted home");
+            return Ok(Some(Self { push: Default::default(), encoder: Encoder::Remote(encoder), preparer, cache_bytes }));
         }
         let gpu = match mode {
             MediaMode::Rtx(_) => local_vision_gpu(mode, args.device, args.split_device)?,
@@ -102,23 +129,21 @@ impl ReadyVision {
         let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), spec.encoder_id(revision, sm), 4)?);
         anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "GLM Flash tower capacity is 4096 tokens per image");
         let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
+        let rank = std::iter::once(args.device).chain(args.split_device).position(|device| device == gpu)
+            .context("Flash vision GPU absent from target topology")?;
+        anyhow::ensure!(admitted.kind == cuteafd_loader::plan::encoder::EncoderKind::Rtx { gpu: rank }
+            && ledger.weights == admitted.weights && ledger.total_bytes() == admitted.admitted_bytes(),
+            "Flash vision allocation differs from admitted physical owners");
         library.cuda_set_device(gpu)?;
-        let admitted = ledger.total_bytes();
-        let loaded = (|| -> Result<_> {
-        let (free, total) = library.cuda_memory_info()?;
-        cuteafd_core::serving_capacity::admit_device_reservations(95,
-            cuteafd_core::serving_capacity::DeviceMemory { device: gpu as u32,
-                total_bytes: total as u64, baseline_free_bytes: free as u64 },
-            &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(), bytes: admitted }])?;
-        // Start before LM preflight: its live baseline already includes the admitted tower.
-        Ok(crate::shared::vision::EncoderService::start_coordinator(&args.snapshot, Some((spec, admitted)), args.native_lib.clone(), gpu, None)?)
-        })();
+        let admitted = admitted.admitted_bytes();
+        let loaded = crate::shared::vision::EncoderService::start_coordinator(&args.snapshot,
+            Some((spec, admitted)), args.native_lib.clone(), gpu, None);
         let restored = library.cuda_set_device(args.device);
         let (service, push) = loaded?;
         restored?;
         tracing::info!(gpu, admitted_bytes = admitted, cache_bytes, sm, "GLM Flash resident vision encoder allocated");
-        Ok((Some(Self { push, encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, 4096)),
-            preparer, cache_bytes }), prefix))
+        Ok(Some(Self { push, encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, 4096)),
+            preparer, cache_bytes }))
     }
 }
 

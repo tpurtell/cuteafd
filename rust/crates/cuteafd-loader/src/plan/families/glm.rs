@@ -533,7 +533,7 @@ impl GlmModel {
 }
 
 impl FamilyModel for GlmModel {
-    fn contract_admission(&self) -> bool { self.id == "glm5" }
+    fn contract_admission(&self) -> bool { true }
 
     fn spec(&self) -> &ModelSpec {
         &self.spec

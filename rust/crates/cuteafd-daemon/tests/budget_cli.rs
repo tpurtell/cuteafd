@@ -571,7 +571,10 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
         let revision = config.get("MODEL_REVISION").copied();
         let snapshot = require_installed_snapshot(name, config["MODEL_ID"], revision, &hf_home);
         if ["glm53-exl3-min.config", "glm53-exl3-max.config",
-            "glm53-exlr8-min.config", "glm53-exlr8-max.config"].contains(&name) {
+            "glm53-exlr8-min.config", "glm53-exlr8-max.config",
+            "glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config",
+            "glm53-flash-exl3-min.config", "glm53-flash-exl3-max.config",
+            "glm53-flash-exlr8-k4-min.config", "glm53-flash-exlr8-k4-max.config"].contains(&name) {
             let temporary = tempfile::tempdir().unwrap();
             let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
                 .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");

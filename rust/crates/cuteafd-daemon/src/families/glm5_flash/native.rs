@@ -106,8 +106,22 @@ impl Admission {
         Ok(Self { facts, metadata, dense, charges, resident })
     }
 
+    pub(super) fn load_owners(&self, cfg: &GlmNextConfig)
+        -> Result<cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad> {
+        use cuteafd_loader::plan::exlr8::residency::ExpertSet;
+        let world = self.dense.len();
+        let vocabulary = VocabularyPlan::new(&self.facts.records, &self.facts.selection, world, 0,
+            cfg.hidden, cfg.vocab_size)?;
+        let shared = (0..world).map(|rank| (0..cfg.layers).filter(|&layer| !cfg.dense[layer])
+            .map(|layer| self.metadata.plan(layer, world, rank, ExpertSet::Shared))
+            .collect::<std::result::Result<Vec<_>, _>>()).collect::<std::result::Result<Vec<_>, _>>()?;
+        cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad::from_plans(
+            &self.dense.iter().map(|rank| rank.plan.clone()).collect::<Vec<_>>(), vocabulary.dense_plan(), &shared)
+    }
+
     pub(super) fn load_shared<'a>(&self, args: &EngineArgs, cfg: &GlmNextConfig,
-        library: &'a cuteafd_ffi::NativeLibrary, programs: &cuteafd_ffi::programs::Programs<'_>)
+        library: &'a cuteafd_ffi::NativeLibrary, programs: &cuteafd_ffi::programs::Programs<'_>,
+        admitted: &cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad)
         -> Result<Vec<crate::shared::experts::exlr8::NativeExperts<'a>>> {
         use crate::shared::{experts::exlr8::{NativeExperts, NativePlan}, memory::device::Device};
         let first = cfg.dense.iter().position(|dense| !dense).context("Flash routed suffix")?;
@@ -120,7 +134,7 @@ impl Admission {
                 && plan.workspace as u64 == self.charges.ranks[rank].shared_workspace,
                 "native Flash shared weights/workspace differ from admission");
             let expected = plan.resident;
-            let shared = NativeExperts::load(library, plan)?;
+            let shared = NativeExperts::load_validated(library, plan, |plans| admitted.validate_shared(plans))?;
             ensure!(shared.resident_bytes() as u64 == expected, "native Flash uploaded shared bytes differ from admission");
             Ok(shared)
         })).collect()
@@ -128,19 +142,18 @@ impl Admission {
 
     pub(super) fn load<'a>(&self, library: &'a cuteafd_ffi::NativeLibrary,
         programs: &'a cuteafd_ffi::programs::Programs<'a>, loader: &super::weights::GlmfLoader<'a>,
-        cfg: &GlmNextConfig, execution: &cuteafd_loader::placement::LayerExecutionPlan, embedding_device: i32)
+        cfg: &GlmNextConfig, execution: &cuteafd_loader::placement::LayerExecutionPlan, embedding_device: i32,
+        admitted: &cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad)
         -> Result<(crate::shared::token_io::TokenEmbedding<'a>,
             (super::weights::GlmfWeights<'a>, Vec<Vec<super::weights::GlmfLayer<'a>>>))> {
         use crate::shared::token_io::{native::NativeVocabulary, TokenEmbedding};
-        let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-        let available = usize::try_from(available)?;
-        let peak = self.dense.iter().try_fold(0usize, |sum, rank|
-            sum.checked_add(rank.plan.read_staging_bytes).context("native Flash loading peak overflow"))?;
-        ensure!(peak <= available, "native Flash dense loading peak {peak} exceeds host availability {available}");
+        ensure!(&self.load_owners(cfg)? == admitted,
+            "native Flash body/shared reader extents differ from admission");
         let plan = VocabularyPlan::new(&self.facts.records, &self.facts.selection, self.dense.len(), 0,
             cfg.hidden, cfg.vocab_size)?;
-        let vocabulary = std::rc::Rc::new(NativeVocabulary::load_with_embedding_device(
-            library, programs, plan, available, 0, peak, embedding_device)?
+        admitted.validate_vocabulary(plan.staging_bytes() as u64)?;
+        let vocabulary = std::rc::Rc::new(NativeVocabulary::load_prepared(
+            library, programs, plan, admitted.vocabulary, embedding_device)?
             .context("native Flash rank0 owns vocabulary")?);
         let source = embedding_source(&self.facts.records, &self.facts.selection, cfg.hidden, cfg.vocab_size)?;
         let embedding = TokenEmbedding::row_fp8(library, source, vocabulary.clone())?;

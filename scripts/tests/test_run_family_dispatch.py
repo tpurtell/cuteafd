@@ -1121,7 +1121,13 @@ def capture_glm_real_planner_launch(snapshot: Path, example: Path, binary: Path,
     deployment = json.loads(output.read_text())
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
-    assert deployment["prefill_unit_rows"] == 2752 and deployment["prefill_waves"] == 3, deployment
+    if deployment["family"] == "glm5_flash":
+        local = int(config["SPARK_COUNT"]) == 0
+        assert deployment["prefill_unit_rows"] == (4096 if local else 2752), deployment
+        assert deployment["prefill_waves"] == (1 if local else 3), deployment
+        assert deployment["report"]["phase_ledger"], deployment
+    else:
+        assert deployment["prefill_unit_rows"] == 2752 and deployment["prefill_waves"] == 3, deployment
     plans = [shlex.split(line) for line in result.stderr.splitlines()
              if "cuteafd plan " in line and "--deployment" in line]
     assert len(plans) == 1, result.stderr
