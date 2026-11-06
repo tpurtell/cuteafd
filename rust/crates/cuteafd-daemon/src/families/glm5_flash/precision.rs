@@ -1,6 +1,5 @@
-//! Header-only admission of the FP8 block consumers' inputs (MLA, dense and
-//! shared-expert projections): checkpoint E4M3 with FP32 128x128 scales, or
-//! BF16 quantized to those blocks at load (the FP8 copy is the only resident one).
+//! Header-only admission: selected native BF16 attention stays BF16; FP8 block
+//! consumers accept native E4M3/scales or BF16 quantized only when selected.
 use cuteafd_core::DType;
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
@@ -100,7 +99,11 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint,
                 ("o_proj.weight", h, v_width),
             ] {
                 let name = format!("{prefix}.self_attn.{suffix}");
-                if core.get_weight(&name).is_none() { block(primary, name, rows, cols, "MLA FP8 block projection")?; }
+                if core.get_weight(&name).is_some() { continue; }
+                let stem = name.strip_suffix(".weight").unwrap();
+                if core.native.get(stem).is_some_and(|p| !p.fp8) {
+                    require(primary, name, DType::Bf16, vec![rows, cols], 2, "native MLA BF16 projection")?;
+                } else { block(primary, name, rows, cols, "MLA FP8 block projection")?; }
             }
         }
         let dense = cfg.dense[layer];

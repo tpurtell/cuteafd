@@ -146,7 +146,7 @@ impl CoreInventory {
 
     /// Remove a fused scratch class only when every served group is native.
     pub fn scratch_mask(&self, cfg: &GlmNextConfig, layers: usize) -> crate::serving_capacity::GlmfCoreScratch {
-        let has = |layer, leaf| self.projections.contains_key(&format!("{PREFIX}{layer}.{leaf}"));
+        let has = |layer, leaf: &str| self.projections.contains_key(&format!("{PREFIX}{layer}.{leaf}"));
         crate::serving_capacity::GlmfCoreScratch {
             kda: (0..layers).filter(|&l| cfg.attention[l] == GlmNextAttention::Kda).all(|l| attention_leaves(cfg.attention[l]).iter().all(|leaf| has(l, &format!("self_attn.{leaf}")))),
             mla: (0..layers).filter(|&l| cfg.attention[l] == GlmNextAttention::Mla).all(|l| attention_leaves(cfg.attention[l]).iter().all(|leaf| has(l, &format!("self_attn.{leaf}")))),

@@ -3,7 +3,7 @@ use super::*;
 use crate::shared::{dense_trellis::{CoreHead, CoreWeights, Projection, ProjectionLayout, ProjectionScratch, codebook, retain_partial},
     memory::device::{Allocation, Device}};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, Bf16F32Add, F32Bf16Narrow};
-use cuteafd_loader::families::glm5_flash::core_admission::{CoreCharges, CoreRankLayout, CoreStageLayout, route_stage_names};
+use cuteafd_loader::families::glm5_flash::core_admission::{CoreCharges, CoreRankLayout, CoreStageLayout, route_stage_names, fp8_projection_name};
 use std::collections::BTreeMap;
 
 type Key = (usize, usize, usize, &'static str);
@@ -80,6 +80,16 @@ impl<'a> Rank<'a> {
             let mut stage_bytes = 0;
             for name in route_stage_names(&engine.cfg, engine.ranks(), owned, index == 0, engine.decode_rows) {
                 stage_bytes = stage_bytes.max(engine.programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0) as usize);
+            }
+            for layer in layers {
+                for weight in layer.attention_native.values().filter(|w| w.layout.fp8) {
+                    let prefix = if layer.attention_share.split() { "glmf2_stage" } else { "glmf_stage" };
+                    let caps = if index == 0 { vec![64, engine.decode_rows] } else { vec![4096] };
+                    for cap in caps {
+                        let name = fp8_projection_name(prefix, weight.layout.shape, cap);
+                        stage_bytes = stage_bytes.max(engine.programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0) as usize);
+                    }
+                }
             }
             let actual_stage = CoreStageLayout::new(&engine.cfg, expected.rows, engine.ranks(), owned, stage_bytes)?;
             ensure!(admission.stages.as_ref().context("Flash K6 stages not admitted")?[index] == actual_stage,
@@ -168,12 +178,24 @@ impl<'a> GlmfEngine<'a> {
         Ok(Self::core_buffer(exchange.recv(rank, slot)?.wrapping_byte_add(prefix), bytes, exchange.device(rank)))
     }
     fn core_linear(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, name: &str,
-        input: Buffer, output: Buffer, rows: usize, plane: usize) -> Result<()> {
+        input: Buffer, output: Buffer, rows: usize, plane: usize, cap: &str) -> Result<()> {
         if let Some(weights) = layer.attention_native.get(name) {
             let [n,k] = weights.layout.shape;
             ensure!(input.bytes >= rows*k*2 && output.bytes >= rows*n*2, "Flash native projection operand extent");
             return self.on(rank, || {
-                ensure!(!weights.layout.fp8, "Flash standalone block-FP8 projection not yet bound");
+                if weights.layout.fp8 {
+                    let prefix = if layer.attention_share.split() { "glmf2_stage" } else { "glmf_stage" };
+                    let capacity = if is_decode(cap) { if cap == "m128" { 128 } else { 64 } } else { 4096 };
+                    let name = fp8_projection_name(prefix, weights.layout.shape, capacity);
+                    let program = self.programs.program(&name, &["x", "weight", "scales", "out", "scratch"])?;
+                    let scratch = w.core.as_ref().context("Flash FP8 slot")?.stage("scratch")?;
+                    let scales = weights.scales.as_ref().context("Flash FP8 scales")?.buffer;
+                    // SAFETY: admitted native rank slices, output and stage workspace
+                    // remain live on this stream throughout graph replay.
+                    return unsafe { program.launch(&[input.ptr, weights.values.buffer.ptr, scales.ptr,
+                        output.ptr, scratch.ptr], &self.fp8_scalars(Scalar::I32(i32::try_from(rows)?),
+                            is_decode(cap), true), self.stream_of(rank)) };
+                }
                 // SAFETY: selected rank slice and retained stage buffers cover the
                 // checked BF16 geometry and remain live throughout graph replay.
                 unsafe { self.library.linear_bf16(input.ptr, weights.values.buffer.ptr, output.ptr,
@@ -235,14 +257,14 @@ impl<'a> GlmfEngine<'a> {
         let slot = w.core.as_ref().context("Flash K6 FFN slot")?;
         let s = &slot.scratch;
         let (gate, up, hidden, scratch) = (s.stage("gate")?, s.stage("up")?, s.stage("hidden")?, s.stage("scratch")?);
-        self.core_linear(rank, w, layer, &ffn_key(layer, "gate"), w.x.buffer, gate, rows, 1)?;
-        self.core_linear(rank, w, layer, &ffn_key(layer, "up"), w.x.buffer, up, rows, 1)?;
+        self.core_linear(rank, w, layer, &ffn_key(layer, "gate"), w.x.buffer, gate, rows, 1, cap)?;
+        self.core_linear(rank, w, layer, &ffn_key(layer, "up"), w.x.buffer, up, rows, 1, cap)?;
         let inter = layer.core[&ffn_key(layer, "gate")].shape[0];
         self.core_stage(rank, layer.split, &format!("swiglu_i{inter}_{cap}"), &[("gate", gate.ptr), ("up", up.ptr),
             ("hidden", hidden.ptr), ("scratch", scratch.ptr)], &[count])?;
         let output = Self::core_buffer(output, rows * self.cfg.hidden * 2, w.x.buffer.device_id);
         let key = ffn_key(layer, "down");
-        self.core_linear(rank, w, layer, &key, hidden, output, rows, 1)?;
+        self.core_linear(rank, w, layer, &key, hidden, output, rows, 1, cap)?;
         if layer.split {
             // The suffix is disjoint from the following BF16 routed/dense publication.
             let index = self.weights.layers.iter().position(|l| std::ptr::eq(l, layer))
@@ -267,7 +289,7 @@ impl<'a> GlmfEngine<'a> {
         let (q,k,v,out,scratch) = (s.stage("q")?,s.stage("k")?,s.stage("v")?,s.stage("values")?,s.stage("scratch")?);
         let input = Self::core_buffer(row_at(&w.x, first, self.cfg.hidden * 2), rows*self.cfg.hidden*2, w.x.buffer.device_id);
         for (name, output) in [("q",q),("k",k),("v",v)] {
-            self.core_linear(rank,w,layer,&format!("self_attn.{name}_proj"),input,output,rows,0)?;
+            self.core_linear(rank,w,layer,&format!("self_attn.{name}_proj"),input,output,rows,0,cap)?;
         }
         self.core_stage(rank,layer.attention_share.split(),&format!("kda_core_{cap}"),&[
             ("x",input.ptr),("q",q.ptr),("k",k.ptr),("v",v.ptr),("gate",q.ptr),("w_fab",layer.ptr("w_aux")?),
@@ -277,19 +299,19 @@ impl<'a> GlmfEngine<'a> {
             ("replay",replay),("scratch",scratch.ptr)],&[count,Scalar::I32(i32::from(spec))])?;
         let destination = Self::core_buffer(w.delta.buffer.ptr.wrapping_byte_add(first*self.cfg.hidden*2),
             rows*self.cfg.hidden*2,w.x.buffer.device_id);
-        self.core_linear(rank,w,layer,"self_attn.o_proj",out,destination,rows,0)
+        self.core_linear(rank,w,layer,"self_attn.o_proj",out,destination,rows,0,cap)
     }
     pub(super) fn core_mla_producer(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, count: Scalar,
         cap: &str, cache: *mut c_void) -> Result<()> {
         let rows = rows(count)?;
         let s = &w.core.as_ref().context("Flash K6 MLA slot")?.scratch;
         let (q,k,scratch) = (s.stage("q")?,s.stage("k")?,s.stage("scratch")?);
-        self.core_linear(rank,w,layer,"self_attn.q_a_proj",w.x.buffer,q,rows,0)?;
-        self.core_linear(rank,w,layer,"self_attn.kv_a_proj_with_mqa",w.x.buffer,k,rows,0)?;
+        self.core_linear(rank,w,layer,"self_attn.q_a_proj",w.x.buffer,q,rows,0,cap)?;
+        self.core_linear(rank,w,layer,"self_attn.kv_a_proj_with_mqa",w.x.buffer,k,rows,0,cap)?;
         self.core_stage(rank,layer.attention_share.split(),&format!("rank_norm_{cap}"),&[("q_a",q.ptr),("kv_a",k.ptr),
             ("q_a_norm",layer.ptr("q_a_norm")?),("kv_a_norm",layer.ptr("kv_a_norm")?),
             ("kv_slots",w.kv_slots.buffer.ptr),("q_resid",w.q_resid.buffer.ptr),("kv_cache",cache),("scratch",scratch.ptr)],&[count])?;
-        self.core_linear(rank,w,layer,"self_attn.q_b_proj",w.q_resid.buffer,q,rows,0)?;
+        self.core_linear(rank,w,layer,"self_attn.q_b_proj",w.q_resid.buffer,q,rows,0,cap)?;
         self.core_stage(rank,layer.attention_share.split(),&format!("absorb_{cap}"),&[("a",q.ptr),
             ("w",layer.ptr("w_uk")?),("out",w.query.buffer.ptr)],&[count])
     }
@@ -298,7 +320,7 @@ impl<'a> GlmfEngine<'a> {
         let values = w.core.as_ref().context("Flash K6 MLA slot")?.scratch.stage("values")?;
         self.core_stage(rank,layer.attention_share.split(),&format!("values_{cap}"),&[("a",w.latent.buffer.ptr),
             ("w",layer.ptr("w_uv")?),("out",values.ptr)],&[count])?;
-        self.core_linear(rank,w,layer,"self_attn.o_proj",values,w.delta.buffer,rows,0)
+        self.core_linear(rank,w,layer,"self_attn.o_proj",values,w.delta.buffer,rows,0,cap)
     }
 }
 

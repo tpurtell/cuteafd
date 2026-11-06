@@ -17,7 +17,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPORTER = ROOT / "python" / "tools" / "aot" / "export_b12x_dsv4_aot.py"
-GEOMETRY = types.SimpleNamespace(moe_inter=2048, dense_inter=12288, index_kpool=4, kda_width=8192, hidden=4096)
+GEOMETRY = types.SimpleNamespace(moe_inter=2048, dense_inter=12288, index_kpool=4, kda_width=8192, hidden=4096,
+                                 q_lora_rank=1536, kv_lora_rank=512, heads=64, qk_nope_dim=256, v_head_dim=256)
 WIDE_STEMS = {
     "index_producer_m128", "index_producer_c_m128", "index_topk_decode_m128", "mhc_post_pre_m128", "kda_m128",
     "kda_w8_m128", "kda_s16_m128", "kda_w8_s16_m128", "mla_producer_m128", "o_m128", "sparse_mla_decode_m128", "ffn_i2048_m128",

@@ -76,10 +76,21 @@ impl CoreCharges {
             && owners.is_none_or(|o| ranks == 2 && o.len() == layers), "Flash K6 admission geometry");
         let owned = owned_mla(cfg, layers, ranks, owners.is_some());
         let mut bodies = vec![Vec::new(); ranks];
+        let mut native_names = [BTreeSet::new(), BTreeSet::new()];
         for layer in 0..layers {
             let owner = owners.and_then(|o| (cfg.attention[layer] == super::GlmNextAttention::Mla).then_some(o[layer]));
             for (rank, weights) in core.layer_weights(cfg, layer, ranks, owner)?.into_iter().enumerate() {
                 bodies[rank].extend(weights.into_values());
+            }
+            for weights in core.layer_native(cfg, layer, ranks, owner)? {
+                for weight in weights.values().filter(|w| w.fp8) {
+                    let prefix = if ranks == 1 || owner.is_some() { "glmf_stage" } else { "glmf2_stage" };
+                    for (index, caps) in [vec![64, decode_rows], vec![4096]].into_iter().enumerate() {
+                        for cap in caps {
+                            native_names[index].insert(fp8_projection_name(prefix, weight.shape, cap));
+                        }
+                    }
+                }
             }
         }
         let head = core.get_weight("lm_head").map(|p| CoreWeightLayout::new(p, TrellisSide::Output, 0, 1)).transpose()?;
@@ -100,8 +111,9 @@ impl CoreCharges {
         };
         let scratch = |decode: bool| -> Result<usize> {
             let mut bytes = 0;
-            for name in route_stage_names(cfg, ranks, owned, decode, decode_rows) {
-                bytes = bytes.max(lookup(&name)?);
+            for name in route_stage_names(cfg, ranks, owned, decode, decode_rows).iter()
+                .chain(native_names[usize::from(!decode)].iter()) {
+                bytes = bytes.max(lookup(name)?);
             }
             Ok(bytes)
         };
@@ -112,6 +124,7 @@ impl CoreCharges {
                 }
             }
         }
+        for name in native_names.iter().flatten() { lookup(name)?; programs.insert(name.clone()); }
         let projection = |body: &[CoreWeightLayout], rows| -> Result<Option<ProjectionScratchLayout>> {
             let mut result: Option<ProjectionScratchLayout> = None;
             for w in body {
@@ -143,6 +156,10 @@ impl CoreCharges {
         Ok(result)
     }
     pub fn bytes(&self, hidden: usize) -> Result<Vec<u64>> { self.ranks.iter().map(|r| r.bytes(hidden)).collect() }
+}
+
+pub fn fp8_projection_name(prefix: &str, [n, k]: [usize; 2], cap: usize) -> String {
+    format!("{prefix}_fp8_linear_k{k}_n{n}_m{cap}")
 }
 
 /// Decode and prefill stages differ even when their live row counts coincide.

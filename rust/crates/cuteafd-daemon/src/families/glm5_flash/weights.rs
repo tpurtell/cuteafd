@@ -161,6 +161,7 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
             AttentionRecord::Operand(Operand { device, buffer: grid, lands: vec![(source(&format!("{weight}_scale_inv"),
                 rows.start/128..rows.end/128, cols.start/128..cols.end/128, 4)?, 0)], bytes: n/128*(k/128)*4 })]);
     }
+    let rule = if mode == AttentionMode::Fp8Compact { crate::shared::fp8_linear::Fp8Scales::Amax } else { rule };
     let whole = source(&weight, rows, cols, 2)?;
     windows(&[whole], 128)?.into_iter().map(|(rects, rows)| {
         let target = Target {

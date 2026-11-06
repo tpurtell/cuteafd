@@ -111,7 +111,7 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
             bytes += one(&format!("{p}.input_layernorm.weight"))? + one(&format!("{p}.post_attention_layernorm.weight"))?;
             match cfg.attention[layer] {
                 GlmNextAttention::Kda => {
-                    if core.get_weight(&a("q_proj")).is_some() {
+                    if core.get_weight(&a("q_proj")).is_some() || core.native.contains_key(&a("q_proj")) {
                         bytes += native[rank].iter().filter(|(name, _)| name.starts_with("self_attn."))
                             .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
                         let aux = elements(&a("f_a_proj.weight"))? + elements(&a("g_a_proj.weight"))?
@@ -141,7 +141,7 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
                         bytes += one(&a("q_a_layernorm.weight"))? + one(&a("kv_a_layernorm.weight"))?;
                         bytes += (cfg.heads * cfg.qk_nope_dim * cfg.kv_lora_rank * 2 / parts) as u64;
                         bytes += (cfg.heads * cfg.v_head_dim * cfg.kv_lora_rank * 2 / parts) as u64;
-                        if core.get_weight(&a("q_a_proj")).is_some() {
+                        if core.get_weight(&a("q_a_proj")).is_some() || core.native.contains_key(&a("q_a_proj")) {
                             bytes += native[rank].iter().filter(|(name, _)| name.starts_with("self_attn."))
                                 .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
                         } else {

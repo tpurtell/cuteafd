@@ -287,7 +287,8 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
     from b12x.integration.cuteafd.glmf_split import (
         compile_glmf_kda_core_aot, compile_glmf_stage_aot,
         compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot,
-        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot)
+        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot,
+        compile_glmf_fp8_linear_aot)
     out = []
     # Wide decode still selects the narrow stage for batches of at most 64 rows.
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
@@ -321,6 +322,15 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
         params = dict(max_rows=rows)
         out.append((f"index_projected_keys_m{rows}", "index_producer", params,
                     partial(compile_glmf_projected_index_keys_aot, g, **params)))
+    # Append standalone seams; never reorder the existing fused exports.
+    for rows in sorted(decode_caps | {prefill_rows}):
+        shapes = {(g.q_lora_rank, g.heads*g.qk_nope_dim), (g.heads*g.v_head_dim, g.hidden),
+                  (g.hidden, g.kda_width), (g.kda_width, g.hidden),
+                  (g.hidden, g.q_lora_rank), (g.hidden, g.kv_lora_rank)}
+        for k, n in sorted(shapes):
+            params = dict(input_features=k, output_features=n, max_rows=rows, decode=rows in decode_caps)
+            out.append((f"fp8_linear_k{k}_n{n}_m{rows}", "attention_projection", params,
+                        partial(compile_glmf_fp8_linear_aot, **params)))
     return out
 
 

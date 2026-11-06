@@ -4975,7 +4975,7 @@ impl<'a> GlmfEngine<'a> {
         if let Some(dir) = trace {
             let qkv_width = self.cfg.q_lora_rank + self.cfg.kv_lora_rank;
             let q_width = heads * self.cfg.qk_nope_dim;
-            let native = layer.core.contains_key("self_attn.q_a_proj");
+            let native = core::stage_attention(layer);
             if native {
                 let slot = w.core.as_ref().context("native MLA trace without stage buffers")?;
                 // q_a has been normalized into q_resid; its stage now contains q_b.
