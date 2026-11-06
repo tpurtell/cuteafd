@@ -178,7 +178,9 @@ def main():
 
             results = {}
             canonical_outputs = {}
-            row_counts = (1, 8, 16, 128, 140, 2048)
+            row_counts = (1, 4, 8, 16, 64, 128, 140, 2048)
+            torch.backends.cuda.matmul.allow_tf32 = False
+            reference = x.float() @ w.float().T
             for arm, operation in arms.items():
                 outputs, timing = {}, {}
                 graph_exact = True
@@ -187,6 +189,8 @@ def main():
                     operation(x[:rows], out)
                     torch.cuda.synchronize()
                     expected = out.clone()
+                    # Match the fork's BF16 projection oracle, without TF32.
+                    torch.testing.assert_close(expected.float(), reference[:rows], rtol=1e-2, atol=1e-2)
                     outputs[rows] = expected
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
@@ -222,7 +226,8 @@ def main():
                         canonical_outputs[rows].view(torch.int16)) for rows, out in outputs.items())
                     assert canonical_exact, (k, n, arm, "retile changed canonical TMA bytes")
                 results[arm] = dict(row_invariant=not mismatches, mismatches=mismatches,
-                                    graph_exact=graph_exact, canonical_exact=canonical_exact, timing=timing)
+                                    graph_exact=graph_exact, canonical_exact=canonical_exact,
+                                    fp32_oracle=True, timing=timing)
             if args.skinny_screen:
                 qualified.append(all(result["row_invariant"] for arm, result in results.items()
                                      if arm.startswith("tma")))
