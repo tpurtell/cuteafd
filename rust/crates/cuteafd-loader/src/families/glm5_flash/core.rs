@@ -449,6 +449,61 @@ mod tests {
     }
 
     #[test]
+    fn alternating_mla_native_k6_records_have_one_owner_in_both_directions() -> Result<()> {
+        use super::super::resident::{resident_weights_placed, GlmfRepresentation};
+        use crate::placement::AttentionPlacement;
+        let (cfg, mut checkpoint) = complete_fixture();
+        checkpoint.tensors.retain(|tensor| !tensor.meta.name.contains(".mlp.experts."));
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        for first in [0, 1] {
+            let mut next = first;
+            let mut previous = resident_weights_placed(&checkpoint, &cfg, 0, 2,
+                GlmfRepresentation::default(), AttentionPlacement::Layers, first).map_err(anyhow::Error::msg)?;
+            for layer in 0..cfg.layers {
+                let mla = cfg.attention[layer] == GlmNextAttention::Mla;
+                let owner = mla.then_some(next as u8);
+                let owned = core.layer_weights(&cfg, layer, 2, owner)?;
+                let split = core.layer_weights(&cfg, layer, 2, None)?;
+                let whole = core.layer_weights(&cfg, layer, 1, None)?;
+                for rank in 0..2 {
+                    for (name, layout) in &split[rank] {
+                        if mla && name.starts_with("self_attn.") {
+                            assert_eq!(owned[rank].contains_key(name), rank == next, "layer {layer}, first {first}");
+                            if rank == next { assert_eq!(owned[rank][name], whole[0][name]); }
+                        } else {
+                            assert_eq!(owned[rank].get(name), Some(layout), "KDA/FFN must retain TP split");
+                        }
+                    }
+                }
+                let current = resident_weights_placed(&checkpoint, &cfg, layer + 1, 2,
+                    GlmfRepresentation::default(), AttentionPlacement::Layers, first).map_err(anyhow::Error::msg)?;
+                if mla {
+                    let layer_bytes = |ranks: usize, rank: usize| -> Result<u64> {
+                        let before = resident_weights_placed(&checkpoint, &cfg, layer, ranks,
+                            GlmfRepresentation::default(), AttentionPlacement::Heads, 0).map_err(anyhow::Error::msg)?;
+                        let after = resident_weights_placed(&checkpoint, &cfg, layer + 1, ranks,
+                            GlmfRepresentation::default(), AttentionPlacement::Heads, 0).map_err(anyhow::Error::msg)?;
+                        Ok(after[rank].weights - before[rank].weights)
+                    };
+                    let full = layer_bytes(1, 0)?;
+                    let peer = current[next ^ 1].weights - previous[next ^ 1].weights;
+                    let native_ffn = split[next ^ 1].iter().filter(|(name, _)| name.starts_with("mlp."))
+                        .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
+                    let shared = 2 * (4 * 24 * 16384 + 256 + 256) + 2 * 4096 * 2
+                        + 288 * 4096 * 2 + 288 * 4;
+                    assert_eq!(peer, native_ffn + shared, "peer retains only FFN, mHC, norms and router");
+                    assert_eq!(current[next].weights - previous[next].weights,
+                        full - (whole[0].iter().filter(|(name, _)| name.starts_with("mlp."))
+                            .map(|(_, layout)| layout.bytes as u64).sum::<u64>() - native_ffn));
+                    next ^= 1;
+                }
+                previous = current;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn published_target_core_has_316_header_native_owners_and_no_kv_padding() -> Result<()> {
         let (cfg, checkpoint) = fixture();
         let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;

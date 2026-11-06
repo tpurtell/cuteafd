@@ -686,6 +686,8 @@ mod tests {
             input.spark_ranks = 0;
             input.requested_pool = Some(262_144);
             let admitted = contract(&input).unwrap();
+            assert_eq!(admitted.validate_spark_topology(4), Err(admission::TopologyRefusal::IdleSparks));
+            admitted.validate_spark_topology(0).unwrap();
             for gpu in 0..2 {
                 let ready = admitted.solved.facts.allocations.iter()
                     .find(|owner| owner.id == format!("glmf.graphs.{gpu}.ready")).unwrap();

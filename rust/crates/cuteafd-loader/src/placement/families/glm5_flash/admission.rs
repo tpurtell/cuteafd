@@ -230,6 +230,7 @@ impl p::Recipe for GlmfRecipe {
 }
 
 pub struct PreparedGlmf<'a> {
+    started: std::time::Instant,
     input: &'a GlmfInputs<'a>,
     pub recipe: GlmfRecipe,
     pub budgets: Vec<p::Budget>,
@@ -252,6 +253,21 @@ pub struct AdmittedGlmf {
     pub native_load: Option<NativeLoad>,
     pub push_host: Option<crate::push_load::PushHostEnvelope>,
     pub encoder: Option<crate::plan::encoder::EncoderPlacement>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TopologyRefusal {
+    #[error("all routed layers fit on the RTX GPUs; set SPARK_COUNT=0")]
+    IdleSparks,
+}
+
+impl AdmittedGlmf {
+    pub fn validate_spark_topology(&self, requested: usize) -> Result<(), TopologyRefusal> {
+        if requested > 0 && self.working.spark_ranks == 0 {
+            return Err(TopologyRefusal::IdleSparks);
+        }
+        Ok(())
+    }
 }
 
 fn invalid(error: impl std::fmt::Display) -> p::Refusal {
@@ -308,6 +324,7 @@ fn modes(i: &GlmfInputs<'_>) -> Vec<LayerMode> {
 
 pub fn prepare<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, mut process: ProcessOwners)
     -> Result<PreparedGlmf<'a>, p::Refusal> {
+    let started = std::time::Instant::now();
     let alternate = process.alternate_resident.take();
     let mut prepared = prepare_fixed(i, sms, rtx_experts, process.clone())?;
     if let Some(resident) = alternate {
@@ -343,6 +360,7 @@ pub fn prepare<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, mut pro
         }
         prepared.recipe.contract.components = components;
     }
+    prepared.started = started;
     Ok(prepared)
 }
 
@@ -645,7 +663,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         prefill: p::Pin::Exact(prefill), operation: p::Operation::Serving,
         resident_weight_limit: i.resident_weight_limit,
         spark_reply_formats: contract.spark_reply_formats.unwrap_or_default() };
-    Ok(PreparedGlmf { input: i, recipe: GlmfRecipe { contract }, budgets, request, counts, arena, sms,
+    Ok(PreparedGlmf { started: std::time::Instant::now(), input: i, recipe: GlmfRecipe { contract }, budgets, request, counts, arena, sms,
         native_load: process.native_load, push_host: process.push_host, encoders: process.encoders })
 }
 
@@ -713,6 +731,8 @@ impl PreparedGlmf<'_> {
                     owner.bytes, Basis::Exact).with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve)));
         }
         let encoder = solved.decisions.encoder.map(|index| self.encoders[index].clone());
+        tracing::debug!(target: "cuteafd::planner", complete_solve_us = self.started.elapsed().as_micros() as u64,
+            graph_slack = ?graph_slack, "Flash recipe preparation, search and exact reconciliation completed");
         Ok(AdmittedGlmf { placement, graphs, working, solved, graph_slack, native_load: self.native_load, push_host: self.push_host, encoder })
     }
 }

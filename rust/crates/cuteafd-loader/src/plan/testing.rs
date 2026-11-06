@@ -560,6 +560,28 @@ pub fn glm5_flash_vision_tensors() -> Vec<Tensor> {
         .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)).collect()
 }
 
+/// Minimal executable FP8 Flash package and step exports for admission fixtures.
+pub fn write_glm5_flash_workspaces(root: &Path) -> std::path::PathBuf {
+    let share = root.join("share");
+    let package = root.join("lib/fp8/fp8-glmf");
+    fs::create_dir_all(&share).unwrap();
+    fs::create_dir_all(&package).unwrap();
+    let layout = json!({"capacities":[{"capacity":4096,"scratch_bytes":4096}]});
+    fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":layout,"tp2":layout}}).to_string()).unwrap();
+    let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_w8", "mla_producer", "o", "ffn_i2048",
+        "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
+            ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
+        .chain(["glmf_mhc_pre", "glmf_sparse_mla_decode_m64", "glmf_sparse_mla_prefill_m4096",
+            "glmf_index_topk_decode_m64", "glmf_index_topk_prefill_m4096",
+            "glmf2_kda_w8_norm_m64", "glmf2_kda_output_rows_m64",
+            "glmf2_kda_w8_norm_m4096", "glmf2_kda_output_rows_m4096",
+            "glmf2_kda_w8_norm_expanded_m4096", "glmf2_kda_output_rows_expanded_m4096"].map(str::to_string))
+        .map(|name| json!({"name":name,"scratch_bytes_at_capacity":{"scratch":4096}})).collect();
+    let path = share.join("PROGRAMS.json");
+    fs::write(&path, json!({"capacities":{"max_context":131072},"programs":programs}).to_string()).unwrap();
+    path
+}
+
 /// Complete coordinator headers plus one expert per routed layer; payloads stay sparse.
 pub fn glm5_flash_tensors(config: &Value) -> Vec<Tensor> {
     use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};

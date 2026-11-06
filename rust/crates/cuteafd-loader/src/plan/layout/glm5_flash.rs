@@ -352,6 +352,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             process.native_load = Some(glmf::admission::NativeLoad::from_plans(&body, &vocabulary, &shared)?);
         }
         let selected = glmf::admission::prepare(&inputs, sms as usize, available.is_some(), process)?.admit()?;
+        selected.validate_spark_topology(spark_ranks)?;
         report.encoder = selected.encoder.clone();
         if report.encoder.as_ref().is_some_and(|encoder| encoder.kind == EncoderKind::Off) {
             if let Some(component) = report.components.iter_mut().find(|component|
@@ -394,6 +395,25 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         }
         Err(error) => {
             let reason = format!("GLM Flash pool-first placement: {error:#}");
+            // Discovery failures still report the bundled tower, but cannot
+            // claim an encoder allocation without a successful joint recipe.
+            if report.encoder.is_none() {
+                use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+                let towers = glm_flash_towers(report, checkpoint);
+                let (weights, scratch, encoder_reason) = match towers.vision {
+                    Ok((weights, scratch)) if report.vision != crate::plan::MediaMode::Off =>
+                        (weights, scratch, format!("encoder not admitted: {reason}")),
+                    Err(why) if report.vision != crate::plan::MediaMode::Off => (0, 0, why),
+                    _ => (0, 0, "disabled".into()),
+                };
+                report.encoder = Some(EncoderPlacement { kind: EncoderKind::Off, weights, scratch,
+                    replicas: vec![], reason: encoder_reason, shortfall: 0 });
+                if report.audio != crate::plan::MediaMode::Off {
+                    report.audio_encoder = Some(EncoderPlacement { kind: EncoderKind::Off, weights: 0,
+                        scratch: 0, replicas: vec![], reason: towers.audio.err()
+                            .unwrap_or_else(|| format!("encoder not admitted: {reason}")), shortfall: 0 });
+                }
+            }
             // `context` is the two-GPU default, so an absent program manifest fails the solve
             // before any pool or replay constraint applies: point at the programs to rebuild
             // rather than at the pool (issue #202).
@@ -401,6 +421,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 Some(placement::PlacementError::MissingContextPrograms { .. })) {
                 "Rebuild the GLM Flash coordinator programs with the context-split kernels \
                     (CUTEAFD_CONTEXT_SPLIT_AOT), or request `heads` explicitly.".into()
+            } else if error.downcast_ref::<glmf::admission::TopologyRefusal>().is_some() {
+                "Set SPARK_COUNT=0; the selected placement needs no Spark workers.".into()
             } else {
                 "Change the reported pool, replay-records or placement constraint.".into()
             };

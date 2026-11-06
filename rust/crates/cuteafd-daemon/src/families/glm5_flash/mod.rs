@@ -1965,6 +1965,7 @@ impl Opened {
             self.experts.as_ref(),
             native_admission.map(|native| (&native.facts, &native.metadata)))?;
         let admitted = admission::admission::prepare(&inputs, sms, true, process)?.admit()?;
+        admitted.validate_spark_topology(spark_ranks)?;
         tracing::info!(graph_slack = ?admitted.graph_slack, phases = ?admitted.solved.phases,
             "GLM Flash admitted exact physical owners");
         let (placement, graphs, working) = (admitted.placement, admitted.graphs, admitted.working);

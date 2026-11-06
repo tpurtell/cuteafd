@@ -3419,6 +3419,12 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             workspace_manifest: Some(path.clone()), ..Default::default() }),
             attention_placement: Some(AttentionPlacement::Heads), ..sparks(peers) };
         let report = plan(dir.path(), &options).unwrap();
+        if peers > 0 && expected_rtx == 3 {
+            assert!(!report.placement_supported && report.solver_placement.is_none());
+            assert!(report.hints.iter().any(|hint| hint.what.contains(
+                "all routed layers fit on the RTX GPUs; set SPARK_COUNT=0")), "{}", render(&report));
+            continue;
+        }
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
         let input = glmf::GlmfInputs {
@@ -4152,7 +4158,8 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     let report = plan(dir.path(), &options).unwrap();
     let host = report.memory_layout.unwrap();
     assert!(!host.devices.iter().any(|d| d.by_category().contains_key(&Category::Embedding)));
-    assert!(host.pool_tokens > gpu.pool_tokens, "host={} GPU={} host_notes={:?} gpu_notes={:?}",
+    // Releasing an embedding cannot grow a pool already at the shared small-card cap.
+    assert!(host.pool_tokens > gpu.pool_tokens || (host.pool_tokens == gpu.pool_tokens && host.pool_tokens == 1_048_576), "host={} GPU={} host_notes={:?} gpu_notes={:?}",
         host.pool_tokens, gpu.pool_tokens, host.notes, gpu.notes);
     assert_eq!(host.devices[1].by_category().get(&Category::Weights), gpu.devices[1].by_category().get(&Category::Weights));
     assert!(host.notes.iter().any(|n| n.contains(&format!("{bytes} device bytes freed"))));
@@ -4855,23 +4862,38 @@ fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
         "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
         "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
         "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
-    let tensors: Vec<_> = super::families::glm::glm_flash_vision_tensors().into_iter()
-        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)).collect();
+    let mut tensors = glm5_flash_tensors(&cfg);
+    tensors.extend(glm5_flash_vision_tensors());
+    let tower_only = snapshot_tp(cfg.clone(), &glm5_flash_vision_tensors(), Some(4));
+    let refused = plan(tower_only.path(), &sparks(4)).unwrap();
+    assert!(!refused.executable());
+    assert!(refused.solver_placement.is_none() && refused.phase_ledger.is_none());
+    let unadmitted = refused.encoder.as_ref().expect("tower discovery survives backbone refusal");
+    assert_eq!(unadmitted.kind, EncoderKind::Off);
+    assert_eq!(unadmitted.weights, 1_128_026_176);
+    assert_eq!(unadmitted.admitted_bytes(), 0);
+    assert!(unadmitted.reason.contains("encoder not admitted:"));
     let dir = snapshot_tp(cfg.clone(), &tensors, Some(4));
+    let manifest = write_glm5_flash_workspaces(dir.path());
+    let base = PlanOptions { attention_placement: Some(AttentionPlacement::Heads),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            workspace_manifest: Some(manifest), drafter_bytes: 256 << 20,
+            context_tokens: 32768, pool_tokens: Some(32768), ..Default::default() }),
+        ..Default::default() };
     for (gpus, gib, ranks) in [(1, 96, 4), (2, 96, 4), (1, 32, 4), (1, 96, 0)] {
-        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-            rtx_bytes: vec![gib << 30; gpus], pool_tokens: Some(32768), ..Default::default()
-        }), ..sparks(ranks) };
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib << 30; gpus],
+            onboard: (ranks > 0).then_some(crate::placement::OnboardSetting::Layers(0)),
+            ..base.layout.clone().unwrap()
+        }), placement: ExpertPlacement::from_spark_ranks(ranks), ..base.clone() };
         let report = plan(dir.path(), &options).unwrap();
         let encoder = report.encoder.as_ref().unwrap();
         assert_eq!(encoder.weights, 1_128_026_176);
-        assert_eq!(encoder.admitted_bytes(), 1_919_933_760);
-        // A tower-only fixture cannot admit backbone experts; configured peers do
-        // not create Spark device rows. Encoder placement follows the actual rows.
+        assert_eq!(encoder.admitted_bytes(), 1_919_933_760, "{gpus} GPUs: {}", render(&report));
         let selected_sparks = report.memory_layout.as_ref().unwrap().devices.iter()
             .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).count();
-        assert_eq!(selected_sparks, 0);
-        assert_eq!(encoder.kind, EncoderKind::Rtx { gpu: gpus - 1 });
+        assert_eq!(selected_sparks, ranks);
+        assert_eq!(encoder.kind, if ranks > 0 { EncoderKind::Spark { rank: 0 } }
+            else { EncoderKind::Rtx { gpu: gpus - 1 } });
         let vision = report.components.iter().find(|c| c.component == Component::Vision).unwrap();
         assert_eq!(vision.status, Status::Ready);
         assert_eq!(vision.rejected, 0);
@@ -4883,20 +4905,20 @@ fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
     }
     let mut bad = cfg.clone(); bad["vision_config"]["num_heads"] = json!(8);
     let invalid = snapshot_tp(bad, &tensors, Some(4));
-    let report = plan(invalid.path(), &sparks(4)).unwrap();
+    let report = plan(invalid.path(), &PlanOptions { placement: ExpertPlacement::from_spark_ranks(4), ..base.clone() }).unwrap();
     assert_ne!(report.components.iter().find(|c| c.component == Component::Vision).unwrap().status, Status::Ready);
     assert_eq!(report.encoder.as_ref().unwrap().admitted_bytes(), 0);
     assert!(!report.placement_supported);
     let mut missing = tensors.clone(); missing.pop();
     let incomplete = snapshot_tp(cfg.clone(), &missing, Some(4));
-    let report = plan(incomplete.path(), &sparks(4)).unwrap();
+    let report = plan(incomplete.path(), &PlanOptions { placement: ExpertPlacement::from_spark_ranks(4), ..base.clone() }).unwrap();
     assert_ne!(report.components.iter().find(|c| c.component == Component::Vision).unwrap().status, Status::Ready);
-    let mut wrong_dtype = tensors.clone(); wrong_dtype[0].1 = "F16";
+    let mut wrong_dtype = tensors.clone(); wrong_dtype.iter_mut().find(|(name, ..)| name.starts_with("model.visual.")).unwrap().1 = "F16";
     let mut extra_tensor = tensors.clone();
     extra_tensor.push(t("model.visual.unrecognized.weight", "BF16", &[1024]));
     for unsupported in [wrong_dtype, extra_tensor] {
         let invalid = snapshot_tp(cfg.clone(), &unsupported, Some(4));
-        let report = plan(invalid.path(), &sparks(4)).unwrap();
+        let report = plan(invalid.path(), &PlanOptions { placement: ExpertPlacement::from_spark_ranks(4), ..base.clone() }).unwrap();
         assert_ne!(component(&report, Component::Vision).status, Status::Ready);
         assert_eq!(report.encoder.as_ref().unwrap().admitted_bytes(), 0);
     }
@@ -4908,7 +4930,7 @@ fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
     mimo_tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let mimo = snapshot(mimo_config, &mimo_tensors);
     let report = plan(mimo.path(), &sparks(4)).unwrap();
-    let glm = plan(dir.path(), &sparks(4)).unwrap();
+    let glm = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local, ..base.clone() }).unwrap();
     let component = |report: &super::PlanReport| serde_json::to_value(report.components.iter()
         .find(|c| c.component == Component::Vision).unwrap()).unwrap().as_object().unwrap().keys().cloned().collect::<Vec<_>>();
     // Both families expose the same component/encoder schema, not a GLM-only side channel.
@@ -5114,32 +5136,40 @@ fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
         "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
         "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
         "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
-    let tensors: Vec<_> = super::families::glm::glm_flash_vision_tensors().into_iter()
-        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)).collect();
+    let mut tensors = glm5_flash_tensors(&cfg);
+    tensors.extend(glm5_flash_vision_tensors());
     let dir = snapshot_tp(cfg, &tensors, Some(4));
-    let base = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        rtx_bytes: vec![96 << 30; 2], pool_tokens: Some(32768), ..Default::default()
+    let base = PlanOptions { attention_placement: Some(AttentionPlacement::Heads), layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        rtx_bytes: vec![96 << 30; 2], pool_tokens: Some(32768),
+        workspace_manifest: Some(write_glm5_flash_workspaces(dir.path())),
+        drafter_bytes: 256 << 20, context_tokens: 32768,
+        onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default()
     }), ..sparks(4) };
-    let sentence = "vision-only Spark workers are not supported; set VISION=rtx or RTX_EXPERT_LAYERS";
+    let sentence = "GLM Flash pool-first placement:";
     for vision in [MediaMode::Spark(None), MediaMode::Spark(Some(0))] {
         let report = plan(dir.path(), &PlanOptions { vision, ..base.clone() }).unwrap();
         assert!(!report.placement_supported, "{vision:?}");
         assert!(!report.executable(), "{vision:?}");
         let encoder = report.encoder.as_ref().unwrap();
         assert_eq!(encoder.kind, EncoderKind::Off, "{vision:?}");
-        assert_eq!(encoder.reason, sentence, "{vision:?}");
+        assert!(encoder.reason.contains(sentence), "{vision:?}: {}", encoder.reason);
         assert_eq!(encoder.shortfall, 0, "{vision:?}");
         assert_eq!(encoder.admitted_bytes(), 0);
         assert_eq!(report.memory_layout.as_ref().unwrap().devices.iter()
             .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).count(), 0);
-        assert!(report.hints.iter().any(|hint| hint.what == sentence), "{:?}", report.hints);
+        assert!(report.hints.iter().any(|hint| hint.what.contains(sentence)), "{:?}", report.hints);
         assert_ne!(component(&report, Component::Vision).status, Status::Disabled);
         assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note| note.contains(sentence)));
     }
-    // Automatic vision still falls back onto the last RTX.
-    let auto = plan(dir.path(), &base).unwrap();
-    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 1 });
-    assert!(auto.hints.iter().all(|hint| hint.what != sentence));
+    let idle = plan(dir.path(), &base).unwrap();
+    assert!(!idle.executable() && idle.solver_placement.is_none() && idle.phase_ledger.is_none());
+    assert!(idle.hints.iter().any(|hint| hint.what.contains(
+        "all routed layers fit on the RTX GPUs; set SPARK_COUNT=0")), "{}", render(&idle));
+    assert_eq!(idle.encoder.as_ref().unwrap().admitted_bytes(), 0);
+    // The same all-local selection admits automatic vision on the last RTX.
+    let auto = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local, ..base.clone() }).unwrap();
+    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 1 }, "{}", render(&auto));
+    assert!(auto.executable(), "{}", render(&auto));
 
     let explicit = plan_spark_count(dir.path(), &PlanOptions {
         vision: MediaMode::Spark(None), ..base.clone()

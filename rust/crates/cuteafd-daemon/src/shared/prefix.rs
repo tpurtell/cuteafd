@@ -348,8 +348,12 @@ mod tests {
                         "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
                         "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
                         "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
-                    let tensors = testing::glm5_flash_vision_tensors();
+                    let mut tensors = testing::glm5_flash_tensors(&config);
+                    tensors.extend(testing::glm5_flash_vision_tensors());
                     testing::write_snapshot(dir.path(), &config, &tensors, Some(4));
+                    options.workspace_manifest = Some(testing::write_glm5_flash_workspaces(dir.path()));
+                    options.drafter_bytes = 256 << 20;
+                    options.context_tokens = 32768;
                 }
                 "muse_spark" => {
                     testing::write_muse_vision_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
@@ -381,8 +385,29 @@ mod tests {
                         assert_eq!(cuteafd_engine::media::EmbeddingCache::new(bytes).capacity(), bytes);
                         bytes as u64
                     };
-                    let planned = report.host_ledger.as_ref().context("host media ledger")?.items.iter()
-                        .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum::<u64>();
+                    let planned = if adapter.id() == "glm5_flash" {
+                        use cuteafd_loader::placement::planner::{Location, Phase};
+                        let ledger = report.phase_ledger.as_ref().context("joint physical ledger")?;
+                        let host = ledger.budgets.iter().find(|budget| budget.locations.contains(&Location::HOST))
+                            .context("physical host budget")?;
+                        let owned = |phase| ledger.phases.iter().find(|row|
+                            row.budget == host.id && row.phase == phase).unwrap().owned;
+                        let zero = input.plan(&PlanOptions { placement, vision, audio: MediaMode::Off,
+                            layout: Some(LayoutOptions { media_cache_bytes: Some(0), ..options.clone() }),
+                            ..Default::default() })?;
+                        let zero_ledger = zero.phase_ledger.as_ref().context("zero-cache physical ledger")?;
+                        let zero_owned = |phase| zero_ledger.phases.iter().find(|row|
+                            row.budget == host.id && row.phase == phase).unwrap().owned;
+                        assert_eq!(owned(Phase::PostTargetKv), zero_owned(Phase::PostTargetKv),
+                            "media cache must not exist before Warmup");
+                        for phase in [Phase::Warmup, Phase::Ready, Phase::Growth] {
+                            assert_eq!(owned(phase) - zero_owned(phase), runtime);
+                        }
+                        owned(Phase::Ready) - zero_owned(Phase::Ready)
+                    } else {
+                        report.host_ledger.as_ref().context("host media ledger")?.items.iter()
+                            .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum::<u64>()
+                    };
                     assert_eq!(planned, runtime, "{}: vision={vision:?}, quota={quota:?}", adapter.id());
                 }
             }

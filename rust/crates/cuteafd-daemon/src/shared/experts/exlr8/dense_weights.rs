@@ -426,6 +426,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn flash_alternating_mla_records_and_residency_follow_both_first_owners() -> Result<()> {
+        use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig, resident};
+        use cuteafd_loader::plan::exlr8::native::DenseFacts;
+        let root = fixture("flash");
+        let cfg = GlmNextConfig::read(root.path())?;
+        let config = serde_json::from_slice(&std::fs::read(root.path().join("config.json"))?)?;
+        let selection = DenseSelection::from_hf(&config)?;
+        let mut records = DenseRecord::inventory(root.path())?;
+        let original = records.iter().find(|record| record.tensor.ends_with(".self_attn.kv_b_proj.weight"))
+            .context("fixture MLA record")?.clone();
+        let mla = cfg.attention.iter().enumerate().filter_map(|(layer, kind)|
+            (*kind == GlmNextAttention::Mla).then_some(layer)).collect::<Vec<_>>();
+        assert!(mla.len() > 1);
+        for &layer in mla.iter().skip(1) {
+            let mut record = original.clone();
+            record.tensor = format!("{}.self_attn.kv_b_proj.weight", selection.layer_prefix(layer)?);
+            record.ownership.whole_mla = Some(layer);
+            records.push(record);
+        }
+        let facts = DenseFacts::new(records.clone(), selection.clone(), cfg.layers, vec![0; 2])?;
+        for first in [0, 1] {
+            let owners = mla.iter().enumerate().map(|(index, &layer)| (layer, first ^ (index % 2)))
+                .collect::<BTreeMap<_, _>>();
+            let plans = facts.plans(&owners)?;
+            let admitted = resident::native_resident(&selection, cfg.layers, &plans, &[0; 2])?;
+            for rank in 0..2 {
+                let runtime = NativeDenseRecords::from_records(&records, &selection, cfg.layers, 2, rank, &owners)?;
+                assert_eq!(runtime.plan.resident_bytes as u64, admitted[rank].weights + admitted[rank].embedding);
+                for (&layer, &owner) in &owners {
+                    assert_eq!(runtime.layers[layer].kv_b.is_some(), rank == owner);
+                    let name = format!("{}.self_attn.kv_b_proj.weight", selection.layer_prefix(layer)?);
+                    assert_eq!(runtime.plan.tensors.iter().filter(|slice| slice.tensor == name).count(), usize::from(rank == owner));
+                    if rank == owner { assert_eq!(runtime.layers[layer].kv_b.as_ref().unwrap().1.heads, cfg.heads); }
+                }
+            }
+            for &layer in &mla {
+                let name = format!("{}.self_attn.kv_b_proj.weight", selection.layer_prefix(layer)?);
+                assert_eq!(plans.iter().flat_map(|plan| &plan.tensors).filter(|slice| slice.tensor == name).count(), 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn compact_native_reader_dispatch_matches_real_allocations() -> Result<()> {
         use cuteafd_loader::plan::exlr8::dense::{DenseAxis, DenseWindow};
         let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
