@@ -48,7 +48,7 @@ impl HostStaging {
     /// Bound open transforms and their reusable pool from the receiver ring.
     /// Overlapping source windows multiply the ring/frontier bound by their
     /// simultaneous fanout, not the footprint of a transitively overlapping chain.
-    /// Disconnected rectangles still charge their entire footprint separately.
+    /// Cross-file transforms still charge their entire footprint separately.
     pub fn for_steps<'s>(steps: impl IntoIterator<Item = &'s [Rect]>, table_bytes: usize) -> Result<Self> {
         use std::collections::BTreeMap;
         let mut extents = BTreeMap::<std::path::PathBuf, Vec<(u64, u64, usize)>>::new();
@@ -58,21 +58,23 @@ impl HostStaging {
                 .context("dense step size overflow"))?;
             total = total.checked_add(bytes).context("dense staging footprint overflow")?;
             largest = largest.max(bytes);
-            let mut contiguous = !rects.is_empty();
+            let mut same_file = !rects.is_empty();
+            let mut start = u64::MAX;
             let mut end = 0;
             for (i, rect) in rects.iter().enumerate() {
                 ensure!(!rect.rows.is_empty() && !rect.cols.is_empty() && rect.cols.end <= rect.row_bytes,
                     "invalid staged rectangle");
                 let first = rect.base.checked_add((rect.rows.start * rect.row_bytes + rect.cols.start) as u64)
                     .context("dense source start overflow")?;
-                if i > 0 && (rect.path != rects[0].path || first != end) { contiguous = false; }
-                end = rect.base.checked_add(((rect.rows.end - 1) * rect.row_bytes + rect.cols.end) as u64)
-                    .context("dense source end overflow")?;
+                if i > 0 && rect.path != rects[0].path { same_file = false; }
+                start = start.min(first);
+                end = end.max(rect.base.checked_add(((rect.rows.end - 1) * rect.row_bytes + rect.cols.end) as u64)
+                    .context("dense source end overflow")?);
             }
-            if contiguous {
-                let rect = &rects[0];
-                let first = rect.base + (rect.rows.start * rect.row_bytes + rect.cols.start) as u64;
-                extents.entry(rect.path.clone()).or_default().push((first, end, bytes));
+            if same_file {
+                // A strided or multi-rectangle transform stays open throughout
+                // its source envelope; holes can only make this bound larger.
+                extents.entry(rects[0].path.clone()).or_default().push((start, end, bytes));
             } else {
                 fallback = fallback.checked_add(bytes).context("dense fallback staging overflow")?;
             }
@@ -473,11 +475,17 @@ pub(crate) mod testing {
         let path = source.path().join("overlapping-k6");
         let file = std::fs::File::create(&path)?;
         let (count, bytes, stride) = (1024usize, 2usize << 20, 1usize << 20);
-        file.set_len((count * stride + bytes) as u64)?;
-        for random in [false, true] {
+        file.set_len((count * stride + 2 * bytes) as u64)?;
+        for (random, multi, strided) in [(false, false, false), (true, false, false),
+            (false, true, false), (true, true, false), (false, true, true), (true, false, true)] {
             let steps = (0..count).map(|i| super::Step { device: 0,
-                rects: vec![super::Rect { name: format!("K6-{i}"), path: path.clone(),
-                    base: (i * stride) as u64, row_bytes: bytes, rows: 0..1, cols: 0..bytes }],
+                rects: if multi { (0..2).map(|half| super::Rect { name: format!("K6-{i}-{half}"),
+                    path: path.clone(), base: (i * stride) as u64,
+                    row_bytes: if strided { bytes } else { bytes / 2 },
+                    rows: half..half + 1, cols: 0..bytes / 2 }).collect() }
+                else { vec![super::Rect { name: format!("K6-{i}"), path: path.clone(),
+                    base: (i * stride) as u64, row_bytes: if strided { bytes } else { bytes / 2 },
+                    rows: 0..2, cols: 0..bytes / 2 }] },
                 jobs: Vec::new() }).collect();
             let layout = super::RankLayout::new(Vec::new(), steps, 0)?;
             let charged = layout.host_staging.staging_bytes as u64;
@@ -487,7 +495,8 @@ pub(crate) mod testing {
             let mut fragments = Vec::new();
             for (i, (offset, _)) in layout.steps.iter().enumerate() {
                 for half in 0..2 {
-                    fragments.push((i * stride + half * bytes / 2, layout.base + offset + (half * bytes / 2) as u64));
+                    fragments.push((i * stride + half * if strided { bytes } else { bytes / 2 },
+                        layout.base + offset + (half * bytes / 2) as u64));
                 }
             }
             fragments.sort_unstable();
@@ -527,6 +536,26 @@ pub(crate) mod testing {
             super::PushDestination::done(arena)?;
             PEAKS.with(|p| { p.take(); });
         }
+        Ok(())
+    }
+
+    #[test]
+    fn strided_and_multi_rect_staging_use_source_window_bounds() -> Result<()> {
+        use crate::shared::experts::rtx::dense::{HostStaging, Rect};
+        let make = |path: &str, base, rows, cols| Rect { name: "slice".into(), path: path.into(),
+            base, row_bytes: 4096, rows, cols };
+        let strided = (0..65536).map(|i| vec![make("shard", 0, i * 8..i * 8 + 8, 0..2048)])
+            .collect::<Vec<_>>();
+        let bound = HostStaging::for_steps(strided.iter().map(Vec::as_slice), 0)?;
+        assert!(bound.staging_bytes < strided.len() * 16384 / 2);
+        let multi = (0..65536).map(|i| vec![make("shard", 0, i * 8..i * 8 + 4, 0..1024),
+            make("shard", 0, i * 8 + 4..i * 8 + 8, 2048..3072)]).collect::<Vec<_>>();
+        let bound = HostStaging::for_steps(multi.iter().map(Vec::as_slice), 0)?;
+        assert!(bound.staging_bytes < multi.len() * 8192 / 2);
+        let cross = (0..8192).map(|i| vec![make("first", 0, i..i + 1, 0..1024),
+            make("second", 0, i..i + 1, 0..1024)]).collect::<Vec<_>>();
+        assert_eq!(HostStaging::for_steps(cross.iter().map(Vec::as_slice), 0)?.staging_bytes,
+            cross.len() * 2048, "independent files keep the safe complete-footprint fallback");
         Ok(())
     }
 
