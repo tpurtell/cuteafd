@@ -303,6 +303,13 @@ def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_
     mock = r'''
 #include <cassert>
 #include <unordered_map>
+#include <string>
+using cudaStream_t = void*;
+using cudaStreamCaptureStatus = int;
+constexpr int cudaStreamCaptureStatusNone = 0;
+constexpr int CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE = 9;
+int cudaStreamIsCapturing(void*, int* out) { *out = 0; return 0; }
+void cuteafd_set_last_error_message(const char*) {}
 using cuteafd_status_t = int;
 using cublasHandle_t = int*;
 using cublasStatus_t = int;
@@ -350,7 +357,7 @@ int main() {
     subprocess.run([str(executable)], check=True, capture_output=True)
 
 
-def test_compiled_graph_capture_prepares_blas_before_capture_without_changing_stream(tmp_path):
+def test_compiled_graph_capture_requires_explicit_blas_prepare_without_changing_stream(tmp_path):
     compiler = shutil.which("g++")
     if not compiler:
         pytest.skip("C++ compiler unavailable")
@@ -376,7 +383,13 @@ def test_compiled_graph_capture_prepares_blas_before_capture_without_changing_st
 #include <limits>
 #include <thread>
 #include <unordered_map>
+#include <string>
 #define CUTEAFD_NATIVE_ENABLE_CUDA 1
+using cudaStreamCaptureStatus = int;
+constexpr int cudaStreamCaptureStatusNone = 0;
+constexpr int CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE = 9;
+static std::string last_error;
+void cuteafd_set_last_error_message(const char* message) { last_error = message; }
 using cuteafd_status_t = int;
 using cudaError_t = int;
 using cublasStatus_t = int;
@@ -412,14 +425,11 @@ template<class... Args> int cublasGemmEx(cublasHandle_t handle, Args...) {
 }
 int cudaStreamBeginCapture(void* stream, int mode) {
   assert(stream && mode == cudaStreamCaptureModeThreadLocal && !capturing);
-  bool ready = false;
-  for (const auto& handle : handles)
-    ready |= handle.thread == std::this_thread::get_id() && handle.device == device;
-  assert(ready);
   ++begins;
   capturing = capture_error == 0;
   return capture_error;
 }
+int cudaStreamIsCapturing(void*, int* out) { *out = capturing ? 1 : 0; return 0; }
 int status_from_cuda(int status) { return status; }
 int status_from_cublas(int status) { return status; }
 void log_blas_handle_created(const char*) {}
@@ -440,11 +450,19 @@ int main() {
     assert(last_gemm->stream == stream);
   };
   assert(cuteafd_cuda_graph_begin_capture(nullptr) == 1 && creates == 0);
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 0);
+  assert(launch_linear_bf16_cublas(&buffer, &buffer, nullptr, &buffer,
+                                1, 1, 1, capture_stream) == 9);
+  assert(capturing && creates == 0 && bindings == 0 && gemms == 0);
+  assert(last_error.find("cuteafd_cuda_linear_bf16_cublas_async") != std::string::npos);
+  assert(last_error.find("prepare_cublas_handle before capture") != std::string::npos);
+  capturing = false;
   device_error = 19;
-  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 19 && begins == 0);
+  assert(cuteafd_cuda_prepare_cublas_handle() == 19 && creates == 0);
   device_error = 0; create_error = 7;
-  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 7 && begins == 0);
+  assert(cuteafd_cuda_prepare_cublas_handle() == 7 && creates == 1);
   create_error = 0;
+  assert(cuteafd_cuda_prepare_cublas_handle() == 0 && creates == 2);
   assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0);
   assert(creates == 2 && bindings == 0);
   gemm(capture_stream);
@@ -458,6 +476,7 @@ int main() {
   capturing = false;
   gemm(eager_stream);
   device = 1;
+  assert(cuteafd_cuda_prepare_cublas_handle() == 0 && creates == 3);
   assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 3);
   gemm(capture_stream);
   assert(last_gemm != first && last_gemm->device == 1);
@@ -466,6 +485,7 @@ int main() {
   assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 3);
   capturing = false;
   std::thread worker([&] {
+    assert(cuteafd_cuda_prepare_cublas_handle() == 0 && creates == 4);
     assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 4);
     gemm(capture_stream);
     assert(last_gemm != first && last_gemm->device == 0);
@@ -474,7 +494,7 @@ int main() {
   worker.join();
   capture_error = 71;
   assert(cuteafd_cuda_graph_begin_capture(capture_stream) == CUTEAFD_STATUS_INTERNAL_ERROR);
-  assert(!capturing && creates == 4 && begins == 6 && gemms == 6);
+  assert(!capturing && creates == 4 && begins == 7 && gemms == 6);
   assert(first->stream == eager_stream);
 }
 '''

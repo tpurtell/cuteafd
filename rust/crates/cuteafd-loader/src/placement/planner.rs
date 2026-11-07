@@ -417,6 +417,31 @@ pub struct Facts {
     pub sequential: Vec<Sequential>,
     pub reservations: Vec<Reservation>,
     pub allowances: Vec<Allowance>,
+    /// Keep derivation identity when a solved ledger is used to prepare again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub driver_page_tables: Vec<DriverPageTable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverPageTable {
+    pub location: Location,
+    pub lifetime: Lifetime,
+    pub backing: String,
+    pub mapped_bytes: u64,
+}
+impl DriverPageTable {
+    pub fn bytes(&self) -> u64 { driver_page_table_bytes(self.mapped_bytes) }
+    pub fn source(&self) -> String {
+        format!("driver page tables: {} (SM120 CUDA 13.2, 2026-11-07, mapped bytes/512)", self.backing)
+    }
+}
+
+/// SM120 driver 13020: Portable|Mapped allocation and Portable registration,
+/// 1/4/16/32 GiB on both RTX PRO 6000s, 2026-11-07 owner probe. Exact slope
+/// 1/512, zero intercept and residuals; cudaMalloc control had no extra charge.
+/// Fractional bytes round only once per backing, never once per pool page.
+pub fn driver_page_table_bytes(mapped_bytes: u64) -> u64 {
+    mapped_bytes.div_ceil(512)
 }
 
 mod contract;
@@ -481,6 +506,9 @@ impl ResolvedPlan {
                 && allowance.lifetime.contains(Phase::Ready, self.facts.phase_order))
             .map(|allowance| Item::new(Category::Runtime, &allowance.source, "", allowance.bytes,
                 if allowance.assumed { Basis::Estimated } else { Basis::Calibrated })));
+        items.extend(self.facts.driver_page_tables.iter().filter(|mapping|
+            mapping.location == location && mapping.lifetime.contains(Phase::Ready, self.facts.phase_order))
+            .map(|mapping| Item::new(Category::Runtime, mapping.source(), "", mapping.bytes(), Basis::Calibrated)));
         Ok(items)
     }
     pub fn remaining(&self, budget: &str, phase: Phase) -> Option<u64> {
@@ -572,6 +600,7 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
             .any(|a| !locations.contains(&a.location))
         || facts.resident_weights.iter().any(|w| !locations.contains(&w.location))
         || facts.reservations.iter().any(|r| !locations.contains(&r.location))
+        || facts.driver_page_tables.iter().any(|mapping| !locations.contains(&mapping.location))
     {
         return Err(Refusal::InvalidFact(
             "allocation outside memory budgets".into(),
@@ -669,6 +698,20 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
             return Err(Refusal::InvalidFact("invalid opaque allowance".into()));
         }
     }
+    let mut mapped = BTreeSet::new();
+    for mapping in &facts.driver_page_tables {
+        let backing = ids.get(&mapping.backing).filter(|owner| owner.view.is_none())
+            .map(|owner| (owner.location, owner.bytes, owner.lifetime))
+            .or_else(|| facts.sequential.iter().find(|group| group.id == mapping.backing)
+                .map(|group| (group.members[0].location, group.peak(), group.members[0].lifetime)));
+        if !matches!(mapping.location.device, Device::Coordinator(_))
+            || mapping.location.domain != Domain::Device
+            || !mapped.insert((mapping.location, mapping.backing.as_str()))
+            || backing != Some((Location::PINNED, mapping.mapped_bytes, mapping.lifetime))
+        {
+            return Err(Refusal::InvalidFact(format!("invalid driver page-table backing {}", mapping.backing)));
+        }
+    }
     Ok(())
 }
 
@@ -729,6 +772,11 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
                     n.checked_add(a.bytes)
                         .ok_or(Refusal::Overflow("phase allowances"))
                 })?;
+            let opaque = facts.driver_page_tables.iter()
+                .filter(|mapping| mapping.lifetime.contains(phase, facts.phase_order)
+                    && budget.locations.contains(&mapping.location))
+                .try_fold(opaque, |n, mapping| n.checked_add(mapping.bytes())
+                    .ok_or(Refusal::Overflow("driver page tables")))?;
             let required = owned
                 .checked_add(opaque)
                 .ok_or(Refusal::Overflow("phase peak"))?;
@@ -851,7 +899,7 @@ pub fn reconcile_legacy_mla_events(
     events: &[OwnerEvent],
 ) -> Result<(), Refusal> {
     if !facts.phase_order.at_or_before(phase, Phase::Warmup) || !facts.deferred.is_empty()
-        || !facts.allowances.is_empty() || !facts.reservations.is_empty() {
+        || !facts.allowances.is_empty() || !facts.reservations.is_empty() || !facts.driver_page_tables.is_empty() {
         return Err(Refusal::InvalidFact(
             "legacy MLA bridge only checks startup owners".into(),
         ));

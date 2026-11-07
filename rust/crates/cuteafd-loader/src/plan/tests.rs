@@ -28,7 +28,7 @@ fn solved_phase_ledger_preserves_chronology_and_renders_each_physical_peak() {
     let at = |phase| Lifetime { first: phase, last: phase };
     let owner = |id, location, bytes, lifetime| Allocation::buffer(id, location, bytes,
         lifetime, Category::Workspace, id);
-    let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET,
+    let facts = Facts { driver_page_tables: vec![], phase_order: PhaseOrder::DRAFT_THEN_TARGET,
         resident_weights: vec![], deferred: vec![],
         allocations: vec![
             owner("gpu0.load", Location::coordinator(0), 700, at(Phase::Load)),

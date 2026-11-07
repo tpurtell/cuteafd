@@ -306,7 +306,7 @@ impl DenseFacts<'_> {
             source: "estimated: retained ordered-upload and draft landing staging; #1326".into(),
             assumed: true });
         allowances.retain(|allowance| allowance.bytes > 0);
-        Ok(Facts { resident_weights, phase_order: PhaseOrder::TARGET_THEN_DRAFT, allocations,
+        Ok(Facts { driver_page_tables: vec![], resident_weights, phase_order: PhaseOrder::TARGET_THEN_DRAFT, allocations,
             deferred: vec![], sequential: vec![], reservations: vec![], allowances })
     }
 }

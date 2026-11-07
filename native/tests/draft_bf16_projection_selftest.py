@@ -94,6 +94,9 @@ def main():
     launch = library.cuteafd_cuda_linear_bf16_cublas_async
     launch.argtypes = [ct.c_void_p] * 4 + [ct.c_size_t] * 3 + [ct.c_void_p]
     launch.restype = ct.c_int
+    library.cuteafd_cuda_prepare_cublas_handle.argtypes = []
+    library.cuteafd_cuda_prepare_cublas_handle.restype = ct.c_int
+    assert library.cuteafd_cuda_prepare_cublas_handle() == 0
     indices = {}
     if not (args.screen or args.skinny_screen):
         class Info(ct.Structure):

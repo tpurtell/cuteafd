@@ -39,7 +39,7 @@ fn facts(target: &TargetBuffers, pages: u64) -> Facts {
         target.page_tokens,
         target.maximum_pages,
         2,
-        Facts { resident_weights: vec![],
+        Facts { driver_page_tables: vec![], resident_weights: vec![],
             phase_order: crate::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
             allocations: vec![],
             deferred: vec![],
@@ -117,7 +117,7 @@ fn prefix_backings_charge_tail_and_window_marks_but_no_target_or_draft_aliases()
                 }
                 assert!(owners.iter().all(|a| a.view.is_none() && a.lifetime == life
                     && a.location == Location::coordinator(device) && a.category == Category::Prefix));
-                let mut contract = Contract::fixed(64, 16, 2, Facts { resident_weights: vec![],
+                let mut contract = Contract::fixed(64, 16, 2, Facts { driver_page_tables: vec![], resident_weights: vec![],
                     phase_order: planner::PhaseOrder::DRAFT_THEN_TARGET, allocations: vec![],
                     deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] });
                 contract.variables = vec![Variable::Prefill(vec![PrefillShape {rows: 64, waves: 1}]), Variable::Lanes(vec![1])];
@@ -217,7 +217,7 @@ fn ml4_target_caches_preserve_nope_and_shared_latent_geometry() {
         let components = target.components(&cfg).unwrap();
         for pages in [1, 17, 128] {
             let mut contract = Contract::fixed(target.page_tokens, target.maximum_pages, 2,
-                Facts { phase_order: planner::PhaseOrder::DRAFT_THEN_TARGET,
+                Facts { driver_page_tables: vec![], phase_order: planner::PhaseOrder::DRAFT_THEN_TARGET,
                     allocations: vec![], deferred: vec![], sequential: vec![],
                     reservations: vec![], allowances: vec![], resident_weights: vec![] });
             contract.variables = vec![

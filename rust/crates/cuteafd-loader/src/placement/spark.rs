@@ -909,7 +909,7 @@ mod tests {
                             assert_eq!(receive_bytes, crate::serving_capacity::prefill_return_bytes_with_format(
                                 waves as u64, rows, ranks as u64, u64::from(geometry.hidden), format).unwrap());
                         }
-                        let mut contract = super::super::planner::Contract::fixed(64, 1, 2, Facts { resident_weights: vec![],
+                        let mut contract = super::super::planner::Contract::fixed(64, 1, 2, Facts { driver_page_tables: vec![], resident_weights: vec![],
                             phase_order: PhaseOrder::DRAFT_THEN_TARGET, allocations: owners.clone(), deferred: vec![],
                             sequential: vec![], reservations: vec![], allowances: vec![],
                         });

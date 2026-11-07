@@ -935,7 +935,8 @@ void log_blas_handle_created(const char* library) {
                library, thread_name);
 }
 
-cuteafd_status_t cublas_handle(cublasHandle_t* out) {
+cuteafd_status_t cublas_handle(cublasHandle_t* out, cudaStream_t stream = nullptr,
+                             const char* entry = "cuteafd_cuda_prepare_cublas_handle") {
   if (out == nullptr) {
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
@@ -948,6 +949,17 @@ cuteafd_status_t cublas_handle(cublasHandle_t* out) {
   static thread_local std::unordered_map<int, cublasHandle_t> handles;
   auto found = handles.find(device);
   if (found == handles.end()) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    const auto capture_status = cudaStreamIsCapturing(stream, &capture);
+    if (capture_status != cudaSuccess) {
+      return status_from_cuda(capture_status);
+    }
+    if (capture != cudaStreamCaptureStatusNone) {
+      const std::string message = std::string(entry) +
+          ": call cuteafd_cuda_prepare_cublas_handle before capture on this thread/device";
+      cuteafd_set_last_error_message(message.c_str());
+      return CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE;
+    }
     cublasHandle_t handle = nullptr;
     const cublasStatus_t status = cublasCreate(&handle);
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -1081,7 +1093,8 @@ cuteafd_status_t launch_linear_bf16_cublas(const uint16_t* input, const uint16_t
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  cuteafd_status_t handle_status = cublas_handle(&handle);
+  cuteafd_status_t handle_status = cublas_handle(&handle, stream,
+      "cuteafd_cuda_linear_bf16_cublas_async");
   if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
@@ -1133,7 +1146,8 @@ cuteafd_status_t launch_linear_bf16_f32_cublas(
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  cuteafd_status_t handle_status = cublas_handle(&handle);
+  cuteafd_status_t handle_status = cublas_handle(&handle, stream,
+      "cuteafd_cuda_linear_bf16_f32_cublas_async");
   if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
@@ -1175,7 +1189,8 @@ cuteafd_status_t launch_linear_bf16_strided_batched_cublas(
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  cuteafd_status_t handle_status = cublas_handle(&handle);
+  cuteafd_status_t handle_status = cublas_handle(&handle, stream,
+      "cuteafd_cuda_linear_bf16_strided_batched_cublas_async");
   if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
@@ -1224,7 +1239,8 @@ cuteafd_status_t launch_matmul_bf16_strided_batched_cublas(
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  cuteafd_status_t handle_status = cublas_handle(&handle);
+  cuteafd_status_t handle_status = cublas_handle(&handle, stream,
+      "cuteafd_cuda_matmul_bf16_strided_batched_cublas_async");
   if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
@@ -1255,7 +1271,7 @@ cuteafd_status_t launch_matmul_bf16_strided_batched_cublas(
 
 }  // namespace
 
-// Internal capture preparation; GEMMs retain their own per-call stream binding.
+// Only shared-cuBLAS users prepare; unrelated captures must not create a handle.
 extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_handle() {
   cublasHandle_t handle = nullptr;
   return cublas_handle(&handle);

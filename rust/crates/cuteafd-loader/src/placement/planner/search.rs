@@ -59,8 +59,14 @@ struct Group {
     /// [piece][budget x phase], precomputed once, without allocation metadata.
     costs: Vec<Vec<Cost>>,
 }
+struct Mapping {
+    activation: Activation,
+    rows: Vec<usize>,
+    bytes: ByteCurve,
+}
 pub(super) struct Compiled {
     starts: Vec<u64>,
+    mappings: Vec<Mapping>,
     pool_page_multiple: u64,
     phase_order: PhaseOrder,
     groups: Vec<Group>,
@@ -80,6 +86,7 @@ impl Compiled {
         let memory_rows = budgets.len() * contract.phase_order.phases().len();
         let rows = memory_rows + contract.gpus;
         let mut groups = BTreeMap::<Activation, Vec<Vec<Cost>>>::new();
+        let mut mappings = Vec::new();
         for component in &contract.components {
             let (charged_rows, opaque) = if let ComponentKind::ResidentWeight(owner) = &component.kind {
                 let Device::Coordinator(gpu) = owner.location.device else { continue };
@@ -95,16 +102,25 @@ impl Compiled {
             } else {
                 continue;
             };
+            let driver = matches!(component.kind, ComponentKind::DriverPageTables { .. });
+            if driver && component.bytes.0.iter().any(|piece| piece.bytes_per_page % 512 != 0) {
+                mappings.push(Mapping { activation: component.activation.clone(), rows: charged_rows,
+                    bytes: component.bytes.clone() });
+                continue;
+            }
             let costs = groups
                 .entry(component.activation.clone())
                 .or_insert_with(|| vec![vec![Cost::default(); rows]; starts.len() - 1]);
             for (index, &first) in starts[..starts.len() - 1].iter().enumerate() {
                 let piece = component.bytes.piece(first)?;
                 let bytes = component.bytes.at(first)?;
+                let (bytes, slope) = if driver {
+                    (driver_page_table_bytes(bytes), piece.bytes_per_page / 512)
+                } else { (bytes, piece.bytes_per_page) };
                 let cost = if opaque {
-                    Cost { opaque: bytes, opaque_slope: piece.bytes_per_page, ..Cost::default() }
+                    Cost { opaque: bytes, opaque_slope: slope, ..Cost::default() }
                 } else {
-                    Cost { owned: bytes, owned_slope: piece.bytes_per_page, ..Cost::default() }
+                    Cost { owned: bytes, owned_slope: slope, ..Cost::default() }
                 };
                 for &row in &charged_rows {
                     costs[index][row].add(cost)?;
@@ -113,6 +129,7 @@ impl Compiled {
         }
         Ok(Self {
             starts,
+            mappings,
             pool_page_multiple: contract.pool_page_multiple,
             phase_order: contract.phase_order,
             rows,
@@ -170,6 +187,14 @@ impl Compiled {
         pages: u64,
     ) -> Result<Vec<PhaseBudget>, Refusal> {
         let piece = self.piece(pages);
+        let mut mapping_bytes = vec![0u64; self.memory_rows];
+        for mapping in self.mappings.iter().filter(|mapping| mapping.activation.active(selected)) {
+            let bytes = driver_page_table_bytes(mapping.bytes.at(pages)?);
+            for &row in &mapping.rows {
+                mapping_bytes[row] = mapping_bytes[row].checked_add(bytes)
+                    .ok_or(Refusal::Overflow("driver page tables"))?;
+            }
+        }
         self.costs(selected, piece)?
             .into_iter()
             .take(self.memory_rows)
@@ -181,7 +206,8 @@ impl Compiled {
                     budget: budget.id.clone(),
                     phase: self.phase_order.phases()[row % self.phase_order.phases().len()],
                     owned: cost.owned,
-                    opaque: cost.opaque,
+                    opaque: cost.opaque.checked_add(mapping_bytes[row])
+                        .ok_or(Refusal::Overflow("driver page table phase"))?,
                     available: budget.available()?,
                 })
             })
@@ -222,6 +248,23 @@ impl Compiled {
                 }
             }
             last = last / self.pool_page_multiple * self.pool_page_multiple;
+            if first <= last && !self.mappings.is_empty() {
+                // Exact per-backing rounding is a monotone staircase, not a
+                // page-rounded affine slope. Refine only the analytical bound.
+                let fits = |pages| -> Result<bool, Refusal> {
+                    Ok(self.phases(budgets, selected, pages)?.iter()
+                        .all(|row| row.owned.checked_add(row.opaque).is_some_and(|bytes| bytes <= row.available)))
+                };
+                if !fits(first)? { continue; }
+                let mut low = first / self.pool_page_multiple;
+                let mut high = last / self.pool_page_multiple;
+                while low < high {
+                    let middle = low + (high - low).div_ceil(2);
+                    if fits(middle * self.pool_page_multiple)? { low = middle; }
+                    else { high = middle - 1; }
+                }
+                last = low * self.pool_page_multiple;
+            }
             if first <= last {
                 answer = Some(last);
             }
@@ -342,6 +385,28 @@ impl Compiled {
                         .any(|c| c[0].option == option)
                     {
                         add_bytes(costs, &minimum)?;
+                    }
+                }
+            }
+        }
+        for mapping in &self.mappings {
+            let mut minimum = u64::MAX;
+            for piece in &mapping.bytes.0 {
+                let first = lower.max(piece.first);
+                if first <= upper.min(piece.last) {
+                    minimum = minimum.min(driver_page_table_bytes(mapping.bytes.at(first)?));
+                }
+            }
+            let mut bytes = vec![0; self.rows];
+            for &row in &mapping.rows { bytes[row] = minimum; }
+            if mapping.activation.guaranteed(domains) {
+                add_bytes(&mut result, &bytes)?;
+            } else if let Some(variable) = mapping.activation.local_variable() {
+                let values = local.entry(variable)
+                    .or_insert_with(|| vec![vec![0; self.rows]; domains[variable].len()]);
+                for (&option, costs) in domains[variable].iter().zip(values) {
+                    if mapping.activation.clauses.iter().any(|clause| clause[0].option == option) {
+                        add_bytes(costs, &bytes)?;
                     }
                 }
             }
@@ -716,6 +781,7 @@ pub(crate) fn apply_reserve_override(contract: &mut Contract, budgets: &mut [Bud
     contract.components.retain(|component| {
         let reserve = match &component.kind {
             ComponentKind::Allowance(allowance) => Some(allowance.location),
+            ComponentKind::DriverPageTables { location, .. } => Some(*location),
             ComponentKind::Allocation { template, .. } if matches!(template.category,
                 Category::Runtime | Category::Reserved) => Some(template.location),
             _ => None,
@@ -750,7 +816,7 @@ pub fn solve(
     contract.validate_home_budgets(&budgets)?;
     // Validate physical budgets independently of conditional allocation choices.
     validate(
-        &Facts { resident_weights: vec![],
+        &Facts { driver_page_tables: vec![], resident_weights: vec![],
             phase_order: contract.phase_order,
             allocations: vec![],
             deferred: vec![],

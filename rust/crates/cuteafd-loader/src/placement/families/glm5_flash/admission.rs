@@ -494,7 +494,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     if counts.is_empty() || counts.iter().any(|&n| n > routed.len()) || !rtx_experts && counts.iter().any(|&n| n > 0) {
         return Err(p::Refusal::Unsupported);
     }
-    let mut contract = p::Contract::fixed(256, maximum, gpus, p::Facts {
+    let mut contract = p::Contract::fixed(256, maximum, gpus, p::Facts { driver_page_tables: vec![],
         phase_order: p::PhaseOrder::TARGET_THEN_DRAFT, allocations: vec![], deferred: vec![],
         sequential: vec![], reservations: vec![], allowances: vec![], resident_weights: vec![],
     });

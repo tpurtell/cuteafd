@@ -1720,6 +1720,7 @@ void test_cuda_matmul_bf16_strided_batched_matches_ref() {
   auto doutput = device_buffer(expected.size() * sizeof(uint16_t));
   copy_h2d(dinput, input);
   copy_h2d(dright, right);
+  require_status(cuteafd_cuda_prepare_cublas_handle(), "prepare shared cuBLAS");
   require_status(cuteafd_cuda_matmul_bf16_strided_batched_cublas_async(
                      static_cast<uint16_t*>(dinput.ptr),
                      static_cast<uint16_t*>(dright.ptr),

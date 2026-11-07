@@ -18,6 +18,7 @@ typedef enum cuteafd_status_t {
   CUTEAFD_STATUS_INTERNAL_ERROR = 6,
   CUTEAFD_STATUS_RDMA_UNAVAILABLE = 7,
   CUTEAFD_STATUS_NCCL_UNAVAILABLE = 8,
+  CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE = 9,
 } cuteafd_status_t;
 
 typedef enum cuteafd_xgrammar_kind_t {
@@ -350,6 +351,8 @@ cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_even
 cuteafd_status_t cuteafd_cuda_graph_census_begin(void* cuda_stream, const char* bank,
     uint64_t rows, int32_t replay, int32_t arm, void** token);
 cuteafd_status_t cuteafd_cuda_graph_census_end(void* token);
+// Required on the calling thread/device before capturing a shared cuBLAS GEMM.
+cuteafd_status_t cuteafd_cuda_prepare_cublas_handle();
 cuteafd_status_t cuteafd_cuda_graph_begin_capture(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_graph_end_capture(void* cuda_stream, void** out_cuda_graph_exec);
 cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
