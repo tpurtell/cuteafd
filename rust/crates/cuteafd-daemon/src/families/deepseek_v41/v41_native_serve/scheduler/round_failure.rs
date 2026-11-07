@@ -133,7 +133,7 @@ impl RoundMember for Active<'_> {
         self.cacheable = false;
         self.failed = true;
     }
-    fn is_done(&self) -> bool { self.finished || self.job.events.is_closed() }
+    fn is_done(&self) -> bool { !self.quarantined && (self.finished || self.job.events.is_closed()) }
     fn id(&self) -> u64 { self.ticket.id() }
 }
 
@@ -236,6 +236,7 @@ pub(super) mod tests {
             next_after_commit: None,
             reserve: cuteafd_engine::reserve::KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 1)
                 .unwrap(), super::super::UNIT_TOKENS).lease(1, 1, 1, usize::MAX).unwrap(), stalled: false,
+            quarantined: false,
             loop_abort: crate::shared::loop_abort::LoopAbortConfig::default().guard(Default::default(), id) },
             output, log)
     }

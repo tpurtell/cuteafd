@@ -92,6 +92,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
 }
 
 struct UnitSlot<'s, 'w, 'a> {
+    /// This slot's index in the prefill slot set (the scheduler poller's key).
+    index: usize,
     pass: &'s mut DistributedTargetPass<'w, 'a>,
     transport: &'s mut DeviceOwner<'a, NativeTp4Wave<'a>>,
     batch: Option<RequestBatch>,
@@ -99,6 +101,11 @@ struct UnitSlot<'s, 'w, 'a> {
     started: Instant,
     /// As on one RTX: this slot's per-layer publication events.
     published: super::super::encoder_units::PublishedLayers<'a>,
+    /// Its commit did not drain within the deadline. Drop must not synchronize
+    /// on the abandoned stream (that would freeze the serving thread) or abort
+    /// the process; the batch is handed to the scheduler poller, which settles
+    /// the commit and releases the slot's owners.
+    quarantined: bool,
 }
 #[cfg(test)]
 thread_local! {
@@ -143,7 +150,10 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
     fn drop(&mut self) {
         // Device-ordered units leave queued work (and cross-slot waits) on
         // every slot's chain: drain them all before any storage is released.
+        // A quarantined slot's chain is the abandoned stream: never synchronize
+        // on it (that would freeze the serving thread).
         for slot in &mut self.slots {
+            if slot.quarantined { continue; }
             if slot.pass.chain.is_some() {
                 crate::shared::decode_graph::fatal_drain(slot.pass.drain_chain(), "cancelled prefill unit chain");
             }
@@ -158,6 +168,19 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
         // units' reservations included) after each slot's work drained.
         let mut requests = self.requests.borrow_mut();
         for slot in &mut self.slots {
+            if slot.quarantined {
+                // The commit did not drain: hand the batch to the scheduler
+                // poller, which settles the abandoned stream and releases the
+                // slot's owners. Never synchronize on it here.
+                if let Some(batch) = slot.batch.take() {
+                    let accepted = super::super::encoder_units::member_rows(&batch).unwrap_or_default();
+                    for &lease in batch.leases() { requests.quarantine_lease(lease); }
+                    requests.prefill_quarantine.push(
+                        crate::families::deepseek_v41::v41_requests::QuarantinedPrefill {
+                            slot: slot.index, accepted, batch, drafts: Vec::new(), encoder: true });
+                }
+                continue;
+            }
             if let Some(mut batch) = slot.batch.take() {
                 if let Err(error) = slot.pass.abort_cache_commit(&mut requests) {
                     tracing::error!(%error, "draining cancelled distributed encoder unit");
@@ -179,7 +202,9 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
         drop(requests);
         // Every exit (completion, error, cancel) leaves each drained slot at
         // rows from 0, so later non-unit work on slot 0 finds no stale window.
+        // A quarantined slot is reset by the scheduler poller once it settles.
         for slot in &mut self.slots {
+            if slot.quarantined { continue; }
             if let Err(error) = slot.select_window(crate::shared::memory::row_window::RowWindow::NONE) {
                 tracing::error!(%error, "resetting a prefill slot's window");
             }
@@ -279,7 +304,15 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         let rows = super::super::encoder_units::member_rows(batch)?;
         slot.pass.enqueue_cache_commit(&self.requests.borrow(), batch, &rows)?;
-        while !slot.pass.poll_cache_commit()? { tokio::task::yield_now().await; }
+        let outcome = crate::shared::serve::lanes::wait_ready(|| slot.pass.poll_cache_commit(),
+            crate::shared::serve::lanes::COMMIT_DEADLINE).await?;
+        if outcome != crate::shared::serve::lanes::WaitOutcome::Ready {
+            // Quarantine: keep the batch, slot and window bits owned. Drop must
+            // not synchronize on the abandoned stream or abort the process.
+            slot.quarantined = true;
+            anyhow::bail!("encoder unit commit did not drain within {:?}",
+                crate::shared::serve::lanes::COMMIT_DEADLINE);
+        }
         slot.pass.commit(&mut self.requests.borrow_mut(), batch, &rows)?;
         slot.batch = None;
         crate::families::deepseek_v41::v41_native_serve::console::totals::prefill(unit.rows.len());
@@ -430,11 +463,12 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let mut hooks = UnitHooks {
             prefill,
             unit_rows,
-            slots: slots.into_iter().map(|(pass, transport)| {
+            slots: slots.into_iter().enumerate().map(|(index, (pass, transport))| {
                 pass.set_attention_decode(false);
                 let published = super::super::encoder_units::PublishedLayers::on_devices(library,
                     |layer| Ok(pass.resources.lanes[map.attention(layer)?].device.id))?;
-                Ok(UnitSlot { pass, transport, batch: None, prepared: None, started: Instant::now(), published })
+                Ok(UnitSlot { index, pass, transport, batch: None, prepared: None, started: Instant::now(), published,
+                    quarantined: false })
             }).collect::<Result<Vec<_>>>()?,
             requests: RefCell::new(requests), lease, packed, chunks, suffix, ahead, keep_running, before_unit, complete: false,
         };

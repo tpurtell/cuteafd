@@ -39,7 +39,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
         tokens: tokens.to_vec(), image_keys, next_after_commit: None,
         reserve: KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 4).unwrap(), UNIT_TOKENS)
-            .lease(tokens.len(), 4, 1, usize::MAX).unwrap(), stalled: false,
+            .lease(tokens.len(), 4, 1, usize::MAX).unwrap(), stalled: false, quarantined: false,
         loop_abort: crate::shared::loop_abort::LoopAbortConfig::default().guard(Default::default(), id) };
     request.emit(&[anchor])?;
     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
@@ -90,6 +90,10 @@ pub(super) struct Active<'a> {
     reserve: Lease,
     /// Waiting for a reservation top-up: kept out of rounds, holding its slot and units.
     stalled: bool,
+    /// Its last commit timed out and is quarantined: kept out of rounds and out
+    /// of retirement until the abandoned device stream completes and the
+    /// quarantine releases it.
+    quarantined: bool,
     /// Loop abort: the per-request guard, built at admission from the live knobs.
     loop_abort: LoopAbort,
 }
@@ -440,6 +444,69 @@ fn pending_prefix_hit(prompt: &[u32], earlier: &[u32]) -> bool {
     !earlier.is_empty() && prompt.starts_with(earlier)
 }
 
+/// Settle quarantined prefill/encoder-unit commits whose device copies have
+/// drained. Never synchronizes: it polls the abandoned stream and, once it
+/// completes, publishes (or aborts) and releases the leases it covered. Returns
+/// whether any prefill quarantine is still pending.
+fn poll_prefill_quarantine<'w, 'a, P: ServingTarget<'w, 'a>>(
+    prefill_slots: &mut super::prefill_target::PrefillSlots<'a, P>, requests: &mut Requests<'a>,
+    draft: &mut Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
+) -> Result<bool> {
+    let mut index = 0;
+    while index < requests.prefill_quarantine.len() {
+        let slot = requests.prefill_quarantine[index].slot;
+        let (pass, transport) = &mut prefill_slots.slots[slot];
+        let ready = pass.poll_cache_commit()?;
+        // A decode-side pass (`ScorePath::Decode`) quarantines without beginning
+        // a draft commit, and `poll_commit` requires one: only touch the draft
+        // when this entry actually registered a commit on it.
+        let has_draft = !requests.prefill_quarantine[index].drafts.is_empty();
+        let draft_ready = match draft.as_deref() {
+            Some(d) if has_draft => d.poll_queued_commit(0)?,
+            _ => true,
+        };
+        if !(ready && draft_ready) { index += 1; continue; }
+        let mut entry = requests.prefill_quarantine.swap_remove(index);
+        let published = match draft.as_deref_mut() {
+            Some(d) if has_draft => d.finish_queued_commit(0, pass, requests, &mut entry.batch, &entry.accepted),
+            _ => pass.commit(requests, &mut entry.batch, &entry.accepted),
+        };
+        if let Err(error) = published {
+            tracing::error!(%error, slot, "quarantined prefill commit failed to publish; aborting");
+            if let Err(cleanup) = pass.abort_cache_commit(requests) {
+                tracing::error!(%cleanup, slot, "aborting a failed quarantined prefill commit");
+            }
+            if has_draft {
+                if let Some(d) = draft.as_deref_mut() {
+                    if let Err(cleanup) = d.abort_queued_commit(0, requests, &mut entry.batch) {
+                        tracing::error!(%cleanup, slot, "aborting a failed quarantined prefill draft commit");
+                    }
+                }
+            }
+        }
+        if entry.encoder {
+            if let Err(error) = P::settle_quarantined_encoder(pass, transport) {
+                tracing::error!(%error, slot, "settling a quarantined encoder unit");
+            }
+        }
+        // The storage is settled: release the leases the commit covered.
+        for &lease in entry.batch.leases() {
+            requests.unquarantine_lease(lease);
+            if let Err(error) = requests.release_if_present(lease) {
+                tracing::error!(%error, slot, "releasing a quarantined prefill request failed");
+            }
+        }
+        for id in entry.drafts {
+            if let Some(d) = draft.as_deref_mut() {
+                if let Err(error) = d.release(id) {
+                    tracing::error!(%error, slot, "releasing a quarantined prefill draft request failed");
+                }
+            }
+        }
+    }
+    Ok(!requests.prefill_quarantine.is_empty())
+}
+
 /// Only cold, whole-unit text prompts pack in this phase. Prefix continuations,
 /// media and scoring retain their ordinary prefill transaction.
 /// A prompt the packer may take: its request, lease and whether it must run
@@ -504,7 +571,16 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
                 stall::tick();
                 Ok(scores)
             })();
-            if replay.is_err() { pass.discard(&mut batch)?; }
+            if let Err(error) = &replay {
+                // A quarantined commit keeps its storage: never discard it.
+                if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_some() {
+                    let drafts = if draft.is_some() {
+                        members.iter().filter_map(|&(lease, _)| requests.cache().request_id(lease).ok()).collect()
+                    } else { Vec::new() };
+                    return Err(super::prefill_target::quarantine_prefill(requests, 0, batch, accepted, drafts, false));
+                }
+                pass.discard(&mut batch)?;
+            }
             replay
         })();
         match result {
@@ -729,7 +805,7 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         let loop_abort = self.args.loop_abort.config().guard(job.finish_detail.clone(), id);
         let mut request = Active { constraint, ticket, lease, job, decoder, anchor, generated: 0, buffered: 0,
             finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit,
-            reserve, stalled: false, loop_abort };
+            reserve, stalled: false, quarantined: false, loop_abort };
         request.ticket.first(request.anchor);
         if let Err(error) = request.emit(&[request.anchor]) {
             request.failed = !request.job.events.is_closed();
@@ -852,6 +928,16 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
         prefixes.tick(requests, draft.as_deref_mut())?;
+        // A commit that timed out is polled here (never synchronized) until its
+        // device copies drain; its requests stay out of rounds until then.
+        if !requests.quarantine.is_empty() {
+            independent::poll_quarantine(first, second, requests, &mut draft, &mut active)?;
+        }
+        // A prefill/encoder-unit commit that timed out is polled the same way;
+        // no prefill round runs until its pass is Idle again.
+        if !requests.prefill_quarantine.is_empty() {
+            poll_prefill_quarantine(prefill_slots, requests, &mut draft)?;
+        }
         media_ready.extend(media.poll(requests, draft.as_deref_mut()));
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
@@ -903,8 +989,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     "native asynchronous vision preparation");
                 leased.into_admitted()
             } else {
-            let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && !media.holds(slot)
-                && !held_slots.contains(&slot) && !prefills.iter().any(|queued| queued.slot == slot)) else { break };
+            let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && requests.slot_free(slot)
+                && !media.holds(slot) && !held_slots.contains(&slot)
+                && !prefills.iter().any(|queued| queued.slot == slot)) else { break };
             let mut prepared = match kv_waiter.poll(0, requests.release_epoch(), busy_slots > 0,
                 |prepared| prepared.job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Ready(prepared) => prepared,
@@ -1137,7 +1224,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         // A prefill round at a completed boundary (both decode lanes drained):
         // one call of each waiting prompt, or every prompt whole with share 0.
-        if prefills.due(active.iter().any(Option::is_some)) {
+        // A quarantined prefill commit still owns its pass: no prefill round may
+        // run until the poller settles it.
+        if requests.prefill_quarantine.is_empty() && prefills.due(active.iter().any(Option::is_some)) {
             stall::mark(stall::Phase::Admission, active.iter().flatten().count() + prefills.len());
             let mut round = Round { lib, args, runtime, first: &mut *first, first_transport: &mut *first_transport,
                 second_transport: &mut *second_transport, requests: &mut *requests, prefill: &mut *prefill_slots,
@@ -1172,10 +1261,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         let members: [Vec<usize>; 2] = std::array::from_fn(|lane| active.iter().enumerate()
             .filter_map(|(slot, request)| request.as_ref().filter(|r| r.lane() == lane && !r.finished && !r.stalled
-                && !r.job.events.is_closed()).map(|_| slot)).collect());
+                && !r.quarantined && !r.job.events.is_closed()).map(|_| slot)).collect());
         if members.iter().all(Vec::is_empty) {
             // Every decoding request waits for units: a retirement or snapshot capture frees them.
-            if active.iter().flatten().any(|r| r.stalled) { std::thread::sleep(Duration::from_millis(1)); }
+            // A quarantined commit is polled by `decode_round`; sleep so the loop does not spin.
+            if active.iter().flatten().any(|r| r.stalled) || !requests.quarantine.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             continue;
         }
         let capacity: Vec<_> = members.iter().flatten().map(|&slot| {
@@ -2798,7 +2890,7 @@ mod sampling_tests {
         let source = include_str!("scheduler.rs");
         let serve = &source[source.find("pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>").unwrap()..];
         let serve = &serve[..serve.find("\n/// Process-wide device-terminal instrumentation.").unwrap()];
-        let round = serve.find("if prefills.due(").unwrap();
+        let round = serve.find("prefills.due(").unwrap();
         let decode = serve.find("P::decode_round(").unwrap();
         assert!(round < decode, "a round runs at the boundary before the decode round");
         assert_eq!(serve.matches("P::decode_round(").count(), 1);
@@ -3646,7 +3738,7 @@ mod loop_abort_tests {
             tokens: Vec::new(), image_keys: super::super::prefix::media_keys(&[], &[]).unwrap(),
             next_after_commit: None,
             reserve: KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 4).unwrap(), UNIT_TOKENS)
-                .lease(1, 4, 1, usize::MAX).unwrap(), stalled: false,
+                .lease(1, 4, 1, usize::MAX).unwrap(), stalled: false, quarantined: false,
             loop_abort,
         };
         (request, receive)
@@ -3723,5 +3815,62 @@ mod loop_abort_tests {
                 assert_eq!(*finish_reason, InferenceFinishReason::Stop),
             other => panic!("last chunk is not Finish: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod prefill_quarantine_tests {
+    /// Finding 2: a timed-out prefill/encoder-unit commit must be registered and
+    /// polled, not discarded (which cancels the batch under the abandoned stream)
+    /// and not left to wedge the pass (which fails the next `execute` on
+    /// `state == Idle`). The scheduler polls it at every boundary and no prefill
+    /// round runs until the pass is Idle again.
+    #[test]
+    fn a_timed_out_prefill_commit_is_registered_and_polled() {
+        let source = include_str!("scheduler.rs");
+        let serve = &source[source.find("pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>").unwrap()..];
+        let serve = &serve[..serve.find("\n/// Process-wide device-terminal instrumentation.").unwrap()];
+        assert!(serve.contains("if !requests.prefill_quarantine.is_empty() {"));
+        assert!(serve.contains("poll_prefill_quarantine(prefill_slots, requests, &mut draft)?;"));
+        assert!(serve.contains("if requests.prefill_quarantine.is_empty() && prefills.due("),
+            "no prefill round may run while a commit is quarantined");
+        // The poller publishes or aborts, settles an encoder unit, then releases
+        // the leases the commit covered.
+        let poll = &source[source.find("fn poll_prefill_quarantine").unwrap()..];
+        let poll = &poll[..poll.find("pub(super) fn serve<").unwrap()];
+        assert!(poll.contains("pass.poll_cache_commit()?"));
+        assert!(poll.contains("pass.commit(requests, &mut entry.batch, &entry.accepted)"));
+        // A decode-side pass quarantines without a draft commit, and
+        // `poll_commit` requires one: the poller must gate on `drafts`.
+        assert!(poll.contains("let has_draft = !requests.prefill_quarantine[index].drafts.is_empty();"));
+        assert!(poll.contains("Some(d) if has_draft => d.poll_queued_commit(0)?"));
+        assert!(poll.contains("Some(d) if has_draft => d.finish_queued_commit(0, pass, requests,"));
+        assert!(poll.contains("pass.abort_cache_commit(requests)"));
+        assert!(poll.contains("P::settle_quarantined_encoder(pass, transport)"));
+        assert!(poll.contains("requests.unquarantine_lease(lease);"));
+        assert!(poll.contains("requests.release_if_present(lease)"));
+        // Every caller that can time out registers the quarantine instead of
+        // discarding the live commit.
+        let prefill = include_str!("prefill_target.rs");
+        assert!(prefill.contains("return Err(quarantine_prefill(self.requests, 0, batch,"));
+        let native = include_str!("../v41_native_serve.rs");
+        assert_eq!(native.matches("prefill_target::quarantine_prefill(requests, 0, batch,").count(), 3,
+            "cold replay, scoring and continuation all register the quarantine");
+        assert!(source.contains("return Err(super::prefill_target::quarantine_prefill(requests, 0, batch, accepted, drafts, false));"),
+            "the packed prefill path registers the quarantine");
+    }
+
+    /// The encoder-unit drop must not synchronize on the abandoned stream and
+    /// must hand its batch to the poller instead of losing it.
+    #[test]
+    fn a_quarantined_encoder_unit_hands_its_batch_to_the_poller() {
+        let source = include_str!("../v41_target_pass/distributed/encoder_units.rs");
+        let drop = &source[source.find("impl Drop for UnitHooks").unwrap()..];
+        let drop = &drop[..drop.find("impl<'a> UnitHooks").unwrap()];
+        assert!(drop.contains("if slot.quarantined { continue; }"),
+            "a quarantined slot's chain is never drained");
+        assert!(drop.contains("requests.prefill_quarantine.push("));
+        assert!(drop.contains("encoder: true"));
+        assert!(drop.contains("requests.quarantine_lease(lease);"));
     }
 }

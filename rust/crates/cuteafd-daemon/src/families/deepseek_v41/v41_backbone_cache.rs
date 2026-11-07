@@ -72,6 +72,12 @@ pub(crate) struct CacheBatch {
     requests: Vec<BatchRequest>,
 }
 impl CacheBatch {
+    /// An empty batch for CPU-only lifecycle tests (never used with a cache).
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self { stage: CacheStage::Full, replay_snapshot: None, reserved: false, identity: 0, owner: 0,
+            requests: Vec::new() }
+    }
     pub fn stage(&self) -> CacheStage { self.stage }
     pub fn is_reserved(&self) -> bool { self.reserved }
     pub fn identity(&self) -> u64 {

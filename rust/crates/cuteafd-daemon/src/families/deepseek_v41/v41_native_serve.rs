@@ -852,7 +852,16 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
                     runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
                     RetainedScores::new(scores::VOCAB, bytes)
                 })();
-                if result.is_err() { pass.discard(&mut batch)?; }
+                if let Err(error) = &result {
+                    if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_some() {
+                        let drafts = if draft.is_some() {
+                            requests.cache().request_id(lease).ok().into_iter().collect()
+                        } else { Vec::new() };
+                        return Err(prefill_target::quarantine_prefill(requests, 0, batch,
+                            vec![chunk.len() as u32], drafts, false));
+                    }
+                    pass.discard(&mut batch)?;
+                }
                 scores = Some(result?);
             } else {
                 if index + 1 == probe.spec.cold_steps.len() {
@@ -1066,7 +1075,16 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
             runtime.block_on(pass.commit_prefill::<C>(requests, &mut batch, scoring_draft, chunk.len() as u32))?;
             Ok(bytes)
         })();
-        if result.is_err() { pass.discard(&mut batch)?; }
+        if let Err(error) = &result {
+            if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_some() {
+                let drafts = if plan.path == crate::shared::probe::ScorePath::Prefill && draft.is_some() {
+                    requests.cache().request_id(lease).ok().into_iter().collect()
+                } else { Vec::new() };
+                return Err(prefill_target::quarantine_prefill(requests, 0, batch,
+                    vec![chunk.len() as u32], drafts, false));
+            }
+            pass.discard(&mut batch)?;
+        }
         let bytes = result?;
         for (&selected_row, row) in selected.iter().zip(bytes.chunks_exact(scores::ROW_BYTES)) {
             probe.row(step.start + selected_row + 1, &RetainedScores::new(scores::VOCAB, row.to_vec())?.logits()?);
@@ -1275,7 +1293,16 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
             runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
             Ok(scores)
         })();
-        if result.is_err() { pass.discard(&mut batch)?; }
+        if let Err(error) = &result {
+            if error.downcast_ref::<crate::shared::serve::lanes::CommitQuarantined>().is_some() {
+                let drafts = if draft.is_some() {
+                    requests.cache().request_id(lease).ok().into_iter().collect()
+                } else { Vec::new() };
+                return Err(prefill_target::quarantine_prefill(requests, 0, batch,
+                    vec![chunk.len() as u32], drafts, false));
+            }
+            pass.discard(&mut batch)?;
+        }
         anchor = Some(result?);
         console::totals::prefill(chunk.len());
         console::Prefill::done(console::PrefillKind::Continuation, 0, index, count, chunk.len(), started);

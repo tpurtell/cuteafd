@@ -357,7 +357,24 @@ pub(crate) struct V41Cache<'a> {
     arenas: Arenas<'a>,
     partial: bool,
     pending: [Option<CaptureTicket>; 2],
+    /// A lane whose queued retain did not drain within the deadline. Its capture
+    /// stays owned and is polled (never synchronized) until it lands; the lane
+    /// is not reused meanwhile.
+    quarantined: [bool; 2],
+    /// A request whose retain was quarantined: its release failed on the pending
+    /// copy, so it is retried by [`V41Cache::poll_quarantined_retains`] once the
+    /// abandoned stream drains. Without this the slot and its KV units leak and
+    /// the next admission fails `request slot occupied`.
+    deferred_releases: [Option<DeferredRelease>; 2],
     capture_session: Option<String>,
+}
+
+/// A request whose retain timed out: its lease and draft slot are released only
+/// after the quarantined capture drains.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeferredRelease {
+    pub lease: CacheLease,
+    pub draft: Option<u64>,
 }
 
 /// What a V4.1 admission restored: the resume point and, for an exact full-prompt hit, the
@@ -373,7 +390,8 @@ impl<'a> V41Cache<'a> {
     pub fn new(arenas: Arenas<'a>, config: PrefixConfig, partial: bool,
         host: Option<(cuteafd_hostcache::config::Config, CudaCopyEngine<'a>)>, layout: FamilyLayout) -> Result<Self> {
         let cache = PrefixCache::new(layout, config, host).map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(Self { cache, arenas, partial, pending: [None, None], capture_session: None })
+        Ok(Self { cache, arenas, partial, pending: [None, None], quarantined: [false, false],
+            deferred_releases: [None, None], capture_session: None })
     }
     pub fn arenas(&self) -> &Arenas<'a> { &self.arenas }
     /// A cache that retains nothing (component fixtures).
@@ -407,11 +425,62 @@ impl<'a> V41Cache<'a> {
     pub fn prefill_hold(&mut self) -> Result<()> { self.cache.prefill_hold() }
 
     /// Unreference released requests' units (after the family drained) and poll the host tier.
-    pub fn tick<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>)
+    pub fn tick<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>)
         -> Result<()> {
-        self.reclaim(requests, draft)?;
+        self.reclaim(requests, draft.as_deref_mut())?;
+        self.poll_quarantined_retains(requests, draft)?;
         self.cache.tick();
         Ok(())
+    }
+    /// Poll quarantined retains (whose copies did not drain within the deadline)
+    /// without synchronizing. Each is published and its lane freed once its
+    /// device copies land.
+    fn poll_quarantined_retains<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>,
+        mut draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
+        for lane in 0..2 {
+            if !self.quarantined[lane] { continue; }
+            if self.pending[lane].is_none() {
+                self.quarantined[lane] = false;
+                self.release_deferred_lane(lane, requests, draft.as_deref_mut());
+                continue;
+            }
+            match self.poll_retain(lane, requests, draft.as_deref_mut()) {
+                Ok(true) => {
+                    self.quarantined[lane] = false;
+                    // The abandoned stream drained: retry the release that failed
+                    // on the pending copy when the request retired.
+                    self.release_deferred_lane(lane, requests, draft.as_deref_mut());
+                }
+                Ok(false) => {}
+                Err(error) => tracing::error!(%error, lane, "quarantined retain poll failed"),
+            }
+        }
+        Ok(())
+    }
+    /// Retry the release a retiring lane deferred behind this lane's quarantine.
+    fn release_deferred_lane<C: DraftChain<'a>>(&mut self, lane: usize, requests: &mut Requests<'a>,
+        mut draft: Option<&mut DraftRuntime<'_, 'a, C>>) {
+        let Some(deferred) = self.deferred_releases[lane].take() else { return };
+        if let Err(error) = requests.release_if_present(deferred.lease) {
+            tracing::error!(%error, lane, "releasing a quarantined request failed; its slot stays held");
+        }
+        if let Some(id) = deferred.draft {
+            if let Some(d) = draft.as_deref_mut() {
+                if let Err(error) = d.release(id) {
+                    tracing::error!(%error, lane, "releasing a quarantined draft request failed");
+                }
+            }
+        }
+    }
+    /// Defer a request's release until its quarantined retain drains. Called by
+    /// the retiring lane when the retain timed out: releasing now would fail on
+    /// the pending copy and leak the slot.
+    pub fn defer_release(&mut self, lane: usize, lease: CacheLease, draft: Option<u64>) {
+        if let Some(slot) = self.deferred_releases.get_mut(lane) { *slot = Some(DeferredRelease { lease, draft }); }
+    }
+    /// Whether a request's release is waiting on a quarantined retain.
+    pub fn release_deferred(&self, lane: usize) -> bool {
+        self.deferred_releases.get(lane).is_some_and(Option::is_some)
     }
     /// Return released requests' units to the pool, so [`V41Cache::room`] sees them.
     pub fn reclaim<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>)
@@ -502,6 +571,9 @@ impl<'a> V41Cache<'a> {
         draft: Option<&mut DraftRuntime<'_, 'a, C>>, kind: SnapshotKind, keys: &[u32], media: &[MediaSpan],
         next: &RetainedScores, lease: CacheLease, draft_id: Option<u64>) -> Result<bool> {
         ensure!(self.pending.get(lane).context("invalid retention lane")?.is_none(), "retention lane occupied");
+        // A quarantined lane's capture is still owned: skip retention rather than
+        // synchronize on the abandoned stream (finding 3).
+        if self.quarantined.get(lane).copied().unwrap_or(false) { return Ok(false); }
         if !self.cache.enabled() { return Ok(false); }
         let end = requests.cache().committed_end(lease)? as usize;
         ensure!(end > 0 && end <= keys.len(), "retained token frontier differs");
@@ -532,6 +604,19 @@ impl<'a> V41Cache<'a> {
         let Some(ticket) = self.pending.get_mut(lane).and_then(Option::take) else { return Ok(()) };
         let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
         self.cache.abort_capture(&family, ticket).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+    /// Abandon a queued retain whose copies did not drain within the deadline.
+    /// Does NOT synchronize on the abandoned stream (that would block the
+    /// current-thread serving runtime). The capture keeps its pages and mark
+    /// owned and is polled by [`V41Cache::tick`] until its device copies land;
+    /// the lane is not reused meanwhile, so the abandoned stream can never read
+    /// storage handed to someone else.
+    pub fn quarantine_retain(&mut self, lane: usize) {
+        let Some(ticket) = self.pending.get(lane).copied().flatten() else { return };
+        tracing::error!(target: "cuteafd::prefix", lane,
+            "queued prefix retain did not drain; quarantining its lane");
+        self.cache.quarantine_capture(ticket);
+        if let Some(flag) = self.quarantined.get_mut(lane) { *flag = true; }
     }
 }
 
@@ -616,5 +701,35 @@ mod tests {
         };
         let text = serde_json::to_string(&meta).unwrap();
         assert_eq!(serde_json::from_str::<V41Meta>(&text).unwrap(), meta);
+    }
+
+    /// Finding 1: a request whose retain timed out must not be released while
+    /// its capture is still pending (the release fails on the pending copy and
+    /// leaks the slot). The retiring lane defers the release; the poller retries
+    /// it once the abandoned stream drains.
+    #[test]
+    fn a_quarantined_retain_defers_its_release_until_the_stream_drains() {
+        let mut cache = V41Cache::configured(0);
+        let lease = CacheLease::unbound_for_test(3);
+        assert!(!cache.release_deferred(0));
+        cache.defer_release(0, lease, Some(7));
+        assert!(cache.release_deferred(0), "the release waits on the quarantine");
+        assert!(!cache.release_deferred(1), "only the timed-out lane defers");
+        // The poller's retry path is wired: `tick` polls quarantined retains and
+        // releases the deferred request once the lane is no longer quarantined.
+        let source = include_str!("prefix.rs");
+        let poll = &source[source.find("fn poll_quarantined_retains").unwrap()..];
+        let poll = &poll[..poll.find("/// Defer a request's release").unwrap()];
+        assert!(poll.contains("self.release_deferred_lane(lane, requests, draft.as_deref_mut());"));
+        let retry = &source[source.find("fn release_deferred_lane").unwrap()..];
+        let retry = &retry[..retry.find("/// Whether a request's release").unwrap()];
+        assert!(retry.contains("requests.release_if_present(deferred.lease)"));
+        assert!(retry.contains("d.release(id)"));
+        // And the retiring lane defers instead of releasing on timeout.
+        let retire = include_str!("scheduler/independent.rs");
+        let retire = &retire[retire.find("async fn retire<").unwrap()..];
+        let retire = &retire[..retire.find("/// Whether lane `lane` retires").unwrap()];
+        assert!(retire.contains("prefixes.borrow_mut().defer_release(lane, request.lease, id);"));
+        assert!(retire.contains("if timed_out {"), "the timeout path must not fall through to release");
     }
 }

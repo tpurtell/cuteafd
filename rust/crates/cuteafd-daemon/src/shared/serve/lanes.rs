@@ -13,6 +13,44 @@
 use anyhow::Result;
 use std::cell::Cell;
 use std::future::Future;
+use std::time::{Duration, Instant};
+
+/// How long a lane commit may wait for its device copies before the round fails.
+pub(crate) const COMMIT_DEADLINE: Duration = Duration::from_secs(120);
+/// How long a lane may wait for a queued prefix retain before giving up.
+pub(crate) const RETAIN_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a lane may wait for the drafter's proposal before giving up.
+pub(crate) const DRAFT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// The outcome of a bounded wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitOutcome {
+    /// The copy/commit drained.
+    Ready,
+    /// The deadline expired before it drained.
+    TimedOut,
+}
+
+/// Poll `ready` until it reports true, bounded by `deadline`. A device copy or
+/// commit that never completes must not spin the lane at 100% CPU forever
+/// (W64 F3): the wait uses the shared host-wait policy
+/// ([`cuteafd_transport::wait_policy`]) so it spins on the critical path and
+/// sleeps once the policy says so, and it gives up at `deadline` so the caller
+/// can quarantine the copy instead of synchronizing on it.
+///
+/// The already-ready path is the hot path: it polls once and never reads the
+/// clock or sleeps, so a normal round pays no timer cost.
+pub(crate) async fn wait_ready(mut ready: impl FnMut() -> Result<bool>, deadline: Duration) -> Result<WaitOutcome> {
+    if ready()? { return Ok(WaitOutcome::Ready); }
+    let started = Instant::now();
+    let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
+    loop {
+        if started.elapsed() >= deadline { return Ok(WaitOutcome::TimedOut); }
+        backoff.pause();
+        tokio::task::yield_now().await;
+        if ready()? { return Ok(WaitOutcome::Ready); }
+    }
+}
 
 /// The stop flag the lanes of one [`LaneSet::join`] share.
 #[derive(Default)]
@@ -131,23 +169,74 @@ pub(crate) trait LaneCommit {
     /// Drain whatever was enqueued and revoke the round's batch, leaving every
     /// owner releasable. Runs after any failure of the steps above.
     fn abort_and_drain(&mut self) -> Result<()>;
+    /// Abandon a commit whose copies did not drain within the deadline. Must NOT
+    /// synchronize on the abandoned stream: that would block the serving thread
+    /// (V4.1 native serve runs on a current-thread runtime). The default leaves
+    /// the owners in place for the caller to quarantine.
+    fn quarantine(&mut self) -> Result<()> { Ok(()) }
+}
+
+/// A commit that timed out and was quarantined. Callers must NOT discard or
+/// release its storage: the device may still be reading it. The owners stay
+/// held until the abandoned stream completes (or the process restarts).
+#[derive(Debug)]
+pub(crate) struct CommitQuarantined;
+impl std::fmt::Display for CommitQuarantined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "commit did not drain; quarantined")
+    }
+}
+impl std::error::Error for CommitQuarantined {}
+
+/// What [`commit`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitOutcome {
+    /// The commit drained and published.
+    Done,
+    /// The commit did not drain within the deadline. Its owners (workspace,
+    /// slot, window bits, snapshot buffers) are still held; the caller must
+    /// keep them owned and poll the abandoned stream until it completes, then
+    /// release. Never synchronize on it from the host.
+    Quarantined,
 }
 
 /// Begin, wait (yielding to peer lanes) and publish one commit; on failure
-/// drain it first and return the original error.
-pub(crate) async fn commit(commit: &mut impl LaneCommit) -> Result<()> {
-    let result = async {
-        commit.begin()?;
-        while !commit.ready()? { tokio::task::yield_now().await; }
-        commit.publish()
-    }.await;
+/// drain it first and return the original error. A timed-out commit is
+/// quarantined instead of drained: synchronizing on the stream it just gave up
+/// on would freeze the whole server.
+pub(crate) async fn commit(commit: &mut impl LaneCommit) -> Result<CommitOutcome> {
+    commit_with_deadline(commit, COMMIT_DEADLINE).await
+}
+
+/// [`commit`] with an explicit deadline (tests use a short one).
+async fn commit_with_deadline(commit: &mut impl LaneCommit, deadline: Duration) -> Result<CommitOutcome> {
+    let mut timed_out = false;
+    let result = match commit.begin() {
+        Ok(()) => match wait_ready(|| commit.ready(), deadline).await {
+            Ok(WaitOutcome::Ready) => commit.publish(),
+            Ok(WaitOutcome::TimedOut) => {
+                timed_out = true;
+                Err(anyhow::anyhow!("lane commit did not drain within {deadline:?}"))
+            }
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
     if let Err(error) = result {
+        if timed_out {
+            // Leave the owners in place: the caller quarantines them and polls
+            // the abandoned stream instead of synchronizing on it.
+            if let Err(cleanup) = commit.quarantine() {
+                tracing::error!(%cleanup, "quarantining a timed-out lane commit");
+            }
+            return Ok(CommitOutcome::Quarantined);
+        }
         if let Err(cleanup) = commit.abort_and_drain() {
             tracing::error!(%cleanup, "draining a failed lane commit");
         }
         return Err(error);
     }
-    Ok(())
+    Ok(CommitOutcome::Done)
 }
 
 #[cfg(test)]
@@ -156,7 +245,7 @@ mod tests {
     use std::cell::RefCell;
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future)
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(future)
     }
 
     async fn peer(lease: LaneLease<'_>, rounds: &Cell<usize>, finished: &Cell<bool>) -> Result<()> {
@@ -292,7 +381,7 @@ mod tests {
     #[test]
     fn commit_waits_for_both_halves_and_drains_on_failure() {
         let mut ok = Fake::default();
-        block_on(commit(&mut ok)).unwrap();
+        assert_eq!(block_on(commit(&mut ok)).unwrap(), CommitOutcome::Done);
         assert_eq!((ok.log.as_slice(), ok.polls), (&["begin", "publish"][..], 3));
         let mut early = Fake { fail_begin: true, ..Fake::default() };
         assert_eq!(block_on(commit(&mut early)).unwrap_err().to_string(), "begin failed");
@@ -300,5 +389,127 @@ mod tests {
         let mut late = Fake { fail_publish: true, ..Fake::default() };
         assert_eq!(block_on(commit(&mut late)).unwrap_err().to_string(), "publish failed");
         assert_eq!(late.log, ["begin", "publish", "abort"]);
+    }
+
+    /// W64 F3: a device copy that never completes must not spin the lane at
+    /// 100% CPU forever. The bounded wait gives up after its deadline.
+    #[test]
+    fn a_wait_that_never_becomes_ready_gives_up_instead_of_spinning() {
+        let started = Instant::now();
+        let outcome = block_on(wait_ready(|| Ok(false), Duration::from_millis(20))).unwrap();
+        assert_eq!(outcome, WaitOutcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2), "the wait must not spin past its deadline");
+    }
+    #[test]
+    fn a_wait_that_becomes_ready_returns_ready() {
+        let mut polls = 0;
+        let outcome = block_on(wait_ready(|| { polls += 1; Ok(polls >= 3) }, Duration::from_secs(1))).unwrap();
+        assert_eq!(outcome, WaitOutcome::Ready);
+        assert_eq!(polls, 3);
+    }
+    /// Finding 4: the already-ready path is the hot path. It must poll exactly
+    /// once and never enter the timer/sleep loop, so a normal round pays no
+    /// timer stall.
+    #[test]
+    fn an_already_ready_wait_polls_once_and_never_sleeps() {
+        let mut polls = 0;
+        let outcome = block_on(wait_ready(|| { polls += 1; Ok(true) }, Duration::ZERO)).unwrap();
+        assert_eq!(outcome, WaitOutcome::Ready);
+        assert_eq!(polls, 1, "the ready path must not poll again");
+    }
+    #[test]
+    fn a_wait_propagates_a_poll_error() {
+        let error = block_on(wait_ready(|| -> Result<bool> { anyhow::bail!("poll failed") },
+            Duration::from_secs(1))).unwrap_err();
+        assert_eq!(error.to_string(), "poll failed");
+    }
+    /// Finding 1: a timed-out commit must be quarantined, not drained. Draining
+    /// synchronizes on the stream the wait just gave up on, which blocks the
+    /// current-thread serving runtime.
+    #[test]
+    fn a_timed_out_commit_is_quarantined_not_drained() {
+        struct Stuck { log: Vec<&'static str> }
+        impl LaneCommit for Stuck {
+            fn begin(&mut self) -> Result<()> { self.log.push("begin"); Ok(()) }
+            fn ready(&mut self) -> Result<bool> { Ok(false) }
+            fn publish(&mut self) -> Result<()> { self.log.push("publish"); Ok(()) }
+            fn abort_and_drain(&mut self) -> Result<()> { self.log.push("abort"); Ok(()) }
+            fn quarantine(&mut self) -> Result<()> { self.log.push("quarantine"); Ok(()) }
+        }
+        let mut stuck = Stuck { log: Vec::new() };
+        // A zero deadline makes the first non-ready poll time out immediately.
+        let outcome = block_on(commit_with_deadline(&mut stuck, Duration::ZERO)).unwrap();
+        assert_eq!(outcome, CommitOutcome::Quarantined);
+        assert_eq!(stuck.log, ["begin", "quarantine"], "a timed-out commit must not drain");
+    }
+
+    /// Engine-level lifecycle: a commit that times out keeps its owners (slot,
+    /// window bit, prefix lane) held while the abandoned stream is still
+    /// pending, and releases them only once the device-side completion fires.
+    /// A second, independent slot keeps working throughout, so the engine does
+    /// not freeze on the abandoned stream.
+    #[test]
+    fn a_quarantined_commit_holds_its_owners_until_the_stream_completes() {
+        /// Models the three owners a decode commit holds: the request slot, the
+        /// window's `writing` bit and the prefix capture lane.
+        #[derive(Default)]
+        struct Owners {
+            slot: Cell<bool>,
+            writing: Cell<bool>,
+            prefix_lane: Cell<bool>,
+            device_done: Cell<bool>,
+            log: RefCell<Vec<&'static str>>,
+        }
+        impl LaneCommit for Owners {
+            fn begin(&mut self) -> Result<()> {
+                self.slot.set(true);
+                self.writing.set(true);
+                self.prefix_lane.set(true);
+                self.log.borrow_mut().push("begin");
+                Ok(())
+            }
+            fn ready(&mut self) -> Result<bool> { Ok(self.device_done.get()) }
+            fn publish(&mut self) -> Result<()> {
+                self.slot.set(false);
+                self.writing.set(false);
+                self.prefix_lane.set(false);
+                self.log.borrow_mut().push("publish");
+                Ok(())
+            }
+            fn abort_and_drain(&mut self) -> Result<()> {
+                self.slot.set(false);
+                self.writing.set(false);
+                self.prefix_lane.set(false);
+                self.log.borrow_mut().push("abort");
+                Ok(())
+            }
+            fn quarantine(&mut self) -> Result<()> {
+                // Keep every owner: the device may still be reading them.
+                self.log.borrow_mut().push("quarantine");
+                Ok(())
+            }
+        }
+        let mut owners = Owners::default();
+        let outcome = block_on(commit_with_deadline(&mut owners, Duration::ZERO)).unwrap();
+        assert_eq!(outcome, CommitOutcome::Quarantined);
+        assert!(owners.slot.get() && owners.writing.get() && owners.prefix_lane.get(),
+            "a quarantined commit must keep its slot, window bit and prefix lane owned");
+        assert_eq!(owners.log.borrow().as_slice(), ["begin", "quarantine"]);
+
+        // A second, independent slot is usable while the abandoned stream is
+        // still pending: the engine keeps serving.
+        let mut other = Owners::default();
+        other.device_done.set(true);
+        assert_eq!(block_on(commit_with_deadline(&mut other, Duration::from_secs(1))).unwrap(),
+            CommitOutcome::Done);
+        assert!(!other.slot.get() && !other.writing.get() && !other.prefix_lane.get());
+
+        // The abandoned stream completes: the owners are released and reusable.
+        owners.device_done.set(true);
+        assert!(owners.ready().unwrap());
+        owners.publish().unwrap();
+        assert!(!owners.slot.get() && !owners.writing.get() && !owners.prefix_lane.get(),
+            "the owners are released once the device-side completion fires");
+        assert_eq!(owners.log.borrow().as_slice(), ["begin", "quarantine", "publish"]);
     }
 }

@@ -53,10 +53,18 @@ pub(crate) struct RequestBatch {
     finished: bool,
 }
 impl RequestBatch {
+    /// An empty batch for CPU-only lifecycle tests (never used with a cache).
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self { cache: CacheBatch::empty_for_test(), prepared: Vec::new(), engram: None, leases: Vec::new(),
+            tokens: Vec::new(), image_mask: Vec::new(), finished: false }
+    }
     pub fn cache(&self) -> Result<&CacheBatch> {
         ensure!(!self.finished, "request batch finished");
         Ok(&self.cache)
     }
+    /// The leases this batch covers (one per member).
+    pub fn leases(&self) -> &[CacheLease] { &self.leases }
     pub fn image_mask(&self) -> &[u8] {
         &self.image_mask
     }
@@ -92,6 +100,39 @@ impl Drop for RequestBatch {
         if let Some(engram) = &mut self.engram { engram.cancel(); }
     }
 }
+/// A decode commit whose device copies did not drain within the deadline. It
+/// keeps the batch (workspace), the request slots and the window `writing` bits
+/// owned until the device-side completion events fire, then publishes or aborts
+/// and releases. It is polled (never synchronized) at each scheduler boundary.
+pub(crate) struct QuarantinedCommit {
+    /// The lane whose pass owns the abandoned commit.
+    pub lane: usize,
+    /// Accepted rows per member, in `slots` order.
+    pub accepted: Vec<u32>,
+    /// The round's workspace; dropping it would cancel the engram wave, so it
+    /// stays owned until the commit settles.
+    pub batch: RequestBatch,
+    /// The active slots whose requests the commit covers.
+    pub slots: Vec<usize>,
+}
+/// A prefill (or encoder-unit) commit whose device copies did not drain within
+/// the deadline. It keeps the batch (workspace) and the pass's window bits
+/// owned until the device-side completion events fire, then publishes or aborts.
+/// It is polled (never synchronized) at each scheduler boundary.
+pub(crate) struct QuarantinedPrefill {
+    /// The prefill slot whose pass owns the abandoned commit.
+    pub slot: usize,
+    /// Accepted rows per member.
+    pub accepted: Vec<u32>,
+    /// The call's workspace; dropping it would cancel the engram wave, so it
+    /// stays owned until the commit settles.
+    pub batch: RequestBatch,
+    /// The draft requests whose commit was begun on the same batch, if any.
+    pub drafts: Vec<u64>,
+    /// An encoder unit also owns its route rings and row window: the poller
+    /// discards them once the commit settles.
+    pub encoder: bool,
+}
 pub(crate) struct Requests<'a> {
     cache: BackboneCache<'a>,
     /// Per capture lane: the lease whose snapshot is queued.
@@ -107,6 +148,15 @@ pub(crate) struct Requests<'a> {
     prefetched: prefetch::PrefetchSlot<CacheLease, EngramWave>,
     /// Requests released so far; admission waiters retry when it moves.
     releases: u64,
+    /// Commits that timed out and are waiting for their device copies to drain.
+    pub quarantine: Vec<QuarantinedCommit>,
+    /// Prefill/encoder-unit commits that timed out and are waiting for their
+    /// device copies to drain.
+    pub prefill_quarantine: Vec<QuarantinedPrefill>,
+    /// Leases held by a quarantined prefill/encoder commit. Their release is
+    /// deferred until the poller settles the commit, so the abandoned stream
+    /// never reads storage handed to someone else.
+    quarantined_leases: Vec<CacheLease>,
 }
 impl<'a> Requests<'a> {
     pub fn engram_host_formulas(&self) -> [(&'static str, u64); 2] {
@@ -139,6 +189,9 @@ impl<'a> Requests<'a> {
             image_requests: 0,
             prefetched: Default::default(),
             releases: 0,
+            quarantine: Vec::new(),
+            prefill_quarantine: Vec::new(),
+            quarantined_leases: Vec::new(),
         })
     }
     pub fn new_distributed(
@@ -159,6 +212,9 @@ impl<'a> Requests<'a> {
             image_requests: 0,
             prefetched: Default::default(),
             releases: 0,
+            quarantine: Vec::new(),
+            prefill_quarantine: Vec::new(),
+            quarantined_leases: Vec::new(),
         })
     }
     pub fn cache(&self) -> &BackboneCache<'a> {
@@ -168,7 +224,8 @@ impl<'a> Requests<'a> {
         pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
             prefix_leases:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),units:vec![Vec::new();slots],
-            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0 })
+            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0,quarantine:Vec::new(),
+            prefill_quarantine:Vec::new(),quarantined_leases:Vec::new() })
     }
     fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
         self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")
@@ -185,6 +242,9 @@ impl<'a> Requests<'a> {
             .find(|r| r.lease == lease)
             .context("request history missing")
     }
+    /// Whether `slot` holds no request. A slot whose release is deferred behind a
+    /// quarantined retain is still occupied, so admission must not pick it.
+    pub fn slot_free(&self, slot: usize) -> bool { self.slots.get(slot).is_some_and(Option::is_none) }
     pub fn admit(&mut self, slot: usize, id: u64) -> Result<CacheLease> {
         ensure!(
             slot < self.slots.len() && self.slots[slot].is_none(),
@@ -261,7 +321,20 @@ impl<'a> Requests<'a> {
     pub fn cancel_foreign_prefetch(&mut self, lease: CacheLease) -> usize {
         self.prefetched.cancel_others(&lease)
     }
+    /// Hold `lease` until a quarantined prefill/encoder commit settles: its
+    /// release is deferred so the abandoned stream never reads freed storage.
+    pub fn quarantine_lease(&mut self, lease: CacheLease) {
+        if !self.quarantined_leases.contains(&lease) { self.quarantined_leases.push(lease); }
+    }
+    /// The poller settled the commit: the lease may be released now.
+    pub fn unquarantine_lease(&mut self, lease: CacheLease) {
+        self.quarantined_leases.retain(|held| *held != lease);
+    }
+    pub fn lease_quarantined(&self, lease: CacheLease) -> bool { self.quarantined_leases.contains(&lease) }
     pub fn release(&mut self, lease: CacheLease) -> Result<()> {
+        // A quarantined commit still owns this lease: the poller releases it
+        // once the abandoned stream drains.
+        if self.lease_quarantined(lease) { return Ok(()); }
         self.prefetched.cancel_owner(&lease);
         if self.cache.request_id(lease).is_ok() { self.cache.ensure_releasable(lease)?; }
         let slot = self

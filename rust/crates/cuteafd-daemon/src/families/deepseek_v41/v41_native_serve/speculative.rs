@@ -419,7 +419,10 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         for window in &mut self.windows {
             if let Err(error) = window.abort_ring(lane) { failure.get_or_insert(error); }
         }
-        self.pending_prefix_ids[lane] = None;
+        // Only free the lane once every ring drained. A failed abort may still
+        // have copies in flight; clearing the pending id would defeat the
+        // release guards in `release` and the backbone cache (finding 3).
+        if failure.is_none() { self.pending_prefix_ids[lane] = None; }
         failure.map_or(Ok(()), Err)
     }
     /// Restore request `id`'s rings at frontier `end` from `mark`. A failure releases the draft

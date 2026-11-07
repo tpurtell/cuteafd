@@ -493,7 +493,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         result
     }
     /// Every lane's undrained ring captures dropped (failed or cancelled work).
-    pub(super) fn discard_route_rings(&mut self) -> Result<()> {
+    pub(crate) fn discard_route_rings(&mut self) -> Result<()> {
         for lane in &mut self.resources.lanes {
             let device = lane.device;
             device.run(|| lane.get_mut().discard_route_ring())?;

@@ -189,6 +189,9 @@ struct PendingCapture<M> {
     ticket: CaptureTicket,
     kind: SnapshotKind,
     entry: Entry<M>,
+    /// Its copies did not drain within the deadline. It stays owned and is
+    /// polled (never synchronized) until they land; its lane is not reused.
+    quarantined: bool,
 }
 
 /// A capture whose storage was taken and whose copies are the caller's to enqueue.
@@ -743,7 +746,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         } else { Ok(None) };
         match queued {
             Ok(Some(ticket)) => {
-                self.pending.push(PendingCapture { ticket, kind, entry });
+                self.pending.push(PendingCapture { ticket, kind, entry, quarantined: false });
                 self.stats.captures_queued += 1;
                 Ok(Captured::Queued(ticket))
             }
@@ -793,7 +796,9 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let ready = match family.capture_ready(ticket) {
             Ok(ready) => ready,
             Err(source) => {
-                self.abort_capture(family, ticket)?;
+                // A quarantined capture must never be synchronized on: leave it
+                // pending (its storage stays owned) instead of aborting it.
+                if !self.pending[index].quarantined { self.abort_capture(family, ticket)?; }
                 return Err(PrefixError::Family { what: "capture poll", source });
             }
         };
@@ -807,6 +812,19 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         }
         self.publish(family, kind, entry)?;
         Ok(true)
+    }
+
+    /// Quarantine a queued capture whose copies did not drain within the deadline. It keeps
+    /// its pages and mark owned and is polled (never synchronized) by
+    /// [`PrefixCache::poll_quarantined`] until its device copies land. Its lane is not reused
+    /// meanwhile, so the abandoned stream can never read storage handed to someone else.
+    pub fn quarantine_capture(&mut self, ticket: CaptureTicket) {
+        if let Some(pending) = self.pending.iter_mut().find(|p| p.ticket == ticket) {
+            if !pending.quarantined {
+                pending.quarantined = true;
+                self.stats.quarantined += 1;
+            }
+        }
     }
 
     /// Abandon a queued capture: its storage returns to the cache once the family proved its
@@ -1182,11 +1200,11 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                     EvictDecision::DroppedUncached => { self.entries.get_mut(&id).unwrap().ticket = None; }
                     EvictDecision::Held => return Err(PrefixError::Host("staging write did not drain".into())),
                 }
-            } else if !self.pending.is_empty() {
+            } else if let Some(index) = self.pending.iter().position(|p| !p.quarantined) {
                 waited = true;
-                let ticket = self.pending[0].ticket;
+                let ticket = self.pending[index].ticket;
                 family.wait_capture(ticket).map_err(|source| PrefixError::Family { what: "capture wait", source })?;
-                let PendingCapture { kind, entry, .. } = self.pending.remove(0);
+                let PendingCapture { kind, entry, .. } = self.pending.remove(index);
                 if let Some(old) = self.retained.bank_mut(kind).remove_exact(&entry.tokens) { self.evict(family, old)?; }
                 self.publish(family, kind, entry)?;
                 self.completed_captures.push(ticket);
