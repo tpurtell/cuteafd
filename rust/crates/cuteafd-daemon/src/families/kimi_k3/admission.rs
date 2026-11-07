@@ -455,8 +455,11 @@ impl<'a> Admission<'a> {
         let global = devices.iter().zip(&self.global_layouts).map(|(&device, layout)| records.global(device, layout))
             .collect::<Result<Vec<_>>>()?;
         memory.sample("weights-global-recorded")?;
-        let layers = (0..self.cfg.layers).map(|layer| records.layer_ranks(devices, layer, &self.layouts[layer]))
-            .collect::<Result<Vec<_>>>()?;
+        let mut layers = Vec::with_capacity(self.cfg.layers);
+        for layer in 0..self.cfg.layers {
+            layers.push(records.layer_ranks(devices, layer, &self.layouts[layer])?);
+            memory.sample_layer(layer, self.cfg.layers)?;
+        }
         memory.sample("weights-core-layers-recorded")?;
         Ok((global, layers))
     }

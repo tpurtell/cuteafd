@@ -164,6 +164,19 @@ fn host_high_water_bytes(status: &str) -> Result<u64> {
 #[cfg(test)]
 mod startup_probe_tests {
     #[test]
+    fn layer_phase_sampling_is_bounded_to_first_three_and_last() {
+        for layers in [0, 1, 2, 3, 4, 61, usize::MAX] {
+            let candidates = [0, 1, 2, 3, layers.saturating_sub(1), layers];
+            for layer in candidates {
+                assert_eq!(super::sampled_startup_layer(layer, layers),
+                    layer < layers && (layer < 3 || layer + 1 == layers));
+            }
+        }
+        assert_eq!((0..61).filter(|&layer| super::sampled_startup_layer(layer, 61)).collect::<Vec<_>>(),
+            [0, 1, 2, 60]);
+    }
+
+    #[test]
     fn phase_deltas_preserve_signed_unclassified_growth() -> anyhow::Result<()> {
         use super::StartupPhaseSample;
         let before = StartupPhaseSample { total: 1000, free: 900, tracked: 50 };
@@ -297,6 +310,10 @@ impl StartupPhaseSample {
     }
 }
 
+fn sampled_startup_layer(layer: usize, layers: usize) -> bool {
+    layer < layers && (layer < 3 || layer == layers - 1)
+}
+
 /// Bounded in-process startup observations, never admission owners or a hot-path probe.
 /// Disabled callers do not synchronize, sample CUDA, or snapshot the native ledger.
 pub(crate) struct StartupMemoryPhases<'a> {
@@ -316,6 +333,13 @@ impl<'a> StartupMemoryPhases<'a> {
     }
 
     pub(crate) fn enabled(&self) -> bool { self.enabled }
+
+    pub(crate) fn sample_layer(&mut self, layer: usize, layers: usize) -> Result<()> {
+        if self.enabled && sampled_startup_layer(layer, layers) {
+            self.sample(&format!("weights-core-layer-{layer}-recorded"))?;
+        }
+        Ok(())
+    }
 
     pub(crate) fn sample(&mut self, stage: &str) -> Result<()> {
         use cuteafd_ffi::memory_ledger::{self, Space};
@@ -350,6 +374,8 @@ impl<'a> StartupMemoryPhases<'a> {
                     "used": sample.used()?, "untracked": sample.used()? - i64::try_from(tracked)?,
                     "used_delta": used_delta, "tracked_delta": tracked_delta,
                     "untracked_delta": untracked_delta, "untracked_since_context": untracked_since_context,
+                    "allocator": memory_ledger::current_cuda_memory_snapshot(),
+                    "allocator_scope": "CUDA current-pool reserved/used telemetry, not PyTorch caching-allocator metrics; core records use direct cudaMalloc; no trim",
                     "cuda_memory_scope": "in-process raw cudaMemGetInfo; no external observer",
                     "runtime_delta_scope": "signed unclassified observation; not a receipt or automatic allowance",
                     "ready_authorized_by_probe": false
