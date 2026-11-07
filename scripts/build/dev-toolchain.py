@@ -7,10 +7,10 @@ keep this conservative rather than risk normalizing away content-affecting edits
 import hashlib
 from pathlib import Path
 
-BASE = 'nvcr.io/nvidia/pytorch:26.05-py3@sha256:'
+BASE = 'nvcr.io/nvidia/pytorch:26.09-py3@sha256:'
 BASE_DIGESTS = {
-    'amd64': 'ca73b4795f0d3ae27e9cd81b1b1f1b7fc6c0a129f7d51a359d2326e95af48a3d',
-    'arm64': 'aa400d4373fa71f30e1714664beabcc64c2d198e72d65e9a3641440b07e7cc83',
+    'amd64': 'f71fd67f6d71f685e0bd08ce6c8df48807624cc5d48886370d3471bc4f89d81d',
+    'arm64': '307c449df7dabed6b36e017a2b2f2e45bdec9dc203b81507111315f1e971de6e',
 }
 
 
