@@ -265,9 +265,11 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         if let Some(members) = self.packed {
             for member in members {
                 e.write_draft_kv(self.w, &member.views[0], member.segment.rows, e.prefill_rows)?;
+                e.diagnostic_draft_kv_bridge(&member.views[0], member.segment.rows)?;
             }
         } else if retains_draft_rows(&unit.rows, self.tokens.len()) {
             e.write_draft_kv(self.w, &self.w.slots[unit.slot], unit.rows.len(), e.prefill_rows)?;
+            e.diagnostic_draft_kv_bridge(&self.w.slots[unit.slot], unit.rows.len())?;
         }
         if self.w1.is_some() {
             // Rank 0 must join the peer's last reader before reusing this slot's entry residual.

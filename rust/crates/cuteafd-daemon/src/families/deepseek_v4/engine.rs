@@ -108,6 +108,7 @@ pub(crate) struct Engine<'a> {
     tp2: Option<Tp2State<'a>>,
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     exchange_policy: ExchangePolicy,
+    diagnostic_draft_bridge: bool,
     /// C4 token-split attention (#58): the build's programs, set at construction (each GPU's C4
     /// pools then hold half the units, plus per-layer scratch pages), and once the peer is
     /// attached, its buffers and exchange (dropped before the head split's exchange, whose abort
@@ -578,6 +579,7 @@ impl<'a> Engine<'a> {
             context: None,
             context_units: RefCell::new(Vec::new()),
             exchange_policy: ExchangePolicy::from_env()?,
+            diagnostic_draft_bridge: std::env::var("CUTEAFD_DIAG_V4_DRAFT_BRIDGE").as_deref() == Ok("1"),
             capture_only: std::cell::Cell::new(false),
             graph_captures: std::cell::Cell::new(0),
             expert_graph_captures: std::cell::Cell::new(0),
@@ -1160,6 +1162,7 @@ impl<'a> Engine<'a> {
                 self.write_draft_kv(w, lane, t, cap)?;
                 self.head_launch(&lane.stream_a, t, t, 0, w)
             })?;
+            self.diagnostic_draft_kv_bridge(lane, t)?;
             if unread {
                 decode_link.as_deref_mut().context("decode transport")?.exchange()?.consumed(0, self.stream)?;
             }

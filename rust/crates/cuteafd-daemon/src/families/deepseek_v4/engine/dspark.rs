@@ -72,6 +72,48 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Transport-only lower bound for a remote drafter, outside target capture.
+    /// Scratch receive slots are dead here; no model state or numerics change.
+    pub(super) fn diagnostic_draft_transfer(&self, sources: &[(*mut c_void, usize)], return_bytes: usize) -> Result<()> {
+        use crate::shared::peer_split::DIRECT;
+        use cuteafd_ffi::peer_exchange::PeerPlane;
+        if !self.diagnostic_draft_bridge || !self.draft_ready() { return Ok(()); }
+        let exchange = self.exchange()?;
+        let mut offset = 0usize;
+        let planes = sources.iter().map(|&(source, bytes)| {
+            let bytes = bytes.next_multiple_of(16);
+            let destination = exchange.recv(1, 0)?.cast::<u8>().wrapping_add(offset).cast();
+            offset = offset.checked_add(bytes).context("draft bridge extent overflow")?;
+            Ok(PeerPlane { source, destination, rows: 1, row_bytes: bytes as u64,
+                source_pitch: bytes as u64, destination_pitch: bytes as u64 })
+        }).collect::<Result<Vec<_>>>()?;
+        let capacity = self.exchange_policy.slot_bytes(self.prefill_rows, self.decode_rows, self.cfg.dim);
+        ensure!(offset <= capacity && return_bytes <= offset, "diagnostic draft bridge exceeds exchange scratch");
+        // Join the peer's prior target reader before reusing its receive slot.
+        exchange.signal(1, DIRECT)?;
+        exchange.wait(0, DIRECT)?;
+        exchange.push_planes(0, 0, &planes)?;
+        exchange.wait(1, 0)?;
+        if return_bytes == 0 {
+            exchange.signal(1, 1)?;
+        } else {
+            exchange.push_to(1, 1, exchange.recv(1, 0)?, exchange.recv(0, 0)?, return_bytes)?;
+        }
+        exchange.wait(0, 1)?;
+        exchange.signal(0, 1)?;
+        exchange.wait(1, 1)
+    }
+
+    pub(super) fn diagnostic_draft_kv_bridge(&self, lane: &UnitSlot<'_>, rows: usize) -> Result<()> {
+        if !self.diagnostic_draft_bridge || !self.draft_ready() { return Ok(()); }
+        let n = rows.min(TAP_ROWS);
+        self.diagnostic_draft_transfer(&[
+            (lane.taps.buffer.ptr, n * self.cfg.dspark_target_layer_ids.len() * self.cfg.dim * 2),
+            (lane.tables.positions.buffer.ptr, rows * 8),
+            (lane.tables.main_slots.buffer.ptr, rows * 8),
+        ], 0)
+    }
+
     /// Writes every stage's main KV for the lane's tapped rows.
     pub(super) fn write_draft_kv(&self, w: &Workspace<'_>, lane: &UnitSlot<'_>, t: usize, cap: usize) -> Result<()> {
         let Some(dspark) = self.weights.dspark.as_ref().filter(|_| self.draft_ready()) else { return Ok(()) };
@@ -165,6 +207,11 @@ impl<'a> Engine<'a> {
         bytes(super::bytes_of(&first), &w.first_tokens)?;
         // The mHC streams start as four copies of each input's embedding.
         self.embedding.embed(inputs, w.draft_ids.buffer, 4, lane.stream_a.buffer, self.stream)?;
+        self.diagnostic_draft_transfer(&[
+            (lane.stream_a.buffer.ptr, rows * 4 * h * 2),
+            (m.positions.buffer.ptr, rows * 8), (m.main_slots.buffer.ptr, rows * 8),
+            (m.swa_indices.buffer.ptr, rows * WINDOW * 4), (m.swa_lengths.buffer.ptr, rows * 4),
+        ], rows * h * 2)?;
         let cap = self.decode_rows;
         let scalar = Scalar::I32(rows as i32);
         for (stage, weights) in dspark.stages.iter().enumerate() {
