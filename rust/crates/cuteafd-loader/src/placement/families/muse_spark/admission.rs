@@ -591,9 +591,20 @@ impl<'a> ProductionInput<'a> {
                         "routed experts (intermediate slices)", maximum_pages));
                 }
                 if count < cfg.layers {
+                    let runtime = cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
+                        .ok_or(Refusal::Overflow("Muse Spark reserve"))?;
+                    let owners = spark_budget.overhead.get(rank).copied().unwrap_or(0)
+                        .checked_sub(runtime).ok_or(Refusal::Overflow("Muse Spark owner decomposition"))?;
                     components.extend(buffer(format!("muse.spark.io.{rank}.{count}"), location,
-                        spark_budget.overhead.get(rank).copied().unwrap_or(0), Lifetime::RESIDENT,
-                        Category::Runtime, "Spark I/O slots and runtime reserve", maximum_pages));
+                        owners, Lifetime::RESIDENT, Category::Workspace, "Spark I/O and execution owners", maximum_pages));
+                    components.extend(buffer(format!("muse.spark.startup.{rank}.{count}"), location,
+                        runtime, Lifetime::RESIDENT, Category::Runtime,
+                        cuteafd_core::memory_layout::spark_runtime_reserve_group(), maximum_pages));
+                    let resident = spark_budget.resident[rank][count..].iter().sum();
+                    components.extend(buffer(format!("muse.spark.arena-growth.{rank}.{count}"), location,
+                        cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(resident),
+                        Lifetime::RESIDENT, Category::Workspace,
+                        cuteafd_core::memory_layout::SPARK_ARENA_DRIVER_OVERHEAD_GROUP, maximum_pages));
                 }
             }
             let envelope = crate::push_load::PushHostEnvelope::new(validation.clone(), vec![dense_bound; gpus],

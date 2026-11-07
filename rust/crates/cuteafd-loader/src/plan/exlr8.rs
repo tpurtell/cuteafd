@@ -258,7 +258,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             .filter(|i| matches!(i.category, cuteafd_core::memory_layout::Category::Weights
                 | cuteafd_core::memory_layout::Category::Embedding | cuteafd_core::memory_layout::Category::Experts)).map(|i| i.bytes).sum())]);
     let mut memory = memory;
-    append_spark_devices(&mut memory, layout, &residents);
+    append_spark_devices(&mut memory, layout, &residents)?;
     append_spark_encoder(&mut memory, report.encoder.as_ref())?;
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
@@ -289,7 +289,7 @@ pub(super) fn bundled_vision_component(checkpoint: &super::Checkpoint) -> Result
 }
 
 fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
-    layout: &super::layout::LayoutOptions, residents: &[u64]) {
+    layout: &super::layout::LayoutOptions, residents: &[u64]) -> Result<()> {
     use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item};
     for (rank, &bytes) in residents.iter().enumerate() {
         if !memory.devices.iter().any(|device| device.kind == DeviceKind::Spark && device.index as usize == rank) {
@@ -300,7 +300,10 @@ fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
         let device = memory.devices.iter_mut().find(|device|
             device.kind == DeviceKind::Spark && device.index as usize == rank).expect("Spark ledger exists");
         device.items.push(Item::new(Category::Experts, "routed_expert", "exlr8", bytes, Basis::Exact));
+        cuteafd_core::memory_layout::charge_spark_runtime(device)
+            .context("EXLR8 Spark arena reserve overflow")?;
     }
+    Ok(())
 }
 
 fn append_spark_encoder(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
@@ -1301,18 +1304,20 @@ mod tests {
                 }).collect(), pool_tokens: 262144, waste: Vec::new(), notes: Vec::new() };
                 let rtx = memory.devices.clone();
                 let residents = (0..ranks).map(|rank| (80 << 30) + rank as u64).collect::<Vec<_>>();
-                append_spark_devices(&mut memory, &layout, &residents);
+                append_spark_devices(&mut memory, &layout, &residents).unwrap();
                 assert_eq!(&memory.devices[..gpus as usize], rtx.as_slice());
                 assert_eq!(memory.pool_tokens, 262144);
                 for (rank, device) in memory.devices[gpus as usize..].iter().enumerate() {
                     assert_eq!(device.index, rank as u32);
                     assert_eq!(device.worker_budget_bytes, budget);
                     assert_eq!(device.capacity_bytes, budget);
-                    assert_eq!(device.items.len(), 1);
+                    assert_eq!(device.items.len(), 3);
+                    assert_eq!(device.used_bytes(), residents[rank]
+                        + cuteafd_core::memory_layout::spark_runtime_reserve_bytes(residents[rank]).unwrap());
                     assert_eq!(device.items[0].bytes, residents[rank]);
                 }
                 let with_sparks = memory.clone();
-                append_spark_devices(&mut memory, &layout, &[]);
+                append_spark_devices(&mut memory, &layout, &[]).unwrap();
                 assert_eq!(memory, with_sparks);
             }
         }
@@ -1331,14 +1336,15 @@ mod tests {
             weights: 1_128_026_176, scratch: 791_907_584, replicas: Vec::new(),
             reason: "bundled tower".into(), shortfall: 0,
         };
-        append_spark_devices(&mut memory, &Default::default(), &[105_213_559_040]);
+        append_spark_devices(&mut memory, &Default::default(), &[105_213_559_040]).unwrap();
         append_spark_encoder(&mut memory, Some(&encoder)).unwrap();
         let device = &memory.devices[0];
         assert_eq!((device.kind, device.index), (DeviceKind::Spark, 0));
-        assert_eq!(device.items.len(), 3);
-        assert_eq!((device.items[1].category, device.items[1].bytes), (Category::Weights, encoder.weights));
-        assert_eq!((device.items[2].category, device.items[2].bytes), (Category::Workspace, encoder.scratch));
-        assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), 107_133_492_800);
+        assert_eq!(device.items.len(), 5);
+        assert_eq!((device.items[3].category, device.items[3].bytes), (Category::Weights, encoder.weights));
+        assert_eq!((device.items[4].category, device.items[4].bytes), (Category::Workspace, encoder.scratch));
+        assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), 107_133_492_800
+            + cuteafd_core::memory_layout::spark_runtime_reserve_bytes(105_213_559_040).unwrap());
         assert_eq!(memory.pool_tokens, 2097152);
     }
 
@@ -1362,17 +1368,18 @@ mod tests {
                 Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact),
                 Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula)],
         }], pool_tokens: 2097152, waste: Vec::new(), notes: Vec::new() };
-        append_spark_devices(&mut memory, &layout, &[experts]);
+        append_spark_devices(&mut memory, &layout, &[experts]).unwrap();
         append_spark_encoder(&mut memory, Some(&encoder)).unwrap();
         assert_eq!(memory.devices.len(), 1);
         let device = &memory.devices[0];
         assert_eq!((device.kind, device.index), (DeviceKind::Spark, 0));
         assert_eq!(device.worker_budget_bytes, layout.spark_bytes);
-        assert_eq!(device.items.len(), 4);
+        assert_eq!(device.items.len(), 6);
         assert_eq!(device.items.iter().filter(|item| item.category == Category::Experts)
             .map(|item| item.bytes).sum::<u64>(), experts);
         assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(),
-            runtime + encoder.weights + encoder.scratch + experts);
+            runtime + encoder.weights + encoder.scratch + experts
+            + cuteafd_core::memory_layout::spark_runtime_reserve_bytes(experts).unwrap());
         assert_eq!(memory.pool_tokens, 2097152);
     }
 

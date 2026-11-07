@@ -115,10 +115,26 @@ Each device has one cap, and weights, KV, workspaces and the reserve all live in
 The planner fixes the layout (layer placement, onboarding, buffers) for `KV_TARGET_TOKENS`;
 the pool then grows into what the fixed layout leaves, up to `KV_MAX_TOKENS`, and the launch
 is refused below `KV_MIN_TOKENS`. The reserve is the sum of named, measured components
-(CUDA context and cuBLAS, loaded code, graphs, runtime growth, the Spark runtime residual)
-plus `FAMILY_RESERVE`; `GPU_RESERVE` / `SPARK_RESERVE` replace the whole reserve and zero
-every built-in component. Startup and `cuteafd plan` print one line per device with the cap,
+(CUDA context and cuBLAS, loaded code, graphs, runtime growth, Spark worker process residency)
+plus `FAMILY_RESERVE`; `GPU_RESERVE` / `SPARK_RESERVE` replace the reserve components.
+Startup and `cuteafd plan` print one line per device with the cap,
 weights, workspaces, every reserve component and the KV target, min, max and pool.
+The coordinator charges the SM121 worker process census (1,596,606,464 B,
+moa/driver 580.178.04, 2026-11-07, #1454) inside `SPARK_MEMORY_CAP`:
+steady anonymous PSS + file PSS + context-phase consumption, subtracting
+context-phase file PSS growth to avoid overlap. The worker's live admission
+checks future allocations against `MemAvailable`, so it does not charge that
+already-resident process/context a second time. The historical 109,760,512-B
+unattributed startup remainder is not an owner and is not charged.
+Arena driver metadata is a workspace owner, not a replaceable reserve:
+48 B per 4096-B page (40 B vmalloc metadata + 8 B secondary page tables).
+This is calibrated from real-worker kernel fields at 40.508, 75.059 and
+103.652 GiB (zero-intercept fits 10.052338 + 1.949590 MiB/GiB).
+Source attributes 16 B/page to `nvidia_pte_t` and 8 B/page to the retained DMA
+page array; 16 B/page of vmalloc remains unattributed. Neither the fit's
+intercept nor whole-host reclaim residuals are charged as fixed allowances.
+Driver bytes survive `SPARK_RESERVE`, including zero. Ring, workspace,
+validation and upload owners also stay separate and are charged once.
 Sizes take `B`, `MB`, `GB`, `MiB` or `GiB` (a bare number is bytes); there are no percentages.
 Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`, ...).
 
@@ -128,9 +144,9 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `KV_MIN_TOKENS` | the serving context; at least 256K on Spark-free layouts | positive count | Refuse the launch below this; missing the target is fine down to it. With Sparks an automatic context may be clamped to the pool. |
 | `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
 | `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
-| `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark ceiling (worker allocation ceiling and routed-weight budget); the cap is what leaves room for the OS. |
+| `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark engine ceiling, including worker process residency and routed weights; the outside-cap gap leaves room for OS/services. |
 | `GPU_RESERVE` | auto | size | Sets the total GPU reserve; every built-in GPU reserve component becomes 0. Still inside the cap. |
-| `SPARK_RESERVE` | auto | size | Same as `GPU_RESERVE`, for Sparks. |
+| `SPARK_RESERVE` | auto | size | Replaces Spark reserve components, not arena driver metadata or actual ring/workspace/staging owners; these survive even a zero override. |
 | `FAMILY_RESERVE` | per-family constant (0; GLM 5.3 Flash 2 GiB until #1442) | size | A named per-GPU reserve added to the measured components; `GPU_RESERVE` overrides it. One key for coordinator GPUs only: no family keeps a per-family Spark margin (Sparks use `SPARK_RESERVE`). |
 | `KV_POOL_TOKENS` | unset | multiple of 64 | V4.1 only: fixed KV pool. Conflicts with `POOL_TOKENS`. |
 | `KV_POOL_SIZE` | unset | `B/MB/GB/MiB/GiB` | V4.1 only: fixed KV pool size. |

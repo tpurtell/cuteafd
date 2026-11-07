@@ -287,7 +287,7 @@ mod tests {
                 Item::new(Category::Kv, "records", "", 20 << 30, Basis::Formula)] };
         let spark = DeviceLayout { kind: Kind::Spark, index: 0, capacity_bytes: 121 << 30, worker_budget_bytes: 108 << 30,
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed", "", 90 << 30, Basis::Exact),
-                cuteafd_core::memory_layout::spark_runtime_residual()] };
+                cuteafd_core::memory_layout::spark_worker_process_resident_item()] };
         let layout = MemoryLayout { devices: vec![gpu, spark], pool_tokens: 1 << 20, waste: vec![], notes: vec![] };
         let lines = MemoryPolicy { family_reserve: Some(1 << 30), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", 1 << 20, &[96 << 30], 96 << 30));
@@ -300,7 +300,7 @@ mod tests {
         // A Spark's cap is its worker ceiling; its residual is a named component.
         assert!(lines[1].starts_with("spark0: cap 110592MiB; weights 92160MiB"), "{}", lines[1]);
         // Sparks carry no family reserve; the residual is their named component.
-        assert!(lines[1].contains("reserve 2560MiB [Spark runtime residual 2560MiB]"), "{}", lines[1]);
+        assert!(lines[1].contains("reserve 1523MiB [Spark worker process resident 1523MiB]"), "{}", lines[1]);
         let overridden = MemoryPolicy { spark_reserve: Some(3 << 30), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", 1 << 20, &[96 << 30], 96 << 30));
         assert!(overridden[1].contains("(overridden)") && overridden[1].contains("SPARK_RESERVE 3072MiB"), "{}", overridden[1]);

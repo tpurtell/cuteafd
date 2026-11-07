@@ -44,7 +44,7 @@ fn kimi_k2_and_glm_k4_tp6_admit_ring_independently_from_mount_staging() -> Resul
             assert_eq!(ring, 134_217_728);
             assert!(ring > budget.pinned_host_bytes);
             let plan = RankPlan::new(&catalog, &[1], 6, rank, budget.resident_bytes)?;
-            let headroom = usize::try_from(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES)?;
+            let headroom = usize::try_from(cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(plan.layout.bytes() as u64))?;
             let peak = plan.layout.bytes() + ring + plan.validation.bytes() + headroom;
             assert_eq!(admit_peak(plan.layout.bytes(), plan.validation.bytes(), budget.read_scratch_bytes,
                 headroom, peak)?, peak);
@@ -70,7 +70,7 @@ fn installed_tp6_admission() -> Result<usize> {
         let pinned = budgets.iter().map(|budget| budget.pinned_host_bytes).max().unwrap();
         let scratch = budgets.iter().map(|budget| budget.read_scratch_bytes).max().unwrap();
         let plan = RankPlan::new(&catalog, &layers, 6, rank, resident)?;
-        let headroom = usize::try_from(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES)?;
+        let headroom = usize::try_from(cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(plan.layout.bytes() as u64))?;
         let peak = plan.layout.bytes() + DEFAULT_SLOTS * DEFAULT_SLOT_BYTES + plan.validation.bytes() + headroom;
         assert_eq!(admit_peak(plan.layout.bytes(), plan.validation.bytes(), scratch, headroom, peak)?, peak);
         assert!(admit_peak(plan.layout.bytes(), plan.validation.bytes(), scratch, headroom, peak - 1).is_err());

@@ -52,7 +52,9 @@ pub fn spark_owner_bytes(extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cu
 pub fn spark_reserve_bytes(waves: u64, unit_rows: u64) -> anyhow::Result<u64> {
     let owners = spark_executions(waves, unit_rows)?.workspace_bytes(spark_owner_bytes)?
         .and_then(|bytes| bytes.total()).ok_or_else(|| anyhow::anyhow!("Kimi Spark owner reserve overflow"))?;
-    Ok(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + owners)
+    cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
+        .and_then(|runtime| runtime.checked_add(owners))
+        .ok_or_else(|| anyhow::anyhow!("Kimi Spark runtime reserve overflow"))
 }
 
 /// Target taps for one prefill call (`rows` lane rows) while the common MLA

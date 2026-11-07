@@ -113,7 +113,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "EXLR8 admission exceeds budget: load {} serve {} budget {}",
         peak.load_peak, peak.serve_peak, config.device_budget);
-    admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
+    admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
     if let Some(stream) = push {
         if let Some(weights) = super::push_exlr8::load(library, config, &plans, &budgets,
             resident, workspace, retained_host, descriptors, stream)? {
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn exlr8_load_order_starts_after_peak_admission() {
         let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
-        let admission = source.find("admit_worker_peak(library, peak.load_peak, peak.serve_peak)?").unwrap();
+        let admission = source.find("admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?").unwrap();
         let order = source.find("crate::shared::experts::load_in_rank_order(&layers, config.rank").unwrap();
         let take = source.find("plans[index].take()").unwrap();
         let upload = source.find("Exlr8Weights::load(library, plan, remaining - workspace)?").unwrap();

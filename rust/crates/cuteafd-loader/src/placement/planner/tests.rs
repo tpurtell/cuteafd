@@ -1599,6 +1599,33 @@ fn pool_pins_are_exact_and_context_is_never_clamped() {
 }
 
 #[test]
+fn full_context_refusal_prices_best_feasible_assignment_not_pruned_alternative() {
+    let mut contract = Linear::new().prepare(&request()).unwrap();
+    let variable = add_profile(&mut contract, vec![0], vec![0], vec![0, 1], &[0, 64]);
+    let mut remote = allocation("remote.experts", 1000);
+    remote.location = Location { device: Device::Spark(0), domain: Domain::Device };
+    let mut component = Component::allocation(remote, ByteCurve::fixed(1000, contract.maximum_pages),
+        false, contract.maximum_pages);
+    component.activation = Activation::choice(variable, 0);
+    contract.components.push(component);
+    let mut spark = budget(100);
+    spark.id = "spark0".into();
+    spark.locations = vec![Location { device: Device::Spark(0), domain: Domain::Device }];
+    let refusal = solve(Request { context: 256, ..request() }, vec![budget(192), spark],
+        &Prepared(contract)).unwrap_err();
+    let Refusal::FullContextShortfall { tokens, limiting, .. } = refusal else {
+        panic!("expected full-context refusal");
+    };
+    assert_eq!(tokens, 128);
+    let Refusal::Capacity { budget, required, available, owners, .. } = *limiting else {
+        panic!("expected capacity witness");
+    };
+    assert_eq!((budget.as_str(), required, available), ("gpu", 256, 192));
+    assert!(!owners.is_empty(), "refusal must retain evaluated owner names");
+    assert!(!owners.iter().any(|owner| owner.contains("remote.experts")));
+}
+
+#[test]
 fn automatic_target_uses_physical_card_not_logical_cap() {
     let recipe = Linear::new();
     let mut card = budget(96 << 30);

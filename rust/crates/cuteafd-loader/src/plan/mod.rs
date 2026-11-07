@@ -883,7 +883,11 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
         cache.state_slots = u32::try_from(options.state_slots.unwrap_or(cuteafd_core::concurrency::state_slots(concurrency)))?;
     }
     match model.placement(input, report, options, requested) {
-        Some(Ok(memory)) => {
+        Some(Ok(mut memory)) => {
+            for device in &mut memory.devices {
+                cuteafd_core::memory_layout::charge_spark_runtime(device)
+                    .ok_or_else(|| anyhow::anyhow!("Spark arena reserve overflow"))?;
+            }
             report.native_serving_admitted = model.native_serving_admission();
             Ok(memory)
         },

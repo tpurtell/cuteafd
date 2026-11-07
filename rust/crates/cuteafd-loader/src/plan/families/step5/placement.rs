@@ -335,7 +335,7 @@ pub(super) fn layout(
                     assignment.resident_bytes,
                     Basis::Exact,
                 ),
-                cuteafd_core::memory_layout::spark_runtime_residual(),
+                cuteafd_core::memory_layout::spark_worker_process_resident_item(),
             ],
         };
         for (group, bytes) in [

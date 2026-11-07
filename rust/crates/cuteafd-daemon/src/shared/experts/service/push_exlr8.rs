@@ -23,7 +23,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, config: &NativeExpertServiceC
         ensure!(checked.plan.files.iter().all(|file|
             cuteafd_loader::push_load::is_push_shard(&root.join(file))), "EXLR8 push source is not a SparkNest shard");
         // Original plans stay alive until the group commits or drains.
-        let headroom = super::spark_runtime_headroom()?;
+        let headroom = super::spark_runtime_headroom(config, cuteafd_core::expert_geometry(), plan.layout.bytes())?;
         let extra = workspace.checked_add(retained_host.checked_mul(2).ok_or_else(||
             anyhow::anyhow!("EXLR8 retained host overflow"))?)
             .and_then(|n| n.checked_add(descriptors))

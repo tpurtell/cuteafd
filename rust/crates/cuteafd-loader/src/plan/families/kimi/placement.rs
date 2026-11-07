@@ -378,13 +378,20 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Check the routed EXL3 arena costs."); return memory; }
     };
     let mut spark = Vec::new();
+    let runtime = cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
+        .expect("zero-arena reserve cannot overflow");
     for rank in 0..ranks {
+        let Some(owners) = spark_budget.overhead[rank].checked_sub(runtime) else {
+            report.refuse_placement("Spark overhead excludes startup reserve".into(),
+                "Keep actual owners separate from the replaceable startup reserve.");
+            return memory;
+        };
         for &count in &counts {
-            // The rank's runtime residual stays charged at every count; the
-            // expert suffix is empty only when every routed layer is onboarded.
+            let active = count < spark_budget.layers.len();
             spark.push(SparkOwner { count, rank,
                 experts: spark_budget.resident[rank][count..].iter().sum(),
-                overhead: spark_budget.overhead[rank] });
+                runtime: if active { runtime } else { 0 },
+                overhead: if active { owners } else { 0 } });
         }
     }
     let mut fixed_owners = fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();

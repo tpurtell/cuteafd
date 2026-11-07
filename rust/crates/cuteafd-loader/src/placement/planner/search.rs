@@ -863,7 +863,25 @@ pub fn solve(
     if pages < minimum {
         // Reuse this search's validated facts and domains; never publish a
         // reduced-context plan or rebuild the family recipe with another context.
-        search.feasible(domains.clone(), pages + multiple)?;
+        if pages > 0 {
+            let mut best = None;
+            search.complete(domains.clone(), pages, &mut best)?;
+            let (_, assignment) = best.ok_or_else(|| search.last.clone())?;
+            // A pruning failure can describe a rejected alternative. Reprice
+            // the best feasible layout at its first infeasible pool page.
+            let next = pages + multiple;
+            let facts = contract.facts(&assignment, next)?;
+            search.last = match evaluate(&facts, &budgets) {
+                Err(error) => error,
+                Ok(_) => {
+                    let fixed: Vec<_> = assignment.into_iter().map(|option| vec![option]).collect();
+                    costs.capacity(&costs.lower_bound(&fixed, next, next)?, &budgets)
+                        .err().ok_or_else(|| Refusal::InvalidFact("pool above maximum is feasible".into()))?
+                }
+            };
+        } else {
+            search.feasible(domains.clone(), pages + multiple)?;
+        }
         if !matches!(search.last, Refusal::Capacity { .. }) {
             return Err(search.last);
         }

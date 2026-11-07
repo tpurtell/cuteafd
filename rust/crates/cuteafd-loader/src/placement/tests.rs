@@ -1760,7 +1760,18 @@ fn spark_budget_feeds_existing_tp2_pool_first_and_mark_selection() {
     req.fixed = marks.iter().cloned().map(|mut demand| { demand.bytes *= 4; demand }).collect();
     let budget = SparkBudgetInventory { layers: vec![0, 1, 2, 3],
         resident: vec![vec![GIB; 4], vec![GIB, GIB, 2 * GIB, GIB]],
-        overhead: vec![GIB; 2], budget: 4 * GIB };
+        overhead: vec![GIB; 2], budget: 4 * GIB
+            + cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(3 * GIB) };
+    assert_eq!(budget.rank_bytes(1, 2).unwrap(), budget.budget);
+    for reserve in [0, 7] {
+        cuteafd_core::memory_policy::MemoryPolicy { spark_reserve: Some(reserve), ..Default::default() }.scoped(|| {
+            // The inventory's overhead already contains the selected reserve;
+            // changing policy must never discard the separate arena metadata.
+            assert_eq!(budget.rank_bytes(1, 2).unwrap(), budget.budget);
+        });
+    }
+    assert_eq!(budget.rank_bytes(1, 3).unwrap(), 2 * GIB
+        + cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(GIB));
     assert_eq!(budget.minimum_rtx_layers().unwrap(), 2); // The asymmetric rank is binding.
     budget.constrain(&mut req).unwrap();
     assert_eq!(req.minimum_expert_layers, 2);

@@ -136,16 +136,97 @@ pub struct Item {
     pub lifetime: ItemLifetime,
 }
 
-/// Shared allowance for unclassified Spark runtime growth, not an exact owner.
-/// Source: V4.1 min/max seven-rank system/cgroup census at 0a6fc7b1;
-/// maximum measured residual 2,083,518,960 B plus margin, attribution pending #388.
-pub const SPARK_RUNTIME_RESIDUAL_BYTES: u64 = 5 * (1 << 29);
-pub const SPARK_RUNTIME_RESIDUAL_GROUP: &str = "Spark runtime residual";
-pub const SPARK_RUNTIME_RESIDUAL_SOURCE: &str = "V4.1 min/max seven-rank system/cgroup census at 0a6fc7b1; maximum measured residual 2,083,518,960 B plus margin; shared cross-family estimate, attribution pending #388";
+/// A worker-process census, separate from future arena and execution owners.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkWorkerProcessResident {
+    pub arch: &'static str,
+    pub anonymous_pss_bytes: u64,
+    pub file_pss_bytes: u64,
+    pub context_phase_bytes: u64,
+    pub context_file_pss_growth_bytes: u64,
+    pub driver: &'static str,
+    pub source: &'static str,
+}
 
-pub fn spark_runtime_residual() -> Item {
-    Item::new(Category::Runtime, SPARK_RUNTIME_RESIDUAL_GROUP, "",
-        SPARK_RUNTIME_RESIDUAL_BYTES, Basis::Estimated).with_lifetime(ItemLifetime::ReadyResident)
+impl SparkWorkerProcessResident {
+    pub const fn bytes(self) -> u64 {
+        self.anonymous_pss_bytes + self.file_pss_bytes + self.context_phase_bytes
+            - self.context_file_pss_growth_bytes
+    }
+}
+
+/// Spark plans target GB10/SM121, independently of the coordinator/host arch.
+/// No x86 worker-process census has been established by this measurement.
+pub const SPARK_WORKER_PROCESS_RESIDENT: &[SparkWorkerProcessResident] = &[
+    SparkWorkerProcessResident { arch: "sm_121", anonymous_pss_bytes: 1_199_439_872,
+        file_pss_bytes: 221_833_216, context_phase_bytes: 230_191_104,
+        context_file_pss_growth_bytes: 54_857_728, driver: "580.178.04",
+        source: "moa actual Kimi TP6 worker 2026-11-07, serve_owners_before_endpoint_rings; context MemAvailable delta less overlapping file PSS growth; #1454" },
+];
+pub const SPARK_WORKER_PROCESS_RESIDENT_BYTES: u64 = SPARK_WORKER_PROCESS_RESIDENT[0].bytes();
+pub const SPARK_WORKER_PROCESS_RESIDENT_GROUP: &str = "Spark worker process resident";
+pub const SPARK_WORKER_PROCESS_RESIDENT_SOURCE: &str = SPARK_WORKER_PROCESS_RESIDENT[0].source;
+pub const SPARK_ARENA_DRIVER_OVERHEAD_GROUP: &str = "driver page tables";
+pub const SPARK_ARENA_DRIVER_OVERHEAD_SOURCE: &str = "moa ARM/SM121 driver 580.178.04 actual-worker 40.508/75.059/103.652-GiB arenas, 2026-11-07 #1454: zero-intercept VmallocUsed fit 10.052338 MiB/GiB and SecPageTables 1.949590 MiB/GiB, calibrated to 40+8 B/page; nvidia_pte_t 16 B/page and nv_dma pages[] 8 B/page source-known, remaining vmalloc 16 B/page unattributed; no fitted intercept or maximum envelope";
+
+/// Kernel-field calibration: 40 B/page vmalloc metadata plus 8 B/page secondary
+/// tables. The whole-host reclaim delta is noisy and is not a fixed allowance.
+pub fn spark_arena_driver_overhead_bytes(resident: u64) -> u64 {
+    (u128::from(resident).div_ceil(4096) * 48) as u64
+}
+
+pub fn calibrated_kimi_spark(selected: Option<(crate::ExpertGeometry, usize, u32)>) -> bool {
+    matches!(selected, Some((geometry, 6, compiled))
+        if geometry == crate::ExpertGeometry::KIMI_K3 && compiled <= 1024)
+}
+
+/// Coordinator ownership inside SPARK_MEMORY_CAP. SPARK_RESERVE replaces the
+/// process reserve, never arena metadata or actual staging/workspace owners.
+pub fn spark_runtime_reserve_bytes(resident: u64) -> Option<u64> {
+    crate::memory_policy::MemoryPolicy::current().spark_reserve
+        .unwrap_or(SPARK_WORKER_PROCESS_RESIDENT_BYTES)
+        .checked_add(spark_arena_driver_overhead_bytes(resident))
+}
+
+/// Future allocations only: the worker process/context already reduced the
+/// live MemAvailable sample. An explicit reserve remains future headroom.
+pub fn spark_worker_future_bytes(selected: Option<(crate::ExpertGeometry, usize, u32)>, resident: u64) -> Option<u64> {
+    crate::memory_policy::MemoryPolicy::current().spark_reserve.unwrap_or(0)
+        .checked_add(spark_arena_driver_overhead_bytes(resident))?
+        .checked_add(if calibrated_kimi_spark(selected) { 4096 } else { 0 })
+}
+
+pub fn spark_runtime_bytes(selected: Option<(crate::ExpertGeometry, usize, u32)>, resident: u64) -> Option<u64> {
+    spark_runtime_reserve_bytes(resident)?.checked_add(if calibrated_kimi_spark(selected) { 4096 } else { 0 })
+}
+
+pub fn spark_runtime_reserve_group() -> &'static str {
+    if crate::memory_policy::MemoryPolicy::current().spark_reserve.is_some() { "SPARK_RESERVE" }
+    else { SPARK_WORKER_PROCESS_RESIDENT_GROUP }
+}
+
+pub fn spark_worker_process_resident_item() -> Item {
+    Item::new(Category::Runtime, SPARK_WORKER_PROCESS_RESIDENT_GROUP, "",
+        SPARK_WORKER_PROCESS_RESIDENT_BYTES, Basis::Calibrated).with_lifetime(ItemLifetime::ReadyResident)
+}
+
+/// Rebuild shared reserves from payload bytes, never from a prior reserve.
+/// Exact I/O, workspace and upload owners are intentionally not removed.
+pub fn charge_spark_runtime(device: &mut DeviceLayout) -> Option<()> {
+    if device.kind != DeviceKind::Spark { return Some(()); }
+    let resident = device.items.iter().filter(|item| item.category == Category::Experts)
+        .try_fold(0u64, |sum, item| sum.checked_add(item.bytes))?;
+    device.items.retain(|item| !matches!(item.group.as_str(), "Spark runtime residual" | "SPARK_RESERVE")
+        && item.group != SPARK_WORKER_PROCESS_RESIDENT_GROUP && item.group != SPARK_ARENA_DRIVER_OVERHEAD_GROUP);
+    if resident == 0 { return Some(()); }
+    if let Some(bytes) = crate::memory_policy::MemoryPolicy::current().spark_reserve {
+        device.items.push(Item::new(Category::Runtime, "SPARK_RESERVE", "", bytes, Basis::Formula));
+    } else {
+        device.items.push(spark_worker_process_resident_item());
+    }
+    device.items.push(Item::new(Category::Workspace, SPARK_ARENA_DRIVER_OVERHEAD_GROUP, "",
+        spark_arena_driver_overhead_bytes(resident), Basis::Calibrated));
+    Some(())
 }
 
 impl Item {
@@ -402,13 +483,59 @@ mod tests {
     }
 
     #[test]
-    fn spark_residual_is_estimated_ready_resident_with_census_provenance() {
-        let item = spark_runtime_residual();
-        assert_eq!(item.bytes, 2_684_354_560);
-        assert!(item.bytes > 2_083_518_960);
-        assert_eq!(item.basis, Basis::Estimated);
+    fn spark_arena_measured_terms_and_reserve_override_preserve_payload_owners() {
+        assert_eq!(spark_arena_driver_overhead_bytes(1 << 30), 12 << 20);
+        assert_eq!(spark_arena_driver_overhead_bytes(117_692_170_240), 1_379_205_120);
+        assert_eq!(spark_arena_driver_overhead_bytes(0), 0);
+        assert_eq!(spark_arena_driver_overhead_bytes(1), 48);
+        assert_eq!(spark_arena_driver_overhead_bytes(u64::MAX), 216_172_782_113_783_808);
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 << 30,
+            worker_budget_bytes: 110 << 30, kv_tokens: 0, items: vec![
+                Item::new(Category::Experts, "arena", "", 64 << 30, Basis::Exact),
+                Item::new(Category::Transport, "ring", "", 128 << 20, Basis::Exact),
+                Item::new(Category::Staging, "upload", "", 4096, Basis::Exact)] };
+        charge_spark_runtime(&mut device).unwrap();
+        let first = device.clone();
+        charge_spark_runtime(&mut device).unwrap();
+        assert_eq!(device, first);
+        crate::memory_policy::MemoryPolicy { spark_reserve: Some(7), ..Default::default() }.scoped(|| {
+            charge_spark_runtime(&mut device).unwrap();
+            assert_eq!(spark_runtime_reserve_bytes(64 << 30), Some(7 + spark_arena_driver_overhead_bytes(64 << 30)));
+            assert_eq!(device.items.len(), 5);
+            assert_eq!(device.items.iter().find(|item| item.group == "ring").unwrap().bytes, 128 << 20);
+            assert_eq!(device.items.iter().find(|item| item.group == "upload").unwrap().bytes, 4096);
+            assert_eq!(device.items.iter().find(|item| item.group == "SPARK_RESERVE").unwrap().bytes, 7);
+        });
+    }
+
+    #[test]
+    fn spark_process_census_is_named_ready_resident_and_not_worker_future_headroom() {
+        let item = spark_worker_process_resident_item();
+        assert_eq!(item.bytes, 1_596_606_464);
+        assert_eq!(SPARK_WORKER_PROCESS_RESIDENT[0].arch, "sm_121");
+        assert_eq!(SPARK_WORKER_PROCESS_RESIDENT[0].bytes(), item.bytes);
+        assert_eq!(item.basis, Basis::Calibrated);
+        let selected = Some((crate::ExpertGeometry::KIMI_K3, 6, 1024));
+        let resident = 64 << 30;
+        assert_eq!(spark_runtime_bytes(selected, resident).unwrap()
+            - spark_worker_future_bytes(selected, resident).unwrap(), item.bytes);
+        for reserve in [0, 7] {
+            crate::memory_policy::MemoryPolicy { spark_reserve: Some(reserve), ..Default::default() }.scoped(|| {
+                assert_eq!(spark_worker_future_bytes(selected, resident),
+                    Some(spark_arena_driver_overhead_bytes(resident) + reserve + 4096));
+                assert_eq!(spark_runtime_bytes(selected, resident), spark_worker_future_bytes(selected, resident));
+                let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 << 30,
+                    worker_budget_bytes: 110 << 30, kv_tokens: 0, items: vec![
+                        Item::new(Category::Experts, "arena", "", resident, Basis::Exact)] };
+                charge_spark_runtime(&mut device).unwrap();
+                let driver = device.items.iter().find(|item| item.group == SPARK_ARENA_DRIVER_OVERHEAD_GROUP).unwrap();
+                assert_eq!(driver.bytes, spark_arena_driver_overhead_bytes(resident));
+                assert_eq!(driver.category, Category::Workspace);
+                assert!(!device.items.iter().any(|item| item.group == SPARK_WORKER_PROCESS_RESIDENT_GROUP));
+            });
+        }
         assert_eq!(item.lifetime, ItemLifetime::ReadyResident);
-        assert!(SPARK_RUNTIME_RESIDUAL_SOURCE.contains("0a6fc7b1"));
+        assert!(SPARK_WORKER_PROCESS_RESIDENT_SOURCE.contains("2026-11-07"));
         let encoded = serde_json::to_value(&item).unwrap();
         assert_eq!(encoded["lifetime"], "ready_resident");
         assert_eq!(serde_json::from_value::<Item>(encoded).unwrap(), item);

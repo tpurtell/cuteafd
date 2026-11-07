@@ -718,11 +718,18 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         }
     }
     let mut spark = Vec::new();
+    let runtime = cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
+        .context("Spark reserve overflow")?;
     if let Some(budget) = &spark_budget {
         for rank in 0..budget.resident.len() {
+            let owners = budget.overhead[rank].checked_sub(runtime)
+                .context("Spark overhead excludes startup reserve")?;
             for &count in &counts {
+                let active = count < budget.layers.len();
                 spark.push(SparkOwner { count, rank,
-                    experts: budget.resident[rank][count..].iter().sum(), overhead: budget.overhead[rank] });
+                    experts: budget.resident[rank][count..].iter().sum(),
+                    runtime: if active { runtime } else { 0 },
+                    overhead: if active { owners } else { 0 } });
             }
         }
     }
@@ -1232,7 +1239,8 @@ pub(super) mod tests {
             spark_budget: Some(SparkBudgetInventory {
                 layers: cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(),
                 resident: vec![vec![0; cfg.dense.iter().filter(|dense| !**dense).count()]; 6],
-                overhead: vec![0; 6], budget: 112 << 30,
+                overhead: vec![cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0).unwrap(); 6],
+                budget: 112 << 30,
             }), draft: None, verify_rows: 0, prefix: None }
     }
 
@@ -1716,8 +1724,9 @@ pub(super) mod tests {
             let mut i = inputs(&cfg);
             i.rtx = Some(RtxInventory { package: "not-loaded".into(), costs: vec![vec![Bytes2 {
                 resident: 1024 * 1024, staging: 4096 }; 2]; cfg.layers], workspace: 8192, layers: selection });
+            let runtime = cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0).unwrap();
             i.spark_budget = Some(SparkBudgetInventory { layers: vec![1, 2, 3, 4],
-                resident: vec![vec![100; 4]; 6], overhead: vec![50; 6], budget: 250 });
+                resident: vec![vec![100; 4]; 6], overhead: vec![runtime + 50; 6], budget: runtime + 253 });
             i
         };
         let admitted = admit(make(Onboard::Auto))?;

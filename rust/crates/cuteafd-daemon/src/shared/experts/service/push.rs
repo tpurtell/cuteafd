@@ -23,7 +23,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         let host_budget = budgets.iter().map(|b| b.read_scratch_bytes).max().unwrap_or(0);
         let available = library.cuda_allocatable_memory_info()
             .context("query Spark push allocatable memory for admission")?.0;
-        let headroom = super::spark_runtime_headroom()?;
+        let headroom = super::spark_runtime_headroom(config, cuteafd_core::expert_geometry(), plan.layout.bytes())?;
         let peak = admit_peak(plan.layout.bytes(), plan.validation.bytes(), host_budget,
             headroom, available)?;
         tracing::info!(rank = config.rank, resident_bytes = plan.layout.bytes(),

@@ -29,7 +29,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         let checked = plan.checked(catalog, &root, config.world, config.rank)?;
         ensure!(checked.plan.files.iter().all(|file| cuteafd_loader::push_load::is_push_shard(&root.join(file))),
             "native push source is not a SparkNest shard");
-        let headroom = super::spark_runtime_headroom()?;
+        let headroom = super::spark_runtime_headroom(config, cuteafd_core::expert_geometry(), plan.layout.bytes())?;
         let peak = admit_peak(plan.layout.bytes(), plan.scratch, plan.host_scratch, headroom,
             library.cuda_allocatable_memory_info()?.0)?;
         ensure!(plan.layout.bytes().checked_add(plan.scratch).is_some_and(|n| n <= config.device_budget),

@@ -467,9 +467,9 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
         .ok_or(crate::placement::PlacementError::Overflow("Spark legacy I/O"))?;
     device.items.retain(|item| !matches!(item.group.as_str(), "expert waves" | "expert intake"
         | "host expert exchange" | "expert row indices" | "endpoint response prefixes" | "rdma rings")
-        && item.group != cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP);
+        && item.group != cuteafd_core::memory_layout::SPARK_WORKER_PROCESS_RESIDENT_GROUP);
     if working.selected_ranks().contains(&rank) {
-        device.items.push(cuteafd_core::memory_layout::spark_runtime_residual());
+        device.items.push(cuteafd_core::memory_layout::spark_worker_process_resident_item());
         device.items.push(Item::new(Category::Workspace, "expert waves", "non-I/O residual",
             wave_allowance.saturating_sub(legacy_io), Basis::Calibrated));
         device.items.push(Item::new(Category::Workspace, "expert intake", if bf16 { "BF16" } else { "FP8 K32" },
@@ -524,11 +524,11 @@ mod selected_spark_io_tests {
             charge_spark_io(&mut device, &working, geometry, 4096, false, rings, GIB).unwrap();
             assert_eq!(device.items.iter().find(|item| item.group == "rdma rings").unwrap().bytes, expected);
             let residual = device.items.iter().find(|item|
-                item.group == cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP).unwrap();
-            assert_eq!(residual.bytes, 5 * (1 << 29));
-            assert_eq!(residual.basis, Basis::Estimated);
+                item.group == cuteafd_core::memory_layout::SPARK_WORKER_PROCESS_RESIDENT_GROUP).unwrap();
+            assert_eq!(residual.bytes, cuteafd_core::memory_layout::SPARK_WORKER_PROCESS_RESIDENT_BYTES);
+            assert_eq!(residual.basis, Basis::Calibrated);
             assert_eq!(residual.lifetime, cuteafd_core::memory_layout::ItemLifetime::ReadyResident);
-            assert!(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_SOURCE.contains("0a6fc7b1"));
+            assert!(cuteafd_core::memory_layout::SPARK_WORKER_PROCESS_RESIDENT_SOURCE.contains("2026-11-07"));
         }
     }
 
@@ -621,7 +621,7 @@ mod selected_spark_io_tests {
             let prefill = slot - (4096 - unit) * row_bytes;
             let decode = 51 * (1 << 20) + 64 * row_bytes + 64 * 16 * 8;
             assert_eq!(reserve, prefill + decode + unit * waves * 16 * 8
-                + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
+                + cuteafd_core::memory_layout::SPARK_WORKER_PROCESS_RESIDENT_BYTES);
             let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
                 prefill_lanes: 1, ..Default::default() };
             let rings = spark_ring_geometry(1);

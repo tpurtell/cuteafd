@@ -51,7 +51,7 @@ pub(super) fn load<'a>(
         );
         // Execution scratch is allocated only after the weight transaction completes.
         let available = library.cuda_allocatable_memory_info()?.0;
-        let headroom = super::spark_runtime_headroom()?;
+        let headroom = super::spark_runtime_headroom(config, cuteafd_core::expert_geometry(), plan.layout.bytes())?;
         let peak = super::push::admit_peak(
             plan.layout.bytes(),
             plan.host_scratch,

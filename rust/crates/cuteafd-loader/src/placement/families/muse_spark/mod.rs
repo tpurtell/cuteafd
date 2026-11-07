@@ -363,7 +363,8 @@ pub fn spark_executions(waves: u64, unit_rows: u64) -> Result<cuteafd_core::Spar
 pub fn spark_reserve_bytes(world: usize, waves: u64, unit_rows: u64) -> Result<u64> {
     let owners = spark_executions(waves, unit_rows)?.workspace_bytes(|extent| owner_bytes(world, extent))?
         .and_then(|bytes| bytes.total()).context("Muse Spark owner reserve overflow")?;
-    Ok(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + owners)
+    cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
+        .and_then(|bytes| bytes.checked_add(owners)).context("Muse Spark reserve overflow")
 }
 
 pub fn owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent) -> Result<cuteafd_core::OwnerBytes> {

@@ -144,6 +144,7 @@ pub struct SparkOwner {
     pub rank: usize,
     pub experts: u64,
     pub overhead: u64,
+    pub runtime: u64,
 }
 
 /// One drafter owner whose extent grows with the retained pool.
@@ -755,14 +756,17 @@ impl Recipe for KimiRecipe {
         for spark in &self.spark {
             let activation = if self.experts.is_none() && spark.count == 0 { Activation::always() }
                 else { let choice = option(spark.count)?; Activation::choice(choice.variable, choice.option) };
-            for (owner_kind, group, bytes) in [
-                ("experts", "routed experts (balanced H128, replicated 3584 rotations)", spark.experts),
-                ("overhead", "Spark rank I/O and estimated runtime residual", spark.overhead),
+            for (owner_kind, group, bytes, category) in [
+                ("experts", "routed experts (balanced H128, replicated 3584 rotations)", spark.experts, Category::Experts),
+                ("overhead", "Spark rank I/O and execution owners", spark.overhead, Category::Workspace),
+                ("startup", cuteafd_core::memory_layout::spark_runtime_reserve_group(), spark.runtime, Category::Runtime),
+                ("arena-growth", cuteafd_core::memory_layout::SPARK_ARENA_DRIVER_OVERHEAD_GROUP,
+                    cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(spark.experts), Category::Workspace),
             ] {
                 if bytes == 0 { continue; }
                 let owner = Allocation::buffer(format!("spark.{}.{owner_kind}.{}", spark.rank, spark.count),
                     Location { device: Device::Spark(spark.rank as u8), domain: Domain::Managed },
-                    bytes, Lifetime::RESIDENT, Category::Experts, group);
+                    bytes, Lifetime::RESIDENT, category, group);
                 let mut component = Component::allocation(owner,
                     ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages);
                 component.activation = activation.clone();
@@ -1154,8 +1158,8 @@ mod tests {
             counts: vec![0, 1, 2], rank_sets: vec![vec![0]] });
         recipe.arenas.push(Arena { count: 2, peak: vec![2000], resident: vec![2000], weights: vec![1800] });
         recipe.spark = vec![
-            SparkOwner { count: 0, rank: 0, experts: 200, overhead: 0 },
-            SparkOwner { count: 1, rank: 0, experts: 100, overhead: 0 },
+            SparkOwner { count: 0, rank: 0, experts: 200, overhead: 0, runtime: 0 },
+            SparkOwner { count: 1, rank: 0, experts: 100, overhead: 0, runtime: 0 },
         ];
         let budgets = budgets(&[(1 << 30, 1 << 30)], 0, &[0], &[150]).unwrap();
         let admitted = recipe.admit(single(), budgets).unwrap();

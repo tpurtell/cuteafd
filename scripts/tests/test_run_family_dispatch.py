@@ -2834,11 +2834,14 @@ MEMORY_POLICY_KEYS = {
 }
 
 
-@pytest.mark.parametrize("family", ["glm5_flash", "glm5", "mimo_v2", "deepseek_v4", "qwen4"])
+@pytest.mark.parametrize("family", ["glm5_flash", "glm5", "mimo_v2", "deepseek_v4", "qwen4", "kimi_k3"])
 def test_every_memory_policy_key_reaches_the_plan_and_the_serve_argv(tmp_path, family):
     config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
               if family == "glm5" else {"model_type": "deepseek_v4"}
-              if family == "deepseek_v4" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
+              if family == "deepseek_v4" else {"model_type": "kimi_k3", "text_config": {
+                  "model_type": "kimi_linear", "num_hidden_layers": 93,
+                  "first_k_dense_replace": 1, "moe_layer_freq": 1}}
+              if family == "kimi_k3" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
     keys = "RTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + "".join(
         f"{key}={value}\n" for key, (_, value) in MEMORY_POLICY_KEYS.items())
     result = _family_launch_result(tmp_path, config, "test/model", keys)
