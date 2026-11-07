@@ -164,6 +164,20 @@ fn host_high_water_bytes(status: &str) -> Result<u64> {
 #[cfg(test)]
 mod startup_probe_tests {
     #[test]
+    fn phase_deltas_preserve_signed_unclassified_growth() -> anyhow::Result<()> {
+        use super::StartupPhaseSample;
+        let before = StartupPhaseSample { total: 1000, free: 900, tracked: 50 };
+        let allocated = StartupPhaseSample { total: 1000, free: 500, tracked: 350 };
+        assert_eq!(allocated.delta(before)?, (400, 300, 100));
+        assert_eq!(before.delta(allocated)?, (-400, -300, -100));
+        let freed = StartupPhaseSample { total: 1000, free: 950, tracked: 0 };
+        assert_eq!(freed.delta(before)?, (-50, -50, 0));
+        assert!(StartupPhaseSample { total: 999, ..before }.delta(before).is_err());
+        assert!(StartupPhaseSample { free: 1001, ..before }.delta(before).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn host_high_water_uses_kernel_kib_units_and_rejects_bad_status() {
         assert_eq!(super::host_high_water_bytes("Name:\tcuteafd\nVmHWM:\t1234 kB\nVmRSS:\t1 kB\n").unwrap(), 1_263_616);
         for status in ["", "VmHWM: 1 B", "VmHWM: -1 kB", "VmHWM: 18446744073709551615 kB"] {
@@ -260,6 +274,111 @@ pub(crate) fn startup_probe(library: &NativeLibrary, devices: &[i32], stage: &st
     })();
     library.cuda_set_device(current)?;
     result
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+struct StartupPhaseSample {
+    total: u64,
+    free: u64,
+    tracked: u64,
+}
+
+impl StartupPhaseSample {
+    fn used(self) -> Result<i64> {
+        i64::try_from(self.total.checked_sub(self.free).context("CUDA free exceeds total")?)
+            .context("CUDA used bytes exceed signed diagnostic range")
+    }
+
+    fn delta(self, before: Self) -> Result<(i64, i64, i64)> {
+        anyhow::ensure!(self.total == before.total, "startup CUDA capacity changed");
+        let used = self.used()? - before.used()?;
+        let tracked = i64::try_from(self.tracked)? - i64::try_from(before.tracked)?;
+        Ok((used, tracked, used - tracked))
+    }
+}
+
+/// Bounded in-process startup observations, never admission owners or a hot-path probe.
+/// Disabled callers do not synchronize, sample CUDA, or snapshot the native ledger.
+pub(crate) struct StartupMemoryPhases<'a> {
+    library: &'a NativeLibrary,
+    devices: Vec<i32>,
+    enabled: bool,
+    previous: Option<(String, Vec<StartupPhaseSample>)>,
+    baseline: Vec<StartupPhaseSample>,
+    native: std::collections::BTreeMap<usize, cuteafd_ffi::memory_ledger::AllocationRecord>,
+    stages: usize,
+}
+
+impl<'a> StartupMemoryPhases<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary, devices: &[i32], enabled: bool) -> Self {
+        Self { library, devices: if enabled { devices.to_vec() } else { Vec::new() }, enabled,
+            previous: None, baseline: Vec::new(), native: Default::default(), stages: 0 }
+    }
+
+    pub(crate) fn enabled(&self) -> bool { self.enabled }
+
+    pub(crate) fn sample(&mut self, stage: &str) -> Result<()> {
+        use cuteafd_ffi::memory_ledger::{self, Space};
+        use serde_json::json;
+        if !self.enabled { return Ok(()); }
+        anyhow::ensure!(self.stages < 64, "startup phase diagnostic exceeded 64 boundaries");
+        let current = self.library.cuda_get_device()?;
+        let result = (|| -> Result<_> {
+            for &device in &self.devices {
+                self.library.cuda_set_device(device)?;
+                self.library.cuda_device_synchronize()?;
+            }
+            let native = memory_ledger::allocations().into_iter()
+                .map(|record| (record.address, record)).collect::<std::collections::BTreeMap<_, _>>();
+            let mut samples = Vec::with_capacity(self.devices.len());
+            for (rank, &device) in self.devices.iter().enumerate() {
+                self.library.cuda_set_device(device)?;
+                let (free, total) = self.library.cuda_physical_memory_info()?;
+                let tracked = native.values().filter(|r| r.key.device == device
+                    && matches!(r.key.space, Space::Device | Space::Managed))
+                    .try_fold(0u64, |sum, r| sum.checked_add(r.bytes as u64).context("startup tracked bytes overflow"))?;
+                let sample = StartupPhaseSample { total: total as u64, free: free as u64, tracked };
+                let (used_delta, tracked_delta, untracked_delta) = self.previous.as_ref()
+                    .map(|(_, samples)| sample.delta(samples[rank])).transpose()?.unwrap_or_default();
+                let baseline = self.baseline.get(rank).copied().unwrap_or(sample);
+                let (_, _, untracked_since_context) = sample.delta(baseline)?;
+                tracing::info!(target: "cuteafd::placement", probe = %json!({
+                    "schema": 3, "kind": "startup-phase", "family": "kimi_k3", "stage": stage,
+                    "index": self.stages, "device": device, "logical_rank": rank,
+                    "previous_stage": self.previous.as_ref().map(|(stage, _)| stage),
+                    "free": sample.free, "total": sample.total, "tracked": tracked,
+                    "used": sample.used()?, "untracked": sample.used()? - i64::try_from(tracked)?,
+                    "used_delta": used_delta, "tracked_delta": tracked_delta,
+                    "untracked_delta": untracked_delta, "untracked_since_context": untracked_since_context,
+                    "cuda_memory_scope": "in-process raw cudaMemGetInfo; no external observer",
+                    "runtime_delta_scope": "signed unclassified observation; not a receipt or automatic allowance",
+                    "ready_authorized_by_probe": false
+                }), "startup memory phase");
+                samples.push(sample);
+            }
+            for (kind, records) in [
+                ("phase-native-removed", self.native.iter().filter(|(address, record)| native.get(*address) != Some(*record))
+                    .map(|(_, record)| record).collect::<Vec<_>>()),
+                ("phase-native-added", native.iter().filter(|(address, record)| self.native.get(*address) != Some(*record))
+                    .map(|(_, record)| record).collect::<Vec<_>>()),
+            ] {
+                for (chunk, records) in records.chunks(64).enumerate() {
+                    tracing::info!(target: "cuteafd::placement", probe = %json!({"schema": 3,
+                        "kind": kind, "family": "kimi_k3", "stage": stage, "index": self.stages,
+                        "offset": chunk * 64, "records": records.iter().map(|r| startup_memory::record(r)).collect::<Vec<_>>()
+                    }), "startup memory phase");
+                }
+            }
+            Ok((samples, native))
+        })();
+        self.library.cuda_set_device(current)?;
+        let (samples, native) = result?;
+        if self.previous.is_none() { self.baseline = samples.clone(); }
+        self.previous = Some((stage.to_owned(), samples));
+        self.native = native;
+        self.stages += 1;
+        Ok(())
+    }
 }
 
 /// Ready code still missing from the current sample, using the same calibrated

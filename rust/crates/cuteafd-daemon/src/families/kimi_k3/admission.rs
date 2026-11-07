@@ -312,7 +312,8 @@ impl<'a> Admission<'a> {
     pub(crate) fn start_and_load<const RANKS: usize>(&mut self, spark: crate::shared::placement::SparkAdmission,
         peers: &[std::net::SocketAddr], devices: [Device<'a>; RANKS], checkpoint: &cuteafd_loader::plan::Checkpoint,
         catalog: &cuteafd_loader::OfficialV41Catalog, streams: [*mut std::ffi::c_void; RANKS],
-        draft_records: crate::shared::experts::rtx::dense::Records)
+        draft_records: crate::shared::experts::rtx::dense::Records,
+        memory: &mut crate::shared::inventory::StartupMemoryPhases<'_>)
         -> Result<(crate::shared::placement::PendingSparkAdmission,
             Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>>, LoadedWeights<'a>)> {
         use crate::shared::experts::rtx::{dense::{self, DenseLoad}, push::{CoordinatorExperts, CoordinatorPush}};
@@ -330,7 +331,7 @@ impl<'a> Admission<'a> {
         let policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&checkpoint.snapshot)?;
         let planned = policy.plan(|| -> Result<_> {
             ensure!(spark.coordinator_pushes(), "Kimi Spark admission did not select required push");
-            let owners = self.record(&devices, checkpoint, &load, &streams)?;
+            let owners = self.record(&devices, checkpoint, &load, &streams, memory)?;
             let mut records = draft_records;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
             let (landed, operands, staged, steps, largest, finishes) = records.summary();
@@ -357,6 +358,7 @@ impl<'a> Admission<'a> {
             Some(((push, streams, ranks), owners, records, dense)) => (Some((push, owners, records, dense)), Some((streams, ranks))),
             None => (None, None),
         };
+        memory.sample("coordinator-push-planned")?;
         let pending = spark.start_with(peers, ranks)?;
         let started = std::time::Instant::now();
         let (weights, pushed) = match planned {
@@ -369,13 +371,15 @@ impl<'a> Admission<'a> {
             }
             None => {
                 let mount = DenseLoad::mount(devices[0].library);
-                let owners = self.record(&devices, checkpoint, &mount, &streams)?;
+                let owners = self.record(&devices, checkpoint, &mount, &streams, memory)?;
                 mount.release();
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Kimi coordinator dense operands mounted");
                 (owners, None)
             }
         };
+        memory.sample("dense-and-pushed-experts-delivered")?;
         let experts = self.finish_rtx(&devices, catalog, rtx, pushed)?;
+        memory.sample("rtx-onboarding-finished")?;
         Ok((pending, experts, self.register(&devices, weights)?))
     }
 
@@ -440,7 +444,8 @@ impl<'a> Admission<'a> {
     /// Every global and layer owner through the shared records on `load`.
     #[allow(clippy::type_complexity)]
     fn record(&self, devices: &[Device<'a>], checkpoint: &cuteafd_loader::plan::Checkpoint,
-        load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, streams: &[(i32, *mut std::ffi::c_void)])
+        load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, streams: &[(i32, *mut std::ffi::c_void)],
+        memory: &mut crate::shared::inventory::StartupMemoryPhases<'_>)
         -> Result<(Vec<GlobalWeights<'a>>, Vec<Vec<LayerWeights<'a>>>)> {
         ensure!(devices.len() == self.devices.len() && streams.len() == devices.len(),
             "Kimi dense records physical inventory differs from admission");
@@ -449,8 +454,10 @@ impl<'a> Admission<'a> {
             dense: load, streams: streams.to_vec() };
         let global = devices.iter().zip(&self.global_layouts).map(|(&device, layout)| records.global(device, layout))
             .collect::<Result<Vec<_>>>()?;
+        memory.sample("weights-global-recorded")?;
         let layers = (0..self.cfg.layers).map(|layer| records.layer_ranks(devices, layer, &self.layouts[layer]))
             .collect::<Result<Vec<_>>>()?;
+        memory.sample("weights-core-layers-recorded")?;
         Ok((global, layers))
     }
 

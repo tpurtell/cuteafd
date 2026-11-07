@@ -168,7 +168,8 @@ impl<'a> Engine<'a> {
         context_programs: [Option<Rc<super::context::Programs<'a>>>; RANKS],
         peer: Option<Rc<PeerExchange<'a>>>, hops: Option<HopLink<'a>>, peers: Vec<std::net::SocketAddr>,
         config: cuteafd_transport::TcpTransportConfig,
-        mut expert_modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; RANKS]) -> Result<Self> {
+        mut expert_modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; RANKS],
+        memory: &mut crate::shared::inventory::StartupMemoryPhases<'_>) -> Result<Self> {
         use crate::shared::placement::{spark_rings, SparkAdmission};
         use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
         use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission};
@@ -183,6 +184,7 @@ impl<'a> Engine<'a> {
             cuteafd_ffi::expert_usage::ExpertUsage::new(library, geometry, &devices, usage_reader)
                 .map(Rc::new)
         }).transpose()?;
+        memory.sample("expert-usage")?;
         cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
         ensure!(matches!(RANKS, 1 | 2), "Kimi startup physical rank count");
         let devices = programs.each_ref().map(|programs| programs.device);
@@ -216,13 +218,16 @@ impl<'a> Engine<'a> {
         // Dense operands and TP2 halves land inside the Spark load (pushed as
         // coordinator ranks when the group pushes, else through the mount).
         let (pending, expert_weights, weights) = admission.start_and_load(spark, &peers, devices, checkpoint, &catalog,
-            exchange_streams.each_ref().map(|stream| stream.raw), draft_records)?;
+            exchange_streams.each_ref().map(|stream| stream.raw), draft_records, memory)?;
         let lanes = usize::try_from(plan.spec().lanes)?;
         let allocated = (0..lanes).map(|lane| (0..RANKS).map(|rank|
             admission.allocate_lane_on(devices[rank], rank, lane, lane_streams[rank].clone()))
             .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+        memory.sample("lane-workspaces")?;
         let kda = (0..RANKS).map(|rank| admission.allocate_kda(devices[rank], rank)).collect::<Result<Vec<_>>>()?;
+        memory.sample("kda-state")?;
         let mla = (0..RANKS).map(|rank| admission.allocate_mla(devices[rank], rank)).collect::<Result<Vec<_>>>()?;
+        memory.sample("mla-kv")?;
         ensure!(context_programs.iter().all(Option::is_some) == admission.context_layout().is_some()
             && (admission.context_layout().is_some() || context_programs.iter().all(Option::is_none)),
             "Kimi context programs differ from admitted storage");
@@ -233,6 +238,7 @@ impl<'a> Engine<'a> {
                 [peer.abort_word(0)?.context("Kimi context missing rank 0 abort word")?,
                     peer.abort_word(1)?.context("Kimi context missing rank 1 abort word")?])?)
         } else { None };
+        memory.sample("context-workspace")?;
         let mut experts = Vec::with_capacity(lanes);
         let mut local = Vec::with_capacity(lanes);
         let mut io = Vec::with_capacity(lanes);
@@ -251,6 +257,7 @@ impl<'a> Engine<'a> {
             io.push((0..RANKS).map(|rank| admission.allocate_io(devices[rank], rank, lane))
                 .collect::<Result<Vec<_>>>()?);
         }
+        memory.sample("expert-execution-and-target-io")?;
         for owners in &experts {
             use crate::shared::experts::rtx::RtxExpertLayer;
             check_expert_owners(&admission.placement.layers,
@@ -263,11 +270,14 @@ impl<'a> Engine<'a> {
         // Weak admission registries must not outlive these strong startup owners
         // until every persistent local binding has acquired the same operands.
         if let Some(draft) = draft.as_mut() { draft.bind_target_ranks(weights.global.clone(), programs[RANKS - 1].clone())?; }
+        memory.sample("draft-probe-and-target-bind")?;
         drop((weights, kda, mla));
         pending.wait()?;
+        memory.sample("workers-loaded")?;
         let world = SparkWorld::canonical(peers.len())?;
         let routed = local.iter().map(|owners| admission.connect_spark(library, &owners[RANKS - 1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
+        memory.sample("registered-transport-egress-staging")?;
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
         let target_view = checkpoint.view.as_ref()
             .context("Kimi engine requires the immutable selected checkpoint view")?.clone();

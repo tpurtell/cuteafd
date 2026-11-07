@@ -289,6 +289,7 @@ weights and scratch alongside the KV pool and routed experts.
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
 | `PROFILE` | unset | comma list of `census`, `transport-timing`, `expert-timing`, `expert-routes`, `draft-timing`, `nsys`, `ncu` | Wraps the coordinator for one launch; nsys and ncu are exclusive. |
+| `CUTEAFD_DIAG_KIMI_STARTUP_MEMORY` | unset (off) | `off`, `pre-capture` | Private coordinator-only Kimi startup attribution. Samples in-process raw CUDA memory and native backing changes at at most 64 synchronized phase boundaries, logs signed used/tracked/unclassified deltas, then intentionally exits before target graph capture or Ready. No external observer, request probes, admission adjustment or automatic allowance. Pass through `wip-cards --arm-env`; default-off launches do not sample or synchronize. |
 | `PROFILE_DIR` | unset | absolute dir | Report destination. |
 | `PROFILE_NCU_KERNEL` | unset | kernel regex | Required by `PROFILE=ncu`; each match is replayed. |
 | `PROFILE_NCU_COUNT`, `PROFILE_NCU_SET`, `PROFILE_NCU_SKIP` | 1, `full`, 0 | 1–9999 / section set / integer | ncu replay count, section set, warm-up matches skipped. |
