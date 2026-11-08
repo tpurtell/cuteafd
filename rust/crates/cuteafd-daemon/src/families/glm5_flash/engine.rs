@@ -3759,7 +3759,7 @@ impl<'a> GlmfEngine<'a> {
 
     pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.startup_graphs }
 
-    /// Physical row count of an ordinary serving verify (lazy graphs use exact rows).
+    /// Physical row count of an ordinary serving verify (an eager step runs exact rows).
     pub(crate) fn serving_decode_rows(&self, rows: usize, spec: bool) -> usize {
         if self.use_graphs && self.startup_graphs { self.buckets.bucket(rows, spec) } else { rows }
     }

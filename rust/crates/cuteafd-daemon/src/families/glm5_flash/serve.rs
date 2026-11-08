@@ -222,8 +222,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         hub.clone(), api.serve(profile.clone(), &snapshot)?);
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
-    // The ready ledger (placement gate): one report at readiness, before any request captures
-    // lazy graphs or loads more code.
+    // The ready ledger (placement gate): one report at readiness, after every startup decode
+    // graph was captured and charged; no request captures a graph.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "GLM 5.3 Flash API is ready");
     tokio::select! {
