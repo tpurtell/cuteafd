@@ -93,6 +93,23 @@ pub(super) struct Tp2State<'a> {
     output_pending: [Cell<bool>; 2],
 }
 
+/// Capture one declared source variant without changing the live route policy.
+pub(super) struct CaptureSource<'a> {
+    source: &'a Cell<RouteSource>,
+    previous: RouteSource,
+}
+
+impl<'a> CaptureSource<'a> {
+    fn new(source: &'a Cell<RouteSource>, broadcast: bool) -> Self {
+        let selected = if broadcast { RouteSource::Broadcast } else { RouteSource::Replicated };
+        Self { source, previous: source.replace(selected) }
+    }
+}
+
+impl Drop for CaptureSource<'_> {
+    fn drop(&mut self) { self.source.set(self.previous); }
+}
+
 impl Tp2State<'_> {
     pub(super) fn has_stages(&self, first: usize, stages: usize) -> bool {
         let ranks = self.ranks[0].borrow();
@@ -100,6 +117,10 @@ impl Tp2State<'_> {
     }
 
     pub(super) fn broadcast(&self) -> bool { self.source.get() == RouteSource::Broadcast }
+
+    pub(super) fn capture_source(&self, broadcast: bool) -> CaptureSource<'_> {
+        CaptureSource::new(&self.source, broadcast)
+    }
 
     pub(super) fn group_rows(&self, rows: usize) -> Result<usize> {
         let group = self.ranks[0].borrow().group_rows(rows)?;
@@ -605,6 +626,27 @@ impl<'a> Engine<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_capture_source_matches_key_and_restores_on_success_or_error() {
+        let banks = cuteafd_loader::serving_capacity::v4_graphs::v4_serving_graph_keys(
+            &[0, 4], 2, 1, 2, &[LOCAL_EXPERTS; 2], true, false).unwrap();
+        for initial in [RouteSource::Replicated, RouteSource::Broadcast] {
+            let source = Cell::new(initial);
+            for key in banks.iter().flatten() {
+                for fail in [false, true] {
+                    let result = (|| -> Result<()> {
+                        let _source = CaptureSource::new(&source, key.tp2_broadcast);
+                        assert_eq!(source.get() == RouteSource::Broadcast, key.tp2_broadcast);
+                        ensure!(!fail, "capture error fixture");
+                        Ok(())
+                    })();
+                    assert_eq!(result.is_err(), fail);
+                    assert_eq!(source.get(), initial);
+                }
+            }
+        }
+    }
 
     fn schedule(layers: usize, local: usize, lanes: usize, decode: bool, broadcast: bool) -> Schedule {
         let mut s = Schedule::default();

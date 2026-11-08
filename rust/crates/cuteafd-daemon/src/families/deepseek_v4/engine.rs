@@ -1924,6 +1924,7 @@ impl<'a> Engine<'a> {
             let w = workspace.as_ref().context("decode workspace")?;
             for (rank, bank) in keys.iter().enumerate() {
                 for &key in bank {
+                    let _source = self.tp2.as_ref().map(|tp2| tp2.capture_source(key.tp2_broadcast));
                     let placement = Placement::new(0, (0..self.decode_rows.div_ceil(256).max(1) as u32).collect());
                     let mut tables = if key.chunked {
                         metadata::verify_step(&[(&placement, 0, key.rows)], &self.shape, self.cfg.index_topk, self.c128_width)?
