@@ -305,7 +305,8 @@ impl Admission {
         let layout = PageLayout { record_bytes: Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim),
             hidden_bytes: cfg.hidden * 2 };
         let bytes = DrafterBytes::native_mtp(reader.checkpoint, cfg)?;
-        ensure!(bytes.owned == fixed + 12 && bytes.pool_unit == layout.bytes() as u64,
+        ensure!(bytes.owned == fixed + 12 && bytes.pools ==
+            [(64 * layout.record_bytes) as u64, layout.hidden_bytes as u64],
             "native MTP planner and runtime inventory differ");
         Ok(Self { format, programs, fixed, bytes })
     }
@@ -618,7 +619,7 @@ pub(crate) fn oracle<'a>(args: &super::super::GoldenArgs, library: &'a NativeLib
     // Target planes/scratch/head stay shared; each pooled page adds just one hidden sidecar.
     let layout = PageLayout { record_bytes: Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim), hidden_bytes: width };
     let demand = DrafterBytes { owned: fixed + (HEAD_ROWS * width) as u64,
-        scratch: 0, pool_unit: layout.bytes() as u64,
+        pools: vec![(64 * layout.record_bytes) as u64, layout.hidden_bytes as u64],
         ..DrafterBytes::native_mtp(checkpoint, cfg)? };
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
         Some(demand), 1, None, args.kv_cache, false, None, false)?;
@@ -736,7 +737,7 @@ mod tests {
             hidden_bytes: cfg.hidden * 2 };
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
             Some(262144), Some(DrafterBytes { owned: fixed + (HEAD_ROWS * layout.hidden_bytes) as u64,
-                scratch: 0, pool_unit: layout.bytes() as u64,
+                pools: vec![(64 * layout.record_bytes) as u64, layout.hidden_bytes as u64],
                 ..DrafterBytes::native_mtp(&checkpoint, &cfg)? }), 2,
             Some(crate::shared::prefix::MarkRule { lanes: 2, entries: 2, budget_bytes: 1 << 30, host: false }),
             std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);

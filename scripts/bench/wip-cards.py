@@ -403,11 +403,13 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     label = f'{card}-{arm_name}-r{repeat}' + ('-simulated' if simulated else '')
     dest = state / label
     dest.mkdir(parents=True, exist_ok=True)
-    if values.get('PROFILE') or values.get('PROFILE_SPARK'):
+    if values.get('PROFILE') or values.get('PROFILE_SPARK') or 'memory' in probes:
         # One per-job directory, mounted on the coordinator and every Spark at
         # the same path; Spark-side files are collected back after the run.
         values['PROFILE_DIR'] = str(dest / 'profile')
         (dest / 'profile').mkdir(exist_ok=True)
+        if 'memory' in probes:
+            save(dest / 'profile' / 'observer-context.json', {'pending': True})
         # nsys sessions start paused (the coordinator's under PROFILE=nsys, each
         # selected Spark rank's under PROFILE_SPARK=nsys); smoke opens them after
         # the sweep's first warm wave and closes them (writing the reports) at
@@ -694,6 +696,8 @@ def preflight_at_grant(job, arm):
     queued behind a running task that still holds a container of the same name."""
     artifacts = preflight_job(job, arm)
     assert_absent(job)
+    if 'memory' in job['probes']:
+        save(Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json', {'pending': True})
     return artifacts
 
 
@@ -1076,6 +1080,8 @@ def check(rc):
     if rc: raise RuntimeError('CUDA/NVML status '+str(rc))
 check(nv.nvmlInit_v2())
 devices=[int(x) for x in os.environ['CARD_GPUS'].split(',')]
+# Both CUDA and NVML numeric indices are filtered by CDI inside this container.
+os.environ['CUDA_VISIBLE_DEVICES']=os.environ['CARD_GPU_UUIDS']
 for i in range(len(devices)):
     check(cuda.cudaSetDevice(i)); check(cuda.cudaFree(c.c_void_p()))
 while True:
@@ -1338,6 +1344,37 @@ for ident in ids:
     return [sys.executable, '-c', program, name, owner]
 
 
+def publish_observer_context(job):
+    """Publish a complete measured sample indexed by container CUDA ordinal."""
+    dest = Path(job['state'])
+    with (dest / 'memory.jsonl').open() as samples:
+        line = samples.readline()
+    if not line.endswith('\n'):
+        return False
+    sample = json.loads(line)
+    physical = job['entry']['gpus']
+    measured = {row['gpu']: row['sampler_bytes'] for row in sample['devices']}
+    if set(measured) != set(physical) or any(type(n) is not int or n <= 0 for n in measured.values()):
+        raise ValueError('invalid measured observer context bytes')
+    path = Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json'
+    temporary = path.with_suffix('.tmp')
+    save(temporary, {str(i): measured[gpu] for i, gpu in enumerate(physical)})
+    temporary.replace(path)
+    return True
+
+
+def observer_gpu_uuids(devices):
+    """Use the launcher's host-side identity resolver before CDI filtering."""
+    script = 'source "$1"\nrelease_resolve_coordinator_gpus "$2" "$3"\nprintf "%s\\n" "${RELEASE_COORDINATOR_GPU_UUIDS[@]}"'
+    resolved = run(['bash', '-c', script, 'observer-gpus',
+                    str(REPO / 'scripts/lib/release-common.sh'),
+                    ','.join(map(str, devices)), str(len(devices))], timeout=30)
+    uuids = resolved.stdout.splitlines()
+    if len(uuids) != len(devices) or any(not re.fullmatch(r'GPU-[A-Za-z0-9-]+', uuid) for uuid in uuids):
+        raise ValueError('launcher returned invalid observer GPU UUIDs')
+    return ','.join(uuids)
+
+
 def observe(job):
     dest = Path(job['state'])
     stop = Path(os.environ['CUTEAFD_SMOKE_STOP'])
@@ -1351,6 +1388,7 @@ def observe(job):
     policy = (dest / 'policy-stats.jsonl').open('w')
     policy_sample_at = 0.
     reader = None
+    observer_published = False
     if 'console' in job['probes']:
         reader = threading.Thread(target=console_frames, args=(os.environ['CUTEAFD_SMOKE_URL'], stop, frames), daemon=True)
         reader.start()
@@ -1360,7 +1398,7 @@ def observe(job):
             gpu_list = ','.join(map(str, e['gpus']))
             image = e['set'].get('COORDINATOR_DOCKER_DEV', 'cuteafd-coordinator-dev')
             owner = hashlib.sha256(job['state'].encode()).hexdigest()
-            cmd = ['docker', 'run', '--rm', '--init', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', *cdi_gpu_args(gpu_list.split(',')), '-e', 'CARD_GPUS=' + gpu_list, '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
+            cmd = ['docker', 'run', '--rm', '--init', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', *cdi_gpu_args(gpu_list.split(',')), '-e', 'CARD_GPUS=' + gpu_list, '-e', 'CARD_GPU_UUIDS=' + observer_gpu_uuids(e['gpus']), '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
             sampler = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=memory, stderr=subprocess.PIPE, text=True)
             lifetime = min(float(e['observer']['timeout_s']), 7200)
             for rank, host in enumerate(e.get('sparks', [])):
@@ -1382,6 +1420,8 @@ def observe(job):
         while not stop.exists():
             if sampler and sampler.poll() is not None:
                 raise RuntimeError('memory sampler exited: ' + sampler.stderr.read())
+            if sampler and not observer_published:
+                observer_published = publish_observer_context(job)
             if spark_errors:
                 raise RuntimeError('Spark memory sampler: ' + '; '.join(spark_errors))
             if spark_samplers:
@@ -3163,6 +3203,8 @@ def main():
                     path.rename(attempt / path.name)
                 if job['entry']['set'].get('PROFILE_DIR'):
                     Path(job['entry']['set']['PROFILE_DIR']).mkdir(exist_ok=True)
+                    if 'memory' in job['probes']:
+                        save(Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json', {'pending': True})
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \

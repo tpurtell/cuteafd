@@ -18,8 +18,10 @@ pub fn startup_graph_component(id: &str, location: Location, rank: crate::placem
 }
 
 /// Reevaluate the selected facts, never select a different pool or placement.
-/// A capture may exceed its estimate if physical capacity still admits it.
-/// On refusal the original receipt stays intact.
+/// A capture may exceed its estimate whenever the allocation itself succeeded:
+/// the graphs are physically resident, so the measured rows are installed and
+/// the budget gap is reported, never turned into a refusal (#1605). Only a
+/// facts mismatch still refuses.
 pub fn reconcile_startup_graphs(plan: &mut ResolvedPlan, prefix: &str,
     estimated: &crate::placement::GraphSet, declared: &[String],
     captured: &[crate::placement::inventory::CapturedGraphRank])
@@ -38,9 +40,19 @@ pub fn reconcile_startup_graphs(plan: &mut ResolvedPlan, prefix: &str,
         owner.bytes = graph.bytes;
         owner.assumed = false;
     }
-    let phases = evaluate(&facts, &plan.budgets)?;
+    let assessment = assess(&facts, &plan.budgets)?;
     plan.facts = facts;
-    plan.phases = phases;
+    plan.phases = assessment.rows;
+    for refusal in &assessment.over_budget {
+        let Refusal::Capacity { budget, phase, required, available, owners } = refusal else {
+            // `assess` reports capacity vetoes only; anything else is a defect.
+            return Err(refusal.clone());
+        };
+        tracing::warn!(budget = %budget, %phase, required, available, owners = ?owners,
+            "startup graph capture succeeded above its admitted estimate ({prefix}); the captured graphs are \
+             resident and serving continues, but this budget has no room for the excess: free device memory \
+             with GPU_MEMORY_CAP or GPU_RESERVE, or measure this layout so its row replaces the estimate");
+    }
     Ok(measured)
 }
 

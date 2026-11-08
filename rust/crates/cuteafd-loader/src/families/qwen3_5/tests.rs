@@ -187,9 +187,15 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
         weight_layout::DenseFormat::Bf16).unwrap();
     assert_eq!(memory.devices[0].items.iter().filter(|item| item.group == "weight arena")
         .map(|item| item.bytes).sum::<u64>(), arena.bytes() as u64);
+    // The arena pays its own single tail; the view-less runtime owners pay one
+    // shared SM120 backing forecast beside it.
     let tail = crate::placement::planner::allocation_granularity_forecast(&[arena.bytes() as u64]).unwrap();
-    assert_eq!(memory.devices[0].items.iter().filter(|item| item.group == crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
-        .map(|item| item.bytes).sum::<u64>(), tail);
+    let tails = memory.devices[0].items.iter()
+        .filter(|item| item.group == crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
+        .map(|item| (item.format.as_str(), item.bytes)).collect::<Vec<_>>();
+    assert_eq!(tails.iter().find(|(source, _)| *source == format!("{}.tail (SM120 direct cudaMalloc, \
+        driver/runtime13020 LAZY, #1454 2026-11-08, sizes-only forecast)", arena.id())).unwrap().1, tail);
+    assert!(tails.iter().any(|(source, _)| source.starts_with("dense.runtime.tail")));
     assert!(memory.devices[0].items.iter().any(|item| item.group == "exact retained prefix marks"
         && item.bytes == buffers.prefix as u64));
     assert!(memory.notes.iter().any(|note| note.contains("no captured graphs")));
@@ -238,8 +244,12 @@ fn native_planner_enforces_independent_checkpoint_weight_and_storage_limits() {
     let message = format!("rtx0 resident weights need {required} bytes, over the {} byte weight budget", required - 1);
     assert!(refused.hints.iter().any(|hint| hint.what.contains(&message)), "{:?}", refused.hints);
 
+    // One byte short of the admitted owners must refuse rather than shrink the
+    // fixed context, now that no opaque growth allowance pads the ledger.
+    let accepted_bytes = accepted.memory_layout.as_ref().unwrap().devices[0].used_bytes();
+    assert!(accepted_bytes > (1 << 20));
     options.coordinator_budget_bytes = required;
-    options.layout.as_mut().unwrap().rtx_bytes = vec![4 << 30];
+    options.layout.as_mut().unwrap().rtx_bytes = vec![accepted_bytes - 1];
     let refused = plan::plan(dir.path(), &options).unwrap();
     assert!(!refused.fits && !refused.native_serving_admitted);
     assert!(!refused.hints.iter().any(|hint| hint.what.contains("resident weights need")), "{:?}", refused.hints);
@@ -471,7 +481,11 @@ fn full_prefill_planner_equals_runtime_recipe_for_each_kv_format() {
                     && item.category == category).unwrap();
                 assert_eq!(item.bytes, bytes as u64, "full={full}, kv={kv}, {category:?}");
             }
-            let bytes = device.used_bytes();
+            // Full scoring only grows the vocabulary head workspace; the SM120
+            // backing tails are a separate forecast that may re-round.
+            let bytes = device.items.iter()
+                .filter(|item| item.group != crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
+                .map(|item| item.bytes).sum::<u64>();
             if let Some(narrow_bytes) = previous {
                 assert_eq!(bytes - narrow_bytes, ((4096 - 64) * cfg.vocab * 4) as u64);
             }

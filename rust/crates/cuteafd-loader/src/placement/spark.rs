@@ -379,21 +379,50 @@ impl PreparedSparkLink {
 
     pub fn components(&self, maximum_pages: u64)
         -> Result<Vec<super::planner::Component>, super::planner::Refusal> {
-        use super::planner::{Activation, Allowance, ByteCurve, Component, ComponentKind, Refusal};
+        use super::planner::{Activation, Allowance, ByteCurve, Component, ComponentKind, Device,
+            Domain, Location, Refusal};
         if maximum_pages == 0 {
             return Err(Refusal::InvalidFact("Spark transport envelope requires a positive pool domain".into()));
         }
-        Ok(self.envelope.iter().map(|(&location, &bytes)| {
+        // Coordinator device storage every candidate owns identically (the
+        // intake rank planes) is one named physical owner, not an envelope.
+        // Only locations the construction-time probe selects among stay opaque.
+        let device = |location: Location| matches!(location,
+            Location { device: Device::Coordinator(_), domain: Domain::Device });
+        let mut out = Vec::new();
+        let first = self.candidates.first()
+            .ok_or_else(|| Refusal::InvalidFact("empty Spark transport candidates".into()))?;
+        for owner in first.owners.iter().filter(|owner| owner.view.is_none() && device(owner.location)) {
+            if self.candidates.iter().any(|candidate| !candidate.owners.iter().any(|other|
+                other.id == owner.id && other.bytes == owner.bytes && other.location == owner.location
+                    && other.lifetime == owner.lifetime && other.category == owner.category
+                    && other.view.is_none()))
+            {
+                return Err(Refusal::InvalidFact(format!(
+                    "Spark transport owner {} is not identical across admitted candidates", owner.id)));
+            }
+            out.push(Component::allocation(owner.clone(),
+                ByteCurve::fixed(owner.bytes, maximum_pages), false, maximum_pages));
+        }
+        let mut envelope = std::collections::BTreeMap::<Location, u64>::new();
+        for candidate in &self.candidates {
+            for (location, bytes) in owner_totals(&candidate.owners)? {
+                if device(location) { continue; }
+                envelope.entry(location).and_modify(|peak| *peak = (*peak).max(bytes)).or_insert(bytes);
+            }
+        }
+        for (location, bytes) in envelope {
             let receipts = self.candidates.iter().map(|candidate| {
                 let owners = candidate.owners.iter().filter(|owner| owner.location == location && owner.view.is_none())
                     .map(|owner| format!("{}={}", owner.id, owner.bytes)).collect::<Vec<_>>().join(",");
                 format!("{:?}/pinned={}: [{owners}]", candidate.mode, candidate.pinned)
             }).collect::<Vec<_>>().join("; ");
-            Component { activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum_pages),
+            out.push(Component { activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum_pages),
                 kind: ComponentKind::Allowance(Allowance { location, bytes, lifetime: self.lifetime,
                     source: format!("{}: Spark intake transport envelope (probe-selected); derived exact finite maximum from candidate geometry; {receipts}", self.prefix),
-                    assumed: false }) }
-        }).collect())
+                    assumed: false }) });
+        }
+        Ok(out)
     }
 }
 
@@ -836,15 +865,31 @@ mod tests {
             assert_eq!(independent.len(), 2);
             assert!(independent.contains_key(&Location::coordinator(1)));
             assert!(independent.contains_key(&Location::PINNED));
+            // Coordinator device storage every candidate owns identically is a
+            // named transport owner; only probe-selected storage stays an envelope.
+            let mut named = std::collections::BTreeMap::<Location, u64>::new();
             for component in plan.components(64).unwrap() {
-                let ComponentKind::Allowance(allowance) = component.kind else { panic!("not an envelope") };
-                assert_eq!(allowance.bytes, independent[&allowance.location]);
-                assert_eq!(allowance.lifetime, lifetime);
-                assert!(!allowance.assumed);
-                assert!(allowance.source.contains("derived exact finite maximum from candidate geometry"));
-                assert!(allowance.source.contains("Gpu/pinned=false"));
-                assert!(allowance.source.contains("Pinned/pinned=true"));
+                match component.kind {
+                    ComponentKind::Allocation { template, .. } => {
+                        assert_eq!(template.location, Location::coordinator(1));
+                        assert!(template.view.is_none());
+                        assert_eq!(template.category, Category::Transport);
+                        *named.entry(template.location).or_default() += component.bytes.at(1).unwrap();
+                    }
+                    ComponentKind::Allowance(allowance) => {
+                        assert_eq!(allowance.location, Location::PINNED);
+                        assert_eq!(allowance.bytes, independent[&allowance.location]);
+                        assert_eq!(allowance.lifetime, lifetime);
+                        assert!(!allowance.assumed);
+                        assert!(allowance.source.contains("derived exact finite maximum from candidate geometry"));
+                        assert!(allowance.source.contains("Gpu/pinned=false"));
+                        assert!(allowance.source.contains("Pinned/pinned=true"));
+                    }
+                    other => panic!("unexpected Spark transport component {other:?}"),
+                }
             }
+            assert_eq!(named.len(), 1);
+            assert_eq!(named[&Location::coordinator(1)], independent[&Location::coordinator(1)]);
             let candidate = plan.selected(SparkIntakeMode::Pinned, true).unwrap();
             let mut oversized = candidate.owners.clone();
             oversized.iter_mut().find(|owner| owner.location == Location::PINNED

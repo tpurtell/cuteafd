@@ -196,6 +196,9 @@ impl<'a> DenseEngine<'a> {
         let pool_tokens = usize::try_from(admitted_plan.pool_tokens)?;
         tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits,
             head_rows = buffers.head_rows, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format),
+            // Basis for the Ready reconciliation: everything already resident
+            // after modules, programs, the engine stream and before weights.
+            preweight_used = total.saturating_sub(free),
             "dense Qwen admitted before weight/state allocation");
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;

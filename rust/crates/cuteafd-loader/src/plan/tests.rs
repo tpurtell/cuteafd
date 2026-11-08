@@ -3783,9 +3783,11 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                     slot_bytes: 8 << 20, alignment: 4096 } }, working.prefill_lanes as usize,
                 true, true, placement::SparkIntakeCandidates::Probed,
                 cuteafd_core::SparkReplyFormat::Bf16, placement::planner::Lifetime::TARGET);
-            let charged_link = selected.solved.facts.allowances.iter().filter(|owner|
+            // Candidate-invariant coordinator device storage is a named owner;
+            // only the probe-selected pinned/host storage stays an envelope.
+            let charged_link = selected.solved.facts.allocations.iter().filter(|owner|
                 owner.location == placement::planner::Location::coordinator(rank as u8)
-                    && owner.source.starts_with("glmf.spark:")).map(|owner| owner.bytes).sum::<u64>();
+                    && owner.group == "Spark intake").map(|owner| owner.bytes).sum::<u64>();
             assert_eq!(charged_link, if rank == 0 && spark {
                 link.unwrap().envelope()[&placement::planner::Location::coordinator(0)]
             } else { 0 });

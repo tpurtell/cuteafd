@@ -108,9 +108,8 @@ fn physical(fixed: &mut Vec<Demand>, backings: &mut Vec<GranularityBacking>, ran
 }
 
 fn pool_physical_bytes(unit: u64, pages: u64) -> Result<u64, Refusal> {
-    unit.checked_mul(pages).and_then(|bytes| bytes.div_ceil(SM120_ALLOCATION_GRANULARITY_BYTES)
-        .checked_mul(SM120_ALLOCATION_GRANULARITY_BYTES))
-        .ok_or(Refusal::Overflow("Step-5 pool backing"))
+    unit.checked_mul(pages).ok_or(Refusal::Overflow("Step-5 pool backing"))
+        .and_then(sm120_request_backing)
 }
 
 /// Both automatic and explicit pools price the backing's physical round-up.
@@ -136,7 +135,12 @@ mod physical_pool_tests {
             assert_eq!(curve.0.last().unwrap().last, maximum);
             assert!(curve.0.windows(2).all(|pair| pair[0].last + 1 == pair[1].first));
             for pages in 1..=maximum {
-                assert_eq!(curve.at(pages)?, (unit * pages).div_ceil(page) * page);
+                // A pool at or below the shared-request threshold costs its own
+                // bytes; larger requests each back their own 2 MiB blocks.
+                let request = unit * pages;
+                let expected = if request <= SM120_SHARED_REQUEST_BYTES { request }
+                    else { request.div_ceil(page) * page };
+                assert_eq!(curve.at(pages)?, expected);
             }
         }
         let baseline_pages = 22_096;

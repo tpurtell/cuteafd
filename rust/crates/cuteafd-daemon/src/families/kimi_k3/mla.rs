@@ -115,6 +115,17 @@ impl CacheLayout {
 
     pub(crate) fn bytes(&self) -> usize { self.bytes }
 
+    /// Physical residency of the cache: every present layer is one cudaMalloc
+    /// of `layer_bytes`, rounded up to the SM120 allocation granularity (a
+    /// request at or below the shared-block threshold costs its own bytes).
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        use cuteafd_loader::placement::planner::{SM120_ALLOCATION_GRANULARITY_BYTES as G,
+            SM120_SHARED_REQUEST_BYTES as SMALL};
+        let layer = u64::try_from(self.layer_bytes).unwrap_or(u64::MAX);
+        let backing = if layer <= SMALL { layer } else { layer.div_ceil(G).saturating_mul(G) };
+        backing.saturating_mul(self.layers.iter().flatten().count() as u64)
+    }
+
     pub(super) fn page_range(&self, layer: usize, page: usize, rows: usize) -> Result<(usize, usize)> {
         ensure!(self.layers.get(layer).is_some_and(Option::is_some), "Kimi MLA cache absent on nonowner or non-MLA layer");
         ensure!(page < self.pages && (1..=MLA_PAGE_ROWS).contains(&rows),

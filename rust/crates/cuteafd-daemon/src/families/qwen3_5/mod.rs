@@ -140,7 +140,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
     let mtp_admission = args.packed_mtp.then(|| engine::mtp::Admission::new(&reader, cfg, &programs)).transpose()?;
     let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
-        args.pool_tokens, mtp_admission.as_ref().map(|a| a.bytes), slots, marks, args.kv_cache, false, None, args.verify_check)?;
+        args.pool_tokens, mtp_admission.as_ref().map(|a| a.bytes.clone()), slots, marks, args.kv_cache, false, None, args.verify_check)?;
     if args.verify_check {
         engine.verify_check(&tokens)?;
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }

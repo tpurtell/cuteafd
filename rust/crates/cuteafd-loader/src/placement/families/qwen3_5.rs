@@ -15,15 +15,26 @@ pub const SINGLE: ExecutorModes = ExecutorModes { family: "qwen3_5", modes: &[WH
     hops: false, attention: AttentionPlacement::Heads };
 
 /// Drafter-owned allocations, excluding the target embedding and vocabulary head.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DrafterBytes {
     pub owned: u64,
     pub weights: ResidentWeights,
     /// The independently retired runtime arena; payload stays separate for workspace subtraction.
     pub weight_arena: Option<(&'static str, u64)>,
     pub scratch: u64,
-    /// Full-context draft K/V per target pool page, not per sequence/context.
-    pub pool_unit: u64,
+    /// Per target-pool-page bytes of every shared-pool KV backing, one entry per
+    /// cudaMalloc the drafter keeps: dSpark's two planes of every layer, or
+    /// native MTP's records and hidden sidecars.
+    pub pools: Vec<u64>,
+    /// Exact device requests behind the retained draft workspace (pool-independent).
+    pub workspace_requests: Vec<u64>,
+    /// The paged draft page table, its own device request.
+    pub page_table_bytes: u64,
+    /// The pinned D2H landing row retained by the draft workspace.
+    pub landing: u64,
+    /// Pinned ordered-H2D staging retained per drafter destination from its
+    /// first upload; sized to the destination's whole extent.
+    pub staging: Vec<(&'static str, u64)>,
     /// All wanted checkpoint tensors coexist in the prefetch HashMap at DraftLoad.
     pub host_prefetch: u64,
     /// Block dSpark prepares a GEMM head; native MTP borrows the target projection.
@@ -81,21 +92,26 @@ impl DrafterBytes {
             owned += value.byte_length.max(256);
         }
         let weights = ResidentWeights(owned);
-        owned += ((64 * 2 + 4096) * cfg.hidden * 2 + 64 * cfg.vocab * 4) as u64;
-        // The independent greedy selector owns one ID/status/log-probability row.
-        owned += 12;
+        // The MTP workspace is three device rows (concat, hidden, logits), and
+        // the independent greedy selector owns one ID/status/log-probability
+        // row; every one is its own cudaMalloc in `Mtp::load`.
+        let workspace_requests = vec![((64 * 2) * cfg.hidden * 2) as u64,
+            (4096 * cfg.hidden * 2) as u64, (64 * cfg.vocab * 4) as u64, 12];
+        owned += workspace_requests.iter().sum::<u64>();
         let record = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
         Ok(Self { owned, weights, weight_arena: None, scratch: 0,
-            pool_unit: (64 * record + cfg.hidden * 2) as u64, host_prefetch: 0, gemm_head: false })
+            pools: vec![(64 * record) as u64, (cfg.hidden * 2) as u64],
+            workspace_requests, page_table_bytes: 0, landing: 0, staging: vec![],
+            host_prefetch: 0, gemm_head: false })
     }
 
     pub fn block_dspark(snapshot: &std::path::Path, config: &serde_json::Value, slots: usize, sms: u64, context: usize)
         -> anyhow::Result<Self> {
         use crate::families::glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation};
         use crate::families::qwen4::Qwen4KvCache;
-        let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)?;
-        ensure!(cfg.window.is_none(), "dense dSpark requires full-context cache");
-        let layout = cfg.paged_cache_layout(slots, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
+        let model = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)?;
+        ensure!(model.window.is_none(), "dense dSpark requires full-context cache");
+        let layout = model.paged_cache_layout(slots, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
         let residency = block_dspark_paged_resident_bytes(config, slots, slots, sms,
             GlmDraftRepresentation::Bf16Only, 0, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
         let host_prefetch = crate::read_safetensors_metadata(&snapshot.join("model.safetensors"))?.iter()
@@ -105,10 +121,71 @@ impl DrafterBytes {
         let arena = crate::serving_capacity::WeightArenaLayout::new("qwen3_5/dspark/gpu0",
             crate::formats::block_dspark::block_dspark_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only)?)?;
         ensure!(arena.payload_bytes() as u64 == residency.weights.0, "dense dSpark arena differs from weight payload");
+        // Every retained device owner behind the shared inventory, in the order
+        // the live drafter allocates it. The sum is asserted against the shared
+        // residency formula so the plan and the executor cannot drift.
+        let requests = dspark_requests(&model, slots)?;
+        let workspace: u64 = requests.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(bytes))
+            .ok_or_else(|| anyhow::anyhow!("draft workspace request overflow"))?;
+        let ring = layout.layer_bytes.first().copied().unwrap_or(0) as u64 / 2;
+        let pools = vec![ring; layout.layer_bytes.len().checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("draft ring count overflow"))?];
+        ensure!(pools.iter().try_fold(0u64, |sum, &unit| sum.checked_add(unit)) == Some(layout.full_bytes),
+            "dense dSpark rings differ from the shared pool extent");
+        let rows = slots.checked_mul(model.block).ok_or_else(|| anyhow::anyhow!("draft row overflow"))? as u64;
+        let tables = layout.page_table_bytes.max(256);
+        let total = residency.owned.checked_sub(residency.weights.0)
+            .and_then(|bytes| bytes.checked_sub(layout.full_bytes))
+            .ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?;
+        ensure!(workspace.checked_add(tables) == Some(total),
+            "dense dSpark workspace differs from the shared residency inventory");
         Ok(Self { owned: residency.owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
             weights: residency.weights, weight_arena: Some(("qwen3_5/dspark/gpu0", arena.bytes() as u64)),
-            scratch: residency.scratch, pool_unit: layout.full_bytes, host_prefetch, gemm_head: true })
+            scratch: residency.scratch, pools,
+            workspace_requests: requests, page_table_bytes: tables, landing: rows * 8,
+            // The serving draft path uploads these destinations through
+            // copy_h2d_ordered, which sizes each retained pinned staging to
+            // dst.bytes on its first upload.
+            staging: vec![("draft.staging.page-table", tables), ("draft.staging.positions", rows * 8),
+                ("draft.staging.tables", 3 * slots as u64 * 4), ("draft.staging.anchors", slots as u64 * 4),
+                ("draft.staging.context-positions", 2048 * 8),
+                ("draft.staging.context-slots", 2048 * 4),
+                ("draft.staging.h", rows * model.hidden as u64 * 2),
+                ("draft.staging.taps", 2048 * model.taps.len() as u64 * model.hidden as u64 * 2)],
+            host_prefetch, gemm_head: true })
     }
+}
+
+/// The retained draft workspace requests, exactly as `DsparkDrafter::load_paged_with`
+/// and `DsparkDrafter::workspace` allocate them. The paged page table is a
+/// separate owner and not part of this list.
+fn dspark_requests(model: &crate::formats::block_dspark::BlockDsparkConfig, slots: usize) -> anyhow::Result<Vec<u64>> {
+    const TAP_ROWS: u64 = 2048;
+    let (h, inter) = (model.hidden as u64, model.intermediate as u64);
+    let q = (model.heads * model.head_dim) as u64;
+    let kv = (model.kv_heads * model.head_dim) as u64;
+    let taps = model.taps.len() as u64;
+    let rows = (slots as u64).checked_mul(model.block as u64).ok_or_else(|| anyhow::anyhow!("draft row overflow"))?;
+    let sequences = slots as u64;
+    let overflow = || anyhow::anyhow!("draft workspace overflow");
+    let term = |a: u64, b: u64, c: u64| a.checked_mul(b).and_then(|n| n.checked_mul(c))
+        .map(|bytes| bytes.max(256)).ok_or_else(overflow);
+    let mut requests = vec![HEAD_WORKSPACE as u64];
+    // The TAP_ROWS context-update buffers allocated with the drafter.
+    for bytes in [term(TAP_ROWS, taps * h, 2)?, term(TAP_ROWS, h, 2)?, term(TAP_ROWS, h, 2)?,
+        term(TAP_ROWS, 2 * kv, 2)?, term(TAP_ROWS, 8, 1)?, term(TAP_ROWS, 4, 1)?] {
+        requests.push(bytes);
+    }
+    // The `workspace()` allocation order, each owner `.max(256)`.
+    for bytes in [term(rows, h, 2)?, term(rows, h, 2)?, term(rows, q + 2 * kv, 2)?, term(rows, q, 2)?,
+        term(rows, kv, 2)?, term(rows, kv, 2)?, term(rows, q, 2)?, term(rows, h, 2)?, term(rows, 2 * inter, 2)?,
+        term(rows, inter, 2)?, term(rows, model.vocab as u64, 4)?, term(sequences, 4, 1)?, term(rows, 4, 1)?,
+        term(rows, 4, 1)?, term(rows, 4, 1)?, term(rows, 8, 1)?, term(sequences, 12, 1)?] {
+        requests.push(bytes);
+    }
+    requests.push(sequences.checked_mul(296 * 8).and_then(|n| n.checked_add(rows * 4))
+        .map(|bytes| bytes.max(256)).ok_or_else(overflow)?);
+    Ok(requests)
 }
 
 /// Geometry shared by offline admission and the live exact-prefix adapter.

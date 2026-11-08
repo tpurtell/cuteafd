@@ -136,17 +136,10 @@ impl Drop for GraphExec<'_> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("GLM rank {rank} decode key {key:?} is absent from the sealed startup graph inventory")]
-struct UndeclaredDecodeGraph {
-    rank: usize,
-    key: GraphKey,
-}
-
-fn startup_capture_allowed(warmed: bool, warming: bool, rank: usize, key: GraphKey)
-    -> std::result::Result<bool, UndeclaredDecodeGraph> {
-    if warmed { Err(UndeclaredDecodeGraph { rank, key }) } else { Ok(warming) }
-}
+/// Only the explicit startup warm-up may capture. A key the sealed startup set
+/// lacks after it runs the segment eagerly: it allocates nothing and pays only
+/// its own launches, so live traffic never captures.
+fn startup_capture_allowed(warmed: bool, warming: bool) -> bool { !warmed && warming }
 
 /// Host tables of one step.
 #[derive(Clone)]
@@ -633,7 +626,6 @@ pub(crate) struct GlmEngine<'a> {
     pub(super) usage_active: Cell<bool>,
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
-    graph_misses: Cell<u64>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<super::drafter::GlmDrafter<'a>>,
     /// Prefix marks admission charged for a window-ring drafter's draft windows (0: none).
@@ -757,6 +749,16 @@ fn latent_cache<'b, T>(cfg: &GlmDsaConfig, index: usize, caches: &'b [T]) -> &'b
     &caches[cfg.kv_source(index)]
 }
 
+/// One rank's captured startup keys and the memory samples on either side of
+/// the capture pass. The planner measures the same keys against its own
+/// declaration, so a coverage or fingerprint mismatch is refused there.
+pub struct StartupGraphCapture {
+    pub rank: usize,
+    pub keys: Vec<cuteafd_loader::serving_capacity::glm_graphs::GlmGraphKey>,
+    pub before: cuteafd_loader::placement::inventory::GraphMemorySample,
+    pub after: cuteafd_loader::placement::inventory::GraphMemorySample,
+}
+
 impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmDsaConfig,
@@ -783,7 +785,7 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(std::collections::HashMap::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
 
     pub(super) fn initialize_usage(&mut self, geometry: Option<cuteafd_core::expert_usage::Geometry>,
@@ -1523,11 +1525,13 @@ impl<'a> GlmEngine<'a> {
 
     /// Captures every decode graph serving can replay: one padded step per
     /// (row bucket, table width) over the scratch page (one real row goes to
-    /// the Sparks), so no request captures. Returns the graph count.
-    pub fn warm_decode_graphs(&self, mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>) -> Result<usize> {
+    /// the Sparks), so no request captures. One eager pass first puts module,
+    /// workspace and BLAS first touch outside executable residency. Returns
+    /// each rank's captured keys and the samples around the capture pass.
+    pub fn warm_decode_graphs(&self, mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>)
+        -> Result<Vec<StartupGraphCapture>> {
+        use cuteafd_loader::placement::inventory::GraphMemorySample;
         let started = std::time::Instant::now();
-        let free = |rank: usize| self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free as i64));
-        let before: Vec<i64> = (0..self.ranks()).map(free).collect::<Result<_>>()?;
         use cuteafd_loader::placement::attention::AttentionPlacement;
         use cuteafd_loader::serving_capacity::glm_graphs::{glm_declared_graphs, glm_graph_shapes, GlmGraphLayer};
         ensure!(!self.graphs_warmed.get() && self.graphs.borrow().is_empty()
@@ -1542,38 +1546,71 @@ impl<'a> GlmEngine<'a> {
         let shapes = glm_graph_shapes(self.max_context, self.pages);
         let declared = glm_declared_graphs(&shapes, attention, self.ranks(), &layers, return_ranks)
             .map_err(anyhow::Error::msg)?;
-        self.graphs_warming.set(true);
-        for shape in &shapes {
-            let (width, bucket) = (shape.table_width, shape.rows);
-            let mut tables = StepTables { segments: Vec::new(), decode: true, positions: Vec::new(), slots: Vec::new(),
-                page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: Vec::new(),
-                lengths: Vec::new(), exchange_rows: 1 };
-            self.pad_rows(&mut tables, bucket);
-            let experts = experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime));
-            self.step(&tables, &vec![0; bucket], bucket, experts, None)?;
-        }
+        // Eager pass: each shape's first module, workspace and BLAS touch lands
+        // outside executable residency, before the before-sample.
+        let mut run = |warming: bool| -> Result<()> {
+            self.graphs_warming.set(warming);
+            for shape in &shapes {
+                let (width, bucket) = (shape.table_width, shape.rows);
+                let mut tables = StepTables { segments: Vec::new(), decode: true, positions: Vec::new(), slots: Vec::new(),
+                    page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: Vec::new(),
+                    lengths: Vec::new(), exchange_rows: 1 };
+                self.pad_rows(&mut tables, bucket);
+                let experts = experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime));
+                self.step(&tables, &vec![0; bucket], bucket, experts, None)?;
+            }
+            Ok(())
+        };
+        run(false)?;
+        let before = self.graph_memory_samples()?;
+        let captured = run(true);
+        self.graphs_warming.set(false);
+        captured?;
         for (rank, expected) in declared.iter().enumerate() {
             let graphs = if rank == 0 { self.graphs.borrow() } else { self.peer()?.graphs.borrow() };
             expected.verify(graphs.keys()).map_err(anyhow::Error::msg)
                 .with_context(|| format!("GLM rank {rank} startup graph coverage"))?;
             let fingerprint = expected.fingerprint(rank as u8).map_err(anyhow::Error::msg)?;
             tracing::info!(rank, ?attention, graphs = expected.len(), %fingerprint,
-                "GLM declared startup graph set captured exactly");
+                "GLM declared startup graph set captured");
         }
+        let after = self.graph_memory_samples()?;
+        self.graphs_warmed.set(true);
+        let captures = (0..self.ranks()).map(|rank| {
+            let graphs = if rank == 0 { self.graphs.borrow() } else { self.peer()?.graphs.borrow() };
+            Ok(StartupGraphCapture { rank, keys: graphs.keys().cloned().collect(),
+                before: before[rank], after: after[rank] })
+        }).collect::<Result<Vec<_>>>()?;
+        tracing::info!(graphs = captures.iter().map(|capture| capture.keys.len()).sum::<usize>(),
+            free = ?captures.iter().map(|capture| (capture.before.free, capture.after.free)).collect::<Vec<_>>(),
+            widths = ?self.table_width_buckets(), rows = ?ROW_BUCKETS,
+            long_rows = ?cuteafd_loader::serving_capacity::GLM_LONG_ROW_BUCKETS,
+            elapsed_ms = started.elapsed().as_millis() as u64, "GLM decode graphs captured at startup");
+        Ok(captures)
+    }
+
+    /// Physical free/total and the ledger's tracked bytes on both ranks, with
+    /// the streams drained so no queued work lands inside the window.
+    fn graph_memory_samples(&self) -> Result<Vec<cuteafd_loader::placement::inventory::GraphMemorySample>> {
+        use cuteafd_loader::placement::inventory::GraphMemorySample;
         // SAFETY: both ranks' streams are live; nothing else is queued.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         if self.peer.is_some() {
             let stream = self.stream_of(1);
             self.on(1, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
         }
-        let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
-        let bytes: Vec<i64> = (0..self.ranks()).map(|rank| Ok(before[rank] - free(rank)?)).collect::<Result<_>>()?;
-        self.graphs_warming.set(false);
-        self.graphs_warmed.set(true);
-        tracing::info!(graphs, ?bytes, widths = ?self.table_width_buckets(), rows = ?ROW_BUCKETS,
-            long_rows = ?cuteafd_loader::serving_capacity::GLM_LONG_ROW_BUCKETS,
-            elapsed_ms = started.elapsed().as_millis() as u64, "GLM decode graphs captured at startup");
-        Ok(graphs)
+        let ledger = cuteafd_ffi::memory_ledger::snapshot();
+        use cuteafd_ffi::memory_ledger::Space;
+        (0..self.ranks()).map(|rank| self.on(rank, || {
+            let device = self.library.cuda_get_device()?;
+            let (free, total) = self.library.cuda_physical_memory_info()?;
+            Ok(GraphMemorySample { free: free as u64, total: total as u64,
+                tracked_device: ledger.total(Space::Device, device) as u64,
+                tracked_pinned: ledger.rows.iter().filter(|row| row.key.space == Space::Pinned)
+                    .map(|row| row.bytes as u64).sum(),
+                tracked_managed: ledger.rows.iter().filter(|row| row.key.space == Space::Managed)
+                    .map(|row| row.bytes as u64).sum() })
+        })).collect()
     }
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
@@ -2149,17 +2186,21 @@ impl<'a> GlmEngine<'a> {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
-        // Only the explicit startup warm-up may capture. Disabled, partial and
-        // transport-free warm paths stay eager, including before Ready.
-        let capture = startup_capture_allowed(self.graphs_warmed.get(), self.graphs_warming.get(), rank, key)
-            .map_err(|error| {
-                let misses = self.graph_misses.get().saturating_add(1);
-                self.graph_misses.set(misses);
-                tracing::error!(rank, ?key, graph_misses = misses, %error,
-                    "GLM sealed startup graph inventory violation");
-                error
-            })?;
-        if !capture { return segment(); }
+        // Only the explicit startup warm-up may capture. Disabled, partial,
+        // transport-free and post-warmup paths stay eager, including before
+        // Ready; the shape allocates nothing outside the declared set.
+        if !startup_capture_allowed(self.graphs_warmed.get(), self.graphs_warming.get()) {
+            // After the startup pass a key the sealed set lacks is real traffic
+            // outside the declared shapes: it ran ungraphed and allocated
+            // nothing, and is reported once through the shared inventory. The
+            // warm pass itself is eager by design, so it reports nothing.
+            if self.graphs_warmed.get() {
+                crate::shared::decode_graph::note_eager(self.cfg.family_id(), &format!("{key:?}"), || format!(
+                    "rank={rank} segment=decode max_context={} pages={} prefill_rows={}",
+                    self.max_context, self.pages, self.prefill_rows));
+            }
+            return segment();
+        }
         // SAFETY: capture records launches on that rank's stream; nothing in the
         // segment synchronizes the host.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
@@ -3327,18 +3368,13 @@ mod long_graph_tests {
     use super::*;
 
     #[test]
-    fn graph_capture_is_startup_only_and_sealed_misses_are_typed_errors() {
-        let key = GraphKey { layer: 7, rows: 64, table_width: 16384, table_stride: 16384,
-            previous: Previous::Planes(6), head: false };
+    fn graph_capture_is_startup_only_and_sealed_misses_run_eager() {
         // Skipped/disabled/partial warm-up never acquires capture permission.
-        assert!(!startup_capture_allowed(false, false, 0, key).unwrap());
-        assert!(startup_capture_allowed(false, true, 0, key).unwrap());
+        assert!(!startup_capture_allowed(false, false));
+        assert!(startup_capture_allowed(false, true));
+        // A sealed set never captures a shape it lacks; the step runs ungraphed.
         for warming in [false, true] {
-            let error = startup_capture_allowed(true, warming, 1, key).unwrap_err();
-            assert_eq!(error.rank, 1);
-            assert_eq!(error.key, key);
-            let message = error.to_string();
-            assert!(message.contains("rank 1") && message.contains(&format!("{key:?}")));
+            assert!(!startup_capture_allowed(true, warming));
         }
     }
 

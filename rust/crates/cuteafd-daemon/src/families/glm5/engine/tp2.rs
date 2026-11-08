@@ -614,6 +614,9 @@ mod whole_tests {
         let warm = engine.split("pub fn warm_decode_graphs(").nth(1).unwrap().split("fn step(").next().unwrap();
         assert!(warm.contains("glm_graph_shapes(self.max_context, self.pages)"));
         assert!(warm.contains("for shape in &shapes"));
+        assert!(warm.contains("run(false)?"));
+        assert!(warm.contains("let before = self.graph_memory_samples()?"));
+        assert!(warm.contains("let after = self.graph_memory_samples()?"));
         assert!(warm.contains("self.graphs_warmed.set(true)"));
     }
 }

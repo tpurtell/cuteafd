@@ -1,6 +1,14 @@
 use super::*;
 use crate::placement::planner::{self, Budget, Contract, Facts, Variable};
 
+/// The searched extent: an independent cudaMalloc request rounds to its own
+/// driver block; sub-block requests stay exact and share blocks.
+fn searched(exact: u64) -> u64 {
+    if planner::independent_request(exact) {
+        exact + planner::allocation_granularity_forecast(&[exact]).unwrap()
+    } else { exact }
+}
+
 pub(super) fn cfg() -> GlmDsaConfig {
     GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap()
 }
@@ -151,9 +159,9 @@ fn named_target_buffers_match_independent_pool_geometry_and_aliases() {
                     .find(|a| a.id == format!("{prefix}.{name}"))
                     .unwrap()
             };
-            assert_eq!(get("kv.0").bytes, (pages + 1) * 41984);
+            assert_eq!(get("kv.0").bytes, searched((pages + 1) * 41984));
             assert_eq!(get("kv.1").bytes, 256);
-            assert_eq!(get("index.0").bytes, (pages + 1) * 8448);
+            assert_eq!(get("index.0").bytes, searched((pages + 1) * 8448));
             assert!(!facts
                 .allocations
                 .iter()
@@ -185,11 +193,17 @@ fn named_target_buffers_match_independent_pool_geometry_and_aliases() {
                     .any(|a| a.id == format!("{prefix}.decode.upload.0.ids")));
             }
             // Views do not charge a second physical arena or shared logits allocation.
+            // Serving prefill lanes are allocated by the first live prefill (Growth),
+            // so they are absent from the Ready charge.
             let phase = planner::evaluate(&facts, &budgets()).unwrap();
             let physical: u64 = facts
                 .allocations
                 .iter()
-                .filter(|a| a.view.is_none() && a.location == Location::coordinator(device))
+                .filter(|a| {
+                    a.view.is_none()
+                        && a.location == Location::coordinator(device)
+                        && a.lifetime.contains(Phase::Ready, facts.phase_order)
+                })
                 .map(|a| a.bytes)
                 .sum();
             assert_eq!(
@@ -230,11 +244,12 @@ fn ml4_target_caches_preserve_nope_and_shared_latent_geometry() {
                 let get = |suffix: &str| facts.allocations.iter().find(|owner|
                     owner.id == format!("glm.target.gpu.0.{suffix}.{layer}"));
                 let bytes = if owned && cfg.owns_kv(layer) {
-                    (pages + 1) * 64 * if cfg.rope(layer) { 656 } else { 528 }
+                    searched((pages + 1) * 64 * if cfg.rope(layer) { 656 } else { 528 })
                 } else { 256 };
                 assert_eq!(get("kv").unwrap().bytes, bytes, "layer {layer}");
                 assert_eq!(get("index").map(|owner| owner.bytes),
-                    (owned && cfg.indexers[layer] == GlmIndexer::Full).then_some((pages + 1) * 8448));
+                    (owned && cfg.indexers[layer] == GlmIndexer::Full)
+                        .then_some(searched((pages + 1) * 8448)));
             }
         }
     }

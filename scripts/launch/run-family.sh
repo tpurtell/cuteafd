@@ -397,6 +397,10 @@ done
 shared_profile_args() {
 release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" "$(get PROFILE_SPARK)"
 profile_args=(${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"})
+# Only the coordinator owns this observer; Spark workers must not subtract it.
+if [[ -n "$(get PROFILE_DIR)" && -f "$(get PROFILE_DIR)/observer-context.json" ]]; then
+  profile_args+=(-e "CUTEAFD_OBSERVER_CONTEXT_FILE=$(get PROFILE_DIR)/observer-context.json")
+fi
 release_profile_sample_args "$(get PROFILE)" "$(get PROFILE_EXPERT_INPUT_SAMPLE)" "$(get PROFILE_EXPERT_ROUTE_WEIGHTS)"
 profile_args+=(${RELEASE_PROFILE_SAMPLE_ARGS[@]+"${RELEASE_PROFILE_SAMPLE_ARGS[@]}"})
 RELEASE_PROFILE_NSYS_GRAPH_TRACE="$(get PROFILE_NSYS_GRAPH_TRACE)" \

@@ -8,6 +8,7 @@ use super::super::{
     Demand, ExpertHome, ExpertRange, HopSpec, LayerAssignment, LayerMode, ModeBytes, MovableId,
     Placement, PoolLimits, ResidentWeights, Tp2Range,
 };
+use crate::families::kimi_k3::allocation;
 use crate::formats::dflash::MlaDraftRuntimeLayout;
 use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_core::spark_reply::SparkReplyFormats;
@@ -295,6 +296,11 @@ pub struct KimiRecipe {
     pub maximum_pages: u64,
     /// Bytes of retained MLA records one page costs each rank.
     pub records_per_page: Vec<u64>,
+    /// Retained MLA record bytes one page costs each layer on each rank. Every
+    /// present entry is one physical cudaMalloc, so its curve carries the SM120
+    /// allocation granularity. Empty for the profiled two-rank layer placement,
+    /// whose whole-layer owners already name one layer each.
+    pub records_by_layer: Vec<[u64; 2]>,
     /// Attention weight bytes per rank for each layer.
     pub layer_attention: Vec<ModeBytes>,
     pub first_moe: usize,
@@ -561,7 +567,6 @@ impl KimiRecipe {
     pub fn balance_graphs(&mut self, cfg: &crate::families::kimi_k3::config::KimiK3Config,
         slots: usize, verify: usize) -> anyhow::Result<()> {
         if self.gpus != 2 || self.placement != AttentionPlacement::Layers { return Ok(()); }
-        use crate::families::kimi_k3::allocation;
         self.fixed.retain(|owner| owner.group != allocation::GRAPH_RESERVE);
         for (option, modes) in self.attention_profiles().iter().enumerate() {
             let graphs = allocation::graphs_for_ranks(cfg, self.lanes as usize, self.prefill.rows as usize,
@@ -706,16 +711,30 @@ impl Recipe for KimiRecipe {
                 .ok_or_else(|| invalid("arena count is not in the declared profile"))?;
             Ok(Choice { variable, option })
         };
-        for (rank, &bytes) in self.records_per_page.iter().enumerate() {
-            if bytes == 0 || !whole.is_empty() { continue; }
-            let owner = Allocation::buffer(format!("records.{rank}"),
-                Location::coordinator(rank as u8), self.page_rows(), Lifetime::RESIDENT,
-                Category::Kv, "records");
-            contract.components.push(Component::allocation(owner,
-                ByteCurve::linear(bytes, bytes, self.maximum_pages), false, self.maximum_pages));
+        if !profiled {
+            if self.records_by_layer.len() != self.attention.len() {
+                return Err(invalid("per-layer record inventory differs from the attention layers"));
+            }
+            for (rank, &bytes) in self.records_per_page.iter().enumerate() {
+                let per_layer = self.records_by_layer.iter().map(|units| units[rank]).sum::<u64>();
+                if per_layer != bytes {
+                    return Err(invalid("per-layer record inventory differs from the per-page total"));
+                }
+                for (layer, units) in self.records_by_layer.iter().enumerate() {
+                    let bytes = units[rank];
+                    if bytes == 0 || rank >= self.gpus { continue; }
+                    let owner = Allocation::buffer(format!("records.{layer}.{rank}"),
+                        Location::coordinator(rank as u8), self.page_rows(), Lifetime::RESIDENT,
+                        Category::Kv, "records");
+                    contract.components.push(Component::allocation(owner,
+                        ByteCurve::linear_rounded(bytes, bytes, self.maximum_pages,
+                            crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES),
+                        false, self.maximum_pages));
+                }
+            }
         }
         for fixed in &self.fixed {
-            if fixed.group == crate::families::kimi_k3::allocation::CODE_OWNER {
+            if fixed.group == allocation::CODE_OWNER {
                 if fixed.weights != 0 || fixed.category != Category::Runtime || fixed.basis != Basis::Estimated
                     || fixed.lifetime != Lifetime::RESIDENT {
                     return Err(invalid("selected-program code must be an Estimated opaque resident owner"));
@@ -754,7 +773,9 @@ impl Recipe for KimiRecipe {
                     let owner = Allocation::buffer(format!("records.{layer}.{option}"),
                         Location::coordinator(gpu), bytes, Lifetime::RESIDENT, Category::Kv, "records");
                     let mut allocation = Component::allocation(owner,
-                        ByteCurve::linear(bytes, bytes, self.maximum_pages), false, self.maximum_pages);
+                        ByteCurve::linear_rounded(bytes, bytes, self.maximum_pages,
+                            crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES),
+                        false, self.maximum_pages);
                     allocation.activation = activation;
                     contract.components.push(allocation);
                 }
@@ -884,6 +905,14 @@ impl Recipe for KimiRecipe {
                     false, self.maximum_pages));
             }
         }
+        // Every fixed device owner is one cudaMalloc of its own bytes; charge
+        // the driver's 2 MiB rounding as its own named tail. Page-scaled owners
+        // carry granularity on their own curve, packed arenas already own a
+        // tail, and the measured context plus captured-graph reserves are
+        // physical baselines, not single driver requests.
+        crate::placement::planner::fixed_request_tails(&mut contract.components, self.maximum_pages,
+            &[allocation::GRAPH_RESERVE, allocation::CODE_OWNER,
+                allocation::CONTEXT_ESTIMATE, allocation::CONTEXT_MEASURED])?;
         Ok(contract)
     }
 }
@@ -941,6 +970,20 @@ pub fn host_upload_owner(maximum: u64) -> Component {
             assumed: true }) }
 }
 
+/// Retained CUDA stream slabs are driver storage that survives every destroyed
+/// stream, so one owner per coordinator GPU charges the startup live peak. This
+/// is not a cudaMalloc request and receives no allocation-tail charge (#1511).
+pub fn stream_slab_owners(ranks: usize, maximum: u64) -> Result<Vec<Component>, Refusal> {
+    let peak = crate::plan::families::kimi::startup_peak_live_streams();
+    let bytes = cuda_stream_slab_bytes(peak)?;
+    Ok((0..ranks).map(|rank| Component {
+        activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum),
+        kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
+            bytes, lifetime: Lifetime::RESIDENT, assumed: false,
+            source: format!("kimi/driver-stream-slabs/gpu{rank} ({peak} peak live streams, SM120 driver/runtime 13020 LAZY, #1511 2026-11-08)") }),
+    }).collect())
+}
+
 pub fn host_scoring_bytes(decode_rows: usize, prefill_rows: usize, vocab: usize) -> Result<u64, Refusal> {
     cuteafd_core::memory_layout::host_logits_bytes(decode_rows as u64, prefill_rows as u64, vocab as u64)
         .ok_or(Refusal::Overflow("Kimi host scoring logits"))
@@ -954,9 +997,14 @@ pub fn host_scoring_owner(bytes: u64, maximum: u64) -> Component {
     )
 }
 
+/// The retained prefix quota is one portable mapped pin, allocated when the
+/// shared scheduler builds the cache before readiness. `add_driver_page_tables`
+/// therefore charges one SM120 mapping per coordinator context at
+/// ceil(bytes / 512) from Ready, matching Step-5's portable host prefix.
 pub fn host_prefix_owner(bytes: u64, maximum: u64) -> Component {
-    Component::allocation(Allocation::buffer("kimi.host.prefix", Location::HOST, bytes,
-        Lifetime::RESIDENT, Category::Prefix, "Kimi retained host prefix quota"),
+    Component::allocation(Allocation::buffer("kimi.host.prefix", Location::PINNED, bytes,
+        Lifetime { first: Phase::Ready, last: Phase::Growth }, Category::Prefix,
+        "Kimi retained host prefix quota"),
         ByteCurve::fixed(bytes, maximum), true, maximum)
 }
 
@@ -989,7 +1037,8 @@ mod tests {
         for ranks in [1, 2] {
             let mut recipe = recipe();
             recipe.gpus = ranks;
-            recipe.records_per_page = vec![64; ranks];
+            recipe.records_per_page = vec![128, 0][..ranks].to_vec();
+            recipe.records_by_layer = vec![[64, 0], [64, 0]];
             for arena in &mut recipe.arenas {
                 arena.peak.resize(ranks, 0);
                 arena.resident.resize(ranks, 0);
@@ -1062,7 +1111,8 @@ mod tests {
                 terminal: crate::placement::TerminalHome::AttentionOwner },
             peer_row_bytes: 0,
             maximum_pages: 4,
-            records_per_page: vec![64],
+            records_per_page: vec![128],
+            records_by_layer: vec![[64, 0], [64, 0]],
             layer_attention: vec![ModeBytes { whole: 100, split: [0; 2] }; 2],
             first_moe: 1,
             kinds: vec![AttentionClass::Kda],
@@ -1204,9 +1254,11 @@ mod tests {
         host.logical_bytes = envelope.bytes().unwrap() + 1024;
         budgets.push(host);
         let admitted = recipe.admit(single(), budgets.clone()).unwrap();
-        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(0));
+        // The retained prefix joins at Ready; Load holds only the push staging.
+        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(1024));
         assert_eq!(admitted.solved.remaining("host", Phase::Ready), Some(envelope.bytes().unwrap()));
-        budgets.last_mut().unwrap().logical_bytes -= 1;
+        // Load owns the push staging alone; one byte below its exact threshold refuses.
+        budgets.last_mut().unwrap().logical_bytes -= 1024 + 1;
         let refusal = recipe.admit(single(), budgets).unwrap_err();
         let limiting = match &refusal {
             Refusal::FullContextShortfall { limiting, .. } => limiting.as_ref(),
@@ -1261,9 +1313,66 @@ mod tests {
         budgets.push(host);
         let admitted = recipe.admit(single(), budgets.clone()).unwrap();
         assert_eq!(admitted.solved.remaining("host", Phase::Ready), Some(0));
-        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(scoring));
+        // The portable prefix is retained from Ready, so Load holds no host bytes.
+        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(1024 + scoring));
         budgets.last_mut().unwrap().logical_bytes -= 1;
         assert!(recipe.admit(single(), budgets).is_err());
+    }
+
+    #[test]
+    fn portable_host_prefix_maps_once_per_coordinator_context_only_while_retained() {
+        use crate::placement::planner::{driver_page_table_bytes, Location, Phase};
+        for gpus in [1, 2] {
+            let mut recipe = recipe();
+            recipe.gpus = gpus;
+            recipe.records_per_page = vec![128, 0][..gpus].to_vec();
+            recipe.records_by_layer = vec![[64, 0], [64, 0]];
+            recipe.arenas = recipe.arenas.iter().map(|arena| Arena { count: arena.count,
+                peak: vec![arena.peak[0]; gpus], resident: vec![arena.resident[0]; gpus],
+                weights: vec![arena.weights[0]; gpus] }).collect();
+            let bytes = 1 << 30;
+            recipe.owners.push(host_prefix_owner(bytes, recipe.maximum_pages));
+            let mut contract = recipe.prepare(&single()).unwrap();
+            contract.add_driver_page_tables();
+            let selected = vec![0; contract.variables.len()];
+            let facts = contract.facts(&selected, 1).unwrap();
+            let prefix = facts.deferred.iter().find(|owner| owner.id == "kimi.host.prefix").unwrap();
+            assert_eq!((prefix.location, prefix.bytes), (Location::PINNED, bytes));
+            assert!(prefix.lifetime.contains(Phase::Ready, facts.phase_order));
+            assert!(prefix.lifetime.contains(Phase::Growth, facts.phase_order));
+            assert!(!prefix.lifetime.contains(Phase::Load, facts.phase_order));
+            let mappings = facts.driver_page_tables.iter().filter(|owner|
+                owner.backing == prefix.id).collect::<Vec<_>>();
+            assert_eq!(mappings.len(), gpus);
+            for rank in 0..gpus {
+                let mapping = mappings.iter().find(|owner|
+                    owner.location == Location::coordinator(rank as u8)).unwrap();
+                assert_eq!(mapping.mapped_bytes, bytes);
+                assert_eq!(mapping.bytes(), driver_page_table_bytes(bytes));
+                assert!(!mapping.lifetime.contains(Phase::Load, facts.phase_order));
+                assert!(mapping.lifetime.contains(Phase::Ready, facts.phase_order));
+                assert!(mapping.lifetime.contains(Phase::Growth, facts.phase_order));
+            }
+        }
+    }
+
+    #[test]
+    fn stream_slab_owner_charges_the_startup_live_peak_per_coordinator_context() {
+        let peak = crate::plan::families::kimi::startup_peak_live_streams();
+        assert_eq!(peak, 7);
+        let bytes = cuda_stream_slab_bytes(peak).unwrap();
+        assert_eq!(bytes, 4 << 20);
+        let owners = stream_slab_owners(2, 4).unwrap();
+        assert_eq!(owners.len(), 2);
+        for (rank, component) in owners.iter().enumerate() {
+            let ComponentKind::Allowance(owner) = &component.kind else { panic!("stream slabs are one allowance") };
+            assert!(!owner.assumed);
+            assert_eq!(owner.location, Location::coordinator(rank as u8));
+            assert_eq!(owner.bytes, bytes);
+            assert_eq!(owner.lifetime, Lifetime::RESIDENT);
+            assert!(owner.source.starts_with(&format!("kimi/driver-stream-slabs/gpu{rank} ({peak} peak live streams")));
+            assert_eq!(component.bytes.at(4).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -1277,7 +1386,8 @@ mod tests {
         let mut recipe = recipe();
         recipe.gpus = 2;
         recipe.hop_spec.terminal = crate::placement::TerminalHome::Replicated;
-        recipe.records_per_page = vec![64; 2];
+        recipe.records_per_page = vec![128; 2];
+        recipe.records_by_layer = vec![[64, 64], [64, 64]];
         recipe.attention = vec![LayerMode::HeadSplit; 2];
         recipe.layer_attention = vec![ModeBytes { whole: 100, split: [50; 2] }; 2];
         recipe.experts = None;
@@ -1360,6 +1470,8 @@ mod tests {
         recipe.spark_links = true;
         recipe.attention.push(recipe.attention[0]);
         recipe.layer_attention.push(recipe.layer_attention[0].clone());
+        recipe.records_by_layer.push(recipe.records_by_layer[0]);
+        recipe.records_per_page[0] += recipe.records_by_layer[0][0];
         recipe.experts = Some(ExpertProfile { layers: vec![1, 2], destination: vec![0],
             counts: vec![0, 1, 2], rank_sets: vec![vec![0]] });
         recipe.arenas.push(Arena { count: 2, peak: vec![2000], resident: vec![2000], weights: vec![1800] });

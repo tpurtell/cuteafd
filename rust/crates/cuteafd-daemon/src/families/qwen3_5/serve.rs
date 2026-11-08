@@ -608,7 +608,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 .then(cuteafd_ffi::memory_ledger::AllocationAudit::begin);
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0),
-                draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), slots,
+                draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes.clone())), slots,
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
                 Some((&engine_args.prefix, lanes,
                     engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device, engine_args.max_context)), false)?);
@@ -808,7 +808,7 @@ mod tests {
         let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
         let admission = Admission::new(&reader, &cfg, &programs)?;
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
-            Some(262144), Some(admission.bytes), 4, Some(crate::shared::prefix::MarkRule {
+            Some(262144), Some(admission.bytes.clone()), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
             std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
         let mtp = Rc::new(MtpCache::load(&engine.borrow(), &reader, admission)?);

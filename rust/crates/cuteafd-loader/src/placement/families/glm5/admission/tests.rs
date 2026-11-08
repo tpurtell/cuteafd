@@ -1,5 +1,13 @@
 use super::*;
 use crate::placement::{FfnMode, planner};
+
+/// The searched extent: an independent cudaMalloc request rounds to its own
+/// driver block; sub-block requests stay exact and share blocks.
+fn searched(exact: u64) -> u64 {
+    if planner::independent_request(exact) {
+        exact + planner::allocation_granularity_forecast(&[exact]).unwrap()
+    } else { exact }
+}
 use cuteafd_core::memory_layout::Category;
 
 fn cfg() -> GlmDsaConfig {
@@ -39,12 +47,13 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
             weights: vec![(EmbeddingHome::Device(0), WeightInventory { ranks: gpus, owners: vec![],
                 core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default(), attention_mount: Default::default() })],
             hooks: (0..gpus).map(|rank| HookBuffers { device: rank as u8, maximum_pages: 1,
-                native: None, core: None, shared_workspace: None }).collect(),
+                native: None, core: None, shared_workspace: None, full_prefill_logits: false }).collect(),
             embedding_read: None, native_load: None,
         },
         draft: DraftFacts::default(), scratch: Default::default(),
         context_scratch: (gpus == 2).then(super::super::GlmContext::default),
         exchange_element_bytes: 2, peer_diagnostics: false, local: None, spark_ranks: ranks,
+        prefix_host: gpus == 1,
         decode_link: (ranks > 0).then(|| production_link(cfg, ranks, PrefillShape { rows: 64, waves: 1 }, false)),
         prefill_link: (ranks > 0).then(|| production_link(cfg, ranks, prefill, true)),
         skip_routed_experts: false, operation: Operation::Serving,
@@ -1201,7 +1210,7 @@ fn one_contract_activates_physical_owners_by_shape_home_and_unique_target_count(
                 );
                 assert_eq!(
                     owner("glm.target.gpu.0.kv.0").bytes,
-                    33 * super::super::RECORD_PAGE_BYTES
+                    searched(33 * super::super::RECORD_PAGE_BYTES)
                 );
                 assert_eq!(
                     owner("glm.target.gpu.0.prefill.rows.h").bytes,
@@ -1282,59 +1291,8 @@ fn graph_layers(owners: &[u8], tp2: &[bool]) -> Vec<GlmGraphLayer> {
 }
 
 #[test]
-fn maintained_graph_figures_cover_every_placement_without_an_automatic_growth_margin() {
-    for (attention, gpus) in [(AttentionPlacement::Heads, 1), (AttentionPlacement::Heads, 2),
-        (AttentionPlacement::Context, 2), (AttentionPlacement::Layers, 2)] {
-        let mut layers = graph_layers(&[0, 1], &[false, gpus == 2]);
-        if attention != AttentionPlacement::Layers {
-            for layer in &mut layers { layer.attention_owner = None; }
-        }
-        for context in [64, 1024, 1025, 131072, 131073, 262144, 262145, 1 << 20] {
-            let graphs = StartupGraphs::new(context, attention, gpus, &layers, 4).unwrap();
-            let floor = (context as usize).div_ceil(PAGE_ROWS as usize);
-            for pages in [floor, floor + 1, floor * 2, 32768] {
-                let actual = glm_declared_graphs(&glm_graph_shapes(context as usize, pages),
-                    attention, gpus, &layers, 4).unwrap();
-                for (rank, declared) in actual.iter().enumerate() {
-                    assert_eq!(declared.fingerprint(rank as u8).unwrap(),
-                        graphs.declared()[rank].fingerprint(rank as u8).unwrap());
-                }
-            }
-            let components = graphs.components(32768).unwrap();
-            assert_eq!(components.len(), gpus, "one whole-set figure, no growth reserve");
-            for (rank, component) in components.iter().enumerate() {
-                let ComponentKind::Allowance(allowance) = &component.kind else {
-                    panic!("graphs are opaque, not physical allocations")
-                };
-                assert_eq!(allowance.location, Location::coordinator(rank as u8));
-                assert_eq!(allowance.lifetime, Lifetime { first: Phase::Warmup, last: Phase::Growth });
-                assert!(allowance.assumed, "these synthetic layouts are estimated, not measured");
-                assert!(allowance.source.contains("instantiate"));
-                let figure = graphs.figures()[rank];
-                assert_eq!(allowance.bytes, figure.bytes);
-                let source = if gpus == 1 { GLM_MIN_GRAPH } else { GLM_MAX_GRAPH[rank] };
-                let keys = if rank == 0 { 16_827u128 } else { 16_614 };
-                assert_eq!(u128::from(figure.bytes),
-                    (u128::from(source.bytes) * if attention == AttentionPlacement::Layers {
-                        (layers.len() * glm_graph_shapes(context as usize, floor).len()) as u128
-                    } else { graphs.declared()[rank].len() as u128 }).div_ceil(keys));
-                for pages in [1, floor as u64, 32768] {
-                    assert_eq!(component.bytes.at(pages).unwrap(), figure.bytes);
-                }
-            }
-        }
-    }
-    let layers = graph_layers(&[0, 1], &[false, true]);
-    assert!(StartupGraphs::new(0, AttentionPlacement::Layers, 2, &layers, 4).is_err());
-    assert!(StartupGraphs::new(64, AttentionPlacement::Layers, 2,
-        &graph_layers(&[2, 0], &[false, true]), 4).is_err());
-    assert!(StartupGraphs::new(64, AttentionPlacement::Layers, 1, &layers, 4).is_err());
-    assert!(StartupGraphs::new(64, AttentionPlacement::Layers, 2, &layers, 4)
-        .unwrap().components(0).is_err());
-}
-
-#[test]
-fn measured_reference_figures_match_independently_declared_min_max_sets() {
+fn graph_figures_are_keyed_by_the_measured_fingerprint_and_estimate_other_layouts() {
+    disallow_synthetic_graphs();
     let min_layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
         dense: layer < 3, local: false, attention_owner: None,
     }).collect();
@@ -1343,118 +1301,181 @@ fn measured_reference_figures_match_independently_declared_min_max_sets() {
     let min = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 4).unwrap();
     let max = StartupGraphs::new(1 << 20, AttentionPlacement::Context, 2, &max_layers, 6).unwrap();
     assert_eq!(min.declared()[0].fingerprint(0).unwrap(), MIN_GRAPHS);
-    assert_eq!(min.figures(), [GLM_MIN_GRAPH]);
-    assert_eq!(min.figures()[0].bytes, 2_560_622_592);
-    assert_eq!(GLM_MIN_CONTEXT.bytes, 598_999_040);
-    assert_eq!(max.figures(), GLM_MAX_GRAPH);
-    assert_eq!(GLM_MAX_CONTEXT.map(|figure| figure.bytes), [594_804_736, 603_193_344]);
-    assert_eq!(GLM_MAX_GRAPH.map(|figure| figure.bytes), [3_042_967_552, 2_971_664_384]);
-    for rank in 0..2 {
-        assert_eq!(max.declared()[rank].fingerprint(rank as u8).unwrap(), MAX_GRAPHS[rank]);
-        assert_eq!(max.figures()[rank].attribution, FigureAttribution::Measured);
-        let ComponentKind::Allowance(allowance) = &max.components(32768).unwrap()[rank].kind else {
-            panic!("expected graph allowance")
-        };
-        assert!(!allowance.assumed);
-        assert_eq!(allowance.bytes, GLM_MAX_GRAPH[rank].bytes);
+    assert_eq!(max.declared()[0].fingerprint(0).unwrap(), MAX_GRAPHS[0]);
+    assert_eq!(max.declared()[1].fingerprint(1).unwrap(), MAX_GRAPHS[1]);
+    assert_eq!(min.ranks()[0].bytes, 2_984_247_296);
+    assert_eq!(max.ranks().iter().map(|rank| rank.bytes).collect::<Vec<_>>(),
+        [3_042_967_552, 2_971_664_384]);
+    for (rank, graph) in min.ranks().iter().enumerate() {
+        assert_eq!(graph.margin, 0);
+        assert_eq!(graph.basis, Basis::Calibrated);
+        assert_eq!(graph.executables as usize, min.declared()[rank].len());
     }
+    assert_eq!(min.figures()[0].attribution, FigureAttribution::Measured);
+    assert_eq!(min.figures()[0].identity.declared_graphs, MIN_GRAPHS);
+    for (rank, component) in max.components(32768).unwrap().iter().enumerate() {
+        let ComponentKind::Allowance(allowance) = &component.kind else {
+            panic!("graphs are opaque, not physical allocations")
+        };
+        assert_eq!(allowance.location, Location::coordinator(rank as u8));
+        assert_eq!(allowance.lifetime, Lifetime { first: Phase::Warmup, last: Phase::Growth });
+        assert_eq!(allowance.bytes, max.ranks()[rank].bytes);
+        assert!(!allowance.assumed, "a measured row is never labelled assumed");
+        assert!(allowance.source.contains("startup graphs"));
+    }
+    // The declared key set, not the context alone, is the identity. Each of
+    // these produces a fingerprint with no measured row; #1605 serves it on the
+    // best measured row for its rank (the default-context row upper-bounds a
+    // lower context), labelled Estimated with one warning, and never scales or
+    // refuses.
     let mut owned = max_layers.clone();
     for (layer, spec) in owned.iter_mut().enumerate() { spec.attention_owner = Some((layer % 2) as u8); }
-    let layers = StartupGraphs::new(1 << 20, AttentionPlacement::Layers, 2, &owned, 6).unwrap();
-    for rank in 0..2 {
-        assert!(layers.declared()[rank].len() > max.declared()[rank].len() * 2);
-        assert!(layers.figures()[rank].bytes <= GLM_MAX_GRAPH[rank].bytes);
-        assert!(layers.figures()[rank].bytes > GLM_MAX_GRAPH[rank].bytes * 9 / 10);
-        assert!(matches!(layers.figures()[rank].attribution, FigureAttribution::Estimated { .. }));
+    let estimated = [
+        StartupGraphs::new(1 << 19, AttentionPlacement::Heads, 1, &min_layers, 4),
+        StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 2, &max_layers, 6),
+        StartupGraphs::new(1 << 20, AttentionPlacement::Layers, 2, &owned, 6),
+        StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 8),
+        StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers[..77], 4),
+    ];
+    for graphs in estimated {
+        let graphs = graphs.expect("an unmeasured declared graph set is served, not refused");
+        for (rank, graph) in graphs.ranks().iter().enumerate() {
+            assert_eq!(graph.basis, Basis::Estimated);
+            assert_eq!(graph.margin, 0);
+            // Same rank first, identically-keyed first within it.
+            let same_rank = super::MEASURED_GLM_GRAPHS.iter().filter(|row| row.rank == rank as u8);
+            let expected = same_rank.clone().filter(|row| row.keys == graph.executables as usize)
+                .map(|row| row.bytes).max()
+                .or_else(|| same_rank.map(|row| row.bytes).max())
+                .expect("the family has a measured row for every rank");
+            assert_eq!(graph.bytes, expected);
+            let figure = &graphs.figures()[rank];
+            assert!(matches!(figure.attribution, FigureAttribution::Estimated { .. }));
+            // The figure keeps the provenance of the row it borrowed.
+            assert!(!figure.identity.declared_graphs.is_empty());
+            assert_eq!(figure.bytes, expected);
+        }
+        for component in graphs.components(32768).unwrap() {
+            let ComponentKind::Allowance(allowance) = &component.kind else {
+                panic!("graphs are opaque, not physical allocations")
+            };
+            assert!(allowance.assumed, "an estimated graph row is labelled assumed");
+        }
     }
-    // Equal counts are not graph-set identity: heads and context have different tables.
-    let heads = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 2, &max_layers, 6).unwrap();
-    for figure in heads.figures() {
-        assert!(matches!(figure.attribution, FigureAttribution::Estimated { .. }));
-    }
+    assert!(StartupGraphs::new(0, AttentionPlacement::Heads, 1, &min_layers, 4).is_err());
+    assert!(StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 4)
+        .unwrap().components(0).is_err());
 }
 
 #[test]
-fn runtime_figures_preserve_recorded_peaks_without_double_charging_or_margins() {
-    for (ranks, layout, context, unattributed) in [
-        (1, MIN_LAYOUT, vec![598_999_040], vec![621_275_328]),
-        (2, MAX_LAYOUT, vec![594_804_736, 603_193_344], vec![912_069_460, 581_053_972]),
-    ] {
-        let figures = RuntimeFigures::new(ranks, layout).unwrap();
-        assert_eq!(figures.context().iter().map(|f| f.bytes).collect::<Vec<_>>(), context);
-        assert_eq!(figures.unattributed().iter().map(|f| f.bytes).collect::<Vec<_>>(), unattributed);
-        assert!(figures.context().iter().chain(figures.unattributed())
-            .all(|f| f.attribution == FigureAttribution::Measured));
-        let load = if ranks == 1 { vec![552_230_080] } else { vec![843_024_212, 509_750_804] };
-        assert_eq!(figures.load().iter().map(|f| f.bytes).collect::<Vec<_>>(), load);
-        for maximum in [1, 32768] {
-            let components = figures.components(maximum).unwrap();
-            assert_eq!(components.len(), ranks * 3);
-            for (index, component) in components.iter().enumerate() {
-                let ComponentKind::Allowance(owner) = &component.kind else {
-                    panic!("opaque runtime has no invented allocation owner")
-                };
-                let rank = index % ranks;
-                let (bytes, lifetime) = match index / ranks {
-                    0 => (context[rank], Lifetime::RESIDENT),
-                    1 => (load[rank], Lifetime { first: Phase::Load, last: Phase::Warmup }),
-                    _ => (unattributed[rank], Lifetime { first: Phase::Ready, last: Phase::Growth }),
-                };
-                assert_eq!(owner.location, Location::coordinator(rank as u8));
-                assert_eq!(owner.bytes, bytes);
-                assert!(!owner.assumed);
-                assert_eq!(owner.lifetime, lifetime);
-                assert_eq!(component.activation, Activation::always());
-                assert_eq!(component.bytes.at(1).unwrap(), bytes);
-                assert_eq!(component.bytes.at(maximum).unwrap(), bytes);
-            }
-        }
-        let estimated = RuntimeFigures::new(ranks, "different complete layout").unwrap();
-        for (source, derived) in figures.context().iter().chain(figures.load()).chain(figures.unattributed())
-            .zip(estimated.context().iter().chain(estimated.load()).chain(estimated.unattributed())) {
-            assert_eq!(derived.bytes, source.bytes, "uncovered is not permission to add a margin");
-            assert_eq!(derived.evidence, source.evidence);
-            assert_eq!(derived.producing_commit, source.producing_commit);
-            assert!(matches!(derived.attribution, FigureAttribution::Estimated { .. }));
-        }
-        assert!(estimated.components(32768).unwrap().iter().all(|component|
-            matches!(&component.kind, ComponentKind::Allowance(a) if a.assumed)));
-        assert!(figures.components(0).is_err());
-    }
-    for ranks in [0, 3, usize::MAX] { assert!(RuntimeFigures::new(ranks, MIN_LAYOUT).is_err()); }
-    assert!(RuntimeFigures::new(1, " ").is_err());
+fn a_live_capture_replaces_the_row_only_at_the_row_fingerprint() {
+    let min_layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
+        dense: layer < 3, local: false, attention_owner: None,
+    }).collect();
+    let min = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 4).unwrap();
+    let set = min.set();
+    assert_eq!(set.lifetime, crate::placement::Lifetime::Startup);
+    assert_eq!(set.shapes, glm_graph_shapes(1 << 20, (1 << 20) / PAGE_ROWS as usize).len() as u64);
+    assert_eq!(set.ranks, min.ranks());
+    assert_eq!(min.capture_note(&set), None);
+    let mut moved = set.clone();
+    moved.ranks[0].bytes += 2 << 20;
+    let note = min.capture_note(&moved).unwrap();
+    assert!(note.contains("update MEASURED_GLM_GRAPHS"), "{note}");
+    assert!(note.contains(&format!("rank 0: row {} -> captured {}", set.ranks[0].bytes, moved.ranks[0].bytes)));
 }
 
 #[test]
-fn load_allowances_cover_each_reference_sample_and_do_not_overlap_ready() {
-    // #1242 raw untracked samples: target, draft, pool, transport, warmed graph.
-    // The final sample has signed instantiate bytes removed; no other graph
-    // bytes are subtracted before instantiate actually happened.
-    for (gpus, layout, rank, raw, context, graph) in [
-        (1, MIN_LAYOUT, 0, [742_390_144, 865_686_208, 988_469_184, 1_078_613_952, 3_711_851_712],
-            598_999_040, 2_560_622_592),
-        (2, MAX_LAYOUT, 0, [863_806_848, 940_924_096, 1_267_960_148, 1_437_828_948, 4_480_796_500],
-            594_804_736, 3_042_967_552),
-        (2, MAX_LAYOUT, 1, [743_268_224, 743_268_224, 1_082_881_044, 1_110_846_996, 4_084_608_532],
-            603_193_344, 2_971_664_384),
-    ] {
-        let figures = RuntimeFigures::new(gpus, layout).unwrap();
-        let peak = raw.into_iter().enumerate().map(|(i, bytes)|
-            bytes - context - if i == 4 { graph } else { 0 }).max().unwrap();
-        assert_eq!(figures.load()[rank].bytes, peak);
-        let components = figures.components(32768).unwrap();
-        for phase in PhaseOrder::DRAFT_THEN_TARGET.phases() {
-            let opaque = components.iter().filter_map(|component| match &component.kind {
-                ComponentKind::Allowance(owner) if owner.location == Location::coordinator(rank as u8)
-                    && owner.lifetime.contains(*phase, PhaseOrder::DRAFT_THEN_TARGET) => Some(owner.bytes),
-                _ => None,
-            }).collect::<Vec<_>>();
-            assert_eq!(opaque.len(), 2, "context plus exactly one residual in {phase}");
-            assert_eq!(opaque.iter().sum::<u64>(), context + if matches!(phase, Phase::Ready | Phase::Growth) {
-                figures.unattributed()[rank].bytes
-            } else { peak });
+fn stream_inventory_counts_long_lived_serving_streams_and_shared_delivery() {
+    use crate::placement::planner::cuda_stream_slab_bytes;
+    let copies = crate::push_load::COPY_STREAMS as u64;
+    // Engine + prefix copy + delivery copies are the floor of every layout.
+    assert_eq!(startup_peak_live_streams(0, false, false), 2 + copies);
+    assert_eq!(startup_peak_live_streams(1, false, false), 2 + copies);
+    // The Spark intakes' copy streams live on the rank that owns their planes.
+    assert_eq!(startup_peak_live_streams(0, true, false), 4 + copies);
+    assert_eq!(startup_peak_live_streams(1, true, false), 2 + copies);
+    // The host-prefix copy engine is per rank; the head split never admits it.
+    assert_eq!(startup_peak_live_streams(0, true, true), 6 + copies);
+    assert_eq!(startup_peak_live_streams(1, true, true), 4 + copies);
+    // One-coordinator serving with Sparks and the host tier needs three slabs;
+    // a head split's ranks need two each.
+    assert_eq!(cuda_stream_slab_bytes(startup_peak_live_streams(0, true, true)).unwrap(), 3 << 21);
+    assert_eq!(cuda_stream_slab_bytes(startup_peak_live_streams(0, true, false)).unwrap(), 2 << 21);
+    assert_eq!(cuda_stream_slab_bytes(startup_peak_live_streams(1, true, false)).unwrap(), 2 << 21);
+}
+
+#[test]
+fn device_stage_rows_partition_each_reference_census_delta_exactly_once() {
+    // #1242 raw untracked samples per phase transition. Each row is the
+    // difference between adjacent samples (with the measured instantiate sum
+    // removed from the final sample). The pool's cudaMalloc backing is no
+    // longer a stage row: the selected pool owners carry the sizes-derived
+    // SM120 granularity tail instead, so it moves with the pool extent.
+    let cases: [(usize, usize, u64, &[(&str, u64)]); 3] = [
+        (1, 0, 598_999_040, &[
+            ("target weight load device staging", 143_391_104),
+            ("drafter load device staging", 123_296_064),
+            ("transport device staging", 90_144_768),
+            ("startup prewarm module first touch", 72_615_168),
+            ("first ready-step CUDA module touch", 69_045_248)]),
+        (2, 0, 594_804_736, &[
+            ("target weight load device staging", 269_002_112),
+            ("drafter load device staging", 77_117_248),
+            ("transport device staging", 169_868_800),
+            ("first ready-step CUDA module touch", 69_045_248)]),
+        (2, 1, 603_193_344, &[
+            ("target weight load device staging", 140_074_880),
+            ("transport device staging", 27_965_952),
+            ("first ready-step CUDA module touch", 71_303_168)]),
+    ];
+    for (gpus, rank, context, rows) in cases {
+        let figures = DeviceFigures::new(gpus, false, false).unwrap();
+        assert_eq!(figures.context()[rank].bytes, context);
+        assert_eq!(figures.context()[rank].attribution, FigureAttribution::Measured);
+        let actual: Vec<_> = figures.stages().iter().filter(|row| row.rank == rank)
+            .map(|row| (row.label, row.bytes)).collect();
+        assert_eq!(actual, rows);
+        assert_eq!(figures.components(32768).unwrap().len(), 2 * gpus + figures.stages().len());
+        for component in figures.components(32768).unwrap() {
+            let ComponentKind::Allowance(owner) = &component.kind else {
+                panic!("a census stage is not a physical allocation")
+            };
+            assert!(!owner.assumed);
+            assert!(owner.source.contains("census") || owner.source.contains("GLM context")
+                || owner.source.contains("stream-slabs"));
+            assert_eq!(component.bytes.at(1).unwrap(), owner.bytes);
+        }
+        let phase_order = PhaseOrder::DRAFT_THEN_TARGET;
+        for (index, row) in figures.stages().iter().enumerate() {
+            let ComponentKind::Allowance(owner) = &figures.components(32768).unwrap()[2 * gpus + index].kind else {
+                panic!("stage rows stay allowance owners")
+            };
+            assert_eq!(owner.bytes, row.bytes);
+            assert_eq!(owner.location, Location::coordinator(row.rank as u8));
+            assert_eq!(owner.lifetime, Lifetime { first: row.first, last: row.last });
+            assert!(owner.lifetime.contains(row.first, phase_order) && owner.lifetime.contains(row.last, phase_order));
+        }
+        // Stream-slot slabs are their own owner and come out of the context row.
+        let slabs = figures.slabs();
+        for rank in 0..gpus {
+            let peak = startup_peak_live_streams(rank, false, false);
+            assert_eq!(slabs[rank], crate::placement::planner::cuda_stream_slab_bytes(peak).unwrap());
+            let ComponentKind::Allowance(owner) = &figures.components(32768).unwrap()[gpus + rank].kind else {
+                panic!("stream slabs stay an allowance owner")
+            };
+            assert_eq!(owner.bytes, slabs[rank]);
+            assert_eq!(owner.lifetime, Lifetime::RESIDENT);
+            assert!(!owner.assumed);
+            assert!(owner.source.contains(&format!("{peak} peak live streams")));
+            let ComponentKind::Allowance(context) = &figures.components(32768).unwrap()[rank].kind else {
+                panic!("the context row stays an allowance owner")
+            };
+            assert_eq!(context.bytes, figures.context()[rank].bytes - slabs[rank]);
         }
     }
+    for gpus in [0, 3, usize::MAX] { assert!(DeviceFigures::new(gpus, false, false).is_err()); }
+    assert!(DeviceFigures::new(1, false, false).unwrap().components(0).is_err());
 }
 
 #[test]
@@ -1667,6 +1688,15 @@ fn fixed_prefix_quota_uses_joint_host_ram_after_steady_and_pinned_owners() {
         .map(|owner| owner.bytes).sum();
     assert!(pinned > 0);
     assert_eq!(steady.owned, pinned);
+    // Serving prefill lanes allocate their pinned H2B staging on the first live
+    // prefill, after Ready, so the host budget carries them at Growth even
+    // though the Ready phase does not.
+    let deferred: u64 = without_prefix.facts.allocations.iter().filter(|owner|
+        owner.location == Location::PINNED && owner.view.is_none()
+            && !owner.lifetime.contains(Phase::Ready, without_prefix.facts.phase_order)
+            && owner.lifetime.contains(Phase::Growth, without_prefix.facts.phase_order))
+        .map(|owner| owner.bytes).sum();
+    assert!(deferred > 0);
 
     // Use the existing resolver, not a new cutover default or free-RAM clamp.
     let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 1 << 20,
@@ -1687,14 +1717,15 @@ fn fixed_prefix_quota_uses_joint_host_ram_after_steady_and_pinned_owners() {
         let mut joint = budgets();
         let occupied = 128 << 20;
         let headroom = 256 << 20;
-        let available = host.steady().bytes + pinned + quota;
+        let available = host.steady().bytes + pinned + deferred + quota;
         joint[2] = Budget { id: "physical.2".into(),
             locations: vec![Location::HOST, Location::PINNED],
             physical_bytes: available + occupied + headroom,
             logical_bytes: available + occupied + headroom,
             baseline: Baseline::Forecast { occupied, source: "external host consumers".into(),
                 assumed: false }, headroom };
-        assert_eq!(joint[2].available().unwrap() - host.steady().bytes - pinned, quota);
+        assert_eq!(joint[2].available().unwrap() - host.steady().bytes - pinned,
+            quota + deferred);
         let admitted = planner::solve(request.clone(), joint.clone(), &with_prefix).unwrap();
         let ready = admitted.phases.iter().find(|phase|
             phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap();
@@ -1731,6 +1762,15 @@ fn auto_embedding_can_move_without_shrinking_fixed_prefix_quota_or_pool() {
     assert_eq!(embedding.bytes, 8192);
     let pinned = without_prefix.phases.iter().find(|phase|
         phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap().owned;
+    // Serving prefill lanes allocate their pinned H2B staging on the first live
+    // prefill, after Ready, so the host budget carries them at Growth even
+    // though the Ready phase does not.
+    let deferred: u64 = without_prefix.facts.allocations.iter().filter(|owner|
+        owner.location == Location::PINNED && owner.view.is_none()
+            && !owner.lifetime.contains(Phase::Ready, without_prefix.facts.phase_order)
+            && owner.lifetime.contains(Phase::Growth, without_prefix.facts.phase_order))
+        .map(|owner| owner.bytes).sum();
+    assert!(deferred > 0);
     let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 1 << 20,
         mark_bytes: 0, draft_bytes: 0 };
     let chunk = geometry.chunk_bytes();
@@ -1743,7 +1783,7 @@ fn auto_embedding_can_move_without_shrinking_fixed_prefix_quota_or_pool() {
             let bytes = ByteCurve::fixed(owner.bytes, with_prefix.maximum_pages);
             Component::allocation(owner, bytes, false, with_prefix.maximum_pages)
         }).collect() });
-        let available = host.steady().bytes + pinned + quota;
+        let available = host.steady().bytes + pinned + deferred + quota;
         let mut joint = budgets();
         joint[2].physical_bytes = available;
         joint[2].logical_bytes = available;
@@ -1762,7 +1802,10 @@ fn auto_embedding_can_move_without_shrinking_fixed_prefix_quota_or_pool() {
             phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap();
         assert_eq!(ready.opaque, host.steady().bytes);
         assert_eq!(ready.owned, pinned + quota - embedding.bytes);
-        assert_eq!(ready.available - ready.owned - ready.opaque, embedding.bytes - 1);
+        // The unpinned host budget still carries the Growth-only prefill
+        // staging, so Ready keeps exactly that much slack plus the 1-byte hole.
+        assert_eq!(ready.available - ready.owned - ready.opaque,
+            embedding.bytes - 1 + deferred);
         let relocated = moved.facts.allocations.iter()
             .find(|owner| owner.id == embedding.id).unwrap();
         assert_eq!(relocated.location, Location::coordinator(0));

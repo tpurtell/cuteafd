@@ -108,11 +108,6 @@ impl GlmDflashPhysicalLayout {
                 add(format!("{p}.{name}"), device, bytes);
             }
         }
-        if let Some(scratch) = layout.fp8_scratch {
-            let bytes = scratch.shapes.iter().map(|s| draft_fp8_scratch_bytes(scratch.rows as u64,
-                s.k, s.n, sm_count as u64, fp8_mode)).max().unwrap_or(0);
-            add("fp8_workspace".into(), device, usize::try_from(bytes)?);
-        }
         let sequences = capacity.max_batch_sequences;
         let rows = capacity.block_rows;
         let drafted = sequences * cfg.drafts();
@@ -132,6 +127,15 @@ impl GlmDflashPhysicalLayout {
             add(format!("workspace.{name}"), device, bytes);
         }
         add("workspace.landing".into(), Location::PINNED, drafted * 20);
+        if let Some(scratch) = layout.fp8_scratch {
+            let bytes = scratch.shapes.iter().map(|s| draft_fp8_scratch_bytes(scratch.rows as u64,
+                s.k, s.n, sm_count as u64, fp8_mode)).max().unwrap_or(0);
+            // The runtime allocates this through shared/fp8_linear.rs as a
+            // workspace owner; keep the receipt in the same bucket.
+            owners.push(Allocation::buffer("fp8_workspace", device,
+                usize::try_from(bytes)?.max(256) as u64,
+                Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Workspace, "draft owners"));
+        }
         // prime_metadata reserves full-sized, per-destination upload owners at readiness.
         for name in ["context_positions", "workspace.positions", "workspace.anchors", "workspace.ids",
             "context.slots", "workspace.attention.tables"] {

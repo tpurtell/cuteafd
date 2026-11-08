@@ -298,13 +298,23 @@ weights and scratch alongside the KV pool and routed experts.
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
 | `PROFILE` | unset | comma list of `census`, `transport-timing`, `expert-timing`, `expert-routes`, `draft-timing`, `nsys`, `ncu` | Wraps the coordinator for one launch; nsys and ncu are exclusive. |
-| `PROFILE_DIR` | unset | absolute dir | Report destination. |
+| `PROFILE_DIR` | unset | absolute dir | Report destination; also runner-owned for `wip-cards --probe memory` without a profiler. |
 | `PROFILE_NCU_KERNEL` | unset | kernel regex | Required by `PROFILE=ncu`; each match is replayed. |
 | `PROFILE_NCU_COUNT`, `PROFILE_NCU_SET`, `PROFILE_NCU_SKIP` | 1, `full`, 0 | 1–9999 / section set / integer | ncu replay count, section set, warm-up matches skipped. |
 | `PROFILE_NSYS_GPU_METRICS`, `PROFILE_NSYS_CPU`, `PROFILE_NSYS_GRAPH_TRACE` | unset | GPU list / `on`/`off` / `node`/`graph` | nsys extras. |
 | `PROFILE_EXPERT_INPUT_SAMPLE`, `PROFILE_EXPERT_ROUTE_WEIGHTS` | unset | row count / `on`/`off` | Require `PROFILE=expert-routes`. |
 | `PROFILE_SPARK`, `PROFILE_SPARK_RANKS` | unset | `nsys`, `ncu` / rank list | Profile Spark workers instead of the coordinator. |
 | `PROFILE_SPARK_NCU_*`, `PROFILE_SPARK_NSYS_GPU_METRICS` | unset | as above | Spark-side profiling. |
+
+The memory probe publishes measured per-logical-GPU sampler context bytes in
+`PROFILE_DIR/observer-context.json`. The launcher declares that file to the
+coordinator only; startup waits at most 30 seconds for the measurement and fails
+if it is missing or invalid. Logical memory samples exclude those bytes from
+used memory and from physical capacity, so the context owner is production-only
+and an uncapped census leaves exactly the observer's bytes out of the pool.
+An explicit smaller `GPU_MEMORY_CAP` uses existing physical headroom instead.
+Raw physical samples and `memory.jsonl` remain unchanged. No observer declaration
+means no adjustment.
 
 `CUTEAFD_DIAG_KIMI_STARTUP_MEMORY` is a private coordinator-only Kimi
 process environment diagnostic, not a launch configuration key. Pass it through

@@ -75,12 +75,13 @@ fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
     };
     let left = map(&plan.facts);
     let right = map(&declared);
-    let staging = plan.facts.allowances.iter().find(|allowance|
-        allowance.location == Location::PINNED).unwrap();
-    assert_eq!(staging.bytes, 128 << 10);
-    assert!(staging.bytes >= 108_000 && staging.assumed);
-    assert_eq!(staging.lifetime, Lifetime::TARGET);
-    assert!(staging.source.starts_with("estimated:"));
+    // Staging is a named physical owner (or nothing); no pinned allowance
+    // stands in for an unmeasured upload buffer any more.
+    assert!(!plan.facts.allowances.iter().any(|allowance| allowance.location == Location::PINNED));
+    // The retained driver stream slab has a second live stream only when the
+    // host prefix cache exists; this plan has no host cache and pays none.
+    assert!(!plan.facts.allowances.iter()
+        .any(|allowance| allowance.source.starts_with("dense Qwen driver stream slabs")));
     assert_eq!(left.len(), plan.facts.allocations.len(), "duplicate owner id");
     assert_eq!(left.len(), right.len());
     for id in left.keys().chain(right.keys()).collect::<std::collections::BTreeSet<_>>() {
@@ -98,7 +99,11 @@ fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
         .filter(|owner| owner.id.starts_with("kv.") && owner.view.is_none())
         .map(|owner| owner.bytes).sum();
     let full = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Full).count() as u64;
-    assert_eq!(kv, full * pages * PAGE_ROWS * 4096);
+    // One cudaMalloc per full-attention layer, each rounded to the SM120
+    // allocation granularity.
+    let per_layer = (pages * PAGE_ROWS * 4096).div_ceil(SM120_ALLOCATION_GRANULARITY_BYTES)
+        * SM120_ALLOCATION_GRANULARITY_BYTES;
+    assert_eq!(kv, full * per_layer);
     // No drafter: the only compiled extent is the 64-row page table itself.
     let contract = facts(&cfg, &weights, &buffers, &arena).prepare(&plan.request).unwrap();
     assert_eq!(contract.maximum_pages, u32::MAX as u64 / PAGE_ROWS);
@@ -108,15 +113,18 @@ fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
 fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
     let (cfg, weights, buffers, arena) = fixture();
     let drafter = DrafterBytes { owned: 4096, weights: ResidentWeights(1024),
-        weight_arena: Some(("qwen3_5/mtp/gpu0", 1280)), scratch: 512, pool_unit: 4096, host_prefetch: 2_720_000_000, gemm_head: false };
+        weight_arena: Some(("qwen3_5/mtp/gpu0", 1280)), scratch: 512, pools: vec![4096],
+        workspace_requests: vec![2048, 1024], page_table_bytes: 0, landing: 0, staging: vec![],
+        host_prefetch: 2_720_000_000, gemm_head: false };
     let mut input = facts(&cfg, &weights, &buffers, &arena);
     input.drafter = Some(drafter);
     let contract = input.prepare(&request()).unwrap();
     assert_eq!(contract.maximum_pages, i32::MAX as u64 / PAGE_ROWS);
-    let plan = admit(request(), budgets(), input).unwrap();
+    let plan = admit(request(), budgets(), input.clone()).unwrap();
     let pages = plan.pool_tokens / PAGE_ROWS;
     let owner = |id: &str| plan.facts.allocations.iter().find(|owner| owner.id == id).unwrap();
-    assert_eq!(owner("draft.kv").bytes, pages * 4096);
+    assert_eq!(owner("draft.kv.0").bytes,
+        (pages * 4096).div_ceil(SM120_ALLOCATION_GRANULARITY_BYTES) * SM120_ALLOCATION_GRANULARITY_BYTES);
     assert_eq!(plan.decisions.draft_home, Some(0));
     assert_eq!(owner("draft.prefetch").bytes, 2_720_000_000);
     assert_eq!(owner("draft.prefetch").location, Location::HOST);
@@ -125,18 +133,19 @@ fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
     assert!(!plan.facts.allocations.iter().any(|owner| owner.id == "draft.weights"));
     assert_eq!(owner("draft.runtime").bytes, owned_rest());
     assert_eq!(owner("draft.scratch").bytes, 512);
-    assert_eq!(owner("draft.kv").lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::Growth });
+    assert_eq!(owner("draft.kv.0").lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::Growth });
     assert!(plan.facts.resident_weights.contains(&ResidentWeight { id: "qwen3_5/mtp/gpu0".into(),
         location: Location::coordinator(0), weights: ResidentWeights(1280) }));
     // Draft KV is a page-linear extent, so a smaller explicit pool pays for
-    // fewer pages rather than a fixed full-context reservation.
+    // fewer pages rather than a fixed full-context reservation; its one
+    // cudaMalloc still rounds to the SM120 backing granularity.
     let mut smaller = request();
     smaller.context = (4 * PAGE_ROWS).into();
     smaller.pool = Pin::Exact(4 * PAGE_ROWS);
     let small = admit(smaller, budgets(), input).unwrap();
     assert_eq!(small.pool_tokens, 4 * PAGE_ROWS);
-    assert_eq!(small.facts.allocations.iter().find(|owner| owner.id == "draft.kv").unwrap().bytes,
-        4 * 4096);
+    assert_eq!(small.facts.allocations.iter().find(|owner| owner.id == "draft.kv.0").unwrap().bytes,
+        (4 * 4096u64).div_ceil(SM120_ALLOCATION_GRANULARITY_BYTES) * SM120_ALLOCATION_GRANULARITY_BYTES);
 }
 
 fn owned_rest() -> u64 { 4096 - 1024 }
@@ -168,7 +177,8 @@ fn padded_weight_backings_replace_payload_and_activate_with_their_single_tails()
     assert_eq!(arena.padding_bytes(), 255);
     let mut input = facts(&cfg, &weights, &buffers, &arena);
     input.drafter = Some(DrafterBytes { owned: 4096, weights: ResidentWeights(1024),
-        weight_arena: Some(("qwen3_5/mtp/gpu0", 1280)), pool_unit: 4096, ..Default::default() });
+        weight_arena: Some(("qwen3_5/mtp/gpu0", 1280)), pools: vec![4096],
+        workspace_requests: vec![2048, 1024], ..Default::default() });
     let contract = input.prepare(&request()).unwrap();
     let home = contract.variables.iter().position(|v| matches!(v, Variable::DraftHome(_))).unwrap();
     let components = |id: &str| contract.components.iter().filter(|component| match &component.kind {
@@ -183,12 +193,16 @@ fn padded_weight_backings_replace_payload_and_activate_with_their_single_tails()
     let draft = components("qwen3_5/mtp/gpu0");
     assert_eq!(draft.len(), 3);
     assert!(draft.iter().all(|component| component.activation == Activation::choice(home, 0)));
-    let plan = admit(request(), budgets(), input).unwrap();
+    let plan = admit(request(), budgets(), input.clone()).unwrap();
     assert_eq!(plan.facts.phase_order, PhaseOrder::TARGET_THEN_DRAFT);
     assert_arena_charge(&plan.facts, arena.id(), arena.bytes() as u64, Lifetime::RESIDENT);
     assert_arena_charge(&plan.facts, "qwen3_5/mtp/gpu0", 1280,
         Lifetime { first: Phase::DraftLoad, last: Phase::Growth });
-    assert_eq!(plan.facts.allocation_granularity.len(), 2);
+    // Two weight-arena tails plus one tail for each side's fixed runtime
+    // owners; pool-shaped KV owners price their own tail in `pool_curve`.
+    assert_eq!(plan.facts.allocation_granularity.len(), 4);
+    assert!(plan.facts.allocation_granularity.iter().any(|tail| tail.id == "dense.runtime.tail"));
+    assert!(plan.facts.allocation_granularity.iter().any(|tail| tail.id == "draft.runtime.tail"));
     assert_eq!(plan.facts.allocations.iter().filter(|owner| owner.location == Location::coordinator(0)
         && owner.category == Category::Weights).map(|owner| owner.bytes).sum::<u64>(), arena.bytes() as u64);
     assert_eq!(plan.facts.allocations.iter().find(|owner| owner.id == "qwen3_5/mtp/gpu0").unwrap().category,
@@ -210,7 +224,7 @@ fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
     ] {
         let mut ask = request();
         ask.pool = pool;
-        let refusal = admit(ask, budgets(), input).unwrap_err();
+        let refusal = admit(ask, budgets(), input.clone()).unwrap_err();
         match expected {
             "below context" => assert!(matches!(&refusal, Refusal::PoolBelowContext { .. }), "{refusal}"),
             "misaligned" => assert!(matches!(&refusal, Refusal::MisalignedPool { .. }), "{refusal}"),
@@ -230,7 +244,7 @@ fn serving_selector_and_sampler_owners_keep_their_domains() {
     for device_sampling in [false, true] {
         let mut input = facts(&cfg, &weights, &buffers, &arena);
         input.serving = Some(ServingFacts { capacity: 64, device_sampling });
-        let plan = admit(request(), budgets(), input).unwrap();
+        let plan = admit(request(), budgets(), input.clone()).unwrap();
         let selector: Vec<_> = plan.facts.allocations.iter()
             .filter(|owner| owner.id.starts_with("selector")).collect();
         assert_eq!(selector.len(), if device_sampling { 24 } else { 2 });
@@ -382,7 +396,7 @@ fn host_chunks_and_diagnostic_staging_are_physical_owners_not_allowances() {
     let mut input = facts(&cfg, &weights, &buffers, &arena);
     input.host_prefix = serving::HostPrefixOwners { quota_bytes: (1 << 30) + 17, chunk_bytes: 256 << 20 };
     input.verify_check = true;
-    let plan = admit(request(), budgets(), input).unwrap();
+    let plan = admit(request(), budgets(), input.clone()).unwrap();
     let owners = &plan.facts.allocations;
     let chunks: Vec<_> = owners.iter().filter(|owner| owner.id.starts_with("host.prefix.")).collect();
     assert_eq!(chunks.len(), 4);

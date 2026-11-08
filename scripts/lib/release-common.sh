@@ -672,7 +672,10 @@ release_profile_docker_args() {
   local -a switches=()
   RELEASE_PROFILE_ARGS=()
   if [[ -z "$profile" && -z "$spark" ]]; then
-    [[ -z "$dir" ]] || release_die "PROFILE_DIR needs PROFILE or PROFILE_SPARK"
+    if [[ -n "$dir" ]]; then
+      [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ && -f "$dir/observer-context.json" ]] || release_die "PROFILE_DIR needs PROFILE, PROFILE_SPARK or a memory observer"
+      RELEASE_PROFILE_ARGS+=(-v "$dir:$dir" -e "CUTEAFD_PROFILE_DIR=$dir")
+    fi
     return 0
   fi
   if [[ -z "$profile" ]]; then

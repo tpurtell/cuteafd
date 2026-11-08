@@ -771,7 +771,8 @@ def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size,
     assert values["SPECULATOR_MODEL_ID"] == "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
     assert values["SPECULATOR_MODEL_REVISION"] == "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
     assert (values["RTX_GPUS"], values["SPARK_COUNT"], values["POOL_TOKENS"]) == (str(len(gpus)), str(ranks), "auto")
-    assert values["VISION"] == values["AUDIO"] == ("spark" if size == "min" else "auto")
+    assert values["VISION"] == ("spark" if size == "min" else "auto")
+    assert values["AUDIO"] == "auto"
     if size == "min":
         assert int(values["MAX_CONTEXT_TOKENS"]) > 262144
         assert int(values["MAX_CONTEXT_TOKENS"]) % 64 == 0

@@ -52,9 +52,14 @@ pub const STEP5: u64 = 0;
 /// Placeholder for measurement.
 pub const QWEN4: u64 = 0;
 /// Dense Qwen (qwen3_5). Inherited: 1 GiB headroom
-/// (`placement/families/qwen3_5/admission.rs:63`, dev `3ce3fbd19`). Probably
-/// covered allocator slack beside the 512 MiB head/runtime growth estimate.
-/// Placeholder for measurement.
+/// (`placement/families/qwen3_5/admission.rs:63`, dev `3ce3fbd19`) beside a
+/// 512 MiB "dense head/runtime growth" estimate. Both are gone: the runtime
+/// now charges named owners (drafter workspace/rings/staging, stream slabs,
+/// allocation-granularity tails, driver page tables, shared cuBLAS
+/// allowances). Measured 2026-11-09 on Qwen3.8-27B BF16 min (1x RTX PRO
+/// 6000, `MEMORY_PADDING=50MiB`, 100M KV): charged 101,899,320,813 B vs
+/// 101,892,816,896 B used at Ready and after the first served request ->
+/// residual -6.2 MiB, and serving adds no device bytes.
 pub const QWEN3_5: u64 = 0;
 /// DeepSeek V4. Inherited: 3 GiB headroom floor (2.9 GiB on cards <=32 GiB)
 /// from `deepseek_v4_headroom_bytes` and `--reserve-gib` 10 (dev `3ce3fbd19`).

@@ -15,6 +15,9 @@ pub struct HookBuffers {
     pub core: Option<CoreRankLayout>,
     /// Manifest-derived shared execution owners and bindings, once per hook.
     pub shared_workspace: Option<crate::plan::exlr8::ExecutionWorkspace>,
+    /// Scoring allocates its prefill lanes during startup; serving allocates
+    /// them on the first live prefill, after Ready.
+    pub full_prefill_logits: bool,
 }
 
 struct Builder {
@@ -108,11 +111,18 @@ impl HookBuffers {
             maximum: self.maximum_pages,
             out: Vec::new(),
         };
-        let workspace = Lifetime {
-            first: Phase::Warmup,
-            last: Phase::Growth,
-        };
         for (index, kind) in ["decode", "prefill"].into_iter().enumerate() {
+            // Decode hooks live in the workspace the startup warm pass allocates.
+            // Prefill hooks live in the lanes the first prefill allocates: during
+            // startup only when scoring, otherwise from live traffic after Ready.
+            let workspace = Lifetime {
+                first: if kind == "prefill" && !self.full_prefill_logits {
+                    Phase::Growth
+                } else {
+                    Phase::Warmup
+                },
+                last: Phase::Growth,
+            };
             if let Some(layouts) = &self.native {
                 let layout = &layouts[index];
                 layout

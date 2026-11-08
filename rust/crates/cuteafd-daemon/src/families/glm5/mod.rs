@@ -540,6 +540,7 @@ mod draft_cli_tests {
     #[test]
     fn planner_charge_equals_admission_charge_for_the_same_geometry() {
         use cuteafd_loader::plan::exlr8::PrefillActivations;
+        cuteafd_loader::placement::families::glm5::admission::allow_synthetic_graphs();
         const GROUP: &str = "GLM target hooks";
         let dir = tempfile::tempdir().unwrap();
         cuteafd_loader::plan::testing::exlr8::glm_admission_snapshot(dir.path());
@@ -563,7 +564,12 @@ mod draft_cli_tests {
                         cuteafd_loader::families::glm5::native::scratch_bytes(
                             &native_dense_layouts(&cfg, &records, &plan, &engine).unwrap()).unwrap()
                     }).collect::<Vec<_>>();
+                    // A serving layout allocates its prefill lanes on the first live
+                    // prefill and charges them at Growth; scoring runs that prefill
+                    // before Ready, so its items hold every lane the admission
+                    // charge names. Compare the scoring view.
                     let layout = cuteafd_loader::plan::layout::LayoutOptions {
+                        full_prefill_logits: true,
                         rtx_bytes: vec![96 << 30; gpus], prefill_rows: engine.prefill_rows as u64,
                         prefill_lanes: u64::from(engine.prefill_waves), prefill_waves: u64::from(engine.prefill_waves),
                         exlr8_prefill_activations: activations.parse::<PrefillActivations>().unwrap(), context_tokens: 65536,
@@ -1280,7 +1286,7 @@ impl Opened {
         let request = production_request(*serving_context, requested_pool,
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
-        let admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
+        let mut admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
             maximum_pool_tokens, attention, gpus: devices.len(), prefill,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!native
                 && !core.as_ref().is_some_and(|core| core.ranks[0].target_head.is_some())), blas, target,
@@ -1288,7 +1294,8 @@ impl Opened {
                 .context("GLM draft marks overflow")? as u64),
             scratch: [scratch(true)?, scratch(false)?], context_scratch: context,
             exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: physical.peer_diagnostics,
-            local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
+            local: source.as_ref().map(|source| (source, physical)), spark_ranks,
+            prefix_host: host_config.is_some(), decode_link, prefill_link,
             skip_routed_experts: args.skip_routed_experts, operation, sync_upload_bytes: 0,
             owners: additional, budgets }.prepare()?.admit(request)?;
         cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5");
@@ -1758,7 +1765,27 @@ impl Opened {
         if engine.weights.layers.len() == self.cfg.layers
             && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
             && (transport.is_some() || args.skip_routed_experts || engine.has_local()) {
-            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
+            let captures = engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))
+                .with_context(|| format!(
+                    "GLM startup graph capture (owner glm.graphs rank 0..{}) failed; free device memory \
+                     with GPU_MEMORY_CAP or GPU_RESERVE", engine.ranks()))?;
+            let declared = admitted.graphs.declared();
+            let measured = captures.iter().map(|capture|
+                cuteafd_loader::placement::inventory::CapturedGraphRank::measure(capture.rank as u8,
+                    &declared[capture.rank], &capture.keys, capture.before, capture.after)
+                    .map_err(anyhow::Error::msg)).collect::<Result<Vec<_>>>()?;
+            // A successful capture is never refused: an excess over the estimate
+            // is reported by the reconcile and serving continues (#1605).
+            let reconciled = cuteafd_loader::placement::planner::serving::reconcile_startup_graphs(
+                &mut admitted.solved, "glm.graphs", &admitted.graphs.set(),
+                admitted.graphs.fingerprints(), &measured).map_err(|error| anyhow::anyhow!(
+                    "{error}; the startup graph receipt does not match this plan"))?;
+            for (rank, (row, live)) in admitted.graphs.ranks().iter().zip(&reconciled.ranks).enumerate() {
+                tracing::info!(rank, executables = live.executables, measured = live.bytes,
+                    plan = row.bytes, "GLM startup graph capture reconciled");
+            }
+            if let Some(note) = admitted.graphs.capture_note(&reconciled) { tracing::warn!("{note}"); }
+            cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5 captured");
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }

@@ -369,7 +369,7 @@ release_profile_exec "$@"
 @pytest.mark.parametrize('profile,directory,message', [
     ('census,flamegraph', '', 'unknown PROFILE switch flamegraph'),
     ('census;rm', '', 'PROFILE must be a comma list'),
-    ('', '/data/prof', 'PROFILE_DIR needs PROFILE or PROFILE_SPARK'),
+    ('', '/data/prof', 'PROFILE_DIR needs PROFILE, PROFILE_SPARK or a memory observer'),
     ('census', 'relative', 'PROFILE_DIR must be an absolute directory'),
     ('nsys', '', 'PROFILE=nsys needs PROFILE_DIR'),
     ('ncu', '', 'PROFILE=ncu needs PROFILE_DIR'),

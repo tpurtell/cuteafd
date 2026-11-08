@@ -1,6 +1,7 @@
 //! Kimi physical-owner admission with checkpoint residency and shared native allocation layouts.
 use super::Model;
 use anyhow::Context;
+use crate::families::kimi_k3::allocation;
 use crate::placement::families::kimi::{self, ExpertProfile, FixedOwner, KimiRecipe, SparkOwner, tp2_arenas, whole_arenas};
 use crate::{placement::*, plan::{Component, ExpertPlacement, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
@@ -294,6 +295,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let mut modes = Vec::with_capacity(cfg.layers);
         let mut layer_attention = Vec::with_capacity(cfg.layers);
         let mut records = vec![0u64; gpus];
+        let mut records_by_layer = Vec::with_capacity(cfg.layers);
         for layer in 0..cfg.layers {
             let mla = cfg.attention[layer] == KimiAttention::Mla;
             let weights = if gpus == 1 {
@@ -322,17 +324,27 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 }
             } else { LayerMode::HeadSplit };
             if mla {
+                let mut units = [0u64; 2];
                 match mode {
-                    LayerMode::Whole { gpu, .. } => records[usize::from(gpu)] += record,
-                    _ => for bytes in &mut records { *bytes += record; },
+                    LayerMode::Whole { gpu, .. } => {
+                        units[usize::from(gpu)] = record;
+                        records[usize::from(gpu)] += record;
+                    }
+                    _ => for rank in 0..gpus {
+                        units[rank] = record;
+                        records[rank] += record;
+                    },
                 }
+                records_by_layer.push(units);
+            } else {
+                records_by_layer.push([0; 2]);
             }
             modes.push(mode);
             layer_attention.push(weights);
         }
-        Ok((modes, layer_attention, records))
+        Ok((modes, layer_attention, records, records_by_layer))
     })();
-    let (modes, layer_attention, mut records_per_page) = match fabricated {
+    let (modes, layer_attention, mut records_per_page, records_by_layer) = match fabricated {
         Ok(value) => value,
         Err(error) => { report.refuse_placement(format!("Kimi packed layer inventory refused: {error:#}"),
             "Check checkpoint layer geometry."); return memory; }
@@ -435,7 +447,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             entry_gpu: 0, head_gpu: head_rank as u8,
             terminal: if gpus == 1 { TerminalHome::AttentionOwner } else { TerminalHome::Replicated } },
         peer_row_bytes, maximum_pages,
-        records_per_page, layer_attention, first_moe,
+        records_per_page, records_by_layer, layer_attention, first_moe,
         kinds,
         experts: Some(ExpertProfile { layers: spark_budget.layers.clone(),
             destination: if gpus == 2 { vec![0, 1] } else { vec![0] },
@@ -468,7 +480,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for (rank, baseline) in baseline.iter().enumerate() {
         if let crate::placement::Baseline::Planned { context_bytes, loaded_bytes } = baseline {
             recipe.fixed.push(FixedOwner { rank: rank as u8, category: Category::Runtime,
-                group: "CUDA context (estimated)".into(), bytes: context_bytes.saturating_add(*loaded_bytes),
+                group: allocation::CONTEXT_ESTIMATE.into(), bytes: context_bytes.saturating_add(*loaded_bytes),
                 weights: 0, lifetime: crate::placement::planner::Lifetime::RESIDENT, basis: Basis::Estimated });
         }
     }
@@ -504,6 +516,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
+    match kimi::stream_slab_owners(gpus, maximum_pages) {
+        Ok(owners) => recipe.owners.extend(owners),
+        Err(error) => { report.refuse_placement(format!("Kimi stream slab owners refused: {error}"),
+            "Use supported coordinator stream counts."); return memory; }
+    }
     match kimi::native_load_owners(&model.core, gpus, maximum_pages) {
         Ok(owners) => recipe.owners.extend(owners),
         Err(error) => { report.refuse_placement(format!("Kimi native load owners refused: {error:#}"),

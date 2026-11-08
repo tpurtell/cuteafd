@@ -384,11 +384,11 @@ mod tests {
         }
         for drafter in drafts {
             let expected = layouts.iter().filter(|layout| layout.id() == target.id()
-                || drafter.and_then(|draft| draft.weight_arena).is_some_and(|(id, _)| id == layout.id())).collect::<Vec<_>>();
+                || drafter.as_ref().and_then(|draft| draft.weight_arena).is_some_and(|(id, _)| id == layout.id())).collect::<Vec<_>>();
             let layout = options.layout.as_mut().unwrap();
-            layout.dense_qwen_mtp = drafter.and_then(|draft| draft.weight_arena)
+            layout.dense_qwen_mtp = drafter.as_ref().and_then(|draft| draft.weight_arena)
                 .is_some_and(|(id, _)| id == "qwen3_5/mtp/gpu0");
-            layout.dense_qwen_drafter_snapshot = drafter.and_then(|draft| draft.weight_arena)
+            layout.dense_qwen_drafter_snapshot = drafter.as_ref().and_then(|draft| draft.weight_arena)
                 .filter(|(id, _)| *id == "qwen3_5/dspark/gpu0")
                 .map(|_| std::env::var_os("CUTEAFD_QWEN_DENSE_ARENA_DRAFT").unwrap().into());
             let report = cuteafd_loader::plan::plan(std::path::Path::new(&snapshot), &options)?;

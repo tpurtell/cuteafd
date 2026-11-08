@@ -168,18 +168,21 @@ fn header_and_installed_min_plans_share_one_arena_backing_and_tail() -> Result<(
         options.layout.as_mut().unwrap().workspace_manifest = installed.then(|| manifest.clone());
         let report = input.plan(&options)?;
         let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("installed={installed}: {:?}", report.hints));
+        // One named tail per fixed single-request device owner: the arena, the
+        // KDA state/marks, and on an installed layout the lane buffers and code.
         let owners = placed.items[0].iter().filter(|item| item.group == ALLOCATION_GRANULARITY_GROUP).collect::<Vec<_>>();
-        assert_eq!(owners.len(), 1);
-        assert_eq!(owners[0].basis, Basis::Estimated);
-        assert_eq!(owners[0].bytes, expected);
+        assert!(owners.iter().all(|item| item.basis == Basis::Estimated && item.bytes > 0),
+            "installed={installed}: {:?}", owners.iter().map(|item| item.bytes).collect::<Vec<_>>());
+        let tail = owners.iter().find(|item| item.bytes == expected)
+            .unwrap_or_else(|| panic!("installed={installed}: missing weight arena tail {expected}"));
         let roots = placed.items[0].iter().filter(|item| item.group == "weight arena").collect::<Vec<_>>();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].bytes, arena.bytes() as u64);
         assert!(!placed.items[0].iter().any(|item| item.group == "kimi arena padding"
             || item.group == "Kimi global weights" || item.group == "layers" || item.group.starts_with("Kimi layer ")));
-        charges.push(roots[0].bytes + owners[0].bytes);
+        charges.push((roots[0].bytes, tail.bytes));
     }
-    assert_eq!(charges[0], charges[1], "the same request inventory must not depend on PROGRAMS.json");
+    assert_eq!(charges[0], charges[1], "the arena request inventory must not depend on PROGRAMS.json");
     Ok(())
 }
 

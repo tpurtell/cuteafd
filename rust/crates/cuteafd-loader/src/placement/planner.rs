@@ -579,8 +579,10 @@ mod contract;
 mod search;
 mod granularity;
 pub use granularity::{AllocationGranularity, GranularityBacking, GranularityEvidence,
-    ALLOCATION_GRANULARITY_GROUP, SM120_ALLOCATION_GRANULARITY_BYTES, allocation_granularity_forecast, allocation_granularity_component,
-    cuda_stream_slab_bytes, independent_backing_slack, weight_arena_components, weight_arena_extent_components};
+    ALLOCATION_GRANULARITY_GROUP, SM120_ALLOCATION_GRANULARITY_BYTES, SM120_SHARED_REQUEST_BYTES,
+    allocation_granularity_forecast, allocation_granularity_component, cuda_stream_slab_bytes,
+    first_independent_pages, fixed_request_tails, independent_backing_slack, independent_request,
+    sm120_request_backing, weight_arena_components, weight_arena_extent_components};
 pub mod native_attention;
 pub mod serving;
 pub use contract::{
@@ -895,9 +897,18 @@ fn resident_weight_totals(facts: &Facts, gpus: usize) -> Result<Vec<ResidentWeig
     Ok(totals)
 }
 
-pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, Refusal> {
+/// Ledger rows plus every capacity veto they raise, in budget/phase order.
+/// `evaluate` refuses the first; a caller reporting a physical event that has
+/// already succeeded (a startup graph capture) logs them all instead (#1605).
+pub struct Assessment {
+    pub rows: Vec<PhaseBudget>,
+    pub over_budget: Vec<Refusal>,
+}
+
+pub fn assess(facts: &Facts, budgets: &[Budget]) -> Result<Assessment, Refusal> {
     validate(facts, budgets)?;
     let mut rows = Vec::new();
+    let mut over_budget = Vec::new();
     for budget in budgets {
         let available = budget.available()?;
         for &phase in facts.phase_order.phases() {
@@ -953,29 +964,12 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
                 .checked_add(opaque)
                 .ok_or(Refusal::Overflow("phase peak"))?;
             if required > available {
-                return Err(Refusal::Capacity {
+                over_budget.push(Refusal::Capacity {
                     budget: budget.id.clone(),
                     phase,
                     required,
                     available,
-                    owners: owners
-                        .iter()
-                        .map(|a| a.id.clone())
-                        .chain(
-                            facts
-                                .sequential
-                                .iter()
-                                .filter(|g| {
-                                    g.members[0].lifetime.contains(phase, facts.phase_order)
-                                        && budget.locations.contains(&g.members[0].location)
-                                })
-                                .map(|g| g.id.clone()),
-                        )
-                        .chain(facts.reservations.iter()
-                            .filter(|r| r.lifetime.contains(phase, facts.phase_order)
-                                && budget.locations.contains(&r.location))
-                            .map(|r| r.id.clone()))
-                        .collect(),
+                    owners: phase_owners(facts, budget, phase),
                 });
             }
             rows.push(PhaseBudget {
@@ -987,7 +981,32 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
             });
         }
     }
-    Ok(rows)
+    Ok(Assessment { rows, over_budget })
+}
+
+/// The owners active in one budget at one phase, in declaration order.
+fn phase_owners(facts: &Facts, budget: &Budget, phase: Phase) -> Vec<String> {
+    facts.allocations.iter().chain(&facts.deferred)
+        .filter(|a| a.view.is_none() && a.lifetime.contains(phase, facts.phase_order)
+            && budget.locations.contains(&a.location))
+        .map(|a| a.id.clone())
+        .chain(facts.sequential.iter()
+            .filter(|g| g.members[0].lifetime.contains(phase, facts.phase_order)
+                && budget.locations.contains(&g.members[0].location))
+            .map(|g| g.id.clone()))
+        .chain(facts.reservations.iter()
+            .filter(|r| r.lifetime.contains(phase, facts.phase_order)
+                && budget.locations.contains(&r.location))
+            .map(|r| r.id.clone()))
+        .collect()
+}
+
+pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, Refusal> {
+    let assessment = assess(facts, budgets)?;
+    match assessment.over_budget.into_iter().next() {
+        Some(refusal) => Err(refusal),
+        None => Ok(assessment.rows),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

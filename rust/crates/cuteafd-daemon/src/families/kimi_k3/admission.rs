@@ -655,7 +655,7 @@ impl<'a> Admission<'a> {
         let charges = self.placement.items[rank].iter().filter(|item| item.group == "records").collect::<Vec<_>>();
         ensure!(if layout.bytes() == 0 { charges.is_empty() } else {
             charges.len() == 1 && charges[0].category == Category::Kv
-                && charges[0].basis == Basis::Exact && charges[0].bytes == layout.bytes() as u64
+                && charges[0].basis == Basis::Exact && charges[0].bytes == layout.reserved_bytes()
         }, "Kimi MLA allocation differs from accepted record charge");
         Ok(layout)
     }
@@ -770,15 +770,18 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         kimi::whole_arenas(&counts, request.expert_workspace, &parts)?
     };
     let mut records = vec![0; RANKS];
+    let mut records_by_layer = vec![[0u64; 2]; cfg.layers];
     if RANKS == 2 && placement_mode == AttentionPlacement::Layers && cfg.mla_layers() > 0 {
         records.fill((MLA_PAGE_ROWS * cache_format.record_bytes()) as u64);
     } else {
-        for (layer, mode) in request.layers.iter().zip(&attention) {
+        for (index, (layer, mode)) in request.layers.iter().zip(&attention).enumerate() {
             for rank in 0..RANKS {
-                records[rank] += match mode {
+                let unit = match mode {
                     LayerMode::Whole { gpu, .. } => if usize::from(*gpu) == rank { layer.kv_unit.unit_bytes_whole } else { 0 },
                     LayerMode::HeadSplit | LayerMode::ContextSplit => layer.kv_unit.unit_bytes_split[rank],
                 };
+                records_by_layer[index][rank] = unit;
+                records[rank] += unit;
             }
         }
     }
@@ -805,7 +808,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     for rank in 0..RANKS {
         let Baseline::Measured { free_bytes } = request.inventory.gpus[rank].baseline else { unreachable!() };
         fixed.push(FixedOwner { rank: rank as u8, category: Category::Runtime,
-            group: "CUDA context and loaded modules".into(),
+            group: cuteafd_loader::families::kimi_k3::allocation::CONTEXT_MEASURED.into(),
             bytes: request.inventory.gpus[rank].capacity_bytes.saturating_sub(free_bytes), weights: 0,
             lifetime: contract::Lifetime::RESIDENT, basis: Basis::Exact });
     }
@@ -814,7 +817,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         prefill: contract::PrefillShape { rows: unit_rows as u64, waves: inputs_waves as u64 },
         lanes, spark_links: spark_ranks > 0, hop_spec: request.hops.clone(),
         peer_row_bytes: request.context_buffers.query_row_bytes + request.context_buffers.partial_row_bytes,
-        maximum_pages, records_per_page: records,
+        maximum_pages, records_per_page: records, records_by_layer,
         layer_attention: request.layers.iter().map(|layer| layer.weights).collect(),
         first_moe: routed.first().copied().unwrap_or(cfg.layers),
         kinds: request.layers.iter().map(|layer| layer.kind).fold(Vec::new(), |mut kinds, kind| {
@@ -882,6 +885,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let scoring_bytes = kimi::host_scoring_bytes(if full_prefill_logits { rows } else { rows.min(64) }, rows, cfg.vocab_size)?;
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
+    recipe.owners.extend(kimi::stream_slab_owners(RANKS, maximum_pages)?);
     let push_host = kimi::selected_push_host_envelope(cfg, &core, RANKS)?;
     recipe.owners.extend(kimi::push_host_owners(&push_host, maximum_pages)?);
     recipe.owners.extend(kimi::native_load_owners(&core, RANKS, maximum_pages)?);
@@ -2114,6 +2118,9 @@ pub(super) mod tests {
         use cuteafd_loader::{families::kimi_k3::allocation, plan::{self, layout::LayoutOptions,
             testing, ExpertPlacement, PlanOptions}};
         use cuteafd_core::memory_layout::DeviceKind;
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct PrefixCli { #[command(flatten)] serve: super::super::serve::ServeArgs }
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
         let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
@@ -2160,13 +2167,13 @@ pub(super) mod tests {
         let mut refused = 0;
         for ((slots, prefix_slots, host_cache_bytes, entries, format, requested_pool), waves) in [
             (16, Some(1), Some(0), 20, MlaCacheFormat::Fp8, None),
-            (8, None, None, 20, MlaCacheFormat::Fp8, None),
+            (8, None, Some(32 << 30), 20, MlaCacheFormat::Fp8, None),
             (16, None, Some(8 << 30), 20, MlaCacheFormat::Fp8, None),
-            (8, None, None, 20, MlaCacheFormat::Bf16, None),
+            (8, None, Some(0), 20, MlaCacheFormat::Bf16, None),
         ].into_iter().flat_map(|case| [2usize, 3, 4].map(move |waves| (case, waves)))
             // Reduced Spark scratch lets all automatic pools fit; retain an
             // explicitly infeasible pool to exercise the typed refusal path.
-            .chain([((8, None, None, 20, MlaCacheFormat::Bf16, Some(1 << 30)), 3)]) {
+            .chain([((8, None, Some(0), 20, MlaCacheFormat::Bf16, Some(1 << 30)), 3)]) {
             let shape = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(6,
                 Default::default(), cuteafd_loader::serving_capacity::prefill_waves::PrefillOverrides {
                     waves: Some(waves as u64), ..Default::default()
@@ -2204,7 +2211,16 @@ pub(super) mod tests {
                 cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, waves as u64, unit as u64)?)?;
             let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
             let arch = ArchContext::for_device("sm_120", capacity);
+            // The installed plan resolves the same pinned host retention this
+            // case asks for; the runtime must be given that quota too, or its
+            // coordinator ledger omits the retained prefix and its mapping.
+            let prefix_cli = PrefixCli::try_parse_from(["serve", "--snapshot", "/fixture",
+                "--native-lib", "/native",
+                "--peers", "127.0.0.1:19000,127.0.0.1:19001,127.0.0.1:19002,127.0.0.1:19003,127.0.0.1:19004,127.0.0.1:19005",
+                "--host-cache-bytes", &host_cache_bytes.unwrap_or(0).to_string()])?;
+            let prefix_args = prefix_cli.serve.prefix;
             let mut i = inputs(&cfg);
+            i.prefix = Some(&prefix_args);
             i.cache_format = format;
             i.requested_pool = requested_pool;
             i.rows = rows; i.waves = waves; i.unit_rows = Some(unit);

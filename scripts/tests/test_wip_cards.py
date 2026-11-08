@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('wip_cards', ROOT / 'scripts/bench/wip-cards.py')
 cards = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cards)
+OBSERVER_GPU_UUIDS = cards.observer_gpu_uuids
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +30,7 @@ def no_stop_handlers(monkeypatch, tmp_path):
     monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
     cards.bench_panels.cache_clear()
+    monkeypatch.setattr(cards, 'observer_gpu_uuids', lambda devices: ','.join(f'GPU-host-{device}' for device in devices))
     monkeypatch.setattr(cards, 'preflight_deployment', lambda job, arm: {
         'spark_roles': [dict(rank=i, experts=True, audio_encoder=bool((job.get('needs') or {}).get('audio')))
                         for i in range(len(job['entry'].get('sparks', [])))],
@@ -1518,7 +1520,8 @@ def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
     assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6'
     assert values['MODEL_REVISION'] == '89998fb177acd9a862ac8bd4fb79bfd50e940c97'
     assert values['SPECULATOR'] == 'dflash2' and values['POOL_TOKENS'] == 'auto'
-    assert values['VISION'] == values['AUDIO'] == ('spark' if size == 'min' else 'auto')
+    assert values['VISION'] == ('spark' if size == 'min' else 'auto')
+    assert values['AUDIO'] == 'auto'
     if size == 'min':
         context = int(values['MAX_CONTEXT_TOKENS'])
         assert context > 262144 and context % 64 == 0
@@ -3140,7 +3143,7 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
             killed.append(True)
 
     def fake_popen(cmd, **kwargs):
-        kwargs['stdout'].write('{"time":1.0,"devices":[{"gpu":0,"raw_bytes":1,"sampler_bytes":0,"corrected_bytes":1}]}\n')
+        kwargs['stdout'].write('{"time":1.0,"devices":[{"gpu":0,"raw_bytes":2,"sampler_bytes":1,"corrected_bytes":1}]}\n')
         kwargs['stdout'].flush()
         return SlowSampler(kwargs['stdout'])
 
@@ -3792,3 +3795,117 @@ def test_spark_teardown_kills_all_before_reaping(entry, tmp_path, monkeypatch):
     assert [e[:2] for e in events[2:]] == [('reap', 0), ('reap', 1)]
     assert all(e[2] > 2 for e in events[2:])
     assert all(child.stdin.closed for child in children)
+
+
+@pytest.mark.parametrize('devices', [[1], [1, 0]])
+def test_sampler_uses_host_uuids_before_cuda_in_cdi_filtered_container(monkeypatch, capsys, devices):
+    import ctypes
+    events = []
+    uuids = ','.join(f'GPU-host-{device}' for device in devices)
+    monkeypatch.setenv('CARD_GPUS', ','.join(map(str, devices)))
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', ','.join(map(str, devices)))
+    monkeypatch.setenv('CARD_GPU_UUIDS', uuids)
+
+    def cuda_device(index):
+        # Numeric host ordinal 1 does not exist after CDI filters to one card.
+        assert os.environ['CUDA_VISIBLE_DEVICES'] == uuids
+        assert index < len(devices)
+        events.append(('cuda', index))
+        return 0
+
+    def memory(free, total):
+        free._obj.value, total._obj.value = 100, 200
+        return 0
+
+    def processes(handle, count, rows):
+        count._obj.value = 1
+        rows[0].pid, rows[0].usedGpuMemory = os.getpid(), 20
+        return 0
+
+    # No numeric-index NVML lookup exists in the filtered-container fixture.
+    nv = SimpleNamespace(nvmlInit_v2=lambda: 0, nvmlDeviceGetHandleByPciBusId_v2=lambda *args: 0,
+        nvmlDeviceGetComputeRunningProcesses_v3=processes)
+    cuda = SimpleNamespace(cudaSetDevice=cuda_device, cudaFree=lambda *args: 0,
+        cudaMemGetInfo=memory, cudaDeviceGetPCIBusId=lambda *args: 0)
+    monkeypatch.setattr(ctypes, 'CDLL', lambda name: nv if name == 'libnvidia-ml.so.1' else cuda)
+    monkeypatch.setattr(time, 'sleep', lambda _: (_ for _ in ()).throw(InterruptedError()))
+    with pytest.raises(InterruptedError):
+        exec(cards.CUDA_SAMPLER, {})
+    sample = json.loads(capsys.readouterr().out)
+    assert [row['gpu'] for row in sample['devices']] == devices
+    assert all(row['sampler_bytes'] == 20 for row in sample['devices'])
+    assert events[:len(devices)] == [('cuda', index) for index in range(len(devices))]
+
+
+def test_observer_uses_same_host_resolver_as_launcher(monkeypatch):
+    seen = []
+    def run(cmd, **kwargs):
+        seen.append(cmd)
+        assert cmd[-2:] == ['1,0', '2']
+        assert 'release_resolve_coordinator_gpus' in cmd[2]
+        assert cmd[4] == str(ROOT / 'scripts/lib/release-common.sh')
+        assert kwargs['timeout'] == 30
+        return SimpleNamespace(stdout='GPU-second\nGPU-first\n')
+    monkeypatch.setattr(cards, 'run', run)
+    assert OBSERVER_GPU_UUIDS([1, 0]) == 'GPU-second,GPU-first'
+    assert len(seen) == 1
+
+
+def test_observer_context_handoff_is_measured_atomic_and_logical(entry, tmp_path):
+    entry.update(gpus=[1, 0], sparks=[], set={'SPARK_COUNT': '0'})
+    job = cards.generate(entry, 'candidate', dict(instance='observer-context', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'memory'}, None, 1)
+    dest = Path(job['state'])
+    handoff = Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json'
+    assert json.loads(handoff.read_text()) == {'pending': True}
+    samples = dest / 'memory.jsonl'
+    samples.write_text('{')
+    assert not cards.publish_observer_context(job)
+    assert json.loads(handoff.read_text()) == {'pending': True}
+    samples.write_text(json.dumps({'devices': [dict(gpu=0, sampler_bytes=234), dict(gpu=1, sampler_bytes=123)]}) + '\n')
+    assert cards.publish_observer_context(job)
+    assert json.loads(handoff.read_text()) == {'0': 123, '1': 234}
+    assert not handoff.with_suffix('.tmp').exists()
+    samples.write_text('{"devices":[{"gpu":1,"sampler_bytes":0}]}\n')
+    with pytest.raises(ValueError, match='invalid measured observer'):
+        cards.publish_observer_context(job)
+
+
+def test_launcher_mounts_and_declares_observer_for_coordinator_only(tmp_path):
+    profile = tmp_path / 'profile'
+    profile.mkdir()
+    (profile / 'observer-context.json').write_text('{"pending":true}\n')
+    source = (ROOT / 'scripts/launch/run-family.sh').read_text()
+    block = 'shared_profile_args() {\n' + source.split('shared_profile_args() {\n', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+    shell = f'source {ROOT}/scripts/lib/release-common.sh\n' + '''
+get() { case "$1" in PROFILE_DIR) printf '%s' "$TEST_PROFILE_DIR";; esac; }
+''' + block + '\nshared_profile_args\nprintf "%s\\0" "${profile_args[@]}"'
+    result = subprocess.run(['bash', '-c', shell], env={**os.environ, 'TEST_PROFILE_DIR': str(profile)}, capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+    args = result.stdout.decode().split('\0')
+    assert f'{profile}:{profile}' in args
+    assert f'CUTEAFD_OBSERVER_CONTEXT_FILE={profile}/observer-context.json' in args
+    # Spark launchers call only release_profile_docker_args, never shared_profile_args.
+    shell = f'source {ROOT}/scripts/lib/release-common.sh\nrelease_profile_docker_args "" "$TEST_PROFILE_DIR" rhea\nprintf "%s\\0" "${{RELEASE_PROFILE_ARGS[@]}}"'
+    result = subprocess.run(['bash', '-c', shell], env={**os.environ, 'TEST_PROFILE_DIR': str(profile)}, capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+    assert b'CUTEAFD_OBSERVER_CONTEXT_FILE' not in result.stdout
+
+
+def test_failed_memory_only_resume_recreates_pending_before_preflight(entry, tmp_path, monkeypatch):
+    entry.update(sparks=[], set={'SPARK_COUNT': '0'})
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    argv = ['--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+            '--state', str(state), '--probe', 'v41-min:memory']
+    rc, _ = _run_main(monkeypatch, argv, rc_for=lambda job: 1)
+    assert rc == 1
+    seen = []
+    def deployment(job, arm):
+        path = Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json'
+        assert json.loads(path.read_text()) == {'pending': True}
+        seen.append(path)
+        return {'spark_roles': [], 'artifact_requirements': {}}
+    monkeypatch.setattr(cards, 'preflight_deployment', deployment)
+    rc, launched = _run_main(monkeypatch, argv + ['--resume'])
+    assert rc == 0 and launched == ['v41-min/a'] and seen

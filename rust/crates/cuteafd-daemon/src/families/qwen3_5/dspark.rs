@@ -166,7 +166,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
     let demand = DrafterBytes::block_dspark(snapshot, &config, 1, library.sm_count()? as u64, cfg.max_context)?;
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(demand), 1, None, args.kv_cache, false, None, args.verify_check)?;
+        Some(demand.clone()), 1, None, args.kv_cache, false, None, args.verify_check)?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
     if args.verify_check { engine.verify_check(prompt)?; }
     let plain = (|| -> Result<(Vec<u32>, Duration, Vec<(f32, Vec<u32>)>)> {

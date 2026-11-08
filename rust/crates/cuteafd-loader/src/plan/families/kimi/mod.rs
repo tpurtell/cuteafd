@@ -37,6 +37,18 @@ pub const SPARK_BUDGET_BYTES: u64 = crate::families::kimi_k3::SPARK_DEFAULT_BUDG
 /// the K2/K3 tier set, TP6 width 512.
 pub const PACKAGE: &str = "kimik3:exl3-k23";
 
+/// Coordinator streams live at the load peak, per GPU: the retained exchange
+/// stream (`startup.rs:292`) and lane compute stream (`startup.rs:304`), the
+/// shared push copy set (`shared/memory/push_consumer.rs:99`, `COPY_STREAMS`),
+/// and the drafter bridge stream (`draft.rs:168` for one owner,
+/// `shared/draft/remote.rs:72` for TP2). KDA and MLA copy streams
+/// (`state.rs:203`, `mla.rs:133`) are created only after the push set retires,
+/// so they do not raise the retained slab count. SM120 driver/runtime 13020
+/// LAZY retains 2 MiB per started group of four live streams (#1511).
+pub fn startup_peak_live_streams() -> u64 {
+    2 + 1 + crate::push_load::COPY_STREAMS as u64
+}
+
 #[derive(Clone)]
 struct Tensor {
     shape: Vec<usize>,

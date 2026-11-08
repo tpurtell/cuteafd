@@ -130,6 +130,7 @@ pub struct BytePiece {
     pub bytes_at_first: u64,
     pub bytes_per_page: u64,
     /// Round the whole affine request independently, not its per-page slope.
+    /// Requests at or below `SMALL` share driver blocks and are not rounded.
     pub granularity: u64,
     /// Equal, independently rounded backings the affine request is split into
     /// (for example one KV page allocation per attention layer). Each backing
@@ -159,20 +160,39 @@ impl BytePiece {
         let raw = self.raw_at(pages)?;
         let request = self.request(raw)
             .ok_or_else(|| Refusal::InvalidFact("curve backings do not divide the request".into()))?;
+        if self.granularity == super::granularity::SM120_ALLOCATION_GRANULARITY_BYTES {
+            return super::granularity::sm120_request_backing(request)?
+                .checked_mul(self.backings)
+                .ok_or(Refusal::Overflow("rounded component curve"));
+        }
         request.div_ceil(self.granularity).checked_mul(self.granularity)
             .and_then(|n| n.checked_mul(self.backings))
             .ok_or(Refusal::Overflow("rounded component curve"))
     }
     /// Each backing rounds on its own: `backings * ceil(raw / backings / G) * G
     /// <= available` iff `raw <= (available / (G * backings)) * G * backings`.
+    /// A backing at or below the shared threshold costs its own bytes instead.
     pub(super) fn last_affordable(&self, available: u64) -> Result<Option<u64>, Refusal> {
         if self.granularity == 0 || self.backings == 0 {
             return Err(Refusal::InvalidFact("zero curve granularity".into()));
         }
         let unit = self.granularity.checked_mul(self.backings)
             .ok_or(Refusal::Overflow("curve affordable backings"))?;
-        let ceiling = (available / unit).checked_mul(unit)
+        let rounded = (available / unit).checked_mul(unit)
             .ok_or(Refusal::Overflow("curve affordable backings"))?;
+        // A backing request at or below the shared small threshold costs its own
+        // bytes, so a sub-threshold pool fits its exact extent.
+        let ceiling = if self.granularity == super::granularity::SM120_ALLOCATION_GRANULARITY_BYTES {
+            let shared = self.backings
+                .checked_mul(super::granularity::SM120_SHARED_REQUEST_BYTES)
+                .ok_or(Refusal::Overflow("curve affordable backings"))?;
+            let exact = (available.min(shared) / self.backings)
+                .checked_mul(self.backings)
+                .ok_or(Refusal::Overflow("curve affordable backings"))?;
+            rounded.max(exact)
+        } else {
+            rounded
+        };
         Ok(if ceiling < self.bytes_at_first { None }
             else if self.bytes_per_page == 0 { Some(self.last) }
             else { Some(self.last.min(self.first.saturating_add(
@@ -186,12 +206,19 @@ impl ByteCurve {
         Self::linear(bytes, 0, maximum)
     }
     pub fn linear(bytes_at_first: u64, bytes_per_page: u64, maximum: u64) -> Self {
+        Self::linear_rounded(bytes_at_first, bytes_per_page, maximum, 1)
+    }
+    /// One physical driver request per page-scaled owner, rounded up to the
+    /// driver's allocation granularity. The rounded extent is the charge, so an
+    /// owner that is exactly one `cudaMalloc` never needs a separate tail.
+    pub fn linear_rounded(bytes_at_first: u64, bytes_per_page: u64, maximum: u64,
+        granularity: u64) -> Self {
         Self(vec![BytePiece {
             first: 1,
             last: maximum,
             bytes_at_first,
             bytes_per_page,
-            granularity: 1,
+            granularity,
             backings: 1,
         }])
     }

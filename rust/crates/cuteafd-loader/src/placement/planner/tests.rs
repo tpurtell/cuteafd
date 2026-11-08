@@ -68,6 +68,20 @@ fn paged_backings_round_each_backing_independently() {
 }
 
 #[test]
+fn requests_at_or_below_one_mib_share_blocks_instead_of_rounding() {
+    let granularity = SM120_ALLOCATION_GRANULARITY_BYTES;
+    for (bytes_at_first, expected) in [(1 << 20, 1 << 20), ((1 << 20) + 1, granularity),
+        (granularity, granularity), (granularity + 1, 2 * granularity)] {
+        let curve = ByteCurve::linear_rounded(bytes_at_first, 0, 4, granularity);
+        assert_eq!(curve.at(1).unwrap(), expected, "bytes_at_first={bytes_at_first}");
+    }
+    // A page-scaled owner crosses the shared-block threshold as its pool grows.
+    let curve = ByteCurve::linear_rounded(1 << 19, 1 << 19, 8, granularity);
+    assert_eq!(curve.at(2).unwrap(), 1 << 20);
+    assert_eq!(curve.at(3).unwrap(), granularity);
+}
+
+#[test]
 fn rounded_affine_search_matches_exact_independent_backings_and_mixed_slopes() {
     let maximum = 32;
     let rounded = |bytes_at_first, bytes_per_page| ByteCurve(vec![BytePiece {
@@ -481,8 +495,20 @@ fn startup_graph_capture_replaces_opaque_estimate_without_reselection() {
         assert_eq!((phase.owned, phase.opaque), (100, 200));
     }
     let good = plan.clone();
-    for bad in [CapturedGraphRank { bytes: 1000, ..capture.clone() },
-        CapturedGraphRank { declared_graphs: "wrong keys".into(), ..capture.clone() },
+    // A capture above every budget is served, not refused: the graphs are
+    // already resident, so the measured row is installed and reported (#1605).
+    let over = CapturedGraphRank { bytes: 1000, ..capture.clone() };
+    let mut above = good.clone();
+    assert_eq!(serving::reconcile_startup_graphs(&mut above, "test", &graphs, &declared, &[over]).unwrap().ranks[0].bytes, 1000);
+    assert_eq!(above.facts.allowances[0].bytes, 1000);
+    assert!(!above.facts.allowances[0].assumed);
+    for phase in above.phases.iter().filter(|phase| matches!(phase.phase, Phase::Warmup | Phase::Ready | Phase::Growth)) {
+        assert_eq!((phase.owned, phase.opaque, phase.available), (100, 1000, 1000));
+    }
+    assert_eq!(above.request, good.request);
+    assert_eq!(above.decisions, good.decisions);
+    // An ill-formed capture still refuses and leaves the receipt intact.
+    for bad in [CapturedGraphRank { declared_graphs: "wrong keys".into(), ..capture.clone() },
         CapturedGraphRank { executables: 3, ..capture.clone() }] {
         assert!(serving::reconcile_startup_graphs(&mut plan, "test", &graphs, &declared, &[bad]).is_err());
         assert_eq!(plan, good);

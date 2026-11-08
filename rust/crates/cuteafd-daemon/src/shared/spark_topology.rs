@@ -269,20 +269,17 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                     "{key}: shared PINNED intake estimate omits a rank or wave");
                 assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
             } else if matches!(family, "glm" | "ml4" | "glmf") {
-                let prefix = if family == "glmf" { "glmf.spark" } else { "glm.prefill" };
                 // GLM's unified physical ledger admits GPU return reserves;
                 // the deleted ordinary-host ledger is not an allocation owner.
+                // Candidate-invariant coordinator-device intake planes are
+                // named Transport owners; only probe-selected pinned/host
+                // storage stays an allowance envelope.
                 let placement = report.solver_placement.as_ref().expect("shared GLM placement");
-                let envelopes: Vec<_> = placement.items[0].iter().filter(|item|
-                    item.group.starts_with(&format!("{prefix}: Spark intake transport envelope"))).collect();
-                assert_eq!(envelopes.len(), 1, "{key}: one admitted prefill endpoint");
-                assert!(envelopes[0].bytes >= intake, "{key}: device return envelope omits ranks");
-                for rank in 0..8 {
-                    let bytes = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
-                        waves * rows * hidden * 2)?;
-                    assert!(envelopes[0].group.contains(&format!(
-                        "{prefix}.intake.rank.{rank}.storage={bytes}")), "{key}: rank {rank} return receipt");
-                }
+                let planes: Vec<_> = placement.items[0].iter().filter(|item|
+                    item.group == "Spark intake"
+                        && item.category == cuteafd_core::memory_layout::Category::Transport).collect();
+                assert_eq!(planes.len(), 1, "{key}: one admitted prefill endpoint");
+                assert!(planes[0].bytes >= intake, "{key}: device intake omits ranks");
                 let ledger = report.phase_ledger.as_ref().expect("joint physical ledger");
                 assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
             } else if matches!(family, "dsv4f" | "dsv4p") {

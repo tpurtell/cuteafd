@@ -437,3 +437,40 @@ pub(crate) fn pending_code(library: &NativeLibrary, device: i32, rank: usize, sp
         basis = ?code.basis, pending_bytes = pending, "loaded code reserved beside admission");
     Ok(pending)
 }
+
+#[test]
+fn observer_capacity_reaches_glm_forecasts_and_v4_physical_inputs() -> Result<()> {
+    // A child isolates the process-wide observer declaration from parallel tests.
+    if std::env::var_os("CUTEAFD_TEST_OBSERVER_CHILD").is_none() {
+        let root = tempfile::tempdir()?;
+        let file = root.path().join("observer.json");
+        std::fs::write(&file, r#"{"0":550}"#)?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "shared::inventory::observer_capacity_reaches_glm_forecasts_and_v4_physical_inputs", "--nocapture"])
+            .env("CUTEAFD_TEST_OBSERVER_CHILD", "1")
+            .env("CUTEAFD_OBSERVER_CONTEXT_FILE", file).output()?;
+        anyhow::ensure!(output.status.success(), "observer child failed: {} {}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return Ok(());
+    }
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.configure_memory(&library, 0, 10_000)?;
+    // Stand in for the external observer's resident context in raw CUDA counters.
+    let mut observer = library.alloc_device_buffer(550, crate::shared::memory::TEST)?;
+    assert_eq!(library.cuda_physical_memory_info()?, (9_450, 10_000));
+    let (free, physical) = library.cuda_allocatable_memory_info()?;
+    assert_eq!((free, physical), (9_450, 9_450));
+    assert_eq!(library.cuda_memory_info()?, (9_450, 9_450));
+    let budgets = cuteafd_loader::placement::families::glm5::admission::production_budgets(
+        &[(physical as u64, physical as u64)], 0, (10_000, 10_000), 0, &[])?;
+    assert_eq!(budgets[0].available()?, 9_450);
+    let capped = cuteafd_loader::placement::families::glm5::admission::production_budgets(
+        &[(physical as u64, 8_000)], 0, (10_000, 10_000), 0, &[])?;
+    assert_eq!(capped[0].available()?, 8_000);
+    // V4 reads this same pre-budget total separately from the logical sample.
+    let v4_physical = library.cuda_allocatable_memory_info()?.1;
+    assert_eq!(v4_physical, physical);
+    library.free_device_buffer(&mut observer)?;
+    Ok(())
+}
