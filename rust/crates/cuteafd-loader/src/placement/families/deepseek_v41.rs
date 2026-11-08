@@ -14,26 +14,33 @@ pub fn startup_lane_shapes(total: u64) -> u64 {
 
 /// Graph executables one decode row shape instantiates per lane: the backbone
 /// lane, index selection, sparse/window attention, both gates and the head
-/// site at every layer that shape reaches. Measured by the startup census.
-const LANE_EXECUTABLES_PER_SHAPE: u64 = 0;
+/// site at every layer that shape reaches. Measured by the startup census
+/// (28,544 lane executables for 2 lanes x 64 shapes).
+const LANE_EXECUTABLES_PER_SHAPE: u64 = 223;
 /// One prefill slot's eager set: the full chunk, the 128-row decoder replay and
-/// their layers' sites. Measured by the startup census.
+/// their layers' sites. The 1x RTX census captured three slots with no
+/// retained executables or bytes; kept at zero until a census shows prefill
+/// slot graphs.
 const SLOT_EXECUTABLES: u64 = 0;
 /// The draft proposals' sealed set. Measured by the startup census.
-const DRAFT_EXECUTABLES: u64 = 0;
+const DRAFT_EXECUTABLES: u64 = 16;
 
 /// Retained device bytes per captured executable, by phase. Driver graph
 /// executables are opaque storage: the census measures the whole capture's
-/// `free` delta, not a per-node estimate. Measured by the startup census.
-const LANE_BYTES_PER_EXECUTABLE: u64 = 0;
+/// `free` delta, not a per-node estimate. Rates are the ceiling of the
+/// measured bytes over the measured count.
+const LANE_BYTES_PER_EXECUTABLE: u64 = 123_211;
 const SLOT_BYTES_PER_EXECUTABLE: u64 = 0;
-const DRAFT_BYTES_PER_EXECUTABLE: u64 = 0;
+const DRAFT_BYTES_PER_EXECUTABLE: u64 = 655_360;
 
 /// Whole-capture census rows: `(rank count, card-class ceiling, prefill slots,
 /// drafter, decode shapes, bytes, executables)`. A row is this process's own
 /// `free` delta across the sealed capture plus the capture count, which is
 /// exact for its geometry and supersedes the per-executable rates there.
-const STARTUP_GRAPH_CENSUS: &[(usize, u64, usize, bool, u64, u64, u64)] = &[];
+/// 1x RTX PRO 6000, 3 Sparks: 3,527,409,664 bytes (3,516,923,904 lanes +
+/// 10,485,760 draft), 28,560 executables, capture 2,416 ms.
+const STARTUP_GRAPH_CENSUS: &[(usize, u64, usize, bool, u64, u64, u64)] =
+    &[(1, 96 << 30, 3, true, 64, 3_527_409_664, 28_560)];
 
 /// The sealed startup capture's residency on one coordinator GPU. Admission
 /// charges it before the pool is sized, because the capture runs after the KV

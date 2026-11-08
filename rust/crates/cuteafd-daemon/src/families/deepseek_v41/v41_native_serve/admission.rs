@@ -603,6 +603,14 @@ pub(super) fn resolve_with_owners(
             prefill.waves as usize, args.dspark, gpu as u8));
     }
     let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
+    // The pre-weight sample is taken after the CUDA context and the family's
+    // module loads, before any weight or pool allocation. Charge that measured
+    // occupancy once, as a named owner, exactly where `live_budgets` used to
+    // take it implicitly out of the free sample.
+    for (gpu, &(free, total)) in memory.iter().enumerate() {
+        retained.push(Owner::charged(gpu as u8, Category::Runtime, "context and loaded modules",
+            (total as u64).saturating_sub(free as u64)));
+    }
     for (gpu, &bytes) in deferred.iter().enumerate().filter(|(_, &bytes)| bytes > 0) {
         retained.push(Owner::charged(
             gpu as u8,

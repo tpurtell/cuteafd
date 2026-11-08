@@ -658,10 +658,15 @@ pub fn live_budgets(
             locations: vec![Location::coordinator(rank as u8)],
             physical_bytes: total,
             logical_bytes: ceiling,
-            baseline: Baseline::Sampled {
-                free,
-                phase: Phase::Load,
-                source: "measured free bytes before the whole-process recipe".into(),
+            // The pre-weight sample already holds the CUDA context and every
+            // module the family loaded. Those bytes are charged as one named
+            // owner ("context and loaded modules") beside this budget, so the
+            // cap starts whole and the ledger matches the device instead of
+            // leaving the occupancy implicit in a free sample.
+            baseline: Baseline::Forecast {
+                occupied: 0,
+                source: format!("full cap; pre-weight free sample {free} charged as context and loaded modules"),
+                assumed: false,
             },
             headroom: crate::placement::reserve::gpu("deepseek_v41"),
         })
