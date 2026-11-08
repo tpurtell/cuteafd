@@ -24,8 +24,11 @@ pub const GLM5_FLASH: u64 = 2 << 30;
 /// (no warmed census yet). Placeholder for measurement.
 pub const KIMI_K3: u64 = 0;
 /// Muse Spark. Inherited: 2 GiB hardcoded headroom (`families/muse_spark/serve.rs:211`,
-/// dev `3ce3fbd19`). Covered first-use CUDA/module/allocator growth beyond the
-/// 160 MiB `GPU_RUNTIME` estimate. Placeholder for measurement.
+/// dev `3ce3fbd19`). Covered first-use CUDA/module/allocator growth beyond a
+/// 160 MiB opaque per-GPU estimate. Deleted in the 2026-11-08 memory campaign:
+/// module loads now happen before the measured pre-weight sample (#1554), the
+/// driver stream slabs are charged per GPU (`muse/driver-stream-slabs/gpuN`),
+/// and the measured unexplained residual at Ready is inside `MEMORY_PADDING`.
 pub const MUSE_SPARK: u64 = 0;
 /// Step-5. Inherited: 2 GiB headroom (`families/step5/serve.rs:317`, dev
 /// `3ce3fbd19`), covering allocator slack and runtime growth; Step-5 captures
