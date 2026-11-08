@@ -504,70 +504,39 @@ pub fn placed_attention(attention: GlmfAttention, placed: &Placement) -> GlmfAtt
 }
 
 
-pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize, sequences: usize,
-    speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> GraphSet {
-    let counts = glmf_graphs::serving_graph_counts(context, pool, cfg.dense_context(), sequences.min(decode_rows), speculation,
-        layers, gpus == 2, &glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms)));
-    let ranks = counts.iter().enumerate().map(|(rank, &count)| {
-        let role = if gpus == 1 { 0 } else { rank + 1 };
-        glmf_graphs::estimated_graph_rank(count, role)
+/// One startup graph ledger from the exact shape list the capture declares.
+/// The executable keys frame the set's identity, so a measured census row can
+/// replace the historical arithmetic before the KV pool is sized.
+fn startup_graph_inventory(shapes: &[(usize, bool, glmf_graphs::GraphGeometry)],
+    layers: usize, gpus: usize) -> GraphSet {
+    let executables = |rank: usize| shapes.len() as u64 * (layers + usize::from(rank == 0)) as u64;
+    let ranks = (0..gpus).map(|rank| {
+        glmf_graphs::estimated_graph_rank(executables(rank), if gpus == 1 { 0 } else { rank + 1 })
     }).collect();
-    GraphSet { ranks, shapes: counts[0] / (layers + 1) as u64, lifetime: Lifetime::Startup }
+    let mut graphs = GraphSet { ranks, shapes: shapes.len() as u64, lifetime: Lifetime::Startup };
+    if let Ok(declared) = glmf_graphs::declared_fingerprints(shapes, layers, gpus) {
+        glmf_graphs::apply_startup_census(&mut graphs, &declared, gpus);
+    }
+    graphs
 }
 
-/// Estimated maximum-pool bound: only power-of-two stride/width transitions
-/// and the dense/long transition can introduce a new graph geometry. This
-/// avoids walking every pool unit or materializing executable shape keys.
+pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize, sequences: usize,
+    speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> GraphSet {
+    let buckets = glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms));
+    let shapes = glmf_graphs::serving_graph_shapes(context, pool.div_ceil(glmf_graphs::PAGE_ROWS),
+        cfg.dense_context(), sequences.min(decode_rows), speculation, &buckets);
+    startup_graph_inventory(&shapes, layers, gpus)
+}
+
+/// The startup graph set of the requested maximum context and pool, from the
+/// same exact shape walk the capture declares. Enumerating the shapes is
+/// bounded by the context in 256-row units, not the pool, so it is cheap; the
+/// result is simultaneous with the capture's declared set, which keeps the
+/// admission bound and the selected exact set identical.
 #[allow(clippy::too_many_arguments)]
 pub fn startup_graph_bound(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize,
     sequences: usize, speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> GraphSet {
-    let pages = pool.div_ceil(glmf_graphs::PAGE_ROWS);
-    let pools = pages / glmf_graphs::UNIT_PAGES;
-    let limit = context.div_ceil(glmf_graphs::UNIT_ROWS).min(pools);
-    let mut boundaries = vec![1, limit];
-    let mut power = 1usize;
-    while power <= limit {
-        boundaries.push(power);
-        boundaries.push(power.saturating_add(1).min(limit));
-        let Some(next) = power.checked_mul(2) else { break };
-        power = next;
-    }
-    boundaries.push(cfg.dense_context().div_ceil(glmf_graphs::UNIT_ROWS).min(limit));
-    boundaries.push(cfg.dense_context().saturating_add(1).div_ceil(glmf_graphs::UNIT_ROWS).min(limit));
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    let (table_pages, table_pools) = cache::glmf_table_pages(context as u64);
-    let table = (table_pages as usize, table_pools as usize);
-    let mut geometries = Vec::new();
-    for units in boundaries.into_iter().filter(|&units| units > 0 && units <= limit) {
-        let capacity = (units * glmf_graphs::UNIT_ROWS).min(context);
-        let mut width = 1;
-        while width / 2 * glmf_graphs::UNIT_ROWS < capacity {
-            let low = if width == 1 { 1 } else { width / 2 * glmf_graphs::UNIT_ROWS + 1 };
-            let high = (width * glmf_graphs::UNIT_ROWS).min(capacity);
-            for long in [false, true] {
-                if (!long && low <= high.min(cfg.dense_context()))
-                    || (long && low.max(cfg.dense_context() + 1) <= high) {
-                    let live = units.min(high.max(131_072).div_ceil(glmf_graphs::UNIT_ROWS).next_power_of_two());
-                    let (page_stride, pool_stride) = glmf_graphs::decode_strides(
-                        live * glmf_graphs::UNIT_PAGES, live, (pages, pools), table);
-                    let key = glmf_graphs::GraphGeometry::keyed(width.min(pool_stride), page_stride, pool_stride, long);
-                    if !geometries.contains(&key) { geometries.push(key); }
-                }
-            }
-            width *= 2;
-        }
-    }
-    let buckets = glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms));
-    let plain = buckets.bucket(sequences.min(decode_rows).clamp(16, 64), false);
-    let rows = buckets.plain.iter().filter(|&&rows| rows <= plain).count()
-        + if speculation { buckets.spec.len() } else { 0 };
-    let shapes = (geometries.len() * rows) as u64;
-    let ranks = (0..gpus).map(|rank| {
-        let executables = shapes * (layers + usize::from(rank == 0)) as u64;
-        glmf_graphs::estimated_graph_rank(executables, if gpus == 1 { 0 } else { rank + 1 })
-    }).collect();
-    GraphSet { ranks, shapes, lifetime: Lifetime::Startup }
+    startup_graphs(cfg, layers, context, pool, sequences, speculation, gpus, decode_rows, sms)
 }
 
 /// Historical P6 local-route observation. Missing exact code/key provenance

@@ -142,6 +142,27 @@ mod tests {
     }
 
     #[test]
+    fn measured_census_row_calibrates_the_serving_key_set_through_the_full_pool() {
+        let buckets = DecodeBuckets::new(verify_budget(64, 188));
+        let shapes = |pool: usize| serving_graph_shapes(1_048_576, pool.div_ceil(PAGE_ROWS), 2051, 16, true, &buckets);
+        let declared = declared_fingerprints(&shapes(2_000_128), 45, 1).unwrap();
+        assert_eq!(declared.len(), 1);
+        // The exact key set the census row was captured on; a count alone would
+        // also match a different set, which is why the fingerprint is framed.
+        assert_eq!(declared[0], STARTUP_GRAPH_CENSUS[0].declared_graphs);
+        // A pool that fills a 96 GiB card keys the same set: the stride floors
+        // and the page-stride/pool-stride caps do not move between 2M and 100M.
+        assert_eq!(declared_fingerprints(&shapes(100_000_000), 45, 1).unwrap()[0], declared[0]);
+        let mut graphs = crate::placement::inventory::GraphSet {
+            ranks: vec![estimated_graph_rank(13_800, 0)], shapes: 300,
+            lifetime: crate::placement::inventory::Lifetime::Startup };
+        apply_startup_census(&mut graphs, &declared, 1);
+        assert_eq!(graphs.ranks[0].bytes, STARTUP_GRAPH_CENSUS[0].bytes);
+        assert_eq!(graphs.ranks[0].margin, 0);
+        assert_eq!(graphs.ranks[0].basis, cuteafd_core::memory_layout::Basis::Calibrated);
+    }
+
+    #[test]
     fn startup_counts_match_rc3_and_peer_has_no_head_graph() {
         let buckets = DecodeBuckets::new(verify_budget(64, 188));
         let shapes = serving_graph_shapes(1_048_576, 2_097_152 / PAGE_ROWS, 2051, 16, true, &buckets);
@@ -213,6 +234,64 @@ pub fn serving_graph_counts(context: usize, pool_tokens: usize, dense: usize, se
     let shapes = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences,
         speculation, buckets).len() as u64;
     std::iter::once(shapes * (layers + 1) as u64).chain(peer.then_some(shapes * layers as u64)).collect()
+}
+
+/// A measured startup decode graph residency for one exact declared key set.
+///
+/// `declared_graphs` fingerprints every captured executable (segment, rows,
+/// speculation, long/short and page-table geometry) for one coordinator rank,
+/// so a row matches only that set, never a count. `gpus` is the coordinator
+/// rank count, because a rank-0 key set alone does not distinguish a one- and
+/// a two-coordinator capture. Provenance records the binary and hardware that
+/// produced the measurement; a row is added by capturing the set in one launch
+/// (#1577), never by scaling a different count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupGraphCensus {
+    pub declared_graphs: &'static str,
+    pub executables: u64,
+    pub gpus: u8,
+    pub bytes: u64,
+    pub programs_sha256: &'static str,
+    pub native_sha256: &'static str,
+    pub toolchain: &'static str,
+    pub gpu_class: &'static str,
+    pub driver: &'static str,
+    pub evidence: &'static str,
+    pub producing_commit: &'static str,
+}
+
+/// Measured startup graph sets. A set without a row uses the historical
+/// estimate, which is why a full-pool capture must be re-measured when the
+/// startup key set changes.
+pub const STARTUP_GRAPH_CENSUS: &[StartupGraphCensus] = &[StartupGraphCensus {
+    declared_graphs: "8757d4da6763b4536c2916bb84f20fc221d86681d487ecae2f0e296a03a0e292",
+    executables: 13_800,
+    gpus: 1,
+    bytes: 2_313_158_656,
+    programs_sha256: "60a42f767fcad1695df928c6d7ce1c8621490354127c001c2f096c9040b9194b",
+    native_sha256: "d6f7646a781d54dccd3aa96118e088e1e58f0291961ac2bf75744bb9e7149811",
+    toolchain: "rustc 1.98.1 (48a229cea 2026-09-01); binary: rustc; commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985; commit-date: 2026-09-01; host: x86_64-unknown-linux-gnu; release: 1.98.1; LLVM version: 22.1.8",
+    gpu_class: "sm_120/188/101973491712",
+    driver: "13.2",
+    evidence: "GLM Flash synchronized startup capture after exact masked-segment prewarm; tracked device growth excluded",
+    producing_commit: "bfe5f6babe3768bd9640d7adaff467fc630850b9",
+}];
+
+/// Replace each rank's estimated residency with the measured value for the same
+/// exact declared set. This is the only place a startup graph charge becomes
+/// calibrated; a set without a row keeps the historical estimate, and the plan
+/// records it as assumed.
+pub fn apply_startup_census(graphs: &mut crate::placement::inventory::GraphSet,
+    declared: &[String], gpus: usize) {
+    for (rank, graph) in graphs.ranks.iter_mut().enumerate() {
+        let Some(fingerprint) = declared.get(rank) else { continue };
+        let Some(row) = STARTUP_GRAPH_CENSUS.iter().find(|row|
+            row.declared_graphs == fingerprint && row.executables == graph.executables
+                && row.gpus as usize == gpus) else { continue };
+        graph.bytes = row.bytes;
+        graph.margin = 0;
+        graph.basis = cuteafd_core::memory_layout::Basis::Calibrated;
+    }
 }
 
 /// Every exchange slot owns its payload, completion word and native control storage.
