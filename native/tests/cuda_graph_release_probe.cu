@@ -9,6 +9,8 @@
 #include <deque>
 #include <random>
 #include <vector>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #define CUDA(call) do { cudaError_t e = (call); if (e != cudaSuccess) { \
   std::fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #call, cudaGetErrorString(e)); \
@@ -126,59 +128,123 @@ static void trim(cudaStream_t stream, const char* stage) {
   if (status != cudaSuccess) cudaGetLastError();
 }
 
+static void initialize(cudaStream_t* stream, uint32_t** output) {
+  CUDA(cudaSetDevice(0));
+  CUDA(cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking));
+  CUDA(cudaMalloc(output, 8192));
+  Args<32> small{};
+  small.output = *output;
+  Args<512> large{};
+  large.output = *output;
+  probe_kernel<32><<<1, 1, 0, *stream>>>(small);
+  probe_kernel<512><<<1, 1, 0, *stream>>>(large);
+  CUDA(cudaStreamSynchronize(*stream));
+}
+
+static void child_ok(pid_t pid) {
+  int status;
+  if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status))
+    std::exit(1);
+}
+
+static void calibrate(Shape& shape) {
+  int fds[2];
+  if (pipe(fds)) std::exit(1);
+  pid_t pid = fork();
+  if (pid < 0) std::exit(1);
+  if (pid == 0) {
+    close(fds[0]);
+    cudaStream_t stream;
+    uint32_t* output;
+    initialize(&stream, &output);
+    size_t before = free_bytes(stream);
+    std::vector<Graph> samples;
+    samples.push_back(create(shape, output, stream, true));
+    verify(shape, output);
+    for (int i = 1; i < 16; ++i) samples.push_back(create(shape, output, stream));
+    size_t after = free_bytes(stream);
+    size_t growth = before > after ? before - after : 0;
+    shape.charge = (growth + 15) / 16;
+    if (!shape.charge) std::exit(1);
+    for (auto& graph : samples) destroy(graph, stream);
+    size_t released = free_bytes(stream);
+    trim(stream, "calibration_destroyed");
+    CUDA(cudaDeviceReset());
+    CUDA(cudaSetDevice(0));
+    size_t reset_free, total;
+    CUDA(cudaMemGetInfo(&reset_free, &total));
+    std::printf("{\"kind\":\"calibrate\",\"nodes\":%d,\"args\":%d,\"charge\":%zu,"
+                "\"free_before\":%zu,\"free_live16\":%zu,\"free_destroyed\":%zu,\"free_reset\":%zu}\n",
+                shape.nodes, shape.args, shape.charge, before, after, released, reset_free);
+    if (write(fds[1], &shape.charge, sizeof(shape.charge)) != sizeof(shape.charge)) std::exit(1);
+    close(fds[1]);
+    std::fflush(stdout);
+    _exit(0);
+  }
+  close(fds[1]);
+  if (read(fds[0], &shape.charge, sizeof(shape.charge)) != sizeof(shape.charge)) std::exit(1);
+  close(fds[0]);
+  child_ok(pid);
+}
+
+static void adversarial(const Shape& first, const Shape& second, size_t cap) {
+  pid_t pid = fork();
+  if (pid < 0) std::exit(1);
+  if (pid == 0) {
+    cudaStream_t stream;
+    uint32_t* output;
+    initialize(&stream, &output);
+    size_t baseline = free_bytes(stream);
+    for (int phase = 0; phase < 4; ++phase) {
+      const Shape& shape = phase % 2 == 0 ? first : second;
+      std::vector<Graph> graphs;
+      size_t before = free_bytes(stream);
+      size_t count = cap / shape.charge;
+      for (size_t i = 0; i < count; ++i) graphs.push_back(create(shape, output, stream));
+      verify(shape, output);
+      size_t filled = free_bytes(stream);
+      for (auto& graph : graphs) destroy(graph, stream);
+      size_t destroyed = free_bytes(stream);
+      std::printf("{\"kind\":\"adversarial\",\"first_nodes\":%d,\"first_args\":%d,"
+                  "\"phase\":%d,\"nodes\":%d,\"args\":%d,\"count\":%zu,\"live_charge\":%zu,"
+                  "\"free_baseline\":%zu,\"free_before\":%zu,\"free_filled\":%zu,\"free_destroyed\":%zu}\n",
+                  first.nodes, first.args, phase, shape.nodes, shape.args, count,
+                  count * shape.charge, baseline, before, filled, destroyed);
+    }
+    trim(stream, "adversarial_destroyed");
+    CUDA(cudaDeviceReset());
+    std::fflush(stdout);
+    _exit(0);
+  }
+  child_ok(pid);
+}
+
 int main(int argc, char** argv) {
   int cycles = argc > 1 ? std::atoi(argv[1]) : 1000;
   size_t cap = (argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 64) * MiB;
   if (cycles < 1000 || cap < 16 * MiB) return 2;
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
-  CUDA(cudaSetDevice(0));
+  // Fork before this parent initializes CUDA: each calibration and adversarial
+  // arm gets a fresh context, so retained executable arenas cannot hide cost.
+  std::vector<Shape> shapes;
+  for (int bytes : {32, 512}) for (int nodes : {1, 10, 100, 1000, 5000}) {
+    shapes.push_back({nodes, bytes});
+    calibrate(shapes.back());
+  }
+  adversarial(shapes.front(), shapes.back(), cap);
+  adversarial(shapes.back(), shapes.front(), cap);
+  cudaStream_t stream;
+  uint32_t* output;
+  initialize(&stream, &output);
   cudaDeviceProp prop;
   CUDA(cudaGetDeviceProperties(&prop, 0));
   int runtime, driver;
   CUDA(cudaRuntimeGetVersion(&runtime));
   CUDA(cudaDriverGetVersion(&driver));
-  cudaStream_t stream;
-  CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  uint32_t* output;
-  CUDA(cudaMalloc(&output, 8192));
-  for (int args : {32, 512}) {
-    Shape warm{1, args};
-    Graph warm_graph = create(warm, output, stream);
-    verify(warm, output);
-    destroy(warm_graph, stream);
-  }
-  size_t baseline = free_bytes(stream);
+  size_t loop_baseline = free_bytes(stream);
   std::printf("{\"kind\":\"start\",\"device\":\"%s\",\"sm\":%d,\"runtime\":%d,"
               "\"driver\":%d,\"cycles\":%d,\"cap\":%zu,\"free_baseline\":%zu}\n",
-              prop.name, prop.major * 10 + prop.minor, runtime, driver, cycles, cap, baseline);
-  std::vector<Shape> shapes;
-  for (int bytes : {32, 512}) for (int nodes : {1, 10, 100, 1000, 5000}) {
-    shapes.push_back({nodes, bytes});
-    Graph graph = create(shapes.back(), output, stream, true);
-    verify(shapes.back(), output);
-    size_t before = free_bytes(stream);
-    destroy(graph, stream);
-    size_t after = free_bytes(stream);
-    std::printf("{\"kind\":\"shape_destroy\",\"nodes\":%d,\"args\":%d,"
-                "\"free_before\":%zu,\"free_after\":%zu}\n", nodes, bytes, before, after);
-  }
-  // Amortize chunk quantization over 16 live graphs. The floor intentionally
-  // overcharges tiny shapes instead of pretending their zero delta means free.
-  for (auto& shape : shapes) {
-    size_t before = free_bytes(stream);
-    std::vector<Graph> samples;
-    for (int i = 0; i < 16; ++i) samples.push_back(create(shape, output, stream));
-    size_t after = free_bytes(stream);
-    size_t growth = before > after ? before - after : 0;
-    shape.charge = std::max<size_t>(2 * MiB / 16, (growth + 15) / 16);
-    for (auto& graph : samples) destroy(graph, stream);
-    size_t released = free_bytes(stream);
-    std::printf("{\"kind\":\"calibrate\",\"nodes\":%d,\"args\":%d,\"charge\":%zu,"
-                "\"free_before\":%zu,\"free_live16\":%zu,\"free_destroyed\":%zu}\n",
-                shape.nodes, shape.args, shape.charge, before, after, released);
-  }
-  trim(stream, "after_calibration");
-  size_t loop_baseline = free_bytes(stream);
+              prop.name, prop.major * 10 + prop.minor, runtime, driver, cycles, cap, loop_baseline);
   std::printf("{\"kind\":\"loop_start\",\"free\":%zu}\n", loop_baseline);
   std::mt19937 random(1605);
   std::deque<Graph> live;
