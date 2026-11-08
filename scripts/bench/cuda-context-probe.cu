@@ -255,6 +255,68 @@ static void mappings(int device0, int device1) {
     }
   }
 }
+// One page write per lane: exercise the mapping without transfer-sized GPU work.
+__global__ static void touch_mapping(unsigned char* p, size_t bytes) {
+  for (size_t i = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4096;
+       i < bytes; i += size_t(gridDim.x) * blockDim.x * 4096) p[i] = 1;
+}
+static void chunks(int device, int peer) {
+  const size_t mib = size_t(1) << 20, gib = size_t(1) << 30;
+  std::vector<int> devices{device};
+  if (peer >= 0 && peer != device) devices.push_back(peer);
+  for (int d : devices) {
+    CUDA(cudaSetDevice(d)); CUDA(cudaFree(nullptr));
+    touch_mapping<<<1, 1>>>(nullptr, 0); CUDA(cudaDeviceSynchronize());
+  }
+  struct Shape { size_t count, bytes; };
+  for (const auto shape : {Shape{1, 32*gib}, Shape{89, 368*mib},
+                          Shape{512, 64*mib}, Shape{128, 256*mib}}) {
+    if (mem_available_kb() * 1024 < (long long)(shape.count * shape.bytes + 8*gib)) {
+      std::fprintf(stderr, "insufficient host memory for chunks\n"); std::exit(1);
+    }
+    std::vector<size_t> baseline;
+    for (int d : devices) baseline.push_back(used(d));
+    auto sample = [&](const char* stage, size_t count, size_t touched) {
+      for (size_t j = 0; j < devices.size(); ++j) {
+        size_t free = 0, total = 0;
+        CUDA(cudaSetDevice(devices[j])); CUDA(cudaDeviceSynchronize());
+        CUDA(cudaMemGetInfo(&free, &total));
+        std::printf("{\"mode\":\"chunks\",\"allocator\":%d,\"device\":%d,"
+            "\"chunk_bytes\":%zu,\"target_count\":%zu,\"count\":%zu,\"stage\":\"%s\","
+            "\"touched_bytes\":%zu,\"free\":%zu,\"total\":%zu,\"delta_bytes\":%lld}\n",
+            device, devices[j], shape.bytes, shape.count, count, stage, touched,
+            free, total, (long long)(total-free) - baseline[j]);
+      }
+      std::fflush(stdout);
+    };
+    sample("before", 0, 0);
+    std::vector<void*> pointers;
+    for (size_t i = 0; i < shape.count; ++i) {
+      CUDA(cudaSetDevice(device)); void* p = nullptr;
+      CUDA(cudaHostAlloc(&p, shape.bytes, cudaHostAllocPortable | cudaHostAllocMapped));
+      pointers.push_back(p);
+      sample("allocated", i+1, 0);
+    }
+    for (int d : devices) {
+      CUDA(cudaSetDevice(d));
+      for (void* p : pointers) { void* alias = nullptr; CUDA(cudaHostGetDevicePointer(&alias, p, 0)); }
+    }
+    sample("aliases", shape.count, 0);
+    for (size_t fraction : {size_t(4), size_t(1)}) {
+      for (void* p : pointers) std::memset(p, 1, shape.bytes/fraction);
+      sample("cpu_touch", shape.count, shape.count*shape.bytes/fraction);
+    }
+    for (int d : devices) {
+      CUDA(cudaSetDevice(d));
+      for (void* p : pointers) touch_mapping<<<256, 256>>>((unsigned char*)p, shape.bytes);
+      CUDA(cudaGetLastError()); CUDA(cudaDeviceSynchronize());
+    }
+    sample("gpu_touch", shape.count, shape.count*shape.bytes);
+    CUDA(cudaSetDevice(device));
+    for (void* p : pointers) CUDA(cudaFreeHost(p));
+    sample("freed", 0, 0);
+  }
+}
 static void driver_check(CUresult status, const char* call) {
   if (status != CUDA_SUCCESS) {
     const char* message = nullptr;
@@ -364,5 +426,6 @@ int main(int argc, char** argv) {
       && last > 0 && last <= 64) lt_handles(device, last, std::strcmp(mode, "lt-with-blas") == 0, prewarm);
   else if (std::strcmp(mode, "mappings") == 0) mappings(device, last);
   else if (std::strcmp(mode, "allocations") == 0 && !prewarm && last > 0 && last <= 64) allocations(device, last);
-  else { std::fprintf(stderr, "usage: probe handles|lt|lt-with-blas [device] [count] [prewarm] | mappings [device0] [device1] | allocations [device] [retained_count]\n"); return 2; }
+  else if (std::strcmp(mode, "chunks") == 0 && !prewarm) chunks(device, argc > 3 ? last : -1);
+  else { std::fprintf(stderr, "usage: probe handles|lt|lt-with-blas [device] [count] [prewarm] | mappings [device0] [device1] | allocations [device] [retained_count] | chunks [device] [peer=-1]\n"); return 2; }
 }
