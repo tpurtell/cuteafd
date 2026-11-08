@@ -2100,7 +2100,7 @@ impl Opened {
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
             blas_head: args.resolved_target_head().blas_head(!self.native && core.get_weight("lm_head").is_none()
                 && representation.head == head::GlmfHeadFormat::Bf16),
-            representation, resident, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
+            representation, resident, workspace, local_workspace, graphs, graphs_measured: true, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
             full_prefill_logits: if shape.full_prefill_logits {
                 cuteafd_loader::plan::layout::full_prefill_logits_bytes("glm5_flash", args.prefill_rows as u64,

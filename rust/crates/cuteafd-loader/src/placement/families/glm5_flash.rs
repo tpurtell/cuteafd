@@ -201,6 +201,10 @@ pub struct GlmfInputs<'a> {
     pub workspace: Vec<GlmfBufferDemand>,
     pub local_workspace: Vec<GlmfBufferDemand>,
     pub graphs: GraphSet,
+    /// Whether the startup graph charge must come from a measured census row.
+    /// Serving sets this, so an unmeasured key set refuses before KV sizing;
+    /// the offline planner clears it and admits [`startup_graphs_estimated`].
+    pub graphs_measured: bool,
     /// Routed layers in backbone order, not including dense layers.
     pub experts: Vec<ExpertCost>,
     pub expert_workspace: u64,
@@ -510,10 +514,17 @@ pub fn placed_attention(attention: GlmfAttention, placed: &Placement) -> GlmfAtt
 /// the KV pool is never sized beside a scaled graph estimate (#1577).
 fn startup_graph_inventory(shapes: &[(usize, bool, glmf_graphs::GraphGeometry)],
     layers: usize, gpus: usize) -> Result<GraphSet, String> {
-    let executables = |rank: usize| shapes.len() as u64 * (layers + usize::from(rank == 0)) as u64;
+    startup_graph_inventory_with(shapes, layers, gpus, |executables, fingerprint, rank|
+        glmf_graphs::census_rank(executables, fingerprint, rank, gpus))
+}
+
+fn startup_graph_inventory_with(shapes: &[(usize, bool, glmf_graphs::GraphGeometry)],
+    layers: usize, gpus: usize,
+    rank: impl Fn(u64, &str, usize) -> Result<GraphRank, String>) -> Result<GraphSet, String> {
+    let executables = |index: usize| shapes.len() as u64 * (layers + usize::from(index == 0)) as u64;
     let declared = glmf_graphs::declared_fingerprints(shapes, layers, gpus)?;
-    let ranks = (0..gpus).map(|rank| glmf_graphs::census_rank(
-        executables(rank), &declared[rank], rank, gpus)).collect::<Result<Vec<_>, String>>()?;
+    let ranks = (0..gpus).map(|index| rank(executables(index), &declared[index], index))
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(GraphSet { ranks, shapes: shapes.len() as u64, lifetime: Lifetime::Startup })
 }
 
@@ -523,6 +534,24 @@ pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: 
     let shapes = glmf_graphs::serving_graph_shapes(context, pool.div_ceil(glmf_graphs::PAGE_ROWS),
         cfg.dense_context(), sequences.min(decode_rows), speculation, &buckets);
     startup_graph_inventory(&shapes, layers, gpus)
+}
+
+/// The planner's startup set: a measured row where one exists, an estimate
+/// (never a proportional scale) elsewhere, so `cuteafd plan` describes any
+/// layout. Serving admission uses [`startup_graphs`], which refuses.
+pub fn startup_graphs_estimated(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize,
+    sequences: usize, speculation: bool, gpus: usize, decode_rows: usize, sms: usize)
+    -> Result<GraphSet, String> {
+    let buckets = glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms));
+    let shapes = glmf_graphs::serving_graph_shapes(context, pool.div_ceil(glmf_graphs::PAGE_ROWS),
+        cfg.dense_context(), sequences.min(decode_rows), speculation, &buckets);
+    startup_graph_inventory_estimated(&shapes, layers, gpus)
+}
+
+fn startup_graph_inventory_estimated(shapes: &[(usize, bool, glmf_graphs::GraphGeometry)],
+    layers: usize, gpus: usize) -> Result<GraphSet, String> {
+    startup_graph_inventory_with(shapes, layers, gpus, |executables, fingerprint, _rank|
+        Ok(glmf_graphs::census_rank_estimated(executables, fingerprint)))
 }
 
 /// The startup graph set of the requested maximum context and pool, from the
@@ -535,6 +564,15 @@ pub fn startup_graph_bound(cfg: &GlmNextConfig, layers: usize, context: usize, p
     sequences: usize, speculation: bool, gpus: usize, decode_rows: usize, sms: usize)
     -> Result<GraphSet, String> {
     startup_graphs(cfg, layers, context, pool, sequences, speculation, gpus, decode_rows, sms)
+}
+
+/// [`startup_graph_bound`] for the offline planner: measured rows where they
+/// exist, estimates elsewhere; it never refuses an unmeasured key set.
+#[allow(clippy::too_many_arguments)]
+pub fn startup_graph_bound_estimated(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize,
+    sequences: usize, speculation: bool, gpus: usize, decode_rows: usize, sms: usize)
+    -> Result<GraphSet, String> {
+    startup_graphs_estimated(cfg, layers, context, pool, sequences, speculation, gpus, decode_rows, sms)
 }
 
 /// Historical P6 local-route observation. Missing exact code/key provenance
@@ -597,6 +635,7 @@ pub(crate) mod tests {
                 embedding: if rank == 0 { 1 << 30 } else { 0 }, weights: (5 << 30) + if rank == 1 { 64 << 20 } else { 0 } }).collect(), workspace: workspace_fixture(ranks, 3 << 30), local_workspace: workspace_fixture(ranks, 2 << 30),
             graphs: startup_graphs(cfg, cfg.layers, 262_144, if capacity <= 34 << 30 { 1 << 20 } else { 2 << 20 },
                 8, true, ranks, 64, 188).unwrap(),
+            graphs_measured: true,
             experts: cfg.dense.iter().filter(|&&dense| !dense).map(|_| ExpertCost {
                 whole: Bytes2 { resident: 2 << 30, staging: 0 },
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, whole_supported: true, spark_ok: true }).collect(),
@@ -777,6 +816,27 @@ pub(crate) mod tests {
             assert_eq!(admitted.solved.phases,
                 planner::evaluate(&admitted.solved.facts, &admitted.solved.budgets).unwrap());
         }
+    }
+
+    #[test]
+    fn serving_refuses_an_unmeasured_startup_set_that_the_planner_estimates() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        // Construct the fixture while the synthetic census is active, then make
+        // this thread behave like a serving launch: only real rows may charge.
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.spark_ranks = 0;
+        input.requested_pool = Some(262_144);
+        glmf_graphs::refuse_unmeasured_graphs();
+        input.graphs_measured = false;
+        let planned = contract(&input).expect("the planner answers for an uncensused key set");
+        assert!(planned.graphs.ranks.iter().all(|rank| rank.basis == Basis::Estimated));
+        assert!(planned.graphs.ranks.iter().all(|rank|
+            rank.bytes == glmf_graphs::estimated_rank(rank.executables).bytes));
+        input.graphs_measured = true;
+        let refusal = contract(&input).err().expect("serving refuses an uncensused key set")
+            .to_string();
+        assert!(refusal.contains("STARTUP_GRAPH_CENSUS"), "{refusal}");
+        assert!(refusal.contains("rank 0 of 2"), "{refusal}");
     }
 
     #[test]

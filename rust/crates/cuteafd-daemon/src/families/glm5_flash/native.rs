@@ -280,7 +280,7 @@ mod tests {
             decode_rows: 64, partial_bytes: 2, max_context: 262_144, sequences: 8, speculation: false,
             state_slots: 8, mark_slots: 8, pool_marks: false, index: Default::default(), kda_state_bytes: 4,
             shared_replay: false, representation: Default::default(), workspace: vec![], local_workspace: vec![],
-            graphs: cuteafd_loader::placement::GraphSet::budget(&vec![0; ranks]), experts: vec![], expert_workspace: 0,
+            graphs: cuteafd_loader::placement::GraphSet::budget(&vec![0; ranks]), graphs_measured: true, experts: vec![], expert_workspace: 0,
             tp2_workspace: [0; 2], drafter_bytes: 0, drafter_weights: Default::default(), drafter_scratch: vec![0; ranks],
             drafter_bridge: None, requested_pool: None, onboard: Onboard::Auto, full_prefill_logits: 0 }
     }

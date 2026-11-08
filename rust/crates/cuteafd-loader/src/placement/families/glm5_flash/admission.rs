@@ -562,6 +562,23 @@ pub fn prepare<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, mut pro
     Ok(prepared)
 }
 
+/// The startup graph charge for one admission: a measured census row when the
+/// input is serving (`graphs_measured`), a planner estimate otherwise. The
+/// declared key set is re-derived from the served context and pool either way,
+/// so the charge and the capture's declared set stay identical.
+fn startup_graph_set(i: &GlmfInputs<'_>, context: usize, pool: usize, gpus: usize, sms: usize)
+    -> Result<GraphSet, p::Refusal> {
+    let (cfg, layers, sequences) = (i.cfg, i.layers, i.sequences as usize);
+    let (speculation, decode_rows) = (i.speculation, i.decode_rows as usize);
+    if i.graphs_measured {
+        startup_graph_bound(cfg, layers, context, pool, sequences, speculation, gpus, decode_rows, sms)
+            .map_err(invalid)
+    } else {
+        startup_graph_bound_estimated(cfg, layers, context, pool, sequences, speculation, gpus,
+            decode_rows, sms).map_err(invalid)
+    }
+}
+
 fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, process: ProcessOwners)
     -> Result<PreparedGlmf<'a>, p::Refusal> {
     if i.graphs.ranks.iter().any(|rank| rank.margin > rank.bytes) {
@@ -987,8 +1004,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         arena.push(peak);
     }
     let graph = if i.graphs.lifetime == Lifetime::Startup {
-        startup_graph_bound(i.cfg, i.layers, i.max_context as usize, (maximum * 256) as usize,
-            i.sequences as usize, i.speculation, gpus, i.decode_rows as usize, sms).map_err(invalid)?
+        startup_graph_set(i, i.max_context as usize, (maximum * 256) as usize, gpus, sms)?
     } else { i.graphs.clone() };
     for (option, &count) in counts.iter().enumerate() {
         let mut selected = graph.clone();
@@ -1052,8 +1068,8 @@ impl PreparedGlmf<'_> {
         let option = self.counts.iter().position(|&n| n == count).ok_or_else(|| invalid("unprepared onboarding count"))?;
         let working = GlmfWorkingSet::candidate(i, count).map_err(invalid)?;
         let mut graphs = if i.graphs.lifetime == Lifetime::Startup {
-            startup_graphs(i.cfg, i.layers, solved.request.context.served(solved.pool_tokens) as usize, solved.pool_tokens as usize,
-                i.sequences as usize, i.speculation, i.gpus.len(), i.decode_rows as usize, self.sms).map_err(invalid)?
+            startup_graph_set(i, solved.request.context.served(solved.pool_tokens) as usize,
+                solved.pool_tokens as usize, i.gpus.len(), self.sms)?
         } else { i.graphs.clone() };
         if i.local_tp2_exl3 && working.spark_ranks == 0 { calibrate_local_tp2_graphs(&mut graphs); }
         let declared_graphs = if graphs.lifetime == Lifetime::Startup {

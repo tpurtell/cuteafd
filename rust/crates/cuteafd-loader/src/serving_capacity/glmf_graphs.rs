@@ -141,6 +141,24 @@ mod tests {
         assert_eq!(peer_exchange_bytes(2, 4096, 4096, 2, false), 268_435_712);
     }
 
+    /// The offline planner answers for a key set no launch has censused: the
+    /// census placeholder marked estimated, never a scale of another set, and
+    /// a measured row still wins. Serving refuses instead ([`census_rank`]).
+    #[test]
+    fn the_planner_estimates_an_uncensused_set_and_still_prefers_a_measured_row() {
+        let uncensused = census_rank_estimated(5_520, "a5164f57bfb3531b8b2c2d25db19642d0ed5923f34fc90e8caa12127a763462f");
+        assert_eq!(uncensused.basis, cuteafd_core::memory_layout::Basis::Estimated);
+        assert_eq!(uncensused.bytes, census_placeholder(5_520));
+        assert_eq!(uncensused.bytes, 5_520 * (2 << 20));
+        assert_eq!(uncensused.margin, 0);
+        let row = STARTUP_GRAPH_CENSUS[0];
+        let measured = census_rank_estimated(row.executables, row.declared_graphs);
+        assert_eq!((measured.bytes, measured.basis),
+            (row.bytes, cuteafd_core::memory_layout::Basis::Calibrated));
+        assert_eq!(estimated_rank(row.executables).bytes, row.bytes,
+            "an uncensused fingerprint with the same count takes the largest measured row, not a scale");
+    }
+
     #[test]
     fn measured_census_row_calibrates_the_serving_key_set_through_the_full_pool() {
         let buckets = DecodeBuckets::new(verify_budget(64, 188));
@@ -263,13 +281,35 @@ pub struct StartupCapture {
 pub fn startup_set(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
     speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets)
     -> Result<crate::placement::inventory::StartupGraphs<(usize, bool, GraphGeometry)>, String> {
+    startup_set_with(context, pool_tokens, dense, sequences, speculation, layers, peer, buckets,
+        census_rank)
+}
+
+/// The planner's startup set: the measured row where one exists, an estimate
+/// ([`estimated_rank`]) elsewhere, so `cuteafd plan` answers for any layout.
+/// Serving admission calls [`startup_set`], which refuses an unmeasured set.
+#[allow(clippy::too_many_arguments)]
+pub fn startup_set_estimated(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
+    speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets)
+    -> Result<crate::placement::inventory::StartupGraphs<(usize, bool, GraphGeometry)>, String> {
+    startup_set_with(context, pool_tokens, dense, sequences, speculation, layers, peer, buckets,
+        |executables, fingerprint, _rank, _gpus| {
+            Ok(census_rank_estimated(executables, fingerprint))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn startup_set_with(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
+    speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets,
+    rank: impl Fn(u64, &str, usize, usize) -> Result<GraphRank, String>)
+    -> Result<crate::placement::inventory::StartupGraphs<(usize, bool, GraphGeometry)>, String> {
     use crate::placement::inventory::{GraphSet, Lifetime};
     let keys = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences, speculation, buckets);
     let shapes = keys.len() as u64;
     let gpus = 1 + usize::from(peer);
     let declared = declared_fingerprints(&keys, layers, gpus)?;
-    let ranks = (0..gpus).map(|rank| census_rank(
-        shapes * (layers + usize::from(rank == 0)) as u64, &declared[rank], rank, gpus))
+    let ranks = (0..gpus).map(|index| rank(
+        shapes * (layers + usize::from(index == 0)) as u64, &declared[index], index, gpus))
         .collect::<Result<Vec<_>, String>>()?;
     Ok(GraphSet { ranks, shapes, lifetime: Lifetime::Startup }.startup(keys)
         .expect("startup geometry list and ledger are constructed together"))
@@ -387,6 +427,27 @@ fn census_rank_for(executables: u64, fingerprint: &str, rank: usize, gpus: usize
 fn census_placeholder(executables: u64) -> u64 {
     STARTUP_GRAPH_CENSUS.iter().filter(|row| row.executables == executables)
         .map(|row| row.bytes).max().unwrap_or_else(|| executables * (2 << 20))
+}
+
+/// One rank's estimate for a declared set with no measured row, for the offline
+/// planner only: the same placeholder a census run admits (the largest measured
+/// row for this executable count, else 2 MiB per executable), marked
+/// [`cuteafd_core::memory_layout::Basis::Estimated`] and never a proportional
+/// scale of another set. Serving admission charges [`census_rank`] instead, so
+/// an unmeasured set refuses rather than starting on this number.
+pub fn estimated_rank(executables: u64) -> GraphRank {
+    GraphRank { executables, bytes: census_placeholder(executables), margin: 0,
+        basis: cuteafd_core::memory_layout::Basis::Estimated }
+}
+
+/// One rank's charge for the planner: the measured row when this exact declared
+/// fingerprint has one, else [`estimated_rank`]. Serving never uses this; it
+/// is the plan command's answer for a layout no launch has censused yet.
+pub fn census_rank_estimated(executables: u64, fingerprint: &str) -> GraphRank {
+    STARTUP_GRAPH_CENSUS.iter().find(|row| row.declared_graphs == fingerprint
+        && row.executables == executables)
+        .map_or_else(|| estimated_rank(executables), |row| GraphRank { executables,
+            bytes: row.bytes, margin: 0, basis: cuteafd_core::memory_layout::Basis::Calibrated })
 }
 
 /// Every exchange slot owns its payload, completion word and native control storage.

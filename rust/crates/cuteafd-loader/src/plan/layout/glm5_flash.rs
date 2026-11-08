@@ -340,9 +340,18 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let speculation = draft > 0 || !draft_tp2.is_empty();
         let automatic_target = placement::PoolPolicy::resolve(&options.rtx_bytes[..ranks], context, None, 256).target;
         let target = options.pool_tokens.filter(|&n| n > 0).unwrap_or(automatic_target);
-        let graphs = glmf::startup_graph_bound(&cfg, cfg.layers, context as usize, target as usize,
+        let graphs = glmf::startup_graph_bound_estimated(&cfg, cfg.layers, context as usize, target as usize,
                 sequences as usize, speculation, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize)
             .map_err(anyhow::Error::msg)?;
+        if graphs.ranks.iter().any(|rank| rank.basis == Basis::Estimated) {
+            report.hints.push(crate::plan::Hint {
+                what: format!("GLM Flash startup decode graphs have no measured census row for this \
+                    declared key set ({} executables on rank 0); the plan estimates {} B \
+                    (STARTUP_GRAPH_CENSUS)", graphs.ranks[0].executables, graphs.ranks[0].bytes),
+                how: "Capture this layout with a memory census (the launcher's `census` profile) and \
+                    add its per-rank instantiate bytes to STARTUP_GRAPH_CENSUS: a serving launch \
+                    refuses an unmeasured key set before sizing KV (#1577).".into() });
+        }
         let inputs = glmf::GlmfInputs {
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), context: crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code,
             headroom_bytes: crate::placement::reserve::gpu("glm5_flash"), spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
@@ -353,7 +362,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 || representation.head != resident::GlmfHeadFormat::Bf16 {
                 placement::planner::serving::BlasHead::Native
             } else { options.bf16_target_head },
-            resident, workspace, local_workspace, graphs, experts,
+            resident, workspace, local_workspace, graphs, graphs_measured: false, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
