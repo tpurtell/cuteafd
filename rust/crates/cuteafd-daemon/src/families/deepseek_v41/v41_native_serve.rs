@@ -828,6 +828,36 @@ fn worker(
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some(), &pool)?;
     scheduler::publish_capacity(&requests, &prefixes, pool.placement.max_pool_tokens_no_onboard);
     vision.connect()?;
+    // Every other pre-Ready owner is priced or measured by now: weights,
+    // workspaces, KV, transports, the reconciled sealed graphs, driver page
+    // tables and BLAS handles. Charge the remainder of each device's measured
+    // occupancy once as context and loaded modules, so the census compares
+    // named owners against the device instead of leaving driver state implicit.
+    {
+        use cuteafd_loader::placement::families::deepseek_v41::admission::{
+            whole_gpu_reserve, CONTEXT_OWNER,
+        };
+        use cuteafd_loader::placement::planner::Location;
+        // A whole-GPU reserve keeps the pre-weight sample as the budget's
+        // sampled baseline instead of naming a context owner, so there is
+        // nothing to reconcile in that mode.
+        if !whole_gpu_reserve() {
+            for gpu in 0..args.rtx_gpus as u8 {
+                lib.cuda_set_device(i32::from(gpu))?;
+                let (free, total) = lib.cuda_memory_info()?;
+                let others = pool.solved.items(Location::coordinator(gpu))?
+                    .iter().filter(|item| item.group != CONTEXT_OWNER)
+                    .try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
+                    .context("V4.1 context owner sum overflow")?;
+                let measured = (total as u64).saturating_sub(free as u64).saturating_sub(others);
+                cuteafd_loader::placement::families::deepseek_v41::admission::reconcile_context_owner(
+                    &mut pool.solved, gpu, measured)
+                    .map_err(|error| anyhow::anyhow!("V4.1 context reconciliation: {error}"))?;
+            }
+            lib.cuda_set_device(0)?;
+        }
+        cuteafd_loader::placement::reserve::log_plan(&pool.solved, "deepseek_v41 ready");
+    }
     admission::startup_phase(&lib, "v41/ready", device_total)?;
     ready
         .take()
@@ -1351,8 +1381,13 @@ mod tests {
         let draft = source.find("draft.capture_startup()?").unwrap();
         let reconcile = source.find("reconcile_startup_graph(").unwrap();
         let receipt = source.find("log_plan(&pool.solved, \"deepseek_v41 captured\")").unwrap();
+        let context = source.find("reconcile_context_owner(").unwrap();
+        let ready = source.find("\"v41/ready\"").unwrap();
         assert!(pool < capture && capture < lane_measure && lane_measure < slots);
         assert!(slots < draft && draft < reconcile && reconcile < receipt);
+        // The context remainder is measured once every late owner exists and
+        // before readiness publishes.
+        assert!(receipt < context && context < ready);
         let single_rank = concat!("free_before", ".saturating_sub");
         assert!(!source.contains(single_rank),
             "per-rank free deltas, not one rank's bytes applied to all");

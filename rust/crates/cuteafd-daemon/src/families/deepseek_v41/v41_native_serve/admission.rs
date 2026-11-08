@@ -606,10 +606,15 @@ pub(super) fn resolve_with_owners(
     // The pre-weight sample is taken after the CUDA context and the family's
     // module loads, before any weight or pool allocation. Charge that measured
     // occupancy once, as a named owner, exactly where `live_budgets` used to
-    // take it implicitly out of the free sample.
-    for (gpu, &(free, total)) in memory.iter().enumerate() {
-        retained.push(Owner::charged(gpu as u8, Category::Runtime, "context and loaded modules",
-            (total as u64).saturating_sub(free as u64)));
+    // take it implicitly out of the free sample. A whole-GPU reserve replaces
+    // named runtime owners in the planner, so there the sample stays the
+    // budget's sampled baseline instead and is not charged a second time.
+    if !families::deepseek_v41::admission::whole_gpu_reserve() {
+        for (gpu, &(free, total)) in memory.iter().enumerate() {
+            retained.push(Owner::charged(gpu as u8, Category::Runtime,
+                families::deepseek_v41::admission::CONTEXT_OWNER,
+                (total as u64).saturating_sub(free as u64)).pre_sample());
+        }
     }
     for (gpu, &bytes) in deferred.iter().enumerate().filter(|(_, &bytes)| bytes > 0) {
         retained.push(Owner::charged(
@@ -1390,10 +1395,13 @@ mod admission_tests {
         }
         let wide = families::deepseek_v41::startup_graphs(96 << 30, 1, 3, true);
         let narrow = families::deepseek_v41::startup_graphs(96 << 30, 1, 1, true);
-        // A prefill slot adds its own eager set; the uncalibrated estimate is
-        // the one retired envelope, so it is flat until the census prices it.
+        // A prefill slot adds its own eager set. Bytes are comparable only
+        // within one basis: the measured row is exact for three slots, while
+        // the ceiling rate can round a subset estimate a few KiB higher.
         assert!(wide.executables >= narrow.executables);
-        assert!(wide.bytes >= narrow.bytes);
+        assert_eq!(wide.basis, cuteafd_core::memory_layout::Basis::Calibrated);
+        assert_eq!(narrow.basis, cuteafd_core::memory_layout::Basis::Estimated);
+        assert!(wide.bytes > 0 && narrow.bytes > 0);
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),

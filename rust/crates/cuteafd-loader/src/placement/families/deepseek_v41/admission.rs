@@ -37,6 +37,9 @@ pub struct Owner {
     pub bytes: u64,
     pub resident: u64,
     pub deferred: bool,
+    /// Already inside the availability sample: a sequential load peak stated
+    /// above that sample excludes it, so it is not subtracted from the peak.
+    pub pre_sample: bool,
     pub lifetime: Lifetime,
     /// An immutable weight arena: `bytes` and `resident` are its physical
     /// extent B, charged once with its single SM120 tail (no per-tensor payload).
@@ -64,9 +67,16 @@ impl Owner {
             bytes,
             resident: 0,
             deferred: false,
+            pre_sample: false,
             lifetime: Lifetime::RESIDENT,
             arena: None,
         }
+    }
+
+    /// The occupancy the availability sample already holds (context, modules).
+    pub fn pre_sample(mut self) -> Self {
+        self.pre_sample = true;
+        self
     }
 
     /// An owner already resident in the serving sample: ledger only.
@@ -105,6 +115,7 @@ impl Owner {
             bytes: demand.bytes,
             resident: demand.resident_weights.0,
             deferred: demand.lifetime == ItemLifetime::PostReadyReserve,
+            pre_sample: false,
             lifetime: match demand.lifetime {
                 ItemLifetime::ReadyResident => Lifetime::RESIDENT,
                 ItemLifetime::PostReadyReserve => Lifetime { first: Phase::Ready, last: Phase::Growth },
@@ -141,6 +152,22 @@ pub fn growth_allowances(total: u64, ranks: usize, slots: usize, draft: bool, gp
     }]
 }
 
+/// The one owner standing for the CUDA context, loaded modules and the other
+/// driver state the availability sample already holds. It is charged from that
+/// sample before weights load and replaced by the measured remainder once every
+/// other pre-Ready owner is priced.
+pub const CONTEXT_OWNER: &str = "context and loaded modules";
+
+/// Whether a whole-GPU reserve (`GPU_RESERVE`) is in force. It replaces the
+/// family's named runtime owners in `apply_reserve_override`, so the measured
+/// pre-weight sample cannot be charged beside the budget in that mode: the
+/// sample stays the budget's sampled baseline and no context owner is added.
+pub fn whole_gpu_reserve() -> bool {
+    cuteafd_core::memory_policy::MemoryPolicy::current()
+        .reserve_override(cuteafd_core::memory_policy::DeviceKind::Gpu)
+        .is_some()
+}
+
 /// Replace a GPU's startup-graph estimate with the capture that actually ran
 /// this process, then re-evaluate the phases. The pool is not resized: the
 /// capture happens after it, and the next start charges the calibrated row.
@@ -154,6 +181,22 @@ pub fn reconcile_startup_graph(plan: &mut crate::placement::planner::ResolvedPla
     }
     owner.bytes = bytes;
     owner.assumed = false;
+    plan.phases = crate::placement::planner::evaluate(&plan.facts, &plan.budgets)?;
+    Ok(())
+}
+
+/// Replace the pre-weight context sample with the measured remainder after
+/// every other Ready owner is priced. This is the one owner that absorbs
+/// driver and module state no allocator receipt names; the pool already exists,
+/// so only the plan and its census report change.
+pub fn reconcile_context_owner(plan: &mut crate::placement::planner::ResolvedPlan, gpu: u8, bytes: u64) -> Result<(), Refusal> {
+    let matches: Vec<_> = plan.facts.allocations.iter_mut()
+        .filter(|owner| owner.location == Location::coordinator(gpu) && owner.group == CONTEXT_OWNER)
+        .collect();
+    let [owner] = matches.try_into().map_err(|_: Vec<_>|
+        invalid("missing or duplicate V4.1 context owner"))?;
+    owner.bytes = bytes;
+    owner.shape = vec![bytes];
     plan.phases = crate::placement::planner::evaluate(&plan.facts, &plan.budgets)?;
     Ok(())
 }
@@ -650,6 +693,14 @@ pub fn live_budgets(
     {
         return Err(invalid("invalid live memory samples"));
     }
+    // The pre-weight sample already holds the CUDA context and every module
+    // the family loaded. Those bytes are charged as one named owner ("context
+    // and loaded modules") beside the budget, so the cap starts whole and the
+    // ledger matches the device instead of leaving the occupancy implicit in a
+    // free sample. A whole-GPU reserve removes that owner, so in that mode the
+    // sample stays the baseline and the reserve still accounts for memory
+    // already in use.
+    let sampled = whole_gpu_reserve();
     let mut budgets = cards
         .iter()
         .enumerate()
@@ -658,15 +709,18 @@ pub fn live_budgets(
             locations: vec![Location::coordinator(rank as u8)],
             physical_bytes: total,
             logical_bytes: ceiling,
-            // The pre-weight sample already holds the CUDA context and every
-            // module the family loaded. Those bytes are charged as one named
-            // owner ("context and loaded modules") beside this budget, so the
-            // cap starts whole and the ledger matches the device instead of
-            // leaving the occupancy implicit in a free sample.
-            baseline: Baseline::Forecast {
-                occupied: 0,
-                source: format!("full cap; pre-weight free sample {free} charged as context and loaded modules"),
-                assumed: false,
+            baseline: if sampled {
+                Baseline::Sampled {
+                    free,
+                    phase: Phase::Load,
+                    source: "whole-GPU reserve; pre-weight free sample".into(),
+                }
+            } else {
+                Baseline::Forecast {
+                    occupied: 0,
+                    source: format!("full cap; pre-weight free sample {free} charged as context and loaded modules"),
+                    assumed: false,
+                }
             },
             headroom: crate::placement::reserve::gpu("deepseek_v41"),
         })
@@ -1096,10 +1150,11 @@ impl<'a> ProductionInput<'a> {
         // Sequential load peaks are absolute above the sample; charge each as
         // the part not already covered by the owners that are live at load,
         // including the drafter's retained weights the peak already contains.
+        // Owners the sample itself already holds are not in those peaks.
         let mut base = vec![0u64; self.gpus];
         for owner in self.owners.iter().chain(draft_demands.iter().flatten()) {
             if let Device::Coordinator(rank) = owner.location.device {
-                if !owner.deferred && owner.lifetime.first == Phase::Load {
+                if !owner.deferred && !owner.pre_sample && owner.lifetime.first == Phase::Load {
                     base[usize::from(rank)] = base[usize::from(rank)]
                         .checked_add(owner.bytes)
                         .ok_or(Refusal::Overflow("V4.1 load base"))?;
