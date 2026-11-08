@@ -1,5 +1,6 @@
 //! Bounded, captured index selection and snapshot-checked candidate sharing.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
+use crate::shared::decode_graph::GraphPolicy;
 use crate::families::deepseek_v41::v41_compressor::{IndexBinding, IndexProposal, IndexScoreGeometry};
 use crate::families::deepseek_v41::v41_index_query::{IndexQueryOutput, IndexQueryGeometry};
 use crate::shared::memory::Tag;
@@ -284,7 +285,7 @@ impl<'a> IndexSelectionWave<'a> {
         Ok(Self {
             storage, window: RowWindow::NONE, shared_scratch_busy: None,
             staging: LayerStaging::new(library, metadata_staging_bytes(capacity), 40, "v41/index-metadata")?, capacity,
-            graph: None, graphs: crate::shared::decode_graph::GraphBank::new(None),
+            graph: None, graphs: crate::shared::decode_graph::GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
             retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0,
             ready: None, pending: None, in_flight: false,
             audit: std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "1"),

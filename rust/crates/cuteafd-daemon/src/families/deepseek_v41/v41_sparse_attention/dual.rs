@@ -1,5 +1,6 @@
 //! Per-slot head-half waves on shared, guarded unit-cap attention storage.
 use super::*;
+use crate::shared::decode_graph::GraphPolicy;
 use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event};
 use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache,CacheAttention,peer_inputs::PeerAttentionInputs};
@@ -95,7 +96,7 @@ impl<'a> DualAttentionWave<'a> {
             halves: [devices[0].own(|| CompactSparseAttentionWave::on_storage(storage.halves[0].clone()))?,
                 devices[1].own(|| CompactSparseAttentionWave::on_storage(storage.halves[1].clone()))?],
             capacity: storage.capacity, storage, window: crate::shared::memory::row_window::RowWindow::NONE,
-            pending: None, tails: GraphBank::new(None),
+            pending: None, tails: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
         })
     }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {

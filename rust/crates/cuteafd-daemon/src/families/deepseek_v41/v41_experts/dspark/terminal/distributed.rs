@@ -1,5 +1,6 @@
 //! Lane-owned draft terminal: RTX1 normalization/sampling, TP2 shared head.
 use super::*;
+use crate::shared::decode_graph::GraphPolicy;
 use crate::shared::memory::device::{Device, DeviceOwner};
 use crate::families::deepseek_v41::v41_target_head::distributed::DistributedVocabularyWave;
 use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
@@ -52,7 +53,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         Ok(Self {
             terminal: devices[1].own(|| weights.terminal_storage(None, capacity, required[1] - head_bytes[1]))?,
             head,
-            graphs: crate::shared::decode_graph::GraphBank::new(None), ready: None, pending: None,
+            graphs: crate::shared::decode_graph::GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"), ready: None, pending: None,
         })
     }
     pub(crate) fn capture_startup(&mut self, capacity: usize, maximum: usize) -> Result<()> {

@@ -11,7 +11,7 @@ use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41SparseAttention, V41SparseBatch, V41SparseSource, V41SparseWindow, V41Kv, V41PeerCopy,
 };
 use std::{ffi::c_void, marker::PhantomData};
-use crate::shared::decode_graph::{GraphBank, GraphOwner};
+use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphPolicy};
 pub(crate) mod dual;
 
 pub(crate) struct AttentionRequest<'a> {
@@ -189,7 +189,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             replay_staging: LayerStaging::new(library, capacity * 8, 40, "v41/sparse-replay")?,
             storage, window: crate::shared::memory::row_window::RowWindow::NONE,
             capacity, batch_rows: batch, attention_plan: None, decode: false,
-            graphs: GraphBank::new(None), graph_limit: 1, warmed_kernels: 0, cold: None,
+            graphs: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"), graph_limit: 1, warmed_kernels: 0, cold: None,
         })
     }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {

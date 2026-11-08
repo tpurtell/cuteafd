@@ -1,7 +1,7 @@
 //! Backbone FP8 window KV production, private proposals and accepted ring writes.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::shared::memory::row_window::RowWindow;
-use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner};
+use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner, GraphPolicy};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Fp8Plan, V41Kv};
@@ -343,7 +343,7 @@ impl<'a> WindowWeights<'a> {
             commit_staging: HostAllocation::new(self.library, commit::staging_bytes(unit), Tag::staging("v41/window-proposal"))?,
             capacity: unit,
             graph: None,
-            graphs: GraphBank::new(None),
+            graphs: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
             ready: None,
             pending_query: None,
             pending_commit: None,

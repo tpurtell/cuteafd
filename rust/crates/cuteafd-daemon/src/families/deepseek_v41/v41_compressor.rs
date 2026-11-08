@@ -1,7 +1,7 @@
 //! CSA2 source weights, immutable proposal execution and accepted-prefix state.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::shared::memory::row_window::RowWindow;
-use crate::shared::decode_graph::{GraphBank, GraphOwner};
+use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphPolicy};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Compressor, V41Kv};
@@ -363,7 +363,7 @@ impl<'a> CompressorWeights<'a> {
             staging: HostAllocation::new(self.library, unit * if self.ratio == 2 { 16 } else { 8 }, Tag::staging("v41/compressor"))?,
             capacity: unit,
             graph: None,
-            retained_graphs: GraphBank::new(None),
+            retained_graphs: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
             ready: None,
             pending_query: None,
             pending_commit: None,
