@@ -688,19 +688,30 @@ pub fn live_budgets(
     cards: &[(u64, u64, u64)],
     spark_bytes: &[u64],
 ) -> Result<Vec<Budget>, Refusal> {
+    budgets(cards, spark_bytes, true)
+}
+
+/// Live admission where the caller charges the pre-weight sample as a named
+/// owner beside the budget (`CONTEXT_OWNER`), so the cap starts whole and the
+/// ledger matches the device. A whole-GPU reserve deletes that runtime owner in
+/// `apply_reserve_override`, so it keeps the sampled baseline instead.
+pub fn live_budgets_charged(
+    cards: &[(u64, u64, u64)],
+    spark_bytes: &[u64],
+) -> Result<Vec<Budget>, Refusal> {
+    budgets(cards, spark_bytes, whole_gpu_reserve())
+}
+
+fn budgets(
+    cards: &[(u64, u64, u64)],
+    spark_bytes: &[u64],
+    sampled: bool,
+) -> Result<Vec<Budget>, Refusal> {
     if !(1..=2).contains(&cards.len())
         || cards.iter().any(|&(total, ceiling, free)| total == 0 || ceiling > total || free > total)
     {
         return Err(invalid("invalid live memory samples"));
     }
-    // The pre-weight sample already holds the CUDA context and every module
-    // the family loaded. Those bytes are charged as one named owner ("context
-    // and loaded modules") beside the budget, so the cap starts whole and the
-    // ledger matches the device instead of leaving the occupancy implicit in a
-    // free sample. A whole-GPU reserve removes that owner, so in that mode the
-    // sample stays the baseline and the reserve still accounts for memory
-    // already in use.
-    let sampled = whole_gpu_reserve();
     let mut budgets = cards
         .iter()
         .enumerate()
@@ -713,7 +724,7 @@ pub fn live_budgets(
                 Baseline::Sampled {
                     free,
                     phase: Phase::Load,
-                    source: "whole-GPU reserve; pre-weight free sample".into(),
+                    source: "sampled pre-weight free bytes".into(),
                 }
             } else {
                 Baseline::Forecast {

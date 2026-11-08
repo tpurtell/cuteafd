@@ -4661,9 +4661,10 @@ fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle
 fn v41_small_card_startup_graph_reserve_preserves_pro_allowance() {
     let dir = strict_v41_snapshot(false);
     // One startup-graphs owner replaces the retired graph and runtime
-    // reserves. Until a sealed-capture census row prices this geometry it
-    // holds exactly the retired pair, so a card plans what it planned before.
-    for (gib, expected) in [(32, 2048u64 << 20), (96, (3264u64 << 20) + (2 << 30))] {
+    // reserves. The census priced the capture, so each card charges its own
+    // declared shape set: the small card's 8-shape bank, the Pro card's 64.
+    let mut charged = Vec::new();
+    for gib in [32u64, 96] {
         let options = PlanOptions {
             layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib << 30], prefill_rows: 256, onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                 context_tokens: 262_144, pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
@@ -4673,8 +4674,14 @@ fn v41_small_card_startup_graph_reserve_preserves_pro_allowance() {
         assert!(report.executable(), "{}", render(&report));
         let memory = report.memory_layout.unwrap();
         let graph = memory.devices[0].items.iter().find(|item| item.group == "startup graphs: deepseek_v41.0").unwrap();
-        assert_eq!(graph.bytes, expected);
+        // This snapshot plans with the family's drafter, so its sealed set
+        // includes the draft proposals' executables.
+        let expected = crate::placement::families::deepseek_v41::startup_graphs(gib << 30, 1, 3, true);
+        assert_eq!(graph.bytes, expected.bytes);
+        assert!(graph.bytes > 0, "the startup capture is never free");
+        charged.push(graph.bytes);
     }
+    assert!(charged[0] < charged[1], "the small card captures fewer shapes: {charged:?}");
 }
 
 #[test]
@@ -4687,7 +4694,8 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(automatic.devices[0].capacity_bytes, 96u64 << 30);
     // The startup graph estimate does not grow with automatic admission.
-    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group == "startup graphs: deepseek_v41.0").unwrap().bytes, (3264 << 20) + (2 << 30));
+    let graphs = crate::placement::families::deepseek_v41::startup_graphs(96 << 30, 1, 3, false).bytes;
+    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group == "startup graphs: deepseek_v41.0").unwrap().bytes, graphs);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
     let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&crate::read_json_file::<Value>(&dir.path().join("config.json")).unwrap(), 1).unwrap();
@@ -4696,7 +4704,7 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     options.layout.as_mut().unwrap().pool_tokens = Some(512);
     let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(explicit.devices[0].capacity_bytes, 96u64 << 30);
-    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group == "startup graphs: deepseek_v41.0").unwrap().bytes, (3264 << 20) + (2 << 30));
+    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group == "startup graphs: deepseek_v41.0").unwrap().bytes, graphs);
 }
 
 #[test]
@@ -4998,8 +5006,11 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     let retired = (2u64 << 30) + arch.cublas_bytes - modules - blas;
     eprintln!("V4.1 synthetic 31 GiB: selected modules {modules}, named BLAS {blas}, retired mixed allowance delta {retired} B; startup graphs are one measured owner");
     // Less physical capacity still refuses rather than shrinking the reserve.
+    // The census-priced startup capture leaves this synthetic card 1 GiB less
+    // room than the retired lazy-capture envelope did, so the refusal sits one
+    // card size lower and the reserve shape is unchanged.
     let limited = PlanOptions { layout: Some(layout::LayoutOptions {
-        rtx_bytes: vec![29 << 30], ..layout.clone() }), ..sparks(4) };
+        rtx_bytes: vec![28 << 30], ..layout.clone() }), ..sparks(4) };
     let limited = plan_spark_count(dir.path(), &limited, 6, Some(4)).unwrap();
     assert!(!limited.executable(), "{}", render(&limited));
     assert_eq!((limited.prefill_reserve_rows, limited.prefill_unit_rows, limited.prefill_waves),

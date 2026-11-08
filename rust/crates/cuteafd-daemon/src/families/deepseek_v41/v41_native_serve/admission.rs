@@ -525,7 +525,7 @@ pub(super) fn resolve_with_owners(
     draft: Option<&families::deepseek_v41::DraftInventory>,
 ) -> Result<Admitted> {
     use families::deepseek_v41::admission::{
-        self, live_budgets, production_request, Owner, ProductionInput,
+        self, live_budgets_charged, production_request, Owner, ProductionInput,
     };
     use cuteafd_core::memory_layout::Category;
     use cuteafd_loader::placement::planner::{Operation, PrefillShape};
@@ -667,7 +667,7 @@ pub(super) fn resolve_with_owners(
     }
     retained.extend(host.owners.clone());
     allowances.extend(host.estimates.clone());
-    let mut budgets = live_budgets(&cards, &sparks)?;
+    let mut budgets = live_budgets_charged(&cards, &sparks)?;
     budgets.extend(admission::production_budgets(&cards.iter().map(|&(total, ceiling, _)| (total, ceiling)).collect::<Vec<_>>(),
         0, Some(host_memory), 0, &[])?.into_iter().filter(|budget| budget.locations.contains(&cuteafd_loader::placement::planner::Location::HOST)));
     let mut blas = families::deepseek_v41::owners::blas_owners(ranks,
