@@ -236,15 +236,6 @@ impl std::fmt::Display for NoKvRoom {
 
 impl std::error::Error for NoKvRoom {}
 
-/// Whether a KV admission was refused for want of memory: an automatic pool with no room after the
-/// fixed costs, or a GPU that cannot hold a fixed pool beside them. Bad samples, overflows and other
-/// errors are not shortfalls.
-pub(crate) fn kv_shortfall(error: &anyhow::Error) -> bool {
-    use cuteafd_core::serving_capacity::CapacityError;
-    error.downcast_ref::<NoKvRoom>().is_some()
-        || matches!(error.downcast_ref::<CapacityError>(), Some(CapacityError::GpuBudgetExceeded { .. }))
-}
-
 #[cfg(test)]
 mod budget_tests {
     use super::*;
@@ -330,17 +321,8 @@ mod budget_tests {
     }
 
     #[test]
-    fn only_memory_refusals_are_kv_shortfalls() {
-        use cuteafd_core::serving_capacity::CapacityError;
+    fn no_kv_room_names_every_gpu() {
         let no_room = anyhow::Error::from(NoKvRoom { free_after_reserve: vec![-1_024, 4_096] });
-        assert!(kv_shortfall(&no_room));
         assert_eq!(no_room.to_string(), "no room for a KV pool after fixed costs (free after reserve [-1024, 4096] bytes)");
-        assert!(kv_shortfall(&no_room.context("planned admission")));
-        let fixed = anyhow::Error::from(CapacityError::GpuBudgetExceeded { device: 0, required: 3, budget: 2, shortfall: 1 });
-        assert!(kv_shortfall(&fixed));
-        for other in [anyhow::Error::from(CapacityError::Invalid("invalid GPU budget or physical memory sample")),
-            anyhow::Error::from(CapacityError::Overflow("GPU allocation budget")), anyhow::anyhow!("CUDA error 2")] {
-            assert!(!kv_shortfall(&other), "{other}");
-        }
     }
 }

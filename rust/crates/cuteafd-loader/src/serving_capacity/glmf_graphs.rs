@@ -136,33 +136,6 @@ pub fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequence
 mod tests {
     use super::*;
     #[test]
-    fn graph_solver_shrinks_without_oscillation_and_preserves_lazy_fallback() {
-        let mut seen = Vec::new();
-        let answer = solve_graph_pool(2048, |pool| -> Result<_, ()> {
-            seen.push(pool);
-            Ok((if pool > 1024 { 768 } else { 1280 }, true))
-        }).unwrap();
-        assert_eq!(answer, (768, true));
-        assert_eq!(seen, [2048, 768]);
-        assert_eq!(solve_graph_pool(2048, |_| -> Result<_, ()> { Ok((512, false)) }).unwrap(), (512, false));
-    }
-
-    #[test]
-    fn graph_admission_retries_only_memory_refusals() {
-        let startup = Some(StartupGraphReserve { reserve: 200, allowance: 100 });
-        let mut calls = Vec::new();
-        assert_eq!(admit_beside_decode_graphs(startup, |graphs| {
-            calls.push(graphs);
-            if graphs.is_some() { Err("memory") } else { Ok(1024) }
-        }, |error| *error == "memory", |retry, _| retry), Ok((1024, false)));
-        assert_eq!(calls, [Some(200), None]);
-        assert_eq!(admit_beside_decode_graphs(startup, |_| Err("geometry"),
-            |error| *error == "memory", |retry, _| retry), Err("geometry"));
-        assert_eq!(admit_beside_decode_graphs(startup, |graphs| Err(if graphs.is_some() { "startup memory" } else { "lazy memory" }),
-            |error| error.ends_with("memory"), |retry, _| retry), Err("startup memory"));
-    }
-
-    #[test]
     fn exchange_matches_peer_slots_and_control_floor() {
         assert_eq!(peer_exchange_bytes(2, 4096, 4096, 2, true), 402_653_440);
         assert_eq!(peer_exchange_bytes(2, 4096, 4096, 2, false), 268_435_712);
@@ -248,42 +221,6 @@ pub fn peer_exchange_bytes(lanes: u64, rows: u64, hidden: u64, partial_bytes: u6
     slots * (rows.max(64) * hidden * partial_bytes).max(256) + ((slots + 1) * 16).max(256)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StartupGraphReserve {
-    pub reserve: u64,
-    pub allowance: u64,
-}
-
-/// Retry only a memory refusal caused by startup bytes above the lazy allowance.
-/// Error classification and contextual diagnostics belong to the caller's edge.
-pub fn admit_beside_decode_graphs<E>(
-    startup: Option<StartupGraphReserve>,
-    mut admit: impl FnMut(Option<u64>) -> Result<usize, E>,
-    shortfall: impl Fn(&E) -> bool,
-    retry_error: impl FnOnce(E, E) -> E,
-) -> Result<(usize, bool), E> {
-    let Some(graphs) = startup else { return Ok((admit(None)?, false)) };
-    let refused = match admit(Some(graphs.reserve)) {
-        Ok(tokens) => return Ok((tokens, true)),
-        Err(error) if graphs.reserve > graphs.allowance && shortfall(&error) => error,
-        Err(error) => return Err(error),
-    };
-    match admit(None) {
-        Ok(tokens) => Ok((tokens, false)),
-        Err(retry) if shortfall(&retry) => Err(refused),
-        Err(retry) => Err(retry_error(retry, refused)),
-    }
-}
-
-/// Re-evaluate an automatic admission at its own graph geometry. Shrinking only avoids
-/// oscillation across graph-shape thresholds; the returned reservation describes the pool.
-/// The closure returns `(pool_tokens, startup_graphs)`, preserving lazy-fallback policy.
-pub fn solve_graph_pool<E>(initial: usize, mut admit: impl FnMut(usize) -> Result<(usize, bool), E>)
-    -> Result<(usize, bool), E> {
-    let mut candidate = initial;
-    loop {
-        let (pool, startup) = admit(candidate)?;
-        if !startup || pool >= candidate { return Ok((candidate.min(pool), startup)); }
-        candidate = pool;
-    }
-}
+// Startup graphs are the only decode graphs a serving engine captures: admission
+// charges every executable before the KV pool is sized, and a shape outside the
+// declared startup set runs eagerly without allocating.

@@ -1615,10 +1615,6 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     Ok(())
 }
 
-/// Internal lazy decode-graph allowance per GPU when startup capture is off
-/// (formerly `--graph-budget-mib`'s default). A graph component of the auto reserve.
-const LAZY_GRAPH_ALLOWANCE_BYTES: u64 = 1536 << 20;
-
 impl EngineArgs {
     /// The target head's mode: explicit `--target-head`, else the shared setting (tensor by
     /// default). The FP8 head's own program ignores it.
@@ -1626,8 +1622,8 @@ impl EngineArgs {
         head::resolve(self.target_head)
     }
 
-    /// Whether serving captures every decode graph at startup (`CUTEAFD_GLMF_STARTUP_GRAPHS`, on unless
-    /// 0). Off, admission keeps the internal lazy-graph allowance instead.
+    /// Whether serving captures every decode graph at startup (on unless `CUTEAFD_GLMF_GRAPHS=0`, which
+    /// runs decode eagerly and charges no graph bytes).
     pub(crate) fn startup_graphs(&self) -> bool {
         engine::startup_graphs_enabled()
     }
@@ -2055,7 +2051,10 @@ impl Opened {
         let graphs = if args.startup_graphs() {
             admission::startup_graph_bound(&self.cfg, layers, args.max_context, pool,
                 sequences, speculation, devices.len(), args.decode_rows, sms)
-        } else { placement::GraphSet::budget(&vec![cuteafd_loader::placement::reserve::gpu_component(LAZY_GRAPH_ALLOWANCE_BYTES); devices.len()]) };
+        } else {
+            // `CUTEAFD_GLMF_GRAPHS=0` captures no graphs and allocates none.
+            placement::GraphSet::budget(&vec![cuteafd_loader::placement::reserve::gpu_component(0); devices.len()])
+        };
         let routed = self.cfg.dense.iter().filter(|dense| !**dense).count();
         let onboard = runtime_onboard(args, self.native, routed, experts.len());
         let inputs = admission::GlmfInputs {
@@ -2440,8 +2439,8 @@ impl Opened {
         let tp2_layers = admitted_expert_layers(&self.cfg, &placement.layers,
             cuteafd_loader::placement::ExpertHome::RtxTp2, args.skip_experts)?;
         let startup_graphs = admitted_graphs.lifetime == cuteafd_loader::placement::Lifetime::Startup;
-        ensure!(tp2_layers.is_empty() || startup_graphs, "GLM Flash TP2 experts require startup graphs; \
-            set CUTEAFD_GLMF_STARTUP_GRAPHS=1 (post-ready captures are not admitted)");
+        ensure!(tp2_layers.is_empty() || startup_graphs, "GLM Flash TP2 experts require the startup \
+            decode graphs; CUTEAFD_GLMF_GRAPHS=0 disables them (runtime captures are not admitted)");
         let tp2_devices = || -> Result<[crate::shared::memory::device::Device<'_>; 2]> {
             let peer = peer_stream.context("TP2 placement without peer device")?;
             Ok([crate::shared::memory::device::Device { library: &self.library, id: args.device },
@@ -2822,10 +2821,6 @@ impl Opened {
         let reserved_units = if args.prefix_marks == prefix::PrefixMarks::Pool {
             cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS } else { 0 };
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
-        if !startup_graphs {
-            tracing::info!(allowance_bytes = LAZY_GRAPH_ALLOWANCE_BYTES,
-                "GLM Flash decode graphs captured lazily within the graph allowance, not at startup");
-        }
         let max_context = crate::shared::context::pool_context("glm5_flash", cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), pool_tokens)?;
         let step_experts = admitted_step_experts(&self.cfg, &placement, args.skip_experts, self.fp8().is_some())?;
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
@@ -2847,9 +2842,6 @@ impl Opened {
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
 
-        if !startup_graphs {
-            engine.capture_graphs_lazily();
-        }
         tracing::info!(index_cache = ?engine.index_cache, pool_tokens, reserved_units, "GLM 5.3 Flash DSA index cache");
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;

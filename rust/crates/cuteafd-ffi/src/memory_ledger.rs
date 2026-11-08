@@ -284,6 +284,23 @@ pub fn tensor(name: &str) {
     });
 }
 
+/// Names the work itself when it is not a checkpoint tensor (a decode graph's
+/// shape key, a scratch region): a failure or live row on this thread reports
+/// it as `tensor` without a `tensor_stem`, so it never joins the weights table.
+#[must_use = "the subject ends when the guard drops"]
+pub struct Subject(Option<&'static str>);
+
+pub fn subject(label: &str) -> Subject {
+    let label = intern(label);
+    CONTEXT.with(|context| Subject(context.borrow_mut().name.replace(label)))
+}
+
+impl Drop for Subject {
+    fn drop(&mut self) {
+        CONTEXT.with(|context| context.borrow_mut().name = self.0);
+    }
+}
+
 /// Format guard: allocations on this thread are tagged with this resident
 /// format (`bf16`, `fp8`, `fp8-scale`, ...) until it drops.
 #[must_use = "the format tag ends when the guard drops"]
