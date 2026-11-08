@@ -69,6 +69,15 @@ pub fn allocation_granularity_forecast(requests: &[u64]) -> Result<u64, Refusal>
         .ok_or(Refusal::Overflow("cudaMalloc granularity"))
 }
 
+/// Physical slack of the independently rounded backings in `requests`: one
+/// SM120 block round-up per request above 1 MiB. Sub-MiB requests share driver
+/// blocks across owners, so their shared remainder is attributable to no single
+/// owner and stays outside this charge.
+pub fn independent_backing_slack(requests: impl IntoIterator<Item = u64>) -> Result<u64, Refusal> {
+    let large = requests.into_iter().filter(|&bytes| bytes > SMALL).collect::<Vec<_>>();
+    allocation_granularity_forecast(&large)
+}
+
 impl AllocationGranularity {
     pub fn requests(&self) -> Vec<u64> {
         self.backings.iter().flat_map(|owner| owner.requests.iter().copied()).collect()

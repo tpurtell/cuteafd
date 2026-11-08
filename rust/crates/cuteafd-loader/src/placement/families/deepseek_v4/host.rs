@@ -180,12 +180,12 @@ fn piecewise(maximum: u64, first_linear: u64, value: impl Fn(u64) -> Result<u64,
     let linear = first_linear.clamp(1, maximum);
     for pages in 1..linear {
         let bytes = value(pages)?;
-        pieces.push(BytePiece { granularity: 1, first: pages, last: pages, bytes_at_first: bytes, bytes_per_page: 0 });
+        pieces.push(BytePiece { granularity: 1, first: pages, last: pages, bytes_at_first: bytes, bytes_per_page: 0, backings: 1, });
     }
     let at_first = value(linear)?;
     let per_page = if linear < maximum { value(linear + 1)?.checked_sub(at_first)
         .ok_or_else(|| Refusal::InvalidFact("V4 pinned tables shrink with the pool".into()))? } else { 0 };
-    pieces.push(BytePiece { granularity: 1, first: linear, last: maximum, bytes_at_first: at_first, bytes_per_page: per_page });
+    pieces.push(BytePiece { granularity: 1, first: linear, last: maximum, bytes_at_first: at_first, bytes_per_page: per_page, backings: 1, });
     Ok(ByteCurve(pieces))
 }
 

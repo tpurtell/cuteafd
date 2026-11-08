@@ -372,8 +372,7 @@ def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     fallback = engine[engine.index("    fn replay(&self, key: GraphKey"):engine.index("    fn miss_graph(")]
     assert "if !self.warming_graphs.get() {" in fallback
     assert "self.miss_graph(key);" in fallback
-    assert "consider adding it to the startup graph set" in engine
-    assert 'crate::shared::decode_graph::note_missing("qwen4", &variant)' in engine
+    assert 'crate::shared::decode_graph::note_eager("qwen4", &variant' in engine
     assert "return Ok(())" in fallback
     graphed = engine[engine.index("    fn decode_graphed("):engine.index("    fn replay(")]
     assert "tables.positions.iter().take_while(|&&position| position >= 0).count()" in graphed

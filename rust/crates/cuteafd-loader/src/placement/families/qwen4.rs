@@ -162,7 +162,7 @@ fn pooled(id: impl Into<String>, location: Location, per_unit: u64, category: Ca
 fn pooled_backing(id: impl Into<String>, location: Location, per_unit: u64, category: Category,
     group: &str, maximum: u64) -> Result<Component, Refusal> {
     let curve = ByteCurve(vec![BytePiece { first: 1, last: maximum, bytes_at_first: per_unit,
-        bytes_per_page: per_unit, granularity: SM120_ALLOCATION_GRANULARITY_BYTES }]);
+        bytes_per_page: per_unit, granularity: SM120_ALLOCATION_GRANULARITY_BYTES, backings: 1 }]);
     let mut component = Component::allocation(Allocation::buffer(id, location, per_unit,
         PlanLifetime::TARGET, category, group), curve.clone(), false, maximum);
     component.byte_extent(curve)?;

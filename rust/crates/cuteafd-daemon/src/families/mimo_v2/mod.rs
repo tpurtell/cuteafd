@@ -681,6 +681,36 @@ mod source_format_tests {
             }
         }
     }
+
+    #[test]
+    fn native_modules_load_inside_the_measured_pre_baseline_window() {
+        let source = include_str!("mod.rs");
+        // The markers are assembled at compile time: written whole here they
+        // would also match this test's own source text, which include_str!
+        // reads back.
+        let start = concat!("// Load only selected modules, then measure the admission",
+            " baseline before tensors.");
+        let end = concat!("let preflight = admission", "::preflight");
+        let window = source.split_once(start).expect("module window start").1;
+        let window = window.split_once(end).expect("module window end").0;
+        let sampled = window.find("let after = self.library.cuda_memory_info()").unwrap();
+        let native = window.find("self.library.tp2_native_initialize()?").unwrap();
+        assert!(native < sampled, "Spark intake native modules must be sampled on TP1 too (#1554)");
+        assert_eq!(window.matches("tp2_native_initialize").count(), 1);
+    }
+
+    #[test]
+    fn serving_decode_graph_misses_join_the_shared_eager_inventory() {
+        let source = include_str!("engine.rs");
+        let eager = source.split_once("self.miss_graph(rank, &key);")
+            .expect("the serving miss branch records its variant").1;
+        assert!(eager.trim_start().starts_with("return segment();"),
+            "a serving miss must run eagerly, never capture on the request");
+        let missing = source.split_once("fn miss_graph(&self").expect("miss_graph body").1;
+        let missing = missing.split_once("\n    }\n").expect("miss_graph end").0;
+        assert!(missing.contains(concat!("crate::shared::decode_graph::note",
+            "_eager(\"mimo_v2\"")), "eager misses go through the one shared entry point");
+    }
 }
 
 impl EngineArgs {
@@ -1061,6 +1091,9 @@ impl Opened {
                     family, split_family: Some(split_cfg.program_family()?),
                 };
                 programs.load_matching(|name| selected.contains(name))?;
+                // Spark intake loads every registered native module even on TP1.
+                // Load before sampling, so admission sees its exact occupancy (#1554).
+                self.library.tp2_native_initialize()?;
                 let after = self.library.cuda_memory_info()?.0;
                 let module_bytes = before.saturating_sub(after) as u64;
                 ensure!(module_bytes <= module_bound,
@@ -1572,11 +1605,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         println!("decode graphs: {graphs} captured in {:.2} s", started.elapsed().as_secs_f64());
     }
     engine.check_tp2_routers()?;
-    let result = golden_body(args, opened, engine);
-    if args.capture_graphs {
-        println!("decode graphs captured after startup: {}", engine.late_captures());
-    }
-    result
+    golden_body(args, opened, engine)
 }
 
 fn read_golden_logits(dir: &std::path::Path, allow_missing: bool) -> Result<Option<Vec<f32>>> {

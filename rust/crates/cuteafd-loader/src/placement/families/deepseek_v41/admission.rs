@@ -413,21 +413,21 @@ fn bounded_curve(per_page: u64, tails: u64, cap: u64, maximum: u64) -> Result<By
             first: 1,
             last: maximum,
             bytes_at_first: linear(1)?,
-            bytes_per_page: 0,
+            bytes_per_page: 0, backings: 1,
         }]));
     }
     if knee >= maximum {
         return Ok(ByteCurve::linear(linear(1)?, per_page, maximum));
     }
     Ok(ByteCurve(vec![
-        BytePiece { granularity: 1, first: 1, last: knee, bytes_at_first: linear(1)?, bytes_per_page: per_page },
+        BytePiece { granularity: 1, first: 1, last: knee, bytes_at_first: linear(1)?, bytes_per_page: per_page, backings: 1, },
         BytePiece { granularity: 1,
             first: knee + 1,
             last: maximum,
             bytes_at_first: cap
                 .checked_mul(per_page)
                 .ok_or(Refusal::Overflow("V4.1 bounded table"))?,
-            bytes_per_page: 0,
+            bytes_per_page: 0, backings: 1,
         },
     ]))
 }

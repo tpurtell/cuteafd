@@ -274,7 +274,9 @@ impl Compiled {
                     .filter(|owner| owner.activation.active(selected) && owner.rows.contains(&row));
                 if let Some(owner) = rounded.next() {
                     let curve = owner.bytes.piece(first)?;
-                    if rounded.next().is_none() && slope == curve.bytes_per_page {
+                    if rounded.next().is_none() && slope == curve.bytes_per_page
+                        && curve.splits_exactly()
+                    {
                         // A single rounded request plus fixed owners has an
                         // exact O(1) inverse, independent of the page domain.
                         let fixed = required - curve.raw_at(first)?;

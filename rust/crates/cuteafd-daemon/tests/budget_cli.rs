@@ -115,8 +115,11 @@ fn global_gpu_storage_flag_reaches_inventory_and_full_layout_admission() {
     let snapshot = tempfile::tempdir().unwrap();
     testing::write_snapshot(snapshot.path(), &testing::mimo_flash_config(),
         &testing::mimo_flash_tensors(), Some(1));
+    // The refused arm only has to sit below the fixture's accounted footprint;
+    // MiMo charges named owners instead of a post-Ready allowance, so the old
+    // 2 GiB boundary now fits.
     for layout in [false, true] {
-        for (gib, accepted) in [("95.5", true), ("2", false)] {
+        for (gib, accepted) in [("95.5", true), ("1", false)] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
             command.args(["--gpu-memory-cap", &format!("{gib}GiB"),
                 "--coordinator-weight-budget-gib", "80", "plan"]).arg(snapshot.path())
@@ -590,7 +593,7 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
     let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(deployment["report"]["fits"], true, "{deployment}");
     // 15 layers under the retired 97% ceiling; the one-cap policy (#1440) admits a 16th
-    // with the measured 575 MiB baseline and 570 MiB runtime allowance still charged.
+    // with the measured 575 MiB baseline and the named Ready owners charged.
     assert_eq!(deployment["report"]["onboard_layers"], 16, "measured min-card local prefix must not drift");
     assert_eq!(deployment["memory_layout"]["pool_tokens"], 2_097_152);
     assert_eq!(deployment["prefill_unit_rows"], 2752);
@@ -603,10 +606,18 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
     let items = lead["items"].as_array().unwrap();
     assert!(items.iter().any(|item| item["group"] == "context+modules"
         && item["bytes"] == 575u64 << 20), "observer-subtracted baseline missing");
-    assert!(items.iter().any(|item| item["bytes"] == 570u64 << 20
+    // Post-Ready owners are named, not an opaque growth allowance: one driver
+    // stream slab per rank and the portable driver page tables of the pinned
+    // host prefix (ceil(32 GiB / 512 B) = 64 MiB), both charged once.
+    assert!(items.iter().any(|item| item["bytes"] == 4u64 << 20
         && item["basis"] == "calibrated"
-        && item["group"].as_str().is_some_and(|group| group.starts_with("measured MiMo post-ready runtime growth"))),
-        "measured runtime allowance missing");
+        && item["group"].as_str().is_some_and(|group| group.starts_with("mimo/driver-stream-slabs/gpu0"))),
+        "driver stream slab missing");
+    assert!(items.iter().any(|item| item["group"] == "driver page tables"
+        && item["bytes"] == 64u64 << 20), "pinned prefix driver page tables missing");
+    assert!(!items.iter().any(|item| item["group"].as_str()
+        .is_some_and(|group| group.contains("post-ready runtime growth"))),
+        "opaque post-Ready allowance returned");
     assert!(admitted <= lead["capacity_bytes"].as_u64().unwrap());
 }
 

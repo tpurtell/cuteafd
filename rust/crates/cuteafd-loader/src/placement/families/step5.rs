@@ -118,7 +118,7 @@ fn pool_physical_bytes(unit: u64, pages: u64) -> Result<u64, Refusal> {
 fn pool_curve(unit: u64, maximum: u64) -> Result<ByteCurve, Refusal> {
     pool_physical_bytes(unit, maximum)?;
     Ok(ByteCurve(vec![BytePiece { first: 1, last: maximum, bytes_at_first: unit,
-        bytes_per_page: unit, granularity: SM120_ALLOCATION_GRANULARITY_BYTES }]))
+        bytes_per_page: unit, granularity: SM120_ALLOCATION_GRANULARITY_BYTES, backings: 1, }]))
 }
 
 #[cfg(test)]

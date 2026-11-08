@@ -811,6 +811,11 @@ pub fn qwen_cache_geometry(
     })
 }
 
+/// Rows in one MiMo sliding-window ring (the target layers' SWA rings, every
+/// MTP stage's ring and its hidden-history ring), matching
+/// `MimoEngine::RING_ROWS`.
+pub const MIMO_RING_ROWS: u64 = 256;
+
 pub fn mimo_cache_geometry(
     cfg: &MimoV2Config,
     layers: usize,
@@ -849,7 +854,7 @@ pub fn mimo_cache_geometry(
             "MiMo full KV pages",
             &[64, full, share.record_bytes(MimoAttention::Full, kv) as u64],
         )?,
-        active_state_per_sequence_bytes: product("MiMo SWA rings", &[swa, 256, swa_record])?,
+        active_state_per_sequence_bytes: product("MiMo SWA rings", &[swa, MIMO_RING_ROWS, swa_record])?,
         retained_mark_bytes: product("MiMo SWA marks", &[swa, cfg.window as u64, swa_record])?,
         context_table_bytes_per_token: 0,
         speculative_replay_bytes: 0,
@@ -870,11 +875,11 @@ pub fn mimo_cache_geometry(
             "MiMo MTP stage rings",
             &[
                 mtp_stages as u64,
-                256,
+                MIMO_RING_ROWS,
                 cfg.record_bytes(MimoAttention::Sliding, kv) as u64,
             ],
         )?;
-        let hidden_ring = product("MiMo MTP hidden ring", &[256, cfg.hidden as u64, 2])?;
+        let hidden_ring = product("MiMo MTP hidden ring", &[MIMO_RING_ROWS, cfg.hidden as u64, 2])?;
         costs[0].active_state_per_sequence_bytes = sum(
             "MiMo MTP active state",
             &[

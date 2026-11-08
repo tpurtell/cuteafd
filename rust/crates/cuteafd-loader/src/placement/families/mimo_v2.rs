@@ -386,7 +386,15 @@ mod tests {
                         let allowances = |phase| solved.facts.allowances.iter().filter(move |owner|
                             owner.location == Location::coordinator(rank as u8)
                                 && owner.lifetime.contains(phase, solved.facts.phase_order));
-                        assert_eq!(allowances(Phase::DraftLoad).count(), 0);
+                        // The CUDA compute stream exists from the first load
+                        // copy, so its driver stream slab is resident in every
+                        // phase. It is the only allowance charged before Ready;
+                        // the old opaque post-Ready growth charge is gone.
+                        let pre_ready = allowances(Phase::DraftLoad).collect::<Vec<_>>();
+                        assert_eq!(pre_ready.len(), 1);
+                        assert!(pre_ready[0].source.starts_with("mimo/driver-stream-slabs"), "{:?}", pre_ready[0].source);
+                        assert_eq!(pre_ready[0].bytes, crate::placement::planner::cuda_stream_slab_bytes(
+                            admission::startup_peak_live_streams()).unwrap());
                         let gemm = allowances(Phase::Ready).filter(|owner| owner.source.starts_with("cuBLAS handles:"))
                             .map(|owner| owner.bytes).sum::<u64>();
                         assert_eq!(gemm, u64::from(rank == 0 && (head.gemm() || (head.bf16() && draft))) * (64 << 20));
