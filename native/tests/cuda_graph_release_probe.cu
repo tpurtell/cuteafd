@@ -116,7 +116,7 @@ static void trim(cudaStream_t stream, const char* stage) {
   size_t before = free_bytes(stream);
   cudaError_t status = cudaDeviceGraphMemTrim(0);
   size_t after = free_bytes(stream);
-  cuuint64_t used = 0, reserved = 0;
+  unsigned long long used = 0, reserved = 0;
   CUDA(cudaDeviceGetGraphMemAttribute(0, cudaGraphMemAttrUsedMemCurrent, &used));
   CUDA(cudaDeviceGetGraphMemAttribute(0, cudaGraphMemAttrReservedMemCurrent, &reserved));
   std::printf("{\"kind\":\"trim\",\"stage\":\"%s\",\"status\":%d,"
@@ -141,10 +141,12 @@ int main(int argc, char** argv) {
   CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   uint32_t* output;
   CUDA(cudaMalloc(&output, 8192));
-  Shape warm{1, 512};
-  Graph warm_graph = create(warm, output, stream);
-  verify(warm, output);
-  destroy(warm_graph, stream);
+  for (int args : {32, 512}) {
+    Shape warm{1, args};
+    Graph warm_graph = create(warm, output, stream);
+    verify(warm, output);
+    destroy(warm_graph, stream);
+  }
   size_t baseline = free_bytes(stream);
   std::printf("{\"kind\":\"start\",\"device\":\"%s\",\"sm\":%d,\"runtime\":%d,"
               "\"driver\":%d,\"cycles\":%d,\"cap\":%zu,\"free_baseline\":%zu}\n",
