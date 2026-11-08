@@ -131,6 +131,10 @@ pub struct BytePiece {
     pub bytes_per_page: u64,
     /// Round the whole affine request independently, not its per-page slope.
     pub granularity: u64,
+    /// Equal, independently rounded backings the affine request is split into
+    /// (for example one KV page allocation per attention layer). Each backing
+    /// round-up applies on its own; `1` charges the affine request once.
+    pub backings: u64,
 }
 impl BytePiece {
     pub(super) fn raw_at(&self, pages: u64) -> Result<u64, Refusal> {
@@ -138,19 +142,37 @@ impl BytePiece {
             .and_then(|n| self.bytes_at_first.checked_add(n))
             .ok_or(Refusal::Overflow("component curve"))
     }
+    /// One backing's requested bytes, or `None` when the split is not exact.
+    fn request(&self, raw: u64) -> Option<u64> {
+        if self.backings == 0 || raw % self.backings != 0 { None } else { Some(raw / self.backings) }
+    }
+    /// Whether every page count of this affine interval splits into whole
+    /// equal backings, which is what the exact O(1) inverse relies on.
+    pub(super) fn splits_exactly(&self) -> bool {
+        self.backings != 0 && self.bytes_at_first % self.backings == 0
+            && self.bytes_per_page % self.backings == 0
+    }
     pub(super) fn at(&self, pages: u64) -> Result<u64, Refusal> {
         if self.granularity == 0 {
             return Err(Refusal::InvalidFact("zero curve granularity".into()));
         }
-        self.raw_at(pages)?.div_ceil(self.granularity).checked_mul(self.granularity)
+        let raw = self.raw_at(pages)?;
+        let request = self.request(raw)
+            .ok_or_else(|| Refusal::InvalidFact("curve backings do not divide the request".into()))?;
+        request.div_ceil(self.granularity).checked_mul(self.granularity)
+            .and_then(|n| n.checked_mul(self.backings))
             .ok_or(Refusal::Overflow("rounded component curve"))
     }
-    /// ceil(raw / G) * G <= available iff raw <= floor(available / G) * G.
+    /// Each backing rounds on its own: `backings * ceil(raw / backings / G) * G
+    /// <= available` iff `raw <= (available / (G * backings)) * G * backings`.
     pub(super) fn last_affordable(&self, available: u64) -> Result<Option<u64>, Refusal> {
-        if self.granularity == 0 {
+        if self.granularity == 0 || self.backings == 0 {
             return Err(Refusal::InvalidFact("zero curve granularity".into()));
         }
-        let ceiling = available / self.granularity * self.granularity;
+        let unit = self.granularity.checked_mul(self.backings)
+            .ok_or(Refusal::Overflow("curve affordable backings"))?;
+        let ceiling = (available / unit).checked_mul(unit)
+            .ok_or(Refusal::Overflow("curve affordable backings"))?;
         Ok(if ceiling < self.bytes_at_first { None }
             else if self.bytes_per_page == 0 { Some(self.last) }
             else { Some(self.last.min(self.first.saturating_add(
@@ -170,6 +192,21 @@ impl ByteCurve {
             bytes_at_first,
             bytes_per_page,
             granularity: 1,
+            backings: 1,
+        }])
+    }
+    /// An affine pool the runtime allocates as `backings` equal pages, each
+    /// rounded up to `granularity` on its own (one KV page allocation per
+    /// attention layer). The split must be exact at every page count.
+    pub fn paged(bytes_at_first: u64, bytes_per_page: u64, granularity: u64, backings: u64,
+        maximum: u64) -> Self {
+        Self(vec![BytePiece {
+            first: 1,
+            last: maximum,
+            bytes_at_first,
+            bytes_per_page,
+            granularity,
+            backings,
         }])
     }
     pub fn at(&self, pages: u64) -> Result<u64, Refusal> {
@@ -187,6 +224,11 @@ impl ByteCurve {
             if piece.first != next || piece.first > piece.last || piece.last > maximum {
                 return Err(Refusal::InvalidFact(
                     "component curve has a gap, overlap or invalid interval".into(),
+                ));
+            }
+            if !piece.splits_exactly() {
+                return Err(Refusal::InvalidFact(
+                    "component curve backings do not split every page exactly".into(),
                 ));
             }
             piece.at(piece.last)?;

@@ -6,8 +6,9 @@ use super::resident::{MimoResidentLayout, MimoResidentOptions};
 use super::weight_arena::MimoArenaLayouts;
 use super::{MimoKvFormats, MimoV2Config, MimoWorkspaceLayout, MimoWorkspaceOptions};
 use crate::plan::checkpoint::Checkpoint;
-use crate::placement::planner::{allocation_granularity_forecast, Lifetime};
-use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError, WeightArenaLayout};
+use crate::placement::planner::{allocation_granularity_forecast, independent_backing_slack, Lifetime};
+use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError, WeightArenaLayout,
+    MIMO_RING_ROWS};
 use cuteafd_core::serving_capacity::{
     CapacityProfile, ContextLimits, DeviceCosts, MemoryReservation,
 };
@@ -139,17 +140,18 @@ pub fn mimo_capacity_profiles(
         options.kv_cache,
         resident_options.native_mtp_layers,
     )?;
+    let target_cache = mimo_cache_geometry(
+        cfg,
+        resident_options.layers,
+        resident_options.coordinator_ranks,
+        options.kv_cache,
+        0,
+    )?;
     let before_kv_state = if resident_options.native_mtp_layers > 0 {
         // MTP stage rings/hidden history and fixed buffers are allocated in
         // with_engine before target KV, interleaved with MTP weight loads.
         // Derive their exact increment from the shared cache description.
-        let target = mimo_cache_geometry(
-            cfg,
-            resident_options.layers,
-            resident_options.coordinator_ranks,
-            options.kv_cache,
-            0,
-        )?;
+        let target = &target_cache;
         let active = cache.ranks[0]
             .active_state_per_sequence_bytes
             .checked_sub(target.ranks[0].active_state_per_sequence_bytes)
@@ -217,14 +219,45 @@ pub fn mimo_capacity_profiles(
             reserve_bytes: 0,
         });
         let mut costs = target_weights;
-        reserve(
-            &mut costs,
-            "state.active_rings",
-            product(
-                "MiMo active rings",
-                &[options.rings, storage.active_state_per_sequence_bytes],
-            )?,
-        );
+        let ring_bytes = product(
+            "MiMo active rings",
+            &[options.rings, storage.active_state_per_sequence_bytes],
+        )?;
+        reserve(&mut costs, "state.active_rings", ring_bytes);
+        // The runtime keeps one ring buffer per sliding layer, one per MTP
+        // stage and one hidden-history ring, each rounded on its own. Charge
+        // those backings' SM120 slack beside the payload they belong to.
+        let swa = cfg.attention[..resident_options.layers].iter()
+            .filter(|attention| **attention == super::MimoAttention::Sliding).count() as u64;
+        let mut ring_requests = Vec::new();
+        if swa > 0 {
+            let total = target_cache.ranks[rank].active_state_per_sequence_bytes;
+            if total % swa != 0 {
+                return Err(CacheGeometryError::Unsupported {
+                    family: "mimo_v2",
+                    what: "target SWA rings do not split over the sliding layers",
+                });
+            }
+            ring_requests.extend(std::iter::repeat_n(
+                options.rings.checked_mul(total / swa)
+                    .ok_or(CacheGeometryError::Overflow("MiMo target ring backing"))?,
+                swa as usize));
+        }
+        // The MTP stage rings and the hidden-history ring live on the lead
+        // rank, matching `mimo_cache_geometry`'s rank-0 addition.
+        if rank == 0 && resident_options.native_mtp_layers > 0 {
+            let record = cfg.record_bytes(super::MimoAttention::Sliding, options.kv_cache) as u64;
+            let stage = product("MiMo MTP stage ring",
+                &[options.rings, MIMO_RING_ROWS, record])?;
+            ring_requests.extend(std::iter::repeat_n(stage,
+                resident_options.native_mtp_layers));
+            ring_requests.push(product("MiMo MTP hidden ring",
+                &[options.rings, MIMO_RING_ROWS, cfg.hidden as u64, 2])?);
+        }
+        let tail = independent_backing_slack(ring_requests).map_err(|error|
+            CacheGeometryError::ResidentTensor { name: "state.active_rings".into(),
+                what: error.to_string() })?;
+        reserve(&mut costs, "state.active_rings.tail", tail);
         reserve(&mut costs, "state.fixed", storage.fixed_state_bytes);
         post_target_kv.push(DeviceCosts {
             device: runtime.device,
@@ -233,15 +266,16 @@ pub fn mimo_capacity_profiles(
             reserve_bytes: 0,
         });
         if options.mark_slots > 0 && mark_bytes > 0 {
-            reserve(
-                &mut costs,
-                "prefix.exact_mark_arena",
-                product(
-                    "MiMo retained marks",
-                    &[options.mark_slots, storage.retained_mark_bytes],
-                )?
-                .max(256),
-            );
+            let marks = product(
+                "MiMo retained marks",
+                &[options.mark_slots, storage.retained_mark_bytes],
+            )?.max(256);
+            reserve(&mut costs, "prefix.exact_mark_arena", marks);
+            // One device mark arena backing per rank, rounded independently.
+            let tail = independent_backing_slack([marks]).map_err(|error|
+                CacheGeometryError::ResidentTensor { name: "prefix.exact_mark_arena".into(),
+                    what: error.to_string() })?;
+            reserve(&mut costs, "prefix.exact_mark_arena.tail", tail);
         }
         reserve(
             &mut costs,

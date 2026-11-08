@@ -112,7 +112,7 @@ fn floored(stride: u64, maximum: u64) -> Result<ByteCurve, Refusal> {
             first: 1,
             last: flat,
             bytes_at_first: FLOOR,
-            bytes_per_page: 0,
+            bytes_per_page: 0, backings: 1,
         });
     }
     if flat < maximum {
@@ -123,7 +123,7 @@ fn floored(stride: u64, maximum: u64) -> Result<ByteCurve, Refusal> {
             first,
             last: maximum,
             bytes_at_first: mul(first, stride)?,
-            bytes_per_page: stride,
+            bytes_per_page: stride, backings: 1,
         });
     }
     Ok(ByteCurve(pieces))

@@ -841,9 +841,6 @@ pub(crate) struct MimoEngine<'a> {
     pub(super) graph_storage_plan: Option<cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan>,
     pub(super) graph_storage_bound_bytes: Option<Vec<u64>>,
     graph_storage_observed_bytes: [Cell<u64>;2],
-    /// Graphs captured while serving (after [`Self::capture_decode_graphs`]): each is a
-    /// shape the startup capture missed.
-    late_captures: Cell<usize>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -931,7 +928,7 @@ impl<'a> MimoEngine<'a> {
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20, Tag::staging("mimo/mtp-staging"))?, 0)), prefill_w8a8: true,
             output_fp8_decode: true, kv_cache,
             decode_graphs: false, graphs: RefCell::new(HashMap::new()), graph_storage_plan: None, graph_storage_bound_bytes: None,
-            graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0) })
+            graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)) })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -2280,8 +2277,11 @@ impl<'a> MimoEngine<'a> {
         })
     }
 
-    /// Launches `segment` on rank `rank`'s stream through the graph captured for `key`,
-    /// capturing it first when `key` is new; `launch` false only captures.
+    /// Launches `segment` on rank `rank`'s stream through the graph captured for `key`;
+    /// `launch` false only captures a startup shape. A serving miss runs the segment
+    /// eagerly through the shared miss inventory ([`Self::miss_graph`]): the
+    /// startup shape set is closed, so a request outside it allocates no graph
+    /// storage and no runtime capture ever happens.
     fn graph(&self, rank: usize, key: GraphKey, launch: bool, segment: impl FnOnce() -> Result<()>) -> Result<()> {
         self.require_live()?;
         let graphs = match (rank, &self.peer) {
@@ -2297,11 +2297,13 @@ impl<'a> MimoEngine<'a> {
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
         if launch {
-            ensure!(self.graph_storage_plan.is_none(),
-                "rank {rank} decode graph {key:?} was not captured during pre-admitted startup");
-            self.late_captures.set(self.late_captures.get() + 1);
-            tracing::debug!(rank, ?key, "MiMo decode segment captured while serving");
+            self.miss_graph(rank, &key);
+            return segment();
         }
+        // Instantiation allocates driver graph storage; name the owner and the
+        // exact shape so a failed capture reports them instead of owner=null.
+        let _scope = cuteafd_ffi::memory_ledger::scope_owned("decode graph");
+        let _owner = cuteafd_ffi::memory_ledger::owner(&format!("mimo/decode-graph/rank{rank}/{key:?}"));
         // SAFETY: capture records launches on that rank's stream; nothing in the
         // segment synchronizes the host or allocates.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
@@ -2316,6 +2318,19 @@ impl<'a> MimoEngine<'a> {
         }
         graphs.borrow_mut().insert(key, exec);
         Ok(())
+    }
+
+    /// Records one eager run of a decode segment the sealed startup set did not
+    /// contain: every occurrence joins the shared `/v1/stats`
+    /// `graph_missing_variants` inventory, and a variant warns once with its
+    /// rank and request context. The variant is the whole baked shape, so two
+    /// distinct misses never share a row.
+    fn miss_graph(&self, rank: usize, key: &GraphKey) {
+        let variant = format!("layer={} rows={} table_stride={} previous={:?} head={}",
+            key.layer, key.rows, key.table_stride, key.previous, key.head);
+        crate::shared::decode_graph::note_eager("mimo_v2", &variant, || format!(
+            "rank={rank} max_context={} pages={} rings={} prefill_rows={}",
+            self.max_context, self.pages, self.rings, self.prefill_rows));
     }
 
     /// Captures (without running) every decode segment of steps of 1..=`max_rows` rows,
@@ -2404,11 +2419,6 @@ impl<'a> MimoEngine<'a> {
             peer_mib = format!("{:.1}", if self.peer.is_some() { mib(free_before[1], free(1)?) } else { 0.0 }),
             "MiMo decode graph memory");
         Ok(after - before)
-    }
-
-    /// Decode segments captured while serving (shapes the startup capture missed).
-    pub fn late_captures(&self) -> usize {
-        self.late_captures.get()
     }
 
     /// Queues rank 1's share of layer `index` (the head split's second GPU),

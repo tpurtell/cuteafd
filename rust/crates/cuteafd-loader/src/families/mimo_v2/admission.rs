@@ -279,6 +279,12 @@ pub fn draft_rank_reservations_with(
         .iter()
         .try_fold(0u64, |sum, r| sum.checked_add(r.bytes))
         .context("DFlash reservation sum")?;
+    // Every steady owner above is its own device allocation, so each rounds an
+    // SM120 backing on its own. Charge that slack once, outside every payload
+    // (the rings and workspaces above 1 MiB plus the FP8 scratch).
+    let tail = crate::placement::planner::independent_backing_slack(costs.iter().map(|cost| cost.bytes))
+        .context("DFlash backing granularity")?;
+    costs.push(MemoryReservation { name: "draft.backing.tail".into(), bytes: tail });
     Ok(DraftReservations {
         arena,
         resident_weights,
@@ -396,13 +402,23 @@ pub fn transport_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
         costs.push(MemoryReservation { name: "transport.peer_control".into(), bytes: ((peer_slots(lanes) + 1) * 16).max(256) as u64 + 256 });
     }
     if rank == 0 && spark_ranks > 0 {
+        use cuteafd_core::serving_capacity::spark_intake_allocation_bytes;
         use crate::serving_capacity::{prefill_return_bytes_with_format, spark_intake_bytes};
+        let decode_rows = super::decode_graph::MIMO_DECODE_ROWS as u64;
+        let prefill_rows = rows.max(super::decode_graph::MIMO_DECODE_ROWS) as u64;
         costs.push(MemoryReservation { name: "transport.spark_intake_planes".into(),
-            bytes: prefill_return_bytes_with_format(lanes as u64, rows.max(super::decode_graph::MIMO_DECODE_ROWS) as u64,
+            bytes: prefill_return_bytes_with_format(lanes as u64, prefill_rows,
                 spark_ranks as u64, cfg.hidden as u64, format)?
-                .checked_add(spark_intake_bytes(1, spark_ranks as u64,
-                    super::decode_graph::MIMO_DECODE_ROWS as u64, cfg.hidden as u64))
+                .checked_add(spark_intake_bytes(1, spark_ranks as u64, decode_rows, cfg.hidden as u64))
                 .context("MiMo intake planes overflow")? });
+        // One whole-rank plane allocation per rank and plane, each rounding an
+        // SM120 backing on its own. The decode planes stay under 1 MiB and share
+        // driver blocks, so only the prefill planes carry attributable slack.
+        let planes = spark_intake_allocation_bytes(
+            lanes as u64 * prefill_rows * cfg.hidden as u64 * 2)?;
+        let tail = crate::placement::planner::independent_backing_slack(
+            std::iter::repeat_n(planes, spark_ranks)).context("MiMo intake backing granularity")?;
+        costs.push(MemoryReservation { name: "transport.spark_intake_planes.tail".into(), bytes: tail });
     }
     Ok(costs)
 }

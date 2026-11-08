@@ -9,7 +9,7 @@ fn rounded_affine_closed_form_equals_enumeration_at_physical_boundaries() {
             for bytes_at_first in [0, 1, granularity, granularity + 1] {
                 for bytes_per_page in [0, 1, granularity / 2, granularity + 7] {
                     let piece = BytePiece { first, last: first + 31, bytes_at_first,
-                        bytes_per_page, granularity };
+                        bytes_per_page, granularity, backings: 1, };
                     let mut budgets = BTreeSet::from([0, 1, u64::MAX]);
                     for pages in first..=piece.last {
                         let bytes = piece.at(pages).unwrap();
@@ -26,16 +26,52 @@ fn rounded_affine_closed_form_equals_enumeration_at_physical_boundaries() {
         }
     }
     assert!(ByteCurve(vec![BytePiece { first: 1, last: 1, bytes_at_first: 1,
-        bytes_per_page: 0, granularity: 0 }]).validate(1).is_err());
+        bytes_per_page: 0, granularity: 0, backings: 1, }]).validate(1).is_err());
     assert!(ByteCurve(vec![BytePiece { first: 1, last: 1, bytes_at_first: u64::MAX,
-        bytes_per_page: 0, granularity: 2 }]).validate(1).is_err());
+        bytes_per_page: 0, granularity: 2, backings: 1, }]).validate(1).is_err());
+}
+
+#[test]
+fn paged_backings_round_each_backing_independently() {
+    for backings in [1, 3, 9] {
+        for (bytes_at_first, bytes_per_page) in [(0, 0), (backings, 0), (5 * backings, 3 * backings)] {
+            let piece = BytePiece { first: 1, last: 24, bytes_at_first,
+                bytes_per_page, granularity: 16, backings, };
+            assert!(piece.splits_exactly(), "{piece:?}");
+            for pages in 1..=piece.last {
+                let raw = bytes_at_first + bytes_per_page * (pages - 1);
+                assert_eq!(piece.at(pages).unwrap(),
+                    backings * (raw / backings).div_ceil(16) * 16, "{piece:?} pages={pages}");
+            }
+            let mut budgets = BTreeSet::from([0, u64::MAX]);
+            for pages in 1..=piece.last {
+                let bytes = piece.at(pages).unwrap();
+                budgets.extend([bytes.saturating_sub(1), bytes, bytes + 1]);
+            }
+            for available in budgets {
+                let expected = (1..=piece.last)
+                    .filter(|&pages| piece.at(pages).unwrap() <= available).max();
+                assert_eq!(piece.last_affordable(available).unwrap(), expected,
+                    "{piece:?}, available={available}");
+            }
+        }
+    }
+    // The exact inverse and the solver both require a whole split at every
+    // page count; an inexact one is refused instead of mispriced.
+    let inexact = ByteCurve::paged(3, 5, 16, 3, 8);
+    assert!(inexact.validate(8).is_err());
+    let split = ByteCurve::paged(30, 60, 16, 3, 8);
+    split.validate(8).unwrap();
+    // Page 3 asks 30 + 60 * 2 = 150 bytes: three 50-byte backings, each
+    // rounded up to its own 64-byte block.
+    assert_eq!(split.at(3).unwrap(), 3 * 64);
 }
 
 #[test]
 fn rounded_affine_search_matches_exact_independent_backings_and_mixed_slopes() {
     let maximum = 32;
     let rounded = |bytes_at_first, bytes_per_page| ByteCurve(vec![BytePiece {
-        first: 1, last: maximum, bytes_at_first, bytes_per_page, granularity: 8,
+        first: 1, last: maximum, bytes_at_first, bytes_per_page, granularity: 8, backings: 1,
     }]);
     for (other, multiple) in [(None, 1), (Some(ByteCurve::linear(2, 2, maximum)), 1),
         (Some(rounded(1, 3)), 1), (Some(rounded(1, 3)), 3)] {
@@ -67,6 +103,23 @@ fn rounded_affine_search_matches_exact_independent_backings_and_mixed_slopes() {
                 }
                 None => assert!(solved.is_err()),
             }
+        }
+    }
+    // A pool allocated as equal, independently rounded backings keeps the same
+    // closed-form limit: each backing's round-up, enumerated page by page.
+    for (backings, bytes_at_first, bytes_per_page) in [(3u64, 24u64, 48u64), (9, 90, 180)] {
+        let curve = ByteCurve::paged(bytes_at_first, bytes_per_page, 8, backings, maximum);
+        let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+        contract.set_byte_extent("kv", curve.clone()).unwrap();
+        contract.components.push(Component::allocation(allocation("fixed", 23),
+            ByteCurve::fixed(23, maximum), false, maximum));
+        for available in 1..=800 {
+            let budgets = vec![budget(available)];
+            let compiled = search::Compiled::new(&contract, &budgets).unwrap();
+            let expected = (1..=maximum)
+                .filter(|&pages| curve.at(pages).unwrap() + 23 <= available).max();
+            assert_eq!(compiled.limit(&budgets, &[0, 0, 0], 1, maximum).unwrap(), expected,
+                "backings={backings}, available={available}");
         }
     }
 }
@@ -957,11 +1010,11 @@ fn pool_page_multiple_aligns_automatic_pool_floor_extent_and_explicit_pins() {
 fn strided_pool_search_matches_enumeration_across_nonmonotonic_breakpoints() {
     let mut contract = Linear { maximum: 64 * 13, ..Linear::new() }.prepare(&request()).unwrap();
     let curve = ByteCurve(vec![
-        BytePiece { granularity: 1, first: 1, last: 3, bytes_at_first: 10, bytes_per_page: 10 },
-        BytePiece { granularity: 1, first: 4, last: 6, bytes_at_first: 100, bytes_per_page: 0 },
-        BytePiece { granularity: 1, first: 7, last: 7, bytes_at_first: 1, bytes_per_page: 0 },
-        BytePiece { granularity: 1, first: 8, last: 11, bytes_at_first: 20, bytes_per_page: 10 },
-        BytePiece { granularity: 1, first: 12, last: 13, bytes_at_first: 80, bytes_per_page: 5 },
+        BytePiece { granularity: 1, first: 1, last: 3, bytes_at_first: 10, bytes_per_page: 10, backings: 1, },
+        BytePiece { granularity: 1, first: 4, last: 6, bytes_at_first: 100, bytes_per_page: 0, backings: 1, },
+        BytePiece { granularity: 1, first: 7, last: 7, bytes_at_first: 1, bytes_per_page: 0, backings: 1, },
+        BytePiece { granularity: 1, first: 8, last: 11, bytes_at_first: 20, bytes_per_page: 10, backings: 1, },
+        BytePiece { granularity: 1, first: 12, last: 13, bytes_at_first: 80, bytes_per_page: 5, backings: 1, },
     ]);
     contract.set_byte_extent("kv", curve.clone()).unwrap();
     for multiple in [1, 2, 3, 4] {
@@ -1059,19 +1112,19 @@ fn piecewise_cost_vectors_match_exact_owners_at_every_breakpoint_neighbor() {
             first: 1,
             last: 4,
             bytes_at_first: 0,
-            bytes_per_page: 16,
+            bytes_per_page: 16, backings: 1,
         },
         BytePiece { granularity: 1,
             first: 5,
             last: 8,
             bytes_at_first: 96,
-            bytes_per_page: 0,
+            bytes_per_page: 0, backings: 1,
         },
         BytePiece { granularity: 1,
             first: 9,
             last: 20,
             bytes_at_first: 128,
-            bytes_per_page: 3,
+            bytes_per_page: 3, backings: 1,
         },
     ]);
     let mut bounded = Component::allocation(allocation("index", 16), curve.clone(), false, 20);
@@ -1141,19 +1194,19 @@ fn analytic_pool_solves_discontinuous_nonmonotone_and_zero_slope_pieces() {
                     first: 1,
                     last: 3,
                     bytes_at_first: 100,
-                    bytes_per_page: 10,
+                    bytes_per_page: 10, backings: 1,
                 },
                 BytePiece { granularity: 1,
                     first: 4,
                     last: 6,
                     bytes_at_first: 1000,
-                    bytes_per_page: 0,
+                    bytes_per_page: 0, backings: 1,
                 },
                 BytePiece { granularity: 1,
                     first: 7,
                     last: 12,
                     bytes_at_first: 50,
-                    bytes_per_page: 10,
+                    bytes_per_page: 10, backings: 1,
                 },
             ]),
         )
@@ -2059,13 +2112,13 @@ fn correlated_count_profiles_match_exhaustive_full_score_oracle() {
             first: 1,
             last: 3,
             bytes_at_first: 20,
-            bytes_per_page: 19,
+            bytes_per_page: 19, backings: 1,
         },
         BytePiece { granularity: 1,
             first: 4,
             last: 6,
             bytes_at_first: 12,
-            bytes_per_page: 13,
+            bytes_per_page: 13, backings: 1,
         },
     ]);
     for gpu in 0..2 {
@@ -2201,7 +2254,7 @@ fn malformed_curves_and_unrepresentable_recipes_are_typed_refusals() {
                 first: 2,
                 last: 4,
                 bytes_at_first: 1,
-                bytes_per_page: 1,
+                bytes_per_page: 1, backings: 1,
             }]),
         )
         .unwrap();
@@ -3218,9 +3271,9 @@ fn analytical_weight_cap_prices_every_finite_piece_and_exact_bound() {
     let mut contract = Linear { maximum: 64 * 12, ..Linear::new() }.prepare(&request()).unwrap();
     let mut owner = resource("piecewise.weight", 0, 100, 12);
     owner.bytes = ByteCurve(vec![
-        BytePiece { granularity: 1, first: 1, last: 3, bytes_at_first: 100, bytes_per_page: 0 },
-        BytePiece { granularity: 1, first: 4, last: 8, bytes_at_first: 10, bytes_per_page: 10 },
-        BytePiece { granularity: 1, first: 9, last: 12, bytes_at_first: 100, bytes_per_page: 0 },
+        BytePiece { granularity: 1, first: 1, last: 3, bytes_at_first: 100, bytes_per_page: 0, backings: 1, },
+        BytePiece { granularity: 1, first: 4, last: 8, bytes_at_first: 10, bytes_per_page: 10, backings: 1, },
+        BytePiece { granularity: 1, first: 9, last: 12, bytes_at_first: 100, bytes_per_page: 0, backings: 1, },
     ]);
     contract.components.push(owner);
     let plan = solve(capped(35), vec![budget(1 << 30)], &Prepared(contract.clone())).unwrap();

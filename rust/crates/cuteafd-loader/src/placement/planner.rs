@@ -580,7 +580,7 @@ mod search;
 mod granularity;
 pub use granularity::{AllocationGranularity, GranularityBacking, GranularityEvidence,
     ALLOCATION_GRANULARITY_GROUP, SM120_ALLOCATION_GRANULARITY_BYTES, allocation_granularity_forecast, allocation_granularity_component,
-    cuda_stream_slab_bytes, weight_arena_components, weight_arena_extent_components};
+    cuda_stream_slab_bytes, independent_backing_slack, weight_arena_components, weight_arena_extent_components};
 pub mod native_attention;
 pub mod serving;
 pub use contract::{

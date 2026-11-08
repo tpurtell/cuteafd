@@ -104,6 +104,22 @@ def test_family_launch_census_probe_reaches_coordinator_and_workers_only_when_as
             assert flag in line, (flag, line)
 
 
+def test_plan_preflight_admits_under_the_launch_instrumentation(tmp_path):
+    """The deployment plan runs with the PROFILE switches the server will get."""
+    prof = tmp_path / 'prof'
+    prof.mkdir()
+    plain = _family_launch_result(tmp_path / 'plain', GLMF_TWO_LAYER, 'test/glmf', '')
+    assert plain.returncode == 0, plain.stderr
+    plan = next(line for line in plain.stderr.splitlines() if 'cuteafd plan' in line)
+    assert 'CUTEAFD_GRAPH_CENSUS' not in plan
+    census = _family_launch_result(tmp_path / 'census', GLMF_TWO_LAYER, 'test/glmf',
+                                   f'PROFILE=census\nPROFILE_DIR={prof}\n')
+    assert census.returncode == 0, census.stderr
+    plan = next(line for line in census.stderr.splitlines() if 'cuteafd plan' in line)
+    for flag in ('CUTEAFD_GRAPH_CENSUS=1', 'CUTEAFD_STARTUP_MEMORY_PROBE=1', f'CUTEAFD_PROFILE_DIR={prof}'):
+        assert flag in plan, (flag, plan)
+
+
 def test_v41_native_census_probes_cover_all_card_sizes():
     family = ROOT / 'rust/crates/cuteafd-daemon/src/families/deepseek_v41'
     single = (family / 'v41_native_serve.rs').read_text()

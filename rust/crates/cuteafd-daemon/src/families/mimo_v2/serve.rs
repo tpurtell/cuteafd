@@ -994,7 +994,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 active = active.len(), steps = lane.steps, verify_s = lane.verify_s, draft_s = lane.draft_s,
                 emit_s = lane.emit_s, gpu_wait_s = phases[0],
-                experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, draft_calls, late_graphs = engine.late_captures(),
+                experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, draft_calls,
                 "request complete");
             (lane.steps, lane.verify_s, lane.draft_s, lane.emit_s) = (0, 0.0, 0.0, 0.0);
             if let Some(row) = request.turn.as_ref().filter(|_| !request.looped && !probe::cold(&request.job.probe)) {

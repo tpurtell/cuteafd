@@ -358,11 +358,9 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
                     .with_context(|| format!("MiMo requires program {name}"))?;
                 Ok(program["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0))
             })?;
-        additional.extend(graphs.reservations(rank, decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
-            decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES)?);
-        debug_assert_eq!(graphs.graph_set(decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
-            decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).bytes(rank), additional.iter()
-                .filter(|r| r.name.starts_with("runtime.decode_graph")).map(|r| r.bytes).sum::<u64>());
+        additional.extend(graphs.reservations(rank)?);
+        debug_assert_eq!(graphs.graph_set().expect("MiMo decode graph set").bytes(rank), additional.iter()
+            .filter(|r| r.name.starts_with("runtime.decode_graph")).map(|r| r.bytes).sum::<u64>());
         runtime.push(MimoRankRuntime { weight_arenas, resident_weights, device: rank as u32, workspaces,
             loading_additional: Vec::new(), additional });
     }
@@ -669,8 +667,7 @@ mod tests {
                         let runtime = (0..ranks).map(|rank| {
                             let mut additional = transport_reservations(&cfg, ranks, rank, 4096, lanes, 4, cuteafd_core::SparkReplyFormat::Bf16).unwrap();
                             if rank == 0 { additional.extend(sampling_reservations(cfg.vocab_size).unwrap()); }
-                            additional.extend(graph.reservations(rank, decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
-                                decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).unwrap());
+                            additional.extend(graph.reservations(rank).unwrap());
                             MimoRankRuntime { weight_arenas: vec![], resident_weights: Default::default(), device: rank as u32, loading_additional: vec![], additional,
                                 workspaces: workspace_options(&cfg, ranks, rank, 4096, 32768, lanes, true,
                                     opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow, pro, |_| Ok(0)).unwrap() }
@@ -812,7 +809,8 @@ mod tests {
                 assert_eq!(bytes(crate::placement::planner::ALLOCATION_GRANULARITY_GROUP), tail);
                 let total = profiles.steady.devices[rank].reservations.iter().map(|row| row.bytes).sum::<u64>()
                     + (32768 / profiles.steady.pool_unit_rows) * profiles.steady.devices[rank].pool_unit_bytes
-                    + crate::placement::families::mimo_v2::admission::POST_READY_RUNTIME_BYTES;
+                    + crate::placement::planner::cuda_stream_slab_bytes(
+                        crate::placement::families::mimo_v2::admission::startup_peak_live_streams()).unwrap();
                 assert_eq!(devices[rank].used_bytes(), total, "one physical charge per arena");
                 eprintln!("native={native} rank={rank} arena B={} tail={tail}", profiles.resident_weights[rank].0);
             }
@@ -1093,47 +1091,43 @@ mod tests {
             .map(|item| item.bytes).sum::<u64>();
         assert!(mappings > 0);
         let runtime = ready.opaque - tails - blas - mappings;
-        assert_eq!(runtime, 570 << 20);
+        assert_eq!(runtime, crate::placement::planner::cuda_stream_slab_bytes(
+            crate::placement::families::mimo_v2::admission::startup_peak_live_streams()).unwrap(),
+            "the only unnamed runtime bytes are the measured driver stream slabs");
         let measured_baseline = 1_179_189_248u64 - 576_716_800;
-        let measured_owned = 97_985_769_216u64;
-        let corrected_peak = 99_185_393_664u64;
-        let measured_runtime = corrected_peak - measured_owned - measured_baseline;
         assert_eq!(measured_baseline, 602_472_448);
-        assert_eq!(measured_runtime, 597_152_000);
         assert_eq!(*occupied, measured_baseline.div_ceil(1 << 20) * (1 << 20));
-        assert_eq!(runtime, measured_runtime.div_ceil(1 << 20) * (1 << 20));
-        assert_eq!(measured_owned + occupied + runtime - corrected_peak, 995_072);
     }
 
     #[test]
-    fn post_ready_runtime_provenance_preserves_every_rank_allowance() {
+    fn driver_stream_slabs_are_named_once_per_rank() {
         use cuteafd_core::memory_layout::{Basis, DeviceKind};
-        for pro in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let config = if pro { mimo_pro_config() } else { mimo_flash_mopd_config() };
-            let tensors = if pro { mimo_pro_tensors() } else { mimo_flash_mopd_tensors() };
-            write_snapshot(dir.path(), &config, &tensors, Some(if pro { 8 } else { 4 }));
-            for (gpus, sparks) in [(1, 2), (1, 4), (2, 2), (2, 4)] {
-                let report = crate::plan::plan(dir.path(), &crate::plan::PlanOptions {
-                    placement: crate::plan::ExpertPlacement::Sparks { ranks: sparks },
-                    layout: Some(LayoutOptions {
-                        rtx_bytes: vec![95 * GIB; gpus], head_split: gpus == 2,
-                        host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
-                    }),
-                    ..Default::default()
-                }).unwrap();
-                let layout = report.memory_layout.unwrap();
-                let devices = layout.devices.iter().filter(|device| device.kind == DeviceKind::Rtx)
-                    .collect::<Vec<_>>();
-                assert_eq!(devices.len(), gpus);
-                let measured = !pro && gpus == 1 && sparks == 2;
-                for device in devices {
-                    let item = device.items.iter().find(|item|
-                        item.group.contains("MiMo post-ready runtime growth")).unwrap();
-                    assert_eq!(item.bytes, 570 << 20);
-                    assert_eq!(item.basis, if measured { Basis::Calibrated } else { Basis::Estimated });
-                    assert!(item.group.starts_with(if measured { "measured " } else { "estimated " }));
-                }
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
+        let slabs = crate::placement::planner::cuda_stream_slab_bytes(
+            crate::placement::families::mimo_v2::admission::startup_peak_live_streams()).unwrap();
+        for (gpus, sparks) in [(1, 2), (1, 4), (2, 2), (2, 4)] {
+            let report = crate::plan::plan(dir.path(), &crate::plan::PlanOptions {
+                placement: crate::plan::ExpertPlacement::Sparks { ranks: sparks },
+                layout: Some(LayoutOptions {
+                    rtx_bytes: vec![95 * GIB; gpus], head_split: gpus == 2,
+                    host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+                }),
+                ..Default::default()
+            }).unwrap();
+            let layout = report.memory_layout.unwrap();
+            let devices = layout.devices.iter().filter(|device| device.kind == DeviceKind::Rtx)
+                .collect::<Vec<_>>();
+            assert_eq!(devices.len(), gpus);
+            for (rank, device) in devices.into_iter().enumerate() {
+                let item = device.items.iter().find(|item|
+                    item.group.starts_with("mimo/driver-stream-slabs")).unwrap();
+                assert_eq!(item.bytes, slabs, "rank {rank}");
+                assert_eq!(item.basis, Basis::Calibrated);
+                assert!(item.group.starts_with(&format!("mimo/driver-stream-slabs/gpu{rank}")));
+                assert!(!device.items.iter().any(|item|
+                    item.group.contains("post-ready runtime growth")),
+                    "the opaque post-ready allowance is gone");
             }
         }
     }
