@@ -3668,7 +3668,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             local_workspace: glmf::step_workspace_demands(&cfg, lanes as usize, 4096, 64,
                 GlmfStepShape { spark: false, ..shape }, decode, prefill),
             // The plan's own startup graph bound (no graph-budget user key).
-            graphs: glmf::startup_graph_bound(&cfg, cfg.layers, 262144, 2 << 20, 8, false, 2, 64, 188),
+            graphs: glmf::startup_graph_bound(&cfg, cfg.layers, 262144, 2 << 20, 8, false, 2, 64, 188).unwrap(),
             experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
             drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,

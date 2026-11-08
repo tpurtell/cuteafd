@@ -988,7 +988,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     }
     let graph = if i.graphs.lifetime == Lifetime::Startup {
         startup_graph_bound(i.cfg, i.layers, i.max_context as usize, (maximum * 256) as usize,
-            i.sequences as usize, i.speculation, gpus, i.decode_rows as usize, sms)
+            i.sequences as usize, i.speculation, gpus, i.decode_rows as usize, sms).map_err(invalid)?
     } else { i.graphs.clone() };
     for (option, &count) in counts.iter().enumerate() {
         let mut selected = graph.clone();
@@ -1053,7 +1053,7 @@ impl PreparedGlmf<'_> {
         let working = GlmfWorkingSet::candidate(i, count).map_err(invalid)?;
         let mut graphs = if i.graphs.lifetime == Lifetime::Startup {
             startup_graphs(i.cfg, i.layers, solved.request.context.served(solved.pool_tokens) as usize, solved.pool_tokens as usize,
-                i.sequences as usize, i.speculation, i.gpus.len(), i.decode_rows as usize, self.sms)
+                i.sequences as usize, i.speculation, i.gpus.len(), i.decode_rows as usize, self.sms).map_err(invalid)?
         } else { i.graphs.clone() };
         if i.local_tp2_exl3 && working.spark_ranks == 0 { calibrate_local_tp2_graphs(&mut graphs); }
         let declared_graphs = if graphs.lifetime == Lifetime::Startup {

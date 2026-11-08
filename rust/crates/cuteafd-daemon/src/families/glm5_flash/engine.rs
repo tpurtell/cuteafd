@@ -1526,7 +1526,7 @@ use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, Projectio
 
 pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, decode_strides, serving_graph_shapes, serving_graph_reserve};
 #[allow(unused_imports)]
-use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, graph_reserve_bytes, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
+use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
 // Inclusive arithmetic crossovers audited against the pinned AOT exporter: an FP8 decode
 // projection has none below its capacity (`FP8_DECODE_ROWS`), where the row-invariant GEMV
 // hands over to the W8A16 GEMM. Full/half-head shapes share these thresholds; MoE
@@ -1826,7 +1826,8 @@ impl<'a> GlmfEngine<'a> {
         if !self.startup_graphs { return Ok(None); }
         let startup = cuteafd_loader::serving_capacity::glmf_graphs::startup_set(
             self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(), sequences,
-            speculation, self.weights.layers.len(), self.peer.is_some(), &self.buckets);
+            speculation, self.weights.layers.len(), self.peer.is_some(), &self.buckets)
+            .map_err(anyhow::Error::msg)?;
         ensure!(self.peer.as_ref().is_none_or(|peer| peer.layers.len() == self.weights.layers.len()),
             "startup graph peer layer inventory differs from planner");
         for (rank, estimate) in startup.inventory.ranks.iter().enumerate() {
@@ -5972,10 +5973,16 @@ mod prefill_lane_tests {
                     }
                 }
             }
-            let reserves = serving_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, true, &buckets);
-            let old = serving_graph_reserve(131_072, 2_097_152, 2051, 16, true, 45, true, &buckets);
-            assert!(reserves.iter().zip(old).all(|(new, old)| new - old < (512 << 20)));
         }
+        // Rank 0's set is the measured census row: the seven-geometry growth
+        // above is charged exactly, not scaled from another set. Only the
+        // censused verify width has a row; a wider verify set refuses.
+        let buckets = DecodeBuckets::new(64);
+        assert_eq!(serving_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, false, &buckets).unwrap(),
+            [cuteafd_loader::serving_capacity::glmf_graphs::STARTUP_GRAPH_CENSUS[0].bytes]);
+        let error = serving_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, false,
+            &DecodeBuckets::new(128)).unwrap_err();
+        assert!(error.contains("no measured instantiate row"), "{error}");
     }
 
     #[test]
@@ -6040,9 +6047,6 @@ mod prefill_lane_tests {
         for sequences in [8, 16] {
             let shapes = super::serving_graph_shapes(32768, 32768, 2051, sequences, true, &buckets);
             assert_eq!(shapes.len() * 46, 6440);
-            let reserve = super::serving_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, true, &buckets);
-            use cuteafd_loader::serving_capacity::glmf_graphs::estimated_graph_rank;
-            assert_eq!(reserve, [estimated_graph_rank(6440, 1).bytes, estimated_graph_rank(6300, 2).bytes]);
             assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false, &buckets).len() * 46, 2576);
         }
         assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true, &buckets).len() * 46, 7084);
@@ -6286,12 +6290,11 @@ mod wide_decode_tests {
 
     /// The startup set grows by one speculative bucket per geometry: at 16 sequences and the 2,097,152-
     /// token pool target, 50 -> 55 shapes at 8,192 tokens, 140 -> 154 at 32,768 and 270 -> 297 at
-    /// 131,072 (the geometries of the graph keys); at 8,192 tokens its estimate grows by 230 graphs
-    /// (32,435,951 B). Each added shape is the budget's bucket, keyed as its own shape by its capture's
-    /// padded tables.
+    /// 131,072 (the geometries of the graph keys); a wider verify budget adds those shapes only.
+    /// Each added shape is the budget's bucket, keyed as its own shape by its capture's padded tables.
     #[test]
     fn the_startup_set_grows_by_one_speculative_bucket_per_geometry() {
-        use super::{graph_reserve_bytes, serving_graph_reserve, serving_graph_shapes, startup_tables, GraphKey, PAGE_ROWS};
+        use super::{serving_graph_shapes, startup_tables, GraphKey, PAGE_ROWS};
         let pages = 2_097_152usize.div_ceil(PAGE_ROWS);
         let (narrow, wide) = (DecodeBuckets::new(DECODE_ROWS), DecodeBuckets::new(127));
         for (context, before, after) in [(8_192usize, 50usize, 55usize), (32_768, 140, 154), (131_072, 270, 297)] {
@@ -6310,11 +6313,6 @@ mod wide_decode_tests {
             assert_eq!(serving_graph_shapes(context, pages, 2051, 16, false, &wide),
                 serving_graph_shapes(context, pages, 2051, 16, false, &narrow));
         }
-        let reserve = |buckets: &DecodeBuckets| serving_graph_reserve(8_192, 2_097_152, 2051, 16, true, 45, false,
-            buckets)[0];
-        assert_eq!(reserve(&narrow), graph_reserve_bytes(50 * 46));
-        assert_eq!(reserve(&narrow), 324_359_510);
-        assert_eq!(reserve(&wide) - reserve(&narrow), 32_435_951);
     }
 
     /// A padded wide step (65, 100 or 126 -> 127 rows) keeps its real tables, masks the rest, runs the
@@ -6348,7 +6346,7 @@ mod wide_decode_tests {
 #[cfg(test)]
 mod graph_key_tests {
     use super::{check_bucket_thresholds, check_decode_thresholds, decode_bucket, decode_strides, glmf_table_pages,
-        graph_geometries, graph_reserve_bytes, serving_graph_reserve, serving_graph_shapes, startup_tables,
+        graph_geometries, serving_graph_reserve, serving_graph_shapes, startup_tables,
         DecodeBuckets, GraphGeometry, GraphKey, StepTables, DECODE_PROJECTION_THRESHOLDS, DECODE_ROWS, MIN_PAGE_STRIDE,
         PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS, UNIT_PAGES, UNIT_ROWS};
     use std::collections::HashSet;
@@ -6473,12 +6471,10 @@ mod graph_key_tests {
                 }
             }
         }
-        // Single-GPU historical whole-capture ratio, without a percentage or minimum margin.
-        for (context, before, after) in [(8192, 1_492_053_743, 324_359_510), (32768, 2_594_876_075, 908_206_627),
-            (131_072, 3_957_186_014u64, 1_751_541_351u64)] {
-            assert_eq!(graph_reserve_bytes(full_keys(context, 32768, dense).len() * 10 * 46), before);
-            assert_eq!(serving_graph_reserve(context, 2_097_152, dense, 16, true, 45, false, &buckets), [after]);
-        }
+        // Only the censused set is charged; other geometries are classified
+        // before any launch and refuse an uncensused declared fingerprint.
+        assert_eq!(serving_graph_reserve(1_048_576, 2_097_152, dense, 16, true, 45, false, &buckets).unwrap(),
+            [cuteafd_loader::serving_capacity::glmf_graphs::STARTUP_GRAPH_CENSUS[0].bytes]);
     }
 
     /// A short step's key leaves out the pool table's width and stride, so the pool top-k, which runs

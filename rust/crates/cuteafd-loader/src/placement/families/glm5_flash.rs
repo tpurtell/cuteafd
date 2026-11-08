@@ -505,23 +505,20 @@ pub fn placed_attention(attention: GlmfAttention, placed: &Placement) -> GlmfAtt
 
 
 /// One startup graph ledger from the exact shape list the capture declares.
-/// The executable keys frame the set's identity, so a measured census row can
-/// replace the historical arithmetic before the KV pool is sized.
+/// Each rank's charge is its measured census row for the fingerprint of those
+/// executable keys; an uncensused set is a refusal naming the fingerprint, so
+/// the KV pool is never sized beside a scaled graph estimate (#1577).
 fn startup_graph_inventory(shapes: &[(usize, bool, glmf_graphs::GraphGeometry)],
-    layers: usize, gpus: usize) -> GraphSet {
+    layers: usize, gpus: usize) -> Result<GraphSet, String> {
     let executables = |rank: usize| shapes.len() as u64 * (layers + usize::from(rank == 0)) as u64;
-    let ranks = (0..gpus).map(|rank| {
-        glmf_graphs::estimated_graph_rank(executables(rank), if gpus == 1 { 0 } else { rank + 1 })
-    }).collect();
-    let mut graphs = GraphSet { ranks, shapes: shapes.len() as u64, lifetime: Lifetime::Startup };
-    if let Ok(declared) = glmf_graphs::declared_fingerprints(shapes, layers, gpus) {
-        glmf_graphs::apply_startup_census(&mut graphs, &declared, gpus);
-    }
-    graphs
+    let declared = glmf_graphs::declared_fingerprints(shapes, layers, gpus)?;
+    let ranks = (0..gpus).map(|rank| glmf_graphs::census_rank(
+        executables(rank), &declared[rank], rank, gpus)).collect::<Result<Vec<_>, String>>()?;
+    Ok(GraphSet { ranks, shapes: shapes.len() as u64, lifetime: Lifetime::Startup })
 }
 
 pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize, sequences: usize,
-    speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> GraphSet {
+    speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> Result<GraphSet, String> {
     let buckets = glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms));
     let shapes = glmf_graphs::serving_graph_shapes(context, pool.div_ceil(glmf_graphs::PAGE_ROWS),
         cfg.dense_context(), sequences.min(decode_rows), speculation, &buckets);
@@ -535,7 +532,8 @@ pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: 
 /// admission bound and the selected exact set identical.
 #[allow(clippy::too_many_arguments)]
 pub fn startup_graph_bound(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize,
-    sequences: usize, speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> GraphSet {
+    sequences: usize, speculation: bool, gpus: usize, decode_rows: usize, sms: usize)
+    -> Result<GraphSet, String> {
     startup_graphs(cfg, layers, context, pool, sequences, speculation, gpus, decode_rows, sms)
 }
 
@@ -598,7 +596,7 @@ pub(crate) mod tests {
             resident: (0..ranks).map(|rank| GlmfResidentRank {
                 embedding: if rank == 0 { 1 << 30 } else { 0 }, weights: (5 << 30) + if rank == 1 { 64 << 20 } else { 0 } }).collect(), workspace: workspace_fixture(ranks, 3 << 30), local_workspace: workspace_fixture(ranks, 2 << 30),
             graphs: startup_graphs(cfg, cfg.layers, 262_144, if capacity <= 34 << 30 { 1 << 20 } else { 2 << 20 },
-                8, true, ranks, 64, 188),
+                8, true, ranks, 64, 188).unwrap(),
             experts: cfg.dense.iter().filter(|&&dense| !dense).map(|_| ExpertCost {
                 whole: Bytes2 { resident: 2 << 30, staging: 0 },
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, whole_supported: true, spark_ok: true }).collect(),
@@ -729,8 +727,8 @@ pub(crate) mod tests {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         for context in [2048, 2051, 4096, 65_536, 131_072, 262_144, 1_048_576] {
             for pool in [256, 4096, 32_768, 131_072, 262_144, 1_360_896, 2_097_152] {
-                let bound = startup_graph_bound(&cfg, cfg.layers, context, pool, 16, true, 2, 64, 188);
-                let exact = startup_graphs(&cfg, cfg.layers, context, pool, 16, true, 2, 64, 188);
+                let bound = startup_graph_bound(&cfg, cfg.layers, context, pool, 16, true, 2, 64, 188).unwrap();
+                let exact = startup_graphs(&cfg, cfg.layers, context, pool, 16, true, 2, 64, 188).unwrap();
                 assert_eq!(bound.shapes, exact.shapes, "context={context}, pool={pool}");
                 assert_eq!(bound.ranks, exact.ranks);
             }
@@ -891,14 +889,14 @@ pub(crate) mod tests {
             if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
         // No external drafter still captures speculative graphs for default copy windows.
-        let copy = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
+        let copy = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188).unwrap();
         assert_eq!(copy.shapes, 280);
         assert_eq!(copy.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [12_880, 12_600]);
         assert_eq!([copy.at_ready(0), copy.at_ready(1)], [
             GraphRank::estimate(12_880, 2_231_369_728, 13_800).unwrap().bytes,
             GraphRank::estimate(12_600, 2_283_798_528, 13_500).unwrap().bytes]);
         assert!(copy.ranks.iter().all(|rank| rank.margin == 0 && rank.basis == Basis::Estimated));
-        let plain = startup_graphs(&cfg, 45, 262_144, 262_144, 8, false, 2, 64, 188);
+        let plain = startup_graphs(&cfg, 45, 262_144, 262_144, 8, false, 2, 64, 188).unwrap();
         assert_eq!(plain.shapes, 112);
         assert_eq!(plain.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [5_152, 5_040]);
     }
@@ -909,7 +907,7 @@ pub(crate) mod tests {
         config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
             if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
-        let mut graphs = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
+        let mut graphs = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188).unwrap();
         calibrate_local_tp2_graphs(&mut graphs);
         let programs = ProgramSet::from_names(&["glmf", "glmf2"], ["glmf_decode", "glmf2_decode"]);
         for rank in 0..2 {
@@ -1576,7 +1574,7 @@ pub(crate) mod tests {
         assert!(placed.pool_tokens < 1 << 20);
         let context = crate::placement::planner::Context::automatic(input.max_context).served(placed.pool_tokens) as usize;
         let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
-            input.sequences as usize, true, 1, 64, 170);
+            input.sequences as usize, true, 1, 64, 170).unwrap();
         assert_eq!(graphs.ranks, expected.ranks);
     }
 
@@ -1591,7 +1589,7 @@ pub(crate) mod tests {
             let (placed, graphs) = admitted_case(&input, true, 188, true, None).map(|(placed, graphs, _)| (placed, graphs)).unwrap();
             let context = crate::placement::planner::Context::automatic(input.max_context).served(placed.pool_tokens) as usize;
             let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
-                64, speculation, 1, 64, 188);
+                64, speculation, 1, 64, 188).unwrap();
             assert_eq!(graphs.ranks, expected.ranks);
         }
     }
@@ -1605,7 +1603,7 @@ pub(crate) mod tests {
         assert_eq!(placed.onboard_layers, 1);
         let context = crate::placement::planner::Context::automatic(input.max_context).served(placed.pool_tokens) as usize;
         let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
-            input.sequences as usize, true, 1, 64, 188);
+            input.sequences as usize, true, 1, 64, 188).unwrap();
         assert_eq!(graphs.ranks, expected.ranks);
     }
 

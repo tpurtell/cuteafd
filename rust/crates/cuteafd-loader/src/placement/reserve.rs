@@ -17,7 +17,7 @@ pub const GLM5: u64 = 0;
 /// 1-Spark probe was the startup graph executables of that checkpoint's
 /// program set charged with another set's per-executable bytes (#1577:
 /// 2,434,793,472 B measured versus 2,082,611,747 B planned, +352 MiB);
-/// `glmf_graphs::estimated_graph_rank` now carries that set's own census.
+/// `glmf_graphs::census_rank` now charges that set's own measured rows.
 /// Driver stream slabs, loaded module code, cuBLAS handles and the pinned
 /// host page tables are the contract's own components (#1561, #1554, #1558,
 /// #1570). #1442 follows the residual from a pool-filled Ready.

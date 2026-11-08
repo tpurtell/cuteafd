@@ -480,11 +480,12 @@ mod draft_cli_tests {
     fn serving_startup_seals_once_for_tp2_and_spark_layouts() {
         use std::cell::{Cell, RefCell};
         use crate::shared::decode_graph::{GraphBank, GraphPolicy};
-        use cuteafd_loader::serving_capacity::glmf_graphs::{startup_set, DecodeBuckets};
+        use cuteafd_loader::serving_capacity::glmf_graphs::{serving_graph_shapes, DecodeBuckets, PAGE_ROWS};
 
         for (name, tp2, spark_ranks) in [("tp2-zero-spark", true, 0),
             ("tp2-spark-suffix", true, 4), ("spark-only", false, 4)] {
-            let startup = startup_set(262144, 262144, 2048, 8, true, 45, true, &DecodeBuckets::new(64));
+            // Only the shape list matters here; it needs no measured census row.
+            let shapes = serving_graph_shapes(262144, 262144 / PAGE_ROWS, 2048, 8, true, &DecodeBuckets::new(64));
             let banks = RefCell::new([GraphBank::with_policy(GraphPolicy::FixedStartup),
                 GraphBank::with_policy(GraphPolicy::FixedStartup)]);
             let seals = Cell::new([0; 2]);
@@ -494,7 +495,7 @@ mod draft_cli_tests {
                 assert_eq!((sequences, speculation), (8, true));
                 events.borrow_mut().push("warm");
                 for (rank, bank) in banks.borrow_mut().iter_mut().enumerate() {
-                    let keys: Vec<_> = startup.keys.iter().enumerate().flat_map(|(shape, _)|
+                    let keys: Vec<_> = shapes.iter().enumerate().flat_map(|(shape, _)|
                         (0..if rank == 0 { 46 } else { 45 }).map(move |segment| (shape, segment))).collect();
                     for key in &keys { bank.insert(*key, (), None); }
                     bank.seal_startup(&keys)?;
@@ -2080,7 +2081,7 @@ impl Opened {
         let pool = if args.pool_tokens > 0 { args.pool_tokens } else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize };
         let graphs = if args.startup_graphs() {
             admission::startup_graph_bound(&self.cfg, layers, args.max_context, pool,
-                sequences, speculation, devices.len(), args.decode_rows, sms)
+                sequences, speculation, devices.len(), args.decode_rows, sms).map_err(anyhow::Error::msg)?
         } else {
             // `CUTEAFD_GLMF_GRAPHS=0` captures no graphs and allocates none.
             placement::GraphSet::budget(&vec![cuteafd_loader::placement::reserve::gpu_component(0); devices.len()])

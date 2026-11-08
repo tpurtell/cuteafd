@@ -40,24 +40,24 @@ impl DecodeBuckets {
     }
 }
 
-/// Whole historical observations are fallback estimates, not qualified census
-/// rows: exact keys and code provenance were not retained (#1463). No margin.
-pub fn estimated_graph_rank(graphs: u64, role: usize) -> GraphRank {
+/// Whole historical observations, kept only for CPU unit fixtures that plan a
+/// synthetic geometry no census covers. No production path scales a count:
+/// admission charges a measured census row for the exact declared fingerprint
+/// ([`census_rank`]) and refuses any other set (#1577).
+#[cfg(test)]
+pub(crate) fn estimated_graph_rank(graphs: u64, role: usize) -> GraphRank {
     let (bytes, count) = [(1_946_157_056, 13_800), (2_231_369_728, 13_800),
         (2_283_798_528, 13_500)][role.min(2)];
     GraphRank::estimate(graphs, bytes, count).expect("GLMF historical graph estimate fits u64")
 }
 
-pub fn graph_reserve_bytes(graphs: usize) -> u64 {
-    estimated_graph_rank(graphs as u64, 0).bytes
-}
-
 /// The startup decode graph set's bytes per rank: `buckets` (the engine's sets) over every geometry.
 #[allow(clippy::too_many_arguments)]
 pub fn serving_graph_reserve(context: usize, pool_tokens: usize, dense: usize,
-    sequences: usize, speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets) -> Vec<u64> {
-    startup_set(context, pool_tokens, dense, sequences, speculation, layers, peer, buckets)
-        .inventory.ranks.iter().map(|rank| rank.bytes).collect()
+    sequences: usize, speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets)
+    -> Result<Vec<u64>, String> {
+    Ok(startup_set(context, pool_tokens, dense, sequences, speculation, layers, peer, buckets)?
+        .inventory.ranks.iter().map(|rank| rank.bytes).collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -153,13 +153,27 @@ mod tests {
         // A pool that fills a 96 GiB card keys the same set: the stride floors
         // and the page-stride/pool-stride caps do not move between 2M and 100M.
         assert_eq!(declared_fingerprints(&shapes(100_000_000), 45, 1).unwrap()[0], declared[0]);
-        let mut graphs = crate::placement::inventory::GraphSet {
-            ranks: vec![estimated_graph_rank(13_800, 0)], shapes: 300,
-            lifetime: crate::placement::inventory::Lifetime::Startup };
-        apply_startup_census(&mut graphs, &declared, 1);
-        assert_eq!(graphs.ranks[0].bytes, STARTUP_GRAPH_CENSUS[0].bytes);
-        assert_eq!(graphs.ranks[0].margin, 0);
-        assert_eq!(graphs.ranks[0].basis, cuteafd_core::memory_layout::Basis::Calibrated);
+        // A one-GPU reserve is charged from the row, never from a scaled count.
+        let graphs = startup_set(1_048_576, 2_000_128, 2051, 16, true, 45, false, &buckets).unwrap();
+        assert_eq!(graphs.inventory.ranks[0].bytes, STARTUP_GRAPH_CENSUS[0].bytes);
+        assert_eq!(graphs.inventory.ranks[0].margin, 0);
+        assert_eq!(graphs.inventory.ranks[0].basis, cuteafd_core::memory_layout::Basis::Calibrated);
+        assert_eq!(graphs.keys.len(), shapes(2_000_128).len());
+        assert_eq!(graphs.inventory.ranks[0].executables, 13_800);
+    }
+
+    #[test]
+    fn uncensused_declared_sets_refuse_with_their_fingerprint() {
+        let buckets = DecodeBuckets::new(verify_budget(64, 188));
+        let (context, pool) = (131_072, 2_097_152);
+        refuse_unmeasured_graphs();
+        let error = startup_set(context, pool, 2051, 16, true, 45, false, &buckets).unwrap_err();
+        assert!(error.contains("no measured instantiate row"), "{error}");
+        assert!(error.contains(&declared_fingerprints(
+            &serving_graph_shapes(context, pool / PAGE_ROWS, 2051, 16, true, &buckets), 45, 1).unwrap()[0]),
+            "{error}");
+        assert!(error.contains("STARTUP_GRAPH_CENSUS"), "{error}");
+        super::SYNTHETIC_GRAPHS.with(|flag| flag.set(true));
     }
 
     #[test]
@@ -167,8 +181,10 @@ mod tests {
         let buckets = DecodeBuckets::new(verify_budget(64, 188));
         let shapes = serving_graph_shapes(1_048_576, 2_097_152 / PAGE_ROWS, 2051, 16, true, &buckets);
         assert_eq!(shapes.len(), 300);
-        let bytes = serving_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, true, &buckets);
-        assert_eq!(bytes, vec![estimated_graph_rank(13_800, 1).bytes, estimated_graph_rank(13_500, 2).bytes]);
+        // Rank 0 is the censused set; rank 1's peer set has no row, and the
+        // test-only fixture fallback supplies its historical estimate.
+        let bytes = serving_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, true, &buckets).unwrap();
+        assert_eq!(bytes, vec![STARTUP_GRAPH_CENSUS[0].bytes, estimated_graph_rank(13_500, 2).bytes]);
         assert_eq!(verify_budget(128, 170), 127);
         assert_eq!(verify_budget(128, 132), 99);
     }
@@ -211,21 +227,23 @@ pub struct StartupCapture {
     pub ranks: Vec<CapturedGraphRank>,
 }
 
-/// One immutable geometry list and estimated per-rank ledger for both admission and capture.
+/// One immutable geometry list and its per-rank ledger for both admission and
+/// capture. Each rank's bytes are its measured census row for the declared
+/// fingerprint; an uncensused set is a refusal naming the fingerprint.
 #[allow(clippy::too_many_arguments)]
 pub fn startup_set(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
     speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets)
-    -> crate::placement::inventory::StartupGraphs<(usize, bool, GraphGeometry)> {
+    -> Result<crate::placement::inventory::StartupGraphs<(usize, bool, GraphGeometry)>, String> {
     use crate::placement::inventory::{GraphSet, Lifetime};
     let keys = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences, speculation, buckets);
     let shapes = keys.len() as u64;
-    let ranks = std::iter::once(shapes * (layers + 1) as u64)
-        .chain(peer.then_some(shapes * layers as u64)).enumerate().map(|(rank, executables)| {
-            let role = if peer { 1 + rank } else { 0 };
-            estimated_graph_rank(executables, role)
-        }).collect();
-    GraphSet { ranks, shapes, lifetime: Lifetime::Startup }.startup(keys)
-        .expect("startup geometry list and ledger are constructed together")
+    let gpus = 1 + usize::from(peer);
+    let declared = declared_fingerprints(&keys, layers, gpus)?;
+    let ranks = (0..gpus).map(|rank| census_rank(
+        shapes * (layers + usize::from(rank == 0)) as u64, &declared[rank], rank, gpus))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(GraphSet { ranks, shapes, lifetime: Lifetime::Startup }.startup(keys)
+        .expect("startup geometry list and ledger are constructed together"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,10 +259,11 @@ pub fn serving_graph_counts(context: usize, pool_tokens: usize, dense: usize, se
 /// `declared_graphs` fingerprints every captured executable (segment, rows,
 /// speculation, long/short and page-table geometry) for one coordinator rank,
 /// so a row matches only that set, never a count. `gpus` is the coordinator
-/// rank count, because a rank-0 key set alone does not distinguish a one- and
-/// a two-coordinator capture. Provenance records the binary and hardware that
-/// produced the measurement; a row is added by capturing the set in one launch
-/// (#1577), never by scaling a different count.
+/// rank count the capture ran with, recorded as provenance: the fingerprint is
+/// per rank, so a rank-0 row serves one- and two-coordinator captures alike and
+/// a second rank needs its own row. Provenance records the binary and hardware
+/// that produced the measurement; a row is added by capturing the set in one
+/// launch (#1577), never by scaling a different count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartupGraphCensus {
     pub declared_graphs: &'static str,
@@ -260,9 +279,9 @@ pub struct StartupGraphCensus {
     pub producing_commit: &'static str,
 }
 
-/// Measured startup graph sets. A set without a row uses the historical
-/// estimate, which is why a full-pool capture must be re-measured when the
-/// startup key set changes.
+/// Measured startup graph sets. A declared set without a row is refused by
+/// [`census_rank`], naming its fingerprint: a startup key-set change needs a
+/// fresh capture and a new row before that layout can serve.
 pub const STARTUP_GRAPH_CENSUS: &[StartupGraphCensus] = &[StartupGraphCensus {
     declared_graphs: "8757d4da6763b4536c2916bb84f20fc221d86681d487ecae2f0e296a03a0e292",
     executables: 13_800,
@@ -277,21 +296,35 @@ pub const STARTUP_GRAPH_CENSUS: &[StartupGraphCensus] = &[StartupGraphCensus {
     producing_commit: "bfe5f6babe3768bd9640d7adaff467fc630850b9",
 }];
 
-/// Replace each rank's estimated residency with the measured value for the same
-/// exact declared set. This is the only place a startup graph charge becomes
-/// calibrated; a set without a row keeps the historical estimate, and the plan
-/// records it as assumed.
-pub fn apply_startup_census(graphs: &mut crate::placement::inventory::GraphSet,
-    declared: &[String], gpus: usize) {
-    for (rank, graph) in graphs.ranks.iter_mut().enumerate() {
-        let Some(fingerprint) = declared.get(rank) else { continue };
-        let Some(row) = STARTUP_GRAPH_CENSUS.iter().find(|row|
-            row.declared_graphs == fingerprint && row.executables == graph.executables
-                && row.gpus as usize == gpus) else { continue };
-        graph.bytes = row.bytes;
-        graph.margin = 0;
-        graph.basis = cuteafd_core::memory_layout::Basis::Calibrated;
+/// Unit fixtures plan synthetic geometries no launch has censused. The
+/// fallback is compiled into test builds only; production refuses instead.
+#[cfg(test)]
+thread_local! {
+    static SYNTHETIC_GRAPHS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+pub(crate) fn refuse_unmeasured_graphs() { SYNTHETIC_GRAPHS.with(|flag| flag.set(false)); }
+
+/// One rank's calibrated ledger from the measured row for its exact declared
+/// fingerprint. Graph instantiate storage is driver memory whose size follows
+/// the captured kernels, not the key count, so a row is never scaled to another
+/// set: an uncensused fingerprint is a refusal naming it and the measurement
+/// that would cover it.
+pub fn census_rank(executables: u64, fingerprint: &str, rank: usize, gpus: usize)
+    -> Result<GraphRank, String> {
+    if let Some(row) = STARTUP_GRAPH_CENSUS.iter().find(|row|
+        row.declared_graphs == fingerprint && row.executables == executables) {
+        return Ok(GraphRank { executables, bytes: row.bytes, margin: 0,
+            basis: cuteafd_core::memory_layout::Basis::Calibrated });
     }
+    #[cfg(test)]
+    if SYNTHETIC_GRAPHS.with(std::cell::Cell::get) {
+        return Ok(estimated_graph_rank(executables, if gpus == 1 { 0 } else { rank + 1 }));
+    }
+    Err(format!("GLM Flash startup graphs: no measured instantiate row for declared key set \
+        {fingerprint} ({executables} executables, rank {rank} of {gpus}); capture this layout with a \
+        memory census and add its device {rank} instantiate bytes to STARTUP_GRAPH_CENSUS"))
 }
 
 /// Every exchange slot owns its payload, completion word and native control storage.
