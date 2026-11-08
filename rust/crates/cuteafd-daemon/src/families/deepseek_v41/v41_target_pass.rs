@@ -208,6 +208,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         resources.index.capture_startup(&rows, |layer, row|
             resources.execution.startup_source(bank, layer, row))?;
         resources.lane.capture_startup_prefill()?;
+        resources.embedding.declare_startup(&rows)?;
+        resources.embedding.finish_startup()?;
         for gate in &mut resources.gates { gate.capture_startup(&rows)?; }
         resources.head.capture_startup(&rows)
     }
@@ -219,6 +221,9 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let rows = super::graph_policy::startup_rows();
         let resources = &mut self.resources;
         resources.execution.capture_startup_producers(bank, &rows)?;
+        resources.embedding.declare_startup(&rows)?;
+        for &row in &rows { resources.embedding.capture_startup(row)?; }
+        resources.embedding.finish_startup()?;
         resources.index.capture_startup(&rows, |layer, row|
             resources.execution.startup_source(bank, layer, row))?;
         let selections = resources.index.startup_selections();

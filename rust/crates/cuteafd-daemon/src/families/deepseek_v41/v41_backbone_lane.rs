@@ -827,6 +827,10 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         let result = (|| -> Result<()> {
             self.query.declare_startup(&keys)?;
             self.router.declare_startup(&keys)?;
+            if let Some(shared) = &mut self.shared { shared.declare_startup(&keys)?; }
+            // This wave's attention tail is recorded in the sparse bank above;
+            // its own bank stays empty so no request can capture into it.
+            self.projection.declare_startup(&[])?;
             let mut sparse_keys = Vec::with_capacity(keys.len());
             for &layer in layers.iter().filter(|_| decode) {
                 self.rebind_startup(layer)?;
@@ -842,6 +846,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
                 for &rows in &startup_rows {
                     self.query.capture_startup(rows as u32)?;
                     self.router.capture_startup(rows as u32)?;
+                    if let Some(shared) = &mut self.shared { shared.capture_startup(rows as u32)?; }
                     if !decode { continue; }
                     // SAFETY: only host phase is armed; sparse capture records
                     // stable geometry and never executes its descriptor storage.
@@ -855,6 +860,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             }
             self.query.finish_startup()?;
             self.router.finish_startup()?;
+            if let Some(shared) = &mut self.shared { shared.finish_startup()?; }
+            self.projection.finish_startup()?;
             self.sparse.as_mut().context("startup sparse owner absent")?.finish_startup()
         })();
         self.block.reset();
@@ -1736,6 +1743,30 @@ mod split_output_tests {
         }
         let dropped = ["tp2_ffn_graphs", ": None"].concat();
         assert_eq!(source.matches(dropped.as_str()).count(), 0, "a lane constructor drops the graph owner");
+    }
+}
+
+#[cfg(test)]
+mod startup_bank_tests {
+    /// The startup capture seals every graph bank this lane can reach: the
+    /// shared-expert bank with the lane's declared keys and the attention
+    /// output's own bank empty (its tail is recorded in the sparse bank).
+    /// An undeclared one would keep capturing at request time.
+    #[test]
+    fn startup_capture_declares_and_seals_the_shared_and_output_banks() {
+        let source = include_str!("v41_backbone_lane.rs");
+        let start = source.find("fn capture_startup_kind(").unwrap();
+        let body = &source[start..start + source[start..].find("\n    pub fn workspace_bytes").unwrap()];
+        assert!(body.contains("shared.declare_startup(&keys)"), "shared bank is not declared");
+        assert!(body.contains("shared.capture_startup(rows as u32)"), "shared shapes are not captured");
+        assert!(body.contains("shared.finish_startup()"), "shared bank is not sealed");
+        assert!(body.contains("self.projection.declare_startup(&[])"), "output bank is not sealed empty");
+        assert!(body.contains("self.projection.finish_startup()"), "output bank is not finished");
+        // The shared capture runs only on decode lanes, whose declared keys equal
+        // the startup rows the capture loop walks.
+        let shared = body.find("shared.capture_startup(rows as u32)").unwrap();
+        let skipped = body.find("if !decode { continue; }").unwrap();
+        assert!(shared < skipped, "shared capture must precede the prefill skip");
     }
 }
 

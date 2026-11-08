@@ -92,6 +92,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             let device = lane.device;
             device.run(|| lane.get_mut().capture_startup_prefill())?;
         }
+        let device = resources.embedding.device;
+        device.run(|| resources.embedding.get_mut().declare_startup(&rows))?;
+        device.run(|| resources.embedding.get_mut().finish_startup())?;
         resources.engram.capture_startup(&rows)?;
         resources.head.capture_startup(&rows)
     }
@@ -115,6 +118,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             // are validated again before every replay.
             device.run(|| lane.get_mut().capture_startup(sinks, &selections, true))?;
         }
+        let device = resources.embedding.device;
+        device.run(|| resources.embedding.get_mut().declare_startup(&rows))?;
+        for &row in &rows { device.run(|| resources.embedding.get_mut().capture_startup(row))?; }
+        device.run(|| resources.embedding.get_mut().finish_startup())?;
         resources.engram.capture_startup(&rows)?;
         resources.head.capture_startup(&rows)
     }

@@ -293,6 +293,13 @@ impl AttentionOutputWave<'_, '_> {
             && (retained || (super::graph_policy::captures_shape(rows)
                 && self.graphs.capture_allowed(self.weights.layer, rows)))
     }
+    /// Seal the startup inventory of this wave's own bank. The lane records its
+    /// attention tail in the sealed sparse bank instead, so this set stays
+    /// empty: every shape outside it runs eagerly and allocates nothing.
+    pub(crate) fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
+        self.graphs.declare_startup(keys)
+    }
+    pub(crate) fn finish_startup(&mut self) -> Result<()> { self.graphs.finish_startup() }
     /// `execute_attention`'s graph decision over inputs already in `input()`
     /// and `positions()` (the window test drives exactly that branch).
     #[cfg(test)]

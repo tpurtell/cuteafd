@@ -250,6 +250,27 @@ impl<'a> BackboneSharedWave<'_, 'a> {
     pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
         BackboneSharedStorage::storage_bytes(library, capacity, capacity)
     }
+    /// Declare this lane's sealed shared-expert inventory before capture. A
+    /// prefill lane declares nothing, so its arbitrary unit tails stay eager.
+    pub(crate) fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
+        self.graphs.declare_startup(keys)
+    }
+    /// Record one already-declared decode shape on the bound layer. The graph
+    /// holds stable plane, weight and scratch addresses only; nothing executes.
+    pub(crate) fn capture_startup(&mut self, rows: u32) -> Result<()> {
+        ensure!(!self.window.is_windowed(), "startup shared FFN capture requires a full lane");
+        ensure!(self.graphs.capture_allowed(self.layer, rows),
+            "startup shared FFN shape outside the declared inventory");
+        if !crate::shared::memory::chain::active() { self.stream().require_complete()?; }
+        // Warm the shape once, as `capture` does, so first-use residency lands in
+        // the eager launch instead of the retained graph.
+        unsafe { self.execute(rows)?; }
+        // SAFETY: the caller runs this inside the sealed startup window on an
+        // idle wave; every captured buffer, weight and scratch plane outlives
+        // the graph bank and only host phase is armed.
+        unsafe { self.capture_ready(rows) }
+    }
+    pub(crate) fn finish_startup(&mut self) -> Result<()> { self.graphs.finish_startup() }
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.window.apply(self.storage.input.buffer, 10240)
     }

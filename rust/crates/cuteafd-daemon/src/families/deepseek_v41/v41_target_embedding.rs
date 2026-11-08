@@ -333,6 +333,53 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             _owner: PhantomData,
         })
     }
+    /// Declare this slot's sealed embedding inventory before capture. A prefill
+    /// slot declares nothing, so its unit tails stay eager and allocate nothing.
+    pub(crate) fn declare_startup(&mut self, rows: &[usize]) -> Result<()> {
+        self.graphs.declare_startup(rows)
+    }
+    /// Record one declared shape on the fixed id/residual/pre planes. The h2d
+    /// copy stays outside the graph, so nothing here depends on request data.
+    pub(crate) fn capture_startup(&mut self, rows: usize) -> Result<()> {
+        ensure!(!self.window.is_windowed(), "startup embedding capture requires a full slot");
+        ensure!((1..=self.capacity).contains(&rows) && rows <= cuteafd_core::V41_VERIFY_ROWS,
+            "startup embedding rows exceed the decode geometry");
+        ensure!(self.graphs.get(rows).is_none() && self.graphs.capture_allowed(rows),
+            "startup embedding shape outside the declared inventory");
+        self.invalidate();
+        unsafe {
+            crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
+            self.acquire_scratch(self.storage.stream.raw)?;
+        }
+        // Warm the shape once, as the request path does, so first-use module and
+        // workspace residency lands in the eager launch instead of the graph.
+        let warmup = unsafe { self.enqueue(rows) };
+        warmup.and(self.synchronize())?;
+        let captured = (|| -> Result<()> {
+            unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
+            let launched = unsafe { self.enqueue(rows) };
+            let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
+            match (launched, captured) {
+                (Ok(()), Ok(graph)) => {
+                    // SAFETY: the capture was never launched; insert retires on
+                    // failure and the containing storage outlives the bank.
+                    if let Err(error) = unsafe { self.graphs.insert(rows, graph) } {
+                        unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
+                        return Err(error);
+                    }
+                    Ok(())
+                },
+                (Err(e), Ok(graph)) => {
+                    unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
+                    Err(e)
+                },
+                (Err(e), Err(_)) | (Ok(()), Err(e)) => Err(e),
+            }
+        })();
+        let released = self.release_scratch();
+        captured.and(released)
+    }
+    pub(crate) fn finish_startup(&mut self) -> Result<()> { self.graphs.finish_startup() }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.invalidate();
         self.synchronize()?;
