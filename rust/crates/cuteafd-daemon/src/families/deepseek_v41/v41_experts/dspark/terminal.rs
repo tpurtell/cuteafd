@@ -198,6 +198,16 @@ impl DsparkTerminal<'_, '_> {
         self.sampling_requests = Some(rngs.len());
         Ok(())
     }
+    /// Startup capture stages the request count alone: capture records the
+    /// sampling kernels and the pinned staging copy, and a real attempt
+    /// restages its own RNG/temperature values before launching the graph, so
+    /// no draws are consumed here.
+    pub(super) fn stage_capture_sampling(&mut self, requests: usize) -> Result<()> {
+        validate_geometry(self.capacity, requests)?;
+        self.ready_requests = None;
+        self.sampling_requests = Some(requests);
+        Ok(())
+    }
     /// The chain retains this pinned staging until its stream completes.
     pub(super) unsafe fn upload_sampling_on(&mut self, stream: *mut c_void) -> Result<()> {
         let count = self.sampling_requests.context("draft sampling not staged")?;

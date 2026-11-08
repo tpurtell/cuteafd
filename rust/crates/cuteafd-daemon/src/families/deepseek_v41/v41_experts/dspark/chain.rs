@@ -1,5 +1,5 @@
 //! Draft transformer chain with optional shared embedding and terminal heads.
-use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner};
+use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner, GraphPolicy};
 use super::{DsparkStage, DsparkTerminal, DsparkWeights};
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowGeometry, WindowLease, WindowRead};
 use crate::shared::memory::Tag;
@@ -177,7 +177,7 @@ impl<'library> DsparkWeights<'library> {
                 self.stage(1, requests, bytes)?,
                 self.stage(2, requests, bytes)?,
             ],
-            graphs: GraphBank::new(None),
+            graphs: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
             ready: None,
             pending: None,
             download: HostAllocation::new(library, requests as usize * (2 * self.draft_width + 1) * 4, Tag::staging("v41/draft-chain"))?,
@@ -227,6 +227,11 @@ impl DsparkChain<'_, '_> {
             for width in widths {
                 self.set_width(width)?;
                 for count in 1..=counts {
+                    // An embedded chain has no local terminal; its distributed
+                    // terminal captures geometry without request state.
+                    if let Some(terminal) = self.terminal.as_mut() {
+                        terminal.stage_capture_sampling(count)?;
+                    }
                     // SAFETY: real ring/weight owners stay pinned; capture only
                     // records commands and never reads uninitialized metadata.
                     unsafe { self.capture_geometry(&geometry, count)?; }
