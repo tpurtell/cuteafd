@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <random>
 #include <vector>
@@ -32,10 +33,13 @@ template <int Bytes> __global__ void probe_kernel(Args<Bytes> args) {
 }
 
 struct Shape { int nodes; int args; size_t charge = 0; };
+static bool executable_only = false;
+
 struct Graph {
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t exec = nullptr;
   size_t charge = 0;
+  int args = 0;
 };
 
 static size_t free_bytes(cudaStream_t stream) {
@@ -50,7 +54,7 @@ static double elapsed_us(Clock::time_point start) {
 static void destroy(Graph& graph, cudaStream_t stream) {
   CUDA(cudaStreamSynchronize(stream));
   CUDA(cudaGraphExecDestroy(graph.exec));
-  CUDA(cudaGraphDestroy(graph.graph));
+  if (graph.graph) CUDA(cudaGraphDestroy(graph.graph));
   graph = {};
 }
 
@@ -71,6 +75,7 @@ static Graph create(const Shape& shape, uint32_t* output, cudaStream_t stream,
                     bool phases = false) {
   Graph graph;
   graph.charge = shape.charge;
+  graph.args = shape.args;
   const size_t before = free_bytes(stream);
   auto start = Clock::now();
   if (shape.args == 32) capture<32>(&graph.graph, shape.nodes, output, stream);
@@ -79,6 +84,12 @@ static Graph create(const Shape& shape, uint32_t* output, cudaStream_t stream,
   const size_t captured = free_bytes(stream);
   start = Clock::now();
   CUDA(cudaGraphInstantiate(&graph.exec, graph.graph, 0));
+  size_t count;
+  CUDA(cudaGraphGetNodes(graph.graph, nullptr, &count));
+  if (executable_only) {
+    CUDA(cudaGraphDestroy(graph.graph));
+    graph.graph = nullptr;
+  }
   double instantiate_us = elapsed_us(start);
   const size_t instantiated = free_bytes(stream);
   start = Clock::now();
@@ -92,8 +103,6 @@ static Graph create(const Shape& shape, uint32_t* output, cudaStream_t stream,
   double replay_us = elapsed_us(start);
   const size_t replayed = free_bytes(stream);
   if (phases) {
-    size_t count;
-    CUDA(cudaGraphGetNodes(graph.graph, nullptr, &count));
     std::printf("{\"kind\":\"shape\",\"nodes\":%d,\"total_nodes\":%zu,\"args\":%d,"
                 "\"free_before\":%zu,\"free_capture\":%zu,\"free_instantiate\":%zu,"
                 "\"free_upload\":%zu,\"free_replay\":%zu,\"capture_us\":%.3f,"
@@ -219,7 +228,68 @@ static void adversarial(const Shape& first, const Shape& second, size_t cap) {
   child_ok(pid);
 }
 
+static void pair_arm(const Shape& first, const Shape& second) {
+  pid_t pid = fork();
+  if (pid < 0) std::exit(1);
+  if (pid == 0) {
+    cudaStream_t stream;
+    uint32_t* output;
+    initialize(&stream, &output);
+    size_t baseline = free_bytes(stream);
+    for (int phase = 0; phase < 4; ++phase) {
+      const Shape& shape = phase == 0 || phase == 3 ? first : second;
+      size_t count = std::max<size_t>(16, 16 * MiB / shape.charge);
+      size_t before = free_bytes(stream);
+      std::vector<Graph> graphs;
+      for (size_t i = 0; i < count; ++i) graphs.push_back(create(shape, output, stream));
+      // Replay the oldest executable after all intervening instantiations.
+      CUDA(cudaGraphLaunch(graphs.front().exec, stream));
+      CUDA(cudaStreamSynchronize(stream));
+      verify(shape, output);
+      size_t filled = free_bytes(stream);
+      for (auto& graph : graphs) destroy(graph, stream);
+      std::printf("{\"kind\":\"pair\",\"x_nodes\":%d,\"x_args\":%d,\"y_nodes\":%d,\"y_args\":%d,"
+                  "\"phase\":%d,\"count\":%zu,\"live_charge\":%zu,\"free_baseline\":%zu,"
+                  "\"free_before\":%zu,\"free_filled\":%zu,\"free_destroyed\":%zu}\n",
+                  first.nodes, first.args, second.nodes, second.args, phase, count,
+                  count * shape.charge, baseline, before, filled, free_bytes(stream));
+    }
+    CUDA(cudaDeviceReset());
+    std::fflush(stdout);
+    _exit(0);
+  }
+  child_ok(pid);
+}
+
+static int class_campaign() {
+  executable_only = true;
+  std::vector<Shape> original;
+  for (int bytes : {32, 512}) for (int nodes : {1, 10, 100, 1000, 5000}) {
+    original.push_back({nodes, bytes});
+    calibrate(original.back());
+  }
+  std::puts("{\"kind\":\"exec_only_original_adversarial\"}");
+  adversarial(original.front(), original.back(), 64 * MiB);
+  adversarial(original.back(), original.front(), 64 * MiB);
+  std::vector<Shape> shapes;
+  for (int bytes : {32, 512}) for (int nodes = 1; nodes <= 8192; nodes *= 2) {
+    shapes.push_back({nodes, bytes});
+    calibrate(shapes.back());
+  }
+  for (int x = 0; x < 14; ++x) for (int y = 0; y < 14; ++y)
+    pair_arm(shapes[x], shapes[y]);
+  for (int x = 0; x < 14; ++x) {
+    pair_arm(shapes[x], shapes[x + 14]);
+    pair_arm(shapes[x + 14], shapes[x]);
+  }
+  std::puts("{\"kind\":\"classes_done\",\"pairs\":224,\"ok\":true}");
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
+  if (argc > 1 && std::strcmp(argv[1], "classes") == 0) return class_campaign();
+  executable_only = argc > 3 && std::strcmp(argv[3], "exec-only") == 0;
   int cycles = argc > 1 ? std::atoi(argv[1]) : 1000;
   size_t cap = (argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 64) * MiB;
   if (cycles < 1000 || cap < 16 * MiB) return 2;
@@ -269,6 +339,9 @@ int main(int argc, char** argv) {
     live_bytes += shape.charge;
     size_t after_capture = free_bytes(stream);
     verify(shape, output);
+    CUDA(cudaGraphLaunch(live.front().exec, stream));
+    CUDA(cudaStreamSynchronize(stream));
+    verify(Shape{0, live.front().args}, output);
     std::printf("{\"kind\":\"cycle\",\"cycle\":%d,\"nodes\":%d,\"args\":%d,"
                 "\"live_count\":%zu,\"live_charge\":%zu,\"evictions\":%d,\"free_before\":%zu,"
                 "\"free_after_evictions\":%zu,\"free_after_capture\":%zu}\n",
