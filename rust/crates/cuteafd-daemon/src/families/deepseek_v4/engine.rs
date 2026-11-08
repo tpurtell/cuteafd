@@ -132,6 +132,7 @@ pub(crate) struct Engine<'a> {
     /// Per lane and rank: this step's context tables (gather and commit counts).
     context_units: RefCell<Vec<[context::ContextUnit; 2]>>,
     capture_only: std::cell::Cell<bool>,
+    declared_graphs: RefCell<Vec<cuteafd_loader::placement::inventory::DeclaredGraphSet<GraphKey>>>,
     graph_captures: std::cell::Cell<usize>,
     expert_graph_captures: std::cell::Cell<usize>,
     pub(super) graph_coverage: crate::shared::decode_graph::census::LaunchCoverage,
@@ -164,9 +165,9 @@ fn slot(layer: usize, ffn: bool, lane: usize) -> usize {
 }
 
 /// `exchange` result for a layer whose experts ran on this GPU.
-const LOCAL_EXPERTS: usize = usize::MAX;
+const LOCAL_EXPERTS: usize = cuteafd_loader::serving_capacity::v4_graphs::LOCAL_EXPERTS;
 /// `exchange` result for a layer whose routed experts were skipped.
-const SKIPPED_EXPERTS: usize = usize::MAX - 1;
+const SKIPPED_EXPERTS: usize = cuteafd_loader::serving_capacity::v4_graphs::SKIPPED_EXPERTS;
 
 /// Vocabulary logits rows a workspace holds (every decode/verify row; a prefill
 /// lands at most this many rows at once and downloads longer spans in chunks).
@@ -181,21 +182,15 @@ struct RowStep<'s> {
     tokens: &'s [u32],
 }
 
-/// Everything a captured decode segment bakes in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct GraphKey {
-    layer: usize,
-    rows: usize,
-    chunked: bool,
-    attention: &'static str,
-    table_width: usize,
-    table_stride: usize,
-    previous: usize,
-    tp2_broadcast: bool,
-    exchange_f32: bool,
+use cuteafd_loader::serving_capacity::v4_graphs::{V4GraphKey as GraphKey, TAIL_SEGMENT};
+
+trait GraphCoverage {
+    fn coverage_segments(self, rank: usize, skip_routed: bool, tp2_layer: bool,
+        draft_ready: bool, last_layer: usize, tap_layers: &[usize],
+        record: impl FnMut(usize, &'static str));
 }
 
-impl GraphKey {
+impl GraphCoverage for GraphKey {
     fn coverage_segments(self, rank: usize, skip_routed: bool, tp2_layer: bool,
         draft_ready: bool, last_layer: usize, tap_layers: &[usize],
         mut record: impl FnMut(usize, &'static str)) {
@@ -226,8 +221,7 @@ impl GraphKey {
     }
 }
 
-/// The decode step's tail (last post, taps, drafter KV, head) as a graph key layer.
-const TAIL_SEGMENT: usize = usize::MAX;
+fn startup_capture_allowed(warming: bool, declared: bool) -> bool { warming && declared }
 
 struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
 
@@ -594,6 +588,7 @@ impl<'a> Engine<'a> {
             context_units: RefCell::new(Vec::new()),
             exchange_policy: ExchangePolicy::from_env()?,
             capture_only: std::cell::Cell::new(false),
+            declared_graphs: RefCell::new(Vec::new()),
             graph_captures: std::cell::Cell::new(0),
             expert_graph_captures: std::cell::Cell::new(0),
             graph_coverage: crate::shared::decode_graph::census::LaunchCoverage::new(),
@@ -1228,8 +1223,7 @@ impl<'a> Engine<'a> {
             |lane, segment| self.coverage_launch(segment, rank, lane, key.rows, launch, reason));
     }
 
-    /// Launches `segment` through a captured graph for `key`, capturing it the
-    /// first time.
+    /// Replay a startup executable, otherwise run the segment eagerly.
     fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
         self.replay_on(0, key, segment)
     }
@@ -1238,9 +1232,11 @@ impl<'a> Engine<'a> {
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
         self.require_live()?;
         let mut key = key;
+        if !self.capture_only.get() {
         if let Some(tp2) = &self.tp2 {
             key.tp2_broadcast = tp2.broadcast();
             key.exchange_f32 = self.exchange_policy.is_f32(key.rows, self.decode_rows);
+        }
         }
         // Diagnostic copies must never become permanent graph nodes.
         if self.tp2.as_ref().is_some_and(|t| t.checking.get()) && !self.capture_only.get() {
@@ -1258,22 +1254,26 @@ impl<'a> Engine<'a> {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
+        // Only the startup warm loop may instantiate executables. Local/TP2
+        // experts and any undeclared traffic shape remain eager forever.
+        if !startup_capture_allowed(self.capture_only.get(),
+            self.declared_graphs.borrow().get(rank).is_some_and(|set| set.contains(&key))) {
+            self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::Eager, "outside-startup-set");
+            return segment();
+        }
         // SAFETY: capture records launches on that rank's stream; nothing in the
         // segment synchronizes the host.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
         let captured = segment();
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
+        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) })
+            .map(|exec| GraphExec(exec, self.library));
         captured?;
         let exec = exec?;
-        if !self.capture_only.get() {
-            self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::CaptureLaunch, "first-miss");
-            self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
-        }
         self.graph_captures.set(self.graph_captures.get() + 1);
         if key.attention.starts_with("tp2-") {
             self.expert_graph_captures.set(self.expert_graph_captures.get() + 1);
         }
-        graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        graphs.borrow_mut().insert(key, exec);
         Ok(())
     }
 
@@ -1885,29 +1885,148 @@ impl<'a> Engine<'a> {
             self.graph_captures.get())
     }
 
-    /// Every local-expert row shape is captured at startup, without executing
-    /// uninitialized routes or unmatched peer waits. Pointer ownership is fixed.
-    pub fn warm_local_graphs(&self) -> Result<()> {
-        self.prepare_workspaces()?;
-        if self.local_layers() == 0 { return Ok(()); }
-        self.warm_tp2_routers()?;
+    /// Capture declared attention and tail segments without launching unmatched
+    /// peer waits or uninitialized expert routes. Every buffer is persistent.
+    pub fn warm_segment_graphs(&self, transports: &mut [SparkLink<'_>], admitted_bytes: &[u64]) -> Result<Vec<i64>> {
+        use cuteafd_loader::serving_capacity::v4_graphs;
+        self.warm_local_graphs()?;
+        self.drain_state()?;
+        let ratios: Vec<_> = self.weights.layers.iter().map(|weights| weights.ratio).collect();
+        let spark_ranks = match transports.first_mut() {
+            Some(link) => link.exchange()?.ranks(), None => 0,
+        };
+        let reductions: Vec<_> = (0..ratios.len()).map(|layer| {
+            if self.skip_routed { SKIPPED_EXPERTS }
+            else if layer < self.local_layers() { LOCAL_EXPERTS } else { spark_ranks }
+        }).collect();
+        let keys = v4_graphs::v4_serving_graph_keys(&ratios, self.shape.units, self.decode_rows,
+            self.ranks(), &reductions, self.tp2.is_some(), self.exchange_policy.is_f32(1, self.decode_rows)).context("V4 startup graph geometry")?;
+        *self.declared_graphs.borrow_mut() = keys.iter().map(|bank|
+            cuteafd_loader::placement::inventory::DeclaredGraphSet::new(bank).map_err(anyhow::Error::msg))
+            .collect::<Result<Vec<_>>>()?;
+        let charged = v4_graphs::v4_startup_graphs(&ratios, self.shape.units, self.decode_rows,
+            self.ranks(), self.tp2.is_some()).context("V4 startup graph charge")?;
+        let declared_bytes: Vec<_> = charged.ranks.iter().map(|rank| rank.bytes).collect();
+        if admitted_bytes != declared_bytes {
+            tracing::warn!(?admitted_bytes, ?declared_bytes,
+                "V4 startup graph estimate differs from admitted owner; continuing capture without replanning (#1612, #1614)");
+        }
+        let expected: usize = keys.iter().map(Vec::len).sum();
+        let sample = || (0..self.ranks()).map(|rank| self.on(rank, ||
+            Ok(self.library.cuda_allocatable_memory_info()?.0))).collect::<Result<Vec<_>>>();
+        let before = sample()?;
+        let started = Instant::now();
+        tracing::warn!(graphs = expected, seed_bytes = v4_graphs::ESTIMATED_EXECUTABLE_SEED,
+            "V4 startup graphs use an Estimated executable seed pending V4 node/rate measurements (#1612, #1614)");
         self.capture_only.set(true);
-        let result = (|| {
-            let work = self.decode_workspace.borrow();
-            let w = work.as_ref().context("decode workspace")?;
-            for t in 1..=self.decode_rows {
-                for layer in 0..self.local_layers() {
-                    self.local_experts(layer, t, w, &w.slots[0], self.decode_rows, 0)?;
-                    if self.tp2_layer(layer) {
-                        let work = self.peer()?.decode_workspace.borrow();
-                        self.peer_experts(layer, 0, work.as_ref().context("peer decode workspace")?, t, true)?;
+        let result = (|| -> Result<()> {
+            let workspace = self.decode_workspace.borrow();
+            let w = workspace.as_ref().context("decode workspace")?;
+            for (rank, bank) in keys.iter().enumerate() {
+                for &key in bank {
+                    let placement = Placement::new(0, (0..self.decode_rows.div_ceil(256).max(1) as u32).collect());
+                    let mut tables = if key.chunked {
+                        metadata::verify_step(&[(&placement, 0, key.rows)], &self.shape, self.cfg.index_topk, self.c128_width)?
+                    } else {
+                        let rows: Vec<_> = (0..key.rows).map(|_| (&placement, 0)).collect();
+                        metadata::decode_step(&rows, &self.shape, self.cfg.index_topk, self.c128_width)?
+                    };
+                    tables.c4_groups = usize::from(key.attention == "c4");
+                    tables.c128_groups = usize::from(key.attention == "c128");
+                    tables.c128_lengths.fill(i32::from(key.attention == "c128"));
+                    tables.c4_table_width = key.table_width.max(1);
+                    tables.c4_table_stride = key.table_stride.max(1);
+                    tables.c4_page_table = vec![0; key.rows * tables.c4_table_stride];
+                    let peer_work = self.peer.as_ref().map(|peer| peer.decode_workspace.borrow());
+                    let own = if rank == 0 { w } else {
+                        peer_work.as_ref().and_then(|work| work.as_ref()).context("peer decode workspace")?
+                    };
+                    let lane = &own.slots[0];
+                    self.on(rank, || self.fill(&lane.tables, &tables))?;
+                    if self.context.is_some() && key.layer != TAIL_SEGMENT {
+                        self.put_context_tables(rank, &lane.tables, &tables, 0, false, &[])?;
                     }
+                    let scalar = Scalar::I32(key.rows as i32);
+                    let reduction = if rank == 0 { match transports.first_mut() {
+                        Some(link) => Some(link.exchange()?.reduction(0)), None => None,
+                    }} else { None };
+                    self.replay_on(rank, key, || {
+                        if key.layer == TAIL_SEGMENT {
+                            let last = self.weights.layers.len() - 1;
+                            if key.previous > 0 {
+                                self.post_layer(w, lane, 0, key.previous, reduction.clone(), scalar, last)?;
+                                self.tap(w, lane, last, key.rows)?;
+                            }
+                            self.write_draft_kv(w, lane, key.rows, self.decode_rows)?;
+                            return self.head_launch(&lane.stream_a, key.rows, key.rows, 0, w);
+                        }
+                        if rank == 1 {
+                            if key.layer > 0 { self.peer_post(key.layer - 1, lane, 0, own, scalar)?; }
+                            return self.peer_front(key.layer, &tables, lane, 0, own, scalar, self.decode_rows);
+                        }
+                        if key.layer == 0 {
+                            if self.embedding.device_gather() { self.gather_streams(lane, key.rows)?; }
+                            if let Some(work) = peer_work.as_ref().and_then(|work| work.as_ref()) {
+                                self.record_peer(0, "entry", DIRECT, true, 0, 0);
+                                self.exchange()?.push_to(0, DIRECT, lane.stream_a.buffer.ptr,
+                                    work.slots[0].stream_a.buffer.ptr, key.rows * 4 * self.cfg.dim * 2)?;
+                            }
+                        }
+                        if key.previous > 0 {
+                            self.post_layer(w, lane, 0, key.previous, reduction.clone(), scalar, key.layer - 1)?;
+                            self.tap(w, lane, key.layer - 1, key.rows)?;
+                        }
+                        let weights = &self.weights.layers[key.layer];
+                        if self.peer.is_some() {
+                            self.attention_split(key.layer, weights, &tables, lane, 0, w, scalar, self.decode_rows)
+                        } else { self.attention(key.layer, weights, &tables, lane, w, scalar, self.decode_rows) }
+                    })?;
+                    // Captures enqueue no executable launches; drain metadata uploads
+                    // before reusing the startup step's staging allocation.
+                    self.drain_state()?;
                 }
             }
             Ok(())
         })();
+        let drained = self.drain_state();
         self.capture_only.set(false);
-        result
+        result?;
+        drained?;
+        if self.graph_captures.get() != expected {
+            tracing::error!(declared = expected, captured = self.graph_captures.get(),
+                "V4 startup capture count differs; missing keys remain eager and actual storage is measured");
+        }
+        for (rank, declared) in self.declared_graphs.borrow().iter().enumerate() {
+            tracing::info!(rank, executables = declared.len(),
+                declared_graphs = %declared.fingerprint(rank as u8).map_err(anyhow::Error::msg)?,
+                "V4 startup graph key coverage");
+            let graphs = if rank == 0 { self.graphs.borrow() } else { self.peer()?.graphs.borrow() };
+            if let Err(error) = declared.verify(graphs.keys()) {
+                let missing: Vec<_> = keys[rank].iter().filter(|key| !graphs.contains_key(key)).collect();
+                let extra: Vec<_> = graphs.keys().filter(|key| !declared.contains(key)).collect();
+                tracing::error!(rank, declared = declared.len(), captured = graphs.len(), ?missing, ?extra, %error,
+                    "V4 startup key coverage differs; missing keys remain eager and actual storage is measured");
+            }
+        }
+        let after = sample()?;
+        let bytes: Vec<_> = before.iter().zip(after).map(|(&before, after)| before as i64 - after as i64).collect();
+        tracing::info!(graphs = expected, elapsed_ms = started.elapsed().as_millis() as u64,
+            graph_bytes = bytes.iter().sum::<i64>(), graph_bytes_by_owner = ?bytes,
+            graph_bytes_charged = charged.ranks.iter().map(|rank| rank.bytes).sum::<u64>(),
+            "V4 decode graphs captured at startup");
+        for (rank, &measured) in bytes.iter().enumerate() {
+            if measured > charged.bytes(rank) as i64 {
+                tracing::warn!(rank, measured, estimated = charged.bytes(rank),
+                    "V4 startup graph capture exceeds executable estimate (#1612, #1614)");
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Expert kernels intentionally remain eager, including route-source checks.
+    pub fn warm_local_graphs(&self) -> Result<()> {
+        self.prepare_workspaces()?;
+        self.warm_tp2_routers()
     }
 
     /// A prefill unit's wave on the link's transport worker: routes and wire
@@ -2058,6 +2177,32 @@ impl Logits {
 
 #[cfg(test)]
 mod coverage_tests {
+    use super::GraphCoverage;
+
+    #[test]
+    fn captures_require_both_startup_phase_and_declared_identity() {
+        for warming in [false, true] {
+            for declared in [false, true] {
+                assert_eq!(super::startup_capture_allowed(warming, declared), warming && declared);
+            }
+        }
+        let banks = cuteafd_loader::serving_capacity::v4_graphs::v4_serving_graph_keys(
+            &[0, 4, 128], 48, 16, 2, &[2; 3], true, false).unwrap();
+        for bank in banks {
+            let declared = cuteafd_loader::placement::inventory::DeclaredGraphSet::new(&bank).unwrap();
+            declared.verify(bank.iter()).unwrap();
+            assert!(declared.verify(bank.iter().skip(1)).is_err());
+            let extra = super::GraphKey { rows: 17, ..bank[0] };
+            assert!(!declared.contains(&extra));
+            assert!(declared.verify(bank.iter().chain(std::iter::once(&extra))).is_err());
+            for attention in ["local-experts", "tp2-replicated", "tp2-broadcast", "draft"] {
+                let eager = super::GraphKey { attention, ..bank[0] };
+                assert!(!declared.contains(&eager));
+                assert!(!super::startup_capture_allowed(true, declared.contains(&eager)));
+            }
+        }
+    }
+
     #[test]
     fn legacy_coverage_matches_attention_expert_and_tail_composition() {
         let base = super::GraphKey { layer: 3, rows: 33, chunked: true, attention: "c4",

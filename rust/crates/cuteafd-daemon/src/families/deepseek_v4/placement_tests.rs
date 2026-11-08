@@ -166,6 +166,19 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
         exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
     let facts = admission::inputs(&cli.engine, &inputs)?;
     let (placement, _, _) = admission::admit(&facts)?;
+    let units = super::pool::PoolShape::context_units(
+        super::pool::PoolShape::units_for(placement.pool_tokens as usize, facts.sequences as usize),
+        placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context);
+    let graphs = cuteafd_loader::serving_capacity::v4_graphs::v4_startup_graphs(
+        &cfg.compress_ratios, units, inputs.decode_rows, case.rtx, placement.tp2.is_some()).unwrap();
+    for (rank, items) in placement.items.iter().enumerate() {
+        let owners: Vec<_> = items.iter().filter(|item| item.group == format!("startup graphs: v4.graphs.{rank}")).collect();
+        assert_eq!(owners.len(), 1, "one Ready graph owner per physical rank");
+        assert_eq!(owners[0].bytes, graphs.at_ready(rank), "plan/serve startup graph charge");
+        assert_eq!(owners[0].basis, cuteafd_core::memory_layout::Basis::Estimated);
+        assert_eq!(graphs.growth(rank), 0);
+    }
+
     crate::shared::context::pool_context("deepseek_v4", facts.serving_context, usize::try_from(placement.pool_tokens)?)?;
     assert_eq!(placement.residual.last(), Some(&cuteafd_loader::placement::ResidualHome::Owned(0)),
         "V4 final residual must live on the rank0 head, not on both ranks");

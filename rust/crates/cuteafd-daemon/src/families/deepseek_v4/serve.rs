@@ -114,8 +114,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         hub.clone(), api.serve(profile.clone(), &args.engine.snapshot)?);
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
-    // The ready ledger (placement gate): one report at readiness, before any request captures
-    // lazy graphs or loads more code.
+    // Startup graph executables are resident before this Ready ledger;
+    // undeclared request shapes remain eager and never capture.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "DeepSeek V4 API is ready");
     tokio::select! {

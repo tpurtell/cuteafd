@@ -1163,6 +1163,47 @@ impl Recipe for PreparedV4<'_> {
                 rank_sets: vec![(0..inputs.spark_ranks as u8).collect()],
             });
         }
+        // Graph classes change only when the pool crosses a width boundary.
+        // One opaque Ready-resident owner per physical rank, never growth.
+        let graph_choices: Vec<_> = match onboard_variable {
+            Some(variable) => self.counts.iter().enumerate().map(|(option, &count)|
+                (Activation::choice(variable, option), self.tp2 && count > 0 || !inputs.draft_half.is_empty())).collect(),
+            None => vec![(Activation::always(), !inputs.draft_half.is_empty())],
+        };
+        for (activation, tp2) in graph_choices {
+        for gpu in 0..inputs.gpus.len() {
+            let mut pieces: Vec<BytePiece> = Vec::new();
+            let mut first = 1;
+            while first <= self.maximum_pages {
+                let units = super::host::pool_units(first, self.page_rows, inputs.sequences.max(1),
+                    self.attention == AttentionPlacement::Context)?;
+                let graphs = crate::serving_capacity::v4_graphs::v4_startup_graphs(
+                    &inputs.cfg.compress_ratios, units as usize, inputs.decode_rows as usize, inputs.gpus.len(), tp2)
+                    .ok_or(Refusal::Overflow("V4 startup graph inventory"))?;
+                // Find the end of this exact class-count interval, logarithmically.
+                let mut low = first;
+                let mut high = self.maximum_pages;
+                while low < high {
+                    let mid = low + (high - low).div_ceil(2);
+                    let units = super::host::pool_units(mid, self.page_rows, inputs.sequences.max(1),
+                        self.attention == AttentionPlacement::Context)?;
+                    let candidate = crate::serving_capacity::v4_graphs::v4_startup_graphs(
+                        &inputs.cfg.compress_ratios, units as usize, inputs.decode_rows as usize, inputs.gpus.len(), tp2)
+                        .ok_or(Refusal::Overflow("V4 startup graph inventory"))?;
+                    if candidate.bytes(gpu) == graphs.bytes(gpu) { low = mid; } else { high = mid - 1; }
+                }
+                pieces.push(BytePiece { first, last: low, bytes_at_first: graphs.bytes(gpu),
+                    bytes_per_page: 0, granularity: 1, backings: 1 });
+                first = low + 1;
+            }
+            let mut component = serving::startup_graph_component(&format!("v4.graphs.{gpu}"),
+                Location::coordinator(gpu as u8), crate::placement::GraphRank::estimated(0, pieces[0].bytes_at_first),
+                self.maximum_pages)?;
+            component.bytes = ByteCurve(pieces);
+            component.activation = activation.clone();
+            owners.components.push(component);
+        }
+        }
         if let Some(variable) = onboard_variable {
             for (option, &count) in self.counts.iter().enumerate() {
                 let activation = Activation::choice(variable, option);

@@ -144,30 +144,7 @@ impl StepTables {
 /// one decode/verify step write distinct rows there (`context_scratch_units` at 64 decode rows).
 pub(crate) const C4_SCRATCH_UNITS: usize = 1;
 
-/// The geometry class a live C4 page count belongs to: its next power of two, clamped to the
-/// pool's page count. The indexer's page-table width is a baked launch scalar (its chunk loop
-/// runs `ceil(width / supertile_pages)` times), and a decode step's live page count grows with
-/// the position, so an unclassed width makes every position a distinct captured graph. Classes
-/// bound that space; rounding up only adds page-table columns the scorer masks, because each
-/// row's visibility (`c4_visible`, in index rows) is unchanged.
-pub(crate) fn c4_width_class(width: usize, units: usize) -> usize {
-    width.max(1).next_power_of_two().min(units.max(1))
-}
-
-/// Every class [`c4_width_class`] can return for a pool of `units` pages, ascending.
-pub(crate) fn c4_width_classes(units: usize) -> Vec<usize> {
-    let units = units.max(1);
-    let mut classes = vec![1usize];
-    while let Some(&last) = classes.last() {
-        match last.checked_mul(2) {
-            Some(next) if next <= units => classes.push(next),
-            _ => break,
-        }
-    }
-    // A clamped class (a pool that is not a power of two) is its own class.
-    if classes.last().copied() != Some(units) { classes.push(units); }
-    classes
-}
+pub(crate) use cuteafd_loader::serving_capacity::v4_graphs::{c4_width_class, c4_width_classes};
 
 /// Tables for a prefill chunk of one sequence: rows are positions
 /// `start..start + tokens`; the caches already hold `start` tokens. The first

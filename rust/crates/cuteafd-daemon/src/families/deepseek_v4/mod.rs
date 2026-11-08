@@ -644,7 +644,7 @@ pub(crate) fn with_engine<T>(
         cuteafd_bench::context::set_resolved("attention-by-kind", &serde_json::to_string(&placement.attention_by_kind)?);
         (placement, host_prefix, expert_usage, embedding, model, shares)
     };
-    let (placement, host_prefix, expert_usage, embedding, model, mut shares) = placement;
+    let (mut placement, host_prefix, expert_usage, embedding, model, mut shares) = placement;
     let context_mode = if check_modes(&placement, split_device.is_some(), &loaded.cfg)? {
         Some(cuteafd_loader::placement::families::deepseek_v4::manifest_context(&loaded.manifest, loaded.family,
             loaded.cfg.n_heads, caps["decode_rows"].as_u64().context("decode_rows")?)
@@ -808,7 +808,35 @@ pub(crate) fn with_engine<T>(
         if remote_experts { tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm"); }
         engine.prepare_workspaces()?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
-        engine.warm_local_graphs()?;
+        let admitted_graph_bytes = placement.items.iter().enumerate().map(|(rank, items)| {
+            let group = format!("startup graphs: v4.graphs.{rank}");
+            let owners: Vec<_> = items.iter().filter(|item| item.group == group).collect();
+            if owners.len() != 1 {
+                tracing::warn!(rank, owners = owners.len(), "V4 admitted startup graph owner count differs; continuing capture");
+            }
+            owners.iter().map(|item| item.bytes).sum()
+        }).collect::<Vec<u64>>();
+        let graph_bytes = engine.warm_segment_graphs(&mut transports, &admitted_graph_bytes)?;
+        for (rank, &bytes) in graph_bytes.iter().enumerate() {
+            let group = format!("startup graphs: v4.graphs.{rank}");
+            let Ok(bytes) = u64::try_from(bytes) else {
+                // A signed free-memory delta can be negative when another owner
+                // retires during capture. Keep the estimate, not a fake zero.
+                tracing::warn!(rank, delta = bytes, "V4 startup graph sample increased free memory; retaining estimate");
+                continue;
+            };
+            if let Some(item) = placement.items[rank].iter_mut().find(|item| item.group == group) {
+                item.bytes = bytes;
+                item.basis = cuteafd_core::memory_layout::Basis::Calibrated;
+            } else {
+                placement.items[rank].push(cuteafd_core::memory_layout::Item {
+                    category: cuteafd_core::memory_layout::Category::Runtime, group, format: String::new(), bytes,
+                    basis: cuteafd_core::memory_layout::Basis::Calibrated,
+                    lifetime: cuteafd_core::memory_layout::ItemLifetime::ReadyResident,
+                });
+            }
+        }
+        cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
         engine.check_routes(&mut transports, &runtime)?;
         let (graphs0, graphs1, captures) = engine.graph_inventory();
         tracing::info!(graphs0, graphs1, captures, units = engine.shape.units,
@@ -1295,7 +1323,7 @@ mod program_selection_tests {
             .split("body(&engine, &mut transports, &runtime)").next().unwrap();
         let install = startup.find("engine.install_local(local)").unwrap();
         let attach = startup.find("engine.attach_context(").unwrap();
-        let capture = startup.find("engine.warm_local_graphs()").unwrap();
+        let capture = startup.find("engine.warm_segment_graphs(").unwrap();
         assert!(install < attach && attach < capture,
             "context auto plan must see resident draft experts and precede graph capture");
         assert_eq!(startup.matches("engine.attach_context(").count(), 1);

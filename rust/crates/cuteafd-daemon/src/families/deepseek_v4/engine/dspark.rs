@@ -127,6 +127,9 @@ impl<'a> Engine<'a> {
         ensure!(self.draft_ready(), "dSpark stage experts are not resident on the coordinator");
         let h = self.cfg.dim;
         let rows = draft_rows(requests.len(), block, self.cfg.dspark_block_size, self.decode_rows, inputs.len())?;
+        let _coverage_step = self.graph_coverage.step("draft", requests.len(), rows);
+        self.coverage_launch("draft", 0, 0, rows,
+            crate::shared::decode_graph::census::Launch::Eager, "dspark-eager");
         let slot = &self.decode_workspace;
         if slot.borrow().is_none() {
             *slot.borrow_mut() = Some(self.workspace(self.decode_rows, 1, false)?);

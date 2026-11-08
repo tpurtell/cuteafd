@@ -13,18 +13,11 @@ pub use host::{pool_units, HostPrefix, PinnedTables, V4Host};
 
 use crate::families::deepseek_v4::DeepseekV4Config;
 use crate::placement::*;
-use crate::placement::inventory::GraphSet;
 use crate::serving_capacity::{deepseek_v4_cache_geometry, deepseek_v4_expert_cost, deepseek_v4_expert_exchange_bytes,
     deepseek_v4_layer_unit_bytes, deepseek_v4_peer_exchange_bytes, V4ExpertCost,
     V4WorkspaceRank};
 use cuteafd_core::memory_layout::{Basis, Category};
 
-/// Lazily captured decode graphs per role (1 GPU, lead, peer): V4 keys its
-/// segment graphs by the exact compressed-table width, so the set grows with
-/// traffic after ready (rc3: +0.5-0.65 GiB Flash, +1.2-1.3 GiB Pro within a
-/// smoke run). Reserved as growth beside the pool, never part of the ready
-/// ledger (`inventory::GraphSet::budget`).
-pub const GRAPH_BYTES: [u64; 3] = [gib(35), gib(40), gib(25)];
 /// Step workspace allowance per role at 4096 prefill rows, used only when no
 /// program manifest gives the exact geometry.
 pub const WORKSPACE_BYTES: [u64; 3] = [gib(480), gib(414), gib(355)];
@@ -306,7 +299,6 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), Place
                 mul(cache.retained_mark_bytes, inputs.mark_slots, "V4 marks")?, Basis::Formula));
         }
         demands.push(Demand::new(gpu, Category::Workspace, "steps", workspace, basis));
-        demands.push(GraphSet::budget(&[GRAPH_BYTES[role]]).demand(0).on(gpu));
         if gpus == 2 {
             demands.push(Demand::new(gpu, Category::Transport, "peer exchange",
                 deepseek_v4_peer_exchange_bytes(hidden, inputs.prefill_rows, inputs.decode_rows, true, inputs.exchange_f32, inputs.prefill_waves)
@@ -480,6 +472,55 @@ mod default_tests {
         let prepared = prepare(input)?;
         let request = production_request(input);
         prepared.admit(request).map(|admitted| admitted.placement)
+    }
+
+    #[test]
+    fn startup_graph_charge_tracks_selected_pool_geometry_without_growth() {
+        use crate::serving_capacity::v4_graphs::v4_startup_graphs;
+        for ranks in [1, 2] {
+            for tokens in [256, 16_128, 16_384, 16_640, 262_144] {
+                let mut input = plan_inputs(&context_cfg());
+                input.gpus.truncate(ranks);
+                input.weights = test_weights(ranks);
+                input.attention = Some(AttentionPlacement::Heads);
+                input.decode_rows = 16;
+                input.max_context = tokens;
+                input.serving_context = crate::placement::planner::Context::pinned(tokens);
+                input.requested_pool = Some(tokens);
+                let placed = admitted(&input).unwrap();
+                let units = super::host::pool_units(placed.pool_tokens / 256, 256, input.sequences, false).unwrap();
+                let expected = v4_startup_graphs(&input.cfg.compress_ratios, units as usize, 16, ranks, false).unwrap();
+                for (rank, items) in placed.items.iter().enumerate() {
+                    let owners: Vec<_> = items.iter().filter(|item| item.group == format!("startup graphs: v4.graphs.{rank}")).collect();
+                    assert_eq!(owners.len(), 1);
+                    assert_eq!(owners[0].bytes, expected.at_ready(rank));
+                    assert_eq!(owners[0].basis, cuteafd_core::memory_layout::Basis::Estimated);
+                    assert_eq!(expected.growth(rank), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn startup_graph_owner_survives_gpu_reserve_override() {
+        cuteafd_core::memory_policy::MemoryPolicy {
+            gpu_reserve: Some(64 << 20), ..Default::default()
+        }.scoped(|| {
+            let input = plan_inputs(&context_cfg());
+            let placed = admitted(&input).unwrap();
+            let context = placed.attention_placement == AttentionPlacement::Context;
+            let page_rows = if context { 512 } else { 256 };
+            let units = super::host::pool_units(placed.pool_tokens / page_rows, page_rows,
+                input.sequences, context).unwrap();
+            let expected = crate::serving_capacity::v4_graphs::v4_startup_graphs(
+                &input.cfg.compress_ratios, units as usize, input.decode_rows as usize, 2, false).unwrap();
+            for (rank, items) in placed.items.iter().enumerate() {
+                let owners: Vec<_> = items.iter().filter(|item|
+                    item.group == format!("startup graphs: v4.graphs.{rank}")).collect();
+                assert_eq!(owners.len(), 1, "GPU_RESERVE must retain the named Ready graph owner (#1612)");
+                assert_eq!(owners[0].bytes, expected.bytes(rank), "exact admitted graph owner check");
+            }
+        });
     }
 
     /// The pre-weight base and the code still to load are named Runtime owners

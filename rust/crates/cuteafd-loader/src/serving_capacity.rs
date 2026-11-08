@@ -71,6 +71,7 @@ pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratc
     GlmfScratch, GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS,
     GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};
 pub mod qwen_graphs;
+pub mod v4_graphs;
 mod v4_placement;
 pub use v4_placement::{deepseek_v4_expert_cost, deepseek_v4_native_workspace, deepseek_v4_tp2_expert_cost, deepseek_v4_tp2_native_workspace, deepseek_v4_tp2_workspace, V4ExpertCost};
 mod v4_workspace;
