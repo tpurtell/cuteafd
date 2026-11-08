@@ -1291,8 +1291,9 @@ const MEASURED_GLM_GRAPHS: [MeasuredGraphSet; 8] = [
         sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
     MeasuredGraphSet { rank: 0, keys: 15_549, fingerprint: "5a2e6d744e3c72d4b192e3e8732ac7681eb2f4f9d44acfa8216420f9df693f70",
         bytes: 2_740_977_664, layout: "ml4-exl3; attention/Heads; 1 rank",
-        census: "ml4 1x census memory-census-20261108T172510Z-raptor-coordinator-57-0",
-        commit: "3baa1a4ab72f8e378c07abd0d22ac473db53a840",
+        census: "ml4-exl3-min-ml4-r1 device 0: 15549 capture instantiate records, sum 2740977664 \
+                 (memory-census-20261108T224347Z-raptor-coordinator-58-0)",
+        commit: "c079db496f217208d7a673d0089e4bdd1c0bc913",
         sparkinfer: "851c42833da26711c68868014cad2fc043916416" },
     MeasuredGraphSet { rank: 0, keys: 15_549, fingerprint: "bc9d9f1d011860a37be849433d80b8b4c728751d7a5bbd8e483d4e147d80c031",
         bytes: 3_445_620_736, layout: "ml4-exl3; attention/Context; 2 ranks",
