@@ -443,7 +443,12 @@ impl<'a> IndexSelectionWave<'a> {
             self.storage.stream.require_complete()?;
             self.ready = None;
             self.graph = self.graphs.launch(&key).map(|owner| (owner.raw, key.clone()));
-            return Ok(cached.is_some() || self.graphs.capture_allowed(&key));
+            let graphable = cached.is_some() || self.graphs.capture_allowed(&key);
+            if !graphable && super::graph_policy::captures_shape(fingerprint[1] as u32) {
+                super::graph_policy::note_miss(format!("index_selection rows={}", fingerprint[1]),
+                    || format!("key={fingerprint:?} retained={}", self.graphs.len()));
+            }
+            return Ok(graphable);
         }
         if let Some(limit) = fixed_limit {
             ensure!(!self.in_flight, "index selection pending");

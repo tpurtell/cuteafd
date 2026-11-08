@@ -100,7 +100,13 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let device = self.terminal.device;
         let terminal = self.terminal.get();
         device.run(|| unsafe {
-            let graph = self.graphs.get(&(terminal.width(), usize::from(sampling), requests)).map(|owner| owner.raw);
+            let key = (terminal.width(), usize::from(sampling), requests);
+            if self.graphs.get(&key).is_none() && !self.graphs.capture_allowed(&key) {
+                crate::families::deepseek_v41::graph_policy::note_miss(
+                    format!("dspark_terminal width={} sampling={sampling} requests={requests}", terminal.width()),
+                    || format!("width={} sampling={sampling} requests={requests}", terminal.width()));
+            }
+            let graph = self.graphs.get(&key).map(|owner| owner.raw);
             let span = terminal.timing.begin(if sampling { "graph_selector_confidence" } else { "graph_terminal_norm" },
                 None, requests * terminal.width, terminal.stream.raw)?;
             crate::shared::decode_graph::census::dispatch(device.library, terminal.stream.raw, c"dspark", requests,

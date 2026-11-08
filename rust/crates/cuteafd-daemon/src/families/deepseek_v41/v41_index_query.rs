@@ -475,6 +475,12 @@ impl IndexQueryWave<'_, '_> {
         if !super::graph_policy::captures_shape(rows)
             || (self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none()
                 && !self.graphs.capture_allowed(self.weights.layer, rows)) {
+            if super::graph_policy::captures_shape(rows)
+                && self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none()
+                && !self.graphs.capture_allowed(self.weights.layer, rows) {
+                super::graph_policy::note_miss(format!("index_query rows={rows} layer={}", self.weights.layer),
+                    || format!("capacity={}", self.capacity));
+            }
             unsafe { self.execute(rows)?; }
             self.origin = Some(binding);
             self.tokens.extend_from_slice(tokens);

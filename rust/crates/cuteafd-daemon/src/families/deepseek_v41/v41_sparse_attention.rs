@@ -814,6 +814,11 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             || exact_small_shape(batch.is_some(), rows, self.batch_rows)) {
             // Exact fingerprints can include launch recipes beyond row count.
             // Freeze the bounded bank rather than evicting and recapturing them.
+            if cached.is_none() && !self.window.is_windowed()
+                && super::graph_policy::captures_shape(rows as u32) && !self.graphs.capture_allowed(&key) {
+                super::graph_policy::note_miss(format!("sparse_attention rows={rows} layer={layer}"),
+                    || format!("windowed={} batch={}", self.window.is_windowed(), batch.is_some()));
+            }
             tracing::debug!(target: "cuteafd::target_step", layer, rows,
                 retained=self.graph_count(layer), "V4.1 sparse attention eager binding");
             unsafe {

@@ -736,6 +736,12 @@ impl WindowWave<'_, '_> {
             || !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed()
             || (!self.graphs.contains(&(prepared.rows, state.owner))
                 && !self.graphs.capture_allowed(&(prepared.rows, state.owner)));
+        if !self.window.is_windowed() && super::graph_policy::captures_shape(prepared.rows as u32)
+            && !self.graphs.contains(&(prepared.rows, state.owner))
+            && !self.graphs.capture_allowed(&(prepared.rows, state.owner)) {
+            super::graph_policy::note_miss(format!("window_query rows={} layer={}", prepared.rows, self.weights.layer),
+                || format!("windowed={} forced={forced_eager}", self.window.is_windowed()));
+        }
         if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
         let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
@@ -831,6 +837,12 @@ impl WindowWave<'_, '_> {
                 // row-0 plane pointers): run it once eagerly, never capture it.
                 // Launch and return: the chain orders consumers (outside a
                 // chain scope `finish` drains on the host as before).
+                if !self.window.is_windowed() && super::graph_policy::captures_shape(prepared.rows as u32)
+                    && !self.graphs.contains(&(prepared.rows, state.owner))
+                    && !self.graphs.capture_allowed(&(prepared.rows, state.owner)) {
+                    super::graph_policy::note_miss(format!("window_execute rows={} layer={}", prepared.rows, self.weights.layer),
+                        || format!("windowed={}", self.window.is_windowed()));
+                }
                 let launched = self.upload(&prepared).and_then(|()| unsafe { self.enqueue(prepared.rows) });
                 launched.and(unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw) })?;
                 self.ready = Some(prepared);

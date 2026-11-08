@@ -1031,6 +1031,12 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             || !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed()
             || (!self.retained_graphs.contains(&(prepared.rows, state.owner))
                 && !self.retained_graphs.capture_allowed(&(prepared.rows, state.owner)));
+        if !self.window.is_windowed() && super::graph_policy::captures_shape(prepared.rows as u32)
+            && !self.retained_graphs.contains(&(prepared.rows, state.owner))
+            && !self.retained_graphs.capture_allowed(&(prepared.rows, state.owner)) {
+            super::graph_policy::note_miss(format!("compressor_query rows={} layer={}", prepared.rows, self.weights.layer),
+                || format!("windowed={} forced={forced_eager}", self.window.is_windowed()));
+        }
         if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
         let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
@@ -1111,6 +1117,12 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         let uncaptured = !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed()
             || (!self.retained_graphs.contains(&(prepared.rows, state.owner))
                 && !self.retained_graphs.capture_allowed(&(prepared.rows, state.owner)));
+        if !self.window.is_windowed() && super::graph_policy::captures_shape(prepared.rows as u32)
+            && !self.retained_graphs.contains(&(prepared.rows, state.owner))
+            && !self.retained_graphs.capture_allowed(&(prepared.rows, state.owner)) {
+            super::graph_policy::note_miss(format!("compressor_execute rows={} layer={}", prepared.rows, self.weights.layer),
+                || format!("windowed={}", self.window.is_windowed()));
+        }
         if crate::shared::memory::chain::active() && self.pending_query.is_none()
             && (uncaptured || self.graph.is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner)) {
             // Order the producer on the chain (forked from the query's

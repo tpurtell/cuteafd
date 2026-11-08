@@ -52,6 +52,14 @@ pub(super) fn captures_shape(rows: u32) -> bool {
         && FIXED_SHAPES.get().is_none_or(|shapes| shapes.contains(&rows))
 }
 
+/// Records one eager run of a shape the policy would graph but the sealed
+/// startup set lacks. Every site that chooses eager for that reason reports
+/// through here, so `/v1/stats["graph_missing_variants"]` holds one entry per
+/// variant and the first execution logs one structured warning.
+pub(super) fn note_miss(shape: String, context: impl FnOnce() -> String) {
+    crate::shared::decode_graph::note_eager("deepseek_v41", &shape, context);
+}
+
 /// The exact decode rows the sealed startup capture records: the small card's
 /// fixed set when one is selected, else every verification row. The capture and
 /// the serving decision read this one list, so no captured row is unreachable.

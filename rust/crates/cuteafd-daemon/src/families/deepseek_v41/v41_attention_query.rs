@@ -548,6 +548,12 @@ impl AttentionQueryWave<'_, '_> {
             if self.window.is_windowed() || !super::graph_policy::captures_shape(rows)
                 || (self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none()
                     && !self.graphs.capture_allowed(self.weights.layer, rows)) {
+                if !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+                    && self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none()
+                    && !self.graphs.capture_allowed(self.weights.layer, rows) {
+                    super::graph_policy::note_miss(format!("attention_query rows={rows} layer={}", self.weights.layer),
+                        || format!("windowed={}", self.window.is_windowed()));
+                }
                 unsafe { self.execute(rows)?; }
                 return Ok(());
             }

@@ -106,6 +106,11 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
         if let Some(captured) = chain.graphs.get(&(count, chain.width)) {
             ensure!(captured.pins == reads.each_ref().map(|read| read.owner), "distributed draft capture owner differs");
         }
+        if !chain.has_graph(count) && !chain.capture_allowed(count) {
+            crate::families::deepseek_v41::graph_policy::note_miss(
+                format!("dspark_chain count={count} width={}", chain.width),
+                || format!("count={count} width={}", chain.width));
+        }
         let pending = PendingDraft { count, reads, warming: !chain.has_graph(count) && chain.graphs.capture_allowed(&(count, chain.width)) && !crate::shared::decode_graph::census::eager("dspark"), armed: true,
             library: chain.stream.library, stream: chain.stream.raw,
             peers: chain.stages.each_ref().map(DsparkStage::peer_stream) };

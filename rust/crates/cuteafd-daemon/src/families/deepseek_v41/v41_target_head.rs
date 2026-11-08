@@ -258,8 +258,12 @@ impl TargetHeadWave<'_, '_> {
     /// Whether this row count runs a captured executable. A shape outside the
     /// sealed startup inventory runs eagerly and allocates nothing.
     fn graphed(&self, rows: usize) -> bool {
-        self.graph(rows).is_some()
-            || (super::graph_policy::captures_shape(rows as u32) && self.graphs.capture_allowed(rows))
+        let retained = self.graph(rows).is_some();
+        if !retained && super::graph_policy::captures_shape(rows as u32) && !self.graphs.capture_allowed(rows) {
+            super::graph_policy::note_miss(format!("target_head rows={rows}"),
+                || format!("capacity={}", self.capacity));
+        }
+        retained || (super::graph_policy::captures_shape(rows as u32) && self.graphs.capture_allowed(rows))
     }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
         self.invalidate();

@@ -821,6 +821,12 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         if self.window.is_windowed() || !super::graph_policy::captures_shape(rows)
             || (self.graphs.get_shape(self.layer, self.weights, rows).is_none()
                 && !self.graphs.capture_allowed(self.layer, rows)) {
+            if !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+                && self.graphs.get_shape(self.layer, self.weights, rows).is_none()
+                && !self.graphs.capture_allowed(self.layer, rows) {
+                super::graph_policy::note_miss(format!("backbone_router rows={rows} layer={}", self.layer),
+                    || format!("capacity={} windowed={}", self.capacity, self.window.is_windowed()));
+            }
             return unsafe { self.execute_counted(rows, phase) };
         }
         if self
@@ -884,6 +890,11 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         // SAFETY: this wave retains all queued input and output storage.
         unsafe { crate::shared::memory::chain::finish_or_wait(self.stream(),
             (!cold || !captures) && device_read).await?; }
+        if cold && !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+            && !self.graphs.capture_allowed(self.layer, rows) {
+            super::graph_policy::note_miss(format!("backbone_router rows={rows} layer={}", self.layer),
+                || format!("capacity={} windowed={}", self.capacity, self.window.is_windowed()));
+        }
         if cold && !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
             && self.graphs.capture_allowed(self.layer, rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {

@@ -143,6 +143,13 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         self.ready_rows = None;
         if self.window.is_windowed() || !crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32)
             || (self.graphs.get(gathered.rows).is_none() && !self.graphs.capture_allowed(gathered.rows)) {
+            if !self.window.is_windowed()
+                && crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32)
+                && self.graphs.get(gathered.rows).is_none() && !self.graphs.capture_allowed(gathered.rows) {
+                crate::families::deepseek_v41::graph_policy::note_miss(
+                    format!("engram_gate rows={} layer={}", gathered.rows, self.layer()),
+                    || format!("capacity={} windowed={}", self.capacity, self.window.is_windowed()));
+            }
             return unsafe { self.execute(residual, gathered) };
         }
         if self.graphs.get(gathered.rows).is_none() {

@@ -767,14 +767,20 @@ mod tests {
                 }
             }
         }
-        // The prefill slots and the drafter each declare their own set, so a
-        // priced census row can never charge less for a superset geometry.
+        // The prefill slots and the drafter each declare their own set, so the
+        // declared executables grow with either. Bytes are only monotone
+        // within one basis: the ceiling rate can round a subset's estimate a
+        // few KiB above the measured superset row, which is exact for its own
+        // geometry and must not be inflated to match an estimate.
         assert!(startup_graphs(96 << 30, 1, 3, true).executables
             >= startup_graphs(96 << 30, 1, 3, false).executables);
         assert!(startup_graphs(96 << 30, 1, 3, true).executables
             >= startup_graphs(96 << 30, 1, 1, true).executables);
-        assert!(startup_graphs(96 << 30, 1, 3, true).bytes
-            >= startup_graphs(96 << 30, 1, 1, true).bytes);
+        assert!(startup_graphs(96 << 30, 1, 1, true).bytes
+            >= startup_graphs(96 << 30, 1, 1, false).bytes);
+        let row = startup_graphs(96 << 30, 1, 3, true);
+        assert_eq!(row.basis, Basis::Calibrated, "the 1x RTX row is measured");
+        assert_eq!(row.bytes, 3_527_409_664);
     }
 
     #[test]
