@@ -963,11 +963,27 @@ mod tests {
         assert_eq!(snapshot().peak[&(Space::Device, 9)], 3015);
     }
 
+    /// Graph capture and instantiate allocate driver storage this ledger never
+    /// sees: a subject names that work in a failure dump without pretending it
+    /// is a checkpoint tensor (no stem, so it never joins the weights table).
+    #[test]
+    fn subject_names_non_tensor_work_without_a_weights_stem() {
+        let _ledger = test_guard();
+        {
+            let _scope = scope("test/graph");
+            let _subject = subject("decode graph rank=0 segment=1 rows=64");
+            let (key, name) = current_key(Space::Device, 12, TEST);
+            assert_eq!(name, Some("decode graph rank=0 segment=1 rows=64"));
+            assert_eq!(key.tensor, None);
+            assert_eq!(key.scope, "test/graph");
+        }
+        assert_eq!(CONTEXT.with(|context| context.borrow().name), None);
+    }
+
     /// A category scope nested inside an owner relabels the category but keeps
     /// the owner, so plan == runtime sums every allocation a component makes.
     #[test]
-    fn owners_survive_nested_category_scopes() {
-        let _ledger = test_guard();
+    fn owners_survive_nested_category_scopes() {        let _ledger = test_guard();
         let base = 0x7100_0000_0000usize;
         {
             let _owner = owner("test/lanes/head");

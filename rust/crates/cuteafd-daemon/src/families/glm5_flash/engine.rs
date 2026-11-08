@@ -1480,6 +1480,9 @@ pub(crate) struct GlmfEngine<'a> {
     /// Every serving decode graph captured at startup, as admission charged it. No runtime capture:
     /// a shape outside the declared set runs eagerly.
     pub(crate) startup_graphs: bool,
+    /// Admission's bytes per executable for each rank's startup set. A capture
+    /// failure names it beside the shape: cudaGraphInstantiate reports no size.
+    graph_estimate: [std::cell::Cell<u64>; 2],
     warming_graphs: std::cell::Cell<bool>,
     /// Run the exact masked capture segments eagerly before sampling residency.
     prewarming_graphs: std::cell::Cell<bool>,
@@ -1785,6 +1788,7 @@ impl<'a> GlmfEngine<'a> {
             experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "glm5_flash")),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
+            graph_estimate: [std::cell::Cell::new(0), std::cell::Cell::new(0)],
             warming_graphs: std::cell::Cell::new(false), prewarming_graphs: std::cell::Cell::new(false),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
             spark_bf16: false, full_prefill_logits: false,
@@ -1825,6 +1829,9 @@ impl<'a> GlmfEngine<'a> {
             speculation, self.weights.layers.len(), self.peer.is_some(), &self.buckets);
         ensure!(self.peer.as_ref().is_none_or(|peer| peer.layers.len() == self.weights.layers.len()),
             "startup graph peer layer inventory differs from planner");
+        for (rank, estimate) in startup.inventory.ranks.iter().enumerate() {
+            self.graph_estimate[rank.min(1)].set(estimate.bytes / estimate.executables.max(1));
+        }
         let shapes = startup.keys;
         let segments = self.weights.layers.len() + 1;
         let expected = startup.inventory.ranks.iter().map(|rank| rank.executables as usize).sum::<usize>();
@@ -4562,14 +4569,16 @@ impl<'a> GlmfEngine<'a> {
         let free = || self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free));
         let before = if calibrating { Some(free()?) } else { None };
         // Capture and instantiate are CUDA-owned allocations the ledger cannot
-        // see; name the plan owner, the scope and this exact shape so an OOM
-        // dump names them instead of `owner=null, scope=other`.
+        // see, and cudaGraphInstantiate reports no requested size; name the plan
+        // owner, the scope, this exact shape and admission's bytes per executable
+        // so an OOM dump names them instead of `owner=null, scope=other`.
         let device = if rank == 1 { self.peer()?.device } else { self.device };
         let _scope = cuteafd_ffi::memory_ledger::scope("glm5_flash.decode-graph");
         let _owner = cuteafd_ffi::memory_ledger::owner(&format!("glmf.graphs.{device}"));
         let _subject = cuteafd_ffi::memory_ledger::subject(&format!(
-            "decode graph rank={rank} segment={} rows={} spec={} long={} pool_width={} page_stride={} pool_stride={}",
-            key.segment, key.rows, key.spec, key.long, key.pool_width, key.page_stride, key.pool_stride));
+            "decode graph rank={rank} segment={} rows={} spec={} long={} pool_width={} page_stride={} pool_stride={} planner_bytes_per_exec={}",
+            key.segment, key.rows, key.spec, key.long, key.pool_width, key.page_stride, key.pool_stride,
+            self.graph_estimate[rank.min(1)].get()));
         // SAFETY: capture records this stream's launches; nothing in a segment
         // synchronizes the host or allocates.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
