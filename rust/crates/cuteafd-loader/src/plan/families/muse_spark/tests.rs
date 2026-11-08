@@ -486,8 +486,14 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
         for row in ledger.phases.iter().filter(|row| row.budget == id) {
             let mappings = pinned.iter().filter(|owner| owner.lifetime.contains(row.phase, PhaseOrder::TARGET_THEN_DRAFT))
                 .map(|owner| driver_page_table_bytes(owner.bytes)).sum::<u64>();
-            assert_eq!(row.opaque, (160 << 20) + tails + mappings,
-                "runtime, target arena tail and physical pinned mappings at {:?}", row.phase);
+            // The retired opaque runtime constant is replaced by the measured
+            // driver stream slabs (`muse/driver-stream-slabs/gpuN`): the model
+            // stream, the push loader's copy streams and the transient rotary
+            // table builder, four live streams per 2 MiB slab (#1561).
+            let peak_live = 1 + crate::push_load::COPY_STREAMS as u64 + 1;
+            let slabs = crate::placement::planner::cuda_stream_slab_bytes(peak_live).unwrap();
+            assert_eq!(row.opaque, slabs + tails + mappings,
+                "driver stream slabs, target arena tail and physical pinned mappings at {:?}", row.phase);
         }
         let ready_mappings = pinned.iter().filter(|owner| owner.lifetime.contains(Phase::Ready, PhaseOrder::TARGET_THEN_DRAFT))
             .map(|owner| driver_page_table_bytes(owner.bytes)).sum::<u64>();

@@ -138,9 +138,12 @@ pub const HOST_RUNTIME: crate::placement::inventory::MemoryFigure = crate::place
         gpu_class: "sm120", driver: "unmeasured", layout: "Muse host ordinary residual" },
 };
 
-/// First-use CUDA/module/allocator growth beyond declared owners and context.
-/// Estimated per GPU from the single-RTX smoke, not an exact allocation census.
-pub const GPU_RUNTIME: u64 = 160 << 20;
+/// Streams that can be live at once on one coordinator GPU: the model stream
+/// (`serve.rs` `Stream::new` per device), the push loader's copy streams
+/// (`push_load::COPY_STREAMS`, used while the dense load is recorded), and the
+/// transient rotary-table builder (`shared/rope.rs` `RotaryTables::load`).
+/// Destroyed streams reuse driver slots, so only the peak counts (#1561).
+pub fn startup_peak_live_streams() -> u64 { 1 + crate::push_load::COPY_STREAMS as u64 + 1 }
 
 impl HostInput {
     pub fn budget(self) -> Budget {
@@ -417,11 +420,18 @@ impl<'a> ProductionInput<'a> {
                 lifetime: Lifetime::RESIDENT, source: HOST_RUNTIME.evidence.into(), assumed: true }) });
         for gpu in 0..gpus {
             let location = Location::coordinator(gpu as u8);
+            // Driver stream slabs survive delivery-stream retirement and are
+            // driver-allocated, not a cudaMalloc request, so they receive no
+            // allocation-tail charge of their own.
+            let peak = startup_peak_live_streams();
+            let slab = cuda_stream_slab_bytes(peak)?;
             components.push(Component { activation: Activation::always(),
-                bytes: ByteCurve::fixed(GPU_RUNTIME, maximum_pages),
-                kind: ComponentKind::Allowance(Allowance { location, bytes: GPU_RUNTIME,
-                    lifetime: Lifetime::RESIDENT, assumed: true,
-                    source: "Muse estimated first-use CUDA/module/allocator growth: 160 MiB above 148052028 B smoke residual (#1326)".into() }) });
+                bytes: ByteCurve::fixed(slab, maximum_pages),
+                kind: ComponentKind::Allowance(Allowance { location, bytes: slab,
+                    lifetime: Lifetime::RESIDENT, assumed: false,
+                    source: format!("muse/driver-stream-slabs/gpu{gpu} ({peak} peak live streams: \
+                        model + {} push copies + transient rotary, SM120 driver/runtime13020 LAZY, \
+                        #1511 2026-11-08)", crate::push_load::COPY_STREAMS) }) });
             let rank_layers = layouts.iter().map(|ranks| &ranks[gpu]).collect::<Vec<_>>();
             let arena = crate::families::muse_spark::weight_layout::coordinator_arena(
                 gpu, gpus, &global, &rank_layers).map_err(anyhow_refusal)?;

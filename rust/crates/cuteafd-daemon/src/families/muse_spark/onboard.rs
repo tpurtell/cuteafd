@@ -73,17 +73,22 @@ pub(crate) fn push_plan(cfg: &MuseSparkConfig, placement: &Placement, gpus: usiz
 
 /// Loads every GPU's onboarded layers (`layers`, ascending) from the installed
 /// coordinator package (`package`: `rtx-tp2` on a pair, `rtx-tp1` on one GPU).
+/// `modules` carries the package modules startup bound before the measured
+/// pre-weight sample (one entry per device, `None` when nothing was preloaded).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cfg: &MuseSparkConfig,
     catalog: &cuteafd_loader::OfficialV41Catalog, package: &std::path::Path, placement: &Placement,
     layers: Vec<usize>, unit_rows: usize,
+    modules: Vec<Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>>,
     pushed: Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>) -> Result<Vec<OnboardedExperts<'a>>> {
     ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1]), "Muse onboarded layers ascending");
     ensure!(devices.len() == programs.len() && matches!(devices.len(), 1 | 2), "Muse onboarding on one GPU or a pair");
+    ensure!(modules.is_empty() || modules.len() == devices.len(), "Muse preloaded module device count");
     let own = own_bytes(cfg, unit_rows);
     let layout = CombineTables { capacity: unit_rows };
     let budgets = budgets(cfg, placement, devices.len(), unit_rows)?;
     let geometry = cuteafd_core::expert_geometry();
+    let mut modules = modules.into_iter();
     let executors: Vec<Exl3Tp2<'a>> = if devices.len() == 2 {
         let budgets = [budgets[0], budgets[1]];
         let weights = match pushed {
@@ -96,7 +101,8 @@ pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cf
             None => Exl3Tp2::load_pair_weights([devices[0], devices[1]], catalog, geometry, [package; 2],
                 layers.clone(), unit_rows, budgets, RtxSelectionPolicy::CanonicalDecode)?,
         };
-        weights.iter().map(|weights| weights.execution()).collect::<Result<_>>()?
+        weights.iter().map(|weights| weights.execution_with_modules(modules.next().flatten()))
+            .collect::<Result<_>>()?
     } else {
         let weights = match pushed {
             Some(mut pushed) => {
@@ -107,7 +113,7 @@ pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cf
             None => Exl3Tp2::load_whole_weights(devices[0], catalog, package, layers.clone(), unit_rows,
                 budgets[0], RtxSelectionPolicy::CanonicalDecode)?,
         };
-        vec![weights.execution()?]
+        vec![weights.execution_with_modules(modules.next().flatten())?]
     };
     executors.into_iter().zip(devices).zip(programs).map(|((executor, &device), programs)| {
         Ok(OnboardedExperts { epilogue: device.run(|| PartialEpilogue::load(device.library, programs, unit_rows))?,

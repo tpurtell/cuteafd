@@ -28,7 +28,10 @@ struct NativePrograms<'a> {
 }
 
 impl<'a> NativePrograms<'a> {
-    fn load(programs: &'a Programs<'a>, device: Device<'a>, admitted: &RankProjections) -> Result<Self> {
+    /// The program bindings `load` needs and the scratch bytes they require.
+    /// The native loader caches modules per device, so a dropped binding stays
+    /// loaded for the process and `load` costs no further module memory.
+    fn bind(programs: &'a Programs<'a>, device: Device<'a>, admitted: &RankProjections) -> Result<(Self, usize)> {
         use cuteafd_ffi::draft_projection::{DraftProjections, ProjectionOutput as Output};
         use cuteafd_ffi::native_attention::Fp8Projections;
         use cuteafd_loader::placement::planner::native_attention::NativeResolution;
@@ -55,8 +58,7 @@ impl<'a> NativePrograms<'a> {
         let fp8_f32 = load_fp8(ProjectionOutput::F32, Output::F32)?;
         ensure!(u64::try_from(required)? == admitted.native_programs.fp8_scratch_bytes,
             "Muse native scratch differs from exact admission");
-        let scratch = if required == 0 { None } else { Some(Allocation::new(device, required, Tag::workspace("muse/core-scratch"))?) };
-        Ok(Self { bf16, bf16_f32, fp8, fp8_f32, scratch, rows })
+        Ok((Self { bf16, bf16_f32, fp8, fp8_f32, scratch: None, rows }, required))
     }
 
     fn launch(&self, rows: usize, input: Buffer, weight: &super::weights::NativeWeights<'_>,
@@ -121,7 +123,18 @@ fn head_chunks(rows: usize, input: Buffer, output: Buffer, k: usize, n: usize,
 }
 
 impl<'a> CorePrograms<'a> {
-    pub(crate) fn load(programs: &'a Programs<'a>, device: Device<'a>, admitted: &RankProjections) -> Result<Self> {
+    /// Every admitted K6 and native projection program, bound without the lane
+    /// scratch. Startup runs this before the measured pre-weight sample so the
+    /// module footprint is part of the resident process, not late growth (#1554).
+    pub(crate) fn preload(programs: &'a Programs<'a>, device: Device<'a>, admitted: &RankProjections) -> Result<()> {
+        Self::bind(programs, device, admitted).map(|_| ())
+    }
+
+    /// The program bindings `load` needs, their scratch layouts and the native
+    /// scratch bytes. Dropping a binding keeps its modules loaded for the process.
+    fn bind(programs: &'a Programs<'a>, device: Device<'a>, admitted: &RankProjections)
+        -> Result<(BTreeMap<(ProjectionKey, ProjectionOutput), Projection<'a>>, Option<ProjectionLayout>,
+            usize, NativePrograms<'a>, usize)> {
         let mut projections = BTreeMap::new();
         let mut required: Option<ProjectionLayout> = None;
         for (&(key, output), &rows) in &admitted.programs {
@@ -133,15 +146,12 @@ impl<'a> CorePrograms<'a> {
             match &mut required { Some(r) => r.merge(&layout)?, None => required = Some(layout) }
             projections.insert((key, output), projection);
         }
-        let scratch = match (&required, &admitted.scratch) {
-            (None, None) => None,
-            (Some(required), Some(admitted)) => {
-                ensure!(required.extents == admitted.extents && required.rows == admitted.rows,
-                    "Muse K6 program scratch differs from admission");
-                Some(required.allocate(device, crate::shared::memory::Tag::workspace("muse/native-projection"))?)
-            }
-            _ => anyhow::bail!("Muse K6 programs and admitted scratch disagree on presence"),
-        };
+        ensure!(required.is_some() == admitted.scratch.is_some(),
+            "Muse K6 programs and admitted scratch disagree on presence");
+        if let (Some(required), Some(admitted)) = (&required, &admitted.scratch) {
+            ensure!(required.extents == admitted.extents && required.rows == admitted.rows,
+                "Muse K6 program scratch differs from admission");
+        }
         let exact_cap = crate::shared::prefill_packing::coordinator_row_cap(programs,
             projections.values().flat_map(|projection| {
                 let policy = projection.program.policy();
@@ -150,7 +160,20 @@ impl<'a> CorePrograms<'a> {
             }).chain(admitted.native_programs.programs.iter().map(|name|
                 (name.as_str(), crate::shared::prefill_packing::ProgramRows::PackedRows))),
             admitted.native_rows)?;
-        let native = NativePrograms::load(programs, device, admitted)?;
+        let (native, native_scratch) = NativePrograms::bind(programs, device, admitted)?;
+        Ok((projections, required, exact_cap, native, native_scratch))
+    }
+
+    pub(crate) fn load(programs: &'a Programs<'a>, device: Device<'a>, admitted: &RankProjections) -> Result<Self> {
+        let (projections, required, exact_cap, mut native, native_scratch) =
+            Self::bind(programs, device, admitted)?;
+        let scratch = match required {
+            Some(required) => Some(required.allocate(device,
+                crate::shared::memory::Tag::workspace("muse/native-projection"))?),
+            None => None,
+        };
+        native.scratch = if native_scratch == 0 { None }
+            else { Some(Allocation::new(device, native_scratch, Tag::workspace("muse/core-scratch"))?) };
         Ok(Self { projections, scratch, exact_cap, native })
     }
 
@@ -260,7 +283,8 @@ mod tests {
             let mut admitted = RankProjections { programs: Default::default(), scratch: None,
                 native_rows: ceiling, native_programs: Resolved::resolve(&requests, ceiling, Some(&typed))?,
                 native: owners.clone() };
-            let registry = NativePrograms::load(&programs, device, &admitted)?;
+            let (mut registry, scratch_bytes) = NativePrograms::bind(&programs, device, &admitted)?;
+            registry.scratch = Some(Allocation::new(device, scratch_bytes, crate::shared::memory::TEST)?);
             assert_eq!(registry.scratch.as_ref().unwrap().buffer.bytes, 2048);
             for owner in &owners {
                 let weight = device.own(|| {
@@ -288,9 +312,9 @@ mod tests {
             library.cuda_set_device(0)?;
             drop(registry);
             admitted.native_programs.fp8_scratch_bytes += 256;
-            assert!(NativePrograms::load(&programs, device, &admitted).is_err());
+            assert!(NativePrograms::bind(&programs, device, &admitted).is_err());
             admitted.native_programs = Resolved::resolve(&requests, ceiling, None)?;
-            assert!(NativePrograms::load(&programs, device, &admitted).is_err());
+            assert!(NativePrograms::bind(&programs, device, &admitted).is_err());
         }
         assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
         Ok(())

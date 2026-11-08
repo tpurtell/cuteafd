@@ -186,17 +186,29 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         let specs = programs[0].names().map(|name| programs[0].spec(name)).collect::<Result<Vec<_>>>()?;
         Some(cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?)
     };
+    let prefill = args.prefill()?;
     let projections = cuteafd_loader::families::muse_spark::weight_layout::projections_with_manifest(
-        &cfg, &core, gpus, args.prefill()?.unit_rows as usize, native_manifest.as_ref())?;
-    let inventory = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |id| {
-        let rank = device_ids.iter().position(|&device| device == id).context("Muse inventory device")?;
-        for name in &projections[rank].native_programs.programs {
-            let spec = programs[rank].spec(name)?;
-            let pointers = spec.pointers.iter().map(String::as_str).collect::<Vec<_>>();
-            programs[rank].program(name, &pointers)?;
-        }
-        Ok(())
-    })?;
+        &cfg, &core, gpus, prefill.unit_rows as usize, native_manifest.as_ref())?;
+    // #1554: every module this rank can run is bound before the measured
+    // pre-weight sample. The native manifest is empty on the HQA target, so the
+    // projection loop that used to live in the sample closure loaded nothing and
+    // the family, rotary, K6 and EXL3 package kernels all arrived afterwards,
+    // showing up as unattributed growth at Ready. The native loader caches
+    // modules per device: binding here costs no further module memory later and
+    // the expert packages stay retained for onboarding.
+    let local_package = cuteafd_loader::placement::families::muse_spark::local_package(
+        &catalog, &args.manifest, gpus, prefill.unit_rows);
+    // A missing package is only fatal when the solve onboards layers; the
+    // admission edge below reports it with its own error.
+    let package_path = match args.rtx_expert_layers {
+        // No onboarding means no expert package: never bind modules the rank cannot launch.
+        cuteafd_loader::placement::Onboard::Layers(0) => None,
+        _ => local_package.as_ref().ok().map(|(path, _)| path.clone()),
+    };
+    let expert_modules = preload_modules(&devices, &programs, &projections, prefill.unit_rows,
+        package_path.as_deref())?;
+    let inventory = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight,
+        |_| Ok(()))?;
     crate::shared::inventory::startup_probe(&library, &device_ids, "muse-preweight", Default::default())?;
     let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let built = startup::admit(startup::Options { host: cuteafd_loader::placement::families::muse_spark::HostInput {
@@ -246,7 +258,6 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
     let mut media = super::media::Ready::load(args, &view, &library, &built.media, built.host)?;
-    let prefill = args.prefill()?;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_formats(args.expert_partial_bf16_max_rows,
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
     let sequences = usize::from(args.max_sequences);
@@ -267,10 +278,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let onboarded = placement.layers.iter().enumerate().filter_map(|(layer, assignment)| matches!(assignment.experts,
         cuteafd_loader::placement::ExpertHome::RtxTp2 | cuteafd_loader::placement::ExpertHome::RtxWhole { .. })
         .then_some(layer)).collect::<Vec<_>>();
-    let package = if onboarded.is_empty() { None } else {
-        Some(cuteafd_loader::placement::families::muse_spark::local_package(&catalog, &args.manifest, gpus,
-            prefill.unit_rows)?.0)
-    };
+    let package = if onboarded.is_empty() { None } else { Some(local_package?.0) };
     let program_refs = programs.iter().collect::<Vec<_>>();
     use crate::shared::experts::rtx::{dense, push::{CoordinatorPush, PushPolicy}};
     let policy = PushPolicy::for_snapshot(&args.snapshot)?;
@@ -355,7 +363,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                 Vec::new()
             }
             Some(package) => super::onboard::load(&devices, &program_refs, &cfg, &catalog, package, placement,
-                onboarded.clone(), usize::try_from(prefill.unit_rows)?, pushed)?,
+                onboarded.clone(), usize::try_from(prefill.unit_rows)?, expert_modules, pushed)?,
         };
         Ok((embedding, ranks, local, draft))
     })?;
@@ -414,6 +422,45 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     // Scheduler-owned selection, cache copies and timing live beside the target head.
     ranks.last().context("Muse scheduler head rank")?.device
         .run(|| run(&backend, sequences, media)).inspect_err(log_worker_error)
+}
+
+/// Every module family a Muse coordinator rank can run, bound before the
+/// measured pre-weight sample (#1554): the required programs, the shared rotary
+/// table builder, the K6 and native projection programs, and — when the layout
+/// may onboard expert layers — the retained EXL3 package capacities onboarding
+/// reuses. The native loader caches modules per device, so these bindings are
+/// the process's whole module footprint and none of them reload later.
+fn preload_modules<'a>(devices: &[crate::shared::memory::device::Device<'a>],
+    programs: &[cuteafd_ffi::programs::Programs<'a>],
+    projections: &[cuteafd_loader::families::muse_spark::weight_layout::RankProjections],
+    unit_rows: u64, package: Option<&std::path::Path>)
+    -> Result<Vec<Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>>> {
+    use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
+    let ranks = devices.len();
+    ensure!(programs.len() == ranks && projections.len() == ranks, "Muse preload device count");
+    for (rank, device) in devices.iter().enumerate() {
+        let rank_programs = programs.get(rank).context("Muse preload programs")?;
+        let admitted = projections.get(rank).context("Muse preload projections")?;
+        device.run(|| {
+            for (name, pointers) in super::programs::required(ranks)? {
+                rank_programs.program(&name, pointers)?;
+            }
+            rank_programs.program(super::programs::ROPE_TABLES, &["cos", "sin"])?;
+            super::core::CorePrograms::preload(rank_programs, *device, admitted)
+        }).with_context(|| format!("Muse module preload on GPU {}", device.id))?;
+    }
+    let Some(package) = package else { return Ok(Vec::new()); };
+    let rows = usize::try_from(unit_rows)?;
+    devices.iter().map(|device| {
+        let modules = if ranks == 2 {
+            Exl3Tp2::preload_tp2_modules(*device, package, rows, cuteafd_core::expert_geometry(),
+                RtxSelectionPolicy::CanonicalDecode)?
+        } else {
+            Exl3Tp2::preload_whole_modules(*device, package, rows, cuteafd_core::expert_geometry(),
+                RtxSelectionPolicy::CanonicalDecode)?
+        };
+        Ok(Some(modules))
+    }).collect()
 }
 
 fn log_worker_error(error: &anyhow::Error) {
