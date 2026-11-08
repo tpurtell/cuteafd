@@ -177,6 +177,35 @@ mod tests {
     }
 
     #[test]
+    fn census_placeholder_reuses_a_measured_count_without_scaling() {
+        assert_eq!(census_placeholder(13_800), STARTUP_GRAPH_CENSUS[0].bytes);
+        assert_eq!(census_placeholder(13_500), 13_500 * (2 << 20));
+    }
+
+    #[test]
+    fn census_placeholder_is_census_only_and_never_scaled() {
+        let buckets = DecodeBuckets::new(verify_budget(64, 188));
+        let (context, pool) = (131_072, 2_097_152);
+        let shapes = serving_graph_shapes(context, pool / PAGE_ROWS, 2051, 16, true, &buckets);
+        let fingerprint = declared_fingerprints(&shapes, 45, 1).unwrap()[0].clone();
+        let executables = 46 * shapes.len() as u64;
+        refuse_unmeasured_graphs();
+        // A serving launch refuses: the placeholder belongs to the census run.
+        let refused = census_rank_for(executables, &fingerprint, 0, 1, false).unwrap_err();
+        assert!(refused.contains("no measured instantiate row"), "{refused}");
+        assert!(refused.contains(&fingerprint), "{refused}");
+        assert!(refused.contains("STARTUP_GRAPH_CENSUS"), "{refused}");
+        // The census run admits the largest measured row for this count so the
+        // capture can produce the real one, and reconcile_startup_graphs
+        // replaces it before Ready.
+        let admitted = census_rank_for(executables, &fingerprint, 0, 1, true).unwrap();
+        assert_eq!(admitted.bytes, census_placeholder(executables));
+        assert_eq!(admitted.basis, cuteafd_core::memory_layout::Basis::Estimated);
+        assert_eq!(admitted.margin, 0);
+        super::SYNTHETIC_GRAPHS.with(|flag| flag.set(true));
+    }
+
+    #[test]
     fn startup_counts_match_rc3_and_peer_has_no_head_graph() {
         let buckets = DecodeBuckets::new(verify_budget(64, 188));
         let shapes = serving_graph_shapes(1_048_576, 2_097_152 / PAGE_ROWS, 2051, 16, true, &buckets);
@@ -313,6 +342,17 @@ pub(crate) fn refuse_unmeasured_graphs() { SYNTHETIC_GRAPHS.with(|flag| flag.set
 /// that would cover it.
 pub fn census_rank(executables: u64, fingerprint: &str, rank: usize, gpus: usize)
     -> Result<GraphRank, String> {
+    census_rank_for(executables, fingerprint, rank, gpus, census_run())
+}
+
+/// Whether this process is the census run that measures the row a declared set
+/// lacks. The placeholder is admitted only here; a serving launch refuses.
+fn census_run() -> bool {
+    std::env::var("CUTEAFD_GRAPH_CENSUS").is_ok_and(|value| value == "1")
+}
+
+fn census_rank_for(executables: u64, fingerprint: &str, rank: usize, gpus: usize, census: bool)
+    -> Result<GraphRank, String> {
     if let Some(row) = STARTUP_GRAPH_CENSUS.iter().find(|row|
         row.declared_graphs == fingerprint && row.executables == executables) {
         return Ok(GraphRank { executables, bytes: row.bytes, margin: 0,
@@ -322,9 +362,31 @@ pub fn census_rank(executables: u64, fingerprint: &str, rank: usize, gpus: usize
     if SYNTHETIC_GRAPHS.with(std::cell::Cell::get) {
         return Ok(estimated_graph_rank(executables, if gpus == 1 { 0 } else { rank + 1 }));
     }
+    // A census run is how an unmeasured fingerprint gets its row: admission
+    // needs *some* charge to start the capture, and `reconcile_startup_graphs`
+    // replaces it with the live capture before Ready. Charge the largest
+    // measured row for the same declared count (or 2 MiB per executable when
+    // there is none), never a proportional scale, and say so.
+    if census {
+        let bytes = census_placeholder(executables);
+        tracing::warn!(fingerprint, executables, rank, gpus, bytes,
+            "GLM Flash startup graph fingerprint has no measured row; this census run charges the \
+             largest measured row for {executables} executables until the live capture reconciles it");
+        return Ok(GraphRank { executables, bytes, margin: 0,
+            basis: cuteafd_core::memory_layout::Basis::Estimated });
+    }
     Err(format!("GLM Flash startup graphs: no measured instantiate row for declared key set \
         {fingerprint} ({executables} executables, rank {rank} of {gpus}); capture this layout with a \
         memory census and add its device {rank} instantiate bytes to STARTUP_GRAPH_CENSUS"))
+}
+
+/// The charge a census run admits an unmeasured declared set with: the largest
+/// measured row for the same executable count, so a genuinely similar layout
+/// cannot be refused for room before its capture can reconcile; 2 MiB per
+/// executable when no row shares the count.
+fn census_placeholder(executables: u64) -> u64 {
+    STARTUP_GRAPH_CENSUS.iter().filter(|row| row.executables == executables)
+        .map(|row| row.bytes).max().unwrap_or_else(|| executables * (2 << 20))
 }
 
 /// Every exchange slot owns its payload, completion word and native control storage.
