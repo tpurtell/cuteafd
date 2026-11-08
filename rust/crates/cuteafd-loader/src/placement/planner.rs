@@ -151,6 +151,93 @@ impl<'a> CoordinatorDevices<'a> {
     pub fn location(self, physical: i32) -> Result<Location, Refusal> {
         Ok(Location::coordinator(self.logical_rank(physical)?))
     }
+
+    /// Translate a complete planner allocation inventory exactly once. Locations
+    /// and tensor names remain logical; shared expert backing IDs name CUDA ordinals.
+    /// Runtime receipts already contain physical IDs and must not pass through this.
+    pub fn remap_weight_arenas(self, allocations: &[Allocation]) -> Result<Vec<Allocation>, Refusal> {
+        let mut names = BTreeMap::new();
+        for allocation in allocations.iter().filter(|a| a.view.is_none()
+            && a.category == Category::Weights && a.group == "weight arena"
+            && a.id.starts_with("experts.")) {
+            let invalid = || Refusal::InvalidFact(format!("invalid logical expert arena {}", allocation.id));
+            let (prefix, identity) = allocation.id.rsplit_once(".gpu.").ok_or_else(invalid)?;
+            let (ordinal, selection) = identity.split_once('.').ok_or_else(invalid)?;
+            let Device::Coordinator(rank) = allocation.location.device else { return Err(invalid()); };
+            if allocation.location.domain != Domain::Device || prefix == "experts."
+                || ordinal != rank.to_string() || selection.len() != 64
+                || !selection.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+                return Err(invalid());
+            }
+            let id = format!("{prefix}.gpu.{}.{selection}", self.physical_device(rank)?);
+            if names.insert(allocation.id.as_str(), id).is_some() {
+                return Err(Refusal::InvalidFact(format!("duplicate expert arena {}", allocation.id)));
+            }
+        }
+        let mut ids = BTreeSet::new();
+        allocations.iter().map(|allocation| {
+            let mut mapped = allocation.clone();
+            if let Some(id) = names.get(allocation.id.as_str()) { mapped.id = id.clone(); }
+            if let Some(view) = &mut mapped.view {
+                if let Some(id) = names.get(view.backing.as_str()) { view.backing = id.clone(); }
+                else if view.backing.starts_with("experts.") {
+                    return Err(Refusal::InvalidFact(format!("missing expert backing for {}", allocation.id)));
+                }
+            }
+            if !ids.insert(mapped.id.clone()) {
+                return Err(Refusal::InvalidFact(format!("duplicate remapped owner {}", mapped.id)));
+            }
+            Ok(mapped)
+        }).collect()
+    }
+
+    /// Preserve the selected plan, capacities and chronology while translating
+    /// backing identities in every owner scope, including derived-owner references.
+    pub fn remap_plan_weight_arenas(self, plan: &ResolvedPlan) -> Result<ResolvedPlan, Refusal> {
+        validate(&plan.facts, &plan.budgets)?;
+        let allocations = plan.facts.allocations.iter().chain(&plan.facts.deferred)
+            .chain(plan.facts.sequential.iter().flat_map(|group| &group.members)).cloned().collect::<Vec<_>>();
+        let mapped = self.remap_weight_arenas(&allocations)?;
+        let names = allocations.iter().zip(&mapped).filter(|(old, new)| old.id != new.id)
+            .map(|(old, new)| (old.id.as_str(), new.id.as_str())).collect::<BTreeMap<_, _>>();
+        let mut out = plan.clone();
+        for owner in &mut out.facts.resident_weights {
+            if let Some(id) = names.get(owner.id.as_str()) { owner.id = (*id).into(); }
+        }
+        for mapping in &mut out.facts.driver_page_tables {
+            if let Some(id) = names.get(mapping.backing.as_str()) { mapping.backing = (*id).into(); }
+        }
+        for owner in &mut out.facts.allocation_granularity {
+            for backing in &mut owner.backings {
+                if let Some(id) = names.get(backing.backing.as_str()) { backing.backing = (*id).into(); }
+            }
+        }
+        for (owner, mapped) in out.facts.allocations.iter_mut().chain(&mut out.facts.deferred)
+            .chain(out.facts.sequential.iter_mut().flat_map(|group| &mut group.members)).zip(mapped) {
+            *owner = mapped;
+        }
+        validate(&out.facts, &out.budgets)?;
+        Ok(out)
+    }
+
+    pub fn reconcile(self, plan: &ResolvedPlan, phase: Phase, receipts: &[Receipt]) -> Result<(), Refusal> {
+        reconcile(&self.remap_plan_weight_arenas(plan)?, phase, receipts)
+    }
+
+    pub fn reconcile_history(self, plan: &ResolvedPlan, phase: Phase,
+        observations: &[Observation]) -> Result<(), Refusal> {
+        reconcile_history(&self.remap_plan_weight_arenas(plan)?, phase, observations)
+    }
+
+    pub fn reconcile_events(self, plan: &ResolvedPlan, phase: Phase,
+        events: &[OwnerEvent], views: &[Observation]) -> Result<(), Refusal> {
+        self.reconcile_startup(plan, phase, events, views, &[])
+    }
+
+    pub fn reconcile_startup(self, plan: &ResolvedPlan, phase: Phase, events: &[OwnerEvent],
+        views: &[Observation], reservations: &[ReservationReceipt]) -> Result<(), Refusal> {
+        reconcile_startup(&self.remap_plan_weight_arenas(plan)?, phase, events, views, reservations)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

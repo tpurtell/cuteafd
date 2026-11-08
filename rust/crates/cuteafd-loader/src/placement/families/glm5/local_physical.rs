@@ -3,7 +3,7 @@ use super::{GlmLocalFormat, LocalInventory};
 use crate::{families::glm5::GlmDsaConfig, OfficialV41Catalog, V41Exl3Layer};
 use crate::placement::planner::{Allocation, Lifetime, Location, View};
 use crate::plan::exlr8::{self, residency::{ExpertSet, MetadataInput}, ExecutionVariant, PrefillActivations};
-use crate::serving_capacity::PackedWeightRegions;
+use crate::serving_capacity::{expert_weight_arena_id, PackedWeightRegions, WeightArenaLayout};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::Category;
 use std::{collections::BTreeMap, path::Path};
@@ -46,8 +46,6 @@ struct LayerStorage {
     bytes: usize,
     /// Receipt suffix, offset within the layer, bytes.
     views: Vec<(String, usize, usize)>,
-    /// Native planes are independent mount owners; other formats use one arena.
-    mount: Vec<(String, usize)>,
 }
 
 /// Parsed headers and installed execution manifests reused for finite prefix
@@ -60,6 +58,7 @@ pub struct LocalPhysicalSource {
     activations: PrefillActivations,
     topk: usize,
     world: usize,
+    format: GlmLocalFormat,
 }
 
 impl LocalPhysicalSource {
@@ -69,9 +68,9 @@ impl LocalPhysicalSource {
     pub(super) fn test_source(world: usize, layers: std::ops::Range<usize>, rows: usize) -> Self {
         Self { weights: std::array::from_fn(|rank| if rank < world {
             layers.clone().map(|layer| (layer, LayerStorage { bytes: 4096,
-                mount: vec![(String::new(), 4096)], views: vec![(String::new(), 0, 4096)] })).collect()
+                views: vec![(String::new(), 0, 4096)] })).collect()
         } else { BTreeMap::new() }), backend: LocalPhysicalInventory::default(),
-            rows, activations: PrefillActivations::A16, topk: 8, world }
+            rows, activations: PrefillActivations::A16, topk: 8, world, format: GlmLocalFormat::Exlr8 }
     }
 
     pub fn read(cfg: &GlmDsaConfig, catalog: &OfficialV41Catalog, local: &LocalInventory,
@@ -81,7 +80,8 @@ impl LocalPhysicalSource {
             && (local.world == 2 || matches!(local.format, GlmLocalFormat::Exlr8 | GlmLocalFormat::Exl3)),
             "GLM local physical source has no executor for this format/world");
         let mut source = Self { weights: Default::default(), backend: Default::default(),
-            rows: input.max_rows, activations: input.activations, topk: cfg.topk, world: local.world };
+            rows: input.max_rows, activations: input.activations, topk: cfg.topk, world: local.world,
+            format: local.format };
         if input.layers.is_empty() { return Ok(source); }
         let programs = if local.format == GlmLocalFormat::Exlr8 {
             Some(serde_json::from_slice::<serde_json::Value>(&std::fs::read(&local.package)?)?)
@@ -96,7 +96,7 @@ impl LocalPhysicalSource {
                         let plan = catalog.exl3().context("EXL3 local headers missing")?
                             .residency(V41Exl3Layer::Backbone(layer), local.world, rank)?;
                         let (offsets, bytes) = plan.device_arena_layout()?;
-                        LayerStorage { bytes, mount: vec![("0".into(), bytes)],
+                        LayerStorage { bytes,
                             views: plan.buffers.iter().zip(offsets).enumerate().map(|(index, (spec, offset))|
                                 (index.to_string(), offset, spec.bytes.max(16))).collect() }
                     }
@@ -106,12 +106,13 @@ impl LocalPhysicalSource {
                         ensure!(unit_limit.is_none_or(|previous| previous == units),
                             "EXLR8 local layers have inconsistent unit limits");
                         unit_limit = Some(units);
-                        LayerStorage { bytes, mount: vec![(String::new(), bytes)],
+                        LayerStorage { bytes,
                             views: vec![(String::new(), 0, bytes)] }
                     }
                     GlmLocalFormat::Nvfp4 { w4a4: true } => {
                         use crate::formats::fp8_experts::Fp8Projection;
-                        let tensors = catalog.fp8().context("NVFP4 local headers missing")?.for_coordinator();
+                        let tensors = catalog.fp8().context("NVFP4 local headers missing")?.for_coordinator()
+                            .for_layer_metadata(layer)?;
                         let (_, slicing) = crate::formats::fp8_experts::exact_layout_directory(&local.package, &tensors, 2, rank);
                         tensors.validate_layer(layer)?;
                         let mut planes = Vec::new();
@@ -122,8 +123,6 @@ impl LocalPhysicalSource {
                         }
                         let packed = PackedWeightRegions::new(planes.iter().copied())?;
                         LayerStorage { bytes: packed.bytes,
-                            mount: planes.iter().enumerate().filter(|(_, bytes)| **bytes > 0)
-                                .map(|(plane, &bytes)| (format!("plane.{plane}"), bytes)).collect(),
                             views: packed.regions.into_iter().enumerate().filter(|(_, region)| !region.is_empty())
                                 .map(|(plane, region)| (format!("plane.{plane}"), region.start, region.len())).collect() }
                     }
@@ -178,20 +177,52 @@ impl LocalPhysicalSource {
             let layers = input.layers.iter().map(|layer| self.weights[rank].get(layer)
                 .with_context(|| format!("GLM local physical layer {layer} not parsed"))).collect::<Result<Vec<_>>>()?;
             let packed = PackedWeightRegions::new(layers.iter().map(|layer| layer.bytes))?;
+            let arena = if input.storage == LocalStorage::Mount && self.format != GlmLocalFormat::Exlr8 {
+                let mut regions = Vec::new();
+                for (&layer, weight) in input.layers.iter().zip(&layers) {
+                    match self.format {
+                        GlmLocalFormat::Exl3 => regions.push((exl3_region(layer, self.world, rank), weight.bytes)),
+                        GlmLocalFormat::Nvfp4 { .. } => {
+                            for (suffix, _, bytes) in &weight.views {
+                                regions.push((format!("{layer}.{}", suffix.strip_prefix("plane.")
+                                    .context("NVFP4 plane missing")?), *bytes));
+                            }
+                        }
+                        GlmLocalFormat::Exlr8 => unreachable!(),
+                    }
+                }
+                let format = if self.format == GlmLocalFormat::Exl3 { "exl3" } else { "fp8" };
+                let layout = WeightArenaLayout::new(expert_weight_arena_id(format, rank as i32, &regions)?, regions)?;
+                out.record(Allocation::buffer(layout.id(), location, u64::try_from(layout.bytes())?,
+                    Lifetime::RESIDENT, Category::Weights, "weight arena"));
+                Some(layout)
+            } else { None };
             let mut rank_backing: Option<String> = None;
             for ((&layer, weight), region) in input.layers.iter().zip(layers).zip(packed.regions) {
                 let name = format!("{prefix}.weight.{layer}");
                 match input.storage {
                     LocalStorage::Mount => {
-                        for (suffix, bytes) in &weight.mount {
-                            out.add(format!("{}.backing", suffix_name(&name, suffix)), location, *bytes, Category::Experts)?;
-                        }
-                        for (suffix, offset, bytes) in &weight.views {
-                            let backing = if weight.mount.len() == 1 && weight.mount[0].0 == "0" {
-                                format!("{name}.0.backing")
-                            } else { format!("{}.backing", suffix_name(&name, suffix)) };
-                            let offset = if suffix.starts_with("plane.") { 0 } else { *offset };
-                            out.add_view(suffix_name(&name, suffix), location, *bytes, backing, offset)?;
+                        if let Some(arena) = &arena {
+                            let layer_offset = if self.format == GlmLocalFormat::Exl3 {
+                                let view = arena.view(&exl3_region(layer, self.world, rank)).context("EXL3 layer view missing")?;
+                                out.add_view(name.clone(), location, view.bytes(), arena.id().into(), view.offset())?;
+                                view.offset()
+                            } else { 0 };
+                            for (suffix, offset, bytes) in &weight.views {
+                                let offset = if self.format == GlmLocalFormat::Exl3 {
+                                    layer_offset.checked_add(*offset).context("EXL3 view offset overflow")?
+                                } else {
+                                    arena.view(&format!("{layer}.{}", suffix.strip_prefix("plane.").context("NVFP4 plane missing")?))
+                                        .context("NVFP4 plane view missing")?.offset()
+                                };
+                                out.add_view(suffix_name(&name, suffix), location, *bytes, arena.id().into(), offset)?;
+                            }
+                        } else {
+                            let backing = format!("{name}.backing");
+                            out.add(backing.clone(), location, weight.bytes, Category::Experts)?;
+                            for (suffix, offset, bytes) in &weight.views {
+                                out.add_view(suffix_name(&name, suffix), location, *bytes, backing.clone(), *offset)?;
+                            }
                         }
                     }
                     LocalStorage::Push => {
@@ -208,6 +239,11 @@ impl LocalPhysicalSource {
                     }
                 }
             }
+        }
+        // Weight backings and aliases already exist when KV is first allocated;
+        // executor, pair and check storage binds afterward.
+        for weight in out.owners.iter_mut().chain(&mut out.views) {
+            weight.lifetime = Lifetime::RESIDENT;
         }
         out.owners.extend(self.backend.owners.iter().cloned());
         out.views.extend(self.backend.views.iter().cloned());
@@ -243,8 +279,9 @@ impl LocalPhysicalInventory {
     /// Both loaders have zero additional device staging.
     pub fn backend_bytes(&self, rank: usize) -> Result<u64> {
         ensure!(rank < 2, "invalid local backend rank {rank}");
-        let prefix = format!("glm.expert.routed.rank.{rank}.");
-        self.owners.iter().filter(|owner| owner.id.starts_with(&prefix))
+        self.owners.iter().filter(|owner| owner.view.is_none()
+            && owner.location == Location::coordinator(rank as u8)
+            && !owner.id.starts_with("glm.expert.routed.routes."))
             .try_fold(0u64, |sum, owner| sum.checked_add(owner.bytes).context("local backend bytes overflow"))
     }
 
@@ -311,6 +348,11 @@ fn validate_input(cfg: &GlmDsaConfig, input: &LocalPhysicalInput) -> Result<()> 
 
 fn suffix_name(name: &str, suffix: &str) -> String {
     if suffix.is_empty() { name.into() } else { format!("{name}.{suffix}") }
+}
+
+fn exl3_region(layer: usize, world: usize, rank: usize) -> String {
+    if world == 1 { format!("BackboneFull {{ layer: {layer} }}.0") }
+    else { format!("BackboneTp2 {{ layer: {layer}, rank: {rank} }}.0") }
 }
 
 fn product(a: usize, b: usize, c: usize) -> Result<usize> {

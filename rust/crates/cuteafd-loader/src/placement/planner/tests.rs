@@ -377,6 +377,182 @@ fn startup_graph_capture_replaces_opaque_estimate_without_reselection() {
     assert!(serving::startup_graph_component("test", Location::coordinator(0), GraphRank { margin: 1, ..rank }, 1).is_err());
 }
 
+#[test]
+fn shared_arena_reconciliation_maps_physical_ids_without_changing_the_plan() -> anyhow::Result<()> {
+    use crate::serving_capacity::{expert_weight_arena_id, WeightArenaLayout};
+    for physical in [&[1][..], &[0, 1], &[1, 0]] {
+        let devices = CoordinatorDevices::new(physical)?;
+        let mut planned = Vec::new();
+        let mut runtime = Vec::new();
+        for (rank, &ordinal) in physical.iter().enumerate() {
+            let location = Location::coordinator(rank as u8);
+            for (selection, label) in [(vec![("layer.3".into(), 257), ("layer.7".into(), 17)], "target"),
+                (vec![("draft.0".into(), 19)], "draft")] {
+                let layout = WeightArenaLayout::new(expert_weight_arena_id("exl3", rank as i32, &selection)?, selection.clone())?;
+                let physical_id = expert_weight_arena_id("exl3", ordinal, &selection)?;
+                let root = Allocation::buffer(layout.id(), location, layout.bytes() as u64,
+                    Lifetime::TARGET, Category::Weights, "weight arena");
+                let address = 0x10000 + rank as u64 * 0x10000 + if label == "draft" { 0x8000 } else { 0 };
+                planned.push(root.clone());
+                runtime.push(Receipt { allocation: Allocation { id: physical_id.clone(), ..root }, address });
+                for (name, view) in layout.views() {
+                    let mut alias = Allocation::buffer(format!("{label}.rank.{rank}.{name}"), location, view.bytes() as u64,
+                        Lifetime::TARGET, Category::Experts, "resident expert owners");
+                    alias.view = Some(View { backing: layout.id().into(), offset: view.offset() as u64 });
+                    planned.push(alias.clone());
+                    alias.view.as_mut().unwrap().backing = physical_id.clone();
+                    runtime.push(Receipt { allocation: alias, address: address + view.offset() as u64 });
+                }
+            }
+        }
+        let mut budgets = vec![budget(4096)];
+        if physical.len() == 2 {
+            let mut peer = budget(4096);
+            peer.id = "peer".into();
+            peer.locations = vec![Location::coordinator(1)];
+            budgets.push(peer);
+        }
+        let mut facts = facts(planned.clone());
+        facts.resident_weights = facts.allocations.iter().filter(|a| a.view.is_none())
+            .map(|a| ResidentWeight::from_allocation(a, ResidentWeights(a.bytes))).collect();
+        let plan = ResolvedPlan { encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
+            pool_tokens: 64, phases: evaluate(&facts, &budgets)?, budgets, facts };
+        let original = plan.clone();
+        let mapped = devices.remap_plan_weight_arenas(&plan)?;
+        assert_eq!(plan, original, "identity translation mutates the admitted plan");
+        assert_eq!(mapped.decisions, plan.decisions);
+        assert_eq!(mapped.phases, plan.phases);
+        assert_eq!(mapped.budgets, plan.budgets);
+        assert_eq!(mapped.facts.allocations, runtime.iter().map(|r| r.allocation.clone()).collect::<Vec<_>>());
+        for resident in &mapped.facts.resident_weights {
+            assert!(mapped.facts.allocations.iter().any(|a| a.id == resident.id && a.location == resident.location));
+        }
+        assert_eq!(devices.remap_weight_arenas(&planned)?, mapped.facts.allocations);
+        devices.reconcile(&plan, Phase::Ready, &runtime)?;
+        let history = runtime.iter().cloned().map(|receipt| Observation {
+            created: receipt.allocation.lifetime.first, freed: None, receipt }).collect::<Vec<_>>();
+        devices.reconcile_history(&plan, Phase::Ready, &history)?;
+        let events = runtime.iter().filter(|r| r.allocation.view.is_none()).cloned()
+            .map(|receipt| OwnerEvent::Allocated { phase: receipt.allocation.lifetime.first, receipt }).collect::<Vec<_>>();
+        let views = history.iter().filter(|o| o.receipt.allocation.view.is_some()).cloned().collect::<Vec<_>>();
+        devices.reconcile_events(&plan, Phase::Ready, &events, &views)?;
+        devices.reconcile_startup(&plan, Phase::Ready, &events, &views, &[])?;
+        assert!(devices.reconcile(&plan, Phase::Ready, &runtime[1..]).is_err());
+        let mut wrong = runtime.clone();
+        wrong[0].allocation.bytes += 1;
+        assert!(devices.reconcile(&plan, Phase::Ready, &wrong).is_err());
+        wrong = runtime.clone();
+        wrong[1].allocation.view.as_mut().unwrap().offset += 1;
+        assert!(devices.reconcile(&plan, Phase::Ready, &wrong).is_err());
+        if physical != [0, 1] { assert!(reconcile(&plan, Phase::Ready, &runtime).is_err()); }
+        let mut invalid = planned.clone();
+        invalid[0].id = "experts.exl3.gpu.0.bad-sha".into();
+        assert!(devices.remap_weight_arenas(&invalid).is_err());
+        assert!(devices.remap_weight_arenas(&planned[1..]).is_err(), "partial rootless inventory accepted");
+    }
+    let mut ordinary = allocation("core/logical/0", 64);
+    ordinary.category = Category::Weights;
+    ordinary.group = "weight arena".into();
+    assert_eq!(CoordinatorDevices::new(&[1])?.remap_weight_arenas(&[ordinary.clone()])?, [ordinary]);
+    Ok(())
+}
+
+#[test]
+fn shared_arena_remap_preserves_derived_backings_and_all_owner_scopes() -> anyhow::Result<()> {
+    use crate::serving_capacity::expert_weight_arena_id;
+    for physical in [&[1][..], &[0, 1], &[1, 0]] {
+        for order in [PhaseOrder::TARGET_THEN_DRAFT, PhaseOrder::DRAFT_THEN_TARGET] {
+            let devices = CoordinatorDevices::new(physical)?;
+            let mut planned = facts(vec![]);
+            let mut expected = facts(vec![]);
+            for inventory in [&mut planned, &mut expected] {
+                inventory.phase_order = order;
+                inventory.allocations.push(Allocation::buffer("mapped.prefix", Location::PINNED,
+                    513, Lifetime::RESIDENT, Category::Prefix, "host prefix"));
+            }
+            let draft = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+            let load = Lifetime { first: Phase::Load, last: Phase::Load };
+            for (rank, &ordinal) in physical.iter().enumerate() {
+                let location = Location::coordinator(rank as u8);
+                // Build physical expectations independently, including derived references.
+                for (inventory, ordinal) in [(&mut planned, rank as i32), (&mut expected, ordinal)] {
+                    let mut resident_backings = Vec::new();
+                    let mut sequential = Vec::new();
+                    for (scope, label, bytes, lifetime) in [
+                        (0, "target", (3 << 20) + 257, Lifetime::RESIDENT),
+                        (1, "deferred", (2 << 20) + 17, Lifetime::RESIDENT),
+                        (1, "draft", (3 << 20) + 33, draft),
+                        (2, "load.a", 513, load),
+                        (2, "load.b", 1025, load),
+                    ] {
+                        let selection = vec![(label.into(), bytes as usize)];
+                        let id = expert_weight_arena_id("exl3", ordinal, &selection)?;
+                        let root = Allocation::buffer(&id, location, bytes, lifetime,
+                            Category::Weights, "weight arena");
+                        if scope == 2 {
+                            sequential.push(root);
+                            continue;
+                        }
+                        inventory.resident_weights.push(ResidentWeight::from_allocation(&root, ResidentWeights(bytes)));
+                        let mut alias = Allocation::buffer(format!("{label}.rank.{rank}.view"), location,
+                            17, lifetime, Category::Experts, "resident expert owners");
+                        alias.view = Some(View { backing: id.clone(), offset: 256 });
+                        let allocations = if scope == 0 { &mut inventory.allocations } else { &mut inventory.deferred };
+                        allocations.extend([root, alias]);
+                        let backing = GranularityBacking { backing: id, requests: vec![bytes] };
+                        if label == "draft" {
+                            inventory.allocation_granularity.push(AllocationGranularity {
+                                id: format!("draft.rank.{rank}.tail"), location, lifetime,
+                                backings: vec![backing], evidence: GranularityEvidence::Forecast,
+                            });
+                        } else {
+                            resident_backings.push(backing);
+                        }
+                    }
+                    inventory.allocation_granularity.push(AllocationGranularity {
+                        id: format!("resident.rank.{rank}.tails"), location, lifetime: Lifetime::RESIDENT,
+                        backings: resident_backings, evidence: GranularityEvidence::Forecast,
+                    });
+                    inventory.sequential.push(Sequential { id: format!("load.rank.{rank}"), members: sequential });
+                    // SM120 maps pinned storage, not device weight arenas.
+                    inventory.driver_page_tables.push(DriverPageTable { model: DriverPageTableModel::Sm120Portable,
+                        location, lifetime: Lifetime::RESIDENT, backing: "mapped.prefix".into(), mapped_bytes: 513 });
+                }
+            }
+            let mut budgets = (0..physical.len()).map(|rank| {
+                let mut row = budget(64 << 20);
+                row.id = format!("gpu{rank}");
+                row.locations = vec![Location::coordinator(rank as u8)];
+                row
+            }).collect::<Vec<_>>();
+            let mut host = budget(4096);
+            host.id = "host".into();
+            host.locations = vec![Location::PINNED];
+            budgets.push(host);
+            let plan = ResolvedPlan { encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
+                pool_tokens: 64, phases: evaluate(&planned, &budgets)?, budgets, facts: planned };
+            let original = plan.clone();
+            let mut expected_plan = plan.clone();
+            expected_plan.facts = expected;
+            assert_eq!(evaluate(&expected_plan.facts, &expected_plan.budgets)?, plan.phases);
+            let mapped = devices.remap_plan_weight_arenas(&plan)?;
+            assert_eq!(mapped, expected_plan);
+            assert_eq!(plan, original, "translation mutates the admitted plan");
+            assert_eq!(mapped.facts.driver_page_tables, plan.facts.driver_page_tables);
+            for (before, after) in plan.facts.allocation_granularity.iter().zip(&mapped.facts.allocation_granularity) {
+                assert_eq!(before.bytes()?, after.bytes()?);
+                assert_eq!(before.requests(), after.requests());
+            }
+            let mut invalid = plan.clone();
+            invalid.facts.allocation_granularity[0].backings[0].backing = "missing".into();
+            let unchanged = invalid.clone();
+            assert!(devices.remap_plan_weight_arenas(&invalid).is_err());
+            assert_eq!(invalid, unchanged);
+        }
+    }
+    Ok(())
+}
+
 fn budget(bytes: u64) -> Budget {
     Budget {
         id: "gpu".into(),

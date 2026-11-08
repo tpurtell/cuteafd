@@ -44,6 +44,57 @@ mod tp2;
 mod packing;
 mod layers;
 mod allocation;
+
+/// Expert weights are loaded before KV; execution, pair and check owners bind later.
+pub(crate) fn resident_expert_weights(
+    receipts: &mut [cuteafd_loader::placement::planner::Receipt],
+) -> Result<()> {
+    use cuteafd_core::memory_layout::Category;
+    use cuteafd_loader::placement::planner::{Domain, Lifetime};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let weight_name = |id: &str| {
+        let rest = id.strip_prefix("glm.expert.routed.rank.").and_then(|rest| {
+            let (rank, rest) = rest.split_once('.')?;
+            (rank == "0" || rank == "1").then_some(rest)?.strip_prefix("weight.")
+        }).or_else(|| id.strip_prefix("glm.expert.shared.rank.").and_then(|rest| {
+            let (rank, rest) = rest.split_once('.')?;
+            (rank == "0" || rank == "1").then_some(rest)?.strip_prefix("layer.")
+        }));
+        rest.is_some_and(|rest| rest.split('.').next().is_some_and(|layer| layer.parse::<usize>().is_ok()))
+    };
+    let owners = receipts.iter().map(|receipt| (receipt.allocation.id.as_str(), &receipt.allocation))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(owners.len() == receipts.len(), "duplicate GLM expert census owner");
+    let mut weights = BTreeSet::new();
+    for receipt in receipts.iter().filter(|receipt| weight_name(&receipt.allocation.id)) {
+        let allocation = &receipt.allocation;
+        ensure!(allocation.location.domain == Domain::Device
+            && allocation.category == Category::Experts && allocation.group == "resident expert owners",
+            "invalid GLM expert weight receipt {}", allocation.id);
+        weights.insert(allocation.id.clone());
+        if let Some(view) = &allocation.view {
+            let root = owners.get(view.backing.as_str()).context("missing GLM expert weight backing")?;
+            ensure!(root.view.is_none() && root.location == allocation.location
+                && (weight_name(&root.id) || (root.category == Category::Weights && root.group == "weight arena")),
+                "invalid GLM expert weight backing {}", view.backing);
+            weights.insert(root.id.clone());
+        }
+    }
+    for receipt in receipts.iter() {
+        let allocation = &receipt.allocation;
+        ensure!(!allocation.view.as_ref().is_some_and(|view| weights.contains(&view.backing))
+            || weights.contains(&allocation.id), "nonweight GLM owner aliases weight backing {}", allocation.id);
+        if weights.contains(&allocation.id) {
+            ensure!(matches!(allocation.lifetime, Lifetime::TARGET | Lifetime::RESIDENT),
+                "unexpected GLM expert weight lifetime {}", allocation.id);
+        }
+    }
+    for receipt in receipts {
+        if weights.contains(&receipt.allocation.id) { receipt.allocation.lifetime = Lifetime::RESIDENT; }
+    }
+    Ok(())
+}
 #[path = "engine/native_dense.rs"]
 pub(crate) mod native_dense;
 #[cfg(test)]

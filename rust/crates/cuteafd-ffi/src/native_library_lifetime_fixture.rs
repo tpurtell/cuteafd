@@ -233,6 +233,13 @@ impl Fixture {
         Ok(())
     }
 
+    /// Allow pair construction while preserving real byte copies; peer launches still fail.
+    pub fn peer_abort_initialization(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this private fixture export only enables the no-argument initializer.
+        unsafe { library.lib.get::<unsafe extern "C" fn()>(b"fixture_peer_abort_initialization")?(); }
+        Ok(())
+    }
+
     pub fn mapped_bytes(&self, library: &NativeLibrary) -> Result<usize> {
         // SAFETY: this private fixture export reads its allocation counter.
         Ok(unsafe { library.lib.get::<unsafe extern "C" fn() -> usize>(b"fixture_mapped_bytes")?() })

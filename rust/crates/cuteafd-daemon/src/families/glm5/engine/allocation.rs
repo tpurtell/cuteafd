@@ -389,6 +389,7 @@ impl GlmEngine<'_> {
         }
         if let Some(pair) = &self.tp2 { pair.allocation_receipts(&mut inventory, "routed")?; }
         if let Some(whole) = &self.whole { whole.allocation_receipts(&mut inventory, "routed.rank.0")?; }
+        super::resident_expert_weights(&mut inventory.receipts)?;
         Ok(inventory.receipts)
     }
 

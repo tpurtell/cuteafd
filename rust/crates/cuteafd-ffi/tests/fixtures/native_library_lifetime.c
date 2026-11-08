@@ -36,6 +36,8 @@ static size_t memory_total[8], memory_used[8], graph_bytes;
 static int immediate_copies;
 /* Untouched, per-owner virtual extents: allocation tests never launch math. */
 static int extent_only;
+static int peer_abort_initialization;
+void fixture_peer_abort_initialization(void) { peer_abort_initialization = 1; }
 static size_t mapped_bytes;
 size_t fixture_mapped_bytes(void) { return mapped_bytes; }
 void fixture_extent_only(void) { extent_only = 1; immediate_copies = 1; }
@@ -105,7 +107,7 @@ int cuteafd_peer_copy_rows_async(void *dst, const void *src, uint64_t bytes,
     (void)dst; (void)src; (void)bytes; (void)rows;
     (void)dst_pitch; (void)src_pitch; (void)stream; return 1;
 }
-int cuteafd_peer_abort_initialize(void) { return extent_only ? 0 : 1; }
+int cuteafd_peer_abort_initialize(void) { return extent_only || peer_abort_initialization ? 0 : 1; }
 int cuteafd_peer_wait_abortable(const uint32_t *flag, uint32_t *state,
     const uint32_t *aborted, void *stream) {
     (void)flag; (void)state; (void)aborted; (void)stream; return 1;
@@ -599,6 +601,24 @@ int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
         pthread_mutex_unlock(&upload_mutex);
     }
     event('Q');
+    return 0;
+}
+int cuteafd_copy_h2d_2d_async(struct device_buffer dst, size_t dst_pitch,
+                            const void *source, size_t src_pitch,
+                            size_t width, size_t rows, void *stream) {
+    if (width > dst_pitch || width > src_pitch) return 1;
+    if (!width || !rows) return 0;
+    if ((rows - 1) > (SIZE_MAX - width) / dst_pitch
+            || (rows - 1) > (SIZE_MAX - width) / src_pitch
+            || (rows - 1) * dst_pitch + width > dst.bytes) return 1;
+    /* Reuse the ordinary upload's immediate, queued and deferred semantics. */
+    for (size_t row = 0; row < rows; ++row) {
+        struct device_buffer target = dst;
+        target.ptr = (char *)dst.ptr + row * dst_pitch;
+        target.bytes = width;
+        if (cuteafd_copy_h2d_async(target,
+                (const char *)source + row * src_pitch, width, stream)) return 1;
+    }
     return 0;
 }
 int cuteafd_copy_h2d_batch_async(const struct device_buffer *dsts, const void *const *sources,
