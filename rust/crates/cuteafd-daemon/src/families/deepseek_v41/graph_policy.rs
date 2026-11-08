@@ -52,6 +52,16 @@ pub(super) fn captures_shape(rows: u32) -> bool {
         && FIXED_SHAPES.get().is_none_or(|shapes| shapes.contains(&rows))
 }
 
+/// The exact decode rows the sealed startup capture records: the small card's
+/// fixed set when one is selected, else every verification row. The capture and
+/// the serving decision read this one list, so no captured row is unreachable.
+pub(super) fn startup_rows() -> Vec<usize> {
+    match FIXED_SHAPES.get() {
+        Some(shapes) => shapes.iter().map(|&row| row as usize).collect(),
+        None => (1..=MAX_DECODE_ROWS).map(|row| row as usize).collect(),
+    }
+}
+
 fn large_shape_captured(rows: u32, prefill: Option<u32>) -> bool {
     rows <= MAX_DECODE_ROWS || rows == cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS
         || prefill.is_none_or(|chunk| rows == chunk)

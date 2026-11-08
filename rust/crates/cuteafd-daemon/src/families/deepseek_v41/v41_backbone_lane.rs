@@ -809,14 +809,19 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             && self.dual_sparse.is_none() && self.tp2_query.is_none() && self.tp2_output.is_none()
             && !self.weights.split_query_b && !self.weights.split_output_b,
             "startup prototype requires idle unsplit target lanes");
-        let rows = if decode { cuteafd_core::V41_VERIFY_ROWS } else { 0 };
-        ensure!(self.capacity >= rows && (!decode || (sinks.len() == 40 && selections.len() == 40)),
+        let startup_rows: Vec<usize> = if decode {
+            super::graph_policy::startup_rows()
+        } else {
+            Vec::new()
+        };
+        ensure!(!decode || (startup_rows.iter().all(|&rows| rows <= self.capacity)
+                && sinks.len() == 40 && selections.len() == 40),
             "startup target capacity or bindings differ");
         let device = self.block.inputs()[0].device_id;
         let layers: Vec<usize> = self.weights.layers.iter().enumerate()
             .filter_map(|(layer, weights)| (weights.device.id == device).then_some(layer)).collect();
         let keys: Vec<(usize, u32)> = layers.iter().flat_map(|&layer|
-            (1..=rows).map(move |rows| (layer, rows as u32))).collect();
+            startup_rows.iter().map(move |&rows| (layer, rows as u32))).collect();
         let original = self.layer;
         self.set_attention_decode(decode);
         let result = (|| -> Result<()> {
@@ -827,14 +832,14 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
                 self.rebind_startup(layer)?;
                 let tail = StartupAttentionTail { projection: &mut self.projection, block: &mut self.block };
                 let sparse = self.sparse.as_ref().context("startup sparse owner absent")?;
-                for rows in 1..=rows {
+                for &rows in &startup_rows {
                     sparse_keys.push(sparse.startup_key(layer, rows, sinks[layer], selections[layer], aligned, Some(&tail))?);
                 }
             }
             self.sparse.as_mut().context("startup sparse owner absent")?.declare_startup(&sparse_keys)?;
             for &layer in &layers {
                 self.rebind_startup(layer)?;
-                for rows in 1..=rows {
+                for &rows in &startup_rows {
                     self.query.capture_startup(rows as u32)?;
                     self.router.capture_startup(rows as u32)?;
                     if !decode { continue; }

@@ -125,30 +125,37 @@ pub struct Opaque {
     pub source: String,
 }
 
-/// The lazy-capture envelope and runtime growth as declared reserves per GPU.
-/// None of these bytes is live at ready, so they
-/// price only the post-ready phases.
-pub fn growth_allowances(total: u64, ranks: usize, gpu: u8) -> Vec<Opaque> {
-    let location = Location::coordinator(gpu);
-    let lifetime = Lifetime { first: Phase::Ready, last: Phase::Growth };
-    let mut out = vec![Opaque {
-        location,
-        bytes: super::graph_reserve(total, ranks),
-        basis: Basis::Calibrated,
-        lifetime,
-        source: "V4.1 lazy graph capture envelope".into(),
-    }];
-    let runtime = super::runtime_reserve(total, ranks);
-    if runtime > 0 {
-        out.push(Opaque {
-            location,
-            bytes: runtime,
-            basis: Basis::Estimated,
-            lifetime,
-            source: "V4.1 runtime growth reserve (estimated; qualified max cards observed 780-854 MiB)".into(),
-        });
+/// The sealed startup capture as one declared reserve per GPU. Its executables
+/// are instantiated before Ready and nothing captures while serving, so this
+/// owner is live from Warmup on; after the capture runs, admission replaces the
+/// estimate with this process's own measured bytes (`reconcile_startup_graph`).
+pub fn growth_allowances(total: u64, ranks: usize, slots: usize, draft: bool, gpu: u8) -> Vec<Opaque> {
+    let graphs = super::startup_graphs(total, ranks, slots, draft);
+    let source = format!("startup graphs: deepseek_v41.{gpu}");
+    vec![Opaque {
+        location: Location::coordinator(gpu),
+        bytes: graphs.bytes,
+        basis: graphs.basis,
+        lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
+        source,
+    }]
+}
+
+/// Replace a GPU's startup-graph estimate with the capture that actually ran
+/// this process, then re-evaluate the phases. The pool is not resized: the
+/// capture happens after it, and the next start charges the calibrated row.
+pub fn reconcile_startup_graph(plan: &mut crate::placement::planner::ResolvedPlan, gpu: u8, bytes: u64) -> Result<(), Refusal> {
+    let source = format!("startup graphs: deepseek_v41.{gpu}");
+    let matches: Vec<_> = plan.facts.allowances.iter_mut().filter(|owner| owner.source == source).collect();
+    let [owner] = matches.try_into().map_err(|_: Vec<_>|
+        invalid("missing or duplicate V4.1 startup graph owner"))?;
+    if owner.location != Location::coordinator(gpu) {
+        return Err(invalid("V4.1 startup graph owner location differs"));
     }
-    out
+    owner.bytes = bytes;
+    owner.assumed = false;
+    plan.phases = crate::placement::planner::evaluate(&plan.facts, &plan.budgets)?;
+    Ok(())
 }
 
 fn byte_component(template: Allocation, curve: ByteCurve, maximum: u64) -> Result<Component, Refusal> {
@@ -1543,15 +1550,13 @@ impl Recipe for V41Recipe<'_> {
 #[cfg(test)]
 mod explicit_budget_tests {
     #[test]
-    fn growth_reserves_price_only_named_graph_and_runtime_owners() {
+    fn startup_graphs_price_the_sealed_capture_alone() {
         for total in [32u64 << 30, 96u64 << 30] {
             for ranks in [1, 2] {
-                let reserves = super::growth_allowances(total, ranks, 0);
-                assert_eq!(reserves.iter().map(|reserve| reserve.bytes).sum::<u64>(),
-                    super::super::graph_reserve(total, ranks)
-                        + super::super::runtime_reserve(total, ranks));
-                assert!(reserves.iter().all(|reserve| reserve.source.contains("graph")
-                    || reserve.source.contains("runtime")));
+                let reserves = super::growth_allowances(total, ranks, 3, true, 0);
+                assert_eq!(reserves.len(), 1);
+                assert_eq!(reserves[0].bytes, super::super::startup_graphs(total, ranks, 3, true).bytes);
+                assert_eq!(reserves[0].source, "startup graphs: deepseek_v41.0");
             }
         }
     }

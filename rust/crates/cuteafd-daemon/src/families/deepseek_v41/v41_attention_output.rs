@@ -278,11 +278,15 @@ impl AttentionOutputWave<'_, '_> {
         AttentionOutputStorage::storage_bytes(library, capacity, capacity, split_output_b)
     }
     /// Graphs bake in row-plane addresses (row_window: capture uses rows from
-    /// 0), so a selected prefill window always executes eagerly.
+    /// 0), so a selected prefill window always executes eagerly. After the
+    /// startup inventory is sealed, a shape it does not hold also runs eagerly.
     fn graphed(&self, rows: u32) -> bool {
         #[cfg(test)]
         if IGNORE_WINDOW.with(|ignore| ignore.get()) { return super::graph_policy::captures_shape(rows); }
-        !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+        !self.window.is_windowed()
+            && (self.graphs.get_shape(self.weights.layer, self.weights, rows).is_some()
+                || (super::graph_policy::captures_shape(rows)
+                    && self.graphs.capture_allowed(self.weights.layer, rows)))
     }
     /// `execute_attention`'s graph decision over inputs already in `input()`
     /// and `positions()` (the window test drives exactly that branch).

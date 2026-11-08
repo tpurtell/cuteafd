@@ -70,9 +70,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }).collect::<Vec<_>>();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
-        "Native module residency: selected V41_FP8_AOT projection exports, estimated separately from physical BLAS pools. The existing lazy graph reserve remains; diagnostic startup capture is uncharged and outside this inventory.".into(),
+        "Native module residency: selected V41_FP8_AOT projection exports, estimated separately from physical BLAS pools. The sealed startup capture is a separate, measured owner and is outside this inventory.".into(),
         "Spark host, wave residual and native runtime: Estimated pending qualified worker inventory; explicit rank I/O remains formula-derived.".into(),
-        "Lazy graph/runtime growth is a typed post-ready reserve, not part of the ready residency claim.".into()];
+        "Sealed startup graph capture is one typed post-ready owner, reconciled from the capture's measured bytes; a shape outside the startup set runs ungraphed.".into()];
     if options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding) {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
@@ -180,7 +180,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             reserves.push(Opaque { location: Location::coordinator(gpu as u8), bytes, basis,
                 lifetime: Lifetime::RESIDENT, source: source.into() });
         }
-        reserves.extend(admission::growth_allowances(total, ranks, gpu as u8));
+        reserves.extend(admission::growth_allowances(total, ranks, slots, dspark, gpu as u8));
     }
     if let Some(draft) = &draft {
         startup.extend(owners.draft_load_phases(draft)?.iter().map(Owner::from_demand));
@@ -360,10 +360,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lazy_graph_reserves_remain_separate_from_native_code_and_blas() {
-        let growth = admission::growth_allowances(96 * GIB, 2, 0);
-        assert!(growth.iter().any(|owner| owner.bytes == 1472 << 20
-            && owner.lifetime.first == crate::placement::planner::Phase::Ready));
+    fn startup_graphs_stay_separate_from_native_code_and_blas() {
+        let growth = admission::growth_allowances(96 * GIB, 2, 3, true, 0);
+        assert_eq!(growth.len(), 1);
+        assert_eq!(growth[0].lifetime.first, crate::placement::planner::Phase::Warmup);
+        assert!(growth[0].source.starts_with("startup graphs: deepseek_v41."));
     }
 
     /// The recipe's KV decomposition is the allocator's own total at every

@@ -238,6 +238,11 @@ impl DsparkChain<'_, '_> {
         recorded.and(restored)
     }
     pub fn has_graph(&self, count: usize) -> bool { self.graphs.contains(&(count, self.width)) }
+    /// Whether this count may still capture at the current width: false once the
+    /// startup inventory is sealed without it.
+    pub(crate) fn capture_allowed(&self, count: usize) -> bool {
+        self.graphs.capture_allowed(&(count, self.width))
+    }
     pub fn width(&self) -> usize { self.width }
     /// Select the draft width (5 or 7, within the loaded maximum) for the next
     /// draft. All storage is sized for the maximum; each width keeps its own

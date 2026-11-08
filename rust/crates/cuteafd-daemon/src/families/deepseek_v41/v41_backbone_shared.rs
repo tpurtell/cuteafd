@@ -368,7 +368,9 @@ impl<'a> BackboneSharedWave<'_, 'a> {
                 input.values.bytes, self.stream().raw) { self.synchronize()?; return Err(error); }
         }
         let rows = input.tokens.len() as u32;
-        if self.window.is_windowed() || !super::graph_policy::captures_shape(rows) {
+        if self.window.is_windowed() || !super::graph_policy::captures_shape(rows)
+            || (self.graphs.get_shape(self.layer, self.weights, rows).is_none()
+                && !self.graphs.capture_allowed(self.layer, rows)) {
             unsafe { self.execute(rows)?; }
             self.origin = Some(input.binding());
             return self.output();
@@ -415,6 +417,7 @@ impl<'a> BackboneSharedWave<'_, 'a> {
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream()).await?; }
         if cold && !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+            && self.graphs.capture_allowed(self.layer, rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result

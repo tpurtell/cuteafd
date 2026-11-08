@@ -242,6 +242,21 @@ impl<'a> BackboneCache<'a> {
         }
         Ok(())
     }
+    /// Record the startup decode rows on a single-device bank's producers. The
+    /// waves live on the same device as the state they read, so no device hop
+    /// is needed (the distributed twin is [`Self::capture_startup_producers`]).
+    pub(crate) fn capture_startup_producers_local(&self, windows: &mut [WindowWave<'_, 'a>],
+        sources: &mut [CompressorWave<'_, 'a>], rows: &[usize]) -> Result<()> {
+        ensure!(windows.len() == self.windows.len() && sources.len() == self.sources.len(),
+            "startup producer owner count differs");
+        for (wave, state) in windows.iter_mut().zip(&self.windows) {
+            wave.capture_startup(state.get(), rows)?;
+        }
+        for (wave, state) in sources.iter_mut().zip(&self.sources) {
+            wave.capture_startup(state.get(), rows)?;
+        }
+        Ok(())
+    }
     /// Bind fresh producer workspaces to this bank's optional replica owners.
     /// Called separately for each independent lane, before any production.
     pub fn configure_producer_replicas(&self,windows:&mut [DeviceOwner<'a,WindowWave<'_, 'a>>],

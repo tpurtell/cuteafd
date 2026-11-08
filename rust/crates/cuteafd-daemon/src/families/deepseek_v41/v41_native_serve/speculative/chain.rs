@@ -31,6 +31,14 @@ pub(crate) trait DraftChain<'a> {
 /// `poll_propose` instead.
 pub(crate) trait ProposeChain<'a>: DraftChain<'a> {
     fn has_graph(&self, count: usize) -> bool;
+    /// Whether this count may still capture at its current width (false once
+    /// the startup inventory is sealed without it).
+    fn capture_allowed(&self, count: usize) -> bool;
+    /// # Safety
+    /// Same contract as [`DraftChain::begin_replay`]; runs the proposal without
+    /// a captured executable.
+    unsafe fn run(&mut self, windows: [&DsparkWindow<'_>; 3],
+        bindings: [&[(WindowLease, u64)]; 3]) -> Result<()>;
     /// Stage the seed tokens and upload them to the device.
     fn set_tokens(&mut self, tokens: &[i32]) -> Result<()>;
     /// Reserve a fresh sampling attempt (synchronizes and uploads).
@@ -48,6 +56,14 @@ pub(crate) trait ProposeChain<'a>: DraftChain<'a> {
 }
 impl<'w, 'a> ProposeChain<'a> for DsparkChain<'w, 'a> {
     fn has_graph(&self, count: usize) -> bool { self.has_graph(count) }
+    fn capture_allowed(&self, count: usize) -> bool {
+        self.capture_allowed(count)
+    }
+    unsafe fn run(&mut self, windows: [&DsparkWindow<'_>; 3],
+        bindings: [&[(WindowLease, u64)]; 3]) -> Result<()> {
+        // SAFETY: forwards the caller's stable window/binding contract.
+        unsafe { self.execute(windows, bindings).map(drop) }
+    }
     fn set_tokens(&mut self, tokens: &[i32]) -> Result<()> { self.set_tokens(tokens) }
     fn prepare_sampling(&mut self, rngs: &mut [&mut cuteafd_core::DsparkRng], temperatures: &[f32]) -> Result<()> {
         self.prepare_sampling(rngs, temperatures)

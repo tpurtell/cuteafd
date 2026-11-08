@@ -183,6 +183,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
                 rows * 4, self.storage.stream.raw)?;
         }
         if self.destinations.is_some() || self.window.is_windowed() || !super::graph_policy::captures_shape(rows as u32)
+            || (self.graphs.get(rows).is_none() && !self.graphs.capture_allowed(rows))
             || crate::shared::decode_graph::census::eager("layer_row") {
             let launched = unsafe { crate::shared::decode_graph::census::dispatch(
                 self.storage.stream.library, self.storage.stream.raw, c"layer_row", rows, None, || self.enqueue(rows)) };

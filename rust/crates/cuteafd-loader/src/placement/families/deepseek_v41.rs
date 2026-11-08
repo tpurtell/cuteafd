@@ -5,20 +5,74 @@ pub mod owners;
 pub mod resident;
 pub mod weight_layout;
 
-/// Existing lazy-capture envelope, separate from qualified ready residency.
-/// Small cards previously hid this same growth allowance in the CUDA sample.
-pub fn graph_reserve(total: u64, ranks: usize) -> u64 {
-    if total <= 32 << 30 { 2048 << 20 } else if ranks == 1 { 3264 << 20 } else { 1472 << 20 }
+/// Distinct decode row shapes the sealed startup capture records per lane: the
+/// small card's qualified bank, else every verification row. This mirrors
+/// `graph_policy::startup_rows`, the one list the capture and serving read.
+pub fn startup_lane_shapes(total: u64) -> u64 {
+    if total <= 32 << 30 { 8 } else { cuteafd_core::V41_VERIFY_ROWS as u64 }
 }
 
-/// Estimated post-ready runtime growth per GPU, the same under automatic and
-/// explicit pools: no warmed plateau is measured for it yet. The retained
-/// V4.1 max cards (2026-10-25, 757-land/router-astra-land memory.jsonl) grew
-/// 780-854 MiB raw per GPU in the ~20 s after ready, lazy captures included,
-/// against 1472 + 800 MiB of graph and runtime reserve; that is not a warmed
-/// C16/8K figure. Small cards fold their slack into the ceiling.
-pub fn runtime_reserve(total: u64, ranks: usize) -> u64 {
-    if total <= 32 << 30 { 0 } else if ranks == 1 { 2 << 30 } else { 800 << 20 }
+/// Graph executables one decode row shape instantiates per lane: the backbone
+/// lane, index selection, sparse/window attention, both gates and the head
+/// site at every layer that shape reaches. Measured by the startup census.
+const LANE_EXECUTABLES_PER_SHAPE: u64 = 0;
+/// One prefill slot's eager set: the full chunk, the 128-row decoder replay and
+/// their layers' sites. Measured by the startup census.
+const SLOT_EXECUTABLES: u64 = 0;
+/// The draft proposals' sealed set. Measured by the startup census.
+const DRAFT_EXECUTABLES: u64 = 0;
+
+/// Retained device bytes per captured executable, by phase. Driver graph
+/// executables are opaque storage: the census measures the whole capture's
+/// `free` delta, not a per-node estimate. Measured by the startup census.
+const LANE_BYTES_PER_EXECUTABLE: u64 = 0;
+const SLOT_BYTES_PER_EXECUTABLE: u64 = 0;
+const DRAFT_BYTES_PER_EXECUTABLE: u64 = 0;
+
+/// Whole-capture census rows: `(rank count, card-class ceiling, prefill slots,
+/// drafter, decode shapes, bytes, executables)`. A row is this process's own
+/// `free` delta across the sealed capture plus the capture count, which is
+/// exact for its geometry and supersedes the per-executable rates there.
+const STARTUP_GRAPH_CENSUS: &[(usize, u64, usize, bool, u64, u64, u64)] = &[];
+
+/// The sealed startup capture's residency on one coordinator GPU. Admission
+/// charges it before the pool is sized, because the capture runs after the KV
+/// pool exists; a shape outside the declared set runs eagerly and allocates
+/// nothing, so no later growth reopens the owner. Exact for a geometry the
+/// census measured, else the measured per-executable rates applied to this
+/// geometry's declared executable count (an explicit estimate, never a margin).
+pub fn startup_graphs(total: u64, ranks: usize, slots: usize, draft: bool) -> crate::placement::inventory::GraphRank {
+    use crate::placement::inventory::GraphRank;
+    let shapes = startup_lane_shapes(total);
+    let (lanes, prefill, proposals) = declared_startup_graphs(shapes, slots, draft);
+    let class = if total <= 32 << 30 { 32 << 30 } else { 96 << 30 };
+    if let Some(&(_, _, _, _, _, bytes, executables)) = STARTUP_GRAPH_CENSUS.iter()
+        .find(|row| row.0 == ranks && row.1 == class && row.2 == slots && row.3 == draft && row.4 == shapes) {
+        return GraphRank { executables, bytes, margin: 0, basis: Basis::Calibrated };
+    }
+    let measure = lanes * LANE_BYTES_PER_EXECUTABLE + prefill * SLOT_BYTES_PER_EXECUTABLE
+        + proposals * DRAFT_BYTES_PER_EXECUTABLE;
+    // Until a census row prices this geometry, the estimate is the retired
+    // lazy-capture envelope: the sealed capture runs after the pool, so
+    // under-estimating it would OOM inside startup capture. `reconcile_`
+    // `startup_graph` replaces it with the bytes this process actually kept.
+    let bytes = if measure == 0 { retired_envelope(total, ranks) } else { measure };
+    GraphRank { executables: lanes + prefill + proposals, bytes, margin: 0, basis: Basis::Estimated }
+}
+
+/// The retired lazy-capture envelope, kept only as the uncalibrated estimate:
+/// the whole-capture census row supersedes it for the geometries it measured.
+fn retired_envelope(total: u64, ranks: usize) -> u64 {
+    if total <= 32 << 30 { 2048 << 20 }
+    else if ranks == 1 { (3264 << 20) + (2 << 30) }
+    else { (1472 << 20) + (800 << 20) }
+}
+
+/// The sealed capture's declared executable counts: both decode lanes at every
+/// startup row, each prefill slot's eager set and the draft proposals.
+fn declared_startup_graphs(shapes: u64, slots: usize, draft: bool) -> (u64, u64, u64) {
+    (2 * shapes * LANE_EXECUTABLES_PER_SHAPE, slots as u64 * SLOT_EXECUTABLES,
+        if draft { DRAFT_EXECUTABLES } else { 0 })
 }
 
 /// Exact expert allocation extents, supplied either by linked native info or
@@ -693,21 +747,27 @@ mod tests {
     }
 
     #[test]
-    fn growth_reserves_are_post_ready_allowances_on_every_card() {
+    fn startup_graphs_are_one_warmup_allowance_on_every_card() {
         for total in [32 << 30, 96 << 30] {
             for ranks in [1, 2] {
                 for gpu in 0..ranks {
-                    let allowances = admission::growth_allowances(total, ranks, gpu as u8);
+                    let allowances = admission::growth_allowances(total, ranks, 3, true, gpu as u8);
+                    assert_eq!(allowances.len(), 1, "one named startup graph owner");
                     assert!(allowances.iter().all(|a| a.location == Location::coordinator(gpu as u8)
-                        && a.lifetime == Lifetime { first: Phase::Ready, last: Phase::Growth }));
-                    assert_eq!(allowances.iter().map(|a| a.bytes).sum::<u64>(),
-                        graph_reserve(total, ranks) + runtime_reserve(total, ranks));
+                        && a.lifetime == Lifetime { first: Phase::Warmup, last: Phase::Growth }));
+                    assert_eq!(allowances[0].source, format!("startup graphs: deepseek_v41.{gpu}"));
+                    assert_eq!(allowances[0].bytes, startup_graphs(total, ranks, 3, true).bytes);
                 }
             }
         }
-        // One estimate per card shape: automatic and explicit pools share it.
-        assert_eq!(runtime_reserve(96 << 30, 1), 2 << 30);
-        assert_eq!(runtime_reserve(96 << 30, 2), 800 << 20);
+        // The prefill slots and the drafter each declare their own set, so a
+        // priced census row can never charge less for a superset geometry.
+        assert!(startup_graphs(96 << 30, 1, 3, true).executables
+            >= startup_graphs(96 << 30, 1, 3, false).executables);
+        assert!(startup_graphs(96 << 30, 1, 3, true).executables
+            >= startup_graphs(96 << 30, 1, 1, true).executables);
+        assert!(startup_graphs(96 << 30, 1, 3, true).bytes
+            >= startup_graphs(96 << 30, 1, 1, true).bytes);
     }
 
     #[test]

@@ -113,12 +113,6 @@ mod spark_tests {
     }
 }
 
-pub(super) fn graph_reserve_bytes(total: usize, dual_gpu: Option<usize>) -> usize {
-    assert!(dual_gpu.is_none_or(|gpu| gpu < 2));
-    families::deepseek_v41::graph_reserve(total as u64, if dual_gpu.is_some() { 2 } else { 1 })
-        as usize
-}
-
 pub(super) fn embedding_placement(
     explicit: Option<crate::shared::memory::EmbedPlacement>,
     total: usize,
@@ -473,6 +467,9 @@ pub(super) struct Admitted {
     pub global_bytes: usize,
     pub reservation_bytes: Vec<usize>,
     pub placement: Placement,
+    /// The admitted plan; the sealed startup capture replaces its startup-graph
+    /// estimate with the bytes this process actually retained.
+    pub solved: cuteafd_loader::placement::planner::ResolvedPlan,
     pub host: families::deepseek_v41::admission::HostFacts,
     pub host_ledger: cuteafd_core::memory_layout::HostLayout,
 }
@@ -598,12 +595,12 @@ pub(super) fn resolve_with_owners(
         ),
         waves: u64::from(args.prefill_waves),
     };
-    // Future owners beside the pool: the calibrated lazy-graph envelope and
-    // runtime growth reserve. None is live at ready,
-    // so each prices only the post-ready phases.
+    // The sealed startup graph capture: instantiated before Ready, outside the
+    // pool, so it prices every phase from Warmup on and nothing grows later.
     let mut allowances = Vec::new();
     for (gpu, sample) in memory.iter().enumerate() {
-        allowances.extend(admission::growth_allowances(sample.1 as u64, ranks, gpu as u8));
+        allowances.extend(admission::growth_allowances(sample.1 as u64, ranks,
+            prefill.waves as usize, args.dspark, gpu as u8));
     }
     let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
     for (gpu, &bytes) in deferred.iter().enumerate().filter(|(_, &bytes)| bytes > 0) {
@@ -743,6 +740,7 @@ pub(super) fn resolve_with_owners(
         global_bytes: groups * (5 * 256 * 356),
         reservation_bytes: ceilings,
         placement,
+        solved: admitted.solved,
     })
 }
 
@@ -1236,15 +1234,17 @@ mod admission_tests {
             }
             assert_eq!(admitted.placement.pool_tokens, args.pool_tokens.unwrap());
             assert_eq!(admitted.reservation_bytes, vec![total; ranks]);
+            // The admitted shape's own slots: this is what admission charges
+            // and what the sealed capture records.
+            let slots = usize::from(args.prefill_waves);
+            let graphs = families::deepseek_v41::startup_graphs(total as u64, ranks, slots, args.dspark).bytes
+                as usize;
             let exact = admitted
                 .cache_bytes
                 .iter()
                 .enumerate()
                 .map(|(gpu, &bytes)| {
-                    let reserve = cuteafd_loader::placement::reserve::gpu("deepseek_v41") as usize
-                        + families::deepseek_v41::runtime_reserve(total as u64, ranks)
-                            as usize
-                        + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
+                    let reserve = cuteafd_loader::placement::reserve::gpu("deepseek_v41") as usize + graphs;
                     let blas = admitted.placement.items[gpu].iter().filter(|item|
                         item.group.starts_with("cuBLAS handles:")
                             || item.group.starts_with("BLAS device initialization"))
@@ -1371,12 +1371,21 @@ mod admission_tests {
     }
 
     #[test]
-    fn graph_reserves_and_small_card_logical_target_remain_distinct() -> Result<()> {
-        assert_eq!(graph_reserve_bytes(96usize << 30, None), 3264 << 20);
-        for rank in [0, 1] {
-            assert_eq!(graph_reserve_bytes(96usize << 30, Some(rank)), 1472 << 20);
+    fn startup_graphs_and_small_card_logical_target_remain_distinct() -> Result<()> {
+        // One owner per GPU: the sealed capture, priced from the same declared
+        // shape count the startup capture records (two lanes, one set per slot).
+        for (total, slots, draft) in [(96u64 << 30, 3, true), (32u64 << 30, 1, false)] {
+            let graphs = families::deepseek_v41::startup_graphs(total, 1, slots, draft);
+            assert_eq!(graphs.margin, 0);
+            assert!(graphs.bytes > 0, "startup graphs must be charged, never zero");
+            assert_eq!(graphs.executables % 2, 0, "both decode lanes are declared");
         }
-        assert_eq!(graph_reserve_bytes(32usize << 30, None), 2048 << 20);
+        let wide = families::deepseek_v41::startup_graphs(96 << 30, 1, 3, true);
+        let narrow = families::deepseek_v41::startup_graphs(96 << 30, 1, 1, true);
+        // A prefill slot adds its own eager set; the uncalibrated estimate is
+        // the one retired envelope, so it is flat until the census prices it.
+        assert!(wide.executables >= narrow.executables);
+        assert!(wide.bytes >= narrow.bytes);
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),

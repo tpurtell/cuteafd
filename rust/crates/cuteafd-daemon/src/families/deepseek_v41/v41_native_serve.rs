@@ -447,10 +447,14 @@ fn worker(
     admission::startup_phase(&lib, "v41/before native preload", device_total)?;
     let _inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
         admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some())?;
+        // Every runtime-registered native kernel loads before the admission
+        // sample, so first-use module growth in a decode lane, a prefill slot
+        // or the drafter is never an untracked post-baseline owner (#1554).
+        lib.tp2_native_initialize()?;
         Ok(())
     })?;
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
-    let pool = admission::admit_startup(&lib, &catalog, &args)?;
+    let mut pool = admission::admit_startup(&lib, &catalog, &args)?;
     args.max_context_tokens = pool.served_context;
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
@@ -759,6 +763,64 @@ fn worker(
         remote_dispatch_layers=40-local_layers, spark_world=expert_world,
         device_occupied_bytes=occupied, device_budget_bytes=?pool.reservation_bytes,
         "native serving residency ready");
+    // Sealed startup decode inventory: both decode lanes' verification rows,
+    // the prefill sets (eager: arbitrary restored tails have no safe padding
+    // mask) and the draft proposals. Nothing captures while serving; a shape
+    // outside this set runs eagerly and allocates nothing.
+    {
+        let bank = requests.cache();
+        // Free bytes per RTX rank: both ranks capture, so each one's own
+        // retained residency is what its ledger owner must charge.
+        let sample = |lib: &cuteafd_ffi::NativeLibrary| -> Result<Vec<u64>> {
+            let mut free = Vec::with_capacity(args.rtx_gpus as usize);
+            for gpu in 0..args.rtx_gpus as i32 {
+                lib.cuda_set_device(gpu)?;
+                free.push(lib.cuda_memory_info()?.0 as u64);
+            }
+            lib.cuda_set_device(0)?;
+            Ok(free)
+        };
+        let executables = || -> u64 {
+            cuteafd_ffi::graph_capture_sites().iter().map(|(_, n)| *n).sum()
+        };
+        let delta = |before: &[u64], after: &[u64]| -> Vec<u64> {
+            before.iter().zip(after).map(|(b, a)| b.saturating_sub(*a)).collect()
+        };
+        let capture_started = Instant::now();
+        let free_before = sample(&lib)?;
+        let execs_before = executables();
+        pass.capture_startup(bank)?;
+        second.capture_startup(bank)?;
+        let free_lanes = sample(&lib)?;
+        let execs_lanes = executables();
+        for (slot, _) in &mut prefill_slots.slots { slot.capture_startup_prefill(bank)?; }
+        let free_slots = sample(&lib)?;
+        let execs_slots = executables();
+        if let Some(draft) = &mut draft { draft.capture_startup()?; }
+        let free_after = sample(&lib)?;
+        let execs_after = executables();
+        let measured = delta(&free_before, &free_after);
+        tracing::info!(capture_ms = capture_started.elapsed().as_millis() as u64,
+            free_before_bytes = ?free_before, free_after_bytes = ?free_after,
+            graph_bytes = ?measured,
+            lanes_bytes = ?delta(&free_before, &free_lanes),
+            lanes_executables = execs_lanes.saturating_sub(execs_before),
+            slots_bytes = ?delta(&free_lanes, &free_slots),
+            slots_executables = execs_slots.saturating_sub(execs_lanes),
+            draft_bytes = ?delta(&free_slots, &free_after),
+            draft_executables = execs_after.saturating_sub(execs_slots),
+            decode_lanes = 2, prefill_slots = slots, draft = draft.is_some(),
+            "V4.1 sealed startup graph capture");
+        // The pool was sized against the estimate; replace it with the bytes
+        // this process retained, so the ledger and the census inputs report the
+        // capture that actually ran.
+        for (gpu, bytes) in measured.into_iter().enumerate() {
+            cuteafd_loader::placement::families::deepseek_v41::admission::reconcile_startup_graph(
+                &mut pool.solved, gpu as u8, bytes)
+                .map_err(|error| anyhow::anyhow!("V4.1 startup graph reconciliation: {error}"))?;
+        }
+        cuteafd_loader::placement::reserve::log_plan(&pool.solved, "deepseek_v41 captured");
+    }
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1258,4 +1320,41 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
         console::Prefill::done(console::PrefillKind::Continuation, 0, index, count, chunk.len(), started);
     }
     anchor.context("prefix continuation produced no logits")
+}
+
+#[cfg(test)]
+mod tests {
+    /// First-use module load is post-baseline growth if it happens after the
+    /// admission sample: every runtime-registered kernel must be resident
+    /// inside the measured PreWeight closure, on one RTX as on a TP2 pair.
+    #[test]
+    fn all_native_modules_load_before_the_admission_sample() {
+        let source = include_str!("v41_native_serve.rs");
+        let measured = source.split("RuntimeInventory::measure").nth(1).unwrap()
+            .split("let mut pool = admission::admit_startup").next().unwrap();
+        let native = measured.find("lib.tp2_native_initialize()?").unwrap();
+        let preload = measured.find("admission::preload(").unwrap();
+        assert!(preload < native, "module load follows the preload it warms");
+        assert_eq!(measured.matches("lib.tp2_native_initialize()?").count(), 1);
+    }
+
+    /// The sealed capture needs the KV pool's addresses, so it runs after
+    /// admission; admission charges an estimate first and the plan is then
+    /// reconciled to this process's own measured residency before Ready.
+    #[test]
+    fn sealed_capture_is_measured_after_the_pool_and_reconciled() {
+        let source = include_str!("v41_native_serve.rs");
+        let pool = source.find("let mut pool = admission::admit_startup").unwrap();
+        let capture = source.find("pass.capture_startup(bank)?").unwrap();
+        let lane_measure = source.find("let free_lanes = sample(&lib)?").unwrap();
+        let slots = source.find("slot.capture_startup_prefill(bank)?").unwrap();
+        let draft = source.find("draft.capture_startup()?").unwrap();
+        let reconcile = source.find("reconcile_startup_graph(").unwrap();
+        let receipt = source.find("log_plan(&pool.solved, \"deepseek_v41 captured\")").unwrap();
+        assert!(pool < capture && capture < lane_measure && lane_measure < slots);
+        assert!(slots < draft && draft < reconcile && reconcile < receipt);
+        let single_rank = concat!("free_before", ".saturating_sub");
+        assert!(!source.contains(single_rank),
+            "per-rank free deltas, not one rank's bytes applied to all");
+    }
 }

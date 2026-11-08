@@ -197,6 +197,38 @@ impl<'a, R> Pass<'a, R> {
     pub(crate) fn set_l2_prefetch(&mut self, on: bool) { self.l2_solo = on; }
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
+    /// Seal the single-RTX prefill graph inventory: arbitrary restored tails
+    /// have no safe padding mask, so prefill stays eager and allocates nothing.
+    pub(crate) fn capture_startup_prefill(&mut self,
+        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {
+        ensure!(self.state == State::Idle, "startup prefill capture requires idle target pass");
+        let resources = &mut self.resources;
+        let rows = [];
+        resources.execution.capture_startup_producers(bank, &rows)?;
+        resources.index.capture_startup(&rows, |layer, row|
+            resources.execution.startup_source(bank, layer, row))?;
+        resources.lane.capture_startup_prefill()?;
+        for gate in &mut resources.gates { gate.capture_startup(&rows)?; }
+        resources.head.capture_startup(&rows)
+    }
+    /// Record every decode verification row on this pass's own owners, then
+    /// seal. A shape outside this set runs eagerly and allocates nothing.
+    pub(crate) fn capture_startup(&mut self,
+        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {
+        ensure!(self.state == State::Idle, "startup graph capture requires idle target pass");
+        let rows = super::graph_policy::startup_rows();
+        let resources = &mut self.resources;
+        resources.execution.capture_startup_producers(bank, &rows)?;
+        resources.index.capture_startup(&rows, |layer, row|
+            resources.execution.startup_source(bank, layer, row))?;
+        let selections = resources.index.startup_selections();
+        let sinks = resources.execution.startup_sinks();
+        // Admitted CUDA planes have native allocation alignment; live views are
+        // validated again before every replay.
+        resources.lane.capture_startup(sinks, &selections, true)?;
+        for gate in &mut resources.gates { gate.capture_startup(&rows)?; }
+        resources.head.capture_startup(&rows)
+    }
     pub fn bind_execution_plan(&self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
         let plan = cuteafd_loader::placement::LayerExecutionPlan::new(placement,
             cuteafd_loader::placement::families::deepseek_v41::execution_hops(1))?;

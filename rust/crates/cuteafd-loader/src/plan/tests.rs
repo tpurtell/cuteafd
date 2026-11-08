@@ -4658,9 +4658,12 @@ fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle
 }
 
 #[test]
-fn v41_small_card_graph_envelope_preserves_pro_allowance() {
+fn v41_small_card_startup_graph_reserve_preserves_pro_allowance() {
     let dir = strict_v41_snapshot(false);
-    for (gib, expected) in [(32, 2u64 << 30), (96, 3264u64 << 20)] {
+    // One startup-graphs owner replaces the retired graph and runtime
+    // reserves. Until a sealed-capture census row prices this geometry it
+    // holds exactly the retired pair, so a card plans what it planned before.
+    for (gib, expected) in [(32, 2048u64 << 20), (96, (3264u64 << 20) + (2 << 30))] {
         let options = PlanOptions {
             layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib << 30], prefill_rows: 256, onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                 context_tokens: 262_144, pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
@@ -4669,7 +4672,7 @@ fn v41_small_card_graph_envelope_preserves_pro_allowance() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.executable(), "{}", render(&report));
         let memory = report.memory_layout.unwrap();
-        let graph = memory.devices[0].items.iter().find(|item| item.group == "V4.1 lazy graph capture envelope").unwrap();
+        let graph = memory.devices[0].items.iter().find(|item| item.group == "startup graphs: deepseek_v41.0").unwrap();
         assert_eq!(graph.bytes, expected);
     }
 }
@@ -4683,8 +4686,8 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
         prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(automatic.devices[0].capacity_bytes, 96u64 << 30);
-    // The runtime growth estimate does not grow with automatic admission.
-    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group.starts_with("V4.1 runtime growth reserve")).unwrap().bytes, 2 << 30);
+    // The startup graph estimate does not grow with automatic admission.
+    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group == "startup graphs: deepseek_v41.0").unwrap().bytes, (3264 << 20) + (2 << 30));
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
     let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&crate::read_json_file::<Value>(&dir.path().join("config.json")).unwrap(), 1).unwrap();
@@ -4693,7 +4696,7 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     options.layout.as_mut().unwrap().pool_tokens = Some(512);
     let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(explicit.devices[0].capacity_bytes, 96u64 << 30);
-    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group.starts_with("V4.1 runtime growth reserve")).unwrap().bytes, 2 << 30);
+    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group == "startup graphs: deepseek_v41.0").unwrap().bytes, (3264 << 20) + (2 << 30));
 }
 
 #[test]
@@ -4989,13 +4992,11 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     assert!(modules >= 34 << 20);
     let blas = bytes("cuBLAS handles:") + bytes("BLAS device initialization");
     assert_eq!(blas, 66 << 20);
-    assert_eq!(bytes("V4.1 lazy graph capture envelope"),
-        crate::placement::families::deepseek_v41::graph_reserve(31 << 30, 1));
-    assert_eq!(bytes("V4.1 runtime growth reserve"),
-        crate::placement::families::deepseek_v41::runtime_reserve(31 << 30, 1));
+    assert_eq!(bytes("startup graphs: deepseek_v41."),
+        crate::placement::families::deepseek_v41::startup_graphs(31 << 30, 1, 3, true).bytes);
     assert_eq!(bytes("native LoadedCode estimate"), 0);
     let retired = (2u64 << 30) + arch.cublas_bytes - modules - blas;
-    eprintln!("V4.1 synthetic 31 GiB: selected modules {modules}, named BLAS {blas}, retired mixed allowance delta {retired} B; graph/runtime unchanged");
+    eprintln!("V4.1 synthetic 31 GiB: selected modules {modules}, named BLAS {blas}, retired mixed allowance delta {retired} B; startup graphs are one measured owner");
     // Less physical capacity still refuses rather than shrinking the reserve.
     let limited = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![29 << 30], ..layout.clone() }), ..sparks(4) };

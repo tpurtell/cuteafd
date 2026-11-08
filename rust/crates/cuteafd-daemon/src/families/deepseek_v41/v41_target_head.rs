@@ -238,6 +238,29 @@ impl TargetHeadWave<'_, '_> {
         }
         unsafe { self.capture_ready(rows) }
     }
+    /// Record the sealed startup row inventory on an idle owner. No warmup runs:
+    /// recording reads only fixed geometry, and the enclosing startup sequence
+    /// drains before serving.
+    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+        ensure!(self.ready.is_none() && self.origin.is_none() && !self.greedy_ready,
+            "target head startup requires an idle owner");
+        ensure!(rows.iter().all(|&row| (1..=self.capacity).contains(&row)),
+            "target head startup row exceeds capacity");
+        self.stream.require_complete()?;
+        self.graphs.declare_startup(rows)?;
+        for &row in rows {
+            // SAFETY: recording owned head buffers neither executes kernels nor
+            // publishes logits; owners stay pinned until the bank is sealed.
+            unsafe { self.capture_ready(row)?; }
+        }
+        self.graphs.finish_startup()
+    }
+    /// Whether this row count runs a captured executable. A shape outside the
+    /// sealed startup inventory runs eagerly and allocates nothing.
+    fn graphed(&self, rows: usize) -> bool {
+        self.graph(rows).is_some()
+            || (super::graph_policy::captures_shape(rows as u32) && self.graphs.capture_allowed(rows))
+    }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
         self.invalidate();
         ensure!((1..=self.capacity).contains(&rows) && self.graph(rows).is_none(),
@@ -350,7 +373,8 @@ impl TargetHeadWave<'_, '_> {
         Ok(())
     }
     unsafe fn capture_block_head(&mut self, rows: usize) -> Result<()> {
-        if super::graph_policy::captures_shape(rows as u32) && self.graph(rows).is_none() {
+        if super::graph_policy::captures_shape(rows as u32) && self.graph(rows).is_none()
+            && self.graphs.capture_allowed(rows) {
             unsafe { self.capture(rows)?; }
         }
         Ok(())
@@ -361,7 +385,7 @@ impl TargetHeadWave<'_, '_> {
         let launched = unsafe { self.enqueue(rows) };
         let drained = self.stream.wait().await;
         launched.and(drained)?;
-        if super::graph_policy::captures_shape(rows as u32) {
+        if super::graph_policy::captures_shape(rows as u32) && self.graphs.capture_allowed(rows) {
             unsafe { self.capture_ready(rows) }
         } else { Ok(()) }
     }
@@ -376,7 +400,7 @@ impl TargetHeadWave<'_, '_> {
         -> Result<TargetLogits<'_>> {
         unsafe { self.copy_block(block, selected)?; }
         self.synchronize()?;
-        if super::graph_policy::captures_shape(selected.len() as u32) {
+        if self.graphed(selected.len()) {
             unsafe { self.capture_block_head(selected.len())?; self.replay(selected.len())?; }
         } else { unsafe { self.execute(selected.len())?; } }
         self.publish_block(block, selected);
@@ -388,7 +412,7 @@ impl TargetHeadWave<'_, '_> {
         -> Result<TargetLogits<'_>> {
         unsafe { self.copy_block(block, selected)?; }
         // Warmup and replay consume input copies on this same stream.
-        let captured = super::graph_policy::captures_shape(selected.len() as u32);
+        let captured = self.graphed(selected.len());
         if captured && self.graph(selected.len()).is_none() {
             unsafe { self.prepare_head_cooperative(selected.len()).await?; }
         }
@@ -407,7 +431,7 @@ impl TargetHeadWave<'_, '_> {
         selected: &[usize], cooperative: bool) -> Result<()> {
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
-        let captured = super::graph_policy::captures_shape(rows as u32);
+        let captured = self.graphed(rows);
         if captured && self.graph(rows).is_none() {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
@@ -464,7 +488,7 @@ impl TargetHeadWave<'_, '_> {
         );
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
-        let captured = super::graph_policy::captures_shape(rows as u32);
+        let captured = self.graphed(rows);
         if captured && self.graph(rows).is_none() {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }

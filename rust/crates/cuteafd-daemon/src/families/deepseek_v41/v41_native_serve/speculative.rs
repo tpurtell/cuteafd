@@ -146,6 +146,17 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
         })
     }
 }
+impl<'w, 'a> DraftRuntime<'w, 'a, DsparkChain<'w, 'a>> {
+    /// Seal the draft proposal inventory: every admitted count and both widths
+    /// are literal keys, so a sealed miss runs eagerly and allocates nothing.
+    pub(crate) fn capture_startup(&mut self) -> Result<()> {
+        ensure!(self.requests.is_empty() && self.pending.iter().all(Option::is_none),
+            "draft startup requires no admitted requests");
+        let windows = self.windows.each_ref();
+        for chain in &mut self.chains { chain.capture_startup(windows)?; }
+        Ok(())
+    }
+}
 impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn admit(&mut self, id: u64) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
@@ -738,15 +749,24 @@ impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
         }
         let windows = self.windows.each_ref();
         let bindings = bindings.each_ref().map(|rows| rows.as_slice());
-        if !self.chains[lane].has_graph(count) {
-            // SAFETY: admitted leases and windows remain owned until the synchronous operation drains.
-            if let Err(error) = unsafe { self.chains[lane].capture(windows, bindings) } {
-                self.chains[lane].note_failure(&error);
-                return Err(error);
+        let launched = {
+            let chain = &mut self.chains[lane];
+            if chain.has_graph(count) {
+                // SAFETY: same stable window/binding lifetime as capture below.
+                unsafe { chain.replay(windows, bindings) }
+            } else if chain.capture_allowed(count) {
+                // SAFETY: admitted leases and windows remain owned until the synchronous operation drains.
+                let captured = unsafe { chain.capture(windows, bindings) };
+                // SAFETY: same stable window/binding lifetime as capture above.
+                captured.and_then(|()| unsafe { chain.replay(windows, bindings) })
+            } else {
+                // A shape outside the sealed startup inventory runs eagerly and
+                // allocates no executable.
+                // SAFETY: same stable window/binding lifetime as capture above.
+                unsafe { chain.run(windows, bindings) }
             }
-        }
-        // SAFETY: same stable window/binding lifetime as capture above.
-        if let Err(error) = unsafe { self.chains[lane].replay(windows, bindings) } {
+        };
+        if let Err(error) = launched {
             self.chains[lane].note_failure(&error);
             return Err(error);
         }
@@ -910,6 +930,8 @@ mod anchor_fallback_tests {
     }
     impl<'a> ProposeChain<'a> for FailingChain {
         fn has_graph(&self, _: usize) -> bool { self.at != At::Capture }
+        fn capture_allowed(&self, _: usize) -> bool { true }
+        unsafe fn run(&mut self, _: [&DsparkWindow<'_>; 3], _: [&[(WindowLease, u64)]; 3]) -> Result<()> { self.step(At::Replay) }
         fn set_tokens(&mut self, tokens: &[i32]) -> Result<()> { self.stage_tokens(tokens) }
         fn prepare_sampling(&mut self, _: &mut [&mut cuteafd_core::DsparkRng], _: &[f32]) -> Result<()> { self.step(At::Sampling) }
         unsafe fn capture(&mut self, _: [&DsparkWindow<'_>; 3], _: [&[(WindowLease, u64)]; 3]) -> Result<()> { self.step(At::Capture) }

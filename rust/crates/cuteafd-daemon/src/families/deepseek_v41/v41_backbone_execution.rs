@@ -8,13 +8,13 @@ pub(crate) use distributed::{DistributedExecution, PendingDistributedProduction}
 pub(crate) use placement::{PlacedProducerStorage, PlacedProducerWaves};
 use crate::families::deepseek_v41::v41_backbone_lane::{BackboneLane, LaneFfn, PendingLaneFfn};
 use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
-use crate::families::deepseek_v41::v41_compressor::{CompressorWave, CompressorWeights};
+use crate::families::deepseek_v41::v41_compressor::{CompressorWave, CompressorWeights, IndexScoreGeometry};
 use crate::families::deepseek_v41::v41_experts::coordinator::{NativeTp4Wave, NativeFfnOutput};
 use crate::families::deepseek_v41::v41_index_lane::IndexLane;
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use crate::families::deepseek_v41::v41_window::{WindowWave, WindowWeights};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::NativeLibrary;
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
 const SOURCES: [usize; 4] = [2, 8, 14, 20];
 const INDEX: [usize; 8] = [2, 8, 14, 20, 24, 28, 32, 36];
@@ -518,6 +518,25 @@ impl Drop for PendingProduction<'_, '_, '_> {
 impl<'w, 'a> BackboneExecution<'w, 'a> {
     pub fn window_batch_enabled() -> bool {
         std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0")
+    }
+    /// The per-layer attention-sink bindings a startup lane capture records.
+    pub(crate) fn startup_sinks(&self) -> &[CuteafdDeviceBuffer; 40] {
+        &self.weights.sink_views
+    }
+    /// The compressed-source geometry a startup index capture records for a
+    /// source layer, read from the bank's own state (the distributed twin is
+    /// [`DistributedExecution::startup_source`]).
+    pub(crate) fn startup_source(&self, bank: &BackboneCache<'a>, layer: usize, rows: usize)
+        -> Result<IndexScoreGeometry> {
+        let index = SOURCES.iter().position(|&source| source == layer)
+            .context("startup index source absent")?;
+        self.sources[index].startup_index_geometry(bank.sources()[index].get(), rows)
+    }
+    /// Record the startup decode rows on this pass's producers against the
+    /// shared cache bank.
+    pub(crate) fn capture_startup_producers(&mut self, bank: &BackboneCache<'a>, rows: &[usize])
+        -> Result<()> {
+        bank.capture_startup_producers_local(&mut self.windows, &mut self.sources, rows)
     }
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
         // One window storage: shared producer scratch, each layer's proposal plane.
