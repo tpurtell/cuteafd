@@ -983,7 +983,8 @@ mod tests {
     /// A category scope nested inside an owner relabels the category but keeps
     /// the owner, so plan == runtime sums every allocation a component makes.
     #[test]
-    fn owners_survive_nested_category_scopes() {        let _ledger = test_guard();
+    fn owners_survive_nested_category_scopes() {
+        let _ledger = test_guard();
         let base = 0x7100_0000_0000usize;
         {
             let _owner = owner("test/lanes/head");
