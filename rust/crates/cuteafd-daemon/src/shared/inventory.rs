@@ -47,7 +47,11 @@ impl RuntimeInventory {
             library.cuda_set_device(device)?;
             let sample = (|| -> Result<RuntimeSample> {
                 let (before, _) = library.cuda_memory_info()?;
-                let (free, total) = after_modules(device, &mut load_modules, || library.cuda_memory_info())?;
+                let (free, total) = after_modules(device, &mut |id| {
+                    load_modules(id)?;
+                    if phase == InventoryPhase::PreWeight { preload_native_modules(library)?; }
+                    Ok(())
+                }, || library.cuda_memory_info())?;
                 let tracked = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
                 let info = library.cuda_device_info(device)?;
                 let text = |chars: &[std::ffi::c_char]| {
@@ -94,6 +98,12 @@ impl RuntimeInventory {
             Baseline::Measured { free_bytes: g.free_bytes.saturating_sub(loaded.get(i).copied().unwrap_or(0)) }))
             .collect()
     }
+}
+
+/// Full runtime-registered inventory, not only selected AOT programs. Called
+/// inside each family's measured module window, before admission samples.
+pub(crate) fn preload_native_modules(library: &NativeLibrary) -> Result<()> {
+    library.tp2_native_initialize()
 }
 
 fn after_modules<T>(device: i32, load: &mut impl FnMut(i32) -> Result<()>,

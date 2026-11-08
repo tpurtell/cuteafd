@@ -1820,6 +1820,7 @@ pub struct NativeLibrary {
     quarantine_after_failed_drain: AtomicBool,
     sync_h2d_staging: Mutex<SyncH2DStagingBuffer>,
     ordered_h2d_staging: Mutex<std::collections::BTreeMap<(i32, usize, usize), OrderedH2DStaging>>,
+    native_modules_loaded: Mutex<std::collections::BTreeSet<i32>>,
     rdma_rc_endpoint_try_poll_fn: RdmaRcEndpointTryPollFn,
 }
 
@@ -2359,6 +2360,7 @@ impl NativeLibrary {
             quarantine_after_failed_drain: AtomicBool::new(false),
             sync_h2d_staging: Mutex::new(SyncH2DStagingBuffer::default()),
             ordered_h2d_staging: Mutex::new(Default::default()),
+            native_modules_loaded: Mutex::new(Default::default()),
             rdma_rc_endpoint_try_poll_fn,
         })
     }

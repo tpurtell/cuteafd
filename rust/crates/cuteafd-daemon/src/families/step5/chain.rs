@@ -636,6 +636,7 @@ mod tests {
         let library =
             unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = crate::shared::memory::device::cache_test_device(&library)?;
+        device.run(|| crate::shared::inventory::preload_native_modules(&library))?;
         let programs = library
             .programs()?
             .with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
@@ -889,6 +890,7 @@ mod tests {
         // SAFETY: the supported runner verifies the native artifact and source seal.
         let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = crate::shared::memory::device::cache_test_device(&library)?;
+        device.run(|| crate::shared::inventory::preload_native_modules(&library))?;
         let programs = library.programs()?.with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
         let checkpoint = Checkpoint::coordinator(&snapshot, false, false)?;
         let link = device.run(|| link(device, &snapshot, &[88, 89, 90]))?;

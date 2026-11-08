@@ -74,23 +74,53 @@ pub struct V4WorkspaceScratch {
     pub decode_index_topk_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Per-lane C4 page-table geometry: the pool-sized allocation every admitted
+/// lane keeps (private packed member lists per prefill lane, one per decode lane).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V4LanePageTable {
+    pub prefill_unit_bytes: u64,
+    pub prefill_fixed_bytes: u64,
+    pub decode_unit_bytes: u64,
+}
+
+pub fn deepseek_v4_lane_page_tables(decode_rows: u64) -> Result<V4LanePageTable, CacheGeometryError> {
+    Ok(V4LanePageTable {
+        prefill_unit_bytes: product("V4 prefill table slope", &[V4_PACKED_MEMBERS as u64, 4])?,
+        prefill_fixed_bytes: (V4_PACKED_MEMBERS * 3 * 4) as u64,
+        decode_unit_bytes: product("V4 decode table slope", &[decode_rows, 4])?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct V4WorkspaceRank {
-    /// Everything except the pool-unit-sized C4 page tables.
+    /// Every pool-independent cudaMalloc this rank's workspace builders issue,
+    /// exactly as requested: `workspace_here`'s planes, lane buffers and fixed
+    /// step buffers plus every lane's private `step_buffers` tables.
+    pub requests: Vec<u64>,
+    /// Sum of `requests`, the demand admission charges for this rank.
     pub fixed_device_bytes: u64,
     pub prefill_waves: u64,
     /// C4 page tables: private packed member lists per prefill slot, one list per decode row.
     pub pool_unit_device_bytes: u64,
     /// Pinned router staging, reported outside GPU admission.
     pub pinned_host_bytes: u64,
-    /// Per-lane table slopes preserve the 256-byte allocation floor for
-    /// custom manifests with fewer than 64 rows.
+    /// Per-lane table slopes and the packing padding each prefill lane keeps;
+    /// the 256-byte allocation floor covers custom manifests with fewer than
+    /// 64 rows.
     pub prefill_lane_table_unit_bytes: u64,
+    pub prefill_lane_table_fixed_bytes: u64,
     pub decode_lane_table_unit_bytes: u64,
 }
 
 impl V4WorkspaceRank {
-    pub fn device_bytes(self, units: u64) -> Result<u64, CacheGeometryError> {
+    pub fn device_bytes(&self, units: u64) -> Result<u64, CacheGeometryError> {
+        // One C4 page table per admitted lane; each is its own allocation.
+        let lane = |unit: u64, fixed: u64| {
+            product("V4 lane table", &[units, unit])?
+                .checked_add(fixed)
+                .ok_or(CacheGeometryError::Overflow("V4 lane table padding"))
+                .map(|bytes| bytes.max(256))
+        };
         sum(
             "V4 workspace total",
             &[
@@ -99,19 +129,10 @@ impl V4WorkspaceRank {
                     "V4 prefill pool tables",
                     &[
                         self.prefill_waves,
-                        product(
-                            "V4 prefill lane table",
-                            &[units, self.prefill_lane_table_unit_bytes],
-                        )?.checked_add((V4_PACKED_MEMBERS * 3 * 4) as u64)
-                            .ok_or(CacheGeometryError::Overflow("V4 packed page padding"))?
-                        .max(256) - (V4_PACKED_MEMBERS * 3 * 4) as u64,
+                        lane(self.prefill_lane_table_unit_bytes, self.prefill_lane_table_fixed_bytes)?,
                     ],
                 )?,
-                product(
-                    "V4 decode pool table",
-                    &[units, self.decode_lane_table_unit_bytes],
-                )?
-                .max(256),
+                lane(self.decode_lane_table_unit_bytes, 0)?,
             ],
         )
     }
@@ -197,22 +218,28 @@ pub fn deepseek_v4_workspace_geometry(
                 index_topk_bytes: scratch.decode_index_topk_bytes,
                 ..scratch
             }, false)?;
+            let mut requests = prefill.0;
+            requests.extend(decode.0);
+            let tables = deepseek_v4_lane_page_tables(decode_rows)?;
             Ok(V4WorkspaceRank {
                 prefill_waves: waves,
-                fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0,
-                    product("V4 packed page padding", &[waves, V4_PACKED_MEMBERS as u64, 3, 4])?])?,
-                pool_unit_device_bytes: sum(
-                    "V4 prefill/decode table slope",
-                    &[product("V4 prefill table slope", &[waves, V4_PACKED_MEMBERS as u64, 4])?, decode.1],
-                )?,
-                pinned_host_bytes: sum("V4 prefill/decode pinned staging", &[prefill.2, decode.2])?,
-                prefill_lane_table_unit_bytes: V4_PACKED_MEMBERS as u64 * 4,
-                decode_lane_table_unit_bytes: product("V4 decode table slope", &[decode_rows, 4])?,
+                fixed_device_bytes: sum("V4 prefill/decode workspaces", &requests)?,
+                pool_unit_device_bytes: sum("V4 prefill/decode table slope", &[
+                    product("V4 prefill table slope", &[waves, tables.prefill_unit_bytes])?,
+                    tables.decode_unit_bytes,
+                ])?,
+                pinned_host_bytes: sum("V4 prefill/decode pinned staging", &[prefill.1, decode.1])?,
+                requests,
+                prefill_lane_table_unit_bytes: tables.prefill_unit_bytes,
+                prefill_lane_table_fixed_bytes: tables.prefill_fixed_bytes,
+                decode_lane_table_unit_bytes: tables.decode_unit_bytes,
             })
         })
         .collect()
 }
 
+/// One workspace shape's exact pool-independent device requests in
+/// `workspace_here`'s allocation order, plus its pinned router staging.
 fn step(
     cfg: &DeepseekV4Config,
     rows: u64,
@@ -222,7 +249,7 @@ fn step(
     ranks: usize,
     scratch: V4WorkspaceScratch,
     prefill: bool,
-) -> Result<(u64, u64, u64), CacheGeometryError> {
+) -> Result<(Vec<u64>, u64), CacheGeometryError> {
     let mul = |values: &[u64]| product("V4 workspace allocation", values);
     let h = cfg.dim as u64;
     let heads = cfg.n_heads as u64 / if rank == 1 { 2 } else { 1 };
@@ -232,39 +259,54 @@ fn step(
     // Packed fields retain private headers and 16-byte-aligned member views.
     let table_rows = rows.checked_add(if prefill { V4_PACKED_TABLE_EXTRA_ROWS as u64 } else { 0 })
         .ok_or(CacheGeometryError::Overflow("V4 packed table rows"))?;
-    // Eighteen metadata arrays (C4/C128 x9); four length/visible arrays.
+    // Eighteen metadata arrays (C4/C128 x9) plus four length/visible arrays.
     let metadata_rows = table_rows
         .checked_add(2)
         .ok_or(CacheGeometryError::Overflow("V4 metadata rows"))?;
-    let lane_allocations = [
+    let mut requests = Vec::new();
+    // The five peer/staging planes are one allocation each, `lanes` wide.
+    for bytes in [
         mul(&[rows, 4, h, 2])?,
         mul(&[rows, 4, h, 2])?,
         mul(&[rows, 4, 4])?,
         mul(&[rows, 16, 4])?,
-        mul(&[rows, 4])?,
         mul(&[rows, h, 2])?,
-        draft(mul(&[
-            deepseek_v4_tap_rows(rows as usize, prefill) as u64,
-            cfg.dspark_target_layer_ids.len() as u64,
-            h,
-            2,
-        ])?),
+    ] {
+        requests.push(product("V4 stream plane", &[lanes, bytes])?.max(256));
+    }
+    let tokens = mul(&[rows, 4])?.max(256);
+    let taps = draft(mul(&[
+        deepseek_v4_tap_rows(rows as usize, prefill) as u64,
+        cfg.dspark_target_layer_ids.len() as u64,
+        h,
+        2,
+    ])?)
+    .max(256);
+    // `step_buffers`' pool-independent tables: positions, main slots, the SWA
+    // and C128 indices, nine C4 and nine C128 metadata arrays, and four
+    // length/visible arrays, each lane's private allocation.
+    let mut tables = vec![
         mul(&[table_rows, 8])?,
         mul(&[table_rows, 8])?,
         mul(&[table_rows, 128, 4])?,
+        mul(&[table_rows, 4])?,
+    ];
+    for _ in 0..18 {
+        tables.push(mul(&[metadata_rows, 4])?);
+    }
+    tables.extend([
+        mul(&[table_rows, 4])?,
+        mul(&[table_rows, 4])?,
         // c128_indices is a compiled context-sized table, not a pool table.
         mul(&[table_rows, c128_width, 4])?,
-    ];
-    let lane = sum("V4 lane allocations", &lane_allocations.map(|n| n.max(256)))?;
-    let lane = sum(
-        "V4 lane metadata",
-        &[
-            lane,
-            mul(&[18, mul(&[metadata_rows, 4])?.max(256)])?,
-            mul(&[4, mul(&[table_rows, 4])?.max(256)])?,
-        ],
-    )?;
-    let fixed_allocations = [
+        mul(&[table_rows, 4])?,
+    ]);
+    for _ in 0..lanes {
+        requests.push(tokens);
+        requests.extend(tables.iter().map(|&bytes| bytes.max(256)));
+        requests.push(taps);
+    }
+    let fixed = [
         mul(&[rows, h, 2])?,
         mul(&[rows, heads, 512, 2])?,
         mul(&[rows, cfg.q_lora_rank as u64, 2])?,
@@ -291,13 +333,9 @@ fn step(
         if ranks == 2 { mul(&[rows, h, 2])? } else { 256 },
         lead(4 << 20), // VocabularyHead persistent workspace.
     ];
-    let fixed = sum(
-        "V4 step allocations",
-        &fixed_allocations.map(|n| n.max(256)),
-    )?;
+    requests.extend(fixed.map(|bytes| bytes.max(256)));
     Ok((
-        sum("V4 step and lanes", &[fixed, mul(&[lanes, lane])?])?,
-        mul(&[rows, lanes, 4])?,
+        requests,
         lead(mul(&[rows, topk * 8 + h + h / 32])?).max(256),
     ))
 }
@@ -387,16 +425,14 @@ mod tests {
         );
         // The table floors are still exact for a custom one-row manifest.
         let tiny =
-            deepseek_v4_workspace_geometry(&config(false), 1, 1, 128, 1, 2, scratch).unwrap()[0];
-        let padding = (V4_PACKED_MEMBERS * 3 * 4) as u64;
+            deepseek_v4_workspace_geometry(&config(false), 1, 1, 128, 1, 2, scratch).unwrap()[0].clone();
         for units in [0, 1, 2, 4, 5, 1032] {
             let runtime_prefill = (V4_PACKED_MEMBERS as u64 * (units + 3) * 4).max(256);
             let runtime_decode = (units * 4).max(256);
-            // fixed_device_bytes already includes padding for both prefill lanes.
-            assert_eq!(tiny.device_bytes(units).unwrap() - tiny.fixed_device_bytes + 2 * padding,
+            assert_eq!(tiny.device_bytes(units).unwrap() - tiny.fixed_device_bytes,
                 2 * runtime_prefill + runtime_decode);
         }
-        assert_eq!(tiny.device_bytes(1).unwrap() - tiny.fixed_device_bytes, 384);
+        assert_eq!(tiny.device_bytes(1).unwrap() - tiny.fixed_device_bytes, 768);
     }
 
     #[test]

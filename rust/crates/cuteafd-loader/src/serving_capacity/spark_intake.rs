@@ -4,7 +4,14 @@ use cuteafd_core::serving_capacity::spark_intake_allocation_bytes;
 
 /// One independently allocated BF16 partial plane per rank and lane.
 pub fn spark_intake_bytes(lanes: u64, ranks: u64, rows: u64, hidden: u64) -> u64 {
-    lanes * ranks * spark_intake_allocation_bytes(rows * hidden * 2).expect("Spark intake backing overflow")
+    spark_intake_requests(lanes, ranks, rows, hidden).into_iter().sum()
+}
+
+/// The exact per-plane requests behind [`spark_intake_bytes`]: `SparkIntake`
+/// allocates one backing per rank and lane.
+pub fn spark_intake_requests(lanes: u64, ranks: u64, rows: u64, hidden: u64) -> Vec<u64> {
+    let bytes = spark_intake_allocation_bytes(rows * hidden * 2).expect("Spark intake backing overflow");
+    vec![bytes; usize::try_from(lanes * ranks).expect("Spark intake lane count")]
 }
 
 /// One allocation per rank containing every outstanding wave's logical slot.
@@ -25,6 +32,16 @@ pub fn prefill_return_bytes_with_format(waves: u64, unit_rows: u64, ranks: u64,
         .checked_mul(ranks).context("Spark return planes overflow")?;
     anyhow::ensure!(format.row_bytes(usize::try_from(hidden)?).is_some(), "unsupported Spark combined reply width");
     Ok(planes)
+}
+
+/// The exact per-rank requests behind [`prefill_return_bytes_with_format`]:
+/// one combined return plane per rank (`SparkIntake::with_waves`).
+pub fn prefill_return_requests_with_format(waves: u64, unit_rows: u64, ranks: u64,
+    hidden: u64, format: cuteafd_core::SparkReplyFormat) -> anyhow::Result<Vec<u64>> {
+    use anyhow::Context;
+    let bytes = prefill_return_bytes_with_format(waves, unit_rows, ranks, hidden, format)?;
+    if bytes == 0 { return Ok(Vec::new()); }
+    Ok(vec![bytes / ranks; usize::try_from(ranks).context("Spark return ranks")?])
 }
 
 /// Prefill row units and how many are in flight on one lane and transport.

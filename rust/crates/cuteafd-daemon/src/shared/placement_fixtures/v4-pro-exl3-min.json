@@ -20,5 +20,6 @@
  "replay_note": "617067888 fixed PRO headroom and 44e533146/488dc75c6 page-list/scratch reductions intentionally returned expert budget. Current onboarding is a CPU planner-shape expectation, not a fresh hardware measurement; historical admission sample and 2M pool remain unchanged.",
  "pool_tokens": 2097152,
  "onboard_layers": 4,
- "note": "launched on 0b90aeca, whose table lacked the dsv4 exl3 single row (pending 0); admission_free_bytes is the launch's raw free less this table's pending code 271719876 B (untracked at the sample 1039045376 B)"
+ "note": "launched on 0b90aeca, whose table lacked the dsv4 exl3 single row (pending 0); admission_free_bytes is the launch's raw free less this table's pending code 271719876 B (untracked at the sample 1039045376 B)",
+ "pending_regeneration": "https://github.com/tpurtell/cuteafd/issues/1588"
 }

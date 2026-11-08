@@ -7,14 +7,14 @@
 //! whole-layer prefix (or a TP2 half prefix) loads after dSpark's stages into
 //! the same arena, so its peak is the running resident total plus the largest
 //! staging step, never the sum of every step.
-use super::{context_buffers, fixed_demands, V4Inputs};
+use super::{context_buffers, fixed_demands, steps_requests, V4Inputs};
 use crate::placement::planner::*;
 use crate::placement::{
     hop_buffer_bytes, plan_hops, residual_homes, AttentionClass, AttentionPlacement, ExpertHome,
     ExpertRange, FfnMode, HopSpec, HopStorage, LayerAssignment, LayerMode, MovableId, Onboard,
     Placement, PoolLimits, ResidentWeights, TerminalHome, Tp2Range,
 };
-use crate::serving_capacity::{deepseek_v4_layer_unit_bytes, V4ExpertCost};
+use crate::serving_capacity::V4ExpertCost;
 use cuteafd_core::memory_layout::Category;
 use cuteafd_core::spark_reply::SparkReplyFormats;
 use std::collections::BTreeSet;
@@ -55,24 +55,6 @@ fn attention(inputs: &V4Inputs) -> AttentionPlacement {
     })
 }
 
-/// One 256-token unit of a layer's compressed records on `gpu`.
-fn layer_unit_on(inputs: &V4Inputs, layer: usize, mode: LayerMode, gpu: usize) -> u64 {
-    let unit = deepseek_v4_layer_unit_bytes(inputs.cfg.compress_ratios[layer]);
-    match mode {
-        LayerMode::HeadSplit => unit,
-        LayerMode::ContextSplit if inputs.cfg.compress_ratios[layer] == 4 => {
-            [unit.div_ceil(2), unit / 2][gpu]
-        }
-        LayerMode::ContextSplit => unit,
-        LayerMode::Whole { gpu: owner, .. } => {
-            if usize::from(owner) == gpu {
-                unit
-            } else {
-                0
-            }
-        }
-    }
-}
 
 /// Running arena peak: the workspace, then each part's resident bytes plus its
 /// transient staging. Equal to the legacy `Arena` peak, and zero when nothing
@@ -299,7 +281,7 @@ fn context_floor(inputs: &V4Inputs) -> u64 {
 pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
     let started = std::time::Instant::now();
     let (modes, attention) = modes(inputs)?;
-    let (_, _, reserves) = fixed_demands(inputs).map_err(invalid)?;
+    let (_, reserves) = fixed_demands(inputs).map_err(invalid)?;
     let budgets = budgets(inputs, &reserves)?;
     if inputs.max_context == 0
         || inputs.prefill_rows == 0
@@ -461,12 +443,16 @@ impl Owners {
         self.components.push(component);
     }
 
-    /// A pool-indexed owner: the curve is also the extent.
+    /// A pool-indexed owner: the curve is also the extent. `fixed` is the
+    /// pool-independent payload (one partial unit per sequence); the curve
+    /// prices the 2 MiB cudaMalloc backing, never the raw payload.
     fn paged(
         &mut self,
         id: String,
         gpu: u8,
         bytes_per_page: u64,
+        fixed: u64,
+        granularity: u64,
         category: Category,
         group: &str,
         activation: Activation,
@@ -474,7 +460,14 @@ impl Owners {
         if bytes_per_page == 0 {
             return Ok(());
         }
-        let curve = ByteCurve::linear(bytes_per_page, bytes_per_page, self.maximum);
+        let curve = if granularity == 0 {
+            ByteCurve::linear(bytes_per_page, bytes_per_page, self.maximum)
+        } else {
+            ByteCurve(vec![BytePiece { first: 1, last: self.maximum,
+                bytes_at_first: bytes_per_page.checked_add(fixed)
+                    .ok_or(Refusal::Overflow("V4 paged extent"))?,
+                bytes_per_page, granularity, backings: 1 }])
+        };
         let mut component = Component::allocation(
             Allocation::buffer(
                 id,
@@ -491,6 +484,45 @@ impl Owners {
         component.byte_extent(curve)?;
         component.activation = activation;
         self.components.push(component);
+        Ok(())
+    }
+
+    /// A pool-independent owner whose exact cudaMalloc requests are known
+    /// here. Its single 2 MiB backing tail is charged as a separate named
+    /// owner; requests that are already aligned add nothing.
+    fn physical(
+        &mut self,
+        id: String,
+        gpu: u8,
+        requests: Vec<u64>,
+        category: Category,
+        group: &str,
+        activation: Activation,
+    ) -> Result<(), Refusal> {
+        let requests: Vec<u64> = requests.into_iter().filter(|&bytes| bytes > 0).collect();
+        let bytes = requests.iter().try_fold(0u64, |sum, &n| sum.checked_add(n)
+            .ok_or(Refusal::Overflow("V4 physical owner")))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let location = Location::coordinator(gpu);
+        let mut component = Component::allocation(
+            Allocation::buffer(id.clone(), location, bytes, STEADY, category, group),
+            ByteCurve::fixed(bytes, self.maximum), false, self.maximum);
+        component.activation = activation;
+        self.components.push(component);
+        // Requests at or below 1 MiB share driver blocks; their rounding is a
+        // pool-level fact, not this owner's. One request above 1 MiB already
+        // forces the whole extent into its own cudaMalloc, so a mixed list
+        // prices its backing exactly like an all-large one.
+        if requests.iter().any(|&bytes| bytes > (1 << 20)) {
+            let granularity = AllocationGranularity { id: format!("{id}.tail"), location,
+                lifetime: STEADY, evidence: GranularityEvidence::Forecast,
+                backings: vec![GranularityBacking { backing: id, requests }] };
+            if granularity.bytes()? > 0 {
+                self.components.push(allocation_granularity_component(granularity, self.maximum)?);
+            }
+        }
         Ok(())
     }
 
@@ -854,18 +886,27 @@ impl Recipe for PreparedV4<'_> {
         if let Some(geometry) = self.expert_usage() {
             owners.components.extend(crate::placement::expert_usage::components(geometry, &[0], self.maximum_pages)?);
         }
-        let (fixed, overhead, _) = fixed_demands(inputs).map_err(invalid)?;
+        let (fixed, _) = fixed_demands(inputs).map_err(invalid)?;
         for (index, demand) in fixed.iter().enumerate() {
             let id = format!("v4.fixed.{index}");
             let activation = Activation::always();
-            owners.owner(
-                id.clone(),
-                demand.gpu,
-                demand.bytes,
-                demand.category,
-                &demand.group,
-                activation.clone(),
-            );
+            // The daemon's own builders report their exact cudaMalloc request
+            // lists for the step workspaces, Spark intake planes and route
+            // probe; the prefix mark arena is one request. Both thereby price
+            // their shared 2 MiB backing instead of only their payload. Any
+            // other demand keeps its logical extent (and is either a single
+            // aligned request or already priced from its own geometry).
+            let requests = match demand.group.as_str() {
+                "steps" => steps_requests(inputs, demand.gpu as usize).map_err(invalid)?,
+                "marks" => Some(vec![demand.bytes]),
+                _ => None,
+            };
+            match requests {
+                Some(requests) => owners.physical(id.clone(), demand.gpu, requests,
+                    demand.category, &demand.group, activation.clone())?,
+                None => owners.owner(id.clone(), demand.gpu, demand.bytes,
+                    demand.category, &demand.group, activation.clone()),
+            }
             owners.weights(id, demand.gpu, demand.resident_weights.0, activation);
         }
         // Owners a caller adds after the family's own facts (an RTX media
@@ -883,33 +924,110 @@ impl Recipe for PreparedV4<'_> {
             );
             owners.weights(id, demand.gpu, demand.resident_weights.0, activation);
         }
-        // The pool's own unit metadata and lane page tables scale with it.
-        let scale = self.page_rows / V4_PAGE_ROWS;
+        // The pool's own lane page tables scale with it.
+        let tables = crate::serving_capacity::deepseek_v4_lane_page_tables(inputs.decode_rows)
+            .map_err(invalid)?;
         let gpus = inputs.gpus.len();
+        let context = self.attention == AttentionPlacement::Context;
+        let sequences = inputs.sequences.max(1);
+        // engine::Engine::new allocates one window ring per cached layer plus
+        // one per dSpark stage, and the lead GPU holds the stages.
+        let stages = inputs.cache_stages as u64;
+        let layers = |gpu: usize| (inputs.cfg.n_layers as u64 + if gpu == 0 { stages } else { 0 });
+        let ring_pages = cuteafd_core::prefix::swa_ring(inputs.cfg.window_size as u64,
+            inputs.prefill_rows, V4_PAGE_ROWS).ok_or(Refusal::Overflow("V4 window ring"))?.rows / V4_PAGE_ROWS;
+        let window = ring_pages.checked_mul(149_760).ok_or(Refusal::Overflow("V4 window ring"))?;
+        // One unit at a time per sequence: `pool_units` adds one partial unit
+        // per sequence, and under a context split the C4 pools hold this GPU's
+        // half plus the compressor's scratch page while C128 stays whole.
+        let c4_unit = |pages: u64, gpu_fixed: bool| -> Result<u64, Refusal> {
+            let total = super::host::pool_units(pages, self.page_rows, sequences, context)?;
+            Ok(if context && gpu_fixed { total / 2 + 1 } else { total })
+        };
         for gpu in 0..gpus {
             for (layer, &mode) in self.modes.iter().enumerate() {
-                let kv = layer_unit_on(inputs, layer, mode, gpu)
-                    .checked_mul(scale)
-                    .ok_or(Refusal::Overflow("V4 pool unit"))?;
+                let ratio = inputs.cfg.compress_ratios.get(layer).copied().unwrap_or(0);
+                let _ = mode;
+                // Window rings: whole on every GPU, one request per layer.
+                owners.physical(format!("v4.cache.{gpu}.{layer}.main"), gpu as u8,
+                    vec![window.checked_mul(sequences).ok_or(Refusal::Overflow("V4 window ring"))?],
+                    Category::Kv, "window rings", Activation::always())?;
+                if ratio == 4 {
+                    let first = c4_unit(1, true)?;
+                    let slope = c4_unit(2, true)?.checked_sub(first)
+                        .ok_or(Refusal::Overflow("V4 C4 units"))?;
+                    for (name, unit) in [("records", 37_440u64), ("index", 8_448u64)] {
+                        owners.paged(format!("v4.cache.{gpu}.{layer}.{name}"), gpu as u8,
+                            unit.checked_mul(slope).ok_or(Refusal::Overflow("V4 C4 slope"))?,
+                            unit.checked_mul(first.checked_sub(slope).ok_or(Refusal::Overflow("V4 C4 fixed"))?)
+                                .ok_or(Refusal::Overflow("V4 C4 fixed"))?,
+                            SM120_ALLOCATION_GRANULARITY_BYTES,
+                            Category::Kv, "records", Activation::always())?;
+                    }
+                    for (index, bytes) in [16 * 1024 * 4u64, 16 * 1024 * 4, 16 * 256 * 4, 16 * 256 * 4]
+                        .into_iter().enumerate() {
+                        owners.physical(format!("v4.cache.{gpu}.{layer}.carry{index}"), gpu as u8,
+                            vec![bytes.checked_mul(sequences).ok_or(Refusal::Overflow("V4 carry"))?],
+                            Category::Kv, "compressor carry", Activation::always())?;
+                    }
+                } else if ratio == 128 {
+                    let first = c4_unit(1, false)?;
+                    let slope = c4_unit(2, false)?.checked_sub(first)
+                        .ok_or(Refusal::Overflow("V4 C128 units"))?;
+                    owners.paged(format!("v4.cache.{gpu}.{layer}.records"), gpu as u8,
+                        1_728u64.checked_mul(slope).ok_or(Refusal::Overflow("V4 C128 slope"))?,
+                        1_728u64.checked_mul(first.checked_sub(slope).ok_or(Refusal::Overflow("V4 C128 fixed"))?)
+                            .ok_or(Refusal::Overflow("V4 C128 fixed"))?,
+                        SM120_ALLOCATION_GRANULARITY_BYTES,
+                        Category::Kv, "records", Activation::always())?;
+                    for index in 0..2u64 {
+                        owners.physical(format!("v4.cache.{gpu}.{layer}.carry{index}"), gpu as u8,
+                            vec![256u64.checked_mul(512).and_then(|n| n.checked_mul(4))
+                                .and_then(|n| n.checked_mul(sequences))
+                                .ok_or(Refusal::Overflow("V4 carry"))?],
+                            Category::Kv, "compressor carry", Activation::always())?;
+                    }
+                }
+            }
+            // Beside the records, not inside them: every admitted lane keeps
+            // its own C4 page table as a pool-sized cudaMalloc. Prefill lanes
+            // hold one private, aligned page list per packed member (16 plus
+            // three alignment rows); the decode lane holds `decode_rows`
+            // lists. `pool_units` adds one partial unit per sequence, and each
+            // backing is rounded independently.
+            let lanes = inputs.workspace.as_ref().and_then(|ranks| ranks.get(gpu as usize))
+                .map(|rank| rank.prefill_waves)
+                .unwrap_or(inputs.prefill_waves);
+            let table_first = c4_unit(1, true)?;
+            let table_slope = c4_unit(2, true)?.checked_sub(table_first)
+                .ok_or(Refusal::Overflow("V4 lane table units"))?;
+            let table_fixed = table_first.checked_sub(table_slope)
+                .ok_or(Refusal::Overflow("V4 lane table units"))?;
+            for lane in 0..lanes {
                 owners.paged(
-                    format!("v4.records.{gpu}.{layer}"),
+                    format!("v4.records.tables.{gpu}.prefill{lane}"),
                     gpu as u8,
-                    kv,
+                    tables.prefill_unit_bytes.checked_mul(table_slope)
+                        .ok_or(Refusal::Overflow("V4 lane table slope"))?,
+                    tables.prefill_unit_bytes.checked_mul(table_fixed)
+                        .and_then(|fixed| fixed.checked_add(tables.prefill_fixed_bytes))
+                        .ok_or(Refusal::Overflow("V4 lane table fixed"))?,
+                    SM120_ALLOCATION_GRANULARITY_BYTES,
                     Category::Kv,
-                    "records",
+                    "lane page tables",
                     Activation::always(),
                 )?;
             }
-            // Beside the records, not inside them: unit metadata and lane page tables.
-            let unit = overhead[gpu]
-                .checked_mul(scale)
-                .ok_or(Refusal::Overflow("V4 pool overhead"))?;
             owners.paged(
-                format!("v4.records.overhead.{gpu}"),
+                format!("v4.records.tables.{gpu}.decode"),
                 gpu as u8,
-                unit,
+                tables.decode_unit_bytes.checked_mul(table_slope)
+                    .ok_or(Refusal::Overflow("V4 lane table slope"))?,
+                tables.decode_unit_bytes.checked_mul(table_fixed)
+                    .ok_or(Refusal::Overflow("V4 lane table fixed"))?,
+                SM120_ALLOCATION_GRANULARITY_BYTES,
                 Category::Kv,
-                "records",
+                "lane page tables",
                 Activation::always(),
             )?;
         }
@@ -923,6 +1041,47 @@ impl Recipe for PreparedV4<'_> {
         if let Some(arena) = &inputs.weights.draft {
             owners.components.extend(weight_arena_components(arena, Location::coordinator(0),
                 Lifetime::RESIDENT, self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?);
+        }
+        // The lead GPU's one borrowed vocabulary GEMM handle and the shared
+        // cuBLASLt initialization: 64 MiB + 2 MiB, created on the first target
+        // or draft vocabulary head. Measured once on the sealed V4 census
+        // (2026-11-08, SM120/driver 13020 LAZY); the head split's peer runs no
+        // vocabulary head, so no second owner exists (#1579).
+        let vocabulary = serving::BlasOwners {
+            name: "shared/blas/vocabulary".into(),
+            process: "coordinator".into(),
+            thread: "v4/blas/serve".into(),
+            location: Location::coordinator(0),
+            gemm: false,
+            lt: true,
+            lifetime: Lifetime::RESIDENT,
+            activation: Activation::always(),
+        };
+        owners.components.extend(serving::blas_components("sm_120", &[vocabulary],
+            self.maximum_pages, PhaseOrder::TARGET_THEN_DRAFT)?);
+        // The driver's retained stream slabs (#1511): one 2 MiB band per four
+        // live streams, which stays on the device after the streams that grew
+        // it retire. V4 holds its engine stream and the prefix cache's copy
+        // stream on every rank, one intake copy stream per Spark link, and --
+        // when the retained host tier is live, exactly when `prefix_owners`
+        // admits a quota -- the host copy engine's store/restore pair with an
+        // event probe on each device. This is not a cudaMalloc request, so it
+        // receives no allocation-tail charge.
+        let host_tier = self.prefix.owners.quota_bytes > 0;
+        let peak = super::startup_peak_live_streams(host_tier, inputs.spark_ranks > 0);
+        let slab = cuda_stream_slab_bytes(peak).map_err(invalid)?;
+        for gpu in 0..gpus {
+            owners.components.push(Component {
+                activation: Activation::always(),
+                bytes: ByteCurve::fixed(slab, self.maximum_pages),
+                kind: ComponentKind::Allowance(Allowance {
+                    location: Location::coordinator(gpu as u8),
+                    bytes: slab,
+                    lifetime: Lifetime::RESIDENT,
+                    assumed: false,
+                    source: format!("v4/driver-stream-slabs/gpu{gpu} ({peak} peak live streams, SM120 driver/runtime13020 LAZY, #1511 2026-11-08)"),
+                }),
+            });
         }
         // Context staging, exchange and workspace exist only under a split.
         if self.attention == AttentionPlacement::Context {

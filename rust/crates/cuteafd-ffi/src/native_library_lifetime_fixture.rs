@@ -229,6 +229,11 @@ impl Fixture {
             .any(|line| line.ends_with(self.module.to_str().unwrap())))
     }
 
+    pub fn native_initializations(&self, library: &NativeLibrary) -> Result<i32> {
+        // SAFETY: the CPU-only fixture returns its own initialization counter.
+        Ok(unsafe { library.lib.get::<unsafe extern "C" fn() -> i32>(b"fixture_native_initializations")?() })
+    }
+
     pub fn events(&self) -> Result<String> {
         Ok(fs::read_to_string(&self.events)?)
     }

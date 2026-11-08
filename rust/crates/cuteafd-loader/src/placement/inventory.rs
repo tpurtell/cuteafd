@@ -207,35 +207,13 @@ impl CodeAllowance {
     }
 }
 
-/// V4 retains its dev mixed residency measurements until fresh owner inventories
-/// replace them (#1579). Removing two dead GEMM handles does not remove the
-/// remaining modules, expert libraries and peer mappings.
-fn v4_loaded_code(experts: &str, split: bool, rank: u8) -> Option<u64> {
-    // SM120, driver 595.91.07 / CUDA 13.2, tagged-ready samples, 2026-10-09..11.
-    const ROWS: &[(&str, bool, u8, u64)] = &[
-        ("*", false, 0, 322_050_368),
-        ("exl3", false, 0, 724_349_124),
-        ("exl3", true, 0, 1_059_185_592),
-        ("exl3", true, 1, 885_694_212),
-        ("*", true, 0, 1_007_333_728),
-        ("*", true, 1, 803_054_544),
-    ];
-    ROWS.iter().filter(|row| row.1 == split && row.2 == rank).find(|row| row.0 == experts)
-        .or_else(|| ROWS.iter().filter(|row| row.1 == split && row.2 == rank).find(|row| row.0 == "*"))
-        .map(|row| row.3)
-}
-
 /// Selected-program code, separate from named BLAS owners in migrated families.
-/// V4 retains its mixed measurements; other families retain their library formula.
-pub fn loaded_code_allowance(program_family: &str, experts: &str, split: bool, rank: u8,
+/// Every family here charges its modules by name and its library storage in
+/// disjoint typed owners; none keeps a mixed residency row.
+pub fn loaded_code_allowance(program_family: &str, _experts: &str, split: bool, _rank: u8,
     arch: &ArchContext, programs: Option<&ProgramSet>) -> CodeAllowance {
-    if loaded_code_family(program_family) == "dsv4" {
-        if let Some(bytes) = v4_loaded_code(experts, split, rank) {
-            return CodeAllowance { bytes, basis: Basis::Calibrated, future_library_bytes: 0 };
-        }
-    }
     // Migrated families keep BLAS and driver storage in disjoint typed owners.
-    if matches!(loaded_code_family(program_family), "glmf" | "glmf-k6" | "kimik3" | "qwen4" | "mimo" | "muse" | "step5") {
+    if matches!(loaded_code_family(program_family), "glmf" | "glmf-k6" | "kimik3" | "qwen4" | "mimo" | "muse" | "step5" | "dsv4") {
         return CodeAllowance { bytes: if loaded_code_family(program_family) == "step5" {
             programs.map_or(32 * MIB, ProgramSet::module_bytes)
         } else {
@@ -1111,25 +1089,22 @@ mod tests {
     }
 
     #[test]
-    fn v4_mixed_residency_and_pending_remain_until_measured_owner_refresh() {
+    fn v4_charges_selected_modules_not_a_mixed_residency_row() {
         let arch = &ARCH_CONTEXTS[1];
-        for (family, experts, split, rank, bytes) in [
-            ("dsv4f", "*", false, 0, 322_050_368),
-            ("dsv4p", "exl3", false, 0, 724_349_124),
-            ("dsv4p2", "exl3", true, 0, 1_059_185_592),
-            ("dsv4p2", "exl3", true, 1, 885_694_212),
-            ("dsv4f2", "*", true, 0, 1_007_333_728),
-            ("dsv4f2", "*", true, 1, 803_054_544),
-        ] {
-            let code = loaded_code_allowance(family, experts, split, rank, arch, None);
-            assert_eq!(code.bytes, bytes);
-            assert_eq!(code.basis, Basis::Calibrated);
-            assert_eq!(code.pending(arch.context_bytes + 100, arch.context_bytes), bytes - 100);
-            assert_eq!(code.pending(arch.context_bytes + bytes, arch.context_bytes), 0);
-            assert_eq!(code.pending(u64::MAX, arch.context_bytes), 0);
+        let programs = ProgramSet::from_names(&["dsv4f", "dsv4p"], ["dsv4f_decode", "dsv4p_decode"]);
+        for family in ["dsv4f", "dsv4f2", "dsv4p", "dsv4p2"] {
+            for package in ["*", "exl3", "unmeasured"] {
+                for (split, rank) in [(false, 0), (true, 0), (true, 1)] {
+                    let code = loaded_code_allowance(family, package, split, rank, arch, Some(&programs));
+                    assert_eq!(code.basis, Basis::Estimated);
+                    assert_eq!(code.bytes, programs.module_bytes());
+                    assert_eq!(code.pending(u64::MAX, arch.context_bytes), 0);
+                    let missing = loaded_code_allowance(family, package, split, rank, arch, None);
+                    assert_eq!(missing.bytes, 34 * MIB);
+                    assert_eq!(missing.basis, Basis::Estimated);
+                }
+            }
         }
-        assert_eq!(loaded_code_allowance("dsv4f", "unmeasured", false, 0, arch, None).bytes,
-            322_050_368);
     }
 
     #[test]

@@ -194,6 +194,7 @@ fn native_tp_rank_sum() -> Result<()> {
     // SAFETY: the official runner supplies the verified sealed native artifact.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? });
     library.cuda_set_device(0)?;
+    crate::shared::inventory::preload_native_modules(&library)?;
     let config = TcpTransportConfig::default();
     SparkAdmission::plan_view(&view, geometry, Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: layers.clone(),

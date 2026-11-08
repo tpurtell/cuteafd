@@ -29,5 +29,6 @@
   }
  ],
  "pool_tokens": 2097152,
- "onboard_layers": 13
+ "onboard_layers": 13,
+ "pending_regeneration": "https://github.com/tpurtell/cuteafd/issues/1588"
 }

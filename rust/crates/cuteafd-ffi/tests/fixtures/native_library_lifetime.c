@@ -179,7 +179,9 @@ int cuteafd_rdma_rc_endpoint_try_poll(void *handle, uint32_t sends,
 
 int cuteafd_set_expert_hidden(uint32_t hidden) { (void)hidden; return 0; }
 int cuteafd_cuda_enable_peer(int peer) { (void)peer; return 0; }
-int cuteafd_tp2_native_initialize(void) { return 0; }
+static int native_initializations;
+int fixture_native_initializations(void) { return native_initializations; }
+int cuteafd_tp2_native_initialize(void) { ++native_initializations; return 0; }
 int cuteafd_peer_exchange_initialize(void) { return 0; }
 
 

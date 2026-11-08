@@ -176,6 +176,18 @@ pub fn host_marks_enabled(gpus: usize, partitioned: bool, host: bool) -> bool {
     host && (gpus == 1 || partitioned)
 }
 
+/// Peak live CUDA streams in one coordinator context at Ready (#1511): the
+/// engine's stream and the prefix cache's copy stream on the rank, one intake
+/// copy stream per Spark link, and -- when the retained host tier is live --
+/// the host copy engine's store/restore pair plus its event probe per device.
+/// Load, rotary and push streams retire before Ready. Only the band matters
+/// (the driver retains a 2 MiB slab per four live streams): 2 and 4 streams
+/// stay in the first band, 6 and 8 in the second.
+pub fn startup_peak_live_streams(host_tier: bool, spark_links: bool) -> u64 {
+    let serving = 1 + 1 + if spark_links { 2 } else { 0 };
+    serving + if host_tier { 4 } else { 0 }
+}
+
 /// Prefix mark slots over every rank's mark, 0 without prefix entries.
 pub fn mark_slots(cfg: &DeepseekV4Config, gpus: usize, prefill_rows: u64, cache_stages: usize, sequences: u64,
     entries: u64, budget_bytes: u64, host: bool) -> Result<u64, PlacementError> {
@@ -192,9 +204,53 @@ pub fn draft_probe_bytes(cfg: &DeepseekV4Config, decode_rows: u64) -> Result<u64
             .ok_or(PlacementError::Overflow("V4 draft route ring"))).map(|bytes| bytes.max(256))
 }
 
-/// Fixed V4 demands and pool overhead per GPU plus each GPU's reserve, the
-/// ones both sides previously computed apart.
-pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>, Vec<u64>), PlacementError> {
+/// Sum one owner's exact device requests.
+fn requests_bytes(what: &'static str, requests: &[u64]) -> Result<u64, PlacementError> {
+    requests.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(bytes))
+        .ok_or(PlacementError::Overflow(what))
+}
+
+/// The rank's Spark intake allocations: one combined prefill return plane per
+/// rank, then one decode intake plane per rank (`SparkIntake::with_waves`).
+fn intake_requests(inputs: &V4Inputs, rank: usize) -> Result<Vec<u64>, PlacementError> {
+    if rank != 0 || inputs.spark_ranks == 0 { return Ok(Vec::new()); }
+    let (hidden, ranks) = (inputs.cfg.dim as u64, inputs.spark_ranks as u64);
+    let mut requests = crate::serving_capacity::prefill_return_requests_with_format(
+        inputs.prefill_waves, inputs.prefill_rows, ranks, hidden, inputs.spark_reply_format,
+    )
+    .map_err(|_| PlacementError::Inventory("V4 Spark reply width or allocation overflow"))?;
+    requests.extend(crate::serving_capacity::spark_intake_requests(
+        1, ranks, inputs.decode_rows, hidden));
+    Ok(requests)
+}
+
+/// The rank's draft route probe: one contiguous device ring.
+fn probe_requests(inputs: &V4Inputs, rank: usize) -> Result<Vec<u64>, PlacementError> {
+    if rank == 0 && !inputs.draft.is_empty() {
+        Ok(vec![draft_probe_bytes(&inputs.cfg, inputs.decode_rows)?])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// The "steps" demand's exact device requests: this rank's workspace
+/// builders plus its intake planes and route probe. `None` when the caller
+/// supplied no exact workspace geometry for this rank.
+pub fn steps_requests(inputs: &V4Inputs, rank: usize) -> Result<Option<Vec<u64>>, PlacementError> {
+    let Some(workspace) = inputs.workspace.as_ref().and_then(|ranks| ranks.get(rank)) else {
+        return Ok(None);
+    };
+    let mut requests = workspace.requests.clone();
+    requests.extend(intake_requests(inputs, rank)?);
+    requests.extend(probe_requests(inputs, rank)?);
+    Ok(Some(requests))
+}
+
+/// Fixed V4 demands plus each GPU's reserve, the ones both sides previously
+/// computed apart. Every pool-owned term (per-layer records, lane page tables)
+/// is a separate exact owner in `Recipe::prepare`, so nothing here scales with
+/// the pool.
+pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), PlacementError> {
     let gpus = inputs.gpus.len();
     let geometry = deepseek_v4_cache_geometry(&inputs.cfg, gpus, inputs.prefill_rows, inputs.cache_stages)
         .map_err(|_| PlacementError::Inventory("V4 cache geometry"))?;
@@ -204,26 +260,23 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>, Vec<u6
         .and_then(|n| n.checked_add(inputs.decode_rows)).ok_or(PlacementError::Overflow("V4 packed lane tables"))?;
     let table_bytes = tables.checked_mul(4).ok_or(PlacementError::Overflow("V4 lane tables"))?;
     let mut demands = Vec::new();
-    let mut overhead = Vec::new();
     let mut reserves = Vec::new();
     for (rank, cache) in geometry.ranks.iter().enumerate() {
         let gpu = rank as u8;
         let role = if gpus == 1 { 0 } else if rank == 0 { 1 } else { 2 };
         let mul = |a: u64, b: u64, what| a.checked_mul(b).ok_or(PlacementError::Overflow(what));
-        let state = mul(cache.active_state_per_sequence_bytes, inputs.sequences, "V4 state")?
-            + cache.fixed_state_bytes + cache.speculative_replay_bytes + mul(table_bytes, inputs.sequences, "V4 tables")?;
+        // Window rings, compressor carry and the per-sequence records unit are
+        // named per-layer physical owners in `Recipe::prepare`; this keeps the
+        // pool-independent replay and lane-table state.
+        let state = cache.fixed_state_bytes + cache.speculative_replay_bytes
+            + mul(table_bytes, inputs.sequences, "V4 tables")?;
         let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
-        let intake = if rank == 0 && inputs.spark_ranks > 0 {
-            crate::serving_capacity::prefill_return_bytes_with_format(inputs.prefill_waves, inputs.prefill_rows,
-                inputs.spark_ranks as u64, hidden, inputs.spark_reply_format)
-                .map_err(|_| PlacementError::Inventory("V4 Spark reply width or allocation overflow"))?
-                + crate::serving_capacity::spark_intake_bytes(1, inputs.spark_ranks as u64, inputs.decode_rows, hidden)
-        } else { 0 };
+        let intake = requests_bytes("V4 Spark intake", &intake_requests(inputs, rank)?)?;
         let exchange = if gpus == 2 {
             deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank, inputs.prefill_waves)
                 .map_err(|_| PlacementError::Overflow("V4 expert exchange"))?
         } else { 0 };
-        let probe = if rank == 0 && !inputs.draft.is_empty() { draft_probe_bytes(&inputs.cfg, inputs.decode_rows)? } else { 0 };
+        let probe = requests_bytes("V4 draft route probe", &probe_requests(inputs, rank)?)?;
         let workspace = inputs.workspace.as_ref().and_then(|w| w.get(rank)).map(|w| w.fixed_device_bytes)
             .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake + probe;
         reserves.push(crate::placement::reserve::gpu("deepseek_v4"));
@@ -246,12 +299,8 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>, Vec<u6
             demands.push(Demand::new(gpu, Category::Workspace, "probe prefill logits", inputs.full_prefill_logits,
                 Basis::Formula));
         }
-        // Unit metadata and every lane's page table follow the pool, beside the
-        // per-layer records.
-        overhead.push(cache.pool_metadata_unit_bytes.checked_add(table_bytes)
-            .ok_or(PlacementError::Overflow("V4 pool overhead"))?);
     }
-    Ok((demands, overhead, reserves))
+    Ok((demands, reserves))
 }
 
 /// The code-inventory package key of a V4 catalog: EXL3 packages load their own modules (the
@@ -260,7 +309,9 @@ pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
     if catalog.exl3().is_some() { "exl3" } else { "*" }
 }
 
-/// Retained dev mixed residency, including BLAS, until measured owners replace it (#1579).
+/// Selected-program module bytes per rank. BLAS handles, modules and driver
+/// storage are disjoint named owners charged by the admission contract; this
+/// no longer carries a mixed residency sample (#1579).
 pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
     let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
     let arch = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES);
@@ -575,4 +626,24 @@ pub fn expert_costs(catalog: &crate::OfficialV41Catalog, stages: usize)
     let draft = (0..stages).map(|stage| deepseek_v4_expert_cost(catalog, stage, true))
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok((layers, draft))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_streams_price_each_ready_band() {
+        let slab = crate::placement::planner::cuda_stream_slab_bytes;
+        // Engine and prefix-copy streams, plus one pair when Sparks carry experts.
+        assert_eq!(startup_peak_live_streams(false, false), 2);
+        assert_eq!(startup_peak_live_streams(false, true), 4);
+        assert_eq!(slab(2).unwrap(), 2 << 20);
+        assert_eq!(slab(4).unwrap(), 2 << 20);
+        // The host tier's copy engine crosses into the second band.
+        assert_eq!(startup_peak_live_streams(true, false), 6);
+        assert_eq!(startup_peak_live_streams(true, true), 8);
+        assert_eq!(slab(6).unwrap(), 4 << 20);
+        assert_eq!(slab(8).unwrap(), 4 << 20);
+    }
 }

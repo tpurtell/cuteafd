@@ -694,9 +694,10 @@ mod source_format_tests {
         let window = source.split_once(start).expect("module window start").1;
         let window = window.split_once(end).expect("module window end").0;
         let sampled = window.find("let after = self.library.cuda_memory_info()").unwrap();
-        let native = window.find("self.library.tp2_native_initialize()?").unwrap();
+        let native = window.find("crate::shared::inventory::preload_native_modules(&self.library)?").unwrap();
         assert!(native < sampled, "Spark intake native modules must be sampled on TP1 too (#1554)");
-        assert_eq!(window.matches("tp2_native_initialize").count(), 1);
+        assert_eq!(window.matches("preload_native_modules").count(), 1);
+        assert!(include_str!("../../shared/inventory.rs").contains("library.tp2_native_initialize()"));
     }
 
     #[test]
@@ -1091,9 +1092,7 @@ impl Opened {
                     family, split_family: Some(split_cfg.program_family()?),
                 };
                 programs.load_matching(|name| selected.contains(name))?;
-                // Spark intake loads every registered native module even on TP1.
-                // Load before sampling, so admission sees its exact occupancy (#1554).
-                self.library.tp2_native_initialize()?;
+                crate::shared::inventory::preload_native_modules(&self.library)?;
                 let after = self.library.cuda_memory_info()?.0;
                 let module_bytes = before.saturating_sub(after) as u64;
                 ensure!(module_bytes <= module_bound,

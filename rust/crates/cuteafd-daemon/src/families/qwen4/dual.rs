@@ -34,7 +34,6 @@ impl Opened {
             &[args.device, peer], crate::shared::inventory::InventoryPhase::PreWeight, |id| {
                 let rank = usize::from(id == peer);
                 programs[rank].load_matching(|name| selected.contains(name))?;
-                self.library.tp2_native_initialize()?;
                 self.library.peer_exchange_initialize()?;
                 self.library.peer_abort_initialize()?;
                 if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1") {

@@ -93,6 +93,7 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
     // SAFETY: the official runner supplies the verified sealed native artifact.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? });
     library.cuda_set_device(0)?;
+    crate::shared::inventory::preload_native_modules(&library)?;
     let config = TcpTransportConfig { max_frame_bytes:
         cuteafd_transport::expert::native_frame_budget(geometry, MAX_ROWS as u32)?, ..Default::default() };
     let spark_world = crate::shared::spark_topology::world(world)?;

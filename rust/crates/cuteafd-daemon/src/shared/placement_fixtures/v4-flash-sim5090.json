@@ -20,5 +20,6 @@
  "historical_report": "benchmarks/deepseek_v4/2026-10-09-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-rc3-sim5090/report.json",
  "note": "44e533146 shared prefill page lists and 488dc75c6 dispatch-specific scratch/egress accounting intentionally returned space; current pool is a CPU planner-shape expectation, not a fresh hardware measurement. Raw admission samples remain unchanged.",
  "pool_tokens": 1048576,
- "onboard_layers": 0
+ "onboard_layers": 0,
+ "pending_regeneration": "https://github.com/tpurtell/cuteafd/issues/1588"
 }

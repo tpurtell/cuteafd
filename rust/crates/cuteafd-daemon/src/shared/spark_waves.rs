@@ -46,8 +46,8 @@
 //! launch behind a pending wait stalls the engine thread until that wait is
 //! released, and for good when the release depends on the stalled thread
 //! (the first Engram dequantization of a cold-start request hung a
-//! 0-RTX-layer prefill this way). [`Waves::start`] loads every registered
-//! native kernel before any wait exists.
+//! 0-RTX-layer prefill this way). Shared pre-weight inventory loads every native
+//! kernel; [`Waves::start`] checks that it happened before any wait exists.
 //!
 //! The worker queues no GPU work at all. A stream memory wait stalls its
 //! hardware queue, and streams share queues, so a wait released by GPU work
@@ -1144,6 +1144,12 @@ pub(crate) struct Waves<'a> {
     grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
 }
 
+fn native_initialize_before_waits(library: &NativeLibrary) -> Result<()> {
+    ensure!(library.native_modules_preloaded()?,
+        "native modules must be preloaded inside the measured pre-weight window before Spark waits");
+    library.tp2_native_initialize()
+}
+
 impl<'a> Waves<'a> {
     /// Bounded, one-shot observation only; not called by send/land/reduce.
     pub(crate) fn worker_allocation_census(&self) -> cuteafd_transport::TransportAllocationCensus {
@@ -1196,11 +1202,10 @@ impl<'a> Waves<'a> {
         let pulls = storage.pull_block.as_ref().map(|block| Pulls { base: block.buffer.ptr as usize });
         let arena_alias = arenas.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
             .map(|alias| alias.ptr as usize)).collect::<Result<Vec<_>>>()?;
-        // Every registered native kernel loads now, with nothing pending: a
-        // lazily loaded kernel's first launch behind a pending wait stalls the
-        // engine thread, for good when the wait's release depends on it.
+        // Admission already loaded every native module. Never let the first
+        // load occur here, after KV sizing or behind another link's waits.
         let started = std::time::Instant::now();
-        library.tp2_native_initialize()?;
+        native_initialize_before_waits(library)?;
         tracing::info!(elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
             "native kernels loaded before Spark waits");
         library.peer_exchange_initialize()?;

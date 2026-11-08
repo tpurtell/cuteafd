@@ -300,3 +300,15 @@ done
 """
     result = run_bash(script, keys)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("path", sorted((ROOT / "examples/configs").glob("*.config")), ids=lambda p: p.name)
+def test_example_media_values_pass_the_release_config_validator(path: Path, tmp_path: Path):
+    # Exercise release_load_config itself, without checkpoint or image lookups:
+    # stop mode still validates values but needs no serving/model inventory.
+    media = [line for line in path.read_text().splitlines()
+             if line.startswith(("VISION=", "AUDIO="))]
+    config = tmp_path / "media.config"
+    config.write_text("\n".join(media) + "\n")
+    result = run_bash(f'release_load_config "{config}" stop')
+    assert result.returncode == 0, f"{path.name}: {result.stderr}"

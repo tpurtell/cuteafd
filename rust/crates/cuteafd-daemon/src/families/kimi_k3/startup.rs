@@ -194,7 +194,6 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
     let inventory = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PreWeight, |_| {
         if RANKS == 2 {
-            library.tp2_native_initialize()?;
             library.peer_exchange_initialize()?;
             library.peer_abort_initialize()?;
             if diagnostics { library.peer_diagnostic_initialize()?; }

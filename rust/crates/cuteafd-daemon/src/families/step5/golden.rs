@@ -714,6 +714,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     // SAFETY: sealed runner library outlives every program, stream and allocation.
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? };
     library.cuda_set_device(args.device)?;
+    crate::shared::inventory::preload_native_modules(&library)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     let pages = (rows as u64).div_ceil(64) + 1;
     let config = PrefixConfig { entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 };
@@ -727,7 +728,10 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let mut cache_bytes = [0; 2];
         let mut stage_bytes = [0; 2];
         for rank in 0..2 {
-            available[rank] = devices[rank].run(|| library.cuda_memory_info())?.0 as u64;
+            available[rank] = devices[rank].run(|| {
+                crate::shared::inventory::preload_native_modules(&library)?;
+                library.cuda_memory_info()
+            })?.0 as u64;
             cache_bytes[rank] = layout.ranks[rank].bytes + layout.geometry.ranks[rank].persistent_unit_bytes * pages;
             stage_bytes[rank] = Staging::bytes(&layout, rank)? as u64;
             let hops = cuteafd_loader::placement::hop_buffer_bytes(ownership.execution().hops(), &ownership.execution().spec(), 2)
@@ -847,11 +851,15 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     // SAFETY: sealed runner library outlives every allocation, transport and program.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? });
     library.cuda_set_device(args.device)?;
+    crate::shared::inventory::preload_native_modules(&library)?;
     let devices = [args.device, peer_device].map(|id| Device { library: &library, id });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     let (selected, _native_selection) = selected_programs(&programs, checkpoint, cfg, 2, unit, Some(&ownership))?;
     for device in &devices {
-        device.run(|| { programs.load_matching(|name| selected.names.iter().any(|selected| selected == name))?; Ok(()) })?;
+        device.run(|| {
+            programs.load_matching(|name| selected.names.iter().any(|selected| selected == name))?;
+            crate::shared::inventory::preload_native_modules(&library)
+        })?;
     }
     let head_rank = ownership.execution().spec().head_gpu as usize;
     let pages = (rows as u64).div_ceil(64) + 1;
@@ -861,7 +869,10 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let mut staging_bytes = [0u64; 2];
     let mut reservations = [0u64; 2];
     for rank in 0..2 {
-        available[rank] = devices[rank].run(|| library.cuda_memory_info()).map(|(free, _)| free as u64)?;
+        available[rank] = devices[rank].run(|| {
+                crate::shared::inventory::preload_native_modules(&library)?;
+                library.cuda_memory_info()
+            }).map(|(free, _)| free as u64)?;
         let admission = Execution::serving_admission(&programs, checkpoint, &ownership, rank, unit, rows, rows)?;
         chain_bytes[rank] = admission.check( u64::MAX, &[])?;
         cache_bytes[rank] = Some(layout.ranks[rank].bytes)
@@ -1026,6 +1037,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         )?
     };
     library.cuda_set_device(args.device)?;
+    crate::shared::inventory::preload_native_modules(&library)?;
     let device = Device {
         library: &library,
         id: args.device,

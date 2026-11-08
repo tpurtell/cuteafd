@@ -143,6 +143,7 @@ impl<'a> DenseEngine<'a> {
         let weight_bytes = NativeWeights::native(checkpoint, &cfg, admitted.norm_dtype.clone())?;
         let target_arena = super::weights::target_arena(checkpoint, &cfg, admitted.norm_dtype.clone(), format)?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
+        crate::shared::inventory::preload_native_modules(library)?;
         let device = Device { library, id: library.cuda_get_device()? };
         let stream = Stream::new(device)?;
         let layout = GdnLayout::new(cfg.gdn)?;

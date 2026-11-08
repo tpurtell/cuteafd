@@ -304,9 +304,6 @@ fn with_backend<T>(args: &ServeArgs,
     let measured = RuntimeInventory::measure(&library, &ids, InventoryPhase::PreWeight, |id| {
         programs.load_matching(|name| selected.contains(name)
             || native_selection.resolved.programs.iter().any(|selected| selected == name))?;
-        // Spark intake loads every registered native module even on TP1. Load
-        // before sampling, so admission sees its exact occupancy (#1554).
-        library.tp2_native_initialize()?;
         if let Some(other) = ids.iter().copied().find(|&other| other != id) {
             library.cuda_enable_peer(other)?;
             library.peer_exchange_initialize()?;
@@ -655,10 +652,10 @@ mod tests {
         let source = include_str!("serve.rs");
         let measured = source.split("let measured = RuntimeInventory::measure").nth(1).unwrap()
             .split("let mut selected_programs").next().unwrap();
-        let native = measured.find("library.tp2_native_initialize()?").unwrap();
-        let peer = measured.find("if let Some(other)").unwrap();
-        assert!(native < peer, "Spark intake native modules must be sampled on TP1 too");
-        assert_eq!(measured.matches("library.tp2_native_initialize()?").count(), 1);
+        assert!(measured.contains("InventoryPhase::PreWeight"));
+        let shared = include_str!("../../shared/inventory.rs");
+        assert!(shared.contains("if phase == InventoryPhase::PreWeight { preload_native_modules(library)?; }"));
+        assert!(shared.contains("library.tp2_native_initialize()"));
     }
 
     #[test]
