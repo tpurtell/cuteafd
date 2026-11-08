@@ -376,6 +376,26 @@ fn with_startup_graphs<T>(tp2: bool, serving: Option<(usize, bool)>, golden: (us
 }
 
 #[cfg(test)]
+mod admission_tests {
+    /// Native module code is lazy (`CUDA_MODULE_LOADING` default): it lands on
+    /// first launch or `cudaFuncGetAttributes`, which is after the pre-weight
+    /// baseline unless it is forced inside the measured closure (#1554, #1577).
+    #[test]
+    fn startup_native_modules_load_inside_the_measured_baseline() {
+        let source = include_str!("mod.rs");
+        // The last occurrence is the real closure; the test modules above it
+        // (which quote this text) are not part of the measured region.
+        let measured = source.rsplit("RuntimeInventory::measure(&self.library, &devices")
+            .next().unwrap();
+        let measured = measured.split("Ok(())\n            })").next().unwrap();
+        let native = measured.find("self.library.tp2_native_initialize()?").unwrap();
+        let peer = measured.find("if let Some(other)").unwrap();
+        assert!(native < peer, "native modules must load before peer initialization");
+        assert_eq!(measured.matches("self.library.tp2_native_initialize()?").count(), 1);
+    }
+}
+
+#[cfg(test)]
 mod draft_cli_tests {
     use super::*;
     use clap::Parser;
@@ -1895,11 +1915,21 @@ impl Opened {
                 programs, self.cfg.hidden, self.cfg.vocab_size)?);
         }
         crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices,
-            crate::shared::inventory::InventoryPhase::PreWeight, |_| {
+            crate::shared::inventory::InventoryPhase::PreWeight, |id| {
                 programs.load_matching(|name| glmf_startup_program(name, split, args.decode_rows > engine::DECODE_ROWS)
                     || core_charge.as_ref().is_some_and(|c| c.programs.iter().any(|n| n == name))
                     || native_code.contains(name)
                     || (self.native && name.starts_with("exlr8_glmf_")))?;
+                // Spark intake and the peer exchange load every registered native
+                // module; load them before this device's sample so admission sees
+                // their exact occupancy (#1554). Lazy module code would otherwise
+                // land after the baseline, uncharged.
+                self.library.tp2_native_initialize()?;
+                if let Some(other) = devices.iter().copied().find(|&other| other != id) {
+                    self.library.cuda_enable_peer(other)?;
+                    self.library.peer_exchange_initialize()?;
+                    self.library.peer_abort_initialize()?;
+                }
                 Ok(())
             })
     }
