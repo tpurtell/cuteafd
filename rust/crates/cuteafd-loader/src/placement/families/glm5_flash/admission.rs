@@ -2,6 +2,20 @@
 use super::*;
 use crate::placement::planner as p;
 
+/// The coordinator context's peak live streams (#1511: SM120 retains 2 MiB per
+/// four live streams; destroyed streams reuse the slots). One serving lane
+/// (`glm5_flash/mod.rs` serving stream), the four delivery lanes
+/// (`push_load::COPY_STREAMS` in `shared/memory/push_consumer.rs`), the packed
+/// head's pack lane (`glm5_flash/head.rs`), the embedding verify lane
+/// (`shared/token_io.rs`) and the expert-usage lane
+/// (`cuteafd-ffi/src/shared/expert_usage.rs`) overlap during the weight load;
+/// a split adds the peer lane (`glm5_flash/mod.rs` peer stream). The Spark
+/// intake and prefix-cache lanes are created after the delivery lanes retire,
+/// so they refill the same slots and never raise the peak.
+pub fn startup_peak_live_streams(gpus: usize) -> u64 {
+    8 + u64::from(gpus > 1)
+}
+
 /// Caller-resolved process owners. Preparing a recipe never samples memory.
 #[derive(Debug, Clone)]
 pub struct ProcessOwners {
@@ -1000,6 +1014,19 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     contract.components.extend(p::serving::blas_components("sm_120", &rtx_blas, maximum, contract.phase_order)?);
     contract.components.extend(p::serving::blas_components("sm_121", &spark_blas, maximum, contract.phase_order)?);
     contract.add_driver_page_tables();
+    // Driver stream slots are slabs, not cudaMalloc requests: no allocation-tail
+    // charge, and the slab survives the streams that first filled it.
+    let peak = startup_peak_live_streams(gpus);
+    let slabs = p::cuda_stream_slab_bytes(peak).map_err(invalid)?;
+    for rank in 0..gpus {
+        contract.components.push(p::Component { activation: p::Activation::always(),
+            bytes: p::ByteCurve::fixed(slabs, maximum),
+            kind: p::ComponentKind::Allowance(p::Allowance {
+                location: p::Location::coordinator(rank as u8), bytes: slabs,
+                lifetime: p::Lifetime::RESIDENT, assumed: false,
+                source: format!("glmf/driver-stream-slabs/gpu{rank} ({peak} peak live streams, \
+                    SM120 driver/runtime13020 LAZY, #1511 2026-11-08)") }) });
+    }
     let request = p::Request { context: i.context,
         pool: PoolPolicy::normalize_request(i.requested_pool).map_or(p::Pin::Auto, p::Pin::Exact),
         onboard: i.onboard.layers(routed.len()).map_or(p::Pin::Auto, |n| p::Pin::Exact(n as u64)),
@@ -1106,6 +1133,35 @@ impl PreparedGlmf<'_> {
 mod tests {
     use super::*;
     use crate::plan::exlr8::residency::{ExpertSet, Residency};
+
+    /// SM120 retains a 2 MiB driver slab per four peak live streams (#1511);
+    /// the charge is one named resident allowance per coordinator GPU.
+    #[test]
+    fn driver_stream_slabs_are_named_resident_allowances_per_gpu() {
+        assert_eq!((startup_peak_live_streams(1), startup_peak_live_streams(2)), (8, 9));
+        assert_eq!(p::cuda_stream_slab_bytes(8).unwrap(), 4 << 20);
+        assert_eq!(p::cuda_stream_slab_bytes(9).unwrap(), 4 << 20);
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for ranks in [1, 2] {
+            let mut input = crate::placement::families::glm5_flash::tests::inputs(&cfg, ranks,
+                crate::placement::inventory::PRO_TOTAL_BYTES);
+            input.drafter_bytes = 0;
+            input.drafter_weights = ResidentWeights(0);
+            input.requested_pool = Some(262_144);
+            let solved = prepare(&input, 188, true, ProcessOwners::new((512 << 30, 512 << 30), 8 << 30))
+                .unwrap().admit().unwrap().solved;
+            let slabs = p::cuda_stream_slab_bytes(startup_peak_live_streams(ranks)).unwrap();
+            for rank in 0..ranks {
+                let owners = solved.facts.allowances.iter().filter(|owner|
+                    owner.location == p::Location::coordinator(rank as u8)
+                        && owner.source.starts_with(&format!("glmf/driver-stream-slabs/gpu{rank} "))
+                        && owner.lifetime.contains(p::Phase::Ready, solved.facts.phase_order)).collect::<Vec<_>>();
+                assert_eq!(owners.len(), 1, "{ranks} GPUs, rank {rank}");
+                assert_eq!(owners[0].bytes, slabs);
+                assert!(!owners[0].assumed);
+            }
+        }
+    }
 
     #[test]
     fn selected_arenas_replace_payload_and_share_activation_with_their_single_tail() -> anyhow::Result<()> {
