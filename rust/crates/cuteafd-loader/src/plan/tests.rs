@@ -4698,9 +4698,12 @@ fn qwen_split_off_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle
 }
 
 #[test]
-fn v41_small_card_graph_envelope_preserves_pro_allowance() {
+fn v41_graph_reserve_is_one_card_size_independent_arena() {
+    // One configured arena per coordinator GPU, the same on every card size.
+    // The small card's own allowance is a capture policy (fixed shapes), not a
+    // second envelope, so it no longer moves the graph owner.
     let dir = strict_v41_snapshot(false);
-    for (gib, expected) in [(32, 2u64 << 30), (96, 3264u64 << 20)] {
+    for gib in [32, 96] {
         let options = PlanOptions {
             layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib << 30], prefill_rows: 256, onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                 context_tokens: 262_144, pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
@@ -4709,8 +4712,8 @@ fn v41_small_card_graph_envelope_preserves_pro_allowance() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.executable(), "{}", render(&report));
         let memory = report.memory_layout.unwrap();
-        let graph = memory.devices[0].items.iter().find(|item| item.group == "V4.1 lazy graph capture envelope").unwrap();
-        assert_eq!(graph.bytes, expected);
+        let graph = memory.devices[0].items.iter().find(|item| item.group.starts_with("graph reserve")).unwrap();
+        assert_eq!(graph.bytes, 1_048_576_000);
     }
 }
 
@@ -4723,8 +4726,9 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
         prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(automatic.devices[0].capacity_bytes, 96u64 << 30);
-    // The runtime growth estimate does not grow with automatic admission.
-    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group.starts_with("V4.1 runtime growth reserve")).unwrap().bytes, 2 << 30);
+    // The graph arena is one configured owner; automatic admission does not
+    // grow it.
+    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, 1_048_576_000);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
     let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&crate::read_json_file::<Value>(&dir.path().join("config.json")).unwrap(), 1).unwrap();
@@ -4733,7 +4737,7 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     options.layout.as_mut().unwrap().pool_tokens = Some(512);
     let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(explicit.devices[0].capacity_bytes, 96u64 << 30);
-    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group.starts_with("V4.1 runtime growth reserve")).unwrap().bytes, 2 << 30);
+    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, 1_048_576_000);
 }
 
 #[test]
@@ -5035,7 +5039,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     eprintln!("V4.1 synthetic 31 GiB: selected modules {modules}, named BLAS {blas}, retired mixed allowance delta {retired} B; one graph reserve");
     // Less physical capacity still refuses rather than shrinking the reserve.
     let limited = PlanOptions { layout: Some(layout::LayoutOptions {
-        rtx_bytes: vec![29 << 30], ..layout.clone() }), ..sparks(4) };
+        rtx_bytes: vec![28 << 30], ..layout.clone() }), ..sparks(4) };
     let limited = plan_spark_count(dir.path(), &limited, 6, Some(4)).unwrap();
     assert!(!limited.executable(), "{}", render(&limited));
     assert_eq!((limited.prefill_reserve_rows, limited.prefill_unit_rows, limited.prefill_waves),
