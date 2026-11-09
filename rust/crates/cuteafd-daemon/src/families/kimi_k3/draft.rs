@@ -629,7 +629,7 @@ mod tests {
         let cache_format = cuteafd_core::MlaCacheFormat::Fp8;
         let spark_cap = cuteafd_core::memory_policy::MemoryPolicy { spark_cap: Some(110 << 30), ..Default::default() };
         let loaded = spark_cap.scoped(|| startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { expert_usage: false, expert_usage_reader: Default::default(),
-            cache_format, attention: None, devices: [0], native_lib: &native, peers,
+            cache_format, attention: None, devices: [0], native_lib: &native, manifest: &manifest, peers,
             rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
             rows: 2048, waves: 2, prefill_rows: Some(1024),
             context: cuteafd_loader::placement::planner::Context::pinned(8192), slots: 2, marks: 0, max_context: 8192, pool_tokens: Some(16384), graphs: false, full_prefill_logits: false,
@@ -717,7 +717,7 @@ mod tests {
         let programs = library.programs()?.with_manifest(&manifest)?;
         let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { expert_usage: false, expert_usage_reader: Default::default(),
             cache_format,
-            attention: None, devices: [0, 1], native_lib: &native, peers,
+            attention: None, devices: [0, 1], native_lib: &native, manifest: &manifest, peers,
             rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
             rows: TARGET_TAP_ROWS, waves: 2, prefill_rows: None, context: cuteafd_loader::placement::planner::Context::pinned(524_288), slots: 1, marks: 1, max_context: 524_288,
             pool_tokens: Some(524_288), graphs: true, full_prefill_logits: false, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
