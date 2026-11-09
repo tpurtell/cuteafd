@@ -897,3 +897,17 @@ mod device_tests {
         }
     }
 }
+
+impl<K: Hash + Eq + Clone + std::fmt::Debug, E> super::CacheAttached for GraphBank<K, E> {
+    fn attach(&mut self, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
+        self.attach_device(device, reserve, site)
+    }
+    fn cycle(&mut self, cycle: super::device::Cycle) { self.cache_cycle(cycle); }
+    fn needs_boundary(&self) -> bool { self.cache_needs_boundary() }
+    fn measured(&mut self, bytes: u64) { self.cache_measured(bytes); }
+    fn tick(&mut self) { self.cache_tick(); }
+    fn drain(&mut self, drain: &mut dyn FnMut() -> anyhow::Result<()>,
+        measure: &mut dyn FnMut() -> anyhow::Result<super::device::ReleaseMeasurement>) -> anyhow::Result<()> {
+        self.cache_drain(drain, measure)
+    }
+}

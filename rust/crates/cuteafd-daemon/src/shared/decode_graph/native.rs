@@ -286,3 +286,37 @@ mod tests {
         Ok(())
     }
 }
+
+impl<W> super::CacheAttached for LayerGraphs<'_, '_, W> {
+    cache_attached_methods!(bank);
+}
+impl super::CacheAttached for RowGraphs<'_> {
+    cache_attached_methods!(bank);
+}
+
+#[cfg(test)]
+mod visitor_tests {
+    use super::*;
+    use super::super::{BindingGraphs, CacheAttached};
+    #[test]
+    fn heterogeneous_control_attaches_one_device_pool() -> Result<()> {
+        use super::super::device::{Basis, Preference};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let mut direct = GraphBank::<u8, ()>::new(None);
+        let mut layers = LayerGraphs::<'_, '_, ()>::new(&library, 64, "test");
+        let mut rows = RowGraphs::new(&library, "fixture", 64, "test");
+        let mut bindings = BindingGraphs::<u16>::new(&library, "fixture")?;
+        let banks: [&mut dyn CacheAttached; 4] = [&mut direct, &mut layers, &mut rows, &mut bindings];
+        for bank in banks {
+            bank.attach(-8802, 64 << 20, Site { name: "visitor-fixture", cycle: Cycle::Other,
+                preference: Preference::Capture, bootstrap: 2 << 20, basis: Basis::Bytes,
+                spans_devices: false })?;
+            bank.cycle(Cycle::Verify);
+            assert!(!bank.needs_boundary());
+            bank.tick();
+            bank.drain(&mut || Ok(()), &mut || Ok(ReleaseMeasurement { released: 0 }))?;
+        }
+        Ok(())
+    }
+}

@@ -5,8 +5,9 @@ ownership stays in `shared/decode_graph/bank.rs`. GLM 5.3 is the reference
 integration in `families/glm5/engine.rs`. Do not copy its model geometry into
 shared policy.
 
-Families using `LayerGraphs` or `RowGraphs` opt into the same controller via
-`attach_device` in `shared/decode_graph/native.rs`. Unattached wrappers keep
+Families using `LayerGraphs`, `RowGraphs`, or `BindingGraphs` opt into the same
+controller via `attach_device` in `shared/decode_graph/{native,binding}.rs`.
+Unattached wrappers keep
 their existing decisions, budgets and statistics unchanged. After attachment,
 use `cache_ticket` before beginning capture (None means eager), then
 `cache_insert` with native topology before `cached_launch`. A ticket cancels
@@ -17,6 +18,14 @@ ranks have queued and drained the complete step, calls `cache_measured` once
 per physical device and `cache_drain` on every bank. `cache_tick` flushes
 pinned-hit counts at boundaries without graph growth. No wrapper synchronizes
 an individual capture or invents model geometry.
+
+`CacheAttached` is the object-safe attachment/cycle/measurement/drain surface
+for heterogeneous family traversal; direct banks and all three adapters
+implement it. A family visitor supplies the physical device, stable site name,
+and explicit peer-span flag alongside `&mut dyn CacheAttached`. Attach before
+any capture, and pass the same device reserve and basis for every visited bank.
+The visitor does not drain or measure on its own; the top-level completed-step
+boundary supplies those callbacks after every consumer has drained.
 
 ## Family inputs
 
