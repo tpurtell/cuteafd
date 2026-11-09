@@ -426,6 +426,29 @@ mod tests {
     }
 
     #[test]
+    fn context_and_generic_trace_entries_expand_only_their_class() -> Result<()> {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Mla).unwrap();
+        let templates = [Op::Context { layer, speculative: false },
+            Op::Attention { layer, sequences: 1, speculative: false },
+            Op::Ffn(layer), Op::Residual(MixSite::Attention(layer))].map(|op|
+                Key { lane: 0, rank: 0, rows: 1, op });
+        for kind in [KimiPrewarmOp::Context, KimiPrewarmOp::Ffn, KimiPrewarmOp::Residual] {
+            let layout = KimiPrewarmLayout { ranks: 2, layout: "trace".into(),
+                reserve_base_bytes: 1, reserve_extra_bytes: 2 << 20,
+                entries: vec![KimiPrewarmEntry { rows: 4, speculative: false, pin: true,
+                    op: Some(kind), sequences: None }] };
+            let keys = prewarm_keys(&cfg, &templates, &layout, 16, 4096);
+            assert_eq!(keys.len(), 1, "only the observed operation class expands");
+            assert_eq!(geometry(keys[0].op), (kind, None));
+            assert_eq!(keys[0].rows, 4);
+            assert!(replay_allowed(keys[0].op, true, false)?);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn the_controller_selects_capture_from_the_reserve_and_runs_eagerly_without_one() {
         use crate::shared::decode_graph::device::Miss;
         let hot = Key { lane: 0, rank: 0, rows: 1, op: Op::Ffn(0) };
