@@ -651,8 +651,12 @@ impl Drop for DsparkChain<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark chain");
         if let Some(pending) = &mut self.pending { pending.armed = false; }
         self.pending = None; // GPU work has drained before read reservations release.
-        self.graphs.retire_all();
-        fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "dSpark chain graphs");
+        if self.graphs.cache_attached() {
+            self.graphs.cache_clear_drained();
+        } else {
+            self.graphs.retire_all();
+            fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "dSpark chain graphs");
+        }
     }
 }
 

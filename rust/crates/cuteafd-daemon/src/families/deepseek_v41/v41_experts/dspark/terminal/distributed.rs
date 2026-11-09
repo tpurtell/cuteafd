@@ -334,8 +334,12 @@ impl Drop for DistributedDsparkTerminal<'_, '_> {
         self.cancel();
         let device = self.terminal.device;
         fatal_drain(device.run(|| self.terminal.synchronize()), "distributed terminal");
-        self.graphs.retire_all();
-        fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "distributed terminal graphs");
+        if self.graphs.cache_attached() {
+            self.graphs.cache_clear_drained();
+        } else {
+            self.graphs.retire_all();
+            fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "distributed terminal graphs");
+        }
     }
 }
 
