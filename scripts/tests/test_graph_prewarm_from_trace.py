@@ -463,6 +463,24 @@ def test_kimi_dominant_verify_pins_exact_attention_and_flagless_siblings():
     assert any(entry["rows"] == 1 and "plain_c1" in entry["reasons"] for entry in report)
 
 
+def test_kimi_lifetime_tiers_are_independent_per_device_and_operation():
+    traces = [kimi_trace(device=rank) for rank in (0, 1)]
+    for rank, data in enumerate(traces):
+        seed = data["graphs"][0]
+        data["graphs"] = [dict(seed, key_id=index,
+            shape=f"lane=0 rank={rank} rows={rows} op={op} " +
+                  ("site=Norm" if op == "residual" else "layer=0"),
+            hits=hits, cycles={"verify": hits},
+            hit_histogram={"interval_ms": 10_000, "start_ms": 0, "counts": [0] * 5})
+            for index, (rows, op, hits) in enumerate([
+                (4, "ffn", 100 if rank == 0 else 1),
+                (8, "ffn", 1 if rank == 0 else 100),
+                (16, "residual", 2)])]
+    row = MODULE.generate_kimi(traces, 2, "max", coverage=1)
+    assert {(entry["rows"], entry["op"]) for entry in row["entries"] if entry["pin"]} == {
+        (4, "ffn"), (8, "ffn"), (16, "residual")}
+
+
 def test_kimi_zero_share_is_valid_and_missing_rank_fails():
     data = kimi_trace()
     data["graphs"][0]["capture_bytes"] = 0
