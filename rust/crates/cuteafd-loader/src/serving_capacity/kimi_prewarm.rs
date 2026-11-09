@@ -5,19 +5,16 @@
 //! checked-in list carries one row per layout and admission reserves that
 //! row's arena on every physical device.
 //!
-//! `reserve_base_bytes` is the layout's measured prewarm arena on its largest
-//! rank and `reserve_extra_bytes` is the 2 MiB allocation tail. Shared
+//! `reserve_base_bytes` holds each physical rank's measured prewarm arena;
+//! `reserve_extra_bytes` is the 2 MiB allocation tail. Shared
 //! GPU_GRAPH_RESERVE_EXTRA supplies runtime headroom; GPU_GRAPH_RESERVE
 //! overrides the whole reserve. The census base is provisional until a
 //! GRAPH_TRACE run replaces them; regenerate with
 //! `scripts/dev/graph-prewarm-from-trace.py --family kimi_k3`.
 //!
-//! Listed rows are the replayable startup geometry: the plain buckets plus
-//! every verify width the drafter reaches (two through its block of eight for
-//! non-context sites, and context decode buckets through the native 64-row
-//! cap). The 4096 prefill bucket and wider prefill-window rows are captured
-//! lazily, if at all: prefill runs the eager body inside a row window, so
-//! those keys never replay and must not be prewarmed (#1646).
+//! Listed rows preserve observed operation, verify variant and attention
+//! sequence count within the native 64-row replay band. Prefill runs eagerly
+//! inside a row window: its keys never replay and are not prewarmed (#1646).
 
 use std::sync::OnceLock;
 
@@ -28,8 +25,7 @@ pub enum KimiPrewarmOp { Residual, Ffn, Attention, Context }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KimiPrewarmEntry {
     pub rows: usize,
-    /// Verify-shaped attention capture at this width. Flagless residual/FFN
-    /// captures at the same rows are covered by any pinned row.
+    /// Verify-shaped attention or context capture; false for flagless sites.
     pub speculative: bool,
     pub pin: bool,
     /// Absent only in the provisional startup bootstrap set.
@@ -44,7 +40,7 @@ pub struct KimiPrewarmLayout {
     /// Coordinator ranks this row was measured on.
     pub ranks: usize,
     pub layout: String,
-    pub reserve_base_bytes: u64,
+    pub reserve_base_bytes: Vec<u64>,
     pub reserve_extra_bytes: u64,
     pub entries: Vec<KimiPrewarmEntry>,
 }
@@ -63,6 +59,9 @@ fn kimi_prewarm_list() -> &'static KimiPrewarmList {
             .expect("checked-in Kimi K3 prewarm list");
         assert_eq!(list.schema_version, 1);
         assert_eq!(list.family, "kimi_k3");
+        for layout in &list.layouts {
+            assert_eq!(layout.reserve_base_bytes.len(), layout.ranks, "Kimi per-rank graph bases");
+        }
         list
     })
 }
@@ -82,7 +81,7 @@ fn kimi_bootstrap_layout() -> &'static KimiPrewarmLayout {
     BOOTSTRAP.get_or_init(|| KimiPrewarmLayout {
         ranks: 0,
         layout: "bootstrap startup set (untraced)".into(),
-        reserve_base_bytes: crate::families::kimi_k3::allocation::GRAPH_CENSUS_BYTES,
+        reserve_base_bytes: vec![],
         reserve_extra_bytes: 2 << 20,
         entries: [1, 4, 16, 64].into_iter().map(|rows|
             KimiPrewarmEntry { rows, speculative: false, pin: true, op: None, sequences: None })
@@ -92,9 +91,15 @@ fn kimi_bootstrap_layout() -> &'static KimiPrewarmLayout {
 }
 
 /// Per-device measured prewarm base and allocation tail.
-pub fn kimi_reserve(ranks: usize) -> (u64, u64) {
+pub fn kimi_reserve(ranks: usize, rank: usize) -> (u64, u64) {
+    assert!(rank < ranks, "Kimi graph reserve rank");
     let layout = kimi_layout(ranks);
-    (layout.reserve_base_bytes, layout.reserve_extra_bytes)
+    let base = if layout.ranks == 0 {
+        crate::families::kimi_k3::allocation::graph_census(ranks, rank).0
+    } else {
+        layout.reserve_base_bytes[rank]
+    };
+    (base, layout.reserve_extra_bytes)
 }
 
 /// Select an exact traced operation/attention geometry. Bootstrap entries have
@@ -125,19 +130,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_layout_names_its_shapes_and_reserves_a_positive_arena() {
+    fn every_layout_names_its_shapes_and_reserves_each_physical_rank() {
         let list = kimi_prewarm_list();
         assert_eq!(list.layouts.len(), 2);
         for layout in &list.layouts {
             assert!(layout.ranks >= 1 && !layout.layout.is_empty());
-            assert!(layout.reserve_base_bytes > 0 && layout.reserve_extra_bytes > 0);
+            assert_eq!(layout.reserve_base_bytes.len(), layout.ranks);
+            assert_eq!(layout.reserve_extra_bytes, 2 << 20);
             assert!(!layout.entries.is_empty());
             assert!(layout.entries.iter().all(|entry| entry.rows > 0));
         }
-        assert!(kimi_reserve(2).0 > kimi_reserve(1).0, "TP2 holds more executables");
+        for layout in &list.layouts {
+            for rank in 0..layout.ranks {
+                assert_eq!(kimi_reserve(layout.ranks, rank).0, layout.reserve_base_bytes[rank]);
+            }
+        }
         assert_eq!(kimi_layout(9).ranks, 0, "untraced layouts use bootstrap, not another row");
-        assert_eq!(kimi_reserve(1).1, 2 << 20);
-        assert_eq!(kimi_reserve(2).1, 2 << 20);
+        assert_eq!(kimi_reserve(1, 0).1, 2 << 20);
+        assert_eq!(kimi_reserve(2, 1).1, 2 << 20);
     }
 
     #[test]
@@ -154,7 +164,7 @@ mod tests {
     #[test]
     fn selection_stays_within_the_layout_operation_and_sequence_variant() {
         let layout = KimiPrewarmLayout { ranks: 1, layout: "test".into(),
-            reserve_base_bytes: 1, reserve_extra_bytes: 2 << 20,
+            reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![KimiPrewarmEntry { rows: 20, speculative: true, pin: true,
                 op: Some(KimiPrewarmOp::Attention), sequences: Some(4) }] };
         let select = |rows, spec, op, seq| kimi_selected(&layout, rows, spec, op, seq, false);
@@ -168,7 +178,7 @@ mod tests {
     #[test]
     fn context_entry_selects_only_its_exact_context_variant() {
         let layout = KimiPrewarmLayout { ranks: 2, layout: "context".into(),
-            reserve_base_bytes: 1, reserve_extra_bytes: 2 << 20,
+            reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![KimiPrewarmEntry { rows: 16, speculative: false, pin: true,
                 op: Some(KimiPrewarmOp::Context), sequences: None }] };
         assert!(kimi_selected(&layout, 16, false, KimiPrewarmOp::Context, None, false));
@@ -182,7 +192,7 @@ mod tests {
     fn generic_entries_select_only_their_own_operation_class() {
         for kind in [KimiPrewarmOp::Residual, KimiPrewarmOp::Ffn] {
             let layout = KimiPrewarmLayout { ranks: 1, layout: "generic".into(),
-                reserve_base_bytes: 1, reserve_extra_bytes: 2 << 20,
+                reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
                 entries: vec![KimiPrewarmEntry { rows: 20, speculative: false, pin: false,
                     op: Some(kind), sequences: None }] };
             for op in [KimiPrewarmOp::Residual, KimiPrewarmOp::Ffn,

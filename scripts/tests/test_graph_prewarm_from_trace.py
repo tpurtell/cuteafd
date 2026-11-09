@@ -276,7 +276,7 @@ def test_regeneration_reproduces_checked_in_base_and_tail(filename):
 
 
 def kimi_trace(device=0, charged=600 << 20, rows=1, speculative=False, cycles=None):
-    shape = (f"lane=0 rank=0 rows={rows} op="
+    shape = (f"lane=0 rank={device} rows={rows} op="
              + (f"attention layer=0 seq=1 spec={int(speculative)}" if speculative
                 else "residual site=Norm"))
     return {"schema_version": 2, "cache": {"device": device, "charged": charged},
@@ -284,6 +284,7 @@ def kimi_trace(device=0, charged=600 << 20, rows=1, speculative=False, cycles=No
             "graphs": [{"device": device, "site": "kimi_k3.step", "bank": 0, "shape": shape,
                         "count": 100, "cycles": cycles if cycles is not None else {"decode": 100},
                         "hits": 100, "evictions": 0, "recaptures": 0, "first_seen_ms": 0,
+                        "capture_bytes": 3 << 20,
                         "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
                                           "counts": [25, 25, 25, 25, 0]}}]}
 
@@ -295,13 +296,13 @@ def test_kimi_layout_row_keeps_replay_widths_and_skips_prefill():
                                 cycles={"prefill": 50}))
     row = MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min", coverage=0.999)
     assert row["entries"] == [{"rows": 1, "speculative": False, "op": "residual", "pin": True}]
-    assert row["reserve_base_bytes"] == 600 << 20
+    assert row["reserve_base_bytes"] == [4 << 20]
     assert row["reserve_extra_bytes"] == 2 << 20
 
 
 def test_kimi_verify_width_is_its_own_pin(tmp_path):
     trace = kimi_trace(rows=4, speculative=True)
-    row = MODULE.generate_kimi([trace], 2, "kimi-k3-exl3-k6-max")
+    row = MODULE.generate_kimi([trace, kimi_trace(device=1, rows=4, speculative=True)], 2, "kimi-k3-exl3-k6-max")
     assert row["entries"] == [{"rows": 4, "speculative": True, "op": "attention", "sequences": 1, "pin": True}]
     out = tmp_path / "kimi_prewarm.json"
     MODULE.merge_kimi_layout(out, MODULE.generate_kimi([kimi_trace()], 1, "kimi-k3-exl3-k6-min"))
@@ -342,7 +343,46 @@ def test_kimi_geometry_preserves_operation_and_attention_sequence_count():
     trace["graphs"][0]["shape"] = "lane=0 rank=0 rows=20 op=attention layer=0 seq=4 spec=1"
     trace["graphs"].append(dict(trace["graphs"][0],
         shape="lane=0 rank=0 rows=20 op=context layer=1 spec=1"))
-    row = MODULE.generate_kimi([trace], 2, "max")
+    row = MODULE.generate_kimi([trace], 1, "max")
     assert row["entries"] == [
         {"rows": 20, "speculative": True, "op": "attention", "sequences": 4, "pin": True},
         {"rows": 20, "speculative": True, "op": "context", "pin": True}]
+
+
+def test_kimi_base_sums_selected_latest_identity_shares_per_rank():
+    import copy
+    first = kimi_trace()
+    first["cache"]["sampled_at_ms"] = 40_000
+    graph = first["graphs"][0]
+    graph.update(key_id=1, capture_bytes=1)
+    sibling = dict(graph, bank=2, cycles={"other": 1}, count=1, capture_bytes=2)
+    first["graphs"] += [dict(graph), sibling,
+                        dict(graph, key_id=3, shape="lane=0 rank=0 rows=64 op=ffn layer=0",
+                             cycles={"other": 1}, capture_bytes=900 << 20)]
+    old = copy.deepcopy(first)
+    old["cache"]["sampled_at_ms"] = 39_000
+    old["graphs"][0]["capture_bytes"] = 100 << 20
+    second = kimi_trace(device=1)
+    second["graphs"][0]["capture_bytes"] = (2 << 20) + 1
+    for inputs in ([old, first, second], [second, first, old]):
+        row = MODULE.generate_kimi(inputs, 2, "max")
+        assert row["reserve_base_bytes"] == [2 << 20, 4 << 20]
+
+
+@pytest.mark.parametrize("share", [None, -1, "0", True])
+def test_kimi_missing_or_invalid_selected_capture_share_fails(share):
+    data = kimi_trace()
+    data["graphs"][0]["capture_bytes"] = share
+    with pytest.raises(ValueError, match="capture_bytes"):
+        MODULE.generate_kimi([data], 1, "min")
+    del data["graphs"][0]["capture_bytes"]
+    with pytest.raises(ValueError, match="capture_bytes"):
+        MODULE.generate_kimi([data], 1, "min")
+
+
+def test_kimi_zero_share_is_valid_and_missing_rank_fails():
+    data = kimi_trace()
+    data["graphs"][0]["capture_bytes"] = 0
+    assert MODULE.generate_kimi([data], 1, "min")["reserve_base_bytes"] == [0]
+    with pytest.raises(ValueError, match="missing a physical rank"):
+        MODULE.generate_kimi([data], 2, "max")

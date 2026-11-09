@@ -370,8 +370,8 @@ pub fn graph_demand(set: &GraphSet, rank: usize) -> Demand {
 /// the whole reserve before KV sizing; the bounded device cache grows into it
 /// lazily and evicts, rather than re-planning memory, when it is full.
 pub fn graph_reserve_demands(ranks: usize) -> anyhow::Result<Vec<Demand>> {
-    let (base, extra) = crate::placement::graph_reserve::kimi_default(ranks);
     (0..ranks).map(|rank| {
+        let (base, extra) = crate::placement::graph_reserve::kimi_default(ranks, rank);
         let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)
             .map_err(anyhow::Error::msg)?;
         tracing::info!(rank, reserve = reserve.bytes, source = %reserve.source,

@@ -9,8 +9,8 @@ pub fn glm_default(family: GlmPrewarmFamily, ranks: usize) -> (u64, u64) {
 }
 /// Kimi K3 selects its arena by coordinator layout (rank count): TP2 captures a
 /// different inventory than a single coordinator.
-pub fn kimi_default(ranks: usize) -> (u64, u64) {
-    crate::serving_capacity::kimi_prewarm::kimi_reserve(ranks)
+pub fn kimi_default(ranks: usize, rank: usize) -> (u64, u64) {
+    crate::serving_capacity::kimi_prewarm::kimi_reserve(ranks, rank)
 }
 pub fn source(id: &str) -> String { format!("graph reserve: {id}") }
 pub fn is_source(source: &str) -> bool { source.starts_with("graph reserve: ") || source.starts_with("startup graphs: ") }

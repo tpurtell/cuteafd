@@ -399,7 +399,7 @@ mod tests {
         use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let layout = KimiPrewarmLayout { ranks: 1, layout: "trace".into(),
-            reserve_base_bytes: 1, reserve_extra_bytes: 2 << 20,
+            reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![
                 KimiPrewarmEntry { rows: 20, speculative: true, pin: true,
                     op: Some(KimiPrewarmOp::Attention), sequences: Some(4) },
@@ -436,7 +436,7 @@ mod tests {
                 Key { lane: 0, rank: 0, rows: 1, op });
         for kind in [KimiPrewarmOp::Context, KimiPrewarmOp::Ffn, KimiPrewarmOp::Residual] {
             let layout = KimiPrewarmLayout { ranks: 2, layout: "trace".into(),
-                reserve_base_bytes: 1, reserve_extra_bytes: 2 << 20,
+                reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
                 entries: vec![KimiPrewarmEntry { rows: 4, speculative: false, pin: true,
                     op: Some(kind), sequences: None }] };
             let keys = prewarm_keys(&cfg, &templates, &layout, 16, 4096);

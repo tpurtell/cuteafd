@@ -5,7 +5,7 @@
     {
       "ranks": 1,
       "layout": "kimi-k3-exl3-k6-min",
-      "reserve_base_bytes": 530579456,
+      "reserve_base_bytes": [530579456],
       "reserve_extra_bytes": 2097152,
       "entries": [
         {
@@ -348,7 +348,7 @@
     {
       "ranks": 2,
       "layout": "kimi-k3-exl3-k6-max",
-      "reserve_base_bytes": 763363328,
+      "reserve_base_bytes": [761266176, 763363328],
       "reserve_extra_bytes": 2097152,
       "entries": [
         {

@@ -15,6 +15,7 @@ GEOMETRY = re.compile(r"rows: (\d+), table_width: (\d+), table_stride: (\d+)")
 # Families sharing one engine share its site names.
 SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5."}
 KIMI_ROWS = re.compile(r"rows=(\d+)")
+KIMI_RANK = re.compile(r"rank=(\d+)")
 KIMI_OP = re.compile(r"op=(\w+)")
 KIMI_SPEC = re.compile(r"spec=(\d)")
 KIMI_SEQUENCES = re.compile(r"seq=(\d+)")
@@ -64,7 +65,6 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
     if not 0 < coverage <= 1:
         raise ValueError("coverage must be in (0, 1]")
     counts = {}
-    arenas = []
     reasons = {}
     identities = {}
     latest = {}
@@ -74,7 +74,6 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
             raise ValueError("expected GRAPH_TRACE schema_version=1 or 2")
         cache = trace["cache"]
         device = int(cache["device"])
-        arenas.append(int(cache["charged"]))
         inferred_end = max((int(graph.get("hit_histogram", {}).get("start_ms", 0)) +
                             len(graph.get("hit_histogram", {}).get("counts", [])) *
                             int(graph.get("hit_histogram", {}).get("interval_ms", 0))
@@ -133,6 +132,29 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
                 **({"sequences": sequences} if sequences is not None else {}),
                 "pin": bool(reasons.get((rows, speculative, op, sequences)))}
                for rows, speculative, op, sequences in sorted(selected)]
+    # Charge only emitted geometry, including startup-only siblings. The
+    # completed-step shares are physical growth; zero is valid allocator reuse.
+    bases = [None] * ranks
+    for device, (_, trace) in latest.items():
+        owners = {int(match.group(1)) for graph in trace["graphs"]
+                  if graph["site"].startswith("kimi_k3.")
+                  and (match := KIMI_RANK.search(graph["shape"])) is not None}
+        if len(owners) != 1:
+            raise ValueError(f"Kimi device {device} needs exactly one physical rank")
+        rank = owners.pop()
+        if not 0 <= rank < ranks or bases[rank] is not None:
+            raise ValueError("Kimi trace device/rank mapping is not one-to-one")
+        shares = []
+        for (owner, *_), (geometry, graph) in identities.items():
+            if owner != device or geometry not in selected:
+                continue
+            share = graph.get("capture_bytes")
+            if not isinstance(share, int) or isinstance(share, bool) or share < 0:
+                raise ValueError(f"Kimi emitted geometry has missing or invalid capture_bytes: {graph['shape']}")
+            shares.append(share)
+        bases[rank] = packed(sum(shares))
+    if any(base is None for base in bases):
+        raise ValueError("Kimi trace is missing a physical rank")
     if pin_report is not None:
         for key in sorted(selected):
             for device in sorted(latest):
@@ -150,7 +172,7 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
                                    "observed_capture_bytes": sum(int(graph.get("capture_bytes") or 0) for graph in graphs),
                                    "full_geometry_cost_bytes": None})
     return {"ranks": ranks, "layout": layout,
-            "reserve_base_bytes": packed(max(arenas)), "reserve_extra_bytes": CHUNK,
+            "reserve_base_bytes": bases, "reserve_extra_bytes": CHUNK,
             "entries": entries}
 
 
