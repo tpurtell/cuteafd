@@ -296,7 +296,7 @@ def test_kimi_layout_row_keeps_replay_widths_and_skips_prefill():
     row = MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min", coverage=0.999)
     assert row["entries"] == [{"rows": 1, "speculative": False, "pin": True}]
     assert row["reserve_base_bytes"] == 600 << 20
-    assert row["reserve_extra_bytes"] == 4 << 20
+    assert row["reserve_extra_bytes"] == 2 << 20
 
 
 def test_kimi_verify_width_is_its_own_pin(tmp_path):
@@ -327,3 +327,11 @@ def test_kimi_invalid_shape_fails(shape):
     trace["graphs"][0]["shape"] = shape
     with pytest.raises(ValueError):
         MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min")
+
+
+def test_kimi_unreachable_rows_are_not_proposed_even_with_decode_counts():
+    trace = kimi_trace()
+    trace["graphs"].append(dict(trace["graphs"][0],
+                                shape="lane=0 rank=0 rows=4096 op=ffn layer=0"))
+    assert MODULE.generate_kimi([trace], 1, "min")["entries"] == [
+        {"rows": 1, "speculative": False, "pin": True}]

@@ -344,7 +344,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         // Only geometry that can replay inside a lane window is prewarmed; the
         // rest is captured lazily if traffic ever asks for it.
         let prewarm = set.keys.iter().copied()
-            .filter(|key| cuteafd_loader::serving_capacity::kimi_prewarm::kimi_prewarm(key.rows))
+            .filter(|key| cuteafd_loader::serving_capacity::kimi_prewarm::kimi_prewarm(RANKS, key.rows, key.op.speculative()))
             .collect::<Vec<_>>();
         let captured = engine.warm_graphs(&prewarm, &reserves)?;
         let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;

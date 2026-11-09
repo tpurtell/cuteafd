@@ -5,10 +5,10 @@
 //! checked-in list carries one row per layout and admission reserves that
 //! row's arena on every physical device.
 //!
-//! `reserve_base_bytes` is the layout's measured startup graph census (the
-//! charged bytes of the prewarm set on its largest rank) and
-//! `reserve_extra_bytes` is one largest live capture above it, which is the
-//! room lazy captures and recaptures need. Both are provisional until a
+//! `reserve_base_bytes` is the layout's measured prewarm arena on its largest
+//! rank and `reserve_extra_bytes` is the 2 MiB allocation tail. Shared
+//! GPU_GRAPH_RESERVE_EXTRA supplies runtime headroom; GPU_GRAPH_RESERVE
+//! overrides the whole reserve. The census base is provisional until a
 //! GRAPH_TRACE run replaces them; regenerate with
 //! `scripts/dev/graph-prewarm-from-trace.py --family kimi_k3`.
 //!
@@ -58,18 +58,31 @@ fn kimi_prewarm_list() -> &'static KimiPrewarmList {
     })
 }
 
-/// The row for a coordinator rank count. Wider layouts than any measured row
-/// reuse the widest one: a reserve that is too small only costs an eager miss,
-/// never a refusal.
+/// An untraced layout must not borrow another layout's geometries.
 pub fn kimi_layout(ranks: usize) -> &'static KimiPrewarmLayout {
     let list = kimi_prewarm_list();
     list.layouts.iter().find(|layout| layout.ranks == ranks)
-        .or_else(|| list.layouts.iter().max_by_key(|layout| layout.ranks))
-        .expect("Kimi K3 prewarm list has a layout row")
+        .unwrap_or_else(|| {
+            tracing::warn!(ranks, "Kimi graph prewarm trace missing for layout; using bootstrap startup set");
+            kimi_bootstrap_layout()
+        })
 }
 
-/// Per-device graph reserve for a coordinator layout: census base plus one
-/// capture of headroom.
+fn kimi_bootstrap_layout() -> &'static KimiPrewarmLayout {
+    static BOOTSTRAP: OnceLock<KimiPrewarmLayout> = OnceLock::new();
+    BOOTSTRAP.get_or_init(|| KimiPrewarmLayout {
+        ranks: 0,
+        layout: "bootstrap startup set (untraced)".into(),
+        reserve_base_bytes: crate::families::kimi_k3::allocation::GRAPH_CENSUS_BYTES,
+        reserve_extra_bytes: 2 << 20,
+        entries: [1, 4, 16, 64].into_iter().map(|rows|
+            KimiPrewarmEntry { rows, speculative: false, pin: true })
+            .chain((2..=64).map(|rows|
+                KimiPrewarmEntry { rows, speculative: true, pin: true })).collect(),
+    })
+}
+
+/// Per-device measured prewarm base and allocation tail.
 pub fn kimi_reserve(ranks: usize) -> (u64, u64) {
     let layout = kimi_layout(ranks);
     (layout.reserve_base_bytes, layout.reserve_extra_bytes)
@@ -77,18 +90,20 @@ pub fn kimi_reserve(ranks: usize) -> (u64, u64) {
 
 /// Whether a listed layout prewarms this row width. Only replayable widths are
 /// listed: prefill-window rows never appear, so they stay eager.
-pub fn kimi_prewarm(rows: usize) -> bool {
-    kimi_prewarm_list().layouts.iter()
-        .flat_map(|layout| &layout.entries)
-        .any(|entry| entry.rows == rows)
+pub fn kimi_prewarm(ranks: usize, rows: usize, speculative: bool) -> bool {
+    (1..=64).contains(&rows) && selected(kimi_layout(ranks), rows, speculative, false)
+}
+
+fn selected(layout: &KimiPrewarmLayout, rows: usize, speculative: bool, pinned: bool) -> bool {
+    layout.entries.iter().any(|entry| (!pinned || entry.pin) && entry.rows == rows
+        && (entry.speculative == speculative || !speculative))
 }
 
 /// A pinned shape. A pin at `(rows, speculative)` also pins the flagless
 /// residual/FFN captures at those rows; it never pins a verify capture of a
 /// different width.
 pub fn kimi_pinned(ranks: usize, rows: usize, speculative: bool) -> bool {
-    kimi_layout(ranks).entries.iter().any(|entry| entry.pin && entry.rows == rows
-        && (entry.speculative == speculative || !speculative))
+    (1..=64).contains(&rows) && selected(kimi_layout(ranks), rows, speculative, true)
 }
 
 /// Provisional per-capture estimate before the cache has a measurement: the
@@ -115,16 +130,18 @@ mod tests {
             assert!(layout.entries.iter().all(|entry| entry.rows > 0));
         }
         assert!(kimi_reserve(2).0 > kimi_reserve(1).0, "TP2 holds more executables");
-        assert_eq!(kimi_reserve(9), kimi_reserve(2), "wider layouts reuse the widest row");
+        assert_eq!(kimi_layout(9).ranks, 0, "untraced layouts use bootstrap, not another row");
+        assert_eq!(kimi_reserve(1).1, 2 << 20);
+        assert_eq!(kimi_reserve(2).1, 2 << 20);
     }
 
     #[test]
     fn prefill_rows_never_prewarm() {
-        assert!(kimi_prewarm(1) && kimi_prewarm(64));
+        assert!(kimi_prewarm(1, 1, false) && kimi_prewarm(1, 64, true));
         for rows in [1024, 3072, 4096] {
-            assert!(!kimi_prewarm(rows), "prefill windows never replay");
+            assert!(!kimi_prewarm(1, rows, false), "prefill windows never replay");
         }
-        assert!(!kimi_prewarm(4097));
+        assert!(!kimi_prewarm(1, 4097, true));
     }
 
     #[test]
@@ -133,9 +150,9 @@ mod tests {
         // block is eight) and context decode buckets 2..=64 all capture at
         // startup and replay, so the bootstrap prewarms every one.
         for rows in 1..=64 {
-            assert!(kimi_prewarm(rows), "row {rows} is startup geometry");
+            assert!(kimi_prewarm(1, rows, false), "row {rows} is startup geometry");
         }
-        assert!(!kimi_prewarm(65), "rows above the native 64-row cap are lazy");
+        assert!(!kimi_prewarm(1, 65, false), "rows above the native 64-row cap are lazy");
     }
 
     #[test]
@@ -150,6 +167,17 @@ mod tests {
         assert!(kimi_pinned(1, 64, true));
         assert!(!kimi_pinned(1, 65, true), "wider verify batches stay lazy");
         assert!(!kimi_pinned(1, 4096, false));
+    }
+
+    #[test]
+    fn selection_stays_within_the_layout_and_speculative_variant() {
+        let layout = KimiPrewarmLayout { ranks: 1, layout: "test".into(),
+            reserve_base_bytes: 1, reserve_extra_bytes: 2 << 20,
+            entries: vec![KimiPrewarmEntry { rows: 3, speculative: false, pin: true }] };
+        assert!(selected(&layout, 3, false, false));
+        assert!(!selected(&layout, 3, true, false));
+        assert!(!selected(&layout, 4, false, false));
+        assert!(selected(kimi_bootstrap_layout(), 4, true, false));
     }
 
     #[test]

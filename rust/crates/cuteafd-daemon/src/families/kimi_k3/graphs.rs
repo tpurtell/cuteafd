@@ -249,7 +249,7 @@ impl<'a> Graphs<'a> {
         mut body: impl FnMut(Key) -> Result<()>) -> Result<usize> {
         let mut captured = 0;
         for &key in keys {
-            if !kimi_prewarm(key.rows) || self.cached(&key) { continue }
+            if !kimi_prewarm(ranks, key.rows, key.op.speculative()) || self.cached(&key) { continue }
             let pinned = kimi_pinned(ranks, key.rows, key.op.speculative());
             let Some(ticket) = self.bank.cache_ticket(&key, pinned, None) else { continue };
             if self.capture(stream, key, ticket, &mut || body(key))? { captured += 1; }
@@ -341,6 +341,21 @@ impl<'a> Graphs<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prewarm_rows_are_reachable_outside_prefill_windows() {
+        for ranks in [1, 2] {
+            for rows in 1..=4096 {
+                for speculative in [false, true] {
+                    if !kimi_prewarm(ranks, rows, speculative) { continue }
+                    assert!(rows <= 64);
+                    let op = Op::Attention { layer: 0, sequences: 1, speculative };
+                    assert!(replay_allowed(op, true, false).unwrap());
+                    assert!(!replay_allowed(op, true, true).unwrap());
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_controller_selects_capture_from_the_reserve_and_runs_eagerly_without_one() {

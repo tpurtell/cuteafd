@@ -57,7 +57,6 @@ def generate_kimi(traces, ranks, layout, coverage=0.999):
         raise ValueError("coverage must be in (0, 1]")
     counts = {}
     arenas = []
-    largest = 0
     reasons = {}
     identities = {}
     latest = {}
@@ -75,14 +74,13 @@ def generate_kimi(traces, ranks, layout, coverage=0.999):
         snapshot_time = int(cache.get("sampled_at_ms", inferred_end))
         if device not in latest or snapshot_time >= latest[device][0]:
             latest[device] = (snapshot_time, trace)
-        for site, values in trace.get("sites", {}).items():
-            if site.startswith("kimi_k3."):
-                largest = max(largest, int(values["largest_bytes"]))
         device_counts = {}
         for graph in trace["graphs"]:
             if not graph["site"].startswith("kimi_k3."):
                 continue
             key = kimi_geometry(graph["shape"])
+            if key[0] > 64:
+                continue  # Row-window prefill keys cannot replay (#1646).
             cycles = graph.get("cycles")
             count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) \
                 if cycles is not None else int(graph["count"])
@@ -98,7 +96,9 @@ def generate_kimi(traces, ranks, layout, coverage=0.999):
                 continue
             identity = (device, graph["site"], graph.get("bank", 0),
                         graph.get("key_id", graph["shape"]))
-            identities[identity] = (kimi_geometry(graph["shape"]), graph)
+            key = kimi_geometry(graph["shape"])
+            if key[0] <= 64:
+                identities[identity] = (key, graph)
     for identity, (key, graph) in identities.items():
         cycles = graph.get("cycles", {})
         if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
@@ -124,7 +124,7 @@ def generate_kimi(traces, ranks, layout, coverage=0.999):
     entries = [{"rows": rows, "speculative": speculative, "pin": bool(reasons.get((rows, speculative)))}
                for rows, speculative in sorted(selected)]
     return {"ranks": ranks, "layout": layout,
-            "reserve_base_bytes": packed(max(arenas)), "reserve_extra_bytes": packed(largest),
+            "reserve_base_bytes": packed(max(arenas)), "reserve_extra_bytes": CHUNK,
             "entries": entries}
 
 
