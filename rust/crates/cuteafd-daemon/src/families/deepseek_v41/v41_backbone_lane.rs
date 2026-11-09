@@ -162,8 +162,8 @@ struct Tp2FfnGraphs<'w,'a> {
 }
 impl<'w,'a> Tp2FfnGraphs<'w,'a> {
     fn new(device:Device<'a>)->Self {
-        let mut bank=crate::shared::decode_graph::LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
-        bank.enable_small_shapes();Self {device,bank}
+        let bank=crate::shared::decode_graph::LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
+        Self {device,bank}
     }
     unsafe fn capture_ready(&mut self,block:&mut BackboneBlockWave<'w,'a>,
         weights:&'w BackboneHcWeights<'a>,binding:QueryBinding,rows:usize,
@@ -757,8 +757,6 @@ pub(crate) struct BackboneLane<'w, 'a> {
     capture_routes: bool,
     /// Layer clock marks and the FFN stage split (routes or a live console).
     capture_timing: bool,
-    /// Decode-row graph shapes are retained (see `retain_small_graph_shapes`).
-    retain_small_shapes: bool,
     route_capture: Vec<Vec<[u32; 6]>>,
     /// Host FFN stage times summed over the captured pass.
     ffn_split: FfnSplit,
@@ -810,31 +808,19 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             && !self.weights.split_query_b && !self.weights.split_output_b,
             "startup prototype requires idle unsplit target lanes");
         let rows = if decode { cuteafd_core::V41_VERIFY_ROWS } else { 0 };
+        let prewarm = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(rows);
         ensure!(self.capacity >= rows && (!decode || (sinks.len() == 40 && selections.len() == 40)),
             "startup target capacity or bindings differ");
         let device = self.block.inputs()[0].device_id;
         let layers: Vec<usize> = self.weights.layers.iter().enumerate()
             .filter_map(|(layer, weights)| (weights.device.id == device).then_some(layer)).collect();
-        let keys: Vec<(usize, u32)> = layers.iter().flat_map(|&layer|
-            (1..=rows).map(move |rows| (layer, rows as u32))).collect();
         let original = self.layer;
         self.set_attention_decode(decode);
         let result = (|| -> Result<()> {
-            self.query.declare_startup(&keys)?;
-            self.router.declare_startup(&keys)?;
-            let mut sparse_keys = Vec::with_capacity(keys.len());
-            for &layer in layers.iter().filter(|_| decode) {
-                self.rebind_startup(layer)?;
-                let tail = StartupAttentionTail { projection: &mut self.projection, block: &mut self.block };
-                let sparse = self.sparse.as_ref().context("startup sparse owner absent")?;
-                for rows in 1..=rows {
-                    sparse_keys.push(sparse.startup_key(layer, rows, sinks[layer], selections[layer], aligned, Some(&tail))?);
-                }
-            }
-            self.sparse.as_mut().context("startup sparse owner absent")?.declare_startup(&sparse_keys)?;
             for &layer in &layers {
                 self.rebind_startup(layer)?;
-                for rows in 1..=rows {
+                for entry in &prewarm {
+                    let rows = entry.rows;
                     self.query.capture_startup(rows as u32)?;
                     self.router.capture_startup(rows as u32)?;
                     if !decode { continue; }
@@ -848,9 +834,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
                     captured?;
                 }
             }
-            self.query.finish_startup()?;
-            self.router.finish_startup()?;
-            self.sparse.as_mut().context("startup sparse owner absent")?.finish_startup()
+            Ok(())
         })();
         self.block.reset();
         let restored = self.rebind_startup(original);
@@ -910,7 +894,6 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             usage_phase: cuteafd_ffi::expert_usage::UsagePhase::Prefill,
             capture_routes: false,
             capture_timing: false,
-            retain_small_shapes: false,
             route_capture: Vec::new(),
             ffn_split: FfnSplit::default(),
             layer_clock: LayerClock::new(weights.library, 40)?,
@@ -933,7 +916,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             sparse: Some(SparseAttentionWave::on_storage(storage.sparse.clone())?), dual_sparse: None,
             capacity: storage.unit as usize, router: first.router.on_storage(storage.router.clone())?,
             layer: storage.first_layer, phase: Phase::Idle, usage_phase: cuteafd_ffi::expert_usage::UsagePhase::Prefill, capture_routes: false, capture_timing: false,
-            retain_small_shapes: false, route_capture: Vec::new(), ffn_split: FfnSplit::default(),
+            route_capture: Vec::new(), ffn_split: FfnSplit::default(),
             layer_clock: LayerClock::new(weights.library, 40)?, l2: None,
         })
     }
@@ -1394,15 +1377,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn trace_stream(&self) -> *mut std::ffi::c_void { self.block.trace_stream() }
     /// Keep every decode-row graph shape once captured (sticky): speculative
     /// verification varies its row count every round, with or without route capture.
-    pub fn retain_small_graph_shapes(&mut self) {
-        self.retain_small_shapes = true;
-        self.query.enable_small_graph_shapes();
-        if let Some(sparse)=&mut self.sparse { sparse.enable_small_graph_shapes(); }
-        if let Some(dual)=&mut self.dual_sparse { dual.enable_small_graph_shapes(); }
-        self.projection.enable_small_graph_shapes();
-        if let Some(shared) = &mut self.shared { shared.enable_small_graph_shapes(); }
-        self.router.enable_small_graph_shapes();
-    }
+    pub fn retain_small_graph_shapes(&mut self) {}
     /// Route ids (router ring and per-layer capture) and, with them, the
     /// pass timing: per-layer CUDA events and the FFN stage split. Disabling
     /// after a pass keeps that pass's routes and marks for reading.
@@ -1484,8 +1459,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn enable_dual_attention(&mut self,peer:Device<'a>,budgets:[usize;2])->Result<()> {
         ensure!(self.phase==Phase::Idle && self.dual_sparse.is_none(),"dual attention requires an unused lane");
         let source=Device { library:self.weights.library,id:self.query.input().device_id };
-        let mut dual=crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],self.capacity,budgets)?;
-        if self.retain_small_shapes { dual.enable_small_graph_shapes(); }
+        let dual=crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],self.capacity,budgets)?;
         source.run(|| { self.sparse=None; Ok(()) })?;
         self.dual_sparse=Some(dual);Ok(())
     }
