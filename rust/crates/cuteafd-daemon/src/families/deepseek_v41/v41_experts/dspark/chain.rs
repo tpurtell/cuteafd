@@ -12,6 +12,15 @@ use std::ffi::c_void;
 mod distributed;
 pub(crate) use distributed::DistributedDsparkChain;
 
+pub(crate) type GraphVisitor<'f> = dyn FnMut(i32, &'static str, bool,
+    &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()> + 'f;
+
+pub(super) fn warn_topology(error: Option<String>) {
+    if let Some(error) = error {
+        tracing::warn!(%error, "dSpark graph topology unavailable; disabling chain reuse");
+    }
+}
+
 /// Whether an error is a device/driver failure (a native-library status return)
 /// rather than a host-side invariant failure. Only device failures are terminal
 /// for a draft chain: a CPU-side guard must not latch the lane.
@@ -220,8 +229,6 @@ impl DsparkChain<'_, '_> {
             "draft startup ring device differs");
         let counts = self.tokens.buffer.bytes / 4;
         let widths: Vec<_> = [5, 7].into_iter().filter(|&w| w <= self.maximum).collect();
-        let keys: Vec<_> = widths.iter().flat_map(|&w| (1..=counts).map(move |count| (count, w))).collect();
-        self.graphs.declare_startup(&keys)?;
         let original = self.width;
         let recorded = (|| -> Result<()> {
             for width in widths {
@@ -232,7 +239,7 @@ impl DsparkChain<'_, '_> {
                     unsafe { self.capture_geometry(&geometry, count)?; }
                 }
             }
-            self.graphs.finish_startup()
+            Ok(())
         })();
         let restored = self.set_width(original);
         recorded.and(restored)
@@ -476,28 +483,32 @@ impl DsparkChain<'_, '_> {
         unsafe { self.capture_geometry(&reads.each_ref().map(WindowRead::geometry), count) }
     }
     unsafe fn capture_geometry(&mut self, reads: &[WindowGeometry; 3], count: usize) -> Result<()> {
-        ensure!(self.graphs.capture_allowed(&(count, self.width)), "draft capture forbidden after startup");
+        let key = (count, self.width);
+        if self.graphs.contains(&key) { return Ok(()); }
+        let Some(ticket) = self.graphs.cache_ticket(&key, false, None) else { return Ok(()); };
         unsafe {
             self.stream
                 .library
                 .cuda_graph_begin_capture(self.stream.raw)?;
         }
         let launched = unsafe { self.enqueue_geometry(reads, count) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let captured = unsafe { self.stream.library.cuda_graph_end_capture_topology(self.stream.raw) };
         self.invalidate();
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
                 let device = self.tokens.buffer.device_id;
                 // SAFETY: chain pins all captured weights/workspaces and drains on Drop.
                 let owner = unsafe { GraphOwner::new(self.stream.library, device, graph,
                     reads.each_ref().map(|r| r.owner))? };
-                self.graphs.insert((count, self.width), owner, None);
+                warn_topology(inspection);
+                self.graphs.cache_commit(key, owner, ticket, nodes as u64, width,
+                    spans || self.spans_devices());
                 tracing::debug!(target: "cuteafd::graph_capture", count, width=self.width,
                     bank=self as *const Self as usize, retained=self.graphs.len(),
                     "native dSpark chain graph captured");
                 Ok(())
             }
-            (Err(error), Ok(graph)) => {
+            (Err(error), Ok((graph, _, _, _, _))) => {
                 unsafe {
                     self.stream.library.cuda_graph_exec_destroy(graph)?;
                 }
@@ -516,7 +527,10 @@ impl DsparkChain<'_, '_> {
     ) -> Result<[CuteafdDeviceBuffer; 2]> {
         let reads = self.prepare(windows, bindings)?;
         let count = bindings[0].len();
-        let captured = self.graphs.get(&(count, self.width)).context("dSpark chain count not captured")?;
+        let Some(captured) = self.graphs.cached_launch(&(count, self.width)) else {
+            // SAFETY: eager execution has the same retained-input contract.
+            return unsafe { self.execute(windows, bindings) };
+        };
         let (graph, owners) = (captured.raw, captured.pins);
         ensure!(
             count == bindings[0].len() && owners == reads.each_ref().map(|r| r.owner),
@@ -563,11 +577,15 @@ impl DsparkChain<'_, '_> {
         Ok(())
     }
     unsafe fn launch_download(&mut self, count: usize) -> Result<()> {
-        let graph = self.graphs.get(&(count, self.width)).context("dSpark chain count not captured")?.raw;
+        let graph = self.graphs.cached_launch(&(count, self.width)).map(|owner| owner.raw);
+        // A denied capture already executed eagerly in the completed warm pass.
+        // Copy that result rather than sampling a second time or requiring a graph.
         let output = self.terminal.as_ref().context("dSpark chain has no terminal")?.output_storage(count)?;
         unsafe {
             let span = self.timing.begin("graph_forward_terminal", None, count * self.width, self.stream.raw)?;
-            self.stream.library.cuda_graph_launch(graph, self.stream.raw)?;
+            if let Some(graph) = graph {
+                self.stream.library.cuda_graph_launch(graph, self.stream.raw)?;
+            }
             self.timing.end(span, self.stream.raw)?;
             let bytes = self.download.bytes_mut();
             self.stream.library.copy_d2h_async(&mut bytes[..count * (self.width + 1) * 4], output[0], self.stream.raw)?;
@@ -641,6 +659,47 @@ impl Drop for DsparkChain<'_, '_> {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+    #[test]
+    fn dspark_full_reserve_miss_runs_eager_without_refusal() -> Result<()> {
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        let mut bank = GraphBank::<(usize, usize), usize>::new(None);
+        bank.attach_device(-164_401, 200, Site {
+            name: "dspark_chain", cycle: Cycle::Wave, preference: Preference::Capture,
+            bootstrap: 100, basis: Basis::Bytes, spans_devices: false,
+        })?;
+        let ticket = bank.cache_ticket(&(1, 5), true, None).expect("initial reserve fits");
+        bank.cache_commit((1, 5), 17, ticket, 1, 1, false);
+        bank.cache_measured(200);
+        let mut eager_runs = 0;
+        for _ in 0..3 {
+            assert!(bank.cached_launch(&(2, 7)).is_none());
+            if bank.cache_ticket(&(2, 7), false, None).is_none() {
+                eager_runs += 1;
+            } else {
+                anyhow::bail!("a full dSpark reserve must not capture");
+            }
+        }
+        assert_eq!(eager_runs, 3);
+        assert_eq!(bank.cached_launch(&(1, 5)), Some(&17));
+        Ok(())
+    }
+
+    #[test]
+    fn dspark_failed_capture_cancels_ticket_and_preserves_eager_fallback() -> Result<()> {
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        let mut bank = GraphBank::<(usize, usize), usize>::new(None);
+        bank.attach_device(-164_402, 200, Site {
+            name: "dspark_chain", cycle: Cycle::Other, preference: Preference::Capture,
+            bootstrap: 100, basis: Basis::Bytes, spans_devices: true,
+        })?;
+        let ticket = bank.cache_ticket(&(1, 5), false, None).expect("initial reserve fits");
+        drop(ticket); // Simulates any failure between begin and owner insertion.
+        bank.cache_measured(0);
+        assert!(bank.cached_launch(&(1, 5)).is_none());
+        assert!(bank.cache_ticket(&(1, 5), false, None).is_some());
+        Ok(())
+    }
+
     fn device() -> anyhow::Error {
         anyhow::Error::new(cuteafd_ffi::NativeStatusError { context: "capture".into(), status: 98,
             detail: "invalid device function".into() }).context("capture failed")
@@ -664,6 +723,20 @@ mod failure_tests {
         let first = failure.check("draft").unwrap_err().to_string();
         failure.record(&anyhow::anyhow!("later host failure"));
         assert_eq!(failure.check("draft").unwrap_err().to_string(), first);
+        Ok(())
+    }
+}
+
+impl DsparkChain<'_, '_> {
+    fn spans_devices(&self) -> bool {
+        self.stages.iter().any(|stage| stage.peer_stream().is_some())
+            || self.embedding.is_some_and(|embedding| embedding.get("embed.weight")
+                .is_ok_and(|table| table.device_id != self.tokens.buffer.device_id))
+    }
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut GraphVisitor<'_>) -> Result<()> {
+        f(self.tokens.buffer.device_id, "dspark_chain", self.spans_devices(), &mut self.graphs)?;
+        for stage in &mut self.stages { stage.visit_graph_banks(f)?; }
+        if let Some(terminal) = &mut self.terminal { terminal.visit_graph_banks(f)?; }
         Ok(())
     }
 }

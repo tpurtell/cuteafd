@@ -252,21 +252,26 @@ impl DsparkMainContext<'_, '_> {
     /// Same initialized-input and exclusive-use contract as execute.
     pub unsafe fn capture(&mut self, rows: u32) -> Result<()> {
         self.prepare(rows)?;
-        ensure!(self.graph.is_none(), "main context already captured");
         unsafe {
             self.execute(rows)?;
         }
         self.ready = None;
+        let key = rows;
+        let Some(ticket) = self.graph.cache_ticket(&key, false, None) else { return Ok(()); };
         unsafe {
             self.stream
                 .library
                 .cuda_graph_begin_capture(self.stream.raw)?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let captured = unsafe { self.stream.library.cuda_graph_end_capture_topology(self.stream.raw) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => unsafe { self.graph.insert(rows, graph)?; },
-            (Err(error), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
+                super::chain::warn_topology(inspection);
+                // SAFETY: context pins captured storage through drained teardown.
+                unsafe { self.graph.cache_insert(key, graph, ticket, nodes as u64, width, spans)?; }
+            },
+            (Err(error), Ok((graph, _, _, _, _))) => {
                 unsafe {
                     self.stream.library.cuda_graph_exec_destroy(graph)?;
                 }
@@ -280,8 +285,10 @@ impl DsparkMainContext<'_, '_> {
     /// Same initialized-input and exclusive-use contract as execute.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<()> {
         self.prepare(rows)?;
-        let (graph, captured) = self.graph.get().context("main context not captured")?;
-        ensure!(rows == captured, "main context replay rows differ");
+        let Some(graph) = self.graph.cached_launch(&rows) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(rows) };
+        };
         let launched = unsafe {
             self.stream
                 .library
@@ -372,5 +379,14 @@ impl Drop for DsparkMainContext<'_, '_> {
         self.pending_writes = None; // Stream drained before slot reservations release.
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark main_context graphs");
+    }
+}
+
+impl DsparkMainContext<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.normalized.buffer.device_id, "dspark_main_context", false, &mut self.graph)?;
+        self.main.visit_graph_banks(f)?;
+        for child in &mut self.kv { child.visit_graph_banks(f)?; }
+        Ok(())
     }
 }

@@ -106,12 +106,7 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
         if let Some(captured) = chain.graphs.get(&(count, chain.width)) {
             ensure!(captured.pins == reads.each_ref().map(|read| read.owner), "distributed draft capture owner differs");
         }
-        if !chain.has_graph(count) && !chain.graphs.capture_allowed(&(count, chain.width)) {
-            crate::families::deepseek_v41::graph_policy::note_miss(
-                format!("dspark_chain count={count} width={}", chain.width),
-                || format!("count={count} width={}", chain.width));
-        }
-        let pending = PendingDraft { count, reads, warming: !chain.has_graph(count) && chain.graphs.capture_allowed(&(count, chain.width)) && !crate::shared::decode_graph::census::eager("dspark"), armed: true,
+        let pending = PendingDraft { count, reads, warming: !chain.has_graph(count) && !crate::shared::decode_graph::census::eager("dspark"), armed: true,
             library: chain.stream.library, stream: chain.stream.raw,
             peers: chain.stages.each_ref().map(DsparkStage::peer_stream) };
         // The local guard drains partial submission failures under GPU1 before
@@ -120,7 +115,7 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
             let lib = chain.stream.library;
             lib.copy_h2d_async(chain.tokens.buffer, &chain.token_staging.bytes_mut()[..count * 4], chain.stream.raw)?;
             for stage in 0..3 { chain.stages[stage].upload_on(&pending.reads[stage], bindings[stage], chain.stream.raw)?; }
-            let graph = chain.graphs.get(&(count, chain.width)).map(|owner| owner.raw);
+            let graph = chain.graphs.cached_launch(&(count, chain.width)).map(|owner| owner.raw);
             let stream = chain.stream.raw;
             let span = chain.timing.begin("graph_forward", None, count * chain.width, stream)?;
             crate::shared::decode_graph::census::dispatch(lib, stream, c"dspark", count, graph,
@@ -222,4 +217,11 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
 }
 impl Drop for DistributedDsparkChain<'_, '_> {
     fn drop(&mut self) { self.cancel(); }
+}
+
+impl DistributedDsparkChain<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::GraphVisitor<'_>) -> Result<()> {
+        self.chain.get_mut().visit_graph_banks(&mut |device, site, _, bank| f(device, site, true, bank))?;
+        self.terminal.visit_graph_banks(f)
+    }
 }

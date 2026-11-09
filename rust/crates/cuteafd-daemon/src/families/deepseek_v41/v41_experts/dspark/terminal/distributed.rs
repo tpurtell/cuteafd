@@ -1,6 +1,5 @@
 //! Lane-owned draft terminal: RTX1 normalization/sampling, TP2 shared head.
 use super::*;
-use crate::shared::decode_graph::GraphPolicy;
 use crate::shared::memory::device::{Device, DeviceOwner};
 use crate::families::deepseek_v41::v41_target_head::distributed::DistributedVocabularyWave;
 use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
@@ -53,15 +52,12 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         Ok(Self {
             terminal: devices[1].own(|| weights.terminal_storage(None, capacity, required[1] - head_bytes[1]))?,
             head,
-            graphs: crate::shared::decode_graph::GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"), ready: None, pending: None,
+            graphs: crate::shared::decode_graph::GraphBank::new(None), ready: None, pending: None,
         })
     }
     pub(crate) fn capture_startup(&mut self, capacity: usize, maximum: usize) -> Result<()> {
         ensure!(self.pending.is_none() && self.ready.is_none(), "terminal startup requires idle owner");
         let widths: Vec<_> = [5, 7].into_iter().filter(|&w| w <= maximum).collect();
-        let keys: Vec<_> = widths.iter().flat_map(|&width| (0..2).flat_map(move |mode|
-            (1..=capacity).map(move |count| (width, mode, count)))).collect();
-        self.graphs.declare_startup(&keys)?;
         let original = self.terminal.width();
         let recorded = (|| -> Result<()> {
             let mut rows = Vec::new();
@@ -77,7 +73,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
             rows.sort_unstable();
             rows.dedup();
             self.head.capture_startup(&rows)?;
-            self.graphs.finish_startup()
+            Ok(())
         })();
         let restored = self.set_width(original);
         recorded.and(restored)
@@ -96,17 +92,12 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         self.ready = None;
         self.terminal.stage_sampling(rngs, temperatures)
     }
-    unsafe fn enqueue_stage(&self, requests: usize, sampling: bool) -> Result<()> {
+    unsafe fn enqueue_stage(&mut self, requests: usize, sampling: bool) -> Result<()> {
         let device = self.terminal.device;
         let terminal = self.terminal.get();
         device.run(|| unsafe {
             let key = (terminal.width(), usize::from(sampling), requests);
-            if self.graphs.get(&key).is_none() && !self.graphs.capture_allowed(&key) {
-                crate::families::deepseek_v41::graph_policy::note_miss(
-                    format!("dspark_terminal width={} sampling={sampling} requests={requests}", terminal.width()),
-                    || format!("width={} sampling={sampling} requests={requests}", terminal.width()));
-            }
-            let graph = self.graphs.get(&key).map(|owner| owner.raw);
+            let graph = self.graphs.cached_launch(&key).map(|owner| owner.raw);
             let span = terminal.timing.begin(if sampling { "graph_selector_confidence" } else { "graph_terminal_norm" },
                 None, requests * terminal.width, terminal.stream.raw)?;
             crate::shared::decode_graph::census::dispatch(device.library, terminal.stream.raw, c"dspark", requests,
@@ -120,19 +111,19 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let terminal = self.terminal.get();
         let mode = usize::from(sampling);
         let width = terminal.width();
-        if !self.graphs.contains(&(width, mode, requests))
-            && self.graphs.capture_allowed(&(width, mode, requests))
-            && !crate::shared::decode_graph::census::eager("dspark") {
-            let graph = device.run(|| unsafe {
+        let key = (width, mode, requests);
+        if !self.graphs.contains(&key) && !crate::shared::decode_graph::census::eager("dspark") {
+            let Some(ticket) = self.graphs.cache_ticket(&key, false, None) else { return Ok(()); };
+            let (graph, nodes, width, spans, inspection) = device.run(|| unsafe {
                 device.library.cuda_graph_begin_capture(terminal.stream.raw)?;
                 // Capture records commands only; runtime begin/enqueue retain
                 // sampling validation before any execution or graph replay.
                 let queued = if sampling { terminal.enqueue_sampling_geometry(requests, terminal.stream.raw) }
                     else { terminal.enqueue_normalize_geometry(requests, terminal.stream.raw) };
-                let captured = device.library.cuda_graph_end_capture(terminal.stream.raw);
+                let captured = device.library.cuda_graph_end_capture_topology(terminal.stream.raw);
                 match (queued, captured) {
                     (Ok(()), Ok(graph)) => Ok(graph),
-                    (Err(error), Ok(graph)) => { device.library.cuda_graph_exec_destroy(graph)?; Err(error) }
+                    (Err(error), Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?; Err(error) }
                     (Ok(()), Err(error)) => Err(error),
                     // A plain enqueue error must not hide a tagged capture error.
                     (Err(queued), Err(captured)) => Err(super::super::chain::prefer_device(queued, captured)),
@@ -140,7 +131,8 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
             })?;
             // SAFETY: terminal pins all storage and Drop drains its device stream.
             let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(device.library, device.id, graph, ())? };
-            self.graphs.insert((width, mode, requests), owner, None);
+            super::super::chain::warn_topology(inspection);
+            self.graphs.cache_commit(key, owner, ticket, nodes as u64, width, spans);
         }
         Ok(())
     }
@@ -344,5 +336,13 @@ impl Drop for DistributedDsparkTerminal<'_, '_> {
         fatal_drain(device.run(|| self.terminal.synchronize()), "distributed terminal");
         self.graphs.retire_all();
         fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "distributed terminal graphs");
+    }
+}
+
+impl DistributedDsparkTerminal<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.terminal.device.id, "dspark_distributed_terminal", true, &mut self.graphs)?;
+        self.terminal.get_mut().visit_graph_banks(&mut |device, site, _, bank| f(device, site, true, bank))?;
+        self.head.visit_graph_banks(f)
     }
 }

@@ -243,14 +243,12 @@ impl DsparkProjection<'_, '_> {
     /// # Safety
     /// Same initialized input contract as execute; captures only owned addresses.
     pub unsafe fn capture(&mut self, rows: u32) -> Result<()> {
-        ensure!(
-            self.graph.is_none(),
-            "dSpark projection graph already captured"
-        );
         unsafe {
             self.execute(rows)?;
         }
         self.ready = None;
+        let key = rows;
+        let Some(ticket) = self.graph.cache_ticket(&key, false, None) else { return Ok(()); };
         unsafe {
             self.standalone.device
                 .library
@@ -258,14 +256,15 @@ impl DsparkProjection<'_, '_> {
         }
         let launched =
             unsafe { self.enqueue(self.input, self.output.buffer, rows, self.standalone.get()?.raw) };
-        let captured = unsafe { self.standalone.device.library.cuda_graph_end_capture(self.standalone.get()?.raw) };
+        let captured = unsafe { self.standalone.device.library.cuda_graph_end_capture_topology(self.standalone.get()?.raw) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
+                super::chain::warn_topology(inspection);
                 // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert(rows, graph)?; }
+                unsafe { self.graph.cache_insert(key, graph, ticket, nodes as u64, width, spans)?; }
                 Ok(())
             }
-            (Err(error), Ok(graph)) => {
+            (Err(error), Ok((graph, _, _, _, _))) => {
                 if let Err(cleanup) = unsafe { self.standalone.device.library.cuda_graph_exec_destroy(graph) }
                 {
                     tracing::error!(%cleanup,"destroying failed projection capture");
@@ -279,11 +278,10 @@ impl DsparkProjection<'_, '_> {
     /// Same input contract as execute, with the captured row count.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<CuteafdDeviceBuffer> {
         self.ready = None;
-        let (graph, captured) = self.graph.get().context("dSpark projection was not captured")?;
-        ensure!(
-            rows == captured,
-            "dSpark projection replay rows differ from capture"
-        );
+        let Some(graph) = self.graph.cached_launch(&rows) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(rows) };
+        };
         let launched = unsafe {
             self.standalone.device
                 .library
@@ -308,5 +306,12 @@ impl Drop for DsparkProjection<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark projection");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark projection graphs");
+    }
+}
+
+impl DsparkProjection<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.standalone.device.id, "dspark_projection", false, &mut self.graph)?;
+        Ok(())
     }
 }

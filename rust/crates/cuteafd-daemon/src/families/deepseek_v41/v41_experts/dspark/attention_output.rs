@@ -128,28 +128,27 @@ impl DsparkAttentionOutput<'_, '_> {
     /// # Safety
     /// Same input contract as execute; warmup and capture use owned storage only.
     pub unsafe fn capture(&mut self, rows: u32) -> Result<()> {
-        ensure!(
-            self.graph.is_none(),
-            "dSpark attention output already captured"
-        );
         unsafe {
             self.execute(rows)?;
         }
         self.ready = None;
+        let key = rows;
+        let Some(ticket) = self.graph.cache_ticket(&key, false, None) else { return Ok(()); };
         unsafe {
             self.standalone.device
                 .library
                 .cuda_graph_begin_capture(self.standalone.get()?.raw)?;
         }
         let launched = unsafe { self.enqueue(rows, self.standalone.get()?.raw) };
-        let captured = unsafe { self.standalone.device.library.cuda_graph_end_capture(self.standalone.get()?.raw) };
+        let captured = unsafe { self.standalone.device.library.cuda_graph_end_capture_topology(self.standalone.get()?.raw) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
+                super::chain::warn_topology(inspection);
                 // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert(rows, graph)?; }
+                unsafe { self.graph.cache_insert(key, graph, ticket, nodes as u64, width, spans)?; }
                 Ok(())
             }
-            (Err(error), Ok(graph)) => {
+            (Err(error), Ok((graph, _, _, _, _))) => {
                 if let Err(cleanup) = unsafe { self.standalone.device.library.cuda_graph_exec_destroy(graph) }
                 {
                     tracing::error!(%cleanup,"destroying failed attention output capture");
@@ -163,14 +162,10 @@ impl DsparkAttentionOutput<'_, '_> {
     /// Same input contract as execute, using the captured row count.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<CuteafdDeviceBuffer> {
         self.ready = None;
-        let (graph, captured) = self
-            .graph
-            .get()
-            .context("dSpark attention output was not captured")?;
-        ensure!(
-            rows == captured,
-            "dSpark attention output replay rows differ"
-        );
+        let Some(graph) = self.graph.cached_launch(&rows) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(rows) };
+        };
         let launched = unsafe {
             self.standalone.device
                 .library
@@ -228,4 +223,12 @@ pub(super) fn pack_grouped_scales<'a>(
         .try_into()
         .ok()
         .context("expected three grouped output scale allocations")
+}
+
+impl DsparkAttentionOutput<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.standalone.device.id, "dspark_attention_output", false, &mut self.graph)?;
+        self.projection.visit_graph_banks(f)?;
+        Ok(())
+    }
 }

@@ -172,24 +172,26 @@ impl<'a> DsparkStage<'_, 'a> {
         requests: &[(WindowLease, u64)],
     ) -> Result<()> {
         self.invalidate();
-        ensure!(self.graph.is_none(), "dSpark stage already captured");
         unsafe {
             self.execute(window, requests)?;
         }
         let read = self.prepare(window, requests)?;
+        let key = (requests.len(), read.owner);
+        let Some(ticket) = self.graph.cache_ticket(&key, false, None) else { return Ok(()); };
         unsafe {
             self.library.cuda_graph_begin_capture(self.ffn.stream()?)?;
         }
         let launched = unsafe { self.enqueue(&read, requests.len()) };
-        let captured = unsafe { self.library.cuda_graph_end_capture(self.ffn.stream()?) };
+        let captured = unsafe { self.library.cuda_graph_end_capture_topology(self.ffn.stream()?) };
         self.invalidate();
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
+                super::chain::warn_topology(inspection);
                 // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert((requests.len(), read.owner), graph)?; }
+                unsafe { self.graph.cache_insert(key, graph, ticket, nodes as u64, width, spans || self.peer_stream().is_some())?; }
                 Ok(())
             }
-            (Err(error), Ok(graph)) => {
+            (Err(error), Ok((graph, _, _, _, _))) => {
                 unsafe {
                     self.library.cuda_graph_exec_destroy(graph)?;
                 }
@@ -207,17 +209,16 @@ impl<'a> DsparkStage<'_, 'a> {
         requests: &[(WindowLease, u64)],
     ) -> Result<[CuteafdDeviceBuffer; 2]> {
         let read = self.prepare(window, requests)?;
-        let (graph, (count, owner)) = self.graph.get().context("dSpark stage not captured")?;
-        ensure!(
-            count == requests.len() && owner == read.owner,
-            "dSpark stage capture binding differs"
-        );
+        let Some(graph) = self.graph.cached_launch(&(requests.len(), read.owner)) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(window, requests) };
+        };
         self.attention.upload(&read, requests)?;
         let launched = unsafe { self.library.cuda_graph_launch(graph, self.ffn.stream()?) };
         let drained = self.ffn.synchronize();
         crate::families::deepseek_v41::v41_experts::dspark::settle(launched, drained)?;
         unsafe {
-            self.ffn.complete_replay(count as u32 * self.width as u32)?;
+            self.ffn.complete_replay(requests.len() as u32 * self.width as u32)?;
         }
         self.ready = true;
         self.output()
@@ -232,5 +233,14 @@ impl Drop for DsparkStage<'_, '_> {
         fatal_drain(self.ffn.synchronize(), "dSpark stage");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark stage graphs");
+    }
+}
+
+impl DsparkStage<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.inputs()[0].device_id, "dspark_stage", self.peer_stream().is_some(), &mut self.graph)?;
+        self.ffn.visit_graph_banks(f)?;
+        self.attention.visit_graph_banks(f)?;
+        Ok(())
     }
 }

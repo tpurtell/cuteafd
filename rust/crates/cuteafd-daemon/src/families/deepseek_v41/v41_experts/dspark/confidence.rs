@@ -105,25 +105,27 @@ impl DsparkConfidence<'_, '_> {
     /// # Safety
     /// Same input contract as execute; warms the launch before graph capture.
     pub unsafe fn capture(&mut self, rows: usize) -> Result<()> {
-        ensure!(self.graph.is_none(), "confidence graph already captured");
         unsafe {
             self.execute(rows)?;
         }
         self.ready_rows = None;
+        let key = rows;
+        let Some(ticket) = self.graph.cache_ticket(&key, false, None) else { return Ok(()); };
         unsafe {
             self.standalone.device
                 .library
                 .cuda_graph_begin_capture(self.standalone.get()?.raw)?;
         }
         let launch = unsafe { self.enqueue(rows) };
-        let capture = unsafe { self.standalone.device.library.cuda_graph_end_capture(self.standalone.get()?.raw) };
+        let capture = unsafe { self.standalone.device.library.cuda_graph_end_capture_topology(self.standalone.get()?.raw) };
         match (launch, capture) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
+                super::chain::warn_topology(inspection);
                 // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert(rows, graph)?; }
+                unsafe { self.graph.cache_insert(key, graph, ticket, nodes as u64, width, spans)?; }
                 Ok(())
             }
-            (Err(error), Ok(graph)) => {
+            (Err(error), Ok((graph, _, _, _, _))) => {
                 if let Err(cleanup) = unsafe { self.standalone.device.library.cuda_graph_exec_destroy(graph) }
                 {
                     tracing::error!(%cleanup, "destroying failed confidence capture");
@@ -137,11 +139,10 @@ impl DsparkConfidence<'_, '_> {
     /// Same input contract as execute; rows must match the captured shape.
     pub unsafe fn replay(&mut self, rows: usize) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
-        let (graph, captured_rows) = self.graph.get().context("confidence graph is not captured")?;
-        ensure!(
-            rows == captured_rows,
-            "confidence replay shape differs from capture"
-        );
+        let Some(graph) = self.graph.cached_launch(&rows) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(rows) };
+        };
         unsafe {
             self.standalone.device
                 .library
@@ -173,5 +174,12 @@ impl Drop for DsparkConfidence<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark confidence");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark confidence graphs");
+    }
+}
+
+impl DsparkConfidence<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.standalone.device.id, "dspark_confidence", false, &mut self.graph)?;
+        Ok(())
     }
 }
