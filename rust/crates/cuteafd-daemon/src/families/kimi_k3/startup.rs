@@ -343,9 +343,11 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         let capture_started = std::time::Instant::now();
         // Only geometry that can replay inside a lane window is prewarmed; the
         // rest is captured lazily if traffic ever asks for it.
-        let prewarm = set.keys.iter().copied()
-            .filter(|key| cuteafd_loader::serving_capacity::kimi_prewarm::kimi_prewarm(RANKS, key.rows, key.op.speculative()))
-            .collect::<Vec<_>>();
+        let prewarm = super::graphs::prewarm_keys(cfg, &set.keys,
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(RANKS), options.slots, unit);
+        tracing::info!(entries = prewarm.len(), attention_entries = prewarm.iter()
+            .filter(|key| matches!(key.op, super::graphs::Op::Attention { .. })).count(),
+            "Kimi selected startup prewarm keys");
         let captured = engine.warm_graphs(&prewarm, &reserves)?;
         let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;
         let after = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;

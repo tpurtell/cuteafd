@@ -17,6 +17,7 @@ SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5."}
 KIMI_ROWS = re.compile(r"rows=(\d+)")
 KIMI_OP = re.compile(r"op=(\w+)")
 KIMI_SPEC = re.compile(r"spec=(\d)")
+KIMI_SEQUENCES = re.compile(r"seq=(\d+)")
 
 
 def packed(value):
@@ -44,10 +45,17 @@ def kimi_geometry(shape):
     if int(rows.group(1)) <= 0:
         raise ValueError("unsupported prewarm geometry")
     spec = KIMI_SPEC.search(shape)
-    return int(rows.group(1)), op.group(1) != "residual" and op.group(1) != "ffn" and spec is not None and spec.group(1) == "1"
+    kind = op.group(1)
+    if kind not in ("residual", "ffn", "attention", "context"):
+        raise ValueError(f"unknown Kimi operation: {kind}")
+    sequences = KIMI_SEQUENCES.search(shape)
+    if kind == "attention" and (sequences is None or not 0 < int(sequences.group(1)) <= int(rows.group(1))):
+        raise ValueError("Kimi attention requires 0 < sequences <= rows")
+    return (int(rows.group(1)), kind not in ("residual", "ffn") and spec is not None and spec.group(1) == "1",
+            kind, int(sequences.group(1)) if kind == "attention" else None)
 
 
-def generate_kimi(traces, ranks, layout, coverage=0.999):
+def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
     """One layout row for the checked-in list: shapes at or below decode row
     coverage, pinned only when the trace shows sustained heat or repeated
     recapture. Prefill rows stay eager and never replay (#1646)."""
@@ -121,8 +129,26 @@ def generate_kimi(traces, ranks, layout, coverage=0.999):
         if covered >= total * coverage:
             break
     selected.update(key for key, why in reasons.items() if why)
-    entries = [{"rows": rows, "speculative": speculative, "pin": bool(reasons.get((rows, speculative)))}
-               for rows, speculative in sorted(selected)]
+    entries = [{"rows": rows, "speculative": speculative, "op": op,
+                **({"sequences": sequences} if sequences is not None else {}),
+                "pin": bool(reasons.get((rows, speculative, op, sequences)))}
+               for rows, speculative, op, sequences in sorted(selected)]
+    if pin_report is not None:
+        for key in sorted(selected):
+            for device in sorted(latest):
+                graphs = [graph for (owner, *_), (geometry, graph) in identities.items()
+                          if owner == device and geometry == key]
+                if not graphs:
+                    continue
+                known = all("permanent_bytes" in graph for graph in graphs)
+                pin_report.append({"device": device, "rows": key[0], "speculative": key[1],
+                                   "op": key[2], "sequences": key[3],
+                                   "pin": bool(reasons.get(key)), "reasons": sorted(reasons.get(key, [])),
+                                   "executables": sum(int(graph.get("executables", 1)) for graph in graphs),
+                                   "observed_permanent_lower_bound_bytes":
+                                       sum(int(graph["permanent_bytes"]) for graph in graphs) if known else None,
+                                   "observed_capture_bytes": sum(int(graph.get("capture_bytes") or 0) for graph in graphs),
+                                   "full_geometry_cost_bytes": None})
     return {"ranks": ranks, "layout": layout,
             "reserve_base_bytes": packed(max(arenas)), "reserve_extra_bytes": CHUNK,
             "entries": entries}
@@ -285,7 +311,7 @@ def main():
         if args.family == "kimi_k3":
             if args.ranks is None or args.layout is None:
                 raise ValueError("kimi_k3 needs --ranks and --layout")
-            result = generate_kimi(traces, args.ranks, args.layout, args.coverage)
+            result = generate_kimi(traces, args.ranks, args.layout, args.coverage, report)
             merge_kimi_layout(args.output, result)
         else:
             result = generate(traces, args.family, args.coverage, args.pin_frequency, report, int(args.layout) if args.layout is not None else None)

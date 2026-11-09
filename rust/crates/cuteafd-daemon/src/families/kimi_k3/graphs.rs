@@ -12,7 +12,7 @@ use crate::shared::{decode_graph::{device::{Basis, Cycle, Preference, Site}, Cac
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config},
     placement::inventory::StartupGraphs,
-    serving_capacity::kimi_prewarm::{kimi_bootstrap, kimi_pinned, kimi_prewarm}};
+    serving_capacity::kimi_prewarm::{kimi_bootstrap, kimi_layout, kimi_selected, KimiPrewarmLayout, KimiPrewarmOp}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Op {
@@ -63,6 +63,58 @@ pub(crate) fn replay_allowed(op: Op, optional: bool, window: bool) -> Result<boo
 pub(crate) use cuteafd_loader::families::kimi_k3::allocation::{GRAPH_RESERVE as RESERVE,
     graph_demand as demand};
 use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_rows};
+
+fn geometry(op: Op) -> (KimiPrewarmOp, Option<usize>) {
+    match op {
+        Op::Residual(_) => (KimiPrewarmOp::Residual, None),
+        Op::Ffn(_) => (KimiPrewarmOp::Ffn, None),
+        Op::Attention { sequences, .. } => (KimiPrewarmOp::Attention, Some(sequences)),
+        Op::Context { .. } => (KimiPrewarmOp::Context, None),
+    }
+}
+
+pub(crate) fn prewarm_selected(layout: &KimiPrewarmLayout, key: Key, pinned: bool) -> bool {
+    let (op, sequences) = geometry(key.op);
+    kimi_selected(layout, key.rows, key.op.speculative(), op, sequences, pinned)
+}
+
+pub(crate) fn pinned(ranks: usize, key: Key) -> bool {
+    prewarm_selected(kimi_layout(ranks), key, true)
+}
+
+/// Project observed trace geometries onto the placement's actual sites. No new
+/// prefill/window keys or unobserved attention row/sequence pairs are invented.
+pub(crate) fn prewarm_keys(cfg: &KimiK3Config, inventory: &[Key], layout: &KimiPrewarmLayout,
+    slots: usize, capacity: usize) -> Vec<Key> {
+    let mut keys = std::collections::HashSet::new();
+    for entry in &layout.entries {
+        if !(1..=64.min(capacity)).contains(&entry.rows) { continue }
+        for &template in inventory {
+            if entry.op.is_none() {
+                if prewarm_selected(layout, template, false) { keys.insert(template); }
+                continue;
+            }
+            let op = match (entry.op.unwrap(), template.op) {
+                (KimiPrewarmOp::Residual, Op::Residual(site)) => Op::Residual(site),
+                (KimiPrewarmOp::Ffn, Op::Ffn(layer)) => Op::Ffn(layer),
+                (KimiPrewarmOp::Context, Op::Context { layer, .. }) =>
+                    Op::Context { layer, speculative: entry.speculative },
+                (KimiPrewarmOp::Attention, Op::Attention { layer, .. }) => {
+                    let Some(sequences) = entry.sequences else { continue };
+                    if sequences == 0 || sequences > slots || sequences > entry.rows
+                        || (cfg.attention[layer] != KimiAttention::Kda && sequences != 1) { continue }
+                    Op::Attention { layer, sequences, speculative: entry.speculative }
+                }
+                _ => continue,
+            };
+            let key = Key { rows: entry.rows, op, ..template };
+            if prewarm_selected(layout, key, false) { keys.insert(key); }
+        }
+    }
+    let mut keys = keys.into_iter().collect::<Vec<_>>();
+    keys.sort_by_cached_key(|key| format!("{key:?}"));
+    keys
+}
 
 /// Every executable the model can need, enumerated from the accepted placement.
 /// Admission charges the graph reserve separately; this set enumerates keys and
@@ -249,8 +301,8 @@ impl<'a> Graphs<'a> {
         mut body: impl FnMut(Key) -> Result<()>) -> Result<usize> {
         let mut captured = 0;
         for &key in keys {
-            if !kimi_prewarm(ranks, key.rows, key.op.speculative()) || self.cached(&key) { continue }
-            let pinned = kimi_pinned(ranks, key.rows, key.op.speculative());
+            if !prewarm_selected(kimi_layout(ranks), key, false) || self.cached(&key) { continue }
+            let pinned = pinned(ranks, key);
             let Some(ticket) = self.bank.cache_ticket(&key, pinned, None) else { continue };
             if self.capture(stream, key, ticket, &mut || body(key))? { captured += 1; }
         }
@@ -343,18 +395,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prewarm_rows_are_reachable_outside_prefill_windows() {
-        for ranks in [1, 2] {
-            for rows in 1..=4096 {
-                for speculative in [false, true] {
-                    if !kimi_prewarm(ranks, rows, speculative) { continue }
-                    assert!(rows <= 64);
-                    let op = Op::Attention { layer: 0, sequences: 1, speculative };
-                    assert!(replay_allowed(op, true, false).unwrap());
-                    assert!(!replay_allowed(op, true, true).unwrap());
-                }
-            }
+    fn every_observed_geometry_expands_to_reachable_keys_and_nothing_else() -> Result<()> {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let layout = KimiPrewarmLayout { ranks: 1, layout: "trace".into(),
+            reserve_base_bytes: 1, reserve_extra_bytes: 2 << 20,
+            entries: vec![
+                KimiPrewarmEntry { rows: 20, speculative: true, pin: true,
+                    op: Some(KimiPrewarmOp::Attention), sequences: Some(4) },
+                KimiPrewarmEntry { rows: 20, speculative: false, pin: false,
+                    op: Some(KimiPrewarmOp::Ffn), sequences: None },
+            ] };
+        let inventory = inventory_for_ranks(&cfg, 1, 4096, 16, 8, 1, |_, _| true)?;
+        let keys = prewarm_keys(&cfg, &inventory.keys, &layout, 16, 4096);
+        assert!(!keys.is_empty());
+        for entry in &layout.entries {
+            assert!(keys.iter().any(|key| key.rows == entry.rows
+                && key.op.speculative() == entry.speculative
+                && geometry(key.op) == (entry.op.unwrap(), entry.sequences)));
         }
+        for key in keys {
+            assert!(prewarm_selected(&layout, key, false));
+            assert!(replay_allowed(key.op, true, false)?);
+            assert!(!replay_allowed(key.op, true, true)?);
+            if let Op::Attention { sequences, .. } = key.op { assert_eq!(sequences, 4); }
+        }
+        assert!(prewarm_keys(&cfg, &inventory.keys, &layout, 2, 4096).iter()
+            .all(|key| !matches!(key.op, Op::Attention { .. })));
+        Ok(())
     }
 
     #[test]

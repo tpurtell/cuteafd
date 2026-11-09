@@ -13,10 +13,14 @@ use std::rc::Rc;
 /// Chunked prefill has no negative-slot semantics (#1486).
 pub(super) fn startup_metadata(rows: usize, sequences: usize, slots: usize) -> Result<[Vec<i32>; 2]> {
     ensure!((1..=4096).contains(&rows) && sequences > 0 && sequences <= slots
-        && (sequences == 1 || sequences == rows) && (rows <= 64 || sequences == 1),
+        && sequences <= rows && (rows <= 64 || sequences == 1),
         "Kimi startup KDA sequences exceed valid distinct slots or row geometry");
-    let indices = (0..rows).map(|row| if sequences == 1 { 0 } else { row as i32 }).collect::<Vec<_>>();
-    Ok([indices.clone(), indices])
+    let indices = (0..rows).map(|row| (row * sequences / rows) as i32).collect::<Vec<_>>();
+    let mut first = vec![0; rows];
+    for row in 1..rows {
+        first[row] = if indices[row] == indices[row - 1] { first[row - 1] } else { row as i32 };
+    }
+    Ok([indices, first])
 }
 
 /// A replay belongs to exactly one verified batch until accept or discard.
@@ -324,8 +328,11 @@ mod tests {
             assert_eq!(first, slots);
             assert!(startup_metadata(rows, rows, rows - 1).is_err());
         }
+        let [slots, first] = startup_metadata(20, 4, 4)?;
+        assert_eq!(slots, (0..4).flat_map(|slot| [slot; 5]).collect::<Vec<_>>());
+        assert_eq!(first, (0..4).flat_map(|slot| [slot * 5; 5]).collect::<Vec<_>>());
         for (rows, sequences, slots) in [(0, 1, 1), (4097, 1, 1), (1, 0, 1),
-            (1, 1, 0), (4, 2, 2), (65, 65, 65)] {
+            (1, 1, 0), (4, 5, 5), (65, 65, 65)] {
             assert!(startup_metadata(rows, sequences, slots).is_err());
         }
         Ok(())

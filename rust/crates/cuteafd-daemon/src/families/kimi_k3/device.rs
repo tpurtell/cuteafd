@@ -923,8 +923,7 @@ impl<'a> LocalLane<'a> {
         let Some(mut graphs) = self.graphs.take() else { return body(self) };
         let stream = self.stream().clone();
         let key = super::graphs::Key { lane: self.lane_index, rank: self.rank, rows, op };
-        let pinned = cuteafd_loader::serving_capacity::kimi_prewarm::kimi_pinned(
-            self.programs.ranks, rows, op.speculative());
+        let pinned = super::graphs::pinned(self.programs.ranks, key);
         // A golden capture records its own sites inside the body; a recorded
         // stream cannot contain those reads.
         let allow_capture = self.capture.is_none();

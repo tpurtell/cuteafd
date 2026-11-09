@@ -568,7 +568,7 @@ impl<'a> Engine<'a> {
         for (lane, pair) in lanes.local.iter_mut().enumerate() {
             for (rank, local) in pair.iter_mut().enumerate() {
                 let binding = keys.iter().copied().filter(|key| key.lane == lane && key.rank == rank).collect::<Vec<_>>();
-                if binding.is_empty() { continue }
+                // Even an empty prewarm list must attach its lazy cache.
                 captured += local.warm_graphs(&binding, rank, reserves[rank])?;
             }
         }
