@@ -113,12 +113,6 @@ mod spark_tests {
     }
 }
 
-pub(super) fn graph_reserve_bytes(total: usize, dual_gpu: Option<usize>) -> usize {
-    assert!(dual_gpu.is_none_or(|gpu| gpu < 2));
-    families::deepseek_v41::graph_reserve(total as u64, if dual_gpu.is_some() { 2 } else { 1 })
-        as usize
-}
-
 pub(super) fn embedding_placement(
     explicit: Option<crate::shared::memory::EmbedPlacement>,
     total: usize,
@@ -623,12 +617,12 @@ pub(super) fn resolve_with_owners(
         ),
         waves: u64::from(args.prefill_waves),
     };
-    // Future owners beside the pool: the calibrated lazy-graph envelope and
-    // runtime growth reserve. None is live at ready,
-    // so each prices only the post-ready phases.
+    // One graph arena per coordinator GPU, charged before KV sizing. The
+    // daemon's bounded device cache spends it; a measured warmup never shrinks
+    // or replaces the configured reserve.
     let mut allowances = Vec::new();
-    for (gpu, sample) in memory.iter().enumerate() {
-        allowances.extend(admission::growth_allowances(sample.1 as u64, ranks, gpu as u8));
+    for gpu in 0..memory.len() {
+        allowances.push(admission::graph_allowance(gpu)?);
     }
     let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
     if charged {
@@ -1430,15 +1424,14 @@ mod admission_tests {
             }
             assert_eq!(admitted.placement.pool_tokens, args.pool_tokens.unwrap());
             assert_eq!(admitted.reservation_bytes, vec![total; ranks]);
+            let graph_reserves = (0..ranks).map(graph_reserve_bytes).collect::<Result<Vec<_>>>()?;
             let exact = admitted
                 .cache_bytes
                 .iter()
                 .enumerate()
                 .map(|(gpu, &bytes)| {
                     let reserve = cuteafd_loader::placement::reserve::gpu("deepseek_v41") as usize
-                        + families::deepseek_v41::runtime_reserve(total as u64, ranks)
-                            as usize
-                        + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
+                        + graph_reserves[gpu];
                     let blas = admitted.placement.items[gpu].iter().filter(|item|
                         item.group.starts_with("cuBLAS handles:")
                             || item.group.starts_with("BLAS device initialization"))
@@ -1564,13 +1557,24 @@ mod admission_tests {
         Ok(())
     }
 
+    /// The same configured reserve admission charged, resolved through the
+    /// family list and `GPU_GRAPH_RESERVE`, so a test cannot invent a third
+    /// graph budget.
+    fn graph_reserve_bytes(rank: usize) -> Result<usize> {
+        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default();
+        Ok(cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
+            .map_err(anyhow::Error::msg)?.bytes as usize)
+    }
+
     #[test]
     fn graph_reserves_and_small_card_logical_target_remain_distinct() -> Result<()> {
-        assert_eq!(graph_reserve_bytes(96usize << 30, None), 3264 << 20);
+        // One configured arena per coordinator GPU, independent of card size
+        // and of the small card's logical target.
+        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default();
+        assert_eq!(base + extra, 1_048_576_000);
         for rank in [0, 1] {
-            assert_eq!(graph_reserve_bytes(96usize << 30, Some(rank)), 1472 << 20);
+            assert_eq!(graph_reserve_bytes(rank)?, (base + extra) as usize);
         }
-        assert_eq!(graph_reserve_bytes(32usize << 30, None), 2048 << 20);
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),

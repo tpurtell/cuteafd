@@ -6,6 +6,13 @@ pub fn glm_default() -> (u64, u64) {
     let list = crate::serving_capacity::glm_graphs::glm_prewarm_list();
     (list.reserve_base_bytes, list.reserve_extra_bytes)
 }
+/// V4.1 bootstrap: the #1635 census10 measured lazy graph growth is the arena
+/// base; the extra is one capture quantum until the trace card measures the
+/// largest single capture on this family's qualification config.
+pub fn v41_default() -> (u64, u64) {
+    let list = crate::serving_capacity::v41_graphs::v41_prewarm_list();
+    (list.reserve_base_bytes, list.reserve_extra_bytes)
+}
 pub fn source(id: &str) -> String { format!("graph reserve: {id}") }
 pub fn is_source(source: &str) -> bool { source.starts_with("graph reserve: ") || source.starts_with("startup graphs: ") }
 

@@ -137,30 +137,23 @@ pub struct Opaque {
     pub source: String,
 }
 
-/// The lazy-capture envelope and runtime growth as declared reserves per GPU.
-/// None of these bytes is live at ready, so they
-/// price only the post-ready phases.
-pub fn growth_allowances(total: u64, ranks: usize, gpu: u8) -> Vec<Opaque> {
-    let location = Location::coordinator(gpu);
-    let lifetime = Lifetime { first: Phase::Ready, last: Phase::Growth };
-    let mut out = vec![Opaque {
-        location,
-        bytes: super::graph_reserve(total, ranks),
+/// The bounded graph arena, one owner per coordinator GPU. Admission charges
+/// the whole configured reserve once before KV sizing; the daemon's device
+/// cache reports its measured high-water against it. `GPU_GRAPH_RESERVE`
+/// overrides it per device and never splits across ranks. Nothing here is live
+/// at Ready, so it prices only the post-ready phases.
+pub fn graph_allowance(rank: usize) -> Result<Opaque, Refusal> {
+    let (base, extra) = crate::placement::graph_reserve::v41_default();
+    let resolved = crate::placement::graph_reserve::current(rank, false, base, extra)
+        .map_err(Refusal::InvalidFact)?;
+    Ok(Opaque {
+        location: Location::coordinator(rank as u8),
+        bytes: resolved.bytes,
+        // A configured budget, not a census estimate: it is never "assumed".
         basis: Basis::Calibrated,
-        lifetime,
-        source: "V4.1 lazy graph capture envelope".into(),
-    }];
-    let runtime = super::runtime_reserve(total, ranks);
-    if runtime > 0 {
-        out.push(Opaque {
-            location,
-            bytes: runtime,
-            basis: Basis::Estimated,
-            lifetime,
-            source: "V4.1 runtime growth reserve (estimated; qualified max cards observed 780-854 MiB)".into(),
-        });
-    }
-    out
+        lifetime: Lifetime { first: Phase::Ready, last: Phase::Growth },
+        source: crate::placement::graph_reserve::source(&format!("v41.graphs.{rank}")),
+    })
 }
 
 /// The runtime base the pre-weight availability sample already holds, named
@@ -1877,17 +1870,12 @@ impl Recipe for V41Recipe<'_> {
 #[cfg(test)]
 mod explicit_budget_tests {
     #[test]
-    fn growth_reserves_price_only_named_graph_and_runtime_owners() {
-        for total in [32u64 << 30, 96u64 << 30] {
-            for ranks in [1, 2] {
-                let reserves = super::growth_allowances(total, ranks, 0);
-                assert_eq!(reserves.iter().map(|reserve| reserve.bytes).sum::<u64>(),
-                    super::super::graph_reserve(total, ranks)
-                        + super::super::runtime_reserve(total, ranks));
-                assert!(reserves.iter().all(|reserve| reserve.source.contains("graph")
-                    || reserve.source.contains("runtime")));
-            }
-        }
+    fn graph_reserve_prices_only_the_named_arena() {
+        let owner = super::graph_allowance(0).unwrap();
+        assert_eq!(owner.bytes, 1_048_576_000);
+        assert_eq!(owner.source, "graph reserve: v41.graphs.0");
+        // The old lazy envelope and runtime growth owner are gone, not renamed.
+        assert!(!owner.source.contains("runtime"));
     }
 }
 

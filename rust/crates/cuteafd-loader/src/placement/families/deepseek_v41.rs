@@ -5,22 +5,6 @@ pub mod owners;
 pub mod resident;
 pub mod weight_layout;
 
-/// Existing lazy-capture envelope, separate from qualified ready residency.
-/// Small cards previously hid this same growth allowance in the CUDA sample.
-pub fn graph_reserve(total: u64, ranks: usize) -> u64 {
-    if total <= 32 << 30 { 2048 << 20 } else if ranks == 1 { 3264 << 20 } else { 1472 << 20 }
-}
-
-/// Estimated post-ready runtime growth per GPU, the same under automatic and
-/// explicit pools: no warmed plateau is measured for it yet. The retained
-/// V4.1 max cards (2026-10-25, 757-land/router-astra-land memory.jsonl) grew
-/// 780-854 MiB raw per GPU in the ~20 s after ready, lazy captures included,
-/// against 1472 + 800 MiB of graph and runtime reserve; that is not a warmed
-/// C16/8K figure. Small cards fold their slack into the ceiling.
-pub fn runtime_reserve(total: u64, ranks: usize) -> u64 {
-    if total <= 32 << 30 { 0 } else if ranks == 1 { 2 << 30 } else { 800 << 20 }
-}
-
 /// Exact expert allocation extents, supplied either by linked native info or
 /// the corresponding published AOT manifest. No device-specific estimate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -693,21 +677,20 @@ mod tests {
     }
 
     #[test]
-    fn growth_reserves_are_post_ready_allowances_on_every_card() {
-        for total in [32 << 30, 96 << 30] {
-            for ranks in [1, 2] {
-                for gpu in 0..ranks {
-                    let allowances = admission::growth_allowances(total, ranks, gpu as u8);
-                    assert!(allowances.iter().all(|a| a.location == Location::coordinator(gpu as u8)
-                        && a.lifetime == Lifetime { first: Phase::Ready, last: Phase::Growth }));
-                    assert_eq!(allowances.iter().map(|a| a.bytes).sum::<u64>(),
-                        graph_reserve(total, ranks) + runtime_reserve(total, ranks));
-                }
+    fn graph_reserve_is_one_post_ready_owner_per_card_of_any_size() {
+        // Card size no longer changes the graph budget: the measured arena is
+        // one family number, and the small-card fixed-shape set is a capture
+        // policy, not a second envelope.
+        for ranks in [1, 2] {
+            for gpu in 0..ranks {
+                let owner = admission::graph_allowance(gpu).unwrap();
+                assert_eq!(owner.location, Location::coordinator(gpu as u8));
+                assert_eq!(owner.lifetime, Lifetime { first: Phase::Ready, last: Phase::Growth });
+                assert_eq!(owner.source, format!("graph reserve: v41.graphs.{gpu}"));
+                assert_eq!(owner.bytes, 1_048_576_000);
+                assert_eq!(owner.basis, Basis::Calibrated);
             }
         }
-        // One estimate per card shape: automatic and explicit pools share it.
-        assert_eq!(runtime_reserve(96 << 30, 1), 2 << 30);
-        assert_eq!(runtime_reserve(96 << 30, 2), 800 << 20);
     }
 
     #[test]

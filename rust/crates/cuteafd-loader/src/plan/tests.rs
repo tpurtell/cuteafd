@@ -5013,7 +5013,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
         (Some(8192), Some(2752), Some(3)));
     assert_eq!(capped.memory_layout.as_ref().unwrap().pool_tokens, 1 << 20);
     // The BLAS/code split retires the mixed 2 GiB row, not the independent
-    // graph/runtime reserves. This synthetic 31 GiB card now fits as well.
+    // graph reserve. This synthetic 31 GiB card now fits as well.
     let compact = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![31 << 30], ..layout.clone() }), ..sparks(4) };
     let compact = plan_spark_count(dir.path(), &compact, 6, Some(4)).unwrap();
@@ -5029,13 +5029,10 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     assert!(modules >= 34 << 20);
     let blas = bytes("cuBLAS handles:") + bytes("BLAS device initialization");
     assert_eq!(blas, 66 << 20);
-    assert_eq!(bytes("V4.1 lazy graph capture envelope"),
-        crate::placement::families::deepseek_v41::graph_reserve(31 << 30, 1));
-    assert_eq!(bytes("V4.1 runtime growth reserve"),
-        crate::placement::families::deepseek_v41::runtime_reserve(31 << 30, 1));
+    assert_eq!(bytes("graph reserve"), 1_048_576_000);
     assert_eq!(bytes("native LoadedCode estimate"), 0);
     let retired = (2u64 << 30) + arch.cublas_bytes - modules - blas;
-    eprintln!("V4.1 synthetic 31 GiB: selected modules {modules}, named BLAS {blas}, retired mixed allowance delta {retired} B; graph/runtime unchanged");
+    eprintln!("V4.1 synthetic 31 GiB: selected modules {modules}, named BLAS {blas}, retired mixed allowance delta {retired} B; one graph reserve");
     // Less physical capacity still refuses rather than shrinking the reserve.
     let limited = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![29 << 30], ..layout.clone() }), ..sparks(4) };
