@@ -5,686 +5,5019 @@
     {
       "ranks": 1,
       "layout": "kimi-k3-exl3-k6-min",
-      "reserve_base_bytes": [530579456],
+      "reserve_base_bytes": [
+        3416260608
+      ],
       "reserve_extra_bytes": 2097152,
       "entries": [
         {
           "rows": 1,
           "speculative": false,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            12703614
+          ]
         },
         {
-          "rows": 4,
+          "rows": 1,
           "speculative": false,
-          "pin": true
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            12703614
+          ]
         },
         {
-          "rows": 16,
+          "rows": 1,
           "speculative": false,
-          "pin": true
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            25543826
+          ]
         },
         {
-          "rows": 64,
+          "rows": 2,
           "speculative": false,
-          "pin": true
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25543826
+          ]
         },
         {
           "rows": 2,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            25544364
+          ]
         },
         {
           "rows": 3,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            10485760
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            25543826
+          ]
         },
         {
           "rows": 4,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            25543826
+          ]
         },
         {
           "rows": 5,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25543826
+          ]
         },
         {
           "rows": 6,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            8388608
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25543826
+          ]
         },
         {
           "rows": 7,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            14680064
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25543826
+          ]
         },
         {
           "rows": 8,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            14680064
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            14680064
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            13071987
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            26284826
+          ]
         },
         {
           "rows": 9,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            3373416
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": true,
+          "capture_bytes": [
+            9698571
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549141
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233366
+          ]
         },
         {
           "rows": 10,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            8388608
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026295
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181906
+          ]
         },
         {
           "rows": 11,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            3103560
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            8922735
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 5,
+          "pin": false,
+          "capture_bytes": [
+            14680064
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11503356
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23130632
+          ]
         },
         {
           "rows": 12,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            2968608
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            8534748
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            30326928
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            60980192
+          ]
         },
         {
           "rows": 13,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            7826304
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": true,
+          "capture_bytes": [
+            22500624
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 6,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549288
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233219
+          ]
         },
         {
           "rows": 14,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            14680064
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 6,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026296
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181905
+          ]
         },
         {
           "rows": 15,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3103560
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25543826
+          ]
         },
         {
           "rows": 16,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            4870800
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            10485760
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 5,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            14003568
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            12549288
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            25233219
+          ]
         },
         {
           "rows": 17,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            10485760
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            10485760
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            10485760
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026295
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181905
+          ]
         },
         {
           "rows": 18,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3103560
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8922736
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549141
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233219
+          ]
         },
         {
           "rows": 19,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            10485760
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            9310800
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026295
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181905
+          ]
         },
         {
           "rows": 20,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3103560
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            13424640
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 6,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8922736
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13072280
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            26284533
+          ]
         },
         {
           "rows": 21,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3373416
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            9698571
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 10,
+          "pin": false,
+          "capture_bytes": [
+            14680064
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026296
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181905
+          ]
         },
         {
           "rows": 22,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3103560
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8922735
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549288
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233219
+          ]
         },
         {
           "rows": 23,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 11,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13594926
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            27336034
+          ]
         },
         {
           "rows": 24,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3508368
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 5,
+          "pin": false,
+          "capture_bytes": [
+            10485760
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549141
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233366
+          ]
         },
         {
           "rows": 25,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            10485760
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
         },
         {
           "rows": 26,
-          "speculative": true,
-          "pin": true
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549141
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12565544
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25266131
+          ]
         },
         {
           "rows": 27,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3242712
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 13,
+          "pin": false,
+          "capture_bytes": [
+            9322797
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549141
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233366
+          ]
         },
         {
           "rows": 28,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
         },
         {
           "rows": 29,
-          "speculative": true,
-          "pin": true
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549141
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233219
+          ]
+        },
+        {
+          "rows": 30,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026296
+          ]
+        },
+        {
+          "rows": 30,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181905
+          ]
         },
         {
           "rows": 30,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 14,
+          "pin": false,
+          "capture_bytes": [
+            8922735
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13072280
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            26284533
+          ]
         },
         {
           "rows": 31,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3373416
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 15,
+          "pin": false,
+          "capture_bytes": [
+            9698571
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549288
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233219
+          ]
         },
         {
           "rows": 32,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 15,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            13071987
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            26284826
+          ]
         },
         {
           "rows": 33,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            3373416
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": true,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549141
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233219
+          ]
         },
         {
           "rows": 34,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9310800
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549288
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233219
+          ]
         },
         {
           "rows": 35,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8388608
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13071987
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            26284826
+          ]
         },
         {
           "rows": 36,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3373416
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9698571
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026296
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181905
+          ]
         },
         {
           "rows": 37,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3103560
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8922735
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026295
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181905
+          ]
         },
         {
           "rows": 38,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3103560
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8922736
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13071987
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            26284826
+          ]
         },
         {
           "rows": 39,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3373416
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9698571
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549141
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233366
+          ]
         },
         {
           "rows": 40,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            10485760
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549141
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233366
+          ]
         },
         {
           "rows": 41,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            10485760
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11503356
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23130632
+          ]
         },
         {
           "rows": 42,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8534748
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13071987
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            26284826
+          ]
         },
         {
           "rows": 43,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9698571
+          ]
         },
         {
           "rows": 44,
-          "speculative": true,
-          "pin": true
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13072280
+          ]
         },
         {
-          "rows": 45,
-          "speculative": true,
-          "pin": true
+          "rows": 46,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13071987
+          ]
+        },
+        {
+          "rows": 46,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            26284826
+          ]
         },
         {
           "rows": 46,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 15,
+          "pin": false,
+          "capture_bytes": [
+            12582912
+          ]
         },
         {
-          "rows": 47,
+          "rows": 46,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9698571
+          ]
         },
         {
           "rows": 48,
-          "speculative": true,
-          "pin": true
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13071987
+          ]
+        },
+        {
+          "rows": 48,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            26284826
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026296
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181905
+          ]
         },
         {
           "rows": 49,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            3103560
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": true,
+          "capture_bytes": [
+            8922735
+          ]
+        },
+        {
+          "rows": 50,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549141
+          ]
+        },
+        {
+          "rows": 50,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233366
+          ]
         },
         {
           "rows": 50,
           "speculative": true,
-          "pin": true
-        },
-        {
-          "rows": 51,
-          "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
         },
         {
           "rows": 52,
-          "speculative": true,
-          "pin": true
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549288
+          ]
         },
         {
           "rows": 53,
-          "speculative": true,
-          "pin": true
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13071987
+          ]
+        },
+        {
+          "rows": 53,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            26284826
+          ]
         },
         {
           "rows": 54,
-          "speculative": true,
-          "pin": true
-        },
-        {
-          "rows": 55,
-          "speculative": true,
-          "pin": true
-        },
-        {
-          "rows": 56,
-          "speculative": true,
-          "pin": true
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026295
+          ]
         },
         {
           "rows": 57,
-          "speculative": true,
-          "pin": true
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026295
+          ]
         },
         {
-          "rows": 58,
-          "speculative": true,
-          "pin": true
+          "rows": 57,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181906
+          ]
         },
         {
           "rows": 59,
-          "speculative": true,
-          "pin": true
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549288
+          ]
+        },
+        {
+          "rows": 60,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026296
+          ]
+        },
+        {
+          "rows": 60,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181905
+          ]
         },
         {
           "rows": 60,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3103560
+          ]
+        },
+        {
+          "rows": 60,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8922735
+          ]
+        },
+        {
+          "rows": 61,
+          "speculative": false,
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 61,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12026295
+          ]
+        },
+        {
+          "rows": 61,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24181906
+          ]
         },
         {
           "rows": 61,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3103560
+          ]
+        },
+        {
+          "rows": 61,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 15,
+          "pin": false,
+          "capture_bytes": [
+            8922735
+          ]
+        },
+        {
+          "rows": 61,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            14680064
+          ]
+        },
+        {
+          "rows": 62,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12549288
+          ]
+        },
+        {
+          "rows": 62,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            25233219
+          ]
         },
         {
           "rows": 62,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3238488
+          ]
+        },
+        {
+          "rows": 62,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9310653
+          ]
+        },
+        {
+          "rows": 63,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13071987
+          ]
+        },
+        {
+          "rows": 63,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            26284826
+          ]
         },
         {
           "rows": 63,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            3373416
+          ]
+        },
+        {
+          "rows": 63,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9698571
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            12703614
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            25543826
+          ]
         },
         {
           "rows": 64,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            3788414
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": true,
+          "capture_bytes": [
+            10891650
+          ]
         }
       ]
     },
     {
       "ranks": 2,
       "layout": "kimi-k3-exl3-k6-max",
-      "reserve_base_bytes": [761266176, 763363328],
+      "reserve_base_bytes": [
+        2975858688,
+        2980052992
+      ],
       "reserve_extra_bytes": 2097152,
       "entries": [
         {
           "rows": 1,
           "speculative": false,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            10138791,
+            10174188
+          ]
         },
         {
-          "rows": 4,
+          "rows": 1,
           "speculative": false,
-          "pin": true
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
-          "rows": 16,
+          "rows": 1,
           "speculative": false,
-          "pin": true
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            13665327,
+            13713036
+          ]
         },
         {
-          "rows": 64,
+          "rows": 1,
           "speculative": false,
-          "pin": true
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            27332041,
+            27573524
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13665327,
+            13713036
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            27330654,
+            27573524
+          ]
         },
         {
           "rows": 2,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            10138791,
+            10174188
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            13665327,
+            13713036
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            27330654,
+            27573524
+          ]
         },
         {
           "rows": 3,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            10138791,
+            10174188
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13665327,
+            13713036
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            27330654,
+            27573524
+          ]
         },
         {
           "rows": 4,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            10138791,
+            10174188
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            13665327,
+            13713036
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            27330654,
+            27573524
+          ]
         },
         {
           "rows": 5,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            10138791,
+            10174188
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": true,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            13665327,
+            13713036
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            27330654,
+            27578360
+          ]
         },
         {
           "rows": 6,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            10138791,
+            10174188
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            13665327,
+            13713036
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            27330654,
+            27573524
+          ]
         },
         {
           "rows": 7,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 1,
+          "pin": true,
+          "capture_bytes": [
+            10138791,
+            10174188
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            12582912
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13665327,
+            13713036
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            27330654,
+            27573524
+          ]
         },
         {
           "rows": 8,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            12294414
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538672,
+            24721268
+          ]
         },
         {
           "rows": 9,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            8732184,
+            9121662
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11208825,
+            10617903
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417990,
+            21350186
+          ]
         },
         {
           "rows": 10,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": true,
+          "capture_bytes": [
+            8316225,
+            7877799
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            11176740
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538768,
+            22473880
+          ]
         },
         {
           "rows": 11,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 2,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            8732088,
+            8292420
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 5,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            12294656
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538768,
+            24721026
+          ]
         },
         {
           "rows": 12,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            8732088,
+            9121662
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 5,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            12582912
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            30264060,
+            29618268
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            60528120,
+            59555176
+          ]
         },
         {
           "rows": 13,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": true,
+          "capture_bytes": [
+            22454028,
+            21974844
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 6,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11208825,
+            11735808
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417990,
+            23597343
+          ]
         },
         {
           "rows": 14,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            12582912
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 6,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329754,
+            11735577
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659708,
+            23597574
+          ]
         },
         {
           "rows": 15,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            9147882,
+            8707041
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 6,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            8388608
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            13665327,
+            13713036
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            27330654,
+            27573524
+          ]
         },
         {
           "rows": 16,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 3,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            10485760
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 6,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            12294414
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538768,
+            24721268
+          ]
         },
         {
           "rows": 17,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            8732088,
+            9121662
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11208825,
+            11735808
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417650,
+            23597343
+          ]
         },
         {
           "rows": 18,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            11327488
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8316565,
+            8707041
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            11735577
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538672,
+            23597574
+          ]
         },
         {
           "rows": 19,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8732184,
+            8707041
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 9,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            10485760
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329954,
+            11735808
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659508,
+            23597343
+          ]
         },
         {
           "rows": 20,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 5,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            9147882,
+            8707041
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11209165,
+            11735577
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417650,
+            23597574
+          ]
         },
         {
           "rows": 21,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8316225,
+            8707041
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329754,
+            11735577
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659708,
+            23597343
+          ]
         },
         {
           "rows": 22,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            10485760
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            9147882,
+            8707272
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769432,
+            12294414
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538672,
+            24721268
+          ]
         },
         {
           "rows": 23,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            8388608
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 5,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8732088,
+            9121662
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 10,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 11,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            10485760
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329754,
+            11735577
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659708,
+            23597574
+          ]
         },
         {
           "rows": 24,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            9147882,
+            8707041
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769432,
+            11735577
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538672,
+            23597343
+          ]
         },
         {
           "rows": 25,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 4,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8732088,
+            8707272
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 10,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 12,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            12294414
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538768,
+            24721268
+          ]
         },
         {
           "rows": 26,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            12582912
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 11,
+          "pin": false,
+          "capture_bytes": [
+            8732088,
+            9121662
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329754,
+            11735808
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659508,
+            23597343
+          ]
         },
         {
           "rows": 27,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            11176740
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538672,
+            22473660
+          ]
         },
         {
           "rows": 28,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11209165,
+            11735577
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417650,
+            23597574
+          ]
         },
         {
           "rows": 29,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 12,
+          "pin": false,
+          "capture_bytes": [
+            8316225,
+            8707041
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 13,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
           "rows": 30,
-          "speculative": true,
-          "pin": true
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            10648643,
+            11735808
+          ]
+        },
+        {
+          "rows": 30,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            21296814,
+            23597343
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329954,
+            11735577
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659508,
+            23597574
+          ]
         },
         {
           "rows": 31,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 13,
+          "pin": false,
+          "capture_bytes": [
+            9147882,
+            8707041
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11208825,
+            11735577
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417650,
+            23597574
+          ]
         },
         {
           "rows": 32,
           "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            11735577
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538768,
+            23597574
+          ]
         },
         {
           "rows": 33,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8732088,
+            8707041
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 14,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            10485760
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329754,
+            12853251
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659508,
+            25844962
+          ]
         },
         {
           "rows": 34,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 7,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9148082,
+            9536283
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329754,
+            11735577
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659708,
+            23597343
+          ]
         },
         {
           "rows": 35,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            12582912
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 14,
+          "pin": false,
+          "capture_bytes": [
+            9147882,
+            8707272
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329754,
+            12294414
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659708,
+            24721268
+          ]
         },
         {
           "rows": 36,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 15,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9147882,
+            9121662
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11208825,
+            10617903
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417650,
+            21350186
+          ]
         },
         {
           "rows": 37,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8316565,
+            7877799
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            12294414
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538768,
+            24721026
+          ]
         },
         {
           "rows": 38,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            10485760
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8732088,
+            9121904
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329754,
+            11735808
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659708,
+            23597343
+          ]
         },
         {
           "rows": 39,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9147882,
+            8707041
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            11176740
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538672,
+            22473880
+          ]
         },
         {
           "rows": 40,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 8,
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8732184,
+            8292420
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            11735577
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538768,
+            23597574
+          ]
         },
         {
           "rows": 41,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8732088,
+            8707041
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11208825,
+            11735577
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417990,
+            23597574
+          ]
         },
         {
           "rows": 42,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8316225,
+            8707041
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11769336,
+            12294656
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            23538672,
+            24721026
+          ]
         },
         {
           "rows": 43,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8732184,
+            9121662
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 44,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11209165,
+            11735808
+          ]
+        },
+        {
+          "rows": 44,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417650,
+            23597343
+          ]
         },
         {
           "rows": 44,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8316225,
+            8707041
+          ]
         },
         {
-          "rows": 45,
+          "rows": 44,
           "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
-          "rows": 46,
-          "speculative": true,
-          "pin": true
+          "rows": 48,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12329754,
+            11735577
+          ]
         },
         {
-          "rows": 47,
-          "speculative": true,
-          "pin": true
+          "rows": 48,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            24659708,
+            23597343
+          ]
         },
         {
           "rows": 48,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            9147882,
+            8707272
+          ]
+        },
+        {
+          "rows": 48,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11208825,
+            11176740
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417990,
+            22473880
+          ]
         },
         {
           "rows": 49,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 16,
+          "pin": false,
+          "capture_bytes": [
+            8316225,
+            8292420
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
           "rows": 50,
           "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
           "rows": 51,
           "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
           "rows": 52,
           "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
           "rows": 53,
           "speculative": true,
-          "pin": true
-        },
-        {
-          "rows": 54,
-          "speculative": true,
-          "pin": true
-        },
-        {
-          "rows": 55,
-          "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
           "rows": 56,
           "speculative": true,
-          "pin": true
-        },
-        {
-          "rows": 57,
-          "speculative": true,
-          "pin": true
-        },
-        {
-          "rows": 58,
-          "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
           "rows": 59,
           "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
           "rows": 60,
           "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 61,
+          "speculative": false,
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            8316225,
+            8707041
+          ]
+        },
+        {
+          "rows": 61,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11209165,
+            11735577
+          ]
+        },
+        {
+          "rows": 61,
+          "speculative": false,
+          "op": "residual",
+          "pin": false,
+          "capture_bytes": [
+            22417650,
+            23597574
+          ]
         },
         {
           "rows": 61,
           "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
           "rows": 62,
           "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         },
         {
           "rows": 63,
           "speculative": true,
-          "pin": true
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "attention",
+          "sequences": 1,
+          "pin": false,
+          "capture_bytes": [
+            10138791,
+            10174188
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            13665327,
+            13713036
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "residual",
+          "pin": true,
+          "capture_bytes": [
+            27330654,
+            27573524
+          ]
         },
         {
           "rows": 64,
           "speculative": true,
-          "pin": true
+          "op": "attention",
+          "sequences": 15,
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": true,
+          "op": "attention",
+          "sequences": 16,
+          "pin": true,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3526536,
+            3538848
+          ]
         }
       ]
     }

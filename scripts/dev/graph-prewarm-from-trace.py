@@ -134,22 +134,6 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
         snapshot_time = int(cache.get("sampled_at_ms", inferred_end))
         if device not in latest or snapshot_time >= latest[device][0]:
             latest[device] = (snapshot_time, trace)
-        device_counts = {}
-        for graph in trace["graphs"]:
-            if not graph["site"].startswith("kimi_k3."):
-                continue
-            key = kimi_geometry(graph["shape"])
-            if key[0] > 64:
-                continue  # Row-window prefill keys cannot replay (#1646).
-            cycles = graph.get("cycles")
-            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) \
-                if cycles is not None else int(graph["count"])
-            if count > 0:
-                device_counts[key] = device_counts.get(key, 0) + count
-        for key, count in device_counts.items():
-            counts[key] = max(counts.get(key, 0), count)
-    if not counts:
-        raise ValueError("trace contains no matching graph identities")
     for device, (_, trace) in latest.items():
         for graph in trace["graphs"]:
             if not graph["site"].startswith("kimi_k3."):
@@ -159,10 +143,15 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
             key = kimi_geometry(graph["shape"])
             if key[0] <= 64:
                 identities[identity] = (key, graph)
+    replayed = {}
     for identity, (key, graph) in identities.items():
         cycles = graph.get("cycles", {})
-        if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
+        request_count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
+        if request_count <= 0 or int(graph.get("hits", 0)) < 1:
             continue
+        replayed[identity] = (key, graph)
+        device_counts = counts.setdefault(identity[0], {})
+        device_counts[key] = device_counts.get(key, 0) + request_count
         why = reasons.setdefault(key, set())
         histogram = graph.get("hit_histogram", {})
         histogram_end = int(histogram.get("start_ms", 0)) + \
@@ -171,7 +160,11 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
             why.add("sustained_heat")
         if int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2:
             why.add("repeated_recapture")
-    lifetime_reasons = kimi_lifetime_pins(identities)
+    counts = {key: max(rows.get(key, 0) for rows in counts.values())
+              for key in {key for rows in counts.values() for key in rows}}
+    if not counts:
+        raise ValueError("trace contains no replayed Kimi request identities")
+    lifetime_reasons = kimi_lifetime_pins(replayed)
     for key, why in lifetime_reasons.items():
         reasons.setdefault(key, set()).update(why)
     ranked = sorted(counts, key=lambda key: (-counts[key], key[0], key[1]))
@@ -232,6 +225,9 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
                                    "lifetime_request_hits": sum(min(int(graph.get("hits", 0)),
                                        sum(int(graph.get("cycles", {}).get(cycle, 0))
                                            for cycle in ("decode", "verify"))) for graph in graphs),
+                                   "zero_hit_sibling_identities": sum(int(graph.get("hits", 0)) == 0 for graph in graphs),
+                                   "zero_hit_sibling_bytes": sum(int(graph.get("capture_bytes") or 0)
+                                       for graph in graphs if int(graph.get("hits", 0)) == 0),
                                    "executables": sum(int(graph.get("executables", 1)) for graph in graphs),
                                    "observed_permanent_lower_bound_bytes":
                                        sum(int(graph["permanent_bytes"]) for graph in graphs) if known else None,

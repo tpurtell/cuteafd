@@ -483,6 +483,47 @@ def test_kimi_lifetime_tiers_are_independent_per_device_and_operation():
         (4, "ffn"), (8, "ffn"), (16, "residual")}
 
 
+def test_kimi_zero_replay_geometry_stays_lazy_even_with_hot_request_counts():
+    data = kimi_trace()
+    seed = data["graphs"][0]
+    data["graphs"].append(dict(seed, key_id=2,
+        shape="lane=0 rank=0 rows=4 op=attention layer=0 seq=1 spec=1",
+        hits=0, cycles={"verify": 10000}, capture_bytes=None,
+        evictions=10, recaptures=10))
+    row = MODULE.generate_kimi([data], 1, "min", coverage=1)
+    assert len(row["entries"]) == 1
+    assert row["entries"][0]["rows"] == 1
+    data["graphs"][0]["hits"] = 0
+    with pytest.raises(ValueError, match="no replayed"):
+        MODULE.generate_kimi([data], 1, "min")
+
+
+def test_kimi_one_replay_selects_whole_geometry_and_charges_zero_hit_sibling():
+    data = kimi_trace()
+    graph = data["graphs"][0]
+    graph.update(hits=1, cycles={"decode": 2}, capture_bytes=3)
+    data["graphs"].append(dict(graph, bank=2, hits=0, capture_bytes=7))
+    report = []
+    row = MODULE.generate_kimi([data], 1, "min", pin_report=report)
+    assert row["entries"][0]["capture_bytes"] == [10]
+    assert report[0]["zero_hit_sibling_identities"] == 1
+    assert report[0]["zero_hit_sibling_bytes"] == 7
+
+
+def test_kimi_old_replayed_geometry_cannot_survive_latest_zero_replay_inventory():
+    import copy
+    old = kimi_trace(rows=4, speculative=True)
+    old["cache"]["sampled_at_ms"] = 100
+    new = copy.deepcopy(old)
+    new["cache"]["sampled_at_ms"] = 200
+    new["graphs"][0].update(hits=0, cycles={"verify": 1}, capture_bytes=None)
+    plain = kimi_trace()["graphs"][0]
+    new["graphs"].append(plain)
+    for traces in ([old, new], [new, old]):
+        row = MODULE.generate_kimi(traces, 1, "min")
+        assert [entry["rows"] for entry in row["entries"]] == [1]
+
+
 def test_kimi_entry_costs_sum_to_each_once_rounded_base():
     traces = [kimi_trace(device=rank) for rank in (0, 1)]
     for rank, data in enumerate(traces):
@@ -498,6 +539,41 @@ def test_kimi_entry_costs_sum_to_each_once_rounded_base():
     traces[1]["graphs"] = traces[1]["graphs"][:1]
     row = MODULE.generate_kimi(traces, 2, "max", coverage=1)
     assert row["entries"][1]["capture_bytes"] == [13, None]
+
+
+def test_kimi_seeded_grouped_trace_reproduces_checked_in_layouts():
+    fixture = json.loads((SCRIPT.parents[1] / "tests/fixtures/kimi-prewarm-seeded.json").read_text())
+    checked = json.loads((SCRIPT.parents[2] /
+        "rust/crates/cuteafd-loader/src/serving_capacity/kimi_prewarm.json").read_text())
+    for layout in fixture["layouts"]:
+        traces = []
+        for rank, device in enumerate(layout["devices"]):
+            data = kimi_trace(device=device["device"])
+            seed = data["graphs"][0]
+            data["graphs"] = []
+            for index, group in enumerate(device["groups"]):
+                rows, spec, op, seq, hits, decode, verify, other, identities, cost = group
+                shape = f"lane=0 rank={rank} rows={rows} op={op}"
+                if op == "attention":
+                    shape += f" layer=0 seq={seq} spec={int(spec)}"
+                elif op == "context":
+                    shape += f" layer=0 spec={int(spec)}"
+                else:
+                    shape += " site=Norm" if op == "residual" else " layer=0"
+                share, tail = divmod(cost, identities)
+                for sibling in range(identities):
+                    data["graphs"].append(dict(seed, key_id=f"{index}-{sibling}", shape=shape,
+                        hits=hits, cycles={"decode": decode, "verify": verify, "other": other},
+                        capture_bytes=share + (sibling < tail),
+                        hit_histogram={"interval_ms": 10000, "start_ms": 0, "counts": [0] * 60}))
+            traces.append(data)
+        result = MODULE.generate_kimi(traces, layout["ranks"], layout["layout"])
+        expected = next(row for row in checked["layouts"] if row["ranks"] == layout["ranks"])
+        assert result == expected
+        for rank in range(layout["ranks"]):
+            assert MODULE.packed(sum(entry["capture_bytes"][rank] or 0
+                for entry in result["entries"])) == result["reserve_base_bytes"][rank]
+        assert result["reserve_extra_bytes"] == MODULE.CHUNK
 
 
 def test_kimi_zero_share_is_valid_and_missing_rank_fails():

@@ -8,8 +8,8 @@
 //! `reserve_base_bytes` holds each physical rank's measured prewarm arena;
 //! `reserve_extra_bytes` is the 2 MiB allocation tail. Shared
 //! GPU_GRAPH_RESERVE_EXTRA supplies runtime headroom; GPU_GRAPH_RESERVE
-//! overrides the whole reserve. The census base is provisional until a
-//! GRAPH_TRACE run replaces them; regenerate with
+//! overrides the whole reserve. Bases and per-entry costs come from the seeded
+//! adaptive min/max GRAPH_TRACE run; regenerate with
 //! `scripts/dev/graph-prewarm-from-trace.py --family kimi_k3`.
 //!
 //! Listed rows preserve observed operation, verify variant and attention
