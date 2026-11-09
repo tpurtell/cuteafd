@@ -66,7 +66,8 @@ fn kimi_prewarm_list() -> &'static KimiPrewarmList {
     })
 }
 
-/// An untraced layout must not borrow another layout's geometries.
+/// An untraced layout prewarms unpinned bootstrap geometry, never another
+/// layout's geometries or pins.
 pub fn kimi_layout(ranks: usize) -> &'static KimiPrewarmLayout {
     let list = kimi_prewarm_list();
     list.layouts.iter().find(|layout| layout.ranks == ranks)
@@ -84,9 +85,9 @@ fn kimi_bootstrap_layout() -> &'static KimiPrewarmLayout {
         reserve_base_bytes: vec![],
         reserve_extra_bytes: 2 << 20,
         entries: [1, 4, 16, 64].into_iter().map(|rows|
-            KimiPrewarmEntry { rows, speculative: false, pin: true, op: None, sequences: None })
+            KimiPrewarmEntry { rows, speculative: false, pin: false, op: None, sequences: None })
             .chain((2..=64).map(|rows|
-                KimiPrewarmEntry { rows, speculative: true, pin: true, op: None, sequences: None })).collect(),
+                KimiPrewarmEntry { rows, speculative: true, pin: false, op: None, sequences: None })).collect(),
     })
 }
 
@@ -160,6 +161,22 @@ mod tests {
         }
         for rows in [0, 65, 1024, 3072, 4096] {
             assert!(!kimi_selected(layout, rows, false, KimiPrewarmOp::Ffn, None, false));
+        }
+    }
+
+    #[test]
+    fn untraced_layout_prewarms_bootstrap_without_pinning() {
+        let layout = kimi_layout(9);
+        assert_eq!(layout.ranks, 0);
+        assert!(!layout.entries.is_empty());
+        assert!(layout.entries.iter().all(|entry| !entry.pin));
+        for entry in &layout.entries {
+            for op in [KimiPrewarmOp::Residual, KimiPrewarmOp::Ffn,
+                KimiPrewarmOp::Attention, KimiPrewarmOp::Context] {
+                let sequences = (op == KimiPrewarmOp::Attention).then_some(1);
+                assert!(kimi_selected(layout, entry.rows, entry.speculative, op, sequences, false));
+                assert!(!kimi_selected(layout, entry.rows, entry.speculative, op, sequences, true));
+            }
         }
     }
 
