@@ -1822,6 +1822,10 @@ pub(super) mod tests {
         for rank in 0..2 {
             let charges = admitted.placement.items[rank].iter().filter(|item|
                 item.group == super::super::graphs::RESERVE).collect::<Vec<_>>();
+            assert_eq!(super::super::graphs::RESERVE, "graph reserve",
+                "shared reconciliation recognizes the canonical graph owner");
+            assert!(!admitted.placement.items[rank].iter().any(|item|
+                item.group == "Kimi startup graph reserve"));
             assert_eq!(charges.len(), 1, "one configured graph arena per device");
             assert_eq!(charges[0].bytes, reserve[rank].bytes);
         }

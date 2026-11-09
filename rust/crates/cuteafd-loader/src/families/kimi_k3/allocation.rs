@@ -259,7 +259,7 @@ impl NativeScratch {
     }
 }
 
-pub const GRAPH_RESERVE: &str = "Kimi startup graph reserve";
+pub const GRAPH_RESERVE: &str = "graph reserve";
 /// Header-only plans calibrate the CUDA context and loaded modules as one
 /// Estimated owner; the runtime replaces it with the measured post-module
 /// baseline under `CONTEXT_MEASURED`. Neither is a single driver request.
