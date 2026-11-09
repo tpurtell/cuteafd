@@ -1,7 +1,7 @@
 //! Learned index-query projections and fused rotary/FP4 preparation on the RTX.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput;
-use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::decode_graph::{CacheAttached, LayerGraphs};
 use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
@@ -217,6 +217,11 @@ pub(crate) struct IndexQueryWave<'w, 'a> {
     tokens: Vec<u64>,
 }
 impl<'w, 'a> IndexQueryWave<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn CacheAttached) -> Result<()>) -> Result<()> {
+        let device = self.storage.hidden.buffer.device_id;
+        f(device, "v41.index.query", false, &mut self.graphs)
+    }
+
     /// Retain captured weight owners while reusing this lane's fixed buffers.
     pub fn rebind(&mut self, weights: &'w IndexQueryWeights<'a>) -> Result<()> {
         ensure!(self.pending.is_none(), "index query pending");
@@ -375,11 +380,6 @@ impl IndexQueryWave<'_, '_> {
         self.tokens.clear();
         unsafe { self.capture_ready(rows) }
     }
-    pub(crate) fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
-        self.storage.stream.require_complete()?;
-        ensure!(self.pending.is_none() && self.ready.is_none(), "index query startup requires an idle owner");
-        self.graphs.declare_startup(keys)
-    }
     pub(crate) fn capture_startup(&mut self, rows: u32) -> Result<()> {
         self.validate(rows)?;
         self.storage.stream.require_complete()?;
@@ -387,20 +387,22 @@ impl IndexQueryWave<'_, '_> {
         // owner, without executing or publishing a query/proposal snapshot.
         unsafe { self.capture_ready(rows) }
     }
-    pub(crate) fn finish_startup(&mut self) -> Result<()> { self.graphs.finish_startup() }
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
+        let Some(ticket) = self.graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(rows), None) else {
+            super::graph_policy::note_miss(format!("index_query rows={rows} layer={}", self.weights.layer), || "graph cache selected eager".into());
+            return Ok(());
+        };
         unsafe {
             self.storage.stream
                 .library
                 .cuda_graph_begin_capture(self.storage.stream.raw)?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
+        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 if let Err(error) = unsafe {
-                    self.graphs
-                        .insert(self.weights.layer, self.weights, rows, graph)
+                    self.graphs.cache_insert(self.weights.layer, self.weights, rows, graph, ticket, nodes as u64, width, spans)
                 } {
                     unsafe {
                         self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
@@ -409,7 +411,7 @@ impl IndexQueryWave<'_, '_> {
                 }
                 Ok(())
             }
-            (Err(e), Ok(graph)) => {
+            (Err(e), Ok((graph, _, _, _, _))) => {
                 unsafe {
                     self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
                 }
@@ -423,10 +425,9 @@ impl IndexQueryWave<'_, '_> {
     pub unsafe fn replay(&mut self, rows: u32) -> Result<IndexQueryOutput<'_>> {
         ensure!(!self.window.is_windowed(), "windowed index query cannot replay");
         self.validate(rows)?;
-        let (graph, count) = self
-            .graphs
-            .get_shape(self.weights.layer, self.weights, rows)
-            .context("index query graph missing")?;
+        let Some((graph, count)) = self.graphs.cached_launch(self.weights.layer, self.weights, rows) else {
+            return unsafe { self.execute(rows) };
+        };
         ensure!(count == rows, "index query capture row count differs");
         let launched = unsafe {
             self.storage.stream
@@ -472,15 +473,7 @@ impl IndexQueryWave<'_, '_> {
             self.storage.stream.library.copy_d2d(dst, src, src.bytes)?;
         }
         let rows = query.rows as u32;
-        if !super::graph_policy::captures_shape(rows)
-            || (self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none()
-                && !self.graphs.capture_allowed(self.weights.layer, rows)) {
-            if super::graph_policy::captures_shape(rows)
-                && self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none()
-                && !self.graphs.capture_allowed(self.weights.layer, rows) {
-                super::graph_policy::note_miss(format!("index_query rows={rows} layer={}", self.weights.layer),
-                    || format!("capacity={}", self.capacity));
-            }
+        if !super::graph_policy::captures_shape(rows) {
             unsafe { self.execute(rows)?; }
             self.origin = Some(binding);
             self.tokens.extend_from_slice(tokens);
@@ -513,9 +506,8 @@ impl IndexQueryWave<'_, '_> {
             && query.hidden.device_id == self.storage.hidden.buffer.device_id, "queued index origin differs");
         self.tokens.extend_from_slice(tokens);
         let rows = query.rows as u32;
-        let graph = if self.window.is_windowed() { None } else { self.graphs.get_shape(self.weights.layer, self.weights, rows) };
+        let graph = if self.window.is_windowed() { None } else { self.graphs.cached_launch(self.weights.layer, self.weights, rows) };
         self.pending = Some((rows, binding, !self.window.is_windowed() && graph.is_none() && super::graph_policy::captures_shape(rows)
-            && self.graphs.capture_allowed(self.weights.layer, rows)
             && !crate::shared::decode_graph::census::eager("layer_row")));
         let result = (|| -> Result<()> { unsafe {
             crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
@@ -572,7 +564,6 @@ impl IndexQueryWave<'_, '_> {
             _owner: PhantomData,
         })
     }
-    pub fn enable_small_graph_shapes(&mut self) { self.graphs.enable_small_shapes(); }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.ready = None;
         self.origin = None;
@@ -617,6 +608,12 @@ mod reuse_tests {
             .collect::<Result<Vec<_>>>()?;
         let budget = IndexQueryWave::device_bytes(&library, 4096)?;
         let mut reused = weights[0].wave(4096, budget)?;
+        reused.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+            crate::shared::decode_graph::device::Site { name,
+                cycle: crate::shared::decode_graph::device::Cycle::Other,
+                preference: crate::shared::decode_graph::device::Preference::Capture,
+                bootstrap: 2 << 20, basis: crate::shared::decode_graph::device::Basis::Bytes,
+                spans_devices: spans }))?;
         let pointers = [
             reused.query_rank().ptr,
             reused.hidden().ptr,

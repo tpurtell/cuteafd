@@ -3,7 +3,7 @@
 pub(crate) mod tp2;
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_block::FfnInput;
-use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::decode_graph::{CacheAttached, LayerGraphs};
 use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_shared_ffn::{SharedFfn, SharedFfnStorage};
@@ -208,6 +208,11 @@ pub(crate) struct BackboneSharedWave<'w, 'a> {
     origin: Option<QueryBinding>,
 }
 impl<'w, 'a> BackboneSharedWave<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn CacheAttached) -> Result<()>) -> Result<()> {
+        let device = self.input().device_id;
+        f(device, "v41.backbone.shared", false, &mut self.graphs)
+    }
+
     /// Reuse this lane's shared-expert storage with another backbone layer.
     pub fn rebind(&mut self, weights: &'w BackboneSharedWeights<'a>) -> Result<()> {
         self.invalidate();
@@ -299,6 +304,10 @@ impl<'a> BackboneSharedWave<'_, 'a> {
     }
     // Warmup has completed. Capture never yields with the stream in capture mode.
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
+        let Some(ticket) = self.graphs.cache_ticket(&(self.layer, rows), super::graph_policy::pinned_shape(rows), None) else {
+            super::graph_policy::note_miss(format!("backbone_shared rows={rows} layer={}", self.layer), || "graph cache selected eager".into());
+            return Ok(());
+        };
         self.invalidate();
         unsafe {
             self.stream()
@@ -306,11 +315,11 @@ impl<'a> BackboneSharedWave<'_, 'a> {
                 .cuda_graph_begin_capture(self.stream().raw)?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
+        let captured = unsafe { self.stream().library.cuda_graph_end_capture_topology(self.stream().raw) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 if let Err(error) =
-                    unsafe { self.graphs.insert(self.layer, self.weights, rows, graph) }
+                    unsafe { self.graphs.cache_insert(self.layer, self.weights, rows, graph, ticket, nodes as u64, width, spans) }
                 {
                     unsafe {
                         self.stream().library.cuda_graph_exec_destroy(graph)?;
@@ -319,7 +328,7 @@ impl<'a> BackboneSharedWave<'_, 'a> {
                 }
                 Ok(())
             }
-            (Err(e), Ok(graph)) => {
+            (Err(e), Ok((graph, _, _, _, _))) => {
                 unsafe {
                     self.stream().library.cuda_graph_exec_destroy(graph)?;
                 }
@@ -332,10 +341,9 @@ impl<'a> BackboneSharedWave<'_, 'a> {
     /// Same contract as execute; graph live row count must match.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<SharedOutput<'_>> {
         self.validate(rows)?;
-        let (graph, count) = self
-            .graphs
-            .get_shape(self.layer, self.weights, rows)
-            .context("shared FFN graph missing")?;
+        let Some((graph, count)) = self.graphs.cached_launch(self.layer, self.weights, rows) else {
+            return unsafe { self.execute(rows) };
+        };
         ensure!(count == rows, "shared FFN captured rows differ");
         let launched = unsafe {
             self.stream()
@@ -407,7 +415,7 @@ impl<'a> BackboneSharedWave<'_, 'a> {
         let launched = (|| unsafe {
             crate::shared::memory::chain::join(self.stream().library, self.stream().raw)?;
             self.stream().library.copy_d2d_async(self.input(), input.values, input.values.bytes, self.stream().raw)?;
-            let graph = if self.window.is_windowed() { None } else { self.graphs.get_shape(self.layer, self.weights, rows).map(|(raw, _)| raw) };
+            let graph = if self.window.is_windowed() { None } else { self.graphs.cached_launch(self.layer, self.weights, rows).map(|(raw, _)| raw) };
             let library = self.stream().library; let stream = self.stream().raw;
             crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
                 graph, || self.enqueue(rows))
@@ -445,7 +453,6 @@ impl<'a> BackboneSharedWave<'_, 'a> {
             _owner: PhantomData,
         })
     }
-    pub fn enable_small_graph_shapes(&mut self) { self.graphs.enable_small_shapes(); }
     /// Evict all shapes for the current layer; other layers remain cached.
     pub fn clear_graph(&mut self) -> Result<()> {
         self.invalidate();

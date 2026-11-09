@@ -2,7 +2,7 @@
 use crate::shared::memory::Tag;
 use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, Stream}};
 use anyhow::{ensure, Context, Result};
-use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::decode_graph::{CacheAttached, LayerGraphs};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Fp8Plan, V41PeerCopy};
 use cuteafd_loader::OfficialV41Catalog;
 use std::rc::Rc;
@@ -131,7 +131,7 @@ impl<'w,'a> Rank<'w,'a> {
             ensure!(!weights[..index].iter().any(|other|other.layer==w.layer),"duplicate projection layer");
         }
         ensure!(storage.stream.device.id == device.id, "projection rank storage device differs");
-        let mut graphs=LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");graphs.enable_small_shapes();
+        let graphs=LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
         Ok(Self { graphs, weights, storage })
     }
 }
@@ -148,18 +148,22 @@ impl<'w,'a> Rank<'w,'a> {
         if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.graphs.get_shape(layer,weights,rows).is_some() { return Ok(()); }
         let device=self.storage.stream.device;
+        let Some(ticket) = self.graphs.cache_ticket(&(layer,rows), super::graph_policy::pinned_shape(rows), None) else {
+            super::graph_policy::note_miss(format!("projection_rank rows={rows}"), || "graph cache selected eager".into());
+            return Ok(());
+        };
         device.run(||unsafe {
             device.library.cuda_graph_begin_capture(self.storage.stream.raw)?;
             let queued=self.enqueue(weights,rows);
-            let captured=device.library.cuda_graph_end_capture(self.storage.stream.raw);
+            let captured=device.library.cuda_graph_end_capture_topology(self.storage.stream.raw);
             match (queued,captured) {
-                (Ok(()),Ok(graph)) => {
-                    if let Err(error)=self.graphs.insert(layer,weights,rows,graph) {
+                (Ok(()),Ok((graph, nodes, width, _spans, _))) => {
+                    if let Err(error)=self.graphs.cache_insert(layer,weights,rows,graph,ticket,nodes as u64,width,true) {
                         device.library.cuda_graph_exec_destroy(graph)?;return Err(error);
                     }
                     Ok(())
                 },
-                (Err(error),Ok(graph)) => { device.library.cuda_graph_exec_destroy(graph)?;Err(error) },
+                (Err(error),Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?;Err(error) },
                 (Err(error),Err(_)) | (Ok(()),Err(error)) => Err(error),
             }
         })
@@ -226,6 +230,17 @@ impl Drop for Drain<'_,'_,'_> {
     }
 }
 impl<'w,'a> Wave<'w,'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn CacheAttached) -> Result<()>) -> Result<()> {
+        let (rank_site, gather_site) = match self.kind {
+            Kind::QueryB => ("v41.projection.query.rank", "v41.projection.query.gather"),
+            Kind::OutputB => ("v41.projection.output.rank", "v41.projection.output.gather"),
+        };
+        for rank in &mut self.ranks {
+            f(rank.storage.input.buffer.device_id, rank_site, true, &mut rank.graphs)?;
+        }
+        f(self.storage.output.buffer.device_id, gather_site, true, &mut self.gather_graphs)
+    }
+
     pub fn kind(&self) -> Kind { self.kind }
     pub(crate) fn capacity(&self) -> u32 { self.capacity }
     pub fn output_device(&self) -> Device<'a> { self.storage.output.device }
@@ -258,7 +273,7 @@ impl<'w,'a> Wave<'w,'a> {
         ensure!(weights[0].len() == weights[1].len()
             && weights[0].iter().zip(weights[1]).all(|(a,b)| a.layer == b.layer),
             "projection rank layers differ");
-        let mut gather_graphs=LayerGraphs::new(a.device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");gather_graphs.enable_small_shapes();
+        let gather_graphs=LayerGraphs::new(a.device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
         Ok(Self { gather_graphs,
             ranks: [Rank::on_storage(weights[0], storage.ranks[0].clone())?, Rank::on_storage(weights[1], storage.ranks[1].clone())?],
             owner: storage.owner, capacity: storage.unit, kind: storage.kind, storage, window: RowWindow::NONE })
@@ -287,18 +302,22 @@ impl<'w,'a> Wave<'w,'a> {
         if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.gather_graphs.get_shape(0,weights,rows).is_some() { return Ok(()); }
         let stream=self.ranks[self.owner].storage.stream.raw;let device=self.storage.output.device;
+        let Some(ticket) = self.gather_graphs.cache_ticket(&(0,rows), super::graph_policy::pinned_shape(rows), None) else {
+            super::graph_policy::note_miss(format!("projection_gather rows={rows}"), || "graph cache selected eager".into());
+            return Ok(());
+        };
         device.run(||unsafe {
             device.library.cuda_graph_begin_capture(stream)?;
             let queued=self.enqueue_gather(rows);
-            let captured=device.library.cuda_graph_end_capture(stream);
+            let captured=device.library.cuda_graph_end_capture_topology(stream);
             match (queued,captured) {
-                (Ok(()),Ok(graph)) => {
-                    if let Err(error)=self.gather_graphs.insert(0,weights,rows,graph) {
+                (Ok(()),Ok((graph, nodes, width, _spans, _))) => {
+                    if let Err(error)=self.gather_graphs.cache_insert(0,weights,rows,graph,ticket,nodes as u64,width,true) {
                         device.library.cuda_graph_exec_destroy(graph)?;return Err(error);
                     }
                     Ok(())
                 },
-                (Err(error),Ok(graph)) => { device.library.cuda_graph_exec_destroy(graph)?;Err(error) },
+                (Err(error),Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?;Err(error) },
                 (Err(error),Err(_)) | (Ok(()),Err(error)) => Err(error),
             }
         })
@@ -333,8 +352,10 @@ impl<'w,'a> Wave<'w,'a> {
                 wave.ranks[input_rank].storage.stream.device.library.cuda_event_record(wave.storage.input_ready[input_rank].raw,producer)
             })?;
         }
-        for rank in &wave.ranks {
+        for rank in &mut wave.ranks {
             let weights=rank.weights.iter().find(|w|w.layer==layer).context("projection layer absent")?;
+            let graph = if wave.window.is_windowed() { None }
+                else { rank.graphs.cached_launch(layer,weights,rows).map(|(raw,_)|raw) };
             rank.storage.stream.device.run(||unsafe {
                 acquire(&rank.storage.guard, rank.storage.stream.raw)?;
                 if producer.is_some() {
@@ -342,18 +363,20 @@ impl<'w,'a> Wave<'w,'a> {
                 }
                 rank.storage.copy.launch_rows(rank.storage.input.buffer,input,k*2,rows as usize,k*2,k*2,rank.storage.stream.raw)?;
                 crate::shared::decode_graph::census::dispatch(rank.storage.stream.device.library, rank.storage.stream.raw,
-                    c"layer_row", rows as usize, if wave.window.is_windowed() { None } else { rank.graphs.get_shape(layer,weights,rows).map(|(raw,_)|raw) },
+                    c"layer_row", rows as usize, graph,
                     || rank.enqueue(weights,rows))
             })?;
         }
         let owner=&wave.ranks[wave.owner];let peer=&wave.ranks[1-wave.owner];
         peer.storage.stream.device.run(|| unsafe { peer.storage.stream.device.library.cuda_event_record(
             wave.storage.peer_done.raw, peer.storage.stream.raw) })?;
+        let gather_graph = if wave.window.is_windowed() { None }
+            else { wave.gather_graphs.cached_launch(0,&owner.weights[0],rows).map(|(raw,_)|raw) };
         owner.storage.stream.device.run(||unsafe {
             acquire(&wave.storage.guard, owner.storage.stream.raw)?;
             owner.storage.stream.device.library.cuda_stream_wait_event(owner.storage.stream.raw,wave.storage.peer_done.raw)?;
             crate::shared::decode_graph::census::dispatch(owner.storage.stream.device.library, owner.storage.stream.raw,
-                c"layer_row", rows as usize, if wave.window.is_windowed() { None } else { wave.gather_graphs.get_shape(0,&owner.weights[0],rows).map(|(raw,_)|raw) },
+                c"layer_row", rows as usize, gather_graph,
                 || wave.enqueue_gather(rows))
         })?;
         let output=CuteafdDeviceBuffer { bytes:rows as usize*n*2,..wave.storage.output.buffer };
@@ -397,6 +420,14 @@ mod tests {
             assert!(Wave::new(banks,capacity,0,[0,0]).is_err());
             let mut lanes=[Wave::new(banks,capacity,0,Wave::device_bytes(&lib,kind,capacity,0)?)?,
                 Wave::new(banks,capacity,1,Wave::device_bytes(&lib,kind,capacity,1)?)?];
+            for lane in &mut lanes {
+                lane.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+                    crate::shared::decode_graph::device::Site { name,
+                        cycle: crate::shared::decode_graph::device::Cycle::Other,
+                        preference: crate::shared::decode_graph::device::Preference::Capture,
+                        bootstrap: 2 << 20, basis: crate::shared::decode_graph::device::Basis::Bytes,
+                        spans_devices: spans }))?;
+            }
             let inputs=[Allocation::new(devices[0],capacity as usize*k*2, crate::shared::memory::TEST)?,
                 Allocation::new(devices[1],capacity as usize*k*2, crate::shared::memory::TEST)?];
             let plan=devices[0].run(||lib.v41_fp8_matrix_plan(capacity,k as u32,n as u32))?;

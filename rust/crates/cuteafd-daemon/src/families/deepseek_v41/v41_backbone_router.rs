@@ -1,7 +1,7 @@
 //! Official backbone routing with block-bound inputs and canonical TP4 requests.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_block::FfnInput;
-use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::decode_graph::{CacheAttached, LayerGraphs};
 use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
@@ -249,6 +249,12 @@ mod reuse_tests {
             .collect::<Result<Vec<_>>>()?;
         for rows in [1, 16, 80, 256] {
             let mut lane = weights[0].wave(rows, BackboneRouterWave::device_bytes(rows)?)?;
+            lane.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+                crate::shared::decode_graph::device::Site { name,
+                    cycle: crate::shared::decode_graph::device::Cycle::Other,
+                    preference: crate::shared::decode_graph::device::Preference::Capture,
+                    bootstrap: 2 << 20, basis: crate::shared::decode_graph::device::Basis::Bytes,
+                    spans_devices: spans }))?;
             let mut handles = std::collections::HashMap::new();
             for (cycle, local) in [false, true, false, true].into_iter().enumerate() {
                 for layer in 0..2 {
@@ -319,6 +325,12 @@ mod reuse_tests {
                 (0..40).collect()
             };
             let mut lane = weights[0].wave(rows, BackboneRouterWave::device_bytes(rows)?)?;
+            lane.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+                crate::shared::decode_graph::device::Site { name,
+                    cycle: crate::shared::decode_graph::device::Cycle::Other,
+                    preference: crate::shared::decode_graph::device::Preference::Capture,
+                    bootstrap: 2 << 20, basis: crate::shared::decode_graph::device::Basis::Bytes,
+                    spans_devices: spans }))?;
             let pointers = lane.inputs().map(|b| b.ptr);
             let mut handles = std::collections::HashMap::new();
             for cycle in 0..2usize {
@@ -432,6 +444,15 @@ pub(crate) struct BackboneRouterWave<'w, 'a> {
     wait: std::cell::RefCell<crate::shared::memory::BlockingWait<'a>>,
 }
 impl<'w, 'a> BackboneRouterWave<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn CacheAttached) -> Result<()>) -> Result<()> {
+        let device = self.b(0).device_id;
+        let (current, other) = if self.full_request {
+            ("v41.router.remote", "v41.router.local")
+        } else { ("v41.router.local", "v41.router.remote") };
+        f(device, current, false, &mut self.graphs)?;
+        f(device, other, false, &mut self.other_graphs)
+    }
+
     pub fn rebind(&mut self, weights: &'w BackboneRouterWeights<'a>) -> Result<()> {
         self.invalidate();
         ensure!(
@@ -624,11 +645,6 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         }
         unsafe { self.capture_ready(rows) }
     }
-    pub(crate) fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
-        self.stream().require_complete()?;
-        self.graphs.declare_startup(keys)?;
-        self.other_graphs.declare_startup(keys)
-    }
     pub(crate) fn capture_startup(&mut self, rows: u32) -> Result<()> {
         self.validate(rows)?;
         self.stream().require_complete()?;
@@ -647,12 +663,12 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         let restored = self.set_local_mode(local);
         result.and(restored)
     }
-    pub(crate) fn finish_startup(&mut self) -> Result<()> {
-        self.graphs.finish_startup()?;
-        self.other_graphs.finish_startup()
-    }
     // Warmup has completed. Capture never yields with the stream in capture mode.
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
+        let Some(ticket) = self.graphs.cache_ticket(&(self.layer, rows), super::graph_policy::pinned_shape(rows), None) else {
+            super::graph_policy::note_miss(format!("backbone_router rows={rows} layer={}", self.layer), || "graph cache selected eager".into());
+            return Ok(());
+        };
         self.invalidate();
         unsafe {
             self.stream()
@@ -660,11 +676,11 @@ impl<'a> BackboneRouterWave<'_, 'a> {
                 .cuda_graph_begin_capture(self.stream().raw)?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
+        let captured = unsafe { self.stream().library.cuda_graph_end_capture_topology(self.stream().raw) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 if let Err(error) =
-                    unsafe { self.graphs.insert(self.layer, self.weights, rows, graph) }
+                    unsafe { self.graphs.cache_insert(self.layer, self.weights, rows, graph, ticket, nodes as u64, width, spans) }
                 {
                     unsafe {
                         self.stream().library.cuda_graph_exec_destroy(graph)?;
@@ -673,7 +689,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
                 }
                 Ok(())
             }
-            (Err(e), Ok(graph)) => {
+            (Err(e), Ok((graph, _, _, _, _))) => {
                 unsafe {
                     self.stream().library.cuda_graph_exec_destroy(graph)?;
                 }
@@ -689,10 +705,9 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     }
     unsafe fn replay_counted(&mut self, rows: u32, phase: Option<cuteafd_ffi::expert_usage::UsagePhase>) -> Result<RouterOutput<'_>> {
         self.validate(rows)?;
-        let (graph, count) = self
-            .graphs
-            .get_shape(self.layer, self.weights, rows)
-            .context("backbone router graph missing")?;
+        let Some((graph, count)) = self.graphs.cached_launch(self.layer, self.weights, rows) else {
+            return unsafe { self.execute_counted(rows, phase) };
+        };
         ensure!(count == rows, "backbone router captured rows differ");
         let launched = unsafe {
             self.stream()
@@ -818,15 +833,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     }
     unsafe fn execute_selected(&mut self, rows: u32, phase: Option<cuteafd_ffi::expert_usage::UsagePhase>) -> Result<RouterOutput<'_>> {
         self.invalidate();
-        if self.window.is_windowed() || !super::graph_policy::captures_shape(rows)
-            || (self.graphs.get_shape(self.layer, self.weights, rows).is_none()
-                && !self.graphs.capture_allowed(self.layer, rows)) {
-            if !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
-                && self.graphs.get_shape(self.layer, self.weights, rows).is_none()
-                && !self.graphs.capture_allowed(self.layer, rows) {
-                super::graph_policy::note_miss(format!("backbone_router rows={rows} layer={}", self.layer),
-                    || format!("capacity={} windowed={}", self.capacity, self.window.is_windowed()));
-            }
+        if self.window.is_windowed() || !super::graph_policy::captures_shape(rows) {
             return unsafe { self.execute_counted(rows, phase) };
         }
         if self
@@ -860,7 +867,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         let cold = self.graphs.get_shape(self.layer, self.weights, rows).is_none();
         let launched = (|| unsafe {
             self.stage_inputs(input.values, image_mask)?;
-            let graph = if self.window.is_windowed() { None } else { self.graphs.get_shape(self.layer, self.weights, rows).map(|(raw, _)| raw) };
+            let graph = if self.window.is_windowed() { None } else { self.graphs.cached_launch(self.layer, self.weights, rows).map(|(raw, _)| raw) };
             let library = self.stream().library; let stream = self.stream().raw;
             crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
                 graph, || self.enqueue(rows))?;
@@ -885,18 +892,12 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         // to follow its eager run, so it chains like a replay instead of
         // stalling the issuing thread on every layer.
         let captures = !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
-            && self.graphs.capture_allowed(self.layer, rows)
             && !crate::shared::decode_graph::census::eager("layer_row");
         // SAFETY: this wave retains all queued input and output storage.
         unsafe { crate::shared::memory::chain::finish_or_wait(self.stream(),
             (!cold || !captures) && device_read).await?; }
+
         if cold && !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
-            && !self.graphs.capture_allowed(self.layer, rows) {
-            super::graph_policy::note_miss(format!("backbone_router rows={rows} layer={}", self.layer),
-                || format!("capacity={} windowed={}", self.capacity, self.window.is_windowed()));
-        }
-        if cold && !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
-            && self.graphs.capture_allowed(self.layer, rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result
@@ -934,10 +935,6 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         })
     }
     /// Clear only this layer; other layers retain their captured shape.
-    pub fn enable_small_graph_shapes(&mut self) {
-        self.graphs.enable_small_shapes();
-        self.other_graphs.enable_small_shapes();
-    }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.invalidate();
         self.synchronize()?;
@@ -1150,6 +1147,12 @@ mod expert_usage_tests {
             let weights = BackboneRouterWeights::load(&library, &catalog, layer, usize::MAX, 1 << 20)?;
             let capacity = 2768;
             let mut wave = weights.wave(capacity, usize::MAX)?;
+            wave.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+                crate::shared::decode_graph::device::Site { name,
+                    cycle: crate::shared::decode_graph::device::Cycle::Other,
+                    preference: crate::shared::decode_graph::device::Preference::Capture,
+                    bootstrap: 2 << 20, basis: crate::shared::decode_graph::device::Basis::Bytes,
+                    spans_devices: spans }))?;
             wave.install_expert_usage(Some(usage.clone()));
             wave.set_local_mode(true)?;
             let [input, mask] = wave.inputs();
