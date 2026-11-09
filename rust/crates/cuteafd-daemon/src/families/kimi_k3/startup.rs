@@ -39,6 +39,7 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
     pub devices: [i32; RANKS],
     pub attention: Option<cuteafd_loader::placement::AttentionPlacement>,
     pub native_lib: &'a Path,
+    pub manifest: &'a Path,
     pub peers: Vec<SocketAddr>,
     pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     /// Lane rows: `waves` prefill units of `rows / waves` each.
@@ -268,6 +269,28 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         startup: reserve_demands, pool_bounded: vec![], rtx,
         spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
     options.max_context = usize::try_from(options.context.served(admitted.placement.pool_tokens))?;
+    {
+        use sha2::{Digest, Sha256};
+        let hash = |path: &Path| -> Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let mut digest = Sha256::new();
+            std::io::copy(&mut file, &mut digest)?;
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {
+                "schema_version": 1, "family": "kimi_k3",
+                "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                "native_sha256": hash(options.native_lib)?, "programs_sha256": hash(options.manifest)?,
+                "layout": format!("{RANKS} RTX/{spark_ranks} Sparks; attention/{:?}; context/{}; slots/{}",
+                    options.attention, options.max_context, options.slots),
+                "devices": inventory.gpus, "spark_world": spark_ranks,
+                "onboard_layers": admitted.placement.onboard_layers,
+                "graph_basis": "uncalibrated Kimi byte fallback"
+            }
+        }));
+    }
     memory.sample("admission-resolved")?;
     let graph_set = admitted.graph_set.take();
     let spark_layers = admitted.working_set().spark_layers;

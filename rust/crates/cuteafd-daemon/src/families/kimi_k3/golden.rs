@@ -610,6 +610,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
         cache_format: args.kv_cache, devices,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         native_lib: args.native_lib.as_deref().context("--native-lib required")?,
+        manifest: &args.manifest,
         peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?),

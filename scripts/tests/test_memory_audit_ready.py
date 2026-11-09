@@ -310,6 +310,24 @@ def test_typed_reports_use_kinds_not_scope_names():
     assert cats == {"kv": 400, "drafter": 200, "untagged": 50, "staging": 50, "runtime": 100}
 
 
+def test_kimi_reconciliation_uses_shared_ready_first_request_and_stats_paths():
+    root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src"
+    startup = (root / "families/kimi_k3/startup.rs").read_text()
+    assert '"memory_reconciliation_provenance"' in startup
+    for field in ["source_commit", "native_sha256", "programs_sha256", "devices"]:
+        assert f'"{field}"' in startup
+    assert '"devices": inventory.gpus' in startup
+    assert "hash(options.manifest)?" in startup
+    for name in ["serve.rs", "golden.rs"]:
+        assert "manifest: &args.manifest" in (root / "families/kimi_k3" / name).read_text()
+    assert 'memory_report::log("ready")' in (root / "families/kimi_k3/serve.rs").read_text()
+    assert 'if stage == "ready" { reconcile::capture(&stage); }' in (root / "shared/memory_report.rs").read_text()
+    scheduler = (root / "shared/qwen/scheduler.rs").read_text()
+    assert 'first_request(requests, &FIRST,' in scheduler
+    assert 'reconcile::capture("first_request")' in scheduler
+    assert 'memory_reconciliation' in (root / "shared/probe.rs").read_text()
+
+
 def test_kind_category_mirrors_every_memory_kind():
     source = (Path(__file__).parents[2] / "rust/crates/cuteafd-core/src/memory_layout.rs").read_text()
     labels = re.findall(r'Self::\w+ => "(\w+)",', source.split("pub const fn label(self)", 1)[1].split("}", 1)[0])
