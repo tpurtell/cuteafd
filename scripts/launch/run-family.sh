@@ -421,7 +421,7 @@ spark_profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_
 }
 shared_graph_census_args() {
 graph_census_args=()
-if [[ "$family" == glm5 ]]; then
+if [[ "$family" == glm5 || "$family" == deepseek_v41 ]]; then
   local graph_reserve graph_trace
   graph_reserve="$(get GPU_GRAPH_RESERVE)"
   graph_trace="$(get GRAPH_TRACE)"
@@ -720,6 +720,10 @@ v41_decode_lanes="$(get DECODE_LANES)"
 # Keep checkpoint paths unchanged inside the full namespace mount.
 count_mounts=(-e "HF_HOME=$container_hf_home" ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} "${namespace_mount_args[@]}"
   -v "$count_config:/run/cuteafd-plan.config:ro")
+# Admit the same graph reserve the server will launch with.
+for key in GPU_GRAPH_RESERVE SPARK_GRAPH_RESERVE; do
+  [[ -z "$(get "$key")" ]] || count_mounts+=(-e "CUTEAFD_$key=$(get "$key")")
+done
 if [[ -n "$wip_layout" ]]; then
   count_mounts+=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro" --entrypoint /opt/cuteafd/bin/cuteafd)
@@ -1447,7 +1451,7 @@ if [[ "$family" == qwen4 ]]; then
 fi
 # Docker options only the Spark expert workers take (their environment and mounts).
 spark_worker_env=""
-if [[ "$family" == glm5 && -n "$(get SPARK_GRAPH_RESERVE)" ]]; then
+if [[ ( "$family" == glm5 || "$family" == deepseek_v41 ) && -n "$(get SPARK_GRAPH_RESERVE)" ]]; then
   spark_worker_env+=" -e $(printf '%q' "CUTEAFD_SPARK_GRAPH_RESERVE=$(get SPARK_GRAPH_RESERVE)")"
 fi
 # Options only the Spark expert workers take.
@@ -2517,7 +2521,7 @@ audio_encoder_hash=""
   # it neither needs nor creates PROFILE_DIR (shared_profile_args owns that, and
   # it still runs after the Spark profile validation below).
   plan_profile_env=()
-  if [[ "$family" == glm5 ]]; then
+  if [[ "$family" == glm5 || "$family" == deepseek_v41 ]]; then
     for key in GPU_GRAPH_RESERVE SPARK_GRAPH_RESERVE; do
       [[ -z "$(get "$key")" ]] || plan_profile_env+=(-e "CUTEAFD_$key=$(get "$key")")
     done

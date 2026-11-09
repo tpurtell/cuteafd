@@ -59,3 +59,39 @@ def test_invalid_trace_fails(change):
     change(data)
     with pytest.raises(ValueError):
         MODULE.generate([data], "glm5")
+
+
+def v41_trace(counts=(32, 32, 1), prefill=False):
+    graphs = [{"device": 0, "site": "deepseek_v41.lane_row", "bank": 1,
+               "shape": f"(7, {rows})", "count": count} for rows, count in zip((1, 16, 128), counts)]
+    if prefill:
+        graphs.append({"device": 0, "site": "deepseek_v41.lane_prefill", "bank": 1,
+                       "shape": "(7, 2752)", "count": 3})
+    return {"schema_version": 1, "cache": {"device": 0, "charged": 5 << 20},
+            "sites": {"deepseek_v41.lane_row": {"largest_bytes": 2 << 20}}, "graphs": graphs}
+
+
+def test_v41_rows_pin_the_hot_decode_width_and_keep_replay():
+    result = MODULE.generate([v41_trace()], "deepseek_v41", coverage=0.99)
+    assert result["family"] == "deepseek_v41"
+    # 1 and 16 are the hot widths; 128 is retained for the decoder replay.
+    assert [entry["rows"] for entry in result["entries"]] == [1, 16, 128]
+    assert [entry["pin"] for entry in result["entries"]] == [True, False, False]
+    assert "table_width" not in result["entries"][0]
+    assert result["reserve_base_bytes"] == 6 << 20
+    assert result["reserve_extra_bytes"] == 2 << 20
+
+
+def test_v41_prefill_chunk_is_admitted_only_when_declared():
+    with pytest.raises(ValueError):
+        MODULE.generate([v41_trace(prefill=True)], "deepseek_v41")
+    result = MODULE.generate([v41_trace(prefill=True)], "deepseek_v41", prefill_rows=2752)
+    assert any(entry["rows"] == 2752 for entry in result["entries"])
+
+
+def test_v41_selection_vector_key_needs_a_site_rule():
+    data = v41_trace()
+    data["graphs"].append({"device": 0, "site": "deepseek_v41.sparse", "bank": 1,
+                           "shape": "(7, [1, 2, 3])", "count": 9})
+    with pytest.raises(ValueError):
+        MODULE.generate([data], "deepseek_v41")
