@@ -20,6 +20,13 @@ impl<'a, K: Hash + Eq + Clone + std::fmt::Debug> BindingGraphs<'a, K> {
     pub fn cache_needs_boundary(&self) -> bool { self.bank.cache_needs_boundary() }
     pub fn cache_measured(&mut self, bytes: u64) { self.bank.cache_measured(bytes); }
     pub fn cache_tick(&mut self) { self.bank.cache_tick(); }
+    /// # Safety
+    /// Captured storage is persistent and outlives all graph launches.
+    pub unsafe fn cache_evict_persistent(&mut self) {
+        // SAFETY: caller guarantees persistent backing for every captured pointer.
+        unsafe { self.bank.cache_evict_persistent(); }
+    }
+
     pub fn cache_drain(&mut self, drain: impl FnOnce() -> Result<()>,
         measure: impl FnOnce() -> Result<super::device::ReleaseMeasurement>) -> Result<()> {
         self.bank.cache_drain(drain, measure)

@@ -1,5 +1,6 @@
 //! Device-wide ARC policy. Native owners stay in GraphBank: this controller
-//! marks victims, and banks destroy them only at a drained cycle boundary.
+//! marks victims; banks with persistent captured storage destroy them without
+//! synchronization. Per-graph storage requires explicit drained retirement.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -290,6 +291,60 @@ pub(crate) fn snapshots() -> Vec<Snapshot> {
     rows
 }
 
+/// Incremental untracked high-water observation. Tracked lazy workspace growth
+/// is removed at every boundary, not merely when the observer is seeded.
+#[derive(Default)]
+struct GrowthObserver { high_water: Option<u64> }
+impl GrowthObserver {
+    fn observe(&mut self, free: u64, total: u64, tracked: u64) -> u64 {
+        let residual = total.saturating_sub(free).saturating_sub(tracked);
+        let growth = self.high_water.map_or(0, |before| residual.saturating_sub(before));
+        self.high_water = Some(self.high_water.unwrap_or(residual).max(residual));
+        growth
+    }
+}
+
+pub(crate) type GraphVisitor<'a> = dyn FnMut(i32, &'static str, bool,
+    &mut dyn super::CacheAttached) -> anyhow::Result<()> + 'a;
+
+fn existing_cache(device: i32) -> Option<SharedCache> {
+    DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
+        .get(&device).cloned()
+}
+
+/// Observe once per physical device, even when several banks or lanes completed.
+/// Call only at a completed submission boundary, never within a peer segment.
+pub(crate) fn observe_device(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<()> {
+    let Some(cache) = existing_cache(device) else { return Ok(()) };
+    let (free, total) = crate::shared::memory::device::Device { library, id: device }
+        .run(|| library.cuda_physical_memory_info())?;
+    let tracked = cuteafd_ffi::memory_ledger::snapshot()
+        .total(cuteafd_ffi::memory_ledger::Space::Device, device) as u64;
+    let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+    let growth = cache.observer.observe(free as u64, total as u64, tracked);
+    if cache.unmeasured { cache.measured_capture(growth); }
+    cache.boundary();
+    Ok(())
+}
+
+/// Observe allocation growth and retire selected persistent-storage executables.
+/// # Safety
+/// Every visited bank's owner pins must borrow persistent engine storage (or be
+/// empty); dropping an executable must not release allocations it captured.
+pub(crate) unsafe fn observe_completed(library: &cuteafd_ffi::NativeLibrary,
+    mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let mut devices = std::collections::BTreeSet::new();
+    visit(&mut |device, _, _, bank| { bank.tick(); devices.insert(device); Ok(()) })?;
+    for device in devices { observe_device(library, device)?; }
+    visit(&mut |_, _, _, bank| {
+        // SAFETY: serving banks retain only borrowed handles of persistent engine
+        // buffers (or ()); their containing pipelines order buffer reuse.
+        unsafe { bank.evict_persistent(); }
+        Ok(())
+    })
+
+}
+
 pub(crate) struct DeviceCache {
     device: i32,
     reserve: u64,
@@ -310,6 +365,7 @@ pub(crate) struct DeviceCache {
     chain_only: bool,
     unmeasured: bool,
     pending_destroy: usize,
+    observer: GrowthObserver,
     counters: HashMap<Cycle, Counters>,
     started: Instant,
     clock_ms: u64,
@@ -326,6 +382,7 @@ impl DeviceCache {
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
+            observer: GrowthObserver::default(),
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").map(Into::into),
             last_trace: Instant::now() - Duration::from_secs(1) }
@@ -1132,5 +1189,21 @@ mod tests {
         assert_eq!(row["cycles"]["decode"], 2);
         assert_eq!(row["cycles"]["verify"], 1);
         assert!(row["first_seen_ms"].is_u64());
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    #[test]
+    fn lazy_tracked_workspaces_do_not_become_graph_growth() {
+        let mut observer = GrowthObserver::default();
+        assert_eq!(observer.observe(900, 1000, 100), 0);
+        assert_eq!(observer.observe(590, 1000, 400), 10);
+        assert_eq!(observer.observe(590, 1000, 400), 0, "second lane cannot charge same capture twice");
+        assert_eq!(observer.observe(290, 1000, 700), 0, "lazy workspace is tracked at each sample");
+        assert_eq!(observer.observe(280, 1000, 700), 10);
+        assert_eq!(observer.observe(590, 1000, 400), 0);
+        assert_eq!(observer.observe(580, 1000, 400), 0, "returning physical high-water is not new growth");
     }
 }

@@ -16,7 +16,10 @@ impl<'a, P> GraphOwner<'a, P> {
     /// # Safety
     /// raw is exclusively owned, instantiated on device, and every captured
     /// allocation is kept alive by pins or the containing wave. The containing
-    /// wave must drain launches before dropping this owner or its external pins.
+    /// wave must drain launches before releasing captured storage. CUDA permits
+    /// destroying an in-flight executable: its native resources are freed after
+    /// the launch completes. Thus early owner drop is safe only when P and the
+    /// containing wave do not release or reuse captured storage prematurely.
     pub unsafe fn new(library: &'a NativeLibrary, device: i32, raw: *mut c_void, pins: P) -> Result<Self> {
         ensure!(!raw.is_null(), "null graph executable");
         Ok(Self { raw, device: Device { library, id: device }, pins })
@@ -59,8 +62,8 @@ mod tests {
 
 impl<P> Drop for GraphOwner<'_, P> {
     fn drop(&mut self) {
-        // SAFETY: the bank returns retired owners only after the owning streams
-        // drain; live entries are dropped by their drained containing wave.
+        // SAFETY: CUDA defers executable release until in-flight launches finish.
+        // The constructor contract keeps captured storage alive independently.
         if let Err(error) = self.device.run(|| unsafe { self.device.library.cuda_graph_exec_destroy(self.raw) }) {
             tracing::error!(%error, device = self.device.id, "destroying graph executable");
         }

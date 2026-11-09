@@ -8,6 +8,10 @@ pub(crate) trait CacheAttached {
     fn needs_boundary(&self) -> bool;
     fn measured(&mut self, bytes: u64);
     fn tick(&mut self);
+    /// # Safety
+    /// Pins released by owner drop must not own captured allocations. Their
+    /// persistent backing storage outlives every in-flight graph launch.
+    unsafe fn evict_persistent(&mut self);
     fn drain(&mut self, drain: &mut dyn FnMut() -> anyhow::Result<()>,
         measure: &mut dyn FnMut() -> anyhow::Result<device::ReleaseMeasurement>) -> anyhow::Result<()>;
 }
@@ -23,6 +27,10 @@ macro_rules! cache_attached_methods {
         fn needs_boundary(&self) -> bool { self.$field.cache_needs_boundary() }
         fn measured(&mut self, bytes: u64) { self.$field.cache_measured(bytes); }
         fn tick(&mut self) { self.$field.cache_tick(); }
+        unsafe fn evict_persistent(&mut self) {
+            // SAFETY: forwarded persistent-storage contract from the visitor.
+            unsafe { self.$field.cache_evict_persistent(); }
+        }
         fn drain(&mut self, drain: &mut dyn FnMut() -> anyhow::Result<()>,
             measure: &mut dyn FnMut() -> anyhow::Result<super::device::ReleaseMeasurement>) -> anyhow::Result<()> {
             self.$field.cache_drain(drain, measure)

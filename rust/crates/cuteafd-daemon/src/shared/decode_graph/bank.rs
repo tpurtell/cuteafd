@@ -1,5 +1,5 @@
-//! Exact-key graph storage. Retirement never destroys an executable until its
-//! caller proves every stream using the captured storage has drained.
+//! Exact-key graph storage. Persistent-buffer executables may be evicted without
+//! draining; owners of per-graph storage require explicit drained retirement.
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use cuteafd_loader::placement::inventory::DeclaredGraphSet;
@@ -283,6 +283,26 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
             binding.flush(&mut cache);
             cache.measured_capture(bytes);
+        }
+    }
+
+    /// Destroy victims without waiting for an idle lane. cudaGraphExecDestroy
+    /// itself is asynchronous-safe; only captured allocation lifetime matters.
+    /// # Safety
+    /// Dropping E must not release captured allocations. Their persistent backing
+    /// storage remains owned by the pipeline, which already orders buffer reuse.
+    pub unsafe fn cache_evict_persistent(&mut self) {
+        let Some(binding) = &mut self.device else { return };
+        let victims: Vec<_> = {
+            let cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+            self.entries.iter().filter_map(|(key, entry)| entry.cached
+                .filter(|(id, _)| cache.pending(*id)).map(|(id, _)| (key.clone(), id))).collect()
+        };
+        for (key, _) in &victims { self.entries.remove(key); }
+        if !victims.is_empty() {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).destroyed(
+                &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+                super::device::ReleaseMeasurement { released: 0 });
         }
     }
 
@@ -813,6 +833,29 @@ mod device_tests {
     }
 
     #[test]
+    fn persistent_victims_release_capacity_without_a_drain_or_idle_lane() {
+        use std::{cell::Cell, rc::Rc};
+        struct Exec(Rc<Cell<usize>>);
+        impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        let drops = Rc::new(Cell::new(0));
+        let mut bank = GraphBank::new(None);
+        bank.attach_device(-318, 20, site()).unwrap();
+        let ticket = bank.cache_ticket(&1, false, None).unwrap();
+        bank.cache_commit(1, Exec(drops.clone()), ticket, 1, 1, false);
+        bank.cache_measured(10);
+        for key in 2..20 {
+            assert!(bank.cache_ticket(&key, false, None).is_none());
+            // SAFETY: fixture executables own no captured buffers or native work.
+            unsafe { bank.cache_evict_persistent(); }
+            assert_eq!(drops.get(), key - 1);
+            let ticket = bank.cache_ticket(&key, false, None).expect("victim capacity reusable without idle");
+            bank.cache_commit(key, Exec(drops.clone()), ticket, 1, 1, false);
+            bank.cache_measured(0);
+        }
+        assert_eq!(super::super::device::snapshots().into_iter().find(|row| row.device == -318).unwrap().charged, 10);
+    }
+
+    #[test]
     fn cached_graph_hits_follow_the_current_cycle_including_pinned_fast_path() {
         let mut bank = GraphBank::new(None);
         bank.attach_device(-303, 100, site()).unwrap();
@@ -916,6 +959,10 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> super::CacheAttached for GraphBa
     fn needs_boundary(&self) -> bool { self.cache_needs_boundary() }
     fn measured(&mut self, bytes: u64) { self.cache_measured(bytes); }
     fn tick(&mut self) { self.cache_tick(); }
+    unsafe fn evict_persistent(&mut self) {
+        // SAFETY: forwarded persistent-storage contract from the visitor.
+        unsafe { self.cache_evict_persistent(); }
+    }
     fn drain(&mut self, drain: &mut dyn FnMut() -> anyhow::Result<()>,
         measure: &mut dyn FnMut() -> anyhow::Result<super::device::ReleaseMeasurement>) -> anyhow::Result<()> {
         self.cache_drain(drain, measure)
