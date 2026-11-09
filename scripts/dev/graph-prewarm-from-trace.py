@@ -118,6 +118,7 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
     if not 0 < coverage <= 1:
         raise ValueError("coverage must be in (0, 1]")
     counts = {}
+    lifetime_hits = {}
     reasons = {}
     identities = {}
     latest = {}
@@ -152,6 +153,8 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
         replayed[identity] = (key, graph)
         device_counts = counts.setdefault(identity[0], {})
         device_counts[key] = device_counts.get(key, 0) + request_count
+        device_hits = lifetime_hits.setdefault(identity[0], {})
+        device_hits[key] = device_hits.get(key, 0) + min(int(graph.get("hits", 0)), request_count)
         why = reasons.setdefault(key, set())
         histogram = graph.get("hit_histogram", {})
         histogram_end = int(histogram.get("start_ms", 0)) + \
@@ -177,10 +180,12 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
         if covered >= total * coverage:
             break
     selected.update(key for key, why in reasons.items() if why)
+    heat = {key: max(rows.get(key, 0) for rows in lifetime_hits.values()) for key in selected}
+    ordered = sorted(selected, key=lambda key: (not bool(reasons.get(key)), -heat[key], key))
     entries = [{"rows": rows, "speculative": speculative, "op": op,
                 **({"sequences": sequences} if sequences is not None else {}),
                 "pin": bool(reasons.get((rows, speculative, op, sequences)))}
-               for rows, speculative, op, sequences in sorted(selected)]
+               for rows, speculative, op, sequences in ordered]
     # Charge only emitted geometry, including startup-only siblings. The
     # completed-step shares are physical growth; zero is valid allocator reuse.
     bases = [None] * ranks
@@ -206,7 +211,7 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
         bases[rank] = packed(sum(shares))
     if any(base is None for base in bases):
         raise ValueError("Kimi trace is missing a physical rank")
-    for entry, key in zip(entries, sorted(selected)):
+    for entry, key in zip(entries, ordered):
         entry["capture_bytes"] = costs[key]
     if pin_report is not None:
         for key in sorted(selected):

@@ -421,7 +421,7 @@ def test_kimi_lifetime_hot_tier_survives_aged_out_rolling_window():
         for index, (rows, hits) in enumerate([(1, 1), (4, 60), (8, 25), (16, 14)])]
     report = []
     row = MODULE.generate_kimi([data], 1, "min", coverage=1, pin_report=report)
-    assert [entry["rows"] for entry in row["entries"] if entry["pin"]] == [1, 4]
+    assert [entry["rows"] for entry in row["entries"] if entry["pin"]] == [4, 1]
     assert not any(entry["rolling_pin"] for entry in report)
     assert {entry["rows"] for entry in report if entry["lifetime_pin"]} == {1, 4}
     assert all(entry["whole_run_interval_spread"] is None for entry in report)
@@ -437,6 +437,23 @@ def test_kimi_lifetime_tier_uses_per_key_counts_and_keeps_cutoff_ties():
         for index, (rows, hits) in enumerate([(4, 40), (8, 30), (16, 30), (32, 1)])]
     row = MODULE.generate_kimi([data], 1, "min", coverage=1)
     assert [entry["rows"] for entry in row["entries"] if entry["pin"]] == [4, 8, 16]
+
+
+def test_kimi_prewarm_orders_pins_then_lifetime_replay_heat_not_requests():
+    data = kimi_trace()
+    seed = data["graphs"][0]
+    data["graphs"] = [dict(seed, key_id=index,
+        shape=f"lane=0 rank=0 rows={rows} op=ffn layer=0",
+        hits=hits, cycles={"verify": requests}, capture_bytes=rows,
+        hit_histogram={"interval_ms": 10000, "start_ms": 0, "counts": [0] * 5})
+        for index, (rows, hits, requests) in enumerate([
+            (1, 1, 1), (4, 100, 100), (8, 2, 1000), (16, 20, 20), (32, 20, 20)])]
+    row = MODULE.generate_kimi([data], 1, "min", coverage=1)
+    assert [(entry["rows"], entry["pin"]) for entry in row["entries"]] == [
+        (4, True), (1, True), (16, False), (32, False), (8, False)]
+    assert [entry["capture_bytes"] for entry in row["entries"]] == [[4], [1], [16], [32], [8]]
+    data["graphs"].reverse()
+    assert MODULE.generate_kimi([data], 1, "min", coverage=1) == row
 
 
 def test_kimi_dominant_verify_pins_exact_attention_and_flagless_siblings():
