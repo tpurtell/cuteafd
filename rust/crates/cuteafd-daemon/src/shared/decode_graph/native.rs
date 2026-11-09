@@ -133,7 +133,11 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
     /// Every launch of this layer's graph completed on every consumer stream.
     pub unsafe fn remove(&mut self, layer: usize) -> Result<()> {
         ensure!(layer < 40, "invalid layer graph index");
-        self.bank.retire_matching(|(l, _)| *l == layer);
+        if self.bank.cache_attached() {
+            self.bank.cache_remove_drained(|(l, _)| *l == layer);
+        } else {
+            self.bank.retire_matching(|(l, _)| *l == layer);
+        }
         self.current[layer] = None;
         drop(self.bank.drain_retired(|| Ok(()))?);
         Ok(())
@@ -141,7 +145,11 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
     /// # Safety
     /// Every queued use of this wave's captured pointers completed.
     pub unsafe fn clear(&mut self) -> Result<()> {
-        self.bank.retire_all();
+        if self.bank.cache_attached() {
+            self.bank.cache_clear_drained();
+        } else {
+            self.bank.retire_all();
+        }
         self.current = [None; 40];
         drop(self.bank.drain_retired(|| Ok(()))?);
         Ok(())
@@ -222,7 +230,11 @@ impl<'a> RowGraphs<'a> {
     /// # Safety
     /// Every queued use completed before releasing graph executables or storage.
     pub unsafe fn clear(&mut self) -> Result<()> {
-        self.bank.retire_all();
+        if self.bank.cache_attached() {
+            self.bank.cache_clear_drained();
+        } else {
+            self.bank.retire_all();
+        }
         drop(self.bank.drain_retired(|| Ok(()))?);
         Ok(())
     }
@@ -317,6 +329,57 @@ mod visitor_tests {
             bank.tick();
             bank.drain(&mut || Ok(()), &mut || Ok(ReleaseMeasurement { released: 0 }))?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+    use super::super::{BindingGraphs, CacheAttached};
+    #[test]
+    fn attached_wrapper_clear_releases_live_capacity_not_physical_charge() -> Result<()> {
+        use super::super::device::{self, Basis, Preference};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let weights = ();
+        let mut rows = RowGraphs::new(&library, "clear-row", 64, "test");
+        let mut layers = LayerGraphs::new(&library, 64, "test");
+        let mut bindings = BindingGraphs::<usize>::new(&library, "clear-binding")?;
+        let site = Site { name: "clear-test", cycle: Cycle::Other, preference: Preference::Capture,
+            bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false };
+        for bank in [&mut rows as &mut dyn CacheAttached, &mut layers, &mut bindings] {
+            bank.attach(-8804, 64 << 20, site)?;
+        }
+        let capture = || -> Result<*mut c_void> {
+            // SAFETY: fixture records no device work or referenced allocations.
+            unsafe {
+                library.cuda_graph_begin_capture(std::ptr::null_mut())?;
+                library.cuda_graph_end_capture(std::ptr::null_mut())
+            }
+        };
+        let row_ticket = rows.cache_ticket(&1, false, None).unwrap();
+        let layer_ticket = layers.cache_ticket(&(0, 1), false, None).unwrap();
+        let binding_ticket = bindings.cache_ticket(&1, false, None).unwrap();
+        // SAFETY: fake executables never launch; all fixture storage outlives them.
+        unsafe {
+            rows.cache_insert(1, capture()?, row_ticket, 1, 1, false)?;
+            layers.cache_insert(0, &weights, 1, capture()?, layer_ticket, 1, 1, false)?;
+            bindings.cache_insert(1, capture()?, binding_ticket, 1, 1, false)?;
+        }
+        rows.cache_measured(6 << 20);
+        let snapshot = || device::snapshots().into_iter().find(|row| row.device == -8804).unwrap();
+        assert_eq!(snapshot().pools.live_execs, 3);
+        let charged = snapshot().charged;
+        // SAFETY: no fixture launch was submitted.
+        unsafe { rows.clear()?; layers.remove(0)?; bindings.clear()?; }
+        let after = snapshot();
+        assert_eq!(after.pools.live_execs, 0);
+        assert_eq!(after.pools.live_nodes, 0);
+        assert_eq!(after.charged, charged);
+        assert!(rows.cache_ticket(&1, false, None).is_some());
+        assert!(layers.cache_ticket(&(0, 1), false, None).is_some());
+        assert!(bindings.cache_ticket(&1, false, None).is_some());
         Ok(())
     }
 }

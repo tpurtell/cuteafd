@@ -249,6 +249,16 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         }
     }
 
+    /// Selective explicit invalidation after all consumers have drained.
+    pub fn cache_remove_drained(&mut self, matches: impl Fn(&K) -> bool) {
+        let keys: Vec<_> = self.entries.keys().filter(|key| matches(key)).cloned().collect();
+        let ids: Vec<_> = keys.iter().filter_map(|key| self.entries.get(key)?.cached.map(|(id, _)| id)).collect();
+        for key in keys { self.entries.remove(&key); }
+        if let Some(binding) = &self.device {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_drained(&ids);
+        }
+    }
+
     pub fn cache_tick(&mut self) {
         if let Some(binding) = &mut self.device {
             let shared = binding.cache.clone();

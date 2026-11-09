@@ -671,8 +671,17 @@ impl DeviceCache {
 
     pub fn remove_bank(&mut self, bank: u64) {
         let ids: Vec<_> = self.records.iter().filter(|(_, r)| r.identity.bank == bank).map(|(&id, _)| id).collect();
-        for id in ids {
-            let record = &self.records[&id];
+        self.remove_drained(&ids);
+    }
+
+    /// Forget destroyed owners, never crediting physical driver-arena release.
+    pub fn remove_drained(&mut self, ids: &[u64]) {
+        for &id in ids {
+            let Some(record) = self.records.get(&id) else { continue };
+            if record.pending_capture {
+                self.pending_bytes = self.pending_bytes.saturating_sub(record.bytes);
+                self.unmeasured = true;
+            }
             if record.pinned || record.pending_destroy || matches!(record.list, Some(List::Recent | List::Frequent)) {
                 self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
                 self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
