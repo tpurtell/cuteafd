@@ -74,7 +74,11 @@ impl<'a, K: Hash + Eq + Clone + std::fmt::Debug> BindingGraphs<'a, K> {
     /// # Safety
     /// Every stream using these captured pointers has successfully drained.
     pub unsafe fn clear(&mut self) -> Result<()> {
-        self.bank.retire_all();
+        if self.bank.cache_attached() {
+            self.bank.cache_clear_drained();
+        } else {
+            self.bank.retire_all();
+        }
         self.current = None;
         drop(self.bank.drain_retired(|| Ok(()))?);
         Ok(())
