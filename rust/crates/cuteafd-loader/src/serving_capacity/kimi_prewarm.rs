@@ -33,6 +33,10 @@ pub struct KimiPrewarmEntry {
     pub op: Option<KimiPrewarmOp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequences: Option<usize>,
+    /// Sum of measured capture shares per logical rank. Zero is allocator reuse;
+    /// an absent rank falls back to the provisional per-executable census.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capture_bytes: Vec<Option<u64>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -85,9 +89,9 @@ fn kimi_bootstrap_layout() -> &'static KimiPrewarmLayout {
         reserve_base_bytes: vec![],
         reserve_extra_bytes: 2 << 20,
         entries: [1, 4, 16, 64].into_iter().map(|rows|
-            KimiPrewarmEntry { rows, speculative: false, pin: false, op: None, sequences: None })
+            KimiPrewarmEntry { rows, speculative: false, pin: false, op: None, sequences: None, capture_bytes: vec![] })
             .chain((2..=64).map(|rows|
-                KimiPrewarmEntry { rows, speculative: true, pin: false, op: None, sequences: None })).collect(),
+                KimiPrewarmEntry { rows, speculative: true, pin: false, op: None, sequences: None, capture_bytes: vec![] })).collect(),
     })
 }
 
@@ -185,7 +189,7 @@ mod tests {
         let layout = KimiPrewarmLayout { ranks: 1, layout: "test".into(),
             reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![KimiPrewarmEntry { rows: 20, speculative: true, pin: true,
-                op: Some(KimiPrewarmOp::Attention), sequences: Some(4) }] };
+                op: Some(KimiPrewarmOp::Attention), sequences: Some(4), capture_bytes: vec![] }] };
         let select = |rows, spec, op, seq| kimi_selected(&layout, rows, spec, op, seq, false);
         assert!(select(20, true, KimiPrewarmOp::Attention, Some(4)));
         assert!(!select(20, true, KimiPrewarmOp::Attention, Some(1)));
@@ -199,7 +203,7 @@ mod tests {
         let layout = KimiPrewarmLayout { ranks: 2, layout: "context".into(),
             reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![KimiPrewarmEntry { rows: 16, speculative: false, pin: true,
-                op: Some(KimiPrewarmOp::Context), sequences: None }] };
+                op: Some(KimiPrewarmOp::Context), sequences: None, capture_bytes: vec![] }] };
         assert!(kimi_selected(&layout, 16, false, KimiPrewarmOp::Context, None, false));
         assert!(!kimi_selected(&layout, 16, true, KimiPrewarmOp::Context, None, false));
         for op in [KimiPrewarmOp::Residual, KimiPrewarmOp::Ffn, KimiPrewarmOp::Attention] {
@@ -213,7 +217,7 @@ mod tests {
             let layout = KimiPrewarmLayout { ranks: 1, layout: "generic".into(),
                 reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
                 entries: vec![KimiPrewarmEntry { rows: 20, speculative: false, pin: false,
-                    op: Some(kind), sequences: None }] };
+                    op: Some(kind), sequences: None, capture_bytes: vec![] }] };
             for op in [KimiPrewarmOp::Residual, KimiPrewarmOp::Ffn,
                 KimiPrewarmOp::Attention, KimiPrewarmOp::Context] {
                 assert_eq!(kimi_selected(&layout, 20, false, op, None, false), op == kind);

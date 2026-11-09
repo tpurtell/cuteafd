@@ -117,8 +117,8 @@ pub(crate) fn prewarm_keys(cfg: &KimiK3Config, inventory: &[Key], layout: &KimiP
 }
 
 /// Fit whole geometries against the admitted prewarm base, never runtime EXTRA.
-/// Byte estimates are provisional until the completed startup boundary measures
-/// the physical arena; admission and the cache still own the configured total.
+/// Measured geometry shares use the same costs that produced the base. Only
+/// unmeasured entries use the provisional per-executable census.
 pub(crate) fn fit_prewarm(keys: Vec<Key>, layout: &KimiPrewarmLayout,
     bases: &[u64], bootstraps: &[u64]) -> Vec<Key> {
     let pins = layout.entries.iter().map(|entry| entry.pin).collect::<Vec<_>>();
@@ -127,11 +127,21 @@ pub(crate) fn fit_prewarm(keys: Vec<Key>, layout: &KimiPrewarmLayout,
         reserve_extra_bytes: 0, entries: vec![entry.clone()],
     }).collect::<Vec<_>>();
     let matches = |index: usize, key: Key| prewarm_selected(&geometries[index], key, false);
+    let costs = layout.entries.iter().enumerate().map(|(index, entry)| {
+        bases.iter().enumerate().map(|(rank, _)| {
+            entry.capture_bytes.get(rank).copied().flatten().map(|bytes|
+                if keys.iter().any(|key| key.rank == rank && matches(index, *key)) { bytes } else { 0 })
+        }).collect::<Vec<_>>()
+    }).collect::<Vec<_>>();
     let fits = |selected: &[usize], bases: &[u64]| {
         bases.iter().enumerate().all(|(rank, base)| {
-            let count = keys.iter().filter(|key| key.rank == rank
-                && selected.iter().any(|index| matches(*index, **key))).count() as u64;
-            count.saturating_mul(bootstraps[rank]) <= *base
+            // Bootstrap entries can overlap. Charge each fallback executable
+            // once, while measured trace entries have disjoint exact geometry.
+            let measured = selected.iter().filter_map(|index| costs[*index][rank])
+                .fold(0u64, u64::saturating_add);
+            let unmeasured = keys.iter().filter(|key| key.rank == rank && selected.iter().any(|index|
+                costs[*index][rank].is_none() && matches(*index, **key))).count() as u64;
+            measured.saturating_add(unmeasured.saturating_mul(bootstraps[rank])) <= *base
         })
     };
     let selected = cuteafd_loader::placement::graph_reserve::prewarm_selection(&pins, bases, fits);
@@ -428,9 +438,9 @@ mod tests {
             reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![
                 KimiPrewarmEntry { rows: 20, speculative: true, pin: true,
-                    op: Some(KimiPrewarmOp::Attention), sequences: Some(4) },
+                    op: Some(KimiPrewarmOp::Attention), sequences: Some(4), capture_bytes: vec![] },
                 KimiPrewarmEntry { rows: 20, speculative: false, pin: false,
-                    op: Some(KimiPrewarmOp::Ffn), sequences: None },
+                    op: Some(KimiPrewarmOp::Ffn), sequences: None, capture_bytes: vec![] },
             ] };
         let inventory = inventory_for_ranks(&cfg, 1, 4096, 16, 8, 1, |_, _| true)?;
         let keys = prewarm_keys(&cfg, &inventory.keys, &layout, 16, 4096);
@@ -464,7 +474,7 @@ mod tests {
             let layout = KimiPrewarmLayout { ranks: 2, layout: "trace".into(),
                 reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
                 entries: vec![KimiPrewarmEntry { rows: 4, speculative: false, pin: true,
-                    op: Some(kind), sequences: None }] };
+                    op: Some(kind), sequences: None, capture_bytes: vec![] }] };
             let keys = prewarm_keys(&cfg, &templates, &layout, 16, 4096);
             assert_eq!(keys.len(), 1, "only the observed operation class expands");
             assert_eq!(geometry(keys[0].op), (kind, None));
@@ -481,12 +491,46 @@ mod tests {
         let layout = KimiPrewarmLayout { ranks: 1, layout: "base-test".into(),
             reserve_base_bytes: vec![20], reserve_extra_bytes: 2 << 20,
             entries: [1, 2, 4].map(|rows| KimiPrewarmEntry { rows, speculative: false,
-                pin: rows == 1, op: Some(KimiPrewarmOp::Ffn), sequences: None }).into() };
+                pin: rows == 1, op: Some(KimiPrewarmOp::Ffn), sequences: None, capture_bytes: vec![] }).into() };
         assert!(fit_prewarm(keys.to_vec(), &layout, &[9], &[10]).is_empty());
         assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[10], &[10]), keys[..1]);
         assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[20], &[10]), keys[..2]);
         assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[30], &[10]), keys);
         assert!(fit_prewarm(keys.to_vec(), &layout, &[0], &[10]).is_empty());
+    }
+
+    #[test]
+    fn prewarm_base_uses_measured_rank_costs_including_zero_and_unmeasured_fallback() {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
+        let keys = (0..2).flat_map(|rank| [1, 2, 4].map(|rows|
+            Key { lane: 0, rank, rows, op: Op::Ffn(0) })).collect::<Vec<_>>();
+        let mut layout = KimiPrewarmLayout { ranks: 2, layout: "measured".into(),
+            reserve_base_bytes: vec![5, 9], reserve_extra_bytes: 2 << 20,
+            entries: [1, 2, 4].map(|rows| KimiPrewarmEntry { rows, speculative: false,
+                pin: rows == 1, op: Some(KimiPrewarmOp::Ffn), sequences: None,
+                capture_bytes: match rows {
+                    1 => vec![Some(2), Some(7)],
+                    2 => vec![Some(0), Some(1)],
+                    _ => vec![Some(3), Some(1)],
+                } }).into() };
+        assert_eq!(fit_prewarm(keys.clone(), &layout, &[5, 9], &[100, 200]), keys);
+        let prefix = keys.iter().copied().filter(|key| key.rows <= 2).collect::<Vec<_>>();
+        assert_eq!(fit_prewarm(keys.clone(), &layout, &[2, 8], &[100, 200]), prefix);
+        assert!(fit_prewarm(keys.clone(), &layout, &[5, 6], &[100, 200]).is_empty());
+        layout.entries[2].capture_bytes = vec![Some(3), None];
+        assert_eq!(fit_prewarm(keys.clone(), &layout, &[5, 208], &[100, 200]), keys);
+        assert_eq!(fit_prewarm(keys, &layout, &[5, 207], &[100, 200]), prefix);
+    }
+
+    #[test]
+    fn prewarm_base_deduplicates_overlapping_unmeasured_bootstrap_entries() {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
+        let keys = vec![Key { lane: 0, rank: 0, rows: 4, op: Op::Ffn(0) }];
+        let layout = KimiPrewarmLayout { ranks: 1, layout: "bootstrap".into(),
+            reserve_base_bytes: vec![10], reserve_extra_bytes: 2 << 20,
+            entries: [false, true].map(|speculative| KimiPrewarmEntry { rows: 4,
+                speculative, pin: false, op: None, sequences: None, capture_bytes: vec![] }).into() };
+        assert_eq!(fit_prewarm(keys.clone(), &layout, &[10], &[10]), keys);
     }
 
     #[test]

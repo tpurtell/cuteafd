@@ -191,6 +191,7 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
     # Charge only emitted geometry, including startup-only siblings. The
     # completed-step shares are physical growth; zero is valid allocator reuse.
     bases = [None] * ranks
+    costs = {key: [None] * ranks for key in selected}
     for device, (_, trace) in latest.items():
         owners = {int(match.group(1)) for graph in trace["graphs"]
                   if graph["site"].startswith("kimi_k3.")
@@ -208,9 +209,12 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
             if not isinstance(share, int) or isinstance(share, bool) or share < 0:
                 raise ValueError(f"Kimi emitted geometry has missing or invalid capture_bytes: {graph['shape']}")
             shares.append(share)
+            costs[geometry][rank] = (costs[geometry][rank] or 0) + share
         bases[rank] = packed(sum(shares))
     if any(base is None for base in bases):
         raise ValueError("Kimi trace is missing a physical rank")
+    for entry, key in zip(entries, sorted(selected)):
+        entry["capture_bytes"] = costs[key]
     if pin_report is not None:
         for key in sorted(selected):
             for device in sorted(latest):
