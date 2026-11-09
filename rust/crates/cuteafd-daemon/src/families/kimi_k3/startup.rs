@@ -362,7 +362,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("pre-capture")?;
     stop_before_capture(memory.enabled())?;
     if let Some(set) = graph_set {
-        let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
+        let before = engine.graph_free_bytes()?;
         let capture_started = std::time::Instant::now();
         // Prewarm reachable decode/verify geometry only; row-window prefill
         // stays eager and unselected replayable geometry can capture lazily.
@@ -383,13 +383,11 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         let warmup = engine.warm_graphs(&prewarm, &reserves)?;
         let captured = warmup.captured;
         let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;
-        let after = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
+        let after = engine.graph_free_bytes()?;
         let census_table = if RANKS == 2 { "GRAPH_CENSUS_TP2" } else { "GRAPH_CENSUS_BYTES" };
         for rank in 0..RANKS {
-            let first_touch_bytes = before.gpus[rank].free_bytes
-                .saturating_sub(warmup.before_capture.gpus[rank].free_bytes);
-            let bytes = warmup.before_capture.gpus[rank].free_bytes
-                .saturating_sub(after.gpus[rank].free_bytes);
+            let first_touch_bytes = before[rank].saturating_sub(warmup.before_capture[rank]);
+            let bytes = warmup.before_capture[rank].saturating_sub(after[rank]);
             let count = prewarm.iter().filter(|key| key.rank == rank).count() as u64;
             let reserved = set.inventory.bytes(rank);
             tracing::info!(rank, first_touch_bytes, owner = "KDA eager first-use storage",

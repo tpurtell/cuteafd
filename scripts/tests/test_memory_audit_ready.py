@@ -343,5 +343,6 @@ def test_kimi_startup_capture_window_excludes_eager_first_touch():
     assert engine.index("observe_device(") < engine.index("local.warm_graphs(")
     assert engine.index("self.graph_settle()?") < engine.index("Ok(GraphWarmup")
     startup = (root / "startup.rs").read_text()
-    assert "let bytes = warmup.before_capture.gpus[rank].free_bytes" in startup
+    assert "let bytes = warmup.before_capture[rank]" in startup
+    assert "cuda_physical_memory_info()?" in (root / "engine.rs").read_text()
     assert "first_touch_bytes" in startup and "capture_delta_bytes" in startup

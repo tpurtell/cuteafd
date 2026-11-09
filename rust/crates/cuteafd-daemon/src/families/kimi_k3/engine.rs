@@ -17,7 +17,7 @@ struct Lanes<'a> {
 
 pub(crate) struct GraphWarmup {
     pub captured: usize,
-    pub before_capture: crate::shared::inventory::RuntimeInventory,
+    pub before_capture: Vec<u64>,
 }
 
 pub(crate) struct Engine<'a> {
@@ -544,6 +544,11 @@ impl<'a> Engine<'a> {
         self.execution.usage_phase.set(phase);
     }
 
+    pub(crate) fn graph_free_bytes(&self) -> Result<Vec<u64>> {
+        self.exchange_streams.iter().map(|stream| stream.device.run(||
+            Ok(stream.device.library.cuda_physical_memory_info()?.0 as u64))).collect()
+    }
+
     /// Prewarm the pinned geometry on every lane and measure the startup arena
     /// once. `reserves` is one bounded graph reserve per physical rank.
     pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key], reserves: &[u64]) -> Result<GraphWarmup> {
@@ -569,9 +574,7 @@ impl<'a> Engine<'a> {
         // No zero may race another lane's warm writes to the shared bank;
         // restore drains all retained readers before capture begins.
         for local in lanes.local.first().into_iter().flatten() { local.restore_startup_kda()?; }
-        let devices = self.exchange_streams.iter().map(|stream| stream.device.id).collect::<Vec<_>>();
-        let before_capture = crate::shared::inventory::RuntimeInventory::measure(self.library(), &devices,
-            crate::shared::inventory::InventoryPhase::PostLoad, |_| Ok(()))?;
+        let before_capture = self.graph_free_bytes()?;
         // Seed after eager first-touch, before any graph allocates driver storage.
         // Otherwise the first completed boundary loses the whole startup arena.
         for (rank, stream) in self.exchange_streams.iter().enumerate() {
