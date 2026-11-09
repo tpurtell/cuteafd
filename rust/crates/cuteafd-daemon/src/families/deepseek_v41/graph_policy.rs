@@ -47,9 +47,16 @@ pub(super) fn set_prefill_rows(rows: u32) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn pinned_shape(rows: u32) -> bool {
+    static PINNED: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    PINNED.get_or_init(|| cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_rows(
+        cuteafd_core::V41_VERIFY_ROWS)).contains(&(rows as usize))
+        || rows == cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS
+        || PREFILL_ROWS.get().is_some_and(|&chunk| rows == chunk)
+}
+
 pub(super) fn captures_shape(rows: u32) -> bool {
     large_shape_captured(rows, PREFILL_ROWS.get().copied())
-        && FIXED_SHAPES.get().is_none_or(|shapes| shapes.contains(&rows))
 }
 
 /// Records one eager run of a shape the policy would graph but this owner's
