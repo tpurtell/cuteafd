@@ -369,6 +369,20 @@ def test_kimi_base_sums_selected_latest_identity_shares_per_rank():
         assert row["reserve_base_bytes"] == [2 << 20, 4 << 20]
 
 
+def test_kimi_bases_follow_logical_rank_not_cuda_ordinal():
+    rank0 = kimi_trace(device=7)
+    rank0["graphs"][0].update(shape="lane=0 rank=0 rows=1 op=residual site=Norm",
+                               capture_bytes=1)
+    rank1 = kimi_trace(device=3)
+    rank1["graphs"][0].update(shape="lane=0 rank=1 rows=1 op=residual site=Norm",
+                               capture_bytes=(2 << 20) + 1)
+    assert MODULE.generate_kimi([rank1, rank0], 2, "max")["reserve_base_bytes"] == [
+        2 << 20, 4 << 20]
+    rank1["graphs"][0]["shape"] = rank0["graphs"][0]["shape"]
+    with pytest.raises(ValueError, match="one-to-one"):
+        MODULE.generate_kimi([rank0, rank1], 2, "max")
+
+
 @pytest.mark.parametrize("share", [None, -1, "0", True])
 def test_kimi_missing_or_invalid_selected_capture_share_fails(share):
     data = kimi_trace()

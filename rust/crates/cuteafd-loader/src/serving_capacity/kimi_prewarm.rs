@@ -146,6 +146,8 @@ mod tests {
             }
         }
         assert_eq!(kimi_layout(9).ranks, 0, "untraced layouts use bootstrap, not another row");
+        assert_eq!(kimi_reserve(9, 0).0,
+            crate::families::kimi_k3::allocation::graph_census(9, 0).0);
         assert_eq!(kimi_reserve(1, 0).1, 2 << 20);
         assert_eq!(kimi_reserve(2, 1).1, 2 << 20);
     }
