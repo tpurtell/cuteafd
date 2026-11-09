@@ -98,6 +98,21 @@ impl DeviceBinding {
     }
 }
 
+pub(crate) struct CaptureTicket {
+    cache: super::device::SharedCache,
+    id: u64,
+    pinned: bool,
+    committed: bool,
+}
+
+impl Drop for CaptureTicket {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.cache.lock().unwrap_or_else(|p| p.into_inner()).cancel_capture(self.id);
+        }
+    }
+}
+
 /// E owns the capture's GraphOwner (including its resource pins). The bank is
 /// independent of the native executable type, allowing CPU-only policy tests.
 pub(crate) struct GraphBank<K, E> {
@@ -194,6 +209,22 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             })
         } else { None };
         self.entries.insert(key, Entry { exec, launched: 0, cached: Some((id, pinned)), pinned_slot });
+    }
+
+    pub fn cache_attached(&self) -> bool { self.device.is_some() }
+
+    /// A capture reservation independent of the bank borrow. Dropping it on any
+    /// failed path cancels the ticket, without synchronizing a peer segment.
+    pub fn cache_ticket(&mut self, key: &K, pinned: bool, estimate: Option<super::device::Estimate>) -> Option<CaptureTicket> {
+        let super::device::Miss::Capture(id) = self.cache_miss(key, pinned, estimate) else { return None };
+        Some(CaptureTicket { cache: self.device.as_ref()?.cache.clone(), id, pinned, committed: false })
+    }
+
+    pub fn cache_commit(&mut self, key: K, exec: E, mut ticket: CaptureTicket,
+        nodes: u64, width: usize, spans_devices: bool) {
+        self.cache_topology(ticket.id, nodes, width, spans_devices);
+        self.cache_insert(key, exec, ticket.id, ticket.pinned);
+        ticket.committed = true;
     }
 
     pub fn cache_cancel(&mut self, id: u64) {

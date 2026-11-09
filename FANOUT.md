@@ -5,6 +5,19 @@ ownership stays in `shared/decode_graph/bank.rs`. GLM 5.3 is the reference
 integration in `families/glm5/engine.rs`. Do not copy its model geometry into
 shared policy.
 
+Families using `LayerGraphs` or `RowGraphs` opt into the same controller via
+`attach_device` in `shared/decode_graph/native.rs`. Unattached wrappers keep
+their existing decisions, budgets and statistics unchanged. After attachment,
+use `cache_ticket` before beginning capture (None means eager), then
+`cache_insert` with native topology before `cached_launch`. A ticket cancels
+itself on every failed path, including begin/end-capture errors. Attached
+wrappers must not call legacy `insert`: it rejects unbudgeted insertion.
+The family traverses every wrapper with `cache_cycle` and, only after all
+ranks have queued and drained the complete step, calls `cache_measured` once
+per physical device and `cache_drain` on every bank. `cache_tick` flushes
+pinned-hit counts at boundaries without graph growth. No wrapper synchronizes
+an individual capture or invents model geometry.
+
 ## Family inputs
 
 - Supply a `Site` name, default `Cycle`, `Preference`, bootstrap byte estimate,
