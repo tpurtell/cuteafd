@@ -312,6 +312,18 @@ def test_kimi_verify_width_is_its_own_pin(tmp_path):
     assert layouts[1]["layout"] == "kimi-k3-exl3-k6-max"
 
 
+def test_kimi_startup_only_geometry_is_neither_selected_nor_pinned():
+    trace = kimi_trace()
+    trace["graphs"].append(dict(trace["graphs"][0],
+        shape="lane=0 rank=0 rows=16 op=attention layer=0 seq=16 spec=0",
+        cycles={"other": 1000}, count=1000, capture_bytes=None,
+        evictions=3, recaptures=3))
+    row = MODULE.generate_kimi([trace], 1, "min")
+    assert row["entries"] == [
+        {"rows": 1, "speculative": False, "op": "residual", "pin": True}]
+    assert row["reserve_base_bytes"] == [4 << 20]
+
+
 def test_kimi_cold_shape_is_listed_but_unpinned():
     trace = kimi_trace()
     trace["graphs"] = [dict(graph, cycles={"decode": 1}, hits=1,

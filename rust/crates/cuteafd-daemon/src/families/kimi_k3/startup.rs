@@ -341,8 +341,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     if let Some(set) = graph_set {
         let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
         let capture_started = std::time::Instant::now();
-        // Only geometry that can replay inside a lane window is prewarmed; the
-        // rest is captured lazily if traffic ever asks for it.
+        // Prewarm reachable decode/verify geometry only; row-window prefill
+        // stays eager and unselected replayable geometry can capture lazily.
         let prewarm = super::graphs::prewarm_keys(cfg, &set.keys,
             cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(RANKS), options.slots, unit);
         tracing::info!(entries = prewarm.len(), attention_entries = prewarm.iter()
