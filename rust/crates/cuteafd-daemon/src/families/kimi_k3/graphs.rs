@@ -116,6 +116,32 @@ pub(crate) fn prewarm_keys(cfg: &KimiK3Config, inventory: &[Key], layout: &KimiP
     keys
 }
 
+/// Fit whole geometries against the admitted prewarm base, never runtime EXTRA.
+/// Byte estimates are provisional until the completed startup boundary measures
+/// the physical arena; admission and the cache still own the configured total.
+pub(crate) fn fit_prewarm(keys: Vec<Key>, layout: &KimiPrewarmLayout,
+    bases: &[u64], bootstraps: &[u64]) -> Vec<Key> {
+    let pins = layout.entries.iter().map(|entry| entry.pin).collect::<Vec<_>>();
+    let geometries = layout.entries.iter().map(|entry| KimiPrewarmLayout {
+        ranks: layout.ranks, layout: layout.layout.clone(), reserve_base_bytes: Vec::new(),
+        reserve_extra_bytes: 0, entries: vec![entry.clone()],
+    }).collect::<Vec<_>>();
+    let matches = |index: usize, key: Key| prewarm_selected(&geometries[index], key, false);
+    let fits = |selected: &[usize], bases: &[u64]| {
+        bases.iter().enumerate().all(|(rank, base)| {
+            let count = keys.iter().filter(|key| key.rank == rank
+                && selected.iter().any(|index| matches(*index, **key))).count() as u64;
+            count.saturating_mul(bootstraps[rank]) <= *base
+        })
+    };
+    let selected = cuteafd_loader::placement::graph_reserve::prewarm_selection(&pins, bases, fits);
+    if selected.len() < layout.entries.len() {
+        tracing::warn!(skipped_entries = layout.entries.len() - selected.len(), base_bytes = ?bases,
+            "Kimi prewarm exceeds base; skipped entries remain runtime misses (pinned set is indivisible)");
+    }
+    keys.into_iter().filter(|key| selected.iter().any(|index| matches(*index, *key))).collect()
+}
+
 /// Every executable the model can need, enumerated from the accepted placement.
 /// Admission charges the graph reserve separately; this set enumerates keys and
 /// validates placement. `verify` (the drafter's block, 0 without one) and `slots` determine every
@@ -446,6 +472,21 @@ mod tests {
             assert!(replay_allowed(keys[0].op, true, false)?);
         }
         Ok(())
+    }
+
+    #[test]
+    fn prewarm_base_keeps_pins_indivisible_then_takes_a_prefix() {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
+        let keys = [1, 2, 4].map(|rows| Key { lane: 0, rank: 0, rows, op: Op::Ffn(0) });
+        let layout = KimiPrewarmLayout { ranks: 1, layout: "base-test".into(),
+            reserve_base_bytes: vec![20], reserve_extra_bytes: 2 << 20,
+            entries: [1, 2, 4].map(|rows| KimiPrewarmEntry { rows, speculative: false,
+                pin: rows == 1, op: Some(KimiPrewarmOp::Ffn), sequences: None }).into() };
+        assert!(fit_prewarm(keys.to_vec(), &layout, &[9], &[10]).is_empty());
+        assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[10], &[10]), keys[..1]);
+        assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[20], &[10]), keys[..2]);
+        assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[30], &[10]), keys);
+        assert!(fit_prewarm(keys.to_vec(), &layout, &[0], &[10]).is_empty());
     }
 
     #[test]

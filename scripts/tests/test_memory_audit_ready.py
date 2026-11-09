@@ -332,3 +332,16 @@ def test_kind_category_mirrors_every_memory_kind():
     source = (Path(__file__).parents[2] / "rust/crates/cuteafd-core/src/memory_layout.rs").read_text()
     labels = re.findall(r'Self::\w+ => "(\w+)",', source.split("pub const fn label(self)", 1)[1].split("}", 1)[0])
     assert sorted(labels) == sorted(memory_audit.KIND_CATEGORY)
+
+
+def test_kimi_startup_capture_window_excludes_eager_first_touch():
+    root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/kimi_k3"
+    engine = (root / "engine.rs").read_text().split("pub(crate) fn warm_graphs(", 1)[1]
+    assert engine.index("restore_startup_kda()?") < engine.index("let before_capture =")
+    assert engine.index("let before_capture =") < engine.index("observe_device(")
+    assert engine.index("set_reserve_policy(") < engine.index("local.warm_graphs(")
+    assert engine.index("observe_device(") < engine.index("local.warm_graphs(")
+    assert engine.index("self.graph_settle()?") < engine.index("Ok(GraphWarmup")
+    startup = (root / "startup.rs").read_text()
+    assert "let bytes = warmup.before_capture.gpus[rank].free_bytes" in startup
+    assert "first_touch_bytes" in startup and "capture_delta_bytes" in startup

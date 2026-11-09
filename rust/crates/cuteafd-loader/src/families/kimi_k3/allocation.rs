@@ -372,8 +372,7 @@ pub fn graph_demand(set: &GraphSet, rank: usize) -> Demand {
 pub fn graph_reserve_demands(ranks: usize) -> anyhow::Result<Vec<Demand>> {
     (0..ranks).map(|rank| {
         let (base, extra) = crate::placement::graph_reserve::kimi_default(ranks, rank);
-        let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)
-            .map_err(anyhow::Error::msg)?;
+        let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)?;
         tracing::info!(rank, reserve = reserve.bytes, source = %reserve.source,
             "Kimi GPU_GRAPH_RESERVE");
         Ok(Demand::new(rank as u8, Category::Runtime, GRAPH_RESERVE, reserve.bytes, Basis::Estimated))

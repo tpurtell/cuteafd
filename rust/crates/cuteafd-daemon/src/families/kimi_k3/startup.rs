@@ -368,18 +368,37 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         // stays eager and unselected replayable geometry can capture lazily.
         let prewarm = super::graphs::prewarm_keys(cfg, &set.keys,
             cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(RANKS), options.slots, unit);
+        let policies = (0..RANKS).map(|rank| {
+            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(RANKS, rank);
+            cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)
+        }).collect::<std::result::Result<Vec<_>, _>>()?;
+        let bases = policies.iter().map(|policy| policy.base_bytes).collect::<Vec<_>>();
+        let bootstraps = (0..RANKS).map(|rank|
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_bootstrap(RANKS, rank)).collect::<Vec<_>>();
+        let prewarm = super::graphs::fit_prewarm(prewarm,
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(RANKS), &bases, &bootstraps);
         tracing::info!(entries = prewarm.len(), attention_entries = prewarm.iter()
             .filter(|key| matches!(key.op, super::graphs::Op::Attention { .. })).count(),
             "Kimi selected startup prewarm keys");
-        let captured = engine.warm_graphs(&prewarm, &reserves)?;
+        let warmup = engine.warm_graphs(&prewarm, &reserves)?;
+        let captured = warmup.captured;
         let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;
         let after = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
         let census_table = if RANKS == 2 { "GRAPH_CENSUS_TP2" } else { "GRAPH_CENSUS_BYTES" };
         for rank in 0..RANKS {
-            let bytes = before.gpus[rank].free_bytes.saturating_sub(after.gpus[rank].free_bytes);
+            let first_touch_bytes = before.gpus[rank].free_bytes
+                .saturating_sub(warmup.before_capture.gpus[rank].free_bytes);
+            let bytes = warmup.before_capture.gpus[rank].free_bytes
+                .saturating_sub(after.gpus[rank].free_bytes);
             let count = prewarm.iter().filter(|key| key.rank == rank).count() as u64;
             let reserved = set.inventory.bytes(rank);
-            tracing::info!(rank, executables = count, captured, measured_bytes = bytes, capture_elapsed_ms,
+            tracing::info!(rank, first_touch_bytes, owner = "KDA eager first-use storage",
+                "Kimi startup first-touch census (excluded from graph arena)");
+            let charged = crate::shared::decode_graph::device::snapshots().into_iter()
+                .find(|sample| sample.device == options.devices[rank]).map_or(0, |sample| sample.charged);
+            let capture_delta = i128::from(bytes) - i128::from(charged);
+            tracing::info!(rank, executables = count, captured, measured_bytes = bytes,
+                graph_charged_bytes = charged, capture_delta_bytes = %capture_delta, capture_elapsed_ms,
                 bytes_per_executable = bytes.div_ceil(count.max(1)),
                 census_estimate_bytes = reserved, reserve = reserves[rank], reserve_basis = "checked-in layout row",
                 "Kimi startup graph census");

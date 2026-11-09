@@ -15,6 +15,11 @@ struct Lanes<'a> {
     experts: Vec<Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>>>,
 }
 
+pub(crate) struct GraphWarmup {
+    pub captured: usize,
+    pub before_capture: crate::shared::inventory::RuntimeInventory,
+}
+
 pub(crate) struct Engine<'a> {
     pub max_pool_tokens_no_onboard: Option<u64>,
     pub host_prefix: Option<cuteafd_hostcache::config::Config>,
@@ -541,7 +546,7 @@ impl<'a> Engine<'a> {
 
     /// Prewarm the pinned geometry on every lane and measure the startup arena
     /// once. `reserves` is one bounded graph reserve per physical rank.
-    pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key], reserves: &[u64]) -> Result<usize> {
+    pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key], reserves: &[u64]) -> Result<GraphWarmup> {
         ensure!(reserves.len() == self.exchange_streams.len(), "Kimi graph reserve per physical rank");
         // No route for this family has calibrated node/executable coefficients,
         // so the whole device selects capture from measured bytes.
@@ -564,11 +569,17 @@ impl<'a> Engine<'a> {
         // No zero may race another lane's warm writes to the shared bank;
         // restore drains all retained readers before capture begins.
         for local in lanes.local.first().into_iter().flatten() { local.restore_startup_kda()?; }
+        let devices = self.exchange_streams.iter().map(|stream| stream.device.id).collect::<Vec<_>>();
+        let before_capture = crate::shared::inventory::RuntimeInventory::measure(self.library(), &devices,
+            crate::shared::inventory::InventoryPhase::PostLoad, |_| Ok(()))?;
         // Seed after eager first-touch, before any graph allocates driver storage.
         // Otherwise the first completed boundary loses the whole startup arena.
         for (rank, stream) in self.exchange_streams.iter().enumerate() {
             crate::shared::decode_graph::device::device_cache(stream.device.id, reserves[rank],
                 crate::shared::decode_graph::device::Basis::Bytes)?;
+            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(reserves.len(), rank);
+            let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+            crate::shared::decode_graph::device::set_reserve_policy(stream.device.id, policy)?;
             crate::shared::decode_graph::device::observe_device(stream.device.library, stream.device.id)?;
         }
         let mut captured = 0;
@@ -583,7 +594,7 @@ impl<'a> Engine<'a> {
         // Startup activity is attributed to Other and charged once, here,
         // before the first serving step can see the arenas as its own.
         self.graph_settle()?;
-        Ok(captured)
+        Ok(GraphWarmup { captured, before_capture })
     }
 
     /// Completed-step graph boundary. Every rank's step is queued and no lane is
