@@ -1,4 +1,34 @@
 //! Canonical serving decode shapes and exact-key graph ownership.
+
+/// Object-safe control surface for a family's heterogeneous graph owners.
+/// The caller drains the complete submitted step before invoking `drain`.
+pub(crate) trait CacheAttached {
+    fn attach(&mut self, device: i32, reserve: u64, site: device::Site) -> anyhow::Result<()>;
+    fn cycle(&mut self, cycle: device::Cycle);
+    fn needs_boundary(&self) -> bool;
+    fn measured(&mut self, bytes: u64);
+    fn tick(&mut self);
+    fn drain(&mut self, drain: &mut dyn FnMut() -> anyhow::Result<()>,
+        measure: &mut dyn FnMut() -> anyhow::Result<device::ReleaseMeasurement>) -> anyhow::Result<()>;
+}
+
+// Adapters delegate control only; model geometry and device placement stay in
+// the family's visitor. Both concrete and trait-object paths share bank state.
+macro_rules! cache_attached_methods {
+    ($field:ident) => {
+        fn attach(&mut self, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
+            self.$field.attach_device(device, reserve, site)
+        }
+        fn cycle(&mut self, cycle: super::device::Cycle) { self.$field.cache_cycle(cycle); }
+        fn needs_boundary(&self) -> bool { self.$field.cache_needs_boundary() }
+        fn measured(&mut self, bytes: u64) { self.$field.cache_measured(bytes); }
+        fn tick(&mut self) { self.$field.cache_tick(); }
+        fn drain(&mut self, drain: &mut dyn FnMut() -> anyhow::Result<()>,
+            measure: &mut dyn FnMut() -> anyhow::Result<super::device::ReleaseMeasurement>) -> anyhow::Result<()> {
+            self.$field.cache_drain(drain, measure)
+        }
+    };
+}
 mod bank;
 pub(crate) mod device;
 pub(crate) mod census;
@@ -9,7 +39,7 @@ pub(crate) use binding::BindingGraphs;
 mod watch;
 pub(crate) use watch::CaptureWatch;
 pub(crate) use native::{LayerGraphs, RowGraphs, LARGE_SHAPES};
-pub(crate) use bank::{missing_variants, note_eager, GraphBank, GraphDecision, GraphPolicy, GraphStats};
+pub(crate) use bank::{missing_variants, note_eager, CaptureTicket, GraphBank, GraphDecision, GraphPolicy, GraphStats};
 pub(crate) use owner::GraphOwner;
 
 pub(crate) fn fatal_drain(result: anyhow::Result<()>, site: &str) {
