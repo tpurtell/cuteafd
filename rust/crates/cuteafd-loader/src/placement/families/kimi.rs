@@ -562,22 +562,6 @@ impl KimiRecipe {
         Ok(())
     }
 
-    /// Charge the configured graph reserve once per physical device. Admission
-    /// owns the whole reserve before KV sizing; the bounded device cache selects
-    /// captures from it and measured warmup never shrinks it.
-    pub fn graph_reserve(&mut self) -> anyhow::Result<()> {
-        self.fixed.retain(|owner| owner.group != allocation::GRAPH_RESERVE);
-        let (base, extra) = crate::placement::graph_reserve::kimi_default(self.gpus);
-        for rank in 0..self.gpus {
-            let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)
-                .map_err(anyhow::Error::msg)?;
-            self.fixed.push(FixedOwner { rank: rank as u8, category: Category::Runtime,
-                group: allocation::GRAPH_RESERVE.into(), bytes: reserve.bytes, weights: 0,
-                lifetime: Lifetime::RESIDENT, basis: Basis::Estimated });
-        }
-        Ok(())
-    }
-
     fn kind_order(&self) -> Vec<AttentionClass> {
         self.kinds.clone()
     }

@@ -366,6 +366,20 @@ pub fn graph_demand(set: &GraphSet, rank: usize) -> Demand {
     demand
 }
 
+/// The configured graph arena, one Demand per physical rank. Admission owns
+/// the whole reserve before KV sizing; the bounded device cache grows into it
+/// lazily and evicts, rather than re-planning memory, when it is full.
+pub fn graph_reserve_demands(ranks: usize) -> anyhow::Result<Vec<Demand>> {
+    let (base, extra) = crate::placement::graph_reserve::kimi_default(ranks);
+    (0..ranks).map(|rank| {
+        let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)
+            .map_err(anyhow::Error::msg)?;
+        tracing::info!(rank, reserve = reserve.bytes, source = %reserve.source,
+            "Kimi GPU_GRAPH_RESERVE");
+        Ok(Demand::new(rank as u8, Category::Runtime, GRAPH_RESERVE, reserve.bytes, Basis::Estimated))
+    }).collect()
+}
+
 pub fn kda_demands(cfg: &KimiK3Config, slots: usize, marks: usize, lanes: usize,
     rank: u8) -> Result<[Demand; 4]> {
     kda_demands_for_layers(cfg.kda_layers(), slots, marks, lanes, rank)
@@ -510,17 +524,19 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
         NativeScratch::from_manifest_for_ranks(manifest, physical_ranks)?, physical_ranks)?;
     let owners = crate::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
-    let graphs = graphs_for_ranks(cfg, 1, unit, slots, verify, physical_ranks,
+    // Enumerate and validate every capturable key; memory is the configured
+    // arena below, not this census row.
+    graphs_for_ranks(cfg, 1, unit, slots, verify, physical_ranks,
         |rank, layer| physical_ranks == 1 || cfg.attention[layer] == KimiAttention::Kda
             || heads || rank == usize::from(owners[layer]))?;
     let mut demands = vec![spark_demand_on(shape, 0, spark_ranks, (physical_ranks - 1) as u8, format)?];
+    demands.extend(graph_reserve_demands(physical_ranks)?);
     for rank in 0..physical_ranks {
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 native operands",
             layout.bytes()? as u64, Basis::Exact));
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 token IO",
             io_extents_for_ranks(cfg.vocab_size, rank, rows, core.get_weight("language_model.lm_head").is_some(), physical_ranks)?
                 .into_iter().sum::<usize>() as u64, Basis::Exact));
-        demands.push(graph_demand(&graphs, rank));
         if physical_ranks == 2 {
             demands.push(exchange_demand(unit, rank as u8, 0)?);
             if core.native_attention_split(physical_ranks) {

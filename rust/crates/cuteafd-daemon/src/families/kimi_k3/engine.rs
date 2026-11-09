@@ -551,7 +551,7 @@ impl<'a> Engine<'a> {
         for (lane, pair) in lanes.local.iter_mut().enumerate() {
             for (rank, local) in pair.iter_mut().enumerate() {
                 let binding = keys.iter().copied().filter(|key| key.lane == lane && key.rank == rank).collect::<Vec<_>>();
-                ensure!(!binding.is_empty(), "Kimi graph inventory omits a binding");
+                if binding.is_empty() { continue }
                 local.prewarm_kda_graphs(&binding, rank)?;
                 // KDA has no peer waits. Serialize the startup bindings that
                 // share slot0 before another lane can write that state bank.
@@ -560,6 +560,7 @@ impl<'a> Engine<'a> {
             }
         }
         ensure!(consumed == keys.len(), "Kimi startup graph inventory has unbound keys");
+
         // Submit every binding first. No zero may race another lane's warm
         // writes to the shared bank; restore drains all retained readers.
         for local in lanes.local.first().into_iter().flatten() { local.restore_startup_kda()?; }
@@ -567,6 +568,7 @@ impl<'a> Engine<'a> {
         for (lane, pair) in lanes.local.iter_mut().enumerate() {
             for (rank, local) in pair.iter_mut().enumerate() {
                 let binding = keys.iter().copied().filter(|key| key.lane == lane && key.rank == rank).collect::<Vec<_>>();
+                if binding.is_empty() { continue }
                 captured += local.warm_graphs(&binding, rank, reserves[rank])?;
             }
         }

@@ -220,6 +220,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     } else if RANKS == 1 || options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Heads) {
         super::graphs::inventory_for_ranks(cfg, 1, unit, options.slots, verify_rows, RANKS, |_, _| true)
     } else { super::graphs::owned_inventory(cfg, 1, unit, options.slots, verify_rows) }).transpose()?;
+    // One configured arena per physical device: admission owns it, and the
+    // startup capture boundary measures inside it.
+    let reserve_demands = if graph_set.is_some() {
+        cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(RANKS)?
+    } else { Vec::new() };
+    let reserves: [u64; RANKS] = std::array::from_fn(|rank|
+        reserve_demands.get(rank).map_or(0, |demand| demand.bytes));
     let mut fixed = if RANKS == 2 { exchange_demands(unit, diagnostics)? } else { vec![] };
     if core.native_attention_split(RANKS) {
         for rank in 0..RANKS {
@@ -258,8 +265,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, serving_context: options.context, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
         unit_rows: options.prefill_rows, full_prefill_logits: options.full_prefill_logits, lane_layouts, fixed,
-        startup: graph_set.as_ref().map_or_else(Vec::new, |set|
-            (0..RANKS).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
+        startup: reserve_demands, pool_bounded: vec![], rtx,
         spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
     options.max_context = usize::try_from(options.context.served(admitted.placement.pool_tokens))?;
     memory.sample("admission-resolved")?;
@@ -333,15 +339,6 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("pre-capture")?;
     stop_before_capture(memory.enabled())?;
     if let Some(set) = graph_set {
-        let (base, extra) = cuteafd_loader::placement::graph_reserve::kimi_default(RANKS);
-        let mut reserves = [0u64; RANKS];
-        for rank in 0..RANKS {
-            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
-                .map_err(anyhow::Error::msg)?;
-            reserves[rank] = reserve.bytes;
-            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
-                "Kimi GPU_GRAPH_RESERVE startup policy");
-        }
         let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
         let capture_started = std::time::Instant::now();
         // Only geometry that can replay inside a lane window is prewarmed; the
@@ -359,10 +356,10 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             let reserved = set.inventory.bytes(rank);
             tracing::info!(rank, executables = count, captured, measured_bytes = bytes, capture_elapsed_ms,
                 bytes_per_executable = bytes.div_ceil(count.max(1)),
-                reserved_bytes = reserved, reserve = reserves[rank], reserve_basis = "checked-in layout row",
+                census_estimate_bytes = reserved, reserve = reserves[rank], reserve_basis = "checked-in layout row",
                 "Kimi startup graph census");
             if bytes > reserves[rank] {
-                tracing::warn!(rank, executables = count, measured_bytes = bytes, reserved_bytes = reserves[rank],
+                tracing::warn!(rank, executables = count, measured_bytes = bytes, reserve = reserves[rank],
                     bytes_per_executable = bytes.div_ceil(count.max(1)), census = census_table,
                     "Kimi startup capture exceeds its graph reserve; update \
                      cuteafd_loader::serving_capacity::kimi_prewarm with this capture");

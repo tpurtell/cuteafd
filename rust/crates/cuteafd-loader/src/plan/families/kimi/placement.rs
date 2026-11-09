@@ -157,11 +157,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 usize::try_from(slots)?, verify, &model.core, matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context),
                 ranks, gpus, opts.resolved_spark_reply_format(false))?;
             if let Some(context) = &context_layout {
-                demands.retain(|d| d.group != allocation::GRAPH_RESERVE);
-                let graphs = allocation::graphs_with_context(cfg, 1, unit, usize::try_from(slots)?, verify,
+                // Validate the context key inventory; the graph reserve is the
+                // configured arena, charged once by the recipe.
+                allocation::graphs_with_context(cfg, 1, unit, usize::try_from(slots)?, verify,
                     gpus, |_, _| true, |layer| cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla,
                     Some(context.decode()))?;
-                demands.extend((0..gpus).map(|rank| allocation::graph_demand(&graphs, rank)));
             }
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
             let native_manifest = input.programs_manifest(path)?;
@@ -205,7 +205,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             Err(error) => { report.refuse_placement(format!("Kimi package admission refused: {error:#}"),
                 "Supply complete matching native and EXL3 workspace manifests."); return memory; }
         }
-        memory.notes[0] = "Kimi shared runtime allocation ledger; graph executable bytes retain the runtime's explicit startup estimate".into();
+        memory.notes[0] = "Kimi shared runtime allocation ledger; the bounded graph reserve is charged once as a configured per-device arena".into();
     } else if !model.core.projections.is_empty() {
         report.refuse_placement("Kimi native K6 requires installed workspace inventory".into(),
             "Supply the matching K6 PROGRAMS.json through --workspace-manifest.");
@@ -463,13 +463,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         crate::placement::planner::serving::BlasHead::Native } else { opts.bf16_target_head }) {
         report.refuse_placement(format!("Kimi BLAS owners refused: {error}"), "Supply supported native head geometry.");
         return memory;
-    }
-    if manifest.is_some() {
-        let graph_result = recipe.graph_reserve();
-        if let Err(error) = graph_result {
-            report.refuse_placement(format!("Kimi graph inventory refused: {error:#}"), "Supply supported graph geometry.");
-            return memory;
-        }
     }
     let occupied = vec![0u64; gpus];
     for (rank, baseline) in baseline.iter().enumerate() {

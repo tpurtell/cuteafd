@@ -158,12 +158,13 @@ def parse_attention() -> dict[str, dict[str, str]]:
 ATTENTION = parse_attention()
 
 
-def test_graph_reserve_keys_are_separate_and_glm_only():
+def test_graph_reserve_keys_follow_the_bounded_cache_families():
     for family in FAMILIES.values():
         keys = family_keys(family)
         assert "GRAPH_RESERVE" not in keys
-        for key in ("GPU_GRAPH_RESERVE", "GPU_GRAPH_RESERVE_EXTRA", "GPU_GRAPH_RESERVE_EXTRA_CAP", "SPARK_GRAPH_RESERVE"):
-            assert (key in keys) == (family == "glm5")
+        for key in ("GPU_GRAPH_RESERVE", "GPU_GRAPH_RESERVE_EXTRA", "GPU_GRAPH_RESERVE_EXTRA_CAP", "GRAPH_TRACE"):
+            assert (key in keys) == (family in {"glm5", "kimi_k3"})
+        assert ("SPARK_GRAPH_RESERVE" in keys) == (family == "glm5")
     assert "GRAPH_RESERVE" not in MATRIX
 
 

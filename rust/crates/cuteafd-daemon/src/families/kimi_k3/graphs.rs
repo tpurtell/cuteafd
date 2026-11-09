@@ -22,8 +22,24 @@ pub(crate) enum Op {
     Ffn(usize),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Key { pub lane: usize, pub rank: usize, pub rows: usize, pub op: Op }
+
+/// One line per captured key. The shared cache stores this as the trace shape,
+/// so `scripts/dev/graph-prewarm-from-trace.py` parses these fields.
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lane={} rank={} rows={} ", self.lane, self.rank, self.rows)?;
+        match self.op {
+            Op::Residual(site) => write!(f, "op=residual site={site:?}"),
+            Op::Attention { layer, sequences, speculative } => write!(
+                f, "op=attention layer={layer} seq={sequences} spec={}", u8::from(speculative)),
+            Op::Context { layer, speculative } => write!(
+                f, "op=context layer={layer} spec={}", u8::from(speculative)),
+            Op::Ffn(layer) => write!(f, "op=ffn layer={layer}"),
+        }
+    }
+}
 
 impl Op {
     /// The speculative (verify) variant. Residual and FFN keys carry no split.
@@ -219,7 +235,10 @@ impl<'a> Graphs<'a> {
 
     /// Drop every executable and this bank's cache records. The caller has
     /// already drained the lane's stream.
-    pub(crate) fn clear(&mut self) { self.bank.cache_clear_drained(); }
+    pub(crate) fn clear(&mut self) {
+        self.bank.cache_clear_drained();
+        self.captured = 0;
+    }
 
     pub(crate) fn replays(&self) -> u64 { self.replays }
 
@@ -336,10 +355,10 @@ mod tests {
         // Zero reserve means every miss runs eagerly.
         let mut eager = Graphs::new();
         eager.attach(-902, 1, 0, 0).unwrap();
-        assert_eq!(eager.bank.cache_miss(&hot, true, None), Miss::Eager);
+        assert!(matches!(eager.bank.cache_miss(&hot, true, None), Miss::Eager));
         // No reserve at all also runs eagerly.
         let mut detached = Graphs::new();
-        assert_eq!(detached.bank.cache_miss(&hot, true, None), Miss::Eager);
+        assert!(matches!(detached.bank.cache_miss(&hot, true, None), Miss::Eager));
         // One physical device has one reserve and basis.
         let mut same = Graphs::new();
         assert!(same.attach(-901, 1, 0, 8 << 20).is_ok());

@@ -842,28 +842,6 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         |rank, layer| !matches!(modes[layer], LayerMode::Whole { gpu, .. } if usize::from(gpu) != rank),
         |layer| modes[layer] == LayerMode::ContextSplit,
         context.as_ref().map(|layout| layout.decode()))).transpose()?;
-    // Admission owns the whole configured graph reserve once per physical
-    // device, before KV sizing. The key inventory above only enumerates and
-    // validates geometry; measured warmup never shrinks this budget.
-    recipe.fixed.retain(|owner| owner.group != super::graphs::RESERVE);
-    if graph_reserve {
-        let (base, extra) = cuteafd_loader::placement::graph_reserve::kimi_default(RANKS);
-        for rank in 0..RANKS {
-            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
-                .map_err(|error| anyhow::anyhow!("GPU_GRAPH_RESERVE: {error}"))?;
-            recipe.fixed.push(FixedOwner { rank: rank as u8, category: Category::Runtime,
-                group: super::graphs::RESERVE.into(), bytes: reserve.bytes, weights: 0,
-                lifetime: Lifetime::RESIDENT, basis: Basis::Estimated });
-            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
-                "Kimi GPU_GRAPH_RESERVE admission owner");
-        }
-    }
-    for demand in &request.startup {
-        if draft.as_ref().is_some_and(|layout| layout.demands((RANKS - 1) as u8).is_ok_and(|(_, peak)| peak.group == demand.group)) { continue; }
-        let mut owner = FixedOwner::ready(demand);
-        owner.lifetime = contract::Lifetime { first: contract::Phase::Load, last: contract::Phase::Load };
-        recipe.fixed.push(owner);
-    }
     ensure!(request.pool_bounded.is_empty(), "Kimi has no pool-bounded native owners");
     let cards = request.inventory.gpus.iter().map(|gpu| (gpu.capacity_bytes,
         cuteafd_ffi::coordinator_gpu_budget().map_or(gpu.capacity_bytes, |limit| limit.0.min(gpu.capacity_bytes))))
@@ -1316,8 +1294,7 @@ pub(super) mod tests {
             automatic.requested_pool = None; automatic.prefix_marks = 2;
             automatic.spark_budget = Some(spark.clone());
             automatic.rtx = Some(plan_rtx(&cfg, &catalog, package.clone(), 4096, 5)?);
-            let graphs = graphs::owned_inventory(&cfg, 1, 4096, 8, 0)?;
-            automatic.startup = (0..2).map(|rank| graphs::demand(&graphs.inventory, rank)).collect();
+            automatic.startup = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(2)?;
             match admit(automatic) {
                 Ok(admitted) => println!("automatic context={context} draft={enabled} pool={} owners={}/{} marks={}",
                     admitted.placement.pool_tokens,
@@ -1831,8 +1808,9 @@ pub(super) mod tests {
     fn owned_candidates_keep_matching_graphs_and_shared_draft_pool() -> Result<()> {
         let cfg = cfg();
         let mut i = inputs(&cfg);
-        let seed = super::super::graphs::owned_inventory(&cfg, i.lanes, i.rows, i.state_slots, i.verify_rows)?;
-        i.startup = (0..2).map(|rank| super::super::graphs::demand(&seed.inventory, rank)).collect();
+        // The configured arena is independent of the winning key inventory.
+        let reserve = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(2)?;
+        i.startup = reserve.clone();
         i.draft = Some(draft_layout(i.state_slots, i.state_slots, 1048576));
         let admitted = admit(i)?;
         let layout = admitted.draft_layout().unwrap();
@@ -1842,8 +1820,10 @@ pub(super) mod tests {
         let set = admitted.graph_set.as_ref().context("winning owner graphs missing")?;
         super::super::graphs::check_placement(&cfg, &admitted.placement, &set.keys)?;
         for rank in 0..2 {
-            let charge = admitted.placement.items[rank].iter().find(|item| item.group == super::super::graphs::RESERVE).unwrap();
-            assert_eq!(charge.bytes, set.inventory.bytes(rank));
+            let charges = admitted.placement.items[rank].iter().filter(|item|
+                item.group == super::super::graphs::RESERVE).collect::<Vec<_>>();
+            assert_eq!(charges.len(), 1, "one configured graph arena per device");
+            assert_eq!(charges[0].bytes, reserve[rank].bytes);
         }
         let marks = admitted.placement.items[1].iter().find(|item| item.group == DRAFT_MARKS).unwrap();
         assert_eq!(marks.bytes, layout.window_mark_bytes()? as u64 * admitted.mark_selection.slots);
@@ -2013,8 +1993,7 @@ pub(super) mod tests {
                 allocation::NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?]];
             i.fixed = vec![allocation::code_demand(0,
                 code.pending(arch.context_bytes + resident, arch.context_bytes), 1)?];
-            i.startup = vec![super::super::graphs::demand(
-                &super::super::graphs::inventory_for_ranks(&cfg, 1, unit, slots, 0, 1, |_, _| true)?.inventory, 0)];
+            i.startup = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(1)?;
             i.gpus[0] = GpuBudget { capacity_bytes: capacity, reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
             Ok(i)
@@ -2239,8 +2218,7 @@ pub(super) mod tests {
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, test_unit(rows, i.waves, i.unit_rows), context,
                 allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
             i.fixed = super::super::startup::exchange_demands(unit, false)?;
-            i.startup = (0..2).map(|rank| super::super::graphs::demand(
-                &super::super::graphs::owned_inventory(&cfg, 1, unit, slots as usize, 0).unwrap().inventory, rank)).collect();
+            i.startup = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(2)?;
             for rank in 0..2 {
                 let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
                     "kimik3", "exl3", true, rank as u8, arch, Some(&programs));
@@ -2306,8 +2284,8 @@ pub(super) mod tests {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let mut i = inputs(&cfg);
         i.attention = Some(AttentionPlacement::Layers);
-        let graphs = super::super::graphs::owned_inventory(&cfg, i.lanes, i.rows, i.state_slots, 0)?;
-        i.startup = (0..2).map(|rank| super::super::graphs::demand(&graphs.inventory, rank)).collect();
+        let reserve = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(2)?;
+        i.startup = reserve.clone();
         // A fixed asymmetric owner makes equal layer counts the wrong balance.
         let whole = LayerLayout::pair(&cfg, 3,
             LayerMode::Whole { gpu: 0, ffn: FfnMode::Split })?[0].attention_bytes()? as u64;
@@ -2322,7 +2300,7 @@ pub(super) mod tests {
         for rank in 0..2 {
             let bytes = admitted.placement.items[rank].iter().filter(|item| item.group == super::super::graphs::RESERVE)
                 .map(|item| item.bytes).sum::<u64>();
-            assert_eq!(bytes, graphs.inventory.bytes(rank));
+            assert_eq!(bytes, reserve[rank].bytes);
             for (layer, assignment) in admitted.placement.layers.iter().enumerate() {
                 let layouts = LayerLayout::pair(&cfg, layer, assignment.mode)?;
                 assert_eq!(admitted.layouts[layer][rank].bytes()?, layouts[rank].bytes()?);
