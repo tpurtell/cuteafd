@@ -1197,6 +1197,30 @@ mod tests {
 #[cfg(test)]
 mod observer_tests {
     use super::*;
+
+    #[test]
+    fn seeded_startup_arena_is_nonzero_and_equals_capture_shares() {
+        for device in [-8810, -8811] {
+            let mut cache = DeviceCache::new(device, 64 << 20);
+            assert_eq!(cache.observer.observe(900 << 20, 1000 << 20, 100 << 20), 0);
+            let site = Site { name: "kimi_k3.step", cycle: Cycle::Other,
+                preference: Preference::Adaptive, bootstrap: 128 << 10,
+                basis: Basis::Bytes, spans_devices: true };
+            for key in 1..=3 {
+                let identity = Identity { bank: 1, site: site.name, key,
+                    shape: format!("startup-{key}").into() };
+                assert!(matches!(cache.miss(identity, site, None, true), Miss::Capture(_)));
+            }
+            let growth = cache.observer.observe(896 << 20, 1000 << 20, 100 << 20);
+            cache.measured_capture(growth);
+            assert_eq!(cache.charged, 4 << 20);
+            assert!(cache.charged > 0);
+            assert_eq!(cache.records.values().map(|record|
+                record.stats.capture_bytes.expect("startup capture measured")).sum::<u64>(), cache.charged);
+            assert_eq!(cache.snapshot().cycles[&Cycle::Other].captures, 3);
+        }
+    }
+
     #[test]
     fn lazy_tracked_workspaces_do_not_become_graph_growth() {
         let mut observer = GrowthObserver::default();

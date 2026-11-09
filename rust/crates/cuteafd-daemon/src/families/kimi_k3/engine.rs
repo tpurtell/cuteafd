@@ -561,9 +561,16 @@ impl<'a> Engine<'a> {
         }
         ensure!(consumed == keys.len(), "Kimi startup graph inventory has unbound keys");
 
-        // Submit every binding first. No zero may race another lane's warm
-        // writes to the shared bank; restore drains all retained readers.
+        // No zero may race another lane's warm writes to the shared bank;
+        // restore drains all retained readers before capture begins.
         for local in lanes.local.first().into_iter().flatten() { local.restore_startup_kda()?; }
+        // Seed after eager first-touch, before any graph allocates driver storage.
+        // Otherwise the first completed boundary loses the whole startup arena.
+        for (rank, stream) in self.exchange_streams.iter().enumerate() {
+            crate::shared::decode_graph::device::device_cache(stream.device.id, reserves[rank],
+                crate::shared::decode_graph::device::Basis::Bytes)?;
+            crate::shared::decode_graph::device::observe_device(stream.device.library, stream.device.id)?;
+        }
         let mut captured = 0;
         for (lane, pair) in lanes.local.iter_mut().enumerate() {
             for (rank, local) in pair.iter_mut().enumerate() {
