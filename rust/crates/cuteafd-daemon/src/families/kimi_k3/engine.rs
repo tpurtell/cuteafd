@@ -25,7 +25,6 @@ pub(crate) struct Engine<'a> {
     execution: Execution<'a>,
     lanes: RefCell<Lanes<'a>>,
     prefix: RefCell<Option<super::prefix::KimiPrefix<'a>>>,
-    startup_captures: Cell<Option<u64>>,
     provisional: RefCell<Option<super::state::Provisional>>,
     hops: Option<HopLink<'a>>,
     peer: Option<Rc<PeerExchange<'a>>>,
@@ -320,7 +319,7 @@ impl<'a> Engine<'a> {
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
         let served_context = local[0][0].max_context();
         Ok(Self { host_prefix: None, max_pool_tokens_no_onboard: None, target_view, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
-            prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
+            prefix: RefCell::new(None), provisional: RefCell::new(None),
             hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap, served_context })
     }
 
@@ -416,6 +415,9 @@ impl<'a> Engine<'a> {
         if let Some(draft) = &self.draft { draft.prepare_target()?; }
         submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
+            for local in lanes.local.iter_mut().flatten() {
+                local.graph_cycle(crate::shared::decode_graph::device::Cycle::Prefill);
+            }
             let metadata = sequences.iter().map(|(p, tokens)| SequenceRows {
                 slot: p.slot, start: p.len, rows: tokens.len(), pages: &p.units,
             }).collect::<Vec<_>>();
@@ -512,9 +514,6 @@ impl<'a> Engine<'a> {
         ensure!(self.terminal.get() == TerminalState::Active, "Kimi engine is terminal ({:?})", self.terminal.get());
         if let Some(peer) = &self.peer { peer.require_live()?; }
         if let Some(draft) = &self.draft { draft.require_live()?; }
-        if let Some(startup) = self.startup_captures.get() {
-            super::graphs::check_captures(startup, cuteafd_ffi::graph_captures())?;
-        }
         Ok(())
     }
 
@@ -540,8 +539,13 @@ impl<'a> Engine<'a> {
         self.execution.usage_phase.set(phase);
     }
 
-    pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key]) -> Result<()> {
-        ensure!(self.startup_captures.get().is_none(), "Kimi startup graphs already sealed");
+    /// Prewarm the pinned geometry on every lane and measure the startup arena
+    /// once. `reserves` is one bounded graph reserve per physical rank.
+    pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key], reserves: &[u64]) -> Result<usize> {
+        ensure!(reserves.len() == self.exchange_streams.len(), "Kimi graph reserve per physical rank");
+        // No route for this family has calibrated node/executable coefficients,
+        // so the whole device selects capture from measured bytes.
+        tracing::warn!("Kimi graph cache uses per-site byte estimates: no calibrated node rates for this route");
         let mut lanes = self.lanes.try_borrow_mut()?;
         let mut consumed = 0;
         for (lane, pair) in lanes.local.iter_mut().enumerate() {
@@ -559,14 +563,42 @@ impl<'a> Engine<'a> {
         // Submit every binding first. No zero may race another lane's warm
         // writes to the shared bank; restore drains all retained readers.
         for local in lanes.local.first().into_iter().flatten() { local.restore_startup_kda()?; }
+        let mut captured = 0;
         for (lane, pair) in lanes.local.iter_mut().enumerate() {
             for (rank, local) in pair.iter_mut().enumerate() {
                 let binding = keys.iter().copied().filter(|key| key.lane == lane && key.rank == rank).collect::<Vec<_>>();
-                local.warm_graphs(&binding, rank)?;
+                captured += local.warm_graphs(&binding, rank, reserves[rank])?;
             }
         }
-        self.startup_captures.set(Some(cuteafd_ffi::graph_captures()));
-        Ok(())
+        drop(lanes);
+        // Startup activity is attributed to Other and charged once, here,
+        // before the first serving step can see the arenas as its own.
+        self.graph_settle()?;
+        Ok(captured)
+    }
+
+    /// Completed-step graph boundary. Every rank's step is queued and no lane is
+    /// mid-segment, so each physical device is sampled once and growth charged.
+    fn graph_settle(&self) -> Result<()> {
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        let boundary = lanes.local.iter().flatten().any(|lane| lane.graph_needs_boundary());
+        if !boundary {
+            for lane in lanes.local.iter_mut().flatten() { lane.graph_tick(); }
+            return Ok(());
+        }
+        let library = self.library();
+        // SAFETY: Kimi owners pin `()`; a capture references only the lane's
+        // persistent buffers and admitted weights, never a per-graph allocation,
+        // and those outlive every queued launch.
+        unsafe { crate::shared::decode_graph::device::observe_completed(library, |visit| {
+            for lane in lanes.local.iter_mut().flatten() {
+                let spans = lane.graph_spans_devices();
+                let Some(device) = lane.graph_device() else { continue };
+                let Some(owner) = lane.graph_owner() else { continue };
+                visit(device, "kimi_k3", spans, owner)?;
+            }
+            Ok(())
+        }) }
     }
 
     /// Scheduler submission keeps full logits on the terminal device. Page
@@ -609,6 +641,10 @@ impl<'a> Engine<'a> {
         let output = submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
             lanes.local[0][self.head()].config().release_geometry()?;
+            let cycle = if rows > 64 { crate::shared::decode_graph::device::Cycle::Prefill }
+                else if speculative { crate::shared::decode_graph::device::Cycle::Verify }
+                else { crate::shared::decode_graph::device::Cycle::Decode };
+            for local in &mut lanes.local[0] { local.graph_cycle(cycle); }
             let metadata = sequences.iter().map(|(placement, tokens)| SequenceRows {
                 slot: placement.slot, start: placement.len, rows: tokens.len(), pages: &placement.units,
             }).collect::<Vec<_>>();
@@ -641,6 +677,7 @@ impl<'a> Engine<'a> {
                 vocab: local[0][self.head()].config().vocab_size, stride: local[0][self.head()].config().vocab_size,
                 stream: stream.raw, greedy: None })
         })?;
+        if let Err(error) = self.graph_settle() { self.shutdown()?; return Err(error); }
         // A nested native operator capturing here is a contract violation too.
         // Abort/drain before propagating it, never release live graph operands.
         if let Err(error) = self.require_live() { self.shutdown()?; return Err(error); }
@@ -764,7 +801,10 @@ impl<'a> Engine<'a> {
             ensure!(!tokens.is_empty() && tokens.len() <= self.prefill.unit_rows,
                 "Kimi diagnostic prefix has no tokens or exceeds one prefill unit");
             let sequences = [SequenceRows { slot: 0, start: 0, rows: tokens.len(), pages }];
-            for local in &mut lanes.local[0] { local.stage_attention(&sequences, pool)?; }
+            for local in &mut lanes.local[0] {
+                local.graph_cycle(crate::shared::decode_graph::device::Cycle::Other);
+                local.stage_attention(&sequences, pool)?;
+            }
             lanes.io[0][0].embed(tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, experts, .. } = &mut *lanes;
             let outputs = self.execution.run(scope, self.peer.as_deref(), self.hops.as_ref(),
@@ -816,6 +856,7 @@ impl<'a> Engine<'a> {
             for (lane, ids) in tokens.iter().enumerate() {
                 ensure!(!ids.is_empty(), "Kimi forward has an empty lane");
                 for local in &mut lanes.local[lane] {
+                    local.graph_cycle(crate::shared::decode_graph::device::Cycle::Other);
                     ensure!(sequences[lane].iter().map(|sequence| sequence.rows).sum::<usize>() == ids.len(),
                         "Kimi forward sequence rows differ from tokens");
                     // Unit calls stage all metadata banks before the pipeline.

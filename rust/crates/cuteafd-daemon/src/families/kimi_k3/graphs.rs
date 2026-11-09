@@ -1,11 +1,18 @@
-//! Startup-only rank-local graphs. Context steps include same-stream device
-//! exchange; ordinary hidden/event joins remain in the shared layer executor.
+//! Rank-local step graphs. Context steps include same-stream device exchange;
+//! ordinary hidden/event joins remain in the shared layer executor.
+//!
+//! Executables are owned by the shared bounded device cache: pinned geometry is
+//! prewarmed once at startup and everything else is captured lazily on the miss
+//! that first needs it, or run eagerly when the controller declines. A step
+//! never refuses for a missing executable.
 use super::block::MixSite;
-use crate::shared::{decode_graph::{GraphBank, GraphDecision, GraphOwner, GraphPolicy},
+use crate::shared::{decode_graph::{device::{Basis, Cycle, Preference, Site}, CacheAttached,
+        CaptureTicket, GraphBank, GraphOwner, GraphPolicy},
     memory::device::Stream};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config},
-    placement::inventory::StartupGraphs};
+    placement::inventory::StartupGraphs,
+    serving_capacity::kimi_prewarm::{kimi_bootstrap, kimi_pinned, kimi_prewarm}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Op {
@@ -17,6 +24,14 @@ pub(crate) enum Op {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Key { pub lane: usize, pub rank: usize, pub rows: usize, pub op: Op }
+
+impl Op {
+    /// The speculative (verify) variant. Residual and FFN keys carry no split.
+    pub(crate) fn speculative(self) -> bool {
+        match self { Self::Attention { speculative, .. } | Self::Context { speculative, .. } => speculative,
+            Self::Residual(_) | Self::Ffn(_) => false }
+    }
+}
 
 /// Scoring and diagnostic decode disable optional arithmetic graphs, not the
 /// mandatory Context exchange executable. Context never runs in a row window.
@@ -33,9 +48,9 @@ pub(crate) use cuteafd_loader::families::kimi_k3::allocation::{GRAPH_RESERVE as 
     graph_demand as demand};
 use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_rows};
 
-/// An estimated reserve until the first real serving census qualifies its bytes.
-/// The exact same key set is charged by admission and sealed by each binding.
-/// `verify` (the drafter's block, 0 without one) and `slots` determine every
+/// Every executable the model can need, enumerated from the accepted placement.
+/// Admission charges the graph reserve separately; this set enumerates keys and
+/// validates placement. `verify` (the drafter's block, 0 without one) and `slots` determine every
 /// flattened speculative batch width, including mixed-width multi-request steps.
 pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     resident: impl Fn(usize, usize) -> bool) -> Result<StartupGraphs<Key>> {
@@ -157,72 +172,151 @@ pub(crate) fn check_placement_for_ranks(cfg: &KimiK3Config, placement: &cuteafd_
     Ok(())
 }
 
-pub(crate) struct Graphs<'a> { bank: GraphBank<Key, GraphOwner<'a, ()>>, replays: u64 }
+/// One lane's graph bank. Every lane on a physical device attaches to that
+/// device's single bounded cache with the same reserve and basis.
+pub(crate) struct Graphs<'a> {
+    bank: GraphBank<Key, GraphOwner<'a, ()>>,
+    replays: u64,
+    captured: usize,
+    device: i32,
+    spans_devices: bool,
+}
 
 impl<'a> Graphs<'a> {
-    pub(crate) fn capture(stream: &Stream<'a>, keys: &[Key],
-        mut arithmetic: impl FnMut(Key) -> Result<()>) -> Result<Self> {
-        let mut bank = GraphBank::with_family(GraphPolicy::FixedStartup, "kimi_k3");
-        bank.warm(keys, |&key| stream.device.run(|| {
-            // SAFETY: startup is exclusive; arithmetic and initialized context
-            // exchange kernels use this exact stream. LocalLane pins operands and drains
-            // its exact stream before releasing this bank or its allocations.
-            unsafe { stream.device.library.cuda_graph_begin_capture(stream.raw)?; }
-            let submitted = arithmetic(key);
-            // End even a failed submission, so startup cannot leave capture active.
-            // SAFETY: this ends the matching capture on the same retained stream.
-            let ended = unsafe { stream.device.library.cuda_graph_end_capture(stream.raw) };
-            match (submitted, ended) {
-                (Ok(()), Ok(raw)) => {
-                    crate::shared::decode_graph::census::capture_key("kimi_k3", "decode",
-                        stream.raw as usize, key.rank as i32, Some(key.lane), &key, raw);
-                    // SAFETY: LocalLane retains all captured pointers and drains before drop.
-                    let owner = unsafe { GraphOwner::new(stream.device.library, stream.device.id, raw, ())? };
-                    Ok((owner, None))
-                }
-                (Err(error), Ok(raw)) => {
-                    // SAFETY: the failed startup executable was never launched.
-                    unsafe { stream.device.library.cuda_graph_exec_destroy(raw)?; }
-                    Err(error)
-                }
-                (Err(error), Err(ended)) => Err(error.context(format!("ending failed capture: {ended:#}"))),
-                (Ok(()), Err(error)) => Err(error),
-            }
-        }))?;
-        Ok(Self { bank, replays: 0 })
+    pub(crate) fn new() -> Self {
+        Self { bank: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "kimi_k3"),
+            replays: 0, captured: 0, device: -1, spans_devices: false }
     }
+
+    /// Attach to `device`'s bounded cache. `bootstrap` is one more capture at the
+    /// family's measured per-executable rate, used until the device is measured.
+    pub(crate) fn attach(&mut self, device: i32, ranks: usize, rank: usize, reserve: u64) -> Result<()> {
+        self.device = device;
+        self.spans_devices = ranks > 1;
+        self.bank.attach_device(device, reserve, Site { name: "kimi_k3.step",
+            cycle: Cycle::Other, preference: Preference::Adaptive,
+            bootstrap: kimi_bootstrap(ranks, rank), basis: Basis::Bytes,
+            spans_devices: self.spans_devices })
+    }
+
+    pub(crate) fn attached(&self) -> bool { self.bank.cache_attached() }
+
+    /// The physical device this lane's executables live on.
+    pub(crate) fn device(&self) -> i32 { self.device }
+    pub(crate) fn spans_devices(&self) -> bool { self.spans_devices }
+    /// Whether any executable is resident; startup-only reconfiguration and
+    /// state restore run before the first one.
+    pub(crate) fn is_empty(&self) -> bool { self.captured == 0 }
+
+    pub(crate) fn cached(&self, key: &Key) -> bool { self.bank.get(key).is_some() }
+
+    pub(crate) fn cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }
+    pub(crate) fn needs_boundary(&self) -> bool { self.bank.cache_needs_boundary() }
+    pub(crate) fn tick(&mut self) { self.bank.cache_tick(); }
+
+    /// Control surface for the engine's completed-step measurement and eviction.
+    pub(crate) fn owner(&mut self) -> &mut dyn CacheAttached { &mut self.bank }
+
+    /// Drop every executable and this bank's cache records. The caller has
+    /// already drained the lane's stream.
+    pub(crate) fn clear(&mut self) { self.bank.cache_clear_drained(); }
 
     pub(crate) fn replays(&self) -> u64 { self.replays }
 
-    pub(crate) fn launch(&mut self, key: Key, stream: &Stream<'a>, context: impl FnOnce() -> String) -> Result<bool> {
-        self.launch_with(key, context, |owner| {
-            ensure!(owner.device() == stream.device.id, "Kimi graph replay device changed");
-            stream.device.run(|| {
-                // SAFETY: binding owns immutable capture pointers and this exact stream.
-                unsafe { stream.device.library.cuda_graph_launch(owner.raw, stream.raw) }
-            })
-        })
+    /// Best-effort startup prewarm of the checked-in pinned geometry. A geometry
+    /// that can never replay inside a lane window is skipped, and a controller
+    /// refusal only leaves that geometry lazy.
+    pub(crate) fn prewarm(&mut self, stream: &Stream<'a>, ranks: usize, keys: &[Key],
+        mut body: impl FnMut(Key) -> Result<()>) -> Result<usize> {
+        let mut captured = 0;
+        for &key in keys {
+            if !kimi_prewarm(key.rows) || self.cached(&key) { continue }
+            let pinned = kimi_pinned(ranks, key.rows, key.op.speculative());
+            let Some(ticket) = self.bank.cache_ticket(&key, pinned, None) else { continue };
+            if self.capture(stream, key, ticket, &mut || body(key))? { captured += 1; }
+        }
+        Ok(captured)
     }
 
-    fn launch_with(&mut self, key: Key, context: impl FnOnce() -> String,
-        replay: impl FnOnce(&GraphOwner<'a, ()>) -> Result<()>) -> Result<bool> {
-        let (decision, owner) = self.bank.enqueue_with_context(&key, context);
-        match decision {
-            GraphDecision::Replay => {
-                let owner = owner.expect("replay has executable");
-                replay(owner)?;
-                self.replays += 1;
+    /// Run one step body through the cache: replay a resident executable, else
+    /// capture it, else run the body eagerly.
+    pub(crate) fn graph(&mut self, stream: &Stream<'a>, key: Key, allow_capture: bool,
+        pinned: bool, mut body: impl FnMut() -> Result<()>) -> Result<()> {
+        if let Some(owner) = self.bank.cached_launch(&key) {
+            let (device, raw) = (owner.device(), owner.raw);
+            ensure!(device == stream.device.id, "Kimi graph replay device changed");
+            // SAFETY: the bank owns immutable capture pointers and LocalLane
+            // retains this exact stream until every launch has drained.
+            stream.device.run(|| unsafe { stream.device.library.cuda_graph_launch(raw, stream.raw) })?;
+            self.replays += 1;
+            return Ok(());
+        }
+        if !allow_capture { return body() }
+        let Some(ticket) = self.bank.cache_ticket(&key, pinned, None) else { return body() };
+        // The body is recorded on this lane's stream; on refusal it runs eagerly
+        // instead. Its own nested cache lookups are disabled by the caller, so
+        // the recorded segment is the eager kernel sequence.
+        if !self.capture(stream, key, ticket, &mut body)? { return body() }
+        let owner = self.bank.get(&key).context("inserted Kimi graph")?;
+        let (device, raw) = (owner.device(), owner.raw);
+        ensure!(device == stream.device.id, "Kimi graph captured a foreign device");
+        // SAFETY: just instantiated on this device and not yet launched.
+        stream.device.run(|| unsafe { stream.device.library.cuda_graph_launch(raw, stream.raw) })?;
+        self.replays += 1;
+        Ok(())
+    }
+
+    /// Capture `body` and own the executable. `false` means the capture was
+    /// declined or failed to instantiate: the caller must run the body eagerly.
+    /// The ticket cancels every failed path, including by drop.
+    fn capture(&mut self, stream: &Stream<'a>, key: Key, ticket: CaptureTicket,
+        body: &mut impl FnMut() -> Result<()>) -> Result<bool> {
+        // SAFETY: the lane is the only writer on this persistent stream for the
+        // duration of the step body; every captured pointer is pinned by LocalLane.
+        if let Err(error) = stream.device.run(|| unsafe {
+            stream.device.library.cuda_graph_begin_capture(stream.raw) }) {
+            tracing::warn!(%error, ?key, "Kimi graph capture unavailable; running eagerly");
+            return Ok(false);
+        }
+        let submitted = body();
+        // SAFETY: ends the matching capture on this same retained stream.
+        let ended = stream.device.run(|| unsafe {
+            stream.device.library.cuda_graph_end_capture_topology(stream.raw) });
+        match (submitted, ended) {
+            (Ok(()), Ok((raw, nodes, width, spans, inspection_error))) => {
+                if let Some(error) = inspection_error {
+                    tracing::warn!(%error, ?key, "Kimi graph topology unknown; capture is not chain reusable");
+                }
+                // SAFETY: LocalLane retains every captured pointer and drains this
+                // stream before releasing the owner or its allocations.
+                let owner = match unsafe {
+                    GraphOwner::new(stream.device.library, stream.device.id, raw, ()) } {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        // SAFETY: the executable was never launched.
+                        unsafe { stream.device.library.cuda_graph_exec_destroy(raw)?; }
+                        return Err(error);
+                    }
+                };
+                crate::shared::decode_graph::census::capture_key("kimi_k3", "decode",
+                    stream.raw as usize, key.rank as i32, Some(key.lane), &key, owner.raw);
+                self.bank.cache_commit(key, owner, ticket, nodes as u64, width,
+                    spans || self.spans_devices);
+                self.captured += 1;
                 Ok(true)
             }
-            GraphDecision::Eager => Ok(false),
-            GraphDecision::Capture => anyhow::bail!("Kimi live submission attempted graph capture"),
+            (Err(error), Ok((raw, ..))) => {
+                // SAFETY: the failed capture's executable has never launched.
+                unsafe { stream.device.library.cuda_graph_exec_destroy(raw)?; }
+                Err(error)
+            }
+            (Err(error), Err(ended)) => Err(error.context(format!("ending failed Kimi capture: {ended:#}"))),
+            (Ok(()), Err(error)) => {
+                tracing::warn!(%error, ?key, "Kimi graph instantiation unavailable; running eagerly");
+                Ok(false)
+            }
         }
     }
-}
-
-pub(crate) fn check_captures(startup: u64, current: u64) -> Result<()> {
-    ensure!(current == startup, "Kimi zero-steady-capture contract: startup={startup}, current={current}");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -230,27 +324,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn context_miss_is_counted_and_requests_eager_submission_without_capture() -> Result<()> {
-        let mut bank = GraphBank::with_family(GraphPolicy::FixedStartup, "kimi_k3");
-        bank.seal_startup(&[])?;
-        let mut graphs = Graphs { bank, replays: 0 };
-        let key = Key { lane: usize::MAX, rank: 0, rows: 17,
-            op: Op::Context { layer: usize::MAX, speculative: true } };
-        let before = crate::shared::decode_graph::missing_variants().into_iter()
-            .find(|entry| entry.family == "kimi_k3" && entry.shape == format!("{key:?}"))
-            .map_or(0, |entry| entry.runs);
-        for _ in 0..2 {
-            assert!(!graphs.launch_with(key, || "context eager regression".into(),
-                |_| panic!("a missing executable cannot replay"))?);
-        }
-        let missing = crate::shared::decode_graph::missing_variants().into_iter()
-            .find(|entry| entry.family == "kimi_k3" && entry.shape == format!("{key:?}"))
-            .expect("context miss must be visible in shared stats");
-        assert_eq!(missing.runs, before + 2);
-        assert_eq!(graphs.bank.stats().eager_runs, 2);
-        assert_eq!(graphs.bank.stats().captures, 0);
-        assert_eq!(graphs.replays(), 0);
-        Ok(())
+    fn the_controller_selects_capture_from_the_reserve_and_runs_eagerly_without_one() {
+        use crate::shared::decode_graph::device::Miss;
+        let hot = Key { lane: 0, rank: 0, rows: 1, op: Op::Ffn(0) };
+        // Distinct synthetic devices: the controller is per physical device.
+        let mut graphs = Graphs::new();
+        graphs.attach(-901, 1, 0, 8 << 20).unwrap();
+        assert!(matches!(graphs.bank.cache_miss(&hot, true, None), Miss::Capture(_)));
+        // A ticket is a reservation, not residency.
+        assert!(graphs.is_empty() && !graphs.cached(&hot));
+        // Zero reserve means every miss runs eagerly.
+        let mut eager = Graphs::new();
+        eager.attach(-902, 1, 0, 0).unwrap();
+        assert_eq!(eager.bank.cache_miss(&hot, true, None), Miss::Eager);
+        // No reserve at all also runs eagerly.
+        let mut detached = Graphs::new();
+        assert_eq!(detached.bank.cache_miss(&hot, true, None), Miss::Eager);
+        // One physical device has one reserve and basis.
+        let mut same = Graphs::new();
+        assert!(same.attach(-901, 1, 0, 8 << 20).is_ok());
+        let mut other = Graphs::new();
+        assert!(other.attach(-901, 1, 0, 16 << 20).is_err());
     }
 
     #[test]
@@ -258,11 +352,11 @@ mod tests {
         let source = include_str!("device.rs");
         let step = source.split("    fn context_step(").nth(1).unwrap()
             .split("    pub(crate) fn context_decode(").next().unwrap();
-        assert!(!step.contains("self.graphs.is_none()"));
+        assert!(!step.contains("self.graphs"));
         assert!(step.contains("crate::shared::peer_split::attention::context_decode("));
         let decode = source.split("    pub(crate) fn context_decode(").nth(1).unwrap()
             .split("    pub(crate) fn context_attention(").next().unwrap();
-        assert!(decode.contains("if !self.replay(bucket, super::graphs::Op::Context { layer, speculative })? {\n            self.context_step(layer, bucket, speculative)?;"));
+        assert!(decode.contains("self.graph_step(bucket, super::graphs::Op::Context { layer, speculative },\n            |lane| lane.context_step(layer, bucket, speculative))?;"));
         assert!(!decode.contains("cuda_graph_begin_capture"));
     }
 
@@ -436,8 +530,6 @@ mod tests {
                 verify.keys.iter().filter(|key| key.rank == rank).count() as u64);
         }
         assert!(verify.keys.len() > small.keys.len());
-        check_captures(19, 19)?;
-        assert!(check_captures(19, 20).is_err());
         Ok(())
     }
 }

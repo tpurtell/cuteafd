@@ -842,11 +842,22 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         |rank, layer| !matches!(modes[layer], LayerMode::Whole { gpu, .. } if usize::from(gpu) != rank),
         |layer| modes[layer] == LayerMode::ContextSplit,
         context.as_ref().map(|layout| layout.decode()))).transpose()?;
+    // Admission owns the whole configured graph reserve once per physical
+    // device, before KV sizing. The key inventory above only enumerates and
+    // validates geometry; measured warmup never shrinks this budget.
     recipe.fixed.retain(|owner| owner.group != super::graphs::RESERVE);
-    if let Some(graphs) = &prepared_graph_set {
-        recipe.fixed.extend((0..RANKS).map(|rank| FixedOwner::ready(&super::graphs::demand(&graphs.inventory, rank))));
+    if graph_reserve {
+        let (base, extra) = cuteafd_loader::placement::graph_reserve::kimi_default(RANKS);
+        for rank in 0..RANKS {
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
+                .map_err(|error| anyhow::anyhow!("GPU_GRAPH_RESERVE: {error}"))?;
+            recipe.fixed.push(FixedOwner { rank: rank as u8, category: Category::Runtime,
+                group: super::graphs::RESERVE.into(), bytes: reserve.bytes, weights: 0,
+                lifetime: Lifetime::RESIDENT, basis: Basis::Estimated });
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
+                "Kimi GPU_GRAPH_RESERVE admission owner");
+        }
     }
-    if graph_reserve { recipe.balance_graphs(cfg, graph_slots, graph_verify)?; }
     for demand in &request.startup {
         if draft.as_ref().is_some_and(|layout| layout.demands((RANKS - 1) as u8).is_ok_and(|(_, peak)| peak.group == demand.group)) { continue; }
         let mut owner = FixedOwner::ready(demand);

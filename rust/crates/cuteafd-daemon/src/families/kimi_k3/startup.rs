@@ -333,34 +333,40 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("pre-capture")?;
     stop_before_capture(memory.enabled())?;
     if let Some(set) = graph_set {
+        let (base, extra) = cuteafd_loader::placement::graph_reserve::kimi_default(RANKS);
+        let mut reserves = [0u64; RANKS];
+        for rank in 0..RANKS {
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
+                .map_err(anyhow::Error::msg)?;
+            reserves[rank] = reserve.bytes;
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
+                "Kimi GPU_GRAPH_RESERVE startup policy");
+        }
         let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
         let capture_started = std::time::Instant::now();
-        engine.warm_graphs(&set.keys)?;
+        // Only geometry that can replay inside a lane window is prewarmed; the
+        // rest is captured lazily if traffic ever asks for it.
+        let prewarm = set.keys.iter().copied()
+            .filter(|key| cuteafd_loader::serving_capacity::kimi_prewarm::kimi_prewarm(key.rows))
+            .collect::<Vec<_>>();
+        let captured = engine.warm_graphs(&prewarm, &reserves)?;
         let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;
         let after = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
         let census_table = if RANKS == 2 { "GRAPH_CENSUS_TP2" } else { "GRAPH_CENSUS_BYTES" };
-        let mut measured = [0u64; RANKS];
         for rank in 0..RANKS {
             let bytes = before.gpus[rank].free_bytes.saturating_sub(after.gpus[rank].free_bytes);
-            let count = set.inventory.ranks[rank].executables;
+            let count = prewarm.iter().filter(|key| key.rank == rank).count() as u64;
             let reserved = set.inventory.bytes(rank);
-            measured[rank] = bytes;
-            tracing::info!(rank, executables = count, measured_bytes = bytes, capture_elapsed_ms,
+            tracing::info!(rank, executables = count, captured, measured_bytes = bytes, capture_elapsed_ms,
                 bytes_per_executable = bytes.div_ceil(count.max(1)),
-                reserved_bytes = reserved, reserve = "estimated",
+                reserved_bytes = reserved, reserve = reserves[rank], reserve_basis = "checked-in layout row",
                 "Kimi startup graph census");
-            if bytes > reserved {
-                tracing::warn!(rank, executables = count, measured_bytes = bytes, reserved_bytes = reserved,
+            if bytes > reserves[rank] {
+                tracing::warn!(rank, executables = count, measured_bytes = bytes, reserved_bytes = reserves[rank],
                     bytes_per_executable = bytes.div_ceil(count.max(1)), census = census_table,
-                    "Kimi startup capture exceeds its calibrated estimate; update \
-                     cuteafd_loader::families::kimi_k3::allocation::{census_table} with this capture");
+                    "Kimi startup capture exceeds its graph reserve; update \
+                     cuteafd_loader::serving_capacity::kimi_prewarm with this capture");
             }
-        }
-        // Every rank's capture is logged before any rank refuses, so a failing
-        // launch still reports the complete census.
-        for rank in 0..RANKS {
-            ensure!(measured[rank] <= set.inventory.bytes(rank),
-                "Kimi startup graphs on rank {rank} exceed admitted reserve");
         }
     }
     Ok(Loaded { engine, admission_free, admitted_bytes, ownership })

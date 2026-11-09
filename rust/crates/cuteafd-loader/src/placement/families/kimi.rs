@@ -562,25 +562,18 @@ impl KimiRecipe {
         Ok(())
     }
 
-    /// Graph bytes follow the same finite boundary as weights and KV. Callers
-    /// build the executable keys only after admission selects that boundary.
-    pub fn balance_graphs(&mut self, cfg: &crate::families::kimi_k3::config::KimiK3Config,
-        slots: usize, verify: usize) -> anyhow::Result<()> {
-        if self.gpus != 2 || self.placement != AttentionPlacement::Layers { return Ok(()); }
+    /// Charge the configured graph reserve once per physical device. Admission
+    /// owns the whole reserve before KV sizing; the bounded device cache selects
+    /// captures from it and measured warmup never shrinks it.
+    pub fn graph_reserve(&mut self) -> anyhow::Result<()> {
         self.fixed.retain(|owner| owner.group != allocation::GRAPH_RESERVE);
-        for (option, modes) in self.attention_profiles().iter().enumerate() {
-            let graphs = allocation::graphs_for_ranks(cfg, self.lanes as usize, self.prefill.rows as usize,
-                slots, verify, self.gpus, |rank, layer|
-                    !matches!(modes[layer], LayerMode::Whole { gpu, .. } if usize::from(gpu) != rank))?;
-            for rank in 0..self.gpus {
-                let demand = allocation::graph_demand(&graphs, rank);
-                let owner = Allocation::buffer(format!("graphs.{option}.{rank}"), Location::coordinator(rank as u8),
-                    demand.bytes, Lifetime::RESIDENT, demand.category, demand.group);
-                let mut component = Component::allocation(owner, ByteCurve::fixed(demand.bytes, self.maximum_pages),
-                    false, self.maximum_pages);
-                component.activation = Activation::choice(0, option);
-                self.owners.push(component);
-            }
+        let (base, extra) = crate::placement::graph_reserve::kimi_default(self.gpus);
+        for rank in 0..self.gpus {
+            let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)
+                .map_err(anyhow::Error::msg)?;
+            self.fixed.push(FixedOwner { rank: rank as u8, category: Category::Runtime,
+                group: allocation::GRAPH_RESERVE.into(), bytes: reserve.bytes, weights: 0,
+                lifetime: Lifetime::RESIDENT, basis: Basis::Estimated });
         }
         Ok(())
     }

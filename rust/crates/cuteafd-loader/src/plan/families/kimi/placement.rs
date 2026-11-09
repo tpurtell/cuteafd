@@ -465,12 +465,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         return memory;
     }
     if manifest.is_some() {
-        let graph_result = (|| -> anyhow::Result<()> {
-            let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
-                crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
-                .transpose()?.unwrap_or(0);
-            recipe.balance_graphs(cfg, usize::try_from(slots)?, verify)
-        })();
+        let graph_result = recipe.graph_reserve();
         if let Err(error) = graph_result {
             report.refuse_placement(format!("Kimi graph inventory refused: {error:#}"), "Supply supported graph geometry.");
             return memory;
