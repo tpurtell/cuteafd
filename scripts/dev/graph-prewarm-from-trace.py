@@ -56,10 +56,63 @@ def kimi_geometry(shape):
             kind, int(sequences.group(1)) if kind == "attention" else None)
 
 
+def kimi_lifetime_pins(identities):
+    """Project per-key lifetime demand onto geometry, without treating the final
+    rolling window as a whole-run history. Startup-only counts never qualify."""
+    reasons = {}
+    classes = {}
+    verify = {}
+    for (device, *_), (key, graph) in identities.items():
+        cycles = graph.get("cycles", {})
+        request_count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
+        if request_count <= 0:
+            continue
+        if key[0] == 1 and not key[1]:
+            reasons.setdefault(key, set()).add("plain_c1")
+        # Capture misses are not hits; cap lifetime hits by request activity so
+        # startup Other replays cannot manufacture a hot tier.
+        hits = min(int(graph.get("hits", 0)), request_count)
+        if hits > 0:
+            classes.setdefault((device, key[2]), []).append((hits, key))
+        if key[1] and key[2] in ("attention", "context"):
+            geometry = (key[0], key[3])
+            verify[(device, geometry)] = verify.get((device, geometry), 0) + int(cycles.get("verify", 0))
+    for rows in classes.values():
+        rows.sort(key=lambda row: -row[0])
+        total = sum(hits for hits, _ in rows)
+        covered = 0
+        cutoff = None
+        for hits, key in rows:
+            if cutoff is not None and hits < cutoff:
+                break
+            reasons.setdefault(key, set()).add("lifetime_hit_tier")
+            covered += hits
+            if covered * 2 >= total and cutoff is None:
+                cutoff = hits
+    # Attention has the exact row/sequence identity; Context carries no sequence
+    # count. Pick one dominant attention geometry per device (or Context when
+    # there is no attention), then include its flagless and Context siblings.
+    for device in {owner[0] for owner in verify}:
+        candidates = [(count, geometry) for (owner, geometry), count in verify.items()
+                      if owner == device and geometry[1] is not None and count > 0]
+        if not candidates:
+            candidates = [(count, geometry) for (owner, geometry), count in verify.items()
+                          if owner == device and count > 0]
+        if not candidates:
+            continue
+        _, (rows, sequences) = min(candidates, key=lambda row: (-row[0], row[1][0], row[1][1] or 0))
+        for (owner, *_), (key, graph) in identities.items():
+            if owner != device or key[0] != rows or not graph.get("cycles", {}).get("verify", 0):
+                continue
+            if key[2] in ("residual", "ffn") or key[1] and (
+                    key[2] == "context" or key[2] == "attention" and key[3] == sequences):
+                reasons.setdefault(key, set()).add("dominant_verify")
+    return reasons
+
+
 def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
-    """One layout row for the checked-in list: shapes at or below decode row
-    coverage, pinned only when the trace shows sustained heat or repeated
-    recapture. Prefill rows stay eager and never replay (#1646)."""
+    """One layout row: lifetime-hot and rolling/churn pins plus unpinned request
+    coverage. Prefill rows stay eager and never replay (#1646)."""
     if ranks < 1 or not layout:
         raise ValueError("kimi_k3 needs a coordinator rank count and layout name")
     if not 0 < coverage <= 1:
@@ -118,6 +171,9 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
             why.add("sustained_heat")
         if int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2:
             why.add("repeated_recapture")
+    lifetime_reasons = kimi_lifetime_pins(identities)
+    for key, why in lifetime_reasons.items():
+        reasons.setdefault(key, set()).update(why)
     ranked = sorted(counts, key=lambda key: (-counts[key], key[0], key[1]))
     total = sum(counts.values())
     covered = 0
@@ -166,6 +222,12 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
                 pin_report.append({"device": device, "rows": key[0], "speculative": key[1],
                                    "op": key[2], "sequences": key[3],
                                    "pin": bool(reasons.get(key)), "reasons": sorted(reasons.get(key, [])),
+                                   "rolling_pin": "sustained_heat" in reasons.get(key, set()),
+                                   "lifetime_pin": key in lifetime_reasons,
+                                   "whole_run_interval_spread": None,
+                                   "lifetime_request_hits": sum(min(int(graph.get("hits", 0)),
+                                       sum(int(graph.get("cycles", {}).get(cycle, 0))
+                                           for cycle in ("decode", "verify"))) for graph in graphs),
                                    "executables": sum(int(graph.get("executables", 1)) for graph in graphs),
                                    "observed_permanent_lower_bound_bytes":
                                        sum(int(graph["permanent_bytes"]) for graph in graphs) if known else None,

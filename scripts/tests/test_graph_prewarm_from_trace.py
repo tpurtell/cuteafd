@@ -324,14 +324,16 @@ def test_kimi_startup_only_geometry_is_neither_selected_nor_pinned():
     assert row["reserve_base_bytes"] == [4 << 20]
 
 
-def test_kimi_cold_shape_is_listed_but_unpinned():
+def test_kimi_cold_shape_outside_lifetime_tier_is_listed_but_unpinned():
     trace = kimi_trace()
-    trace["graphs"] = [dict(graph, cycles={"decode": 1}, hits=1,
-                           hit_histogram={"interval_ms": 10_000, "start_ms": 0,
-                                          "counts": [1, 0, 0, 0, 0]})
-                       for graph in trace["graphs"]]
-    row = MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min")
-    assert row["entries"] == [{"rows": 1, "speculative": False, "op": "residual", "pin": False}]
+    trace["graphs"].append(dict(trace["graphs"][0],
+        shape="lane=0 rank=0 rows=16 op=residual site=Norm", cycles={"decode": 1}, hits=1,
+        hit_histogram={"interval_ms": 10_000, "start_ms": 0,
+                       "counts": [1, 0, 0, 0, 0]}))
+    row = MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min", coverage=1)
+    assert row["entries"] == [
+        {"rows": 1, "speculative": False, "op": "residual", "pin": True},
+        {"rows": 16, "speculative": False, "op": "residual", "pin": False}]
 
 
 @pytest.mark.parametrize("shape", ["bad", "lane=0 rank=0 rows=0 op=residual site=Norm"])
@@ -404,6 +406,61 @@ def test_kimi_missing_or_invalid_selected_capture_share_fails(share):
     del data["graphs"][0]["capture_bytes"]
     with pytest.raises(ValueError, match="capture_bytes"):
         MODULE.generate_kimi([data], 1, "min")
+
+
+def test_kimi_lifetime_hot_tier_survives_aged_out_rolling_window():
+    data = kimi_trace()
+    data["cache"]["sampled_at_ms"] = 900_000
+    seed = data["graphs"][0]
+    data["graphs"] = [dict(seed, key_id=index,
+        shape=f"lane=0 rank=0 rows={rows} op=residual site=Norm",
+        hits=hits, count=hits, cycles={"decode": hits},
+        hit_histogram={"interval_ms": 10_000, "start_ms": 310_000, "counts": [0] * 60})
+        for index, (rows, hits) in enumerate([(1, 1), (4, 60), (8, 25), (16, 14)])]
+    report = []
+    row = MODULE.generate_kimi([data], 1, "min", coverage=1, pin_report=report)
+    assert [entry["rows"] for entry in row["entries"] if entry["pin"]] == [1, 4]
+    assert not any(entry["rolling_pin"] for entry in report)
+    assert {entry["rows"] for entry in report if entry["lifetime_pin"]} == {1, 4}
+    assert all(entry["whole_run_interval_spread"] is None for entry in report)
+
+
+def test_kimi_lifetime_tier_uses_per_key_counts_and_keeps_cutoff_ties():
+    data = kimi_trace()
+    seed = data["graphs"][0]
+    data["graphs"] = [dict(seed, key_id=index,
+        shape=f"lane=0 rank=0 rows={rows} op=ffn layer={index}",
+        hits=hits, cycles={"verify": hits},
+        hit_histogram={"interval_ms": 10_000, "start_ms": 0, "counts": [0] * 5})
+        for index, (rows, hits) in enumerate([(4, 40), (8, 30), (16, 30), (32, 1)])]
+    row = MODULE.generate_kimi([data], 1, "min", coverage=1)
+    assert [entry["rows"] for entry in row["entries"] if entry["pin"]] == [4, 8, 16]
+
+
+def test_kimi_dominant_verify_pins_exact_attention_and_flagless_siblings():
+    data = kimi_trace()
+    seed = data["graphs"][0]
+    shapes = [
+        ("rows=20 op=attention layer=0 seq=4 spec=1", 100),
+        ("rows=20 op=attention layer=0 seq=5 spec=1", 10),
+        ("rows=20 op=context layer=1 spec=1", 100),
+        ("rows=20 op=ffn layer=1", 1),
+        ("rows=20 op=residual site=Norm", 1),
+        ("rows=1 op=residual site=Norm", 1),
+        ("rows=4 op=ffn layer=2", 100),
+        ("rows=4 op=residual site=Norm", 100),
+    ]
+    data["graphs"] = [dict(seed, key_id=index, shape="lane=0 rank=0 " + shape,
+        hits=count, cycles={"decode" if "rows=1 " in shape else "verify": count},
+        hit_histogram={"interval_ms": 10_000, "start_ms": 0, "counts": [0] * 5})
+        for index, (shape, count) in enumerate(shapes)]
+    report = []
+    MODULE.generate_kimi([data], 1, "min", coverage=1, pin_report=report)
+    dominant = [entry for entry in report if "dominant_verify" in entry["reasons"]]
+    assert {(entry["op"], entry["sequences"]) for entry in dominant} == {
+        ("attention", 4), ("context", None), ("ffn", None), ("residual", None)}
+    assert all(entry["rows"] == 20 for entry in dominant)
+    assert any(entry["rows"] == 1 and "plain_c1" in entry["reasons"] for entry in report)
 
 
 def test_kimi_zero_share_is_valid_and_missing_rank_fails():
