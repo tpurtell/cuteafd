@@ -605,7 +605,9 @@ mod tests {
         let mut peer_site = site(Preference::Capture);
         peer_site.spans_devices = true;
         let Miss::Capture(id) = cache.miss(key(1), peer_site, None, false) else { panic!("capture expected") };
-        assert!(cache.chain_only);
+        assert!(!cache.chain_only); // Admission already excludes peer reuse.
+        // Isolate topology's independent protection against hidden peer pointers.
+        cache.chain_only = true;
         cache.captured_topology(id, 1, 1, false);
         assert!(!cache.chain_only);
         assert!(cache.records[&id].spans_devices);

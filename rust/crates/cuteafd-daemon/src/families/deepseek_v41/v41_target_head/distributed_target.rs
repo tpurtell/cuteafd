@@ -143,6 +143,13 @@ pub(crate) struct DistributedTargetHead<'w, 'a> {
     greedy: Vec<(u32, f32)>,
 }
 impl<'w, 'a> DistributedTargetHead<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self,
+        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
+    ) -> Result<()> {
+        f(self.normalize.device.id, "target_norm", true, &mut self.normalize.get_mut().graphs)?;
+        self.vocabulary.visit_graph_banks(f)
+    }
+
     pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
         ensure!(self.binding.is_none() && self.selected.is_empty(), "target head startup requires an idle owner");
         ensure!(rows.iter().all(|&row| row <= self.capacity), "target head startup row exceeds capacity");

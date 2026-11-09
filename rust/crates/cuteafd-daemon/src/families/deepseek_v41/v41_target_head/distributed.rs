@@ -148,6 +148,18 @@ pub(crate) struct DistributedVocabularyWave<'w, 'a> {
     copy_pending: bool,
 }
 impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self,
+        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
+    ) -> Result<()> {
+        for rank in &mut self.ranks {
+            let device = rank.device.id;
+            for (mode, graphs) in rank.get_mut().graphs.iter_mut().enumerate() {
+                f(device, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, true, graphs)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
         ensure!(self.ready.is_none() && self.pending_logits.is_none() && !self.copy_pending,
             "vocabulary startup requires an idle owner");
