@@ -90,7 +90,10 @@ def stat_kind(path) -> str:
 
 def listing(path) -> str | None:
     try:
-        return stable(sorted(os.listdir(path)))
+        # Metadata discovery lists sys.path entries, including interpreter debris
+        # that differs between otherwise identical source checkouts.
+        return stable(sorted(name for name in os.listdir(path)
+                             if name != "__pycache__" and not name.endswith(".pyc")))
     except OSError:
         return None
 
