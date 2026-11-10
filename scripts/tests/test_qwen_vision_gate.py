@@ -112,8 +112,13 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
                         (18432, 1536), (9216, 1536), (7168, 12288), (7168, 6144),
                         (8192, 8192), (8192, 4096)}
     flash_hqa_tiles = {(4096, 4096), (4096, 8192), (4096, 16384)}
+    # Kimi K3's BF16 core: the dense projections at decode and verify widths.
+    kimi_tiles = {(2112, 7168), (3584, 7168), (6144, 7168), (24752, 7168),
+                  (7168, 3072), (7168, 3584)}
     assert (native_hqa_tiles | flash_hqa_tiles).isdisjoint(qwen_tiles)
-    assert set(tables["DECODE_TMA_TILES"]) == qwen_tiles | step5_tiles | native_hqa_tiles | flash_hqa_tiles
+    assert kimi_tiles.isdisjoint(qwen_tiles)
+    assert set(tables["DECODE_TMA_TILES"]) == \
+        qwen_tiles | step5_tiles | native_hqa_tiles | flash_hqa_tiles | kimi_tiles
     for (n, k), entries in tables["SKINNY_TILES_BY_ROWS"].items():
         assert len({t for _, _, _, t in entries}) == 1
         assert entries[-1][0] == scalar_rule(n, k)
