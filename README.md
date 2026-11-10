@@ -39,27 +39,40 @@ record **8K w/tail**: three served prefill units plus 40 tokens (8,296 at
 2,752 rows/unit), omitted from card images and README tables.
 Decode and agentic-session workloads are unchanged.
 
-## What's new in v4.1.0
+## What's new in v5.0.0
 
-- **Table look-ahead for DeepSeek V4.1 Engram and Qwen 3.8 PLE:** rows read at
-  random every token are fetched ahead of need into a small bounded cache, in
-  prefill-unit deadline order, starting when a request is admitted. Decode
-  prefetches each round's anchor during the draft phase. The read profile
-  follows each file's own placement (local or remote), with no setting.
-  V4.1 8K prefill: 10.3k → 11.2k tok/s on 2× RTX + 6 Sparks, 7.0k → 8.2k on
-  1× RTX + 3 Sparks.
-- **Faster Spark expert prefill:** the warp-specialized EXL3 FC1 rotation is
-  chosen per hardware class (hoisted on RTX, in-tile on DGX Spark). GLM 5.3 on
-  2× RTX + 6 Sparks: 8K prefill 2.6k → 3.5k tok/s. V4 Pro, GLM 5.3 Flash and
-  Kimi K3 gain 5-17%.
-- **One coordinator GPU selector for every family:** `COORDINATOR_GPUS` takes
-  an ordered pair (primary first) by index, PCI bus id or UUID, DeepSeek V4.1
-  included. It replaces the `COORDINATOR_GPU*` keys.
-- **RDMA queue pairs bind to the address that routes to each peer**, never to
-  the first address in the GID table, so a port shared with a management
-  network can't pick the wrong one.
+- **New models:** Mistral Large 4 (K4 experts, native K6 core, Pixtral vision)
+  and Muse Spark (vision and PCM audio, both DFlash2 drafters). Step-5 EXL3
+  gets a native K6 core, GLM 5.3 Flash EXLR8 runs natively, and Kimi K3 adds a
+  single-RTX card (1× RTX + 6 Sparks).
+- **High-quality attention (HQA) checkpoints:** six `-HQA` EXL3 Core-K6
+  releases (GLM 5.3, GLM 5.3 Flash, Kimi K3, Step-5, Muse Spark, Mistral
+  Large 4) restore the original attention projections byte for byte.
+  `ATTENTION_MODE` selects `hqa` (default), `compact` or `fp8-compact`, and
+  the planner sizes memory for the mode you pick.
+- **Decode CUDA graphs in every family,** in one bounded cache per GPU that
+  pre-captures the most-replayed shapes at startup. A capture that runs out of
+  memory falls back to eager instead of failing.
+- **One memory admission policy:** each device has a single cap
+  (`GPU_MEMORY_CAP`, `SPARK_MEMORY_CAP`), and every allocation is charged to a
+  named, measured owner. Weights load into one packed arena per GPU, and the
+  `/memory` dashboard shows each owner's admitted and live bytes.
+- **Speculation:** `DRAFT_LENGTH` fixes the draft length in every family;
+  DFlash2 and dSpark split across both GPUs on dual RTX.
+- **Concurrency up to 64,** with every concurrency-dependent size derived at
+  boot; KV is reserved in decode chunks, not the whole output up front.
+- **Spark-free layouts:** the planner decides whether the RTX GPUs alone can
+  hold a model (`SPARK_COUNT=0`), and GLM 5.3 and Mistral Large 4 can onboard
+  whole expert layers on one RTX.
+- **Serving:**
+  - tool-call argument streaming;
+  - loop abort;
+  - distinct 429s for a full queue and an expired wait;
+  - bad requests return 400 without stopping the server;
+  - a stall watchdog;
+  - expert-usage heat maps at `/experts`.
 
-Full notes: [v4.1.0 release](https://github.com/tpurtell/cuteafd/releases/tag/v4.1.0) ·
+Full notes: [v5.0.0 release](https://github.com/tpurtell/cuteafd/releases/tag/v5.0.0) ·
 [all releases](https://github.com/tpurtell/cuteafd/releases)
 
 ## Models
