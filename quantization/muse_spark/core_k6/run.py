@@ -362,6 +362,8 @@ def make_plan(source,tokens,root,export,*,core_bits=6,core_only=False):
         identity['qualification']='per-module-calibrated-metrics-and-exact-packed-byte-oracle-not-K6-pilot'
         identity['runtime']['cuda_allocation_cap_bytes']=40*GIB
         identity['runtime']['container_memory_bytes']=110*GIB
+        identity['runtime']['torch_allow_tf32_cublas_override']=os.environ.get('TORCH_ALLOW_TF32_CUBLAS_OVERRIDE')
+        identity['runtime']['nvidia_tf32_override']=os.environ.get('NVIDIA_TF32_OVERRIDE')
     return dict(identity=identity,source=str(source.snapshot),tokens=str(tokens),root=str(root),export=str(export),
         inventory=summary,publication_repo=None if core_only else TARGET_REPO,temporary_reserve_bytes=256*GIB,
         required_free_bytes=summary['target_payload_bytes']+320*GIB)

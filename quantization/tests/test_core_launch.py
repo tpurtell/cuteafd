@@ -46,6 +46,8 @@ def test_container_is_bounded_user_sm121_readonly_source(tmp_path, family, prefl
     assert command[command.index("--memory-swap") + 1] == cap
     assert "--user" in command and "--privileged" not in command
     assert "CUTEAFD_DEV_MEMORY=" + cap in command and "TORCH_CUDA_ARCH_LIST=12.1" in command
+    assert "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0" in command
+    assert "NVIDIA_TF32_OVERRIDE=0" in command
     assert "--network" in command and command[command.index("--network") + 1] == "none"
     assert command[command.index("--entrypoint") + 1] == "python3"
     assert command[command.index("--entrypoint") + 2] == row["image_id"]
