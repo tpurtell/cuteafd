@@ -1,0 +1,1 @@
+{"model_type":"kimi_k3","quantization_config":{"per_module_metadata":"quantize_config.k6.json:tensor_storage"}}

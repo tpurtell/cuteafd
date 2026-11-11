@@ -1,0 +1,1 @@
+{"weight_map":{"model.embed_tokens.weight":"shared.safetensors","model.layers.0.mlp.experts.0.gate_proj.trellis":"shared.safetensors","model.layers.0.self_attn.q_proj.mcg":"core-k6.safetensors","model.layers.0.self_attn.q_proj.suh":"core-k6.safetensors","model.layers.0.self_attn.q_proj.svh":"core-k6.safetensors","model.layers.0.self_attn.q_proj.trellis":"core-k6.safetensors"}}

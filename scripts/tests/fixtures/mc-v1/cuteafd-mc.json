@@ -1,0 +1,65 @@
+{
+  "original_core_dtype": "BF16",
+  "schema": "cuteafd-mc-v1",
+  "shared_inventory_sha256": "1fb4551df22a63f50f22340099e2b495813979999164ec641931f466fe674655",
+  "source": {
+    "repo": "example/source",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "variants": [
+    {
+      "config": "config.k6.json",
+      "core_bits": 6,
+      "core_tensors": [
+        "model.layers.0.self_attn.q_proj.mcg",
+        "model.layers.0.self_attn.q_proj.suh",
+        "model.layers.0.self_attn.q_proj.svh",
+        "model.layers.0.self_attn.q_proj.trellis"
+      ],
+      "fingerprint": "2c998320fea2f7f60a2c8e605ab68e85bd63cf96188b3724e4fccd3a96c2f10e",
+      "index": "model.k6.safetensors.index.json",
+      "metadata_sha256": {
+        "config.k6.json": "193dc3fcaf8a5b619f349228f6855b2cf5646446ec50e83b2c175f7e06447699",
+        "model.k6.safetensors.index.json": "052c3b93ab0487d5821d42971292783d62885b647d6e6c725f9829de080d905f",
+        "quantize_config.k6.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+      },
+      "name": "k6-compact",
+      "quantize": "quantize_config.k6.json"
+    },
+    {
+      "config": "config.k8.json",
+      "core_bits": 8,
+      "core_tensors": [
+        "model.layers.0.self_attn.q_proj.mcg",
+        "model.layers.0.self_attn.q_proj.suh",
+        "model.layers.0.self_attn.q_proj.svh",
+        "model.layers.0.self_attn.q_proj.trellis"
+      ],
+      "fingerprint": "86470216c28b0b319efd25d2eba3dc7ac12c2d0a955ec0747f3d2d01558da76b",
+      "index": "model.k8.safetensors.index.json",
+      "metadata_sha256": {
+        "config.k8.json": "1eac7476ac7dc8074d58c55945ea2ef2e66440b97c9805afd3a7680567b917d9",
+        "model.k8.safetensors.index.json": "f2b4c94b0b8d1a803c48a726f56f8b525462eefc8c4e3eb203f911bd80f92b10",
+        "quantize_config.k8.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+      },
+      "name": "k8-compact",
+      "quantize": "quantize_config.k8.json"
+    },
+    {
+      "config": "config.json",
+      "core_bits": 16,
+      "core_tensors": [
+        "model.layers.0.self_attn.q_proj.weight"
+      ],
+      "fingerprint": "4d585770a7aee778ae778d5d7e11dd013e69efd2740654c4a852f6f232d9ed16",
+      "index": "model.safetensors.index.json",
+      "metadata_sha256": {
+        "config.json": "06bad57bfb02281a74a875e3b1fca85d19091acde57e5790a8c2283279a0b6d7",
+        "model.safetensors.index.json": "162b74c82af43322f1b565a28f1dd708078c804417d7da2e495ea0d5135d953e",
+        "quantize_config.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+      },
+      "name": "original",
+      "quantize": "quantize_config.json"
+    }
+  ]
+}
