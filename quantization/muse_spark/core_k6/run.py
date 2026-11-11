@@ -26,7 +26,7 @@ from kimi_k3.uniform_k2.storage import (RollingBoundary,atomic_json,canonical,co
 from kimi_k3.core_k6.run import exclusive_run,hardlink_frontier
 from . import numerical,codec
 from .source import MuseSource
-from .recipe import BASE_REPO,BASE_REVISION,TARGET_REPO,MODULE_COUNT,reviewed_modules,inventory
+from .recipe import BASE_REPO,BASE_REVISION,TARGET_REPO,MODULE_COUNT,BASE_CORE_MODULE_COUNT,reviewed_modules,inventory
 from .storage import ProjectionStore,StageStore,RouteSpool,load_tensors
 
 GIB=1024**3
@@ -49,12 +49,13 @@ def compact():
 
 
 class Progress:
-    def __init__(self,root):
+    def __init__(self,root,*,core_only=False):
         self.root=Path(root);self.root.mkdir(parents=True,exist_ok=True)
+        self.core_only=core_only
         self.started=time.monotonic()
         self.state=dict(status='running',started=datetime.now(timezone.utc).isoformat(),
             pid=os.getpid(),projections=sum(1 for _ in (self.root/'evidence').rglob('*.json')),
-            total_projections=MODULE_COUNT)
+            total_projections=BASE_CORE_MODULE_COUNT if core_only else MODULE_COUNT)
     def emit(self,event,**fields):
         if event=='projection_committed':self.state['projections']+=1
         row=dict(event=event,time=datetime.now(timezone.utc).isoformat(),
@@ -62,11 +63,13 @@ class Progress:
             cuda_gib=torch.cuda.memory_allocated()/GIB if torch.cuda.is_initialized() else 0,
             gpu_peak_gib=torch.cuda.max_memory_allocated()/GIB if torch.cuda.is_initialized() else 0,
             free_gib=shutil.disk_usage(self.root).free/GIB,**fields)
+        if self.core_only:row['host_plus_cuda_gib']=row['rss_gib']+row['cuda_gib']
         self.state.update(row)
         with (self.root/'events.jsonl').open('a') as f:f.write(canonical(row)+'\n')
         atomic_json(self.root/'status.json',self.state)
         print(canonical(row),flush=True)
-        if row['rss_gib']>76 or row['cuda_gib']>86 or row['free_gib']<64:
+        if (row['rss_gib']>76 or row['cuda_gib']>(64 if self.core_only else 86)
+                or row['free_gib']<64):
             raise MemoryError('Muse producer exceeded bounded host/GPU/disk admission')
 
 
@@ -77,10 +80,12 @@ def commit_batch(directory,index,row,state):
 
 
 class Engine:
-    def __init__(self,source,records,root,export,identity,progress):
+    def __init__(self,source,records,root,export,identity,progress,*,core_bits=6,core_only=False):
         self.source,self.records,self.root,self.export=source,records,Path(root),Path(export)
         self.identity,self.progress=identity,progress
-        self.selection=reviewed_modules()
+        self.core_bits,self.core_only=core_bits,core_only
+        self.selection=(reviewed_modules() if core_bits==6 and not core_only else
+            reviewed_modules(core_bits=core_bits,core_only=core_only))
         self.tokens=sum(len(r['input_ids']) for r in records)
         self.boundary=RollingBoundary(self.root/'frontier',identity)
         self.rotary=None
@@ -88,7 +93,8 @@ class Engine:
         location='head' if layer=='head' else f'layers/{layer:03d}'
         evidence='head' if layer=='head' else f'layer-{layer:03d}'
         return ProjectionStore(self.root/location/'projections',self.root/'evidence'/evidence,
-            self.identity,self.selection,self.progress,codec)
+            self.identity,self.selection,self.progress,codec,
+            **(dict(core_only=True) if self.core_only else {}))
     def emit_batch(self,phase,layer,index):
         if index%64==0 or index+1==len(self.records):
             self.progress.emit('phase_progress',phase=phase,layer=layer,batches=index+1,total_batches=len(self.records))
@@ -199,38 +205,41 @@ class Engine:
                 stages.retire('b');compact()
             if stages.load('e') is None:
                 self.group(block,layer,checkpoints,['mlp.pre_expert_proj'],stages,'c')
-                def observations():
-                    for index,state in self.phase_batches(stages,'c'):
-                        selected,weights,near=numerical.router_choices(block.mlp,state['normalized'])
-                        yield index,dict(input=numerical.expert_input(block,state['normalized']),selected=selected,near=near)
-                spool=RouteSpool.create(self.root/f'layers/{layer:03d}/routes',self.identity,self.tokens,
-                    observations(),self.progress,layer)
-                # Allocate once, read one expert at a time. Source values are
-                # replaced by committed serialized reconstructions before any
-                # downstream capture; resume uses exactly the same receipts.
-                numerical.materialize_routed_experts(self.source,block,layer)
-                try:
-                    for expert in range(256):
-                        ep=prefix+f'mlp.experts.{expert}.'
-                        input_covariance,input_evidence=spool.hessian(expert)
-                        for part in ('gate_proj','up_proj'):
-                            target=numerical.expert_weight(block,expert,part)
-                            checkpoints.ensure(ep+part,target,input_covariance,extra_evidence=input_evidence)
-                            target.copy_(checkpoints.dense(ep+part))
-                        del input_covariance
-                        down_covariance,down_evidence=spool.hessian(expert,down=block.mlp.experts.gate_up_proj[expert])
-                        # Keep actual route counts and the exact recovery rule
-                        # beside every candidate, including resumed records.
-                        extra=dict(natural_rows=len(spool.route_rows[expert]),
-                            augmented_rows=len(spool.recovery_rows[expert]),ranks=[9,16],
-                            post_expert_norm='official-before-routing-weight')
-                        down=numerical.expert_weight(block,expert,'down_proj')
-                        checkpoints.ensure(ep+'down_proj',down,down_covariance,extra_evidence=dict(down_evidence,**extra))
-                        down.copy_(checkpoints.dense(ep+'down_proj'))
-                        del down_covariance
-                        if expert%16==0:self.progress.emit('expert_progress',layer=layer,expert=expert)
-                        compact()
-                finally:spool.close()
+                if self.core_only:
+                    numerical.materialize_routed_experts(self.source,block,layer)
+                else:
+                    def observations():
+                        for index,state in self.phase_batches(stages,'c'):
+                            selected,weights,near=numerical.router_choices(block.mlp,state['normalized'])
+                            yield index,dict(input=numerical.expert_input(block,state['normalized']),selected=selected,near=near)
+                    spool=RouteSpool.create(self.root/f'layers/{layer:03d}/routes',self.identity,self.tokens,
+                        observations(),self.progress,layer)
+                    # Allocate once, read one expert at a time. Source values are
+                    # replaced by committed serialized reconstructions before any
+                    # downstream capture; resume uses exactly the same receipts.
+                    numerical.materialize_routed_experts(self.source,block,layer)
+                    try:
+                        for expert in range(256):
+                            ep=prefix+f'mlp.experts.{expert}.'
+                            input_covariance,input_evidence=spool.hessian(expert)
+                            for part in ('gate_proj','up_proj'):
+                                target=numerical.expert_weight(block,expert,part)
+                                checkpoints.ensure(ep+part,target,input_covariance,extra_evidence=input_evidence)
+                                target.copy_(checkpoints.dense(ep+part))
+                            del input_covariance
+                            down_covariance,down_evidence=spool.hessian(expert,down=block.mlp.experts.gate_up_proj[expert])
+                            # Keep actual route counts and the exact recovery rule
+                            # beside every candidate, including resumed records.
+                            extra=dict(natural_rows=len(spool.route_rows[expert]),
+                                augmented_rows=len(spool.recovery_rows[expert]),ranks=[9,16],
+                                post_expert_norm='official-before-routing-weight')
+                            down=numerical.expert_weight(block,expert,'down_proj')
+                            checkpoints.ensure(ep+'down_proj',down,down_covariance,extra_evidence=dict(down_evidence,**extra))
+                            down.copy_(checkpoints.dense(ep+'down_proj'))
+                            del down_covariance
+                            if expert%16==0:self.progress.emit('expert_progress',layer=layer,expert=expert)
+                            compact()
+                    finally:spool.close()
                 self.new_phase(stages,'e');h=codec.DenseRawHessian(4096);entries=[]
                 for index,state in self.phase_batches(stages,'c'):
                     selected,weights,near=numerical.router_choices(block.mlp,state['normalized'])
@@ -253,7 +262,8 @@ class Engine:
             self.commit_phase(stages,'f',entries)
             del block,state,hidden,output;compact()
         from .export import assemble_layer
-        receipt=assemble_layer(self.source,layer,checkpoints.replacements(names),self.export,self.identity)
+        receipt=assemble_layer(self.source,layer,checkpoints.replacements(names),self.export,self.identity,
+            **(dict(core_bits=self.core_bits,core_only=True) if self.core_only else {}))
         manifest=stages.load('f',checksum=True)
         links=hardlink_frontier(self.boundary,layer,stages.directory('f'),manifest)
         result=self.boundary.commit(layer,links)
@@ -295,33 +305,64 @@ def code_identity():
     return {str(p.relative_to(REPO)):sha256_file(p) for p in sorted(paths)}
 
 
-def make_plan(source,tokens,root,export):
-    summary=inventory(source)
+def producer_recipe(*, core_bits=6, core_only=False):
+    if type(core_bits) is not int or core_bits not in (6,8):
+        raise ValueError('Muse core bits must be 6 or 8')
+    if core_bits!=6 and not core_only:
+        raise ValueError('K8 Muse production requires --core-only')
+    if not core_only:
+        return dict(RECIPE)
+    recipe=dict(RECIPE,core_bits=core_bits,head_bits=core_bits,core_only=True,
+        expert_bits=16,experts='native-source-BF16-forward-only-not-exported',
+        ordering='qkv-then-o-then-pre-expert-then-native-experts-then-post-expert-before-successor-layer')
+    del recipe['cold_experts']
+    return recipe
+
+
+def make_plan(source,tokens,root,export,*,core_bits=6,core_only=False):
+    recipe=producer_recipe(core_bits=core_bits,core_only=core_only)
+    summary=inventory(source,core_bits=core_bits,core_only=core_only)
     manifest=json.loads((tokens/'manifest.json').read_text())
     if source.snapshot.name!=BASE_REVISION or manifest['splits']['calibration']['count']!=1426:
         raise ValueError('production requires pinned source and full1426-prompt calibration stream')
-    from .pilot import validate_report
     qualification_path=root.parent/'pilot/qualification.json'
-    qualification=validate_report(qualification_path)
-    if qualification['identity']['native']!=numerical.source_identity():
-        raise ValueError('pilot runtime/source identity differs from production')
-    if qualification['identity']['token_manifest_sha256']!=sha256_file(tokens/'manifest.json'):
-        raise ValueError('pilot token stream differs from production')
-    for relative,digest in qualification['identity']['code'].items():
-        if sha256_file(REPO/relative)!=digest:
-            raise ValueError('pilot numerical source changed: '+relative)
+    if core_only:
+        records=load_token_records(tokens,'calibration')
+        if len(records)!=1426 or sum(len(row['input_ids']) for row in records)!=manifest['splits']['calibration']['tokens']:
+            raise ValueError('core-only production requires all reviewed calibration rows')
+        qualification_sha256=None
+    else:
+        from .pilot import validate_report
+        qualification_path=root.parent/'pilot/qualification.json'
+        qualification=validate_report(qualification_path)
+        if qualification['identity']['native']!=numerical.source_identity():
+            raise ValueError('pilot runtime/source identity differs from production')
+        if qualification['identity']['token_manifest_sha256']!=sha256_file(tokens/'manifest.json'):
+            raise ValueError('pilot token stream differs from production')
+        for relative,digest in qualification['identity']['code'].items():
+            if sha256_file(REPO/relative)!=digest:
+                raise ValueError('pilot numerical source changed: '+relative)
+        qualification_sha256=sha256_file(qualification_path)
     identity=dict(schema='cuteafd-muse-spark-k4-core-k6-production-k128-v2',source_repo=BASE_REPO,
-        source_revision=BASE_REVISION,qualification_sha256=sha256_file(qualification_path),source_config_sha256=sha256_file(source.snapshot/'config.json'),
+        source_revision=BASE_REVISION,qualification_sha256=qualification_sha256,source_config_sha256=sha256_file(source.snapshot/'config.json'),
         source_index_sha256=sha256_file(source.snapshot/'model.safetensors.index.json'),
-        token_manifest_sha256=sha256_file(tokens/'manifest.json'),recipe=RECIPE,
+        token_manifest_sha256=sha256_file(tokens/'manifest.json'),recipe=recipe,
         runtime=dict(numerical=numerical.source_identity(),cuda=torch.version.cuda,
             image=os.environ.get('MUSE_QUANT_IMAGE_ID'),gpu=os.environ.get('MUSE_AUTHORIZED_GPU'),
             tf32=False,matmul_precision='highest',attention_backend='official-sdpa',
             cublas_workspace_config=os.environ.get('CUBLAS_WORKSPACE_CONFIG')),
         calibration=dict(samples=1426,tokens=manifest['splits']['calibration']['tokens']),code=code_identity(),
         gptqmodel_commit=subprocess.check_output(['git','-C',str(REPO/'third_party/gptqmodel'),'rev-parse','HEAD'],text=True).strip())
+    if core_only:
+        import core_export
+        identity['schema']='cuteafd-muse-spark-core-only-production-k128-v1'
+        identity['code']['quantization/core_export.py']=sha256_file(Path(core_export.__file__))
+        oracle=REPO/'third_party/sparkinfer/tests/_reference/native_trellis.py'
+        identity['code'][str(oracle.relative_to(REPO))]=sha256_file(oracle)
+        identity['qualification']='per-module-calibrated-metrics-and-exact-packed-byte-oracle-not-K6-pilot'
+        identity['runtime']['cuda_allocation_cap_bytes']=64*GIB
     return dict(identity=identity,source=str(source.snapshot),tokens=str(tokens),root=str(root),export=str(export),
-        inventory=summary,publication_repo=TARGET_REPO,temporary_reserve_bytes=256*GIB,
+        inventory=summary,publication_repo=None if core_only else TARGET_REPO,temporary_reserve_bytes=256*GIB,
         required_free_bytes=summary['target_payload_bytes']+320*GIB)
 
 
@@ -333,14 +374,26 @@ def cleanup_complete(root):
     fsync_directory(root)
 
 
-def main():
+def argument_parser():
     parser=argparse.ArgumentParser(description=__doc__)
     for name in ('source-snapshot','tokens','root','export'):parser.add_argument('--'+name,type=Path,required=True)
     for name in ('resume','preflight','publish-only'):parser.add_argument('--'+name,action='store_true')
+    parser.add_argument('--core-bits',type=int,choices=(6,8),default=6)
+    parser.add_argument('--core-only',action='store_true',
+        help='export only 373 packed core modules; retain native experts for causal propagation')
+    return parser
+
+
+def main():
+    parser=argument_parser()
     args=parser.parse_args()
+    try:producer_recipe(core_bits=args.core_bits,core_only=args.core_only)
+    except ValueError as error:parser.error(str(error))
+    if args.core_only and args.publish_only:
+        parser.error('core-only artifacts are assembled/published by the MC coordinator')
     args.tokens,args.root,args.export=(p.expanduser().resolve() for p in (args.tokens,args.root,args.export))
     source=MuseSource(args.source_snapshot);args.root.mkdir(parents=True,exist_ok=True)
-    plan=make_plan(source,args.tokens,args.root,args.export)
+    plan=make_plan(source,args.tokens,args.root,args.export,core_bits=args.core_bits,core_only=args.core_only)
     prior=args.root/'plan.json'
     if prior.exists() and json.loads(prior.read_text())!=plan:raise ValueError('immutable production plan differs')
     if args.preflight:
@@ -357,23 +410,30 @@ def main():
             publish(args.export,args.root,TARGET_REPO)
         return
     torch.set_num_threads(8);numerical.configure_math()
-    torch.cuda.set_per_process_memory_fraction(86*GIB/torch.cuda.get_device_properties(0).total_memory)
-    progress=Progress(args.root)
+    torch.cuda.set_per_process_memory_fraction((64 if args.core_only else 86)*GIB/torch.cuda.get_device_properties(0).total_memory)
+    progress=Progress(args.root,core_only=args.core_only)
     with torch.inference_mode(),exclusive_run(args.root):
         if not prior.exists():atomic_json(prior,plan)
         if (args.root/'quantization-complete.json').exists():
             cleanup_complete(args.root);progress.emit('quantization_complete');return
         records=load_token_records(args.tokens,'calibration')
-        engine=Engine(source,records,args.root,args.export,plan['identity'],progress)
+        engine=Engine(source,records,args.root,args.export,plan['identity'],progress,
+            core_bits=args.core_bits,core_only=args.core_only)
         current=engine.initial()
         for layer in range(current['layer']+1,62):current=engine.layer(layer,current)
         head=engine.head(current)
-        from .export import finalize_export
-        summary=finalize_export(source,engine.selection,head.replacements(['lm_head']),args.export,
-            engine.identity,args.root/'evidence')
+        if args.core_only:
+            from .export import finalize_core_only
+            summary=finalize_core_only(source,engine.selection,head.replacements(['lm_head']),args.export,
+                engine.identity,args.root/'evidence',core_bits=args.core_bits)
+        else:
+            from .export import finalize_export
+            summary=finalize_export(source,engine.selection,head.replacements(['lm_head']),args.export,
+                engine.identity,args.root/'evidence')
         atomic_json(args.root/'quantization-complete.json',dict(identity=engine.identity,summary=summary))
-        from .validate import audit_completed
-        atomic_json(args.root/'completed-export-audit.json',audit_completed(source,args.root,args.export))
+        if not args.core_only:
+            from .validate import audit_completed
+            atomic_json(args.root/'completed-export-audit.json',audit_completed(source,args.root,args.export))
         cleanup_complete(args.root);progress.state['status']='quantized';progress.emit('quantization_complete',**summary)
     source.close()
 

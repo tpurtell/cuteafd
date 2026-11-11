@@ -35,7 +35,9 @@ def _geometry(inputs, outputs, bits, group):
     return dict(_shared_geometry(inputs, outputs, bits, group), sharded_side=1)
 
 
-def reviewed_core_modules():
+def reviewed_core_modules(*, core_bits=6):
+    if type(core_bits) is not int or core_bits not in (6,8):
+        raise ValueError("Muse core bits must be 6 or 8")
     selected = {}
     for layer in range(LAYER_COUNT):
         prefix = f'{PREFIX}layers.{layer}.'
@@ -43,8 +45,8 @@ def reviewed_core_modules():
             ('self_attn.q_proj',8192,8192),('self_attn.k_proj',8192,1024),
             ('self_attn.v_proj',8192,1024),('self_attn.o_proj',8192,8192),
             ('mlp.pre_expert_proj',8192,4096),('mlp.post_expert_proj',4096,8192)):
-            selected[prefix+name] = _geometry(inputs,outputs,6,'base_core')
-    selected['lm_head'] = _geometry(8192,202048,6,'base_core')
+            selected[prefix+name] = _geometry(inputs,outputs,core_bits,'base_core')
+    selected['lm_head'] = _geometry(8192,202048,core_bits,'base_core')
     return selected
 
 
@@ -54,8 +56,9 @@ def reviewed_expert_modules():
             for part in ('gate_proj','up_proj','down_proj')}
 
 
-def reviewed_modules():
-    return reviewed_core_modules() | reviewed_expert_modules()
+def reviewed_modules(*, core_bits=6, core_only=False):
+    core = reviewed_core_modules(core_bits=core_bits)
+    return core if core_only else core | reviewed_expert_modules()
 
 
 def removed_source_names(selection=None):
@@ -77,7 +80,7 @@ def validate_config(document):
         raise ValueError('Muse source must be native BF16')
 
 
-def inventory(source):
+def inventory(source, *, core_bits=6, core_only=False):
     validate_config(source.document)
     if source.config != source.document['text_config']:
         raise ValueError('Muse text config differs from source document')
@@ -111,16 +114,33 @@ def inventory(source):
         for group in ('base_core','routed')}
     if (len(specs)-len(removed)!=PRESERVED_TENSOR_COUNT or total-removed_bytes+packed!=TARGET_PAYLOAD_BYTES):
         raise ValueError('Muse output inventory arithmetic differs')
-    return dict(source_payload_bytes=total,source_tensors=len(specs),selected_modules=len(selected),
+    summary = dict(source_payload_bytes=total,source_tensors=len(specs),selected_modules=len(selected),
         selected_source_bytes=removed_bytes,selected_packed_bytes=packed,
         preserved_bytes=total-removed_bytes,preserved_tensors=len(specs)-len(removed),
         target_payload_bytes=total-removed_bytes+packed,target_tensors=TARGET_TENSOR_COUNT,
         shards=len(by_shard),parts=parts,fused_expert_layout=FUSED_EXPERT_LAYOUT)
 
+    if core_bits==6 and not core_only:
+        return summary
+    selected=reviewed_modules(core_bits=core_bits,core_only=core_only)
+    removed=removed_source_names(selected)
+    removed_bytes=sum(math.prod(specs[name][1])*2 for name in removed)
+    packed=sum(packed_bytes(g) for g in selected.values())
+    summary.update(selected_modules=len(selected),selected_source_bytes=removed_bytes,
+        selected_packed_bytes=packed,preserved_bytes=0 if core_only else total-removed_bytes,
+        preserved_tensors=0 if core_only else len(specs)-len(removed),
+        target_payload_bytes=packed if core_only else total-removed_bytes+packed,
+        target_tensors=len(selected)*4+(0 if core_only else len(specs)-len(removed)),
+        parts={group:dict(modules=sum(g['group']==group for g in selected.values()),
+            source_bytes=sum(g['in_features']*g['out_features']*2 for g in selected.values() if g['group']==group),
+            packed_bytes=sum(packed_bytes(g) for g in selected.values() if g['group']==group))
+            for group in ('base_core','routed')})
+    return summary
 
-def selected_modules(source):
-    inventory(source)
-    return reviewed_modules()
+
+def selected_modules(source, *, core_bits=6, core_only=False):
+    inventory(source,core_bits=core_bits,core_only=core_only)
+    return reviewed_modules(core_bits=core_bits,core_only=core_only)
 
 
 _SELECTED_SOURCE_BYTES = sum(g['in_features']*g['out_features']*2 for g in reviewed_modules().values())

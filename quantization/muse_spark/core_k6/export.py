@@ -15,7 +15,7 @@ from kimi_k3.uniform_k2.storage import (assemble_shard, atomic_json, canonical,
                                        fsync_directory, read_header, verify_receipt)
 from .recipe import (BASE_REPO, BASE_REVISION, BASE_PAYLOAD_BYTES, BASE_TENSOR_COUNT,
                      MCG_MULTIPLIER, TARGET_PAYLOAD_BYTES, TARGET_TENSOR_COUNT,
-                     packed_specs, packed_bytes, reviewed_modules, selected_modules, removed_source_names, FUSED_EXPERT_LAYOUT)
+                     packed_specs, packed_bytes, reviewed_modules, reviewed_core_modules, selected_modules, removed_source_names, FUSED_EXPERT_LAYOUT)
 
 
 _WIDTHS = dict(I16=2, F16=2, I32=4)
@@ -213,13 +213,18 @@ def _target_shard(name):
     return _shard_name(SHARD_COUNT)
 
 
-def assemble_layer(source, layer, replacements, export, identity):
+def assemble_layer(source, layer, replacements, export, identity, *, core_bits=6, core_only=False):
     """Replace the layer's core/expert selection and audit every native byte."""
     if type(layer) is not int or not 0 <= layer < LAYER_COUNT:
         raise ValueError("invalid Muse layer")
     export = Path(export)
     export.mkdir(parents=True, exist_ok=True)
     prefix = _layer_prefix(layer)
+    if core_only:
+        from core_export import assemble_core_shard
+        selection = {name: g for name, g in reviewed_core_modules(core_bits=core_bits).items()
+                     if name.startswith(prefix)}
+        return assemble_core_shard(replacements, selection, export, _shard_name(layer + 1), identity)
     selection = {name: g for name, g in reviewed_modules().items() if name.startswith(prefix)}
     originals = {name: (source.snapshot / shard, name) for name, shard in source.weight_map.items()
                  if name.startswith(prefix)}
@@ -504,3 +509,43 @@ sizes. Complete per-module numerical evidence is bundled under
 generation, long-context quality or serving performance. Vision/audio
 components are preserved, and were not calibrated or quantized by this job.
 """
+
+
+def finalize_core_only(source, selection, head_replacements, export, identity, evidence_root, *, core_bits=8):
+    """Finish an isolated 373-module artifact, never copying native payloads/assets."""
+    from core_export import assemble_core_shard, finalize_core_export
+    if selection != selected_modules(source,core_bits=core_bits,core_only=True):
+        raise ValueError("core-only selection differs from reviewed Muse source")
+    export=Path(export)
+    assemble_core_shard(head_replacements,{"lm_head":selection["lm_head"]},export,
+        _shard_name(SHARD_COUNT),identity)
+    expected_shards={_shard_name(i) for i in range(1,SHARD_COUNT+1)}
+    if {path.relative_to(export).as_posix() for path in export.rglob("*.safetensors")} != expected_shards:
+        raise ValueError("core-only shard inventory differs")
+    records={}
+    evidence_root=Path(evidence_root)
+    if evidence_root.is_symlink() or not evidence_root.is_dir():
+        raise ValueError("core-only evidence must be a regular directory")
+    for path in sorted(evidence_root.rglob("*.json")):
+        if path.is_symlink():
+            raise ValueError("refuse symlink numerical evidence")
+        record=json.loads(path.read_text());module=record.get("module")
+        if module not in selection or module in records:
+            raise ValueError("core-only numerical evidence inventory differs")
+        g=selection[module]
+        if (record.get("bits")!=g["bits"] or
+                record.get("logical_shape")!=[g["out_features"],g["in_features"]] or
+                not record.get("metrics") or
+                record.get("evidence",{}).get("packed_byte_oracle",{}).get("passed") is not True):
+            raise ValueError("core-only reconstruction evidence incomplete")
+        canonical(record)
+        records[module]=record
+    if set(records)!=set(selection):
+        raise ValueError("core-only evidence does not cover all 373 modules")
+    summary=finalize_core_export(selection,export,identity)
+    for module,record in records.items():
+        atomic_json(export/"quantization-errors"/(module+".json"),record)
+    atomic_json(export/"quantization-provenance.json",identity)
+    _fsync_tree(export)
+    return dict(summary,quantized_projections=len(selection),core_projections=len(selection),
+        routed_projections=0,preserved_tensors=0,preserved_bytes=0)
