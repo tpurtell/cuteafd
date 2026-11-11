@@ -41,10 +41,32 @@ def publication_inventory(output):
         files[name] = dict(bytes=path.stat().st_size, sha256=digest)
     parent_name = PARENTS[family][0] if family in PARENTS else 'Kimi-K3.1-Pro-EXL3-K2-Core-K6'
     parent_repo = 'wrldsuksgo2mars/' + parent_name
+    copied = {}
+    for target, source in sorted(state['copies'].items()):
+        path = output / target
+        digest = sha256_file(path)
+        validated = validation['copied_file_sha256'].get(target)
+        if validated is not None and digest != validated:
+            raise ValueError('validated inherited file changed: ' + target)
+        size = path.stat().st_size
+        git_blob = None
+        if size <= 64 << 20:
+            raw = path.read_bytes()
+            git_blob = hashlib.sha1(f'blob {len(raw)}\0'.encode() + raw).hexdigest()
+        copied[target] = dict(bytes=size, sha256=digest, git_blob=git_blob)
+    if family == 'ml4':
+        from mc_package import family_recipe, read_header, SUFFIXES
+        _, selection = family_recipe(family)
+        forbidden = {m + '.' + suffix for m in selection for suffix in SUFFIXES}
+        for name in list(files) + list(copied):
+            if name.endswith('.safetensors') and forbidden.intersection(read_header(output / name)[0]):
+                raise ValueError('ML4 publication physically contains quantized core: ' + name)
     packet = dict(schema='cuteafd-package-upload-plan-v1', repo_id=DESTINATIONS[family],
         identity=state['identity'], validation_sha256=sha256_file(output / 'package-validation.json'),
         parent_repo=parent_repo, parent_revision=state['identity']['parent_revision'],
-        copies=state['copies'], new_files=files, new_bytes=sum(r['bytes'] for r in files.values()))
+        copies=state['copies'], copy_files=copied, new_files=files,
+        new_bytes=sum(r['bytes'] for r in files.values()),
+        copied_bytes=sum(r['bytes'] for r in copied.values()))
     return packet
 
 
@@ -76,6 +98,10 @@ def publish(output, state_root, approved_packet, *, api=None):
         parent_remote = _remote(api, packet['parent_repo'], packet['parent_revision'])
         if not set(packet['copies'].values()) <= parent_remote.keys():
             raise ValueError('copy source file absent from pinned parent')
+        for target, source in packet['copies'].items():
+            remote, local = parent_remote[source], packet['copy_files'][target]
+            if remote['bytes'] != local['bytes'] or remote['blob'] not in (local['sha256'], local['git_blob']):
+                raise ValueError('local inherited bytes differ from pinned parent: ' + target)
         guard_path = state_root / 'destination.json'
         if guard_path.exists():
             guard = json.loads(guard_path.read_text())
@@ -89,7 +115,16 @@ def publish(output, state_root, approved_packet, *, api=None):
                 raise ValueError('destination must be new, empty and public')
             guard = dict(commit=info.sha)
             atomic_json(guard_path, guard)
-        operations, expected, prepared = [], {}, {}
+        info = api.repo_info(repo, repo_type='model')
+        if info.private:
+            raise ValueError('destination became private')
+        if info.sha != guard['commit'] and not (state_root / 'upload-complete.json').exists():
+            # A lost commit reply is recoverable only after every preupload receipt exists.
+            records = state_root / 'preuploaded'
+            if any(not (records / (hashlib.sha256(n.encode()).hexdigest() + '.json')).exists()
+                   for n in packet['new_files']):
+                raise ValueError('destination moved before preparation completed')
+        operations, expected = [], {}
         for target, source in sorted(packet['copies'].items()):
             operations.append(CommitOperationCopy(src_path_in_repo=source, path_in_repo=target,
                 src_revision=packet['parent_revision'], src_repo_id=packet['parent_repo'], src_repo_type='model'))
@@ -127,8 +162,11 @@ def publish(output, state_root, approved_packet, *, api=None):
                     blob = hashlib.sha1(f'blob {len(raw)}\0'.encode() + raw).hexdigest()
                 record = dict(mode=mode, bytes=planned['bytes'], blob=blob, local=local)
                 atomic_json(record_path, record)
+            if record['bytes'] != planned['bytes'] or (record['mode'] == 'lfs' and record['blob'] != planned['sha256']):
+                raise ValueError('preupload receipt differs from approved bytes: ' + name)
+            if _fingerprint(path) != local or sha256_file(path) != planned['sha256']:
+                raise ValueError('upload source changed during preupload: ' + name)
             operations.append(operation)
-            prepared[name] = record
             expected[name] = dict(bytes=record['bytes'], blob=record['blob'])
         info = api.repo_info(repo, repo_type='model')
         if info.private:

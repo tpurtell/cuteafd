@@ -143,6 +143,115 @@ def test_output_overlap_refused(tmp_path, monkeypatch):
         package.assemble(**args)
 
 
+class FakePublishApi:
+    def __init__(self, packet):
+        self.packet = packet
+        self.head = 'a' * 40
+        self.files = {}
+        self.uploaded = []
+        self.commits = 0
+        self.fail_after = None
+        self.lose_reply = False
+        self.parent = {source: dict(bytes=packet['copy_files'][target]['bytes'],
+            blob=packet['copy_files'][target]['sha256']) for target, source in packet['copies'].items()}
+
+    def repo_info(self, repo, **kwargs):
+        return SimpleNamespace(sha=self.head, private=False)
+
+    def model_info(self, repo, revision):
+        assert revision == self.head
+        return SimpleNamespace(sha=self.head)
+
+    def preupload_lfs_files(self, repo, operations, **kwargs):
+        import hashlib
+        for operation in operations:
+            if self.fail_after is not None and len(self.uploaded) >= self.fail_after:
+                raise RuntimeError('transport interrupted')
+            operation._should_ignore = False
+            operation._upload_mode = 'lfs'
+            with operation.as_file() as stream:
+                operation.upload_info.sha256 = hashlib.sha256(stream.read()).digest()
+            operation._is_uploaded = True
+            self.uploaded.append(operation.path_in_repo)
+
+    def create_commit(self, repo, operations, **kwargs):
+        from huggingface_hub import CommitOperationCopy
+        assert kwargs['parent_commit'] == self.head
+        for operation in operations:
+            if isinstance(operation, CommitOperationCopy):
+                self.files[operation.path_in_repo] = self.parent[operation.src_path_in_repo]
+            else:
+                self.files[operation.path_in_repo] = dict(bytes=operation.upload_info.size,
+                    blob=operation.upload_info.sha256.hex())
+        self.commits += 1
+        self.head = 'b' * 40
+        if self.lose_reply:
+            raise RuntimeError('lost commit reply')
+        return SimpleNamespace(oid=self.head)
+
+
+def publisher_fixture(tmp_path, monkeypatch):
+    import mc_publish
+    import upload_model
+    import huggingface_hub
+    from huggingface_hub.utils import _runtime
+    args = fixture(tmp_path, monkeypatch)
+    package.assemble(**args)
+    packet = mc_publish.publication_inventory(args['output'])
+    api = FakePublishApi(packet)
+    monkeypatch.setattr(mc_publish.importlib.metadata, 'version', lambda name: '1.26.1')
+    monkeypatch.setattr(_runtime, 'is_xet_available', lambda: True)
+    monkeypatch.setattr(huggingface_hub, 'HfApi', lambda **kwargs: api)
+    monkeypatch.setattr(upload_model, '_remote', lambda client, repo, rev:
+        api.parent if repo == packet['parent_repo'] else api.files)
+    return mc_publish, args['output'], tmp_path / 'upload-state', packet, api
+
+
+def test_publish_recovers_preupload_and_lost_commit_reply(tmp_path, monkeypatch):
+    publisher, output, state, packet, api = publisher_fixture(tmp_path, monkeypatch)
+    api.fail_after = 2
+    with pytest.raises(RuntimeError, match='transport interrupted'):
+        publisher.publish(output, state, packet, api=api)
+    assert api.commits == 0
+    api.fail_after = None
+    api.lose_reply = True
+    with pytest.raises(RuntimeError, match='lost commit reply'):
+        publisher.publish(output, state, packet, api=api)
+    prepared = list(api.uploaded)
+    result = publisher.publish(output, state, packet, api=api)
+    assert result['status'] == 'uploaded'
+    assert api.uploaded == prepared
+    assert len(prepared) == len(set(prepared)) == len(packet['new_files'])
+    assert api.commits == 1
+
+
+def test_publish_rejects_approval_mismatch_without_hub_action(tmp_path, monkeypatch):
+    publisher, output, state, packet, api = publisher_fixture(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match='separately approved'):
+        publisher.publish(output, state, dict(packet, new_bytes=-1), api=api)
+    assert not state.exists()
+    assert not api.uploaded
+
+
+def test_publish_rejects_wrong_pinned_parent_bytes(tmp_path, monkeypatch):
+    publisher, output, state, packet, api = publisher_fixture(tmp_path, monkeypatch)
+    api.parent['mixed.safetensors']['blob'] = 'f' * 64
+    with pytest.raises(ValueError, match='pinned parent'):
+        publisher.publish(output, state, packet, api=api)
+    assert not api.uploaded
+    assert not (state / 'destination.json').exists()
+
+
+def test_ml4_upload_inventory_rejects_hidden_quantized_core_asset(tmp_path, monkeypatch):
+    from mc_publish import publication_inventory
+    args = fixture(tmp_path, monkeypatch, 'ml4')
+    save_file(tensors('head', dict(in_features=128, out_features=128,
+        stored_out_features=128), 6), args['parent'] / 'unindexed.safetensors')
+    package.assemble(**args)
+    with pytest.raises(ValueError, match='physically contains quantized core'):
+        publication_inventory(args['output'])
+
+
 def test_exact_pattern_excludes_only_requested_modules():
     patterns=package.exact_patterns(['^layers\\.[0-9]+\\.(?:core|expert)$'],
         {'layers.0.core','layers.1.core','layers.0.expert'}, {'layers.0.core'})
