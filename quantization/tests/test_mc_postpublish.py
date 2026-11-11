@@ -129,7 +129,7 @@ def test_import_hardcodes_offline_no_copy_and_checks_zero_bytes(staged_inputs, m
 def test_cleanup_never_accepts_unverified_receipt(tmp_path):
     receipt = dump(tmp_path / 'verify.json', dict(status='verification-running'))
     with pytest.raises(ValueError, match='verified imported'):
-        post.cleanup(receipt, [tmp_path], tmp_path / 'clean.json', [])
+        post.cleanup(receipt, [tmp_path], tmp_path / 'clean.json', [], tmp_path / 'dependencies.json')
 
 
 def test_cleanup_rejects_shared_stores_and_protected_roots(tmp_path, monkeypatch):
@@ -139,7 +139,7 @@ def test_cleanup_rejects_shared_stores_and_protected_roots(tmp_path, monkeypatch
     receipt = dump(tmp_path / 'verify.json', dict(status='imported-hashes-and-readiness-verified', snapshot='/mnt/sparknest/model'))
     for root, protected in [(builds, []), (tmp_path / '.cache/cuteafd/instances', []), (builds / 'active', [builds / 'active/input'])]:
         with pytest.raises(ValueError, match='unsafe or protected'):
-            post.cleanup(receipt, [root], tmp_path / 'clean.json', protected)
+            post.cleanup(receipt, [root], tmp_path / 'clean.json', protected, tmp_path / 'dependencies.json')
 
 
 def test_cleanup_separates_retained_payload_and_last_links(tmp_path, monkeypatch):
@@ -152,7 +152,11 @@ def test_cleanup_separates_retained_payload_and_last_links(tmp_path, monkeypatch
     os.link(root / 'intermediate.bin', root / 'second-link.bin')
     (root / 'proof.json').write_text('{}')
     receipt = dump(tmp_path / 'verify.json', dict(status='imported-hashes-and-readiness-verified', snapshot='/mnt/sparknest/model'))
-    result = post.cleanup(receipt, [root], tmp_path / 'clean.json', [])
+    script = tmp_path / 'remaining-script.py'
+    script.write_text('unrelated source')
+    dependencies = tmp_path / 'dependencies.json'
+    post.dependency_check([root], {post.socket.gethostname(): [str(script)]}, dependencies)
+    result = post.cleanup(receipt, [root], tmp_path / 'clean.json', [], dependencies)
     assert result['logical_unlinked_bytes'] == 7 + 9 + 9 + 2
     assert result['retained_hardlink_payload_bytes'] == 7
     assert result['removed_last_link_intermediate_bytes'] == 11
@@ -160,6 +164,42 @@ def test_cleanup_separates_retained_payload_and_last_links(tmp_path, monkeypatch
     assert (tmp_path / 'sparknest-owned').read_bytes() == b'payload'
     assert (Path(result['retained']) / '0/proof.json').read_text() == '{}'
     assert not root.exists()
+
+
+def test_dependency_check_rejects_referenced_roots(tmp_path):
+    script = tmp_path / 'assembly.py'
+    root = tmp_path / 'to-remove'
+    script.write_text('source = ' + str(root / 'export'))
+    receipt = tmp_path / 'dependencies.json'
+    with pytest.raises(ValueError, match='references cleanup root'):
+        post.dependency_check([root], {post.socket.gethostname(): [str(script)]}, receipt)
+    assert not receipt.exists()
+    with pytest.raises(ValueError, match='nonempty'):
+        post.dependency_check([root], {}, receipt)
+
+
+@pytest.mark.parametrize('change', ['status', 'roots', 'stale', 'input'])
+def test_cleanup_requires_matching_unchanged_dependency_proof(tmp_path, monkeypatch, change):
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    root = tmp_path / '.cache/cuteafd/builds/owned'
+    root.mkdir(parents=True)
+    script = tmp_path / 'assembly.py'
+    script.write_text('independent producer')
+    receipt = dump(tmp_path / 'verify.json', dict(status='imported-hashes-and-readiness-verified', snapshot='/mnt/sparknest/model'))
+    dependencies = tmp_path / 'dependencies.json'
+    proof = post.dependency_check([root], {post.socket.gethostname(): [str(script)]}, dependencies)
+    if change == 'status':
+        proof['status'] = 'unchecked'
+    elif change == 'roots':
+        proof['roots'] = []
+    elif change == 'stale':
+        proof['checked_at'] -= 3601
+    else:
+        script.write_text('modified producer')
+    dump(dependencies, proof)
+    with pytest.raises(ValueError, match='dependency'):
+        post.cleanup(receipt, [root], tmp_path / 'clean.json', [], dependencies)
+    assert root.exists() and not (tmp_path / 'clean-retained').exists()
 
 
 def test_inherited_alias_is_same_inode_without_payload_copy(staged_inputs, tmp_path):

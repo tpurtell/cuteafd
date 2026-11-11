@@ -13,8 +13,11 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import shlex
 import stat
 import subprocess
+import socket
+import time
 
 from kimi_k3.uniform_k2.storage import atomic_json, sha256_file
 
@@ -284,7 +287,37 @@ def verify(stage_receipt, import_receipt, hub, planner, programs, v4, receipt_pa
     return receipt
 
 
-def cleanup(verify_receipt, roots, receipt_path, protected):
+def dependency_check(roots, inventory, receipt_path=None):
+    """Check explicitly inventoried remaining packet scripts/plans on their hosts."""
+    roots = sorted(str(Path(p).absolute()) for p in roots)
+    if not inventory or not all(paths for paths in inventory.values()):
+        raise ValueError('nonempty dependency input inventory required')
+    checks = []
+    for host, paths in sorted(inventory.items()):
+        for path in sorted(paths):
+            if not Path(path).is_absolute():
+                raise ValueError('absolute dependency input path required')
+            if host == socket.gethostname():
+                raw = Path(path).read_bytes()
+            else:
+                command = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', host,
+                           'python3 -I -c ' + shlex.quote(
+                               'import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())')
+                           + ' ' + shlex.quote(path)]
+                raw = subprocess.run(command, capture_output=True, check=True, timeout=120).stdout
+            text = raw.decode('utf-8')
+            if any(root in text for root in roots):
+                raise ValueError('remaining dependency references cleanup root: ' + host + ':' + path)
+            checks.append(dict(host=host, path=path, sha256=hashlib.sha256(raw).hexdigest()))
+    result = dict(schema='cuteafd-postpublish-dependencies-v1', status='no-cleanup-root-references',
+                  cleanup_host=socket.gethostname(), roots=roots, inventory=inventory,
+                  checks=checks, checked_at=time.time())
+    if receipt_path is not None:
+        atomic_json(receipt_path, result)
+    return result
+
+
+def cleanup(verify_receipt, roots, receipt_path, protected, dependency_receipt):
     """Delete only explicit owned build roots, after verification and FD checks.
 
     Caller must supply every running job's source/dependency roots as protected.
@@ -304,6 +337,17 @@ def cleanup(verify_receipt, roots, receipt_path, protected):
             raise ValueError('cleanup root is unsafe or protected: ' + str(root))
     if any(a != b and contained(a, b) for a in roots for b in roots):
         raise ValueError('overlapping cleanup roots')
+    dependencies = load(dependency_receipt)
+    if (dependencies.get('schema') != 'cuteafd-postpublish-dependencies-v1'
+            or dependencies.get('status') != 'no-cleanup-root-references'
+            or dependencies.get('cleanup_host') != socket.gethostname()
+            or dependencies.get('roots') != sorted(map(str, roots))
+            or not 0 <= time.time() - dependencies.get('checked_at', 0) <= 3600
+            or any(contained(Path(dependency_receipt).resolve(), root) for root in roots)):
+        raise ValueError('matching fresh dependency-check receipt required before cleanup')
+    current = dependency_check(roots, dependencies['inventory'])
+    if current['checks'] != dependencies['checks']:
+        raise ValueError('dependency input changed since preflight')
     for proc in Path('/proc').iterdir():
         if not proc.name.isdigit():
             continue
@@ -335,7 +379,8 @@ def cleanup(verify_receipt, roots, receipt_path, protected):
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, dest)
     intent = dict(schema='cuteafd-postpublish-cleanup-v1', status='cleanup-started',
-        verification_sha256=sha256_file(verify_receipt), roots=list(map(str, roots)),
+        verification_sha256=sha256_file(verify_receipt), dependency_check_sha256=sha256_file(dependency_receipt),
+        roots=list(map(str, roots)),
         protected=list(map(str, protected)), retained=str(evidence), logical_unlinked_bytes=logical,
         retained_hardlink_payload_bytes=sum(r['bytes'] for r in inodes.values() if r['nlink'] > r['removed_links']),
         removed_last_link_intermediate_bytes=sum(r['bytes'] for r in inodes.values() if r['nlink'] == r['removed_links']),
@@ -373,8 +418,12 @@ def main():
     v = commands.add_parser('verify')
     for key in ('stage-receipt', 'import-receipt', 'hub', 'planner', 'programs', 'v4', 'receipt'):
         v.add_argument('--' + key, type=Path, required=True)
+    d = commands.add_parser('check-dependencies')
+    d.add_argument('--inventory', type=Path, required=True)
+    d.add_argument('--root', type=Path, action='append', required=True)
+    d.add_argument('--receipt', type=Path, required=True)
     c = commands.add_parser('cleanup')
-    for key in ('verify-receipt', 'receipt'):
+    for key in ('verify-receipt', 'receipt', 'dependency-receipt'):
         c.add_argument('--' + key, type=Path, required=True)
     c.add_argument('--root', type=Path, action='append', required=True)
     c.add_argument('--protected', type=Path, action='append', required=True)
@@ -392,9 +441,12 @@ def main():
     if action == 'stage':
         args['sources'] = load(args['sources']) if args['sources'] else None
         args['inherited'] = load(args['inherited']) if args['inherited'] else None
-    if action == 'cleanup':
+    if action in ('cleanup', 'check-dependencies'):
         args['roots'] = args.pop('root')
-    result = {'stage': stage, 'alias': alias_inherited, 'import': import_staged, 'verify': verify, 'cleanup': cleanup}[action](**args)
+    if action == 'check-dependencies':
+        args['inventory'] = load(args['inventory'])
+    result = {'stage': stage, 'alias': alias_inherited, 'import': import_staged, 'verify': verify,
+              'check-dependencies': dependency_check, 'cleanup': cleanup}[action](**args)
     print(json.dumps({k: v for k, v in result.items() if k not in ('files', 'plans', 'result')}, sort_keys=True))
 
 
