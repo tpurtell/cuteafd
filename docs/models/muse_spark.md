@@ -15,31 +15,9 @@ place. The starting configs also serve the checkpoint's bundled vision and
 PCM audio towers by default; qualification and caveats are recorded below
 and on #923.
 
-## Attention bundles
+## Attention and core views
 
-The HQA publication `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6-HQA`
-(revision `12065621f67bb2a8baa67af90877cc99e8bf81fc`) restores exactly 62
-attention `o_proj` matrices to BF16; q/k/v remain K6. Select the model-lifetime
-bundle with `ATTENTION_MODE=hqa` (default), `fp8-compact`, or `compact`.
-Planning, serving, golden checks and inspection use the same immutable selected
-config, index and quantization metadata; worker identities separate the modes.
-
-`hqa` uses shared ordered-K16 BF16 projections. `fp8-compact` converts the
-selected BF16 output projections to row-major E4M3 with F32 block-128 scales
-at load/push, then uses native W8A16 (never W8A8). On a head-split pair, both
-native routes emit F32 partials, add them in rank order and narrow to BF16 once.
-`compact` reads the bundled parent K6 attention index and never opens the
-replaced native shards. A missing or inconsistent compact bundle refuses.
-Bundled media tower names, shard mappings and relevant configuration must
-match across the selected and default views before sharing tower loaders.
-
-Native modes admit a conservative 16.5 GiB per rank of load-only pinned host
-push staging through the shared receive/transform envelope. This is host RAM,
-not GPU residency or KV capacity. Compact preserves its historical 1 GiB/rank
-(single RTX) or 2 GiB/rank (RTX pair) dense push bound. The planner separately
-names retained native values/scales and load-only device conversion storage.
-These modes are under qualification on the PRO 6000 layouts; no 5090 result or
-performance winner is implied.
+The `-HQA` checkpoints are withdrawn from Hugging Face. They're being replaced by multi-core (MC) checkpoints that bundle the original dense core with selectable K8 and K6 cores. Until those publish, serve the Core-K6 checkpoint above.
 
 ## Architecture
 

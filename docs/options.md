@@ -213,7 +213,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `ATTENTION_MODE` | `hqa` | `hqa`, `compact`, `fp8-compact` | Per qualified checkpoint family in `scripts/lib/attention-variants.json` (shared by launcher, launch-key registry and daemon; no separate per-family key gate): default native HQA bundle, parent compact bundle, or deterministic load/push FP8 conversion of native BF16. Already-FP8 HQA cannot be converted again. Step-5 converts native O only, including private MTP O, and retains F32 TP2 partials. Selected for the model lifetime. |
+| `ATTENTION_MODE` | `hqa` | `hqa`, `compact`, `fp8-compact` | **The `-HQA` checkpoints this selects are withdrawn from Hugging Face; this key is being replaced by a core-view selector for multi-core (MC) checkpoints.** Per qualified checkpoint family in `scripts/lib/attention-variants.json` (shared by launcher, launch-key registry and daemon; no separate per-family key gate): default native HQA bundle, parent compact bundle, or deterministic load/push FP8 conversion of native BF16. Already-FP8 HQA cannot be converted again. Step-5 converts native O only, including private MTP O, and retains F32 TP2 partials. Selected for the model lifetime. |
 | `ATTENTION_PLACEMENT` | `auto` | `auto`, `context`, `layers`, `heads` | Per-family defaults and refusals are in the table below. |
 | `ATTENTION_PLAN_ROWS` | `auto` | `auto`, positive int | Decode/verify reduction plan rows. |
 | `MAX_CONTEXT_TOKENS` | `auto` | `auto`, 1–1048576 | `auto`: serve min(model maximum context, admitted pool). A number pins context and requires the pool to cover it. Plan and every serve command use `--max-context-tokens` with `auto` or a number; explicit CLI overrides the config. Compiled workspace/table extent is internal, not a user context setting. |
@@ -441,9 +441,8 @@ Every key the launcher knows, checked against each launch path's real
 accept/refuse behaviour. `✓` means the family's config validation accepts it;
 `✗` means the launch stops with `unused configuration key: KEY` (exit 2).
 `SPARK_<rank>_*` covers ranks 0–7. In the combined GLM 5.3 / ML4 column,
-`ATTENTION_MODE` is accepted for both families. ML4 HQA keeps its native E4M3
-weights and F32 block-128 scales; `compact` selects parent K6 attention, while
-`fp8-compact` returns `UnsupportedFp8Conversion` because its HQA is already FP8.
+`ATTENTION_MODE` is accepted for both families; the `-HQA` checkpoints it
+selected are withdrawn (see above).
 
 | Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

@@ -17,21 +17,9 @@ Set `TP2_DFLASH=off` to keep the draft on GPU1; direct CLI users can pass
 Starting config (replace the REPLACE-ME Spark hosts and the 192.0.2.x RoCE
 addresses): [max](../../examples/configs/kimi-k3-exl3-k6-max.config).
 
-## Attention Views
+## Attention and core views
 
-`wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6-HQA` bundles three attention modes.
-Set `MODEL_ID` to this checkpoint and `MODEL_REVISION` to
-`46b802d31c737bc64b4251ad158b9b3ffc4e04f6` when adapting the starting config.
-The default HQA view retains native BF16 attention output and MLA query
-projections alongside the K6 core. `ATTENTION_MODE=compact` selects the bundled
-parent K6 attention; `ATTENTION_MODE=fp8-compact` instead converts the selected
-native BF16 projections to block-scaled FP8, with BF16 activations. The default
-is `ATTENTION_MODE=hqa`, and only one mode applies to the model lifetime.
-
-The corresponding CLI flags are `--compact-attention` and
-`--fp8-compact-attention`. Plan, inspect, serve and golden select the complete
-checkpoint bundle before planning or loading. Incomplete or mixed bundles
-refuse, and each mode has its own checkpoint fingerprint and memory charges.
+The `-HQA` checkpoints are withdrawn from Hugging Face. They're being replaced by multi-core (MC) checkpoints that bundle the original dense core with selectable K8 and K6 cores. Until those publish, serve the Core-K6 checkpoint above.
 
 ## Release card
 

@@ -30,35 +30,9 @@ its roughly 1.81M-token pool and onboards none. These are planner results,
 not hardware qualification. Start from the published-revision-pinned
 `examples/configs/step5-exl3-k6core-{min,max}.config`.
 
-## HQA Attention
+## Attention and core views
 
-`wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6-HQA` at revision
-`61f9275e7f604cb11a5ae9a64a07ff1c600174b7` retains the compact parent's
-experts and core, but restores all 95 attention O projections to BF16,
-including private MTP layers 92-94. Q/K/V remain EXL3; there are no q_b
-projections. Set `MODEL_ID` and `MODEL_REVISION` to this publication when
-starting from the EXL3 example config.
-
-`ATTENTION_MODE=hqa` (the default) selects the native bundle.
-`ATTENTION_MODE=compact`, or direct CLI `--compact-attention`, selects its
-bundled parent attention without reading the native attention shards. The
-selected config, index and quantization metadata remain fixed for planning,
-loading and execution; cache and golden identities distinguish the modes.
-The planner prices each selected mode from its own tensor headers, including
-native load staging and all private predictor owners, before sizing the pool
-and onboarding experts. Parent-only checkpoint layouts do not predict HQA fit.
-
-Native O uses row-invariant ordered-K16 BF16-weight projections. Whole CSA
-and MTP outputs stay BF16; TP2 SWA produces F32 partials, sums them in peer
-order and narrows directly to BF16 without a trellis output rotation.
-`ATTENTION_MODE=fp8-compact` / `--fp8-compact-attention` converts the selected
-native BF16 O matrices to one resident E4M3 copy plus F32 block-128 scales,
-using the identity-bound amax/RNE recipe. Activations remain BF16 (W8A16),
-whole CSA/MTP outputs remain BF16, and TP2 SWA keeps genuine F32 partials.
-The manifest-owned FP8 workspace borrows dead trellis scratch on the same
-serialized lane stream; it adds no per-layer workspace allocation. Hardware
-quality and performance qualification are pending; enabling bundle selection
-is not numerical qualification.
+The `-HQA` checkpoints are withdrawn from Hugging Face. They're being replaced by multi-core (MC) checkpoints that bundle the original dense core with selectable K8 and K6 cores. Until those publish, serve the Core-K6 checkpoint above.
 
 ## Native MTP
 
