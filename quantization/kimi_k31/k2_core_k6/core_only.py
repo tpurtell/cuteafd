@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 from pathlib import Path
 import shutil
 
@@ -113,6 +114,9 @@ def make_plan(source, tokens, root, export, bits):
     recipe['training_error_alarm'] = dict(limit=LIMIT, domain='regularized-Hessian-training-not-heldout')
     plan['identity'] = copy.deepcopy(plan['identity'])
     plan['identity'].update(schema='cuteafd-kimi-k31-core-only-v1', recipe=recipe)
+    plan['identity']['precision'] = dict(matmul_precision="highest", allow_tf32=False,
+            torch_allow_tf32_cublas_override=os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"),
+            nvidia_tf32_override=os.environ.get("NVIDIA_TF32_OVERRIDE"))
     plan['identity']['memory'] = dict(container_bytes=110 * run.GIB, cuda_allocation_cap_bytes=100 * run.GIB)
     for path in (Path(__file__), run.REPO / 'quantization/core_export.py'):
         plan['identity']['code'][str(path.relative_to(run.REPO))] = sha256_file(path)
@@ -173,6 +177,7 @@ def main():
             torch.set_num_threads(8)
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
+            torch.set_float32_matmul_precision("highest")
             torch.cuda.set_per_process_memory_fraction(100 * run.GIB / torch.cuda.get_device_properties(0).total_memory)
             records = run.load_token_records(args.tokens)
             engine = Engine(source, records, args.root, args.export, plan['identity'],

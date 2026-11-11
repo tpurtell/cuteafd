@@ -112,6 +112,8 @@ def container_command(record, *, preflight=False):
     environment = dict(HOME=str(build / "home"), USER=record["user"], LOGNAME=record["user"],
         CUTEAFD_DEV_MEMORY=memory, CUDA_VISIBLE_DEVICES="" if preflight else "0",
         NVIDIA_VISIBLE_DEVICES="void" if preflight else "all",
+        # NGC enables TF32 through an environment override even with Python flags off.
+        TORCH_ALLOW_TF32_CUBLAS_OVERRIDE="0", NVIDIA_TF32_OVERRIDE="0",
         TORCH_CUDA_ARCH_LIST="12.1", CUDA_HOME="/usr/local/cuda", MAX_JOBS="8",
         OMP_NUM_THREADS="8", OPENBLAS_NUM_THREADS="8", MKL_NUM_THREADS="8",
         USE_HUB_KERNELS="0", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",

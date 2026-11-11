@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -76,6 +77,9 @@ def make_core_plan(source, tokens, root, export, *, core_bits):
         source_config_sha256=sha256_file(source.snapshot / "config.json"),
         source_index_sha256=sha256_file(source.snapshot / "model.safetensors.index.json"),
         token_manifest_sha256=sha256_file(tokens / "manifest.json"), recipe=numerical_recipe,
+        precision=dict(matmul_precision="highest", allow_tf32=False,
+            torch_allow_tf32_cublas_override=os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"),
+            nvidia_tf32_override=os.environ.get("NVIDIA_TF32_OVERRIDE")),
         calibration=dict(samples=manifest["splits"]["calibration"]["count"],
                          tokens=manifest["splits"]["calibration"]["tokens"]),
         code={str(path.relative_to(REPO)): sha256_file(path) for path in code},
@@ -143,6 +147,7 @@ def run_core_only(args):
         torch.set_num_threads(8)
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
         # The 96 GiB unified-memory container reserves 32 GiB for the host.
         # Legacy full export retains its independent 86 GiB allocator limit.
         torch.cuda.set_per_process_memory_fraction(
