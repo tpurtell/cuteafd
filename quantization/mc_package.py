@@ -335,7 +335,14 @@ def assemble(family, parent, source, output, *, k8=None, parent_revision=None, s
     elif (parent / 'consolidated.safetensors.index.json').exists():
         atomic_json(output / 'consolidated.safetensors.index.json', load_json(output / 'model.safetensors.index.json'))
         metadata.append('consolidated.safetensors.index.json')
-    card = ('# ' + recipe.BASE_REPO.split('/')[-1] + (' EXL3 K4 native core\n\n' if family == 'ml4' else ' EXL3 multi-core\n\n')
+    parent_card = (parent / 'README.md').read_text() if (parent / 'README.md').exists() else ''
+    front_matter = ''
+    if parent_card.startswith('---\n'):
+        boundary = parent_card.find('\n---\n', 4)
+        if boundary < 0:
+            raise ValueError('parent model-card front matter is unterminated')
+        front_matter = parent_card[:boundary + 5] + '\n'
+    card = (front_matter + '# ' + recipe.BASE_REPO.split('/')[-1] + (' EXL3 K4 native core\n\n' if family == 'ml4' else ' EXL3 multi-core\n\n')
         + 'Derived from `' + recipe.BASE_REPO + '@' + recipe.BASE_REVISION + '`.\n\n'
         + ('This plain checkpoint keeps the original FP8/BF16 core and K4 experts. No quantized core payload is included.\n\n'
            if family == 'ml4' else 'The default index selects the original BF16 core. `cuteafd-mc.json` discovers complete K8 and K6 alternate views; experts, media and drafters are shared.\n\n')

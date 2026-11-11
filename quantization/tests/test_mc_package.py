@@ -136,6 +136,15 @@ def test_nested_drafter_and_license_assets_are_copied(tmp_path, monkeypatch):
     assert (args['output']/'LICENSE').read_text()=='source terms'
 
 
+def test_parent_license_front_matter_is_preserved(tmp_path, monkeypatch):
+    args = fixture(tmp_path, monkeypatch)
+    front = '---\nlicense: other\nlicense_name: source-license\nbase_model: test/source\n---\n'
+    (args['parent'] / 'README.md').write_text(front + '# Historical parent\n')
+    package.assemble(**args)
+    assert (args['output'] / 'README.md').read_text().startswith(front)
+    assert (args['output'] / 'README.parent.md').read_text() == front + '# Historical parent\n'
+
+
 def test_output_overlap_refused(tmp_path, monkeypatch):
     args=fixture(tmp_path,monkeypatch)
     args['output']=args['parent']/'output'
