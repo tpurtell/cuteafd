@@ -70,6 +70,37 @@ def publication_inventory(output):
     return packet
 
 
+def verified_remote_tree(api, repo, commit, expected, attributes):
+    """Keep content exact, allowing only Hub-added literal LFS attributes."""
+    from huggingface_hub import hf_hub_download
+    from upload_model import _remote
+
+    actual = _remote(api, repo, commit)
+    if actual == expected:
+        return actual, None
+    name = '.gitattributes'
+    if (actual.keys() != expected.keys() or name not in expected
+            or any(actual[n] != row for n, row in expected.items() if n != name)):
+        raise ValueError('published inventory differs from approved tree')
+    # The Hub adds per-file LFS rules during commit creation. Never allow
+    # rewritten original rules, arbitrary patterns, or changes to other files.
+    if not attributes.endswith(b'\n') or actual[name]['bytes'] > len(attributes) + 4096 * len(expected):
+        raise ValueError('unexpected server-normalized attributes')
+    raw = Path(hf_hub_download(repo, name, revision=commit, token=api.token)).read_bytes()
+    blob = hashlib.sha1(f'blob {len(raw)}\0'.encode() + raw).hexdigest()
+    if actual[name] != dict(bytes=len(raw), blob=blob) or not raw.startswith(attributes):
+        raise ValueError('unexpected server-normalized attributes')
+    added = raw[len(attributes):].splitlines(keepends=True)
+    allowed = {n.encode() + b' filter=lfs diff=lfs merge=lfs -text\n'
+               for n, row in expected.items() if len(row['blob']) == 64
+               and not any(c in n for c in '*?[]\\\r\n\t ')}
+    if not added or len(added) != len(set(added)) or not set(added) <= allowed:
+        raise ValueError('unexpected server-normalized attributes')
+    delta = dict(approved=expected[name], published=actual[name],
+                 added_lfs_rules=[line.decode('utf-8').rstrip('\n') for line in added])
+    return actual, delta
+
+
 def publish(output, state_root, approved_packet, *, api=None):
     """Publish exactly the separately reviewed packet. Never call before approval."""
     from huggingface_hub import CommitOperationAdd, CommitOperationCopy, HfApi
@@ -171,19 +202,19 @@ def publish(output, state_root, approved_packet, *, api=None):
         info = api.repo_info(repo, repo_type='model')
         if info.private:
             raise ValueError('destination became private')
+        attributes = (output / '.gitattributes').read_bytes()
         if info.sha != guard['commit']:
-            if _remote(api, repo, info.sha) != expected:
-                raise ValueError('destination moved to an unrelated tree')
+            verified_remote_tree(api, repo, info.sha, expected, attributes)
             commit = info.sha
         else:
             commit = api.create_commit(repo, operations, repo_type='model', revision='main',
                 parent_commit=guard['commit'], commit_message='Publish calibrated EXL3 checkpoint with original native core').oid
-        if _remote(api, repo, commit) != expected:
-            raise ValueError('published inventory differs from approved tree')
+        published, normalization = verified_remote_tree(api, repo, commit, expected, attributes)
         anonymous = HfApi(token=False)
         if anonymous.model_info(repo, revision=commit).sha != commit:
             raise ValueError('published commit is not anonymously readable')
         receipt = dict(schema='cuteafd-upload-receipt-v1', status='uploaded', repo_id=repo,
-                       commit=commit, plan=packet, files=expected)
+                       commit=commit, plan=packet, files=published,
+                       server_normalized_attributes=normalization)
         atomic_json(state_root / 'upload-complete.json', receipt)
         return receipt
