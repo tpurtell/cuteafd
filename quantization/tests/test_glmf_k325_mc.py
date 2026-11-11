@@ -34,7 +34,7 @@ def setup(tmp_path, monkeypatch):
     experts = tmp_path / mixed.EXPERT_REVISION
     experts.mkdir()
     indexed(experts, {'source.safetensors': tensors(module, geometry, 3) | {'forbidden.weight_scale_inv': torch.ones(1)}})
-    dump(experts, 'quantize_config.json', dict(tensor_storage={module: dict(bits_per_weight=3,
+    dump(experts, 'quantize_config.json', dict(bits=3, tensor_storage={module: dict(bits_per_weight=3,
         stored_tensors={n: dict(torch_dtype=package.DTYPES[dtype], shape=shape)
         for n, (dtype, shape) in package.packed_specs(module, dict(geometry, bits=3)).items()})}))
     audit = tmp_path / 'audit.json'
@@ -60,7 +60,8 @@ def test_clean_experts_core_and_shared_exact_without_inactive_native(tmp_path, m
         index, config, quant, _ = package.mc_manifest.FILES[view]
         inv = package.inventory(args['output'], index)
         assert 'norm.weight' in inv['mapping']
-        assert package.load_json(args['output'] / quant)['bits'] == 3.25
+        assert package.load_json(args['output'] / quant)['bits'] == 3
+        assert package.load_json(args['output'] / config)['quantization_config']['bits'] == 3
     packet = mc_publish.publication_inventory(args['output'])
     assert packet['repo_id'] == 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC'
     assert packet['parent_repo'] == 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC'

@@ -134,7 +134,7 @@ def assemble(parent, experts, output, parent_audit):
         quant = package.load_json(parent / quant_file)
         for module in modules:
             quant['tensor_storage'][module] = deepcopy(package_storage[module])
-        quant['bits'] = config['quantization_config']['bits'] = 3.25
+        quant['bits'] = config['quantization_config']['bits'] = package.load_json(experts / 'quantize_config.json')['bits']
         quant['meta'] = dict(package_sources=dict(
             target_experts=dict(repo=EXPERT_REPO, revision=EXPERT_REVISION, layers=[3, 44]),
             core_shared_mtp=dict(repo=audit['repo_id'], revision=PARENT_REVISION)),
