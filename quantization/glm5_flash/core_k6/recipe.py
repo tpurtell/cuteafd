@@ -30,11 +30,13 @@ KDA_LAYERS = tuple(i for i in range(TARGET_LAYER_COUNT) if i not in MLA_LAYERS)
 SOURCE_CONFIG_SHA256 = "cef231c35fa99c8d2ae06b0d76dfd090499fbac9f5f51b854b1f32760e3a8e18"
 
 
-def reviewed_core_modules(*, include_mtp=True):
+def reviewed_core_modules(*, include_mtp=True, core_bits=6):
+    if type(core_bits) is not int or core_bits not in (6, 8):
+        raise ValueError("unreviewed GLM Flash core bitrate")
     selected = {}
     for layer in range(LAYER_COUNT if include_mtp else TARGET_LAYER_COUNT):
         prefix = f"{PREFIX}layers.{layer}."
-        bits = 4 if layer == MTP_LAYER else 6
+        bits = 4 if layer == MTP_LAYER else core_bits
         group = "mtp_core" if layer == MTP_LAYER else "base_core"
         attention = (("q_proj", 4096, 8192), ("k_proj", 4096, 8192),
                      ("v_proj", 4096, 8192), ("o_proj", 8192, 4096)) if layer in KDA_LAYERS else (
@@ -49,7 +51,7 @@ def reviewed_core_modules(*, include_mtp=True):
             selected[prefix + mlp + name] = _geometry(inputs, outputs, bits, group)
         if layer == MTP_LAYER:
             selected[prefix + "eh_proj"] = _geometry(8192, 4096, 4, group)
-    selected["lm_head"] = _geometry(4096, 154880, 6, "base_core")
+    selected["lm_head"] = _geometry(4096, 154880, core_bits, "base_core")
     return selected
 
 
