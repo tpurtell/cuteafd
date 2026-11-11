@@ -123,10 +123,11 @@ def verify_core_evidence(selection, root, identity):
 
 
 def run_core_only(args):
-    from gptqmodel.utils.glm5_flash_core import GlmFlashBF16Source
+    from mistral_large4.core_k6.numerical import fork_module
     from core_export import assemble_core_shard, finalize_core_export
 
-    source = GlmFlashBF16Source(args.source_snapshot)
+    numerical = fork_module('utils.glm5_flash_core')
+    source = numerical.GlmFlashBF16Source(args.source_snapshot)
     try:
         args.tokens, args.root, args.export = (
             path.expanduser().resolve() for path in (args.tokens, args.root, args.export))
