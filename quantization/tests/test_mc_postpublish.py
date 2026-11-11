@@ -90,7 +90,8 @@ def test_import_hardcodes_offline_no_copy_and_checks_zero_bytes(staged_inputs, m
         with pytest.raises(ValueError, match='did not complete'):
             post.import_staged(staged_inputs['receipt_path'], receipt)
     else:
-        result = post.import_staged(staged_inputs['receipt_path'], receipt)
+        result = post.import_staged(staged_inputs['receipt_path'], receipt, nest='/installed/bin/nest')
+        assert calls[0][0] == calls[1][0] == '/installed/bin/nest'
         assert result['status'] == 'offline-no-copy-imported'
         assert result['fetched_bytes'] == result['copied_bytes'] == 0
     assert '--offline' in calls[0] and '--no-copy' in calls[0]

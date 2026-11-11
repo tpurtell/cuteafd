@@ -356,6 +356,7 @@ def main():
     i = commands.add_parser('import')
     i.add_argument('--stage-receipt', type=Path, required=True)
     i.add_argument('--receipt', type=Path, required=True)
+    i.add_argument('--nest', default='nest', help='Installed nest executable (absolute path for service environments)')
     v = commands.add_parser('verify')
     for key in ('stage-receipt', 'import-receipt', 'hub', 'planner', 'programs', 'v4', 'receipt'):
         v.add_argument('--' + key, type=Path, required=True)
