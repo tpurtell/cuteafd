@@ -41,10 +41,11 @@ def test_container_is_bounded_user_sm121_readonly_source(tmp_path, family, prefl
     row = record(tmp_path, family)
     command = launch.container_command(row, preflight=preflight)
     assert command[:3] == ["docker", "run", "--rm"]
-    assert command[command.index("--memory") + 1] == "96g"
-    assert command[command.index("--memory-swap") + 1] == "96g"
+    cap = "110g" if family in ("kimi-k31", "muse") else "96g"
+    assert command[command.index("--memory") + 1] == cap
+    assert command[command.index("--memory-swap") + 1] == cap
     assert "--user" in command and "--privileged" not in command
-    assert "CUTEAFD_DEV_MEMORY=96g" in command and "TORCH_CUDA_ARCH_LIST=12.1" in command
+    assert "CUTEAFD_DEV_MEMORY=" + cap in command and "TORCH_CUDA_ARCH_LIST=12.1" in command
     assert "--network" in command and command[command.index("--network") + 1] == "none"
     assert command[command.index("--entrypoint") + 1] == "python3"
     assert command[command.index("--entrypoint") + 2] == row["image_id"]
@@ -204,7 +205,7 @@ def test_oversized_or_uncapped_memory_override_refused(tmp_path, monkeypatch, ca
     monkeypatch.setattr(launch.socket, "gethostname", lambda: "raptor")
     monkeypatch.setenv("CUTEAFD_DEV_MEMORY", cap)
     monkeypatch.setattr(launch, "checked_source", lambda *a: pytest.fail("must reject before source validation"))
-    with pytest.raises(ValueError, match="96g"):
+    with pytest.raises(ValueError, match="110g"):
         launch.main(["--core-only", "--host", "rhea", "--source-snapshot", "/mnt/sparknest/source",
                      "--tokens", "/tokens", "--root", "/root", "--export", "/export"], family="muse")
 
@@ -291,3 +292,10 @@ def test_preflight_accepts_corpus_directory_not_file(tmp_path, monkeypatch):
     tokens.write_text('not a corpus directory')
     with pytest.raises(ValueError, match='corpus directory'):
         launch.validate_remote(row)
+
+
+def test_explicit_runtime_keeps_its_transformers_release(tmp_path):
+    row = record(tmp_path, 'muse')
+    row.update(runtime_python='/overlay/bin/python', runtime_root='/overlay')
+    command = launch.container_command(row)
+    assert not any('third_party/transformers/src' in arg for arg in command)

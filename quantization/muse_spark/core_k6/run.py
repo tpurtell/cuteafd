@@ -68,7 +68,7 @@ class Progress:
         with (self.root/'events.jsonl').open('a') as f:f.write(canonical(row)+'\n')
         atomic_json(self.root/'status.json',self.state)
         print(canonical(row),flush=True)
-        if (row['rss_gib']>76 or row['cuda_gib']>(64 if self.core_only else 86)
+        if (row['rss_gib']>(100 if self.core_only else 76) or row['cuda_gib']>(40 if self.core_only else 86)
                 or row['free_gib']<64):
             raise MemoryError('Muse producer exceeded bounded host/GPU/disk admission')
 
@@ -360,7 +360,8 @@ def make_plan(source,tokens,root,export,*,core_bits=6,core_only=False):
         oracle=REPO/'third_party/sparkinfer/tests/_reference/native_trellis.py'
         identity['code'][str(oracle.relative_to(REPO))]=sha256_file(oracle)
         identity['qualification']='per-module-calibrated-metrics-and-exact-packed-byte-oracle-not-K6-pilot'
-        identity['runtime']['cuda_allocation_cap_bytes']=64*GIB
+        identity['runtime']['cuda_allocation_cap_bytes']=40*GIB
+        identity['runtime']['container_memory_bytes']=110*GIB
     return dict(identity=identity,source=str(source.snapshot),tokens=str(tokens),root=str(root),export=str(export),
         inventory=summary,publication_repo=None if core_only else TARGET_REPO,temporary_reserve_bytes=256*GIB,
         required_free_bytes=summary['target_payload_bytes']+320*GIB)
@@ -410,7 +411,7 @@ def main():
             publish(args.export,args.root,TARGET_REPO)
         return
     torch.set_num_threads(8);numerical.configure_math()
-    torch.cuda.set_per_process_memory_fraction((64 if args.core_only else 86)*GIB/torch.cuda.get_device_properties(0).total_memory)
+    torch.cuda.set_per_process_memory_fraction((40 if args.core_only else 86)*GIB/torch.cuda.get_device_properties(0).total_memory)
     progress=Progress(args.root,core_only=args.core_only)
     with torch.inference_mode(),exclusive_run(args.root):
         if not prior.exists():atomic_json(prior,plan)

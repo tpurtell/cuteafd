@@ -120,3 +120,14 @@ def test_plan_validates_corpus_and_paths_without_cuda(tmp_path, monkeypatch):
     monkeypatch.setattr(core.run, 'load_token_records', lambda *a: [{}])
     with pytest.raises(ValueError, match='full'):
         core.make_plan(object(), tmp_path/'tokens', tmp_path/'run', tmp_path/'export', 8)
+
+
+def test_core_adapter_supplies_complete_causal_and_codec_surface(tmp_path):
+    engine = core.Engine(object(), [], tmp_path/'run', tmp_path/'export', {}, {}, Progress(), device='cpu')
+    from gptqmodel.utils import kimi_k31, kimi_k3_core_stream, kimi_k3_core_format
+    assert engine.math.DenseRawHessian is kimi_k31.DenseRawHessian
+    for name in ('attention_inputs', 'attention_finish', 'capture_linear_input',
+                 'shared_down_input', 'routed_up_input', 'complete_moe', 'final_head_input'):
+        assert getattr(engine.math, name) is getattr(kimi_k3_core_stream, name)
+    assert engine.math.quantize_core_projection is kimi_k3_core_format.quantize_core_projection
+    assert engine.math.reconstruct_core_projection is kimi_k3_core_format.reconstruct_core_projection
