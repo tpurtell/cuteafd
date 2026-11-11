@@ -121,6 +121,8 @@ def container_command(record, *, preflight=False):
         GPTQMODEL_EXLLAMAV3_BUILD_ROOT=str(build / "exllamav3"),
         TORCH_EXTENSIONS_DIR=str(build / "torch-extensions"),
         TRITON_CACHE_DIR=str(build / "triton"), TMPDIR=str(build / "tmp"))
+    if record["family"] != "kimi-k31":
+        environment["PYTHONPATH"] += ":" + str(source / "third_party/transformers/src")
     for key, value in environment.items():
         result += ["-e", f"{key}={value}"]
     runner = source / "quantization" / FAMILIES[record["family"]] / "run.py"
@@ -152,9 +154,9 @@ def validate_remote(record):
     if not beneath(source_snapshot, Path("/mnt/sparknest")) or not source_snapshot.is_dir():
         raise ValueError("source snapshot must stream from /mnt/sparknest")
     tokens = Path(record["tokens"])
-    if not tokens.is_file() or not any(beneath(tokens.resolve(), parent) for parent in
-                                         (Path("/mnt/sparknest"), source, build)):
-        raise ValueError("tokens must exist inside a mounted source, build or SparkNest path")
+    if not tokens.is_dir() or not any(beneath(tokens.resolve(), parent) for parent in
+                                        (Path("/mnt/sparknest"), source, build)):
+        raise ValueError("tokens must be a corpus directory inside a mounted source, build or SparkNest path")
     subprocess.run(["python3", str(source / "scripts/build/assert-build-filesystem.py"), str(build)],
                    check=True, timeout=60)
     if output(["findmnt", "-n", "-o", "MAJ:MIN", "-T", build.parent]) != output(

@@ -252,3 +252,42 @@ def test_cleanup_failure_cannot_report_success(tmp_path, monkeypatch):
     monkeypatch.setattr(launch.subprocess, 'check_output', lambda *a, **kw: 'still-live-container')
     with pytest.raises(RuntimeError, match='remains after cleanup'):
         launch.execute(record(tmp_path))
+
+
+@pytest.mark.parametrize('family', launch.FAMILIES)
+def test_transformers_source_only_for_hf5_families(tmp_path, family):
+    row = record(tmp_path, family)
+    command = launch.container_command(row)
+    pythonpath = next(arg for arg in command if arg.startswith('PYTHONPATH='))
+    assert ('third_party/transformers/src' in pythonpath) is (family != 'kimi-k31')
+
+
+def test_preflight_accepts_corpus_directory_not_file(tmp_path, monkeypatch):
+    source = tmp_path / 'source'
+    (source / '.git').mkdir(parents=True)
+    snapshot = tmp_path / 'snapshot'
+    snapshot.mkdir()
+    build = tmp_path / '.cache/cuteafd/builds/mc-glmf'
+    tokens = build / 'tokens'
+    tokens.mkdir(parents=True)
+    monkeypatch.setattr(launch.Path, 'home', lambda: tmp_path)
+    monkeypatch.setattr(launch, 'REPO', source)
+    monkeypatch.setattr(launch.socket, 'gethostname', lambda: 'rhea')
+    monkeypatch.setattr(launch, 'checked_source', lambda *a: 'committed')
+    monkeypatch.setattr(launch.os, 'getuid', lambda: 1234)
+    monkeypatch.setattr(launch.os, 'getgid', lambda: 2345)
+    original_beneath = launch.beneath
+    monkeypatch.setattr(launch, 'beneath', lambda path, parent: (
+        path == snapshot and parent == Path('/mnt/sparknest')) or original_beneath(path, parent))
+    monkeypatch.setattr(launch, 'output', lambda command: 'sha256:pinned' if command[0] == 'docker' else '0:1')
+    commands = []
+    monkeypatch.setattr(launch.subprocess, 'run', lambda command, **kw: commands.append(command))
+    row = record(tmp_path)
+    row.update(build_root=str(build), root=str(build / 'state'), export=str(build / 'export'),
+               tokens=str(tokens), source_snapshot=str(snapshot))
+    launch.validate_remote(row)
+    assert any('--preflight' in command for command in commands)
+    tokens.rmdir()
+    tokens.write_text('not a corpus directory')
+    with pytest.raises(ValueError, match='corpus directory'):
+        launch.validate_remote(row)
