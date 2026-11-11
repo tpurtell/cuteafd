@@ -46,6 +46,34 @@ def test_stage_is_hardlinks_and_standard_cache_layout(staged_inputs):
     assert not (repo / 'snapshots' / ('a' * 40) / 'stage-receipt.json').exists()
 
 
+def test_identical_files_share_canonical_inode_and_pass_import(staged_inputs, monkeypatch):
+    source = staged_inputs['package'] / 'weight.safetensors'
+    duplicate = staged_inputs['package'] / 'duplicate.safetensors'
+    duplicate.write_bytes(source.read_bytes())
+    assert duplicate.stat().st_ino != source.stat().st_ino
+    packet = post.load(staged_inputs['packet_path'])
+    packet['new_files'][duplicate.name] = packet['new_files'][source.name]
+    dump(staged_inputs['packet_path'], packet)
+    audit = post.load(staged_inputs['audit_path'])
+    audit['files'][duplicate.name] = audit['files'][source.name]
+    audit['packet_sha256'] = post.sha256_file(staged_inputs['packet_path'])
+    dump(staged_inputs['audit_path'], audit)
+    result = post.stage(**staged_inputs)
+    a, b = (result['files'][n] for n in (source.name, duplicate.name))
+    assert a['inode'] == b['inode'] == duplicate.stat().st_ino
+    assert a['source'] == b['source'] == str(duplicate)
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        raw = dict(job=123) if len(calls) == 1 else dict(
+            job=dict(finished=True, cancelled=False, error=None),
+            **{'import': dict(copied_bytes=0, errors=[], cancelled=False)})
+        return SimpleNamespace(stdout=json.dumps(raw))
+    monkeypatch.setattr(post.subprocess, 'run', run)
+    imported = post.import_staged(staged_inputs['receipt_path'], staged_inputs['receipt_path'].parent / 'import.json')
+    assert imported['status'] == 'offline-no-copy-imported'
+
+
 def test_missing_or_changed_payload_fails_before_creating_stage(staged_inputs):
     (staged_inputs['package'] / 'weight.safetensors').write_bytes(b'wrong')
     with pytest.raises(ValueError, match='differs'):

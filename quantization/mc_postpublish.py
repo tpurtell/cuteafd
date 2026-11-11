@@ -101,6 +101,19 @@ def stage(package, destination, packet_path, audit_path, attributes, receipt_pat
         rows[name] = dict(source=str(source), oid=oid, bytes=md.st_size, sha256=remote['sha256'],
                           device=md.st_dev, inode=md.st_ino, mtime_ns=md.st_mtime_ns)
         blobs.setdefault(oid, source)
+    # Equal content may come from distinct inodes; the cache stores one backing per OID.
+    canonical_metadata = {}
+    for row in rows.values():
+        if not row.get('inherited'):
+            canonical_metadata.setdefault(row['oid'], {k: row[k] for k in ('source', 'device', 'inode', 'mtime_ns')})
+    for name, row in rows.items():
+        if row.get('inherited'):
+            continue
+        source = Path(row['source'])
+        md = source.stat()
+        if (md.st_dev, md.st_ino, md.st_size, md.st_mtime_ns) != (row['device'], row['inode'], row['bytes'], row['mtime_ns']):
+            raise ValueError('source changed before staging: ' + name)
+        row.update(canonical_metadata[row['oid']], validated_source=str(source))
     repo = destination / ('models--' + packet['repo_id'].replace('/', '--'))
     (repo / 'blobs').mkdir(parents=True)
     snapshot = repo / 'snapshots' / audit['commit']
