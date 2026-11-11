@@ -48,7 +48,17 @@ def fixture(tmp_path, monkeypatch, family='glmf'):
     if family == 'ml4':
         dump(source, 'consolidated.safetensors.index.json', package.load_json(source / 'model.safetensors.index.json'))
     indexed(k8, {'core.safetensors': tensors('head', geometry, 8)})
-    producer = dict(source_repo=recipe.BASE_REPO, source_revision=recipe.BASE_REVISION)
+    producer = dict(source_repo=recipe.BASE_REPO, source_revision=recipe.BASE_REVISION,
+                    calibration=dict(samples=1426, tokens=1234567))
+    (k8 / 'quantization-errors').mkdir()
+    dump(k8 / 'quantization-errors', 'head.json', dict(module='head', logical_shape=[128,128],
+        evidence=dict(bits=8, identity_rows=0, hessian_rows=1234567),
+        metrics=dict(hessian_sample_count=1234567, quantizer_path='hessian_ldlq',
+            hessian_numerical_contract='signed-block-hadamard-congruence-fp64-v1',
+            hessian_weighted_relative_error=1e-6,
+            reconstruction=dict(reference_finite=True, error_finite=True)),
+        packed_byte_oracle=dict(schema='cuteafd-core-packed-byte-oracle-v1', bits=8,
+                                passed=True, tile_count=8)))
     dump(k8, 'core-export.json', dict(identity=producer, modules=1, bits=[8]))
     from kimi_k3.uniform_k2.storage import file_identity, sha256_file
     dump(k8, 'core.safetensors.json', dict(identity=producer,
@@ -73,6 +83,19 @@ def test_mc_all_views_byte_exact_and_shared_parent_copy(tmp_path, monkeypatch):
     assert package.load_json(output/'quantize_config.json')['tensor_storage'] == {}
     assert package.load_json(output/'quantize_config.k8.json')['tensor_storage']['head']['bits_per_weight'] == 8
     assert package.assemble(**args) == result
+
+
+def test_k8_diagnostics_require_full_rows_and_publish_reports(tmp_path, monkeypatch):
+    args = fixture(tmp_path, monkeypatch)
+    package.assemble(**args)
+    assert (args['output'] / 'quantization-errors.k8/head.json').exists()
+    assert (args['output'] / 'quantization-provenance.k8.json').exists()
+    path = args['k8'] / 'quantization-errors/head.json'
+    row = package.load_json(path)
+    row['evidence']['hessian_rows'] -= 1
+    path.write_text(json.dumps(row))
+    with pytest.raises(ValueError, match='full-corpus'):
+        package.assemble(**args)
 
 
 def test_ml4_repack_has_no_inactive_physical_core(tmp_path, monkeypatch):

@@ -9,6 +9,7 @@ import argparse
 from copy import deepcopy
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -182,7 +183,49 @@ def view_metadata(parent_quant, parent_config, selection, specs, *, bits, quanti
     return quant, config
 
 
-def assemble(family, parent, source, output, *, k8=None, parent_revision=None, shard_target=2_000_000_000):
+def k8_diagnostics(root, selection, identity):
+    """Retain every real-row reconstruction/oracle report without model imports."""
+    root = Path(root)
+    paths = sorted(root.rglob('*.json'))
+    records = {}
+    tokens = identity['calibration']['tokens']
+    if identity['calibration']['samples'] != 1426:
+        raise ValueError('K8 diagnostics require the complete calibration corpus')
+    for path in paths:
+        row = load_json(path)
+        module = row.get('module')
+        if module is None:
+            continue
+        if module not in selection or module in records:
+            raise ValueError('unexpected or duplicate K8 diagnostic module')
+        geometry = selection[module]
+        evidence, metrics = row.get('evidence', {}), row.get('metrics', {})
+        oracle = row.get('packed_byte_oracle', evidence.get('packed_byte_oracle', {}))
+        reconstruction = metrics.get('reconstruction', {})
+        error = metrics.get('hessian_weighted_relative_error')
+        if (row.get('logical_shape') != [geometry['out_features'], geometry['in_features']]
+                or evidence.get('bits') != 8 or evidence.get('identity_rows') != 0
+                or evidence.get('hessian_rows') != tokens
+                or metrics.get('hessian_sample_count') != tokens
+                or metrics.get('quantizer_path') != 'hessian_ldlq'
+                or metrics.get('hessian_numerical_contract') != 'signed-block-hadamard-congruence-fp64-v1'
+                or not isinstance(error, (float, int)) or not math.isfinite(error) or error < 0
+                or reconstruction.get('reference_finite') is not True
+                or reconstruction.get('error_finite') is not True
+                or oracle.get('passed') is not True or oracle.get('bits') != 8
+                or oracle.get('schema') != 'cuteafd-core-packed-byte-oracle-v1'
+                or oracle.get('tile_count') != 8):
+            raise ValueError('incomplete full-corpus K8 reconstruction/oracle report: ' + module)
+        if 'identity' in row and row['identity'] != identity:
+            raise ValueError('K8 diagnostic producer identity differs')
+        records[module] = row
+    if records.keys() != selection.keys():
+        raise ValueError('K8 diagnostics do not cover exact reviewed module set')
+    return records
+
+
+def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
+             parent_revision=None, shard_target=2_000_000_000):
     recipe, selection = family_recipe(family)
     parent, source, output = [Path(p).resolve() for p in (parent, source, output)]
     inputs = [parent, source] + ([Path(k8).resolve()] if k8 else [])
@@ -277,6 +320,13 @@ def assemble(family, parent, source, output, *, k8=None, parent_revision=None, s
                     for n, spec in packed_specs(module, dict(g, bits=8)).items()}
         if k8_inv['specs'] != expected:
             raise ValueError('K8 inventory contains missing, native or expert tensors')
+        diagnostics = k8_diagnostics(k8_evidence or k8 / 'quantization-errors', selection, complete['identity'])
+        for module, row in sorted(diagnostics.items()):
+            filename = 'quantization-errors.k8/' + module + '.json'
+            atomic_json(output / filename, row)
+            new.append(filename)
+        atomic_json(output / 'quantization-provenance.k8.json', complete['identity'])
+        new.append('quantization-provenance.k8.json')
         k8_map = {}
         for shard in k8_inv['headers']:
             producer_receipt = load_json(k8 / (shard + '.json'))
@@ -352,7 +402,7 @@ def assemble(family, parent, source, output, *, k8=None, parent_revision=None, s
     (output / '.gitattributes').write_text('*.safetensors filter=lfs diff=lfs merge=lfs -text\n')
     metadata += ['README.md', '.gitattributes']
     report = dict(identity=identity, new_files=sorted(new + metadata), copies=copies,
-        new_shards={name: receipts[name] for name in new},
+        new_shards=receipts,
         core_tensors={view: row[1] for view, row in views.items()},
         source_tensor_locations={n: source_inv['mapping'][n] for n in native},
         source_snapshot=str(source), parent_snapshot=str(parent))
@@ -426,6 +476,8 @@ def main():
     parser.add_argument('--parent-revision')
     parser.add_argument('--source', type=Path)
     parser.add_argument('--k8', type=Path)
+    parser.add_argument('--k8-evidence', type=Path,
+                        help='Complete producer evidence tree; default K8 export/quantization-errors')
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--validate-only', action='store_true')
     args = parser.parse_args()
@@ -435,7 +487,7 @@ def main():
         if not args.family or not args.parent or not args.source:
             parser.error('build requires family, parent, source and output')
         result = assemble(args.family, args.parent, args.source, args.output,
-                          k8=args.k8, parent_revision=args.parent_revision)
+                          k8=args.k8, k8_evidence=args.k8_evidence, parent_revision=args.parent_revision)
     print(json.dumps(result, sort_keys=True))
 
 
