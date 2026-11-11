@@ -44,6 +44,18 @@ class Checkpoints(ProjectionCheckpoints):
 
 
 class Engine(run.Engine):
+    def __init__(self, *args, numerical=None, **kwargs):
+        if numerical is None:
+            from gptqmodel.utils import kimi_k31, kimi_k3_core_stream, kimi_k3_core_format
+            from types import SimpleNamespace
+            names = ('attention_inputs', 'attention_finish', 'capture_linear_input',
+                     'shared_down_input', 'routed_up_input', 'complete_moe', 'final_head_input')
+            numerical = SimpleNamespace(**{name: getattr(kimi_k3_core_stream, name) for name in names},
+                DenseRawHessian=kimi_k31.DenseRawHessian,
+                quantize_core_projection=kimi_k3_core_format.quantize_core_projection,
+                reconstruct_core_projection=kimi_k3_core_format.reconstruct_core_projection)
+        super().__init__(*args, numerical=numerical, **kwargs)
+
     def _checkpoints(self, layer):
         name = 'head' if layer == 'head' else f'layer-{layer:03d}'
         directory = self.root / 'head/projections' if layer == 'head' else self.root / f'layers/{layer:03d}/projections'
@@ -101,6 +113,7 @@ def make_plan(source, tokens, root, export, bits):
     recipe['training_error_alarm'] = dict(limit=LIMIT, domain='regularized-Hessian-training-not-heldout')
     plan['identity'] = copy.deepcopy(plan['identity'])
     plan['identity'].update(schema='cuteafd-kimi-k31-core-only-v1', recipe=recipe)
+    plan['identity']['memory'] = dict(container_bytes=110 * run.GIB, cuda_allocation_cap_bytes=100 * run.GIB)
     for path in (Path(__file__), run.REPO / 'quantization/core_export.py'):
         plan['identity']['code'][str(path.relative_to(run.REPO))] = sha256_file(path)
     # Preserve full source validation, but reserve only isolated dense payloads.
@@ -154,13 +167,13 @@ def main():
             finalize_core_export(selection(args.core_bits), args.export, plan['identity'])
             source.close()
             return
-        progress = run.CoreProgress(args.root, host_limit=86, gpu_limit=64)
+        progress = run.CoreProgress(args.root, host_limit=100, gpu_limit=100)
         progress.state['total_projections'] = len(selection(args.core_bits))
         try:
             torch.set_num_threads(8)
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
-            torch.cuda.set_per_process_memory_fraction(64 * run.GIB / torch.cuda.get_device_properties(0).total_memory)
+            torch.cuda.set_per_process_memory_fraction(100 * run.GIB / torch.cuda.get_device_properties(0).total_memory)
             records = run.load_token_records(args.tokens)
             engine = Engine(source, records, args.root, args.export, plan['identity'],
                             selection(args.core_bits), progress)

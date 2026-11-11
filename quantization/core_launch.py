@@ -93,9 +93,10 @@ def common(record):
 def container_command(record, *, preflight=False):
     source = Path(record["remote_source_root"])
     build = Path(record["build_root"])
+    memory = "110g" if record["family"] in ("kimi-k31", "muse") else "96g"
     result = ["docker", "run", "--rm", "--name", record["container"] + ("-check" if preflight else ""),
               "--network", "none", "--user", f"{record['uid']}:{record['gid']}",
-              "--memory", "96g", "--memory-swap", "96g", "--stop-timeout", "30",
+              "--memory", memory, "--memory-swap", memory, "--stop-timeout", "30",
               "--ulimit", "nofile=65536:65536", "--workdir", str(source),
               "--mount", f"type=bind,src={source},dst={source},readonly",
               "--mount", "type=bind,src=/mnt/sparknest,dst=/mnt/sparknest,readonly",
@@ -109,7 +110,7 @@ def container_command(record, *, preflight=False):
     if not preflight:
         result += ["--gpus", "all"]
     environment = dict(HOME=str(build / "home"), USER=record["user"], LOGNAME=record["user"],
-        CUTEAFD_DEV_MEMORY="96g", CUDA_VISIBLE_DEVICES="" if preflight else "0",
+        CUTEAFD_DEV_MEMORY=memory, CUDA_VISIBLE_DEVICES="" if preflight else "0",
         NVIDIA_VISIBLE_DEVICES="void" if preflight else "all",
         TORCH_CUDA_ARCH_LIST="12.1", CUDA_HOME="/usr/local/cuda", MAX_JOBS="8",
         OMP_NUM_THREADS="8", OPENBLAS_NUM_THREADS="8", MKL_NUM_THREADS="8",
@@ -121,7 +122,7 @@ def container_command(record, *, preflight=False):
         GPTQMODEL_EXLLAMAV3_BUILD_ROOT=str(build / "exllamav3"),
         TORCH_EXTENSIONS_DIR=str(build / "torch-extensions"),
         TRITON_CACHE_DIR=str(build / "triton"), TMPDIR=str(build / "tmp"))
-    if record["family"] != "kimi-k31":
+    if record["family"] != "kimi-k31" and runtime == "python3":
         environment["PYTHONPATH"] += ":" + str(source / "third_party/transformers/src")
     for key, value in environment.items():
         result += ["-e", f"{key}={value}"]
@@ -298,9 +299,10 @@ def main(argv=None, *, family=None):
     locks_for(args.host)
     if socket.gethostname().split(".")[0] != "raptor":
         raise ValueError("launch from raptor, where the canonical hardware queue lives")
-    cap = os.environ.get("CUTEAFD_DEV_MEMORY", "96g").lower()
-    if cap != "96g":
-        raise ValueError("this launcher requires CUTEAFD_DEV_MEMORY=96g (no uncapped override)")
+    expected_cap = "110g" if args.family in ("kimi-k31", "muse") else "96g"
+    cap = os.environ.get("CUTEAFD_DEV_MEMORY", expected_cap).lower()
+    if cap != expected_cap:
+        raise ValueError(f"this family requires CUTEAFD_DEV_MEMORY={expected_cap} (no uncapped override)")
     if args.runtime_python != "python3":
         if not Path(args.runtime_python).is_absolute() or not args.runtime_root or not args.runtime_root.is_absolute():
             parser.error("runtime-python override requires absolute runtime-python and runtime-root")
@@ -318,7 +320,7 @@ def main(argv=None, *, family=None):
     build = Path(identity["home"]) / ".cache/cuteafd/builds" / ("mc-" + args.family)
     record = dict(family=args.family, host=args.host, commit=commit, unit=unit, container=unit,
                   uid=identity["uid"], gid=identity["gid"], user=identity["user"],
-                  build_root=str(build), remote_source_root=str(remote_source),
+                  build_root=str(build), remote_source_root=str(remote_source), container_memory=expected_cap,
                   runtime_python=args.runtime_python, runtime_root=str(args.runtime_root or remote_source),
                   resume=args.resume, image_id=output(ssh(args.host,
                       ["docker", "image", "inspect", IMAGE, "--format", "{{.Id}}"])))
