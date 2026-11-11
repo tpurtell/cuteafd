@@ -47,7 +47,7 @@ def validate_projection(packed, shape):
     if (inputs%128 or set(packed) != {'trellis','suh','svh','mcg'}
             or packed['trellis'].dtype != torch.int16 or packed['trellis'].ndim != 3
             or tuple(packed['trellis'].shape[:2]) != (inputs//16,stored//16)
-            or packed['trellis'].shape[-1] not in (64,80,96)
+            or packed['trellis'].shape[-1] not in (64,80,96,128)
             or packed['suh'].dtype != torch.float16 or tuple(packed['suh'].shape) != (inputs,)
             or packed['svh'].dtype != torch.float16 or tuple(packed['svh'].shape) != (stored,)
             or packed['mcg'].dtype != torch.int32 or tuple(packed['mcg'].shape) not in ((),(1,))
@@ -62,7 +62,7 @@ def validate_projection(packed, shape):
 
 @torch.inference_mode()
 def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, device='cuda:0'):
-    if bits not in (4,5,6) or type(bits) is not int or seed!=787 or sigma!=.025:
+    if bits not in (4,5,6,8) or type(bits) is not int or seed!=787 or sigma!=.025:
         raise ValueError('unreviewed Muse codec parameters')
     if (weight.ndim!=2 or weight.dtype!=torch.bfloat16 or weight.shape[1]%128
             or raw_hessian.get('finalized') is not False or type(raw_hessian.get('count')) is not int
@@ -100,6 +100,16 @@ def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, de
             raise ValueError('nonfinite/negative calibrated quantization metric: '+key)
     if metrics['hessian_weighted_reference_denominator']<=0:
         raise ValueError('calibrated reference energy is zero')
+    if bits==8:
+        reconstruction=metrics.get('reconstruction',{})
+        if (reconstruction.get('domain')!='regularized_exl3_search_space' or
+                reconstruction.get('reference_finite') is not True or
+                reconstruction.get('error_finite') is not True):
+            raise ValueError('K8 requires finite per-module reconstruction diagnostics')
+        for key in ('mse','nmse','error_sum_sq','reference_sum_sq','max_abs_error'):
+            value=reconstruction.get(key)
+            if type(value) not in (float,int) or not math.isfinite(value) or value<0:
+                raise ValueError('invalid K8 reconstruction metric: '+key)
     packed={k:v.detach().cpu() for k,v in packed.items()}
     evidence=validate_projection(packed,list(weight.shape))
     if evidence['bits']!=bits:

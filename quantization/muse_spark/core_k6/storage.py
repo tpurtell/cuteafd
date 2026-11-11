@@ -6,9 +6,38 @@ from pathlib import Path
 import numpy as np
 import torch
 from .codec import covariance_accumulator, ACCUMULATION_CONTRACT
-from glm5.core_k6.storage import ProjectionStore, RouteSpool as SharedRouteSpool, load_tensors
+from glm5.core_k6.storage import ProjectionStore as SharedProjectionStore, RouteSpool as SharedRouteSpool, load_tensors
 from kimi_k3.core_k6.storage import StageStore
 from kimi_k3.uniform_k2.storage import atomic_json,sha256_file,file_identity,fsync_directory
+
+
+class ProjectionStore(SharedProjectionStore):
+    def __init__(self,*args,core_only=False,**kwargs):
+        self.core_only=core_only
+        self.oracle_verified=set()
+        super().__init__(*args,**kwargs)
+
+    def load(self,name):
+        saved=super().load(name)
+        if self.core_only and saved is not None and name not in self.oracle_verified:
+            from core_export import sampled_packed_oracle
+            oracle=sampled_packed_oracle(self.paths(name)[0],name,self.selection[name],device=self.device)
+            if oracle.get('passed') is not True:
+                raise ValueError('packed-byte oracle did not pass')
+            prior=saved['evidence'].get('packed_byte_oracle')
+            if prior is not None and prior!=oracle:
+                raise ValueError('resumed packed-byte oracle differs')
+            saved['evidence']['packed_byte_oracle']=oracle
+            atomic_json(self.paths(name)[1],saved)
+            self.record_evidence(name,saved)
+            self.oracle_verified.add(name)
+        return saved
+
+    def ensure(self,name,weight,raw_factory=None,extra_evidence=None):
+        path=super().ensure(name,weight,raw_factory,extra_evidence)
+        if self.core_only:
+            self.load(name)  # Oracle consumes the durable packed bytes, including on resume.
+        return path
 
 
 class RouteSpool(SharedRouteSpool):
