@@ -108,6 +108,19 @@ def test_ml4_repack_has_no_inactive_physical_core(tmp_path, monkeypatch):
     assert 'head.trellis' not in package.read_header(args['output']/'native-parent-mixed.safetensors')[0]
 
 
+def test_ml4_independent_audit_proves_experts_and_rejects_tamper(tmp_path, monkeypatch):
+    args = fixture(tmp_path, monkeypatch, 'ml4')
+    package.assemble(**args)
+    report = package.audit_ml4(args['output'])
+    assert report['inherited_tensors'] == 1 and report['core_tensors'] == 1
+    shard = args['output'] / 'native-parent-mixed.safetensors'
+    with shard.open('r+b') as stream:
+        stream.seek(-1, 2)
+        stream.write(b'X')
+    with pytest.raises(ValueError, match='inherited tensor bytes differ'):
+        package.audit_ml4(args['output'])
+
+
 def test_unexpected_parent_physical_tensor_rejected(tmp_path, monkeypatch):
     args = fixture(tmp_path,monkeypatch)
     index=package.load_json(args['parent']/'model.safetensors.index.json')

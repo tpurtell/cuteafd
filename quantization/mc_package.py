@@ -6,6 +6,7 @@ publication plan: the publisher must copy them from the pinned parent revision.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from copy import deepcopy
 import hashlib
 import json
@@ -411,6 +412,73 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
     return validate(output)
 
 
+def audit_ml4(output):
+    """Independently prove every retained tensor against pinned parent bytes."""
+    output = Path(output)
+    state = load_json(output / 'package-state.json')
+    if state['identity']['family'] != 'ml4':
+        raise ValueError('ML4 physical byte audit requires an ML4 package')
+    parent = full_parent_inventory(state['parent_snapshot'])
+    target = full_parent_inventory(output)
+    recipe, selection = family_recipe('ml4')
+    removed = {n for module, geometry in selection.items()
+               for n in packed_specs(module, dict(geometry, bits=6))}
+    native = restored_names('ml4', selection)
+    shared = parent['mapping'].keys() - removed
+    if target['mapping'].keys() != shared | native:
+        raise ValueError('ML4 exact target tensor inventory differs')
+    for path in output.rglob('*.safetensors'):
+        header, _ = read_header(path)
+        if removed.intersection(header):
+            raise ValueError('ML4 physically contains quantized core: ' + str(path))
+    proofs = {}
+    for shard in sorted(parent['headers']):
+        names = sorted(n for n in shared if parent['mapping'][n] == shard)
+        with ExitStack() as stack:
+            origin = Path(state['parent_snapshot']) / shard
+            source_header, source_base = read_header(origin)
+            source_stream = stack.enter_context(origin.open('rb'))
+            targets = {}
+            for name in names:
+                destination = output / target['mapping'][name]
+                if destination not in targets:
+                    header, base = read_header(destination)
+                    targets[destination] = (stack.enter_context(destination.open('rb')), header, base)
+                stream, header, base = targets[destination]
+                start, end = source_header[name]['data_offsets']
+                left, right = header[name]['data_offsets']
+                if ((source_header[name]['dtype'], source_header[name]['shape'], end-start)
+                        != (header[name]['dtype'], header[name]['shape'], right-left)):
+                    raise ValueError('ML4 inherited tensor geometry differs: ' + name)
+                source_stream.seek(source_base + start)
+                stream.seek(base + left)
+                digest = hashlib.sha256()
+                remaining = end - start
+                while remaining:
+                    count = min(16 << 20, remaining)
+                    source_bytes, target_bytes = source_stream.read(count), stream.read(count)
+                    if len(source_bytes) != count or source_bytes != target_bytes:
+                        raise ValueError('ML4 inherited tensor bytes differ: ' + name)
+                    digest.update(source_bytes)
+                    remaining -= count
+                proofs[name] = digest.hexdigest()
+    native_proofs = {}
+    source = inventory(state['source_snapshot'], 'consolidated.safetensors.index.json')
+    for name in sorted(native):
+        digest = tensor_hash(source['root'] / source['mapping'][name], name)
+        if tensor_hash(output / target['mapping'][name], name) != digest:
+            raise ValueError('ML4 original core differs: ' + name)
+        native_proofs[name] = digest
+    receipt = dict(schema='cuteafd-ml4-independent-byte-audit-v1', identity=state['identity'],
+        status='all-native-and-shared-bytes-exact-no-physical-quantized-core',
+        inherited_tensor_sha256=proofs, original_core_tensor_sha256=native_proofs,
+        inherited_tensors=len(proofs), inherited_payload_bytes=sum(parent['sizes'][n] for n in shared),
+        core_tensors=len(native_proofs), core_payload_bytes=sum(source['sizes'][n] for n in native),
+        physical_safetensors=len(list(output.rglob('*.safetensors'))))
+    atomic_json(output.parent / 'independent-byte-audit.json', receipt)
+    return {k:v for k,v in receipt.items() if not k.endswith('tensor_sha256')}
+
+
 def validate(output):
     output = Path(output)
     state = load_json(output / 'package-state.json')
@@ -480,8 +548,12 @@ def main():
                         help='Complete producer evidence tree; default K8 export/quantization-errors')
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--validate-only', action='store_true')
+    parser.add_argument('--audit-ml4', action='store_true',
+                        help='Independently compare every inherited/native tensor payload')
     args = parser.parse_args()
-    if args.validate_only:
+    if args.audit_ml4:
+        result = audit_ml4(args.output)
+    elif args.validate_only:
         result = validate(args.output)
     else:
         if not args.family or not args.parent or not args.source:
