@@ -45,11 +45,9 @@ Decode and agentic-session workloads are unchanged.
   and Muse Spark (vision and PCM audio, both DFlash2 drafters). Step-5 EXL3
   gets a native K6 core, GLM 5.3 Flash EXLR8 runs natively, and Kimi K3 adds a
   single-RTX card (1× RTX + 6 Sparks).
-- **High-quality attention (HQA) checkpoints:** six `-HQA` EXL3 Core-K6
-  releases (GLM 5.3, GLM 5.3 Flash, Kimi K3, Step-5, Muse Spark, Mistral
-  Large 4) restore the original attention projections byte for byte.
-  `ATTENTION_MODE` selects `hqa` (default), `compact` or `fp8-compact`, and
-  the planner sizes memory for the mode you pick.
+- **High-quality attention (HQA) checkpoints:** shipped with v5.0.0 and since
+  withdrawn from Hugging Face. Multi-core (MC) checkpoints with a selectable
+  original, K8 or K6 dense core are replacing them.
 - **Decode CUDA graphs in every family,** in one bounded cache per GPU that
   pre-captures the most-replayed shapes at startup. A capture that runs out of
   memory falls back to eager instead of failing.

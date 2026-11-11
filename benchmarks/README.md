@@ -10,6 +10,11 @@ workloads are unchanged.
 
 ## v5 HQA Comparison
 
+> **Withdrawn checkpoints.** The six `-HQA` repositories measured below have
+> been removed from Hugging Face, so their revision links no longer resolve.
+> The results are kept as a historical record; multi-core (MC) checkpoints with
+> selectable original/K8/K6 cores are replacing them.
+
 The [v5 smoke matrix](../scripts/bench/release-smoke-v5.json) adds 11 max-only
 attention arms. Compact is the regular max card; HQA/FP8-compact use the
 pinned dual-view checkpoint. Mistral Large 4 runs only its `hqa` arm,
@@ -33,7 +38,7 @@ Release smoke run; use the linked report for coverage and capacity details.
 
 ² W8A8 prefill ([#1751](https://github.com/tpurtell/cuteafd/issues/1751))
 
-Pinned checkpoint revisions (original / matching `-HQA` repository):
+Pinned checkpoint revisions (original / matching `-HQA` repository, now withdrawn):
 
 | Max card | Original revision | HQA revision |
 | --- | --- | --- |
