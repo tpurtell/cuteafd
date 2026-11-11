@@ -95,6 +95,9 @@ def supervise(path):
 
 
 def main():
+    from core_launch import dispatch
+    if dispatch('glmf'):
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("source-snapshot", "tokens", "root"):
         parser.add_argument("--" + name, type=Path)

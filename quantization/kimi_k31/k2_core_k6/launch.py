@@ -49,6 +49,9 @@ def gpu_command(common, *, container, helper, pilot=False, qualification=None):
 
 
 def main():
+    from core_launch import dispatch
+    if dispatch('kimi-k31'):
+        return
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('source-snapshot', 'tokens', 'root', 'export', 'qualification-report'):
         p.add_argument('--' + name, type=Path)
