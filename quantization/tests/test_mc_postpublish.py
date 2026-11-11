@@ -113,6 +113,26 @@ def test_cleanup_rejects_shared_stores_and_protected_roots(tmp_path, monkeypatch
             post.cleanup(receipt, [root], tmp_path / 'clean.json', protected)
 
 
+def test_cleanup_separates_retained_payload_and_last_links(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    root = tmp_path / '.cache/cuteafd/builds/owned'
+    root.mkdir(parents=True)
+    (root / 'retained.safetensors').write_bytes(b'payload')
+    os.link(root / 'retained.safetensors', tmp_path / 'sparknest-owned')
+    (root / 'intermediate.bin').write_bytes(b'temporary')
+    os.link(root / 'intermediate.bin', root / 'second-link.bin')
+    (root / 'proof.json').write_text('{}')
+    receipt = dump(tmp_path / 'verify.json', dict(status='imported-hashes-and-readiness-verified', snapshot='/mnt/sparknest/model'))
+    result = post.cleanup(receipt, [root], tmp_path / 'clean.json', [])
+    assert result['logical_unlinked_bytes'] == 7 + 9 + 9 + 2
+    assert result['retained_hardlink_payload_bytes'] == 7
+    assert result['removed_last_link_intermediate_bytes'] == 11
+    assert result['observed_free_delta_bytes'] == result['free_after'] - result['free_before']
+    assert (tmp_path / 'sparknest-owned').read_bytes() == b'payload'
+    assert (Path(result['retained']) / '0/proof.json').read_text() == '{}'
+    assert not root.exists()
+
+
 def test_inherited_alias_is_same_inode_without_payload_copy(staged_inputs, tmp_path):
     packet = post.load(staged_inputs['packet_path'])
     row = packet['new_files'].pop('weight.safetensors')

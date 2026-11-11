@@ -307,11 +307,16 @@ def cleanup(verify_receipt, roots, receipt_path, protected):
     evidence.mkdir(parents=True, exist_ok=False)
     before = shutil.disk_usage(build_root).free
     logical = 0
+    inodes = {}
     for i, root in enumerate(roots):
         for path in root.rglob('*'):
             if path.is_symlink() or not path.is_file():
                 continue
-            logical += path.stat().st_size
+            md = path.stat()
+            logical += md.st_size
+            key = (md.st_dev, md.st_ino)
+            entry = inodes.setdefault(key, dict(bytes=md.st_size, nlink=md.st_nlink, removed_links=0))
+            entry['removed_links'] += 1
             if path.suffix in ('.json', '.jsonl', '.log', '.stderr', '.txt', '.py', '.sh'):
                 dest = evidence / str(i) / path.relative_to(root)
                 dest.parent.mkdir(parents=True, exist_ok=True)
@@ -319,6 +324,9 @@ def cleanup(verify_receipt, roots, receipt_path, protected):
     intent = dict(schema='cuteafd-postpublish-cleanup-v1', status='cleanup-started',
         verification_sha256=sha256_file(verify_receipt), roots=list(map(str, roots)),
         protected=list(map(str, protected)), retained=str(evidence), logical_unlinked_bytes=logical,
+        retained_hardlink_payload_bytes=sum(r['bytes'] for r in inodes.values() if r['nlink'] > r['removed_links']),
+        removed_last_link_intermediate_bytes=sum(r['bytes'] for r in inodes.values() if r['nlink'] == r['removed_links']),
+        byte_accounting_note='Unique inode sizes; external hardlinks retain payload, last-link bytes are not a physical reclaim measurement.',
         free_before=before)
     atomic_json(receipt_path, intent)
     for root in roots:
