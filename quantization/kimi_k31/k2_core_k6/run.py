@@ -265,9 +265,17 @@ class Engine(CoreEngine):
             self._quant_group(block, checkpoints, [moe + 'routed_expert_up_proj'], store, 'e', 'routed-up')
         self._phase_f(block, store)
 
+    def _assemble_layer(self, layer, replacements):
+        from .export import assemble_layer
+        return assemble_layer(self.source, layer, replacements, self.export, self.identity)
+
+    def _finalize_export(self, replacements):
+        from .export import finalize_export
+        return finalize_export(self.source, self.all_selection, replacements,
+                               self.export, self.identity, self.root / 'evidence')
+
     @torch.inference_mode()
     def layer(self, layer, current):
-        from .export import assemble_layer
         started = time.monotonic()
         store = StageStore(self.root / f'layers/{layer:03d}/stages', self.identity)
         phases = {name: store.load(name, checksum=True) for name in ('a', 'b', 'c', 'd', 'e', 'f')}
@@ -295,7 +303,7 @@ class Engine(CoreEngine):
                 verify_receipt(path, saved, checksum=True)
                 replacements[name] = path
         self.progress.emit('layer_assembly_started', layer=layer)
-        receipt = assemble_layer(self.source, layer, replacements, self.export, self.identity)
+        receipt = self._assemble_layer(layer, replacements)
         batches = hardlink_frontier(self.boundary, layer, store.directory('f'), store.load('f'))
         current = self.boundary.commit(layer, batches)
         store.clear()
@@ -361,8 +369,7 @@ class Engine(CoreEngine):
             del weight, raw
             self.source.close()
             compact_memory()
-        summary = finalize_export(self.source, self.all_selection, checkpoints.replacements([module]),
-                                  self.export, self.identity, self.root / 'evidence')
+        summary = self._finalize_export(checkpoints.replacements([module]))
         atomic_json(self.root / 'quantization-complete.json',
                     dict(identity=self.identity, summary=summary, time=utc_now()))
         store.clear()
@@ -374,6 +381,9 @@ class Engine(CoreEngine):
 
 
 def main():
+    if '--core-only' in sys.argv[1:]:
+        from .core_only import main as core_main
+        return core_main()
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('source-snapshot', 'tokens', 'root', 'export'):
         p.add_argument('--' + name, required=True, type=Path)

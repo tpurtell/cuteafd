@@ -249,7 +249,8 @@ class ProjectionCheckpoints:
             if path.exists():
                 path.unlink()
             packed, metrics, evidence = self.numerical.quantize_core_projection(
-                weight, raw_hessian, bits=6, seed=787, sigma=.025, device=self.device)
+                weight, raw_hessian, bits=self.selection[module].get("bits", 6),
+                seed=787, sigma=.025, device=self.device)
             receipt = commit_safetensors(path, {module + "." + suffix: value for suffix, value in packed.items()})
             saved = dict(identity=self.identity, module=module, logical_shape=list(weight.shape),
                          metrics=metrics, evidence=evidence, **receipt)
