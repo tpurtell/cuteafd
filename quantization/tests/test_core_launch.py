@@ -301,3 +301,114 @@ def test_explicit_runtime_keeps_its_transformers_release(tmp_path):
     row.update(runtime_python='/overlay/bin/python', runtime_root='/overlay')
     command = launch.container_command(row)
     assert not any('third_party/transformers/src' in arg for arg in command)
+
+
+def test_remote_start_is_bounded_detached_and_idempotent(tmp_path, monkeypatch):
+    row = record(tmp_path)
+    monkeypatch.setattr(launch.socket, 'gethostname', lambda: row['host'])
+    monkeypatch.setattr(launch, 'checked_source', lambda *a: row['commit'])
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return type('Result', (), {'returncode': 0})()
+    monkeypatch.setattr(launch.subprocess, 'run', run)
+    launch.remote_start(row)
+    command = calls[0]
+    assert command[:2] == ['systemd-run', '--user']
+    assert '--remote-worker' in command
+    assert '--property=KillMode=mixed' in command
+    assert '--property=RuntimeMaxSec=' + str(launch.RUN_SECONDS + 300) in command
+    launch.remote_start(row)
+    assert len([c for c in calls if c[0]=='systemd-run']) == 1
+    changed = dict(row, resume=False)
+    with pytest.raises(ValueError, match='identity differs'):
+        launch.remote_start(changed)
+
+
+def test_remote_wait_returns_receipt_without_conflating_exit_255(tmp_path, capsys):
+    row = record(tmp_path)
+    _, terminal = launch.remote_paths(row)
+    terminal.parent.mkdir(parents=True)
+    terminal.write_text(json.dumps(dict(unit=row['unit'], returncode=255)))
+    assert launch.remote_wait(row) == 0
+    assert json.loads(capsys.readouterr().out)['returncode'] == 255
+
+
+def test_remote_worker_writes_terminal_after_container_cleanup(tmp_path, monkeypatch):
+    row = record(tmp_path)
+    path, terminal = launch.remote_paths(row)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(row))
+    events = []
+    monkeypatch.setattr(launch, 'forwarding', lambda *a, **kw: events.append('run') or 42)
+    monkeypatch.setattr(launch.subprocess, 'run', lambda *a, **kw: events.append('cleanup'))
+    monkeypatch.setattr(launch, 'output', lambda *a: '')
+    assert launch.remote_worker(path) == 42
+    assert events == ['run', 'cleanup']
+    assert json.loads(terminal.read_text())['returncode'] == 42
+
+
+@pytest.mark.parametrize('codes', [[0], [255, 0]])
+def test_detached_execute_reconnects_without_removing_container(tmp_path, monkeypatch, codes):
+    import io
+    row = dict(record(tmp_path), remote_supervisor=True)
+    monkeypatch.setattr(launch, 'require_lease', lambda *a: None)
+    calls = []
+    monkeypatch.setattr(launch.subprocess, 'run', lambda command, **kw: calls.append(command) or type('R', (), {'returncode':0})())
+    pending = iter(codes)
+    class Process:
+        def __init__(self, *a, **kw):
+            self.returncode = next(pending)
+            self.stdout = io.StringIO(json.dumps(dict(unit=row['unit'],returncode=17)))
+        def poll(self): return self.returncode
+    monkeypatch.setattr(launch.subprocess, 'Popen', Process)
+    monkeypatch.setattr(launch.time, 'sleep', lambda *a: None)
+    assert launch.execute(row) == 17
+    assert len(calls) == 1
+    assert '--remote-start' in calls[0][-1]
+    assert 'docker rm' not in calls[0][-1]
+
+
+def test_detached_cancel_stops_only_owned_unit_and_container(tmp_path, monkeypatch):
+    import signal
+    row = dict(record(tmp_path), remote_supervisor=True)
+    monkeypatch.setattr(launch, 'require_lease', lambda *a: None)
+    handlers = {}
+    monkeypatch.setattr(launch.signal, 'signal', lambda sig, fn: handlers.setdefault(sig,fn))
+    calls=[]
+    def run(command, **kw):
+        calls.append(command)
+        if '--remote-start' in command[-1]: handlers[signal.SIGTERM](signal.SIGTERM,None)
+        return type('R', (), {'returncode':0})()
+    monkeypatch.setattr(launch.subprocess, 'run', run)
+    monkeypatch.setattr(launch, 'output', lambda *a: '')
+    assert launch.execute(row) == 128+signal.SIGTERM
+    assert 'systemctl --user stop mc-test' == calls[1][-1]
+    assert 'docker rm --force mc-test' == calls[2][-1]
+
+
+def test_detached_launch_is_selected_for_new_records(tmp_path, monkeypatch):
+    row = dict(record(tmp_path), remote_supervisor=True)
+    monkeypatch.setattr(launch, 'execute_detached', lambda value: 23 if value is row else 1)
+    assert launch.execute(row) == 23
+
+
+def test_lost_remote_start_reply_retries_same_unit_without_cleanup(tmp_path, monkeypatch):
+    import io
+    row = dict(record(tmp_path), remote_supervisor=True)
+    monkeypatch.setattr(launch, 'require_lease', lambda *a: None)
+    starts = iter([255, 0])
+    calls=[]
+    def run(command, **kw):
+        calls.append(command)
+        return type('R', (), {'returncode':next(starts)})()
+    monkeypatch.setattr(launch.subprocess, 'run', run)
+    class Process:
+        returncode=0
+        stdout=io.StringIO(json.dumps(dict(unit=row['unit'],returncode=0)))
+        def __init__(self,*a,**kw):pass
+        def poll(self):return 0
+    monkeypatch.setattr(launch.subprocess, 'Popen', Process)
+    monkeypatch.setattr(launch.time, 'sleep', lambda *a: None)
+    assert launch.execute(row)==0
+    assert len(calls)==2 and calls[0]==calls[1]

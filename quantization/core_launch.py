@@ -218,7 +218,136 @@ def require_lease(host):
             raise ValueError("hardware lock is not held: " + name)
 
 
+def remote_paths(record):
+    root = Path(record["build_root"]) / "launches"
+    return root / (record["unit"] + ".json"), root / (record["unit"] + ".exit.json")
+
+
+def remote_worker(path):
+    record = json.loads(Path(path).read_text())
+    source = Path(record["remote_source_root"])
+    guard = source / "quantization/kimi_k3/core_k6/run_guard.py"
+    command = ["timeout", "--foreground", "--signal=TERM", "--kill-after=120", str(RUN_SECONDS),
+               "python3", str(guard), "--container", record["container"], "--", *container_command(record)]
+    code = 1
+    try:
+        with Path(path).with_suffix(".log").open("a") as log:
+            code = forwarding(command, stop_seconds=35, stdout=log, stderr=subprocess.STDOUT)
+    finally:
+        subprocess.run(["docker", "rm", "--force", record["container"]], timeout=30, check=False)
+        if output(["docker", "ps", "-aq", "--filter", "name=^/" + record["container"] + "$"]):
+            raise RuntimeError("owned container remains after remote cleanup")
+        _, terminal = remote_paths(record)
+        atomic_json(terminal, dict(returncode=code, finished_ns=time.time_ns(), unit=record["unit"]))
+    return code
+
+
+def remote_start(record):
+    if socket.gethostname().split(".")[0] != record["host"]:
+        raise ValueError("remote supervisor reached the wrong host")
+    checked_source(record["remote_source_root"], record["commit"])
+    path, terminal = remote_paths(record)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if json.loads(path.read_text()) != record:
+            raise ValueError("remote launch identity differs")
+        # Lost start replies must not create a second producer.
+        if terminal.exists() or subprocess.run(
+                ["systemctl", "--user", "is-active", "--quiet", record["unit"]], timeout=30).returncode == 0:
+            return
+        raise RuntimeError("remote launch exists without an active unit or terminal receipt")
+    atomic_json(path, record)
+    subprocess.run(["systemd-run", "--user", "--unit", record["unit"], "--collect",
+        "--property=Type=exec", "--property=KillMode=mixed", "--property=TimeoutStopSec=180",
+        "--property=RuntimeMaxSec=" + str(RUN_SECONDS + 300),
+        "--working-directory", record["remote_source_root"], sys.executable,
+        str(Path(__file__).resolve()), "--remote-worker", str(path)], check=True, timeout=60)
+
+
+def remote_wait(record):
+    _, terminal = remote_paths(record)
+    deadline = time.monotonic() + RUN_SECONDS + 600
+    while time.monotonic() < deadline:
+        if terminal.exists():
+            result = json.loads(terminal.read_text())
+            if result["unit"] != record["unit"]:
+                raise ValueError("remote terminal identity differs")
+            print(json.dumps(result), flush=True)
+            return 0
+        time.sleep(60)
+    raise TimeoutError("remote producer did not write a terminal receipt")
+
+
+def execute_detached(record):
+    require_lease(record["host"])
+    remote = str(Path(record["remote_source_root"]) / "quantization/core_launch.py")
+    cancelled = []
+    previous = {sig: signal.signal(sig, lambda signum, _frame: cancelled.append(signum))
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    deadline = time.monotonic() + RUN_SECONDS + 900
+    try:
+        # A remote unit owns container lifetime, not this SSH connection.
+        started = 255
+        for attempt in range(3):
+            try:
+                started = subprocess.run(ssh(record["host"], ["python3", remote, "--remote-start", json.dumps(record)]),
+                                         timeout=90).returncode
+            except subprocess.TimeoutExpired:
+                started = 255
+            if started != 255 or cancelled:
+                break
+            for _ in range(60):
+                if cancelled:
+                    break
+                time.sleep(1)
+        if started:
+            cancelled.append(0)
+        while time.monotonic() < deadline and not cancelled:
+            process = subprocess.Popen(ssh(record["host"],
+                ["python3", remote, "--remote-wait", json.dumps(record)]), stdout=subprocess.PIPE, text=True)
+            while process.poll() is None and not cancelled and time.monotonic() < deadline:
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+            if cancelled or time.monotonic() >= deadline:
+                process.terminate()
+                process.wait(timeout=30)
+                break
+            if process.returncode == 0:
+                try:
+                    result = json.loads(process.stdout.read())
+                    if result['unit'] != record['unit'] or not isinstance(result['returncode'], int):
+                        raise ValueError('remote terminal identity differs')
+                    return result['returncode']
+                except (ValueError, KeyError):
+                    cancelled.append(0)
+                    break
+            if process.returncode != 255:
+                # Nontransport errors can come from the waiter itself; stop the
+                # owned unit before releasing the hardware lease in that case.
+                cancelled.append(0)
+                break
+            # Reconnect without killing healthy remote work on a transport failure.
+            for _ in range(60):
+                if cancelled:
+                    break
+                time.sleep(1)
+        subprocess.run(ssh(record["host"], ["systemctl", "--user", "stop", record["unit"]]),
+                       timeout=210, check=False)
+        subprocess.run(ssh(record["host"], ["docker", "rm", "--force", record["container"]]),
+                       timeout=30, check=False)
+        if output(ssh(record["host"], ["docker", "ps", "-aq", "--filter", "name=^/" + record["container"] + "$"])):
+            raise RuntimeError("owned container remains after cancellation")
+        return 128 + cancelled[0] if cancelled else 124
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 def execute(record):
+    if record.get("remote_supervisor"):
+        return execute_detached(record)
     require_lease(record["host"])
     source = Path(record["remote_source_root"])
     guard = source / "quantization/kimi_k3/core_k6/run_guard.py"
@@ -268,7 +397,7 @@ def dispatch(family, argv=None):
 
 def main(argv=None, *, family=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    for private in ("remote-check", "validate-remote", "execute", "supervise"):
+    for private in ("remote-check", "validate-remote", "execute", "supervise", "remote-start", "remote-worker", "remote-wait"):
         parser.add_argument("--" + private, help=argparse.SUPPRESS)
     parser.add_argument("--family", choices=FAMILIES, default=family)
     parser.add_argument("--host", required=False, help="rhea, moa or cassowary (core-only only)")
@@ -282,6 +411,13 @@ def main(argv=None, *, family=None):
     parser.add_argument("--runtime-python", default="python3", help="container Python; optional pre-staged HF4 overlay")
     parser.add_argument("--runtime-root", type=Path, help="read-only overlay root containing --runtime-python")
     args = parser.parse_args(argv)
+    if args.remote_start:
+        remote_start(json.loads(args.remote_start))
+        return 0
+    if args.remote_worker:
+        return remote_worker(Path(args.remote_worker))
+    if args.remote_wait:
+        return remote_wait(json.loads(args.remote_wait))
     if args.supervise:
         return supervise(Path(args.supervise))
     if args.execute:
@@ -324,7 +460,7 @@ def main(argv=None, *, family=None):
                   uid=identity["uid"], gid=identity["gid"], user=identity["user"],
                   build_root=str(build), remote_source_root=str(remote_source), container_memory=expected_cap,
                   runtime_python=args.runtime_python, runtime_root=str(args.runtime_root or remote_source),
-                  resume=args.resume, image_id=output(ssh(args.host,
+                  resume=args.resume, remote_supervisor=True, image_id=output(ssh(args.host,
                       ["docker", "image", "inspect", IMAGE, "--format", "{{.Id}}"])))
     for name in ("source_snapshot", "tokens", "root", "export"):
         value = getattr(args, name)
