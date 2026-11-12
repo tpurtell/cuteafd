@@ -76,6 +76,7 @@ def plan_fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(recipe, "inventory", lambda _: {})
     monkeypatch.setattr(core, "sha256_file", lambda path: "test-" + path.name)
     monkeypatch.setattr(core.importlib.metadata, "version", lambda _: "test")
+    monkeypatch.setattr(core, "model_runtime", lambda: {"transformers_version": "model-test"})
     monkeypatch.setattr(core.subprocess, "check_output", lambda *a, **kw: "test-pin")
     source = SimpleNamespace(snapshot=source_dir,
         reference=SimpleNamespace(verify_runtime_source=lambda: {"pin": "transformers"}))
@@ -97,6 +98,7 @@ def test_smoke_identity_keeps_full_selection_and_numerics(tmp_path, monkeypatch)
     assert smoke["identity"]["recipe"]["smoke_layer_limit"] == 4
     assert smoke["identity"]["recipe"]["hessian_accumulation"] == run.RECIPE["hessian_accumulation"]
     assert smoke["identity"]["runtime"] == {"pin": "transformers"}
+    assert smoke["identity"]["encoder_delta"]["k6_gptqmodel_commit"] == "25dd11c391ce6bf3ceadf8722e8274c3cde7079a"
     assert "quantization/glm5_flash/core_k6/storage.py" in smoke["identity"]["code"]
     assert "python/reference/families/step5/golden.py" in smoke["identity"]["code"]
     assert full["required_free_bytes"] < 300 * run.GIB
