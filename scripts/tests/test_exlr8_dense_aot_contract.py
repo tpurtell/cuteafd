@@ -361,11 +361,17 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
                      "compile_minimax_oai_split_aot"):
         setattr(module, compiler, lambda **kwargs: kwargs)
     monkeypatch.setitem(sys.modules, module.__name__, module)
+    module = types.ModuleType("b12x.integration.cuteafd.minimax")
+    for compiler in ("compile_minimax_norm_aot", "compile_minimax_router_scores_aot",
+                     "compile_minimax_kv_pack_aot"):
+        setattr(module, compiler, lambda: None)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
     namespace = {"geometries": ["minimax"], "manifest": {"families": {}, "family_capacities": {}},
                  "work": [], "CHECKPOINT_CONTEXTS": {},
                  "args": types.SimpleNamespace(decode_rows=64, prefill_rows=4096, max_context=1048576)}
     helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-               and node.name in ("geometry_context", "minimax_sparse_programs", "minimax_producer_programs")]
+               and node.name in ("geometry_context", "minimax_sparse_programs", "minimax_producer_programs",
+                                 "minimax_forward_programs")]
     exec(compile(ast.Module(body=helpers + [branch], type_ignores=[]), "dispatch", "exec"), namespace)
     assert namespace["manifest"]["families"] == {"minimax": {"abi_version": 1}}
     assert namespace["manifest"]["family_capacities"] == {"minimax": {"max_context": 1048576}}
@@ -398,7 +404,10 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
                                   "minimax_attention_decode", "minimax_attention_extend",
                                   "minimax_norm_rope_h64", "minimax_norm_rope_h4",
                                   "minimax_index_producer", "minimax_oai_split_i3072",
-                                  "minimax_oai_split_i12288"]
+                                  "minimax_oai_split_i12288", "minimax_residual_norm",
+                                  "minimax_router_scores", "minimax_kv_pack"]
+    assert all(params == {"max_rows": 4096} and thunk() is None
+               for _, _, _, params, thunk in namespace["work"][-3:])
     namespace.update(family="glmf", suffix="sentinel", op="attention")
     exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
     assert namespace["stem"] == "glmf_sentinel"

@@ -298,6 +298,19 @@ def minimax_producer_programs(prefill_rows: int):
     return result
 
 
+def minimax_forward_programs(prefill_rows: int):
+    from b12x.integration.cuteafd.minimax import (
+        compile_minimax_norm_aot, compile_minimax_router_scores_aot,
+        compile_minimax_kv_pack_aot,
+    )
+
+    return [(suffix, op, dict(max_rows=prefill_rows), compiler) for suffix, op, compiler in (
+        ("residual_norm", "minimax_residual_norm", compile_minimax_norm_aot),
+        ("router_scores", "minimax_router_scores", compile_minimax_router_scores_aot),
+        ("kv_pack", "minimax_kv_pack", compile_minimax_kv_pack_aot),
+    )]
+
+
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
     # Fused top-k has fixed CTA-group spin barriers. The native table has no
     # loaded-kernel occupancy gate/fallback; even a new decode bucket must not
@@ -1763,6 +1776,7 @@ def main() -> None:
         work += [("minimax", *item) for item in minimax_sparse_programs(
             args.decode_rows, args.prefill_rows, args.max_context)]
         work += [("minimax", *item) for item in minimax_producer_programs(args.prefill_rows)]
+        work += [("minimax", *item) for item in minimax_forward_programs(args.prefill_rows)]
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.
