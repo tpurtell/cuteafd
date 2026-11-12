@@ -235,6 +235,7 @@ def test_core_plan_requires_full_calibration_and_hashes_fresh_recipe(tmp_path, m
     monkeypatch.setattr(recipe, "inventory", lambda _: {})
     monkeypatch.setattr(core_only, "sha256_file", lambda path: "test-" + path.name)
     monkeypatch.setattr(core_only.importlib.metadata, "version", lambda _: "test")
+    monkeypatch.setattr(core_only, "model_runtime", lambda: {"transformers_version": "model-test"})
     monkeypatch.setattr(core_only.subprocess, "check_output", lambda *a, **kw: "test-pin")
     source = SimpleNamespace(snapshot=source_dir)
     before = deepcopy(run.RECIPE)
@@ -252,6 +253,7 @@ def test_core_plan_requires_full_calibration_and_hashes_fresh_recipe(tmp_path, m
     assert plan["identity"]["recipe"]["core_bits"] == 8
     assert plan["identity"]["recipe"]["expert_bits"] is None
     assert "quantization/core_export.py" in plan["identity"]["code"]
+    assert plan["identity"]["encoder_delta"]["k6_gptqmodel_commit"] == "a196a448fb3f76774c31e02b42523997f05385e3"
     manifest["splits"]["calibration"]["count"] = 32
     (tokens / "manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="full"):

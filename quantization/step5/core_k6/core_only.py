@@ -49,6 +49,14 @@ class CoreOnlyEngine(Engine):
             f"core-layer-{layer:03d}.safetensors", self.identity)
 
 
+def model_runtime():
+    import transformers
+    return dict(transformers_version=transformers.__version__,
+        transformers_file=str(Path(transformers.__file__).resolve()),
+        model_file=str(REPO / "python/reference/families/step5/golden.py"),
+        model_sha256=sha256_file(REPO / "python/reference/families/step5/golden.py"))
+
+
 def make_core_plan(source, tokens, root, export, *, core_bits, layer_limit=None):
     if layer_limit is not None and (type(layer_limit) is not int
             or not 1 <= layer_limit <= recipe.TARGET_LAYER_COUNT):
@@ -102,8 +110,12 @@ def make_core_plan(source, tokens, root, export, *, core_bits, layer_limit=None)
             ["git", "-C", str(fork), "rev-parse", "HEAD"], text=True).strip(),
         sparkinfer_commit=subprocess.check_output(
             ["git", "-C", str(REPO / "third_party/sparkinfer"), "rev-parse", "HEAD"], text=True).strip(),
+        encoder_delta=dict(k6_gptqmodel_commit="25dd11c391ce6bf3ceadf8722e8274c3cde7079a",
+            change="K8 bitrate validation enabled (1..8); adapter formatting; same MCG/FP64-congruence recipe",
+            core_only="native-BF16 experts propagate; target core only; shared K4 MTP unchanged"),
+        model_runtime=model_runtime(),
         packages={name: importlib.metadata.version(name) for name in
-                  ("torch", "transformers", "numpy", "safetensors")})
+                  ("torch", "transformers", "numpy", "safetensors", "huggingface-hub", "tokenizers")})
     payload = sum(recipe.packed_bytes(g) for g in selected.values())
     selected_source = sum(g["in_features"] * g["out_features"] * 2 for g in selected.values())
     summary.update(selected_modules=len(selected), selected_source_bytes=selected_source,
