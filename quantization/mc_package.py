@@ -326,6 +326,14 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
                 or complete['identity']['source_revision'] != recipe.BASE_REVISION
                 or complete['modules'] != len(selection) or complete['bits'] != [8]):
             raise ValueError('K8 completion receipt source/modules/bitrate differs')
+        if family in ('step5', 'glm5'):
+            provenance = complete['identity']
+            if not (provenance.get('gptqmodel_commit')
+                    and provenance.get('encoder_delta', {}).get('k6_gptqmodel_commit')
+                    and provenance.get('encoder_delta', {}).get('change')
+                    and provenance.get('model_runtime', {}).get('transformers_version')
+                    and provenance.get('packages', {}).get('torch')):
+                raise ValueError('seed K8 receipt requires encoder delta and actual model runtime')
         k8_inv = full_parent_inventory(k8)
         expected = {n: spec for module, g in selection.items()
                     for n, spec in packed_specs(module, dict(g, bits=8)).items()}
@@ -410,6 +418,14 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
         + ('Only target-core matrices change between views. The parent K4 MTP dense modules '
            f'({27 if family == "step5" else 8} modules) remain shared unchanged across all three views; '
            'they are neither restored to BF16 nor encoded at K8.\n\n' if family in ('step5', 'glm5') else '')
+        + (f"K8 encoder fork: `{complete['identity']['gptqmodel_commit']}`; "
+           f"inherited K6 encoder fork: `{complete['identity']['encoder_delta']['k6_gptqmodel_commit']}`. "
+           f"Delta: {complete['identity']['encoder_delta']['change']}. "
+           f"K8 model runtime: Transformers `{complete['identity']['model_runtime']['transformers_version']}`, "
+           f"Torch `{complete['identity']['packages']['torch']}`. "
+           'The K8 encoder build need not match the historical K6 build. Full source hashes, '
+           'calibration, recipe and actual dependency versions are recorded in '
+           '`quantization-provenance.k8.json`.\n\n' if family in ('step5', 'glm5') else '')
         + 'Original-core byte proofs and package inventory are in `package-validation.json`. Parent diagnostics describe the parent quantization, not the restored core. '
         + 'See `README.parent.md` and inherited license/usage files for checkpoint terms. No generation quality or serving performance qualification is claimed by this assembly.\n')
     (output / 'README.md').write_text(card)

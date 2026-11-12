@@ -50,6 +50,10 @@ def fixture(tmp_path, monkeypatch, family='glmf'):
     indexed(k8, {'core.safetensors': tensors('head', geometry, 8)})
     producer = dict(source_repo=recipe.BASE_REPO, source_revision=recipe.BASE_REVISION,
                     calibration=dict(samples=1426, tokens=1234567))
+    if family in ('step5', 'glm5'):
+        producer.update(gptqmodel_commit='current-encoder',
+            encoder_delta=dict(k6_gptqmodel_commit='historical-encoder', change='K8 validation enabled'),
+            model_runtime=dict(transformers_version='model-version'), packages=dict(torch='torch-version'))
     (k8 / 'quantization-errors').mkdir()
     dump(k8 / 'quantization-errors', 'head.json', dict(module='head', logical_shape=[128,128],
         evidence=dict(bits=8, identity_rows=0, hessian_rows=1234567),
@@ -387,3 +391,24 @@ def test_seed_mc_preserves_shared_k4_mtp_across_views(tmp_path, monkeypatch, fam
     card = (args['output']/'README.md').read_text()
     assert f'({mtp_count} modules)' in card
     assert 'neither restored to BF16 nor encoded at K8' in card
+
+
+@pytest.mark.parametrize('family', ['step5', 'glm5'])
+def test_seed_card_discloses_encoder_delta_and_actual_runtime(tmp_path, monkeypatch, family):
+    args = fixture(tmp_path, monkeypatch, family=family)
+    package.assemble(**args)
+    card = (args['output'] / 'README.md').read_text()
+    assert 'current-encoder' in card and 'historical-encoder' in card
+    assert 'K8 validation enabled' in card
+    assert 'model-version' in card and 'torch-version' in card
+    assert 'quantization-provenance.k8.json' in card
+
+
+@pytest.mark.parametrize('family', ['step5', 'glm5'])
+def test_seed_package_rejects_missing_encoder_delta(tmp_path, monkeypatch, family):
+    args = fixture(tmp_path, monkeypatch, family=family)
+    receipt = package.load_json(args['k8'] / 'core-export.json')
+    receipt['identity'].pop('encoder_delta')
+    dump(args['k8'], 'core-export.json', receipt)
+    with pytest.raises(ValueError, match='encoder delta'):
+        package.assemble(**args)
