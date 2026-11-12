@@ -677,6 +677,27 @@ fn reference_mxfp4(raw: &[u8], plane: usize, width: usize, padded: usize, bytes:
     let mut output = vec![0; bytes];
     for row in 0..rows {
         for col in 0..cols {
+            if padded == width && width % 128 != 0 {
+                let half = if plane < 2 { padded } else { rows };
+                let half_index = row / half;
+                let local_row = row % half;
+                let nt = local_row / 128;
+                let tile_rows = (half - nt * 128).min(128);
+                let block = if scales { 4 } else { 16 };
+                let kt = col / block;
+                let tile_cols = (cols - kt * block).min(block);
+                let (r, c) = (local_row % 128, col % block);
+                // Compact tails flatten [K32, N32, N8, K4, N4] without padded tiles.
+                let lane = if scales { r * tile_cols + c } else {
+                    ((((c / 4 * (tile_rows / 32) + r / 32) * 8 + r % 8) * 4
+                        + c % 4) * 4) + (r % 32) / 8
+                };
+                let target = (half_index * half * cols + nt * 128 * cols
+                    + kt * tile_rows * block + lane) * element;
+                let source = (row * cols + col) * element;
+                output[target..target + element].copy_from_slice(&raw[source..source + element]);
+                continue;
+            }
             let tile = row / 256 * kt + col / (128 / divisor);
             let local_row = row % 256;
             let local_col = col % (128 / divisor);
