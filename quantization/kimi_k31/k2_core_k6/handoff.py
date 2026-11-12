@@ -254,7 +254,8 @@ def retire(root):
     # Exact, task-owned leaves only. Never enumerate or remove the managed hub.
     paths = [EXPORT, LOCAL_HUB / REPO_NAME, STAGE_PARENT / REPO_NAME,
              root / "frontier", root / "head/stages", root / "head/projections",
-             BASE / "kernel-cache", BUILD_ROOT / "exllamav3"]
+             BASE / "kernel-cache", BASE / "pilot/candidates", BASE / "pilot-final/candidates",
+             BUILD_ROOT / "exllamav3", BUILD_ROOT / "tmp"]
     paths.extend(BUILD_ROOT.glob("target*"))
     for layer in range(93):
         paths.extend(root / f"layers/{layer:03d}" / leaf
