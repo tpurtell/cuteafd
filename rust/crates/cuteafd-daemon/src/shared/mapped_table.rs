@@ -73,7 +73,10 @@ impl<'a> MappedTableDevice<'a> {
                 let ids = job.batch.source.rows(job.unit);
                 let rows = ids.iter().map(|&id| u64::try_from(id)).collect::<std::result::Result<Vec<_>, _>>()?;
                 let bytes = rows.len() * table.row_bytes();
-                table.gather(&rows, &mut slot.bytes.bytes_mut()[..bytes], priority)
+                tracing::debug!(table = name, unit = job.unit, rows = rows.len(), ?priority, "token-table gather worker started");
+                let result = table.gather(&rows, &mut slot.bytes.bytes_mut()[..bytes], priority);
+                tracing::debug!(table = name, unit = job.unit, success = result.is_ok(), "token-table gather worker finished");
+                result
             }, |slot| Ok(slot.bytes.copy_ready()?))?))
         };
         let prefill = pipeline(prefill_rows, 2 * prefill_slots, "prefill", ReadPriority::Prefill)?;
@@ -117,6 +120,7 @@ impl<'a> MappedTableDevice<'a> {
         let pipeline = Arc::clone(if decode { &self.decode } else { &self.prefill });
         let job = RowJob { batch: Arc::clone(batch), unit };
         let ticket = pipeline.try_submit(job.clone(), true)?;
+        tracing::debug!(table = self.name, unit, decode, rows = ids.len(), submitted = ticket.is_some(), "token-table unit begun");
         *entry = true;
         Ok(PendingRows { ticket, job, pipeline, bytes: ids.len() * table.row_bytes() })
     }
@@ -132,6 +136,8 @@ impl<'a> MappedTableDevice<'a> {
         ensure!(!self.library.is_quarantined_after_failed_drain(), "token-table device is quarantined");
         ensure!(dst.device_id == self.device && dst.bytes >= pending.bytes, "token-table destination geometry");
         let started = std::time::Instant::now();
+        tracing::debug!(table = self.name, unit = pending.job.unit, bytes = pending.bytes,
+            submitted = pending.ticket.is_some(), "token-table consumer waiting");
         let mut ticket = match pending.ticket.take() {
             Some(ticket) => ticket,
             None => pending.pipeline.submit_timeout(pending.job.clone(), true, Duration::from_secs(120))?,
@@ -143,6 +149,8 @@ impl<'a> MappedTableDevice<'a> {
             Err(GatherFailure::Worker(error)) => return Err(error.into()),
         };
         self.lookahead.table().table().stats().record_stall(started.elapsed());
+        tracing::debug!(table = self.name, unit = pending.job.unit, elapsed_ms = started.elapsed().as_millis() as u64,
+            "token-table gather ready");
         let slot = lease.slot_mut().context("empty table lease")?;
         let mut destinations = self.destinations.borrow_mut();
         let index = match destinations.iter().position(|entry| entry.pointer == dst.ptr as usize) {

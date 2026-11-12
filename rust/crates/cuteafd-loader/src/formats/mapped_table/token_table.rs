@@ -105,11 +105,13 @@ impl TokenTable {
             Ok(bytes)
         };
         let mut fallback = misses.len();
+        tracing::debug!(?priority, rows = ids.len(), misses = misses.len(), pending = pending.len(), "token-table cache lookup complete");
         if !misses.is_empty() {
             let bytes = read(&misses, output)?;
             pins.publish_all(misses.iter().enumerate().filter_map(|(i, &(_, cached, _))|
                 cached.map(|c| (c, [&bytes[i * width..(i + 1) * width], &[][..]]))))?;
         }
+        tracing::debug!(?priority, pending = pending.len(), "token-table demand reads published");
         let mut failed = Vec::new();
         for &(cached, slot, id) in &pending {
             if pins.wait(cached) { output[slot * width..(slot + 1) * width].copy_from_slice(pins.row(cached)); }
@@ -121,6 +123,7 @@ impl TokenTable {
             fallback += failed.len();
         }
         let waited = pending.len() - failed.len();
+        tracing::debug!(?priority, waited, fallback, "token-table cache waits complete");
         if fallback > 0 || waited > 0 { self.table.stats().record_gather_misses(class == RowClass::Decode, fallback, waited); }
         drop(pins);
         for (source, slot) in dups {

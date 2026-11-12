@@ -2070,7 +2070,13 @@ impl<S: Send + 'static, J, E> GatherTicket<S, J, E> {
             Ok(result) => match result.map_err(GatherFailure::Job)? {
                 Some(lease) => Ok(GatherPoll::Ready(lease)), None => Ok(GatherPoll::Cancelled),
             },
-            Err(_) => { self.cancel(); Err(GatherFailure::Worker(MappedTableError::Stopped("gather wait timed out or worker stopped"))) }
+            Err(error) => {
+                self.cancel();
+                Err(GatherFailure::Worker(MappedTableError::Stopped(match error {
+                    mpsc::RecvTimeoutError::Timeout => "gather wait timed out; worker still owns unfinished staging",
+                    mpsc::RecvTimeoutError::Disconnected => "gather worker stopped before completion",
+                })))
+            }
         }
     }
 
