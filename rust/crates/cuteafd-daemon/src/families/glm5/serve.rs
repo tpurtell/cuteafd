@@ -868,7 +868,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     engine.prefill_rows, engine.prefill_capacity());
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, prefill_rows,
                     DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits, &mut state,
-                    |(placement, transport), chunk, rows| {
+                    |(placement, transport), chunk, rows, _position| {
                         let experts = transport.as_deref_mut().map(|t| (t, runtime));
                         if rows > 1 {
                             Ok(engine.prefill_scoring_media(placement, chunk, experts, rows, &request_media)?

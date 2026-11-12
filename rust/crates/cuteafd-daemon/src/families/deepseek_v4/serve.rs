@@ -862,7 +862,7 @@ fn schedule(
                 let mut placement = admitted.placement;
                 let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows, probe::verify_rows(&job.probe), engine.full_prefill_logits,
                     &mut (&mut placement, &mut *transports),
-                    |(placement, transports), chunk, rows| {
+                    |(placement, transports), chunk, rows, _position| {
                         if prefix_score_path(placement.len, chunk.len()) == probe::ScorePath::Decode {
                             Ok(Some(probe::ScoreLogits::Device(engine.verify_device(
                                 &mut [(&mut **placement, chunk)], transports, runtime)?)))

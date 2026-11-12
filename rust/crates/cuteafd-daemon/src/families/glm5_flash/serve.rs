@@ -1146,7 +1146,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 let mut placement = admitted.placement;
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
                     DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits, &mut placement,
-                    |placement, chunk, rows| {
+                    |placement, chunk, rows, _position| {
                         if rows > 1 {
                             engine.prefill_scoring_media(placement, chunk, &request_media)
                         } else {

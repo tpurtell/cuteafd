@@ -749,7 +749,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let scored = probe::score(engine.library, &job.probe, &tokens, from,
                     engine.prefill_capacity(),
                     DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits(), &mut placement,
-                    |placement, chunk, rows| Ok(engine.prefill_media_device(placement, chunk, rows > 1, None, None, Some(&request_media))?
+                    |placement, chunk, rows, _position| Ok(engine.prefill_media_device(placement, chunk, rows > 1, None, None, Some(&request_media))?
                         .map(probe::ScoreLogits::Device)),
                     |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, None, Some(&request_media))?
                         .context("scoring needs every layer"));

@@ -190,6 +190,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             crate::shared::memory_report::release_load_staging(&library)?;
             loaded.engine.configure_packing(worker_args.prefill_packing)?;
             let backend = KimiBackend::new(&loaded.engine)?;
+            cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
             // The shared selector allocates on the calling thread's device and
             // consumes logits on the terminal rank's exact producing stream.
             library.cuda_set_device(worker_args.split_device.unwrap_or(worker_args.device))?;

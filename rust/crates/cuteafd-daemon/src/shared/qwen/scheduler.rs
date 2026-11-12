@@ -145,6 +145,12 @@ pub(crate) trait Backend<'a> {
     fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], logit_rows: usize,
         pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
+    fn streamed_prefill_scoring(&self) -> bool { false }
+    fn prefill_scoring(&self, placement: &mut Self::Placement, tokens: &[u32], logit_rows: usize,
+        _position: usize, _probe: &probe::ProbeRef, pool: &cuteafd_engine::prefix::RefPagePool)
+        -> Result<Option<probe::ScoreLogits>> {
+        Ok(self.prefill_device(placement, tokens, logit_rows, pool)?.map(probe::ScoreLogits::Device))
+    }
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> { None }
     fn coordinator_packed_cap(&self) -> Result<Option<usize>> { Ok(None) }
     fn checked_packed_limits(&self) -> Result<Option<crate::shared::prefill_packing::Limits>> {
@@ -837,7 +843,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                                 Err(_) => break,
                             }
                         };
-                        if let Err(error) = probe::validate_scoring(&job.probe, geometry.full_prefill_logits) {
+                        if let Err(error) = probe::validate_scoring(&job.probe,
+                            geometry.full_prefill_logits || engine.streamed_prefill_scoring()) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -976,9 +983,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let scored = probe::score(engine.library(), &job.probe, &tokens, from, geometry.prefill_rows,
-                    geometry.decode_rows, probe::verify_rows(&job.probe), geometry.full_prefill_logits, &mut placement,
-                    |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, rows, cache.pool())?
-                        .map(probe::ScoreLogits::Device)),
+                    geometry.decode_rows, probe::verify_rows(&job.probe),
+                    geometry.full_prefill_logits || engine.streamed_prefill_scoring(), &mut placement,
+                    |placement, chunk, rows, position| engine.prefill_scoring(placement, chunk, rows,
+                        position, &job.probe, cache.pool()),
                     |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false,
                         UngraphedKind::Scoring, cache.pool())?
                         .context("scoring needs every layer"));

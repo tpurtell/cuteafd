@@ -172,8 +172,9 @@ pub fn standard_balance(reference: &Reference) -> Value {
 }
 
 pub fn prefill_admitted(settings: &[crate::report::Setting]) -> bool {
-    settings.iter().any(|s| s.name == "full-prefill-logits"
+    settings.iter().any(|s| (s.name == "full-prefill-logits"
         && s.value.as_deref().is_some_and(|v| matches!(v, "true" | "on" | "1")))
+        || (s.name == "prefill-scoring" && s.source == "resolved" && s.value.as_deref() == Some("streamed")))
 }
 
 /// V4.1 scores selected prefill rows without the all-row workspace switch.
@@ -887,6 +888,11 @@ mod tests {
     fn prefill_admission_uses_resolved_launch_setting_only() {
         use crate::report::Setting;
         assert!(!prefill_admitted(&[]));
+        for source in ["resolved", "cli", "default"] {
+            let setting = Setting { name: "prefill-scoring".into(), value: Some("streamed".into()),
+                source: source.into(), ..Default::default() };
+            assert_eq!(prefill_admitted(&[setting]), source == "resolved");
+        }
         for value in ["false", "off", "0", "true", "on", "1"] {
             let setting = Setting { name:"full-prefill-logits".into(), value:Some(value.into()),
                 default:Some("false".into()), source:"cli".into() };

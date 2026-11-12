@@ -650,7 +650,7 @@ impl<'a> Engine<'a> {
         sequences: &mut [(&mut super::prefix::Placement, &[u32])],
         pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool)
         -> Result<crate::shared::token_io::DeviceLogits> {
-        self.step_device_mode(sequences, pool, logit_rows, graphed, false)
+        self.step_device_mode(sequences, pool, logit_rows, graphed, false, None)
     }
 
     pub(crate) fn verify_device(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
@@ -658,11 +658,19 @@ impl<'a> Engine<'a> {
         -> Result<crate::shared::token_io::DeviceLogits> {
         let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
             rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi verify rows overflow")))?;
-        self.step_device_mode(sequences, pool, rows, graphed, true)
+        self.step_device_mode(sequences, pool, rows, graphed, true, None)
+    }
+
+    pub(crate) fn prefill_scoring(&self, placement: &mut super::prefix::Placement, tokens: &[u32],
+        logit_rows: usize, pool: &cuteafd_engine::prefix::RefPagePool,
+        consume: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits) -> Result<()>) -> Result<()> {
+        self.step_device_mode(&mut [(placement, tokens)], pool, logit_rows, true, false, Some(consume))?;
+        Ok(())
     }
 
     fn step_device_mode(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
-        pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool, speculative: bool)
+        pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool, speculative: bool,
+        mut consume: Option<&mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits) -> Result<()>>)
         -> Result<crate::shared::token_io::DeviceLogits> {
         self.require_live()?;
         ensure!(self.provisional.borrow().is_none(), "Kimi pending verify must be accepted or discarded before reuse");
@@ -672,7 +680,8 @@ impl<'a> Engine<'a> {
         let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
             rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi submission rows overflow")))?;
         let geometry = self.geometry()?;
-        let logit_capacity = if geometry.full_prefill_logits { geometry.prefill_rows } else { geometry.decode_rows };
+        let logit_capacity = if consume.is_some() || geometry.full_prefill_logits { geometry.prefill_rows }
+            else { geometry.decode_rows };
         ensure!(!sequences.is_empty() && logit_rows > 0 && logit_rows <= rows && logit_rows <= logit_capacity,
             "Kimi device submission logit extent");
         // Validate every frontier before enqueue: a failed batch cannot publish
@@ -714,11 +723,25 @@ impl<'a> Engine<'a> {
             let normalized = result?[0];
             let input = crate::shared::prefix::view(normalized,
                 (rows - logit_rows) * 7168 * 2, logit_rows * 7168 * 2)?;
-            let logits = io[0][self.head()].project(input, logit_rows, &local[0][self.head()])?;
-            let stream = local[0][self.head()].stream();
-            Ok(crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(), rows: logit_rows,
-                vocab: local[0][self.head()].config().vocab_size, stride: local[0][self.head()].config().vocab_size,
-                stream: stream.raw, greedy: None })
+            let head = &local[0][self.head()];
+            let describe = |logits: cuteafd_ffi::CuteafdDeviceBuffer, rows| crate::shared::token_io::DeviceLogits {
+                ptr: logits.ptr.cast_const(), rows, vocab: head.config().vocab_size,
+                stride: head.config().vocab_size, stream: head.stream().raw, greedy: None };
+            if let Some(consume) = consume.as_mut() {
+                let mut last = None;
+                for span in crate::shared::probe::head_spans(logit_rows, 64)? {
+                    let (first, rows) = (span.start, span.len());
+                    let span = crate::shared::prefix::view(input, first * 7168 * 2, rows * 7168 * 2)?;
+                    let logits = io[0][self.head()].project(span, rows, head)?;
+                    // Consume the exact head tile before its scratch is overwritten.
+                    consume(first, describe(logits, rows))?;
+                    last = Some(describe(logits, rows));
+                }
+                last.context("Kimi scoring produced no head spans")
+            } else {
+                let logits = io[0][self.head()].project(input, logit_rows, head)?;
+                Ok(describe(logits, logit_rows))
+            }
         })?;
         if let Err(error) = self.graph_settle() { self.shutdown()?; return Err(error); }
         // A nested native operator capturing here is a contract violation too.

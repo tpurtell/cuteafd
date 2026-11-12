@@ -561,7 +561,7 @@ impl DeviceLogits {
 
     /// Rows `[row, row + count)` of each span, concatenated. Every copy queues on
     /// the producing stream behind the logits, so one drain completes them all.
-    fn download(&self, library: &NativeLibrary, spans: &[(usize, usize)]) -> Result<Vec<f32>> {
+    pub(crate) fn download(&self, library: &NativeLibrary, spans: &[(usize, usize)]) -> Result<Vec<f32>> {
         let total: usize = spans.iter().map(|&(_, count)| count).sum();
         ensure!(spans.iter().all(|&(row, count)| row + count <= self.rows && (count == 1 || self.stride == self.vocab)),
             "logits download outside {} rows", self.rows);
