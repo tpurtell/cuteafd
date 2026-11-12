@@ -134,7 +134,7 @@ def container_command(record, *, preflight=False):
         GPTQMODEL_EXLLAMAV3_BUILD_ROOT=str(build / "exllamav3"),
         TORCH_EXTENSIONS_DIR=str(build / "torch-extensions"),
         TRITON_CACHE_DIR=str(build / "triton"), TMPDIR=str(build / "tmp"))
-    if record["family"] in ("step5", "glm5") or (record["family"] != "kimi-k31" and runtime == "python3"):
+    if record["family"] == "step5" or (record["family"] != "kimi-k31" and runtime == "python3"):
         environment["PYTHONPATH"] += ":" + str(source / "third_party/transformers/src")
     for key, value in environment.items():
         result += ["-e", f"{key}={value}"]
