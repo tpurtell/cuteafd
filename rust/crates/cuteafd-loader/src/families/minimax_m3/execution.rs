@@ -416,6 +416,19 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn head_inventory_has_one_owner_per_native_allocation() {
+        let config = cfg();
+        let head = HeadLayout::new(&config, 1024).unwrap();
+        assert_eq!(head.buffers(), vec![("tokens", 4096), ("normalized", 1024 * 6144 * 2),
+            ("logits", 1024 * 200064 * 4),
+            ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64)]);
+        assert!(HeadLayout::new(&config, 0).is_err());
+        assert!(HeadLayout::new(&config, 4097).is_err());
+        let mut wrong = config.clone(); wrong.vocab_size -= 1;
+        assert!(HeadLayout::new(&wrong, 1024).is_err());
+    }
+
+    #[test]
     fn forward_inventory_validates_all_kernels_without_private_scratch() {
         let manifest: Value = serde_json::from_str(include_str!(
             "../../../../cuteafd-ffi/tests/fixtures/minimax_forward_programs.json")).unwrap();

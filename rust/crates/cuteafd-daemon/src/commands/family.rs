@@ -142,6 +142,14 @@ mod tests {
     }
 
     #[test]
+    fn minimax_qualifies_without_opening_serving() {
+        let golden = argv(Kind::Golden, args(Some("minimax_m3"), &["--nll"])).unwrap().unwrap();
+        assert_eq!(golden, ["cuteafd", "minimax-golden", "--nll"]);
+        assert!(argv(Kind::Serve, args(Some("minimax_m3"), &[])).unwrap_err()
+            .to_string().contains("serving remains refused"));
+    }
+
+    #[test]
     fn family_flag_selects_the_command_and_forwards_everything_else() {
         let argv = argv(Kind::Serve, args(Some("glm5_flash"), &["--port", "9"])).unwrap().unwrap();
         assert_eq!(argv, ["cuteafd", "serve-glmf", "--port", "9"]);

@@ -141,7 +141,9 @@ fn run(args: GoldenArgs) -> Result<()> {
     residual.inventory(&mut inventory, "residual")?;
     for (slot, owner) in owners.iter().enumerate() { owner.inventory(&mut inventory, &format!("unit.{slot}"))?; }
     for (slot, owner) in metadata.iter().enumerate() { owner.inventory(&mut inventory, &format!("metadata.{slot}"))?; }
-    tracing::info!(receipts = %serde_json::to_string(&inventory.receipts)?, "MiniMax retained owner inventory");
+    let receipts = inventory.receipts.iter().map(|receipt| serde_json::json!({
+        "allocation":receipt.allocation, "address":receipt.address })).collect::<Vec<_>>();
+    tracing::info!(receipts = %serde_json::to_string(&receipts)?, "MiniMax retained owner inventory");
     pending.wait()?;
     let mut link = device.run(|| SparkLink::prepared(&library, SparkWorld::canonical(args.peers.len())?,
         &args.peers, config, link_layout))?;
@@ -229,4 +231,26 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
     ensure!(score.kl <= 0.03 && score.top1 >= 0.95,
         "MiniMax qualification failed: KL={} (<=0.03), top1={} (>=0.95)", score.kl, score.top1);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reference_rejects_an_unpinned_manifest_before_loading_any_rows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("manifest.json"), b"{}")?;
+        assert!(reference(root.path(), None, 200064).unwrap_err().to_string()
+            .contains("immutable publication"));
+        Ok(())
+    }
+    #[test]
+    fn golden_uses_shared_estimator_and_terminal_release_before_retirement() {
+        let source = include_str!("golden.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("fidelity_rows::score_compact("));
+        assert!(source.contains("sequence_units("));
+        assert!(source.contains("pending.wait()?"));
+        assert!(source.contains("terminal_quiesce().and_then(|_| link.terminal_drain_copies())"));
+        assert!(source.contains("stream.drain()).and_then(|_| link.terminal_release())"));
+    }
 }
