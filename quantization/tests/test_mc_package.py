@@ -76,6 +76,47 @@ def fixture(tmp_path, monkeypatch, family='glmf'):
     return dict(family=family,parent=parent,source=source,k8=k8 if family != 'ml4' else None,output=output)
 
 
+@pytest.mark.parametrize('disagreement', [None, 'payload', 'inventory'])
+def test_source_advisory_size_requires_reviewed_headers(tmp_path, monkeypatch, disagreement):
+    args = fixture(tmp_path, monkeypatch)
+    recipe, selection = package.family_recipe(args['family'])
+    recipe.BASE_PAYLOAD_BYTES = 128 * 128 * 2 + (2 if disagreement == 'payload' else 0)
+
+    def check_inventory(source):
+        header, _ = package.read_header(source.snapshot / source.weight_map['head.weight'])
+        expected = [128, 64] if disagreement == 'inventory' else [128, 128]
+        if header['head.weight']['shape'] != expected:
+            raise ValueError('source recipe inventory differs')
+
+    recipe.inventory = check_inventory
+    dump(args['source'], 'config.json', dict(text_config={}))
+    index = package.load_json(args['source'] / 'model.safetensors.index.json')
+    index['metadata']['total_size'] += 1234
+    dump(args['source'], 'model.safetensors.index.json', index)
+    if disagreement:
+        with pytest.raises(ValueError, match='reviewed recipe|recipe inventory'):
+            package.assemble(**args)
+        assert not args['output'].exists()
+        return
+    package.assemble(**args)
+    provenance = package.load_json(args['output'] / 'package-provenance.json')
+    assert provenance['source_payload_bytes'] == dict(declared=34002, measured=32768, reviewed=32768)
+    assert package.inventory(args['output'])['index']['metadata']['total_size'] == 65536
+
+
+@pytest.mark.parametrize('kind', ['parent', 'k8', 'output'])
+def test_non_source_index_totals_stay_strict(tmp_path, monkeypatch, kind):
+    args = fixture(tmp_path, monkeypatch)
+    if kind == 'output':
+        package.assemble(**args)
+    root = args[kind]
+    index = package.load_json(root / 'model.safetensors.index.json')
+    index['metadata']['total_size'] += 1
+    dump(root, 'model.safetensors.index.json', index)
+    with pytest.raises(ValueError, match='total_size differs'):
+        package.inventory(root)
+
+
 def test_mc_all_views_byte_exact_and_shared_parent_copy(tmp_path, monkeypatch):
     args = fixture(tmp_path, monkeypatch)
     result = package.assemble(**args)

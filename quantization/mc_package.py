@@ -61,7 +61,7 @@ def load_json(path):
     return json.loads(Path(path).read_text())
 
 
-def inventory(root, index_name='model.safetensors.index.json'):
+def inventory(root, index_name='model.safetensors.index.json', *, reviewed_payload_bytes=None):
     root = Path(root)
     index = load_json(root / index_name)
     mapping = index['weight_map']
@@ -74,7 +74,11 @@ def inventory(root, index_name='model.safetensors.index.json'):
         value = headers[shard][name]
         specs[name] = (value['dtype'], value['shape'])
         sizes[name] = value['data_offsets'][1] - value['data_offsets'][0]
-    if index.get('metadata', {}).get('total_size') != sum(sizes.values()):
+    measured = sum(sizes.values())
+    if reviewed_payload_bytes is not None:
+        if measured != reviewed_payload_bytes:
+            raise ValueError('source header payload differs from reviewed recipe')
+    elif index.get('metadata', {}).get('total_size') != measured:
         raise ValueError('selected index total_size differs from headers')
     return dict(root=root, index=index, mapping=mapping, headers=headers, specs=specs, sizes=sizes)
 
@@ -251,7 +255,10 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
         raise ValueError('MC package requires complete calibrated K8 export')
     parent_inv = full_parent_inventory(parent)
     source_index = 'consolidated.safetensors.index.json' if family == 'ml4' else 'model.safetensors.index.json'
-    source_inv = inventory(source, source_index)
+    reviewed_source_bytes = (recipe.BASE_PAYLOAD_BYTES
+                             if hasattr(recipe, 'inventory') and hasattr(recipe, 'BASE_PAYLOAD_BYTES')
+                             else None)
+    source_inv = inventory(source, source_index, reviewed_payload_bytes=reviewed_source_bytes)
     from types import SimpleNamespace
     document = load_json(source / 'config.json') if (source / 'config.json').exists() else None
     if hasattr(recipe, 'inventory'):
@@ -281,6 +288,9 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
         parent_quantize_sha256=sha256_file(parent / 'quantize_config.json'),
         source_config_sha256=sha256_file(source / 'config.json') if (source / 'config.json').exists() else None,
         source_index_sha256=sha256_file(source / source_index),
+        source_payload_bytes=dict(declared=source_inv['index'].get('metadata', {}).get('total_size'),
+                                  measured=sum(source_inv['sizes'].values()),
+                                  reviewed=reviewed_source_bytes),
         k8_receipt_sha256=sha256_file(Path(k8) / 'core-export.json') if k8 else None)
     output.mkdir(parents=True, exist_ok=True)
     plan_path = output / 'package-plan.json'
