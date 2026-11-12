@@ -71,6 +71,7 @@ def make_core_plan(source, tokens, root, export, *, core_bits, layer_limit=None)
     code = [*(Path(__file__).with_name(name) for name in
               ("core_only.py", "run.py", "storage.py", "recipe.py", "compat.py")),
         REPO / "quantization/core_export.py",
+        REPO / "quantization/mistral_large4/core_k6/numerical.py",
         REPO / "quantization/step5/prepare_corpus.py",
         REPO / "quantization/glm5_flash/core_k6/run.py",
         REPO / "quantization/glm5_flash/core_k6/storage.py",
