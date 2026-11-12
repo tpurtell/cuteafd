@@ -2,3 +2,4 @@
 pub(crate) mod weights;
 pub(crate) mod dense;
 pub(crate) mod attention;
+pub(crate) mod layer;

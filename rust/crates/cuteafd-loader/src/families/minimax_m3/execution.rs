@@ -238,6 +238,38 @@ impl MsaPrograms {
     }
 }
 
+/// Retained arithmetic outputs for one in-flight shared prefill unit. Dense
+/// quantization and MSA scratch are separate owners, not repeated charges here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitLayout { pub rows: u32 }
+impl UnitLayout {
+    pub fn new(cfg: &MiniMaxM3Config, rows: u32) -> Result<Self, Refusal> {
+        if rows == 0 || rows > 4096 || (cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim,
+            cfg.dense_intermediate, cfg.shared_intermediate, cfg.experts, cfg.topk)
+                != (6144, 64, 4, 128, 12288, 3072, 128, 4)
+            || cfg.routed_scale != 2.0 || cfg.rms_norm_eps != 1e-6
+            || cfg.swiglu_alpha != 1.702 || cfg.swiglu_limit != 7.0 {
+            return Err(Refusal::InvalidFact("MiniMax native unit arithmetic geometry".into()));
+        }
+        Ok(Self { rows })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        let rows = u64::from(self.rows);
+        [("residual", 6144 * 4), ("query", 8192 * 2), ("key", 512 * 2),
+            ("value", 512 * 2), ("index_query", 512 * 2), ("index_key", 128 * 2),
+            ("gate", 12288 * 2), ("up", 12288 * 2), ("ffn", 6144 * 2),
+            ("routed", 6144 * 2), ("combined", 6144 * 2), ("logits", 128 * 4), ("route_ids", 4 * 4),
+            ("route_weights", 4 * 4)].into_iter().map(|(name, stride)| (name, rows * stride)).collect()
+    }
+    pub fn components(self, prefix: &str, rank: u8, lifetime: Lifetime,
+        maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if self.rows == 0 || self.rows > 4096 {
+            return Err(Refusal::InvalidFact("MiniMax native unit row capacity".into()));
+        }
+        components(self.buffers(), prefix, rank, lifetime, maximum_pages, Category::Workspace)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MsaCache {
     pub layers: u32,
