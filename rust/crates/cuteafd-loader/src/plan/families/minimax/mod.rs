@@ -296,5 +296,13 @@ impl FamilyModel for Model {
         super::require(ok, || format!("{stem}: expected {:?} {:?}{}, found {}", contract.storage, contract.shape,
             if contract.bias { " with bias" } else { "" }, super::describe(operand)))
     }
-    // No placement or expert package is claimed before native exports and measured owners exist.
+    fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
+        if !operand.is_compressed_nvfp4() { return None; }
+        let package = "minimax:nvfp4a4";
+        Some(ExpertContract {
+            package: package.into(), block: 16,
+            spark_worlds: crate::plan::experts::spark_worlds(package, self.cfg.intermediate),
+            local: Err("MiniMax RTX expert onboarding is not qualified; serving remains refused".into()),
+        })
+    }
 }

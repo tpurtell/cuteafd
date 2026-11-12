@@ -45,7 +45,7 @@ pub(crate) fn contract(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, weights: 
         allocations: vec![], deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
         driver_page_tables: vec![], allocation_granularity: vec![] };
     let mut contract = Contract::fixed(64, pages, 1, empty);
-    // Fixed domains follow placement::families::kimi::Input::prepare: even a
+    // Fixed domains follow placement::families::kimi::KimiRecipe::prepare: even a
     // cold one-shape contract must declare prefill and lane decisions.
     contract.variables = vec![Variable::Prefill(vec![PrefillShape {
         rows: u64::from(rows), waves: u64::try_from(waves)? }]), Variable::Lanes(vec![1])];
@@ -191,6 +191,19 @@ mod tests {
         for id in ["residual", "sync-h2d", "head.download", "head.host-logits", "unit.0.residual"] {
             assert!(admitted.allocations.iter().any(|owner| owner.id == id), "missing admitted {id}");
         }
+        let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+            cuteafd_loader::plan::checkpoint::CoreView::Original)?;
+        let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
+        let exports = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports();
+        let executions = cuteafd_loader::plan::spark_executions::admit_family("minimax_m3", &exports,
+            None, u64::from(rows), waves as u64)?;
+        let model = cuteafd_transport::worker_selection::ModelAdmission::for_clients(
+            ExpertGeometry::MINIMAX_M3, endpoint, spark_rings(TcpTransportConfig::default().max_frame_bytes)?,
+            1, executions)?;
+        crate::shared::placement::SparkAdmission::plan_view(&view, ExpertGeometry::MINIMAX_M3,
+            Some(&catalog), &cuteafd_loader::placement::SparkWorkingSet {
+                rtx_layers: vec![], spark_layers: (3..cfg.layers).collect(), spark_ranks: 4, prefill_lanes: 1 },
+            4, model, None)?;
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.configure_memory(&library, 0, 96usize << 30)?;

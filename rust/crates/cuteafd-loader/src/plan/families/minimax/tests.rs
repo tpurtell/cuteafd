@@ -78,6 +78,33 @@ fn minimax_native_inventory_is_planned_not_executable() {
 }
 
 #[test]
+fn minimax_spark_recipe_uses_compressed_divisor_headers_without_opening_serving() {
+    use crate::plan::format::{ScaleDirection, detect, group_by_stem};
+    let (dir, _, _) = fixture();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = MINIMAX_M3.open(&checkpoint).unwrap();
+    let stem = format!("{TEXT}layers.3.block_sparse_moe.experts.0.w1");
+    let groups = group_by_stem(&checkpoint.tensors);
+    let mut operand = detect(&groups[&stem]).unwrap();
+    let contract = model.experts(&operand).unwrap();
+    assert_eq!(contract.package, "minimax:nvfp4a4");
+    assert_eq!(contract.block, 16);
+    assert_eq!(contract.spark_worlds, (2..=8).collect::<Vec<_>>());
+    assert!(contract.local.is_err());
+    for world in 2..=8 {
+        assert_eq!(crate::plan::experts::checkpoint_spark_recipe(&checkpoint, world, &[3]).unwrap(),
+            crate::plan::experts::spark_recipe(&contract.package, 3072, world).unwrap());
+    }
+    operand.input_scale = None;
+    assert!(model.experts(&operand).is_none());
+    operand = detect(&groups[&stem]).unwrap();
+    operand.global_scale.as_mut().unwrap().direction = ScaleDirection::Multiply;
+    assert!(model.experts(&operand).is_none());
+    assert!(model.experts(&detect(&groups[&format!("{TEXT}layers.0.self_attn.q_proj")]).unwrap()).is_none());
+    assert!(!plan::plan(dir.path(), &PlanOptions::default()).unwrap().executable());
+}
+
+#[test]
 fn generic_native_validation_rejects_missing_and_drifted_minimax_tensors_early() {
     let (dir, cfg, mut tensors) = fixture();
     let name = format!("{TEXT}layers.0.self_attn.index_k_proj.weight_scale_inv");
