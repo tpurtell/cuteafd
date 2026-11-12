@@ -38,6 +38,22 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     required_receive(receive(library, plan, &checked, budgets, config.rank, &PushClient::default(), stream, group, token))
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Spark {phase} panicked: {message}")]
+pub(super) struct StartupPanic {
+    phase: &'static str,
+    message: String,
+}
+
+pub(super) fn catch_startup<T>(phase: &'static str, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|payload| {
+        let message = payload.downcast_ref::<String>().cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|value| (*value).to_owned()))
+            .unwrap_or_else(|| "non-string panic payload".into());
+        Err(StartupPanic { phase, message }.into())
+    })
+}
+
 /// Decline before returning a startup error, so other ranks leave Begin cleanly.
 /// No allocation occurs for snapshots outside a SparkNest namespace.
 pub(super) fn plan_offer<T>(snapshot: &std::path::Path, stream: &mut TcpStream,
@@ -51,7 +67,7 @@ fn plan_offer_namespace<T>(snapshot: &std::path::Path, stream: &mut TcpStream,
     plan: impl FnOnce(&std::path::Path, &str) -> Result<(T, Offer)>)
     -> Result<Option<(T, (u64, u64))>> {
     use crate::shared::experts::rtx::push::{PushPolicy, PushStartupError};
-    let planned = (|| -> Result<_> {
+    let planned = catch_startup("push planning", || -> Result<_> {
         match namespace {
             Ok((root, host)) => PushPolicy::Required.plan(|| plan(&root, &host)).map_err(Into::into),
             Err(error) => {
@@ -59,7 +75,7 @@ fn plan_offer_namespace<T>(snapshot: &std::path::Path, stream: &mut TcpStream,
                 Ok(None)
             }
         }
-    })();
+    });
     let offer = match &planned {
         Ok(Some((_, offer))) => Ok(offer.clone()),
         Ok(None) => Err("snapshot is not a SparkNest namespace".into()),

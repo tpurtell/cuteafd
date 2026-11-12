@@ -43,6 +43,7 @@ pub(crate) enum Layer<'a> {
     Fp8 {
         widen: Vec<Range<usize>>,
         scalars: Vec<Range<usize>>,
+        scalar_convention: cuteafd_loader::formats::fp8_experts::Nvfp4ScaleConvention,
         inputs: Option<(Range<usize>, Range<usize>, usize)>,
         /// Scale grids landed packed (`rows` x `width` from the region start)
         /// whose execution layout pads each row to `pitch`: (region, rows, width, pitch).
@@ -96,6 +97,7 @@ impl Layer<'_> {
         Ok(Self::Fp8 {
             widen,
             scalars,
+            scalar_convention: tensors.nvfp4_scale_convention(),
             inputs,
             expand: Vec::new(),
         })
@@ -146,16 +148,17 @@ pub(crate) fn initialize<'a>(
                 }
                 Layer::Exl3 { region, residency } => exl3(arena, *region, residency)?,
                 Layer::Exlr8 { region, residency } => exlr8(arena, *region, residency)?,
-                Layer::Fp8 { widen, scalars, inputs, expand } => {
+                Layer::Fp8 { widen, scalars, scalar_convention, inputs, expand } => {
                     for range in scalars {
                         ensure!(range.len() % 4 == 0, "partial NVFP4 scalar");
                         let mut image = vec![0; range.len()];
                         arena.device().run(|| arena.device().library.copy_d2h(
                             &mut image, arena.buffer(range.clone())?))?;
-                        ensure!(image.chunks_exact(4).all(|v| {
-                            let value = f32::from_le_bytes(v.try_into().unwrap());
-                            value.is_finite() && value > 0.
-                        }), "NVFP4 projection has a non-positive or non-finite scalar");
+                        scalar_convention.normalize_bytes(&mut image)?;
+                        if *scalar_convention == cuteafd_loader::formats::fp8_experts::Nvfp4ScaleConvention::Divisor {
+                            arena.device().run(|| arena.device().library.copy_h2d(
+                                arena.buffer(range.clone())?, &image))?;
+                        }
                     }
                     for range in widen { widen_scales(arena, range.clone(), 1024 * 1024)?; }
                     // Packed grids (widened above when BF16) spread to their row pitch.

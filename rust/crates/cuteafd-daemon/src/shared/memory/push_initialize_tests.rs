@@ -647,6 +647,7 @@ fn fp8_header_plans_widen_pad_and_validate_like_mount() -> Result<()> {
             &[Layer::Fp8 {
                 widen: vec![],
                 scalars: vec![0..4],
+                scalar_convention: cuteafd_loader::formats::fp8_experts::Nvfp4ScaleConvention::Multiplier,
                 inputs: None,
                 expand: vec![],
             }],

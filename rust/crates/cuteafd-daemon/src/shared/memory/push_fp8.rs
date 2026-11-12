@@ -112,6 +112,7 @@ impl RankPlan {
                 initialize: push_initialize::Layer::Fp8 {
                     widen: vec![],
                     scalars: vec![],
+                    scalar_convention: tensors.nvfp4_scale_convention(),
                     inputs: None,
                     expand: vec![],
                 },
@@ -158,6 +159,7 @@ impl RankPlan {
                 push_initialize::Layer::Fp8 {
                     widen,
                     scalars,
+                    scalar_convention: _,
                     inputs,
                     expand,
                 } => {
@@ -322,26 +324,7 @@ fn source_names(
     expert: usize,
     projection: Fp8Projection,
 ) -> Vec<String> {
-    let name = tensors.name(layer, expert, projection);
-    let mut names = vec![name.clone()];
-    if tensors.format() != ExpertFormat::Bf16 {
-        names.push(format!(
-            "{name}{}",
-            if tensors.format().packed_fp4() {
-                "_scale"
-            } else {
-                "_scale_inv"
-            }
-        ));
-    }
-    if tensors.format() == ExpertFormat::Nvfp4 {
-        names.push(format!("{name}_scale_2"));
-        names.push(format!(
-            "{}.input_scale",
-            name.strip_suffix(".weight").unwrap()
-        ));
-    }
-    names
+    tensors.projection_source_names(layer, expert, projection)
 }
 /// A scale grid whose execution rows pad to a wider pitch (MXFP4 down
 /// projections pad K/32 scale bytes to 4): pushed packed, spread after Done.
@@ -394,6 +377,7 @@ fn initialize(
     Ok(push_initialize::Layer::Fp8 {
         widen,
         scalars,
+        scalar_convention: tensors.nvfp4_scale_convention(),
         inputs,
         expand,
     })
