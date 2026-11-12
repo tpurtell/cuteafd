@@ -32,6 +32,7 @@ pub(crate) struct PrefillCall<'c> {
     pub slots: usize,
     pub logit_rows: usize,
     pub media: Option<&'c cuteafd_engine::media::RequestMedia>,
+    pub scoring: Option<crate::shared::probe::ScoringRows<'c>>,
 }
 
 /// Head microbatches within a unit, paired with their output-suffix row offset.
@@ -220,7 +221,12 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
         let (rank, lane, stream) = (&self.ranks[last], &state.lanes[last], self.streams[last]);
         for (rows, offset) in chunks {
             let logits = rank.device.run(|| super::forward::head(self.cfg, rank, lane, rows, stream))?;
-            if self.call.logit_rows == 1 {
+            if let Some(scoring) = self.call.scoring {
+                let device_logits = crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(),
+                    rows: logits.bytes / (self.cfg.vocab_size * 4), vocab: self.cfg.vocab_size,
+                    stride: self.cfg.vocab_size, stream, greedy: None };
+                rank.device.run(|| scoring.record(rank.device.library, offset, &device_logits))?;
+            } else if self.call.logit_rows == 1 {
                 self.logits = Some(logits);
             } else {
                 let output = rank.prefill_logits.as_ref().context("Muse prefill logits not admitted")?.buffer;
@@ -247,6 +253,18 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
+
+    #[test]
+    fn streamed_head_is_consumed_before_unit_commit_without_full_buffer() {
+        let source = include_str!("prefill.rs");
+        let end = source.split_once("    fn end_unit(").unwrap().1
+            .split_once("    fn commit_unit(").unwrap().0;
+        let streamed = end.split_once("if let Some(scoring) = self.call.scoring {").unwrap().1
+            .split_once("} else if").unwrap().0;
+        assert!(streamed.contains("scoring.record(rank.device.library, offset, &device_logits)"));
+        assert!(!streamed.contains("prefill_logits"));
+        assert!(end.find("super::forward::head").unwrap() < end.find("scoring.record").unwrap());
+    }
 
     #[test]
     fn scored_suffix_tiles_units_and_head_microbatches() -> anyhow::Result<()> {
