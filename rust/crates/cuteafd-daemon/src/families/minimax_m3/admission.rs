@@ -45,6 +45,10 @@ pub(crate) fn contract(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, weights: 
         allocations: vec![], deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
         driver_page_tables: vec![], allocation_granularity: vec![] };
     let mut contract = Contract::fixed(64, pages, 1, empty);
+    // Fixed domains follow placement::families::kimi::Input::prepare: even a
+    // cold one-shape contract must declare prefill and lane decisions.
+    contract.variables = vec![Variable::Prefill(vec![PrefillShape {
+        rows: u64::from(rows), waves: u64::try_from(waves)? }]), Variable::Lanes(vec![1])];
     let c = &mut contract.components;
     c.extend(weight_arena_components(&weights.arena, Location::coordinator(0), Lifetime::RESIDENT,
         pages, MemoryKind::Weights)?);
@@ -106,7 +110,8 @@ pub(crate) fn admit(contract: &Contract, free: u64, total: u64, host: (u64, u64)
         physical_bytes: total, logical_bytes: policy.gpu_cap_bytes(total),
         baseline: Baseline::Sampled { free, phase: Phase::Load, source: "MiniMax pre-weight CUDA sample after modules".into() },
         headroom: cuteafd_loader::placement::reserve::gpu("minimax_m3") }, host.budget("MiniMax golden")?];
-    let facts = contract.facts(&[], contract.maximum_pages)?;
+    let selected = vec![0; contract.variables.len()];
+    let facts = contract.facts(&selected, contract.maximum_pages)?;
     let phases = evaluate(&facts, &budgets)?;
     tracing::info!(record = %serde_json::json!({"facts":facts,"budgets":budgets,"phases":phases}),
         "MiniMax cold golden admission");
@@ -119,6 +124,86 @@ mod tests {
     use crate::shared::memory::receipts::Inventory;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
     use cuteafd_loader::serving_capacity::WeightArenaLayout;
+
+    #[test]
+    fn cold_shape_domains_resolve_before_fixed_owner_facts() -> Result<()> {
+        let facts = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![],
+            allocations: vec![], deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
+            driver_page_tables: vec![], allocation_granularity: vec![] };
+        let mut contract = Contract::fixed(64, 256, 1, facts);
+        contract.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 1024, waves: 3 }]),
+            Variable::Lanes(vec![1])];
+        let decision = contract.decisions(&[0, 0])?;
+        assert_eq!(decision.prefill, PrefillShape { rows: 1024, waves: 3 });
+        assert_eq!(decision.lanes, 1);
+        assert!(contract.facts(&[0, 0], 256)?.allocations.is_empty());
+        assert!(contract.facts(&[], 256).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed vendor headers and CUTEAFD_PROGRAM_MANIFEST; CPU only"]
+    fn installed_minimax_cold_contract_admits_before_allocation() -> Result<()> {
+        use crate::shared::{memory::device::{Allocation as DeviceAllocation, Device}, placement::spark_rings};
+        use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkReplyFormat};
+        use cuteafd_loader::placement::{SparkEndpointOwners, SparkIntakeCandidates};
+        use cuteafd_transport::TcpTransportConfig;
+        let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e");
+        let checkpoint = Checkpoint::open(snapshot)?;
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+        cfg.release_geometry()?;
+        let weights = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &vec![0; cfg.layers])?.remove(0);
+        let path = std::env::var("CUTEAFD_PROGRAM_MANIFEST").context("installed MiniMax CPU test needs the sealed manifest")?;
+        let manifest = serde_json::from_slice(&std::fs::read(path)?)?;
+        let rows = 1024;
+        let tokens = 16383;
+        let waves = 3;
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: rows,
+            ingress: SparkIngress::Bf16, partial_reply_bytes: None };
+        let link = PreparedSparkLink::endpoint("spark", 0,
+            SparkEndpointOwners { ranks: 4, geometry: ExpertGeometry::MINIMAX_M3,
+                endpoint, rings: spark_rings(TcpTransportConfig::default().max_frame_bytes)? },
+            waves, true, true, SparkIntakeCandidates::Probed, SparkReplyFormat::Bf16, Lifetime::TARGET)?;
+        let contract = contract(&checkpoint, &cfg, &weights, &manifest, rows, tokens, waves, &link, "sm_120")?;
+        let decision = contract.decisions(&vec![0; contract.variables.len()])?;
+        assert_eq!(decision.prefill, PrefillShape { rows: u64::from(rows), waves: waves as u64 });
+        assert_eq!(decision.lanes, 1);
+        struct Prepared(Contract);
+        impl Recipe for Prepared {
+            fn prepare(&self, _: &Request) -> std::result::Result<Contract, Refusal> { Ok(self.0.clone()) }
+        }
+        let request = Request { context: cuteafd_loader::placement::planner::Context::pinned(u64::from(tokens)),
+            pool: Pin::Exact(u64::from(tokens.div_ceil(64)) * 64), onboard: Pin::Exact(0),
+            prefill: Pin::Exact(decision.prefill), operation: Operation::Scoring,
+            resident_weight_limit: None, spark_reply_formats: Default::default() };
+        let budgets = vec![Budget { id: "rtx0".into(), locations: vec![Location::coordinator(0)],
+            physical_bytes: 96 << 30, logical_bytes: 96 << 30,
+            baseline: Baseline::Sampled { free: 94 << 30, phase: Phase::Load, source: "CPU fixture".into() },
+            headroom: cuteafd_loader::placement::reserve::gpu("minimax_m3") },
+            cuteafd_loader::placement::families::qwen4::host::HostMemory {
+                total: 192 << 30, available: 160 << 30 }.budget("MiniMax CPU fixture")?];
+        let resolved = solve(request, budgets, &Prepared(contract.clone()))?;
+        assert_eq!(resolved.decisions.prefill, decision.prefill);
+        let admitted = admit(&contract, 94 << 30, 96 << 30, (192 << 30, 160 << 30))?;
+        assert_eq!(admitted.allocations, resolved.facts.allocations);
+        assert_eq!(admitted.resident_weights.len(), 1);
+        assert!(admitted.allocations.iter().any(|owner| owner.id == weights.arena.id()));
+        for id in ["residual", "sync-h2d", "head.download", "head.host-logits", "unit.0.residual"] {
+            assert!(admitted.allocations.iter().any(|owner| owner.id == id), "missing admitted {id}");
+        }
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 96usize << 30)?;
+        // Reach the same allocation boundary as the GPU path without reading
+        // checkpoint payloads or allocating the full target arena in host RAM.
+        let metadata = admitted.allocations.iter().find(|owner| owner.id == "metadata.0.positions")
+            .context("admitted metadata owner missing")?;
+        let allocated = DeviceAllocation::new(Device { library: &library, id: 0 },
+            usize::try_from(metadata.bytes)?, cuteafd_core::memory_layout::Tag::workspace("minimax/metadata"))?;
+        assert_eq!(allocated.buffer.bytes as u64, metadata.bytes);
+        assert!(!allocated.buffer.ptr.is_null());
+        Ok(())
+    }
 
     #[test]
     fn sync_upload_owner_takes_maximum_not_sum_or_mount_floor() -> Result<()> {
