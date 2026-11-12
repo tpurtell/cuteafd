@@ -357,8 +357,10 @@ fn installed_minimax_headers_match_native_contract() {
     let report = plan::plan(path, &PlanOptions::default()).unwrap();
     eprintln!("MiniMax installed plan: min_spark_ranks={:?}, spark_budget_bytes={}",
         report.min_spark_ranks, report.spark_budget_bytes);
-    // Runtime placement remains gated, so this is not a serving-fit witness.
-    assert_eq!(report.min_spark_ranks, None);
+    // Header-derived package fit is not a serving qualification.
+    assert_eq!(report.min_spark_ranks, Some(3));
+    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert!(!report.fits && !report.placement_supported && !report.executable());
     let routed_bytes = checkpoint.tensors.iter()
         .filter(|tensor| tensor.meta.name.contains(".block_sparse_moe.experts."))
         .map(|tensor| tensor.meta.byte_length).sum::<u64>();
