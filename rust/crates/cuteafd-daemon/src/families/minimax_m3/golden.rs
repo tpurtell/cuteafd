@@ -92,6 +92,8 @@ fn run(args: GoldenArgs) -> Result<()> {
         fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256, windows.len(),
         windows.iter().map(|window| window.positions.len()).sum::<usize>(), names.len());
     if args.check_headers { return Ok(()); }
+    cuteafd_core::set_expert_geometry(ExpertGeometry::MINIMAX_M3)
+        .map_err(|_| anyhow::anyhow!("MiniMax golden needs an isolated process"))?;
     ensure!(args.peers.len() == 4, "MiniMax golden currently qualifies four real Spark ranks");
     ensure!(!args.save_logits.try_exists()? && args.save_logits.parent().is_some_and(Path::is_dir),
         "MiniMax logits output needs an existing parent and a new directory");
@@ -247,6 +249,8 @@ mod tests {
     #[test]
     fn golden_uses_shared_estimator_and_terminal_release_before_retirement() {
         let source = include_str!("golden.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("set_expert_geometry(ExpertGeometry::MINIMAX_M3)"));
+        assert!(source.find("set_expert_geometry(").unwrap() < source.find("NativeLibrary::load(").unwrap());
         assert!(source.contains("fidelity_rows::score_compact("));
         assert!(source.contains("sequence_units("));
         assert!(source.contains("pending.wait()?"));

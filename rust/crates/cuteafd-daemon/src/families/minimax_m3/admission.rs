@@ -33,6 +33,12 @@ pub(crate) fn contract(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, weights: 
     }
     let mut raw = vec![Allocation::buffer("residual", Location::coordinator(0), u64::from(tokens) * 6144 * 4,
         Lifetime::TARGET, Category::Workspace, "cold scoring residual")];
+    // project downloads bytes and decodes an FP32 vector before releasing them.
+    for name in ["head.download", "head.host-logits"] {
+        raw.push(Allocation::buffer(name, Location::HOST,
+            u64::from(rows) * cfg.vocab_size as u64 * 4, Lifetime::TARGET,
+            Category::Workspace, "cold scoring head download"));
+    }
     let mount = weights.mount_load(checkpoint)?;
     for (name, location, bytes) in [("source", Location::PINNED, mount.pinned_source),
         ("rows", Location::HOST, mount.full_row_cache), ("tables", Location::PINNED, mount.pinned_tables)] {
@@ -46,9 +52,10 @@ pub(crate) fn contract(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, weights: 
     fixed_request_tails(&mut buffers, pages, &[])?;
     c.extend(buffers);
     c.extend(link.components(pages)?);
+    let head = crate::shared::target_head::TargetHead::configured().blas_head(true);
     c.extend(serving::blas_components(arch, &[serving::BlasOwners {
         name: "minimax/head".into(), process: "coordinator".into(), thread: "golden".into(),
-        location: Location::coordinator(0), gemm: true, lt: true, lifetime: Lifetime::TARGET,
+        location: Location::coordinator(0), gemm: head.gemm(), lt: head.lt(), lifetime: Lifetime::TARGET,
         activation: Activation::always() }], pages, PhaseOrder::TARGET_THEN_DRAFT)?);
     let stream = Allocation::buffer("driver.stream-slabs", Location::coordinator(0), cuda_stream_slab_bytes(1)?,
         Lifetime::RESIDENT, Category::Runtime, "one ordered golden stream");
