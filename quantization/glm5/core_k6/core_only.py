@@ -103,6 +103,7 @@ def make_core_plan(source, tokens, root, export, *, core_bits, layer_limit=None)
     code = [*(Path(__file__).with_name(name) for name in
               ("core_only.py", "run.py", "storage.py", "recipe.py")),
         REPO / "quantization/core_export.py",
+        REPO / "quantization/mistral_large4/core_k6/numerical.py",
         REPO / "quantization/glm5/prepare_corpus.py",
         REPO / "quantization/kimi_k3/prepare_corpus.py",
         REPO / "quantization/kimi_k3/core_k6/run.py",
@@ -163,6 +164,8 @@ def verify_core_evidence(selection, root, identity):
 
 
 def run_core_only(args):
+    from mistral_large4.core_k6.numerical import fork_module
+    fork_module('utils.glm5_core')
     from gptqmodel.utils.glm5_core import GlmBF16Source
     from core_export import assemble_core_shard, finalize_core_export
 

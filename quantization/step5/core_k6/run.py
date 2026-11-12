@@ -19,6 +19,9 @@ if __package__ in (None,''):
 os.environ.setdefault('PYTORCH_ALLOC_CONF','expandable_segments:True')
 import torch
 from torch import nn
+if '--core-only' in sys.argv:
+    from mistral_large4.core_k6.numerical import fork_module
+    fork_module('utils.step5_core')
 from glm5_flash.core_k6.run import Engine as FlashEngine,Progress as FlashProgress,compact,commit_batch
 from kimi_k3.uniform_k2.storage import atomic_json,canonical,commit_safetensors,fsync_directory,sha256_file
 from kimi_k3.core_k6.run import exclusive_run,hardlink_frontier
