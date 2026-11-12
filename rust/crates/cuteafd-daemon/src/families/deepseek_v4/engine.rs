@@ -915,6 +915,20 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Consume scoring rows through the ordinary serving unit schedule and head scratch.
+    pub(crate) fn prefill_streamed_scoring(&self, placement: &mut Placement, tokens: &[u32],
+        transports: &mut [SparkLink<'_>], scoring: crate::shared::probe::ScoringRows<'_>)
+        -> Result<crate::shared::probe::ScoreLogits> {
+        let _coverage_step = self.graph_coverage.step("prefill", 1, tokens.len());
+        let (start, t) = (placement.len, tokens.len());
+        ensure!(t > 0 && t <= self.prefill_capacity() && start + t <= self.max_context,
+            "prefill span of {t} tokens at {start} exceeds the span or context capacity");
+        self.cache_cycle(crate::shared::decode_graph::device::Cycle::Prefill);
+        self.prefill_units_with(placement, tokens, transports, 0, None, false, Some(scoring))?;
+        placement.len += t;
+        Ok(crate::shared::probe::ScoreLogits::Recorded)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prefill_step(
         &self,

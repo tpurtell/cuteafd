@@ -251,7 +251,7 @@ impl<'a> Engine<'a> {
                 }).transpose()?;
                 let mut hooks = super::prefill::UnitHooks { engine: self, placement: sequences[0].0,
                     tokens: &tokens, tables: &tables, w, w1, transport, logit_rows: 0, download: false,
-                    on_layer: None, logits: Vec::new(), landed: 0, packed: Some(&members),
+                    on_layer: None, scoring: None, logits: Vec::new(), landed: 0, packed: Some(&members),
                     context_plans: vec![Default::default(); self.prefill_waves], staging_owner: [None; 2] };
                 prefill_pipeline::run_prefill_units(&mut hooks, &units, 1)?;
                 self.finish_route_step()?;

@@ -7,6 +7,14 @@ impl<'a> Engine<'a> {
         &self, placement: &Placement, tokens: &[u32], transports: &mut [SparkLink<'_>], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, download: bool,
     ) -> Result<Logits> {
+        self.prefill_units_with(placement, tokens, transports, logit_rows, on_layer, download, None)
+    }
+
+    pub(super) fn prefill_units_with(
+        &self, placement: &Placement, tokens: &[u32], transports: &mut [SparkLink<'_>], logit_rows: usize,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, download: bool,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>,
+    ) -> Result<Logits> {
         let transports = RefCell::new(transports);
         crate::shared::experts::rtx::pair::submit(
             || self.require_live(), || self.shutdown_submission(&mut transports.borrow_mut()), || {
@@ -46,7 +54,7 @@ impl<'a> Engine<'a> {
                     None => None,
                 };
                 let (logits, landed) = self.run_units(placement, tokens, &tables, w, w1, transport, logit_rows,
-                    download, on_layer, &units, waves)?;
+                    download, on_layer, &units, waves, scoring)?;
                 self.finish_route_step()?;
                 // No unit cursor survives into decode/verify: all geometry is selected by hook.
                 self.context_units.borrow_mut().clear();
@@ -67,9 +75,10 @@ impl<'a> Engine<'a> {
     fn run_units(&self, placement: &Placement, tokens: &[u32], tables: &[StepTables], w: &Workspace<'a>,
         w1: Option<&Workspace<'a>>, transport: Option<&mut crate::shared::spark_waves::Waves<'_>>,
         logit_rows: usize, download: bool, on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        units: &[Unit], waves: usize) -> Result<(Vec<f32>, usize)> {
+        units: &[Unit], waves: usize, scoring: Option<crate::shared::probe::ScoringRows<'_>>)
+        -> Result<(Vec<f32>, usize)> {
         let mut hooks = UnitHooks { engine: self, placement, tokens, tables, w, w1, transport, logit_rows, download,
-            on_layer, logits: Vec::new(), landed: 0,
+            on_layer, scoring, logits: Vec::new(), landed: 0,
             packed: None, context_plans: vec![Default::default(); self.prefill_waves], staging_owner: [None; 2] };
         prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
         Ok((hooks.logits, hooks.landed))
@@ -86,6 +95,7 @@ pub(super) struct UnitHooks<'h, 'a, 't, 'l, 'c> {
     pub(super) transport: Option<&'t mut crate::shared::spark_waves::Waves<'l>>,
     pub(super) logit_rows: usize,
     pub(super) download: bool,
+    pub(super) scoring: Option<crate::shared::probe::ScoringRows<'h>>,
     pub(super) on_layer: Option<&'c mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     pub(super) logits: Vec<f32>,
     pub(super) landed: usize,
@@ -241,7 +251,13 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         let rows = unit.rows.len();
         if self.packed.is_some() { return Ok(()); }
         let wanted = unit.rows.end.saturating_sub((self.tokens.len() - self.logit_rows).max(unit.rows.start));
-        if self.download {
+        if let Some(scoring) = self.scoring {
+            let capacity = self.w.vocab_logits.buffer.bytes / (e.cfg.vocab_size * 4);
+            for span in crate::shared::probe::head_spans(rows, capacity.min(LOGIT_ROWS))? {
+                e.head_launch(&self.w.slots[unit.slot].stream_a, span.end, span.len(), 0, self.w)?;
+                scoring.record(e.library, unit.rows.start + span.start, &e.device_logits(self.w, span.len()))?;
+            }
+        } else if self.download {
             let mut done = 0;
             while done < wanted {
                 let chunk = (wanted - done).min(LOGIT_ROWS);
@@ -283,6 +299,32 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoring_consumes_bounded_heads_before_unit_commit() -> Result<()> {
+        for capacity in [1, 48, LOGIT_ROWS] {
+            let units = prefill_pipeline::sequence_units(8257, 2752, 3, 43)?;
+            let mut positions = Vec::new();
+            for unit in units {
+                for span in crate::shared::probe::head_spans(unit.rows.len(), capacity)? {
+                    positions.extend(span.map(|row| unit.rows.start + row));
+                }
+            }
+            assert_eq!(positions, (0..8257).collect::<Vec<_>>());
+        }
+        let source = include_str!("prefill.rs");
+        let units = source.split_once("    pub(super) fn prefill_units_with(").unwrap().1
+            .split_once("\n    }").unwrap().0;
+        assert!(units.contains("crate::shared::experts::rtx::pair::submit("));
+        assert!(units.contains("sequence_units(tokens.len(), self.prefill_rows, waves,"));
+        let end = source.split_once("    fn end_unit(").unwrap().1.split_once("\n    }").unwrap().0;
+        let scoring = end.split_once("if let Some(scoring) = self.scoring").unwrap().1
+            .split_once("} else if self.download").unwrap().0;
+        assert!(scoring.contains("head_spans(rows, capacity.min(LOGIT_ROWS))"));
+        assert!(scoring.find("e.head_launch(").unwrap() < scoring.find("scoring.record(").unwrap());
+        assert!(!scoring.contains("self.logits.extend"));
+        Ok(())
+    }
 
     #[test]
     fn draft_ring_keeps_previous_unit_when_final_tail_is_short() -> Result<()> {
