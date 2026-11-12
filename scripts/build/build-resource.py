@@ -225,7 +225,10 @@ def main():
     try:
         if stopping or not owner_alive(args.owner, start):
             return
-        (args.lease_dir / 'granted').write_text(json.dumps({'host': host, 'slots': slots or 1}))
+        grant = {'host': host, 'slots': slots or 1}
+        if host in LAN_SEEDS:
+            grant['slot'] = int(Path(handles[-1].name).name.split('.')[-2])
+        (args.lease_dir / 'granted').write_text(json.dumps(grant))
         fd = os.open(args.lease_dir / 'release', os.O_RDONLY | os.O_NONBLOCK)
         # No lease expiry: each phase has its own terminating timeout. Stop
         # the instance's build container before *any* mutex release.

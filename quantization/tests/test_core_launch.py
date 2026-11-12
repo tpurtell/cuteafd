@@ -507,13 +507,19 @@ def test_seed_execute_requires_counting_slot_and_export_lock(tmp_path, monkeypat
     directory.mkdir(parents=True)
     lease = tmp_path / 'lease'
     lease.mkdir()
-    (lease / 'granted').write_text(json.dumps(dict(host=host, slots=3)))
+    (lease / 'granted').write_text(json.dumps(dict(host=host, slots=3, slot=1)))
     (lease / 'export-granted').write_text(json.dumps(dict(host=host)))
     monkeypatch.setattr(launch.Path, 'home', lambda: tmp_path)
     monkeypatch.setenv('CUTEAFD_CORE_SEED_LEASE', str(lease))
     monkeypatch.setenv('CUTEAFD_HW_LOCKS_HELD', host + '-export')
     with pytest.raises(ValueError, match='counting lease is not held'):
         launch.require_lease(host)
+    assert not (directory / (host + '.build.0.lock')).exists()
+    assert not (directory / (host + '.build.2.lock')).exists()
+    with (directory / (host + '.build.2.lock')).open('a') as other:
+        launch.fcntl.flock(other, launch.fcntl.LOCK_EX | launch.fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match='counting lease is not held'):
+            launch.require_lease(host)
     with (directory / (host + '.build.1.lock')).open('a') as slot:
         launch.fcntl.flock(slot, launch.fcntl.LOCK_EX | launch.fcntl.LOCK_NB)
         with pytest.raises(ValueError, match='hardware lock is not held'):

@@ -227,13 +227,15 @@ def require_lease(host):
         turn = json.loads((lease / "export-granted").read_text())
         if grant["host"] != host or turn["host"] != host or (lease / "export-done").exists():
             raise ValueError("seed counting lease and export turn are required")
+        slot = grant["slot"]
+        if type(slot) is not int or not 0 <= slot < grant["slots"]:
+            raise ValueError("invalid granted seed counting slot")
         occupied = False
-        for slot in range(grant["slots"]):
-            with (directory / f"{host}.build.{slot}.lock").open("a") as lock:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    occupied = True
+        with (directory / f"{host}.build.{slot}.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                occupied = True
         if not occupied:
             raise ValueError("seed counting lease is not held")
     for name in expected:
