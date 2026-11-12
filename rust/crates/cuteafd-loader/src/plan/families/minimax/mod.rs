@@ -301,7 +301,7 @@ impl FamilyModel for Model {
         let package = "minimax:nvfp4a4";
         Some(ExpertContract {
             package: package.into(), block: 16,
-            spark_worlds: crate::plan::experts::spark_worlds(package, self.cfg.intermediate),
+            spark_worlds: crate::plan::experts::spark_worlds(package, self.cfg.moe_intermediate),
             local: Err("MiniMax RTX expert onboarding is not qualified; serving remains refused".into()),
         })
     }
