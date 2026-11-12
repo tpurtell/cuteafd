@@ -26,14 +26,14 @@ impl Drop for Head<'_> {
 }
 impl<'a> Head<'a> {
     pub fn new(stream: Rc<Stream<'a>>, programs: &'a Programs<'a>, cfg: &MiniMaxM3Config, rows: usize) -> Result<Self> {
-        ensure!((1..=4096).contains(&rows) && cfg.hidden == 6144, "MiniMax head geometry");
+        let layout = cuteafd_loader::families::minimax_m3::execution::HeadLayout::new(cfg, u32::try_from(rows)?)?;
         let device = stream.device;
-        let allocate = |bytes| Allocation::new(device, bytes, Tag::workspace("minimax/head"));
-        let tokens = allocate(rows * 4)?;
-        let normalized = allocate(rows * 6144 * 2)?;
-        let logits = allocate(rows.checked_mul(cfg.vocab_size).and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| anyhow::anyhow!("MiniMax head extent overflow"))?)?;
-        let workspace = allocate(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE)?;
+        let mut buffers = layout.buffers().into_iter().map(|(_, bytes)|
+            Allocation::new(device, usize::try_from(bytes)?, Tag::workspace("minimax/head")));
+        let tokens = buffers.next().unwrap()?;
+        let normalized = buffers.next().unwrap()?;
+        let logits = buffers.next().unwrap()?;
+        let workspace = buffers.next().unwrap()?;
         let head = device.run(|| {
             // SAFETY: handle borrows this retained private workspace until drop;
             // row and checkpoint dimensions are checked before construction.

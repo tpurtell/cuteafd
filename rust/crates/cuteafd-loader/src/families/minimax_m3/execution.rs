@@ -270,6 +270,27 @@ impl UnitLayout {
     }
 }
 
+/// Embedding/final-norm and shared vocabulary-head storage for bounded scoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadLayout { pub rows: u32, pub vocab: u32 }
+impl HeadLayout {
+    pub fn new(cfg: &MiniMaxM3Config, rows: u32) -> Result<Self, Refusal> {
+        if rows == 0 || rows > 4096 || cfg.hidden != 6144 || cfg.vocab_size != 200064 {
+            return Err(Refusal::InvalidFact("MiniMax target head geometry".into()));
+        }
+        Ok(Self { rows, vocab: cfg.vocab_size as u32 })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        let rows = u64::from(self.rows);
+        vec![("tokens", rows * 4), ("normalized", rows * 6144 * 2),
+            ("logits", rows * u64::from(self.vocab) * 4),
+            ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64)]
+    }
+    pub fn components(self, prefix: &str, rank: u8, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.buffers(), prefix, rank, Lifetime::TARGET, maximum_pages, Category::Workspace)
+    }
+}
+
 /// One immutable unit's request metadata. Shared page tables belong to MsaCache;
 /// positions/causal extents differ by unit and must not alias a sibling slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
