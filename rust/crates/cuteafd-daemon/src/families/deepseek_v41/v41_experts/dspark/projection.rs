@@ -199,14 +199,14 @@ impl DsparkProjection<'_, '_> {
         let info = library.v41_fp8_matrix_plan_info(capacity, k, n)?;
         let backings = cuteafd_loader::serving_capacity::v41_workspace::projection_backings(capacity as usize,
             k as usize, n as usize, info.scratch_bytes as usize, true)?;
-        cuteafd_loader::serving_capacity::v41_workspace::projection_backing_bytes(&backings)
+        cuteafd_loader::serving_capacity::v41_workspace::projection_requested_bytes(&backings)
     }
     pub fn external_input_bytes(library: &NativeLibrary, kind: ProjectionKind, capacity: u32) -> Result<usize> {
         let (_, _, k, n) = kind.binding()?;
         let info = library.v41_fp8_matrix_plan_info(capacity, k, n)?;
         let backings = cuteafd_loader::serving_capacity::v41_workspace::projection_backings(capacity as usize,
             k as usize, n as usize, info.scratch_bytes as usize, false)?;
-        cuteafd_loader::serving_capacity::v41_workspace::projection_backing_bytes(&backings)
+        cuteafd_loader::serving_capacity::v41_workspace::projection_requested_bytes(&backings)
     }
     // Storage access for an exclusive containing owner that tracks completion itself.
     pub(super) fn output_storage(&self) -> CuteafdDeviceBuffer {

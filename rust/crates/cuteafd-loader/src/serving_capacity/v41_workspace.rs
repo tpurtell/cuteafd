@@ -58,7 +58,15 @@ pub fn projection_backings(rows: usize, k: usize, n: usize, scratch: usize,
     }
 }
 
-/// Each physical request and its independent driver tail are charged once.
+/// Requested extents only: the retained measured-occupancy owner charges driver
+/// tails globally, so projection workspace budgets must not include them again.
+pub fn projection_requested_bytes(backings: &[WeightArenaLayout]) -> Result<usize> {
+    backings.iter().try_fold(0usize, |sum, backing| {
+        sum.checked_add(backing.bytes()).ok_or_else(|| anyhow::anyhow!("projection extent overflow"))
+    })
+}
+
+/// Physical comparison for choosing backings, not an additional admission charge.
 pub fn projection_backing_bytes(backings: &[WeightArenaLayout]) -> Result<usize> {
     backings.iter().try_fold(0usize, |sum, backing| {
         let bytes = crate::placement::planner::sm120_request_backing(backing.bytes() as u64)?;
@@ -141,8 +149,13 @@ mod tests {
         assert_eq!((old.len(), new.len()), (32, 44));
         assert_eq!(old.iter().map(WeightArenaLayout::bytes).sum::<usize>(),
             new.iter().map(WeightArenaLayout::bytes).sum::<usize>());
+        assert_eq!(projection_requested_bytes(&old)?, 309_213_312);
+        assert_eq!(projection_requested_bytes(&new)?, 309_213_312);
         assert_eq!(independent_backing_slack(old.iter().map(|b| b.bytes() as u64))?, 24_222_604);
-        assert_eq!(independent_backing_slack(new.iter().map(|b| b.bytes() as u64))?, 14_662_588);
+        let measured_tail = independent_backing_slack(new.iter().map(|b| b.bytes() as u64))?;
+        assert_eq!(measured_tail, 14_662_588);
+        assert_eq!(projection_requested_bytes(&new)? as u64 + measured_tail,
+            projection_backing_bytes(&new)? as u64, "measured tails are charged exactly once");
         assert_eq!(projection_backing_bytes(&old)? - projection_backing_bytes(&new)?, 9_560_016);
         Ok(())
     }
