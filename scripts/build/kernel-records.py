@@ -246,8 +246,9 @@ def install_backend_cache(directory=None):
     BaseDSL._cuteafd_backend_cache = cache
     import atexit
     def report():
-        from _export_cache import stats
-        stats("backend", layer="backend", hits=cache.hits, misses=cache.misses)
+        if cache.hits or cache.misses:
+            from _export_cache import stats
+            stats("backend", layer="backend", hits=cache.hits, misses=cache.misses)
     atexit.register(report)
     if getattr(BaseDSL.compile_and_cache, "_cuteafd_backend_cache", False):
         return cache
