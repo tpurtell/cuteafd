@@ -554,6 +554,36 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         if logit_rows == 0 { return Ok(None); }
         Ok(Some(logits))
     }
+    fn streamed_prefill_scoring(&self) -> bool { true }
+    fn prefill_scoring(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
+        position: usize, probe: &crate::shared::probe::ProbeRef, pool: &RefPagePool)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        if logit_rows <= 1 || self.full_prefill_logits {
+            return Ok(self.prefill_device(placement, tokens, logit_rows, pool)?
+                .map(crate::shared::probe::ScoreLogits::Device));
+        }
+        ensure!(logit_rows <= tokens.len(), "Step-5 scoring logits extent");
+        self.state.submit(|| {
+            let (mut step, _) = self.state.post_execution(self.execute_inner(&[(&mut *placement, tokens)], pool,
+                cuteafd_transport::ExpertV2SourceKind::Prefill, Some(0))?)?;
+            let rank = self.execution.ownership().execution().spec().head_gpu as usize;
+            let head = self.execution.head()?;
+            let scoring = crate::shared::probe::ScoringRows { probe, position };
+            // The complete transformer call stays intact. Its terminal residual
+            // was retained in the independent input owner before head scratch reuse.
+            step.compose(rank, head, |head, meta| {
+                for span in crate::shared::probe::head_spans(logit_rows, self.rows.min(64))? {
+                    let source = super::mtp::slice(self.inputs.residual.buffer,
+                        (tokens.len() - logit_rows + span.start) * H * 4, span.len() * H * 4)?;
+                    let logits = head.device_logits_on(source, span.len(), meta.stream)?;
+                    scoring.record(self.library, span.start, &logits)?;
+                }
+                Ok(())
+            })?;
+            step.publish_wave(&mut [(placement, tokens.len())])?;
+            Ok(Some(crate::shared::probe::ScoreLogits::Recorded))
+        })
+    }
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
         Some(self.packing_limits())
     }
@@ -676,6 +706,40 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoring_consumes_bounded_heads_before_transaction_publication() {
+        let source = include_str!("backend.rs");
+        let scoring = source.split("fn prefill_scoring(").nth(1).unwrap()
+            .split("fn packed_limits(").next().unwrap();
+        assert!(source.contains("fn streamed_prefill_scoring(&self) -> bool { true }"));
+        assert!(scoring.contains("ExpertV2SourceKind::Prefill, Some(0)"));
+        assert!(scoring.contains("head_spans(logit_rows, self.rows.min(64))"));
+        assert!(scoring.contains("self.inputs.residual.buffer"));
+        assert!(scoring.find("step.compose(").unwrap() < scoring.find("scoring.record(").unwrap());
+        assert!(scoring.find("scoring.record(").unwrap() < scoring.find("step.publish_wave(").unwrap());
+        assert!(scoring.contains("ScoreLogits::Recorded"));
+        assert!(!scoring.contains("Allocation::new"));
+        let execute = source.split("fn execute_inner(").nth(1).unwrap()
+            .split("fn immediate(").next().unwrap();
+        assert!(execute.contains("if rows == 0"));
+        assert!(execute.contains("input.residual.buffer, output, meta.rows * H * 4"));
+    }
+
+    #[test]
+    fn scoring_head_spans_cover_suffix_without_changing_transformer_rows() {
+        for total in [2, 63, 64, 65, 2048, 8192, 12345] {
+            for wanted in [2, total] {
+                if wanted > total { continue; }
+                let mut seen = Vec::new();
+                for span in crate::shared::probe::head_spans(wanted, 64).unwrap() {
+                    assert!(span.len() <= 64);
+                    seen.extend(total - wanted + span.start..total - wanted + span.end);
+                }
+                assert_eq!(seen, (total - wanted..total).collect::<Vec<_>>());
+            }
+        }
+    }
 
     #[test]
     fn packed_check_cancellation_is_member_local_and_heads_finish_before_scratch_reuse() {
