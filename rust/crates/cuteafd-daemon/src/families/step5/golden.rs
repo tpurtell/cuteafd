@@ -51,10 +51,10 @@ pub(crate) struct GoldenArgs {
     native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     manifest: PathBuf,
-    /// Pinned official reference export containing meta.json and windows/ID/layerNN.bin.
+    /// Pinned reference export, or a directory with only tokens.bin for self-comparison NLL.
     #[arg(long, required_unless_present = "graph_oracle")]
     golden: Option<PathBuf>,
-    #[arg(long, required_unless_present = "graph_oracle")]
+    #[arg(long, required_unless_present_any = ["graph_oracle", "nll"])]
     window: Option<String>,
     /// Compare every target logit bit with eager, capture and replay from one restored prompt.
     #[arg(long, requires = "split_device", conflicts_with_all = ["golden", "window", "nll",
@@ -327,9 +327,31 @@ fn hidden_metrics(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
     Ok((dot / (norm * ours).sqrt(), (error / norm).sqrt()))
 }
 
+fn token_only(args: &GoldenArgs) -> Result<bool> {
+    let Some(golden) = &args.golden else { return Ok(false); };
+    match std::fs::symlink_metadata(golden.join("meta.json")) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(args.nll),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
     let golden = args.golden.as_ref().context("--golden required outside graph oracle")?;
-    let window = args.window.as_deref().context("--window required outside graph oracle")?;
+    if token_only(args)? {
+        ensure!(args.compare_layers.is_empty() && !args.compare_final_norm && !args.fp8_diagnostic_reference
+            && !args.prefix_state, "token-only NLL cannot qualify reference-dependent diagnostics");
+        let bytes = std::fs::read(golden.join("tokens.bin"))?;
+        ensure!(!bytes.is_empty() && bytes.len() % 4 == 0, "invalid golden token extent");
+        let mut tokens = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let rows = args.prefill.unwrap_or(tokens.len());
+        ensure!((2..=4096).contains(&rows) && rows <= tokens.len(), "token-only NLL requires 2..4096 rows");
+        ensure!(tokens.iter().all(|&t| (t as usize) < vocab), "reference token outside vocabulary");
+        tokens.truncate(rows);
+        return Ok(Reference { positions: (1..rows).collect(), tokens, expected: vec![], hidden: vec![], final_norm: None });
+    }
+    let window = args.window.as_deref().context("--window required for pinned reference")?;
     ensure!(
         !window.is_empty()
             && window.bytes()
@@ -978,12 +1000,17 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         let ours = select_scored_rows(&actual, &reference.positions, cfg.vocab)?;
         let targets = reference.positions.iter().map(|&p| reference.tokens[p]).collect::<Vec<_>>();
         let nll = scored_nll(&ours, &targets, cfg.vocab)?;
-        let reference_nll = scored_nll(&reference.expected, &targets, cfg.vocab)?;
-        let (kl, max_kl) = scored_kl(&reference.expected, &ours, cfg.vocab)?;
-        println!("Step-5 shared complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (no serving/lossless/cache qualification)", targets.len(), nll-reference_nll);
-        // Engine-only stop bars do not measure quantization error against the BF16 root.
-        if args.fp8_diagnostic_reference {
-            shared_diagnostic_verdict(nll, reference_nll, kl, max_kl)?;
+        ensure!(actual.iter().all(|v| v.is_finite()), "nonfinite Step-5 logits");
+        if reference.expected.is_empty() {
+            println!("Step-5 shared token-only rows={rows} scored={} engine_nll={nll:.12} (self-comparison only; no reference qualification)", targets.len());
+        } else {
+            let reference_nll = scored_nll(&reference.expected, &targets, cfg.vocab)?;
+            let (kl, max_kl) = scored_kl(&reference.expected, &ours, cfg.vocab)?;
+            println!("Step-5 shared complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (no serving/lossless/cache qualification)", targets.len(), nll-reference_nll);
+            // Engine-only stop bars do not measure quantization error against the BF16 root.
+            if args.fp8_diagnostic_reference {
+                shared_diagnostic_verdict(nll, reference_nll, kl, max_kl)?;
+            }
         }
     }
     pool.borrow_mut().release(&family, &placement.pages)?;
@@ -1114,8 +1141,10 @@ fn run(args: GoldenArgs) -> Result<()> {
     }
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
-    checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), &format,
-        args.fp8_diagnostic_reference)?;
+    if !token_only(&args)? {
+        checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), &format,
+            args.fp8_diagnostic_reference)?;
+    }
     let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
     let reference = if args.graph_oracle {
@@ -1297,9 +1326,14 @@ fn run(args: GoldenArgs) -> Result<()> {
         let ours = select_scored_rows(&actual, &positions, cfg.vocab)?;
         let targets = positions.iter().map(|&p| tokens[p]).collect::<Vec<_>>();
         let nll = scored_nll(&ours, &targets, cfg.vocab)?;
-        let reference_nll = scored_nll(&expected, &targets, cfg.vocab)?;
-        let (kl, max_kl) = scored_kl(&expected, &ours, cfg.vocab)?;
-        println!("Step-5 complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (pinned {reference_kind}; no serving/lossless/cache qualification)", targets.len(), nll - reference_nll);
+        ensure!(actual.iter().all(|v| v.is_finite()), "nonfinite Step-5 logits");
+        if expected.is_empty() {
+            println!("Step-5 token-only rows={rows} scored={} engine_nll={nll:.12} (self-comparison only; no reference qualification)", targets.len());
+        } else {
+            let reference_nll = scored_nll(&expected, &targets, cfg.vocab)?;
+            let (kl, max_kl) = scored_kl(&expected, &ours, cfg.vocab)?;
+            println!("Step-5 complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (pinned {reference_kind}; no serving/lossless/cache qualification)", targets.len(), nll - reference_nll);
+        }
         return Ok(());
     }
     let mut bytes = vec![0; rows * H * 4];
@@ -1328,6 +1362,37 @@ mod tests {
         ].into_iter().chain(flags.iter().copied()))?;
         let crate::cli::Commands::Step5Golden(args) = cli.command else { unreachable!() };
         Ok(args)
+    }
+
+    #[test]
+    fn token_only_nll_accepts_tokens_but_never_bypasses_present_reference_metadata() -> Result<()> {
+        use clap::Parser;
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("tokens.bin"), [0u32, 1, 2].into_iter()
+            .flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "step5-golden", "--snapshot", "/snapshot",
+            "--golden", root.path().to_str().unwrap(), "--last-layer", "91", "--nll", "--save-logits", "/out"])?;
+        let crate::cli::Commands::Step5Golden(mut args) = cli.command else { unreachable!() };
+        diagnostic_selection(&args)?;
+        assert!(args.window.is_none() && token_only(&args)?);
+        let data = reference(&args, 3)?;
+        assert_eq!(data.tokens, [0, 1, 2]);
+        assert_eq!(data.positions, [1, 2]);
+        assert!(data.expected.is_empty());
+        assert!(reference(&args, 2).is_err());
+        args.prefill = Some(1);
+        assert!(reference(&args, 3).is_err());
+        args.prefill = None;
+        args.fp8_diagnostic_reference = true;
+        assert!(reference(&args, 3).is_err());
+        args.fp8_diagnostic_reference = false;
+        std::fs::write(root.path().join("meta.json"), b"{}")?;
+        assert!(!token_only(&args)?);
+        assert!(reference(&args, 3).err().unwrap().to_string().contains("--window required"));
+        args.window = Some("code-1".into());
+        let error = reference(&args, 3).err().unwrap().to_string();
+        assert!(error.contains("explicitly selected pinned official target reference"), "{error}");
+        Ok(())
     }
 
     #[test]
