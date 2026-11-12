@@ -255,6 +255,22 @@ def test_deployment_preserves_release_container_commands(
             for flag in ("--kda-output-shard", "--kda-prefill-expanded"):
                 if flag in before["command"]:
                     before["command"].remove(flag)
+        if old["host"] == "coordinator" and "--coordinator-weight-budget-gib" not in before["command"]:
+            # Serve admits resident weights against the planner's budget; historical
+            # captures predate passing it and fell back to the 80 GiB default.
+            planned = {plan[plan.index("--coordinator-weight-budget-gib") + 1]
+                       for plan in current["plans"] if "--coordinator-weight-budget-gib" in plan}
+            assert len(planned) == 1, (entry["name"], planned)
+            budget = planned.pop()
+            command = after["command"]
+            assert command.count("--coordinator-weight-budget-gib") == 1
+            assert command[command.index("--coordinator-weight-budget-gib") + 1] == budget
+            anchor_flag = "--snapshot" if entry["family"] != "deepseek_v41" else None
+            if anchor_flag:
+                position = before["command"].index(anchor_flag) + 2
+            else:
+                position = command.index("--coordinator-weight-budget-gib")
+            before["command"][position:position] = ["--coordinator-weight-budget-gib", budget]
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
             assert after["env"][fingerprint] != before["env"][fingerprint], (entry["name"], old["host"])

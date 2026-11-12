@@ -544,6 +544,9 @@ def test_qualifying_family_capacity_uses_cuda_total(tmp_path, family):
     plan = _line(result, "cuteafd plan")
     assert int(_flag(plan, "--gpu-memory-cap")) == total
     assert float(_flag(plan, "--coordinator-weight-budget-gib")) == total / 2**30
+    # Serve admits resident weights against the budget the plan was made with.
+    serve = _line(result, "serve-kimi --snapshot" if family == "kimi" else "serve-step5 --snapshot")
+    assert _flag(serve, "--coordinator-weight-budget-gib") == _flag(plan, "--coordinator-weight-budget-gib")
 
 
 @pytest.mark.parametrize("ranks", (6, 7, 8))

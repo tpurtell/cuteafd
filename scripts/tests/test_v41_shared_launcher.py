@@ -129,6 +129,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # The serve command is the same set of flags and values (clap ignores order;
         # --usage now precedes nothing it depends on).
         assert after["command"][:3] == before["command"][:3], where
+        planned_budget = {plan[plan.index("--coordinator-weight-budget-gib") + 1]
+                          for plan in current["plans"] if "--coordinator-weight-budget-gib" in plan}
         # The planner's prefill waves and reserve reach the shared executor.
         value = lambda flag: after["command"][after["command"].index(flag) + 1]
         expected_command = before["command"] + (["--mapped-scale-preload-gib", "0",
@@ -136,6 +138,10 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
             "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
         if role == "coordinator":
             expected_command.append("--expert-usage")
+            # Serve admits resident weights against the planner's budget (captures
+            # predate passing it and fell back to the 80 GiB default).
+            assert len(planned_budget) == 1, where
+            expected_command += ["--coordinator-weight-budget-gib", next(iter(planned_budget))]
             expected_command[expected_command.index("--max-context-tokens") + 1] = "auto"
         # With Sparks, serve's unit is the planner's third of the reserve (fixed depth 3).
         if role == "coordinator" and value("--prefill-waves") == "3" and "--prefill-batch-tokens" in expected_command:
@@ -609,3 +615,16 @@ def test_no_literal_sixteen_request_admission_bound() -> None:
             if literal.search(text):
                 offenders.append(f"{path.relative_to(ROOT)}:{line}: {text.strip()}")
     assert not offenders, "\n".join(offenders)
+
+
+def test_v41_serve_admits_weights_against_the_planned_budget(tmp_root) -> None:
+    """serve-native receives the same --coordinator-weight-budget-gib the planner used,
+    so startup admission never falls back to the 80 GiB default the plan did not assume."""
+    import v41_launch_capture as capture_module
+
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    budgets = {plan[plan.index("--coordinator-weight-budget-gib") + 1]
+               for plan in result["plans"] if "--coordinator-weight-budget-gib" in plan}
+    assert len(budgets) == 1
+    assert command[command.index("--coordinator-weight-budget-gib") + 1] == budgets.pop()
