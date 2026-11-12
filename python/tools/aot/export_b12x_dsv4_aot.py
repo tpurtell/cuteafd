@@ -303,11 +303,13 @@ def minimax_forward_programs(prefill_rows: int):
         compile_minimax_norm_aot, compile_minimax_router_scores_aot,
         compile_minimax_kv_pack_aot,
     )
+    from b12x.integration.cuteafd.index_cache import compile_index_cache_gather_aot
 
     return [(suffix, op, dict(max_rows=prefill_rows), compiler) for suffix, op, compiler in (
         ("residual_norm", "minimax_residual_norm", compile_minimax_norm_aot),
         ("router_scores", "minimax_router_scores", compile_minimax_router_scores_aot),
         ("kv_pack", "minimax_kv_pack", compile_minimax_kv_pack_aot),
+        ("index_cache_gather", "index_cache_gather", compile_index_cache_gather_aot),
     )]
 
 

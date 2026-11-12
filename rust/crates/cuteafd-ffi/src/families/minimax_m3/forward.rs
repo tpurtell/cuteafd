@@ -56,12 +56,12 @@ impl ForwardLayout {
         // for them: the specialization never reads bias/tables/positions.
         self.validate(b.rows, [(b.input, bytes(b.rows, 6144 * 4)?), (b.weight, 6144 * 2),
             (b.weight, 0), (b.weight, 0), (b.weight, 0), (b.weight, 0),
-            (b.output, bytes(b.rows, 6144 * 2)?)], [4, 2, 2, 2, 2, 8, 16], &[6])
+            (b.output, bytes(b.rows, 6144 * 2)?)], [16; 7], &[6])
     }
     fn router(self, b: RouterBatch) -> Result<[Buffer; 3]> {
         if self.kind != Kind::RouterScores { return Err(invalid("not router scores")); }
         self.validate(b.rows, [(b.input, bytes(b.rows, 6144 * 2)?), (b.weight, 128 * 6144 * 4),
-            (b.output, bytes(b.rows, 128 * 4)?)], [16, 4, 4], &[2])
+            (b.output, bytes(b.rows, 128 * 4)?)], [16; 3], &[2])
     }
     fn kv(self, b: KvBatch) -> Result<[Buffer; 8]> {
         if self.kind != Kind::KvPack || b.batch == 0 || b.pool_pages == 0 {
@@ -71,8 +71,34 @@ impl ForwardLayout {
             (b.slots, bytes(b.rows, 8)?), (b.batch_ids, bytes(b.rows, 4)?),
             (b.key_descale, bytes(b.batch, 16)?), (b.value_descale, bytes(b.batch, 16)?),
             (b.key_cache, bytes(b.pool_pages, 64 * 512)?),
-            (b.value_cache, bytes(b.pool_pages, 64 * 512)?)], [16, 16, 8, 4, 4, 4, 16, 16], &[6, 7])
+            (b.value_cache, bytes(b.pool_pages, 64 * 512)?)], [16; 8], &[6, 7])
     }
+}
+
+pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<ForwardLayout> {
+    let layout = ForwardLayout::from_spec(spec)?;
+    let operands: &[(&str, &str, &str)] = match layout.kind {
+        Kind::ResidualNorm => &[("float32", "[rows,1,6144]", "in"), ("bfloat16", "[6144]", "in"),
+            ("bfloat16", "[6144] (ignored unless bias)", "in"),
+            ("bfloat16", "[positions,0] (ignored unless rotary)", "in"),
+            ("bfloat16", "[positions,0] (ignored unless rotary)", "in"),
+            ("int64", "[rows] (ignored unless rotary)", "in"), ("bfloat16", "[rows,1,6144]", "out")],
+        Kind::RouterScores => &[("bfloat16", "[rows,6144]", "in"),
+            ("float32", "[128,6144]", "in"), ("float32", "[rows,128]", "out")],
+        Kind::KvPack => &[("bfloat16", "[rows,4,128]", "in"), ("bfloat16", "[rows,4,128]", "in"),
+            ("int64", "[rows] (physical slots; negative skips writes)", "in"), ("int32", "[rows]", "in"),
+            ("float32", "[batch,4]", "in"), ("float32", "[batch,4]", "in"),
+            ("uint8", "[pages,64,4,128]", "out"), ("uint8", "[pages,64,4,128]", "out")],
+    };
+    let pointers = entry["pointers"].as_array().ok_or_else(|| invalid("forward pointer metadata"))?;
+    if entry["op"] != layout.kind.name() || pointers.len() != operands.len()
+        || pointers.iter().zip(layout.kind.names().iter().zip(operands))
+            .any(|(p, (name, (dtype, shape, role)))| p["name"] != *name || p["dtype"] != *dtype
+                || p["shape"] != *shape || p["role"] != *role)
+        || entry["scalars"] != serde_json::json!([{"name":"rows","type":"int32"}]) {
+        return Err(invalid("forward exported operand or operation contract"));
+    }
+    Ok(layout)
 }
 
 #[derive(Clone, Copy)]
@@ -159,6 +185,51 @@ mod tests {
             assert!(ForwardLayout::from_spec(&wrong).is_err());
             let mut wrong = expected; wrong.geometry = serde_json::json!({});
             assert!(ForwardLayout::from_spec(&wrong).is_err());
+        }
+    }
+    #[test]
+    fn validates_forward_manifest_operands_before_loading() {
+        for kind in Kind::ALL {
+            let spec = spec(kind);
+            // The exporter ABI is independently pinned by the fork's GPU oracles.
+            let operands = match kind {
+                Kind::ResidualNorm => vec![("float32", "[rows,1,6144]"), ("bfloat16", "[6144]"),
+                    ("bfloat16", "[6144] (ignored unless bias)"),
+                    ("bfloat16", "[positions,0] (ignored unless rotary)"),
+                    ("bfloat16", "[positions,0] (ignored unless rotary)"),
+                    ("int64", "[rows] (ignored unless rotary)"), ("bfloat16", "[rows,1,6144]")],
+                Kind::RouterScores => vec![("bfloat16", "[rows,6144]"),
+                    ("float32", "[128,6144]"), ("float32", "[rows,128]")],
+                Kind::KvPack => vec![("bfloat16", "[rows,4,128]"), ("bfloat16", "[rows,4,128]"),
+                    ("int64", "[rows] (physical slots; negative skips writes)"), ("int32", "[rows]"),
+                    ("float32", "[batch,4]"), ("float32", "[batch,4]"),
+                    ("uint8", "[pages,64,4,128]"), ("uint8", "[pages,64,4,128]")],
+            };
+            let entry = serde_json::json!({"op":kind.name(),
+                "scalars":[{"name":"rows","type":"int32"}],
+                "pointers":kind.names().iter().zip(operands).enumerate().map(|(i,(n,(d,s)))|
+                    serde_json::json!({"name":n,"dtype":d,"shape":s,
+                        "role":if i + 1 == kind.names().len() || kind == Kind::KvPack && i == 6 {"out"} else {"in"}}))
+                    .collect::<Vec<_>>()});
+            assert!(validate_entry(&spec, &entry).is_ok());
+            let fixture = crate::native_library_lifetime_fixture::Fixture::build_for_tests().unwrap();
+            let library = fixture.load().unwrap();
+            let mut installed = entry.clone();
+            installed["name"] = spec.name.clone().into();
+            installed["geometry"] = spec.geometry.clone();
+            installed["capacity_rows"] = spec.capacity_rows.into();
+            installed["scratch_bytes_at_capacity"] = serde_json::json!({});
+            fixture.register_programs(&library, &[installed.clone()]).unwrap();
+            let path = fixture.directory().join("PROGRAMS.json");
+            std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"programs":[installed]})).unwrap()).unwrap();
+            let programs = library.programs().unwrap().with_manifest(&path).unwrap();
+            assert_eq!(ForwardProducer::bind(&programs, kind).unwrap().layout, ForwardLayout { kind, rows: 4096 });
+            for field in ["name", "dtype", "shape", "role"] {
+                let mut wrong = entry.clone(); wrong["pointers"][0][field] = "wrong".into();
+                assert!(validate_entry(&spec, &wrong).is_err());
+            }
+            let mut wrong = entry; wrong["scalars"][0]["type"] = "int64".into();
+            assert!(validate_entry(&spec, &wrong).is_err());
         }
     }
     #[test]

@@ -366,6 +366,9 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
                      "compile_minimax_kv_pack_aot"):
         setattr(module, compiler, lambda: None)
     monkeypatch.setitem(sys.modules, module.__name__, module)
+    module = types.ModuleType("b12x.integration.cuteafd.index_cache")
+    module.compile_index_cache_gather_aot = lambda: None
+    monkeypatch.setitem(sys.modules, module.__name__, module)
     namespace = {"geometries": ["minimax"], "manifest": {"families": {}, "family_capacities": {}},
                  "work": [], "CHECKPOINT_CONTEXTS": {},
                  "args": types.SimpleNamespace(decode_rows=64, prefill_rows=4096, max_context=1048576)}
@@ -405,9 +408,10 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
                                   "minimax_norm_rope_h64", "minimax_norm_rope_h4",
                                   "minimax_index_producer", "minimax_oai_split_i3072",
                                   "minimax_oai_split_i12288", "minimax_residual_norm",
-                                  "minimax_router_scores", "minimax_kv_pack"]
+                                  "minimax_router_scores", "minimax_kv_pack",
+                                  "minimax_index_cache_gather"]
     assert all(params == {"max_rows": 4096} and thunk() is None
-               for _, _, _, params, thunk in namespace["work"][-3:])
+               for _, _, _, params, thunk in namespace["work"][-4:])
     namespace.update(family="glmf", suffix="sentinel", op="attention")
     exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
     assert namespace["stem"] == "glmf_sentinel"
