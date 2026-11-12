@@ -461,6 +461,29 @@ impl<'a> DenseEngine<'a> {
         Ok(output)
     }
 
+    /// Consume the terminal residual before MTP or the next serving call reuses it.
+    pub(crate) fn record_prefill_head(&mut self, rows: usize, logit_rows: usize,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<()> {
+        ensure!(logit_rows > 0 && logit_rows <= rows && rows <= ROWS, "dense scoring head extent");
+        self.healthy = false;
+        let norm = self.programs.program(&format!("{}_norm", self.admitted.prefix), &["x", "weight", "out"])?;
+        let hidden = self.planes.residual.ptr.cast::<u8>()
+            .wrapping_add((rows - logit_rows) * self.cfg.hidden * 2).cast();
+        // SAFETY: the complete prefill left these residual rows live; normalization
+        // and every bounded projection/copy share the target stream before reuse.
+        unsafe { norm.launch(&[hidden, self.weights.norm.buffer.ptr, self.planes.norm.ptr],
+            &[Scalar::I32(i32::try_from(logit_rows)?)], self.stream.raw)?; }
+        for span in crate::shared::probe::head_spans(logit_rows, HEAD_ROWS)? {
+            let hidden = CuteafdDeviceBuffer { ptr: self.planes.norm.ptr.cast::<u8>()
+                .wrapping_add(span.start * self.cfg.hidden * 2).cast(),
+                bytes: span.len() * self.cfg.hidden * 2, ..self.planes.norm };
+            let logits = self.target_head(hidden, self.logits.buffer, span.len())?;
+            scoring.record(self.stream.device.library, span.start, &logits)?;
+        }
+        self.healthy = true;
+        Ok(())
+    }
+
     /// Attention keeps each member's native row route and state; the dense FFN
     /// sees the adjacent packed rows once. Tables reuse the admitted singleton scratch.
     pub(crate) fn prefill_packed(&mut self, sequences: &[(usize, &[u32])],

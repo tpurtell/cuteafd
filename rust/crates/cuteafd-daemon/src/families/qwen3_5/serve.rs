@@ -58,6 +58,57 @@ pub(crate) struct DenseBackend<'e, 'a> {
 }
 
 impl<'e, 'a> DenseBackend<'e, 'a> {
+    fn prefill_with(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        ensure!(!tokens.is_empty() && logit_rows <= tokens.len(), "dense prefill scoring extent");
+        ensure!(self.pending.borrow().is_none(), "dense prefill during pending verify");
+        let mut engine = self.engine.borrow_mut();
+        ensure!(engine.slot_position(placement.slot)? == placement.len, "dense prefill placement/state frontier differs");
+        engine.bind_slot(placement.slot, &placement.units)?;
+        let mut output = None;
+        // Each tap tile is consumed before the target reuses its residual plane.
+        let tile = if self.drafter.is_some() { TAP_ROWS } else { tokens.len() };
+        for (index, chunk) in tokens.chunks(tile).enumerate() {
+            let first = index * tile;
+            let end = first + chunk.len();
+            let head_first = tokens.len() - logit_rows;
+            ensure!(scoring.is_some() || logit_rows <= chunk.len() || head_first >= end,
+                "dense tapped prefill requires bounded scoring rows");
+            let last_layer = engine.cfg.attention.len() - 1;
+            output = Some(engine.prefill_tapped(placement.slot, chunk,
+                if scoring.is_none() && end == tokens.len() { logit_rows } else { 0 }, |layer, hidden| {
+                    if let Some(draft) = &self.drafter {
+                        draft.tap_streams_at(layer, hidden.ptr, 1, 0, chunk.len(), 0)?;
+                    }
+                    if layer == last_layer {
+                        if let Some(mtp) = &self.mtp { mtp.capture_hidden(hidden, chunk.len())?; }
+                    }
+                    Ok(())
+                })?);
+            if let Some(scoring) = scoring {
+                let first_scored = first.max(head_first);
+                if first_scored < end {
+                    engine.record_prefill_head(chunk.len(), end - first_scored,
+                        crate::shared::probe::ScoringRows { position: scoring.position + first_scored - head_first,
+                            ..scoring })?;
+                }
+            }
+            if let Some(mtp) = &self.mtp {
+                mtp.update_captured(&mut engine, placement.slot, placement.len + first, chunk)?;
+            }
+            if let Some(draft) = &self.drafter {
+                let rows = (0..chunk.len()).map(|tap_row| ContextRow { tap_row, slot: placement.slot,
+                    position: placement.len + first + tap_row }).collect::<Vec<_>>();
+                draft.update(&rows)?;
+            }
+        }
+        let output = output.context("empty dense prefill")?;
+        placement.len += tokens.len();
+        placement.state_len = placement.len;
+        Ok((logit_rows > 0).then_some(if scoring.is_some() { crate::shared::probe::ScoreLogits::Recorded }
+            else { crate::shared::probe::ScoreLogits::Device(output) }))
+    }
+
     /// Retained weight owners for the opt-in startup census: the target arena
     /// (with its embedding and head) and the separately admitted drafter arena.
     fn weight_census(&self, device: i32) -> Result<crate::shared::memory::receipts::Census> {
@@ -234,43 +285,19 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     fn log_table_stats(&self, _phase: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         _pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(self.pending.borrow().is_none(), "dense prefill during pending verify");
-        let mut engine = self.engine.borrow_mut();
-        ensure!(engine.slot_position(placement.slot)? == placement.len, "dense prefill placement/state frontier differs");
-        engine.bind_slot(placement.slot, &placement.units)?;
-        let mut output = None;
-        // Each tap tile is consumed before the target reuses its residual plane.
-        let tile = if self.drafter.is_some() { TAP_ROWS } else { tokens.len() };
-        for (index, chunk) in tokens.chunks(tile).enumerate() {
-            let first = index * tile;
-            let end = first + chunk.len();
-            let head_first = tokens.len() - logit_rows;
-            ensure!(logit_rows <= chunk.len() || head_first >= end,
-                "dense tapped prefill requires bounded scoring rows");
-            let last_layer = engine.cfg.attention.len() - 1;
-            output = Some(engine.prefill_tapped(placement.slot, chunk,
-                if end == tokens.len() { logit_rows } else { 0 }, |layer, hidden| {
-                    if let Some(draft) = &self.drafter {
-                        draft.tap_streams_at(layer, hidden.ptr, 1, 0, chunk.len(), 0)?;
-                    }
-                    if layer == last_layer {
-                        if let Some(mtp) = &self.mtp { mtp.capture_hidden(hidden, chunk.len())?; }
-                    }
-                    Ok(())
-                })?);
-            if let Some(mtp) = &self.mtp {
-                mtp.update_captured(&mut engine, placement.slot, placement.len + first, chunk)?;
-            }
-            if let Some(draft) = &self.drafter {
-                let rows = (0..chunk.len()).map(|tap_row| ContextRow { tap_row, slot: placement.slot,
-                    position: placement.len + first + tap_row }).collect::<Vec<_>>();
-                draft.update(&rows)?;
-            }
+        match self.prefill_with(placement, tokens, logit_rows, None)? {
+            Some(crate::shared::probe::ScoreLogits::Device(logits)) => Ok(Some(logits)),
+            None => Ok(None),
+            Some(_) => unreachable!("ordinary dense prefill returns device logits"),
         }
-        let output = output.context("empty dense prefill")?;
-        placement.len += tokens.len();
-        placement.state_len = placement.len;
-        Ok((logit_rows > 0).then_some(output))
+    }
+    fn streamed_prefill_scoring(&self) -> bool { true }
+    fn prefill_scoring(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
+        position: usize, probe: &crate::shared::probe::ProbeRef, _pool: &cuteafd_engine::prefix::RefPagePool)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        let streamed = logit_rows > 1 && !self.engine.borrow().full_prefill_logits();
+        self.prefill_with(placement, tokens, logit_rows,
+            streamed.then_some(crate::shared::probe::ScoringRows { probe, position }))
     }
     fn coordinator_packed_cap(&self) -> Result<Option<usize>> {
         if self.packing == crate::shared::prefill_packing::PackingMode::Exact {
@@ -733,6 +760,46 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn streamed_heads_are_consumed_before_mtp_or_next_tap_tile() {
+        let source = include_str!("serve.rs");
+        let prefill = source.split_once("    fn prefill_with(").unwrap().1
+            .split_once("    /// Retained weight owners").unwrap().0;
+        assert!(prefill.contains("if self.drafter.is_some() { TAP_ROWS } else { tokens.len() }"));
+        assert!(prefill.contains("if scoring.is_none() && end == tokens.len() { logit_rows } else { 0 }"));
+        assert!(prefill.find("engine.prefill_tapped").unwrap() < prefill.find("engine.record_prefill_head").unwrap());
+        assert!(prefill.find("engine.record_prefill_head").unwrap() < prefill.find("mtp.update_captured").unwrap());
+        assert!(prefill.find("engine.record_prefill_head").unwrap() < prefill.find("draft.update(&rows)").unwrap());
+        let engine = include_str!("engine.rs");
+        let head = engine.split_once("    pub(crate) fn record_prefill_head(").unwrap().1
+            .split_once("    /// Attention keeps").unwrap().0;
+        assert!(head.contains("head_spans(logit_rows, HEAD_ROWS)"));
+        assert!(head.find("self.target_head(").unwrap() < head.find("scoring.record(").unwrap());
+        assert!(!head.contains("alloc"));
+    }
+
+    #[test]
+    fn streamed_suffix_positions_cover_serving_tap_cuts_once() {
+        for rows in [1usize, 63, 64, 65, 511, 512, 513, 4096] {
+            for wanted in [1, rows.div_ceil(2), rows] {
+                for tile in [TAP_ROWS, rows] {
+                    let head_first = rows - wanted;
+                    let mut positions = Vec::new();
+                    for first in (0..rows).step_by(tile) {
+                        let end = (first + tile).min(rows);
+                        let first_scored = first.max(head_first);
+                        if first_scored < end {
+                            for span in crate::shared::probe::head_spans(end - first_scored, 64).unwrap() {
+                                positions.extend(span.map(|row| 1000 + first_scored - head_first + row));
+                            }
+                        }
+                    }
+                    assert_eq!(positions, (1000..1000 + wanted).collect::<Vec<_>>());
+                }
+            }
+        }
     }
 
     #[test]
