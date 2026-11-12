@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +50,17 @@ def _flag(line: str, flag: str) -> str | None:
     if "cuteafd" in tokens:
         tokens = tokens[tokens.index("cuteafd"):]
     return tokens[tokens.index(flag) + 1] if flag in tokens else None
+
+
+@pytest.mark.parametrize("filter", ["", "info,cuteafd::shared::mapped_table=debug"])
+def test_generic_log_filter_reaches_coordinator_and_workers(tmp_path: Path, filter: str) -> None:
+    result = _kimi(tmp_path, extra_env={"RUST_LOG": filter})
+    serve = _line(result, "serve-kimi --snapshot")
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    expected = f"RUST_LOG={filter or 'info'}"
+    assert expected in serve.split()
+    assert len(workers) == 6
+    assert all(expected in shlex.split(worker) for worker in workers)
 
 
 def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> None:
