@@ -2564,8 +2564,36 @@ impl<'a> Qwen4Engine<'a> {
         Ok(logits)
     }
 
+    pub(crate) fn prefill_scoring(&self, placement: &mut Qwen4Placement, tokens: &[u32], logit_rows: usize,
+        position: usize, probe: &crate::shared::probe::ProbeRef)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        if logit_rows <= 1 || self.full_prefill_logits {
+            return Ok(self.prefill_device(placement, tokens, None, None, logit_rows)?
+                .map(crate::shared::probe::ScoreLogits::Device));
+        }
+        ensure!(logit_rows <= tokens.len(), "Qwen scoring logits extent");
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(), || {
+            let scoring = crate::shared::probe::ScoringRows { probe, position };
+            if self.prefill_shape.is_some() {
+                if self.prefill_units_with(placement, tokens, logit_rows, Some(scoring))?.is_none() { return Ok(None); }
+            } else {
+                if self.prefill_device(placement, tokens, None, None, 1)?.is_none() { return Ok(None); }
+                let workspace = self.workspace.borrow();
+                let w = workspace.as_ref().context("Qwen scoring workspace")?;
+                let (_, cur) = self.last_streams.get();
+                self.on_owner(0, || self.record_head(w, &w.streams[cur], tokens.len(), logit_rows, scoring))?;
+            }
+            Ok(Some(crate::shared::probe::ScoreLogits::Recorded))
+        })
+    }
+
     fn prefill_units(&self, placement: &mut Qwen4Placement, tokens: &[u32], logit_rows: usize)
         -> Result<Option<DeviceLogits>> {
+        self.prefill_units_with(placement, tokens, logit_rows, None)
+    }
+
+    fn prefill_units_with(&self, placement: &mut Qwen4Placement, tokens: &[u32], logit_rows: usize,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<DeviceLogits>> {
         use crate::shared::prefill_pipeline::{sequence_units, run_prefill_units};
         let shape = self.prefill_shape.context("Qwen prefill unit shape")?.validate()?;
         ensure!(self.gdn_banks.len() == 1 && self.hops.is_none(),
@@ -2583,13 +2611,14 @@ impl<'a> Qwen4Engine<'a> {
         // Keep the cuts independent of wave count for same-cut identity checks.
         let mut units = sequence_units(t, shape.unit_rows as usize, 1, self.weights.layers.len())?;
         for unit in &mut units { unit.slot = unit.index % waves; }
+        let retained_rows = if scoring.is_some() { 1 } else { logit_rows };
         let replace = self.workspace.borrow().as_ref().is_none_or(|w| w.rows != shape.unit_rows as usize
-            || w.slot_rows != shape.slot_rows() as usize || w.logit_rows < logit_rows);
+            || w.slot_rows != shape.slot_rows() as usize || w.logit_rows < retained_rows);
         if replace {
             self.allow_workspace_creation()?;
             self.drain_state()?;
             *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
-                if self.full_prefill_logits { self.prefill_rows } else { logit_rows }, shape.slot_rows() as usize,
+                if self.full_prefill_logits { self.prefill_rows } else { retained_rows }, shape.slot_rows() as usize,
                 if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
             self.prepare_prefill_units()?;
         }
@@ -2604,7 +2633,7 @@ impl<'a> Qwen4Engine<'a> {
         let run = |transport: Option<&mut crate::shared::spark_waves::Waves<'_>>| {
             let mut hooks = UnitHooks { engine: self, transport, w, placement, tokens, tables: unit_tables, ple_batch,
                 current: vec![0; units.len()], entered: vec![false; units.len()],
-                pending: (0..units.len()).map(|_| None).collect(), logit_rows };
+                pending: (0..units.len()).map(|_| None).collect(), logit_rows, scoring };
             run_prefill_units(&mut hooks, &units, waves)
         };
         // Spark waves build, post and land on the link's exchange worker
@@ -2630,7 +2659,7 @@ impl<'a> Qwen4Engine<'a> {
             self.drain_partial_step()?;
             return Ok(None);
         }
-        Ok(Some(self.device_logits(w, logit_rows, false)))
+        Ok(Some(self.device_logits(w, retained_rows, false)))
     }
 
     pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
@@ -3527,16 +3556,35 @@ impl<'a> Qwen4Engine<'a> {
 
     /// The stream mixer and lm_head over the last `logit_rows` rows, and with
     /// `greedy` the rows' greedy tokens into `select` (decode graphs).
-    fn head(&self, w: &Workspace<'_>, streams: &Dev<'_>, t: usize, rows: Scalar, logit_rows: usize) -> Result<()> {
-        let h = self.cfg.hidden;
+    fn mix_head(&self, w: &Workspace<'_>, streams: &Dev<'_>, rows: Scalar) -> Result<()> {
         let [norm, down, up] = &self.weights.mixer;
         self.run("qwen4_head", &[("streams", w.live(streams, HC * self.cfg.hidden * 2)), ("norm", norm.buffer.ptr),
             ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.live(&w.x, self.cfg.hidden * 2)),
-            ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+            ("scratch", w.scratch.buffer.ptr)], &[rows])
+    }
+
+    fn head(&self, w: &Workspace<'_>, streams: &Dev<'_>, t: usize, rows: Scalar, logit_rows: usize) -> Result<()> {
+        self.mix_head(w, streams, rows)?;
         ensure!(logit_rows <= t, "{logit_rows} logits rows of a {t}-row step");
-        // SAFETY: row t - logit_rows of the [t, H] mixer output lies inside `x`.
-        let x = unsafe { w.live(&w.x, self.cfg.hidden * 2).cast::<u8>().add((t - logit_rows) * h * 2) }.cast();
+        let x = w.live(&w.x, self.cfg.hidden * 2).cast::<u8>()
+            .wrapping_add((t - logit_rows) * self.cfg.hidden * 2).cast();
         self.logits(w, x, logit_rows)
+    }
+
+    fn record_head(&self, w: &Workspace<'_>, streams: &Dev<'_>, rows: usize, logit_rows: usize,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<()> {
+        ensure!(logit_rows > 0 && logit_rows <= rows, "Qwen scoring head extent");
+        self.mix_head(w, streams, Scalar::I32(i32::try_from(rows)?))?;
+        // The ordinary prefill plane can be just one row. Consume each tile
+        // before reuse without growing that admitted plane or changing unit cuts.
+        w.logit_offset.set(0);
+        for span in crate::shared::probe::head_spans(logit_rows, w.logit_rows.min(DECODE_ROWS))? {
+            let x = w.live(&w.x, self.cfg.hidden * 2).cast::<u8>()
+                .wrapping_add((rows - logit_rows + span.start) * self.cfg.hidden * 2).cast();
+            self.logits(w, x, span.len())?;
+            scoring.record(self.library, span.start, &self.device_logits(w, span.len(), false))?;
+        }
+        Ok(())
     }
 
     /// FP32 logits of `rows` BF16 head inputs at `x` (rows of `[*, H]`) into the
@@ -4297,6 +4345,7 @@ struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
     entered: Vec<bool>,
     pending: Vec<Option<crate::shared::mapped_table::PendingRows>>,
     logit_rows: usize,
+    scoring: Option<crate::shared::probe::ScoringRows<'t>>,
 }
 
 impl UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
@@ -4413,8 +4462,14 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         let first = self.tokens.len() - self.logit_rows;
         let count = unit.rows.end.saturating_sub(unit.rows.start.max(first));
         if count > 0 && engine.weights.layers.len() == engine.cfg.layers {
-            self.w.logit_offset.set(unit.rows.start.max(first) - first);
-            engine.head(self.w, &self.w.streams[cur], unit.rows.len(), Scalar::I32(unit.rows.len() as i32), count)?;
+            let offset = unit.rows.start.max(first) - first;
+            if let Some(scoring) = self.scoring {
+                engine.record_head(self.w, &self.w.streams[cur], unit.rows.len(), count,
+                    crate::shared::probe::ScoringRows { position: scoring.position + offset, ..scoring })?;
+            } else {
+                self.w.logit_offset.set(offset);
+                engine.head(self.w, &self.w.streams[cur], unit.rows.len(), Scalar::I32(unit.rows.len() as i32), count)?;
+            }
         }
         engine.last_streams.set((false, cur));
         Ok(())
@@ -4438,6 +4493,46 @@ mod prefill_unit_tests {
     use super::*;
     use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
     use std::ops::Range;
+
+    #[test]
+    fn streamed_head_tiles_respect_the_existing_one_row_plane() -> Result<()> {
+        for rows in [1usize, 63, 64, 65, 511, 4096, 8192] {
+            for wanted in [1, rows.div_ceil(2), rows] {
+                for capacity in [1, 64] {
+                    let first = rows - wanted;
+                    let mut positions = Vec::new();
+                    for unit in sequence_units(rows, 2048, 1, 2)? {
+                        let begin = unit.rows.start.max(first);
+                        let count = unit.rows.end.saturating_sub(begin);
+                        if count == 0 { continue; }
+                        for span in crate::shared::probe::head_spans(count, capacity)? {
+                            assert!(span.len() <= capacity);
+                            positions.extend(span.map(|row| 1000 + begin - first + row));
+                        }
+                    }
+                    assert_eq!(positions, (1000..1000 + wanted).collect::<Vec<_>>());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_scoring_preserves_units_and_consumes_head_before_reuse() {
+        let source = include_str!("engine.rs");
+        let units = source.split_once("    fn prefill_units_with(").unwrap().1
+            .split_once("    pub(crate) fn configure_packing").unwrap().0;
+        assert!(units.contains("let retained_rows = if scoring.is_some() { 1 } else { logit_rows }"));
+        assert!(units.contains("sequence_units(t, shape.unit_rows as usize, 1, self.weights.layers.len())"));
+        let head = source.split_once("    fn record_head(").unwrap().1.split_once("    /// FP32 logits").unwrap().0;
+        assert!(head.contains("head_spans(logit_rows, w.logit_rows.min(DECODE_ROWS))"));
+        assert!(head.find("self.mix_head").unwrap() < head.find("head_spans").unwrap());
+        assert!(head.find("self.logits(").unwrap() < head.find("scoring.record(").unwrap());
+        assert!(!head.contains("workspace("));
+        let hooks = source.split_once("struct UnitHooks<").unwrap().1
+            .split_once("fn validate_prefill_span(").unwrap().0;
+        assert!(hooks.contains("engine.record_head(self.w, &self.w.streams[cur]"));
+    }
 
     #[test]
     fn unit_tables_keep_absolute_addresses_and_reset_sequence_rows() -> Result<()> {

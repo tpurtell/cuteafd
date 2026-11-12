@@ -386,6 +386,12 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.prefill_device(placement, tokens, None, None, rows)
     }
+    fn streamed_prefill_scoring(&self) -> bool { true }
+    fn prefill_scoring(&self, placement: &mut Self::Placement, tokens: &[u32], rows: usize,
+        position: usize, probe: &crate::shared::probe::ProbeRef, _pool: &cuteafd_engine::prefix::RefPagePool)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        self.engine.prefill_scoring(placement, tokens, rows, position, probe)
+    }
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
         self.engine.packed_limits()
     }
