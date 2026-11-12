@@ -3261,21 +3261,29 @@ def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, key
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
-def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
+@pytest.mark.parametrize("family", ["glm5_flash", "qwen3_5"])
+def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path, family):
+    dense = family == "qwen3_5"
+    config = DENSE_CONFIG if dense else SPLIT_CONFIGS[family]
+    model = "Qwen/Qwen3.5-9B" if dense else "test/glmf"
+    keys = "RTX_GPUS=1\n" + ("SPARK_COUNT=0\n" if dense else "")
+    options = {"extra_args": ("--wip", "dense-test"),
+               "encoder_plan": {"placement_supported": True, "fits": True, "spark_ranks": 0}} if dense else {}
     root = tmp_path / "dumps"
     root.mkdir()
-    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  f"RTX_GPUS=1\nPROBE_DUMP_ROOT={root}\n")
+    result = _family_launch_result(tmp_path, config, model,
+                                  keys + f"PROBE_DUMP_ROOT={root}\n", **options)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    serve = "serve-qwen35" if dense else "serve-glmf"
+    launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
     assert f"-v {root}:{root} -e CUTEAFD_PROBE_DUMP_ROOT={root}" in launch
-    result = _family_launch_result(tmp_path / "unset", SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "RTX_GPUS=1\n")
+    result = _family_launch_result(tmp_path / "unset", config, model, keys, **options)
     assert result.returncode == 0 and "CUTEAFD_PROBE_DUMP_ROOT" not in result.stderr
-    result = _family_launch_result(tmp_path / "missing", SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  f"PROBE_DUMP_ROOT={tmp_path}/absent\n")
+    result = _family_launch_result(tmp_path / "missing", config, model,
+                                  keys + f"PROBE_DUMP_ROOT={tmp_path}/absent\n", **options)
     assert result.returncode == 2 and "PROBE_DUMP_ROOT must be" in result.stderr
-    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+    blocked = ("docker run ", "ssh ", "nest ") if dense else ("docker ", "ssh ", "nest ")
+    assert not any(line.startswith(blocked) for line in result.stderr.splitlines())
 
 
 def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
