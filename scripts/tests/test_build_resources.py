@@ -775,6 +775,26 @@ def test_seed_export_releases_host_umbrella_before_queueing_and_avoids_deadlock(
             queued.wait(timeout=5)
 
 
+def test_counting_lease_survives_empty_release_fifo_with_open_writer(tmp_path, locks):
+    lease, process, owner = _lease(tmp_path, 'open-writer', '--host', 'kakapo')
+    writer = os.open(lease / 'release', os.O_RDWR | os.O_NONBLOCK)
+    try:
+        _wait_file(lease / 'granted')
+        (lease / 'export-request').touch()
+        _wait_file(lease / 'export-granted')
+        assert process.poll() is None
+        assert resource.try_lock(locks / 'kakapo-export.lock') is None
+        os.write(writer, b'x')
+        assert process.wait(timeout=10) == 0
+    finally:
+        os.close(writer)
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        owner.terminate()
+        owner.wait(timeout=5)
+
+
 def test_two_builds_on_one_seed_share_cpu_slots_but_serialize_the_export(tmp_path, locks):
     first = _lease(tmp_path, 'a', '--host', 'kakapo')
     second = _lease(tmp_path, 'b', '--host', 'kakapo')

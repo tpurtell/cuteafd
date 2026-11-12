@@ -234,7 +234,11 @@ def main():
         # the instance's build container before *any* mutex release.
         export_state = 'idle'
         while not stopping and owner_alive(args.owner, start):
-            if os.read(fd, 1):
+            try:
+                released = os.read(fd, 1)
+            except BlockingIOError:
+                released = b''
+            if released:
                 break
             if export_state == 'idle' and (args.lease_dir / 'export-request').exists():
                 export_state = take_export_turn(export_turn, directory, host, args,
