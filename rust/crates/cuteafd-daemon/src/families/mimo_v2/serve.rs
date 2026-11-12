@@ -612,7 +612,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             }
                         };
                         failures.watch(&job.events);
-                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits()) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, true) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -748,9 +748,16 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let mut placement = admitted.placement;
                 let scored = probe::score(engine.library, &job.probe, &tokens, from,
                     engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits(), &mut placement,
-                    |placement, chunk, rows, _position| Ok(engine.prefill_media_device(placement, chunk, rows > 1, None, None, Some(&request_media))?
-                        .map(probe::ScoreLogits::Device)),
+                    DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
+                    |placement, chunk, rows, position| {
+                        if rows > 1 && !engine.full_prefill_logits() {
+                            engine.prefill_streamed_scoring(placement, chunk, &request_media,
+                                probe::ScoringRows { probe: &job.probe, position })
+                        } else {
+                            Ok(engine.prefill_media_device(placement, chunk, rows > 1, None, None, Some(&request_media))?
+                                .map(probe::ScoreLogits::Device))
+                        }
+                    },
                     |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, None, Some(&request_media))?
                         .context("scoring needs every layer"));
                 match scored {

@@ -554,6 +554,7 @@ struct UnitHooks<'h, 'a> {
     peer_work: Option<&'h [Workspace<'a>]>,
     media: Option<&'h cuteafd_engine::media::RequestMedia>,
     all_logits: bool,
+    scoring: Option<crate::shared::probe::ScoringRows<'h>>,
     output: &'h Workspace<'a>,
     last: usize,
     packed: Option<&'h [PackedMember<'a>]>,
@@ -752,7 +753,9 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
         let e = self.engine;
         if e.weights.layers.len() != e.cfg.layers || self.packed.is_some() { return Ok(()); }
         let w = &self.work[unit.index];
-        if self.all_logits {
+        if let Some(scoring) = self.scoring {
+            e.record_head(w, unit.rows.len(), unit.rows.start, scoring)?;
+        } else if self.all_logits {
             let bytes = unit.rows.len() * e.cfg.vocab_size * 4;
             let output = self.output.logits.view(unit.rows.start * e.cfg.vocab_size * 4, bytes)?;
             e.head().launch(w.head.as_deref(), w.x.buffer, output.buffer, unit.rows.len(), e.stream)?;
@@ -1610,6 +1613,18 @@ impl<'a> MimoEngine<'a> {
         Ok(logits)
     }
 
+    /// Score the ordinary serving span without retaining an all-call logits plane.
+    pub(crate) fn prefill_streamed_scoring(&self, placement: &mut MimoPlacement, tokens: &[u32],
+        media: &cuteafd_engine::media::RequestMedia, scoring: crate::shared::probe::ScoringRows<'_>)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        let (t, start) = (tokens.len(), placement.len);
+        ensure!(t > 0 && t <= self.prefill_capacity() && start + t <= self.max_context,
+            "prefill of {t} rows at {start}");
+        self.submit(|| self.step_units_with(placement, tokens, false, Some(media), Some(scoring)))?;
+        placement.len += t;
+        Ok((self.weights.layers.len() == self.cfg.layers).then_some(crate::shared::probe::ScoreLogits::Recorded))
+    }
+
     /// A continuous span reuses unit slots without draining at a wave boundary.
     pub fn prefill_capacity(&self) -> usize { self.prefill_span_rows }
 
@@ -1634,6 +1649,12 @@ impl<'a> MimoEngine<'a> {
 
     fn step_units(&self, placement: &MimoPlacement, tokens: &[u32], all_logits: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        self.step_units_with(placement, tokens, all_logits, media, None)
+    }
+
+    fn step_units_with(&self, placement: &MimoPlacement, tokens: &[u32], all_logits: bool,
+        media: Option<&cuteafd_engine::media::RequestMedia>, scoring: Option<crate::shared::probe::ScoringRows<'_>>)
+        -> Result<Option<DeviceLogits>> {
         use crate::shared::prefill_pipeline::{sequence_units, run_prefill_units};
         self.graph_cycle_prefill();
         self.prepare_scoring_prefill()?;
@@ -1654,7 +1675,7 @@ impl<'a> MimoEngine<'a> {
         let peer_work = peer_base.map(|base| units.iter().map(|unit| base.unit_view(unit.slot,
             self.prefill_rows, self.cfg.hidden, self.cfg.rope_dim, self.cfg.topk)).collect::<Result<Vec<_>>>()).transpose()?;
         let mut hooks = UnitHooks { engine: self, tokens, tables: &tables, work: &work,
-            peer_work: peer_work.as_deref(), media, all_logits, output: base, last: units.len() - 1, packed: None,
+            peer_work: peer_work.as_deref(), media, all_logits, scoring, output: base, last: units.len() - 1, packed: None,
         };
         let result = run_prefill_units(&mut hooks, &units, waves);
         self.unit_index.set(None);
@@ -1779,7 +1800,7 @@ impl<'a> MimoEngine<'a> {
             self.prepare_tp2_route_step(&[tokens.len()])?;
             let mut hooks = UnitHooks { engine: self, tokens: &tokens, tables: &tables, work: &work,
                 peer_work: peer_work.as_ref().map(|w| &w[..]), media: None, all_logits: false,
-                output: base, last: 0, packed: Some(&members) };
+                scoring: None, output: base, last: 0, packed: Some(&members) };
             let result = run_prefill_units(&mut hooks, &units, self.prefill_waves());
             self.unit_index.set(None);
             result?;
@@ -2015,6 +2036,15 @@ impl<'a> MimoEngine<'a> {
         ensure!(n <= t && n <= w.logits_rows, "head exceeds admitted logits rows");
         let x = Self::region(&w.x, (t - n) *self.cfg.hidden *2, n *self.cfg.hidden *2);
         self.head().launch(w.head.as_deref(), x, w.logits.buffer, n, self.stream)
+    }
+
+    fn record_head(&self, w: &Workspace<'_>, rows: usize, offset: usize,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<()> {
+        for span in crate::shared::probe::head_spans(rows, w.logits_rows.min(DECODE_ROWS))? {
+            self.launch_head(w, span.end, span.len(), false)?;
+            scoring.record(self.library, offset + span.start, &self.device_logits(w, span.len(), false))?;
+        }
+        Ok(())
     }
 
     /// `bytes` at `offset` inside `dev`.
@@ -3370,6 +3400,33 @@ mod terminal_fault_tests;
 #[cfg(test)]
 mod tests {
     use super::{attention_workspace_geometry, expert_capacity, prefill_span_rows, scale_operand, MimoAttentionWorkspace, MimoPlacement, DECODE_ROWS, PAGE_ROWS};
+
+    #[test]
+    fn scoring_heads_cover_serving_units_before_the_slot_is_reused() -> anyhow::Result<()> {
+        use crate::shared::{prefill_pipeline::sequence_units, probe::head_spans};
+        for capacity in [1, 16, 64] {
+            let units = sequence_units(4099, 2048, 2, 48)?;
+            let positions = units.iter().map(|unit| {
+                Ok(head_spans(unit.rows.len(), capacity)?.flat_map(|span|
+                    span.map(|row| unit.rows.start + row)).collect::<Vec<_>>())
+            }).collect::<anyhow::Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
+            assert_eq!(positions, (0..4099).collect::<Vec<_>>());
+        }
+        let source = include_str!("engine.rs");
+        let entry = source.split_once("    pub(crate) fn prefill_streamed_scoring(").unwrap().1
+            .split_once("\n    }").unwrap().0;
+        assert!(entry.contains("self.submit(|| self.step_units_with("));
+        let units = source.split_once("    fn step_units_with(").unwrap().1
+            .split_once("\n    }").unwrap().0;
+        assert!(units.contains("sequence_units(tokens.len(), self.prefill_rows, waves,"));
+        assert!(units.contains("run_prefill_units(&mut hooks, &units, waves)"));
+        let end = source.split_once("    fn end_unit(").unwrap().1.split_once("\n    }").unwrap().0;
+        assert!(end.contains("e.record_head(w, unit.rows.len(), unit.rows.start, scoring)?"));
+        let head = source.split_once("    fn record_head(").unwrap().1.split_once("\n    }").unwrap().0;
+        assert!(head.contains("head_spans(rows, w.logits_rows.min(DECODE_ROWS))"));
+        assert!(head.find("self.launch_head(").unwrap() < head.find("scoring.record(").unwrap());
+        Ok(())
+    }
 
     #[test]
     fn empty_prewarm_with_nonzero_reserve_captures_on_first_runtime_miss() -> anyhow::Result<()> {
