@@ -296,6 +296,14 @@ def test_preflight_accepts_corpus_directory_not_file(tmp_path, monkeypatch):
         launch.validate_remote(row)
 
 
+@pytest.mark.parametrize('family', ['step5', 'glm5'])
+def test_seed_runtime_overlay_keeps_checkout_transformers(tmp_path, family):
+    row = record(tmp_path, family)
+    row.update(runtime_python='/overlay/bin/python', runtime_root='/overlay')
+    command = launch.container_command(row)
+    assert any('third_party/transformers/src' in arg for arg in command)
+
+
 def test_explicit_runtime_keeps_its_transformers_release(tmp_path):
     row = record(tmp_path, 'muse')
     row.update(runtime_python='/overlay/bin/python', runtime_root='/overlay')
