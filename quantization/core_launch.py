@@ -24,8 +24,14 @@ FAMILIES = {
     "kimi-k31": "kimi_k31/k2_core_k6",
     "glmf": "glm5_flash/core_k6",
     "muse": "muse_spark/core_k6",
+    "step5": "step5/core_k6",
+    "glm5": "glm5/core_k6",
 }
-HOST_LOCKS = {"rhea": "rhea", "moa": "moa", "cassowary": "cassowary,cassowary-export"}
+HOST_LOCKS = {"rhea": "rhea", "moa": "moa", "kakapo": "kakapo-export",
+              "cassowary": "cassowary-export"}
+SEEDS = {"kakapo", "cassowary"}
+MEMORY_CAPS = {"kimi-k31": "110g", "muse": "110g", "glmf": "96g",
+               "step5": "96g", "glm5": "96g"}
 POOL = {"ostrich", "dodo", "emu", "kiwi"}
 WAIT_SECONDS = 21600
 RUN_SECONDS = 72 * 3600
@@ -77,7 +83,7 @@ def locks_for(host):
     if host in POOL:
         raise ValueError("pool Spark requires sparks.lock; this launcher does not acquire it")
     if host not in HOST_LOCKS:
-        raise ValueError("core-only host must be rhea, moa or cassowary")
+        raise ValueError("core-only host must be rhea, moa, kakapo or cassowary")
     return HOST_LOCKS[host]
 
 
@@ -87,13 +93,17 @@ def common(record):
         result += ["--" + name.replace("_", "-"), record[name]]
     if record["resume"]:
         result.append("--resume")
+    if record.get("layer_limit") is not None:
+        result += ["--layer-limit", str(record["layer_limit"])]
     return result
 
 
 def container_command(record, *, preflight=False):
     source = Path(record["remote_source_root"])
     build = Path(record["build_root"])
-    memory = "110g" if record["family"] in ("kimi-k31", "muse") else "96g"
+    memory = MEMORY_CAPS[record["family"]]
+    if record.get("container_memory", memory) != memory:
+        raise ValueError("recorded container memory cap differs from family policy")
     result = ["docker", "run", "--rm", "--name", record["container"] + ("-check" if preflight else ""),
               "--network", "none", "--user", f"{record['uid']}:{record['gid']}",
               "--memory", memory, "--memory-swap", memory, "--stop-timeout", "30",
@@ -137,6 +147,8 @@ def validate_remote(record):
     host = socket.gethostname().split(".")[0]
     if host != record["host"]:
         raise ValueError("remote preflight reached the wrong host")
+    if record.get("container_memory", MEMORY_CAPS[record["family"]]) != MEMORY_CAPS[record["family"]]:
+        raise ValueError("recorded container memory cap differs from family policy")
     locks_for(host)
     source = Path(record["remote_source_root"])
     if REPO != source:
@@ -209,6 +221,21 @@ def require_lease(host):
     if not expected.issubset(os.environ.get("CUTEAFD_HW_LOCKS_HELD", "").split(",")):
         raise ValueError("execute requires enclosing raptor hwlock lease")
     directory = Path.home() / ".cache/cuteafd"
+    if host in SEEDS:
+        lease = Path(os.environ.get("CUTEAFD_CORE_SEED_LEASE", "/nonexistent"))
+        grant = json.loads((lease / "granted").read_text())
+        turn = json.loads((lease / "export-granted").read_text())
+        if grant["host"] != host or turn["host"] != host or (lease / "export-done").exists():
+            raise ValueError("seed counting lease and export turn are required")
+        occupied = False
+        for slot in range(grant["slots"]):
+            with (directory / f"{host}.build.{slot}.lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    occupied = True
+        if not occupied:
+            raise ValueError("seed counting lease is not held")
     for name in expected:
         with (directory / (name + ".lock")).open("a") as lock:
             try:
@@ -366,15 +393,99 @@ def execute(record):
             raise RuntimeError("owned container remains after cleanup")
 
 
+def seed_lease_command(record, directory):
+    return [sys.executable, str(REPO / "scripts/build/build-resource.py"),
+            "--host", record["host"], "--lease-dir", str(directory),
+            "--owner", str(os.getpid()), "--wait", str(WAIT_SECONDS),
+            "--container", record["container"]]
+
+
+def wait_lease_marker(process, directory, marker, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if (directory / marker).exists():
+            return json.loads((directory / marker).read_text())
+        if process.poll() is not None:
+            raise RuntimeError("seed lease exited before " + marker)
+        if (directory / "export-failed").exists():
+            raise RuntimeError((directory / "export-failed").read_text())
+        time.sleep(1)
+    raise TimeoutError("seed lease timed out waiting for " + marker)
+
+
+def stop_owned_remote(record):
+    subprocess.run(ssh(record["host"], ["systemctl", "--user", "stop", record["unit"]]),
+                   timeout=210, check=False)
+    subprocess.run(ssh(record["host"], ["docker", "rm", "--force", record["container"]]),
+                   timeout=30, check=False)
+    if output(ssh(record["host"], ["docker", "ps", "-aq", "--filter", "name=^/" + record["container"] + "$"])):
+        raise RuntimeError("owned seed container remains after cancellation")
+
+
+def supervise_seed(path, record, check, execute_command, log):
+    directory = path.with_suffix(".lease")
+    directory.mkdir()
+    os.mkfifo(directory / "release", 0o600)
+    release = os.open(directory / "release", os.O_RDWR | os.O_NONBLOCK)
+    process = subprocess.Popen(seed_lease_command(record, directory), stdout=log, stderr=subprocess.STDOUT)
+    # Signal handlers keep teardown ordered even while waiting for a counting slot.
+    def cancelled(signum, _frame):
+        raise InterruptedError("seed supervisor interrupted by signal " + str(signum))
+    previous = {sig: signal.signal(sig, cancelled) for sig in
+                (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    active = False
+    try:
+        grant = wait_lease_marker(process, directory, "granted", WAIT_SECONDS + 60)
+        if grant["host"] != record["host"]:
+            raise ValueError("seed lease granted the wrong host")
+        subprocess.run(check, check=True, timeout=900, stdout=log, stderr=subprocess.STDOUT)
+        (directory / "export-request").touch()
+        grant = wait_lease_marker(process, directory, "export-granted", WAIT_SECONDS + 60)
+        if grant["host"] != record["host"]:
+            raise ValueError("seed export turn granted the wrong host")
+        subprocess.run(check, check=True, timeout=900, stdout=log, stderr=subprocess.STDOUT)
+        environment = dict(os.environ, CUTEAFD_HW_LOCKS_HELD=locks_for(record["host"]),
+                           CUTEAFD_CORE_SEED_LEASE=str(directory))
+        (directory / "active").touch()
+        active = True
+        code = forwarding(["timeout", "--foreground", "--signal=TERM", "--kill-after=300",
+                           str(RUN_SECONDS + 1200), *execute_command],
+                          env=environment, stdout=log, stderr=subprocess.STDOUT)
+        # execute returns only after the detached worker has removed its container.
+        (directory / "active").unlink()
+        active = False
+        return code
+    finally:
+        try:
+            if active:
+                stop_owned_remote(record)
+                (directory / "active").unlink(missing_ok=True)
+            (directory / "export-done").touch()
+            os.write(release, b"1")
+            process.wait(timeout=90)
+        finally:
+            os.close(release)
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+
 def supervise(path):
     record = json.loads(path.read_text())
     check = [sys.executable, str(Path(__file__).resolve()), "--remote-check", json.dumps(record)]
     execute_command = [sys.executable, str(Path(__file__).resolve()), "--execute", json.dumps(record)]
-    command = [sys.executable, str(REPO / "scripts/hw/hwlock.py"), "--locks", locks_for(record["host"]),
-               "--wait", str(WAIT_SECONDS), "--preflight", shlex.join(check),
-               "--preflight-timeout", "900", "--", *execute_command]
-    with path.with_suffix(".log").open("a") as log:
-        code = forwarding(command, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        with path.with_suffix(".log").open("a") as log:
+            if record["host"] in SEEDS:
+                code = supervise_seed(path, record, check, execute_command, log)
+            else:
+                command = [sys.executable, str(REPO / "scripts/hw/hwlock.py"), "--locks", locks_for(record["host"]),
+                           "--wait", str(WAIT_SECONDS), "--preflight", shlex.join(check),
+                           "--preflight-timeout", "900", "--", *execute_command]
+                code = forwarding(command, stdout=log, stderr=subprocess.STDOUT)
+    except BaseException as error:
+        atomic_json(path.with_suffix(".exit.json"), dict(returncode=1, error=repr(error),
+                    finished_ns=time.time_ns(), unit=record["unit"]))
+        raise
     result = dict(returncode=code, finished_ns=time.time_ns(), unit=record["unit"])
     atomic_json(path.with_suffix(".exit.json"), result)
     if code == 0:
@@ -400,12 +511,13 @@ def main(argv=None, *, family=None):
     for private in ("remote-check", "validate-remote", "execute", "supervise", "remote-start", "remote-worker", "remote-wait"):
         parser.add_argument("--" + private, help=argparse.SUPPRESS)
     parser.add_argument("--family", choices=FAMILIES, default=family)
-    parser.add_argument("--host", required=False, help="rhea, moa or cassowary (core-only only)")
+    parser.add_argument("--host", required=False, help="rhea, moa, kakapo or cassowary (core-only only)")
     parser.add_argument("--core-only", action="store_true")
     parser.add_argument("--core-bits", type=int, choices=[8], default=8)
     for name in ("source-snapshot", "tokens", "root", "export"):
         parser.add_argument("--" + name, type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--layer-limit", type=int, help="bounded numerical smoke; separate output root required")
     parser.add_argument("--remote-source-root", type=Path, default=REPO,
                         help="pre-staged clean checkout of the same commit, recursively initialized")
     parser.add_argument("--runtime-python", default="python3", help="container Python; optional pre-staged HF4 overlay")
@@ -437,8 +549,10 @@ def main(argv=None, *, family=None):
     locks_for(args.host)
     if socket.gethostname().split(".")[0] != "raptor":
         raise ValueError("launch from raptor, where the canonical hardware queue lives")
-    expected_cap = "110g" if args.family in ("kimi-k31", "muse") else "96g"
-    cap = os.environ.get("CUTEAFD_DEV_MEMORY", expected_cap).lower()
+    if args.layer_limit is not None and (args.family not in ("step5", "glm5") or args.layer_limit < 1):
+        parser.error("positive layer-limit is supported only for step5/glm5 smoke")
+    expected_cap = MEMORY_CAPS[args.family]
+    cap = os.environ.get("CUTEAFD_DEV_MEMORY", "").lower()
     if cap != expected_cap:
         raise ValueError(f"this family requires CUTEAFD_DEV_MEMORY={expected_cap} (no uncapped override)")
     if args.runtime_python != "python3":
@@ -460,7 +574,7 @@ def main(argv=None, *, family=None):
                   uid=identity["uid"], gid=identity["gid"], user=identity["user"],
                   build_root=str(build), remote_source_root=str(remote_source), container_memory=expected_cap,
                   runtime_python=args.runtime_python, runtime_root=str(args.runtime_root or remote_source),
-                  resume=args.resume, remote_supervisor=True, image_id=output(ssh(args.host,
+                  resume=args.resume, layer_limit=args.layer_limit, remote_supervisor=True, image_id=output(ssh(args.host,
                       ["docker", "image", "inspect", IMAGE, "--format", "{{.Id}}"])))
     for name in ("source_snapshot", "tokens", "root", "export"):
         value = getattr(args, name)
@@ -469,7 +583,8 @@ def main(argv=None, *, family=None):
         record[name] = str(value)
     # Fail early without taking a ticket. hwlock repeats this before enqueue
     # and at grant; neither check exposes a GPU to the producer preflight.
-    main(["--remote-check", json.dumps(record)])
+    if record["host"] not in SEEDS:
+        main(["--remote-check", json.dumps(record)])
     local = Path.home() / ".cache/cuteafd/builds" / ("mc-" + args.family) / "launches"
     subprocess.run(["python3", str(REPO / "scripts/build/assert-build-filesystem.py"), str(local)],
                    check=True, timeout=60)

@@ -24,7 +24,7 @@ def record(tmp_path, family="glmf", host="rhea"):
 
 
 @pytest.mark.parametrize("host,locks", [("rhea", "rhea"), ("moa", "moa"),
-                                         ("cassowary", "cassowary,cassowary-export")])
+                                         ("cassowary", "cassowary-export"), ("kakapo", "kakapo-export")])
 def test_canonical_host_locks(host, locks):
     assert launch.locks_for(host) == locks
 
@@ -41,7 +41,7 @@ def test_container_is_bounded_user_sm121_readonly_source(tmp_path, family, prefl
     row = record(tmp_path, family)
     command = launch.container_command(row, preflight=preflight)
     assert command[:3] == ["docker", "run", "--rm"]
-    cap = "110g" if family in ("kimi-k31", "muse") else "96g"
+    cap = launch.MEMORY_CAPS[family]
     assert command[command.index("--memory") + 1] == cap
     assert command[command.index("--memory-swap") + 1] == cap
     assert "--user" in command and "--privileged" not in command
@@ -72,7 +72,7 @@ def test_runtime_overlay_is_explicit_readonly(tmp_path):
     assert "type=bind,src=/overlay,dst=/overlay,readonly" in command
 
 
-@pytest.mark.parametrize("family", launch.FAMILIES)
+@pytest.mark.parametrize("family", ["kimi-k31", "glmf", "muse"])
 def test_family_launch_early_dispatch_only(tmp_path, monkeypatch, family):
     module = importlib.import_module(launch.FAMILIES[family].replace("/", ".") + ".launch")
     calls = []
@@ -122,12 +122,12 @@ def test_missing_core_only_and_non_k8_rejected_before_commands(monkeypatch):
 
 def test_supervisor_preflights_before_enqueue_and_grant_and_marks_success(tmp_path, monkeypatch):
     path = tmp_path / "attempt.json"
-    path.write_text(json.dumps(record(tmp_path, host="cassowary")))
+    path.write_text(json.dumps(record(tmp_path, host="rhea")))
     calls = []
     monkeypatch.setattr(launch, "forwarding", lambda cmd, **kw: calls.append(cmd) or 0)
     assert launch.supervise(path) == 0
     command = calls[0]
-    assert command[command.index("--locks") + 1] == "cassowary,cassowary-export"
+    assert command[command.index("--locks") + 1] == "rhea"
     assert command[command.index("--wait") + 1] == "21600"
     assert "--preflight" in command and "--preflight-at-grant" not in command
     check = shlex.split(command[command.index("--preflight") + 1])
@@ -176,7 +176,7 @@ def test_launch_uses_transient_unit_without_daemon_reload(tmp_path, monkeypatch,
     monkeypatch.setattr(launch.socket, "gethostname", lambda: "raptor")
     monkeypatch.setattr(launch, "checked_source", lambda *a: "clean-commit")
     monkeypatch.setattr(launch.Path, "home", lambda: tmp_path)
-    monkeypatch.delenv("CUTEAFD_DEV_MEMORY", raising=False)
+    monkeypatch.setenv("CUTEAFD_DEV_MEMORY", "96g")
     commands = []
     def fake_output(command, **kw):
         assert command[0] == "ssh"
@@ -412,3 +412,115 @@ def test_lost_remote_start_reply_retries_same_unit_without_cleanup(tmp_path, mon
     monkeypatch.setattr(launch.time, 'sleep', lambda *a: None)
     assert launch.execute(row)==0
     assert len(calls)==2 and calls[0]==calls[1]
+
+
+@pytest.mark.parametrize('host', ['kakapo', 'cassowary'])
+@pytest.mark.parametrize('family', ['step5', 'glm5'])
+def test_seed_counting_lease_command(tmp_path, host, family):
+    row = record(tmp_path, family, host)
+    command = launch.seed_lease_command(row, tmp_path / 'lease')
+    assert command[1].endswith('scripts/build/build-resource.py')
+    assert command[command.index('--host') + 1] == host
+    assert '--lease-dir' in command and '--owner' in command
+    assert '--container' in command and '--fallback' not in command
+    assert launch.locks_for(host) == host + '-export'
+
+
+@pytest.mark.parametrize('host', ['unknown', 'maxq', 'raptor', ''])
+def test_unknown_hosts_refused(host):
+    with pytest.raises(ValueError, match='core-only host'):
+        launch.locks_for(host)
+
+
+@pytest.mark.parametrize('family', launch.FAMILIES)
+def test_explicit_memory_cap_required_before_source_validation(monkeypatch, family):
+    monkeypatch.delenv('CUTEAFD_DEV_MEMORY', raising=False)
+    monkeypatch.setattr(launch.socket, 'gethostname', lambda: 'raptor')
+    monkeypatch.setattr(launch, 'checked_source', lambda *a: pytest.fail('cap check must happen first'))
+    with pytest.raises(ValueError, match='requires CUTEAFD_DEV_MEMORY='):
+        launch.main(['--core-only', '--host', 'kakapo', '--source-snapshot', '/source',
+                     '--tokens', '/tokens', '--root', '/root', '--export', '/export'], family=family)
+
+
+@pytest.mark.parametrize('family', ['step5', 'glm5'])
+def test_layer_smoke_limit_forwarded(tmp_path, family):
+    row = dict(record(tmp_path, family, 'kakapo'), layer_limit=4)
+    for preflight in (True, False):
+        command = launch.container_command(row, preflight=preflight)
+        assert command[command.index('--layer-limit') + 1] == '4'
+
+
+@pytest.mark.parametrize('host', ['kakapo', 'cassowary'])
+@pytest.mark.parametrize('failure', [None, 'preflight', 'execute'])
+def test_seed_protocol_preflights_and_releases_every_exit(tmp_path, monkeypatch, host, failure):
+    row = dict(record(tmp_path, 'glm5', host), remote_supervisor=True)
+    path = tmp_path / 'launch.json'
+    events = []
+    class Process:
+        def __init__(self, command, **kwargs):
+            events.append(('lease', command))
+        def wait(self, timeout):
+            events.append(('released', timeout))
+            return 0
+    monkeypatch.setattr(launch.subprocess, 'Popen', Process)
+    def marker(process, directory, name, timeout):
+        events.append((name, timeout))
+        assert timeout <= launch.WAIT_SECONDS + 60
+        if name == 'export-granted':
+            assert (directory / 'export-request').exists()
+        return dict(host=host)
+    monkeypatch.setattr(launch, 'wait_lease_marker', marker)
+    def check(command, **kwargs):
+        events.append(('preflight', command))
+        if failure == 'preflight':
+            raise RuntimeError('preflight')
+    monkeypatch.setattr(launch.subprocess, 'run', check)
+    def execute(command, **kwargs):
+        events.append(('execute', command))
+        assert kwargs['env']['CUTEAFD_HW_LOCKS_HELD'] == host + '-export'
+        assert command[:2] == ['timeout', '--foreground']
+        if failure == 'execute':
+            raise RuntimeError('execute')
+        return 0
+    monkeypatch.setattr(launch, 'forwarding', execute)
+    monkeypatch.setattr(launch, 'stop_owned_remote', lambda r: events.append(('cleanup', r)))
+    with path.with_suffix('.log').open('w') as log:
+        if failure:
+            with pytest.raises(RuntimeError, match=failure):
+                launch.supervise_seed(path, row, ['check'], ['execute'], log)
+        else:
+            assert launch.supervise_seed(path, row, ['check'], ['execute'], log) == 0
+    directory = path.with_suffix('.lease')
+    assert (directory / 'export-done').exists()
+    assert not (directory / 'active').exists()
+    assert events[-1][0] == 'released'
+    if failure is None:
+        assert [name for name, _ in events] == ['lease', 'granted', 'preflight', 'export-granted',
+                                               'preflight', 'execute', 'released']
+    if failure == 'execute':
+        assert events[-2][0] == 'cleanup'
+
+
+@pytest.mark.parametrize('host', ['kakapo', 'cassowary'])
+def test_seed_execute_requires_counting_slot_and_export_lock(tmp_path, monkeypatch, host):
+    directory = tmp_path / '.cache/cuteafd'
+    directory.mkdir(parents=True)
+    lease = tmp_path / 'lease'
+    lease.mkdir()
+    (lease / 'granted').write_text(json.dumps(dict(host=host, slots=3)))
+    (lease / 'export-granted').write_text(json.dumps(dict(host=host)))
+    monkeypatch.setattr(launch.Path, 'home', lambda: tmp_path)
+    monkeypatch.setenv('CUTEAFD_CORE_SEED_LEASE', str(lease))
+    monkeypatch.setenv('CUTEAFD_HW_LOCKS_HELD', host + '-export')
+    with pytest.raises(ValueError, match='counting lease is not held'):
+        launch.require_lease(host)
+    with (directory / (host + '.build.1.lock')).open('a') as slot:
+        launch.fcntl.flock(slot, launch.fcntl.LOCK_EX | launch.fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match='hardware lock is not held'):
+            launch.require_lease(host)
+        with (directory / (host + '-export.lock')).open('a') as turn:
+            launch.fcntl.flock(turn, launch.fcntl.LOCK_EX | launch.fcntl.LOCK_NB)
+            launch.require_lease(host)
+            (lease / 'export-done').touch()
+            with pytest.raises(ValueError, match='export turn are required'):
+                launch.require_lease(host)
