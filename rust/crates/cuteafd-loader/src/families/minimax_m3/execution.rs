@@ -50,6 +50,48 @@ impl ProducerPrograms {
     }
 }
 
+/// Stateless forward kernels add no private scratch owner. Their outputs live
+/// in the lane/unit activation owners; gather reuses the MSA prefill staging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardPrograms {
+    pub layouts: [cuteafd_ffi::minimax_m3::forward::ForwardLayout; 3],
+    pub gather: cuteafd_ffi::index_cache::Layout,
+}
+impl ForwardPrograms {
+    pub fn resolve(manifest: &serde_json::Value, rows: u32) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        use cuteafd_ffi::minimax_m3::forward::{Kind, validate_entry};
+        let entries = manifest["programs"].as_array()
+            .ok_or_else(|| Refusal::InvalidFact("MiniMax PROGRAMS.json has no program list".into()))?;
+        let mut specs = Vec::new();
+        let mut layouts = Vec::new();
+        let mut gather = None;
+        for name in Kind::ALL.map(Kind::name).into_iter().chain(["minimax_index_cache_gather"]) {
+            let missing = |detail| Refusal::MissingExport { export: name.into(),
+                geometry: "MiniMax residual norm/FP32 router/paged KV and bounded index staging".into(), context: 0, detail };
+            let mut found = entries.iter().filter(|entry| entry["name"] == name);
+            let entry = found.next().ok_or_else(|| missing("absent from PROGRAMS.json".into()))?;
+            if found.next().is_some() { return Err(missing("duplicate program".into())); }
+            let parsed = ProgramEntry::from_manifest(entry).map_err(|e| missing(e.to_string()))?;
+            let capacity = if name == "minimax_index_cache_gather" {
+                let layout = cuteafd_ffi::index_cache::validate_entry(&parsed.spec, entry)
+                    .map_err(|e| missing(e.to_string()))?;
+                gather = Some(layout);
+                layout.rows as u32
+            } else {
+                let layout = validate_entry(&parsed.spec, entry).map_err(|e| missing(e.to_string()))?;
+                layouts.push(layout);
+                layout.rows
+            };
+            if rows == 0 || rows > capacity {
+                return Err(missing(format!("compiled rows={capacity}, requested rows={rows}")));
+            }
+            specs.push(parsed.spec);
+        }
+        Ok((Self { layouts: layouts.try_into().expect("three forward kernels"),
+            gather: gather.expect("bounded gather") }, specs))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MsaPrograms {
     pub layouts: [Layout; 4],
@@ -273,6 +315,27 @@ mod tests {
             &serde_json::from_str(include_str!("fixtures/config.json")).unwrap(),
         )
         .unwrap()
+    }
+    #[test]
+    fn forward_inventory_validates_all_kernels_without_private_scratch() {
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-ffi/tests/fixtures/minimax_forward_programs.json")).unwrap();
+        let (programs, specs) = ForwardPrograms::resolve(&manifest, 2048).unwrap();
+        assert_eq!(specs.len(), 4);
+        assert_eq!(programs.gather.rows, 4096);
+        assert!(specs.iter().all(|spec| spec.scratch.is_empty()));
+        assert!(ForwardPrograms::resolve(&manifest, 0).is_err());
+        assert!(ForwardPrograms::resolve(&manifest, 4097).is_err());
+        for i in 0..4 {
+            let mut bad = manifest.clone(); bad["programs"].as_array_mut().unwrap().remove(i);
+            assert!(ForwardPrograms::resolve(&bad, 1).is_err());
+            let mut bad = manifest.clone(); bad["programs"].as_array_mut().unwrap().push(manifest["programs"][i].clone());
+            assert!(ForwardPrograms::resolve(&bad, 1).is_err());
+            for field in ["dtype", "shape", "role"] {
+                let mut bad = manifest.clone(); bad["programs"][i]["pointers"][0][field] = json!("wrong");
+                assert!(ForwardPrograms::resolve(&bad, 1).is_err());
+            }
+        }
     }
     #[test]
     fn producer_inventory_charges_each_scratch_owner_once() {

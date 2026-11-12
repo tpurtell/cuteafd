@@ -1,0 +1,270 @@
+{
+  "programs": [
+    {
+      "name": "minimax_residual_norm",
+      "family": "minimax",
+      "op": "minimax_residual_norm",
+      "params": {
+        "max_rows": 4096
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "width": 6144,
+        "heads": 1,
+        "eps": 1e-06,
+        "zero_centered": true,
+        "subtract_mean": false,
+        "bias": false,
+        "rotary": 0
+      },
+      "pointers": [
+        {
+          "name": "x",
+          "dtype": "float32",
+          "shape": "[rows,1,6144]",
+          "role": "in"
+        },
+        {
+          "name": "weight",
+          "dtype": "bfloat16",
+          "shape": "[6144]",
+          "role": "in"
+        },
+        {
+          "name": "bias",
+          "dtype": "bfloat16",
+          "shape": "[6144] (ignored unless bias)",
+          "role": "in"
+        },
+        {
+          "name": "cos",
+          "dtype": "bfloat16",
+          "shape": "[positions,0] (ignored unless rotary)",
+          "role": "in"
+        },
+        {
+          "name": "sin",
+          "dtype": "bfloat16",
+          "shape": "[positions,0] (ignored unless rotary)",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows] (ignored unless rotary)",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,1,6144]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {}
+    },
+    {
+      "name": "minimax_router_scores",
+      "family": "minimax",
+      "op": "minimax_router_scores",
+      "params": {
+        "max_rows": 4096
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "hidden": 6144,
+        "experts": 128
+      },
+      "pointers": [
+        {
+          "name": "x",
+          "dtype": "bfloat16",
+          "shape": "[rows,6144]",
+          "role": "in"
+        },
+        {
+          "name": "weight",
+          "dtype": "float32",
+          "shape": "[128,6144]",
+          "role": "in"
+        },
+        {
+          "name": "logits",
+          "dtype": "float32",
+          "shape": "[rows,128]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {}
+    },
+    {
+      "name": "minimax_kv_pack",
+      "family": "minimax",
+      "op": "minimax_kv_pack",
+      "params": {
+        "max_rows": 4096
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "heads": 4,
+        "head_dim": 128,
+        "page_rows": 64
+      },
+      "pointers": [
+        {
+          "name": "k",
+          "dtype": "bfloat16",
+          "shape": "[rows,4,128]",
+          "role": "in"
+        },
+        {
+          "name": "v",
+          "dtype": "bfloat16",
+          "shape": "[rows,4,128]",
+          "role": "in"
+        },
+        {
+          "name": "slots",
+          "dtype": "int64",
+          "shape": "[rows] (physical slots; negative skips writes)",
+          "role": "in"
+        },
+        {
+          "name": "batch_ids",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "k_descale",
+          "dtype": "float32",
+          "shape": "[batch,4]",
+          "role": "in"
+        },
+        {
+          "name": "v_descale",
+          "dtype": "float32",
+          "shape": "[batch,4]",
+          "role": "in"
+        },
+        {
+          "name": "key_cache",
+          "dtype": "uint8",
+          "shape": "[pages,64,4,128]",
+          "role": "out"
+        },
+        {
+          "name": "value_cache",
+          "dtype": "uint8",
+          "shape": "[pages,64,4,128]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {}
+    },
+    {
+      "name": "minimax_index_cache_gather",
+      "family": "minimax",
+      "op": "index_cache_gather",
+      "params": {
+        "max_rows": 4096
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "page_rows": 64,
+        "head_dim": 128,
+        "page_bytes": 8448,
+        "padding_multiple": 256
+      },
+      "pointers": [
+        {
+          "name": "cache",
+          "dtype": "uint8",
+          "shape": "[pool_pages,8448]",
+          "role": "in"
+        },
+        {
+          "name": "pages",
+          "dtype": "int32",
+          "shape": "[table_width]",
+          "role": "in"
+        },
+        {
+          "name": "lengths",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "keys",
+          "dtype": "uint8",
+          "shape": "[output_tokens,128]",
+          "role": "out"
+        },
+        {
+          "name": "scales",
+          "dtype": "float32",
+          "shape": "[output_tokens]",
+          "role": "out"
+        },
+        {
+          "name": "starts",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "out"
+        },
+        {
+          "name": "ends",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "table_width",
+          "type": "int32"
+        },
+        {
+          "name": "page_begin",
+          "type": "int32"
+        },
+        {
+          "name": "pool_pages",
+          "type": "int64"
+        },
+        {
+          "name": "live_tokens",
+          "type": "int32"
+        },
+        {
+          "name": "output_tokens",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {}
+    }
+  ]
+}

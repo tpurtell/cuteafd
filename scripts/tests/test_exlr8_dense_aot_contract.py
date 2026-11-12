@@ -465,6 +465,54 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
     assert (build / "scope.json").read_text() == "minimax,expert_reply||"
 
 
+def minimax_forward_fixture():
+    base = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd"
+    namespace = {
+        "torch": types.SimpleNamespace(**{name: name for name in
+                 ("bfloat16", "int64", "int32", "float32", "uint8")}),
+        "Operand": lambda name, dtype, shape, role="in", **kwargs:
+            dict(name=name, dtype=dtype, shape=shape, role=role),
+        "Scalar": lambda name, kind="int32": dict(name=name, type=kind),
+        "compile_program": lambda launch, **kwargs: kwargs,
+        "_dtype": lambda dtype: dtype, "AffineNorm": lambda *args: None,
+        "_RouterScores": lambda: None, "_KvPack": lambda: None, "_IndexCacheGather": lambda: None,
+    }
+    modules = {}
+    for source, names in (("pointwise", ("compile_affine_norm_aot",)),
+                          ("minimax", ("compile_minimax_norm_aot", "compile_minimax_router_scores_aot",
+                                       "compile_minimax_kv_pack_aot")),
+                          ("index_cache", ("compile_index_cache_gather_aot",))):
+        path = base / (source + ".py")
+        nodes = [node for node in ast.parse(path.read_text()).body
+                 if isinstance(node, ast.FunctionDef) and node.name in names]
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+        module = types.ModuleType("b12x.integration.cuteafd." + source)
+        for name in names:
+            setattr(module, name, namespace[name])
+        modules[module.__name__] = module
+    exporter = ast.parse((ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text())
+    helper = next(node for node in exporter.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "minimax_forward_programs")
+    dispatch = {}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "forward", "exec"), dispatch)
+    import unittest.mock
+    expected = []
+    with unittest.mock.patch.dict(sys.modules, modules):
+        for suffix, op, params, thunk in dispatch["minimax_forward_programs"](4096):
+            program = thunk()
+            expected.append(dict(name="minimax_" + suffix, family="minimax", op=op,
+                params=params, capacity_rows=4096, geometry=program["geometry"],
+                pointers=list(program["operands"]), scalars=list(program["scalars"]),
+                scratch_bytes_at_capacity={}))
+    return {"programs": expected}
+
+
+def test_minimax_forward_fixture_matches_pinned_fork_without_cuda():
+    import json
+    fixture = ROOT / "rust/crates/cuteafd-ffi/tests/fixtures/minimax_forward_programs.json"
+    assert json.loads(fixture.read_text()) == minimax_forward_fixture()
+
+
 def test_minimax_producer_fixture_matches_pinned_fork_without_cuda():
     import json
 
