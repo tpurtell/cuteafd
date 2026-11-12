@@ -27,8 +27,7 @@ FAMILIES = {
     "step5": "step5/core_k6",
     "glm5": "glm5/core_k6",
 }
-HOST_LOCKS = {"rhea": "rhea", "moa": "moa", "kakapo": "kakapo-export",
-              "cassowary": "cassowary-export"}
+HOST_LOCKS = {"rhea": "rhea", "moa": "moa", "kakapo": "", "cassowary": ""}
 SEEDS = {"kakapo", "cassowary"}
 MEMORY_CAPS = {"kimi-k31": "110g", "muse": "110g", "glmf": "96g",
                "step5": "96g", "glm5": "96g"}
@@ -217,16 +216,15 @@ def forwarding(command, *, stop_seconds=None, **kwargs):
 
 
 def require_lease(host):
-    expected = set(locks_for(host).split(","))
+    expected = set(filter(None, locks_for(host).split(",")))
     if not expected.issubset(os.environ.get("CUTEAFD_HW_LOCKS_HELD", "").split(",")):
         raise ValueError("execute requires enclosing raptor hwlock lease")
     directory = Path.home() / ".cache/cuteafd"
     if host in SEEDS:
         lease = Path(os.environ.get("CUTEAFD_CORE_SEED_LEASE", "/nonexistent"))
         grant = json.loads((lease / "granted").read_text())
-        turn = json.loads((lease / "export-granted").read_text())
-        if grant["host"] != host or turn["host"] != host or (lease / "export-done").exists():
-            raise ValueError("seed counting lease and export turn are required")
+        if grant["host"] != host:
+            raise ValueError("seed counting lease granted the wrong host")
         slot = grant["slot"]
         if type(slot) is not int or not 0 <= slot < grant["slots"]:
             raise ValueError("invalid granted seed counting slot")
@@ -440,11 +438,7 @@ def supervise_seed(path, record, check, execute_command, log):
         grant = wait_lease_marker(process, directory, "granted", WAIT_SECONDS + 60)
         if grant["host"] != record["host"]:
             raise ValueError("seed lease granted the wrong host")
-        subprocess.run(check, check=True, timeout=900, stdout=log, stderr=subprocess.STDOUT)
-        (directory / "export-request").touch()
-        grant = wait_lease_marker(process, directory, "export-granted", WAIT_SECONDS + 60)
-        if grant["host"] != record["host"]:
-            raise ValueError("seed export turn granted the wrong host")
+        # Long-running encodes share LAN seeds with WIP builds, not their export turn.
         subprocess.run(check, check=True, timeout=900, stdout=log, stderr=subprocess.STDOUT)
         environment = dict(os.environ, CUTEAFD_HW_LOCKS_HELD=locks_for(record["host"]),
                            CUTEAFD_CORE_SEED_LEASE=str(directory))
@@ -462,7 +456,6 @@ def supervise_seed(path, record, check, execute_command, log):
             if active:
                 stop_owned_remote(record)
                 (directory / "active").unlink(missing_ok=True)
-            (directory / "export-done").touch()
             os.write(release, b"1")
             process.wait(timeout=90)
         finally:
