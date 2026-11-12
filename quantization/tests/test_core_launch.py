@@ -24,7 +24,7 @@ def record(tmp_path, family="glmf", host="rhea"):
 
 
 @pytest.mark.parametrize("host,locks", [("rhea", "rhea"), ("moa", "moa"),
-                                         ("cassowary", "cassowary-export"), ("kakapo", "kakapo-export")])
+                                         ("cassowary", ""), ("kakapo", "")])
 def test_canonical_host_locks(host, locks):
     assert launch.locks_for(host) == locks
 
@@ -431,7 +431,7 @@ def test_seed_counting_lease_command(tmp_path, host, family):
     assert command[command.index('--host') + 1] == host
     assert '--lease-dir' in command and '--owner' in command
     assert '--container' in command and '--fallback' not in command
-    assert launch.locks_for(host) == host + '-export'
+    assert launch.locks_for(host) == ''
 
 
 @pytest.mark.parametrize('host', ['unknown', 'maxq', 'raptor', ''])
@@ -458,6 +458,28 @@ def test_layer_smoke_limit_forwarded(tmp_path, family):
         assert command[command.index('--layer-limit') + 1] == '4'
 
 
+@pytest.mark.parametrize('host', ['kakapo', 'cassowary', 'rhea', 'moa'])
+def test_supervise_routes_seeds_away_from_hwlock_wrapper(tmp_path, monkeypatch, host):
+    row = record(tmp_path, host=host)
+    path = tmp_path / 'launch.json'
+    path.write_text(json.dumps(row))
+    calls = []
+    def seed(path, record, check, execute, log):
+        calls.append(('seed', record['host']))
+        return 0
+    def wrapper(command, **kwargs):
+        calls.append(('hwlock', command))
+        assert command[1].endswith('scripts/hw/hwlock.py')
+        assert command[command.index('--locks') + 1] == host
+        return 0
+    monkeypatch.setattr(launch, 'supervise_seed', seed)
+    monkeypatch.setattr(launch, 'forwarding', wrapper)
+    assert launch.supervise(path) == 0
+    assert len(calls) == 1
+    assert calls[0][0] == ('seed' if host in launch.SEEDS else 'hwlock')
+    assert json.loads(path.with_suffix('.done.json').read_text())['returncode'] == 0
+
+
 @pytest.mark.parametrize('host', ['kakapo', 'cassowary'])
 @pytest.mark.parametrize('failure', [None, 'preflight', 'execute'])
 def test_seed_protocol_preflights_and_releases_every_exit(tmp_path, monkeypatch, host, failure):
@@ -474,8 +496,7 @@ def test_seed_protocol_preflights_and_releases_every_exit(tmp_path, monkeypatch,
     def marker(process, directory, name, timeout):
         events.append((name, timeout))
         assert timeout <= launch.WAIT_SECONDS + 60
-        if name == 'export-granted':
-            assert (directory / 'export-request').exists()
+        assert name == 'granted'
         return dict(host=host)
     monkeypatch.setattr(launch, 'wait_lease_marker', marker)
     def check(command, **kwargs):
@@ -485,7 +506,8 @@ def test_seed_protocol_preflights_and_releases_every_exit(tmp_path, monkeypatch,
     monkeypatch.setattr(launch.subprocess, 'run', check)
     def execute(command, **kwargs):
         events.append(('execute', command))
-        assert kwargs['env']['CUTEAFD_HW_LOCKS_HELD'] == host + '-export'
+        assert kwargs['env']['CUTEAFD_HW_LOCKS_HELD'] == ''
+        assert not (path.with_suffix('.lease') / 'export-request').exists()
         assert command[:2] == ['timeout', '--foreground']
         if failure == 'execute':
             raise RuntimeError('execute')
@@ -499,27 +521,25 @@ def test_seed_protocol_preflights_and_releases_every_exit(tmp_path, monkeypatch,
         else:
             assert launch.supervise_seed(path, row, ['check'], ['execute'], log) == 0
     directory = path.with_suffix('.lease')
-    assert (directory / 'export-done').exists()
+    assert not any(directory.glob('export-*'))
     assert not (directory / 'active').exists()
     assert events[-1][0] == 'released'
     if failure is None:
-        assert [name for name, _ in events] == ['lease', 'granted', 'preflight', 'export-granted',
-                                               'preflight', 'execute', 'released']
+        assert [name for name, _ in events] == ['lease', 'granted', 'preflight', 'execute', 'released']
     if failure == 'execute':
         assert events[-2][0] == 'cleanup'
 
 
 @pytest.mark.parametrize('host', ['kakapo', 'cassowary'])
-def test_seed_execute_requires_counting_slot_and_export_lock(tmp_path, monkeypatch, host):
+def test_seed_execute_requires_own_counting_slot_without_export_lock(tmp_path, monkeypatch, host):
     directory = tmp_path / '.cache/cuteafd'
     directory.mkdir(parents=True)
     lease = tmp_path / 'lease'
     lease.mkdir()
     (lease / 'granted').write_text(json.dumps(dict(host=host, slots=3, slot=1)))
-    (lease / 'export-granted').write_text(json.dumps(dict(host=host)))
     monkeypatch.setattr(launch.Path, 'home', lambda: tmp_path)
     monkeypatch.setenv('CUTEAFD_CORE_SEED_LEASE', str(lease))
-    monkeypatch.setenv('CUTEAFD_HW_LOCKS_HELD', host + '-export')
+    monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     with pytest.raises(ValueError, match='counting lease is not held'):
         launch.require_lease(host)
     assert not (directory / (host + '.build.0.lock')).exists()
@@ -530,11 +550,12 @@ def test_seed_execute_requires_counting_slot_and_export_lock(tmp_path, monkeypat
             launch.require_lease(host)
     with (directory / (host + '.build.1.lock')).open('a') as slot:
         launch.fcntl.flock(slot, launch.fcntl.LOCK_EX | launch.fcntl.LOCK_NB)
-        with pytest.raises(ValueError, match='hardware lock is not held'):
-            launch.require_lease(host)
+        launch.require_lease(host)
+        assert not (directory / (host + '-export.lock')).exists()
+        # A build may own the export turn while the encode owns its counting slot.
         with (directory / (host + '-export.lock')).open('a') as turn:
             launch.fcntl.flock(turn, launch.fcntl.LOCK_EX | launch.fcntl.LOCK_NB)
             launch.require_lease(host)
-            (lease / 'export-done').touch()
-            with pytest.raises(ValueError, match='export turn are required'):
-                launch.require_lease(host)
+        (lease / 'granted').write_text(json.dumps(dict(host='wrong-host', slots=3, slot=1)))
+        with pytest.raises(ValueError, match='wrong host'):
+            launch.require_lease(host)
