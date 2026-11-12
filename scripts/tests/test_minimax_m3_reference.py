@@ -442,12 +442,20 @@ def test_one_token_dense_forward_matches_hand_computed_native_qdq(snapshot):
     torch.testing.assert_close(actual, torch.full_like(hidden, 3.75), rtol=0, atol=0)
 
 
-def test_isolated_nvfp4_scratch_contract_and_oai_plain_separation():
+def test_isolated_nvfp4_scratch_contract_and_oai_plain_separation(tmp_path):
     import importlib.util
     path = ROOT / 'native/tests/minimax_nvfp4_expert_selftest.py'
     spec = importlib.util.spec_from_file_location('minimax_expert_oracle', path)
     oracle = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(oracle)
+    payload = bytes([0, 1, 7, 128, 255, 0])
+    manifest = oracle.write_payload(tmp_path, 'scales', payload, (2, 3), 'e4m3fn-u8')
+    assert manifest == {'path': 'scales.bin', 'shape': [2, 3], 'dtype': 'e4m3fn-u8',
+                        'bytes': len(payload), 'sha256': oracle.digest(tmp_path / 'scales.bin')}
+    assert (tmp_path / manifest['path']).read_bytes() == payload
+    with pytest.raises(FileExistsError):
+        oracle.write_payload(tmp_path, 'scales', b'changed', (7,), 'u8')
+    assert (tmp_path / manifest['path']).read_bytes() == payload
     for rows, capacity in [(1, 1), (16, 16), (64, 80)]:
         offsets, sizes, extent = oracle.scratch_regions(128, 6144, 3072, rows, capacity)
         assert all(offset % 1024 == 0 for offset in offsets)

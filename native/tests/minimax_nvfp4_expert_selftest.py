@@ -40,6 +40,15 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def write_payload(directory, name, value, shape, dtype):
+    """Persist a drained byte view, including enough metadata for CPU replay."""
+    path = directory / (name + '.bin')
+    with path.open('xb') as stream:
+        stream.write(value)
+    return {'path': path.name, 'shape': list(shape), 'dtype': dtype,
+            'bytes': len(value), 'sha256': digest(path)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--snapshot', type=Path, required=True)
@@ -173,8 +182,22 @@ def main():
         meta = view(0, torch.int32).cpu()
         pair_pos = view(2, torch.int32).reshape(rows, k)[:, 0].cpu()
         tile_codes = meta[4 + 3 * e:4 + 3 * e + int(meta[1])]
+        xq = view(3, torch.uint8).reshape(-1, h // 2)
+        x_s = view(4, torch.uint8).reshape(-1, h // 16)
         aq = view(7, torch.uint8).reshape(-1, n // 2)
         a_s = view(8, torch.uint8).reshape(-1, n // 16)
+        args.out.mkdir(parents=True, exist_ok=False)
+        payloads = {}
+        def persist(name, value, dtype):
+            raw = value.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+            payloads[name] = write_payload(args.out, name, raw, value.shape, dtype)
+        persist('input', x, 'bf16-le')
+        persist('input_row_ids', row_ids, 'i64-le')
+        persist('expert_ids', expert_ids, 'i32-le')
+        persist('pair_positions', pair_pos, 'i32-le')
+        # Exclude unused capacity and padding: only initialized metadata/rows
+        # belong in a replay, not arbitrary allocator bytes.
+        persist('metadata', meta[:4 + 3 * e + int(meta[1])], 'i32-le')
         def metrics(value, reference):
             delta = value.float() - reference.float()
             assert torch.isfinite(delta).all()
@@ -199,16 +222,31 @@ def main():
             packed = aq[compact.cuda()]
             scales = a_s[compact.cuda()].view(torch.float8_e4m3fn)
             native_q = model.dequant_nvfp4(packed, scales, global_scale)
+            prefix = f'expert{expert:03d}_'
+            for name, value, dtype in [
+                    ('scratch_rows', compact, 'i64-le'),
+                    ('input_packed', xq[compact.cuda()], 'e2m1-pairs-u8'),
+                    ('input_scales', x_s[compact.cuda()], 'e4m3fn-u8'),
+                    ('postactivation_packed', packed, 'e2m1-pairs-u8'),
+                    ('postactivation_scales', scales.view(torch.uint8), 'e4m3fn-u8'),
+                    ('postactivation_qdq', native_q, 'f32-le'),
+                    ('oai_postactivation_qdq', oai_q, 'f32-le'),
+                    ('plain_postactivation_qdq', plain_q, 'f32-le'),
+                    ('down_global_scale', global_scale.reshape(1).float(), 'f32-le')]:
+                persist(prefix + name, value, dtype)
             row = {'expert': expert, 'input_rows': row_groups[group].tolist(),
                    'oai': metrics(actual[start:stop], expected[start:stop]),
                    'plain': metrics(actual[start:stop], plain_expected[start:stop]),
                    'postactivation_qdq_oai': metrics(native_q, oai_q),
                    'postactivation_qdq_plain': metrics(native_q, plain_q)}
             result['per_expert'].append(row)
-        args.out.mkdir(parents=True, exist_ok=False)
-        (args.out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         for name, value in [('native', actual), ('oai', expected), ('plain', plain_expected)]:
-            value.float().cpu().numpy().astype('<f4').tofile(args.out / (name + '.bin'))
+            persist(name, value.float(), 'f32-le')
+        result['replay'] = {'schema': 1, 'snapshot': str(args.snapshot),
+                            'scratch_offsets': offsets, 'scratch_sizes': sizes,
+                            'row_order': 'selected expert order, then input row order',
+                            'padding_saved': False, 'payloads': payloads}
+        (args.out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         print(json.dumps(result, indent=2), flush=True)
         assert all(row['oai']['nrmse'] < args.max_nrmse for row in result['per_expert']), 'native expert exceeds stop bar'
         assert result['oai']['nrmse'] < result['plain']['nrmse'], 'native matches plain activation better than OAI'
