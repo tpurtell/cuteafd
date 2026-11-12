@@ -7,3 +7,4 @@ pub(crate) mod cache;
 pub(crate) mod prefill;
 pub(crate) mod head;
 pub(crate) mod admission;
+pub(crate) mod golden;

@@ -110,6 +110,12 @@ pub(crate) fn resolve(kind: Kind, args: FamilyArgs) -> Result<Option<ResolvedFam
         }
         (None, None) => bail!("cuteafd {}: pass --snapshot DIR (the family is read from it) or --family ID", kind.name()),
     };
+    if family == "minimax_m3" {
+        anyhow::ensure!(kind == Kind::Golden,
+            "MiniMax serving remains refused until full-model qualification");
+        return Ok(Some(ResolvedFamily { argv: ["cuteafd", "minimax-golden"].into_iter()
+            .map(String::from).chain(args.args).collect(), view }));
+    }
     let Some(&(_, serve, golden)) = FAMILIES.iter().find(|(id, _, _)| *id == family) else {
         bail!("unknown family {family}; known: {}",
             FAMILIES.iter().map(|(id, ..)| *id).collect::<Vec<_>>().join(", "));

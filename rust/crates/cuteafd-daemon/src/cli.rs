@@ -217,6 +217,9 @@ pub(crate) enum Commands {
     /// Compare a cold Kimi decoder prefix against a flagged residual state.
     #[command(hide = true)]
     KimiGolden(crate::families::kimi_k3::golden::GoldenArgs),
+    /// Qualify native MiniMax full-model prefill with real Spark experts.
+    #[command(hide = true)]
+    MinimaxGolden(crate::families::minimax_m3::golden::GoldenArgs),
     /// Serve Kimi K3 with TP2 attention and six real Spark expert ranks.
     #[command(hide = true)]
     ServeKimi(crate::families::kimi_k3::serve::ServeArgs),

@@ -64,7 +64,7 @@ fn selected_programs(cfg: &MiniMaxM3Config, weights: &CoordinatorWeights,
     let (_, msa) = MsaPrograms::resolve(cfg, manifest, 1, rows, tokens)?;
     let (_, producers) = ProducerPrograms::resolve(manifest, rows)?;
     let (_, forward) = ForwardPrograms::resolve(manifest, rows)?;
-    let (_, dense) = weights.resolve_dense_programs(manifest, rows)?;
+    let dense = weights.resolve_dense_programs(manifest, rows)?;
     Ok(msa.iter().chain(&producers).chain(&forward).chain(&dense)
         .map(|spec| spec.name.clone()).collect())
 }
@@ -132,7 +132,8 @@ fn run(args: GoldenArgs) -> Result<()> {
     let mut metadata = (0..waves).map(|_| cache.metadata(args.prefill_rows)).collect::<Result<Vec<_>>>()?;
     let head = Head::new(Rc::clone(&stream), &programs, &cfg, args.prefill_rows as usize)?;
     let residual = Allocation::new(device, tokens as usize * 6144 * 4, Tag::workspace("minimax/residual"))?;
-    let mut inventory = Inventory::new(CoordinatorDevices::new(&[args.device])?, "minimax",
+    let devices = [args.device];
+    let mut inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax",
         Lifetime::TARGET, Category::Workspace, "cold golden");
     target.inventory(&mut inventory, "target")?;
     cache.inventory(&mut inventory, "cache")?;

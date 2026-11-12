@@ -93,6 +93,16 @@ keys below onto, and `cuteafd serve --family ID --help` lists a family's serve
 flags. Users set keys, not these flags or the `CUTEAFD_*` environment variables
 the launcher derives from them.
 
+`cuteafd golden --family minimax_m3` (hidden alias `minimax-golden`) is a
+qualification-only native full-model prefill path; MiniMax serving stays refused.
+It requires `--nll --golden DATASET --save-logits NEW_DIR`, a checkpoint snapshot,
+native library and program manifest, and four real Spark `--peers` endpoints.
+`--window ID` selects one sealed quick-subset window. `--prefill-rows` defaults
+to 1024 (page-aligned 256..4096); `--prefill-waves` defaults to 3 (1..4).
+`--check-headers` validates the immutable reference and checkpoint/export geometry
+without CUDA or workers. Scores use the shared top1024-plus-tail estimator;
+qualification requires mean KL <=0.03 and top-1 agreement >=0.95.
+
 `cuteafd kimi-golden --rtx-expert-layers auto|all|N` defaults to `auto`, using
 startup's real-device admission rather than forcing zero coordinator layers.
 Golden's expert-layer hint must cover the planner-selected Spark layers under
