@@ -2010,7 +2010,7 @@ fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result
 fn mc_target_views_preserve_fixed_k4_mtp_contract() -> anyhow::Result<()> {
     use crate::plan::checkpoint::{CheckpointView, CoreView};
     let original = exl3_snapshot();
-    let cp = Checkpoint::inventory(original.path())?;
+    let cp = Checkpoint::open(original.path())?;
     let cfg = Config::parse(&cp)?;
     let tensors = cp.tensors.iter().map(|t| (t.meta.name.clone(),
         match t.meta.dtype { DType::Bf16 => "BF16", DType::F16 => "F16", DType::F32 => "F32",

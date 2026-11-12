@@ -113,6 +113,14 @@ This all-layer dense/attention/DSA diagnostic is **not** a full-model golden.
 K3.1 DSA is admitted only through the explicit golden role;
 serving remains refused until qualification. The flag is unavailable to serve.
 
+`cuteafd step5-golden --golden TOKENS_DIR --nll --last-layer 91` accepts a
+`tokens.bin`-only directory for same-engine core-view comparisons (2..4096 U32
+tokens). No `--window` is needed; `--save-logits` retains the actual selected
+view identity. This mode reports finite logits and engine NLL only, not reference
+qualification, and refuses reference-dependent layer, final-norm, FP8 and prefix
+checks. A present `meta.json` always selects the existing pinned-reference path
+and its identity checks; missing or invalid reference fields never fall back.
+
 `cuteafd qwen35-golden --golden DATASET --window ID` also accepts the pinned
 published compact fidelity dataset for graph qualification when decode graphs
 are enabled. It compares full decode logits byte-for-byte across graph-off,
