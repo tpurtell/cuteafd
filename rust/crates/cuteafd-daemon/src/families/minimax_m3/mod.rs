@@ -4,3 +4,5 @@ pub(crate) mod dense;
 pub(crate) mod attention;
 pub(crate) mod layer;
 pub(crate) mod cache;
+pub(crate) mod prefill;
+pub(crate) mod head;
