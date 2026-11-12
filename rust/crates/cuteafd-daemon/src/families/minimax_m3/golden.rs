@@ -116,7 +116,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         waves, true, true, SparkIntakeCandidates::Probed, SparkReplyFormat::Bf16, Lifetime::TARGET)?;
     let contract = admission::contract(&checkpoint, &cfg, &weights, &manifest,
         args.prefill_rows, tokens, waves, &link_layout, &sample.arch)?;
-    admission::admit(&contract, sample.free_bytes, sample.total_bytes, host)?;
+    let facts = admission::admit(&contract, sample.free_bytes, sample.total_bytes, host)?;
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let exports = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports();
     let executions = cuteafd_loader::plan::spark_executions::admit_family("minimax_m3", &exports,
@@ -143,6 +143,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     residual.inventory(&mut inventory, "residual")?;
     for (slot, owner) in owners.iter().enumerate() { owner.inventory(&mut inventory, &format!("unit.{slot}"))?; }
     for (slot, owner) in metadata.iter().enumerate() { owner.inventory(&mut inventory, &format!("metadata.{slot}"))?; }
+    admission::reconcile_sync_h2d(&library, &facts, &mut inventory)?;
     let receipts = inventory.receipts.iter().map(|receipt| serde_json::json!({
         "allocation":receipt.allocation, "address":receipt.address })).collect::<Vec<_>>();
     tracing::info!(receipts = %serde_json::to_string(&receipts)?, "MiniMax retained owner inventory");
@@ -165,6 +166,9 @@ fn run(args: GoldenArgs) -> Result<()> {
         tracing::error!(%error, "MiniMax terminal drainage failed; refusing to retire queued compute storage");
         std::process::abort();
     }
+    let mut final_inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax",
+        Lifetime::RESIDENT, Category::Staging, "cold golden completion");
+    admission::reconcile_sync_h2d(&library, &facts, &mut final_inventory)?;
     result
 }
 

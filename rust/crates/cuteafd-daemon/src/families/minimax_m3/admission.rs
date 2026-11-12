@@ -1,8 +1,41 @@
 //! Fixed cold-golden owners, admitted before target/cache/exchange allocation.
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Category, MemoryKind};
 use cuteafd_loader::{families::minimax_m3::{MiniMaxM3Config, execution::*, weight_layout::CoordinatorWeights},
     placement::{planner::*, PreparedSparkLink}, plan::Checkpoint};
+
+fn sync_h2d_bytes(checkpoint: &Checkpoint, weights: &CoordinatorWeights, rows: u32, tokens: u32) -> Result<u64> {
+    use cuteafd_loader::shared::dense_read::{ReadBatch, STEP_BYTES};
+    // One library-wide backing survives DenseLoad::release. The mount source
+    // is different storage and is live simultaneously with this copy buffer.
+    let mut bytes = (u64::from(tokens) * 256).max(u64::from(rows) * 8).max(16);
+    for (name, view) in weights.arena.views() {
+        let header = checkpoint.header(name).with_context(|| format!("MiniMax upload lacks {name}"))?;
+        let count = if header.shape.len() >= 2 { header.shape[0] } else { 1 };
+        ensure!(count > 0 && view.bytes() % count == 0, "MiniMax upload row extent");
+        let width = view.bytes() / count;
+        bytes = bytes.max(ReadBatch::new(count, width, width, STEP_BYTES)?.packed_bytes as u64);
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn reconcile_sync_h2d(library: &cuteafd_ffi::NativeLibrary, facts: &Facts,
+    inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+    let planned = facts.allocations.iter().find(|owner| owner.id == "sync-h2d")
+        .context("MiniMax synchronous upload owner was not admitted")?;
+    let buffer = library.sync_h2d_staging_buffer()?.context("MiniMax synchronous upload backing missing")?;
+    ensure!(planned.location == Location::PINNED && planned.view.is_none()
+        && !buffer.ptr.is_null() && buffer.bytes > 0 && buffer.bytes as u64 <= planned.bytes
+        && buffer.flags & cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED != 0,
+        "MiniMax synchronous upload backing {} exceeds/violates admitted owner {}",
+        buffer.bytes, planned.bytes);
+    let mut allocation = planned.clone();
+    allocation.bytes = buffer.bytes as u64;
+    inventory.extend(vec![Receipt { allocation, address: buffer.ptr as u64 }])?;
+    tracing::info!(admitted_bytes = planned.bytes, resident_bytes = buffer.bytes,
+        "MiniMax synchronous upload owner reconciled");
+    Ok(())
+}
 
 pub(crate) fn contract(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, weights: &CoordinatorWeights,
     manifest: &serde_json::Value, rows: u32, tokens: u32, waves: usize,
@@ -32,7 +65,9 @@ pub(crate) fn contract(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, weights: 
         c.extend(producers.workspace_components(&format!("{prefix}.attention"), 0, Lifetime::TARGET, pages)?);
     }
     let mut raw = vec![Allocation::buffer("residual", Location::coordinator(0), u64::from(tokens) * 6144 * 4,
-        Lifetime::TARGET, Category::Workspace, "cold scoring residual")];
+        Lifetime::TARGET, Category::Workspace, "cold scoring residual"),
+        Allocation::buffer("sync-h2d", Location::PINNED, sync_h2d_bytes(checkpoint, weights, rows, tokens)?,
+            Lifetime::RESIDENT, Category::Staging, "library-wide synchronous H2D backing")];
     // project downloads bytes and decodes an FP32 vector before releasing them.
     for name in ["head.download", "head.host-logits"] {
         raw.push(Allocation::buffer(name, Location::HOST,
@@ -76,4 +111,63 @@ pub(crate) fn admit(contract: &Contract, free: u64, total: u64, host: (u64, u64)
     tracing::info!(record = %serde_json::json!({"facts":facts,"budgets":budgets,"phases":phases}),
         "MiniMax cold golden admission");
     Ok(facts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::memory::receipts::Inventory;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use cuteafd_loader::serving_capacity::WeightArenaLayout;
+
+    #[test]
+    fn sync_upload_owner_takes_maximum_not_sum_or_mount_floor() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_snapshot(dir.path(), &serde_json::json!({"model_type":"fixture"}),
+            &[("weight".into(), "BF16", vec![64, 128])], None);
+        let checkpoint = Checkpoint::open(dir.path())?;
+        let weights = CoordinatorWeights { rank: 0, layers: vec![], projections: vec![],
+            arena: WeightArenaLayout::new("minimax/target/0", [("weight".into(), 64 * 128 * 2)])? };
+        assert_eq!(sync_h2d_bytes(&checkpoint, &weights, 256, 2)?, 16384);
+        assert_eq!(sync_h2d_bytes(&checkpoint, &weights, 4096, 2)?, 32768);
+        assert_eq!(sync_h2d_bytes(&checkpoint, &weights, 4096, 1000)?, 256000);
+        assert!(weights.mount_load(&checkpoint)?.pinned_source > 16384);
+        let source = include_str!("admission.rs").split("#[cfg(test)]").next().unwrap();
+        assert_eq!(source.matches("Allocation::buffer(\"sync-h2d\"").count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn sync_upload_reconciliation_observes_backing_and_rejects_unadmitted_growth() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let devices = [0];
+        let mut facts = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![],
+            allocations: vec![Allocation::buffer("sync-h2d", Location::PINNED, 16, Lifetime::RESIDENT,
+                Category::Staging, "library-wide synchronous H2D backing")], deferred: vec![],
+            sequential: vec![], reservations: vec![], allowances: vec![], driver_page_tables: vec![],
+            allocation_granularity: vec![] };
+        let inventory = || Inventory::new(CoordinatorDevices::new(&devices).unwrap(), "minimax",
+            Lifetime::TARGET, Category::Workspace, "fixture");
+        assert!(reconcile_sync_h2d(&library, &facts, &mut inventory()).is_err());
+        let destination = crate::shared::memory::device::Allocation::new(
+            crate::shared::memory::device::Device { library: &library, id: 0 }, 32,
+            cuteafd_core::memory_layout::Tag::workspace("fixture"))?;
+        library.copy_h2d(destination.buffer, &[0; 16])?;
+        let mut startup = inventory();
+        reconcile_sync_h2d(&library, &facts, &mut startup)?;
+        assert_eq!(startup.receipts.len(), 1);
+        assert_eq!(startup.receipts[0].allocation.id, "minimax.sync-h2d");
+        assert_eq!(startup.receipts[0].allocation.bytes, 16);
+        let mut completion = inventory();
+        reconcile_sync_h2d(&library, &facts, &mut completion)?;
+        assert_eq!(startup.receipts[0].address, completion.receipts[0].address);
+        library.copy_h2d(destination.buffer, &[0; 32])?;
+        assert!(reconcile_sync_h2d(&library, &facts, &mut inventory()).is_err());
+        facts.allocations[0].bytes = 32;
+        reconcile_sync_h2d(&library, &facts, &mut inventory())?;
+        assert_eq!(library.release_sync_h2d_staging()?, 32);
+        Ok(())
+    }
 }
