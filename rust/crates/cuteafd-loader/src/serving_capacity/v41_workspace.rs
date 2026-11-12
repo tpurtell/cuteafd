@@ -158,7 +158,7 @@ mod tests {
                         projection_backing_bytes(std::slice::from_ref(&combined))?);
                     let planes = backings.iter().flat_map(|b| b.views().iter().map(|(name, view)|
                         (name.clone(), view.bytes()))).collect::<std::collections::BTreeMap<_, _>>();
-                    assert_eq!(planes.len(), backings.iter().map(|b| b.views().len()).sum());
+                    assert_eq!(planes.len(), backings.iter().map(|b| b.views().len()).sum::<usize>());
                     assert_eq!(planes, combined.views().iter().map(|(name, view)|
                         (name.clone(), view.bytes())).collect());
                     for backing in backings {
