@@ -440,3 +440,25 @@ def test_one_token_dense_forward_matches_hand_computed_native_qdq(snapshot):
     # SwiGLU(1,1)=2*sigmoid(1.702), BF16=1.6953125, MXFP8 QDQ=1.75.
     actual = model.layer_forward(hidden, weights, cfg, 0, "served")
     torch.testing.assert_close(actual, torch.full_like(hidden, 3.75), rtol=0, atol=0)
+
+
+def test_isolated_nvfp4_scratch_contract_and_oai_plain_separation():
+    import importlib.util
+    path = ROOT / 'native/tests/minimax_nvfp4_expert_selftest.py'
+    spec = importlib.util.spec_from_file_location('minimax_expert_oracle', path)
+    oracle = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oracle)
+    for rows, capacity in [(1, 1), (16, 16), (64, 80)]:
+        offsets, sizes, extent = oracle.scratch_regions(128, 6144, 3072, rows, capacity)
+        assert all(offset % 1024 == 0 for offset in offsets)
+        assert all(b >= a + oracle.aligned(size) for a, b, size in zip(offsets, offsets[1:], sizes))
+        assert extent == offsets[-1] + oracle.aligned(sizes[-1])
+        assert sizes[5:7] == [0, 0]  # fused preactivations are not exported
+    gate = torch.tensor([[-10., -1., 0., 1., 10.]], dtype=torch.bfloat16)
+    up = torch.tensor([[10., -10., 0., 2., 10.]], dtype=torch.bfloat16)
+    clipped_gate, clipped_up = gate.float().clamp(max=7), up.float().clamp(-7, 7)
+    expected = (clipped_gate * torch.sigmoid(1.702 * clipped_gate) * (clipped_up + 1)).bfloat16()
+    assert torch.equal(model.swiglu_oai(gate, up), expected)
+    plain = (torch.nn.functional.silu(clipped_gate) * clipped_up).bfloat16()
+    assert not torch.equal(plain, expected)
+    assert model.swiglu_oai(gate, up)[0, 0] != model.swiglu_oai(gate.clamp(min=-7), up)[0, 0]
