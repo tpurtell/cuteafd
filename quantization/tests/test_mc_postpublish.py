@@ -226,3 +226,38 @@ def test_inherited_alias_is_same_inode_without_payload_copy(staged_inputs, tmp_p
     assert result['copied_bytes'] == result['fetched_bytes'] == 0
     post.alias_inherited(staged_inputs['receipt_path'], hub, receipt)
     assert source.stat().st_nlink == 2
+
+
+@pytest.mark.parametrize('budget', [None, 94.97021484375])
+@pytest.mark.parametrize('hints', [[], ['missing native export']])
+def test_verify_uses_qualified_budget_and_rejects_hints(staged_inputs, monkeypatch, budget, hints):
+    staged = post.stage(**staged_inputs)
+    root = staged_inputs['receipt_path'].parent
+    imported = dump(root / 'import.json', dict(status='offline-no-copy-imported',
+        stage_sha256=post.sha256_file(staged_inputs['receipt_path'])))
+    (Path(staged['repo']) / 'snapshots' / ('a' * 40) / 'cuteafd-mc.json').write_text('{}')
+    # The extra fixture marker is itself part of this test's verified inventory.
+    staged['files']['cuteafd-mc.json'] = dict(bytes=2, sha256=hashlib.sha256(b'{}').hexdigest())
+    dump(staged_inputs['receipt_path'], staged)
+    dump(imported, dict(status='offline-no-copy-imported',
+        stage_sha256=post.sha256_file(staged_inputs['receipt_path'])))
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps(dict(
+            fits=True, config_error=None, missing_shards=[], numerics_deviations=[], hints=hints)))
+    monkeypatch.setattr(post.subprocess, 'run', run)
+    args = (staged_inputs['receipt_path'], imported, Path(staged['repo']).parent,
+        Path('/planner'), Path('/PROGRAMS.json'), Path('/v4'), root / 'verify.json')
+    if hints:
+        with pytest.raises(ValueError, match='not ready'):
+            post.verify(*args, coordinator_weight_budget_gib=budget)
+    else:
+        assert post.verify(*args, coordinator_weight_budget_gib=budget)['verified_files'] == 3
+        assert len(calls) == 3
+    for command in calls:
+        assert '--require-ready' in command
+        if budget is None:
+            assert '--coordinator-weight-budget-gib' not in command
+        else:
+            assert command[command.index('--coordinator-weight-budget-gib') + 1] == str(budget)

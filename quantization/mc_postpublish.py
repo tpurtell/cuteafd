@@ -246,7 +246,8 @@ def import_staged(stage_receipt, receipt_path, *, nest='nest'):
     return receipt
 
 
-def verify(stage_receipt, import_receipt, hub, planner, programs, v4, receipt_path):
+def verify(stage_receipt, import_receipt, hub, planner, programs, v4, receipt_path,
+           coordinator_weight_budget_gib=None):
     staged, imported = load(stage_receipt), load(import_receipt)
     if imported.get('status') != 'offline-no-copy-imported' or imported['stage_sha256'] != sha256_file(stage_receipt):
         raise ValueError('matching completed no-copy import required')
@@ -270,6 +271,8 @@ def verify(stage_receipt, import_receipt, hub, planner, programs, v4, receipt_pa
             '--workspace-manifest', str(programs), '--json', '--require-ready']
         if view:
             command += ['--core-view', view]
+        if coordinator_weight_budget_gib is not None:
+            command += ['--coordinator-weight-budget-gib', str(coordinator_weight_budget_gib)]
         result = subprocess.run(command, capture_output=True, text=True, timeout=600, env=env)
         plan = dict(command=command, exit_code=result.returncode, stdout=result.stdout, stderr=result.stderr)
         plans[view or 'native'] = plan
@@ -277,7 +280,8 @@ def verify(stage_receipt, import_receipt, hub, planner, programs, v4, receipt_pa
         if result.returncode:
             raise ValueError('normal HF_HOME readiness failed; inspect receipt')
         parsed = json.loads(result.stdout)
-        if not parsed['fits'] or parsed['config_error'] or parsed['missing_shards'] or parsed['numerics_deviations']:
+        if (not parsed['fits'] or parsed['config_error'] or parsed['missing_shards']
+                or parsed['numerics_deviations'] or parsed.get('hints')):
             raise ValueError('imported checkpoint not ready')
     receipt = dict(schema='cuteafd-postpublish-verify-v1', status='imported-hashes-and-readiness-verified',
         stage_sha256=sha256_file(stage_receipt), import_sha256=sha256_file(import_receipt),
@@ -418,6 +422,8 @@ def main():
     v = commands.add_parser('verify')
     for key in ('stage-receipt', 'import-receipt', 'hub', 'planner', 'programs', 'v4', 'receipt'):
         v.add_argument('--' + key, type=Path, required=True)
+    v.add_argument('--coordinator-weight-budget-gib', type=float,
+                   help='Explicit weights-only cap used by the qualified readiness plan')
     d = commands.add_parser('check-dependencies')
     d.add_argument('--inventory', type=Path, required=True)
     d.add_argument('--root', type=Path, action='append', required=True)
