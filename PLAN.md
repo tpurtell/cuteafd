@@ -6,6 +6,19 @@ K2/Core-K6 and original-default MC checkpoint publication, native placement
 and guarded cleanup are complete; receipts are recorded in PR #1783.
 Serving and full-model generation/fidelity qualification remain pending #1777.
 
+TJ additionally authorized the post-publication storage handoff on Nov 12:
+native SparkNest `hf import --offline --no-copy`, then an even one-copy spread
+with `plan --place --factor 1/8` across `raptor:d2`, `raptor:d3`, ostrich, emu,
+dodo, kiwi, rhea and moa. A separate durable CPU service waits for verified
+publication and producer exit; the numerical producer remains frozen. Mandatory
+local reflinks bridge the /home and /srv Btrfs subvolumes without copying weight
+data. Reuse existing checksum receipts and native job/placement metadata; TJ
+explicitly declined an additional full-model hash or network weight reread.
+After successful placement, retire only this quant's off-grid managed copies,
+standalone export/cache, obsolete recovery payloads and build staging, checking
+process/container use first. Preserve managed source checkpoints, logs, scalar
+receipts and shared stores. Keep the progress timer until the handoff finishes.
+
 One attention/FFN-disaggregated engine for the open-weights MoE models that
 soar on consumer Blackwell: strong RTX PRO 6000 head(s) for attention, dense
 projections, routing, shared experts, sampling and speculation; a pool of DGX
