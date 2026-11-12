@@ -2228,7 +2228,7 @@ impl<'a> GlmfEngine<'a> {
         let tokens: Vec<u32> = (0..rows).map(|i| (i % self.cfg.vocab_size) as u32).collect();
         *tp2.schedule.borrow_mut() = Some(Default::default());
         tp2.checking.set(true);
-        self.prefill_units_with(&mut placement, &tokens, false, false, None, 1, None, None)?;
+        self.prefill_units_with(&mut placement, &tokens, false, false, None, 1, None, None, None)?;
         *tp2.schedule.borrow_mut() = Some(Default::default());
         tp2.checking.set(true);
         self.decode_step(&mut [(&mut placement, 1)], &[1], None, false, None, None, true)?;
@@ -3491,6 +3491,16 @@ impl<'a> GlmfEngine<'a> {
             })).transpose()
     }
 
+    /// Preserve the serving transformer's units; consume each head tile before reuse.
+    pub(crate) fn prefill_streamed_scoring(&self, placement: &mut GlmfPlacement, tokens: &[u32],
+        media: &cuteafd_engine::media::RequestMedia, scoring: crate::shared::probe::ScoringRows<'_>)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        let waves = if self.pipelined() { self.prefill_waves } else { 1 };
+        self.prefill_units_with(placement, tokens, true, false, Some(media), waves,
+            None, None, Some(scoring))?;
+        Ok((self.weights.layers.len() == self.cfg.layers).then_some(crate::shared::probe::ScoreLogits::Recorded))
+    }
+
     fn prefill_step(&self, placement: &mut GlmfPlacement, tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, all_logits: bool, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
@@ -3502,14 +3512,14 @@ impl<'a> GlmfEngine<'a> {
         }
         let waves = if on_layer.is_some() || forced.is_some() || !self.pipelined() { 1 }
             else { self.prefill_waves };
-        self.prefill_units_with(placement, tokens, all_logits, device, media, waves, on_layer, forced)
+        self.prefill_units_with(placement, tokens, all_logits, device, media, waves, on_layer, forced, None)
     }
 
     /// Compare executor widths without changing row cuts or numerical kernels.
     pub(crate) fn prefill_unit_width(&self, placement: &mut GlmfPlacement, tokens: &[u32], waves: usize)
         -> Result<Option<Vec<f32>>> {
         ensure!(waves > 0 && waves <= self.prefill_waves, "unit width exceeds admitted slots");
-        self.prefill_units_with(placement, tokens, true, false, None, waves, None, None)?
+        self.prefill_units_with(placement, tokens, true, false, None, waves, None, None, None)?
             .map(|logits| logits.into_host(self.library)).transpose()
     }
 
@@ -3535,7 +3545,8 @@ impl<'a> GlmfEngine<'a> {
     fn prefill_units_with(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool,
         device: bool, media: Option<&cuteafd_engine::media::RequestMedia>, waves: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<StepLogits>> {
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
         let (start, t) = (placement.len, tokens.len());
         // Cuts preserve MLA page alignment and recurrent state order.
         let cuts = if on_layer.is_some() || forced.is_some() {
@@ -3557,7 +3568,7 @@ impl<'a> GlmfEngine<'a> {
             first += n;
         }
         let logits = self.step_units_with(&steps, if all_logits { t } else { 1 }, device, media,
-            waves, on_layer, forced)?;
+            waves, on_layer, forced, scoring)?;
         placement.len += t;
         placement.kda_len = placement.len;
         Ok(logits)
@@ -5412,17 +5423,18 @@ impl<'a> GlmfEngine<'a> {
     /// Execute one continuous span with retained per-unit slots.
     fn step_units(&self, units: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<StepLogits>> {
-        self.step_units_with(units, logit_rows, device, media, self.prefill_waves, None, None)
+        self.step_units_with(units, logit_rows, device, media, self.prefill_waves, None, None, None)
     }
 
     fn step_units_with(&self, units: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>, waves: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<StepLogits>> {
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
         crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || self.shutdown_submission(),
             |scope| self.step_units_inner(scope, units, logit_rows, device, media,
-                waves, on_layer, forced))
+                waves, on_layer, forced, scoring))
     }
 }
 

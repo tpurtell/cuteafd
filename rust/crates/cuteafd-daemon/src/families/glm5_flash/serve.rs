@@ -320,6 +320,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         let encoder = vision.map_or(super::media::Encoder::Off, |vision| vision.encoder);
         let health = encoder.health_handle();
         let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
+        cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
         anyhow::ensure!(engine.has_expert_homes(), "serve-glmf needs an admitted home for every routed layer");
         anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
@@ -1020,7 +1021,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             }
                         };
 
-                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, true) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -1145,9 +1146,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits, &mut placement,
-                    |placement, chunk, rows, _position| {
-                        if rows > 1 {
+                    DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
+                    |placement, chunk, rows, position| {
+                        if rows > 1 && !engine.full_prefill_logits {
+                            engine.prefill_streamed_scoring(placement, chunk, &request_media,
+                                probe::ScoringRows { probe: &job.probe, position })
+                        } else if rows > 1 {
                             engine.prefill_scoring_media(placement, chunk, &request_media)
                         } else {
                             Ok(engine.prefill_media_device(placement, chunk, &request_media)?.map(probe::ScoreLogits::Device))

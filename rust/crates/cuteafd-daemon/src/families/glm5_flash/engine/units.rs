@@ -24,7 +24,7 @@ fn staging_turn(owners: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer:
     reuse
 }
 
-struct UnitHooks<'e, 'a, 'w, 'd, 'f, 't, 'n> {
+struct UnitHooks<'e, 'a, 'w, 'd, 'f, 't, 'n, 's> {
     engine: &'e GlmfEngine<'a>,
     /// The Spark link's transport worker (every Spark layer's waves).
     transport: Option<&'t mut crate::shared::spark_waves::Waves<'n>>,
@@ -39,13 +39,14 @@ struct UnitHooks<'e, 'a, 'w, 'd, 'f, 't, 'n> {
     wanted: usize,
     device: bool,
     logits: Vec<f32>,
+    scoring: Option<crate::shared::probe::ScoringRows<'s>>,
     result: Option<DeviceLogits>,
     media: Option<&'w cuteafd_engine::media::RequestMedia>,
     on_layer: Option<&'d mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     forced: Option<&'f dyn Fn(usize) -> Option<Vec<u8>>>,
 }
 
-impl<'a> UnitHooks<'_, 'a, '_, '_, '_, '_, '_> {
+impl<'a> UnitHooks<'_, 'a, '_, '_, '_, '_, '_, '_> {
     fn rows(&self, unit: &Unit) -> usize { unit.rows.len() }
     fn peer(&self, unit: &Unit) -> Result<Option<&Workspace<'a>>> {
         self.peer.map(|p| p.get(unit.slot)).transpose()
@@ -104,7 +105,7 @@ impl<'a> UnitHooks<'_, 'a, '_, '_, '_, '_, '_> {
     }
 }
 
-impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
+impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_, '_> {
     type Ticket = Ticket;
     fn route(&self, layer: usize) -> FfnRoute {
         if !self.engine.weights.layers[layer].dense
@@ -257,8 +258,13 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
                 let capacity = logits_capacity(w.logits.buffer.bytes, e.cfg.vocab_size)?;
                 for rows in head_spans(unit.rows.len(), wanted, capacity) {
                     e.logits(w, rows.end, rows.len(), false)?;
-                    self.logits.extend(e.download(&w.logits, rows.len() * e.cfg.vocab_size * 4)?
-                        .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+                    if let Some(scoring) = self.scoring {
+                        scoring.record(e.library, unit.rows.start + rows.start - (self.total - self.wanted),
+                            &e.device_logits(w, rows.len(), false))?;
+                    } else {
+                        self.logits.extend(e.download(&w.logits, rows.len() * e.cfg.vocab_size * 4)?
+                            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+                    }
                 }
             }
         }
@@ -272,7 +278,8 @@ impl<'a> GlmfEngine<'a> {
         steps: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>, max_waves: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<StepLogits>> {
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
         let waves = max_waves.min(self.prefill_waves).min(steps.len()).max(1);
         ensure!(on_layer.is_none() && forced.is_none() || waves == 1,
             "prefill diagnostics require executor N=1");
@@ -286,7 +293,7 @@ impl<'a> GlmfEngine<'a> {
         let total: usize = steps.iter().map(|(t, _)| t.positions.len()).sum();
         let capacity = logits_capacity(work[0].logits.buffer.bytes, self.cfg.vocab_size)?;
         ensure!(!device || logit_rows <= capacity, "device prefill logits exceed admitted rows");
-        ensure!(logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
+        ensure!(logit_rows <= total && (scoring.is_some() || self.full_prefill_logits || logit_rows <= DECODE_ROWS),
             "prefill logits exceed admitted rows");
         let mut ranked = Vec::new();
         let mut units = Vec::new();
@@ -318,7 +325,7 @@ impl<'a> GlmfEngine<'a> {
         let run = |transport: Option<&mut crate::shared::spark_waves::Waves<'_>>| {
             let mut hooks = UnitHooks { engine: self, transport, steps, ranked, work: &work, peer: peer.as_ref(),
                 released, consumed, waves, total, wanted: logit_rows, device, logits: Vec::new(), result: None,
-                media, on_layer, forced };
+                media, on_layer, forced, scoring };
             run_prefill_units(&mut hooks, &units, waves).map(|()| (hooks.result, hooks.logits))
         };
         // Spark waves build, post and land on the link's exchange worker
@@ -349,7 +356,7 @@ impl<'a> GlmfEngine<'a> {
         // stays queued: the next call's boundary drain (above) or the next reader
         // (selection, prefix capture) waits for it.
         if self.weights.layers.len() < self.cfg.layers { self.synchronize()?; return Ok(None); }
-        if logit_rows == 0 { return Ok(None); }
+        if logit_rows == 0 || scoring.is_some() { return Ok(None); }
         Ok(Some(if device { StepLogits::Device(result.context("last-unit logits")?) }
             else { StepLogits::Host(logits) }))
     }
@@ -373,6 +380,27 @@ mod tests {
         }
         assert_eq!(head_spans(4096, 129, 64).collect::<Vec<_>>(),
             vec![3967..4031, 4031..4095, 4095..4096]);
+    }
+
+    #[test]
+    fn streamed_tiles_map_unit_rows_to_contiguous_probe_positions() {
+        for lengths in [vec![1], vec![63, 65], vec![2752, 2752, 2752], vec![4096, 257]] {
+            let total: usize = lengths.iter().sum();
+            for wanted in [1, total / 2, total].into_iter().filter(|&n| n > 0) {
+                let mut first = 0;
+                let mut recorded = Vec::new();
+                for n in &lengths {
+                    let unit = first..first + n;
+                    let keep = unit.end.saturating_sub((total - wanted).max(unit.start));
+                    for rows in head_spans(*n, keep, DECODE_ROWS) {
+                        let offset = unit.start + rows.start - (total - wanted);
+                        recorded.extend(offset..offset + rows.len());
+                    }
+                    first = unit.end;
+                }
+                assert_eq!(recorded, (0..wanted).collect::<Vec<_>>());
+            }
+        }
     }
 
     #[test]

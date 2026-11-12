@@ -51,6 +51,17 @@ consumer-side evidence, not prerequisites for publishing a dataset.
 The numerical comparison design below describes how consumers can judge kernel
 changes using the fixed dataset; its old calibration campaigns are historical.
 
+### Bounded prefill scoring (2026-11-12)
+
+Kimi and GLM Flash accept prefill-shaped fidelity probes on ordinary serving
+launches, without reserving all-call logits before KV sizing. Scoring preserves
+the serving transformer's prefill calls and unit cuts, projects through existing
+head storage, and consumes selected rows before that storage is reused. Raw
+logits dumps use those same rows for byte-exactness and full-vocabulary KL.
+Other families retain their existing admission requirement during migration;
+the legacy flag remains only until each family's paired exactness check passes.
+Scoring continues through normal request admission.
+
 ## 0. Recommendation in one box
 
 - **Hard bar (paired, same engine, same positions, decode-shaped scoring):**

@@ -447,6 +447,20 @@ pub(crate) fn device_rows(library: &NativeLibrary, probe: &ProbeRef, logits: &De
     Ok(())
 }
 
+/// A selected-row consumer; device scratch may be reused as soon as `record` returns.
+#[derive(Clone, Copy)]
+pub(crate) struct ScoringRows<'p> {
+    pub probe: &'p ProbeRef,
+    pub position: usize,
+}
+
+impl ScoringRows<'_> {
+    pub(crate) fn record(self, library: &NativeLibrary, offset: usize, logits: &DeviceLogits) -> Result<()> {
+        let position = self.position.checked_add(offset).ok_or_else(|| anyhow::anyhow!("scoring position overflow"))?;
+        device_rows(library, self.probe, logits, 0, logits.rows, position)
+    }
+}
+
 /// Head tiles only: transformer calls and their causal/pipeline geometry stay unchanged.
 pub(crate) fn head_spans(rows: usize, capacity: usize) -> Result<impl Iterator<Item = std::ops::Range<usize>>> {
     anyhow::ensure!(rows > 0 && capacity > 0, "scoring head rows/capacity must be positive");
