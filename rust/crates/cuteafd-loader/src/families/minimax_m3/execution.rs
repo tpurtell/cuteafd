@@ -270,6 +270,49 @@ impl UnitLayout {
     }
 }
 
+/// One immutable unit's request metadata. Shared page tables belong to MsaCache;
+/// positions/causal extents differ by unit and must not alias a sibling slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitMetadata { pub rows: u32 }
+impl UnitMetadata {
+    pub fn new(rows: u32) -> Result<Self, Refusal> {
+        if rows == 0 || rows > 4096 {
+            return Err(Refusal::InvalidFact("MiniMax metadata row capacity".into()));
+        }
+        Ok(Self { rows })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        let rows = u64::from(self.rows);
+        vec![("positions", rows * 8), ("slots", rows * 8), ("batch_ids", rows * 4),
+            ("causal_lengths", rows * 4), ("cache_lengths", 4), ("query_offsets", 8),
+            ("key_descale", 16), ("value_descale", 16)]
+    }
+    pub fn components(self, prefix: &str, rank: u8, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        Self::new(self.rows)?;
+        components(self.buffers(), prefix, rank, Lifetime::TARGET, maximum_pages, Category::Workspace)
+    }
+}
+
+/// Native producers read one interleaved [positions, cos32 + sin32] FP32 table.
+/// This is intentionally not the shared two-plane BF16 rotary representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsaRope { pub positions: u32 }
+impl MsaRope {
+    pub fn new(cfg: &MiniMaxM3Config, positions: u32) -> Result<Self, Refusal> {
+        if positions == 0 || u64::from(positions) > cfg.max_position as u64
+            || cfg.rotary_dim != 64 || cfg.rope_theta != 10_000_000.0 {
+            return Err(Refusal::InvalidFact("MiniMax FP32 partial rotary geometry".into()));
+        }
+        Ok(Self { positions })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        vec![("cos_sin", u64::from(self.positions) * 64 * 4)]
+    }
+    pub fn components(self, prefix: &str, rank: u8, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.buffers(), prefix, rank, Lifetime::TARGET, maximum_pages, Category::Workspace)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MsaCache {
     pub layers: u32,

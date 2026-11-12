@@ -101,7 +101,8 @@ impl<'a> UnitOwner<'a> {
             // SAFETY: immutable arena view and unit-owned input/output survive
             // the retained stream; native binding checks all extents/aliases.
             unsafe { kernels.norm.norm(forward::NormBatch { rows, input: self.plane("residual")?,
-                weight, output: self.dense.producer_destination() }, self.stream.raw) }
+                weight, output: self.dense.producer_destination() }, self.stream.raw)?; }
+            Ok(())
         })
     }
     /// # Safety
@@ -177,7 +178,8 @@ impl<'a> UnitOwner<'a> {
             // former normalized activation may now be reused for OAI output.
             unsafe { (if shared { &kernels.oai_shared } else { &kernels.oai_dense }).oai(producers::OaiBatch {
                 rows, gate: self.plane("gate")?, up: self.plane("up")?,
-                output: self.dense.producer_destination() }, self.stream.raw) }
+                output: self.dense.producer_destination() }, self.stream.raw)?; }
+            Ok(())
         })?;
         let down = Self::projection(admitted, layer, &format!("{stem}.down_proj"))?;
         self.dense.prepare(&kernels.dense, down, rows as u32, self.stream.raw)?
