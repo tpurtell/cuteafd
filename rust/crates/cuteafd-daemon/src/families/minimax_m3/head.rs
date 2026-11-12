@@ -70,6 +70,12 @@ impl<'a> Head<'a> {
             }
         })
     }
+    pub fn copy_normalized(&self, bytes: &mut [u8]) -> Result<()> {
+        ensure!(!bytes.is_empty() && bytes.len() <= self.rows * 6144 * 2
+            && bytes.len() % (6144 * 2) == 0, "MiniMax normalized tap extent");
+        self.stream.drain()?;
+        self.stream.device.run(|| self.stream.device.library.copy_d2h(bytes, self.normalized.buffer))
+    }
     pub fn project(&self, weights: &TargetWeights<'_>, residual: Buffer, rows: usize) -> Result<Vec<f32>> {
         ensure!(rows > 0 && rows <= self.rows, "MiniMax head live rows");
         let norm = weights.operand("language_model.model.norm.weight")?.buffer;

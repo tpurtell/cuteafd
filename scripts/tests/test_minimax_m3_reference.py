@@ -268,6 +268,23 @@ def panel(tokens):
     return result
 
 
+def test_final_norm_tap_preserves_bf16_words_and_scored_input_offset(tmp_path):
+    from families.minimax_m3.golden import write_final_norm
+    import numpy as np
+    window = panel([1, 7, 3, 9, 11, 5, 2])["windows"][0]
+    values = torch.arange(4 * 32).reshape(4, 32).bfloat16() / 3
+    write_final_norm(tmp_path, window, values)
+    target = tmp_path / "windows/sample"
+    np.testing.assert_array_equal(np.fromfile(target / "final_norm.bf16.bin", dtype="<u2"),
+                                  values.view(torch.uint16).numpy().ravel())
+    assert json.loads((target / "final_norm.json").read_text()) == {
+        "dtype": "BF16", "hidden": 32, "first_input_row": 2, "rows": 4, "diagnostic_only": True}
+    with pytest.raises(ValueError, match="dtype/rows"):
+        write_final_norm(tmp_path, window, values.float())
+    with pytest.raises(ValueError, match="dtype/rows"):
+        write_final_norm(tmp_path, window, values[:3])
+
+
 @pytest.mark.parametrize("activation", ["served", "served-cache", "bf16"])
 def test_layer_resume_is_byte_exact_and_loads_only_remaining_layer(snapshot, tmp_path, monkeypatch, activation):
     from families.minimax_m3.golden import run_layers
@@ -280,6 +297,12 @@ def test_layer_resume_is_byte_exact_and_loads_only_remaining_layer(snapshot, tmp
     assert (trace / "layer00.attention_projected.bin").stat().st_size == 7 * 32 * 4
     assert (trace / "layer01.router_ids.bin").stat().st_size == 7 * 2 * 4
     assert (trace / "layer01.residual.bin").read_bytes() == (trace / "layer01.bin").read_bytes()
+    residuals, _ = run_layers(snapshot, manifest, tmp_path / "residuals", activation=activation,
+                              layers=[0, 1], residual_only=True)
+    assert residuals[0].path.read_bytes() == complete[0].path.read_bytes()
+    residual_trace = tmp_path / "residuals/windows/sample"
+    assert sorted(p.name for p in residual_trace.iterdir()) == ["layer00.bin", "layer01.bin"]
+    assert (residual_trace / "layer01.bin").read_bytes() == (trace / "layer01.bin").read_bytes()
     stopped, times = run_layers(snapshot, manifest, tmp_path / "partial", activation=activation, stop_after_layer=0)
     assert [t["layer"] for t in times] == [0]
     assert not (tmp_path / "partial/meta.json").exists()

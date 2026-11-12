@@ -28,8 +28,10 @@ pub(crate) struct GoldenArgs {
     /// New directory for shared scoring probes and fidelity.json.
     #[arg(long)] save_logits: PathBuf,
     #[arg(long)] window: Option<String>,
-    /// Diagnostic residual/branch taps beneath save-logits; requires one window.
+    /// Diagnostic residual/branch taps beneath save-logits; requires selected windows.
     #[arg(long, value_delimiter = ',', num_args = 1..)] tap_layers: Vec<usize>,
+    /// Keep only layer residuals, plus final normalized hidden and scored logits.
+    #[arg(long, requires = "tap_layers")] tap_residual_only: bool,
     #[arg(long, value_delimiter = ',', num_args = 1..)] peers: Vec<SocketAddr>,
     #[arg(long, default_value_t = 0)] device: i32,
     #[arg(long, default_value_t = 1024)] prefill_rows: u32,
@@ -52,8 +54,10 @@ fn reference(root: &Path, id: Option<&str>, vocab: usize) -> Result<Vec<Window>>
     let panel = fidelity_dataset::load(root, &manifest)?;
     let mut windows = fidelity_dataset::quick_windows(&panel)?;
     if let Some(id) = id {
-        windows.retain(|window| window.id == id);
-        ensure!(windows.len() == 1, "MiniMax window must belong to the sealed quick subset");
+        let ids = id.split(',').collect::<BTreeSet<_>>();
+        ensure!(ids.len() == id.split(',').count(), "MiniMax window IDs must be unique");
+        windows.retain(|window| ids.contains(window.id.as_str()));
+        ensure!(windows.len() == ids.len(), "MiniMax windows must belong to the sealed quick subset");
     }
     ensure!(!windows.is_empty() && windows.iter().all(|window| window.media.is_empty()
         && (2..=16384).contains(&window.tokens.len()) && window.score_from > 0
@@ -81,7 +85,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     ensure!(args.tap_layers.is_empty() || (args.window.is_some()
         && args.tap_layers.iter().all(|&layer| layer < 60)
         && args.tap_layers.iter().collect::<BTreeSet<_>>().len() == args.tap_layers.len()),
-        "MiniMax taps require one --window and unique layers 0..59");
+        "MiniMax taps require --window and unique layers 0..59");
     let view = args.attention.selected_view.clone().map(Ok)
         .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
@@ -216,12 +220,16 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
             head.embed(weights, &window.tokens[first..end], span)?;
         }
         let mut taps = if args.tap_layers.is_empty() { None } else {
-            let root = args.save_logits.join("layer-taps");
-            let taps = LayerTaps::new(root.clone(), &args.tap_layers, args.prefill_rows)?;
+            let parent = args.save_logits.join("layer-taps");
+            std::fs::create_dir_all(&parent)?;
+            let root = parent.join(&window.id);
+            let mut taps = LayerTaps::new(root.clone(), &args.tap_layers, args.prefill_rows)?;
+            taps.residual_only = args.tap_residual_only;
             std::fs::write(root.join("meta.json"), serde_json::to_vec(&serde_json::json!({
                 "diagnostic_only":true,"window":window.id,"tokens":window.tokens,
                 "input_rows":count,"hidden":6144,"layers":args.tap_layers,
                 "residual_dtype":"F32","branch_dtype":"BF16","byte_order":"little",
+                "residual_only":args.tap_residual_only,"final_norm_dtype":"BF16",
                 "row_index":"zero-based input token","provenance":provenance}))?)?;
             Some(taps)
         };
@@ -234,6 +242,7 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
             let rows = chunk.rows.len();
             let span = crate::shared::prefix::view(residual.buffer, first * 6144 * 4, rows * 6144 * 4)?;
             let logits = head.project(weights, span, rows)?;
+            if let Some(taps) = &mut taps { taps.final_norm(head, first, rows)?; }
             for (row, logits) in logits.chunks_exact(cfg.vocab_size).enumerate() {
                 let position = first + row + 1;
                 if position >= window.score_from { probe.row(position, logits); }

@@ -34,6 +34,7 @@ pub(crate) struct LayerTaps {
     root: std::path::PathBuf,
     layers: std::collections::BTreeSet<usize>,
     bytes: Vec<u8>,
+    pub residual_only: bool,
 }
 impl LayerTaps {
     pub fn host_bytes(rows: u32) -> u64 { u64::from(rows) * 6144 * 4 }
@@ -41,17 +42,23 @@ impl LayerTaps {
         ensure!(!layers.is_empty() && layers.iter().all(|&layer| layer < 60), "MiniMax tap layers outside decoder");
         std::fs::create_dir(&root)?;
         Ok(Self { root, layers: layers.iter().copied().collect(),
-            bytes: vec![0; usize::try_from(Self::host_bytes(rows))?] })
+            bytes: vec![0; usize::try_from(Self::host_bytes(rows))?], residual_only: false })
     }
     fn write(&mut self, layer: usize, stage: &str, plane: &str, width: usize,
         unit: &Unit, owner: &UnitOwner<'_>) -> Result<()> {
-        if !self.layers.contains(&layer) { return Ok(()); }
+        if !self.layers.contains(&layer) || (self.residual_only && stage != "residual") { return Ok(()); }
         let count = unit.rows.len().checked_mul(6144 * width).context("MiniMax tap extent")?;
         ensure!(count <= self.bytes.len(), "MiniMax tap exceeds admitted host buffer");
         owner.stream.drain()?;
         owner.stream.device.run(|| owner.stream.device.library.copy_d2h(
             &mut self.bytes[..count], owner.plane(plane)?))?;
         self.write_bytes(layer, stage, unit.rows.start, &self.bytes[..count])
+    }
+    pub fn final_norm(&mut self, head: &super::head::Head<'_>, first: usize, rows: usize) -> Result<()> {
+        let count = rows.checked_mul(6144 * 2).context("MiniMax final norm tap extent")?;
+        ensure!(count <= self.bytes.len(), "MiniMax final norm tap exceeds admitted host buffer");
+        head.copy_normalized(&mut self.bytes[..count])?;
+        self.write_bytes(60, "final_norm.bf16", first, &self.bytes[..count])
     }
     fn write_bytes(&self, layer: usize, stage: &str, first: usize, bytes: &[u8]) -> Result<()> {
         use std::io::Write;

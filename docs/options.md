@@ -97,16 +97,20 @@ the launcher derives from them.
 qualification-only native full-model prefill path; MiniMax serving stays refused.
 It requires `--nll --golden DATASET --save-logits NEW_DIR`, a checkpoint snapshot,
 native library and program manifest, and four real Spark `--peers` endpoints.
-`--window ID` selects one sealed quick-subset window. `--prefill-rows` defaults
+`--window ID[,ID...]` selects unique sealed quick-subset windows. `--prefill-rows` defaults
 to 1024 (page-aligned 256..4096); `--prefill-waves` defaults to 3 (1..4).
 `--check-headers` validates the immutable reference and checkpoint/export geometry
 without CUDA or workers. Scores use the shared top1024-plus-tail estimator;
 qualification requires mean KL <=0.03 and top-1 agreement >=0.95.
-Diagnostic `--tap-layers 0,1,2,3` requires one `--window` and unique layer IDs
+Diagnostic `--tap-layers 0,1,2,3` requires `--window` and unique layer IDs
 0..59. It writes F32 input/post-attention/final residuals and BF16 projected
-attention/local-MLP branches in `NEW_DIR/layer-taps`, with zero-based input-row
-suffixes and explicit diagnostic metadata. Copies drain the issuing stream and
-reuse one admitted host buffer; taps are off by default and do not waive scoring.
+attention/local-MLP branches in `NEW_DIR/layer-taps/ID`, with zero-based input-row
+suffixes and explicit diagnostic metadata. `--tap-residual-only` omits sublayer
+branches. Both modes also export the final BF16 normalized hidden before the
+head. Copies drain the issuing stream and reuse one admitted host buffer; taps
+are off by default and do not waive scoring. The family reference CLI's
+`--layers 0 1 ...` exports residuals, branches and scored final norm;
+`--residual-only` omits branches without bypassing ordinary prefix qualification.
 
 `cuteafd kimi-golden --rtx-expert-layers auto|all|N` defaults to `auto`, using
 startup's real-device admission rather than forcing zero coordinator layers.
