@@ -53,7 +53,8 @@ def compact():
 
 
 class Progress:
-    def __init__(self,root):
+    def __init__(self,root,*,host_limit_gib=58,gpu_limit_gib=86):
+        self.host_limit_gib,self.gpu_limit_gib=host_limit_gib,gpu_limit_gib
         self.root=Path(root);self.root.mkdir(parents=True,exist_ok=True)
         self.process=psutil.Process()
         self.state=dict(status="running",started=datetime.now(timezone.utc).isoformat(),pid=os.getpid(),
@@ -72,7 +73,8 @@ class Progress:
             f.write(canonical(row)+"\n")
         atomic_json(self.root/"status.json",self.state)
         print(canonical(row),flush=True)
-        if row["rss_gib"] > 58 or row["cuda_gib"] > 86 or row["free_gib"] < 64:
+        if (row["rss_gib"] > self.host_limit_gib or row["cuda_gib"] > self.gpu_limit_gib
+                or row["free_gib"] < 64):
             raise MemoryError("GLM producer exceeded host/GPU/disk admission")
 
 
@@ -344,9 +346,12 @@ class Engine:
         store.retire("a","b","c","d","e")
         return result
 
+    def assemble_layer(self,layer,replacements):
+        from .export import assemble_layer
+        return assemble_layer(self.source,layer,replacements,self.export,self.identity)
+
     @torch.inference_mode()
     def layer(self,layer,current,*,block=None,boundary_layer=None):
-        from .export import assemble_layer
         start=time.monotonic()
         boundary_layer=layer if boundary_layer is None else boundary_layer
         store=StageStore(self.root/f"layers/{layer:03d}/stages",self.identity)
@@ -383,7 +388,7 @@ class Engine:
             del block;compact()
         # Do not advance/retire the frontier until the complete layer shard
         # and its independent preserved-byte audit are durable.
-        receipt=assemble_layer(self.source,layer,checkpoints.replacements(names),self.export,self.identity)
+        receipt=self.assemble_layer(layer,checkpoints.replacements(names))
         manifest=store.load("f")
         links=hardlink_frontier(self.boundary,boundary_layer,store.directory("f"),manifest)
         current=self.boundary.commit(boundary_layer,links)
@@ -453,7 +458,21 @@ def main():
     parser.add_argument("--resume",action="store_true")
     parser.add_argument("--preflight",action="store_true")
     parser.add_argument("--publish-only",action="store_true")
+    parser.add_argument("--core-only",action="store_true")
+    parser.add_argument("--core-bits",type=int,choices=(8,))
+    parser.add_argument("--layer-limit",type=int)
     args=parser.parse_args()
+    if args.layer_limit is not None and (not args.core_only or args.layer_limit <= 0):
+        parser.error("--layer-limit requires --core-only and a positive integer")
+    if args.core_only:
+        if args.publish_only:
+            parser.error("core-only payload publication belongs to the MC assembler")
+        if args.core_bits is None:
+            args.core_bits=8
+        from .core_only import run_core_only
+        return run_core_only(args)
+    if args.core_bits is not None:
+        parser.error("--core-bits requires --core-only")
     from gptqmodel.utils.glm5_core import GlmBF16Source
     source=GlmBF16Source(args.source_snapshot)
     args.tokens,args.root,args.export=(p.expanduser().resolve() for p in (args.tokens,args.root,args.export))
