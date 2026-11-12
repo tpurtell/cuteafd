@@ -87,6 +87,9 @@ def tree_state(roots) -> dict:
 
 
 def _tree_state(root: Path) -> dict:
+    if root.is_file():
+        info = root.lstat()
+        return {str(root): (info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev)}
     state = {}
     for directory, _, names in os.walk(root):
         for name in names:
@@ -114,6 +117,7 @@ def run(args) -> int:
         os.execvp(command[0], command)
     roots = cache.Roots(ROOT, Path(args.build_dir))
     identity = {"schema": cache.SCHEMA, "layer": "invocation", "toolchain": toolchain,
+                "outputs": [normalized(path, roots) for path in args.output],
                 "argv": [normalized(argument, roots) for argument in command]}
     identity_key = cache.stable(identity)
     label = Path(next((part for part in command if part.endswith(".py")), command[0])).name
@@ -128,7 +132,10 @@ def run(args) -> int:
     if os.environ.get("CUTEAFD_EXPORT_CACHE_REQUIRE_HIT") == "1":
         cache.stats("required-hit-missed", layer="invocation", exporter=label)
         return 3
-    watched = output_roots(command, roots.build)
+    watched = ([Path(os.path.realpath(path)) for path in args.output]
+               if args.output else output_roots(command, roots.build))
+    if any(path != roots.build and roots.build not in path.parents for path in watched):
+        raise ValueError("declared export output is outside the build directory")
     with tempfile.TemporaryDirectory(prefix="export-reads-") as reads:
         environment = dict(os.environ)
         environment["CUTEAFD_EXPORT_CACHE_OUTPUTS"] = json.dumps([str(path) for path in watched])
@@ -231,6 +238,8 @@ def main() -> int:
     sub = parser.add_subparsers(dest="action", required=True)
     runner = sub.add_parser("run")
     runner.add_argument("--build-dir", required=True)
+    runner.add_argument("--output", action="append", default=[],
+                        help="exact output file or owned subtree (repeatable; excludes parallel sibling jobs)")
     runner.add_argument("command", nargs=argparse.REMAINDER)
     summary = sub.add_parser("stats")
     summary.add_argument("file", type=Path)

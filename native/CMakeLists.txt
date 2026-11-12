@@ -336,9 +336,10 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
   # Every export command runs through the content-addressed export cache
   # (scripts/build/export-cache.py): a pass-through unless CUTEAFD_EXPORT_CACHE
   # names a store and CUTEAFD_EXPORT_IMAGE_ID the compiler image.
-  set(CUTEAFD_EXPORT_LAUNCHER "${Python3_EXECUTABLE}"
+  set(CUTEAFD_EXPORT_CACHE_COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/export-cache.py" run
-    --build-dir "${CMAKE_CURRENT_BINARY_DIR}" --)
+    --build-dir "${CMAKE_CURRENT_BINARY_DIR}")
+  set(CUTEAFD_EXPORT_LAUNCHER ${CUTEAFD_EXPORT_CACHE_COMMAND} --)
   execute_process(
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     RESULT_VARIABLE CUTEAFD_SPARKINFER_VERIFY_RESULT

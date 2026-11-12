@@ -220,6 +220,10 @@ def is_path(value) -> bool:
     return isinstance(value, (str, bytes, os.PathLike))
 
 
+def user_magic_present():
+    return any(os.path.lexists(os.path.expanduser(name)) for name in ("~/.magic", "~/.magic.mgc"))
+
+
 def evaluate(roots: Roots, check: str):
     """The current value of one recorded check."""
     kind, _, rest = check.partition("|")
@@ -234,6 +238,8 @@ def evaluate(roots: Roots, check: str):
         return import_probe(roots.path(directory), tail)
     if kind == "env":
         return os.environ.get(rest)
+    if kind == "file-user-magic":
+        return user_magic_present()
     raise ValueError(f"unknown check {check}")
 
 
@@ -451,6 +457,34 @@ class Recorder:
                 self.unknown.add("python-child-without-site")
             if environment is not None and environment.get(READS_ENV) != os.environ.get(READS_ENV):
                 self.unknown.add("python-child-without-recorder")
+            return
+        if program == "file":
+            # Only plain read-only probes; alternate magic databases and indirect
+            # file lists need their own input scanner.
+            self.note_read(shutil.which(os.fsdecode(executable)) or os.fsdecode(executable))
+            for name in ("MAGIC", "HOME", "POSIXLY_CORRECT", "LC_ALL", "LC_CTYPE", "LANG"):
+                value = os.environ.get(name)
+                if environment is not None and environment.get(name) != value:
+                    self.unknown.add("file-environment:" + name)
+                    return
+                self._observe("env|" + name, lambda value=value: value)
+            # Only the image's default database is known; user databases are
+            # refused, including one created between this run and a lookup.
+            self._observe("file-user-magic|", user_magic_present)
+            if os.environ.get("MAGIC") or user_magic_present():
+                self.unknown.add("file-user-magic")
+                return
+            positional = False
+            for path in argv[1:]:
+                if path == "--" and not positional:
+                    positional = True
+                elif path.startswith("-") and not positional:
+                    if path not in ("-b", "--brief", "-L", "--dereference"):
+                        self.unknown.add("file-option:" + path)
+                        return
+                else:
+                    self.note_read(path)
+                    self.note_stat(path, stat_kind(path))
             return
         if program in QUERIES:
             return
