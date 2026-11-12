@@ -24,14 +24,14 @@ def load_exporter(monkeypatch):
 def test_local_shapes_and_sides(monkeypatch):
     shapes = load_exporter(monkeypatch)["KIMI_SHAPES"]
     assert len({name for name, *_ in shapes}) == len(shapes)
-    assert {(k, n, side) for _, k, n, side in shapes} == {
+    assert {item[1:4] for item in shapes} == {
         (7168, 6144, 1), (6144, 7168, 2), (7168, 3072, 1), (3072, 7168, 2),
         (7168, 3584, 1), (3584, 7168, 1), (7168, 1536, 1), (7168, 640, 1),
         (1536, 18432, 1), (1536, 9216, 1), (7168, 12288, 1),
         (12288, 7168, 1), (7168, 163840, 1), (6144, 7168, 1),
     }
-    assert all(k % 128 == n % 128 == 0 for _, k, n, _ in shapes)
-    assert not any(n == 576 or k == 1792 or n == 1792 for _, k, n, _ in shapes)
+    assert all(k % 128 == n % 128 == 0 for _, k, n, *_ in shapes)
+    assert not any(n == 576 or k == 1792 or n == 1792 for _, k, n, *_ in shapes)
 
 
 def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
@@ -117,7 +117,9 @@ def test_k8_screen_is_opt_in_and_names_do_not_collide(monkeypatch):
     transforms.compile_trellis_output_aot = lambda **params: params
     monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
     shipping = module["programs"](families=tuple(module["FAMILY_SHAPES"]))
-    assert {params["bits"] for _, op, params, _ in shipping if op == "trellis_linear"} == {4, 6}
+    assert {params["bits"] for _, op, params, _ in shipping if op == "trellis_linear"} == {4, 6, 8}
+    assert all(params["bits"] == 6 for name, op, params, _ in shipping
+               if op == "trellis_linear" and name.startswith("trellis_ml4_"))
     shapes = module["KIMI_SHAPES"] + module["kimi_k8_screen_shapes"]()
     screen = module["programs_for_shapes"](shapes)
     assert len({name for name, *_ in screen}) == len(screen)
@@ -175,17 +177,17 @@ def test_bf16_diagnostic_specialization_preserves_stems_and_default(monkeypatch)
 def test_glm_architecture_geometries_and_unique_policy_lookup(monkeypatch):
     module = load_exporter(monkeypatch)
     shapes = module["shapes_for"](("glm",))
-    assert {(k, n, side) for _, k, n, side in shapes} == {
+    assert {item[1:4] for item in shapes} == {
         (6144, 2048, 1), (6144, 640, 1), (2048, 16384, 1), (2048, 8192, 1),
         (16384, 6144, 1), (8192, 6144, 2), (6144, 12288, 1), (6144, 6144, 1),
         (12288, 6144, 1), (6144, 6144, 2), (6144, 1024, 1), (2048, 6144, 1),
         (1024, 6144, 2), (6144, 154880, 1),
     }
     policies = module["row_policies"](("kimik3", "glm"))
-    keys = [(p["input_features"], p["output_features"], p["sharded_side"], p["codebook"])
+    keys = [(p["input_features"], p["output_features"], p["sharded_side"], p["codebook"], p.get("bits", 6))
             for p in policies]
     assert len(set(keys)) == len(keys)
-    assert all(k % 128 == n % 128 == 0 for _, k, n, _ in shapes)
+    assert all(k % 128 == n % 128 == 0 for _, k, n, *_ in shapes)
     head = next(p for p in policies if p["shape"] == "glm_lm_head")
     assert head["output_program"] == "trellis_output_n154880_f32"
     assert (6144, 576, 1) not in {item[1:] for item in shapes}
@@ -276,7 +278,7 @@ def test_muse_geometries_dtypes_and_existing_family_order(monkeypatch):
             setattr(fake, method, lambda **params: params)
         monkeypatch.setitem(sys.modules, name, fake)
     geometries = {shape[1:] for shape in module["shapes_for"](("muse",))}
-    assert geometries == {(8192, 4096, 1), (8192, 8192, 1), (8192, 512, 1),
+    assert {shape[:3] for shape in geometries} == {(8192, 4096, 1), (8192, 8192, 1), (8192, 512, 1),
                           (8192, 1024, 1), (4096, 8192, 2), (4096, 8192, 1),
                           (8192, 2048, 1), (2048, 8192, 2), (8192, 202112, 1)}
     programs = module["programs"](families=("muse",), input_dtype="bf16")
@@ -284,7 +286,7 @@ def test_muse_geometries_dtypes_and_existing_family_order(monkeypatch):
     assert {"trellis_output_n8192_bf16", "trellis_output_n8192_f32",
             "trellis_output_n202112_f32"} <= names
     policies = module["row_policies"](("muse",))
-    assert len(policies) == 18
+    assert len(policies) == 36
     for policy in policies:
         assert all(policy[field] in names for field in ("native_input", "native_program", "output_program"))
         expected = "f32" if policy["shape"] in ("muse_o_tp2", "muse_post_expert_tp2", "muse_lm_head") else "bf16"
@@ -355,3 +357,20 @@ def test_muse_f32_head_chunk_row_invariance():
         assert torch.equal(result.cpu().view(torch.int32), expected_softcap.view(torch.int32)), (
             f"Muse trimmed/softcapped head depends on chunk rows={chunk}")
         print(f"Muse head byte-invariant: chunk={chunk}, rows=128, second_chunk=64", flush=True)
+
+
+@pytest.mark.parametrize("family", ["glm", "step5"])
+def test_k8_target_shapes_and_shared_mtp_widths(monkeypatch, family):
+    module = load_exporter(monkeypatch)
+    shapes = module["shapes_for"]((family,))
+    key = lambda item: (*item[1:4], module["_bits"](item))
+    targets = [item for item in module["FAMILY_SHAPES"][family] if module["_bits"](item) == 6]
+    assert {key(item) for item in shapes if module["_bits"](item) == 8} == {
+        (*item[1:4], 8) for item in targets}
+    assert all(module["_bits"](item) == 4 for item in shapes if "mtp" in item[0])
+    assert all(module["_bits"](item) == 6 for item in module["shapes_for"](("ml4",)))
+    policies = module["row_policies"]((family,))
+    keys = [(p["input_features"], p["output_features"], p["sharded_side"],
+             p["codebook"], p.get("bits", 6)) for p in policies]
+    assert len(keys) == len(set(keys))
+    assert all(p["native_program"].endswith("_k8") for p in policies if p.get("bits") == 8)

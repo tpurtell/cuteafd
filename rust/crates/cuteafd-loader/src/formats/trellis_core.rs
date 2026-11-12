@@ -182,6 +182,8 @@ pub struct CoreContract {
     pub widths: &'static [usize],
     pub split: CoreSplit,
     pub padded_outputs: bool,
+    /// Only target-core widths follow CORE_VIEW; shared fixed-width drafts do not.
+    pub view_varying: bool,
 }
 
 impl CoreContract {
@@ -240,7 +242,7 @@ pub fn read_projections(
         let suffixes = members.keys().map(String::as_str).collect::<Vec<_>>();
         let module = exl3_module(&stem, &suffixes, |suffix| members.get(suffix).map(|t| &t.meta))?;
         contract.validate_width(&stem, module.bits)?;
-        if checkpoint.view.as_ref().is_some_and(|view| view.is_mc()) {
+        if contract.view_varying && checkpoint.view.as_ref().is_some_and(|view| view.is_mc()) {
             let expected_bits = match checkpoint.core_view() {
                 crate::plan::checkpoint::CoreView::K6Compact => 6,
                 crate::plan::checkpoint::CoreView::K8Compact => 8,
@@ -319,7 +321,7 @@ mod tests {
     #[test]
     fn family_shipping_contracts_refuse_nonshipping_widths() -> Result<()> {
         for family in ["GLM 5.3", "GLM Flash", "Muse", "Mistral Large 4", "Step-5"] {
-            let contract = CoreContract { family, widths: &[6], split: CoreSplit::Whole, padded_outputs: false };
+            let contract = CoreContract { family, widths: &[6], split: CoreSplit::Whole, view_varying: true, padded_outputs: false };
             contract.validate_width("model.q_proj", 6)?;
             for bits in [4, 5, 8] {
                 let error = contract.validate_width("model.q_proj", bits).unwrap_err().to_string();

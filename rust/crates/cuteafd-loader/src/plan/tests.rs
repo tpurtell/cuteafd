@@ -200,7 +200,7 @@ fn glm_and_ml4_planner_native_core_widths_equal_loader_contracts() {
     let cases: [(&dyn family::Family, &str, Vec<usize>, &[usize]); 3] = [
         (&families::glm::GLM5, "lm_head", vec![64, 6144], crate::families::glm5::core::NATIVE_CORE_WIDTHS),
         (&families::glm::GLM5_FLASH, "lm_head", vec![64, 4096], crate::families::glm5_flash::core::NATIVE_CORE_WIDTHS),
-        (&families::mistral_large4::MISTRAL_LARGE4, "output", vec![204800, 6144], crate::families::glm5::core::NATIVE_CORE_WIDTHS),
+        (&families::mistral_large4::MISTRAL_LARGE4, "output", vec![204800, 6144], crate::families::glm5::core::ML4_CORE_WIDTHS),
     ];
     for ((family, stem, shape, widths), dir) in cases.into_iter().zip(&dirs) {
         let checkpoint = Checkpoint::open(dir.path()).unwrap();

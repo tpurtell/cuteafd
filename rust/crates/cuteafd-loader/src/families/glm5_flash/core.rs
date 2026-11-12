@@ -91,7 +91,7 @@ impl CoreInventory {
                 && !leaf.contains(".experts."));
         let expected = expected(cfg);
         let projections = read_projections(checkpoint, &expected, selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { family: "GLM Flash", widths: NATIVE_CORE_WIDTHS, split, padded_outputs: false }))?;
+            |stem| split(cfg, stem).map(|split| CoreContract { family: "GLM Flash", widths: NATIVE_CORE_WIDTHS, split, view_varying: true, padded_outputs: false }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
         // Stage complete native MLA/FFN groups whenever a member is BF16.
         // KDA's packed BF16 path already preserves its source precision.

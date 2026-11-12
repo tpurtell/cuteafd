@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, ffi::c_void};
 /// Every actual header-selected geometry is resolved before capture. Projection
 /// scratch is serialized; the caller retains split output cores in row slots.
 pub(crate) struct CorePrograms<'a> {
-    projections: BTreeMap<(usize, usize, usize, &'static str), Projection<'a>>,
+    projections: BTreeMap<(usize, usize, usize, &'static str, usize), Projection<'a>>,
     layouts: [Option<ProjectionLayout>; 2],
     stages: [cuteafd_loader::families::glm5::core::CoreStageLayout; 2],
     native_bf16: [cuteafd_ffi::draft_projection::DraftProjections<'a>; 2],
@@ -31,7 +31,7 @@ impl<'a> CorePrograms<'a> {
         for weights in layers.iter().flat_map(|layer| layer.core.values()) {
             let key = projection_key(weights);
             if projections.contains_key(&key) { continue; }
-            let projection = Projection::load_geometry(programs, key.0, key.1, key.2, key.3,
+            let projection = Projection::load_geometry_bits(programs, key.0, key.1, key.2, key.4, key.3,
                 rows, TrellisDType::Bf16)?;
             ProjectionLayout::new(&projection.program, rows)?;
             for (layout, rows) in layouts.iter_mut().zip([super::engine::DECODE_ROWS, unit]) {
@@ -173,9 +173,9 @@ impl CoreScratch<'_> {
 fn stage_program(name: &str, ranks: usize) -> bool {
     cuteafd_loader::families::glm5::DensePrograms::Trellis.stage(name, ranks == 2)
 }
-fn projection_key(weights: &CoreWeights<'_>) -> (usize, usize, usize, &'static str) {
+fn projection_key(weights: &CoreWeights<'_>) -> (usize, usize, usize, &'static str, usize) {
     use cuteafd_loader::formats::dense_trellis::TrellisSide;
-    (weights.shape[1], weights.shape[0], if weights.side == TrellisSide::Input { 2 } else { 1 }, book(weights))
+    (weights.shape[1], weights.shape[0], if weights.side == TrellisSide::Input { 2 } else { 1 }, book(weights), weights.bits)
 }
 
 pub(crate) use crate::shared::dense_trellis::{CoreHead, head_launch};

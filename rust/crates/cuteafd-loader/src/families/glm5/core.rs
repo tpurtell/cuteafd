@@ -3,9 +3,13 @@
 use super::GlmDsaConfig;
 use crate::{formats::trellis_core::{CoreContract, read_projections}, plan::Checkpoint};
 
-// GLM 5.3 still binds K6-only programs. ML4 ships its original FP8 core or K6,
-// not K8; both need exporter and runtime dispatch changes before widening.
-pub(crate) const NATIVE_CORE_WIDTHS: &[usize] = &[6];
+// GLM MC targets bind header-selected K6/K8 programs; ML4 remains K6-only.
+pub(crate) const NATIVE_CORE_WIDTHS: &[usize] = &[6, 8];
+pub(crate) const ML4_CORE_WIDTHS: &[usize] = &[6];
+
+fn core_widths(cfg: &GlmDsaConfig) -> &'static [usize] {
+    if cfg.variant.is_glm() { NATIVE_CORE_WIDTHS } else { ML4_CORE_WIDTHS }
+}
 pub use crate::formats::trellis_core::{CoreProjection, CoreSplit, ProjectionScratchLayout};
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
@@ -203,8 +207,8 @@ impl CoreInventory {
             (role, false)
         })?;
         let projections = read_projections(checkpoint, &expected(cfg), selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: NATIVE_CORE_WIDTHS, split,
-                padded_outputs: kv_a.contains(stem) }))?;
+            |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: core_widths(cfg), split,
+                view_varying: true, padded_outputs: kv_a.contains(stem) }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
         let shapes = expected(cfg);
         for layer in 0..cfg.layers {
@@ -541,11 +545,11 @@ impl CoreCharges {
 
 fn policy_programs(weight: &crate::formats::trellis_core::CoreWeightLayout,
     manifest: &serde_json::Value) -> Result<[String; 3]> {
-    use cuteafd_ffi::dense_trellis::{validate_package_geometry, TrellisDType};
+    use cuteafd_ffi::dense_trellis::{validate_package_geometry_bits, TrellisDType};
     let book = match weight.codebook { crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
         crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" };
     let side = if weight.side == crate::formats::dense_trellis::TrellisSide::Input { 2 } else { 1 };
-    validate_package_geometry(manifest, weight.shape[1], weight.shape[0], side, book, 4096,
+    validate_package_geometry_bits(manifest, weight.shape[1], weight.shape[0], side, weight.bits, book, 4096,
         // The vocabulary head (GLM `lm_head`, Mistral `output`) produces F32 logits.
         if matches!(weight.stem.as_str(), "lm_head" | "output") { TrellisDType::F32 } else { TrellisDType::Bf16 })
         .with_context(|| format!("{}: GLM native K6 package", weight.stem))

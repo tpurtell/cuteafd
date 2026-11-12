@@ -37,7 +37,10 @@ Stored `k8-compact` and `k6-compact` views are offered by
 `wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC`,
 `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC` and
 `wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`; `cuteafd-mc.json` declares the
-views actually present at the selected revision. Plain checkpoints support only
+views actually present at the selected revision. Step-5 and GLM 5.3 also execute
+header-native K6/K8 target cores (including vocabulary heads); Step-5 shared MTP
+projections stay K4 in every view. ML4 stays K6-only for quantized core storage;
+its FP8 original has no quantized core. Plain checkpoints support only
 `original`, including checkpoints that previously accepted Flash `fp8-compact`.
 MC `fp8-compact` converts exactly the original variant's `core_tensors`; published
 Flash MCs include KDA and the target head. Explicit KDA/head conversion keys apply

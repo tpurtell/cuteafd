@@ -2005,3 +2005,51 @@ fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result
     }
     Ok(())
 }
+
+#[test]
+fn mc_target_views_preserve_fixed_k4_mtp_contract() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{CheckpointView, CoreView};
+    let original = exl3_snapshot();
+    let cp = Checkpoint::inventory(original.path())?;
+    let cfg = Config::parse(&cp)?;
+    let tensors = cp.tensors.iter().map(|t| (t.meta.name.clone(),
+        match t.meta.dtype { DType::Bf16 => "BF16", DType::F16 => "F16", DType::F32 => "F32",
+            DType::I16 => "I16", DType::I32 => "I32", DType::U8 => "U8", DType::F8E4M3 => "F8_E4M3",
+            _ => panic!("fixture dtype") }, t.meta.shape.clone())).collect::<Vec<_>>();
+    let target = exl3::expected(&cfg).into_iter().filter(|(name, _)|
+        exl3::split(&cfg, name.strip_suffix(".weight").unwrap()).is_some()
+        && !name.strip_prefix("model.layers.").and_then(|s| s.split('.').next())
+            .and_then(|s| s.parse::<usize>().ok()).is_some_and(|layer| layer >= cfg.layers))
+        .collect();
+    for mtp_bits in [4, 6, 8] {
+        let mut tensors = tensors.clone();
+        for (name, _, shape) in &mut tensors {
+            if name.starts_with("model.layers.92.") && name.ends_with(".trellis") {
+                shape[2] = 16 * mtp_bits;
+            }
+        }
+        let fixture = tempfile::tempdir()?;
+        testing::write_mc_snapshot(fixture.path(), &cp.config, &tensors, &target);
+        for view in [CoreView::Original, CoreView::K8Compact, CoreView::K6Compact] {
+            let checkpoint = Checkpoint::open_view(&CheckpointView::select(fixture.path(), view)?)?;
+            let inventory = exl3::CoreInventory::from_checkpoint(&cfg, &checkpoint);
+            if mtp_bits != 4 {
+                let error = format!("{:#}", inventory.unwrap_err());
+                assert!(error.contains("shipping widths [4]"), "{view:?}: {error}");
+                continue;
+            }
+            let inventory = inventory?;
+            assert_eq!(inventory.get("model.layers.92.eh_proj").unwrap().bits, 4);
+            assert_eq!(inventory.get("model.layers.94.transformer.shared_head.output").unwrap().bits, 4);
+            if view == CoreView::Original {
+                assert_eq!(inventory.projections.len(), 27);
+                assert!(inventory.get("lm_head").is_none());
+            } else {
+                assert_eq!(inventory.projections.len(), 672);
+                assert_eq!(inventory.get("lm_head").unwrap().bits,
+                    if view == CoreView::K8Compact { 8 } else { 6 });
+            }
+        }
+    }
+    Ok(())
+}
