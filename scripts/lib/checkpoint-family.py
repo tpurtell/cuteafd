@@ -5,7 +5,7 @@ layers carry routed experts.
   checkpoint-family.py CONFIG_JSON   -> "FAMILY MODEL_TYPE FIRST_LAYER LAST_LAYER"
 
 FAMILY is the long family id (deepseek_v41, deepseek_v4, glm5, glm5_flash,
-mimo_v2, qwen4, qwen3_5, step5, kimi_k3, muse_spark, mistral_large4). The Spark ranks serve routed experts on [FIRST, LAST]
+mimo_v2, qwen4, qwen3_5, step5, kimi_k3, muse_spark, mistral_large4, minimax_m3). The Spark ranks serve routed experts on [FIRST, LAST]
 (LAST -1: through the end); MTP/nextn layers past the decoder stay off them for
 GLM 5.3 Flash and Qwen 3.8, whose serve paths do not run their MTP heads.
 
@@ -37,6 +37,7 @@ FAMILIES = {
     "kimi_k31": "kimi_k3",
     "muse_spark": "muse_spark",
     "mistral_large4": "mistral_large4",
+    "minimax_m3_vl": "minimax_m3",
 }
 
 
@@ -94,7 +95,8 @@ def describe(config: dict) -> tuple[str, str, int, int]:
     if family is None:
         raise SystemExit(f"unsupported model_type {kind!r}; known: {', '.join(sorted(FAMILIES))}")
     first, last = 0, -1
-    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "muse_spark", "mistral_large4"):
+    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "muse_spark", "mistral_large4",
+                  "minimax_m3"):
         layers = text.get("num_hidden_layers")
         if not isinstance(layers, int) or layers <= 0:
             raise SystemExit("config lacks num_hidden_layers")
@@ -140,6 +142,17 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         # mtp_dspark drafter is dense, so the Sparks serve backbone layers only.
         first = _dense_prefix(text, layers)
         last = layers - 1
+    elif family == "minimax_m3":
+        # text_config.moe_layer_freq: 0 dense, 1 routed, one entry per layer (the
+        # loader's MiniMaxM3Config reads the same list). The DSpark drafter is dense.
+        freq = text.get("moe_layer_freq")
+        if (not isinstance(freq, list) or len(freq) != layers
+                or any(type(x) is not int or x not in (0, 1) for x in freq)):
+            raise SystemExit("minimax_m3 needs text_config.moe_layer_freq of 0/1 per layer")
+        first = freq.index(1) if 1 in freq else layers
+        if 0 in freq[first:]:
+            raise SystemExit("unsupported minimax_m3 MoE layer pattern: dense layer after a routed one")
+        last = layers - 1
     elif family in ("qwen4", "qwen3_5"):
         kinds = {"linear_attention": "gdn", "full_attention": "full"}
         if _pattern(text, layers, {"layer_types": kinds}) is None:
@@ -175,7 +188,7 @@ def routed_layers(config: dict) -> int | None:
     if family == "glm5_flash":
         # Reuse the runtime-equivalent pattern checks, including agreement.
         describe(config)
-    if family in ("kimi_k3", "mistral_large4"):
+    if family in ("kimi_k3", "mistral_large4", "minimax_m3"):
         _, _, first, last = describe(config)
         return last - first + 1
     dense = _pattern(text, layers, {"mlp_layer_types": {"dense": True, "sparse": False},

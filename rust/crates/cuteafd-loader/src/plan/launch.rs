@@ -68,6 +68,16 @@ pub fn describe(config: &Value) -> Result<LaunchDescription> {
             let (first, last) = kimi_routed(text_config(config))?;
             ("kimi_k3", first, Some(last))
         }
+        // `text_config.moe_layer_freq` marks routed layers; the bundled DSpark
+        // drafter is dense, so the Sparks serve backbone layers only.
+        "minimax_m3_vl" => {
+            let cfg = crate::families::minimax_m3::MiniMaxM3Config::from_hf(config)?;
+            let first = cfg.moe.iter().position(|&moe| moe).unwrap_or(cfg.layers);
+            if cfg.moe[first..].iter().any(|&moe| !moe) {
+                bail!("unsupported minimax_m3 MoE layer pattern: dense layer after a routed one");
+            }
+            ("minimax_m3", first, Some(cfg.layers - 1))
+        }
         // Every Muse decoder layer is a MoE (`mlp_layer_types` all sparse).
         "muse_spark" => {
             let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(config)?;
