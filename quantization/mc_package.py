@@ -168,11 +168,13 @@ def view_metadata(parent_quant, parent_config, selection, specs, *, bits, quanti
             quant.pop(key, None)
         else:
             quant[key] = bits
-    for key in ('kept_tensors', 'retained_native_tensors'):
-        if key in quant:
-            if bits is None:
-                quant[key].update({name: dict(shape=shape, torch_dtype=DTYPES[dtype])
-                    for name, (dtype, shape) in specs.items()})
+    if bits is None:
+        if 'kept_tensors' in quant:
+            quant['kept_tensors'].update({name: dict(shape=shape, torch_dtype=DTYPES[dtype])
+                for name, (dtype, shape) in specs.items()})
+        if 'retained_native_tensors' in quant:
+            quant['retained_native_tensors'].update({name: dict(shape=shape, dtype=dtype)
+                for name, (dtype, shape) in specs.items()})
     quant['per_module_metadata'] = quantize_file + ':tensor_storage'
     inline = config['quantization_config']
     inline['per_module_metadata'] = quant['per_module_metadata']
@@ -501,6 +503,10 @@ def validate(output):
                 declared[name] = (dtype, tensor['shape'])
         if any(inv['specs'].get(n) != spec for n, spec in declared.items()):
             raise ValueError('selected quant metadata differs from tensor headers')
+        for name, tensor in q.get('retained_native_tensors', {}).items():
+            if (set(tensor) != {'dtype', 'shape'}
+                    or inv['specs'].get(name) != (tensor['dtype'], tensor['shape'])):
+                raise ValueError('retained native metadata differs from tensor headers')
         if family == 'ml4':
             _, selected = family_recipe(family)
             if set(selected) & q['tensor_storage'].keys():

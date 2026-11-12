@@ -85,6 +85,55 @@ def test_mc_all_views_byte_exact_and_shared_parent_copy(tmp_path, monkeypatch):
     assert package.assemble(**args) == result
 
 
+@pytest.mark.parametrize('family', ['muse', 'kimi-k31'])
+def test_restored_native_metadata_uses_safetensors_dtype(tmp_path, monkeypatch, family):
+    args = fixture(tmp_path, monkeypatch, family=family)
+    quant = package.load_json(args['parent'] / 'quantize_config.json')
+    retained = {'expert.weight': dict(dtype='BF16', shape=[128, 128])}
+    kept = {'expert.weight': dict(torch_dtype='bfloat16', shape=[128, 128])}
+    quant.update(retained_native_tensors=retained, kept_tensors=kept)
+    dump(args['parent'], 'quantize_config.json', quant)
+    if family == 'kimi-k31':
+        revision = 'a' * 40
+        parent = args['parent'].with_name(revision)
+        args['parent'].rename(parent)
+        args.update(parent=parent, parent_revision=revision)
+        monkeypatch.delitem(package.PARENTS, family)
+    package.assemble(**args)
+    original = package.load_json(args['output'] / 'quantize_config.json')
+    assert original['retained_native_tensors'] == retained | {
+        'head.weight': dict(dtype='BF16', shape=[128, 128])}
+    assert original['kept_tensors'] == kept | {
+        'head.weight': dict(torch_dtype='bfloat16', shape=[128, 128])}
+    for bits in (6, 8):
+        compact = package.load_json(args['output'] / f'quantize_config.k{bits}.json')
+        assert compact['retained_native_tensors'] == retained
+        assert compact['kept_tensors'] == kept
+
+
+def test_validate_rejects_retained_native_schema_and_dtype(tmp_path, monkeypatch):
+    args = fixture(tmp_path, monkeypatch)
+    package.assemble(**args)
+    path = args['output'] / 'quantize_config.json'
+    quant = package.load_json(path)
+    quant['retained_native_tensors'] = {'head.weight': dict(torch_dtype='bfloat16', shape=[128, 128])}
+    dump(args['output'], path.name, quant)
+    state = package.load_json(args['output'] / 'package-state.json')
+    manifest = package.mc_manifest.build(args['output'], source_repo='test/source',
+        source_revision='source-sha', core_tensors=state['core_tensors'])
+    dump(args['output'], package.mc_manifest.MANIFEST, manifest)
+    with pytest.raises(ValueError, match='retained native metadata'):
+        package.validate(args['output'])
+    quant['retained_native_tensors']['head.weight'] = dict(dtype='F32', shape=[128, 128])
+    dump(args['output'], path.name, quant)
+    state = package.load_json(args['output'] / 'package-state.json')
+    manifest = package.mc_manifest.build(args['output'], source_repo='test/source',
+        source_revision='source-sha', core_tensors=state['core_tensors'])
+    dump(args['output'], package.mc_manifest.MANIFEST, manifest)
+    with pytest.raises(ValueError, match='retained native metadata'):
+        package.validate(args['output'])
+
+
 def test_k8_diagnostics_require_full_rows_and_publish_reports(tmp_path, monkeypatch):
     args = fixture(tmp_path, monkeypatch)
     package.assemble(**args)
