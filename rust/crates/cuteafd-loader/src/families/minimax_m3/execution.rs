@@ -192,9 +192,12 @@ impl MsaPrograms {
         let mut buffers = vec![
             ("index.query", rows * 512),
             ("index.scales", rows * 16),
+            ("index.produced_keys", rows * 128),
+            ("index.produced_scales", rows * 4),
             ("selections", rows * 256),
             ("index.scratch", index.scratch),
             ("attention.query", rows * 16384),
+            ("attention.key", rows * 1024),
             ("attention.output", rows * 16384),
             ("attention.lse", rows * 256),
             ("attention.scratch", attention.scratch),
