@@ -145,13 +145,16 @@ impl<'library> DsparkWeights<'library> {
         );
         let (index, name, k, n) = kind.binding()?;
         let kernel = library.v41_fp8_matrix_plan(capacity, k, n)?;
-        let arena = crate::shared::memory::weight_arena::workspace_arena(library,
-            cuteafd_loader::serving_capacity::v41_workspace::projection(capacity as usize, k as usize,
-                n as usize, kernel.info().scratch_bytes as usize, external.is_none())?,
-            cuteafd_core::memory_layout::ArenaTag::drafter_workspace("v41/draft-projection"))?;
+        let arenas = cuteafd_loader::serving_capacity::v41_workspace::projection_backings(
+            capacity as usize, k as usize, n as usize, kernel.info().scratch_bytes as usize,
+            external.is_none())?.into_iter().map(|layout| {
+                crate::shared::memory::weight_arena::workspace_arena(library, layout,
+                    cuteafd_core::memory_layout::ArenaTag::drafter_workspace("v41/draft-projection"))
+            }).collect::<Result<Vec<_>>>()?;
         let plane = |name| -> Result<_> {
-            let bytes = arena.layout().view(name).context("draft projection plane")?.bytes();
-            Ok(DeviceAllocation::from_allocation(arena.view(name, bytes)?))
+            let (arena, view) = arenas.iter().find_map(|arena|
+                arena.layout().view(name).map(|view| (arena, view))).context("draft projection plane")?;
+            Ok(DeviceAllocation::from_allocation(arena.view(name, view.bytes())?))
         };
         let owned_input = if external.is_none() { Some(plane("input")?) } else { None };
         let input = external.unwrap_or_else(|| owned_input.as_ref().unwrap().buffer);
@@ -194,14 +197,16 @@ impl DsparkProjection<'_, '_> {
     ) -> Result<usize> {
         let (_, _, k, n) = kind.binding()?;
         let info = library.v41_fp8_matrix_plan_info(capacity, k, n)?;
-        Ok(cuteafd_loader::serving_capacity::v41_workspace::projection(capacity as usize,
-            k as usize, n as usize, info.scratch_bytes as usize, true)?.bytes())
+        let backings = cuteafd_loader::serving_capacity::v41_workspace::projection_backings(capacity as usize,
+            k as usize, n as usize, info.scratch_bytes as usize, true)?;
+        cuteafd_loader::serving_capacity::v41_workspace::projection_backing_bytes(&backings)
     }
     pub fn external_input_bytes(library: &NativeLibrary, kind: ProjectionKind, capacity: u32) -> Result<usize> {
         let (_, _, k, n) = kind.binding()?;
         let info = library.v41_fp8_matrix_plan_info(capacity, k, n)?;
-        Ok(cuteafd_loader::serving_capacity::v41_workspace::projection(capacity as usize,
-            k as usize, n as usize, info.scratch_bytes as usize, false)?.bytes())
+        let backings = cuteafd_loader::serving_capacity::v41_workspace::projection_backings(capacity as usize,
+            k as usize, n as usize, info.scratch_bytes as usize, false)?;
+        cuteafd_loader::serving_capacity::v41_workspace::projection_backing_bytes(&backings)
     }
     // Storage access for an exclusive containing owner that tracks completion itself.
     pub(super) fn output_storage(&self) -> CuteafdDeviceBuffer {

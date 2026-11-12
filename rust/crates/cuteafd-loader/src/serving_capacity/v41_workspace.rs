@@ -41,6 +41,31 @@ pub fn projection(rows: usize, k: usize, n: usize, scratch: usize, owned_input: 
     layout("draft-projection", planes)
 }
 
+/// Scratch and data retire together, but small requests can share driver pages.
+/// Keep a single backing unless splitting saves physical SM120 bytes.
+pub fn projection_backings(rows: usize, k: usize, n: usize, scratch: usize,
+    owned_input: bool) -> Result<Vec<WeightArenaLayout>> {
+    let combined = projection(rows, k, n, scratch, owned_input)?;
+    let mut data = combined.views().iter().filter(|(name, _)| name.as_str() != "scratch")
+        .collect::<Vec<_>>();
+    data.sort_by_key(|(_, view)| view.offset());
+    let split = vec![layout("draft-projection/scratch", [("scratch".into(), scratch)])?,
+        layout("draft-projection/data", data.into_iter().map(|(name, view)| (name.clone(), view.bytes())))?];
+    if projection_backing_bytes(&split)? < projection_backing_bytes(std::slice::from_ref(&combined))? {
+        Ok(split)
+    } else {
+        Ok(vec![combined])
+    }
+}
+
+/// Each physical request and its independent driver tail are charged once.
+pub fn projection_backing_bytes(backings: &[WeightArenaLayout]) -> Result<usize> {
+    backings.iter().try_fold(0usize, |sum, backing| {
+        let bytes = crate::placement::planner::sm120_request_backing(backing.bytes() as u64)?;
+        sum.checked_add(usize::try_from(bytes)?).ok_or_else(|| anyhow::anyhow!("projection backing overflow"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +112,60 @@ mod tests {
             assert_eq!(new_requests.iter().sum::<u64>(), new_payload);
             assert_eq!(independent_backing_slack(old_requests)?, old_tail);
             assert_eq!(independent_backing_slack(new_requests)?, new_tail);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn measured_projection_backings_avoid_small_request_threshold() -> Result<()> {
+        use crate::placement::planner::independent_backing_slack;
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for _ in 0..6 {
+            for (k, n, scratch) in [(5120, 1280, 923648), (1280, 32768, 146432),
+                (5120, 512, 714752), (8192, 5120, 918528)] {
+                old.push(projection(40, k, n, scratch, true)?);
+                new.extend(projection_backings(40, k, n, scratch, true)?);
+            }
+        }
+        for (rows, scratch) in [(64, 1509376), (2752, 68356096)] {
+            old.push(projection(rows, 15360, 5120, scratch, true)?);
+            new.extend(projection_backings(rows, 15360, 5120, scratch, true)?);
+        }
+        for _ in 0..3 {
+            for (rows, scratch) in [(64, 629760), (2752, 22912000)] {
+                old.push(projection(rows, 5120, 512, scratch, false)?);
+                new.extend(projection_backings(rows, 5120, 512, scratch, false)?);
+            }
+        }
+        assert_eq!((old.len(), new.len()), (32, 44));
+        assert_eq!(old.iter().map(WeightArenaLayout::bytes).sum::<usize>(),
+            new.iter().map(WeightArenaLayout::bytes).sum::<usize>());
+        assert_eq!(independent_backing_slack(old.iter().map(|b| b.bytes() as u64))?, 24_222_604);
+        assert_eq!(independent_backing_slack(new.iter().map(|b| b.bytes() as u64))?, 14_662_588);
+        assert_eq!(projection_backing_bytes(&old)? - projection_backing_bytes(&new)?, 9_560_016);
+        Ok(())
+    }
+
+    #[test]
+    fn projection_split_preserves_planes_and_never_increases_physical_charge() -> Result<()> {
+        for rows in [1, 16, 40, 64, 256, 2752, 4096] {
+            for scratch in [0, 1, (1 << 20) - 1, 1 << 20, (1 << 20) + 1, 22912000] {
+                for owned_input in [false, true] {
+                    let combined = projection(rows, 5120, 512, scratch, owned_input)?;
+                    let backings = projection_backings(rows, 5120, 512, scratch, owned_input)?;
+                    assert!(projection_backing_bytes(&backings)? <=
+                        projection_backing_bytes(std::slice::from_ref(&combined))?);
+                    let planes = backings.iter().flat_map(|b| b.views().iter().map(|(name, view)|
+                        (name.clone(), view.bytes()))).collect::<std::collections::BTreeMap<_, _>>();
+                    assert_eq!(planes.len(), backings.iter().map(|b| b.views().len()).sum());
+                    assert_eq!(planes, combined.views().iter().map(|(name, view)|
+                        (name.clone(), view.bytes())).collect());
+                    for backing in backings {
+                        assert!(backing.views().values().all(|v| v.offset() % 256 == 0));
+                    }
+                }
+            }
         }
         Ok(())
     }

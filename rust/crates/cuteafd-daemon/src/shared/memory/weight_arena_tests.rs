@@ -322,8 +322,14 @@ fn v41_workspace_components_allocate_once_and_retain_independent_generations() -
     fixture.strict_device_free(&library, true)?;
     for rank in 0..2 {
         library.cuda_set_device(rank)?;
-        for layout in [v41_workspace::hc(1)?, v41_workspace::window(1, 1, &[0, 1], 256)?,
-            v41_workspace::engram(1, 256)?, v41_workspace::projection(1, 5120, 512, 256, true)?] {
+        let mut layouts = vec![v41_workspace::hc(1)?, v41_workspace::window(1, 1, &[0, 1], 256)?,
+            v41_workspace::engram(1, 256)?];
+        layouts.extend(v41_workspace::projection_backings(1, 5120, 512, 256, true)?);
+        let split = v41_workspace::projection_backings(40, 5120, 512, 714752, true)?;
+        assert_eq!(split.len(), 2);
+        assert_ne!(split[0].id(), split[1].id());
+        layouts.extend(split);
+        for layout in layouts {
             let before = fixture.events()?;
             let arena = workspace_arena(&library, layout.clone(), ArenaTag::workspace("test/v41-workspace"))?;
             assert_eq!(arena.layout().bytes(), layout.bytes());

@@ -324,13 +324,15 @@ impl<'a> NativePrograms<'a> {
     }
 
     fn projection(&self, rows: u64, k: u64, n: u64) -> Result<u64> {
-        Ok(crate::serving_capacity::v41_workspace::projection(rows as usize, k as usize, n as usize,
-            self.scratch(rows, k, n)? as usize, true)?.bytes() as u64)
+        let backings = crate::serving_capacity::v41_workspace::projection_backings(rows as usize,
+            k as usize, n as usize, self.scratch(rows, k, n)? as usize, true)?;
+        Ok(crate::serving_capacity::v41_workspace::projection_backing_bytes(&backings)? as u64)
     }
 
     fn external_projection(&self, rows: u64, k: u64, n: u64) -> Result<u64> {
-        Ok(crate::serving_capacity::v41_workspace::projection(rows as usize, k as usize, n as usize,
-            self.scratch(rows, k, n)? as usize, false)?.bytes() as u64)
+        let backings = crate::serving_capacity::v41_workspace::projection_backings(rows as usize,
+            k as usize, n as usize, self.scratch(rows, k, n)? as usize, false)?;
+        Ok(crate::serving_capacity::v41_workspace::projection_backing_bytes(&backings)? as u64)
     }
 
     fn main_context(&self, rows: u64) -> Result<u64> {
