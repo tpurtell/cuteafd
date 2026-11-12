@@ -273,6 +273,13 @@ def test_layer_resume_is_byte_exact_and_loads_only_remaining_layer(snapshot, tmp
     from families.minimax_m3.golden import run_layers
     manifest = panel([1, 7, 3, 9, 11, 5, 2])
     complete, complete_times = run_layers(snapshot, manifest, tmp_path / "complete", activation=activation)
+    traced, _ = run_layers(snapshot, manifest, tmp_path / "traced", activation=activation, layers=[0, 1])
+    assert traced[0].path.read_bytes() == complete[0].path.read_bytes()
+    trace = tmp_path / "traced/windows/sample"
+    assert (trace / "layer00.input.bin").stat().st_size == 7 * 32 * 4
+    assert (trace / "layer00.attention_projected.bin").stat().st_size == 7 * 32 * 4
+    assert (trace / "layer01.router_ids.bin").stat().st_size == 7 * 2 * 4
+    assert (trace / "layer01.residual.bin").read_bytes() == (trace / "layer01.bin").read_bytes()
     stopped, times = run_layers(snapshot, manifest, tmp_path / "partial", activation=activation, stop_after_layer=0)
     assert [t["layer"] for t in times] == [0]
     assert not (tmp_path / "partial/meta.json").exists()

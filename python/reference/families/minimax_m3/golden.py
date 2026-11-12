@@ -223,7 +223,8 @@ def run_layers(snapshot, manifest, out, *, device="cpu", activation="served", re
             next_states = []
             for window, previous in zip(windows, states, strict=True):
                 hidden = torch.from_numpy(previous.load()).view(residual_dtype).to(weights.device)
-                hidden = model.layer_forward(hidden, layer, cfg, index, activation)
+                trace = {} if layers and index in layers else None
+                hidden = model.layer_forward(hidden, layer, cfg, index, activation, trace=trace)
                 if not torch.isfinite(hidden).all():
                     raise ValueError(f"non-finite MiniMax hidden at layer {index}")
                 bits = hidden.cpu().view(torch.uint16).numpy()
@@ -232,7 +233,10 @@ def run_layers(snapshot, manifest, out, *, device="cpu", activation="served", re
                     target = out / "windows" / window["id"]
                     target.mkdir(parents=True, exist_ok=True)
                     hidden.float().cpu().numpy().astype("<f4").tofile(target / f"layer{index:02d}.bin")
-                del hidden, bits
+                    for name, value in trace.items():
+                        dtype = "<i4" if name == "router_ids" else "<f4"
+                        value.float().cpu().numpy().astype(dtype).tofile(target / f"layer{index:02d}.{name}.bin")
+                del hidden, bits, trace
             del layer
             weights.close()
             times.append({"layer": index, "seconds": time.monotonic() - started,

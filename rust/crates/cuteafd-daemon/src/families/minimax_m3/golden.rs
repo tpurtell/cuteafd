@@ -1,5 +1,5 @@
 //! Cold full-model qualification only. No serving entrypoint or reference bridge.
-use super::{admission, cache::Cache, head::Head, layer::{Kernels, UnitOwner}, prefill::Prefill,
+use super::{admission, cache::Cache, head::Head, layer::{Kernels, UnitOwner}, prefill::{LayerTaps, Prefill},
     weights::TargetWeights};
 use crate::shared::{inventory::{InventoryPhase, RuntimeInventory},
     memory::{device::{Allocation, Device, Stream}, receipts::Inventory},
@@ -28,6 +28,8 @@ pub(crate) struct GoldenArgs {
     /// New directory for shared scoring probes and fidelity.json.
     #[arg(long)] save_logits: PathBuf,
     #[arg(long)] window: Option<String>,
+    /// Diagnostic residual/branch taps beneath save-logits; requires one window.
+    #[arg(long, value_delimiter = ',', num_args = 1..)] tap_layers: Vec<usize>,
     #[arg(long, value_delimiter = ',', num_args = 1..)] peers: Vec<SocketAddr>,
     #[arg(long, default_value_t = 0)] device: i32,
     #[arg(long, default_value_t = 1024)] prefill_rows: u32,
@@ -76,6 +78,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 fn run(args: GoldenArgs) -> Result<()> {
     ensure!(args.nll && args.prefill_rows >= 256 && args.prefill_rows <= 4096
         && args.prefill_rows % 64 == 0, "MiniMax needs --nll and page-aligned prefill rows 256..=4096");
+    ensure!(args.tap_layers.is_empty() || (args.window.is_some()
+        && args.tap_layers.iter().all(|&layer| layer < 60)
+        && args.tap_layers.iter().collect::<BTreeSet<_>>().len() == args.tap_layers.len()),
+        "MiniMax taps require one --window and unique layers 0..59");
     let view = args.attention.selected_view.clone().map(Ok)
         .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
@@ -114,8 +120,15 @@ fn run(args: GoldenArgs) -> Result<()> {
     let link_layout = PreparedSparkLink::endpoint("spark", 0,
         SparkEndpointOwners { ranks: args.peers.len(), geometry: ExpertGeometry::MINIMAX_M3, endpoint, rings },
         waves, true, true, SparkIntakeCandidates::Probed, SparkReplyFormat::Bf16, Lifetime::TARGET)?;
-    let contract = admission::contract(&checkpoint, &cfg, &weights, &manifest,
+    let mut contract = admission::contract(&checkpoint, &cfg, &weights, &manifest,
         args.prefill_rows, tokens, waves, &link_layout, &sample.arch)?;
+    if !args.tap_layers.is_empty() {
+        use cuteafd_loader::placement::planner::{Allocation as PlannedAllocation, ByteCurve, Component, Location};
+        let bytes = LayerTaps::host_bytes(args.prefill_rows);
+        contract.components.push(Component::allocation(PlannedAllocation::buffer("golden.layer-taps",
+            Location::HOST, bytes, Lifetime::TARGET, Category::Workspace, "diagnostic layer download"),
+            ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
+    }
     let facts = admission::admit(&contract, sample.free_bytes, sample.total_bytes, host)?;
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let exports = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports();
@@ -202,9 +215,20 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
             let span = crate::shared::prefix::view(residual.buffer, first * 6144 * 4, (end - first) * 6144 * 4)?;
             head.embed(weights, &window.tokens[first..end], span)?;
         }
+        let mut taps = if args.tap_layers.is_empty() { None } else {
+            let root = args.save_logits.join("layer-taps");
+            let taps = LayerTaps::new(root.clone(), &args.tap_layers, args.prefill_rows)?;
+            std::fs::write(root.join("meta.json"), serde_json::to_vec(&serde_json::json!({
+                "diagnostic_only":true,"window":window.id,"tokens":window.tokens,
+                "input_rows":count,"hidden":6144,"layers":args.tap_layers,
+                "residual_dtype":"F32","branch_dtype":"BF16","byte_order":"little",
+                "row_index":"zero-based input token","provenance":provenance}))?)?;
+            Some(taps)
+        };
         let units = sequence_units(count, args.prefill_rows as usize, owners.len(), cfg.layers)?;
         Prefill { cfg, admitted, weights, kernels, cache, owners, metadata, waves: link.exchange()?,
-            residual: residual.buffer, placement_version: 17, next_identity: &mut next_identity }.run(&units)?;
+            residual: residual.buffer, placement_version: 17, next_identity: &mut next_identity,
+            taps: taps.as_mut() }.run(&units)?;
         for chunk in units {
             let first = chunk.rows.start;
             let rows = chunk.rows.len();

@@ -102,6 +102,11 @@ to 1024 (page-aligned 256..4096); `--prefill-waves` defaults to 3 (1..4).
 `--check-headers` validates the immutable reference and checkpoint/export geometry
 without CUDA or workers. Scores use the shared top1024-plus-tail estimator;
 qualification requires mean KL <=0.03 and top-1 agreement >=0.95.
+Diagnostic `--tap-layers 0,1,2,3` requires one `--window` and unique layer IDs
+0..59. It writes F32 input/post-attention/final residuals and BF16 projected
+attention/local-MLP branches in `NEW_DIR/layer-taps`, with zero-based input-row
+suffixes and explicit diagnostic metadata. Copies drain the issuing stream and
+reuse one admitted host buffer; taps are off by default and do not waive scoring.
 
 `cuteafd kimi-golden --rtx-expert-layers auto|all|N` defaults to `auto`, using
 startup's real-device admission rather than forcing zero coordinator layers.

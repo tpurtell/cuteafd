@@ -25,6 +25,41 @@ pub(crate) struct Prefill<'s, 'a> {
     pub placement_version: u64,
     /// Monotonic nonzero request identity, retained across scoring windows.
     pub next_identity: &'s mut u64,
+    pub taps: Option<&'s mut LayerTaps>,
+}
+
+/// Diagnostic-only synchronous copies; never enabled by serving or ordinary golden.
+/// One admitted host buffer is reused after draining the issuing stream.
+pub(crate) struct LayerTaps {
+    root: std::path::PathBuf,
+    layers: std::collections::BTreeSet<usize>,
+    bytes: Vec<u8>,
+}
+impl LayerTaps {
+    pub fn host_bytes(rows: u32) -> u64 { u64::from(rows) * 6144 * 4 }
+    pub fn new(root: std::path::PathBuf, layers: &[usize], rows: u32) -> Result<Self> {
+        ensure!(!layers.is_empty() && layers.iter().all(|&layer| layer < 60), "MiniMax tap layers outside decoder");
+        std::fs::create_dir(&root)?;
+        Ok(Self { root, layers: layers.iter().copied().collect(),
+            bytes: vec![0; usize::try_from(Self::host_bytes(rows))?] })
+    }
+    fn write(&mut self, layer: usize, stage: &str, plane: &str, width: usize,
+        unit: &Unit, owner: &UnitOwner<'_>) -> Result<()> {
+        if !self.layers.contains(&layer) { return Ok(()); }
+        let count = unit.rows.len().checked_mul(6144 * width).context("MiniMax tap extent")?;
+        ensure!(count <= self.bytes.len(), "MiniMax tap exceeds admitted host buffer");
+        owner.stream.drain()?;
+        owner.stream.device.run(|| owner.stream.device.library.copy_d2h(
+            &mut self.bytes[..count], owner.plane(plane)?))?;
+        self.write_bytes(layer, stage, unit.rows.start, &self.bytes[..count])
+    }
+    fn write_bytes(&self, layer: usize, stage: &str, first: usize, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let path = self.root.join(format!("layer{layer:02}.{stage}.row{first:06}.bin"));
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(bytes)?;
+        Ok(())
+    }
 }
 impl Prefill<'_, '_> {
     pub fn run(&mut self, units: &[Unit]) -> Result<()> {
@@ -75,13 +110,26 @@ impl PrefillHooks for Prefill<'_, '_> {
         })
     }
     fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+        if let Some(taps) = &mut self.taps {
+            taps.write(layer, "input", "residual", 4, unit, &self.owners[unit.slot])?;
+        }
         let request = self.cache.request(&self.metadata[unit.slot], layer)?;
         // SAFETY: cache/metadata owners retain bounded physical IDs and all
         // buffers; the shared executor orders earlier units at this layer.
-        unsafe { self.owners[unit.slot].attention(self.kernels, self.weights, self.admitted, layer, request) }
+        unsafe { self.owners[unit.slot].attention(self.kernels, self.weights, self.admitted, layer, request)?; }
+        if let Some(taps) = &mut self.taps {
+            taps.write(layer, "attention_projected.bf16", "ffn", 2, unit, &self.owners[unit.slot])?;
+            taps.write(layer, "post_attention", "residual", 4, unit, &self.owners[unit.slot])?;
+        }
+        Ok(())
     }
     fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
-        self.owners[unit.slot].ffn(self.kernels, self.weights, self.admitted, layer, unit.rows.len(), false)
+        self.owners[unit.slot].ffn(self.kernels, self.weights, self.admitted, layer, unit.rows.len(), false)?;
+        if let Some(taps) = &mut self.taps {
+            taps.write(layer, "mlp.bf16", "ffn", 2, unit, &self.owners[unit.slot])?;
+            taps.write(layer, "residual", "residual", 4, unit, &self.owners[unit.slot])?;
+        }
+        Ok(())
     }
     fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<WaveTicket> {
         let rows = unit.rows.len();
@@ -104,7 +152,7 @@ impl PrefillHooks for Prefill<'_, '_> {
         owner.ffn(self.kernels, self.weights, self.admitted, layer, rows, true)?;
         Ok(ticket)
     }
-    fn land_experts(&mut self, _: usize, unit: &Unit, ticket: WaveTicket) -> Result<()> {
+    fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: WaveTicket) -> Result<()> {
         let slot = ticket.slot();
         let owner = &self.owners[unit.slot];
         owner.stream.device.run(|| {
@@ -114,7 +162,11 @@ impl PrefillHooks for Prefill<'_, '_> {
             unsafe { self.waves.reduce(slot, std::ptr::null(), owner.plane("routed")?.ptr.cast(),
                 unit.rows.len(), owner.stream.raw) }
         })?;
-        owner.join_routed(self.kernels, unit.rows.len())
+        owner.join_routed(self.kernels, unit.rows.len())?;
+        if let Some(taps) = &mut self.taps {
+            taps.write(layer, "residual", "residual", 4, unit, owner)?;
+        }
+        Ok(())
     }
     fn end_unit(&mut self, unit: &Unit) -> Result<()> {
         let owner = &self.owners[unit.slot];
@@ -145,6 +197,18 @@ fn request(identity: u64, version: u64, layer: usize, start: usize, rows: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layer_taps_are_bounded_and_never_overwrite() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let taps = LayerTaps::new(directory.path().join("taps"), &[0, 1, 2, 3], 256)?;
+        assert_eq!(taps.bytes.len() as u64, LayerTaps::host_bytes(256));
+        assert_eq!(taps.bytes.len(), 256 * 6144 * 4);
+        taps.write_bytes(0, "residual", 64, &[1, 2, 3, 4])?;
+        assert_eq!(std::fs::read(directory.path().join("taps/layer00.residual.row000064.bin"))?, [1, 2, 3, 4]);
+        assert!(taps.write_bytes(0, "residual", 64, &[9]).is_err());
+        assert!(LayerTaps::new(directory.path().join("bad"), &[60], 256).is_err());
+        Ok(())
+    }
     #[test]
     fn requests_retain_causal_positions_and_checkpoint_native_bf16_ingress() -> Result<()> {
         let routes = (0..8).map(|route| ExpertProtocolV2RouteEntry {
