@@ -214,6 +214,31 @@ def test_publication_packet_is_local_and_detects_changed_metadata(tmp_path, monk
         publication_inventory(args['output'])
 
 
+@pytest.mark.parametrize('family,repo', [
+    ('step5', 'wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC'),
+    ('glm5', 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC'),
+])
+def test_seed_publication_packets_copy_whole_parent_shards(tmp_path, monkeypatch, family, repo):
+    from mc_publish import publication_inventory
+    args = fixture(tmp_path, monkeypatch, family=family)
+    package.assemble(**args)
+    packet = publication_inventory(args['output'])
+    assert packet['repo_id'] == repo
+    assert packet['copies'] == {'mixed.safetensors': 'mixed.safetensors'}
+    uploaded_shards = {n for n in packet['new_files'] if n.endswith('.safetensors')}
+    assert uploaded_shards == {'original-core-0001.safetensors', 'k8-core.safetensors'}
+    assert 'mixed.safetensors' not in packet['new_files']
+    for view in ('original', 'k8-compact'):
+        index = package.mc_manifest.FILES[view][0]
+        mapping = package.load_json(args['output'] / index)['weight_map']
+        assert mapping['expert.weight'] == 'mixed.safetensors'
+        assert not any(mapping.get('head.' + suffix) == 'mixed.safetensors'
+                       for suffix in package.SUFFIXES)
+    k6_index = package.mc_manifest.FILES['k6-compact'][0]
+    mapping = package.load_json(args['output'] / k6_index)['weight_map']
+    assert mapping['head.trellis'] == 'mixed.safetensors'
+
+
 def test_nested_drafter_and_license_assets_are_copied(tmp_path, monkeypatch):
     args=fixture(tmp_path,monkeypatch)
     (args['parent']/'dflash').mkdir()
