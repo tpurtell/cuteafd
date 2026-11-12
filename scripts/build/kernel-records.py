@@ -124,12 +124,20 @@ CUTEAFD_EXPORT_CONTEXT_SPACING_S HF_HUB_CACHE HF_HOME XDG_CACHE_HOME TRITON_DISA
 """.split())
 
 
+PROVENANCE_ENVIRONMENT_NAMES = frozenset({
+        "CUTEAFD_EXPORT_HOST_CLASS", "CUTEAFD_EXPORT_HOST_CONTEXTS", "CUTEAFD_EXPORT_HOST_WORKERS",
+        "CUTEAFD_EXPORT_JOBS", "CUTEAFD_EXPORT_SLOT_DIR", "CUTEAFD_EXPORT_HOST_SLOT_DIR",
+        "CUTEAFD_EXPORT_GPU_SLOT_DIR", "CUTEAFD_EXPORT_GPU_BUDGET_MIB",
+        "CUTEAFD_EXPORT_WORKER_GPU_MIB", "CUTEAFD_EXPORT_WORKER_RAM_MIB",
+        "CUTEAFD_EXPORT_CONTEXT_SPACING_S", "HF_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME",
+})
+
+
 def export_environment():
+    # Only settings read by exporters belong here, not arbitrary CUTEAFD_ launch
+    # settings. New reads require classification in the source-scan regression.
     values = {name: os.environ.get(name) for name in sorted(EXPORT_ENVIRONMENT_NAMES)}
-    # The export cache's launcher variables name per-run paths (its read records,
-    # stats, build and output directories): control, never export semantics.
-    values.update({name: value for name, value in sorted(os.environ.items())
-                   if name.startswith("CUTEAFD_") and not name.startswith("CUTEAFD_EXPORT_CACHE_")})
+    values.update({name: "<provenance>" for name in PROVENANCE_ENVIRONMENT_NAMES})
     # These are forced by the offline worker, not inherited policy. Paths name
     # verified sources or disposable compiler storage rather than semantic inputs.
     values.update(CUTEAFD_BUILD_KIND=os.environ.get("CUTEAFD_BUILD_KIND", "development"),
@@ -175,7 +183,8 @@ def stage0_inputs(root, payload, capability):
             relative = path.relative_to(root).as_posix()
             if not path.is_file() or any(fnmatch.fnmatch(relative, pattern) for pattern in rules["ignore"]):
                 continue
-            if any(fnmatch.fnmatch(relative, pattern) for pattern in rules["global"]):
+            if (any(fnmatch.fnmatch(relative, pattern) for pattern in rules["global"])
+                    and not any(fnmatch.fnmatch(relative, pattern) for pattern in rules.get("global_ignore", []))):
                 hashes[relative] = digest(path.read_bytes())
     return json.loads(json.dumps({"identity": identity, "global_sources": hashes,
                                   "rules": digest(rules_path.read_bytes())}, sort_keys=True))

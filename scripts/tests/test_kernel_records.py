@@ -217,12 +217,15 @@ def compiler_inputs(tmp_path, monkeypatch):
     return payload, exporter
 
 
-def test_orchestration_edits_keep_all_publication_jobs_reusable(tmp_path, compiler_inputs):
+def test_orchestration_edits_keep_all_publication_jobs_reusable(tmp_path, compiler_inputs, monkeypatch):
     payload, exporter = compiler_inputs
     spec = importlib.util.spec_from_file_location(
         "identity_publisher", ROOT / "scripts/build/export-placement-inputs.py")
     publisher = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(publisher)
+    # Job enumeration is tested separately against installed metadata; replay
+    # identity must not need retired checkpoints in this synthetic source tree.
+    monkeypatch.setattr(publisher, "live_configs", lambda: [])
     jobs = publisher.export_jobs()
     for _, name, _ in jobs:
         (exporter.parent / name).write_bytes(exporter.read_bytes())
@@ -231,13 +234,31 @@ def test_orchestration_edits_keep_all_publication_jobs_reusable(tmp_path, compil
         job = {**payload, "exporter": name, "args": args}
         previous.append((job, {"stage0_inputs": records.stage0_inputs(tmp_path, job, (12, 0)),
             "source_reads_sha256": {str(exporter.relative_to(tmp_path)): records.digest(exporter.read_bytes())}}))
-    for script in ("kernel-records.py", "compare-sm-exports.py", "export-placement-inputs.py"):
+    for script in ("kernel-records.py", "compare-sm-exports.py", "export-placement-inputs.py",
+                   "build-wip-artifacts.sh", "wip-native-store.sh"):
         (tmp_path / "scripts/build" / script).write_text("def report():\n    return 'new rsync/reporting'\n")
         for job, prior in previous:
             assert records.job_candidates(tmp_path, prior, records.stage0_inputs(tmp_path, job, (12, 0))) == []
     for job, prior in previous:
         changed = {**job, "args": [*job["args"], "--changed-exporter-arg"]}
         assert records.job_candidates(tmp_path, prior, records.stage0_inputs(tmp_path, changed, (12, 0))) == ["job-global-inputs"]
+
+
+def test_orchestration_paths_do_not_key_replay_but_executed_helpers_do(tmp_path, compiler_inputs, monkeypatch):
+    payload, exporter = compiler_inputs
+    helper = tmp_path / "scripts/build/build-wip-artifacts.sh"
+    helper.write_text("old assembly")
+    inputs = records.stage0_inputs(tmp_path, payload, (12, 0))
+    prior = {"stage0_inputs": inputs, "source_reads_sha256": {
+        str(exporter.relative_to(tmp_path)): records.digest(exporter.read_bytes())}}
+    for name in (*records.PROVENANCE_ENVIRONMENT_NAMES, "CUTEAFD_DEV_ARTIFACTS", "CUTEAFD_KACHE",
+                 "CUTEAFD_KACHE_MODE", "CUTEAFD_KACHE_CACHE_DIR", "CUTEAFD_KACHE_SHIM_DIR"):
+        monkeypatch.setenv(name, "/changed/" + name)
+    helper.write_text("new assembly")
+    assert records.job_candidates(tmp_path, prior, records.stage0_inputs(tmp_path, payload, (12, 0))) == []
+    prior["source_reads_sha256"][str(helper.relative_to(tmp_path))] = records.digest(b"old assembly")
+    assert records.job_candidates(tmp_path, prior, records.stage0_inputs(tmp_path, payload, (12, 0))) == [
+        "scripts/build/build-wip-artifacts.sh"]
 
 
 @pytest.mark.parametrize("changed", ["exporter", "args", "global", "helper", "environment", "toolchain"])
@@ -550,7 +571,7 @@ def test_export_environment_covers_every_source_read(monkeypatch):
                                 and ast.unparse(node.slice) == "key"), (path, node.lineno)
     assert names <= records.EXPORT_ENVIRONMENT_NAMES
     assert names <= records.export_environment().keys()
-    for name in names - {"CUTEAFD_SOURCE_ROOT", "CUTEAFD_SPARKINFER_SOURCE_DIR",
+    for name in names - records.PROVENANCE_ENVIRONMENT_NAMES - {"CUTEAFD_SOURCE_ROOT", "CUTEAFD_SPARKINFER_SOURCE_DIR",
                           "CUTEAFD_SPARKINFER_LOCK_FILE", "TRITON_CACHE_DIR",
                           "CUDA_VISIBLE_DEVICES", "B12X_COMPILE_DISK_CACHE",
                           "B12X_COMPILE_MEMORY_CACHE", "CUTEAFD_EXPORT_NARROW_AOT",

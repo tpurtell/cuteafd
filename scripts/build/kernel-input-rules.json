@@ -1,5 +1,6 @@
 {
   "schema": 1,
   "ignore": ["**/tests/**", "**/test_*.py", "**/docs/**", "**/benchmarks/**", "**/bench/**", "**/README*", "**/*.md", "**/__pycache__/**", "**/*.pyc", "scripts/build/kernel-records.py", "scripts/build/compare-sm-exports.py", "scripts/build/export-placement-inputs.py"],
+  "global_ignore": ["scripts/build/build-wip-artifacts.sh", "scripts/build/wip-native-store.sh"],
   "global": ["third_party/sparkinfer/b12x/_lib/**", "third_party/sparkinfer/b12x/__init__.py", "python/tools/lib/**", "scripts/build/**", "docker/**"]
 }
