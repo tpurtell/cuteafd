@@ -290,10 +290,15 @@ fn native_out_of_place_planes_match_mount_reference() -> Result<()> {
         id: 0,
     };
     for nv in [false, true] {
-        for (width, stored) in [(384usize, 384), (576, 640), (576, 576)] {
-            if !nv && stored == 576 {
-                continue;
-            }
+        let geometries = if nv {
+            vec![(384usize, 384), (576, 640), (576, 576)]
+        } else {
+            [384usize, 576].into_iter().map(|width| {
+                cuteafd_core::mxfp4_layouts::stored_width(5120, width)
+                    .map(|stored| (width, stored)).context("MXFP4 fixture storage width")
+            }).collect::<Result<Vec<_>>>()?
+        };
+        for (width, stored) in geometries {
             let layout = NativePlanes::new(5120, width, stored, 1, nv)?;
             let mut raw = vec![0u8; layout.bytes];
             for plane in 0..4 {
