@@ -297,11 +297,11 @@ def test_preflight_accepts_corpus_directory_not_file(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('family', ['step5', 'glm5'])
-def test_seed_runtime_overlay_keeps_checkout_transformers(tmp_path, family):
+def test_seed_runtime_overlay_uses_family_transformers(tmp_path, family):
     row = record(tmp_path, family)
     row.update(runtime_python='/overlay/bin/python', runtime_root='/overlay')
     command = launch.container_command(row)
-    assert any('third_party/transformers/src' in arg for arg in command)
+    assert any('third_party/transformers/src' in arg for arg in command) is (family == 'step5')
 
 
 def test_explicit_runtime_keeps_its_transformers_release(tmp_path):
