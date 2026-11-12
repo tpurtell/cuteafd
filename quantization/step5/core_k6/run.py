@@ -148,9 +148,12 @@ class Engine(FlashEngine):
             self._commit_phase(store,'mtp-head',[],[('head',h)])
         checkpoints.ensure(name,block.transformer.shared_head.output.weight,self._raw(store,'mtp-head','head'))
 
+    def assemble_layer(self,layer,replacements):
+        from .export import assemble_layer
+        return assemble_layer(self.source,layer,replacements,self.export,self.identity)
+
     @torch.inference_mode()
     def layer(self,layer,current,*,block=None,boundary_layer=None):
-        from .export import assemble_layer
         start=time.monotonic();boundary_layer=layer if boundary_layer is None else boundary_layer
         store=StageStore(self.root/f'layers/{layer:03d}/stages',self.identity)
         phases={p:store.load(p,checksum=True) for p in ('a','c','d','e','f')}
@@ -179,7 +182,7 @@ class Engine(FlashEngine):
         if layer>=92:
             if block is None:block=self.source.load_block(layer,self.device,include_experts=False)
             self._stage_head(block,layer,store,checkpoints)
-        receipt=assemble_layer(self.source,layer,checkpoints.replacements(names),self.export,self.identity)
+        receipt=self.assemble_layer(layer,checkpoints.replacements(names))
         manifest=store.load('f');links=hardlink_frontier(self.boundary,boundary_layer,store.directory('f'),manifest)
         current=self.boundary.commit(boundary_layer,links)
         store.clear();checkpoints.retire()
@@ -310,7 +313,16 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('source-snapshot','tokens','root','export'):p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--resume',action='store_true');p.add_argument('--preflight',action='store_true');p.add_argument('--publish-only',action='store_true')
+    p.add_argument('--core-only',action='store_true')
+    p.add_argument('--core-bits',type=int,choices=(6,8),default=6)
+    p.add_argument('--layer-limit',type=int)
     args=p.parse_args()
+    if args.core_only:
+        if args.publish_only:p.error('core-only output is assembled and published separately')
+        from .core_only import run_core_only
+        return run_core_only(args)
+    if args.core_bits!=6 or args.layer_limit is not None:
+        p.error('core bitrate changes and layer-limit require --core-only')
     from gptqmodel.utils.step5_core import Step5BF16Source
     source=Step5BF16Source(args.source_snapshot,reference_root=REPO/'python/reference')
     args.tokens,args.root,args.export=(v.expanduser().resolve() for v in (args.tokens,args.root,args.export))
