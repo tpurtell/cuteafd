@@ -353,3 +353,37 @@ def test_exact_pattern_excludes_only_requested_modules():
     assert re.search(patterns[0],'layers.1.core')
     assert re.search(patterns[0],'layers.0.expert')
     assert not re.search(patterns[0],'layers.0.core')
+
+
+@pytest.mark.parametrize('family,count,mtp_layer', [('step5',645,92), ('glm5',547,78)])
+def test_seed_families_register_target_core_only(family, count, mtp_layer):
+    recipe, selection = package.family_recipe(family)
+    assert len(selection) == count
+    assert selection == recipe.reviewed_core_modules(include_mtp=False)
+    assert all(g['bits'] == 6 for g in selection.values())
+    assert all('.experts.' not in name for name in selection)
+    assert all(not name.startswith(f'model.layers.{layer}.')
+               for name in selection for layer in range(mtp_layer, mtp_layer+3))
+    assert len(package.PARENTS[family][1]) == 40
+
+
+@pytest.mark.parametrize('family,mtp_count', [('step5',27), ('glm5',8)])
+def test_seed_mc_preserves_shared_k4_mtp_across_views(tmp_path, monkeypatch, family, mtp_count):
+    args = fixture(tmp_path, monkeypatch, family=family)
+    geometry = dict(in_features=128,out_features=128,stored_out_features=128,bits=4)
+    shared_mtp = tensors('model.layers.999.mtp', geometry, 4)
+    parent = args['parent']
+    indexed(parent, {'mixed.safetensors': tensors('head',geometry,6) | shared_mtp})
+    quant = package.load_json(parent/'quantize_config.json')
+    quant['tensor_storage']['model.layers.999.mtp'] = dict(bits_per_weight=4,
+        stored_tensors={name: dict(shape=shape, torch_dtype=package.DTYPES[dtype])
+                       for name, (dtype, shape) in packed_specs('model.layers.999.mtp', geometry).items()})
+    dump(parent,'quantize_config.json',quant)
+    package.assemble(**args)
+    for view in ('original','k8-compact','k6-compact'):
+        index_name = package.mc_manifest.FILES[view][0]
+        mapping = package.load_json(args['output']/index_name)['weight_map']
+        assert all(mapping[name]=='mixed.safetensors' for name in shared_mtp)
+    card = (args['output']/'README.md').read_text()
+    assert f'({mtp_count} modules)' in card
+    assert 'neither restored to BF16 nor encoded at K8' in card

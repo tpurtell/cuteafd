@@ -28,6 +28,8 @@ PARENTS = {
     'glmf': ('GLM-5.3-Flash-EXL3-K4-Core-K6', '5d3fffe1df9c4a109bbbdafb60dc19df9fac019d'),
     'muse': ('Muse-Spark-Open-EXL3-K4-Core-K6', '89998fb177acd9a862ac8bd4fb79bfd50e940c97'),
     'ml4': ('Mistral-Large-4-EXL3-K4-Core-K6', '03c80aebaa483d55760703ae5bc0c9734c9d67d6'),
+    'step5': ('Step-5-Preview-EXL3-K4-Core-K6', '83d47a384eabc07ea6fcfaac4779b0e5f013ce89'),
+    'glm5': ('GLM-5.3-EXL3-K4-Core-K6', '5a4e83a09a11f3145332ed632d28a9894ea88225'),
 }
 
 
@@ -44,6 +46,12 @@ def family_recipe(family):
     elif family == 'ml4':
         from mistral_large4.core_k6 import recipe
         selection = recipe.reviewed_core_modules()
+    elif family in ('step5', 'glm5'):
+        if family == 'step5':
+            from step5.core_k6 import recipe
+        else:
+            from glm5.core_k6 import recipe
+        selection = recipe.reviewed_core_modules(include_mtp=False)
     else:
         raise ValueError('unknown package family')
     return recipe, selection
@@ -248,7 +256,7 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
     document = load_json(source / 'config.json') if (source / 'config.json').exists() else None
     if hasattr(recipe, 'inventory'):
         adapter = SimpleNamespace(snapshot=source, weight_map=source_inv['mapping'], document=document,
-            config=document if family in ('ml4', 'kimi-k31') else document['text_config'],
+            config=document if family in ('ml4', 'kimi-k31', 'glm5') else document['text_config'],
             text_config=document.get('text_config'))
         recipe.inventory(adapter)
     quant = load_json(parent / 'quantize_config.json')
@@ -399,6 +407,9 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
         + 'Derived from `' + recipe.BASE_REPO + '@' + recipe.BASE_REVISION + '`.\n\n'
         + ('This plain checkpoint keeps the original FP8/BF16 core and K4 experts. No quantized core payload is included.\n\n'
            if family == 'ml4' else 'The default index selects the original BF16 core. `cuteafd-mc.json` discovers complete K8 and K6 alternate views; experts, media and drafters are shared.\n\n')
+        + ('Only target-core matrices change between views. The parent K4 MTP dense modules '
+           f'({27 if family == "step5" else 8} modules) remain shared unchanged across all three views; '
+           'they are neither restored to BF16 nor encoded at K8.\n\n' if family in ('step5', 'glm5') else '')
         + 'Original-core byte proofs and package inventory are in `package-validation.json`. Parent diagnostics describe the parent quantization, not the restored core. '
         + 'See `README.parent.md` and inherited license/usage files for checkpoint terms. No generation quality or serving performance qualification is claimed by this assembly.\n')
     (output / 'README.md').write_text(card)
@@ -545,7 +556,7 @@ def validate(output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--family', choices=['kimi-k31', 'glmf', 'muse', 'ml4'])
+    parser.add_argument('--family', choices=['kimi-k31', 'glmf', 'muse', 'ml4', 'step5', 'glm5'])
     parser.add_argument('--parent', type=Path)
     parser.add_argument('--parent-revision')
     parser.add_argument('--source', type=Path)
