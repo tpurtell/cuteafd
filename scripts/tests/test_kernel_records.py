@@ -12,6 +12,48 @@ records = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(records)
 
 
+@pytest.mark.parametrize("changed", ["ir", "identity", "option", "pipeline", "signature"])
+def test_backend_cache_keys_lowering_inputs_not_export_placement(tmp_path, changed):
+    from types import SimpleNamespace
+    class Option:
+        pass
+    option = SimpleNamespace(value="old")
+    dsl = SimpleNamespace(compile_options=SimpleNamespace(options={Option: option}))
+    def compile(dsl, module, sig="sig", function_name="kernel", func_type="executor",
+                pipeline="pipeline", no_jit_engine=True, no_cache=True):
+        pass
+    cache = records.BackendCache(tmp_path, {"compiler": "old"})
+    before = cache.key(dsl, compile, None, (), {}, "ir")
+    kwargs, ir = {}, "ir"
+    if changed == "ir":
+        ir = "new ir"
+    elif changed == "identity":
+        cache.identity = {"compiler": "new"}
+    elif changed == "option":
+        option.value = "new"
+    elif changed == "pipeline":
+        kwargs["pipeline"] = "new"
+    else:
+        kwargs["sig"] = "new"
+    assert before and before != cache.key(dsl, compile, None, (), kwargs, ir)
+    assert cache.key(dsl, compile, None, (), {"no_cache": False}, ir) is None
+
+
+def test_backend_identity_ignores_frontend_and_worker_provenance(tmp_path, compiler_inputs, monkeypatch):
+    import sys
+    sys.path.insert(0, str(ROOT / "python/tools/lib"))
+    try:
+        before = records.backend_identity()
+        for name in ("CUDA_VISIBLE_DEVICES", "CUTEAFD_EXPORT_JOBS", "CUTEAFD_EXPORT_SLOT_DIR",
+                     "CUTEAFD_DEV_ARTIFACTS", "CUTEAFD_KACHE", "CUTEAFD_EXL3_ROUTE_BLOCKS"):
+            monkeypatch.setenv(name, "changed")
+        assert records.backend_identity() == before
+        monkeypatch.setenv("CUTEAFD_EXPORT_IMAGE_ID", "sha256:changed")
+        assert records.backend_identity() != before
+    finally:
+        sys.path.pop(0)
+
+
 def test_change_report_classifies_and_flags_exact_groups(tmp_path):
     old = {"programs/glmf_mhc.o": {"group": "programs", "ir_sha256": "a", "object_sha256": "x",
         "source_reads_sha256": {"kernel.py": "old", "unchanged.py": "same"}, "resources": [{"kernels": {"k": {"registers": 32}}}],
@@ -420,6 +462,7 @@ def fake_worker(tmp_path, monkeypatch, fake_cutlass):
         is_initialized=lambda: False)
     monkeypatch.setattr(importlib.metadata, "version", lambda name: "fake")
     monkeypatch.setattr(worker_records, "stage0_inputs", lambda *args: {"fake": True})
+    monkeypatch.setattr(worker_records, "install_backend_cache", lambda *args: None)
     monkeypatch.setattr(worker, "load_file", lambda name, path:
                         worker_records if name == "placement_kernel_records" else types.SimpleNamespace(
                             cuda_images=lambda blob: [(0, blob)]))

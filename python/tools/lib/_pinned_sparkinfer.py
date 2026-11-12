@@ -143,6 +143,21 @@ _pin_cute_host_target()
 HOST_TARGET = host_target()
 
 
+def _install_backend_cache():
+    # One implementation and identity for CMake, offline republishes and spawned
+    # variant workers. Runtime JIT caches cannot retain export_to_c's compiler IR.
+    name = "_cuteafd_kernel_records"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, ROOT / "scripts/build/kernel-records.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    sys.modules[name].install_backend_cache()
+
+
+_install_backend_cache()
+
+
 def export_target(properties) -> str:
     """What an AOT manifest records as its device: the compiled target
     ("sm120"), never the export host's GPU marketing name, which made two hosts'
