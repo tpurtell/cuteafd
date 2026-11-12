@@ -1616,7 +1616,7 @@ mod tests {
             ),
             (
                 include_str!("../../../families/glm5/engine.rs"),
-                "step_lanes",
+                "step_lanes_with",
                 "replay_on",
             ),
             (
