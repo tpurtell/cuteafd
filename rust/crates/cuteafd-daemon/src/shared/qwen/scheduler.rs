@@ -671,6 +671,15 @@ mod readiness_tests {
     }
 
     #[test]
+    fn streamed_scoring_capability_is_published_before_scheduler_readiness() {
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        let init = source.split_once("= initialize(|| {").unwrap().1.split_once("}, initialized)?;").unwrap().0;
+        let capability = init.split_once("if engine.streamed_prefill_scoring() {").unwrap().1
+            .split_once('}').unwrap().0;
+        assert!(capability.contains("set_resolved(\"prefill-scoring\", \"streamed\")"));
+    }
+
+    #[test]
     fn scheduler_init_failure_never_publishes_ready() {
         let published = Cell::new(false);
         let result = initialize(|| -> Result<()> { anyhow::bail!("scheduler init failed") }, || {
@@ -784,6 +793,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     // Publish readiness only after all fallible scheduler-owned startup work.
     let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
         let (family, cache) = engine.prefix_cache(prefix, max_sequences)?;
+        if engine.streamed_prefill_scoring() {
+            cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+        }
         let markers = crate::shared::prefix::marker_ids(snapshot, engine.message_starts())?;
         let grammars = crate::shared::constraints::Compiler::with_vocab(
             engine.library(), snapshot.join("tokenizer.json"), geometry.vocab_size, eos);
