@@ -779,9 +779,16 @@ def test_two_builds_on_one_seed_share_cpu_slots_but_serialize_the_export(tmp_pat
     first = _lease(tmp_path, 'a', '--host', 'kakapo')
     second = _lease(tmp_path, 'b', '--host', 'kakapo')
     try:
+        granted_slots = set()
         for lease, _, _ in (first, second):
             _wait_file(lease / 'granted')
-            assert json.loads((lease / 'granted').read_text()) == {'host': 'kakapo', 'slots': 3}
+            grant = json.loads((lease / 'granted').read_text())
+            slot = grant.pop('slot')
+            assert grant == {'host': 'kakapo', 'slots': 3}
+            assert 0 <= slot < 3
+            granted_slots.add(slot)
+            assert resource.try_lock(locks / f'kakapo.build.{slot}.lock') is None
+        assert len(granted_slots) == 2
         # Both hold a counting slot at once: their Cargo phases overlap.
         assert resource.held_slots(locks, 'kakapo', 3) == 2
         (first[0] / 'export-request').touch()
