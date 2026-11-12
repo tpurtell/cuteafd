@@ -1320,6 +1320,31 @@ impl<'a> GlmEngine<'a> {
             || self.prefill_rows_logits(placement, tokens, experts, None, logit_rows))
     }
 
+    pub(crate) fn prefill_streamed_scoring(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        media: &cuteafd_engine::media::RequestMedia, scoring: crate::shared::probe::ScoringRows<'_>)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        crate::shared::experts::rtx::pair::submit(
+            || self.require_live(), || {
+                crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM scoring shutdown");
+                Ok(())
+            }, || self.with_media(placement.len, tokens.len(), Some(media), || {
+                self.prefill_step_with(placement, tokens, experts, None, tokens.len(), Some(scoring))?;
+                Ok((self.weights.layers.len() == self.cfg.layers)
+                    .then_some(crate::shared::probe::ScoreLogits::Recorded))
+            }))
+    }
+
+    fn record_head(&self, w: &Workspace<'_>, rows: usize, offset: usize,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<()> {
+        let capacity = w.logits.buffer.bytes / (self.cfg.vocab_size * 4);
+        for span in crate::shared::probe::head_spans(rows, capacity.min(DECODE_ROWS))? {
+            self.launch_head(w, span.end, span.len())?;
+            scoring.record(self.library, offset + span.start, &self.device_logits(w, span.len(), false))?;
+        }
+        Ok(())
+    }
+
     /// Teacher-forced decode chunks may cross an image span too, not just prefill chunks.
     pub fn verify_scoring_media(&self, placement: &mut GlmPlacement, tokens: &[u32],
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
@@ -1407,6 +1432,13 @@ impl<'a> GlmEngine<'a> {
     fn prefill_step(&self, placement: &mut GlmPlacement, tokens: &[u32],
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, logit_rows: usize) -> Result<Option<StepLogits>> {
+        self.prefill_step_with(placement, tokens, experts, on_layer, logit_rows, None)
+    }
+
+    fn prefill_step_with(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, logit_rows: usize,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
         let (start, t) = (placement.len, tokens.len());
         if on_layer.is_none() && self.pipelined() && t >= 2 * MIN_LANE_ROWS && experts.is_some() {
             // Equal page-aligned units of at most `prefill_rows`, a multiple of the
@@ -1417,15 +1449,19 @@ impl<'a> GlmEngine<'a> {
             let link = link.as_mut().context("GLM prefill units need the prefill link")?;
             let depth = self.depth;
             ensure!(depth.waves <= link.waves(), "{} prefill waves exceed the link's {} slots", depth.waves, link.waves());
-            let cuts = crate::shared::prefill_pipeline::retained_logits_units(t, depth.unit_rows, depth.waves,
-                MIN_LANE_ROWS, logit_rows, if self.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS })?;
+            let cuts = if scoring.is_some() {
+                crate::shared::prefill_pipeline::prefill_units(t, depth.unit_rows, depth.waves, MIN_LANE_ROWS)?
+            } else {
+                crate::shared::prefill_pipeline::retained_logits_units(t, depth.unit_rows, depth.waves,
+                    MIN_LANE_ROWS, logit_rows, if self.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS })?
+            };
             let (mut lanes, mut chunks) = (Vec::new(), Vec::new());
             for rows in cuts {
                 lanes.push(self.prefill_tables(placement, start + rows.start, rows.len())?);
                 chunks.push(&tokens[rows]);
             }
             let runtime = self.prefill_runtime.as_ref().context("GLM prefill runtime")?;
-            let logits = self.step_lanes(&lanes, &chunks, depth, logit_rows, link, runtime)?;
+            let logits = self.step_lanes_with(&lanes, &chunks, depth, logit_rows, link, runtime, scoring)?;
             placement.len += t;
             return Ok(logits);
         }
@@ -1434,14 +1470,19 @@ impl<'a> GlmEngine<'a> {
         self.last_prefill_units.set(1);
         // Short chunks, callbacks and partial-layer goldens use the same
         // prefill owner as units; the decode link admits decode rows only.
+        let head_rows = if scoring.is_some() { 0 } else { logit_rows };
         let logits = if experts.is_some() {
             let mut link = self.prefill_link.borrow_mut();
             let link = link.as_mut().context("GLM Spark prefill needs the prefill link")?;
             let runtime = self.prefill_runtime.as_ref().context("GLM prefill runtime")?;
-            self.step(&tables, tokens, logit_rows, Some((link, runtime)), on_layer)?
+            self.step(&tables, tokens, head_rows, Some((link, runtime)), on_layer)?
         } else {
-            self.step(&tables, tokens, logit_rows, None, on_layer)?
+            self.step(&tables, tokens, head_rows, None, on_layer)?
         };
+        if let Some(scoring) = scoring.filter(|_| self.weights.layers.len() == self.cfg.layers) {
+            let work = self.prefill_slots.borrow();
+            self.record_head(&work[0], t, 0, scoring)?;
+        }
         placement.len += t;
         Ok(logits.map(StepLogits::Device))
     }
@@ -2680,12 +2721,19 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn step_lanes(&self, lanes: &[StepTables], chunks: &[&[u32]], depth: crate::shared::prefill_depth::PrefillDepth,
         logit_rows: usize, link: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
+        self.step_lanes_with(lanes, chunks, depth, logit_rows, link, runtime, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_lanes_with(&self, lanes: &[StepTables], chunks: &[&[u32]], depth: crate::shared::prefill_depth::PrefillDepth,
+        logit_rows: usize, link: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
         crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || {
                 crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM submission shutdown");
                 Ok(())
             },
-            |scope| self.step_lanes_inner(scope, lanes, chunks, depth, logit_rows, link, runtime))
+            |scope| self.step_lanes_inner(scope, lanes, chunks, depth, logit_rows, link, runtime, scoring))
     }
 
     fn join_peer_reader(&self) -> Result<()> {
@@ -2701,7 +2749,7 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn step_lanes_inner(&self, _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, lanes: &[StepTables],
         chunks: &[&[u32]], depth: crate::shared::prefill_depth::PrefillDepth, logit_rows: usize, link: &mut SparkLink<'_>,
-        _runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
+        _runtime: &tokio::runtime::Runtime, scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
         // `lanes` are the call's units in order; at most `waves` are in flight,
         // unit `u` holding slot `u % waves` on both ranks.
         let waves = depth.waves.min(lanes.len()).max(1);
@@ -2716,7 +2764,8 @@ impl<'a> GlmEngine<'a> {
             Some(here)
         }).collect();
         let total: usize = counts.iter().sum();
-        ensure!(logit_rows <= counts.last().copied().unwrap_or(0) && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
+        ensure!(scoring.is_some() || (logit_rows <= counts.last().copied().unwrap_or(0)
+            && (self.full_prefill_logits || logit_rows <= DECODE_ROWS)),
             "prefill logits must lie in the last unit and stay within {DECODE_ROWS} rows without full_prefill_logits");
         ensure!(counts.iter().all(|&n| n <= workspaces[0].rows) && chunks.iter().zip(&counts).all(|(c, &n)| c.len() == n),
             "prefill unit exceeds its workspace");
@@ -2875,10 +2924,11 @@ impl<'a> GlmEngine<'a> {
         ensure!(transport.fits(self.wave_staging_bytes()?), "the prefill link's staging is narrower than its widest wave");
         let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, peers: &peers, layers, counts: &counts,
             begin: &begin, attention: &attention, post: &post, transport, cap, waves,
-            ranked: &ranked, total, owned_hops: owned_hops.map(|n| vec![vec![0; n]; lanes.len()]) };
+            ranked: &ranked, total, owned_hops: owned_hops.map(|n| vec![vec![0; n]; lanes.len()]), scoring };
         let ran = crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves);
         drop(hooks);
         if let Some(pair) = &self.tp2 { ran.and(pair.finish_span())?; } else { ran?; }
+        if scoring.is_some() { return Ok(None); }
         // The last unit's workspace holds the call's last rows.
         let last = lanes.len() - 1;
         self.prefill_logits(&[workspaces[last % waves]], &[counts[last]], logit_rows)
@@ -3372,6 +3422,7 @@ struct UnitHooks<'h, 'a, 'l, B, A, P> {
     ranked: &'h [[StepTables; 2]],
     total: usize,
     owned_hops: Option<Vec<Vec<usize>>>,
+    scoring: Option<crate::shared::probe::ScoringRows<'h>>,
 }
 
 enum UnitTicket {
@@ -3448,6 +3499,9 @@ where B: Fn(usize) -> Result<()>,
         }
         // Drains (diagnostics only) and compares this unit's routes before its slot is reused.
         if let Some(pair) = &self.engine.tp2 { pair.finish_unit(unit.slot, unit.index)?; }
+        if let Some(scoring) = self.scoring.filter(|_| self.layers.len() == self.engine.cfg.layers) {
+            self.engine.record_head(self.workspaces[unit.slot], unit.rows.len(), unit.rows.start, scoring)?;
+        }
         Ok(())
     }
     fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
@@ -3715,13 +3769,50 @@ mod native_decode_order_tests {
 #[cfg(test)]
 mod prefill_unit_tests {
     #[test]
+    fn streamed_scoring_keeps_serving_cuts_and_consumes_before_slot_reuse() {
+        let source = include_str!("engine.rs");
+        let pass = source.split("fn prefill_step_with(").nth(1).unwrap()
+            .split("pub fn verify(").next().unwrap();
+        assert!(pass.contains("let cuts = if scoring.is_some()"));
+        assert!(pass.contains("prefill_units(t, depth.unit_rows, depth.waves, MIN_LANE_ROWS)"));
+        assert!(pass.contains("let head_rows = if scoring.is_some() { 0 } else { logit_rows }"));
+        let end = source.split("fn end_unit(").nth(1).unwrap().split("fn commit_unit(").next().unwrap();
+        assert!(end.find("owned_unit_exit").unwrap() < end.find("record_head").unwrap());
+        assert!(end.contains("unit.rows.len(), unit.rows.start, scoring"));
+        let head = source.split("fn record_head(").nth(1).unwrap()
+            .split("pub fn verify_scoring_media(").next().unwrap();
+        assert!(head.contains("capacity.min(DECODE_ROWS)"));
+        assert!(head.find("self.launch_head(").unwrap() < head.find("scoring.record(").unwrap());
+        assert!(!head.contains("Vec::"));
+        let serve = include_str!("serve.rs");
+        assert!(serve.contains("probe::validate_scoring(&job.probe, true)"));
+        assert!(serve.contains("else { engine.prefill_capacity() }"));
+        assert!(serve.contains("rows > 1 && !engine.full_prefill_logits"));
+    }
+
+    #[test]
+    fn scoring_head_tiles_cover_recycled_unit_positions_once() {
+        use crate::shared::prefill_pipeline::prefill_units;
+        for total in [1, 63, 64, 65, 511, 512, 4096, 8192, 12417] {
+            let cuts = prefill_units(total, 4096, 3, super::MIN_LANE_ROWS).unwrap();
+            let mut positions = Vec::new();
+            for unit in cuts {
+                for span in crate::shared::probe::head_spans(unit.len(), super::DECODE_ROWS).unwrap() {
+                    positions.extend(unit.start + span.start..unit.start + span.end);
+                }
+            }
+            assert_eq!(positions, (0..total).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
     fn serial_prefill_never_uses_decode_transport_or_eager_host_staging() {
         let source = include_str!("engine.rs");
         let fallback = source.split("fn prefill_step(").nth(1).unwrap()
             .split("fn step(").next().unwrap();
         let check = |body: &str| body.contains("self.prefill_link.borrow_mut()")
-            && body.contains("self.step(&tables, tokens, logit_rows, Some((link, runtime)), on_layer)?")
-            && !body.contains("self.step(&tables, tokens, logit_rows, experts, on_layer)?");
+            && body.contains("self.step(&tables, tokens, head_rows, Some((link, runtime)), on_layer)?")
+            && !body.contains("self.step(&tables, tokens, head_rows, experts, on_layer)?");
         assert!(check(fallback));
         assert!(!check(&fallback.replace("Some((link, runtime))", "experts")));
         let shared = source.split("fn shared_here(").nth(1).unwrap()

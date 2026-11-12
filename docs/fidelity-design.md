@@ -53,14 +53,19 @@ changes using the fixed dataset; its old calibration campaigns are historical.
 
 ### Bounded prefill scoring (2026-11-12)
 
-Kimi and GLM Flash accept prefill-shaped fidelity probes on ordinary serving
+Kimi, GLM Flash and GLM 5.3 / Mistral Large 4 accept prefill-shaped fidelity probes on ordinary serving
 launches, without reserving all-call logits before KV sizing. Scoring preserves
 the serving transformer's prefill calls and unit cuts, projects through existing
 head storage, and consumes selected rows before that storage is reused. Raw
 logits dumps use those same rows for byte-exactness and full-vocabulary KL.
 Other families retain their existing admission requirement during migration;
 the legacy flag remains only until each family's paired exactness check passes.
-Scoring continues through normal request admission.
+Scoring continues through normal request admission. GLM 5.3 / Mistral Large 4
+stream the actual serving cuts; legacy all-row retention could collapse those
+cuts into a serial diagnostic call. Their paired comparison therefore reports
+coverage and delta KL against the same reference, not byte identity across
+different transformer cuts. Standard-tier wall time measures the host-gather
+cost; a device reducer is follow-up work only if that cost is unacceptable.
 
 ## 0. Recommendation in one box
 
