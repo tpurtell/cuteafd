@@ -134,6 +134,7 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
     args.draft_length.report_inactive(args.engine.draft.is_some() || args.engine.mtp > 0);
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
