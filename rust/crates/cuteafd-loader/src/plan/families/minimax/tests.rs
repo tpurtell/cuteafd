@@ -716,7 +716,7 @@ fn shared_recipe_supports_layouts_and_measured_baselines_without_replanning() {
 }
 
 #[test]
-fn shared_recipe_refuses_invalid_owners_concurrency_and_missing_exports() {
+fn shared_recipe_refuses_invalid_owners_and_request_geometry() {
     use crate::placement::families::minimax_m3::{self as shared, LocalPackage};
     use crate::placement::planner::{Operation, Recipe, Refusal};
     let inputs = recipe_inputs(2, 4);
@@ -725,6 +725,11 @@ fn shared_recipe_refuses_invalid_owners_concurrency_and_missing_exports() {
     for concurrency in [0, 65, 128] {
         let mut bad = inputs.clone();
         bad.sequences = concurrency;
+        assert!(matches!(bad.prepare(&request), Err(Refusal::InvalidFact(_))));
+    }
+    for (rows, waves) in [(0, 3), (4097, 3), (1024, 0)] {
+        let mut bad = inputs.clone();
+        bad.prefill = crate::placement::planner::PrefillShape { rows, waves };
         assert!(matches!(bad.prepare(&request), Err(Refusal::InvalidFact(_))));
     }
     let mut bad = inputs.clone();
@@ -740,12 +745,99 @@ fn shared_recipe_refuses_invalid_owners_concurrency_and_missing_exports() {
     assert!(bad.prepare(&pinned).unwrap_err().to_string().contains("fp8-minimax-nvfp4a4/tp2"));
     // Missing local exports never prevent a remote-only layout.
     bad.admit(request.clone()).unwrap();
-    let mut bad = inputs.clone();
-    let manifest = std::sync::Arc::make_mut(&mut bad.manifest);
-    manifest["programs"].as_array_mut().unwrap().retain(|p|
-        p["name"].as_str() != Some("exlr8_dense_mxfp8_k6144_n8192_s1_a8"));
-    let error = bad.prepare(&request).unwrap_err().to_string();
-    assert!(error.contains("exlr8_dense_mxfp8_k6144_n8192_s1_a8"), "{error}");
+}
+
+#[test]
+fn shared_recipe_names_every_missing_duplicate_or_malformed_native_export() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::{Operation, Recipe, Refusal};
+    for gpus in [1, 2] {
+        let inputs = recipe_inputs(gpus, 4);
+        let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+            inputs.prefill, Operation::Serving, None, Default::default());
+        inputs.prepare(&request).unwrap();
+        for entry in inputs.manifest["programs"].as_array().unwrap() {
+            let name = entry["name"].as_str().unwrap();
+            for fault in ["missing", "duplicate", "operand", "capacity"] {
+                let mut bad = inputs.clone();
+                let programs = std::sync::Arc::make_mut(&mut bad.manifest)["programs"].as_array_mut().unwrap();
+                match fault {
+                    "missing" => programs.retain(|program| program["name"] != name),
+                    "duplicate" => programs.push(entry.clone()),
+                    _ => {
+                        let program = programs.iter_mut().find(|program| program["name"] == name).unwrap();
+                        if fault == "operand" { program["pointers"][0]["dtype"] = serde_json::json!("wrong"); }
+                        else { program["capacity_rows"] = serde_json::json!(0); }
+                    }
+                }
+                let error = bad.prepare(&request).unwrap_err();
+                let Refusal::MissingExport { export, geometry, detail, .. } = &error else {
+                    panic!("{gpus} RTX {name} {fault}: {error:?}");
+                };
+                assert_eq!(export, name, "{gpus} RTX {fault}: {error}");
+                assert!(!geometry.is_empty() && !detail.is_empty(), "{error}");
+                if fault == "missing" { assert!(detail.contains("absent"), "{error}"); }
+                if fault == "duplicate" { assert!(detail.contains("duplicate"), "{error}"); }
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_recipe_refuses_valid_but_undersized_native_exports() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::{Operation, Recipe, Refusal};
+    use cuteafd_ffi::minimax_m3::{Layout, Mode, producers::{Kind, ProducerLayout}};
+    for gpus in [1, 2] {
+        let inputs = recipe_inputs(gpus, 4);
+        let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+            inputs.prefill, Operation::Serving, None, Default::default());
+        let msa = [Mode::IndexDecode, Mode::IndexPrefill, Mode::AttentionDecode, Mode::AttentionExtend];
+        for original in inputs.manifest["programs"].as_array().unwrap().iter()
+            .filter(|entry| entry["name"].as_str().unwrap().starts_with("minimax_")) {
+            let name = original["name"].as_str().unwrap();
+            // Cover row capacity for every mode, plus index context and attention batch extents.
+            let dimensions = if msa.iter().any(|mode| mode.name() == name) { 2 } else { 1 };
+            for dimension in 0..dimensions {
+                let mut bad = inputs.clone();
+                let entry = std::sync::Arc::make_mut(&mut bad.manifest)["programs"].as_array_mut().unwrap()
+                    .iter_mut().find(|entry| entry["name"] == name).unwrap();
+                if let Some(mode) = msa.iter().copied().find(|mode| mode.name() == name) {
+                    let extent_key = if matches!(mode, Mode::IndexDecode | Mode::IndexPrefill) {
+                        "max_pages"
+                    } else { "max_batch" };
+                    let mut rows = entry["capacity_rows"].as_u64().unwrap() as u32;
+                    let mut extent = entry["geometry"][extent_key].as_u64().unwrap() as u32;
+                    if dimension == 0 {
+                        rows = if matches!(mode, Mode::IndexDecode | Mode::AttentionDecode) { 8 } else { 512 };
+                    } else {
+                        extent = if matches!(mode, Mode::IndexDecode | Mode::IndexPrefill) { extent / 2 } else { 8 };
+                    }
+                    // Keep the smaller export internally valid, including its physical scratch ABI.
+                    let layout = Layout::new(mode, rows, extent).unwrap();
+                    entry["capacity_rows"] = rows.into();
+                    for section in ["geometry", "params"] {
+                        entry[section]["max_rows"] = rows.into();
+                        entry[section][extent_key] = extent.into();
+                    }
+                    entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
+                    let scratch = entry["pointers"].as_array_mut().unwrap().iter_mut()
+                        .find(|pointer| pointer["name"] == "scratch").unwrap();
+                    scratch["shape"] = serde_json::json!(format!("[{}]", layout.scratch));
+                } else {
+                    entry["capacity_rows"] = serde_json::json!(512);
+                    if let Some(kind) = Kind::ALL.into_iter().find(|kind| kind.name() == name) {
+                        let scratch = ProducerLayout::new(kind, 512).unwrap().scratch();
+                        if scratch > 0 { entry["scratch_bytes_at_capacity"]["scratch"] = scratch.into(); }
+                    }
+                }
+                let error = bad.prepare(&request).unwrap_err();
+                assert!(matches!(&error, Refusal::MissingExport { export, detail, .. }
+                    if export == name && detail.contains("compiled") && detail.contains("requested")),
+                    "{gpus} RTX {name} dimension {dimension}: {error}");
+            }
+        }
+    }
 }
 
 #[test]
