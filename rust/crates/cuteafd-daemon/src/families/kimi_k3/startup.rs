@@ -269,8 +269,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             }
         }
     }
-    let mut selected = cuteafd_loader::placement::ProgramSet::from_names(
-        if core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] }, programs.names());
+    let program_families = match (full.dsa.is_some(), !core.projections.is_empty()) {
+        (false, false) => &["kimik3"][..],
+        (false, true) => &["kimik3", "kimi"][..],
+        (true, false) => &["kimik3", "kimik31"][..],
+        (true, true) => &["kimik3", "kimik31", "kimi"][..],
+    };
+    let mut selected = cuteafd_loader::placement::ProgramSet::from_names(program_families, programs.names());
     selected.names.extend(native_exports.programs.iter().cloned());
     selected.names.sort();
     selected.names.dedup();

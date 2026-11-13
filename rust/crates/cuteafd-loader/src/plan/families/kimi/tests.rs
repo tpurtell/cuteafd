@@ -923,3 +923,70 @@ fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<
     assert!(Checkpoint::open(dir.path()).is_err());
     Ok(())
 }
+
+#[test]
+fn k31_original_core_plan_charges_index_records_once_and_refuses_compact_core() -> Result<()> {
+    use crate::families::kimi_k3::config::KimiK3Config;
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+
+    let dir = snapshot(true);
+    let mut cfg = testing::kimi_k3_config();
+    cfg["model_type"] = serde_json::json!("kimi_k31");
+    cfg["architectures"] = serde_json::json!(["KimiK31ForConditionalGeneration"]);
+    cfg["text_config"]["dsa_config"] = serde_json::json!({
+        "dsa_layers": cfg["text_config"]["linear_attn_config"]["full_attn_layers"],
+        "index_num_heads": 32, "index_head_dim": 128, "index_topk": 2048,
+        "index_rope_dim": 0, "index_k_norm_type": "layernorm",
+        "index_topk_freq": 1, "index_skip_topk_offset": 1,
+    });
+    std::fs::write(dir.path().join("config.json"), cfg.to_string())?;
+    let path = dir.path().join("model.safetensors.index.json");
+    let mut index: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let parsed = KimiK3Config::from_hf(&cfg)?;
+    let mut headers = Vec::new();
+    for (layer, kind) in parsed.attention.iter().enumerate() {
+        if *kind != KimiAttention::Mla { continue; }
+        let root = format!("language_model.model.layers.{layer}.self_attn.indexer");
+        for (leaf, shape) in [("wq_b.weight", vec![4096, 1536]), ("wk.weight", vec![128, 7168]),
+            ("weights_proj.weight", vec![32, 7168]), ("k_norm.weight", vec![128]), ("k_norm.bias", vec![128])] {
+            let name = format!("{root}.{leaf}");
+            index["weight_map"][&name] = serde_json::json!("indexers.safetensors");
+            headers.push(t(name, "BF16", &shape));
+        }
+    }
+    testing::write_safetensors(&dir.path().join("indexers.safetensors"), &headers);
+    std::fs::write(&path, index.to_string())?;
+
+    let input = testing::BudgetedPlanInput::open(dir.path())?;
+    let mut options = with_layout(6, Some(115 << 30));
+    let report = input.plan(&options)?;
+    assert!(!report.wip_launchable(), "serve-kimi stays fail-closed for K3.1 in Stage 1");
+    let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
+    let memory = report.memory_layout.as_ref().unwrap();
+    for dev in memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx) {
+        let index_items: Vec<_> = dev.items.iter()
+            .filter(|i| i.category == Category::Kv && i.group == "index records")
+            .collect();
+        assert_eq!(index_items.len(), 1, "index records must be charged once per rank: {:?}", dev.items);
+        assert!(index_items[0].bytes > 0);
+    }
+    assert!(placed.pool_tokens > 0);
+
+    // Compact K6 core view remains fail-closed until Stage 2 (#1777).
+    let k6_dir = tempfile::tempdir()?;
+    testing::write_kimi_core_snapshot(k6_dir.path(), true);
+    std::fs::write(k6_dir.path().join("config.json"), cfg.to_string())?;
+    let k6_index_path = k6_dir.path().join("model.safetensors.index.json");
+    let mut k6_index: Value = serde_json::from_slice(&std::fs::read(&k6_index_path)?)?;
+    for (name, ..) in &headers {
+        k6_index["weight_map"][name] = serde_json::json!("indexers.safetensors");
+    }
+    testing::write_safetensors(&k6_dir.path().join("indexers.safetensors"), &headers);
+    std::fs::write(&k6_index_path, k6_index.to_string())?;
+    options.attention_placement = None;
+    let k6_report = testing::BudgetedPlanInput::open(k6_dir.path())?.plan(&options)?;
+    assert!(!k6_report.placement_supported);
+    assert!(k6_report.hints.iter().any(|h| h.what.contains("compact core views")),
+        "{:?}", k6_report.hints);
+    Ok(())
+}

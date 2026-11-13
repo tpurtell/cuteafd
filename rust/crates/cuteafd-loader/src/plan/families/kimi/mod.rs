@@ -398,8 +398,11 @@ impl FamilyModel for Model {
             DType::F32 => format::Encoding::F32,
             _ => return Err(format!("{stem}: unsupported Kimi text dtype {:?}", expected.dtype)),
         };
+        let expected_companions: &[&str] = if self.tensors.contains_key(&format!("{stem}.bias")) {
+            &["bias"]
+        } else { &[] };
         super::require(operand.logical == expected.shape && operand.is_plain(&[encoding])
-            && operand.input_scale.is_none() && operand.companions.is_empty(), ||
+            && operand.input_scale.is_none() && operand.companions == expected_companions, ||
             format!("{stem}: expected plain {:?} {:?}, found {}", expected.dtype, expected.shape, super::describe(operand)))
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {

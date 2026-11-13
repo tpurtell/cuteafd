@@ -95,9 +95,9 @@ impl<'a> W8<'a> {
             shared: KimiFfn::load(programs, cfg.moe_intermediate * cfg.shared_experts / ranks, mode)?, cfg: cfg.clone() })
     }
 
-    pub(crate) fn residual(&self, site: MixSite, batch: KimiResidualBatch,
+    pub(crate) fn residual(&self, cfg: &KimiK3Config, site: MixSite, batch: KimiResidualBatch,
         stream: *mut std::ffi::c_void) -> Result<()> {
-        let key = residual_site(&self.cfg, site)?;
+        let key = residual_site(cfg, site)?;
         let (_, program) = self.residuals.iter().find(|(existing, _)| *existing == key)
             .ok_or_else(|| anyhow::anyhow!("unresolved Kimi residual site"))?;
         program.launch(batch, stream)?;
@@ -1092,7 +1092,7 @@ impl<'a> LocalLane<'a> {
                 device.run(|| {
                     if self.programs.dsa.is_some() {
                         program.produce(layer, weights, batch, self.lane.stream.raw)?;
-                        self.dsa_attention(layer, batch)?;
+                        self.dsa_attention(layer, batch, speculative)?;
                         program.output(layer, weights, batch, self.lane.stream.raw)
                     } else { program.forward(layer, weights, batch, self.lane.stream.raw) }
                 })?;
@@ -1351,7 +1351,7 @@ impl<'a> LocalLane<'a> {
             fn produce(&mut self) -> Result<()> { self.local.mla_produce(self.layer, self.batch) }
             fn attention(&mut self) -> Result<()> {
                 if self.local.programs.dsa.is_some() {
-                    return self.local.dsa_selected(self.layer, self.batch, true);
+                    return self.local.dsa_selected(self.layer, self.batch, true, false);
                 }
                 let stream = self.local.stream();
                 stream.device.run(|| self.local.programs.mla[0].extend.attention(self.layer, self.batch, stream.raw))
@@ -1418,11 +1418,12 @@ impl<'a> LocalLane<'a> {
 
     /// Ordinary placement shares physical page IDs between index and MLA.
     /// Context must instead merge global candidates into its independent local table.
-    fn dsa_attention(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
-        self.dsa_selected(layer, batch, false)
+    fn dsa_attention(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch, speculative: bool) -> Result<()> {
+        self.dsa_selected(layer, batch, false, speculative)
     }
 
-    fn dsa_selected(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch, staging: bool) -> Result<()> {
+    fn dsa_selected(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch, staging: bool,
+        speculative: bool) -> Result<()> {
         ensure!(staging == self.mla.parity(), "Kimi Context DSA requires logical slots in gathered staging");
         let programs = self.programs.dsa.as_ref().context("Kimi DSA programs not resolved")?;
         let unit = usize::from(batch.rows > 64);
@@ -1452,7 +1453,7 @@ impl<'a> LocalLane<'a> {
                 scores: if staging { self.lane.buffer("DSA scores")? } else { indices },
                 scratch: self.lane.buffer("DSA selector scratch")?,
             }, stream.raw)?;
-            self.mla_program(layer, batch.rows, false)?.selected(layer, cuteafd_ffi::KimiSparseBatch {
+            self.mla_program(layer, batch.rows, speculative)?.selected(layer, cuteafd_ffi::KimiSparseBatch {
                 rows: batch.rows, cache_tokens: batch.cache_pages * 64,
                 query: batch.query, cache: batch.cache, indices,
                 lengths: self.lane.buffer("DSA selected lengths")?,
@@ -1603,7 +1604,7 @@ impl<'a> LocalLane<'a> {
                         super::core_runtime::mla_query_projected(split,projected("mla.q_b")?,rows,batch.q_resid,
                             q_b,weights.buffer("mla.uk")?,batch.query,stream.raw)?;
                     }
-                    if self.programs.dsa.is_some() { self.dsa_attention(layer, batch)?; }
+                    if self.programs.dsa.is_some() { self.dsa_attention(layer, batch, speculative)?; }
                     else { attention.attention(layer,batch,stream.raw)?; }
                     super::core_runtime::mla_gate_projected(split,projected("mla.gate")?,rows,input,batch.attention,
                         weights.buffer("mla.uv")?,self.lane.buffer("K6 gate")?,normalized,stream.raw)?;
@@ -1727,7 +1728,7 @@ impl<'a> LocalLane<'a> {
         let output = self.plane("normalized", rows, 7168)?;
         let batch = KimiResidualBatch { rows, arena_rows: self.lane.rows(), arena: self.lane.buffer("residual arena")?,
             delta: self.plane("delta", rows, 7168)?, score_weight, norm_weight, output };
-        self.lane.stream.device.run(|| self.programs.w8.residual(site, batch, self.lane.stream.raw))?;
+        self.lane.stream.device.run(|| self.programs.w8.residual(&self.cfg, site, batch, self.lane.stream.raw))?;
         if let Some(capture) = &self.capture {
             if let MixSite::Ffn(layer) = site {
                 let prefix = view(self.lane.buffer("residual arena")?, 8 * self.lane.rows() * 7168 * 2, rows * 7168 * 2)?;

@@ -40,11 +40,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
-    if let Err(error) = cfg.validate_attention_runtime() {
-        report.refuse_placement(error.to_string(),
-            "Complete the Gated DSA kernel and prefix-cache qualification tracked in #1777; dense MLA is not an equivalent fallback.");
+    if cfg.dsa.is_some() && (!model.core.projections.is_empty() || !model.core.native.is_empty()) {
+        report.refuse_placement(
+            "Kimi K3.1 compact core views (K6/K8) are unqualified; use --core-view original (#1777)".into(),
+            "Qualify K8/K6 compact core views on K3.1 (#1777), or plan --core-view original.");
         return MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(),
-            notes: vec!["Kimi K3.1 headers and core views are recognized; sparse execution is not qualified".into()] };
+            notes: vec!["Kimi K3.1 compact core placement remains gated pending core-view qualification (#1777)".into()] };
     }
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
