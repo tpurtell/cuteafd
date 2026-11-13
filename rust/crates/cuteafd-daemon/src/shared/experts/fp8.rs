@@ -1033,7 +1033,7 @@ mod tests {
     #[test]
     fn pushed_native_receipts_and_bytes_match_mount_arena() -> anyhow::Result<()> {
         use super::*;
-        use crate::shared::{experts::rtx::push::{tests::receive_pushed, dense::Records},
+        use crate::shared::{experts::rtx::{push::tests::receive_pushed, dense::Records},
             memory::{device::Device, push_coordinator::CoordinatorExpertPlan, receipts::Inventory}};
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
         let native = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
