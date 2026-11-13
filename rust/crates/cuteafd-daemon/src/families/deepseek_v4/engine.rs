@@ -934,12 +934,18 @@ impl<'a> Engine<'a> {
     pub(crate) fn prefill_streamed_scoring(&self, placement: &mut Placement, tokens: &[u32],
         transports: &mut [SparkLink<'_>], scoring: crate::shared::probe::ScoringRows<'_>)
         -> Result<crate::shared::probe::ScoreLogits> {
+        self.prefill_consumer(placement, tokens, transports, None, scoring)
+    }
+
+    pub(crate) fn prefill_consumer(&self, placement: &mut Placement, tokens: &[u32],
+        transports: &mut [SparkLink<'_>], on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<crate::shared::probe::ScoreLogits> {
         let _coverage_step = self.graph_coverage.step("prefill", 1, tokens.len());
         let (start, t) = (placement.len, tokens.len());
         ensure!(t > 0 && t <= self.prefill_capacity() && start + t <= self.max_context,
             "prefill span of {t} tokens at {start} exceeds the span or context capacity");
         self.cache_cycle(crate::shared::decode_graph::device::Cycle::Prefill);
-        self.prefill_units_with(placement, tokens, transports, 0, None, false, Some(scoring))?;
+        self.prefill_units_with(placement, tokens, transports, 0, on_layer, false, Some(scoring))?;
         placement.len += t;
         Ok(crate::shared::probe::ScoreLogits::Recorded)
     }

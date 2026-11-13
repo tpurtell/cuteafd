@@ -370,8 +370,7 @@ fn embed_source(catalog: &cuteafd_loader::OfficialV41Catalog, dim: usize) -> Res
     crate::shared::token_io::EmbedSource::new(catalog.snapshot(), &tensor.shard, &tensor.metadata, dim)
 }
 
-pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
-    args.engine.full_prefill_logits |= args.nll;
+pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -878,9 +877,8 @@ pub(crate) fn with_engine<T>(
 fn golden(args: GoldenArgs) -> Result<()> {
     let shared = args.golden.join("manifest.json").try_exists()?;
     if args.packed_check.is_some() {
-        ensure!(shared && args.engine.full_prefill_logits && args.window.is_none()
-            && args.save_logits.is_none() && args.layers.is_none(),
-            "--packed-check requires a published V4 Flash set and --full-prefill-logits, without other diagnostics");
+        ensure!(shared && args.window.is_none() && args.save_logits.is_none() && args.layers.is_none(),
+            "--packed-check requires a published V4 Flash set without other diagnostics");
     } else if shared {
         ensure!(args.nll && args.save_logits.is_some(), "shared V4 fidelity needs --nll --save-logits DIR");
         ensure!(args.prefill.is_none() && !args.draft && args.verify_rows.is_none()
@@ -1002,14 +1000,12 @@ fn score_fidelity(args: &GoldenArgs, engine: &engine::Engine<'_>, transports: &m
         probe.admitted("deepseek_v4", &window.tokens, 0);
         probe.selected_score_path("prefill");
         probe.provenance(provenance.clone());
+        let consumer = Some(probe.clone());
         for chunk in fidelity_chunks(window.tokens.len(), chunk_rows)? {
             let first_scored = chunk.start.max(window.score_from - 1).min(chunk.end);
             let wanted = chunk.end - first_scored;
-            let logits = engine.prefill(&mut placement, &window.tokens[chunk.clone()], transports, runtime, wanted, None)?;
-            ensure!(logits.len() == wanted * vocab, "V4 fidelity logits shape differs");
-            for (row, logits) in logits.chunks_exact(vocab).enumerate() {
-                probe.row(first_scored + row + 1, logits);
-            }
+            engine.prefill_streamed_scoring(&mut placement, &window.tokens[chunk.clone()], transports,
+                crate::shared::probe::ScoringRows { consumer: &consumer, position: chunk.start + 1 })?;
             if wanted > 0 { probe.scored_prefill_chunk(first_scored + 1, wanted); }
         }
         let record = probe.record();
@@ -1045,60 +1041,50 @@ fn nll_run(args: &GoldenArgs, cfg: &DeepseekV4Config, engine: &engine::Engine<'_
     let tokens: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let vocab = cfg.vocab_size;
     ensure!(tokens.len() >= 2 && tokens.iter().all(|&t| (t as usize) < vocab), "invalid golden tokens");
-    let golden = match std::fs::read(args.golden.join("logits.bin")) {
-        Ok(bytes) => {
-            ensure!(bytes.len() == tokens.len() * vocab * 4, "golden logits row coverage differs");
-            Some(f32s(&bytes))
+    use std::io::Write;
+    let golden = crate::shared::golden_scores::ReferenceRows::open(
+        &args.golden.join("logits.bin"), tokens.len(), vocab, true)?;
+    let mut output = args.save_logits.as_ref().map(|dir| -> Result<_> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("tokens.bin"), &bytes)?;
+        Ok(std::io::BufWriter::new(std::fs::File::create(dir.join("logits.bin"))?))
+    }).transpose()?;
+    let mut raw = std::env::var_os("CUTEAFD_DUMP_PREFILL_LOGITS").map(|path|
+        std::fs::File::create(path).map(std::io::BufWriter::new)).transpose()?;
+    let mut metrics = crate::shared::golden_scores::RowMetrics::default();
+    let mut digest = std::collections::hash_map::DefaultHasher::new();
+    let consumer = crate::shared::probe::CallbackRows::new(|position: usize, values: &[f32]| {
+        let row = position.checked_sub(1).context("V4 golden zero score position")?;
+        ensure!(row == metrics.rows && values.len() == vocab, "V4 golden logits row order/shape differs");
+        let reference = golden.as_ref().map(|r| r.row(row)).transpose()?;
+        metrics.push(values, reference.as_deref(), tokens.get(row + 1).copied())?;
+        values.iter().for_each(|v| v.to_bits().hash(&mut digest));
+        for writer in [&mut output, &mut raw].into_iter().flatten() {
+            for value in values { writer.write_all(&value.to_le_bytes())?; }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
+        Ok(())
+    });
     let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len())?;
     let chunk = args.chunk.unwrap_or(engine.prefill_capacity()).min(engine.prefill_capacity());
     ensure!(chunk > 0, "prefill chunk must be positive");
     let started = Instant::now();
-    let mut logits = Vec::new();
-    for tokens in tokens.chunks(chunk) {
-        logits.extend(engine.prefill(&mut placement, tokens, transports, runtime, tokens.len(), None)?);
+    for (index, part) in tokens.chunks(chunk).enumerate() {
+        engine.prefill_streamed_scoring(&mut placement, part, transports,
+            crate::shared::probe::ScoringRows { consumer: &consumer, position: index * chunk + 1 })?;
     }
+    drop(consumer);
     allocator.release(placement);
     let seconds = started.elapsed().as_secs_f64();
-    ensure!(logits.len() == tokens.len() * vocab && logits.iter().all(|v| v.is_finite()),
-        "missing or nonfinite engine logits");
-    if let Some(dir) = &args.save_logits {
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("tokens.bin"), bytes)?;
-        std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
-    }
-    let lp = |row: &[f32]| {
-        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-        let lse = max + row.iter().map(|&v| (v as f64 - max).exp()).sum::<f64>().ln();
-        row.iter().map(|&v| v as f64 - lse).collect::<Vec<_>>()
-    };
-    let argmax = |row: &[f32]| row.iter().enumerate().max_by(|a,b| a.1.total_cmp(b.1)).unwrap().0;
-    let (mut nll, mut reference_nll, mut kl, mut agree) = (0.0, 0.0, 0.0, 0usize);
-    let mut digest = std::collections::hash_map::DefaultHasher::new();
-    logits.iter().for_each(|v| v.to_bits().hash(&mut digest));
-    for (r, ours) in logits.chunks_exact(vocab).enumerate() {
-        let q = lp(ours);
-        if let Some(&next) = tokens.get(r + 1) { nll -= q[next as usize]; }
-        if let Some(golden) = &golden {
-            let theirs = &golden[r * vocab..][..vocab];
-            ensure!(theirs.iter().all(|v| v.is_finite()), "nonfinite golden row {r}");
-            agree += usize::from(argmax(ours) == argmax(theirs));
-            let p = lp(theirs);
-            kl += p.iter().zip(&q).map(|(p,q)| p.exp() * (p-q)).sum::<f64>();
-            if let Some(&next) = tokens.get(r + 1) { reference_nll -= p[next as usize]; }
-        }
-    }
+    ensure!(metrics.rows == tokens.len(), "V4 golden prefill row coverage differs");
+    for writer in [&mut output, &mut raw].into_iter().flatten() { writer.flush()?; }
     let rows = tokens.len();
     if golden.is_some() {
         println!("prefill logits: {rows} tokens in {seconds:.2} s | top-1 agreement {:.2}% | mean NLL engine {:.4} golden {:.4} | mean KL(golden||engine) {:.5}",
-            100.0 * agree as f64 / rows as f64, nll / (rows-1) as f64, reference_nll / (rows-1) as f64, kl / rows as f64);
+            100.0 * metrics.agree as f64 / rows as f64, metrics.nll / (rows-1) as f64, metrics.reference_nll / (rows-1) as f64, metrics.kl / rows as f64);
     } else {
         println!("prefill logits: {rows} tokens in {seconds:.2} s | mean NLL engine {:.4} | logits digest {:016x}",
-            nll / (rows-1) as f64, digest.finish());
+            metrics.nll / (rows-1) as f64, digest.finish());
     }
     Ok(())
 }
@@ -1136,7 +1122,20 @@ fn golden_run(
     let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len())?;
     let chunk = args.chunk.unwrap_or(engine.prefill_capacity()).min(engine.prefill_capacity());
-    let mut logits = Vec::new();
+    ensure!(chunk > 0 && tokens.len() >= 2 && prefill > 0, "invalid golden prefill extent");
+    let vocab = cfg.vocab_size;
+    let golden = crate::shared::golden_scores::ReferenceRows::open(
+        &args.golden.join("logits.bin"), tokens.len(), vocab, false)?.context("golden logits missing")?;
+    let mut metrics = crate::shared::golden_scores::RowMetrics::default();
+    let mut last = Vec::new();
+    let consumer = crate::shared::probe::CallbackRows::new(|position: usize, values: &[f32]| {
+        let row = position.checked_sub(1).context("V4 golden zero score position")?;
+        ensure!(row == metrics.rows && values.len() == vocab, "V4 golden prefill row order/shape differs");
+        let reference = golden.row(row)?;
+        metrics.push(values, Some(&reference), tokens.get(row + 1).copied())?;
+        last = values.to_vec();
+        Ok(())
+    });
     let mut offset = 0;
     while offset < prefill {
         let end = (offset + chunk).min(prefill);
@@ -1151,10 +1150,14 @@ fn golden_run(
         };
         // Per-layer streams are compared only for a whole-prompt prefill.
         let whole = offset == 0 && end == tokens.len() && compare_layers > 0;
-        logits.extend(engine.prefill(&mut placement, &tokens[offset..end], transports, runtime,
-            end - offset, if whole { Some(&mut compare) } else { None })?);
+        engine.prefill_consumer(&mut placement, &tokens[offset..end], transports,
+            if whole { Some(&mut compare) } else { None },
+            crate::shared::probe::ScoringRows { consumer: &consumer, position: offset + 1 })?;
         offset = end;
     }
+    drop(consumer);
+    ensure!(metrics.rows == prefill, "V4 golden prefill row coverage differs");
+    let mut logits = Vec::new();
     let prefill_elapsed = started.elapsed();
     println!("prefill host phases: {}", engine.profile.borrow().report());
     *engine.profile.borrow_mut() = engine::Profile::default();
@@ -1197,21 +1200,17 @@ fn golden_run(
             decode_started.elapsed().as_secs_f64() * 1e3 / decode_steps as f64);
     }
     println!("prefill: {prefill} tokens in {:.2} s", prefill_elapsed.as_secs_f64());
-    let vocab = cfg.vocab_size;
-    let golden = f32s(&std::fs::read(args.golden.join("logits.bin"))?);
-    ensure!(golden.len() == logits.len(), "golden logits {} vs engine {}", golden.len(), logits.len());
+    ensure!(logits.len() == decode_steps * vocab, "V4 golden decode row coverage differs");
     let argmax = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap();
-    let (mut agree, mut next_ok, mut golden_next_ok) = (0usize, 0usize, 0usize);
-    for (row, (ours, theirs)) in logits.chunks_exact(vocab).zip(golden.chunks_exact(vocab)).enumerate() {
-        let (a, b) = (argmax(ours), argmax(theirs));
-        agree += usize::from(a == b);
-        if row + 1 < tokens.len() {
-            next_ok += usize::from(a == tokens[row + 1] as usize);
-            golden_next_ok += usize::from(b == tokens[row + 1] as usize);
-        }
+    for (row, ours) in logits.chunks_exact(vocab).enumerate() {
+        let row = prefill + row;
+        let reference = golden.row(row)?;
+        metrics.push(ours, Some(&reference), tokens.get(row + 1).copied())?;
+        last = ours.to_vec();
     }
+    let (agree, next_ok, golden_next_ok) = (metrics.agree, metrics.next_ok, metrics.reference_next);
     let t = tokens.len();
-    let (cosine, rel) = similarity(&logits[(t - 1) * vocab..], &golden[(t - 1) * vocab..]);
+    let (cosine, rel) = similarity(&last, &golden.row(t - 1)?);
     println!(
         "logits: top-1 agreement {:.1}% | next-token accuracy engine {:.1}% golden {:.1}% | last row cosine {cosine:.6} rel_l2 {rel:.3e}",
         100.0 * agree as f64 / t as f64,
@@ -1221,7 +1220,8 @@ fn golden_run(
     if decode_steps > 0 {
         let (mut decode_agree, mut worst) = (0usize, 1f64);
         for row in prefill..t {
-            let (ours, theirs) = (&logits[row * vocab..][..vocab], &golden[row * vocab..][..vocab]);
+            let reference = golden.row(row)?;
+            let (ours, theirs) = (&logits[(row - prefill) * vocab..][..vocab], reference.as_slice());
             decode_agree += usize::from(argmax(ours) == argmax(theirs));
             if argmax(ours) != argmax(theirs) {
                 let margin = |l: &[f32]| { let mut v = l.to_vec(); v.sort_by(|a, b| b.total_cmp(a)); v[0] - v[1] };
@@ -1231,7 +1231,7 @@ fn golden_run(
             worst = worst.min(similarity(ours, theirs).0);
         }
         // FNV-1a over the decode rows' logits bits: equal digests are byte-identical runs.
-        let digest = logits[prefill * vocab..].iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+        let digest = logits.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
             (h ^ u64::from(v.to_bits())).wrapping_mul(0x100_0000_01b3)
         });
         println!("decode rows: top-1 agreement {:.1}% | worst row cosine {worst:.6} | logits digest {digest:016x}",
@@ -1241,7 +1241,7 @@ fn golden_run(
         ensure!(decode_steps > 0, "--save-logits without --nll saves the decode rows: pass --prefill N");
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("tokens.bin"), tokens[prefill..].iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>())?;
-        std::fs::write(dir.join("logits.bin"), logits[prefill * vocab..].iter().flat_map(|v| v.to_le_bytes())
+        std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes())
             .collect::<Vec<_>>())?;
         println!("saved {decode_steps} decode rows (positions {prefill}..{t}) to {}", dir.display());
     }

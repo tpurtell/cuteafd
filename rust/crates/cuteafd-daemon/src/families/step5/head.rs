@@ -280,14 +280,20 @@ impl<'a> TargetHeadOwner<'a> {
         })
     }
 
-    /// Caller drains the target chain first; this diagnostic downloads all rows.
-    pub fn logits(&self, input: CuteafdDeviceBuffer) -> Result<Vec<f32>> {
+    /// Caller drains the target chain first; consume bounded host tiles before reuse.
+    pub fn logits_consumer(&self, input: CuteafdDeviceBuffer, scoring: crate::shared::probe::ScoringRows<'_>) -> Result<()> {
         let mut guard = self.stream.get()?.cancellation_guard("Step-5 diagnostic head input borrow");
         let logits = self.device_logits_on(input, self.rows, self.stream.get()?)?;
-        let values = self.stream.device.run(|| logits.to_host(self.stream.device.library))?;
+        self.stream.device.run(|| {
+            for span in crate::shared::probe::head_spans(self.rows, 64)? {
+                let tile = crate::shared::token_io::DeviceLogits {
+                    ptr: logits.ptr.wrapping_byte_add(span.start * V * 4), rows: span.len(), ..logits };
+                scoring.record(self.stream.device.library, span.start, &tile)?;
+            }
+            Ok(())
+        })?;
         guard.complete = true;
-        ensure!(values.iter().all(|v| v.is_finite()), "nonfinite Step-5 logits");
-        Ok(values)
+        Ok(())
     }
 }
 

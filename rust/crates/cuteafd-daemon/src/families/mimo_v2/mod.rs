@@ -396,28 +396,36 @@ mod draft_storage_tests {
         let tokens = [0, 1, 0];
         let prefill = [1.0, -0.0, 2.0, 3.0];
         let decode = [4.0, 5.0];
-        save_golden_logits(&dir, &tokens, 2, &prefill, &decode).unwrap();
+        let mut dump = GoldenDump::new(&dir, &tokens, 2).unwrap();
+        for row in prefill.chunks_exact(2) { dump.row(row).unwrap(); }
+        assert!(dump.finish().is_err());
+        dump.row(&decode).unwrap();
+        dump.finish().unwrap();
         assert_eq!(std::fs::read(dir.join("logits.bin")).unwrap(),
             prefill.iter().chain(&decode).flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
         assert_eq!(std::fs::read(dir.join("tokens.bin")).unwrap(),
             tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
-        assert!(save_golden_logits(&dir, &tokens, 2, &prefill, &decode).is_err());
-        let bad = root.path().join("invalid");
-        assert!(save_golden_logits(&bad, &tokens, 2, &prefill, &[]).is_err());
-        assert!(save_golden_logits(&bad, &tokens, 2, &[f32::NAN; 6], &[]).is_err());
-        assert!(!bad.exists());
+        assert!(GoldenDump::new(&dir, &tokens, 2).is_err());
+        assert!(dump.row(&decode).is_err());
+        let mut bad = GoldenDump::new(&root.path().join("invalid"), &tokens, 2).unwrap();
+        assert!(bad.row(&[f32::NAN, 0.0]).is_err());
+        assert!(bad.row(&[0.0]).is_err());
+        assert_eq!(bad.rows, 0);
     }
 
     #[test]
     fn token_only_golden_is_allowed_only_for_an_explicit_logits_dump() {
+        use crate::shared::golden_scores::ReferenceRows;
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_golden_logits(dir.path(), true).unwrap().is_none());
-        assert!(read_golden_logits(dir.path(), false).is_err());
-        std::fs::write(dir.path().join("logits.bin"), [0u8; 3]).unwrap();
-        assert!(read_golden_logits(dir.path(), true).is_err());
-        std::fs::write(dir.path().join("logits.bin"), 1.0f32.to_le_bytes()).unwrap();
-        assert_eq!(read_golden_logits(dir.path(), true).unwrap(), Some(vec![1.0]));
-        assert_eq!(read_golden_logits(dir.path(), false).unwrap(), Some(vec![1.0]));
+        let path = dir.path().join("logits.bin");
+        assert!(ReferenceRows::open(&path, 1, 1, true).unwrap().is_none());
+        assert!(ReferenceRows::open(&path, 1, 1, false).is_err());
+        std::fs::write(&path, [0u8; 3]).unwrap();
+        assert!(ReferenceRows::open(&path, 1, 1, true).is_err());
+        std::fs::write(&path, 1.0f32.to_le_bytes()).unwrap();
+        for optional in [false, true] {
+            assert_eq!(ReferenceRows::open(&path, 1, 1, optional).unwrap().unwrap().row(0).unwrap(), vec![1.0]);
+        }
     }
 
     #[test]
@@ -1694,7 +1702,8 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
     let opened = open_checked(&args.engine, args.draft_replay.is_some())?;
     ensure!(args.draft_replay.is_none() || opened.weight_formats.head == MimoProjectionRepresentation::Bf16,
         "--draft-replay requires a separately loaded BF16 target head; checkpoint FP8 has no BF16 resident fallback");
-    opened.with_engine(&args.engine, |engine| golden_run(&args, &opened, engine))
+    opened.with_engine_output(&args.engine, MimoPrefillOutput::LastRow,
+        |engine| golden_run(&args, &opened, engine))
 }
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>) -> Result<()> {
@@ -1707,29 +1716,38 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     golden_body(args, opened, engine)
 }
 
-fn read_golden_logits(dir: &std::path::Path, allow_missing: bool) -> Result<Option<Vec<f32>>> {
-    let bytes = match std::fs::read(dir.join("logits.bin")) {
-        Ok(bytes) => bytes,
-        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    ensure!(bytes.len() % 4 == 0, "MiMo golden logits are not complete FP32 values");
-    Ok(Some(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+struct GoldenDump {
+    output: std::io::BufWriter<std::fs::File>,
+    vocab: usize,
+    rows: usize,
+    expected: usize,
 }
 
-fn save_golden_logits(dir: &std::path::Path, tokens: &[u32], vocab: usize,
-    prefill: &[f32], decode: &[f32]) -> Result<()> {
-    use std::io::Write;
-    ensure!(!tokens.is_empty() && vocab > 0 && tokens.iter().all(|&t| (t as usize) < vocab)
-        && tokens.len().checked_mul(vocab) == prefill.len().checked_add(decode.len())
-        && prefill.len() % vocab == 0 && decode.len() % vocab == 0
-        && prefill.iter().chain(decode).all(|v| v.is_finite()), "MiMo logits dump shape/finite mismatch");
-    std::fs::create_dir(dir).context("MiMo logits output must be a new directory")?;
-    let mut output = std::io::BufWriter::new(std::fs::File::create(dir.join("logits.bin"))?);
-    for value in prefill.iter().chain(decode) { output.write_all(&value.to_le_bytes())?; }
-    output.flush()?;
-    std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
-    Ok(())
+impl GoldenDump {
+    fn new(dir: &std::path::Path, tokens: &[u32], vocab: usize) -> Result<Self> {
+        ensure!(!tokens.is_empty() && vocab > 0 && tokens.iter().all(|&t| (t as usize) < vocab),
+            "MiMo logits dump token/vocabulary mismatch");
+        std::fs::create_dir(dir).context("MiMo logits output must be a new directory")?;
+        std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+        Ok(Self { output: std::io::BufWriter::new(std::fs::File::create(dir.join("logits.bin"))?),
+            vocab, rows: 0, expected: tokens.len() })
+    }
+
+    fn row(&mut self, values: &[f32]) -> Result<()> {
+        use std::io::Write;
+        ensure!(self.rows < self.expected && values.len() == self.vocab && values.iter().all(|v| v.is_finite()),
+            "MiMo logits dump row shape/finite mismatch");
+        for value in values { self.output.write_all(&value.to_le_bytes())?; }
+        self.rows += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        use std::io::Write;
+        ensure!(self.rows == self.expected, "MiMo logits dump row coverage differs");
+        self.output.flush()?;
+        Ok(())
+    }
 }
 
 fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>) -> Result<()> {
@@ -1815,21 +1833,44 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
     let capacity = if unit_execution { engine.prefill_capacity() } else { engine.prefill_rows };
     let chunk = args.prefill_chunk.unwrap_or(prefill).clamp(1, capacity);
     ensure!(!args.teacher_force || chunk >= prefill, "--teacher-force needs a single prefill chunk");
+    use std::io::Write;
+    let reference = crate::shared::golden_scores::ReferenceRows::open(
+        &args.golden.join("logits.bin"), tokens.len(), cfg.vocab_size, args.save_logits.is_some())?;
+    let mut saved = args.save_logits.as_ref().map(|dir| GoldenDump::new(dir, &tokens, cfg.vocab_size)).transpose()?;
+    let mut raw_prefill = if args.nll {
+        std::env::var_os("CUTEAFD_DUMP_PREFILL_LOGITS").map(|path|
+            std::fs::File::create(path).map(std::io::BufWriter::new)).transpose()?
+    } else { None };
     let mut logits = None;
-    let mut prefill_logits: Vec<f32> = Vec::new();
+    let mut prefill_metrics = crate::shared::golden_scores::RowMetrics::default();
     for first in (0..prefill).step_by(chunk) {
         let n = chunk.min(prefill - first);
         let mut prefill_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut worst);
-        logits = engine.prefill_forced(&mut placement, &tokens[first..first + n], args.nll,
-            (!unit_execution).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>),
-            args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>))?;
+        let hook = (!unit_execution).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>);
+        let forced = args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>);
         if args.nll {
-            prefill_logits.extend(logits.as_deref().unwrap_or_default());
+            let consumer = crate::shared::probe::CallbackRows::new(|position: usize, values: &[f32]| {
+                let row = position.checked_sub(1).context("MiMo golden zero score position")?;
+                ensure!(row == prefill_metrics.rows && values.len() == cfg.vocab_size,
+                    "MiMo golden prefill row order/shape differs");
+                let theirs = reference.as_ref().map(|r| r.row(row)).transpose()?;
+                prefill_metrics.push(values, theirs.as_deref(), tokens.get(row + 1).copied())?;
+                if let Some(writer) = &mut saved { writer.row(values)?; }
+                if let Some(writer) = &mut raw_prefill {
+                    for value in values { writer.write_all(&value.to_le_bytes())?; }
+                }
+                logits = Some(values.to_vec());
+                Ok(())
+            });
+            engine.prefill_consumer(&mut placement, &tokens[first..first + n], hook, forced,
+                crate::shared::probe::ScoringRows { consumer: &consumer, position: first + 1 })?
+                .context("MiMo golden needs every target layer")?;
+        } else {
+            logits = engine.prefill_forced(&mut placement, &tokens[first..first + n], false, hook, forced)?;
         }
     }
-    if args.nll {
-        logits = prefill_logits.len().checked_sub(cfg.vocab_size).map(|at| prefill_logits[at..].to_vec());
-    }
+    if args.nll { ensure!(prefill_metrics.rows == prefill, "MiMo golden prefill row coverage differs"); }
+    if let Some(writer) = &mut raw_prefill { writer.flush()?; }
     let prefill_seconds = started.elapsed().as_secs_f64();
     if chunk < prefill {
         println!("prefill in chunks of {chunk}: worst cosine per layer {:?}",
@@ -1865,64 +1906,38 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         println!("decode steps of {}: warm median {:.3} ms, first {:.3} ms", args.step_rows, 1e3 * warm[warm.len() / 2],
             1e3 * step_times[0]);
     }
-    let reference = if !prefill_logits.is_empty() || !decode_logits.is_empty() || logits.is_some() {
-        read_golden_logits(&args.golden, args.save_logits.is_some())?
-    } else { None };
-    if let Some(golden) = &reference {
-        ensure!(tokens.len().checked_mul(cfg.vocab_size) == Some(golden.len())
-            && golden.iter().all(|v| v.is_finite()), "MiMo golden logits shape/finite mismatch");
-    }
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
-    // Rows of `ours` are the logits of positions `first..`: top-1 agreement
-    // with the golden, next-token accuracy and mean NLL of the next tokens.
-    let score = |label: &str, ours_all: &[f32], first: usize| -> Result<()> {
-        // Numerics A/B between engine configs (benchmarks): the decode rows' logits, F32.
-        if let (true, Ok(path)) = (label == "decode", std::env::var("CUTEAFD_DUMP_DECODE_LOGITS")) {
-            std::fs::write(&path, ours_all.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-        }
-        let Some(golden) = reference.as_ref() else { return Ok(()); };
-        let vocab = cfg.vocab_size;
-        let (mut agree, mut next_ok, mut golden_next, mut nll, mut kl) = (0usize, 0usize, 0usize, 0f64, 0f64);
-        let rows = ours_all.len() / vocab;
-        let log_softmax = |l: &[f32]| -> Vec<f64> {
-            let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-            let lse = top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln();
-            l.iter().map(|&x| x as f64 - lse).collect()
-        };
-        for r in 0..rows {
-            let (ours, theirs) = (&ours_all[r * vocab..][..vocab], &golden[(first + r) * vocab..][..vocab]);
-            agree += usize::from(argmax(ours) == argmax(theirs));
-            // KL(golden || engine) of the next-token distributions.
-            let (p, q) = (log_softmax(theirs), log_softmax(ours));
-            kl += p.iter().zip(&q).map(|(a, b)| a.exp() * (a - b)).sum::<f64>();
-            if let Some(&next) = tokens.get(first + r + 1) {
-                next_ok += usize::from(argmax(ours) == next as usize);
-                golden_next += usize::from(argmax(theirs) == next as usize);
-                let top = ours.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-                let sum: f64 = ours.iter().map(|&l| (l as f64 - top).exp()).sum();
-                nll += top + sum.ln() - ours[next as usize] as f64;
-            }
-        }
-        let scored = tokens.len().saturating_sub(first + 1).min(rows).max(1) as f64;
+    let report = |label: &str, metrics: &crate::shared::golden_scores::RowMetrics| {
+        if reference.is_none() || metrics.rows == 0 { return; }
+        let (rows, scored) = (metrics.rows, metrics.scored.max(1) as f64);
         println!("{label} logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-            golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
-            100.0 * next_ok as f64 / scored, 100.0 * golden_next as f64 / scored, nll / scored, kl / rows as f64);
-        Ok(())
+            golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * metrics.agree as f64 / rows as f64,
+            100.0 * metrics.next_ok as f64 / scored, 100.0 * metrics.reference_next as f64 / scored,
+            metrics.nll / scored, metrics.kl / rows as f64);
     };
-    if let Some(dir) = &args.save_logits {
-        save_golden_logits(dir, &tokens, cfg.vocab_size, &prefill_logits, &decode_logits)?;
+    if let Some(writer) = &mut saved {
+        ensure!(prefill_metrics.rows == prefill && decode_logits.len() == (tokens.len() - prefill) * cfg.vocab_size,
+            "MiMo logits dump row coverage differs");
+        for row in decode_logits.chunks_exact(cfg.vocab_size) { writer.row(row)?; }
+        writer.finish()?;
     }
-    if !prefill_logits.is_empty() {
-        score("prefill", &prefill_logits, 0)?;
-    }
+    report("prefill", &prefill_metrics);
     if !decode_logits.is_empty() {
-        score("decode", &decode_logits, prefill)?;
+        if let Ok(path) = std::env::var("CUTEAFD_DUMP_DECODE_LOGITS") {
+            std::fs::write(path, decode_logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+        }
+        let mut metrics = crate::shared::golden_scores::RowMetrics::default();
+        for (row, values) in decode_logits.chunks_exact(cfg.vocab_size).enumerate() {
+            let theirs = reference.as_ref().map(|r| r.row(prefill + row)).transpose()?;
+            metrics.push(values, theirs.as_deref(), tokens.get(prefill + row + 1).copied())?;
+        }
+        report("decode", &metrics);
     }
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");
     if let (Some(logits), Some(golden)) = (logits, reference.as_ref()) {
-        let last = &golden[(prefill - 1) * cfg.vocab_size..][..cfg.vocab_size];
-        let (cosine, _) = similarity(&logits, last);
-        println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(&logits), argmax(last));
+        let last = golden.row(prefill - 1)?;
+        let (cosine, _) = similarity(&logits, &last);
+        println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(&logits), argmax(&last));
     }
     {
         let profile = engine.profile.borrow();
@@ -2175,14 +2190,22 @@ fn prefill_digest(engine: &engine::MimoEngine<'_>, placement: &mut engine::MimoP
             rows.hash(&mut hashers[layer]);
             Ok(())
         };
-        let out = engine.prefill_forced(placement, part, logits, Some(&mut on_layer), None)?
-            .context("the resume check needs every layer")?;
         if logits {
-            for values in out.chunks_exact(vocab) {
+            let consumer = crate::shared::probe::CallbackRows::new(|_position, values: &[f32]| {
+                ensure!(values.len() == vocab, "resume logits vocabulary differs");
                 values.iter().for_each(|v| v.to_bits().hash(&mut logit_hash));
                 argmax.push(values.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(i, _)| i));
-            }
-            last = out[out.len() - vocab..].to_vec();
+                last.clear();
+                last.extend_from_slice(values);
+                Ok(())
+            });
+            let position = placement.len + 1;
+            engine.prefill_consumer(placement, part, Some(&mut on_layer), None,
+                crate::shared::probe::ScoringRows { consumer: &consumer, position })?
+                .context("the resume check needs every layer")?;
+        } else {
+            engine.prefill_forced(placement, part, false, Some(&mut on_layer), None)?
+                .context("the resume check needs every layer")?;
         }
     }
     Ok(SuffixRun { layers: hashers.iter().map(Hasher::finish).collect(), logits: logit_hash.finish(), argmax, last })

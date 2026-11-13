@@ -940,7 +940,6 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 }
 
 fn golden(mut args: GoldenArgs) -> Result<()> {
-    args.engine.full_prefill_logits |= args.nll;
     if let Some(members) = args.packed_check {
         ensure!((2..=8).contains(&members), "--packed-check needs 2..=8 members");
         args.engine.slots = args.engine.slots.max(2 * members);
@@ -1117,14 +1116,11 @@ fn score_fidelity(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engi
         probe.admitted("qwen4", &window.tokens, 0);
         probe.selected_score_path("prefill");
         probe.provenance(provenance.clone());
+        let consumer = Some(probe.clone());
         for chunk in fidelity_chunks(window.tokens.len(), engine.prefill_rows)? {
-            let logits = engine.prefill_forced(&mut placement, &window.tokens[chunk.clone()], None, None, chunk.len())?
+            engine.prefill_consumer(&mut placement, &window.tokens[chunk.clone()], None, None, chunk.len(),
+                crate::shared::probe::ScoringRows { consumer: &consumer, position: chunk.start + 1 })?
                 .context("Qwen fidelity needs all target logits")?;
-            ensure!(logits.len() == chunk.len() * vocab, "Qwen fidelity logits shape differs");
-            for (row, logits) in logits.chunks_exact(vocab).enumerate() {
-                let position = chunk.start + row + 1;
-                if position >= window.score_from { probe.row(position, logits); }
-            }
             probe.scored_prefill_chunk(chunk.start + 1, chunk.len());
         }
         let record = probe.record();
@@ -1152,17 +1148,9 @@ fn score_fidelity(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engi
     Ok(())
 }
 
-fn golden_logits(root: &std::path::Path, dump_only: bool, expected: usize) -> Result<Option<Vec<f32>>> {
-    let bytes = match std::fs::read(root.join("logits.bin")) {
-        Ok(bytes) => bytes,
-        Err(error) if dump_only && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("Qwen golden logits; pass --save-logits for a pure engine dump"),
-    };
-    ensure!(bytes.len() == expected.checked_mul(4).context("Qwen golden logits extent overflow")?,
-        "Qwen golden logits shape differs");
-    let values = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
-    ensure!(values.iter().all(|v| v.is_finite()), "Qwen golden logits are non-finite");
-    Ok(Some(values))
+fn golden_logits(root: &std::path::Path, dump_only: bool, rows: usize, vocab: usize)
+    -> Result<Option<crate::shared::golden_scores::ReferenceRows>> {
+    crate::shared::golden_scores::ReferenceRows::open(&root.join("logits.bin"), rows, vocab, dump_only)
 }
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'_>) -> Result<()> {
@@ -1172,7 +1160,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
     ensure!(!token_bytes.is_empty() && token_bytes.len().is_multiple_of(4), "Qwen golden token extent differs");
     let tokens: Vec<u32> = token_bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let reference_logits = golden_logits(&args.golden, args.save_logits.is_some(),
-        tokens.len().checked_mul(cfg.vocab_size).context("Qwen golden logits shape overflow")?)?;
+        tokens.len(), cfg.vocab_size)?;
     if reference_logits.is_none() { println!("Qwen engine-only logits dump; no reference NLL/KL or agreement comparison"); }
     let mut allocator = engine::Allocator::new(engine.pages, engine.slots, cfg);
     let mut placement = allocator.admit(tokens.len() + args.bench_decode + usize::from(args.bench_decode > 0))?;
@@ -1213,28 +1201,53 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         Some(rows)
     };
     ensure!(!args.teacher_force || prefill <= engine.prefill_rows, "teacher forcing takes one prefill chunk");
+    use std::io::Write;
     let mut logits: Option<Vec<f32>> = None;
+    let mut prefill_metrics = crate::shared::golden_scores::RowMetrics::default();
+    let mut saved_prefill = if args.nll {
+        args.save_logits.as_ref().map(|dir| -> Result<_> {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(dir.join("tokens.bin"), &token_bytes[..prefill * 4])?;
+            Ok(std::io::BufWriter::new(std::fs::File::create(dir.join("logits.bin"))?))
+        }).transpose()?
+    } else { None };
+    let mut raw_prefill = if args.nll {
+        std::env::var_os("CUTEAFD_DUMP_PREFILL_LOGITS").map(|path|
+            std::fs::File::create(path).map(std::io::BufWriter::new)).transpose()?
+    } else { None };
     let mut done = 0;
     while done < prefill {
         let n = engine.prefill_rows.min(prefill - done);
         let first = done;
-        let chunk = if engine.prefill_shape.is_some() {
+        let mut on_layer = |layer, streams: &[u8]| compare(layer, first, streams, &mut worst);
+        let hook = if engine.prefill_shape.is_some() {
             ensure!(!args.teacher_force, "Qwen unit golden compares logits, not teacher-forced layer streams");
-            engine.prefill_forced(&mut placement, &tokens[done..done + n], None, None, if args.nll { n } else { 1 })?
+            None
+        } else { Some(&mut on_layer as &mut dyn FnMut(usize, &[u8]) -> Result<()>) };
+        let forced = args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>);
+        if args.nll {
+            let consumer = crate::shared::probe::CallbackRows::new(|position: usize, values: &[f32]| {
+                let row = position.checked_sub(1).context("Qwen golden zero score position")?;
+                ensure!(values.len() == cfg.vocab_size && row == prefill_metrics.rows,
+                    "Qwen golden logits row order/shape differs");
+                let reference = reference_logits.as_ref().map(|r| r.row(row)).transpose()?;
+                prefill_metrics.push(values, reference.as_deref(), tokens.get(row + 1).copied())?;
+                for writer in [&mut saved_prefill, &mut raw_prefill].into_iter().flatten() {
+                    for value in values { writer.write_all(&value.to_le_bytes())?; }
+                }
+                logits = Some(values.to_vec());
+                Ok(())
+            });
+            engine.prefill_consumer(&mut placement, &tokens[done..done + n], hook, forced, n,
+                crate::shared::probe::ScoringRows { consumer: &consumer, position: first + 1 })?
+                .context("Qwen golden needs every target layer")?;
         } else {
-            engine.prefill_forced(&mut placement, &tokens[done..done + n],
-                Some(&mut |layer, streams| compare(layer, first, streams, &mut worst)),
-                args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), if args.nll { n } else { 1 })?
-        };
-        logits = match (logits, chunk) {
-            (Some(mut all), Some(more)) if args.nll => {
-                all.extend(more);
-                Some(all)
-            }
-            (_, chunk) => chunk,
-        };
+            logits = engine.prefill_forced(&mut placement, &tokens[done..done + n], hook, forced, 1)?;
+        }
         done += n;
     }
+    if args.nll { ensure!(prefill_metrics.rows == prefill, "Qwen golden prefill row coverage differs"); }
+    for writer in [&mut saved_prefill, &mut raw_prefill].into_iter().flatten() { writer.flush()?; }
     let prefill_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let mut decode_worst = Vec::new();
@@ -1281,12 +1294,16 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
                 std::fs::write(&path, decode_logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
             }
             if let Some(golden) = &reference_logits {
-                let (agree, next_ok, golden_next, nll, scored) = score(&decode_logits, golden, &tokens, prefill, vocab);
-                let rows = decode_logits.len() / vocab;
+                let mut metrics = crate::shared::golden_scores::RowMetrics::default();
+                for (row, values) in decode_logits.chunks_exact(vocab).enumerate() {
+                    let reference = golden.row(prefill + row)?;
+                    metrics.push(values, Some(&reference), tokens.get(prefill + row + 1).copied())?;
+                }
+                let (rows, scored) = (metrics.rows, metrics.scored.max(1));
                 println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-                    golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
-                    100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
-                    nll / scored.max(1) as f64, crate::families::glm5_flash::mean_kl(&decode_logits, golden, prefill, vocab));
+                    golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * metrics.agree as f64 / rows as f64,
+                    100.0 * metrics.next_ok as f64 / scored as f64, 100.0 * metrics.reference_next as f64 / scored as f64,
+                    metrics.nll / scored as f64, metrics.kl / rows as f64);
             }
         }
     }
@@ -1295,13 +1312,6 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
     if let Some(dir) = &args.save_logits {
         std::fs::create_dir_all(dir)?;
         if args.nll {
-            let rows = logits.as_deref().context("--save-logits with --nll produced no logits")?;
-            ensure!(rows.len() == prefill * vocab, "saved logits cover {} of {prefill} prefill rows",
-                rows.len() / vocab);
-            std::fs::write(dir.join("tokens.bin"), tokens[..prefill].iter()
-                .flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>())?;
-            std::fs::write(dir.join("logits.bin"), rows.iter()
-                .flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
             println!("saved {prefill} prefill rows to {}", dir.display());
         } else {
             ensure!(prefill < tokens.len(), "--save-logits without --nll saves the decode rows: pass --prefill N");
@@ -1377,23 +1387,25 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s{loads}");
     if let Some(logits) = logits {
         // Match the decode dump for exact before/after prefill qualification.
-        if let Ok(path) = std::env::var("CUTEAFD_DUMP_PREFILL_LOGITS") {
-            std::fs::write(&path, logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        if !args.nll {
+            if let Ok(path) = std::env::var("CUTEAFD_DUMP_PREFILL_LOGITS") {
+                std::fs::write(&path, logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            }
         }
         let Some(golden) = &reference_logits else { return Ok(()) };
         if args.nll {
-            let (agree, next_ok, golden_next, nll, scored) = score(&logits, golden, &tokens, 0, vocab);
-            let (_, _, _, golden_nll, _) = score(&golden[..prefill * vocab], &golden, &tokens, 0, vocab);
+            let m = &prefill_metrics;
+            let scored = m.scored.max(1) as f64;
             println!("prefill logits: top-1 agreement {:.1}% over {prefill} rows | next-token accuracy engine {:.1}% \
-                golden {:.1}% | mean NLL engine {:.4} golden {:.4}", 100.0 * agree as f64 / prefill as f64,
-                100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
-                nll / scored.max(1) as f64, golden_nll / scored.max(1) as f64);
+                golden {:.1}% | mean NLL engine {:.4} golden {:.4}", 100.0 * m.agree as f64 / prefill as f64,
+                100.0 * m.next_ok as f64 / scored, 100.0 * m.reference_next as f64 / scored,
+                m.nll / scored, m.reference_nll / scored);
         }
         let logits = &logits[logits.len() - vocab..];
-        let last = &golden[(prefill - 1) * vocab..][..vocab];
-        let (cosine, _) = similarity(logits, last);
+        let last = golden.row(prefill - 1)?;
+        let (cosine, _) = similarity(logits, &last);
         let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
-        println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(logits), argmax(last));
+        println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(logits), argmax(&last));
     }
     Ok(())
 }
@@ -1419,18 +1431,21 @@ mod golden_tests {
     #[test]
     fn engine_only_logits_dump_requires_explicit_opt_in_and_rejects_bad_references() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(golden_logits(dir.path(), true, 4).unwrap().is_none());
-        assert!(golden_logits(dir.path(), false, 4).is_err());
+        assert!(golden_logits(dir.path(), true, 2, 2).unwrap().is_none());
+        assert!(golden_logits(dir.path(), false, 2, 2).is_err());
         let values = [0.0f32, 1.0, -1.0, 2.0];
         let path = dir.path().join("logits.bin");
         std::fs::write(&path, values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
-        assert_eq!(golden_logits(dir.path(), true, 4).unwrap().unwrap(), values);
-        assert!(golden_logits(dir.path(), true, 3).is_err());
+        let reference = golden_logits(dir.path(), true, 2, 2).unwrap().unwrap();
+        assert_eq!(reference.row(0).unwrap(), values[..2]);
+        assert_eq!(reference.row(1).unwrap(), values[2..]);
+        assert!(reference.row(2).is_err());
+        assert!(golden_logits(dir.path(), true, 3, 1).is_err());
         std::fs::write(&path, f32::NAN.to_le_bytes()).unwrap();
-        assert!(golden_logits(dir.path(), true, 1).is_err());
+        assert!(golden_logits(dir.path(), true, 1, 1).unwrap().unwrap().row(0).is_err());
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        assert!(golden_logits(dir.path(), true, 1).is_err());
+        assert!(golden_logits(dir.path(), true, 1, 1).is_err());
     }
 
     #[test]

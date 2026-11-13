@@ -34,8 +34,14 @@ fn arm(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &tokio::runtim
             if range.len() == 1 {
                 let i = active[range.start];
                 let (start, rows) = chunks[range.start];
-                logits[i].extend(engine.prefill(&mut placements[i], &prompts[i][start..start + rows],
-                    links, runtime, rows, None)?);
+                let consumer = crate::shared::probe::CallbackRows::new(|position, values: &[f32]| {
+                    ensure!(position == starts[i] + logits[i].len() / engine.cfg.vocab_size + 1,
+                        "packed singleton scoring row order differs");
+                    logits[i].extend_from_slice(values);
+                    Ok(())
+                });
+                engine.prefill_consumer(&mut placements[i], &prompts[i][start..start + rows],
+                    links, None, crate::shared::probe::ScoringRows { consumer: &consumer, position: start + 1 })?;
             } else {
                 actual_packs += 1;
                 let ids = &active[range.clone()];
@@ -156,8 +162,7 @@ pub(super) fn run(engine: &Engine<'_>, links: &mut [SparkLink<'_>], runtime: &to
     windows: &[Window], members: usize, mode: PackingMode) -> Result<()> {
     ensure!((2..=16).contains(&members) && engine.shape.sequences >= members,
         "packed check needs 2 to 16 admitted sequence slots");
-    ensure!(engine.full_prefill_logits && engine.prefill_rows >= 200,
-        "packed check requires --full-prefill-logits and >=200 prefill rows");
+    ensure!(engine.prefill_rows >= 200, "packed check requires >=200 prefill rows");
     let selected = windows.iter().filter(|w| w.positions.len() == 512).take(members + 1).collect::<Vec<_>>();
     ensure!(selected.len() == members + 1, "packed check needs distinct sealed windows and a replacement partner");
     for (i, window) in selected.iter().enumerate() {

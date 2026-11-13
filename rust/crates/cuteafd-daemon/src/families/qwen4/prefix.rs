@@ -335,14 +335,22 @@ pub(crate) fn prefill_digest(engine: &Qwen4Engine<'_>, placement: &mut Qwen4Plac
             rows.hash(&mut hashers[layer]);
             Ok(())
         };
-        let out = engine.prefill_forced(placement, part, Some(&mut on_layer), None, if logits { part.len() } else { 1 })?
-            .context("the resume check needs every layer")?;
         if logits {
-            for values in out.chunks_exact(vocab) {
+            let consumer = crate::shared::probe::CallbackRows::new(|_position, values: &[f32]| {
+                ensure!(values.len() == vocab, "resume logits vocabulary differs");
                 values.iter().for_each(|v| v.to_bits().hash(&mut logit_hash));
                 argmax.push(values.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(i, _)| i));
-            }
-            last = out[out.len() - vocab..].to_vec();
+                last.clear();
+                last.extend_from_slice(values);
+                Ok(())
+            });
+            let position = placement.len + 1;
+            engine.prefill_consumer(placement, part, Some(&mut on_layer), None, part.len(),
+                crate::shared::probe::ScoringRows { consumer: &consumer, position })?
+                .context("the resume check needs every layer")?;
+        } else {
+            engine.prefill_forced(placement, part, Some(&mut on_layer), None, 1)?
+                .context("the resume check needs every layer")?;
         }
     }
     Ok(SuffixRun { layers: hashers.iter().map(Hasher::finish).collect(), logits: logit_hash.finish(), argmax, last })

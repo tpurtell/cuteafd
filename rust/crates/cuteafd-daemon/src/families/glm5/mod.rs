@@ -2108,7 +2108,6 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 }
 
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
-    args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some();
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -2136,58 +2135,62 @@ fn write_attention_identity(dir: &std::path::Path, view: &cuteafd_loader::plan::
     Ok(())
 }
 
-/// --nll: score one retained prefill unit per call, downloading its logits
-/// before the next call reuses the workspace: mean NLL, top-1 agreement, KL.
+/// `--nll` consumes bounded head tiles before the ordinary workspace is reused.
 fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
-    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    use std::hash::{Hash, Hasher};
+    use std::io::Write;
+    let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+    ensure!(bytes.len().is_multiple_of(4), "golden tokens are not complete U32 values");
+    let tokens: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let vocab = opened.cfg.vocab_size;
+    ensure!(tokens.len() >= 2 && tokens.iter().all(|&t| (t as usize) < vocab), "invalid golden tokens");
+    let reference = crate::shared::golden_scores::ReferenceRows::open(
+        &args.golden.join("logits.bin"), tokens.len(), vocab, true)?;
+    let mut output = args.save_logits.as_ref().map(|dir| -> Result<_> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("tokens.bin"), &bytes)?;
+        write_attention_identity(dir, &opened.view)?;
+        Ok(std::io::BufWriter::new(std::fs::File::create(dir.join("logits.bin"))?))
+    }).transpose()?;
+    let mut raw = std::env::var_os("CUTEAFD_DUMP_PREFILL_LOGITS").map(|path|
+        std::fs::File::create(path).map(std::io::BufWriter::new)).transpose()?;
+    let mut metrics = crate::shared::golden_scores::RowMetrics::default();
+    let mut digest = std::collections::hash_map::DefaultHasher::new();
+    let consumer = crate::shared::probe::CallbackRows::new(|position: usize, values: &[f32]| {
+        let row = position.checked_sub(1).context("GLM golden zero score position")?;
+        ensure!(row == metrics.rows && values.len() == vocab, "GLM golden logits row order/shape differs");
+        let theirs = reference.as_ref().map(|r| r.row(row)).transpose()?;
+        metrics.push(values, theirs.as_deref(), tokens.get(row + 1).copied())?;
+        values.iter().for_each(|v| v.to_bits().hash(&mut digest));
+        for writer in [&mut output, &mut raw].into_iter().flatten() {
+            for value in values { writer.write_all(&value.to_le_bytes())?; }
+        }
+        Ok(())
+    });
     let mut placement = engine::PageAllocator::new(engine).admit(tokens.len())?;
     let started = Instant::now();
-    let mut logits = Vec::new();
     let rows = crate::shared::probe::scoring_prefill_capacity(true, engine.prefill_rows, engine.prefill_capacity());
-    for chunk in tokens.chunks(rows) {
-        logits.extend(engine.prefill_rows_logits(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)),
-            None, chunk.len())?.context("the prefill needs every layer")?);
+    let media = cuteafd_engine::media::RequestMedia::new(Vec::new(), opened.cfg.hidden, tokens.len())?;
+    for (index, chunk) in tokens.chunks(rows).enumerate() {
+        engine.prefill_streamed_scoring(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)),
+            &media, crate::shared::probe::ScoringRows { consumer: &consumer, position: index * rows + 1 })?
+            .context("the prefill needs every layer")?;
     }
+    drop(consumer);
     let seconds = started.elapsed().as_secs_f64();
-    if let Some(dir) = &args.save_logits {
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>())?;
-        std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-        write_attention_identity(dir, &opened.view)?;
+    ensure!(metrics.rows == tokens.len(), "GLM golden prefill row coverage differs");
+    for writer in [&mut output, &mut raw].into_iter().flatten() { writer.flush()?; }
+    let rows = metrics.rows;
+    let scored = metrics.scored as f64;
+    if reference.is_some() {
+        println!("prefill logits: {rows} tokens in {seconds:.2} s | top-1 agreement {:.2}% | mean NLL engine {:.4} golden \
+            {:.4} | mean KL(golden||engine) {:.5}", 100.0 * metrics.agree as f64 / rows as f64,
+            metrics.nll / scored, metrics.reference_nll / scored, metrics.kl / rows as f64);
+    } else {
+        println!("prefill logits: {rows} tokens in {seconds:.2} s | mean NLL engine {:.4} | logits digest {:016x}",
+            metrics.nll / scored, digest.finish());
     }
-    let nll_of = |l: &[f32], next: u32| {
-        let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-        top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln() - l[next as usize] as f64
-    };
-    let Ok(golden) = std::fs::read(args.golden.join("logits.bin")) else {
-        // No golden logits (a token file alone): the engine's NLL of the text and a digest of
-        // every logit (bitwise A/B between builds and runs).
-        use std::hash::{Hash, Hasher};
-        let mut digest = std::collections::hash_map::DefaultHasher::new();
-        logits.iter().for_each(|v| v.to_bits().hash(&mut digest));
-        let nll: f64 = (0..tokens.len() - 1).map(|r| nll_of(&logits[r * vocab..][..vocab], tokens[r + 1])).sum();
-        println!("prefill logits: {} tokens in {seconds:.2} s | mean NLL engine {:.4} | logits digest {:016x}",
-            tokens.len(), nll / (tokens.len() - 1) as f64, digest.finish());
-        return Ok(());
-    };
-    let golden: Vec<f32> = golden.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-    let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
-    let rows = tokens.len();
-    let (mut agree, mut nll, mut golden_nll) = (0usize, 0f64, 0f64);
-    for r in 0..rows {
-        let (ours, theirs) = (&logits[r * vocab..][..vocab], &golden[r * vocab..][..vocab]);
-        agree += usize::from(argmax(ours) == argmax(theirs));
-        if let Some(&next) = tokens.get(r + 1) {
-            nll += nll_of(ours, next);
-            golden_nll += nll_of(theirs, next);
-        }
-    }
-    println!("prefill logits: {rows} tokens in {seconds:.2} s | top-1 agreement {:.2}% | mean NLL engine {:.4} golden \
-        {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64, nll / (rows - 1) as f64,
-        golden_nll / (rows - 1) as f64, mean_kl(&logits, &golden[..logits.len()], vocab));
     Ok(())
 }
 
@@ -2461,8 +2464,7 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
     let rows = args.engine.prefill_rows;
     crate::shared::prefill_pipeline::retained_logits_units(rows, rows,
         usize::from(args.engine.prefill_waves), 256,
-        if args.nll || args.resume_at.is_some() { rows } else { 1 },
-        if args.engine.full_prefill_logits { args.engine.prefill_rows } else { engine::DECODE_ROWS })?;
+        1, engine::DECODE_ROWS)?;
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine, transport, runtime| golden_run(&args, &opened, engine, transport, runtime))
 }

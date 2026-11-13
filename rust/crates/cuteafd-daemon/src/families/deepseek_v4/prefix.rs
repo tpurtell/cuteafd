@@ -459,16 +459,21 @@ impl Runner<'_, '_, '_> {
                 layers[layer].bytes(rows);
                 Ok(())
             };
-            let rows = if logits { part.len() } else { 0 };
             let digest: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>> =
                 if self.lanes { None } else { Some(&mut on_layer) };
-            let out = self.engine.prefill(placement, part, self.transports, self.runtime, rows, digest)?;
             if logits {
-                for values in out.chunks_exact(vocab) {
+                let consumer = crate::shared::probe::CallbackRows::new(|_, values: &[f32]| {
+                    ensure!(values.len() == vocab && values.iter().all(|v| v.is_finite()),
+                        "V4 resume logits shape/finite mismatch");
                     values.iter().for_each(|v| logit_digest.word(v.to_bits()));
                     argmax.push(values.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(i, _)| i));
-                }
-                last = out[out.len() - vocab..].to_vec();
+                    last = values.to_vec();
+                    Ok(())
+                });
+                self.engine.prefill_consumer(placement, part, self.transports, digest,
+                    crate::shared::probe::ScoringRows { consumer: &consumer, position: 1 })?;
+            } else {
+                self.engine.prefill(placement, part, self.transports, self.runtime, 0, digest)?;
             }
         }
         Ok(SuffixRun { layers: layers.iter().map(|d| d.0).collect(), logits: logit_digest.0, argmax, last })

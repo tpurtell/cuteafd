@@ -495,15 +495,21 @@ fn prefill_digest(engine: &GlmEngine<'_>, placement: &mut GlmPlacement, tokens: 
             Ok(())
         };
         let transport = experts.as_mut().map(|(t, r)| (&mut **t, *r));
-        let out = engine.prefill_rows_logits(placement, part, transport, Some(&mut on_layer),
-            if logits { part.len() } else { 1 })?
-            .ok_or_else(|| anyhow::anyhow!("the resume check needs every layer"))?;
         if logits {
-            for values in out.chunks_exact(vocab) {
+            let consumer = crate::shared::probe::CallbackRows::new(|_, values: &[f32]| {
+                anyhow::ensure!(values.len() == vocab && values.iter().all(|v| v.is_finite()),
+                    "GLM resume logits shape/finite mismatch");
                 values.iter().for_each(|v| v.to_bits().hash(&mut logit_hash));
                 argmax.push(values.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(i, _)| i));
-            }
-            last = out[out.len() - vocab..].to_vec();
+                last = values.to_vec();
+                Ok(())
+            });
+            engine.prefill_consumer(placement, part, transport, Some(&mut on_layer),
+                crate::shared::probe::ScoringRows { consumer: &consumer, position: 1 })?
+                .ok_or_else(|| anyhow::anyhow!("the resume check needs every layer"))?;
+        } else {
+            engine.prefill_rows_logits(placement, part, transport, Some(&mut on_layer), 1)?
+                .ok_or_else(|| anyhow::anyhow!("the resume check needs every layer"))?;
         }
     }
     Ok(SuffixRun { layers: hashers.iter().map(Hasher::finish).collect(), logits: logit_hash.finish(), argmax, last })
@@ -557,7 +563,6 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
     use super::engine::PageAllocator;
     use anyhow::{ensure, Context};
     ensure!(engine.weights.layers.len() == engine.cfg.layers, "--resume-at needs every layer");
-    ensure!(engine.full_prefill_logits, "--resume-at needs every prefill row's logits");
     ensure!(experts.is_some() || engine.skip_routed(), "--resume-at needs Spark peers or --skip-routed-experts");
     ensure!(at > 0 && at < n && n <= tokens.len(), "--resume-at {at} must lie inside the {n} prefilled tokens");
     let chunk = chunk.clamp(1, engine.prefill_rows);

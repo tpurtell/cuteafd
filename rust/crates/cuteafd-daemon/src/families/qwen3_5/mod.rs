@@ -6,6 +6,7 @@ pub(crate) mod serve;
 pub(crate) mod engine;
 mod dspark;
 use anyhow::{ensure, Context, Result};
+#[cfg(test)]
 use crate::shared::golden_scores::{select_scored_rows, scored_nll, scored_kl};
 use std::path::PathBuf;
 use cuteafd_loader::families::qwen3_5::Qwen35Checkpoint;
@@ -120,11 +121,14 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let positions = positions.unwrap_or_else(|| (1..tokens.len()).collect());
     ensure!(!positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
         && positions.windows(2).all(|p| p[0] < p[1]), "invalid reference score positions");
-    let reference = if compact { Vec::new() } else { std::fs::read(directory.join("logits.bin"))? };
     let reference_rows = if golden.join("windows.json").is_file() { positions.len() } else { tokens.len() };
-    ensure!(compact || reference.len() == reference_rows * cfg.vocab * 4, "reference logits shape mismatch");
-    let reference: Vec<_> = reference.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-    ensure!(reference.iter().all(|v| v.is_finite()), "nonfinite reference logits");
+    let reference = if compact { None } else {
+        let reference = crate::shared::golden_scores::ReferenceRows::open(
+            &directory.join("logits.bin"), reference_rows, cfg.vocab, false)?.unwrap();
+        // Preserve validation of unscored reference rows without retaining the prompt.
+        for row in 0..reference_rows { reference.row(row)?; }
+        Some(reference)
+    };
     let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::open(&args.snapshot)?;
     let native = args.native_lib.as_ref().context("dense golden requires --native-lib")?;
     // SAFETY: the selected library remains loaded until programs and all GPU owners drop.
@@ -165,50 +169,53 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     if args.prefix_check { engine::prefix::check(&engine, &tokens)?; }
     let mut engine = engine.into_inner();
     if let Some(window) = graph_window {
-        let (off, on) = engine.golden_decode_graphs(&tokens, &positions, args.prefill_chunk)?
+        let (off_nll, on_nll) = engine.golden_decode_graphs(&tokens, &positions, args.prefill_chunk)?
             .context("compact dense graph oracle requires an enabled graph cache")?;
-        let targets: Vec<_> = positions.iter().map(|&p| tokens[p]).collect();
-        let off_nll = scored_nll(&off, &targets, cfg.vocab)?;
-        let on_nll = scored_nll(&on, &targets, cfg.vocab)?;
         ensure!(off_nll.to_bits() == on_nll.to_bits(), "dense graph-on/off NLL differs");
         println!("dense graph NLL: window {}, {} scored rows, off {off_nll:.8}, measured-on {on_nll:.8}; external top-1024 quality is qualified separately by the standard card",
             window.id, positions.len());
         return Ok(());
     }
-    let mut logits = Vec::with_capacity(tokens.len() * cfg.vocab);
-    let mut first = 0;
-    for chunk in tokens.chunks(args.prefill_chunk) {
-        let values = engine.evaluate(chunk, |_layer, _hidden| Ok(()))?;
-        ensure!(values.iter().all(|v| v.is_finite()), "nonfinite dense logits at input {first}");
-        logits.extend(values);
-        first += chunk.len();
-    }
-    if let Some(directory) = &args.save_logits {
+    use std::io::Write;
+    let mut saved = args.save_logits.as_ref().map(|directory| -> Result<_> {
         std::fs::create_dir_all(directory)?;
         std::fs::write(directory.join("tokens.bin"), &token_bytes)?;
-        let bytes: Vec<_> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
-        std::fs::write(directory.join("logits.bin"), bytes)?;
+        Ok(std::io::BufWriter::new(std::fs::File::create(directory.join("logits.bin"))?))
+    }).transpose()?;
+    let reference = reference.context("dense logits reference missing")?;
+    let mut metrics = crate::shared::golden_scores::DenseRowMetrics::default();
+    let mut recorded = 0;
+    let consumer = crate::shared::probe::CallbackRows::new(|position, values: &[f32]| {
+        ensure!(position == recorded && values.len() == cfg.vocab && values.iter().all(|v| v.is_finite()),
+            "dense scoring row order/shape/finiteness differs");
+        if let Some(saved) = saved.as_mut() {
+            for value in values { saved.write_all(&value.to_le_bytes())?; }
+        }
+        if let Ok(index) = positions.binary_search(&(position + 1)) {
+            let theirs = reference.row(if reference_rows == tokens.len() { position } else { index })?;
+            metrics.push(values, &theirs, tokens[position + 1])?;
+        }
+        recorded += 1;
+        Ok(())
+    });
+    let mut first = 0;
+    for chunk in tokens.chunks(args.prefill_chunk) {
+        engine.evaluate_consumer(chunk, |_layer, _hidden| Ok(()),
+            crate::shared::probe::ScoringRows { consumer: &consumer, position: first })?;
+        first += chunk.len();
     }
-    let ours = select_scored_rows(&logits, &positions, cfg.vocab)?;
-    let theirs = if reference_rows == tokens.len() {
-        select_scored_rows(&reference, &positions, cfg.vocab)?
-    } else { reference };
-    let targets: Vec<_> = positions.iter().map(|&p| tokens[p]).collect();
-    let nll = scored_nll(&ours, &targets, cfg.vocab)?;
-    let reference_nll = scored_nll(&theirs, &targets, cfg.vocab)?;
-    if let Some((off, on)) = engine.golden_decode_graphs(&tokens, &positions, args.prefill_chunk)? {
-        let off_nll = scored_nll(&off, &targets, cfg.vocab)?;
-        let on_nll = scored_nll(&on, &targets, cfg.vocab)?;
+    drop(consumer);
+    if let Some(saved) = saved.as_mut() { saved.flush()?; }
+    ensure!(recorded == tokens.len() && metrics.rows == positions.len(), "dense scoring rows incomplete");
+    let nll = metrics.nll / metrics.rows as f64;
+    let reference_nll = metrics.reference_nll / metrics.rows as f64;
+    if let Some((off_nll, on_nll)) = engine.golden_decode_graphs(&tokens, &positions, args.prefill_chunk)? {
         ensure!(off_nll.to_bits() == on_nll.to_bits(), "dense graph-on/off NLL differs");
         println!("dense graph NLL: off {off_nll:.8}, on {on_nll:.8}, evaluate {nll:.8}, reference {reference_nll:.8}; decode minus evaluate {:.8}", off_nll - nll);
         ensure!((on_nll - reference_nll).abs() <= args.nll_tolerance,
             "dense graph decode NLL differs from reference by {:.8}", on_nll - reference_nll);
     }
-    let (mean_kl, max_kl) = scored_kl(&theirs, &ours, cfg.vocab)?;
-    let argmax = |row: &[f32]| row.iter().enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0))).unwrap().0;
-    let agree = ours.chunks_exact(cfg.vocab).zip(theirs.chunks_exact(cfg.vocab))
-        .filter(|(ours, theirs)| argmax(ours) == argmax(theirs)).count();
+    let (mean_kl, max_kl, agree) = (metrics.kl / metrics.rows as f64, metrics.max_kl, metrics.agree);
     println!("dense prefill logits: {} input rows, top-1 agreement {agree}/{} ({:.4}%); mean NLL {nll:.8}, reference {reference_nll:.8}, delta {:.8}; KL(reference||engine) mean {mean_kl:.8}, max {max_kl:.8}",
         tokens.len(), positions.len(), agree as f64 * 100.0 / positions.len() as f64, nll - reference_nll);
     ensure!((nll - reference_nll).abs() <= args.nll_tolerance,

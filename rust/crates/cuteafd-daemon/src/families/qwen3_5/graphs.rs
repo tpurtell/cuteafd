@@ -177,7 +177,7 @@ impl DenseEngine<'_> {
     /// Qualification only: compare identical decode shapes without changing the
     /// eager evaluate path or rebuilding the engine's captured backing.
     pub(crate) fn golden_decode_graphs(&mut self, tokens: &[u32], positions: &[usize], chunk: usize)
-        -> Result<Option<(Vec<f32>, Vec<f32>)>> {
+        -> Result<Option<(f64, f64)>> {
         use crate::shared::speculation::target::{VerifyRequest, VerifyRow};
         use sha2::{Digest, Sha256};
         if !self.graphs.enabled { return Ok(None); }
@@ -186,27 +186,35 @@ impl DenseEngine<'_> {
         let id = self.stream.device.id;
         let replay_hits = || device::snapshots().iter().filter(|row| row.device == id)
             .flat_map(|row| row.cycles.values()).map(|cycle| cycle.hits).sum::<u64>();
-        let mut score = |capturing: bool| -> Result<(Vec<f32>, Vec<u8>)> {
+        let mut score = |capturing: bool| -> Result<(f64, Vec<u8>)> {
             self.reset_slot(0)?;
             self.graphs.capture_ready.set(capturing);
-            let mut selected = Vec::with_capacity(positions.len() * self.cfg.vocab);
+            let mut nll = 0.0;
+            let mut scored = 0;
             let mut digest = Sha256::new();
-            let mut first = 0;
-            for tokens in tokens.chunks(chunk.min(64)) {
-                let rows = tokens.iter().enumerate().map(|(offset, &token)| VerifyRow {
-                    slot: 0, position: first + offset, token: Some(token) }).collect::<Vec<_>>();
-                let logits = self.decode_device(&[0], VerifyRequest { rows: &rows, tap_layers: &[] })?
-                    .to_host(self.stream.device.library)?;
-                for value in &logits { digest.update(value.to_le_bytes()); }
-                for &position in positions.iter().filter(|&&p| p > first && p <= first + tokens.len()) {
-                    let row = position - first - 1;
-                    selected.extend_from_slice(&logits[row * self.cfg.vocab..(row + 1) * self.cfg.vocab]);
+            let vocab = self.cfg.vocab;
+            let consumer = crate::shared::probe::CallbackRows::new(|position, values: &[f32]| {
+                for value in values { digest.update(value.to_le_bytes()); }
+                if positions.binary_search(&(position + 1)).is_ok() {
+                    nll += crate::shared::golden_scores::scored_nll(values, &[tokens[position + 1]], vocab)?;
+                    scored += 1;
                 }
-                first += tokens.len();
+                Ok(())
+            });
+            let mut first = 0;
+            for chunk in tokens.chunks(chunk.min(64)) {
+                let rows = chunk.iter().enumerate().map(|(offset, &token)| VerifyRow {
+                    slot: 0, position: first + offset, token: Some(token) }).collect::<Vec<_>>();
+                let logits = self.decode_device(&[0], VerifyRequest { rows: &rows, tap_layers: &[] })?;
+                crate::shared::probe::ScoringRows { consumer: &consumer, position: first }
+                    .record(self.stream.device.library, 0, &logits)?;
+                first += chunk.len();
             }
-            Ok((selected, digest.finalize().to_vec()))
+            drop(consumer);
+            ensure!(scored == positions.len() && scored > 0, "dense graph scoring rows incomplete");
+            Ok((nll / scored as f64, digest.finalize().to_vec()))
         };
-        let result: Result<(Vec<f32>, Vec<f32>, u64)> = (|| {
+        let result: Result<(f64, f64, u64)> = (|| {
             let (off, off_digest) = score(false)?;
             // A short window may touch each stride only once. Warm every shape
             // before measuring so capture-only execution cannot pass this oracle.
