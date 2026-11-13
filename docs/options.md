@@ -108,7 +108,16 @@ the launcher derives from them.
 `cuteafd golden --family minimax_m3` (hidden alias `minimax-golden`) is a
 qualification-only native full-model prefill path; MiniMax serving stays refused.
 Explicit two-RTX heads planning is available with half KV and replicated index
-storage; `auto` stays layers. Serve admission refuses heads with
+storage; `auto` stays contiguous whole attention with neuron-split FFNs on two RTX.
+The two-RTX layers recipe requires an explicit qualified BF16/F32 split-wire
+precision as an internal admission input. No precision is silently selected:
+default planning and serve admission cleanly refuse with "MiniMax split FFN wire
+precision not qualified/selected" until qualification selects it. Each rank
+normalizes the broadcast FP32 residual locally; the FP32 meeting preserves the
+BF16 whole-FFN boundary before the replicated residual add. GPU0 owns the sole
+Spark endpoint and router; onboarded TP2 routes reach GPU1 as exact IDs/weights
+on the split exchange control sequence, without GPU1 router weights or logits.
+Serve admission refuses heads with
 "narrow-head MiniMax kernels not qualified" until native qualification completes.
 Golden requires `--nll --golden DATASET --save-logits NEW_DIR`, a checkpoint snapshot,
 native library and program manifest, and four real Spark `--peers` endpoints.

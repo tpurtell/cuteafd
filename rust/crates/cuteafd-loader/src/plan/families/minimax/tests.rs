@@ -586,12 +586,27 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         format!("{}/../cuteafd-ffi/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap() };
     let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
     let owners = shared::layer_owners(cfg.layers, gpus);
-    let targets = CoordinatorWeights::plan(&checkpoint, &cfg, gpus,
-        &owners.iter().map(|&g| usize::from(g)).collect::<Vec<_>>()).unwrap();
+    let (targets, mount) = if gpus == 2 {
+        let weights = crate::families::minimax_m3::weight_layout::SplitFfnWeights::plan(&checkpoint, &cfg,
+            &owners.iter().map(|&g| usize::from(g)).collect::<Vec<_>>(),
+            crate::placement::planner::EmbeddingHome::Device(0)).unwrap();
+        let mount = weights.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect();
+        (weights.into_iter().map(|t| t.target).collect::<Vec<_>>(), mount)
+    } else {
+        let weights = CoordinatorWeights::plan(&checkpoint, &cfg, gpus,
+            &owners.iter().map(|&g| usize::from(g)).collect::<Vec<_>>()).unwrap();
+        let mount = weights.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect();
+        (weights, mount)
+    };
     // Programs: MSA, producers, forward and this layout's dense exports.
     let mut programs = Vec::new();
     for name in ["minimax_msa_programs", "minimax_producer_programs", "minimax_forward_programs"] {
         programs.extend(fixture(name)["programs"].as_array().unwrap().clone());
+    }
+    for (whole, half) in [(3072, 1536), (12288, 6144)] {
+        let entry = programs.iter().find(|e| e["name"] == format!("minimax_oai_split_i{whole}")).unwrap();
+        let half_entry = entry.to_string().replace(&whole.to_string(), &half.to_string());
+        programs.push(serde_json::from_str(&half_entry).unwrap());
     }
     let mut dense = std::collections::BTreeMap::new();
     for target in &targets {
@@ -610,7 +625,7 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
     // Executor geometry checks are release-exact (E128); the fixture keeps four experts' headers.
     let mut release = cfg.clone(); release.experts = 128;
-    MiniMaxInputs { cfg: release, gpus, attention: if gpus == 2 { crate::placement::AttentionPlacement::Layers }
+    MiniMaxInputs { cfg: release, gpus, split_wire: Some(crate::families::minimax_m3::execution::WirePrecision::Bf16), attention: if gpus == 2 { crate::placement::AttentionPlacement::Layers }
         else { crate::placement::AttentionPlacement::Heads }, spark_ranks: ranks, context: Context::automatic(1 << 20),
         maximum_pool_tokens: 4 << 20, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
         manifest, routed: routed.clone(),
@@ -621,13 +636,13 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         }).collect(),
         local: LocalPackage::Installed { scratch: 64 << 20, output: prefill.rows * cfg.hidden as u64 * 2 },
         spark: (0..=routed.len()).map(charge).collect(),
-        links: shared::spark_link((gpus - 1) as u8, ranks, prefill, Default::default()).unwrap(),
+        links: shared::spark_link(0, ranks, prefill, Default::default()).unwrap(),
         spark_reply_formats: Default::default(), drafter: None, vision: None, budgets,
         code: vec![64 << 20; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
         expert_usage: None, resident_weight_limit: None,
         push_host_envelopes: vec![None; routed.len() + 1],
-        mount: targets.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect() }
+        mount }
 }
 
 /// H1 contract: the shared recipe charges each physical owner exactly once on
@@ -1213,7 +1228,7 @@ fn cached_expert_prefixes_match_independent_legacy_inventory() {
 
 #[test]
 fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
-    use crate::families::minimax_m3::execution::{HeadLayout, MsaPrograms, MsaRope, ProducerPrograms, UnitLayout};
+    use crate::families::minimax_m3::execution::{HeadLayout, MsaPrograms, MsaRope, ProducerPrograms, UnitLayout, PartialFfnLayout, AttentionLayout, RouterLayout, SplitLayout};
     use crate::placement::families::minimax_m3::{self as shared, Owner};
     use crate::placement::planner::{serving, Allocation, Lifetime, Location, Operation};
     use std::collections::BTreeMap;
@@ -1241,7 +1256,8 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
             let context = inputs.context.maximum as u32;
             let (msa, _) = MsaPrograms::resolve(&inputs.cfg, &inputs.manifest,
                 capacity.decode.rows, capacity.prefill.rows, context).unwrap();
-            let (producers, _) = ProducerPrograms::resolve(&inputs.manifest, capacity.prefill.rows).unwrap();
+            let (producers, _) = if gpus == 2 { ProducerPrograms::resolve_split(&inputs.manifest, capacity.prefill.rows).unwrap() }
+                else { ProducerPrograms::resolve(&inputs.manifest, capacity.prefill.rows).unwrap() };
             let mut expected = BTreeMap::new();
             let tokens = Owner::DecodeTokenIds { gpu: 0 }.id();
             expected.insert(tokens.clone(), (concurrency * 4, Location::coordinator(0), Lifetime::TARGET));
@@ -1268,7 +1284,15 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
                     .chain((0..inputs.prefill.waves).map(|slot| (true, slot))) {
                     let prefix = if prefill { Owner::Unit { gpu, slot } } else { Owner::Decode { gpu } }.id();
                     let metadata = capacity.metadata(prefill);
-                    add(&mut expected, &prefix, location, UnitLayout::new(&inputs.cfg, metadata.rows).unwrap().buffers());
+                    if gpus == 2 {
+                        add(&mut expected, &prefix, location, PartialFfnLayout::new(&inputs.cfg, gpu as u8, metadata.rows).unwrap().buffers());
+                        add(&mut expected, &prefix, location, AttentionLayout::new(&inputs.cfg, metadata.rows).unwrap().buffers());
+                        if gpu == 0 { add(&mut expected, &prefix, location, RouterLayout::new(metadata.rows).unwrap().buffers()); }
+                        add(&mut expected, &format!("{prefix}.split"), location,
+                            SplitLayout::new(metadata.rows, inputs.split_wire.unwrap()).unwrap().buffers());
+                    } else {
+                        add(&mut expected, &prefix, location, UnitLayout::new(&inputs.cfg, metadata.rows).unwrap().buffers());
+                    }
                     add(&mut expected, &format!("{prefix}.metadata"), location, metadata.buffers());
                     let uploads = capacity.metadata_uploads(prefill);
                     assert_eq!(uploads.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
@@ -1612,7 +1636,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
         manifest_path: &manifest_path, manifest: expected.manifest.clone(),
         coordinator: Coordinator::Planned { cards: vec![CoordinatorCard {
             physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },
-        attention: Some(AttentionPlacement::Heads), physical_devices: &[0, 1],
+        attention: Some(AttentionPlacement::Heads), split_wire: None, physical_devices: &[0, 1],
         spark_ranks: 4, spark_bytes: 100 << 30, prefill: expected.prefill,
         context_tokens: 1 << 20, pool_tokens: Some(1 << 20), sequences: 16,
         host: (512 << 30, 480 << 30), host_cache_bytes: Some(1 << 30), prefix_entries: 64,
@@ -1623,6 +1647,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
     assert_eq!(heads.targets, expected.targets);
     assert_eq!(heads.mount, expected.mount);
     request.attention = None;
+    request.split_wire = Some(crate::families::minimax_m3::execution::WirePrecision::Bf16);
     let layers = gather(&request).unwrap();
     assert_eq!(layers.attention, AttentionPlacement::Layers);
     assert_eq!(layers.owners, crate::placement::families::minimax_m3::layer_owners(60, 2));
@@ -1671,8 +1696,13 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
         assert!(!report.executable());
         assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
         assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
-        let placed = report.solver_placement.as_ref().expect("shared solved placement");
-        assert_eq!(placed.attention_placement, report.attention_placement);
+        if attention.is_none() {
+            assert!(report.solver_placement.is_none(), "unselected split precision must not produce a plan");
+            assert!(format!("{report:?}").contains("wire precision not qualified/selected"));
+        } else {
+            let placed = report.solver_placement.as_ref().expect("shared solved placement");
+            assert_eq!(placed.attention_placement, report.attention_placement);
+        }
     }
 }
 
@@ -1796,6 +1826,65 @@ fn decode_token_upload_is_one_exact_entry_rank_pair() {
                 assert_eq!(owner.location, location);
                 assert_eq!(owner.lifetime, Lifetime::TARGET);
                 assert!(owner.view.is_none());
+            }
+        }
+    }
+}
+
+
+#[test]
+fn split_recipe_precision_roles_and_onboard_route_receives_are_exact() {
+    use crate::families::minimax_m3::execution::{ExecutionRole, Normalization, WirePrecision};
+    use crate::placement::families::minimax_m3::{self as shared, Owner, ServingRefusal};
+    use crate::placement::{FfnMode, HopPoint, LayerMode, Onboard, ResidualHome, planner::*};
+    for wire in [WirePrecision::Bf16, WirePrecision::F32] {
+        for concurrency in [1, 16, 64] {
+            for count in [0, 1] {
+                let mut inputs = recipe_inputs(2, if count == 0 { 4 } else { 0 });
+                inputs.split_wire = Some(wire);
+                inputs.sequences = concurrency;
+                let request = shared::request(inputs.context, Some(32768), Onboard::Layers(count),
+                    inputs.prefill, Operation::Serving, None, Default::default());
+                let admitted = inputs.admit(request.clone()).unwrap();
+                assert!(admitted.placement.layers.iter().zip(&inputs.owners).all(|(layer, &gpu)|
+                    layer.mode == LayerMode::Whole { gpu, ffn: FfnMode::Split }));
+                assert!(admitted.placement.residual.iter().skip(1).all(|home| *home == ResidualHome::Replicated));
+                assert_eq!(admitted.placement.hops.iter().filter(|h| matches!(h.at, HopPoint::AfterAttention(_))).count(), inputs.cfg.layers);
+                assert!(!admitted.placement.hops.iter().any(|h| matches!(h.at, HopPoint::Exit | HopPoint::BeforeLayer(_))));
+                assert_eq!(admitted.placement.tp2.is_some(), count > 0);
+                let allocations = &admitted.solved.facts.allocations;
+                for gpu in 0..2 {
+                    assert!(!inputs.targets[1].arena.views().keys().any(|name|
+                        name.ends_with(".block_sparse_moe.gate.weight") || name.ends_with(".e_score_correction_bias")));
+                    for layer in 0..inputs.cfg.layers {
+                        let roles = inputs.roles(layer, gpu, concurrency as u32).unwrap();
+                        assert_eq!(roles.len(), 1 + usize::from(inputs.owners[layer] as usize == gpu));
+                        assert_eq!(roles.last().unwrap().role, ExecutionRole::PartialFfn);
+                        assert!(roles.iter().all(|r| r.normalization == Normalization::Local
+                            && r.residual_bytes == concurrency * 6144 * 4));
+                    }
+                    for (rows, prefix) in std::iter::once((concurrency, Owner::Decode { gpu }.id()))
+                        .chain((0..inputs.prefill.waves).map(|slot| (inputs.prefill.rows, Owner::Unit { gpu, slot }.id()))) {
+                        let owner = |name: &str| allocations.iter().find(|a| a.id == format!("{prefix}.{name}"));
+                        for (name, stride) in [("residual", 6144 * 4), ("gate", 6144 * 2), ("up", 6144 * 2),
+                            ("ffn", 6144 * 2), ("routed", 6144 * 2), ("split.local", 6144 * wire.bytes() as u64),
+                            ("split.receive", 6144 * wire.bytes() as u64), ("split.meeting", 6144 * 4)] {
+                            let found = owner(name).unwrap();
+                            assert_eq!(found.bytes, rows * stride, "{}", found.id);
+                            assert!(found.view.is_none(), "wire/meeting/whole output must be disjoint");
+                            assert_eq!(found.location, Location::coordinator(gpu as u8));
+                        }
+                        for name in ["split.control", "split.abort"] { assert_eq!(owner(name).unwrap().bytes, 256); }
+                        assert_eq!(owner("route_ids").is_some(), gpu == 0 || count > 0);
+                        assert_eq!(owner("route_weights").is_some(), gpu == 0 || count > 0);
+                        assert_eq!(owner("logits").is_some(), gpu == 0);
+                        assert!(owner("combined").is_none(), "no duplicate whole FFN output");
+                        assert_eq!(allocations.iter().filter(|a| a.id == format!("{prefix}.dense.output")).count(), 1);
+                    }
+                }
+                inputs.split_wire = None;
+                assert!(matches!(inputs.admit(request.clone()), Err(Refusal::Unqualified { family: "minimax_m3", .. })));
+                assert!(matches!(inputs.admit_serving(request), Err(ServingRefusal::SplitWireNotQualified)));
             }
         }
     }

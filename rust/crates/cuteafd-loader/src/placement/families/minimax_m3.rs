@@ -131,11 +131,11 @@ impl Owner {
 
 }
 
-/// Qualified whole-layer execution remains the automatic policy. Explicit TP2
-/// heads has a separate planning descriptor and a typed serving refusal until
-/// narrow-head native kernels qualify.
+/// One RTX keeps Whole execution. Two RTX use contiguous whole attention and
+/// split FFNs; explicit heads has its own unqualified planning descriptor.
 pub const MINIMAX_M3: ExecutorModes = ExecutorModes { family: "minimax_m3",
-    modes: &[WHOLE, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }], hops: true,
+    modes: &[WHOLE, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner },
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], hops: true,
     attention: AttentionPlacement::Layers };
 
 const HEADS_PLAN: ExecutorModes = ExecutorModes { family: "minimax_m3",
@@ -146,6 +146,8 @@ const HEADS_PLAN: ExecutorModes = ExecutorModes { family: "minimax_m3",
 pub enum ServingRefusal {
     #[error("narrow-head MiniMax kernels not qualified")]
     NarrowHeadsNotQualified,
+    #[error("MiniMax split FFN wire precision not qualified/selected")]
+    SplitWireNotQualified,
     #[error(transparent)]
     Plan(#[from] Refusal),
 }
@@ -329,6 +331,8 @@ pub struct MiniMaxInputs {
     pub cfg: MiniMaxM3Config,
     pub gpus: usize,
     pub attention: AttentionPlacement,
+    /// Explicit qualification/planning input; no conservative wire envelope.
+    pub split_wire: Option<WirePrecision>,
     pub spark_ranks: usize,
     pub context: Context,
     /// Largest pool the build indexes (KV max), in tokens.
@@ -398,6 +402,7 @@ pub fn request(context: Context, pool: Option<u64>, onboard: crate::placement::O
 pub fn spark_link(gpu: u8, ranks: usize, prefill: PrefillShape, replies: SparkReplyFormats)
     -> Result<Vec<crate::placement::PreparedSparkLink>, Refusal> {
     use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
+    if gpu != 0 { return Err(invalid("the sole minimax.spark endpoint belongs on GPU0")); }
     if ranks == 0 { return Ok(Vec::new()); }
     let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
     Ok(vec![PreparedSparkLink::endpoint("minimax.spark", gpu, SparkEndpointOwners { ranks,
@@ -459,9 +464,29 @@ impl MiniMaxInputs {
 
     pub fn heads(&self) -> bool { self.gpus == 2 && self.attention == AttentionPlacement::Heads }
 
+    pub fn split(&self) -> bool { self.gpus == 2 && self.attention == AttentionPlacement::Layers }
+
+    pub fn roles(&self, layer: usize, gpu: usize, rows: u32) -> Result<Vec<RoleDescriptor>, Refusal> {
+        if !self.split() || layer >= self.cfg.layers || gpu >= self.gpus
+            || self.owners.len() != self.cfg.layers {
+            return Err(invalid("split role layer/rank geometry"));
+        }
+        let partial = PartialFfnLayout::new(&self.cfg, gpu as u8, rows)?.descriptor();
+        let mut roles = Vec::new();
+        if self.owners[layer] as usize == gpu { roles.push(RoleDescriptor {
+            role: ExecutionRole::WholeAttention, ..partial }); }
+        roles.push(partial);
+        Ok(roles)
+    }
+
+    fn selected_wire(&self) -> Result<WirePrecision, Refusal> {
+        self.split_wire.ok_or(Refusal::Unqualified { family: "minimax_m3",
+            reason: "MiniMax split FFN wire precision not qualified/selected" })
+    }
+
     fn modes(&self) -> Vec<LayerMode> {
         if self.heads() { vec![LayerMode::HeadSplit; self.cfg.layers] }
-        else { self.owners.iter().map(|&gpu| LayerMode::Whole { gpu, ffn: FfnMode::Owner }).collect() }
+        else { self.owners.iter().map(|&gpu| LayerMode::Whole { gpu, ffn: if self.split() { FfnMode::Split } else { FfnMode::Owner } }).collect() }
     }
 
     fn validate_attention(&self) -> Result<(), Refusal> {
@@ -491,6 +516,7 @@ impl MiniMaxInputs {
     pub fn admit_serving(&self, request: Request) -> Result<AdmittedMiniMax, ServingRefusal> {
         self.validate_attention()?;
         if self.heads() { return Err(ServingRefusal::NarrowHeadsNotQualified); }
+        if self.split() && self.split_wire.is_none() { return Err(ServingRefusal::SplitWireNotQualified); }
         Ok(self.admit(request)?)
     }
 
@@ -500,7 +526,7 @@ impl MiniMaxInputs {
         HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: self.cfg.hidden as u64 * 4,
             rows: self.prefill.rows.max(self.sequences), lanes: LANES, entry_gpu: 0,
             head_gpu: self.head_gpu(),
-            terminal: if self.heads() { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } }
+            terminal: if self.gpus == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } }
     }
 
     /// The available onboarding counts: an ordered prefix of the routed layers.
@@ -581,6 +607,7 @@ impl MiniMaxInputs {
             return Err(invalid("invalid execution inventory extent"));
         }
         self.validate_attention()?;
+        if self.split() { self.selected_wire()?; }
         self.validate_embedding()?;
         cuteafd_core::concurrency::validate("minimax_m3", self.sequences).map_err(invalid)?;
         let mut out = Vec::new();
@@ -605,6 +632,18 @@ impl MiniMaxInputs {
             cuteafd_ffi::SYNC_H2D_CHUNK_BYTES as u64,
             Lifetime { first: Phase::Load, last: Phase::Warmup }, Category::Staging,
             "library-wide synchronous H2D startup chunk", maximum));
+        Ok(out)
+    }
+
+    fn split_unit_components(&self, gpu: usize, rows: u32, prefix: &str, maximum: u64)
+        -> Result<Vec<Component>, Refusal> {
+        let mut out = PartialFfnLayout::new(&self.cfg, gpu as u8, rows)?.components(prefix, maximum)?;
+        if self.owners.contains(&(gpu as u8)) {
+            out.extend(AttentionLayout::new(&self.cfg, rows)?.components(prefix, gpu as u8, maximum)?);
+        }
+        if gpu == 0 { out.extend(RouterLayout::new(rows)?.components(prefix, 0, maximum)?); }
+        out.extend(SplitLayout::new(rows, self.selected_wire()?)?
+            .components(&format!("{prefix}.split"), gpu as u8, maximum)?);
         Ok(out)
     }
 
@@ -657,7 +696,9 @@ impl MiniMaxInputs {
         }
         out.extend(MsaRope::new(cfg, context)?.components(&Owner::Rope { gpu }.id(), gpu as u8, maximum)?);
         let (msa, _) = MsaPrograms::resolve(cfg, &self.manifest, decode_rows, rows, context)?;
-        let (producers, _) = ProducerPrograms::resolve(&self.manifest, capacity.execution_rows())?;
+        let (producers, _) = if self.split() {
+            ProducerPrograms::resolve_split(&self.manifest, capacity.execution_rows())?
+        } else { ProducerPrograms::resolve(&self.manifest, capacity.execution_rows())? };
         ForwardPrograms::resolve(&self.manifest, capacity.execution_rows())?;
         target.resolve_dense_programs(&self.manifest, capacity.execution_rows())?;
         // One decode lane on every rank (its layers' work), then one owner
@@ -665,6 +706,8 @@ impl MiniMaxInputs {
         let decode = Owner::Decode { gpu }.id();
         if self.heads() {
             out.extend(HeadsLayout::new(cfg, gpu as u8, decode_rows)?.components(&decode, Lifetime::TARGET, maximum)?);
+        } else if self.split() {
+            out.extend(self.split_unit_components(gpu, decode_rows, &decode, maximum)?);
         } else {
             out.extend(UnitLayout::new(cfg, decode_rows)?.components(&decode, gpu as u8, Lifetime::TARGET, maximum)?);
         }
@@ -679,6 +722,8 @@ impl MiniMaxInputs {
             let unit = UnitLayout::new(cfg, rows)?;
             if self.heads() {
                 out.extend(HeadsLayout::new(cfg, gpu as u8, rows)?.components(&prefix, Lifetime::TARGET, maximum)?);
+            } else if self.split() {
+                out.extend(self.split_unit_components(gpu, rows, &prefix, maximum)?);
             } else { out.extend(unit.components(&prefix, gpu as u8, Lifetime::TARGET, maximum)?); }
             if gpu == 0 {
                 // Host tokens enter only the entry rank's prefill units. The
@@ -840,6 +885,12 @@ impl Recipe for MiniMaxInputs {
                 }
             }
             if count > 0 {
+                if self.split() {
+                    for (rows, prefix) in std::iter::once((decode_rows, Owner::Decode { gpu: 1 }.id()))
+                        .chain((0..self.prefill.waves).map(|slot| (capacity.prefill.rows, Owner::Unit { gpu: 1, slot }.id()))) {
+                        components.extend(with(RouteReceiveLayout::new(rows)?.components(&prefix, maximum)?, &activation));
+                    }
+                }
                 if pair {
                     // No local halves means no OwnerTp2 exchange. Boundary
                     // hops retain their own storage independently of onboarding.
@@ -964,9 +1015,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn executor_runs_whole_owner_layers_only() {
+    fn executor_runs_single_whole_and_pair_split_layers() {
         assert!(MINIMAX_M3.runs(WHOLE) && MINIMAX_M3.runs(LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }));
-        assert!(!MINIMAX_M3.runs(LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }));
+        assert!(MINIMAX_M3.runs(LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }));
         assert!(!MINIMAX_M3.runs(LayerMode::HeadSplit));
         assert!(!MINIMAX_M3.runs(LayerMode::ContextSplit));
         assert_eq!(MINIMAX_M3.attention, AttentionPlacement::Layers);

@@ -86,7 +86,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let sequences = opts.resolved_concurrency("minimax_m3");
     let physical_devices = (0..gpus as i32).collect::<Vec<_>>();
     let request = FactsRequest { checkpoint: input.checkpoint(), cfg, catalog, manifest_path: &manifest_path,
-        manifest: manifest.clone(), attention: Some(attention), physical_devices: &physical_devices, coordinator: Coordinator::Planned { cards: cards.clone() }, spark_ranks: ranks,
+        manifest: manifest.clone(), attention: Some(attention), split_wire: None, physical_devices: &physical_devices, coordinator: Coordinator::Planned { cards: cards.clone() }, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("minimax_m3"),
         replies: opts.spark_reply_formats, head: opts.bf16_target_head, expert_usage: opts.expert_usage,
@@ -130,7 +130,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     notes.push(format!("MiniMax attention {}: {}; pool {} tokens; {onboarded} of {routed} routed layers onboarded \
         ({}); unit {} x {} waves; C{sequences}", placed.attention_summary(),
         if inputs.heads() { "TP2 paired query/KV/index groups, replicated index keys, split FFN neurons" }
-        else if gpus == 2 { "contiguous whole-layer owners (one boundary hop), routed experts TP2 halves" }
+        else if gpus == 2 { "contiguous whole attention, split FFN neurons and replicated residuals; routed experts TP2 halves" }
         else { "every layer on rtx0" }, placed.pool_tokens, if gpus == 2 { "TP2 halves" } else { "whole layers" },
         shape.rows, shape.waves));
     let mut devices = Vec::new();

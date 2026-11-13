@@ -247,7 +247,7 @@ mod tests {
             manifest_path: &manifest_path, manifest: manifest.clone(),
             coordinator: Coordinator::Planned { cards: vec![CoordinatorCard {
                 physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },
-            attention: Some(AttentionPlacement::Heads), physical_devices: &[0, 1],
+            attention: Some(AttentionPlacement::Heads), split_wire: None, physical_devices: &[0, 1],
             spark_ranks: 4, spark_bytes: 100 << 30, prefill: PrefillShape { rows, waves: 3 },
             context_tokens: 1 << 20, pool_tokens: Some(1 << 20), sequences: 16,
             host: (512 << 30, 480 << 30), host_cache_bytes: Some(0), prefix_entries: 0,
