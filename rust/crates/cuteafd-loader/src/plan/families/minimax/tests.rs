@@ -39,11 +39,11 @@ fn execution_inventory_is_exact_recipe_partition_before_shared_finalization() {
                     combined.push(Component::allocation(owner, bytes, false, maximum));
                 }
             }
-            combined.extend(crate::families::minimax_m3::execution::HeadLayout::new(&inputs.cfg, shared::DECODE_ROWS)
+            combined.extend(crate::families::minimax_m3::execution::HeadLayout::new(&inputs.cfg, inputs.request_capacity().unwrap().decode.rows)
                 .unwrap().components(&Owner::Head.id(), head, maximum).unwrap());
             combined.extend(serving::ServingOwners {
                 selector: serving::SelectorOwners { location: Location::coordinator(head),
-                    capacity: (concurrency as usize).max(shared::DECODE_ROWS as usize),
+                    capacity: concurrency as usize,
                     vocab: inputs.cfg.vocab_size, device_sampling: inputs.device_sampling },
                 prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 },
             }.components(maximum).unwrap());
@@ -797,7 +797,7 @@ fn zero_onboard_pair_has_no_local_expert_or_exchange_owners() {
         assert_eq!(workspace, if count == 0 { 0 } else { 4 });
         assert_eq!(admitted.expert_backings.len(), if count == 0 { 0 } else { 2 });
         let rows = crate::serving_capacity::OwnerTp2Rows::new(inputs.cfg.hidden as u64,
-            inputs.cfg.topk as u64, inputs.prefill.rows.max(u64::from(shared::DECODE_ROWS)), false).unwrap();
+            inputs.cfg.topk as u64, inputs.prefill.rows.max(u64::from(inputs.request_capacity().unwrap().decode.rows)), false).unwrap();
         for demand in rows.demands().unwrap() {
             let id = format!("{}.{}", shared::Owner::Tp2 { gpu: demand.gpu as usize }.id(),
                 demand.group.replace(' ', "_"));
@@ -1107,5 +1107,134 @@ fn cached_expert_prefixes_match_independent_legacy_inventory() {
             assert!(inventory.prefixes(&vec![-1; devices.len()]).is_err());
             if devices.len() == 2 { assert!(inventory.prefixes(&[0, 0]).is_err()); }
         }
+    }
+}
+
+
+#[test]
+fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
+    use crate::families::minimax_m3::execution::{HeadLayout, MsaPrograms, MsaRope, ProducerPrograms, UnitLayout};
+    use crate::placement::families::minimax_m3::{self as shared, Owner};
+    use crate::placement::planner::{serving, Allocation, Lifetime, Location, Operation};
+    use std::collections::BTreeMap;
+
+    fn add(expected: &mut BTreeMap<String, (u64, Location, Lifetime)>, prefix: &str,
+        location: Location, buffers: impl IntoIterator<Item = (impl AsRef<str>, u64)>) {
+        for (name, bytes) in buffers {
+            assert!(expected.insert(format!("{prefix}.{}", name.as_ref()),
+                (bytes, location, Lifetime::TARGET)).is_none());
+        }
+    }
+    fn add_owner(expected: &mut BTreeMap<String, (u64, Location, Lifetime)>, owner: Allocation) {
+        assert!(owner.view.is_none());
+        assert!(expected.insert(owner.id, (owner.bytes, owner.location, owner.lifetime)).is_none());
+    }
+    for gpus in [1, 2] {
+        for concurrency in [1, 16, 64] {
+            let mut inputs = recipe_inputs(gpus, 4);
+            inputs.sequences = concurrency;
+            let capacity = inputs.request_capacity().unwrap();
+            assert_eq!((capacity.decode.rows, capacity.decode.requests), (concurrency as u32, concurrency as u32));
+            assert_eq!(capacity.prefill.requests, (concurrency as u32).min(capacity.prefill.rows));
+            assert_eq!(capacity.execution_rows(), capacity.decode.rows.max(capacity.prefill.rows),
+                "native expert workspace covers the largest single bounded invocation");
+            let context = inputs.context.maximum as u32;
+            let (msa, _) = MsaPrograms::resolve(&inputs.cfg, &inputs.manifest,
+                capacity.decode.rows, capacity.prefill.rows, context).unwrap();
+            let (producers, _) = ProducerPrograms::resolve(&inputs.manifest, capacity.prefill.rows).unwrap();
+            let mut expected = BTreeMap::new();
+            // These are the allocation inputs used by the runtime constructors,
+            // not component helpers or a second fixture-specific sizing rule.
+            for gpu in 0..gpus {
+                let location = Location::coordinator(gpu as u8);
+                let cache = capacity.cache(context).unwrap();
+                add(&mut expected, &Owner::Cache { gpu }.id(), location,
+                    cache.buffers().unwrap().into_iter().filter(|(name, _)| !name.starts_with("layer.")));
+                assert_eq!(cache.requests, concurrency as u32);
+                for slot in 0..concurrency {
+                    for (plane, bytes) in [("table", u64::from(cache.table_width) * 4), ("length", 4)] {
+                        assert!(expected.insert(Owner::PrefixH2d { gpu, slot, plane }.id(),
+                            (bytes, Location::PINNED, Lifetime::TARGET)).is_none());
+                    }
+                }
+                add(&mut expected, &Owner::Rope { gpu }.id(), location,
+                    MsaRope::new(&inputs.cfg, context).unwrap().buffers());
+                for (prefill, slot) in std::iter::once((false, 0))
+                    .chain((0..inputs.prefill.waves).map(|slot| (true, slot))) {
+                    let prefix = if prefill { Owner::Unit { gpu, slot } } else { Owner::Decode { gpu } }.id();
+                    let metadata = capacity.metadata(prefill);
+                    add(&mut expected, &prefix, location, UnitLayout::new(&inputs.cfg, metadata.rows).unwrap().buffers());
+                    add(&mut expected, &format!("{prefix}.metadata"), location, metadata.buffers());
+                    let uploads = capacity.metadata_uploads(prefill);
+                    assert_eq!(uploads.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+                        if prefill { vec!["positions", "slots", "batch_ids", "causal_lengths", "cache_lengths", "query_offsets"] }
+                        else { vec!["positions", "slots", "causal_lengths", "cache_lengths"] });
+                    add(&mut expected, &format!("{prefix}.metadata"), Location::PINNED,
+                        uploads.into_iter().map(|(name, bytes)| (format!("{name}.upload"), bytes)));
+                    if prefill && gpu == 0 {
+                        add(&mut expected, &prefix, Location::PINNED,
+                            [("route_ids.upload", u64::from(metadata.rows) * 4)]);
+                    }
+                    let dense = format!("{prefix}.dense");
+                    add_owner(&mut expected, inputs.targets[gpu].dense_input(metadata.rows).unwrap()
+                        .allocation(&dense, gpu as u8, Lifetime::TARGET));
+                    for owner in inputs.targets[gpu].dense_workspace(metadata.rows).unwrap()
+                        .allocations(&dense, gpu as u8, Lifetime::TARGET) { add_owner(&mut expected, owner); }
+                    add(&mut expected, &format!("{prefix}.attention"), location, msa.workspace(prefill));
+                    add(&mut expected, &format!("{prefix}.attention"), location, producers.workspace());
+                }
+            }
+            let head = Location::coordinator((gpus - 1) as u8);
+            add(&mut expected, &Owner::Head.id(), head,
+                HeadLayout::new(&inputs.cfg, capacity.decode.rows).unwrap().buffers());
+            for owner in (serving::SelectorOwners { location: head, capacity: capacity.decode.rows as usize,
+                vocab: inputs.cfg.vocab_size, device_sampling: inputs.device_sampling })
+                .allocations("selector", serving::ServingOwners::LIFETIME).unwrap() {
+                add_owner(&mut expected, owner);
+            }
+            let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+                inputs.prefill, Operation::Serving, None, Default::default());
+            let admitted = inputs.admit(request).unwrap();
+            let actual = admitted.solved.facts.allocations.iter().filter(|owner|
+                ["minimax.cache.", "minimax.prefix.h2d.", "minimax.rope.", "minimax.decode.",
+                    "minimax.unit.", "minimax.head.", "selector."].iter().any(|prefix| owner.id.starts_with(prefix)))
+                .map(|owner| {
+                    assert!(owner.view.is_none(), "{}", owner.id);
+                    (owner.id.clone(), (owner.bytes, owner.location, owner.lifetime))
+                }).collect::<BTreeMap<_, _>>();
+            assert_eq!(actual, expected, "{gpus} RTX C{concurrency}: constructor allocation inputs vs recipe");
+        }
+    }
+}
+
+#[test]
+fn packed_prefill_can_have_fewer_rows_than_boot_requests_but_exports_must_cover_both() {
+    use crate::families::minimax_m3::execution::MsaPrograms;
+    use crate::placement::families::minimax_m3::RequestCapacity;
+    use crate::placement::planner::Refusal;
+    let inputs = recipe_inputs(1, 4);
+    let capacity = RequestCapacity::new(64, 32).unwrap();
+    assert_eq!((capacity.decode.rows, capacity.decode.requests), (64, 64));
+    assert_eq!((capacity.prefill.rows, capacity.prefill.requests), (32, 32));
+    assert_eq!(capacity.execution_rows(), 64);
+    assert!(MsaPrograms::resolve(&inputs.cfg, &inputs.manifest, capacity.decode.rows,
+        capacity.prefill.rows, inputs.context.maximum as u32).is_ok());
+    // A valid but smaller AttentionExtend batch ABI must still be refused.
+    let mut manifest = (*inputs.manifest).clone();
+    let entry = manifest["programs"].as_array_mut().unwrap().iter_mut()
+        .find(|entry| entry["name"] == "minimax_attention_extend").unwrap();
+    entry["params"]["max_batch"] = serde_json::json!(32);
+    entry["geometry"]["max_batch"] = serde_json::json!(32);
+    let layout = cuteafd_ffi::minimax_m3::Layout::new(cuteafd_ffi::minimax_m3::Mode::AttentionExtend, 4096, 32).unwrap();
+    entry["scratch_bytes_at_capacity"]["scratch"] = serde_json::json!(layout.scratch);
+    let scratch = entry["pointers"].as_array_mut().unwrap().iter_mut()
+        .find(|pointer| pointer["name"] == "scratch").unwrap();
+    scratch["shape"] = serde_json::json!(format!("[{}]", layout.scratch));
+    let error = MsaPrograms::resolve(&inputs.cfg, &manifest, capacity.decode.rows,
+        capacity.prefill.rows, inputs.context.maximum as u32).unwrap_err();
+    assert!(matches!(error, Refusal::MissingExport { ref export, ref detail, .. }
+        if export == "minimax_attention_extend" && detail.contains("requested rows=32 extent=64")), "{error:?}");
+    for (requests, rows) in [(0, 32), (65, 32), (1, 0), (1, 4097)] {
+        assert!(RequestCapacity::new(requests, rows).is_err());
     }
 }
