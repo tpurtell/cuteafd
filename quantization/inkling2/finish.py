@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 from .container import TASK, BUILD
 from .publish import publish, load
@@ -31,6 +32,9 @@ def main():
     complete = handoff(root, TASK/'hf-stage')
     cleanup = retire(root, intermediates=[root/name for name in ('packed','activations','target-taps','routes')],
                      build_root=BUILD)
+    # Deliver the terminal receipts to the same progress conversation before
+    # retiring its timer; otherwise a fast handoff between ticks goes unreported.
+    subprocess.run([sys.executable, str(TASK/'progress-updates/notify.py')], check=True, timeout=90)
     # Disable only completed task units. The active handoff oneshot exits
     # naturally; stopping it here would interrupt its final receipt/log write.
     subprocess.run(['systemctl','--user','disable','cuteafd-inkling2-quant.service',
