@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires installed GLM 5.3 and Kimi K3 native headers"]
+    #[ignore = "requires installed GLM 5.3 and MiMo V2.6 Pro native headers"]
     fn installed_native_headers_push_bytes_and_receipts_match_mount() -> anyhow::Result<()> {
         use super::*;
         use crate::shared::memory::{device::Device, push_fp8::RankPlan,
@@ -1099,12 +1099,14 @@ mod tests {
         native.strict_device_free(&library, true)?;
         let device = Device { library: &library, id: 1 };
         for (repo, format) in [("zai-org/GLM-5.3", ExpertFormat::Fp8Block128),
-            ("nvidia/GLM-5.3-NVFP4", ExpertFormat::Nvfp4), ("moonshotai/Kimi-K3", ExpertFormat::Mxfp4)] {
+            ("nvidia/GLM-5.3-NVFP4", ExpertFormat::Nvfp4), ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", ExpertFormat::Mxfp4)] {
             let home = std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(||
                 PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
             let model = home.join("hub").join(format!("models--{}", repo.replace('/', "--")));
             let revision = std::fs::read_to_string(model.join("refs/main"))?;
-            let installed = cuteafd_loader::read_expert_catalog(&model.join("snapshots").join(revision.trim()))?;
+            let snapshot = model.join("snapshots").join(revision.trim());
+            let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+            let installed = cuteafd_loader::read_expert_catalog(&snapshot)?;
             let tensors = installed.fp8().context("installed native expert headers missing")?;
             assert_eq!(tensors.format(), format, "{repo}");
             let layer = tensors.shape().first_layer;
@@ -1131,7 +1133,6 @@ mod tests {
             // Sparse synthetic payloads avoid reading or copying checkpoint weights.
             let headers = (0..32).flat_map(|expert| headers.iter().map(move |(name, dtype, shape)|
                 t(name.replace(".experts.0.", &format!(".experts.{expert}.")), dtype, shape))).collect::<Vec<_>>();
-            let config: serde_json::Value = serde_json::from_slice(&std::fs::read(installed.snapshot().join("config.json"))?)?;
             write_snapshot(root.path(), &config, &headers, None);
             let mut shape = *tensors.shape();
             shape.experts = 32;
