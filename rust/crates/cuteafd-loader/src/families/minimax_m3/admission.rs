@@ -57,6 +57,8 @@ pub struct FactsRequest<'a> {
     pub manifest_path: &'a Path,
     pub manifest: Arc<serde_json::Value>,
     pub coordinator: Coordinator,
+    /// Logical rank to physical CUDA device, shared with runtime arena IDs.
+    pub physical_devices: &'a [i32],
     pub spark_ranks: usize,
     pub spark_bytes: u64,
     pub prefill: PrefillShape,
@@ -143,6 +145,11 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     let ranks = request.spark_ranks;
     if !(1..=2).contains(&gpus) {
         return Err(refused(format!("MiniMax runs on one RTX or an RTX pair, not {gpus}"), "Use --rtx 1 or --rtx 2."));
+    }
+    if request.physical_devices.len() != gpus || request.physical_devices.iter().any(|&device| device < 0)
+        || request.physical_devices.iter().copied().collect::<std::collections::BTreeSet<_>>().len() != gpus {
+        return Err(refused("MiniMax physical device inventory differs from its coordinator ranks",
+            "Provide one distinct physical CUDA ID per coordinator rank."));
     }
     let context = if request.context_tokens == 0 { cfg.max_position as u64 } else { request.context_tokens };
     if context > cfg.max_position as u64 {

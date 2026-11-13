@@ -41,8 +41,9 @@ pub const LANES: u64 = 1;
 pub const DECODE_ROWS: u32 = 64;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 
-/// Stable recipe/runtime owner identity. Component descriptors append their
-/// field names to these prefixes; a physical backing has exactly one owner.
+/// Stable recipe/runtime owner identity. `id` is the full planner identity;
+/// `inventory_name` omits the `minimax.` prefix supplied by runtime Inventory.
+/// Experts/Spark identities are selection groups, not physical backing IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Owner {
     Target { gpu: usize },
@@ -57,6 +58,7 @@ pub enum Owner {
     Experts { gpu: usize, count: usize },
     Spark { rank: usize, kind: &'static str, count: usize },
     Mount { gpu: usize },
+    PrefixH2d { gpu: usize, slot: u64, plane: &'static str },
 }
 
 impl Owner {
@@ -74,8 +76,15 @@ impl Owner {
             Self::Experts { gpu, count } => format!("minimax.experts.{gpu}.{count}"),
             Self::Spark { rank, kind, count } => format!("minimax.spark.{rank}.{kind}.{count}"),
             Self::Mount { gpu } => format!("minimax.mount.{gpu}"),
+            Self::PrefixH2d { gpu, slot, plane } => format!("minimax.prefix.h2d.{gpu}.{slot}.{plane}"),
         }
     }
+    /// Name passed to an Inventory constructed with the `minimax` prefix.
+    /// Target arenas carry their own canonical backing ID rather than an alias.
+    pub fn inventory_name(self) -> Option<String> {
+        self.id().strip_prefix("minimax.").map(str::to_owned)
+    }
+
 }
 
 /// What the MiniMax executor runs. One RTX owns every layer. A pair owns
@@ -101,6 +110,82 @@ fn refusal(error: anyhow::Error) -> Refusal { invalid(format!("{error:#}")) }
 pub struct LayerExperts {
     pub whole: u64,
     pub half: [u64; 2],
+}
+
+/// Source route selected by the shared push policy. A failed push may fall
+/// back to mount only with this same canonical final layout and identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertStorage { Push, Mount }
+
+/// A layer's final planes are offsets in its rank's one physical backing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertLayerBacking {
+    pub layer: usize,
+    pub region: std::ops::Range<usize>,
+    pub slicing: crate::formats::fp8_experts::Slicing,
+    pub planes: [std::ops::Range<usize>; 6],
+}
+
+/// Passive view of the shared loaders' canonical backing. Never injects an
+/// identity or changes their packing. Both push and mount receipts use `arena`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertBacking {
+    pub gpu: usize,
+    pub physical_device: i32,
+    pub count: usize,
+    pub storage: ExpertStorage,
+    /// Full alias prefix; runtime strips only its Inventory's `minimax.` once.
+    pub inventory_prefix: String,
+    pub arena: WeightArenaLayout,
+    pub layers: Vec<ExpertLayerBacking>,
+    /// Host-only post-delivery validation, not part of the device backing.
+    pub validation_bytes: usize,
+}
+
+impl ExpertBacking {
+    pub fn plan(tensors: &crate::formats::fp8_experts::Fp8ExpertTensors, layers: &[usize],
+        gpus: usize, gpu: usize, physical_device: i32) -> anyhow::Result<Self> {
+        use crate::formats::fp8_experts::{Fp8Projection, Slicing};
+        use crate::serving_capacity::{expert_weight_arena_id, fp8_expert_regions};
+        anyhow::ensure!((1..=2).contains(&gpus) && gpu < gpus && physical_device >= 0
+            && !layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1]),
+            "invalid MiniMax expert selection");
+        let tensors = tensors.for_coordinator();
+        let slicing = Slicing::Blocks(128);
+        let regions = fp8_expert_regions(&tensors, layers, gpus, gpu, slicing)?;
+        let arena = WeightArenaLayout::new(expert_weight_arena_id("fp8", physical_device, &regions)?, regions)?;
+        let mut shards = std::collections::BTreeSet::new();
+        let mut views = Vec::new();
+        let mut push_compatible = true;
+        for &layer in layers {
+            let tensors = tensors.for_layer_metadata(layer)?;
+            let planes = (0..6).map(|plane| arena.view(&format!("{layer}.{plane}"))
+                .map_or(0..0, |view| view.offset()..view.offset() + view.bytes()))
+                .collect::<Vec<_>>();
+            let first = planes.iter().filter(|plane| !plane.is_empty()).map(|plane| plane.start).min()
+                .ok_or_else(|| anyhow::anyhow!("empty MiniMax expert layer"))?;
+            let end = planes.iter().map(|plane| plane.end).max().unwrap();
+            // RankPlan rejects inter-plane padding rather than silently
+            // widening admission; a nonpushable selection uses mount.
+            push_compatible &= end - first == planes.iter().map(|plane| plane.len()).sum::<usize>();
+            for expert in 0..tensors.shape().experts {
+                for projection in Fp8Projection::ALL {
+                    for name in tensors.projection_source_names(layer, expert, projection) {
+                        shards.insert(tensors.push_source(&name)?.0.path);
+                    }
+                }
+            }
+            views.push(ExpertLayerBacking { layer, region: first..end, slicing,
+                planes: planes.try_into().unwrap() });
+        }
+        let storage = if push_compatible && !shards.is_empty()
+            && shards.iter().all(|path| crate::push_load::is_push_shard(path)) {
+            ExpertStorage::Push
+        } else { ExpertStorage::Mount };
+        Ok(Self { gpu, physical_device, count: layers.len(), storage,
+            inventory_prefix: format!("minimax.experts.{gpu}.{}", layers.len()), arena,
+            layers: views, validation_bytes: 0 })
+    }
 }
 
 /// The installed coordinator fp8moe package (`fp8-minimax-nvfp4a4`).
@@ -360,6 +445,15 @@ impl MiniMaxInputs {
         for (name, bytes) in cache.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
             out.extend(buffer(format!("{}.{name}", Owner::Cache { gpu }.id()), location, bytes, Lifetime::TARGET,
                 Category::Kv, "MSA page tables", maximum));
+        }
+        // Ordered H2D staging is keyed by destination and copy stream, not a
+        // ring: each retained request table and length has its own pinned owner.
+        // Shared pinned accounting charges exact payload; no device rounding.
+        for slot in 0..self.sequences {
+            for (plane, bytes) in [("table", u64::from(cache.table_width) * 4), ("length", 4)] {
+                out.extend(buffer(Owner::PrefixH2d { gpu, slot, plane }.id(), Location::PINNED, bytes,
+                    Lifetime::TARGET, Category::Staging, "prefix ordered H2D staging", maximum));
+            }
         }
         out.extend(MsaRope::new(cfg, context)?.components(&Owner::Rope { gpu }.id(), gpu as u8, maximum)?);
         let (msa, _) = MsaPrograms::resolve(cfg, &self.manifest, DECODE_ROWS, rows, context)?;
