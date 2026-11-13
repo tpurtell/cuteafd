@@ -37,7 +37,7 @@ pub struct ProcessOwners {
     pub target_arenas: Vec<Vec<crate::serving_capacity::WeightArenaLayout>>,
     pub alternate_target_arenas: Vec<Vec<crate::serving_capacity::WeightArenaLayout>>,
     /// Native shared experts retain their independent format-owned backings.
-    pub shared_arenas: Vec<Vec<(String, u64)>>,
+    pub shared_arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
     /// Drafter backings indexed by coordinator home (sharded only for TP2).
     pub draft_arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
     pub push_host: Option<crate::push_load::PushHostEnvelope>,
@@ -257,10 +257,12 @@ impl ProcessOwners {
             self.alternate_target_arenas = layouts(&alternate)?;
         }
         self.shared_arenas = if let Some((_, metadata)) = native {
-            (0..i.gpus.len()).map(|rank| (0..i.layers).filter(|&layer| !i.cfg.dense[layer]).map(|layer| {
-                let plan = metadata.plan(layer, i.gpus.len(), rank, crate::plan::exlr8::residency::ExpertSet::Shared)?;
-                Ok((format!("glm.weights.gpu.{rank}.shared.layer.{layer}.backing"), plan.resident_bytes as u64))
-            }).collect::<anyhow::Result<Vec<_>>>()).collect::<anyhow::Result<Vec<_>>>()?
+            (0..i.gpus.len()).map(|rank| {
+                let plans = (0..i.layers).filter(|&layer| !i.cfg.dense[layer]).map(|layer|
+                    metadata.plan(layer, i.gpus.len(), rank, crate::plan::exlr8::residency::ExpertSet::Shared))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                crate::plan::exlr8::residency::shared_arena(&plans)
+            }).collect::<anyhow::Result<Vec<_>>>()?
         } else { vec![] };
         Ok(())
     }
@@ -926,11 +928,9 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             }
         }
     }
-    for (rank, layouts) in process.shared_arenas.iter().enumerate() {
-        for (id, bytes) in layouts {
-            contract.components.extend(p::weight_arena_extent_components(id, *bytes,
-                p::Location::coordinator(rank as u8), p::Lifetime::RESIDENT, maximum, cuteafd_core::memory_layout::MemoryKind::Weights)?);
-        }
+    for (rank, layout) in process.shared_arenas.iter().enumerate() {
+        add_arena(&mut contract, layout, rank, p::Lifetime::RESIDENT, &p::Activation::always(),
+            cuteafd_core::memory_layout::MemoryKind::Weights)?;
     }
     for (index, row) in facts.fixed.iter().enumerate() {
         if row.demand.group == "pending code" {

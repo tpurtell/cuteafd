@@ -1,5 +1,6 @@
 //! Installed-header replay and compact real uploads share production dispatch.
 use super::*;
+use super::super::engine;
 use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
 use cuteafd_core::memory_layout::{Category, MemoryKind};
 use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
@@ -233,13 +234,26 @@ fn arena_inventory(label: &str, inventory: &WeightInventory) -> Result<()> {
                 offset: arena.view(&expected.id).context("target alias recipe")?.offset() as u64 });
             assert_eq!(matches, [&expected], "noncharging alias preserves its physical operand");
         }
-        for shared in inventory.owners.iter().filter(|owner| owner.allocation.location == location
-            && owner.allocation.id.contains(".shared.layer.")) {
-            let owner = &shared.allocation;
-            tail += arena_charge(&components, &owner.id, location, owner.bytes, owner.bytes, MemoryKind::Weights)?;
-            backing += owner.bytes;
-            old += owner.bytes;
+        let shared = inventory.owners.iter().filter(|owner| owner.allocation.location == location
+            && owner.allocation.id.contains(".shared.layer.")).collect::<Vec<_>>();
+        if !shared.is_empty() {
+            let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/shared/{rank}"),
+                shared.iter().map(|owner| (owner.allocation.id.clone(), owner.allocation.bytes as usize)))?;
+            tail += arena_charge(&components, layout.id(), location, layout.bytes() as u64,
+                layout.payload_bytes() as u64, MemoryKind::Weights)?;
+            backing += layout.bytes() as u64;
+            old += layout.payload_bytes() as u64;
             roots += 1;
+            for owner in shared {
+                let aliases = components.iter().filter_map(|component| match &component.kind {
+                    ComponentKind::Allocation { template, .. } if template.id == owner.allocation.id => Some(template),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                let mut expected = owner.allocation.clone();
+                expected.view = Some(View { backing: layout.id().into(),
+                    offset: layout.view(&expected.id).context("shared alias recipe")?.offset() as u64 });
+                assert_eq!(aliases, [&expected], "shared layers alias the single rank backing");
+            }
         }
         assert_eq!(components.iter().filter(|component| matches!(&component.kind,
             ComponentKind::Allocation { template, .. } if template.location == location && template.view.is_none())).count(), roots);
@@ -687,6 +701,192 @@ fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacemen
         signatures(expected.owners.into_iter().map(|o| o.allocation)),
         signatures(actual)
     );
+    Ok(())
+}
+
+#[test]
+fn ml4_alpha_records_without_reads_and_decodes_only_after_group_commit() -> Result<()> {
+    use crate::shared::experts::rtx::{dense, push};
+    use std::os::unix::fs::FileExt;
+    let (fixture, library) = compact_dso()?;
+    fixture.immediate_copies(&library)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (config, mut tensors) = fixture::glm5_compact_weights();
+    let mut cfg = GlmDsaConfig::from_hf(&config)?;
+    cfg.variant = GlmDsaConfig::from_hf(&fixture::mistral_large4_config())?.variant;
+    tensors.push(fixture::t("lerope.alpha", "BF16", &[cfg.qk_rope_head_dim / 2]));
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let tensor = catalog.tensor("lerope.alpha")?;
+    let bits = (0..cfg.qk_rope_head_dim / 2).map(|i|
+        [0x0000u16, 0x8000, 0x3f80, 0xbf80, 0x0001, 0x7f80, 0x7fc1][i % 7]).collect::<Vec<_>>();
+    let bytes = bits.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+    std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+        .write_all_at(&bytes, tensor.metadata.byte_offset)?;
+    let loader = GlmLoader { library: &library, catalog: &catalog, device: 0,
+        stream: std::ptr::null_mut(), peers: vec![], arenas: None,
+        allocation_prefix: String::new(), push: None };
+    let mount = loader.rope_alpha(&cfg)?;
+    let timing = crate::shared::memory::load_timing::Split::start();
+    let (pushed, records) = dense::recording(|| loader.rope_alpha(&cfg))?;
+    assert_eq!(timing.read_bytes(), 0, "alpha planning must not mount-read its payload");
+    assert!(pushed.values().unwrap_err().to_string().contains("before load-group commit"));
+    assert_eq!(records.host_operands.len(), 1);
+    assert!(records.operands.is_empty() && records.steps.is_empty());
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    let device = Device { library: &library, id: 0 };
+    device.run(|| push::tests::receive_pushed(device, None, root.path(), sockets.path(), &records, None, 0, 0))?;
+    let actual = pushed.values()?.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+    assert_eq!(actual, bits.iter().map(|&value| u32::from(value) << 16).collect::<Vec<_>>());
+    assert_eq!(actual, mount.values()?.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+    Ok(())
+}
+
+#[test]
+fn rotary_tables_are_exact_target_arena_views_with_no_new_device_allocation() -> Result<()> {
+    let (fixture, library) = compact_dso()?;
+    fixture.immediate_copies(&library)?;
+    for ml4 in [false, true] {
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let (config, mut tensors) = fixture::glm5_compact_weights();
+        let mut cfg = GlmDsaConfig::from_hf(&config)?;
+        if ml4 {
+            cfg.variant = GlmDsaConfig::from_hf(&fixture::mistral_large4_config())?.variant;
+            tensors.push(fixture::t("lerope.alpha", "BF16", &[cfg.qk_rope_head_dim / 2]));
+        }
+        fixture::write_snapshot(root.path(), &config, &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        if ml4 {
+            use std::os::unix::fs::FileExt;
+            let tensor = catalog.tensor("lerope.alpha")?;
+            let alpha = (0..cfg.qk_rope_head_dim / 2).flat_map(|i|
+                (0x3f00u16 + i as u16).to_le_bytes()).collect::<Vec<_>>();
+            std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+                .write_all_at(&alpha, tensor.metadata.byte_offset)?;
+        }
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+        for ranks in [1, 2] {
+            let mut inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers, None,
+                false, false, EmbeddingHome::Device(0))?;
+            let bytes = inventory.add_rotary(64, cfg.qk_rope_head_dim)? as usize;
+            inventory.add_rotary(64, cfg.qk_rope_head_dim)?;
+            assert!(inventory.add_rotary(65, cfg.qk_rope_head_dim).is_err());
+            let components = inventory.components(1)?;
+            for rank in 0..ranks {
+                assert!(components.iter().any(|component| matches!(&component.kind,
+                    cuteafd_loader::placement::planner::ComponentKind::Allocation { template, .. }
+                        if template.id == format!("glm.weights.gpu.{rank}.rope")
+                            && template.bytes == bytes as u64 && template.view.as_ref()
+                                .is_some_and(|view| view.backing == format!("glm/coordinator/{rank}")))));
+            }
+            let arenas = inventory.coordinator_arenas()?.into_iter().enumerate().map(|(rank, layout)| {
+                Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+                    Device { library: &library, id: rank as i32 }, layout, crate::shared::memory::TEST_ARENA)?))
+            }).collect::<Result<BTreeMap<_, _>>>()?;
+            let loader = GlmLoader { library: &library, catalog: &catalog, device: 0,
+                stream: std::ptr::null_mut(), peers: vec![], arenas: Some(std::rc::Rc::new(arenas)),
+                allocation_prefix: String::new(), push: None };
+            let alpha = ml4.then(|| loader.rope_alpha(&cfg)).transpose()?;
+            let active = 37;
+            let expected = if let Some(variant) = cfg.variant.ml4() {
+                variant.rope_table(&alpha.as_ref().unwrap().values()?, active)?
+            } else {
+                let dim = cfg.qk_rope_head_dim;
+                let mut table = vec![0f32; active * dim];
+                let inv = (0..dim / 2).map(|i|
+                    1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / dim as f32)).collect::<Vec<_>>();
+                for position in 0..active {
+                    for (i, frequency) in inv.iter().enumerate() {
+                        let angle = position as f32 * frequency;
+                        table[position * dim + i] = angle.cos();
+                        table[position * dim + dim / 2 + i] = angle.sin();
+                    }
+                }
+                table
+            };
+            fixture.quiet_events(&library, false)?;
+            let before = fixture.events()?.matches('D').count();
+            for rank in 0..ranks {
+                Device { library: &library, id: rank as i32 }.run(|| -> Result<()> {
+                    let rotary = loader.allocate("rope", bytes)?;
+                    engine::fill_rotary(&library, &cfg, alpha.as_ref(), active, &rotary)?;
+                    assert_eq!(rotary.buffer.bytes, bytes, "retain full admitted extent");
+                    let mut actual = vec![0; expected.len() * 4];
+                    library.copy_d2h(&mut actual, rotary.buffer)?;
+                    assert_eq!(actual, expected.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>());
+                    assert!(engine::fill_rotary(&library, &cfg, alpha.as_ref(), 65, &rotary).is_err());
+                    Ok(())
+                })?;
+            }
+            assert_eq!(fixture.events()?.matches('D').count(), before, "rotary views must not allocate");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn peer_routers_use_one_target_backing_and_replay_identical_push_bytes() -> Result<()> {
+    use crate::shared::experts::rtx::{dense, push};
+    use std::os::unix::fs::FileExt;
+    let (fixture, library) = compact_dso()?;
+    fixture.immediate_copies(&library)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (config, tensors) = fixture::glm5_compact_weights();
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let cfg = GlmDsaConfig::read(root.path())?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+    let range = cfg.first_moe_layer..cfg.layers;
+    let mut inventory = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None,
+        false, false, EmbeddingHome::Device(0))?;
+    inventory.add_peer_routers(&range.clone().collect::<Vec<_>>())?;
+    let components = inventory.components(1)?;
+    let peer_arena = inventory.coordinator_arenas()?.remove(1);
+    assert!(components.iter().any(|component| matches!(&component.kind,
+        cuteafd_loader::placement::planner::ComponentKind::Allocation { template, .. }
+            if template.id == "glm.weights.gpu.1.layer.1.operand.gate"
+                && template.view.as_ref().is_some_and(|view| view.backing == peer_arena.id()))));
+    let arenas = inventory.coordinator_arenas()?.into_iter().enumerate().map(|(rank, layout)| {
+        Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            Device { library: &library, id: rank as i32 }, layout, crate::shared::memory::TEST_ARENA)?))
+    }).collect::<Result<BTreeMap<_, _>>>()?;
+    for index in range.clone() {
+        for (_, name) in super::peer_router_names(&cfg, index) {
+            let tensor = catalog.tensor(&name)?;
+            let bytes = (0..tensor.metadata.byte_length).map(|i| (i as u8).wrapping_mul(17).wrapping_add(3)).collect::<Vec<_>>();
+            std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+                .write_all_at(&bytes, tensor.metadata.byte_offset)?;
+        }
+    }
+    let sink = std::rc::Rc::new(super::landing::PushSink::default());
+    let loader = GlmLoader { library: &library, catalog: &catalog, device: 0,
+        stream: std::ptr::null_mut(), peers: vec![crate::shared::peer_split::RankDevice {
+            device: 1, stream: std::ptr::null_mut() }], arenas: Some(std::rc::Rc::new(arenas)),
+        allocation_prefix: String::new(), push: Some(sink.clone()) };
+    let (_, mut peers) = loader.model(&cfg, cfg.layers, None, false)?;
+    let _ = sink.take();
+    fixture.quiet_events(&library, false)?;
+    let before = fixture.events()?.matches('D').count();
+    let timing = crate::shared::memory::load_timing::Split::start();
+    let ((), mut records) = dense::recording(|| loader.peer_routers(&cfg, &mut peers[0], range.clone()))?;
+    records.extend(sink.take().0);
+    assert_eq!(timing.read_bytes(), 0, "router recording must not mount-read payloads");
+    assert_eq!(fixture.events()?.matches('D').count(), before, "router replicas are arena views");
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    let device = Device { library: &library, id: 1 };
+    device.run(|| push::tests::receive_pushed(device, None, root.path(), sockets.path(), &records, None, 0, 1))?;
+    for index in range {
+        for (key, name) in super::peer_router_names(&cfg, index) {
+            let land = super::landing::Land::whole(&catalog, &name, 0)?;
+            let expected = super::landing::read(&catalog, &[land.clone()], land.bytes())?;
+            let buffer = peers[0][index].allocation_buffers().into_iter()
+                .find(|(name, _)| name == &format!("operand.{key}"))
+                .context("peer router allocation")?.1;
+            let mut actual = vec![0; expected.len()];
+            library.copy_d2h(&mut actual, buffer)?;
+            assert_eq!(actual, expected, "peer router {name}");
+        }
+    }
     Ok(())
 }
 

@@ -12,6 +12,19 @@ use std::sync::{Arc, Mutex};
 
 type Result<T> = std::result::Result<T, ResidencyError>;
 
+/// One physical shared-expert backing per coordinator rank. Layer images keep
+/// their internal offsets; descriptor pointers are rebound after allocation.
+pub fn shared_arena(plans: &[Residency]) -> anyhow::Result<crate::serving_capacity::WeightArenaLayout> {
+    let first = plans.first().context("empty EXLR8 shared arena")?;
+    ensure!(matches!(first.world, 1 | 2) && first.rank < first.world,
+        "invalid EXLR8 shared arena rank");
+    ensure!(plans.iter().all(|plan| plan.set == ExpertSet::Shared
+        && plan.rank == first.rank && plan.world == first.world), "EXLR8 shared arena identity differs");
+    crate::serving_capacity::WeightArenaLayout::new(format!("glm/shared/{}", first.rank),
+        plans.iter().map(|plan| (format!("glm.weights.gpu.{}.shared.layer.{}.backing", plan.rank, plan.layer),
+            plan.resident_bytes)))
+}
+
 fn number_string(metadata: &serde_json::Value, key: &str) -> anyhow::Result<usize> {
     metadata[key].as_str().with_context(|| format!("EXLR8 slice {key} missing"))?
         .parse().with_context(|| format!("EXLR8 slice {key} invalid"))

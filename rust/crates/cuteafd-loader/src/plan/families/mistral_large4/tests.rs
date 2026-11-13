@@ -213,10 +213,11 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
             else { crate::placement::AttentionPlacement::Heads }, "{ranks}+{gpus}");
         let layer_owners = (gpus == 2).then(||
             crate::placement::families::glm5::attention_owners(&cfg, cfg.layers).unwrap());
-        let weights = crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
+        let mut weights = crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
             &checkpoint, gpus, cfg.layers, layer_owners.as_deref(),
             crate::families::glm5::native_bf16(), false,
             crate::placement::planner::EmbeddingHome::Device(0)).unwrap();
+        weights.add_rotary(1 << 20, cfg.qk_rope_head_dim).unwrap();
         let arenas = weights.coordinator_arenas().unwrap();
         assert_eq!(arenas[0].view("glm.weights.embedding").unwrap().bytes() as u64,
             checkpoint.tensors.iter().find(|tensor| tensor.meta.name == cfg.embedding()).unwrap().meta.byte_length);

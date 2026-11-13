@@ -913,7 +913,11 @@ impl<'a> ProductionInput<'a> {
         {
             return Err(invalid("incomplete production geometry"));
         }
-        let TargetFacts { weights, hooks, embedding_read, native_load } = self.target;
+        let TargetFacts { mut weights, hooks, embedding_read, native_load } = self.target;
+        for (_, inventory) in &mut weights {
+            inventory.add_rotary(self.context, self.cfg.qk_rope_head_dim)
+                .map_err(|error| invalid(&error.to_string()))?;
+        }
         let partitioned = self.attention == AttentionPlacement::Context;
         if self.attention != AttentionPlacement::Heads && self.gpus != 2
             || partitioned != self.context_scratch.is_some()
@@ -994,13 +998,14 @@ impl<'a> ProductionInput<'a> {
             recipe.owners.push(Case { when: vec![], value: load.components(maximum_pages) });
         }
         for (home, weights) in &weights {
-            recipe.weights.push(Case { when: vec![When::Embedding(*home)], value: weights.clone() });
             let filler = embedding_read.filter(|_| *home == EmbeddingHome::Device(0));
             let sync = self.sync_upload_bytes.max(self.draft.sync_upload_bytes)
                 .max(native_load.as_ref().map_or(0, |load| load.sync_upload_bytes))
                 .max(weights.core_loading.sync_upload_bytes)
                 .max(weights.kv_b_loading.sync_upload_bytes)
                 .max(weights.row_loading.sync_upload_bytes)
+                .max(self.context.checked_mul(self.cfg.qk_rope_head_dim as u64)
+                    .and_then(|bytes| bytes.checked_mul(4)).ok_or_else(|| invalid("rotary upload overflow"))?)
                 .max(filler.map_or(0, |batch| batch.packed_bytes as u64));
             let lifetime = Lifetime { first: Phase::Load, last: Phase::PostTargetKv };
             let owners = [
@@ -1057,22 +1062,17 @@ impl<'a> ProductionInput<'a> {
                     crate::placement::ResidentWeights(owner.bytes)), ByteCurve::fixed(owner.bytes, maximum_pages)));
             }
             recipe.owners.push(Case { when: when.clone(), value: components });
-            if count > 0 && self.gpus == 2 {
-                for (home, weights) in &weights {
-                    let mut replicated = weights.clone();
-                    let start = replicated.owners.len();
-                    replicated.add_peer_routers(&(self.cfg.first_moe_layer..self.cfg.first_moe_layer + count)
+            // Router replicas extend the selected target backing, rather than
+            // adding separately charged allocations beside its original extent.
+            for (home, weights) in &weights {
+                let mut selected = weights.clone();
+                if count > 0 && self.gpus == 2 {
+                    selected.add_peer_routers(&(self.cfg.first_moe_layer..self.cfg.first_moe_layer + count)
                         .collect::<Vec<_>>()).map_err(|error| invalid(&error.to_string()))?;
-                    replicated.owners.drain(..start);
-                    replicated.core_loading = Default::default();
-                    replicated.kv_b_loading = Default::default();
-                    replicated.row_loading = Default::default();
-                    replicated.attention_mount = Default::default();
-                    let mut condition = when.clone();
-                    condition.push(When::Embedding(*home));
-                    recipe.owners.push(Case { when: condition,
-                        value: WeightInventory::standalone_components(&replicated.owners, maximum_pages) });
                 }
+                let mut condition = when.clone();
+                condition.push(When::Embedding(*home));
+                recipe.weights.push(Case { when: condition, value: selected });
             }
             for device in 0..self.gpus as u8 {
                 recipe.targets.push(Case { when: {
@@ -2088,6 +2088,13 @@ impl Recipe for GlmRecipe<'_> {
             requires: vec![],
             components: vec![],
         };
+        if self.cfg.variant.ml4().is_some() {
+            let bytes = self.cfg.qk_rope_head_dim as u64;
+            contract.components.push(Component::allocation(Allocation::buffer("glm.load.rope_alpha",
+                Location::PINNED, bytes, Lifetime { first: Phase::Load, last: Phase::PostTargetKv },
+                cuteafd_core::memory_layout::Category::Staging, "ML4 committed LeRoPE source"),
+                ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
+        }
         let prefill = contract.variables.len();
         contract
             .variables
@@ -2301,8 +2308,11 @@ impl Recipe for GlmRecipe<'_> {
             if case.value.ranks != self.gpus {
                 return Err(invalid("weight rank count differs from contract"));
             }
-            let mut components = case.value.components(self.maximum_pages)?;
-            components.extend(case.value.loading_components(self.maximum_pages)?);
+            let mut weights = case.value.clone();
+            weights.add_rotary(self.context, self.cfg.qk_rope_head_dim)
+                .map_err(|error| invalid(&error.to_string()))?;
+            let mut components = weights.components(self.maximum_pages)?;
+            components.extend(weights.loading_components(self.maximum_pages)?);
             domains.append(&mut contract, &case.when, components)?;
         }
         for case in &self.graphs {

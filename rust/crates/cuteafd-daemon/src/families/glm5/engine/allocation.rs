@@ -405,6 +405,8 @@ impl GlmEngine<'_> {
             Lifetime::RESIDENT, Category::Weights, "target checkpoint owners");
         for rank in 0..self.ranks() {
             let layers = if rank == 0 { &self.weights.layers } else { &self.peer()?.layers };
+            let rotary = if rank == 0 { &self.cos_sin } else { &self.peer()?.cos_sin };
+            rotary.inventory(&mut inventory, &format!("rank.{rank}.rope"))?;
             for (layer, weights) in layers.iter().enumerate() {
                 for (_, buffer) in weights.allocation_buffers() {
                     ensure!(devices.logical_rank(buffer.device_id)? as usize == rank, "weight on wrong logical rank");
@@ -425,7 +427,6 @@ impl GlmEngine<'_> {
                 }
             }
         }
-        if let Some(alpha) = &self.weights.rope_alpha { inventory.host("rope_alpha", alpha)?; }
         inventory.receipts.extend(self.embedding.allocation_receipts(devices, "glm.embedding")?);
         Ok(inventory.receipts)
     }
@@ -557,11 +558,10 @@ impl GlmEngine<'_> {
         let physical_devices = self.census_physical_devices()?;
         let devices = CoordinatorDevices::new(&physical_devices)?;
         for rank in 0..self.ranks() {
-            let (kv, index, rope, decode, prefill) = if rank == 0 {
+            let (kv, index, decode, prefill) = if rank == 0 {
                 (
                     &self.kv,
                     &self.index,
-                    &self.cos_sin,
                     &self.decode_workspace,
                     &self.prefill_slots,
                 )
@@ -570,7 +570,6 @@ impl GlmEngine<'_> {
                 (
                     &peer.kv,
                     &peer.index,
-                    &peer.cos_sin,
                     &peer.decode_workspace,
                     &peer.prefill_slots,
                 )
@@ -599,7 +598,6 @@ impl GlmEngine<'_> {
                     )?;
                 }
             }
-            census.buffer("rope", rope.buffer, Lifetime::TARGET, Category::Kv)?;
             if let Some(workspace) = decode.borrow().as_ref() {
                 census.rows(
                     "decode",

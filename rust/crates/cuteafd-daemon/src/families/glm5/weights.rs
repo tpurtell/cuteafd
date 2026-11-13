@@ -194,9 +194,21 @@ pub(crate) struct GlmWeights<'a> {
     pub layers: Vec<GlmLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
     pub head: GlmHead<'a>,
-    /// LeRoPE `exp`-scale of each RoPE frequency (`lerope.alpha`, F32), for
-    /// variants whose RoPE table carries it; the table is built from it.
-    pub rope_alpha: Option<Vec<f32>>,
+    /// Retained through group commit and both ranks' rotary-table construction.
+    pub rope_alpha: Option<RopeAlpha<'a>>,
+}
+
+pub(crate) struct RopeAlpha<'a> {
+    storage: crate::shared::memory::HostAllocation<'a>,
+    landing: crate::shared::memory::HostLanding,
+}
+impl RopeAlpha<'_> {
+    pub(crate) fn values(&self) -> Result<Vec<f32>> {
+        ensure!(self.landing.ready.load(std::sync::atomic::Ordering::Acquire),
+            "Mistral Large 4 lerope.alpha read before load-group commit");
+        Ok(self.storage.bytes().chunks_exact(2).map(|bytes|
+            f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16)).collect())
+    }
 }
 
 /// The vocabulary head rank 0 owns: the checkpoint's BF16 head (the shared
@@ -273,7 +285,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
     out
 }
 
-fn peer_router_names(cfg: &GlmDsaConfig, layer: usize) -> impl Iterator<Item = (&'static str, String)> + '_ {
+pub(super) fn peer_router_names(cfg: &GlmDsaConfig, layer: usize) -> impl Iterator<Item = (&'static str, String)> + '_ {
     [("gate", Op::Router), ("gate.bias", Op::RouterBias)].into_iter()
         .filter_map(move |(operand, role)| cfg.weight(layer, role).map(|name| (operand, name)))
 }
@@ -295,7 +307,24 @@ impl<'a> GlmLoader<'a> {
 
     fn scoped(&self, prefix: String) -> Self { Self { allocation_prefix: prefix, ..self.clone() } }
 
-    /// Replicate only admitted local routers; their bytes are charged to the TP2 expert arena.
+    pub(crate) fn rope_alpha(&self, cfg: &GlmDsaConfig) -> Result<RopeAlpha<'a>> {
+        let tensor = self.catalog.tensor("lerope.alpha")?;
+        ensure!(tensor.metadata.dtype == DType::Bf16
+            && tensor.metadata.shape == [cfg.qk_rope_head_dim / 2]
+            && tensor.metadata.byte_length == cfg.qk_rope_head_dim as u64,
+            "lerope.alpha must be BF16 [rope/2]");
+        let _owner = cuteafd_ffi::memory_ledger::owner("glm.load.rope_alpha");
+        let mut storage = crate::shared::memory::HostAllocation::new(self.library,
+            cfg.qk_rope_head_dim, Tag::staging("glm/load/rope-alpha"))?;
+        let landing = crate::shared::memory::HostLanding::new(&mut storage);
+        crate::shared::experts::rtx::dense::host_operand(crate::shared::experts::rtx::dense::HostOperand {
+            device: self.device, landing: landing.clone(),
+            rect: Land::whole(self.catalog, "lerope.alpha", 0)?.rect(self.catalog)?.0,
+        }, crate::shared::experts::rtx::push::PushPolicy::for_snapshot(self.catalog.snapshot())?)?;
+        Ok(RopeAlpha { storage, landing })
+    }
+
+    /// Replicate only admitted local routers into the peer's target arena.
     pub(crate) fn peer_routers(&self, cfg: &GlmDsaConfig, layers: &mut [GlmLayer<'a>], range: std::ops::Range<usize>) -> Result<()> {
         let peer = *self.peers.first().context("TP2 router replica needs peer")?;
         let native = (self.catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8)
@@ -304,19 +333,16 @@ impl<'a> GlmLoader<'a> {
             for (operand, name) in peer_router_names(cfg, index) {
                 let allocation = crate::shared::peer_split::on_device(self.library, peer.device, || {
                     let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 router replica");
+                    let scoped = self.scoped(format!("layer.{index}.operand."));
                     if let Some(records) = &native {
                         let record = records.iter().find(|record| record.tensor == name)
                             .with_context(|| format!("EXLR8 local router missing {name}"))?;
                         ensure!(record.components.len() == 1, "EXLR8 router must be one native tensor");
-                        let source = &record.components[0].source;
-                        let mut bytes = vec![0u8; source.bytes];
-                        crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(&source.path)?
-                            .read_exact_at(&mut bytes, source.offset))?;
-                        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256),
-                            Tag::weights("glm/tp2-router"))?;
-                        self.library.copy_h2d(allocation.buffer, &bytes)?;
-                        Ok(allocation)
-                    } else { GlmLoader { arenas: None, ..self.clone() }.one(operand, &name) }
+                        let load = crate::shared::experts::rtx::dense::DenseLoad::mount(self.library);
+                        crate::shared::experts::exlr8::dense_weights::landed_with(self.library, &load,
+                            &name, &record.components[0], cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity,
+                            peer.stream, |_, bytes| scoped.allocate_owner(operand, bytes))
+                    } else { scoped.one(operand, &name) }
                 })?;
                 layers[index].operands.insert(operand, allocation);
             }
@@ -1165,11 +1191,7 @@ impl<'a> GlmLoader<'a> {
             layers: shares.next().context("rank 0")?,
             norm: norm.context("global norm route")?,
             head: head.context("global head route")?,
-            rope_alpha: cfg.variant.ml4().map(|_| -> Result<Vec<f32>> {
-                let (bytes, dtype, shape) = self.raw("lerope.alpha")?;
-                ensure!(dtype == DType::Bf16 && shape == [cfg.qk_rope_head_dim / 2], "lerope.alpha must be BF16 [rope/2]");
-                Ok(bytes.chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect())
-            }).transpose()?,
+            rope_alpha: cfg.variant.ml4().map(|_| self.rope_alpha(cfg)).transpose()?,
         };
         crate::shared::memory::staging::release_staging();
         split.log("glm5 dense");

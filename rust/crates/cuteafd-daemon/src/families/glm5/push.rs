@@ -18,6 +18,34 @@ mod tests {
     use cuteafd_loader::plan::testing::{t, write_safetensors};
 
     #[test]
+    fn native_shared_owners_are_retained_across_the_recorded_group_commit() {
+        let source = include_str!("mod.rs");
+        let native = source.split("fn load_native<'s>").nth(1).unwrap()
+            .split("/// The row-FP8 embedding").next().unwrap();
+        let recorder = native.find("Recorder::start(push.is_some())").unwrap();
+        let shared = native.find("NativeExperts::load_admitted").unwrap();
+        let finish = native.find("native push recorder").unwrap();
+        let delivery = native.find("push.receive_with").unwrap();
+        assert!(recorder < shared && shared < finish && finish < delivery);
+        assert!(native.contains("planned_drafter, shared)"));
+    }
+
+    #[test]
+    fn peer_router_replicas_join_dense_delivery_before_engine_publication() {
+        let source = include_str!("mod.rs");
+        let planning = source.split("let mut plan_dense =").nth(1).unwrap()
+            .split("let admission =").next().unwrap();
+        assert!(planning.find("planning.peer_routers").unwrap() < planning.find("sink.take()").unwrap());
+        let native = source.split("fn load_native<'s>").nth(1).unwrap();
+        assert!(native.find("loader.peer_routers").unwrap() < native.find("native push recorder").unwrap());
+        let publication = source.split("let mut engine = engine::GlmEngine::new").nth(1).unwrap()
+            .split("if owners.is_some()").next().unwrap();
+        assert!(!publication.contains("peer_routers"));
+        assert!(!include_str!("weights.rs").split("pub(crate) fn peer_routers").nth(1).unwrap()
+            .split("fn raw").next().unwrap().contains("arenas: None"));
+    }
+
+    #[test]
     fn glm_dflash_source_plan_joins_target_and_draft_repositories_on_one_rank() -> Result<()> {
         let root = tempfile::tempdir()?;
         let target = root.path().join("models--glm53/snapshots/target");

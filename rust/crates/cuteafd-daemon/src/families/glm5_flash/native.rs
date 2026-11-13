@@ -254,12 +254,13 @@ mod tests {
                         for (rank, layout) in runtime.iter().enumerate() {
                             let mut bytes = layout.bytes() as u64;
                             let mut tail = allocation_granularity_forecast(&[bytes])?;
-                            for (id, extent) in &process.shared_arenas[rank] {
+                            let shared = &process.shared_arenas[rank];
+                            for (id, view) in shared.views() {
                                 let layer: usize = id.split(".layer.").nth(1).unwrap().split('.').next().unwrap().parse()?;
-                                assert_eq!(*extent, metadata.plan(layer, ranks, rank, ExpertSet::Shared)?.resident_bytes as u64);
-                                bytes += extent;
-                                tail += allocation_granularity_forecast(&[*extent])?;
+                                assert_eq!(view.bytes(), metadata.plan(layer, ranks, rank, ExpertSet::Shared)?.resident_bytes);
                             }
+                            bytes += shared.bytes() as u64;
+                            tail += allocation_granularity_forecast(&[shared.bytes() as u64])?;
                             let old = resident[rank].weights + if rank == home { resident.iter().map(|r| r.embedding).sum() } else { 0 };
                             eprintln!("FLASH_CHARGE native-target manifest={selected} attention={mode:?} embedding={home} ranks={ranks} rank={rank} old={old} B={bytes} tail={tail} new={} delta={} old_rounding=no",
                                 bytes + tail, i128::from(bytes + tail) - i128::from(old));
