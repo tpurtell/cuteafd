@@ -450,6 +450,30 @@ mod device_free_tests {
     use super::*;
 
     #[test]
+    fn upload_event_capacity_refuses_overflow_and_reuses_retired_slot() -> Result<()> {
+        const CAPACITY: usize = 4096;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let mut events = (0..CAPACITY).map(|_| library.cuda_event_create_ordering())
+            .collect::<Result<Vec<_>>>()?;
+        assert!(library.cuda_event_create_ordering().is_err(), "event capacity must fail closed");
+        let retired = events.swap_remove(CAPACITY / 2);
+        // SAFETY: this private CPU fixture owns the live event; no work was recorded.
+        unsafe { library.cuda_event_destroy(retired)?; }
+        events.push(library.cuda_event_create_ordering()?);
+        assert!(library.cuda_event_create_ordering().is_err(), "reuse must not grow the event table");
+        fixture.drain(&library)?;
+        for event in events {
+            // SAFETY: each live fixture-owned event appears once and has no queued work.
+            unsafe { library.cuda_event_destroy(event)?; }
+        }
+        let event = library.cuda_event_create_ordering()?;
+        // SAFETY: the fresh fixture-owned event remains live and unrecorded.
+        unsafe { library.cuda_event_destroy(event)?; }
+        Ok(())
+    }
+
+    #[test]
     fn physical_query_restores_device_and_outlives_library() -> Result<()> {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
