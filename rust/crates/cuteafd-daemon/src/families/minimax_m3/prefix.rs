@@ -94,11 +94,11 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
     }
     fn capture(&self, _: MarkSlot, placement: &Placement, len: usize) -> Result<(), BoxError> {
         self.validate(placement, len)?;
-        ensure!(len == placement.len, "MiniMax capture is not at the committed frontier");
+        if len != placement.len { return Err("MiniMax capture is not at the committed frontier".into()); }
         Ok(())
     }
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut Placement, len: usize) -> Result<(), BoxError> {
-        ensure!(mark.is_none(), "MiniMax paged snapshots have no positional mark");
+        if mark.is_some() { return Err("MiniMax paged snapshots have no positional mark".into()); }
         self.validate(placement, len)?;
         let next = Placement { len, ..placement.clone() };
         self.install(&next)?;
@@ -106,8 +106,9 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
         Ok(())
     }
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
-        ensure!(copy.rows > 0 && copy.rows <= PAGE_ROWS && copy.owner.is_none()
-            && copy.from != copy.to, "MiniMax invalid uniform-pool tail copy");
+        if !(copy.rows > 0 && copy.rows <= PAGE_ROWS && copy.owner.is_none() && copy.from != copy.to) {
+            return Err("MiniMax invalid uniform-pool tail copy".into());
+        }
         let mut copies = Vec::new();
         for (rank, bank) in self.0.banks.iter().enumerate() {
             for layer in bank.layers.clone() {
@@ -145,6 +146,7 @@ mod tests {
     use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
     use cuteafd_ffi::{native_library_lifetime_fixture::Fixture, NativeLibrary};
     use cuteafd_loader::families::minimax_m3::{MiniMaxM3Config, execution::{MsaCache, MsaRope}};
+    use cuteafd_hostcache::copy::{CopyEngine, Stream as CopyStream};
 
     fn cfg() -> MiniMaxM3Config {
         let mut cfg = MiniMaxM3Config::from_hf(&serde_json::from_str(include_str!(
@@ -191,9 +193,111 @@ mod tests {
         }
         Ok(())
     }
+    fn check_binding(family: &MiniMaxPrefix<'_>, placement: &Placement) -> Result<()> {
+        family.0.copies.drain()?;
+        for bank in &family.0.banks {
+            let width = bank.layout.table_width as usize;
+            let table = view(bank.plane("page_table")?, placement.slot * width * 4, width * 4)?;
+            let length = view(bank.plane("lengths")?, placement.slot * 4, 4)?;
+            let mut bytes = vec![0; table.bytes];
+            let mut frontier = [0; 4];
+            bank.stream.device.run(|| {
+                bank.stream.device.library.copy_d2h(&mut bytes, table)?;
+                bank.stream.device.library.copy_d2h(&mut frontier, length)
+            })?;
+            let ids = bytes.chunks_exact(4).map(|entry| i32::from_le_bytes(entry.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(&ids[..placement.units.len()], placement.units.iter().map(|&id| id as i32)
+                .collect::<Vec<_>>());
+            assert!(ids[placement.units.len()..].iter().all(|&id| id == 0));
+            assert_eq!(i32::from_le_bytes(frontier), placement.len as i32);
+        }
+        Ok(())
+    }
     fn cache(family: &MiniMaxPrefix<'_>) -> Result<PrefixCache<CudaCopyEngine<'static>>> {
         Ok(PrefixCache::new(family.layout(), PrefixConfig {
             entries: 8, mark_slots: 0, keep_logits: true, min_tokens: 1 }, None)?)
+    }
+
+    #[test]
+    fn request_bindings_reuse_reserved_staging_and_reject_invalid_page_lists() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let family = family(&library, 12)?;
+        for (rank, bank) in family.0.banks.iter().enumerate() {
+            family.0.copies.ordered(rank, |stream| {
+                let width = bank.layout.table_width as usize;
+                for slot in 0..bank.layout.requests as usize {
+                    for destination in [view(bank.plane("page_table")?, slot * width * 4, width * 4)?,
+                        view(bank.plane("lengths")?, slot * 4, 4)?] {
+                        let staging = library.ordered_h2d_staging_buffer(destination, stream)?.unwrap();
+                        assert_eq!(staging.bytes, destination.bytes);
+                        for len in [0, 1, 64, 65, 128] {
+                            bank.install(&Placement { units: vec![0, 1], slot, len }, stream)?;
+                        }
+                        assert_eq!(library.ordered_h2d_staging_buffer(destination, stream)?.unwrap().ptr,
+                            staging.ptr);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        for placement in [Placement { units: vec![0, 0], slot: 0, len: 65 },
+            Placement { units: vec![12], slot: 0, len: 1 },
+            Placement { units: vec![0], slot: 4, len: 1 },
+            Placement { units: vec![0], slot: 0, len: 65 },
+            Placement { units: vec![], slot: 0, len: 0 }] {
+            assert!(family.install(&placement).is_err());
+        }
+        family.0.copies.drain()?;
+        Ok(())
+    }
+
+    #[test]
+    fn host_promotion_restores_both_ranks_and_only_clobbers_rewritten_scratch() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let family = family(&library, 12)?;
+        let engine = CudaCopyEngine::registered_owned(&library, family.snapshot_owners())?;
+        let host = cuteafd_hostcache::config::Config { bytes: 4 << 20, chunk_bytes: 1 << 20,
+            min_tokens: 1, ..Default::default() };
+        let mut cache = PrefixCache::new(family.layout(), PrefixConfig {
+            entries: 8, mark_slots: 0, keep_logits: true, min_tokens: 1 }, Some((host, engine)))?;
+        let tokens: Vec<u32> = (0..65).collect();
+        let mut p = cache.admit(&family, &tokens, 128, false, |pages| build(pages, 0))?.placement;
+        for (i, &page) in p.units.iter().enumerate() { write_page(&family, page, i + 41)?; }
+        let expected = p.units.iter().map(|&page| read_page(&family, page)).collect::<Result<Vec<_>>>()?;
+        p.len = tokens.len();
+        let scratch = &family.0.scratch;
+        scratch.device.run(|| library.copy_h2d(scratch.buffer, &vec![0x5a; scratch.buffer.bytes]))?;
+        assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &p,
+            After::from_logits(&[0.0, 1.0], true))?);
+        cache.host_engine_mut().unwrap().synchronize(CopyStream::Store)?;
+        cache.tick();
+        cache.release(&family, &p.units)?;
+        cache.clear(&family)?;
+        scratch.device.run(|| library.copy_h2d(scratch.buffer, &vec![0xb3; scratch.buffer.bytes]))?;
+        let hit = cache.admit(&family, &tokens, 128, false, |pages| build(pages, 1))?;
+        assert_eq!(hit.resume, tokens.len());
+        assert!(hit.source.as_ref().unwrap().host);
+        check_binding(&family, &hit.placement)?;
+        for (&page, bytes) in hit.placement.units.iter().zip(expected) {
+            assert_eq!(read_page(&family, page)?, bytes);
+        }
+        let mut bytes = vec![0; scratch.buffer.bytes];
+        scratch.device.run(|| library.copy_d2h(&mut bytes, scratch.buffer))?;
+        assert_eq!(bytes[0], 0x5a);
+        assert!(bytes[1..].iter().all(|&byte| byte == 0xb3));
+        // begin_unit's full residual copy replaces host_tail's byte before the
+        // first layer sees it; no permanent model state aliases this scratch.
+        scratch.device.run(|| library.copy_h2d(scratch.buffer, &vec![0x61; scratch.buffer.bytes]))?;
+        scratch.device.run(|| library.copy_d2h(&mut bytes, scratch.buffer))?;
+        assert!(bytes.iter().all(|&byte| byte == 0x61));
+        cache.release(&family, &hit.placement.units)?;
+        cache.clear(&family)?;
+        Ok(())
     }
 
     #[test]
@@ -230,6 +334,7 @@ mod tests {
         assert_eq!(hit.resume, 65);
         assert_eq!(hit.source.as_ref().unwrap().kind, SnapshotKind::Prompt);
         assert!(hit.source.as_ref().unwrap().plan.exact());
+        check_binding(&family, &hit.placement)?;
         assert_eq!(read_page(&family, hit.placement.units[0])?, first);
         assert_eq!(read_page(&family, hit.placement.units[1])?, prompt_tail);
         let sibling = cache.admit(&family, &prompt, 192, false, |pages| build(pages, 2))?;
@@ -242,6 +347,7 @@ mod tests {
         let hit = cache.admit(&family, &turn, 192, false, |pages| build(pages, 1))?;
         assert_eq!(hit.resume, 129);
         assert_eq!(hit.source.as_ref().unwrap().kind, SnapshotKind::Turn);
+        check_binding(&family, &hit.placement)?;
         assert_eq!(read_page(&family, hit.placement.units[1])?, turn_middle);
         assert_eq!(read_page(&family, hit.placement.units[2])?, turn_tail);
         cache.release(&family, &hit.placement.units)?;
