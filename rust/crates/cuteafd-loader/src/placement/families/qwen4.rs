@@ -1032,6 +1032,12 @@ impl Recipe for QwenDual<'_> {
         // metadata, the MTP record arena and pending rows, and the deferred MTP
         // id buffer. The MTP arena is priced as its own physical backing.
         let tables = (1 + QWEN_DECODE_ROWS as u64) * 5 * 4;
+        let hops = plan_hops(&self.owners.iter().map(|&gpu|
+            LayerMode::Whole { gpu: gpu as u8, ffn: FfnMode::Owner }).collect::<Vec<_>>(), &self.hop_spec)
+            .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+        let layout = crate::placement::HopLinkLayout::new(&hops, &self.hop_spec)
+            .ok_or(Refusal::Overflow("Qwen hop control"))?;
+        components.extend(layout.control_components("qwen.hops", PlanLifetime::RESIDENT, self.maximum_pages));
         let mut overhead = [tables, tables];
         let mtp_records = if a.mtp {
             complete.persistent_unit_bytes
@@ -1283,6 +1289,12 @@ mod tests {
         for (gpu, scales) in [(0, Vec::<u64>::new()), (1, Vec::new())] {
             assert_eq!(placement.items[gpu].iter().filter(|item| item.category == Category::Tables)
                 .map(|item| item.bytes).collect::<Vec<_>>(), scales);
+        }
+        for rank in 0..2 {
+            let controls = placement.items[rank].iter().filter(|item| item.group == "residual hop control")
+                .collect::<Vec<_>>();
+            assert_eq!(controls.len(), 1);
+            assert_eq!(controls[0].bytes, 256);
         }
         // Both charged hops are receive slots the executor allocates.
         let row = cfg.hc_width() as u64 * 2;
@@ -1583,6 +1595,7 @@ mod tests {
         let runtime = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
             0, None, ResidentWeights(1024), None)).unwrap();
         assert_eq!(planned, runtime);
+        assert!(!planned.items.iter().flatten().any(|item| item.group == "residual hop control"));
         assert_eq!(planned.pool_tokens, 2 << 20);
         // Both baselines and CLI zero select the same automatic admission.
         let zero = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },

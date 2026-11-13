@@ -805,6 +805,11 @@ impl Recipe for MiniMaxInputs {
             components.extend(buffer(Owner::Hops { gpu }.id(), Location::coordinator(gpu as u8), bytes,
                 Lifetime::TARGET, Category::Transport, "residual hops", maximum));
         }
+        if pair && !self.heads() {
+            let layout = crate::placement::HopLinkLayout::new(&hops, &spec)
+                .ok_or(Refusal::Overflow("MiniMax hop control"))?;
+            components.extend(layout.control_components("minimax.hops", Lifetime::TARGET, maximum));
+        }
         // Onboarding: one ordered count profile; destination both GPUs (TP2) or GPU0.
         let counts = self.counts();
         let onboard = contract_variables.len();

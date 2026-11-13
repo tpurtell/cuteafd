@@ -802,6 +802,16 @@ impl Recipe for KimiRecipe {
                 let hops = plan_hops(modes, &self.hop_spec).map_err(|error| invalid(&error.to_string()))?;
                 let buffers = hop_buffer_bytes(&hops, &self.hop_spec, self.gpus)
                     .ok_or(Refusal::Overflow("Kimi residual hop buffers"))?;
+                if self.gpus == 2 && self.hop_spec.rows > 0 && self.hop_spec.lanes > 0
+                    && self.hop_spec.storage == crate::placement::HopStorage::ReceiveSlots {
+                    let layout = crate::placement::HopLinkLayout::new(&hops, &self.hop_spec)
+                        .ok_or(Refusal::Overflow("Kimi hop control"))?;
+                    for mut component in layout.control_components(&format!("kimi.hops.{option}"),
+                        Lifetime::RESIDENT, self.maximum_pages) {
+                        if profiled { component.activation = Activation::choice(0, option); }
+                        contract.components.push(component);
+                    }
+                }
                 for (rank, &bytes) in buffers.iter().enumerate() {
                     if bytes == 0 { continue; }
                     let owner = Allocation::buffer(format!("residual hops.{option}.{rank}"),
@@ -1449,6 +1459,28 @@ mod tests {
             assert!(owner.source.starts_with(&format!("kimi/driver-stream-slabs/gpu{rank} ({peak} peak live streams")));
             assert_eq!(component.bytes.at(4).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn hop_control_follows_pair_lifecycle_even_when_heads_have_no_hops() {
+        let mut recipe = recipe();
+        let control_count = |contract: &Contract| contract.components.iter().filter(|component|
+            matches!(&component.kind, ComponentKind::Allocation { template, .. }
+                if template.group == "residual hop control")).count();
+        assert_eq!(control_count(&recipe.prepare(&single()).unwrap()), 0);
+        recipe.gpus = 2;
+        recipe.hop_spec = HopSpec { storage: crate::placement::HopStorage::ReceiveSlots,
+            row_bytes: 16, rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0,
+            terminal: crate::placement::TerminalHome::Replicated };
+        recipe.records_per_page = vec![128; 2];
+        recipe.records_by_layer = vec![[64, 64]; 2];
+        recipe.attention = vec![LayerMode::HeadSplit; 2];
+        recipe.layer_attention = vec![ModeBytes { whole: 100, split: [50; 2] }; 2];
+        recipe.experts = None;
+        recipe.arenas = vec![Arena { count: 0, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] }];
+        toy_weight_owners(&mut recipe);
+        assert!(plan_hops(&recipe.attention, &recipe.hop_spec).unwrap().is_empty());
+        assert_eq!(control_count(&recipe.prepare(&single()).unwrap()), 2);
     }
 
     #[test]

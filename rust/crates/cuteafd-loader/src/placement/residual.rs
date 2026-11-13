@@ -366,9 +366,78 @@ pub fn hop_buffer_bytes(hops: &[Hop], spec: &HopSpec, gpus: usize) -> Option<Vec
     }).collect()
 }
 
+
+/// Physical requests of a receive-slot HopLink, including control on both
+/// ranks even with no hops. Call only when the executor constructs a HopLink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopLinkLayout {
+    pub receive: [Vec<u64>; 2],
+    pub control_bytes: u64,
+}
+impl HopLinkLayout {
+    pub fn new(hops: &[Hop], spec: &HopSpec) -> Option<Self> {
+        if spec.storage != HopStorage::ReceiveSlots || spec.row_bytes == 0
+            || spec.row_bytes % 16 != 0 || spec.rows == 0 || spec.lanes == 0
+            || hops.iter().any(|hop| hop.storage != spec.storage || hop.row_bytes != spec.row_bytes
+                || hop.from >= 2 || hop.to >= 2 || hop.from == hop.to) {
+            return None;
+        }
+        let slot = spec.rows.checked_mul(spec.row_bytes)?.max(256);
+        let control_bytes = spec.lanes.checked_mul(HOP_SLOTS)?.checked_add(1)?.checked_mul(16)?.max(256);
+        let requests = |rank| -> Option<Vec<u64>> {
+            let into = hops.iter().filter(|hop| hop.charged() && hop.to == rank).count() as u64;
+            let count = usize::try_from(spec.lanes.checked_mul(into.min(HOP_SLOTS))?).ok()?;
+            usize::try_from(slot.checked_mul(count as u64)?).ok()?;
+            Some(vec![slot; count])
+        };
+        usize::try_from(control_bytes).ok()?;
+        Some(Self { receive: [requests(0)?, requests(1)?], control_bytes })
+    }
+
+    pub fn control_components(&self, prefix: &str, lifetime: super::planner::Lifetime,
+        maximum: u64) -> Vec<super::planner::Component> {
+        use super::planner::{Allocation, ByteCurve, Component, Location};
+        (0..2).map(|rank| Component::allocation(Allocation::buffer(
+            format!("{prefix}.{rank}.control"), Location::coordinator(rank), self.control_bytes,
+            lifetime, cuteafd_core::memory_layout::Category::Transport, "residual hop control"),
+            ByteCurve::fixed(self.control_bytes, maximum), false, maximum)).collect()
+    }
+
+    /// Individual backings for families without an existing payload census.
+    pub fn receive_components(&self, prefix: &str, lifetime: super::planner::Lifetime,
+        maximum: u64) -> Vec<super::planner::Component> {
+        use super::planner::{Allocation, ByteCurve, Component, Location};
+        self.receive.iter().enumerate().flat_map(|(rank, slots)| slots.iter().enumerate()
+            .map(move |(slot, &bytes)| Component::allocation(Allocation::buffer(
+                format!("{prefix}.{rank}.recv.{slot}"), Location::coordinator(rank as u8), bytes,
+                lifetime, cuteafd_core::memory_layout::Category::Transport, "residual hops"),
+                ByteCurve::fixed(bytes, maximum), false, maximum))).collect()
+    }
+}
+
 #[cfg(test)]
 mod pipeline_lane_tests {
     use super::*;
+
+    #[test]
+    fn hop_layout_controls_exist_even_without_receive_slots() {
+        let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: 16, rows: 1,
+            lanes: 4, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+        let empty = HopLinkLayout::new(&[], &spec).unwrap();
+        assert_eq!(empty.receive, [Vec::<u64>::new(), Vec::<u64>::new()]);
+        assert_eq!(empty.control_bytes, 256);
+        let hop = Hop { at: HopPoint::AfterAttention(0), from: 0, to: 1,
+            kind: HopKind::Broadcast, storage: spec.storage, row_bytes: spec.row_bytes };
+        let layout = HopLinkLayout::new(&[hop], &spec).unwrap();
+        assert_eq!(layout.receive, [vec![], vec![256; 4]]);
+        assert_eq!(layout.control_components("test.hop", super::super::planner::Lifetime::RESIDENT, 1).len(), 2);
+        for bad in [HopSpec { storage: HopStorage::DirectInput, ..spec },
+            HopSpec { rows: 0, ..spec }, HopSpec { lanes: 0, ..spec },
+            HopSpec { row_bytes: 15, ..spec }, HopSpec { rows: u64::MAX, ..spec },
+            HopSpec { lanes: u64::MAX, ..spec }] {
+            assert!(HopLinkLayout::new(&[hop], &bad).is_none());
+        }
+    }
 
     #[test]
     fn admitted_pipeline_lanes_are_exact_and_never_silently_capped() {

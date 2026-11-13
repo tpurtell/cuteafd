@@ -563,7 +563,7 @@ mod tests {
             for rank in 0..2 {
                 let progress=if diagnostics {(2*std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256)}else{0};
                 assert_eq!(native[rank].bytes as usize,rows*HIDDEN*2+256+256
-                    +(((cuteafd_loader::placement::HOP_SLOTS+1)*16)as usize).max(256)+progress);
+                    +progress);
                 assert_eq!(native[rank].basis,Basis::Exact);
             }
         }}

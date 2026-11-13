@@ -221,6 +221,10 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         let request = shared::request(inputs.context, None, crate::placement::Onboard::Auto, prefill,
             crate::placement::planner::Operation::Serving, None, Default::default());
         let contract = inputs.prepare(&request).unwrap();
+        assert_eq!(contract.components.iter().filter(|component| matches!(&component.kind,
+            ComponentKind::Allocation { template, .. } if template.group == "residual hop control")).count(),
+            if gpus == 2 && placement == AttentionPlacement::Layers { 2 } else { 0 });
+
         // Every allocation id is unique within one activation class.
         let mut seen = std::collections::BTreeSet::new();
         for component in &contract.components {

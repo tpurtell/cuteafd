@@ -418,10 +418,16 @@ impl<'a> Step5Recipe<'a> {
             }
             if ranks == 2 {
                 let mut requests = vec![(inputs.unit_rows() as u64 * 4096 * 4).max(256); 8];
-                requests.extend([256; 3]);
+                requests.extend([256; 2]);
                 if inputs.peer_diagnostics { requests.push((9 * 48).max(256)); }
                 physical(&mut fixed, &mut backings, rank, Category::Transport,
-                    "Step-5 private peer and hop control", requests)?;
+                    "Step-5 private peer control", requests)?;
+                let spec = inputs.hops();
+                let plan = crate::placement::plan_hops(ownership.execution().modes(), &spec)?;
+                let layout = crate::placement::HopLinkLayout::new(&plan, &spec)
+                    .context("Step-5 hop control layout")?;
+                physical(&mut fixed, &mut backings, rank, Category::Transport,
+                    "residual hop control", vec![layout.control_bytes])?;
                 let slot = inputs.hops().rows * inputs.hops().row_bytes;
                 if hops[rank] > 0 {
                     ensure!(slot > 0 && hops[rank] % slot == 0, "Step-5 hop request inventory");

@@ -577,6 +577,11 @@ impl Recipe for InklingInputs {
             components.extend(buffer(format!("inkling2.hops.{gpu}"), Location::coordinator(gpu as u8), bytes,
                 Lifetime::TARGET, Category::Transport, "residual hops", maximum));
         }
+        if pair && self.placement == AttentionPlacement::Layers {
+            let layout = crate::placement::HopLinkLayout::new(&hops, &spec)
+                .ok_or(Refusal::Overflow("Inkling 2 hop control"))?;
+            components.extend(layout.control_components("inkling2.hops", Lifetime::TARGET, maximum));
+        }
         // Onboarding: one ordered count profile; destination both GPUs (TP2) or GPU0.
         let counts = self.counts();
         let onboard = contract_variables.len();

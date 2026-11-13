@@ -468,6 +468,7 @@ fn production_whole_local_has_no_pair_owners_and_rejects_wrong_world() {
         owner.location != Location::coordinator(1)
             && !owner.id.contains(".peer.") && !owner.id.contains(".checks.")
             && !owner.id.ends_with(".rows.payload")));
+    assert!(!admitted.solved.facts.allocations.iter().any(|owner| owner.group == "residual hop control"));
     assert!(admitted.graphs.layers[cfg.first_moe_layer].local);
     let mut input = production_input(&cfg, 2, 4, prefill);
     input.local = Some((&source, physical));
@@ -859,6 +860,7 @@ fn execution_adapter_uses_resolved_homes_and_unique_tp2_prefix_and_backend_bytes
         let resolved = planner::solve(Request { onboard: Pin::Exact(onboard), ..request() }, budgets(), &recipe).unwrap();
         let inventory = if onboard == 0 { Default::default() } else { local.clone() };
         let (placement, working) = recipe.execution(&resolved, &inventory).unwrap();
+        assert!(!resolved.facts.allocations.iter().any(|owner| owner.group == "residual hop control"));
         assert_eq!(placement.pool_tokens, resolved.pool_tokens);
         assert!(placement.pool_limits.0.is_empty());
         assert_eq!(placement.max_pool_tokens_no_onboard, None);
@@ -933,6 +935,14 @@ fn execution_adapter_preserves_whole_expert_range_and_shared_hop_geometry() {
         entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
     assert_eq!(placement.residual, residual_homes(&recipe.attention, &spec).unwrap());
     assert_eq!(placement.hops, plan_hops(&recipe.attention, &spec).unwrap());
+    for rank in 0..2 {
+        let controls = resolved.facts.allocations.iter().filter(|owner|
+            owner.group == "residual hop control" && owner.location == Location::coordinator(rank)).collect::<Vec<_>>();
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].bytes, 256);
+        assert!(resolved.facts.allocations.iter().any(|owner| owner.group == "residual hops"
+            && owner.location == Location::coordinator(rank)));
+    }
 }
 
 #[test]

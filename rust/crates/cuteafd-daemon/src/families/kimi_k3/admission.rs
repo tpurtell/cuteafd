@@ -2067,7 +2067,7 @@ pub(super) mod tests {
         let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
         assert_eq!(planned.items.iter().filter(|item| item.category == Category::Prefix)
             .map(|item| item.bytes).sum::<u64>(), mark_bytes * marks as u64);
-        assert!(!planned.items.iter().any(|item| item.group == "Kimi peer/abort/hop controls"));
+        assert!(!planned.items.iter().any(|item| item.group == "Kimi peer/abort controls"));
         Ok(())
     }
 
