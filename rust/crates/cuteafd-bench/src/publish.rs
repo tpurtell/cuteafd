@@ -365,6 +365,12 @@ pub fn slim(report: &mut Value) {
         match value {
             Value::Array(values) => values.iter_mut().for_each(record),
             Value::Object(object) => {
+                // Fidelity panels already carry verdicts and per-window summaries.
+                for path in ["decode", "prefill"] {
+                    if let Some(rows) = object.get_mut(path).and_then(|run| run.pointer_mut("/score/records")) {
+                        *rows = Value::Array(Vec::new());
+                    }
+                }
                 for key in ["requests", "warm_requests", "cold_response", "completed_response",
                     "retained_prewarm", "attempted_assistant", "assistant_replay",
                     "pool_before", "pool_samples", "pool_after", "expert_usage", "expert_usage_scope"] {
@@ -1979,12 +1985,15 @@ mod tests {
         let placed = |report| vec![Placed { dir: PathBuf::from(format!("benchmarks/{family}/rc1")), report }];
         let full = placed(before.clone());
         let slimmed_placed = placed(after.clone());
-        let matrix = one_row_of(&full[0]);
+        let matrix = if accepted(&full[0].report) { one_row_of(&full[0]) }
+            else { Matrix { rows: Vec::new(), retired: Vec::new() } };
         assert_eq!(results(&full, &matrix).unwrap(), results(&slimmed_placed, &matrix).unwrap());
         assert_eq!(index(&full), index(&slimmed_placed));
         let published = BTreeSet::from([full[0].dir.clone()]);
         let full_family = family_cards(&select(&full, &matrix).unwrap(), &published, family);
-        assert!(!full_family.is_empty(), "oracle must compare the report's family cards");
+        if accepted(&full[0].report) {
+            assert!(!full_family.is_empty(), "oracle must compare the report's family cards");
+        }
         assert_eq!(full_family, family_cards(&select(&slimmed_placed, &matrix).unwrap(), &published, family));
         let mut exports = vec!["card.svg".to_string(), "report.svg".to_string()];
         exports.extend(crate::render::report::shown(&before).iter().map(|id| format!("panel-{id}.svg")));
@@ -2013,9 +2022,38 @@ mod tests {
         assert_slim_exports_identical(full);
     }
 
-    /// Run with CUTEAFD_TEST_SLIM_REPORT pointing at an unmodified run report.
     #[test]
-    #[ignore = "requires an external full Release smoke report"]
+    fn slim_standard_fidelity_keeps_summaries_in_passes_history_and_partial() {
+        let mut full = serde_json::to_value(crate::sample::full_report()).unwrap();
+        let panel = full["panels"].as_array_mut().unwrap().iter_mut()
+            .find(|panel| panel["id"] == "fidelity").unwrap();
+        let pass = &mut panel["passes"][0];
+        for path in ["decode", "prefill"] {
+            let row = pass[path]["score"]["records"][0].clone();
+            pass[path]["score"]["records"] = serde_json::json!(vec![row; 16_384]);
+        }
+        pass["thermal"] = serde_json::json!({"seconds": 30, "power_cap_seconds": 12});
+        panel["partial"] = pass.clone();
+        panel["history"] = serde_json::json!([panel["passes"][0].clone()]);
+        let mut expected = panel.clone();
+        for pointer in ["/passes/0", "/partial", "/history/0"] {
+            for path in ["decode", "prefill"] {
+                expected.pointer_mut(pointer).unwrap()[path]["score"]["records"] = serde_json::json!([]);
+            }
+        }
+        assert!(serde_json::to_vec(&full).unwrap().len() > 2_000_000);
+        let slimmed = assert_slim_exports_identical(full);
+        let panel = slimmed["panels"].as_array().unwrap().iter()
+            .find(|panel| panel["id"] == "fidelity").unwrap();
+        assert_eq!(panel, &expected, "only raw rows are removed from fidelity snapshots");
+        let mut twice = slimmed.clone();
+        slim(&mut twice);
+        assert_eq!(twice, slimmed);
+    }
+
+    /// Run with CUTEAFD_TEST_SLIM_REPORT pointing at an unmodified smoke or panel report.
+    #[test]
+    #[ignore = "requires an external full smoke or panel report"]
     fn slim_real_rc1_report_preserves_all_publication_exports() {
         let path = std::env::var_os("CUTEAFD_TEST_SLIM_REPORT").expect("CUTEAFD_TEST_SLIM_REPORT");
         let text = std::fs::read_to_string(path).unwrap();
