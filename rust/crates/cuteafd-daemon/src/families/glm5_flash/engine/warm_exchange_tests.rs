@@ -132,3 +132,67 @@ fn native_mla_trace_reads_live_stages_with_rank_local_extents() {
     assert!(trace.contains("t * heads * self.cfg.v_head_dim * 2"));
     assert!(!trace.contains("t * self.cfg.heads"));
 }
+
+/// #1878: with Spark experts (no RtxTp2 layers) rank 1's routed-layer segment reaches
+/// `peer_attention`'s shared-FFN arm. A split K-core shared expert (`core_ffn`) publishes
+/// and waits on the FFN slot itself, a generation rank 0's masked boundary never matches,
+/// so a captured segment that runs it leaves rank 1 one push short. Every way a segment
+/// runs, eager or captured, must therefore pass through the same masked boundary.
+#[test]
+fn captured_segments_keep_the_masked_boundary_on_spark_backed_tp2() {
+    let source = include_str!("../engine.rs");
+    let replay = body(source, "    fn replay_on(", "    fn masked_segment(");
+    let begin = replay.find("decode_graph::begin_capture(&self.library, stream, &ticket)").unwrap();
+    let end = replay.find("cuda_graph_end_capture_topology(stream)").unwrap();
+    let captured = &replay[begin..end];
+    // Inside the capture window the segment runs only under the mask.
+    assert!(captured.contains("self.masked_segment(&segment)"), "capture must run the masked segment");
+    assert!(!captured.replace("self.masked_segment(&segment)", "").contains("segment()"),
+        "an unmasked segment() inside the capture window adds rank 1's shared-FFN push");
+    // Every other way a missed segment runs is masked too.
+    assert!(!replay.replace("self.masked_segment(", "").contains("segment()"));
+    let mask = body(source, "    fn masked_segment(", "    fn graphs_of(");
+    assert!(mask.find("self.capturing.set(true)").unwrap() < mask.find("segment()").unwrap());
+    assert!(mask.find("segment()").unwrap() < mask.find("self.capturing.set(false)").unwrap());
+
+    // The shared FFN arm on rank 1 is live only for non-TP2 routed layers (Spark experts).
+    let peer = body(source, "fn peer_attention(", "fn peer_post(");
+    let guard = peer.find("if !layer.dense && self.capturing.get() { return Ok(()); }").unwrap();
+    let shared = peer.find("(false, _) if !self.tp2_layer(index) =>").unwrap();
+    assert!(guard < shared);
+    let core = include_str!("core.rs");
+    let ffn = body(core, "fn core_ffn(", "fn core_kda(");
+    let (core_push, core_wait) = (ffn.matches("self.core_publish(").count(), ffn.matches("self.exchange_wait(").count());
+    assert_eq!((core_push, core_wait), (1, 1));
+    let wrapper = body(source, "fn peer_segment(", "fn decode_primitive(");
+    assert!(wrapper.contains("if !layer.dense && !self.tp2_layer(index)"));
+    let warm = body(wrapper, "if self.warming_graphs.get() {", "} else {");
+    assert!(!warm.contains("self.ffn_on("), "masked warming never runs the shared FFN");
+
+    // Balance of layer i's FFN slot flag (`slot(i, true, 0)`) in a masked capture step, per
+    // direction. `core_publish` signals that same flag (`push_to(rank, at, ..)`).
+    let meet = body(source, "fn meet_ffn(", "fn peer_ffn_out(");
+    let post = body(source, "fn peer_post(", "fn peer_segment(");
+    let (meet_push, meet_wait) = (meet.matches("self.exchange_push(").count(), meet.matches("self.exchange_wait(").count());
+    let post_wait = post.matches("self.exchange_wait(").count();
+    let wrapper_push = wrapper.matches("self.exchange_push(").count();
+    let tp2_push = body(source, "fn tp2_publish(", "fn router_on(").matches("self.exchange_push(").count();
+    assert_eq!((meet_push, meet_wait, post_wait, wrapper_push, tp2_push), (1, 1, 1, 1, 1));
+    for tp2 in [false, true] {
+        for masked in [true, false] {
+            // The shared-FFN arm runs inside the segment only when unmasked on a non-TP2 layer.
+            let in_segment = !masked && !tp2;
+            // Rank 0 -> rank 1: rank 0's masked boundary runs no shared FFN, only meet_ffn's push.
+            let to_rank1 = meet_push;
+            let rank1_waits = post_wait + if in_segment { core_wait } else { 0 };
+            // Rank 1 -> rank 0: the wrapper's publication, or tp2_publish on a TP2 layer.
+            let from_rank1 = if tp2 { tp2_push } else { wrapper_push + if in_segment { core_push } else { 0 } };
+            let rank0_waits = meet_wait;
+            let balanced = to_rank1 == rank1_waits && from_rank1 == rank0_waits;
+            // Exactly the unmasked Spark-backed capture is one push short on rank 1, as observed
+            // live (expected 280, observed 279).
+            assert_eq!(balanced, masked || tp2, "tp2={tp2} masked={masked}");
+            if !balanced { assert_eq!(rank1_waits - to_rank1, 1); }
+        }
+    }
+}

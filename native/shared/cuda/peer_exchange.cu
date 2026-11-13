@@ -11,6 +11,8 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace {
@@ -135,6 +137,22 @@ __device__ __forceinline__ uint64_t global_ns() {
 // the trap faults this stream, so the host sees an error instead of a hang.
 constexpr uint64_t kWaitTimeoutNs = 60ull * 1000 * 1000 * 1000;
 
+// Process-wide record of an abortable wait that timed out, in mapped pinned
+// host memory (see cuteafd_peer_wait_timeout). `cuteafd_peer_abort_initialize`
+// binds it on each device. Once `count` is set every abortable wait on every
+// device exits, as a published terminal abort does, instead of trapping: a
+// trap is a sticky device fault (Xid 43, CUDA 719 on every later call) that
+// leaves nothing the host can drain.
+struct WaitTimeout {
+  uint32_t count;
+  uint32_t expected;
+  uint32_t observed;
+  uint32_t reserved;
+  uint64_t flag;
+};
+__device__ WaitTimeout* g_wait_timeout = nullptr;
+__device__ uint64_t g_wait_timeout_ns = kWaitTimeoutNs;
+
 __global__ void wait_flag(const uint32_t* flag, uint32_t* state) {
   if (threadIdx.x == 0) {
     const uint32_t expected = state[0] + 1;
@@ -174,6 +192,8 @@ __global__ void wait_flag_abortable(const uint32_t* flag, uint32_t* state, const
   if (threadIdx.x == 0) {
     const uint32_t expected = state[0] + 1;
     const uint64_t start = global_ns();
+    WaitTimeout* timeout = g_wait_timeout;
+    const uint64_t limit = g_wait_timeout_ns;
     uint32_t polls = 0;
     if constexpr (Diagnostic) {
       volatile cuteafd_peer_progress_t* p = diagnostic.local + diagnostic.slot;
@@ -199,14 +219,33 @@ __global__ void wait_flag_abortable(const uint32_t* flag, uint32_t* state, const
         if constexpr (Diagnostic) diagnostic.local[diagnostic.slot].wait_phase = 4;
         break;
       }
-      if ((++polls & 1023) == 0 && global_ns() - start > kWaitTimeoutNs) {
-        printf("peer_wait_abortable: missing push or terminal abort after 60 s "
+      if ((++polls & 1023) != 0) continue;
+      // Another wait already timed out: the process is terminal, exit like an abort.
+      if (timeout && aborted && load_acquire_sys(&timeout->count)) {
+        if constexpr (Diagnostic) diagnostic.local[diagnostic.slot].wait_phase = 5;
+        break;
+      }
+      if (global_ns() - start > limit) {
+        const uint32_t seen = load_acquire_sys(flag);
+        printf("peer_wait_abortable: missing push or terminal abort after %llu ms "
                "flag=%p state=%p aborted=%p expected=%u observed=%u receive=%u abort=%u\n",
-               static_cast<const void*>(flag), static_cast<void*>(state),
-               static_cast<const void*>(aborted), expected, load_acquire_sys(flag),
+               (unsigned long long)(limit / 1000000), static_cast<const void*>(flag), static_cast<void*>(state),
+               static_cast<const void*>(aborted), expected, seen,
                state[0], aborted ? load_acquire_sys(aborted) : 0);
         if constexpr (Diagnostic) diagnostic_dump(diagnostic);
-        __trap();
+        if (!timeout || !aborted) __trap();
+        // Skip the wait without advancing its receive sequence (as an abort does),
+        // publish this rank's abort word for its later queued/captured waits, and
+        // record the timeout for the host, which retires the engine and drains.
+        volatile WaitTimeout* record = timeout;
+        record->expected = expected;
+        record->observed = seen;
+        record->flag = reinterpret_cast<uint64_t>(flag);
+        __threadfence_system();
+        store_release_sys(&timeout->count, 1);
+        store_release_sys(const_cast<uint32_t*>(aborted), 1);
+        if constexpr (Diagnostic) diagnostic.local[diagnostic.slot].wait_phase = 6;
+        break;
       }
     }
   }
@@ -517,6 +556,45 @@ extern "C" int32_t cuteafd_host_signal(uint32_t* flag, uint32_t* send_state, uin
   return cudaGetLastError();
 }
 
+namespace {
+std::mutex g_wait_timeout_mutex;
+std::atomic<WaitTimeout*> g_wait_timeout_host{nullptr};
+uint64_t g_wait_timeout_bound = 0;  // devices whose symbol holds the record (bit per ordinal)
+
+// Writes one of this file's device symbols on a private non-blocking stream: a
+// legacy-stream copy could serialize behind a spinning wait another exchange queued.
+template <typename T>
+cudaError_t write_symbol(const T& symbol, const void* value, size_t bytes) {
+  cudaStream_t stream = nullptr;
+  CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  cudaError_t status = cudaMemcpyToSymbolAsync(symbol, value, bytes, 0, cudaMemcpyHostToDevice, stream);
+  const cudaError_t drained = cudaStreamSynchronize(stream);
+  const cudaError_t destroyed = cudaStreamDestroy(stream);
+  if (status == cudaSuccess) status = drained;
+  if (status == cudaSuccess) status = destroyed;
+  return status;
+}
+
+// The one mapped record (allocated on first use, never freed: queued or
+// captured waits on any device may read it until process exit).
+cudaError_t wait_timeout_record(WaitTimeout** device_alias) {
+  std::lock_guard<std::mutex> lock(g_wait_timeout_mutex);
+  WaitTimeout* record = g_wait_timeout_host.load(std::memory_order_acquire);
+  if (!record) {
+    void* host = nullptr;
+    CHECK(CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &host, sizeof(WaitTimeout), 1, CUTEAFD_MEMORY_KIND_TRANSPORT,
+        "native/peer-wait-timeout", cudaHostAlloc(&host, sizeof(WaitTimeout), cudaHostAllocPortable | cudaHostAllocMapped)));
+    std::memset(host, 0, sizeof(WaitTimeout));
+    record = static_cast<WaitTimeout*>(host);
+    g_wait_timeout_host.store(record, std::memory_order_release);
+  }
+  void* alias = nullptr;
+  CHECK(cudaHostGetDevicePointer(&alias, record, 0));
+  *device_alias = static_cast<WaitTimeout*>(alias);
+  return cudaSuccess;
+}
+}  // namespace
+
 extern "C" int32_t cuteafd_peer_abort_initialize() {
   cudaFuncAttributes attributes{};
   for (const void* kernel : {reinterpret_cast<const void*>(wait_flag_abortable<false>),
@@ -524,7 +602,38 @@ extern "C" int32_t cuteafd_peer_abort_initialize() {
     const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
     if (status != cudaSuccess) return status;
   }
+  // Bind the timeout record once per device, before its first abortable wait.
+  int device = 0;
+  CHECK(cudaGetDevice(&device));
+  if (device < 0 || device >= 64) return cudaErrorInvalidDevice;
+  {
+    std::lock_guard<std::mutex> lock(g_wait_timeout_mutex);
+    if (g_wait_timeout_bound & (1ull << device)) return cudaSuccess;
+  }
+  WaitTimeout* record = nullptr;
+  CHECK(wait_timeout_record(&record));
+  CHECK(write_symbol(g_wait_timeout, &record, sizeof(record)));
+  std::lock_guard<std::mutex> lock(g_wait_timeout_mutex);
+  g_wait_timeout_bound |= 1ull << device;
   return cudaSuccess;
+}
+
+extern "C" int32_t cuteafd_peer_wait_timeout(uint32_t* expected, uint32_t* observed, uint64_t* flag) {
+  // Lock-free: hosts check this beside every stream drain.
+  WaitTimeout* host = g_wait_timeout_host.load(std::memory_order_acquire);
+  if (!host) return 0;
+  const volatile WaitTimeout* record = host;
+  const uint32_t count = __atomic_load_n(&host->count, __ATOMIC_ACQUIRE);
+  if (!count) return 0;
+  if (expected) *expected = record->expected;
+  if (observed) *observed = record->observed;
+  if (flag) *flag = record->flag;
+  return int32_t(count);
+}
+
+extern "C" int32_t cuteafd_peer_wait_timeout_configure(uint64_t timeout_ns) {
+  if (!timeout_ns) return cudaErrorInvalidValue;
+  return write_symbol(g_wait_timeout_ns, &timeout_ns, sizeof(timeout_ns));
 }
 
 extern "C" int32_t cuteafd_peer_wait_abortable(const uint32_t* flag, uint32_t* recv_state,
