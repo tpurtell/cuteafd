@@ -79,15 +79,6 @@ impl CoordinatorExpertPlan {
     fn native(catalog: &OfficialV41Catalog, layers: &[usize], world: usize, gpu: usize, admitted: usize) -> Result<Self> {
         ensure!((1..=2).contains(&world) && gpu < world && !layers.is_empty()
             && layers.windows(2).all(|ids| ids[0] < ids[1]), "coordinator native layers must be ordered on one or two GPUs");
-        if let Some(tensors) = catalog.fp8() {
-            let tensors = tensors.for_coordinator();
-            let selected = layers.iter().map(|&layer| (layer, tensors.exact_slicing(world))).collect::<Vec<_>>();
-            let plan = super::push_fp8::RankPlan::from_tensors(&tensors, &selected, world, gpu, admitted)?;
-            let validation = ValidationLayout::exl3(&[], plan.layout.bytes() as u64, usize::MAX)?;
-            return Ok(Self { residencies: Vec::new(), exlr8: Vec::new(), native: Vec::new(), native_layers: Vec::new(),
-                layers: layers.to_vec(), gpu, world, layout: plan.layout.clone(), validation,
-                scales: Default::default(), fp8: Some(plan) });
-        }
         use crate::shared::experts::layer::ExpertLayer;
         let selections = layers.iter().map(|&layer| if world == 1 { ExpertLayer::BackboneFull { layer } }
             else { ExpertLayer::BackboneTp2 { layer, rank: gpu } }).collect::<Vec<_>>();
@@ -100,8 +91,35 @@ impl CoordinatorExpertPlan {
     pub fn native_selected(catalog: &OfficialV41Catalog,
         selections: &[crate::shared::experts::layer::ExpertLayer], gpu: usize, admitted: usize) -> Result<Self> {
         use crate::shared::experts::layer::ExpertLayer;
-        ensure!(!selections.is_empty() && catalog.exl3().is_none() && catalog.fp8().is_none(),
-            "coordinator native push takes MXFP4 or NVFP4 selections");
+        ensure!(!selections.is_empty() && catalog.exl3().is_none(),
+            "coordinator native push takes native expert selections");
+        if let Some(tensors) = catalog.fp8() {
+            ensure!(gpu < 2, "coordinator native physical GPU must be 0 or 1");
+            let tensors = tensors.for_coordinator();
+            let mut shard = None;
+            let mut selected = Vec::new();
+            for &selection in selections {
+                let (layer, world, rank) = match selection {
+                    ExpertLayer::BackboneFull { layer } => (layer, 1, 0),
+                    ExpertLayer::BackboneTp2 { layer, rank } => {
+                        ensure!(rank == gpu, "native TP2 selection differs from GPU");
+                        (layer, 2, rank)
+                    }
+                    _ => anyhow::bail!("FP8-family selections require absolute backbone layer IDs, not {selection:?}"),
+                };
+                ensure!(shard.is_none_or(|previous| previous == (world, rank)),
+                    "one native expert set must have homogeneous checkpoint world/rank");
+                shard = Some((world, rank));
+                let view = tensors.for_layer_metadata(layer)?;
+                selected.push((layer, view.exact_slicing(world)));
+            }
+            let (world, rank) = shard.context("native expert set has no checkpoint shard")?;
+            let plan = super::push_fp8::RankPlan::from_tensors(&tensors, &selected, world, rank, admitted)?;
+            let validation = ValidationLayout::exl3(&[], plan.layout.bytes() as u64, usize::MAX)?;
+            return Ok(Self { residencies: Vec::new(), exlr8: Vec::new(), native: Vec::new(),
+                native_layers: selections.to_vec(), layers: selected.iter().map(|&(layer, _)| layer).collect(),
+                gpu, world, layout: plan.layout.clone(), validation, scales: Default::default(), fp8: Some(plan) });
+        }
         let nvfp4 = catalog.nvfp4().is_some();
         let mut seen = Vec::new();
         let native = selections.iter().map(|&selection| {
@@ -219,7 +237,7 @@ impl CoordinatorExpertPlan {
         ensure!(host >= base + self.layout.bytes() as u64, "expert host tail overlaps device planes");
         if let Some(plan) = &self.fp8 {
             return plan.append_tensors(builder, &catalog.fp8().context("FP8 expert headers absent")?.for_coordinator(),
-                rank, self.world, self.gpu, base);
+                rank, self.world, if self.world == 1 { 0 } else { self.gpu }, base);
         }
         if !self.exlr8.is_empty() {
             for (index, residency) in self.exlr8.iter().enumerate() {
