@@ -5,7 +5,7 @@ import types
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'quantization'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kimi_k31.k2_core_k6 import quality
 from kimi_k3.uniform_k2.storage import atomic_json
 
