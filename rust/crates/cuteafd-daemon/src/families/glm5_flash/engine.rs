@@ -1633,10 +1633,9 @@ impl GraphKey {
 /// What the decode graph caches did and hold.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GraphCounts {
-    /// Executables held, the step shapes they belong to (segment 0's), and their charged bytes.
+    /// Executables held and the step shapes they belong to (segment 0's).
     pub held: usize,
     pub shapes: usize,
-    pub bytes: u64,
 }
 
 type GraphExec<'a> = GraphOwner<'a, ()>;
@@ -4680,13 +4679,12 @@ impl<'a> GlmfEngine<'a> {
         }
     }
 
-    /// Decode graph cache occupancy: executables held, their step shapes and charged bytes.
+    /// Decode graph cache occupancy; physical bytes belong to the shared device cache.
     pub(crate) fn graph_stats(&self) -> GraphCounts {
         (0..self.ranks()).fold(GraphCounts::default(), |total, rank| {
             let graphs = self.graphs_of(rank).borrow();
             GraphCounts { held: total.held + graphs.len(),
-                shapes: total.shapes + graphs.count(|key| key.segment == 0),
-                bytes: total.bytes + graphs.bytes() }
+                shapes: total.shapes + graphs.count(|key| key.segment == 0) }
         })
     }
 

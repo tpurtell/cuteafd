@@ -2245,7 +2245,7 @@ def test_capture_ticket_native_failures_always_report_backoff():
                         path.read_text(), flags=re.MULTILINE | re.DOTALL)
         if ".cache_ticket(" not in source and path.name != "dual.rs":
             continue
-        for native in re.finditer(r"\.cuda_graph_(?:begin_capture|end_capture_topology)\(", source):
+        for native in re.finditer(r"(?:decode_graph::begin_capture|\.cuda_graph_end_capture_topology)\(", source):
             prefix = source[max(0, native.start() - 180):native.start()]
             assert re.search(r"(?:plan\.)?ticket\.capture_result\([^;{}]*$", prefix), path
             checked += 1
@@ -2256,10 +2256,10 @@ def test_capture_ticket_native_failures_always_report_backoff():
         ("muse_spark", "graphs.rs", "cache_ticket_failed"),
         ("kimi_k3", "graphs.rs", "cache_ticket_failed"),
         ("step5", "graphs.rs", "cache_ticket_failed"),
-        ("deepseek_v4", "engine.rs", "cache_capture_failed"),
-        ("mimo_v2", "engine.rs", "cache_capture_failed"),
-        ("glm5", "engine.rs", "cache_capture_failed"),
-        ("glm5_flash", "engine.rs", "cache_capture_failed"),
+        ("deepseek_v4", "engine.rs", "cache_ticket_failed"),
+        ("mimo_v2", "engine.rs", "cache_ticket_failed"),
+        ("glm5", "engine.rs", "cache_ticket_failed"),
+        ("glm5_flash", "engine.rs", "cache_ticket_failed"),
     ]:
         source = (families / family / file).read_text()
         warnings = [warning for warning in re.finditer(r'tracing::warn!\([^\n]*\);', source)

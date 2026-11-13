@@ -380,7 +380,7 @@ def test_qwen_graph_cache_precedes_ready_and_diagnostics_bypass_capture():
     # runs eagerly when the policy has no room); diagnostics and the prewarm's
     # untimed eager pass never capture, and a request-time miss is recorded
     # once for /v1/stats.
-    assert engine.count("cuda_graph_begin_capture(") == 1
+    assert engine.count("decode_graph::begin_capture(") == 1
     replay = engine[engine.index("    fn replay(&self, key: GraphKey"):engine.index("    fn miss_graph(")]
     assert "if !self.graph_capture.get() || (!self.graph_warmed.get() && !self.warming_graphs.get()) {" in replay
     assert "if !self.warming_graphs.get() { self.miss_graph(key); }" in replay
