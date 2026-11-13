@@ -171,6 +171,7 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let mut future = Vec::new();
+    let mut expert_arenas = Vec::new();
     if cfg.ple_layers.first().is_some_and(|&layer| layer < layers) {
         future.push(Demand::new(0, Category::Weights, "PLE scale", 256, Basis::Exact)
             .with_resident_weights(ResidentWeights(256)));
@@ -187,9 +188,14 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
                 let planned = crate::families::deepseek_v4::local::plan(library, &args.native_lib,
                     catalog, usize::from(mtp), &backbone, rows, usize::MAX)?;
                 ensure!(planned.layers == backbone, "Qwen EXL3 header plan omits admitted layers");
-                future.push(Demand::new(0, Category::Experts, "resident EXL3 experts",
-                    planned.peak_bytes as u64, Basis::Exact)
-                    .with_resident_weights(ResidentWeights(planned.resident_weights as u64)));
+                let selections = (0..usize::from(mtp)).map(|stage| ExpertLayer::Dspark { stage })
+                    .chain(backbone.iter().map(|&layer| ExpertLayer::BackboneFull { layer }))
+                    .collect::<Vec<_>>();
+                expert_arenas.push(crate::shared::experts::weight_layout::layout(args.device, "exl3",
+                    crate::shared::experts::exl3::regions(catalog, selections)?)?);
+                future.push(Demand::new(0, Category::Workspace, "EXL3 execution and load workspace",
+                    planned.peak_bytes.checked_sub(planned.resident_weights)
+                        .context("Qwen EXL3 peak below resident weights")? as u64, Basis::Exact));
                 if PushPolicy::for_snapshot(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot))?
                     == PushPolicy::Required {
                     use crate::shared::experts::rtx::push::{CoordinatorExperts, WholeOwner};
@@ -218,8 +224,7 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
                     let layout = crate::shared::experts::weight_layout::layout(args.device, "fp8",
                         crate::shared::experts::fp8::regions(&tensors, &ids, 1, 0,
                             cuteafd_loader::formats::fp8_experts::Slicing::Padded)?)?;
-                    future.push(Demand::new(0, Category::Experts, "resident native experts",
-                        layout.bytes() as u64, Basis::Exact).with_resident_weights(ResidentWeights(layout.bytes() as u64)));
+                    expert_arenas.push(layout);
                     future.push(Demand::new(0, Category::Workspace, "native expert scratch",
                         cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes(metadata.scratch_layout(), rows)? as u64, Basis::Exact));
                 }
@@ -245,6 +250,8 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
             .unwrap_or_else(|| cuteafd_loader::placement::ProgramSet::from_names(&["qwen4"], [])))?;
     let mut inputs = placement_inputs(args, admission, source, (sample.free_bytes, sample.total_bytes), pending, context, host);
     inputs.arenas = arenas;
+    inputs.expert_arenas = expert_arenas;
+    inputs.preallocation = true;
     inputs.future = future;
     // The optional tower already loaded before this sample, so only declare its
     // resident bytes. Its physical allocation is part of the measured baseline.
@@ -337,7 +344,7 @@ fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, s
     (available, total): (u64, u64), pending: u64, context: cuteafd_loader::placement::planner::Context,
     host: qwen4::QwenHost) -> qwen4::QwenInputs<'a> {
     qwen4::QwenInputs {
-        arenas: vec![], future: vec![],
+        arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         loaded_weights: Default::default(),
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), context, admission, capacity_bytes: total,
@@ -1197,7 +1204,7 @@ mod tests {
                     .checked_add(qwen4::single_expert_weights(&catalog, cfg.layers, true, false)?)?;
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
                 let planned = qwen4::QwenInputs {
-                    arenas: vec![], future: vec![],
+                    arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
                     loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs, capacity_bytes: capacity,

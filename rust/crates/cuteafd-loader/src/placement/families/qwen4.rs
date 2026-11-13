@@ -48,6 +48,10 @@ pub struct QwenInputs<'a> {
     pub loaded_weights: ResidentWeights,
     /// Future checkpoint backings for callers that sample before uploading.
     pub arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
+    /// Resident routed-expert backings, distinct from target/draft arenas.
+    pub expert_arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
+    /// Whether the measured baseline predates embeddings and Spark intake.
+    pub preallocation: bool,
     /// Exact future expert, workspace and load-staging owners.
     pub future: Vec<Demand>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
@@ -265,11 +269,9 @@ impl<'a> QwenSingle<'a> {
     pub fn budget(&self) -> Result<Budget, Refusal> {
         let baseline = plan_baseline(&self.inputs.baseline, self.inputs.capacity_bytes,
             "qwen4 single-owner")?;
-        // TP1 loads the portable embedding before sampling; its mapping is
-        // charged by the named driver page-table rows, so the measured owner
-        // excludes it. Validate the same fact the owner needs here.
         measured_occupancy(&self.inputs.baseline, self.inputs.capacity_bytes,
-            crate::placement::planner::driver_page_table_bytes(self.inputs.host.host_embedding))?;
+            if self.inputs.preallocation { 0 } else {
+                crate::placement::planner::driver_page_table_bytes(self.inputs.host.host_embedding) })?;
         Ok(Budget { id: "rtx0".into(), locations: vec![Location::coordinator(0)],
             physical_bytes: self.inputs.capacity_bytes, logical_bytes: self.inputs.capacity_bytes,
             baseline,
@@ -380,9 +382,8 @@ impl Recipe for QwenSingle<'_> {
             components.push(owner("qwen.loaded.code", gpu, inputs.pending_code_bytes,
                 Category::Runtime, "loaded code", PlanLifetime::RESIDENT, self.maximum_pages));
         }
-        if inputs.spark_ranks > 0 && matches!(inputs.baseline, Baseline::Planned { .. }) {
-            // Runtime creates SparkLink before sampling free memory. Only the
-            // header-only planner still reserves its return planes and codec.
+        if inputs.spark_ranks > 0 && (inputs.preallocation || matches!(inputs.baseline, Baseline::Planned { .. })) {
+            // A pre-weight sample cannot already include the future SparkLink.
             let bytes = crate::serving_capacity::prefill_return_bytes_with_format(
                 a.prefill_shape.map_or(1, |shape| shape.waves),
                 a.prefill_shape.map_or(a.prefill_rows.max(64), |shape| shape.unit_rows),
@@ -400,7 +401,8 @@ impl Recipe for QwenSingle<'_> {
         // baseline deduction.
         if let Some(owner) = measured_occupancy_owner("Qwen context and selected modules",
             &inputs.baseline, inputs.capacity_bytes,
-            crate::placement::planner::driver_page_table_bytes(inputs.host.host_embedding),
+            if inputs.preallocation { 0 } else {
+                crate::placement::planner::driver_page_table_bytes(inputs.host.host_embedding) },
             gpu, self.maximum_pages)? {
             components.push(owner);
         }
@@ -410,6 +412,10 @@ impl Recipe for QwenSingle<'_> {
                 self.maximum_pages, if layout.id().contains("/mtp/") {
                     cuteafd_core::memory_layout::MemoryKind::DrafterWeights
                 } else { cuteafd_core::memory_layout::MemoryKind::Weights })?);
+        }
+        for layout in &inputs.expert_arenas {
+            components.extend(weight_arena_components(layout, gpu, PlanLifetime::RESIDENT,
+                self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::Experts)?);
         }
         for (index, demand) in inputs.future.iter().enumerate() {
             if demand.gpu != 0 {
@@ -1524,7 +1530,7 @@ mod tests {
         loaded: ResidentWeights, limit: Option<ResidentWeights>) -> QwenInputs<'a> {
         let gib = 1u64 << 30;
         QwenInputs { blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: limit, loaded_weights: loaded,
-            arenas: vec![], future: vec![],
+            arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg, layers: cfg.layers, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
@@ -1710,6 +1716,52 @@ mod tests {
         let (runtime, _) = intake(Baseline::Measured { free_bytes: 96 << 30 });
         assert!(!runtime.items[0].iter().any(|item| item.group == "Spark intake planes"));
         assert_eq!(runtime.pool_tokens, planned.pool_tokens);
+    }
+
+    #[test]
+    fn preweight_sample_keeps_occupancy_and_charges_future_mapping_and_intake() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        let occupied = 4u64 << 20;
+        let mut inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: (96 << 30) - occupied },
+            4, Some(131072), ResidentWeights(0), None);
+        inputs.preallocation = true;
+        let control = admitted(&inputs).unwrap().1;
+        let planes = control.items(Location::coordinator(0)).unwrap().into_iter()
+            .filter(|item| item.group == "Spark intake planes").collect::<Vec<_>>();
+        assert_eq!(planes.len(), 1);
+        assert_eq!(planes[0].bytes, crate::serving_capacity::prefill_return_bytes_with_format(1, 4096,
+            4, cfg.hidden as u64, cuteafd_core::SparkReplyFormat::Bf16).unwrap());
+        inputs.host.host_embedding = 327_681;
+        let embedded = admitted(&inputs).unwrap().1;
+        let baseline = embedded.facts.allowances.iter().filter(|owner|
+            crate::placement::sampled_baseline::is_source(&owner.source)).collect::<Vec<_>>();
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(baseline[0].bytes, occupied);
+        assert_embedding_charge(&control, &embedded, inputs.host.host_embedding, 1);
+    }
+
+    #[test]
+    fn preweight_expert_arena_has_one_backing_resident_claim_and_tail() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        let mut inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+            0, Some(131072), ResidentWeights(0), None);
+        let layout = crate::serving_capacity::WeightArenaLayout::new("qwen.test.experts",
+            [("first".into(), (3 << 20) + 1), ("second".into(), 17)]).unwrap();
+        let bytes = layout.bytes() as u64;
+        inputs.preallocation = true;
+        inputs.expert_arenas.push(layout);
+        let solved = admitted(&inputs).unwrap().1;
+        let roots = solved.facts.allocations.iter().filter(|owner| owner.id == "qwen.test.experts")
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].bytes, bytes);
+        assert_eq!(roots[0].category, Category::Experts);
+        let claims = solved.facts.resident_weights.iter().filter(|owner| owner.id == "qwen.test.experts")
+            .collect::<Vec<_>>();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].weights, ResidentWeights(bytes));
+        assert_eq!(solved.facts.allocation_granularity.iter().filter(|tail|
+            tail.id == "qwen.test.experts.tail").count(), 1);
     }
 
     fn assert_embedding_charge(control: &ResolvedPlan, embedded: &ResolvedPlan, bytes: u64, gpus: usize) {

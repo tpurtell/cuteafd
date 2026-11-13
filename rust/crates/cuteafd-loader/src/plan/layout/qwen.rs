@@ -273,7 +273,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
             input.expert_catalog()?, cfg.layers, local, mtp)?)?;
     }
     let inputs = crate::placement::families::qwen4::QwenInputs {
-        arenas: vec![], future: vec![],
+        arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
         blas_head: if options.qwen_representation.fp8_head { crate::placement::planner::serving::BlasHead::Native } else { options.bf16_target_head },
         loaded_weights,
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), context: crate::placement::planner::Context::resolve(shape.context_tokens, (options.context_tokens > 0).then_some(options.context_tokens)),
