@@ -209,6 +209,14 @@ impl CoordinatorExpertPlan {
     /// As `append`, with this plan's logical space starting at `base` of the
     /// rank's (the coordinator's dense operands come first).
     pub fn append_at(&self, builder: &mut Builder, catalog: &OfficialV41Catalog, rank: u32, base: u64) -> Result<()> {
+        self.append_split(builder, catalog, rank, base, base + self.layout.bytes() as u64)
+    }
+
+    /// Device planes and host validation/staging have independent rank offsets.
+    /// Multiple separately retired arenas share one contiguous device prefix.
+    pub fn append_split(&self, builder: &mut Builder, catalog: &OfficialV41Catalog,
+        rank: u32, base: u64, host: u64) -> Result<()> {
+        ensure!(host >= base + self.layout.bytes() as u64, "expert host tail overlaps device planes");
         if let Some(plan) = &self.fp8 {
             return plan.append_tensors(builder, &catalog.fp8().context("FP8 expert headers absent")?.for_coordinator(),
                 rank, self.world, self.gpu, base);
@@ -226,7 +234,7 @@ impl CoordinatorExpertPlan {
             for (index, (planes, &selection)) in self.native.iter().zip(&self.native_layers).enumerate() {
                 let range = self.layout.region(index)?;
                 let destination = Destination { rank, offset: base + range.start as u64, bytes: range.len() as u64 };
-                let scalars = planes.nvfp4.then_some(Destination { rank, offset: base + scalar_offset,
+                let scalars = planes.nvfp4.then_some(Destination { rank, offset: host + scalar_offset - self.layout.bytes() as u64,
                     bytes: planes.scalar_bytes() as u64 });
                 scalar_offset += planes.scalar_bytes() as u64;
                 for expert in 0..planes.experts {
@@ -237,7 +245,7 @@ impl CoordinatorExpertPlan {
                     builder.v41_resident(catalog, &names, planes, expert, world, checkpoint_rank as u32, destination, scalars)?;
                 }
             }
-            self.scales.append(builder, rank, base + self.scales.base(&self.layout))?;
+            self.scales.append(builder, rank, host + self.scales.base(&self.layout) - self.layout.bytes() as u64)?;
             return Ok(());
         }
         for (index, residency) in self.residencies.iter().enumerate() {
@@ -246,7 +254,7 @@ impl CoordinatorExpertPlan {
             builder.exl3_residency(catalog, residency, &offsets, Destination {
                 rank, offset: base + range.start as u64, bytes: range.len() as u64 })?;
         }
-        let validation = ValidationLayout::exl3(&self.residencies, base + self.layout.bytes() as u64, usize::MAX)?;
+        let validation = ValidationLayout::exl3(&self.residencies, host, usize::MAX)?;
         ensure!(validation.bytes() == self.validation.bytes(), "shifted validation differs");
         validation.append(builder, catalog, rank)
     }

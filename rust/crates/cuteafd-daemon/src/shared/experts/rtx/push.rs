@@ -5,6 +5,8 @@
 #[cfg(test)]
 pub(crate) mod tests;
 mod policy;
+mod sets;
+use sets::{SetLayout, Sets};
 pub(crate) use policy::{PushPolicy, PushStartupError};
 use crate::shared::memory::Tag;
 use crate::shared::memory::{push_consumer::PushDestination, push_coordinator::CoordinatorExpertPlan};
@@ -223,23 +225,40 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     client: &cuteafd_loader::push_load::PushClient, stream: &mut std::net::TcpStream, credentials: (u64, u64),
     slots: usize, slot_bytes: usize,
 ) -> Result<Option<PushedExperts<'a>>> {
+    receive_sets_rank(device, tp2.into_iter().collect(), dense, rank, client, stream, credentials,
+        slots, slot_bytes)?.map(single_set).transpose()
+}
+
+fn single_set(mut sets: Vec<PushedExperts<'_>>) -> Result<PushedExperts<'_>> {
+    ensure!(sets.len() <= 1, "single-set caller received multiple independent expert owners");
+    Ok(sets.pop().unwrap_or_default())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receive_sets_rank<'a, D: PushDestination<Delivered = ()>>(
+    device: crate::shared::memory::device::Device<'a>,
+    tp2: Vec<(&OfficialV41Catalog, CoordinatorExpertPlan, &CheckedPlan)>, dense: Option<DenseRank<D>>, rank: usize,
+    client: &cuteafd_loader::push_load::PushClient, stream: &mut std::net::TcpStream, credentials: (u64, u64),
+    slots: usize, slot_bytes: usize,
+) -> Result<Option<Vec<PushedExperts<'a>>>> {
     use crate::shared::memory::{push_consumer, push_initialize, weight_arena::ExpectedCoverage};
     use cuteafd_ffi::push_ring::RegisteredRing;
     use cuteafd_transport::worker_selection::push;
     use std::os::fd::AsRawFd;
-    ensure!(tp2.is_some() || dense.is_some(), "coordinator rank receives nothing");
+    ensure!(!tp2.is_empty() || dense.is_some(), "coordinator rank receives nothing");
     let reads = crate::shared::memory::load_timing::Split::start();
     let library = device.library;
     let (group, token) = credentials;
-    tracing::info!(group, rank, device = device.id, tp2 = tp2.is_some(), dense = dense.is_some(),
+    tracing::info!(group, rank, device = device.id, expert_sets = tp2.len(), dense = dense.is_some(),
         "coordinator push rank joining load group");
     let joined = device.run(|| -> Result<_> {
-        let arena = tp2.as_ref().map(|(_, plan, checked)| {
+        let arena = tp2.iter().map(|(_, plan, checked)| {
             join_stage(group, rank, device.id, "expert arena", plan.layout.bytes(), || {
                 let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank)?)?;
                 plan.scales.destination(device, plan.layout.clone(), expected)
             })
-        }).transpose()?;
+        }).collect::<Result<Vec<_>>>()?;
+        let arena = if arena.is_empty() { None } else { Some(Sets::new(arena)?) };
         let ring_bytes = slots.checked_mul(slot_bytes).context("push ring bytes overflow")?;
         let ring = join_stage(group, rank, device.id, "host-ring registration", ring_bytes,
             || RegisteredRing::new(library, slots, slot_bytes, Tag::staging("experts/rtx-push-ring")))?;
@@ -264,7 +283,9 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
             }
             (None, None) => unreachable!("checked above"),
         };
-        let Some(((catalog, plan, _), delivered)) = tp2.zip(delivered) else { return Ok(PushedExperts::default()) };
+        let delivered = delivered.unwrap_or_default();
+        ensure!(tp2.len() == delivered.len(), "expert-set delivery count differs from plans");
+        tp2.into_iter().zip(delivered).map(|((catalog, plan, _), delivered)| {
         if let Some(fp8) = &plan.fp8 {
             let initialize = fp8.layers.iter().map(|layer| match &layer.initialize {
                 push_initialize::Layer::Fp8 { widen, scalars, scalar_convention, inputs, expand } => push_initialize::Layer::Fp8 {
@@ -317,6 +338,7 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
             let budget = crate::shared::experts::exl3::Exl3Weights::plan(catalog, selection)?;
             crate::shared::experts::exl3::Exl3Weights::from_push(ready.clone(), region, layout, budget)
         }).collect::<Result<Vec<_>>>().map(PushedExperts::Exl3)
+        }).collect::<Result<Vec<_>>>()
     });
     if let Err(error) = &candidate { tracing::warn!(group, rank, %error, "coordinator push candidate rejected"); }
     if push::completed_with(stream, candidate.as_ref().map(|_| ()).map_err(|error| format!("{error:#}"))).context("coordinator push completion")? {
@@ -328,7 +350,7 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
             eprintln!("coordinator rank {rank}: zero receiver-thread mount bytes");
         }
         reads.log("coordinator receiver push");
-        tracing::info!(group, rank, layers = weights.len(), "coordinator push committed; publishing ready rank arena");
+        tracing::info!(group, rank, expert_sets = weights.len(), layers = weights.iter().map(PushedExperts::len).sum::<usize>(), "coordinator push committed; publishing ready rank arena");
         return Ok(Some(weights));
     }
     drop(candidate);
@@ -376,6 +398,8 @@ pub(crate) enum CoordinatorExperts {
     Exlr8 { manifest: String, layers: Vec<usize>, budgets: Vec<usize> },
     Whole { owners: Vec<WholeOwner> },
     Native { owners: Vec<WholeOwner> },
+    /// Independently retired expert sets, in publication order on every GPU.
+    Sets(Vec<CoordinatorExperts>),
 }
 
 impl CoordinatorExperts {
@@ -384,12 +408,16 @@ impl CoordinatorExperts {
     pub(crate) fn host_envelope(&self, catalog: &OfficialV41Catalog, gpus: usize,
         dense: &[super::dense::HostStaging]) -> Result<PushHostEnvelope> {
         self.validate_ranks(gpus)?;
-        let plans = (0..gpus).map(|gpu| self.plan(catalog, gpu)).collect::<Result<Vec<_>>>()?;
-        push_host_envelope(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), dense)
+        let plans = (0..gpus).map(|gpu| self.plans(catalog, gpu)).collect::<Result<Vec<_>>>()?;
+        sets_host_envelope(&plans.iter().map(Vec::as_slice).collect::<Vec<_>>(), dense)
     }
 
     fn validate_ranks(&self, gpus: usize) -> Result<()> {
         match self {
+            Self::Sets(sets) => {
+                ensure!(!sets.is_empty(), "coordinator expert sets are empty");
+                for set in sets { set.validate_ranks(gpus)?; }
+            }
             Self::Tp2 { budgets, .. } => ensure!(gpus == 2 && budgets.len() == gpus,
                 "coordinator TP2 budgets require two ranks"),
             Self::Exlr8 { budgets, .. } => ensure!(budgets.len() == gpus,
@@ -406,10 +434,21 @@ impl CoordinatorExperts {
         Ok(())
     }
 
+    fn plans(&self, catalog: &OfficialV41Catalog, gpu: usize) -> Result<Vec<CoordinatorExpertPlan>> {
+        match self {
+            Self::Sets(sets) => sets.iter().try_fold(Vec::new(), |mut plans, set| {
+                plans.extend(set.plans(catalog, gpu)?);
+                Ok(plans)
+            }),
+            _ => Ok(self.plan(catalog, gpu)?.into_iter().collect()),
+        }
+    }
+
     /// Dense-only ranks have no expert plan. A whole owner's checkpoint shard
     /// identity never depends on its position in the coordinator group.
     fn plan(&self, catalog: &OfficialV41Catalog, gpu: usize) -> Result<Option<CoordinatorExpertPlan>> {
         let plan = match self {
+            Self::Sets(_) => anyhow::bail!("expert sets require the multi-set planner"),
             Self::Exlr8 { manifest, layers, budgets } => CoordinatorExpertPlan::exlr8(catalog, manifest, layers, budgets.len(), gpu,
                 *budgets.get(gpu).context("coordinator EXLR8 TP2 budget per GPU")?)?,
             Self::Tp2 { layers, budgets } => CoordinatorExpertPlan::new(catalog, layers, gpu,
@@ -445,7 +484,7 @@ impl CoordinatorExperts {
 /// family's dense operands. Per-GPU TP2 plans, the in-process loopback
 /// streams, and the entries the group driver appends after the Spark ranks.
 pub(crate) struct CoordinatorPush {
-    gpus: Vec<(Option<CoordinatorExpertPlan>, std::net::TcpStream)>,
+    gpus: Vec<(Vec<CoordinatorExpertPlan>, std::net::TcpStream)>,
     host: String,
     snapshot: std::path::PathBuf,
     dense: DenseSlot,
@@ -459,13 +498,25 @@ pub(crate) struct CoordinatorPush {
 /// Header-only inventory; no capacity sampling and no allocation.
 pub(crate) fn push_host_envelope(plans: &[Option<&CoordinatorExpertPlan>],
     dense: &[super::dense::HostStaging]) -> Result<PushHostEnvelope> {
+    let plans = plans.iter().map(|plan| plan.iter().copied().collect::<Vec<_>>()).collect::<Vec<_>>();
+    referenced_host_envelope(&plans, dense)
+}
+
+fn sets_host_envelope(plans: &[&[CoordinatorExpertPlan]], dense: &[super::dense::HostStaging]) -> Result<PushHostEnvelope> {
+    let plans = plans.iter().map(|plans| plans.iter().collect::<Vec<_>>()).collect::<Vec<_>>();
+    referenced_host_envelope(&plans, dense)
+}
+
+fn referenced_host_envelope(plans: &[Vec<&CoordinatorExpertPlan>], dense: &[super::dense::HostStaging]) -> Result<PushHostEnvelope> {
     ensure!(dense.is_empty() || dense.len() == plans.len(), "push dense host rank identity");
-    Ok(PushHostEnvelope::with_retained(plans.iter().map(|plan| plan.map_or(Ok(0), |p| p.transient_host_bytes())
-        .and_then(|bytes| Ok(u64::try_from(bytes)?))).collect::<Result<Vec<_>>>()?,
+    let sum = |plans: &[&CoordinatorExpertPlan], bytes: fn(&CoordinatorExpertPlan) -> Result<usize>| -> Result<u64> {
+        plans.iter().try_fold(0u64, |total, plan| total.checked_add(u64::try_from(bytes(plan)?)?)
+            .context("expert sets host extent overflow"))
+    };
+    Ok(PushHostEnvelope::with_retained(plans.iter().map(|plans| sum(plans, CoordinatorExpertPlan::transient_host_bytes)).collect::<Result<Vec<_>>>()?,
         (0..plans.len()).map(|rank| dense.get(rank).map_or(Ok(0), |p| p.bytes())
             .and_then(|bytes| Ok(u64::try_from(bytes)?))).collect::<Result<Vec<_>>>()?,
-        plans.iter().map(|plan| plan.map_or(Ok(0), |p| p.retained_host_bytes())
-            .and_then(|bytes| Ok(u64::try_from(bytes)?))).collect::<Result<Vec<_>>>()?,
+        plans.iter().map(|plans| sum(plans, CoordinatorExpertPlan::retained_host_bytes)).collect::<Result<Vec<_>>>()?,
         cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?)
 }
 
@@ -559,11 +610,11 @@ impl CoordinatorPush {
             Some(experts) => {
                 experts.validate_ranks(gpus)?;
                 let catalog = catalog.context("coordinator expert push needs the expert catalog")?;
-                (0..gpus).map(|gpu| experts.plan(catalog, gpu)).collect::<Result<Vec<_>>>()?
+                (0..gpus).map(|gpu| experts.plans(catalog, gpu)).collect::<Result<Vec<_>>>()?
             }
-            None => (0..gpus).map(|_| None).collect(),
+            None => (0..gpus).map(|_| Vec::new()).collect(),
         };
-        let actual = push_host_envelope(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[])?;
+        let actual = sets_host_envelope(&plans.iter().map(Vec::as_slice).collect::<Vec<_>>(), &[])?;
         validate_push_host(host_envelope.as_ref(), &actual)?;
         tracing::info!(gpus, host_peak_bytes = actual.bytes()?, "coordinator push host envelope validated");
         let (mut driver, mut ranks) = (Vec::new(), Vec::new());
@@ -586,12 +637,16 @@ impl CoordinatorPush {
             for (gpu, offer) in offers.iter().enumerate() {
                 let rank = u32::try_from(offer.rank)?;
                 let (base, host) = dense.as_ref().map_or((0, 0), |dense| (dense[gpu].base, dense[gpu].host_bytes));
-                let tp2 = append_experts.as_ref().map(|experts| experts.plan(
+                let tp2 = append_experts.as_ref().map(|experts| experts.plans(
                     catalog.context("coordinator expert push needs the expert catalog")?, gpu))
-                    .transpose()?.flatten();
-                let (host_base, total) = rank_bytes(base, tp2.as_ref().map_or(0, |p| p.logical_bytes()), host);
+                    .transpose()?.unwrap_or_default();
+                let layout = SetLayout::plans(&tp2)?;
+                let (host_base, total) = rank_bytes(base, layout.logical_bytes(), host);
                 if let Some(dense) = dense.as_ref() { (dense[gpu].append)(builder, rank, host_base)?; }
-                if let (Some(plan), Some(catalog)) = (&tp2, catalog) { plan.append_at(builder, catalog, rank, base)?; }
+                for (index, plan) in tp2.iter().enumerate() {
+                    let (device, host) = layout.offsets(index)?;
+                    plan.append_split(builder, catalog.context("expert catalog")?, rank, base + device, base + host)?;
+                }
                 ensure!(offer.placement.is_empty() && offer.arena_bytes == total,
                     "coordinator push offer differs from its admitted arenas");
             }
@@ -661,6 +716,15 @@ impl CoordinatorPush {
         *self.dense.lock().expect("coordinator dense slot") = Some(plans);
     }
 
+    /// Single-set families reject unexpected extra owners instead of dropping them.
+    pub(crate) fn receive_with<'a, D: PushDestination<Delivered = ()>, U>(self,
+        devices: Vec<crate::shared::memory::device::Device<'a>>, catalog: Option<&OfficialV41Catalog>, sparks: usize,
+        dense: Option<Result<(Vec<DensePlan>, Vec<D>)>>, beside: impl FnOnce() -> U)
+        -> (Result<Option<Vec<PushedExperts<'a>>>>, U) {
+        let (result, value) = self.receive_sets_with(devices, catalog, sparks, dense, beside);
+        (result.and_then(|ranks| ranks.map(|ranks| ranks.into_iter().map(single_set).collect()).transpose()), value)
+    }
+
     /// Receives every coordinator GPU (two: each on its own thread) while
     /// `beside` runs on this thread. `dense`: each GPU's plan (published to the
     /// group driver before the offers) and destination (unaliased descriptors of
@@ -668,10 +732,10 @@ impl CoordinatorPush {
     /// and the group commits). Planning/admission failures decline all coordinator
     /// ranks and fail startup only after the peer handshake completes.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn receive_with<'a, D: PushDestination<Delivered = ()>, U>(self,
+    pub(crate) fn receive_sets_with<'a, D: PushDestination<Delivered = ()>, U>(self,
         devices: Vec<crate::shared::memory::device::Device<'a>>, catalog: Option<&OfficialV41Catalog>, sparks: usize,
         dense: Option<Result<(Vec<DensePlan>, Vec<D>)>>, beside: impl FnOnce() -> U)
-        -> (Result<Option<Vec<PushedExperts<'a>>>>, U) {
+        -> (Result<Option<Vec<Vec<PushedExperts<'a>>>>>, U) {
         use cuteafd_ffi::push_ring::{DEFAULT_SLOTS, DEFAULT_SLOT_BYTES};
         let Self { gpus, host, snapshot, dense: slot, driver, socket, host_envelope } = self;
         if devices.len() != gpus.len() || dense.as_ref().is_some_and(|d| d.as_ref()
@@ -687,8 +751,8 @@ impl CoordinatorPush {
             if let Some(Err(error)) = &dense { anyhow::bail!("dense planning: {error:#}"); }
             let staging = dense.as_ref().and_then(|d| d.as_ref().ok())
                 .map(|(plans, _)| plans.iter().map(|p| p.host_staging).collect::<Vec<_>>()).unwrap_or_default();
-            let plans = gpus.iter().map(|(plan, _)| plan.as_ref()).collect::<Vec<_>>();
-            let actual = push_host_envelope(&plans, &staging)?;
+            let plans = gpus.iter().map(|(plans, _)| plans.as_slice()).collect::<Vec<_>>();
+            let actual = sets_host_envelope(&plans, &staging)?;
             validate_push_host(host_envelope.as_ref(), &actual)?;
             tracing::info!(host_peak_bytes = actual.bytes()?, expert_bytes = ?actual.expert_bytes,
                 dense_bytes = ?actual.dense_bytes, retained_bytes = ?actual.retained_bytes,
@@ -710,32 +774,30 @@ impl CoordinatorPush {
         let client = match client(socket) { Ok(client) => client, Err(error) => return (Err(error), beside()) };
         let phase = crate::shared::memory::load_timing::Split::start();
         let (snapshot, namespace_host) = (&snapshot, &host);
-        let receive = |gpu: usize, (tp2, mut stream, dense): (Option<CoordinatorExpertPlan>, std::net::TcpStream, Option<D>)| {
+        let receive = |gpu: usize, (tp2, mut stream, dense): (Vec<CoordinatorExpertPlan>, std::net::TcpStream, Option<D>)| {
             let rank = group_rank(sparks, gpu);
             let (base, host) = bases[gpu];
             let planned = (|| -> Result<_> {
                 ensure!(!declined, "coordinator dense operands were not planned");
-                let Some(plan) = &tp2 else { return Ok(None) };
-                let catalog = catalog.context("coordinator TP2 push needs the expert catalog")?;
                 let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
-                let checked = plan.checked(catalog, &root, world, rank)?;
-                ensure!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
-                    "coordinator push source is not a SparkNest shard");
-                Ok(Some(checked))
+                tp2.iter().map(|plan| {
+                    let checked = plan.checked(catalog.context("coordinator expert push needs the expert catalog")?, &root, world, rank)?;
+                    ensure!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
+                        "coordinator push source is not a SparkNest shard");
+                    Ok(checked)
+                }).collect::<Result<Vec<_>>>()
             })();
             if let Err(error) = &planned { tracing::warn!(gpu, %error, "coordinator push planning failed; declining group"); }
-            let tp2_bytes = tp2.as_ref().map_or(0, |p| p.logical_bytes());
-            let (host_base, arena_bytes) = rank_bytes(base, tp2_bytes, host);
+            let tp2_bytes = SetLayout::plans(&tp2)?.logical_bytes();
+            let (_, arena_bytes) = rank_bytes(base, tp2_bytes, host);
             let offer = planned.as_ref().map(|_| cuteafd_transport::worker_selection::push::Offer {
                 rank, host: namespace_host.clone(), arena_bytes, placement: Vec::new() })
                 .map_err(|error| format!("{error:#}"));
             let credentials = planned_offer(&mut stream, planned, offer)?;
             let Some((checked, credentials)) = credentials else { return Ok(None) };
-            let tp2 = match (tp2, checked.as_ref()) {
-                (Some(plan), Some(checked)) => Some((catalog.context("expert catalog")?, plan, checked)),
-                _ => None,
-            };
-            receive_rank(devices[gpu], tp2, dense.map(|destination| DenseRank { destination, base }), rank,
+            let tp2 = tp2.into_iter().zip(&checked).map(|(plan, checked)|
+                Ok((catalog.context("expert catalog")?, plan, checked))).collect::<Result<Vec<_>>>()?;
+            receive_sets_rank(devices[gpu], tp2, dense.map(|destination| DenseRank { destination, base }), rank,
                 &client, &mut stream, credentials, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)
         };
         let inputs: Vec<_> = gpus.into_iter().zip(destinations).map(|((tp2, stream), dense)| (tp2, stream, dense)).collect();
