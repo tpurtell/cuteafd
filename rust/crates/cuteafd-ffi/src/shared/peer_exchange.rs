@@ -286,6 +286,20 @@ impl NativeLibrary {
             .then_some(PeerWaitTimeout { expected, observed, flag })
     }
 
+    /// A probe of the timeout record that owns the loaded library (it stays mapped while
+    /// the probe lives), for an independent watcher thread. `None` without the record.
+    pub fn peer_wait_timeout_probe(&self) -> Option<impl Fn() -> bool + Send + Sync + 'static> {
+        type F = unsafe extern "C" fn(*mut u32, *mut u32, *mut u64) -> i32;
+        let lib = std::sync::Arc::clone(&self.lib);
+        // SAFETY: lookup only; the symbol stays valid while `lib` is held by the probe.
+        let f: F = *unsafe { lib.get::<F>(b"cuteafd_peer_wait_timeout") }.ok()?;
+        Some(move || {
+            let _owner = &lib;
+            // SAFETY: null outputs are accepted; the entry point reads mapped host memory only.
+            unsafe { f(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) != 0 }
+        })
+    }
+
     /// An error once any abortable peer wait in this process timed out.
     pub fn check_peer_wait_timeout(&self) -> Result<()> {
         match self.peer_wait_timeout() {
