@@ -721,6 +721,12 @@ fn prefix_ordered_uploads_match_each_request_destination() {
             let admitted = inputs.admit(request).unwrap();
             let mut bytes = 0;
             for gpu in 0..gpus {
+                let decode = Owner::DecodeTable { gpu };
+                assert_eq!(decode.inventory_name().unwrap(), format!("cache.{gpu}.decode_table"));
+                let allocation = admitted.solved.facts.allocations.iter().find(|a| a.id == decode.id()).unwrap();
+                assert_eq!(allocation.location, Location::coordinator(gpu as u8));
+                assert_eq!(allocation.bytes, concurrency * inputs.context.maximum.div_ceil(64).div_ceil(4) * 16);
+                assert!(allocation.view.is_none());
                 for slot in 0..concurrency {
                     for (plane, expected) in [("table", inputs.context.maximum.div_ceil(64) * 4), ("length", 4)] {
                         let owner = Owner::PrefixH2d { gpu, slot, plane };
@@ -842,4 +848,86 @@ fn heads_target_slices_match_headers_and_charge_one_arena_per_rank() -> anyhow::
         }
     }
     Ok(())
+}
+
+#[test]
+fn cached_expert_prefixes_match_independent_legacy_inventory() {
+    use crate::placement::families::minimax_m3::{ExpertBacking, ExpertInventory, ExpertLayerBacking, ExpertStorage};
+    use crate::serving_capacity::WeightArenaLayout;
+    fn legacy(tensors: &crate::formats::fp8_experts::Fp8ExpertTensors, layers: &[usize],
+        gpus: usize, gpu: usize, physical_device: i32) -> anyhow::Result<ExpertBacking> {
+        use crate::formats::fp8_experts::{Fp8Projection, Slicing};
+        use crate::serving_capacity::{expert_weight_arena_id, fp8_expert_regions};
+        anyhow::ensure!((1..=2).contains(&gpus) && gpu < gpus && physical_device >= 0
+            && !layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1]),
+            "invalid MiniMax expert selection");
+        let tensors = tensors.for_coordinator();
+        let slicing = Slicing::Blocks(128);
+        let regions = fp8_expert_regions(&tensors, layers, gpus, gpu, slicing)?;
+        let arena = WeightArenaLayout::new(expert_weight_arena_id("fp8", physical_device, &regions)?, regions)?;
+        let mut shards = std::collections::BTreeSet::new();
+        let mut views = Vec::new();
+        let mut push_compatible = true;
+        for &layer in layers {
+            let tensors = tensors.for_layer_metadata(layer)?;
+            let planes = (0..6).map(|plane| arena.view(&format!("{layer}.{plane}"))
+                .map_or(0..0, |view| view.offset()..view.offset() + view.bytes()))
+                .collect::<Vec<_>>();
+            let first = planes.iter().filter(|plane| !plane.is_empty()).map(|plane| plane.start).min()
+                .ok_or_else(|| anyhow::anyhow!("empty MiniMax expert layer"))?;
+            let end = planes.iter().map(|plane| plane.end).max().unwrap();
+            // RankPlan rejects inter-plane padding rather than silently
+            // widening admission; a nonpushable selection uses mount.
+            push_compatible &= end - first == planes.iter().map(|plane| plane.len()).sum::<usize>();
+            for expert in 0..tensors.shape().experts {
+                for projection in Fp8Projection::ALL {
+                    for name in tensors.projection_source_names(layer, expert, projection) {
+                        shards.insert(tensors.push_source(&name)?.0.path);
+                    }
+                }
+            }
+            views.push(ExpertLayerBacking { layer, region: first..end, slicing,
+                planes: planes.try_into().unwrap() });
+        }
+        let storage = if push_compatible && !shards.is_empty()
+            && shards.iter().all(|path| crate::push_load::is_push_shard(path)) {
+            ExpertStorage::Push
+        } else { ExpertStorage::Mount };
+        Ok(ExpertBacking { gpu, physical_device, count: layers.len(), storage,
+            inventory_prefix: format!("minimax.experts.{gpu}.{}", layers.len()), arena,
+            layers: views, validation_bytes: 0 })
+    }
+    let (root, mut config, mut headers) = fixture();
+    let experts = headers.iter().filter(|(name, ..)| name.contains("layers.3.block_sparse_moe.experts."))
+        .cloned().collect::<Vec<_>>();
+    for layer in [1, 2] {
+        config["text_config"]["moe_layer_freq"][layer] = 1.into();
+        headers.extend(experts.iter().map(|(name, dtype, shape)|
+            (name.replace("layers.3.", &format!("layers.{layer}.")), *dtype, shape.clone())));
+    }
+    testing::write_snapshot(root.path(), &config, &headers, None);
+    for push in [false, true] {
+        if push {
+            rustix::fs::setxattr(root.path().join("model-00001-of-00001.safetensors"),
+                "user.sparknest.hosts", b"[]", rustix::fs::XattrFlags::empty()).unwrap();
+        }
+        let catalog = crate::read_expert_catalog(root.path()).unwrap();
+        let tensors = catalog.fp8().unwrap();
+        let layers = [1, 2, 3];
+        for devices in [vec![0], vec![1], vec![0, 1], vec![1, 0]] {
+            let inventory = ExpertInventory::new(tensors, &layers, devices.len()).unwrap();
+            let prefixes = inventory.prefixes(&devices).unwrap();
+            assert!(prefixes[0].is_empty());
+            for count in 1..=layers.len() {
+                for (gpu, &device) in devices.iter().enumerate() {
+                    let expected = legacy(tensors, &layers[..count], devices.len(), gpu, device).unwrap();
+                    assert_eq!(prefixes[count][gpu], expected);
+                    assert_eq!(expected.storage, if push { ExpertStorage::Push } else { ExpertStorage::Mount });
+                }
+            }
+            assert!(inventory.prefixes(&[]).is_err());
+            assert!(inventory.prefixes(&vec![-1; devices.len()]).is_err());
+            if devices.len() == 2 { assert!(inventory.prefixes(&[0, 0]).is_err()); }
+        }
+    }
 }

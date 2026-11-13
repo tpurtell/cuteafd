@@ -5,7 +5,7 @@
 //! [`MiniMaxInputs`](crate::placement::families::minimax_m3::MiniMaxInputs),
 //! which `placement::planner::solve` admits. No family code samples memory or
 //! sizes a pool here.
-use crate::placement::families::minimax_m3::{self as shared, ExpertBacking, LocalPackage, MiniMaxInputs, SparkCharge};
+use crate::placement::families::minimax_m3::{self as shared, LocalPackage, MiniMaxInputs, SparkCharge};
 use crate::placement::planner::{serving, Budget, Context, PrefillShape};
 use crate::placement::{ArchContext, ResidentWeights, SparkWorkingSet};
 use anyhow::{ensure, Context as _};
@@ -163,12 +163,9 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         .map_err(|error| refused(format!("MiniMax mount inventory refused: {error:#}"), "Check checkpoint headers."))?;
     let tensors = request.catalog.fp8().ok_or_else(|| refused("MiniMax native expert catalog missing",
         "Provide compressed-tensors NVFP4 expert headers."))?;
-    let expert_backings = (0..=routed.len()).map(|count| {
-        if count == 0 { return Ok(Vec::new()); }
-        (0..gpus).map(|gpu| ExpertBacking::plan(tensors, &routed[..count], gpus, gpu,
-            request.physical_devices[gpu])).collect::<anyhow::Result<Vec<_>>>()
-    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(
-        format!("MiniMax expert backing inventory refused: {error:#}"), "Provide complete native expert headers."))?;
+    let expert_backings = shared::ExpertInventory::new(tensors, &routed, gpus)
+        .and_then(|inventory| inventory.prefixes(request.physical_devices)).map_err(|error| refused(
+            format!("MiniMax expert backing inventory refused: {error:#}"), "Provide complete native expert headers."))?;
     let local = local_package(request.catalog, request.manifest_path, shape.rows, gpus);
     let spark = spark_charges(request.checkpoint, request.catalog, &routed, ranks, shape)
         .map_err(|error| refused(format!("MiniMax Spark inventory refused: {error:#}"),
