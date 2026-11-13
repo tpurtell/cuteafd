@@ -1,5 +1,11 @@
 # CuteAFD plan
 
+## Kimi K3.1 Pro qualification
+
+K2/Core-K6 and original-default MC checkpoint publication, native placement
+and guarded cleanup are complete; receipts are recorded in PR #1783.
+Serving and full-model generation/fidelity qualification remain pending #1777.
+
 One attention/FFN-disaggregated engine for the open-weights MoE models that
 soar on consumer Blackwell: strong RTX PRO 6000 head(s) for attention, dense
 projections, routing, shared experts, sampling and speculation; a pool of DGX

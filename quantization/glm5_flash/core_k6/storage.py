@@ -2,10 +2,48 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import torch
 
 from glm5.core_k6.storage import ProjectionStore, RouteSpool as _RouteSpool, StageStore, load_tensors
+from kimi_k3.uniform_k2.storage import atomic_json
+
+
+class CoreProjectionStore(ProjectionStore):
+    """Keep calibrated scalar evidence and certify the committed packed bytes."""
+
+    def record_evidence(self, name, saved):
+        from core_export import sampled_packed_oracle
+        path = self.evidence / (name + ".json")
+        prior = json.loads(path.read_text()) if path.exists() else {}
+        oracle = prior.get("evidence", {}).get("packed_byte_oracle")
+        if (prior.get("packed_sha256") != saved["sha256"]
+                or prior.get("identity") != self.identity or oracle is None):
+            oracle = sampled_packed_oracle(self.paths(name)[0], name,
+                self.selection[name], device=self.device)
+        if oracle.get("passed") is not True or oracle.get("bits") != self.selection[name]["bits"]:
+            raise ValueError("packed-byte oracle did not certify selected core bitrate")
+        evidence = dict(saved["evidence"], packed_byte_oracle=oracle)
+        if prior.get("packed_sha256") == saved["sha256"] and prior.get("identity") == self.identity:
+            if "reconstruction" in prior.get("evidence", {}):
+                evidence["reconstruction"] = prior["evidence"]["reconstruction"]
+        atomic_json(path, dict(identity=self.identity, packed_sha256=saved["sha256"],
+            **{key: saved[key] for key in ("module", "bits", "logical_shape", "metrics")},
+            evidence=evidence))
+
+    def dense(self, name):
+        dense = super().dense(name)
+        if not bool(torch.isfinite(dense).all()):
+            raise ValueError("nonfinite serialized core reconstruction")
+        path = self.evidence / (name + ".json")
+        saved = json.loads(path.read_text())
+        saved["evidence"]["reconstruction"] = dict(dtype=str(dense.dtype),
+            logical_shape=list(dense.shape), finite=True,
+            max_abs=float(dense.abs().max()),
+            method="serialized-MCG-FP16-scales-native-output-crop")
+        atomic_json(path, saved)
+        return dense
 
 
 class RouteSpool(_RouteSpool):

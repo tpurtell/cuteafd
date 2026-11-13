@@ -43,6 +43,9 @@ def supervise(path):
 
 
 def main():
+    from core_launch import dispatch
+    if dispatch('muse'):
+        return
     parser=argparse.ArgumentParser(description=__doc__)
     for name in ('source-snapshot','tokens','root','export','output','qualification-report','source-audit','native-reference-root'):
         parser.add_argument('--'+name,type=Path)
