@@ -83,34 +83,18 @@
     },
     {
       "family": "glm5",
-      "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
+      "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
       "5090": {
         "status": "na",
-        "reason": "doesn't fit"
+        "reason": "No 5090 card in this rollout; RTX PRO 6000 columns only."
       },
       "1rtx": {
-        "status": "current",
-        "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min"
+        "status": "pending",
+        "reason": "MC original min card pending K8 kernel pin #1903 and measurement (#1906)."
       },
       "2rtx": {
-        "status": "current",
-        "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max"
-      }
-    },
-    {
-      "family": "glm5",
-      "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6",
-      "5090": {
-        "status": "na",
-        "reason": "doesn't fit"
-      },
-      "1rtx": {
-        "status": "current",
-        "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-1rtx-4spark-glm53-exl3-k6core-min"
-      },
-      "2rtx": {
-        "status": "current",
-        "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max"
+        "status": "pending",
+        "reason": "MC original max card pending K8 kernel pin #1903 and measurement (#1906)."
       }
     },
     {
@@ -291,18 +275,18 @@
     },
     {
       "family": "step5",
-      "checkpoint": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6",
+      "checkpoint": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
       "5090": {
         "status": "na",
-        "reason": "doesn't fit"
+        "reason": "No 5090 card in this rollout; RTX PRO 6000 columns only."
       },
       "1rtx": {
-        "status": "current",
-        "report": "benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min"
+        "status": "pending",
+        "reason": "MC original min card pending K8 kernel pin #1903 and measurement (#1906)."
       },
       "2rtx": {
-        "status": "current",
-        "report": "benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max"
+        "status": "pending",
+        "reason": "MC original max card pending K8 kernel pin #1903 and measurement (#1906)."
       }
     },
     {
@@ -511,6 +495,48 @@
       "report": "benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min-nospec",
       "release": "v4.0.0",
       "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "glm53-exl3-min",
+      "config": "examples/configs/glm53-exl3-min.config",
+      "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min",
+      "release": "v5.0.0",
+      "release_note": "Retired 2026-11-13; replaced by wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC original view (#1906)."
+    },
+    {
+      "name": "glm53-exl3-max",
+      "config": "examples/configs/glm53-exl3-max.config",
+      "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max",
+      "release": "v5.0.0",
+      "release_note": "Retired 2026-11-13; replaced by wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC original view (#1906)."
+    },
+    {
+      "name": "glm53-exl3-k6core-min",
+      "config": "examples/configs/glm53-exl3-k6core-min.config",
+      "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-1rtx-4spark-glm53-exl3-k6core-min",
+      "release": "v5.0.0",
+      "release_note": "Retired 2026-11-13; replaced by wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC original view (#1906)."
+    },
+    {
+      "name": "glm53-exl3-k6core-max",
+      "config": "examples/configs/glm53-exl3-k6core-max.config",
+      "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max",
+      "release": "v5.0.0",
+      "release_note": "Retired 2026-11-13; replaced by wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC original view (#1906)."
+    },
+    {
+      "name": "step5-exl3-k6core-min",
+      "config": "examples/configs/step5-exl3-k6core-min.config",
+      "report": "benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min",
+      "release": "v5.0.0",
+      "release_note": "Retired 2026-11-13; replaced by wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC original view (#1906)."
+    },
+    {
+      "name": "step5-exl3-k6core-max",
+      "config": "examples/configs/step5-exl3-k6core-max.config",
+      "report": "benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max",
+      "release": "v5.0.0",
+      "release_note": "Retired 2026-11-13; replaced by wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC original view (#1906)."
     }
   ]
 }

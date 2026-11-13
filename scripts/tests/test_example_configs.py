@@ -585,8 +585,8 @@ def test_v5_smoke_card_inventory() -> None:
                 "timeout_s": 30,
                 "required": True,
             }
-    assert len(cards) == 39
-    assert len({(family, model) for family, model, _ in cards}) == 20
+    assert len(cards) == 37
+    assert len({(family, model) for family, model, _ in cards}) == 19
     assert sum(column == "5090" for _, _, column in cards) == 7
     assert not names.intersection(entry["name"] for entry in smoke["retired"])
 
@@ -985,6 +985,8 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     assert set(published) - {entry["name"] for entry in retired} == {
         "v41-flash-reference-tp4", "glm53f-exl3-5090", "v4-flash-reference-tp4",
         "glm53-exlr8-a8-max", "qwen38-27b-bf16-min-nospec", "qwen38-27b-fp8-min-nospec",
+        "glm53-exl3-min", "glm53-exl3-max", "glm53-exl3-k6core-min",
+        "glm53-exl3-k6core-max", "step5-exl3-k6core-min", "step5-exl3-k6core-max",
     }
     reports = [(path, json.loads(path.read_text())) for path in (ROOT / "benchmarks").glob("*/*/report.json")]
     for entry in retired:
@@ -1041,3 +1043,47 @@ def test_glmf_exlr8_k4_cards_preserve_qualified_native_recipes(filename: str) ->
                        for other in entries.values()) == 1
     if "matrix-gate" in filename:
         assert entries["glmf-exlr8-k4-max"]["prefill_lengths"] == [65536]
+
+
+@pytest.mark.parametrize("family,model,revision,sparks", [
+    ("glm5", "GLM-5.3-EXL3-K4-MC", "c39486376dee84e5faa4904e014e07d7b6e76405", 4),
+    ("step5", "Step-5-Preview-EXL3-K4-MC", "4483a4bd874e8c360aec486ea72bd31d1ad7a247", 3),
+])
+def test_glm53_step5_mc_rollout_pins_original_and_separates_comparisons(
+    family: str, model: str, revision: str, sparks: int,
+) -> None:
+    repo = "wrldsuksgo2mars/" + model
+    release = json.loads((ROOT / "scripts/bench/release-smoke-v5.json").read_text())
+    comparisons = json.loads((ROOT / "scripts/bench/release-smoke-v51-mc-core-comparison.json").read_text())
+    published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
+    entries = [entry for entry in release["entries"] if entry["set"].get("MODEL_ID") == repo]
+    assert len(entries) == 2
+    assert {tuple(entry["gpus"]) for entry in entries} == {(1,), (0, 1)}
+    for entry in entries:
+        values = {**keys(ROOT / entry["config"]), **entry["set"]}
+        assert values["MODEL_REVISION"] == revision
+        assert values["CORE_VIEW"] == "original"
+        assert len(entry["sparks"]) == (sparks if len(entry["gpus"]) == 1 else 6)
+        assert values["SPECULATOR"] == ("dflash2" if family == "glm5" else "mtp")
+    compact = [entry for entry in comparisons["entries"] if entry["family"] == family]
+    assert {entry["set"]["CORE_VIEW"] for entry in compact} == {"k8-compact", "k6-compact"}
+    for entry in compact:
+        assert entry["set"]["MODEL_ID"] == repo
+        assert entry["set"]["MODEL_REVISION"] == revision
+        assert entry["gpus"] == [0, 1] and len(entry["sparks"]) == 6
+        assert entry["name"] not in {entry["name"] for entry in release["entries"]}
+    unsupported = [entry for entry in comparisons["unsupported"] if entry["family"] == family]
+    assert len(unsupported) == 1
+    assert unsupported[0]["core_view"] == "fp8-compact"
+    assert unsupported[0]["status"] == "na" and unsupported[0]["reason"]
+    rows = [row for row in published["cells"] if row["checkpoint"] == repo]
+    assert len(rows) == 1
+    assert all(rows[0][column]["status"] in {"pending", "current"} for column in ("1rtx", "2rtx"))
+    retired_models = {"wrldsuksgo2mars/" + name for name in (
+        "GLM-5.3-EXL3-K4-v1", "GLM-5.3-EXL3-K4-Core-K6", "Step-5-Preview-EXL3-K4-Core-K6",
+    )}
+    assert not retired_models.intersection(row["checkpoint"] for row in published["cells"])
+    assert not retired_models.intersection(entry["set"].get("MODEL_ID") for entry in release["entries"])
+    for page in ("docs/models/" + family + ".md", "docs/mc-checkpoints.md", "docs/options.md"):
+        assert model in (ROOT / page).read_text()
+        assert revision in (ROOT / page).read_text()
