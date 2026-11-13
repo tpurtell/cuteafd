@@ -142,10 +142,49 @@ pub(crate) struct RequestRank<'a> {
     pub bank: Rc<PageBank<'a>>,
 }
 
+/// Entry-rank token ids never alias prefill or routing scratch. The retained
+/// stream orders each upload after the preceding decode consumer.
+pub(crate) struct DecodeTokens<'a> {
+    stream: Rc<Stream<'a>>,
+    ids: Allocation<'a>,
+}
+impl Drop for DecodeTokens<'_> {
+    fn drop(&mut self) { self.stream.drain_or_abort("MiniMax decode token retirement"); }
+}
+impl<'a> DecodeTokens<'a> {
+    fn new(stream: Rc<Stream<'a>>, rows: u32) -> Result<Self> {
+        let ids = Allocation::new(stream.device, rows as usize * 4, Tag::workspace("minimax/decode-tokens"))?;
+        stream.device.run(|| {
+            // SAFETY: private admitted destination and retained decode stream;
+            // reservation precedes all requests and staging sealing.
+            unsafe { stream.device.library.reserve_h2d_ordered(ids.buffer, stream.raw) }
+        })?;
+        Ok(Self { stream, ids })
+    }
+    pub fn upload(&self, tokens: &[u32]) -> Result<Buffer> {
+        ensure!(!tokens.is_empty() && tokens.len() <= self.ids.buffer.bytes / 4,
+            "MiniMax decode tokens exceed admitted concurrency");
+        let bytes = tokens.iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>();
+        self.stream.device.run(|| {
+            // SAFETY: the dedicated full-capacity destination and reserved
+            // staging survive every consumer on this same retained stream.
+            unsafe { self.stream.device.library.copy_h2d_ordered(self.ids.buffer, &bytes, self.stream.raw) }
+        })?;
+        Ok(self.ids.buffer)
+    }
+    fn inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
+        let name = Owner::DecodeTokenIds { gpu: 0 }.inventory_name().unwrap();
+        self.ids.inventory(inventory, &name)?;
+        upload_inventory(inventory, &format!("{name}.upload"), self.stream.device.library,
+            self.ids.buffer, self.stream.raw)
+    }
+}
+
 /// Retained request storage only, not arithmetic, transport or a serving loop.
 /// Prefix-copy staging is inventoried by MiniMaxPrefix after it is attached.
 pub(crate) struct RequestState<'a> {
     pub capacity: RequestCapacity,
+    pub tokens: DecodeTokens<'a>,
     pub ranks: Vec<RequestRank<'a>>,
 }
 
@@ -202,8 +241,18 @@ impl<'a> RequestState<'a> {
                     && std::ptr::eq(stream.device.library, library)),
                 "MiniMax request streams differ from admitted physical ranks/waves");
         }
+        let token_id = Owner::DecodeTokenIds { gpu: 0 }.id();
+        for (id, location) in [(token_id.clone(), cuteafd_loader::placement::planner::Location::coordinator(0)),
+            (format!("{token_id}.upload"), cuteafd_loader::placement::planner::Location::PINNED)] {
+            let owners = solved.facts.allocations.iter().filter(|owner| owner.id == id).collect::<Vec<_>>();
+            ensure!(owners.len() == 1 && owners[0].view.is_none()
+                && owners[0].bytes == u64::from(capacity.decode.rows) * 4 && owners[0].location == location
+                && owners[0].lifetime == cuteafd_loader::placement::planner::Lifetime::TARGET,
+                "MiniMax decode token owner differs from admission: {id}");
+        }
         // Validate every rank before the first allocation: a later malformed
         // reader or split mode cannot leave a partially constructed request set.
+        let tokens = DecodeTokens::new(Rc::clone(&streams[0].decode), capacity.decode.rows)?;
         let rope = MsaRope::new(cfg, context)?;
         let mut ranks = Vec::with_capacity(streams.len());
         for (readers, owned) in streams.into_iter().zip(layers) {
@@ -217,7 +266,7 @@ impl<'a> RequestState<'a> {
                 .collect::<Result<Vec<_>>>()?;
             ranks.push(RequestRank { decode, prefill, bank });
         }
-        Ok(Self { capacity, ranks })
+        Ok(Self { capacity, tokens, ranks })
     }
 
     pub fn banks(&self) -> Vec<Rc<PageBank<'a>>> {
@@ -232,6 +281,9 @@ impl<'a> RequestState<'a> {
             ensure!(inventory.location(rank.bank.stream.device.id)? == Location::coordinator(gpu as u8),
                 "MiniMax request inventory rank mapping differs from construction");
         }
+        ensure!(Rc::ptr_eq(&self.tokens.stream, &self.ranks[0].decode.stream),
+            "MiniMax token input differs from entry-rank decode stream");
+        self.tokens.inventory(inventory)?;
         for (gpu, rank) in self.ranks.iter().enumerate() {
             rank.bank.inventory(inventory, u8::try_from(gpu)?)?;
             rank.decode.inventory(inventory,
@@ -865,12 +917,18 @@ mod tests {
         let shape = PrefillShape { rows: capacity.prefill.rows.into(), waves: 3 };
         let pages = u64::from(capacity.decode.requests).max(8);
         let pool_tokens = pages * PAGE_ROWS as u64;
-        let allocations = (0..ranks).map(|rank| -> Result<Vec<_>> {
+        let mut allocations: Vec<_> = (0..ranks).map(|rank| -> Result<Vec<_>> {
             Ok(capacity.cache(257)?.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer."))
                 .map(|(name, bytes)| cuteafd_loader::placement::planner::Allocation::buffer(
                     format!("{}.{name}", Owner::Cache { gpu: rank }.id()), Location::coordinator(rank as u8),
                     bytes, Lifetime::TARGET, Category::Kv, "admitted cache globals")).collect())
         }).collect::<Result<Vec<_>>>()?.into_iter().flatten().collect();
+        let id = Owner::DecodeTokenIds { gpu: 0 }.id();
+        for (id, location, category) in [(id.clone(), Location::coordinator(0), Category::Workspace),
+            (format!("{id}.upload"), Location::PINNED, Category::Staging)] {
+            allocations.push(cuteafd_loader::placement::planner::Allocation::buffer(id, location,
+                u64::from(capacity.decode.rows) * 4, Lifetime::TARGET, category, "decode token ids"));
+        }
         let solved = ResolvedPlan { encoder_diagnostics: vec![],
             request: cuteafd_loader::placement::families::minimax_m3::request(Context::automatic(257),
                 Some(pool_tokens), cuteafd_loader::placement::Onboard::Layers(0), shape,
@@ -950,7 +1008,25 @@ mod tests {
                     (receipt.allocation.bytes, receipt.allocation.location, receipt.allocation.lifetime)))
                     .collect::<BTreeMap<_, _>>();
                 assert_eq!(actual.len(), first.receipts.len());
-                let mut expected_owners = 0;
+                let token_id = Owner::DecodeTokenIds { gpu: 0 }.id();
+                assert_eq!(actual.get(&token_id), Some(&(concurrency * 4, Location::coordinator(0), Lifetime::TARGET)));
+                assert_eq!(actual.get(&format!("{token_id}.upload")), Some(&(concurrency * 4, Location::PINNED, Lifetime::TARGET)));
+                assert!(!actual.contains_key(&Owner::DecodeTokenIds { gpu: 1 }.id()));
+                let staging = Device { library: &library, id: ids[0] }.run(|| library.ordered_h2d_staging_buffer(
+                    state.tokens.ids.buffer, state.tokens.stream.raw))?.unwrap();
+                for count in [1, concurrency as usize, 1] {
+                    let tokens = (0..count).map(|index| index as u32 + 103).collect::<Vec<_>>();
+                    let buffer = state.tokens.upload(&tokens)?;
+                    state.tokens.stream.drain()?;
+                    let bytes = Device { library: &library, id: ids[0] }.run(|| read(&library, buffer, count * 4))?;
+                    assert_eq!(bytes, tokens.iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>());
+                    let next = Device { library: &library, id: ids[0] }.run(|| library.ordered_h2d_staging_buffer(
+                        buffer, state.tokens.stream.raw))?.unwrap();
+                    assert_eq!((next.ptr, next.bytes), (staging.ptr, staging.bytes));
+                }
+                assert!(state.tokens.upload(&[]).is_err());
+                assert!(state.tokens.upload(&vec![1; concurrency as usize + 1]).is_err());
+                let mut expected_owners = 2;
                 for (gpu, rank) in state.ranks.iter().enumerate() {
                     let location = Location::coordinator(gpu as u8);
                     let mut expected = Vec::new();
@@ -1026,6 +1102,39 @@ mod tests {
         }
         let admitted = request_admission(&cfg, 1, capacity)?;
         assert!(RequestState::new(&cfg, capacity, &admitted, vec![]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn decode_token_owners_reject_bad_admission_before_allocating() -> Result<()> {
+        use cuteafd_loader::placement::planner::{Location, View};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let mut cfg = config(); cfg.layers = 2;
+        let capacity = RequestCapacity::new(16, 128)?;
+        let token_id = Owner::DecodeTokenIds { gpu: 0 }.id();
+        for id in [token_id.clone(), format!("{token_id}.upload")] {
+            for case in 0..6 {
+                let mut admitted = request_admission(&cfg, 2, capacity)?;
+                let owners = &mut admitted.solved.facts.allocations;
+                let index = owners.iter().position(|owner| owner.id == id).unwrap();
+                match case {
+                    0 => { owners.remove(index); }
+                    1 => owners[index].bytes += 4,
+                    2 => owners[index].location = Location::coordinator(1),
+                    3 => owners.push(owners[index].clone()),
+                    4 => owners[index].lifetime = Lifetime::RESIDENT,
+                    5 => owners[index].view = Some(View { backing: "unexpected".into(), offset: 0 }),
+                    _ => unreachable!(),
+                }
+                let streams = request_streams(&library, &[1, 0])?;
+                let before = fixture.events()?;
+                assert!(RequestState::new(&cfg, capacity, &admitted, streams).is_err(), "{id} case {case}");
+                let after = fixture.events()?;
+                assert!(!after[before.len()..].contains('D'), "{id} case {case} allocated before validating");
+            }
+        }
         Ok(())
     }
 
