@@ -7,5 +7,6 @@ pub(crate) mod cache;
 pub(crate) mod prefix;
 pub(crate) mod prefill;
 pub(crate) mod head;
+mod graphs;
 pub(crate) mod admission;
 pub(crate) mod golden;
