@@ -163,6 +163,8 @@ fn publish_dashboard(value: &Value) {
 
 pub(crate) fn log(stage: &str) {
     if stage == "ready" {
+        // Every family's startup prewarm is done; no two-GPU graph instantiates mid-request.
+        crate::shared::decode_graph::device::seal_cross_device_capture();
         memory_ledger::fault::ready();
         let summary = memory_ledger::fault::compact_summary(stage);
         tracing::info!(target: "cuteafd::memory", "{summary}");
