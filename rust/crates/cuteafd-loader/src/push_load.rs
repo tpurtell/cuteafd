@@ -35,6 +35,32 @@ pub fn admitted_push_envelope(largest_selected_dense_bytes: u64, slots: usize, s
         .and_then(|n| n.checked_add(largest.checked_mul(10)?)).ok_or_else(overflow)
 }
 
+/// Peak post-Done native expert validation scratch. Layers execute serially;
+/// gate/up input checks coexist, while widening and row expansion reuse storage.
+pub fn fp8_host_scratch(widen: impl IntoIterator<Item = usize>,
+    scalars: impl IntoIterator<Item = usize>, inputs: Option<[usize; 2]>,
+    expand: impl IntoIterator<Item = (usize, usize)>)
+    -> Result<usize, crate::placement::planner::Refusal> {
+    use crate::placement::planner::Refusal;
+    let overflow = || Refusal::Overflow("native push validation scratch");
+    let widening = widen.into_iter().try_fold(0, |peak: usize, bytes| {
+        let bytes = bytes.min(1024 * 1024);
+        Ok(peak.max(bytes.checked_add(bytes / 2).ok_or_else(overflow)?))
+    })?;
+    let scalar = scalars.into_iter().max().unwrap_or(0);
+    let inputs = match inputs {
+        Some([gate, up]) => gate.checked_add(up).ok_or_else(overflow)?,
+        None => 0,
+    };
+    let expanding = expand.into_iter().try_fold(0, |peak: usize, (width, pitch)| {
+        if pitch == 0 { return Err(Refusal::InvalidFact("zero native push scale pitch".into())); }
+        let bytes = (1024 * 1024 / pitch).max(1)
+            .checked_mul(width.checked_add(pitch).ok_or_else(overflow)?).ok_or_else(overflow)?;
+        Ok(peak.max(bytes))
+    })?;
+    Ok(widening.max(scalar).max(inputs).max(expanding))
+}
+
 /// Header-derived concurrent coordinator receive owners, admitted by the
 /// caller's complete recipe before any push allocation or group handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]

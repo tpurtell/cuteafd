@@ -169,41 +169,17 @@ impl RankPlan {
         }
         // Post-Done checks reuse one scalar vector or one bounded widening
         // chunk at a time. Include both simultaneous gate/up check vectors.
-        let host_scratch = plans
-            .iter()
-            .map(|plan| match &plan.initialize {
-                push_initialize::Layer::Fp8 {
-                    widen,
-                    scalars,
-                    scalar_convention: _,
-                    inputs,
-                    expand,
-                } => {
-                    let widening = widen
-                        .iter()
-                        .map(|range| {
-                            range.len().min(1024 * 1024) + range.len().min(1024 * 1024) / 2
-                        })
-                        .max()
-                        .unwrap_or(0);
-                    let scalar = scalars.iter().map(|range| range.len()).max().unwrap_or(0);
-                    let inputs = inputs
-                        .as_ref()
-                        .map_or(0, |(gate, up, _)| gate.len() + up.len());
-                    let expanding = expand
-                        .iter()
-                        .map(|(_, _, width, pitch)| {
-                            let rows = (1024 * 1024 / pitch).max(1);
-                            rows * (width + pitch)
-                        })
-                        .max()
-                        .unwrap_or(0);
-                    widening.max(scalar).max(inputs).max(expanding)
-                }
+        let host_scratch = plans.iter().try_fold(0, |peak: usize, plan| -> Result<usize> {
+            let scratch = match &plan.initialize {
+                push_initialize::Layer::Fp8 { widen, scalars, inputs, expand, .. } =>
+                    cuteafd_loader::push_load::fp8_host_scratch(
+                        widen.iter().map(|range| range.len()), scalars.iter().map(|range| range.len()),
+                        inputs.as_ref().map(|(gate, up, _)| [gate.len(), up.len()]),
+                        expand.iter().map(|(_, _, width, pitch)| (*width, *pitch)))?,
                 _ => 0,
-            })
-            .max()
-            .unwrap_or(0);
+            };
+            Ok(peak.max(scratch))
+        })?;
         Ok(Self {
             layout,
             layers: plans,

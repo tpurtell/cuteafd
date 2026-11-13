@@ -659,3 +659,86 @@ fn installed_minimax_nvfp4_push_and_mount_match_with_synthetic_payloads() -> Res
     }
     Ok(())
 }
+
+// Frozen pre-extraction arithmetic: this oracle must not call the shared helper.
+fn legacy_host_scratch(plan: &RankPlan) -> usize {
+    plan.layers.iter().map(|layer| match &layer.initialize {
+        push_initialize::Layer::Fp8 { widen, scalars, inputs, expand, .. } => {
+            let widening = widen.iter().map(|range|
+                range.len().min(1024 * 1024) + range.len().min(1024 * 1024) / 2).max().unwrap_or(0);
+            let scalar = scalars.iter().map(|range| range.len()).max().unwrap_or(0);
+            let inputs = inputs.as_ref().map_or(0, |(gate, up, _)| gate.len() + up.len());
+            let expanding = expand.iter().map(|(_, _, width, pitch)|
+                (1024 * 1024 / pitch).max(1) * (width + pitch)).max().unwrap_or(0);
+            widening.max(scalar).max(inputs).max(expanding)
+        }
+        _ => 0,
+    }).max().unwrap_or(0)
+}
+
+#[test]
+fn extracted_native_scratch_matches_legacy_for_all_storage_geometries() -> Result<()> {
+    for (format, bf16_scales) in [(ExpertFormat::Fp8Block128, false),
+        (ExpertFormat::Fp8Block128, true), (ExpertFormat::Nvfp4, false), (ExpertFormat::Mxfp4, false)] {
+        let root = tempfile::tempdir()?;
+        let catalog = fixture(root.path(), format, bf16_scales)?;
+        for world in [1, 2, 3, 4, 6, 8] {
+            for rank in 0..world {
+                for exact in [false, true] {
+                    let tensors = catalog.fp8().unwrap();
+                    let layers = [1, 2].into_iter().map(|layer| Ok((layer,
+                        if exact { tensors.for_layer_metadata(layer)?.exact_slicing(world) }
+                        else { Slicing::Padded }))).collect::<Result<Vec<_>>>()?;
+                    let plan = RankPlan::new(&catalog, &layers, world, rank, usize::MAX)?;
+                    assert_eq!(plan.host_scratch, legacy_host_scratch(&plan),
+                        "{format:?} bf16_scales={bf16_scales} TP{world} rank{rank} exact={exact}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn installed_snapshot(repo: &str) -> Result<std::path::PathBuf> {
+    let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from).unwrap_or_else(||
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
+    let model = home.join("hub").join(format!("models--{}", repo.replace('/', "--")));
+    let revision = std::fs::read_to_string(model.join("refs/main"))?;
+    Ok(model.join("snapshots").join(revision.trim()))
+}
+
+#[test]
+#[ignore = "requires installed native family headers; header-only, no CUDA or payload reads"]
+fn installed_native_scratch_matches_legacy() -> Result<()> {
+    // Kimi's supported Spark path is EXL3, so its official FP8 catalog is not
+    // a native push candidate and is covered by the EXL3 loader tests instead.
+    for repo in ["zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash", "nvidia/GLM-5.3-NVFP4",
+        "nvidia/GLM-5.3-Flash-NVFP4", "stepfun-ai/Step-5-Preview",
+        "Qwen/Qwen3.8-Flash-Next-FP8", "nvidia/Qwen3.8-Flash-Next-NVFP4",
+        "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "MiniMaxAI/MiniMax-M3.1-Flash"] {
+        let snapshot = installed_snapshot(repo)?;
+        let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        let tensors = catalog.fp8().with_context(|| format!("{repo}: native headers absent"))?;
+        let layer = tensors.shape().first_layer;
+        for world in [1, 2, 4, 6] {
+            for rank in 0..world {
+                for exact in [false, true] {
+                    let slicing = if exact { tensors.for_layer_metadata(layer)?.exact_slicing(world) }
+                        else { Slicing::Padded };
+                    let view = tensors.for_layer_metadata(layer)?;
+                    if let Err(error) = view.rank_range_with(world, rank, slicing) {
+                        ensure!(RankPlan::new(&catalog, &[(layer, slicing)], world, rank, usize::MAX).is_err(),
+                            "invalid source slicing must not produce a native push plan");
+                        eprintln!("{repo} TP{world} rank{rank} exact={exact}: unsupported source slice: {error}");
+                        continue;
+                    }
+                    let plan = RankPlan::new(&catalog, &[(layer, slicing)], world, rank, usize::MAX)?;
+                    assert_eq!(plan.host_scratch, legacy_host_scratch(&plan),
+                        "{repo} TP{world} rank{rank} exact={exact}");
+                }
+            }
+        }
+        eprintln!("{repo}: legacy scratch exact; native header geometry TP1/2/4/6");
+    }
+    Ok(())
+}

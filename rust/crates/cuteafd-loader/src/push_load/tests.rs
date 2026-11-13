@@ -772,3 +772,15 @@ fn host_envelope_validates_geometry_capacity_and_physical_lifetimes() {
     assert_eq!(refusal, admitted.validate_usage(&actual).unwrap_err());
     assert!(admitted.allocations("").is_err());
 }
+
+#[test]
+fn native_validation_scratch_is_serial_bounded_and_checked() -> Result<(), crate::placement::planner::Refusal> {
+    assert_eq!(fp8_host_scratch([], [], None, [])?, 0);
+    assert_eq!(fp8_host_scratch([1, 2 << 20], [17], Some([19, 23]), [])?, 1536 << 10);
+    assert_eq!(fp8_host_scratch([], [512, 1024], Some([1024, 1024]), [])?, 2048);
+    assert_eq!(fp8_host_scratch([], [], None, [(3, 4)])?, (1024 * 1024 / 4) * 7);
+    assert!(fp8_host_scratch([], [], Some([usize::MAX, 1]), []).is_err());
+    assert!(fp8_host_scratch([], [], None, [(1, 0)]).is_err());
+    assert!(fp8_host_scratch([], [], None, [(usize::MAX, 1)]).is_err());
+    Ok(())
+}
