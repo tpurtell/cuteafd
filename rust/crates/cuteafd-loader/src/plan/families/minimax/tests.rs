@@ -1239,6 +1239,9 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
                 capacity.decode.rows, capacity.prefill.rows, context).unwrap();
             let (producers, _) = ProducerPrograms::resolve(&inputs.manifest, capacity.prefill.rows).unwrap();
             let mut expected = BTreeMap::new();
+            let tokens = Owner::DecodeTokenIds { gpu: 0 }.id();
+            expected.insert(tokens.clone(), (concurrency * 4, Location::coordinator(0), Lifetime::TARGET));
+            expected.insert(format!("{tokens}.upload"), (concurrency * 4, Location::PINNED, Lifetime::TARGET));
             // These are the allocation inputs used by the runtime constructors,
             // not component helpers or a second fixture-specific sizing rule.
             for gpu in 0..gpus {
