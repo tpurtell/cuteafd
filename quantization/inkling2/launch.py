@@ -21,12 +21,13 @@ def maxq_command(arguments):
         shlex.join(['env', 'PYTHONPATH='+str(REPO/'quantization'), *map(str, arguments)])]
 
 
-def worker(mode):
+def worker(mode, output_io='legacy'):
     from .container import command
     name = 'cuteafd-inkling2-'+mode
     arguments = ['-m', 'inkling2.pilot', '--source', str(SOURCE), '--output', str(TASK/'pilot.json')]
     if mode == 'production':
-        arguments = ['-m', 'inkling2.run', '--source', str(SOURCE), '--corpus', str(TASK/'prepared-corpus'),
+        module = 'inkling2.io_resume' if output_io == 'sequential' else 'inkling2.run'
+        arguments = ['-m', module, '--source', str(SOURCE), '--corpus', str(TASK/'prepared-corpus'),
             '--root', str(TASK/'production'), '--output', str(TASK/'output')]
     elif mode == 'build':
         code = 'from inkling2.numerical import fork_module; fork_module("exllamav3.ext").prewarm_exllamav3_extension()'
@@ -40,7 +41,7 @@ def worker(mode):
         run_arguments = repr(arguments)
         arguments = ['-c', 'import subprocess,sys,runpy; subprocess.run(['+
             repr(str(REPO/'scripts/build/build-slot.sh'))+',sys.executable,"-c",'+repr(prewarm)+
-            '],check=True);sys.argv='+run_arguments+'[1:];runpy.run_module("inkling2.run",run_name="__main__")']
+            '],check=True);sys.argv='+run_arguments+'[1:];runpy.run_module('+repr(module)+',run_name="__main__")']
     argv = command(arguments, name=name, fork=Path.home()/'Developer/GPTQModel' if mode != 'production' else None)
     child = None
     def terminate(signum, frame):
@@ -64,9 +65,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=['build', 'pilot', 'production'], required=True)
     parser.add_argument('--worker', action='store_true')
+    parser.add_argument('--output-io',choices=['legacy','sequential'],default='legacy')
     args = parser.parse_args()
     if args.worker:
-        return worker(args.mode)
+        return worker(args.mode,args.output_io)
     root = TASK/'production'
     if args.mode == 'production' and (root/'quantization-complete.json').exists():
         report = json.loads((root/'quantization-complete.json').read_text())
@@ -81,7 +83,8 @@ def main():
         '/home/tj/Developer/cuteafd/scripts/hw/hwlock.py', '--locks', 'maxq', '--wait', str(wait),
         '--preflight', shlex.join(preflight), '--preflight-timeout', '180', '--',
         *maxq_command(['timeout', '--signal=TERM', '--kill-after=60', str(runtime),
-            PYTHON, '-m', 'inkling2.launch', '--worker', '--mode', args.mode])]
+            PYTHON, '-m', 'inkling2.launch', '--worker', '--mode', args.mode,
+            '--output-io',args.output_io])]
     return subprocess.call(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                             'raptor', shlex.join(remote)])
 

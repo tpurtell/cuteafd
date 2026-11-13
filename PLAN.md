@@ -27,6 +27,12 @@ TJ also requests remaining time and an estimated completion date/time in every
 update (Asia/Taipei). Start with a clearly provisional range from measured
 partial expert throughput; replace it with completed-layer timing as available.
 Keep layer ETA separate from head/MTP, upload and placement allowances.
+TJ explicitly authorized interrupt/fix/resume for the scratch I/O defect on
+2026-11-13. Preserve the original numerical files, identity, committed weights
+and legacy output receipts. The operational `io_resume` entry patches only the
+frozen runner's output memmap interface: new expert outputs append sequentially,
+and reads combine committed legacy slots with new files byte for byte. Its
+code/provenance is tracked separately; no numerical state or source is rewritten.
 
 Source header audit: `thinkingmachines/Inkling-2-Small-MXFP8` at
 `3febc62259ee92ea36e2fb6e8303371c4eb3922c`, 48 indexed model shards plus
