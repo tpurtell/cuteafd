@@ -46,6 +46,10 @@ pub struct QwenInputs<'a> {
     pub resident_weight_limit: Option<ResidentWeights>,
     /// Checkpoint owners already charged to the physical baseline.
     pub loaded_weights: ResidentWeights,
+    /// Future checkpoint backings for callers that sample before uploading.
+    pub arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
+    /// Exact future expert, workspace and load-staging owners.
+    pub future: Vec<Demand>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// Shared model extent and optional operator context pin.
     pub context: crate::placement::planner::Context,
@@ -401,6 +405,23 @@ impl Recipe for QwenSingle<'_> {
             components.push(owner);
         }
         components.push(weights("qwen.loaded.owners", gpu, inputs.loaded_weights, self.maximum_pages));
+        for layout in &inputs.arenas {
+            components.extend(weight_arena_components(layout, gpu, PlanLifetime::RESIDENT,
+                self.maximum_pages, if layout.id().contains("/mtp/") {
+                    cuteafd_core::memory_layout::MemoryKind::DrafterWeights
+                } else { cuteafd_core::memory_layout::MemoryKind::Weights })?);
+        }
+        for (index, demand) in inputs.future.iter().enumerate() {
+            if demand.gpu != 0 {
+                return Err(Refusal::InvalidFact("Qwen single future owner outside rank zero".into()));
+            }
+            let id = format!("qwen.future.{index}");
+            components.push(owner(id.clone(), gpu, demand.bytes, demand.category, &demand.group,
+                PlanLifetime::RESIDENT, self.maximum_pages));
+            if demand.resident_weights.0 > 0 {
+                components.push(weights(id, gpu, demand.resident_weights, self.maximum_pages));
+            }
+        }
         if inputs.host.uploads.len() != 1 {
             return Err(Refusal::InvalidFact("Qwen single-owner host owners must name one upload owner".into()));
         }
@@ -1503,6 +1524,7 @@ mod tests {
         loaded: ResidentWeights, limit: Option<ResidentWeights>) -> QwenInputs<'a> {
         let gib = 1u64 << 30;
         QwenInputs { blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: limit, loaded_weights: loaded,
+            arenas: vec![], future: vec![],
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg, layers: cfg.layers, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
