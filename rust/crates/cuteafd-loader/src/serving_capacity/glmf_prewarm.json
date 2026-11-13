@@ -277,6 +277,145 @@
           "pin": false
         }
       ]
+    },
+    "2-sparks": {
+      "measured_bytes": [
+        125829120,
+        117440512
+      ],
+      "measured_executables": [
+        644,
+        630
+      ],
+      "reserve_extra_bytes": 2097152,
+      "entries": [
+        {
+          "rows": 1,
+          "spec": false,
+          "long": false,
+          "pool_width": 0,
+          "page_stride": 64,
+          "pool_stride": 0,
+          "pin": false
+        },
+        {
+          "rows": 1,
+          "spec": false,
+          "long": true,
+          "pool_width": 64,
+          "page_stride": 256,
+          "pool_stride": 64,
+          "pin": false
+        },
+        {
+          "rows": 2,
+          "spec": true,
+          "long": false,
+          "pool_width": 0,
+          "page_stride": 64,
+          "pool_stride": 0,
+          "pin": false
+        },
+        {
+          "rows": 2,
+          "spec": true,
+          "long": true,
+          "pool_width": 128,
+          "page_stride": 1024,
+          "pool_stride": 256,
+          "pin": false
+        },
+        {
+          "rows": 4,
+          "spec": true,
+          "long": false,
+          "pool_width": 0,
+          "page_stride": 64,
+          "pool_stride": 0,
+          "pin": true
+        },
+        {
+          "rows": 4,
+          "spec": true,
+          "long": true,
+          "pool_width": 128,
+          "page_stride": 1024,
+          "pool_stride": 256,
+          "pin": false
+        },
+        {
+          "rows": 8,
+          "spec": true,
+          "long": false,
+          "pool_width": 0,
+          "page_stride": 64,
+          "pool_stride": 0,
+          "pin": false
+        },
+        {
+          "rows": 8,
+          "spec": true,
+          "long": true,
+          "pool_width": 128,
+          "page_stride": 1024,
+          "pool_stride": 256,
+          "pin": false
+        },
+        {
+          "rows": 16,
+          "spec": true,
+          "long": false,
+          "pool_width": 0,
+          "page_stride": 64,
+          "pool_stride": 0,
+          "pin": false
+        },
+        {
+          "rows": 16,
+          "spec": true,
+          "long": true,
+          "pool_width": 128,
+          "page_stride": 1024,
+          "pool_stride": 256,
+          "pin": false
+        },
+        {
+          "rows": 32,
+          "spec": true,
+          "long": false,
+          "pool_width": 0,
+          "page_stride": 64,
+          "pool_stride": 0,
+          "pin": false
+        },
+        {
+          "rows": 32,
+          "spec": true,
+          "long": true,
+          "pool_width": 128,
+          "page_stride": 1024,
+          "pool_stride": 256,
+          "pin": false
+        },
+        {
+          "rows": 64,
+          "spec": true,
+          "long": false,
+          "pool_width": 0,
+          "page_stride": 64,
+          "pool_stride": 0,
+          "pin": false
+        },
+        {
+          "rows": 64,
+          "spec": true,
+          "long": true,
+          "pool_width": 128,
+          "page_stride": 1024,
+          "pool_stride": 256,
+          "pin": false
+        }
+      ]
     }
   }
 }
