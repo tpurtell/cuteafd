@@ -521,7 +521,16 @@ impl MiniMaxInputs {
         out.extend(target.dense_workspace(DECODE_ROWS).map_err(refusal)?.components(&format!("{decode}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
         for slot in 0..self.prefill.waves {
             let prefix = Owner::Unit { gpu, slot }.id();
-            out.extend(UnitLayout::new(cfg, rows)?.components(&prefix, gpu as u8, Lifetime::TARGET, maximum)?);
+            let unit = UnitLayout::new(cfg, rows)?;
+            out.extend(unit.components(&prefix, gpu as u8, Lifetime::TARGET, maximum)?);
+            if gpu == 0 {
+                // Host tokens enter only the entry rank's prefill units. The
+                // stable U32 upload view shares route_ids' address, not its
+                // larger top-k extent; device-ID decode/verify uploads nothing.
+                out.extend(buffer(format!("{prefix}.route_ids.upload"), Location::PINNED,
+                    u64::from(unit.rows) * 4, Lifetime::TARGET, Category::Staging,
+                    "entry prefill ordered token IDs", maximum));
+            }
             out.extend(UnitMetadata::new(rows)?.components(&format!("{prefix}.metadata"), gpu as u8, maximum)?);
             out.extend(target.dense_input(rows).map_err(refusal)?.components(&format!("{prefix}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
             out.extend(target.dense_workspace(rows).map_err(refusal)?.components(&format!("{prefix}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
