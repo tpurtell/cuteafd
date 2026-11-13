@@ -1566,9 +1566,20 @@ fn heads_expert_backend_charges_tp2_exchange_separately_without_weight_replicati
                 assert_eq!(admitted.expert_backings.len(), gpus);
                 if gpus == 2 {
                     let whole = recipe_inputs(1, 4);
-                    let halves = admitted.expert_backings.iter().map(|b| b.arena.payload_bytes()).sum::<usize>();
-                    assert_eq!(halves, whole.expert_backings[1][0].arena.payload_bytes(),
-                        "two native half backings, not two full copies");
+                    let whole = &whole.expert_backings[1][0];
+                    let expert_count = whole.arena.view(&format!("{layer}.0")).unwrap().bytes()
+                        / (3072 * 6144 / 2);
+                    for plane in 0..6 {
+                        let name = format!("{layer}.{plane}");
+                        let whole_bytes = whole.arena.view(&name).unwrap().bytes();
+                        let halves = admitted.expert_backings.iter()
+                            .map(|backing| backing.arena.view(&name).unwrap().bytes()).sum::<usize>();
+                        // Each scale plane retains two FP32 native scalars per
+                        // expert on both ranks; matrix and block scales split.
+                        let replicated = if plane % 2 == 1 { expert_count * 8 } else { 0 };
+                        assert_eq!(halves, whole_bytes + replicated,
+                            "plane {plane}: native half matrices plus replicated scalar metadata");
+                    }
                 }
             }
         }
