@@ -5,8 +5,8 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::Tag;
 use cuteafd_engine::prefix::RefPagePool;
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
-use cuteafd_loader::families::minimax_m3::{MiniMaxM3Config,
-    execution::{MsaCache, MsaRope, UnitMetadata}};
+use cuteafd_loader::{families::minimax_m3::{MiniMaxM3Config,
+    execution::{MsaCache, MsaRope, UnitMetadata}}, placement::families::minimax_m3::Owner};
 use std::{collections::BTreeMap, ops::Range, rc::Rc};
 
 /// One cold sequence, with all pages reserved before the first producer launch.
@@ -66,7 +66,8 @@ impl<'a> Cache<'a> {
         Metadata::new(Rc::clone(&self.stream), UnitMetadata::new(capacity)?)
     }
     pub fn prepare(&self, metadata: &mut Metadata<'a>, span: Range<usize>) -> Result<()> {
-        ensure!(span.start < span.end && span.end <= self.tokens && span.len() <= metadata.capacity
+        ensure!(metadata.mode == MetadataMode::Cold && span.start < span.end
+            && span.end <= self.tokens && span.len() <= metadata.capacity
             && Rc::ptr_eq(&self.stream, &metadata.stream), "MiniMax cold metadata extent/stream");
         // A slot is reused only after its previous consumer has completed.
         self.stream.drain()?;
@@ -76,13 +77,12 @@ impl<'a> Cache<'a> {
             (i64::from(self.pages[row / 64]) * 64 + (row % 64) as i64).to_le_bytes()
         }).collect::<Vec<_>>();
         let causal = span.clone().flat_map(|row| ((row + 1) as i32).to_le_bytes()).collect::<Vec<_>>();
-        let scales = [1.0f32; 4].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
         let offsets = [0i32, span.len() as i32].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
         self.stream.device.run(|| {
             for (name, bytes) in [("positions", positions), ("slots", slots),
                 ("batch_ids", vec![0; span.len() * 4]), ("causal_lengths", causal),
                 ("cache_lengths", (span.end as i32).to_le_bytes().to_vec()),
-                ("query_offsets", offsets), ("key_descale", scales.clone()), ("value_descale", scales)] {
+                ("query_offsets", offsets)] {
                 self.stream.device.library.copy_h2d(metadata.plane(name)?, &bytes)?;
             }
             Ok(())
@@ -269,11 +269,14 @@ impl<'a> PageBank<'a> {
     }
     fn prepare_metadata(&self, metadata: &mut Metadata<'a>, appends: &[Append<'_>], decode: bool) -> Result<()> {
         self.validate_metadata(metadata)?;
+        ensure!(metadata.mode == if decode { MetadataMode::Decode } else { MetadataMode::Prefill },
+            "MiniMax metadata mode differs from execution");
         ensure!(!appends.is_empty() && appends.len() <= metadata.layout.requests as usize
             && appends.len() <= self.layout.requests as usize
             && (!decode || Rc::ptr_eq(&metadata.stream, &self.stream)),
             "MiniMax metadata request count or decode stream differs from admission");
         let mut planes = metadata.layout.buffers().into_iter()
+            .filter(|(name, _)| metadata.mode.uploads(name))
             .map(|(name, bytes)| Ok((name, vec![0; usize::try_from(bytes)?])))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let width = self.layout.table_width as usize;
@@ -302,16 +305,13 @@ impl<'a> PageBank<'a> {
                 put(&mut planes, "positions", (row + local) * 8, &(position as i64).to_le_bytes())?;
                 put(&mut planes, "slots", (row + local) * 8, &(slot as i64).to_le_bytes())?;
                 put(&mut planes, "causal_lengths", (row + local) * 4, &((position + 1) as i32).to_le_bytes())?;
-                if decode { put(&mut planes, "batch_ids", row * 4, &(index as i32).to_le_bytes())?; }
             }
             let block = metadata.layout.segment_offset(index as u32)? as usize;
             let length = if decode { index * 4 } else { block };
-            let offset = if decode { (index + 1) * 4 } else { block + 4 };
             put(&mut planes, "cache_lengths", length, &(end as i32).to_le_bytes())?;
-            put(&mut planes, "query_offsets", offset,
-                &(if decode { index + 1 } else { append.rows } as i32).to_le_bytes())?;
-            let scales = [1.0f32; 4].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
-            for name in ["key_descale", "value_descale"] { put(&mut planes, name, block, &scales)?; }
+            if !decode {
+                put(&mut planes, "query_offsets", block + 4, &(append.rows as i32).to_le_bytes())?;
+            }
             if decode {
                 for (entry, page) in table[index * width * 4..(index + 1) * width * 4]
                     .chunks_exact_mut(4).zip(&append.placement.units) {
@@ -384,11 +384,15 @@ impl<'a> PageBank<'a> {
     pub fn inventory(&self, inventory: &mut Inventory<'_>, gpu: u8) -> Result<()> {
         for (name, allocation) in &self.planes {
             let id = if let Some(suffix) = name.strip_prefix("layer.") {
-                format!("minimax.kv.{suffix}")
-            } else { format!("minimax.cache.{gpu}.{name}") };
+                let (layer, plane) = suffix.split_once('.').context("MiniMax KV inventory name")?;
+                let plane = PAGE_PLANES.iter().find(|&&(name, _)| name == plane)
+                    .context("MiniMax KV inventory plane")?.0;
+                Owner::Kv { layer: layer.parse()?, plane }.inventory_name().unwrap()
+            } else { format!("{}.{name}", Owner::Cache { gpu: gpu.into() }.inventory_name().unwrap()) };
             allocation.inventory(inventory, &id)?;
         }
-        self.cos_sin.inventory(inventory, &format!("minimax.rope.{gpu}.cos_sin"))
+        self.cos_sin.inventory(inventory,
+            &format!("{}.cos_sin", Owner::Rope { gpu: gpu.into() }.inventory_name().unwrap()))
     }
 }
 
@@ -413,9 +417,23 @@ struct PreparedSegment {
     end: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataMode { Cold, Prefill, Decode }
+impl MetadataMode {
+    fn uploads(self, name: &str) -> bool {
+        match self {
+            Self::Cold => false,
+            Self::Prefill => matches!(name, "positions" | "slots" | "batch_ids"
+                | "causal_lengths" | "cache_lengths" | "query_offsets"),
+            Self::Decode => matches!(name, "positions" | "slots" | "causal_lengths" | "cache_lengths"),
+        }
+    }
+}
+
 pub(crate) struct Metadata<'a> {
     stream: Rc<Stream<'a>>,
     pub layout: UnitMetadata,
+    mode: MetadataMode,
     capacity: usize,
     span: Option<Range<usize>>,
     segments: Vec<PreparedSegment>,
@@ -427,19 +445,47 @@ impl Drop for Metadata<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("MiniMax request metadata retirement"); }
 }
 impl<'a> Metadata<'a> {
+    /// Cold golden uses synchronous uploads, with no retained ordered staging.
     pub fn new(stream: Rc<Stream<'a>>, layout: UnitMetadata) -> Result<Self> {
-        ensure!(UnitMetadata::for_requests(layout.rows, layout.requests)? == layout,
+        Self::for_mode(stream, layout, MetadataMode::Cold)
+    }
+    pub fn new_prefill(stream: Rc<Stream<'a>>, layout: UnitMetadata) -> Result<Self> {
+        Self::for_mode(stream, layout, MetadataMode::Prefill)
+    }
+    pub fn new_decode(stream: Rc<Stream<'a>>, layout: UnitMetadata) -> Result<Self> {
+        ensure!(layout.rows <= 64 && layout.requests == layout.rows,
+            "MiniMax decode metadata must match admitted concurrency");
+        Self::for_mode(stream, layout, MetadataMode::Decode)
+    }
+    fn for_mode(stream: Rc<Stream<'a>>, layout: UnitMetadata, mode: MetadataMode) -> Result<Self> {
+        ensure!(UnitMetadata::for_requests(layout.rows, layout.requests)? == layout
+            && (mode != MetadataMode::Cold || layout.requests == 1),
             "MiniMax metadata differs from admission");
         let planes = layout.buffers().into_iter().map(|(name, bytes)| {
             Ok((name.into(), Allocation::new(stream.device, usize::try_from(bytes)?,
                 Tag::workspace("minimax/metadata"))?))
         }).collect::<Result<BTreeMap<_, _>>>()?;
-        let metadata = Self { stream, layout, capacity: layout.rows as usize, span: None,
+        let metadata = Self { stream, layout, mode, capacity: layout.rows as usize, span: None,
             segments: Vec::new(), bank_table: None, decode: false, planes };
         metadata.stream.device.run(|| {
-            for owner in metadata.planes.values() {
-                // SAFETY: private fixed destination/stream, reserved before Ready.
-                unsafe { metadata.stream.device.library.reserve_h2d_ordered(owner.buffer, metadata.stream.raw)?; }
+            let library = metadata.stream.device.library;
+            for name in ["key_descale", "value_descale"] {
+                let dst = metadata.plane(name)?;
+                let bytes = (0..dst.bytes / 4).flat_map(|_| 1.0f32.to_le_bytes()).collect::<Vec<_>>();
+                library.copy_h2d(dst, &bytes)?;
+            }
+            if mode == MetadataMode::Decode {
+                for name in ["batch_ids", "query_offsets"] {
+                    let dst = metadata.plane(name)?;
+                    let bytes = (0..dst.bytes / 4).flat_map(|i| (i as i32).to_le_bytes()).collect::<Vec<_>>();
+                    library.copy_h2d(dst, &bytes)?;
+                }
+            }
+            for (name, owner) in &metadata.planes {
+                if mode.uploads(name) {
+                    // SAFETY: private fixed destination/stream, reserved before Ready.
+                    unsafe { library.reserve_h2d_ordered(owner.buffer, metadata.stream.raw)?; }
+                }
             }
             Ok(())
         })?;
@@ -448,6 +494,7 @@ impl<'a> Metadata<'a> {
     fn upload(&self, planes: &BTreeMap<&str, Vec<u8>>) -> Result<()> {
         self.stream.device.run(|| {
             for (name, bytes) in planes {
+                ensure!(self.mode.uploads(name), "MiniMax attempted upload to constant metadata {name}");
                 // SAFETY: validated full planes retain stable backing and staging;
                 // the helper orders reuse after the previous transfer on this stream.
                 unsafe { self.stream.device.library.copy_h2d_ordered(self.plane(name)?, bytes, self.stream.raw)?; }
@@ -510,7 +557,14 @@ mod tests {
         let canonical = device.run(|| read(&library, bank.plane("page_table")?, bank.plane("page_table")?.bytes))?;
         let lengths = device.run(|| read(&library, bank.plane("lengths")?, bank.plane("lengths")?.bytes))?;
         let original = placements.clone();
-        let mut metadata = Metadata::new(Rc::clone(&stream), UnitMetadata::for_requests(16, 4)?)?;
+        let mut metadata = Metadata::new_prefill(Rc::clone(&stream), UnitMetadata::for_requests(16, 4)?)?;
+        let mut decode_metadata = Metadata::new_decode(Rc::clone(&stream), UnitMetadata::for_requests(4, 4)?)?;
+        for owner in [&metadata, &decode_metadata] {
+            for (name, allocation) in &owner.planes {
+                assert_eq!(device.run(|| library.ordered_h2d_staging_buffer(allocation.buffer, stream.raw))?
+                    .is_some(), owner.mode.uploads(name), "{name} {:?}", owner.mode);
+            }
+        }
         let requests = [Append { first_row: 0, placement: &placements[0], rows: 3 },
             Append { first_row: 3, placement: &placements[1], rows: 5 },
             Append { first_row: 8, placement: &placements[2], rows: 1 }];
@@ -539,6 +593,10 @@ mod tests {
                 Ok(())
             })?;
         }
+        assert!(bank.prepare_decode(&mut metadata, &[&placements[0]]).is_err());
+        assert!(bank.prepare_segments(&mut decode_metadata, &requests).is_err());
+        drop(metadata);
+        let mut metadata = decode_metadata;
         let stable = metadata.planes.values().map(|owner| owner.buffer.ptr as usize).collect::<Vec<_>>();
         let staging = device.run(|| library.ordered_h2d_staging_buffer(bank.plane("decode_table")?, stream.raw))?
             .context("decode-table staging not reserved")?;
@@ -585,6 +643,54 @@ mod tests {
         assert!(bank.segments(&metadata, 2).is_err());
         drop(metadata); drop(bank); drop(stream);
         assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, 32 << 20);
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_modes_retain_only_mutable_ordered_staging_at_admitted_concurrency() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let device = Device { library: &library, id: 1 };
+        let stream = Rc::new(Stream::new(device)?);
+        for concurrency in [1, 16, 64] {
+            let layout = UnitMetadata::for_requests(concurrency, concurrency)?;
+            for owner in [Metadata::new_decode(Rc::clone(&stream), layout)?,
+                Metadata::new_prefill(Rc::clone(&stream), layout)?,
+                Metadata::new(Rc::clone(&stream), UnitMetadata::new(concurrency)?)?] {
+                let mut pinned = 0;
+                for (name, allocation) in &owner.planes {
+                    let staging = device.run(|| library.ordered_h2d_staging_buffer(allocation.buffer, stream.raw))?;
+                    assert_eq!(staging.is_some(), owner.mode.uploads(name));
+                    if let Some(staging) = staging {
+                        assert_eq!(staging.bytes, allocation.buffer.bytes);
+                        pinned += staging.bytes;
+                    }
+                    if matches!(name.as_str(), "key_descale" | "value_descale") {
+                        assert_eq!(device.run(|| read(&library, allocation.buffer, allocation.buffer.bytes))?,
+                            (0..allocation.buffer.bytes / 4).flat_map(|_| 1.0f32.to_le_bytes()).collect::<Vec<_>>());
+                    }
+                    if owner.mode == MetadataMode::Decode && matches!(name.as_str(), "batch_ids" | "query_offsets") {
+                        assert_eq!(device.run(|| read(&library, allocation.buffer, allocation.buffer.bytes))?,
+                            (0..allocation.buffer.bytes / 4).flat_map(|i| (i as i32).to_le_bytes()).collect::<Vec<_>>());
+                    }
+                }
+                let buffers = owner.layout.buffers().into_iter().collect::<BTreeMap<_, _>>();
+                let mutable = buffers["positions"] + buffers["slots"] + buffers["causal_lengths"]
+                    + buffers["cache_lengths"];
+                let expected = match owner.mode {
+                    MetadataMode::Cold => 0,
+                    MetadataMode::Decode => mutable,
+                    MetadataMode::Prefill => mutable + buffers["batch_ids"] + buffers["query_offsets"],
+                };
+                assert_eq!(pinned as u64, expected);
+            }
+        }
+        assert!(Metadata::new_decode(Rc::clone(&stream), UnitMetadata::new(16)?).is_err());
+        assert!(Metadata::new_decode(Rc::clone(&stream), UnitMetadata::for_requests(65, 65)?).is_err());
+        drop(stream);
         assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
         Ok(())
     }
