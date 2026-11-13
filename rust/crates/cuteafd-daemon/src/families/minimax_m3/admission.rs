@@ -243,18 +243,24 @@ mod tests {
         let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
         let manifest_path = dir.path().join("PROGRAMS.json");
         let manifest = std::sync::Arc::new(serde_json::json!({"programs":[]}));
-        let request = FactsRequest { checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
-            manifest_path: &manifest_path, manifest,
+        let request = |rows| FactsRequest { checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
+            manifest_path: &manifest_path, manifest: manifest.clone(),
             coordinator: Coordinator::Planned { cards: vec![CoordinatorCard {
                 physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },
             attention: Some(AttentionPlacement::Heads), physical_devices: &[0, 1],
-            spark_ranks: 4, spark_bytes: 100 << 30, prefill: PrefillShape { rows: 1024, waves: 3 },
+            spark_ranks: 4, spark_bytes: 100 << 30, prefill: PrefillShape { rows, waves: 3 },
             context_tokens: 1 << 20, pool_tokens: Some(1 << 20), sequences: 16,
             host: (512 << 30, 480 << 30), host_cache_bytes: Some(0), prefix_entries: 0,
             replies: Default::default(), head: serving::BlasHead::Gemm,
             expert_usage: false, resident_weight_limit: ResidentWeights(80 << 30) };
+        let error = serve_admission::admit(request(65), &[], Onboard::Layers(0)).unwrap_err();
+        let refused = error.downcast_ref::<cuteafd_loader::families::minimax_m3::admission::Refused>()
+            .expect("prefill alignment must fail before measured-device facts or heads admission");
+        assert!(refused.what.contains("64-row aligned"));
+        assert!(error.downcast_ref::<ServingRefusal>().is_none());
+
         let sample = serve_admission::Sample { total: 96 << 30, cap: 96 << 30, free: 94 << 30, pending_code: 0 };
-        let error = serve_admission::admit(request, &[sample; 2], Onboard::Layers(0)).unwrap_err();
+        let error = serve_admission::admit(request(1024), &[sample; 2], Onboard::Layers(0)).unwrap_err();
         assert!(matches!(error.downcast_ref::<ServingRefusal>(), Some(ServingRefusal::NarrowHeadsNotQualified)), "{error:#}");
         assert!(format!("{error:#}").contains("narrow-head MiniMax kernels not qualified"));
         Ok(())
