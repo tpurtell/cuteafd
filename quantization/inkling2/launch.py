@@ -67,14 +67,16 @@ def main():
     parser.add_argument('--worker', action='store_true')
     parser.add_argument('--output-io',choices=['legacy','sequential'],default='legacy')
     args = parser.parse_args()
-    if args.worker:
-        return worker(args.mode,args.output_io)
     root = TASK/'production'
     if args.mode == 'production' and (root/'quantization-complete.json').exists():
         report = json.loads((root/'quantization-complete.json').read_text())
         if report.get('status') != 'passed':
             raise ValueError('unrecognized completion receipt; diagnose before reuse')
         return 0
+    if args.mode == 'production' and (root/'output-io-code.json').exists() and args.output_io != 'sequential':
+        raise ValueError('sequential output backend is already active; refuse legacy output resume')
+    if args.worker:
+        return worker(args.mode,args.output_io)
     preflight = maxq_command([PYTHON, '-m', 'inkling2.preflight', '--source', SOURCE,
                               *(['--production'] if args.mode == 'production' else [])])
     wait = 1800 if args.mode == 'production' else 300
