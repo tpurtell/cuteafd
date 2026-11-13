@@ -5,7 +5,7 @@ use crate::shared::{
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::ArenaTag;
-use cuteafd_loader::{families::minimax_m3::weight_layout::CoordinatorWeights, plan::Checkpoint};
+use cuteafd_loader::{families::minimax_m3::weight_layout::{CoordinatorWeights, HeadsWeights, TensorSlice}, plan::Checkpoint};
 use std::collections::BTreeMap;
 use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
 
@@ -55,17 +55,54 @@ impl<'a> TargetWeights<'a> {
         Ok((target, embedding))
     }
 
+    /// Native head/neuron slices use the same admitted mount/recorded-push path.
+    pub fn load_heads(device: Device<'a>, checkpoint: &Checkpoint, layout: &HeadsWeights) -> Result<Self> {
+        let arena = DeviceWeightArena::new(device, layout.target.arena.clone(), ArenaTag::weights("minimax/target"))?;
+        Self::load_selected(device, checkpoint, &layout.target, &arena, false, Some(layout))
+    }
+
+    pub fn load_heads_with_embedding(device: Device<'a>, checkpoint: &Checkpoint,
+        layout: &HeadsWeights, placement: EmbedPlacement) -> Result<(Self, TokenEmbedding<'a>)> {
+        ensure!(layout.target.rank == 0, "MiniMax heads embedding must load on entry rank");
+        ensure!(layout.target.arena.view(EMBEDDING).is_some() == (placement == EmbedPlacement::Gpu),
+            "MiniMax heads embedding placement differs from admission");
+        let tensor = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == EMBEDDING)
+            .context("MiniMax embedding header")?;
+        let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta,
+            *tensor.meta.shape.get(1).context("MiniMax embedding shape")?)?;
+        let arena = DeviceWeightArena::new(device, layout.target.arena.clone(), ArenaTag::weights("minimax/target"))?;
+        let (embedding, target) = device.run(|| TokenEmbedding::load_with(device.library, source, placement,
+            || Self::load_selected(device, checkpoint, &layout.target, &arena, true, Some(layout)),
+            |_, bytes| arena.view(EMBEDDING, bytes)))?;
+        Ok((target, embedding))
+    }
+
     fn load_into(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights,
         arena: &DeviceWeightArena<'a>, embedding_loaded: bool) -> Result<Self> {
+        Self::load_selected(device, checkpoint, layout, arena, embedding_loaded, None)
+    }
+
+    fn load_selected(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights,
+        arena: &DeviceWeightArena<'a>, embedding_loaded: bool, heads: Option<&HeadsWeights>) -> Result<Self> {
         let mut rects = BTreeMap::new();
         for (name, view) in layout.arena.views() {
             if embedding_loaded && name == EMBEDDING { continue; }
-            let rect = Rect::tensor(checkpoint, name, None, None)?;
+            let rect = match heads {
+                Some(heads) => {
+                    let TensorSlice { rows, columns, .. } = heads.slices.get(name)
+                        .context("MiniMax heads source slice missing")?;
+                    Rect::tensor(checkpoint, name, Some(rows.clone()), Some(columns.clone()))?
+                }
+                None => Rect::tensor(checkpoint, name, None, None)?,
+            };
             ensure!(rect.bytes() == view.bytes(), "MiniMax mount {name}: source differs from admitted view");
             rects.insert(name.clone(), rect);
         }
         let dense = DenseLoad::mount(device.library);
-        dense.admit_mount(layout.mount_load(checkpoint)?)?;
+        dense.admit_mount(match heads {
+            Some(heads) => heads.mount_load(checkpoint)?,
+            None => layout.mount_load(checkpoint)?,
+        })?;
         let mut operands = BTreeMap::new();
         for (name, rect) in rects {
             let bytes = rect.bytes();
@@ -337,6 +374,63 @@ mod tests {
             assert_eq!(fixture.events()?.matches('D').count(), 1);
             drop((target, embedding));
             assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, 1 << 20);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn heads_rectangles_preserve_bytes_and_read_source_once_per_gpu() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let (checkpoint, _, source) = checkpoint(dir.path())?;
+        for rank in 0..2 {
+            let mut slices = BTreeMap::new();
+            let mut expected = BTreeMap::new();
+            for tensor in &checkpoint.tensors {
+                let name = &tensor.meta.name;
+                let rows = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
+                let row_bytes = source[name].len() / rows;
+                let columns = if name.starts_with("q.") {
+                    rank * (row_bytes / 2)..(rank + 1) * (row_bytes / 2)
+                } else { 0..row_bytes };
+                let bytes = source[name].chunks_exact(row_bytes)
+                    .flat_map(|row| row[columns.clone()].iter().copied()).collect::<Vec<_>>();
+                expected.insert(name.clone(), bytes);
+                slices.insert(name.clone(), TensorSlice { rows: 0..rows, columns, row_bytes });
+            }
+            let layout = HeadsWeights { target: CoordinatorWeights { rank, layers: vec![2, 5],
+                arena: WeightArenaLayout::new(format!("minimax/target/{rank}"), expected.iter()
+                    .map(|(name, bytes)| (name.clone(), bytes.len())))?, projections: Vec::new() }, slices };
+            let device = Device { library: &library, id: rank as i32 };
+            let phase = crate::shared::memory::load_timing::Split::start();
+            let mounted = TargetWeights::load_heads(device, &checkpoint, &layout)?;
+            assert_eq!(phase.read_bytes(), source.values().map(|bytes| bytes.len() as u64).sum::<u64>(),
+                "partial-column row windows read each source byte once per GPU");
+            drop(phase);
+            let (pushed, records) = crate::shared::experts::rtx::dense::recording(||
+                TargetWeights::load_heads(device, &checkpoint, &layout))?;
+            assert!(records.steps.is_empty(), "heads loads must not transform weights");
+            let phase = crate::shared::memory::load_timing::Split::start();
+            crate::shared::experts::rtx::push::tests::receive_pushed(device, None,
+                dir.path(), dir.path(), &records, None, 0, 0)?;
+            assert_eq!(phase.read_bytes(), 0, "push receiver must not reread checkpoint");
+            for (name, expected) in &expected {
+                for weights in [&mounted, &pushed] {
+                    let mut bytes = vec![0; expected.len()];
+                    device.run(|| library.copy_d2h(&mut bytes, weights.operand(name)?.buffer))?;
+                    assert_eq!(&bytes, expected, "rank {rank} {name}");
+                }
+            }
+            let devices = [rank as i32];
+            let mut inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax",
+                Lifetime::TARGET, Category::Weights, "heads fixture");
+            pushed.inventory(&mut inventory, "target")?;
+            let roots = inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].allocation.id, layout.target.arena.id());
+            assert_eq!(roots[0].allocation.bytes, layout.target.arena.bytes() as u64);
         }
         Ok(())
     }

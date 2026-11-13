@@ -713,3 +713,78 @@ fn expert_backing_descriptor_uses_canonical_mount_regions_and_physical_ids() {
         }
     }
 }
+
+#[test]
+fn heads_target_slices_match_headers_and_charge_one_arena_per_rank() -> anyhow::Result<()> {
+    use crate::families::minimax_m3::weight_layout::{CoordinatorWeights, HeadsWeights};
+    use crate::placement::planner::{ComponentKind, EmbeddingHome};
+    let (dir, _, _) = fixture();
+    let checkpoint = Checkpoint::open(dir.path())?;
+    let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+    for embedding in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
+        let heads = HeadsWeights::plan(&checkpoint, &cfg, embedding)?;
+        let whole = CoordinatorWeights::plan_with_embedding(&checkpoint, &cfg, 2, &[0, 0, 1, 1], embedding)?;
+        let mut replicated = 0;
+        let mut unique = std::collections::BTreeMap::new();
+        for target in &whole { for name in target.arena.views().keys() {
+            unique.insert(name.clone(), checkpoint.header(name).unwrap().byte_length as usize);
+        }}
+        for (name, bytes) in &unique {
+            let slices = heads.iter().filter_map(|h| h.slices.get(name)).collect::<Vec<_>>();
+            let payload: usize = slices.iter().map(|s| s.bytes()).sum();
+            if slices.len() == 2 && slices.iter().all(|s| s.bytes() == *bytes) {
+                replicated += bytes;
+                assert_eq!(payload, 2 * bytes, "{name}");
+            } else { assert_eq!(payload, *bytes, "{name}"); }
+        }
+        assert_eq!(heads.iter().map(|h| h.target.arena.payload_bytes()).sum::<usize>(),
+            unique.values().sum::<usize>() + replicated);
+        for (rank, h) in heads.iter().enumerate() {
+            assert_eq!(h.target.rank, rank);
+            assert_eq!(h.target.layers, [0, 1, 2, 3]);
+            assert_eq!(h.target.arena.bytes(), h.slices.values().map(|s| s.bytes()).sum::<usize>()
+                + h.target.arena.padding_bytes());
+            // The reduced four-expert bias has 16 bytes, unlike the release's
+            // aligned 128-expert bias. Its next view needs 240 padding bytes.
+            assert_eq!(h.target.arena.padding_bytes(), 240);
+            h.mount_load(&checkpoint)?;
+            let components = h.target.weight_components(1024)?;
+            assert_eq!(components.iter().filter(|c| matches!(&c.kind,
+                ComponentKind::Allocation { template, .. } if template.view.is_none())).count(), 1);
+            assert_eq!(components.iter().filter(|c| matches!(c.kind,
+                ComponentKind::AllocationGranularity(_))).count(), 1);
+            for (stem, rows, columns, row_bytes) in [
+                ("self_attn.q_proj.weight", rank*4096..(rank+1)*4096, 0..6144, 6144),
+                ("self_attn.q_proj.weight_scale_inv", rank*4096..(rank+1)*4096, 0..192, 192),
+                ("self_attn.k_proj.weight", rank*256..(rank+1)*256, 0..6144, 6144),
+                ("self_attn.index_q_proj.weight", rank*256..(rank+1)*256, 0..6144, 6144),
+                ("self_attn.index_k_proj.weight", 0..128, 0..6144, 6144),
+                ("self_attn.index_k_proj.weight_scale_inv", 0..128, 0..192, 192),
+                ("self_attn.o_proj.weight", 0..6144, rank*4096..(rank+1)*4096, 8192),
+                ("self_attn.o_proj.weight_scale_inv", 0..6144, rank*128..(rank+1)*128, 256),
+                ("mlp.gate_proj.weight", rank*6144..(rank+1)*6144, 0..6144, 6144),
+                ("mlp.down_proj.weight_scale_inv", 0..6144, rank*192..(rank+1)*192, 384),
+                ("input_layernorm.weight", 0..1, 0..12288, 12288),
+                ("self_attn.q_norm.weight", 0..1, 0..256, 256)] {
+                let s = &h.slices[&format!("{TEXT}layers.0.{stem}")];
+                assert_eq!((&s.rows, &s.columns, s.row_bytes), (&rows, &columns, row_bytes), "{stem}");
+            }
+            for (stem, rows, columns) in [
+                ("shared_experts.gate_proj.weight", rank*1536..(rank+1)*1536, 0..6144),
+                ("shared_experts.down_proj.weight_scale_inv", 0..6144, rank*48..(rank+1)*48),
+                ("gate.weight", 0..4, 0..6144*4),
+                ("e_score_correction_bias", 0..1, 0..16)] {
+                let s = &h.slices[&format!("{TEXT}layers.3.block_sparse_moe.{stem}")];
+                assert_eq!((&s.rows, &s.columns), (&rows, &columns), "{stem}");
+            }
+            for p in &h.target.projections {
+                assert_eq!(h.slices[&format!("{}.weight",p.stem)].bytes(),p.input*p.output);
+                assert_eq!(h.slices[&format!("{}.weight_scale_inv",p.stem)].bytes(),p.input/32*p.output);
+            }
+            assert_eq!(h.target.arena.view(&format!("{TEXT}embed_tokens.weight")).is_some(),
+                rank == 0 && embedding == EmbeddingHome::Device(0));
+            assert_eq!(h.target.arena.view("language_model.lm_head.weight").is_some(),rank == 1);
+        }
+    }
+    Ok(())
+}
