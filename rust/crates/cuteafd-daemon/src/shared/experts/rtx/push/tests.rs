@@ -813,7 +813,7 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: Option<&cuteafd_lo
     single_set(receive_pushed_sets(device, catalog, root, socket_dir, records, tp2.into_iter().collect(), sparks, gpu)?)
 }
 
-fn receive_pushed_sets<'a>(device: Device<'a>, catalog: Option<&cuteafd_loader::OfficialV41Catalog>,
+pub(crate) fn receive_pushed_sets<'a>(device: Device<'a>, catalog: Option<&cuteafd_loader::OfficialV41Catalog>,
     root: &std::path::Path, _socket_dir: &std::path::Path, records: &crate::shared::experts::rtx::dense::Records,
     tp2: Vec<CoordinatorExpertPlan>, sparks: usize, gpu: usize) -> Result<Vec<PushedExperts<'a>>> {
     use crate::shared::experts::rtx::dense::RankLayout;

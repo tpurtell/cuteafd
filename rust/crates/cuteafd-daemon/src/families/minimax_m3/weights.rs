@@ -264,8 +264,29 @@ mod tests {
             let dir = tempfile::tempdir_in(fixture.directory())?;
             let tensors = vec![(EMBEDDING.into(), "BF16", vec![4, 128]),
                 ("norm.weight".into(), "BF16", vec![128])];
-            cuteafd_loader::plan::testing::write_snapshot(dir.path(),
-                &serde_json::json!({"model_type":"fixture", "tie_word_embeddings":false}), &tensors, None);
+            let mut config: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"), "/../cuteafd-loader/src/families/minimax_m3/fixtures/config.json")))?;
+            config.as_object_mut().unwrap().remove("vision_config");
+            let text = &mut config["text_config"];
+            for (key, value) in [("vocab_size", 4), ("hidden_size", 128), ("num_hidden_layers", 1),
+                ("num_attention_heads", 1), ("num_key_value_heads", 1), ("dense_intermediate_size", 128),
+                ("bos_token_id", 0), ("eos_token_id", 1)] { text[key] = value.into(); }
+            text["moe_layer_freq"] = serde_json::json!([0]);
+            text["sparse_attention_config"]["sparse_num_index_heads"] = 1.into();
+            text["sparse_attention_config"]["sparse_attention_freq"] = serde_json::json!([0]);
+            text["sparse_attention_config"]["sparse_disable_index_value"] = serde_json::json!([1]);
+            let mut headers = tensors.clone();
+            headers.push(("language_model.lm_head.weight".into(), "BF16", vec![4, 128]));
+            headers.push(("language_model.model.norm.weight".into(), "BF16", vec![128]));
+            for norm in ["input_layernorm", "post_attention_layernorm", "self_attn.q_norm", "self_attn.k_norm"] {
+                headers.push((format!("language_model.model.layers.0.{norm}.weight"), "BF16", vec![128]));
+            }
+            for stem in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+                "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+                headers.push((format!("language_model.model.layers.0.{stem}.weight"), "F8_E4M3", vec![128, 128]));
+                headers.push((format!("language_model.model.layers.0.{stem}.weight_scale_inv"), "U8", vec![128, 4]));
+            }
+            cuteafd_loader::plan::testing::write_snapshot(dir.path(), &config, &headers, None);
             let checkpoint = Checkpoint::open(dir.path())?;
             let regions = tensors.iter().filter(|(name, _, _)|
                 placement == EmbedPlacement::Gpu || name != EMBEDDING)

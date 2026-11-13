@@ -71,6 +71,23 @@ impl<'a> Head<'a> {
             }
         })
     }
+    pub fn embed_tokens(&self, embedding: &crate::shared::token_io::TokenEmbedding<'_>,
+        tokens: &[u32], residual: Buffer) -> Result<()> {
+        ensure!(!tokens.is_empty() && tokens.len() <= self.rows
+            && tokens.iter().all(|&token| (token as usize) < self.vocab), "MiniMax embedding tokens");
+        let device = self.stream.device;
+        self.stream.drain()?;
+        device.run(|| {
+            embedding.embed(tokens, self.tokens.buffer, 1, self.normalized.buffer, self.stream.raw)?;
+            // SAFETY: the gathered BF16 rows and residual remain live on this
+            // stream; adding to zero preserves the baseline BF16-to-FP32 cast.
+            unsafe {
+                device.library.cuda_zero_bytes_async(residual, tokens.len() * 6144 * 4, self.stream.raw)?;
+                device.library.cuda_accumulate_bf16_to_f32_async(self.normalized.buffer, residual,
+                    tokens.len() * 6144, self.stream.raw)
+            }
+        })
+    }
     pub fn copy_normalized(&self, bytes: &mut [u8]) -> Result<()> {
         ensure!(!bytes.is_empty() && bytes.len() <= self.rows * 6144 * 2
             && bytes.len() % (6144 * 2) == 0, "MiniMax normalized tap extent");
