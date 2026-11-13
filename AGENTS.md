@@ -262,6 +262,8 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   `CUTEAFD_DEV_ARTIFACTS=DIR` mounts a sealed WIP artifact tree read-only at its own
   path for tests that need built native packages. `CUTEAFD_DEV_MEMORY=16g` caps the
   container's memory and swap; use it for every test on a shared Spark.
+  `CUTEAFD_DEV_CONTAINER_NAME=NAME` names the container, so a lease holder
+  (`build-resource.py --container NAME`) stops it before releasing the lease.
   `scripts/build/cuteafd-dev.sh cpu -- COMMAND` runs CPU-only with the canonical
   `/workspace/cuteafd` source mount and passes optional cache mounts/setup. Container
   targets use `CUTEAFD_DEV_TARGET_DIR=$HOME/.cache/cuteafd/builds/<task>/target`
