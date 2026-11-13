@@ -2,7 +2,7 @@
 use super::{cache::{self, RequestState, RequestStreams}, graphs::{self, Graphs, Op},
     head::Head, layer::{Kernels, UnitOwner}, prefix::MiniMaxPrefix, weights::TargetWeights};
 use crate::shared::{decode_graph::device::Basis,
-    memory::receipts::{Census, Inventory}, token_io::{EmbedPlacement, SelectPlacement, TokenEmbedding, TokenSelector}};
+    memory::receipts::{Census, Inventory}, token_io::{EmbedPlacement, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::Category;
 use cuteafd_ffi::{programs::Programs, expert_usage::{ExpertUsage, UsageDevice, UsageStorage}};
@@ -32,7 +32,6 @@ pub(crate) struct Storage<'a> {
     pub prefix: MiniMaxPrefix<'a>,
     pub head: Head<'a>,
     pub embedding: TokenEmbedding<'a>,
-    pub selector: RefCell<TokenSelector<'a>>,
     pub usage: Option<ExpertUsage<'a>>,
     devices: Vec<i32>,
 }
@@ -127,14 +126,9 @@ impl<'a> Owners<'a> {
         let requests = RequestState::new(&inputs.cfg, capacity, admitted, streams)?;
         let prefix = MiniMaxPrefix::new(requests.banks(), ranks[0].prefill[0].borrow().prefix_scratch())?;
         let head_stream = Rc::clone(&ranks.last().context("MiniMax head rank")?.decode.borrow().stream);
-        let head = Head::new(Rc::clone(&head_stream), programs, &inputs.cfg, capacity.decode.rows as usize)?;
-        let selector = head_stream.device.run(|| {
-            let mut selector = TokenSelector::new(library,
-                if inputs.device_sampling { SelectPlacement::Device } else { SelectPlacement::Host },
-                inputs.cfg.vocab_size, capacity.decode.rows as usize)?;
-            selector.reserve_sampler()?;
-            Ok(RefCell::new(selector))
-        })?;
+        let head = Head::new(head_stream, programs, &inputs.cfg, capacity.decode.rows as usize)?;
+        // The shared Qwen scheduler constructs and owns the one admitted
+        // selector. Retaining a second one here would double-charge storage.
         let usage = inputs.expert_usage.as_ref().map(|geometry| {
             let producers = devices.iter().enumerate().take(geometry.routed_layers.len())
                 .map(|(gpu, &cuda)| Ok(UsageDevice { logical: u8::try_from(gpu)?, cuda }))
@@ -142,7 +136,7 @@ impl<'a> Owners<'a> {
             ExpertUsage::new(library, geometry.clone(), &producers, Default::default())
         }).transpose()?;
         let storage = Rc::new(Storage { ranks, requests: RefCell::new(requests), prefix, head,
-            embedding, selector, usage, devices });
+            embedding, usage, devices });
         let census = storage.inventory()?;
         reconcile(&census, &admitted.solved.facts, &contract.components, pages, retained_owner)?;
         let mut graphs = Vec::with_capacity(inputs.gpus);
@@ -191,17 +185,6 @@ impl Storage<'_> {
         let mut census = Census::default();
         census.owners(weights.receipts);
         census.owners(execution.receipts);
-        let mut selector = Inventory::new(devices, "serving",
-            cuteafd_loader::placement::planner::serving::ServingOwners::LIFETIME,
-            Category::Workspace, "retained token selector");
-        self.selector.borrow().allocation_receipts(&mut selector, "selector")?;
-        // The shared API prefixes local inventories; canonical serving owners
-        // live at the root rather than under the MiniMax execution namespace.
-        for receipt in &mut selector.receipts {
-            receipt.allocation.id = receipt.allocation.id.strip_prefix("serving.")
-                .context("MiniMax selector receipt namespace")?.to_owned();
-        }
-        census.owners(selector.receipts);
         if let Some(usage) = &self.usage {
             let mut observed = Inventory::new(devices, "expert-usage", Lifetime::TARGET,
                 Category::Workspace, "retained expert telemetry");
@@ -223,12 +206,13 @@ impl Storage<'_> {
 }
 
 /// This is deliberately not a complete serving reconciliation: the scheduler
-/// must also attach transport/experts/draft/media/host-cache owners, account for
-/// expert-usage host history/worker metadata, and reconcile startup/driver/graph
+/// must also reconcile its own canonically charged selector (without allocating
+/// another here), attach transport/experts/draft/media/host-cache owners, account
+/// for expert-usage host history/worker metadata, and reconcile startup/driver/graph
 /// allowances before signalling readiness.
 fn retained_owner(id: &str) -> bool {
     ["minimax/target/", "minimax.kv.", "minimax.cache.", "minimax.rope.", "minimax.decode.",
-        "minimax.unit.", "minimax.prefix.h2d.", "minimax.head.", "selector.", "expert-usage.gpu"]
+        "minimax.unit.", "minimax.prefix.h2d.", "minimax.head.", "expert-usage.gpu"]
         .iter().any(|prefix| id.starts_with(prefix))
 }
 
@@ -377,7 +361,7 @@ mod tests {
             .chain((0..2).map(|rank| canonical::spark_budget(rank, 100 << 30)))
             .chain([cuteafd_loader::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
         Ok(MiniMaxInputs { cfg: cfg.clone(), gpus,
-            attention: cuteafd_loader::placement::AttentionPlacement::Layers,
+            attention: canonical::MINIMAX_M3.check_attention(None, gpus, gpus == 2)?,
             spark_ranks: 2, context: ModelContext::pinned(257),
             maximum_pool_tokens: 256 * 64, prefill, sequences: concurrency, manifest: std::sync::Arc::new(manifest(&targets)?),
             routed: routed.clone(), expert_backings, owners, budgets,
@@ -464,12 +448,14 @@ mod tests {
                 assert_eq!(census.receipts.iter().filter(|r|
                     r.allocation.id.starts_with("expert-usage.gpu")).count(),
                     if expert_usage { 3 * ids.len().min(inputs.routed.len()) } else { 0 });
-                assert_eq!(census.receipts.iter().any(|r| r.allocation.id.starts_with("selector.sampler.")),
-                    device_sampling);
-                for receipt in census.receipts.iter().filter(|r| r.allocation.id == "selector.output") {
-                    assert_eq!(receipt.allocation.location, Location::coordinator((ids.len() - 1) as u8));
-                    assert_eq!(receipt.allocation.bytes, concurrency * 12);
-                }
+                assert!(!census.receipts.iter().any(|r| r.allocation.id.starts_with("selector.")),
+                    "the shared scheduler must own the sole selector");
+                let selector = admitted.solved.facts.allocations.iter().find(|owner|
+                    owner.id == "selector.output").context("admitted scheduler selector missing")?;
+                assert_eq!(selector.location, Location::coordinator((ids.len() - 1) as u8));
+                assert_eq!(selector.bytes, concurrency * 12);
+                assert_eq!(admitted.solved.facts.allocations.iter().any(|owner|
+                    owner.id.starts_with("selector.sampler.")), device_sampling);
                 reconcile(&census, &admitted.solved.facts, &contract.components, 129, retained_owner)?;
                 let index = census.receipts.iter().position(|receipt|
                     receipt.allocation.id == Owner::Kv { layer: 0, plane: "index" }.id()).unwrap();
