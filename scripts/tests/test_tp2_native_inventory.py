@@ -185,7 +185,9 @@ def test_peer_watchdog_reports_counters_and_opt_in_exchange_identity():
     identity = shared.split("pub fn trace_identity", 1)[1].split(
         "pub fn terminal_state", 1)[0]
     assert 'if self.ends[0].progress.is_none()' in identity
-    assert 'var("CUTEAFD_PEER_WAIT_DIAGNOSTICS")' in shared
+    assert 'peer_wait_diagnostics()' in shared
+    storage = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/peer_storage.rs").read_text()
+    assert 'PEER_WAIT_DIAGNOSTIC: &str = "CUTEAFD_DIAG_PEER_WAIT"' in storage
     for field in ["device =", "stream =", "flag_index =", "receive_state =", "abort ="]:
         assert field in identity
     assert "synchronize(" not in identity

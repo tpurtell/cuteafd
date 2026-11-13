@@ -36,7 +36,7 @@ impl Opened {
                 programs[rank].load_matching(|name| selected.contains(name))?;
                 self.library.peer_exchange_initialize()?;
                 self.library.peer_abort_initialize()?;
-                if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1") {
+                if cuteafd_loader::serving_capacity::peer_wait_diagnostics() {
                     self.library.peer_diagnostic_initialize()?;
                 }
                 Ok(())
@@ -52,7 +52,7 @@ impl Opened {
         fixed.extend(admission::loaded_media_weights(&[args.device, peer], args.planner_media_weights)?);
         fixed.extend(experts.transport);
         fixed.extend(qwen4::dual_peer_diagnostics(
-            std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1")));
+            cuteafd_loader::serving_capacity::peer_wait_diagnostics()));
         let draft = if mtp { qwen4::dual_draft_demands(catalog, &args.native_lib, args.prefill_rows as u64)? }
             else { Vec::new() };
         let draft_budget = usize::try_from(draft.iter().map(|d| d.bytes).sum::<u64>())?;

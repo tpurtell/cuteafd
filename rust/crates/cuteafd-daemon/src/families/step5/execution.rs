@@ -750,7 +750,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                     broadcast_logged: (0..count).map(|_| Cell::new(false)).collect(),
                 };
                 let mut expected = tp2_exchange_requests(unit, lanes, kind)?;
-                if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|value| value == "1") {
+                if cuteafd_loader::serving_capacity::peer_wait_diagnostics() {
                     expected.push(cuteafd_loader::serving_capacity::PeerStorageLayout::new(
                         2 * lanes, scratch, true)?.progress_bytes as u64);
                 }

@@ -1,6 +1,16 @@
 //! Physical peer-exchange backings, shared with the native allocation path.
 use anyhow::{ensure, Context, Result};
 
+/// The private peer-wait diagnostic (`CUTEAFD_DIAG_PEER_WAIT=1`): per-issue push/wait
+/// progress records and both ranks' frontier dumps on a timed-out wait. The launcher
+/// forwards every `CUTEAFD_DIAG_*` variable to the coordinator (`wip-cards --arm-env`).
+pub const PEER_WAIT_DIAGNOSTIC: &str = "CUTEAFD_DIAG_PEER_WAIT";
+
+/// Whether the peer-wait diagnostic is on in this process.
+pub fn peer_wait_diagnostics() -> bool {
+    std::env::var(PEER_WAIT_DIAGNOSTIC).is_ok_and(|value| value == "1")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerStorageLayout {
     pub receive_bytes: usize,
