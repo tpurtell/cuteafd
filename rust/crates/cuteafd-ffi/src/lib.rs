@@ -2770,6 +2770,9 @@ impl NativeLibrary {
     pub fn free_device_buffer(&self, buffer: &mut CuteafdDeviceBuffer) -> Result<()> {
         let free_fn: FreeDeviceBufferFn = self.cuteafd_free_device_buffer()?;
         let address = buffer.ptr as usize;
+        self.retire_ordered_h2d_destinations(*buffer)?;
+        // SAFETY: ordered uploads to this allocation (including interior views)
+        // completed and released their sources before the native free.
         let status = unsafe { free_fn(buffer) };
         self.status_to_result("cuteafd_free_device_buffer", status)?;
         memory_ledger::record_free(address);
@@ -3254,6 +3257,45 @@ impl NativeLibrary {
             return Err(error);
         }
         Ok(())
+    }
+
+    fn retire_ordered_h2d_destinations(&self, buffer: CuteafdDeviceBuffer) -> Result<()> {
+        anyhow::ensure!(!self.is_quarantined_after_failed_drain(), "ordered H2D library is quarantined");
+        let start = buffer.ptr as usize;
+        if start == 0 || buffer.bytes == 0 { return Ok(()); }
+        let end = start.checked_add(buffer.bytes).context("ordered H2D destination range overflow")?;
+        let mut entries = self.ordered_h2d_staging.lock()
+            .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
+        let keys = entries.range((buffer.device_id, 0, 0)..=(buffer.device_id, usize::MAX, usize::MAX))
+            .filter_map(|(&key, _)| (start <= key.2 && key.2 < end).then_some(key))
+            .collect::<Vec<_>>();
+        if keys.is_empty() { return Ok(()); }
+        let previous = self.cuda_get_device()?;
+        let retired = (|| -> Result<()> {
+            self.cuda_set_device(buffer.device_id)?;
+            // Prove every stream's completion before releasing any source.
+            for key in &keys {
+                let entry = entries.get_mut(key).expect("ordered upload destination present");
+                if entry.pending {
+                    // SAFETY: this entry retains its live event and pinned source.
+                    unsafe { self.cuda_event_synchronize(entry.event)?; }
+                    entry.pending = false;
+                }
+            }
+            for key in &keys {
+                let entry = entries.get_mut(key).expect("ordered upload destination present");
+                // SAFETY: all copies into this allocation completed above.
+                unsafe { self.cuda_event_destroy(entry.event)?; }
+                entry.event = std::ptr::null_mut();
+                entry.staging.release_with_library(self);
+                entries.remove(key);
+            }
+            Ok(())
+        })();
+        let restored = self.cuda_set_device(previous);
+        let result = retired.and(restored);
+        if result.is_err() { self.quarantine_module_after_failed_drain(); }
+        result
     }
 
     fn release_ordered_h2d_staging(&self) -> Result<()> {

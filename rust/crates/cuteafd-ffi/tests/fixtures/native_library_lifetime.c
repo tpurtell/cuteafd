@@ -360,9 +360,18 @@ int cuteafd_cuda_dmabuf_allocation_granularity(size_t *out) {
     return 0;
 }
 
+static _Alignas(256) unsigned char reused_device_storage[256];
+static int reuse_device_storage, reused_device_live;
+void fixture_reuse_device_storage(void) { reuse_device_storage = 1; }
+
 int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out, uint32_t kind, const char *owner) {
     if (!valid_tag(kind, owner)) return 1;
-    if (extent_only) {
+    if (reuse_device_storage) {
+        if (reused_device_live || bytes > sizeof(reused_device_storage)) return 1;
+        out->ptr = reused_device_storage;
+        reused_device_live = 1;
+        memset(out->ptr, 0, bytes);
+    } else if (extent_only) {
         out->ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (out->ptr == MAP_FAILED) return 1;
@@ -389,7 +398,9 @@ int cuteafd_free_device_buffer(struct device_buffer *buffer) {
     }
     event('d');
     if (buffer->flags == 1) memory_used[buffer->device_id] -= buffer->bytes;
-    if (extent_only && buffer->flags == 1) {
+    if (reuse_device_storage && buffer->ptr == reused_device_storage) {
+        reused_device_live = 0;
+    } else if (extent_only && buffer->flags == 1) {
         if (munmap(buffer->ptr, buffer->bytes)) return 1;
         mapped_bytes -= buffer->bytes;
     } else { free(buffer->ptr); }

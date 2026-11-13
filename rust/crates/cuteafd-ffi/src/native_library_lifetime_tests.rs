@@ -223,6 +223,97 @@ fn ordered_upload_sizes_staging_once_and_refuses_growth() -> Result<()> {
 }
 
 #[test]
+fn ordered_upload_retirement_allows_destination_address_reuse() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    // SAFETY: this private fixture mode returns one deterministic 256-byte backing.
+    unsafe { library.lib.get::<unsafe extern "C" fn()>(b"fixture_reuse_device_storage")?(); }
+    let stream = 1usize as *mut c_void;
+    let mut first = library.alloc_device_buffer(8, crate::memory_ledger::TEST)?;
+    let old = first;
+    // SAFETY: the fixture-owned destination stays live until free drains its copy.
+    unsafe { library.copy_h2d_ordered(first, &[1; 8], stream)?; }
+    let before = fixture.events()?;
+    library.free_device_buffer(&mut first)?;
+    assert_eq!(&fixture.events()?[before.len()..], "SLEFd",
+        "complete upload, destroy its event, release source, then free destination");
+    assert!(library.ordered_h2d_staging_buffer(old, stream)?.is_none());
+    let mut second = library.alloc_device_buffer(256, crate::memory_ledger::TEST)?;
+    assert_eq!(second.ptr, old.ptr);
+    // SAFETY: a new owner at the retired address has its own full-extent staging.
+    unsafe {
+        library.reserve_h2d_ordered(second, stream)?;
+        library.copy_h2d_ordered(second, &[2; 256], stream)?;
+    }
+    assert_eq!(library.ordered_h2d_staging_buffer(second, stream)?.unwrap().bytes, 256);
+    let saved = second.ptr;
+    library.free_device_buffer(&mut second)?;
+    // SAFETY: this fixture's static storage remains live after logical device free.
+    assert_eq!(unsafe { std::slice::from_raw_parts(saved.cast::<u8>(), 256) }, &[2; 256]);
+    assert!(library.ordered_h2d_staging.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[test]
+fn ordered_upload_retirement_covers_interior_views_and_all_streams_only_on_owner_device() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    let mut root = library.alloc_device_buffer(64, crate::memory_ledger::TEST)?;
+    let mut other = library.alloc_device_buffer(8, crate::memory_ledger::TEST)?;
+    let a = 1usize as *mut c_void;
+    let b = 2usize as *mut c_void;
+    let slot = CuteafdDeviceBuffer { ptr: root.ptr.wrapping_byte_add(16), bytes: 8, ..root };
+    // SAFETY: root/slot/other are disjoint live destinations on retained fixture streams.
+    unsafe {
+        library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: 8, ..root }, &[1; 8], a)?;
+        library.copy_h2d_ordered(slot, &[2; 8], b)?;
+        library.copy_h2d_ordered(other, &[3; 8], a)?;
+    }
+    library.cuda_set_device(1)?;
+    // SAFETY: the fixture permits the same synthetic address on another device;
+    // this reservation has no pending copy and must not be retired with device 0.
+    unsafe { library.reserve_h2d_ordered(CuteafdDeviceBuffer { device_id: 1, ..slot }, b)?; }
+    library.cuda_set_device(0)?;
+    let before = fixture.events()?;
+    library.free_device_buffer(&mut root)?;
+    assert_eq!(&fixture.events()?[before.len()..], "SLSLEFEFd",
+        "both streams drain before either source or the root is freed");
+    assert!(library.ordered_h2d_staging_buffer(slot, b)?.is_none());
+    assert!(library.ordered_h2d_staging_buffer(other, a)?.is_some());
+    assert!(library.ordered_h2d_staging_buffer(CuteafdDeviceBuffer { device_id: 1, ..slot }, b)?.is_some());
+    assert_eq!(library.cuda_get_device()?, 0);
+    library.free_device_buffer(&mut other)?;
+    library.release_ordered_h2d_staging()?;
+    Ok(())
+}
+
+#[test]
+fn ordered_upload_retirement_failed_drain_keeps_destination_sources_and_module() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    let mut dst = library.alloc_device_buffer(8, crate::memory_ledger::TEST)?;
+    let original = dst;
+    let stream = 1usize as *mut c_void;
+    // SAFETY: the fixture destination and synthetic stream remain retained on failure.
+    unsafe { library.copy_h2d_ordered(dst, &[1; 8], stream)?; }
+    fixture.configure_pack(&library, 0, 1)?;
+    let before = fixture.events()?;
+    assert!(library.free_device_buffer(&mut dst).is_err());
+    assert_eq!((dst.ptr, dst.bytes), (original.ptr, original.bytes));
+    assert_eq!(&fixture.events()?[before.len()..], "S");
+    assert!(library.is_quarantined_after_failed_drain());
+    assert!(library.ordered_h2d_staging_buffer(dst, stream)?.is_some());
+    let before = fixture.events()?;
+    drop(library);
+    assert_eq!(fixture.events()?, before, "failed free retains destination, source, event and module");
+    assert!(fixture.resident()?);
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ordered_upload_failed_fence_retains_sources_and_module() -> Result<()> {
     let _ledger = memory_ledger::test_guard();
