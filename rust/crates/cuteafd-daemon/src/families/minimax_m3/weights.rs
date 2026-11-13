@@ -7,6 +7,12 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::ArenaTag;
 use cuteafd_loader::{families::minimax_m3::weight_layout::CoordinatorWeights, plan::Checkpoint};
 use std::collections::BTreeMap;
+use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
+
+#[path = "push.rs"]
+pub(crate) mod push;
+
+const EMBEDDING: &str = "language_model.model.embed_tokens.weight";
 
 /// Views retain the packed backing after the loading arena retires. There is
 /// deliberately no per-tensor allocation or converted weight representation.
@@ -21,15 +27,45 @@ impl<'a> TargetWeights<'a> {
     /// This synchronous mount publishes no views until every operand has landed.
     pub fn mount(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights) -> Result<Self> {
         ensure!(!is_recording(), "MiniMax synchronous target mount cannot publish recorded operands");
+        Self::load(device, checkpoint, layout)
+    }
+
+    /// Under dense recording these same native views are push destinations.
+    /// The caller must retain them unread until the admitted group commits.
+    pub fn load(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights) -> Result<Self> {
+        let arena = DeviceWeightArena::new(device, layout.arena.clone(), ArenaTag::weights("minimax/target"))?;
+        Self::load_into(device, checkpoint, layout, &arena, false)
+    }
+
+    /// Entry-rank embedding and target share the admitted backing on GPU. Host
+    /// placement uses the shared single-residency mapped pinned table instead.
+    pub fn load_with_embedding(device: Device<'a>, checkpoint: &Checkpoint,
+        layout: &CoordinatorWeights, placement: EmbedPlacement) -> Result<(Self, TokenEmbedding<'a>)> {
+        ensure!(layout.rank == 0, "MiniMax embedding must load on the entry rank");
+        ensure!(layout.arena.views().contains_key(EMBEDDING) == (placement == EmbedPlacement::Gpu),
+            "MiniMax embedding placement differs from admitted arena");
+        let tensor = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == EMBEDDING)
+            .context("MiniMax embedding header")?;
+        let hidden = *tensor.meta.shape.get(1).context("MiniMax embedding shape")?;
+        let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, hidden)?;
+        let arena = DeviceWeightArena::new(device, layout.arena.clone(), ArenaTag::weights("minimax/target"))?;
+        let (embedding, target) = device.run(|| TokenEmbedding::load_with(device.library, source, placement,
+            || Self::load_into(device, checkpoint, layout, &arena, true),
+            |_, bytes| arena.view(EMBEDDING, bytes)))?;
+        Ok((target, embedding))
+    }
+
+    fn load_into(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights,
+        arena: &DeviceWeightArena<'a>, embedding_loaded: bool) -> Result<Self> {
         let mut rects = BTreeMap::new();
         for (name, view) in layout.arena.views() {
+            if embedding_loaded && name == EMBEDDING { continue; }
             let rect = Rect::tensor(checkpoint, name, None, None)?;
             ensure!(rect.bytes() == view.bytes(), "MiniMax mount {name}: source differs from admitted view");
             rects.insert(name.clone(), rect);
         }
         let dense = DenseLoad::mount(device.library);
         dense.admit_mount(layout.mount_load(checkpoint)?)?;
-        let arena = DeviceWeightArena::new(device, layout.arena.clone(), ArenaTag::weights("minimax/target"))?;
         let mut operands = BTreeMap::new();
         for (name, rect) in rects {
             let bytes = rect.bytes();
@@ -181,6 +217,127 @@ mod tests {
         drop(weights);
         assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, capacity);
         assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_target_push_matches_mount_without_receiver_reads() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.configure_memory(&library, 1, 1 << 20)?;
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let (checkpoint, layout, expected) = checkpoint(dir.path())?;
+        let device = Device { library: &library, id: 1 };
+        let mounted = TargetWeights::mount(device, &checkpoint, &layout)?;
+        let (pushed, records) = crate::shared::experts::rtx::dense::recording(||
+            TargetWeights::load(device, &checkpoint, &layout))?;
+        assert_eq!(records.operands.len(), expected.len());
+        assert!(records.steps.is_empty());
+        let phase = crate::shared::memory::load_timing::Split::start();
+        let delivered = crate::shared::experts::rtx::push::tests::receive_pushed(device, None,
+            dir.path(), dir.path(), &records, None, 0, 0)?;
+        assert_eq!(delivered.len(), 0);
+        assert_eq!(phase.read_bytes(), 0,
+            "push receiver must not read checkpoint mount bytes");
+        for (name, expected) in &expected {
+            let mut actual = vec![0; expected.len()];
+            let mut baseline = vec![0; expected.len()];
+            device.run(|| library.copy_d2h(&mut actual, pushed.operand(name)?.buffer))?;
+            device.run(|| library.copy_d2h(&mut baseline, mounted.operand(name)?.buffer))?;
+            assert_eq!(&actual, expected, "{name}");
+            assert_eq!(actual, baseline, "{name}");
+        }
+        assert_eq!(fixture.events()?.matches('D').count(), 2);
+        drop((pushed, mounted));
+        assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, 1 << 20);
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_uses_one_residency_and_shared_push_records() -> Result<()> {
+        for placement in [EmbedPlacement::Gpu, EmbedPlacement::Host] {
+            let fixture = Fixture::build_for_tests()?;
+            let library = fixture.load()?;
+            fixture.immediate_copies(&library)?;
+            fixture.configure_memory(&library, 1, 1 << 20)?;
+            let dir = tempfile::tempdir_in(fixture.directory())?;
+            let tensors = vec![(EMBEDDING.into(), "BF16", vec![4, 128]),
+                ("norm.weight".into(), "BF16", vec![128])];
+            let mut config: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"), "/../cuteafd-loader/src/families/minimax_m3/fixtures/config.json")))?;
+            config.as_object_mut().unwrap().remove("vision_config");
+            let text = &mut config["text_config"];
+            for (key, value) in [("vocab_size", 4), ("hidden_size", 128), ("num_hidden_layers", 1),
+                ("num_attention_heads", 1), ("num_key_value_heads", 1), ("dense_intermediate_size", 128),
+                ("bos_token_id", 0), ("eos_token_id", 1)] { text[key] = value.into(); }
+            text["moe_layer_freq"] = serde_json::json!([0]);
+            text["sparse_attention_config"]["sparse_num_index_heads"] = 1.into();
+            text["sparse_attention_config"]["sparse_attention_freq"] = serde_json::json!([0]);
+            text["sparse_attention_config"]["sparse_disable_index_value"] = serde_json::json!([1]);
+            let mut headers = tensors.clone();
+            headers.push(("language_model.lm_head.weight".into(), "BF16", vec![4, 128]));
+            headers.push(("language_model.model.norm.weight".into(), "BF16", vec![128]));
+            for norm in ["input_layernorm", "post_attention_layernorm", "self_attn.q_norm", "self_attn.k_norm"] {
+                headers.push((format!("language_model.model.layers.0.{norm}.weight"), "BF16", vec![128]));
+            }
+            for stem in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+                "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+                headers.push((format!("language_model.model.layers.0.{stem}.weight"), "F8_E4M3", vec![128, 128]));
+                headers.push((format!("language_model.model.layers.0.{stem}.weight_scale_inv"), "U8", vec![128, 4]));
+            }
+            cuteafd_loader::plan::testing::write_snapshot(dir.path(), &config, &headers, None);
+            let checkpoint = Checkpoint::open(dir.path())?;
+            let regions = tensors.iter().filter(|(name, _, _)|
+                placement == EmbedPlacement::Gpu || name != EMBEDDING)
+                .map(|(name, _, shape)| (name.clone(), shape.iter().product::<usize>() * 2));
+            let layout = CoordinatorWeights { rank: 0, layers: Vec::new(), projections: Vec::new(),
+                arena: WeightArenaLayout::new("minimax/target/0", regions)? };
+            let device = Device { library: &library, id: 1 };
+            let ((target, embedding), records) = crate::shared::experts::rtx::dense::recording(||
+                TargetWeights::load_with_embedding(device, &checkpoint, &layout, placement))?;
+            assert_eq!(library.cuda_get_device()?, 0);
+            assert_eq!(embedding.placement(), placement);
+            assert_eq!(embedding.owner().id, 1);
+            assert!(target.operand(EMBEDDING).is_err(), "embedding table has a single inventory owner");
+            assert_eq!(records.operands.len(), if placement == EmbedPlacement::Gpu { 2 } else { 1 });
+            assert_eq!(records.host_operands.len(), usize::from(placement == EmbedPlacement::Host));
+            let phase = crate::shared::memory::load_timing::Split::start();
+            crate::shared::experts::rtx::push::tests::receive_pushed(device, None,
+                dir.path(), dir.path(), &records, None, 0, 0)?;
+            assert_eq!(phase.read_bytes(), 0);
+            assert_eq!(embedding.host_rows(&[0, 3])?, vec![0; 2 * 128 * 2]);
+            let physical = [1];
+            let devices = CoordinatorDevices::new(&physical)?;
+            let mut inventory = Inventory::new(devices, "minimax", Lifetime::TARGET,
+                Category::Workspace, "cold golden");
+            target.inventory(&mut inventory, "target")?;
+            // Exercise the golden's actual import path before census normalization.
+            if placement == EmbedPlacement::Gpu {
+                assert!(inventory.extend(embedding.allocation_receipts(devices, "embedding")?).is_err(),
+                    "Resident embedding roots must not replace Target arena owners");
+            }
+            embedding.inventory(&mut inventory, "embedding", Lifetime::TARGET)?;
+            assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.id == layout.arena.id()).count(), 1);
+            let table = inventory.receipts.iter().find(|r| r.allocation.id == "minimax.embedding.table")
+                .context("missing embedding table receipt")?;
+            assert_eq!(table.allocation.lifetime, Lifetime::TARGET);
+            if placement == EmbedPlacement::Gpu {
+                assert_eq!(table.allocation.view.as_ref().context("embedding must be an arena view")?.backing,
+                    layout.arena.id());
+            }
+            let mut census = Census::default();
+            census.owners(inventory.receipts);
+            embedding.allocation_aliases(&mut census, devices, "minimax.embedding")?;
+            census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+            let roots = census.receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
+            assert_eq!(roots.len(), if placement == EmbedPlacement::Gpu { 1 } else { 2 });
+            assert_eq!(roots.iter().filter(|r| r.allocation.location.domain
+                == cuteafd_loader::placement::planner::Domain::Device).count(), 1);
+            assert_eq!(fixture.events()?.matches('D').count(), 1);
+            drop((target, embedding));
+            assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, 1 << 20);
+        }
         Ok(())
     }
 

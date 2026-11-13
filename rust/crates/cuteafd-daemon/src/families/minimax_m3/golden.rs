@@ -44,6 +44,8 @@ pub(crate) struct GoldenArgs {
 
 fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 
+const EMBEDDING_UPLOAD: &str = "minimax.unit.0.0.route_ids.upload";
+
 fn reference(root: &Path, id: Option<&str>, vocab: usize) -> Result<Vec<Window>> {
     let bytes = std::fs::read(root.join("manifest.json"))?;
     ensure!(digest(&bytes) == fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256,
@@ -133,16 +135,69 @@ fn run(args: GoldenArgs) -> Result<()> {
             Location::HOST, bytes, Lifetime::TARGET, Category::Workspace, "diagnostic layer download"),
             ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
     }
+    use crate::shared::{experts::rtx::{dense::HostStaging, push::{push_host_envelope, PushPolicy}},
+        token_io::{EmbedPlacement, TokenEmbedding}};
+    use cuteafd_loader::placement::planner::{ByteCurve, Component, ComponentKind};
+    let policy = PushPolicy::for_snapshot(view.snapshot())?;
+    let envelope = if policy == PushPolicy::Required {
+        // Every target operand is a direct native upload; no transform pool or
+        // retained index is needed, only this coordinator's receive ring.
+        let envelope = push_host_envelope(&[None], &[HostStaging::default()])?;
+        contract.components.retain(|component| !matches!(&component.kind,
+            ComponentKind::Allocation { template, .. } if template.group == "target mount"));
+        for allocation in envelope.allocations("minimax.push")? {
+            let bytes = allocation.bytes;
+            contract.components.push(Component::allocation(allocation,
+                ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
+        }
+        let bytes = u64::from(args.prefill_rows) * 4;
+        let allocation = cuteafd_loader::placement::planner::Allocation::buffer(EMBEDDING_UPLOAD,
+            cuteafd_loader::placement::planner::Location::PINNED, bytes, Lifetime::TARGET,
+            Category::Staging, "ordered embedding ids");
+        contract.components.push(Component::allocation(allocation,
+            ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
+        contract.add_driver_page_tables();
+        Some(envelope)
+    } else { None };
     let facts = admission::admit(&contract, sample.free_bytes, sample.total_bytes, host)?;
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let exports = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports();
     let executions = cuteafd_loader::plan::spark_executions::admit_family("minimax_m3", &exports,
         None, u64::from(args.prefill_rows), waves as u64)?;
     let model = ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint, rings, 1, executions)?;
-    let pending = SparkAdmission::plan_view(&view, ExpertGeometry::MINIMAX_M3, Some(&catalog),
+    let admission = SparkAdmission::plan_view(&view, ExpertGeometry::MINIMAX_M3, Some(&catalog),
         &SparkWorkingSet { rtx_layers: vec![], spark_layers: (3..cfg.layers).collect(),
-            spark_ranks: args.peers.len(), prefill_lanes: 1 }, args.peers.len(), model, None)?.start(&args.peers)?;
-    let target = TargetWeights::mount(device, &checkpoint, &weights)?;
+            spark_ranks: args.peers.len(), prefill_lanes: 1 }, args.peers.len(), model, None)?;
+    let weight_load = crate::shared::memory::load_timing::Split::start();
+    let target_load = crate::shared::memory::load_timing::Split::start();
+    tracing::info!("MiniMax weight transaction start");
+    let (target, embedding): (TargetWeights<'_>, Option<TokenEmbedding<'_>>) = if let Some(envelope) = envelope {
+        ensure!(admission.coordinator_pushes(), "MiniMax target and Spark experts must join one push group");
+        let (prepared, membership) = super::weights::push::prepare(&view, &catalog, &[device],
+            args.peers.len(), vec![], envelope, ||
+                TargetWeights::load_with_embedding(device, &checkpoint, &weights, EmbedPlacement::Gpu))?;
+        let pending = admission.start_with(&args.peers, membership)?;
+        let ((target, embedding), experts) = prepared.receive(&catalog)?;
+        ensure!(experts.iter().all(Vec::is_empty), "MiniMax cold golden has no coordinator expert sets");
+        target_load.log("minimax.target-resident");
+        tracing::info!(resident_bytes = weights.arena.bytes(), "MiniMax target weights resident");
+        let spark_wait = crate::shared::memory::load_timing::Split::start();
+        tracing::info!("MiniMax pending Spark wait start");
+        pending.wait()?;
+        spark_wait.log("minimax.experts-resident.wait");
+        (target, Some(embedding))
+    } else {
+        let pending = admission.start(&args.peers)?;
+        let target = TargetWeights::mount(device, &checkpoint, &weights)?;
+        target_load.log("minimax.target-resident");
+        tracing::info!(resident_bytes = weights.arena.bytes(), "MiniMax target weights resident");
+        let spark_wait = crate::shared::memory::load_timing::Split::start();
+        tracing::info!("MiniMax pending Spark wait start");
+        pending.wait()?;
+        spark_wait.log("minimax.experts-resident.wait");
+        (target, None)
+    };
+    weight_load.log("minimax.experts-resident.total");
     let kernels = Kernels::bind(device, &programs, &manifest, &cfg, &weights, args.prefill_rows, tokens)?;
     let stream = Rc::new(Stream::new(device)?);
     let mut owners = (0..waves).map(|_| UnitOwner::new(&kernels, Rc::clone(&stream), &cfg, &weights,
@@ -151,20 +206,41 @@ fn run(args: GoldenArgs) -> Result<()> {
     let mut metadata = (0..waves).map(|_| cache.metadata(args.prefill_rows)).collect::<Result<Vec<_>>>()?;
     let head = Head::new(Rc::clone(&stream), &programs, &cfg, args.prefill_rows as usize)?;
     let residual = Allocation::new(device, tokens as usize * 6144 * 4, Tag::workspace("minimax/residual"))?;
+    let embedding_ids = crate::shared::prefix::view(owners[0].plane("route_ids")?, 0,
+        args.prefill_rows as usize * 4)?;
+    let embedding_upload = if embedding.is_some() {
+        device.run(|| {
+            // SAFETY: this stable full-capacity U32 view and the issuing stream
+            // live through all golden work; every consumer is stream ordered.
+            unsafe { library.reserve_h2d_ordered(embedding_ids, stream.raw) }
+        })?;
+        Some(library.ordered_h2d_staging_buffer(embedding_ids, stream.raw)?
+            .context("MiniMax ordered embedding staging was not reserved")?)
+    } else { None };
     let devices = [args.device];
     let mut inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax",
         Lifetime::TARGET, Category::Workspace, "cold golden");
     target.inventory(&mut inventory, "target")?;
+    if let Some(embedding) = &embedding {
+        embedding.inventory(&mut inventory, "embedding", Lifetime::TARGET)?;
+    }
     cache.inventory(&mut inventory, "cache")?;
     head.inventory(&mut inventory, "head")?;
     residual.inventory(&mut inventory, "residual")?;
     for (slot, owner) in owners.iter().enumerate() { owner.inventory(&mut inventory, &format!("unit.{slot}"))?; }
     for (slot, owner) in metadata.iter().enumerate() { owner.inventory(&mut inventory, &format!("metadata.{slot}"))?; }
+    if let Some(buffer) = embedding_upload {
+        let planned = facts.allocations.iter().find(|allocation| allocation.id == EMBEDDING_UPLOAD)
+            .context("MiniMax ordered embedding staging was not admitted")?;
+        ensure!(buffer.bytes as u64 == planned.bytes && buffer.bytes == args.prefill_rows as usize * 4,
+            "MiniMax ordered embedding staging differs from exact admitted extent");
+        inventory.receipts.push(cuteafd_loader::placement::planner::Receipt {
+            allocation: planned.clone(), address: buffer.ptr as u64 });
+    }
     admission::reconcile_sync_h2d(&library, &facts, &mut inventory)?;
     let receipts = inventory.receipts.iter().map(|receipt| serde_json::json!({
         "allocation":receipt.allocation, "address":receipt.address })).collect::<Vec<_>>();
     tracing::info!(receipts = %serde_json::to_string(&receipts)?, "MiniMax retained owner inventory");
-    pending.wait()?;
     let mut link = device.run(|| SparkLink::prepared(&library, SparkWorld::canonical(args.peers.len())?,
         &args.peers, config, link_layout))?;
     link.enable_terminal_ownership(Arc::clone(&library))?;
@@ -174,7 +250,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         let mut shape = SparkSessionShape::new(args.prefill_rows, 6144, 4, ExpertV2Dtype::Bf16)?;
         shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         device.run(|| link.bootstrap(&shape))?;
-        score(&args, &view, &cfg, &weights, &target, &kernels, &cache, &head, &residual,
+        score(&args, &view, &cfg, &weights, &target, embedding.as_ref(), &kernels, &cache, &head, &residual,
             &mut owners, &mut metadata, &mut link)
     })();
     let terminal = link.terminal_quiesce().and_then(|_| link.terminal_drain_copies())
@@ -186,12 +262,19 @@ fn run(args: GoldenArgs) -> Result<()> {
     let mut final_inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax",
         Lifetime::RESIDENT, Category::Staging, "cold golden completion");
     admission::reconcile_sync_h2d(&library, &facts, &mut final_inventory)?;
+    if let Some(initial) = embedding_upload {
+        let actual = library.ordered_h2d_staging_buffer(embedding_ids, stream.raw)?
+            .context("MiniMax ordered embedding staging retired before completion")?;
+        ensure!(actual.ptr == initial.ptr && actual.bytes == initial.bytes,
+            "MiniMax ordered embedding staging grew after first reserve");
+    }
     result
 }
 
 #[allow(clippy::too_many_arguments)]
 fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
-    admitted: &CoordinatorWeights, weights: &TargetWeights<'a>, kernels: &Kernels<'a>,
+    admitted: &CoordinatorWeights, weights: &TargetWeights<'a>,
+    embedding: Option<&crate::shared::token_io::TokenEmbedding<'a>>, kernels: &Kernels<'a>,
     cache: &Cache<'a>, head: &Head<'a>, residual: &Allocation<'a>, owners: &mut [UnitOwner<'a>],
     metadata: &mut [super::cache::Metadata<'a>], link: &mut SparkLink<'a>) -> Result<()> {
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
@@ -217,7 +300,13 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
         for first in (0..count).step_by(args.prefill_rows as usize) {
             let end = (first + args.prefill_rows as usize).min(count);
             let span = crate::shared::prefix::view(residual.buffer, first * 6144 * 4, (end - first) * 6144 * 4)?;
-            head.embed(weights, &window.tokens[first..end], span)?;
+            if let Some(embedding) = embedding {
+                let owner = &owners[0];
+                let ids = crate::shared::prefix::view(owner.plane("route_ids")?, 0,
+                    args.prefill_rows as usize * 4)?;
+                Head::embed_tokens(cfg, args.prefill_rows as usize, embedding,
+                    &window.tokens[first..end], &owner.stream, ids, owner.dense.producer_destination(), span)?;
+            } else { head.embed(weights, &window.tokens[first..end], span)?; }
         }
         let mut taps = if args.tap_layers.is_empty() { None } else {
             let parent = args.save_logits.join("layer-taps");

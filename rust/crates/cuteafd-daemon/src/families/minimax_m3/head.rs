@@ -71,6 +71,47 @@ impl<'a> Head<'a> {
             }
         })
     }
+    /// Prefill uses unit-owned scratch, independently of the bounded vocabulary
+    /// head. `ids` is the same full-capacity U32 view reserved at startup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn embed_tokens(cfg: &MiniMaxM3Config, capacity_rows: usize,
+        embedding: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32],
+        stream: &Stream<'_>, ids: Buffer, gathered: Buffer, residual: Buffer) -> Result<()> {
+        check_embedding(cfg, capacity_rows, embedding, tokens.len(), stream, ids, gathered, residual)?;
+        embedding.check(tokens)?;
+        upload_embedding_ids(stream, ids, tokens)?;
+        // SAFETY: the ordered upload initializes every consumed id on this
+        // stream. The caller retains the unit scratch and embedding until the
+        // stream drains; all prior scratch consumers are ordered on it.
+        unsafe { Self::embed_device_ids(cfg, capacity_rows, embedding, tokens.len(), stream,
+            ids, gathered, residual) }
+    }
+    /// Decode/verify consumes device token ids directly, without a host hop.
+    ///
+    /// # Safety
+    /// `ids` holds `rows` initialized U32 token ids when `stream` reaches the
+    /// gather. All scratch consumers/producers are ordered on this stream (or
+    /// joined by events). The table, ids, gathered BF16 rows and FP32 residual
+    /// stay live until it drains; peer tables require enabled peer access.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn embed_device_ids(cfg: &MiniMaxM3Config, capacity_rows: usize,
+        embedding: &crate::shared::token_io::TokenEmbedding<'_>, rows: usize,
+        stream: &Stream<'_>, ids: Buffer, gathered: Buffer, residual: Buffer) -> Result<()> {
+        check_embedding(cfg, capacity_rows, embedding, rows, stream, ids, gathered, residual)?;
+        let count = rows.checked_mul(cfg.hidden).ok_or_else(|| anyhow::anyhow!("MiniMax embedding extent overflow"))?;
+        stream.device.run(|| {
+            // SAFETY: checked disjoint same-device extents; caller retains and
+            // orders every operand on this stream through drainage. Shared
+            // gather handles BF16, row-FP8 and peer/mapped tables uniformly.
+            unsafe {
+                embedding.gather(ids.ptr, std::ptr::null(), rows, 1, std::ptr::null(),
+                    gathered.ptr, None, crate::shared::peer_split::RankDevice {
+                        device: stream.device.id, stream: stream.raw })?;
+                stream.device.library.cuda_zero_bytes_async(residual, count * 4, stream.raw)?;
+                stream.device.library.cuda_accumulate_bf16_to_f32_async(gathered, residual, count, stream.raw)
+            }
+        })
+    }
     pub fn copy_normalized(&self, bytes: &mut [u8]) -> Result<()> {
         ensure!(!bytes.is_empty() && bytes.len() <= self.rows * 6144 * 2
             && bytes.len() % (6144 * 2) == 0, "MiniMax normalized tap extent");
@@ -129,6 +170,45 @@ impl<'a> Head<'a> {
         ensure!(logits.iter().all(|value| value.is_finite()), "MiniMax nonfinite head logits");
         Ok(logits)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_embedding(cfg: &MiniMaxM3Config, capacity_rows: usize,
+    embedding: &crate::shared::token_io::TokenEmbedding<'_>, rows: usize,
+    stream: &Stream<'_>, ids: Buffer, gathered: Buffer, residual: Buffer) -> Result<()> {
+    ensure!(cfg.hidden == 6144 && embedding.hidden() == cfg.hidden && embedding.vocab() == cfg.vocab_size,
+        "MiniMax embedding differs from admitted config");
+    check_embedding_buffers(cfg.hidden, capacity_rows, rows, stream.device.id, ids, gathered, residual)
+}
+
+fn check_embedding_buffers(hidden: usize, capacity_rows: usize, rows: usize, device: i32,
+    ids: Buffer, gathered: Buffer, residual: Buffer) -> Result<()> {
+    ensure!(rows > 0 && rows <= capacity_rows, "MiniMax embedding exceeds admitted unit rows");
+    let id_bytes = capacity_rows.checked_mul(4).ok_or_else(|| anyhow::anyhow!("MiniMax id extent overflow"))?;
+    let values = rows.checked_mul(hidden).ok_or_else(|| anyhow::anyhow!("MiniMax embedding extent overflow"))?;
+    let bytes = values.checked_mul(4).ok_or_else(|| anyhow::anyhow!("MiniMax residual extent overflow"))?;
+    ensure!(ids.bytes == id_bytes, "MiniMax embedding ids need a stable full-capacity U32 view");
+    let spans = [(ids, id_bytes, 4), (gathered, bytes / 2, 2), (residual, bytes, 4)];
+    let mut ranges = Vec::with_capacity(spans.len());
+    for (buffer, bytes, alignment) in spans {
+        let first = buffer.ptr as usize;
+        let end = first.checked_add(bytes).ok_or_else(|| anyhow::anyhow!("MiniMax embedding address overflow"))?;
+        ensure!(first != 0 && first % alignment == 0 && buffer.device_id == device && buffer.bytes >= bytes,
+            "MiniMax embedding scratch device, alignment or extent");
+        ensure!(ranges.iter().all(|&(start, stop)| end <= start || stop <= first),
+            "MiniMax embedding scratch overlaps");
+        ranges.push((first, end));
+    }
+    Ok(())
+}
+
+fn upload_embedding_ids(stream: &Stream<'_>, ids: Buffer, tokens: &[u32]) -> Result<()> {
+    let bytes = tokens.iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>();
+    stream.device.run(|| {
+        // SAFETY: the stable full-capacity unit destination and stream survive
+        // every queued consumer; ordered staging retains this host source.
+        unsafe { stream.device.library.copy_h2d_ordered(ids, &bytes, stream.raw) }
+    })
 }
 
 #[cfg(test)]
@@ -325,6 +405,52 @@ mod tests {
             assert_eq!(spans.iter().flat_map(|span| span.clone().map(|row| prediction + row))
                 .collect::<Vec<_>>(), (prediction..prediction + rows).collect::<Vec<_>>());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_embedding_capacity_is_independent_of_head_rows() -> Result<()> {
+        let buffer = |address, bytes| Buffer { ptr: address as *mut std::ffi::c_void,
+            bytes, device_id: 1, flags: 0 };
+        let capacity = 2752;
+        let ids = buffer(0x10000usize, capacity * 4);
+        let gathered = buffer(0x20000, capacity * 6144 * 2);
+        let residual = buffer(0x4000000, capacity * 6144 * 4);
+        for rows in [1, 64, 65, capacity] {
+            check_embedding_buffers(6144, capacity, rows, 1, ids, gathered, residual)?;
+        }
+        assert!(check_embedding_buffers(6144, capacity, capacity + 1, 1, ids, gathered, residual).is_err());
+        for bytes in [4, capacity * 4 * 4] {
+            assert!(check_embedding_buffers(6144, capacity, 1, 1,
+                Buffer { bytes, ..ids }, gathered, residual).is_err());
+        }
+        assert!(check_embedding_buffers(6144, capacity, 1, 0, ids, gathered, residual).is_err());
+        assert!(check_embedding_buffers(6144, capacity, 1, 1, ids,
+            Buffer { ptr: residual.ptr, ..gathered }, residual).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_ids_reserve_exact_capacity_once_for_differing_live_rows() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let stream = Stream::new(Device { library: &library, id: 1 })?;
+        let capacity = 2752;
+        let ids = Allocation::new(stream.device, capacity * 4, Tag::workspace("minimax/test-ids"))?;
+        assert!(library.ordered_h2d_staging_buffer(ids.buffer, stream.raw)?.is_none());
+        upload_embedding_ids(&stream, ids.buffer, &[1])?;
+        let initial = library.ordered_h2d_staging_buffer(ids.buffer, stream.raw)?.unwrap();
+        assert_eq!(initial.bytes, capacity * 4);
+        let events = fixture.events()?;
+        for rows in [64, 65, capacity, 1] {
+            upload_embedding_ids(&stream, ids.buffer, &vec![7; rows])?;
+            let actual = library.ordered_h2d_staging_buffer(ids.buffer, stream.raw)?.unwrap();
+            assert_eq!((actual.ptr, actual.bytes), (initial.ptr, capacity * 4));
+        }
+        assert_eq!(fixture.events()?.matches('A').count(), events.matches('A').count());
+        assert!(library.sync_h2d_staging_buffer()?.is_none());
+        stream.drain()?;
         Ok(())
     }
 }
