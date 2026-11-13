@@ -898,6 +898,15 @@ fn cached_expert_prefixes_match_independent_legacy_inventory() {
             layers: views, validation_bytes: 0 })
     }
     let (root, mut config, mut headers) = fixture();
+    // Thirty-two experts align the NVFP4 scalar tails to 256 bytes, so the
+    // pushable-source arm actually exercises Push rather than padded Mount.
+    config["text_config"]["num_local_experts"] = 32.into();
+    let first = headers.iter().filter(|(name, ..)| name.contains("layers.3.block_sparse_moe.experts.0."))
+        .cloned().collect::<Vec<_>>();
+    for expert in 4..32 {
+        headers.extend(first.iter().map(|(name, dtype, shape)|
+            (name.replace(".experts.0.", &format!(".experts.{expert}.")), *dtype, shape.clone())));
+    }
     let experts = headers.iter().filter(|(name, ..)| name.contains("layers.3.block_sparse_moe.experts."))
         .cloned().collect::<Vec<_>>();
     for layer in [1, 2] {
