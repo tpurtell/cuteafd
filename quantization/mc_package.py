@@ -198,13 +198,20 @@ def view_metadata(parent_quant, parent_config, selection, specs, *, bits, quanti
     return quant, config
 
 
+def calibration_count_key(identity):
+    keys = [key for key in ('samples', 'prompts') if key in identity['calibration']]
+    if len(keys) != 1:
+        raise ValueError('K8 calibration requires exactly one of samples or prompts')
+    return keys[0]
+
+
 def k8_diagnostics(root, selection, identity):
     """Retain every real-row reconstruction/oracle report without model imports."""
     root = Path(root)
     paths = sorted(root.rglob('*.json'))
     records = {}
     tokens = identity['calibration']['tokens']
-    if identity['calibration']['samples'] != 1426:
+    if identity['calibration'][calibration_count_key(identity)] != 1426:
         raise ValueError('K8 diagnostics require the complete calibration corpus')
     for path in paths:
         row = load_json(path)
@@ -445,7 +452,8 @@ def assemble(family, parent, source, output, *, k8=None, k8_evidence=None,
         new_shards=receipts,
         core_tensors={view: row[1] for view, row in views.items()},
         source_tensor_locations={n: source_inv['mapping'][n] for n in native},
-        source_snapshot=str(source), parent_snapshot=str(parent))
+        source_snapshot=str(source), parent_snapshot=str(parent),
+        k8_calibration_count_key=calibration_count_key(complete['identity']) if k8 else None)
     atomic_json(output / 'package-state.json', report)
     atomic_json(output / 'package-provenance.json', identity)
     return validate(output)
@@ -575,7 +583,8 @@ def validate(output):
                    new_file_bytes=sum((output / n).stat().st_size for n in state['new_files']),
                    new_file_sha256={n: sha256_file(output / n) for n in state['new_files']},
                    copied_file_sha256={n: sha256_file(output / n) for n in state['copies'] if not n.endswith('.safetensors')},
-                   copied_files=len(state['copies']), status='validated-headers-and-byte-exactness')
+                   copied_files=len(state['copies']), status='validated-headers-and-byte-exactness',
+                   k8_calibration_count_key=state.get('k8_calibration_count_key'))
     atomic_json(output / 'package-validation.json', receipt)
     return receipt
 

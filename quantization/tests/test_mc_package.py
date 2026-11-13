@@ -32,7 +32,7 @@ def tensors(module, geometry, bits):
             for n, (dtype, shape) in packed_specs(module, dict(geometry, bits=bits)).items()}
 
 
-def fixture(tmp_path, monkeypatch, family='glmf'):
+def fixture(tmp_path, monkeypatch, family='glmf', calibration_key='samples', calibration_tokens=1234567):
     parent, source, k8, output = [tmp_path / p for p in ('parent-sha', 'source-sha', 'k8', 'output')]
     for path in (parent, source, k8):
         path.mkdir()
@@ -49,15 +49,15 @@ def fixture(tmp_path, monkeypatch, family='glmf'):
         dump(source, 'consolidated.safetensors.index.json', package.load_json(source / 'model.safetensors.index.json'))
     indexed(k8, {'core.safetensors': tensors('head', geometry, 8)})
     producer = dict(source_repo=recipe.BASE_REPO, source_revision=recipe.BASE_REVISION,
-                    calibration=dict(samples=1426, tokens=1234567))
+                    calibration={calibration_key: 1426, 'tokens': calibration_tokens})
     if family in ('step5', 'glm5'):
         producer.update(gptqmodel_commit='current-encoder',
             encoder_delta=dict(k6_gptqmodel_commit='historical-encoder', change='K8 validation enabled'),
             model_runtime=dict(transformers_version='model-version'), packages=dict(torch='torch-version'))
     (k8 / 'quantization-errors').mkdir()
     dump(k8 / 'quantization-errors', 'head.json', dict(module='head', logical_shape=[128,128],
-        evidence=dict(bits=8, identity_rows=0, hessian_rows=1234567),
-        metrics=dict(hessian_sample_count=1234567, quantizer_path='hessian_ldlq',
+        evidence=dict(bits=8, identity_rows=0, hessian_rows=calibration_tokens),
+        metrics=dict(hessian_sample_count=calibration_tokens, quantizer_path='hessian_ldlq',
             hessian_numerical_contract='signed-block-hadamard-congruence-fp64-v1',
             hessian_weighted_relative_error=1e-6,
             reconstruction=dict(reference_finite=True, error_finite=True)),
@@ -177,6 +177,34 @@ def test_validate_rejects_retained_native_schema_and_dtype(tmp_path, monkeypatch
     dump(args['output'], package.mc_manifest.MANIFEST, manifest)
     with pytest.raises(ValueError, match='retained native metadata'):
         package.validate(args['output'])
+
+
+@pytest.mark.parametrize('key,tokens', [('samples', 1234567), ('prompts', 1201086)])
+def test_k8_native_calibration_key_preserved(tmp_path, monkeypatch, key, tokens):
+    family = 'kimi-k31' if key == 'prompts' else 'glmf'
+    args = fixture(tmp_path, monkeypatch, family=family, calibration_key=key, calibration_tokens=tokens)
+    if family == 'kimi-k31':
+        revision = 'a' * 40
+        parent = args['parent'].with_name(revision)
+        args['parent'].rename(parent)
+        args.update(parent=parent, parent_revision=revision)
+        monkeypatch.delitem(package.PARENTS, family)
+    original = (args['k8'] / 'core-export.json').read_bytes()
+    result = package.assemble(**args)
+    assert result['k8_calibration_count_key'] == key
+    assert package.load_json(args['output'] / 'package-state.json')['k8_calibration_count_key'] == key
+    assert package.load_json(args['output'] / 'quantization-provenance.k8.json')['calibration'] == {
+        key: 1426, 'tokens': tokens}
+    assert (args['k8'] / 'core-export.json').read_bytes() == original
+
+
+@pytest.mark.parametrize('counts', [{}, {'samples': 1426, 'prompts': 1426}])
+def test_k8_calibration_ambiguous_or_missing_refused(tmp_path, monkeypatch, counts):
+    args = fixture(tmp_path, monkeypatch)
+    identity = package.load_json(args['k8'] / 'core-export.json')['identity']
+    identity['calibration'] = dict(counts, tokens=1234567)
+    with pytest.raises(ValueError, match='exactly one of samples or prompts'):
+        package.k8_diagnostics(args['k8'] / 'quantization-errors', {'head': {}}, identity)
 
 
 def test_k8_diagnostics_require_full_rows_and_publish_reports(tmp_path, monkeypatch):
