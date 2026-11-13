@@ -298,7 +298,7 @@ the peer addition. It does not replace MLA, dense/shared FFN, or Spark
 expert reduction.
 
 With two distinct coordinator GPUs, select the following on `cuteafd serve-glmf`,
-retaining `--fp8-prefill mla,ffn` and the existing FP8 DFlash2 drafter:
+retaining the existing FP8 DFlash2 drafter:
 
 ```text
 --kda-fp8 row128 --fp8-head --kda-output-shard --kda-prefill-expanded

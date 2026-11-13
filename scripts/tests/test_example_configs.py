@@ -870,7 +870,8 @@ def test_checkpoint_onboarding_rejects_invalid_grammar(value):
 def test_mc_fp8_example_declares_only_activation_extras(name: str, tmp_path: Path) -> None:
     values = keys(EXAMPLES / name)
     assert values["CORE_VIEW"] == "fp8-compact"
-    assert values["GLM5_FLASH_FP8_PREFILL"] == "mla,ffn,kda-in,kda-o"
+    # W8A16 prefill like every family's fp8-compact core: no activation opt-in keys.
+    assert not {"GLM5_FLASH_ATTENTION_FP8_PREFILL", "GLM5_FLASH_FFN_FP8_PREFILL"} & set(values)
     assert values["RTX_GPUS"] == "2" and values["SPARK_COUNT"] == "0"
     assert "GLM5_FLASH_FP8_HEAD" not in values and "GLM5_FLASH_KDA_FP8" not in values
     assert re.fullmatch("[0-9a-f]{40}", values["MODEL_REVISION"])
@@ -881,7 +882,7 @@ def test_mc_fp8_example_declares_only_activation_extras(name: str, tmp_path: Pat
         extra_args=("--wip", "mc-fp8-test"), encoder_plan=LOCAL_PLAN)
     launch = _coordinator(result)
     assert "--core-view fp8-compact" in launch
-    assert "--fp8-prefill mla,ffn,kda-in,kda-o" in launch
+    assert "fp8-prefill" not in launch
 
 
 @pytest.mark.parametrize("name", sorted(V4_PREP))

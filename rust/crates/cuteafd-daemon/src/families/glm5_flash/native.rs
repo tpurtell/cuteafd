@@ -27,8 +27,9 @@ pub(super) fn normalize(args: &mut EngineArgs) {
     args.kda_output_shard = false;
     args.kda_prefill_expanded = false;
     args.kda_nvfp4_gate = None;
-    args.fp8_prefill.clear();
-    args.fp8_prefill.push(super::Fp8PrefillGroup::None);
+    args.attention_fp8_prefill.clear();
+    args.attention_fp8_prefill.push(super::Fp8PrefillGroup::None);
+    args.ffn_fp8_prefill = false;
 }
 
 pub(super) fn normalize_head(args: &mut EngineArgs, native_head: bool) {
@@ -51,7 +52,8 @@ pub(super) fn resolved_settings(args: &EngineArgs) -> Vec<(&'static str, String)
         ("fp8-head", args.head_format.setting().into()),
         ("kda-fp8", match args.kda_fp8 { fp8::KdaFp8::Off => "off", fp8::KdaFp8::Channel => "channel", fp8::KdaFp8::Row128 => "row128" }.into()),
         ("kda-nvfp4-gate", args.kda_nvfp4_gate.clone().unwrap_or_else(|| "off".into())),
-        ("fp8-prefill", { use clap::ValueEnum; args.fp8_prefill.iter().map(|value| value.to_possible_value().unwrap().get_name().to_owned()).collect::<Vec<_>>().join(",") })]
+        ("attention-fp8-prefill", { use clap::ValueEnum; args.attention_fp8_prefill.iter().map(|value| value.to_possible_value().unwrap().get_name().to_owned()).collect::<Vec<_>>().join(",") }),
+        ("ffn-fp8-prefill", args.ffn_fp8_prefill.to_string())]
 }
 
 pub(super) fn validate_headers(format: CheckpointFormat, legacy: impl FnOnce() -> Result<()>) -> Result<()> {

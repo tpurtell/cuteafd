@@ -256,6 +256,26 @@ mod tests {
         assert!(selected.check_metadata_bytes("config.k8.json", b"{}").is_err());
         Ok(())
     }
+
+    #[test]
+    fn only_mc_checkpoints_declare_a_core_view() -> Result<()> {
+        let root = fixture();
+        for view in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact, CoreView::Fp8Compact] {
+            let selected = CheckpointView::select(&root, view)?;
+            assert_eq!(selected.declared_view(), Some(view));
+            assert_eq!(selected.fp8_recipe().is_some(), view == CoreView::Fp8Compact);
+        }
+        // A plain checkpoint (no cuteafd-mc.json) has only its own core: no view, no recipe.
+        let plain = tempfile::tempdir()?;
+        crate::plan::testing::write_snapshot(plain.path(), &crate::plan::testing::kimi_k3_config(),
+            &crate::plan::testing::kimi_k3_tensors(false), None);
+        let selected = CheckpointView::select(plain.path(), CoreView::Original)?;
+        assert!(!selected.is_mc());
+        assert_eq!((selected.declared_view(), selected.fp8_recipe()), (None, None));
+        assert!(CheckpointView::select(plain.path(), CoreView::K6Compact).is_err());
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]

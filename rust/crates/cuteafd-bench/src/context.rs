@@ -60,6 +60,13 @@ impl ServerContext {
         apply_resolved(&mut self.settings, name, value);
     }
 
+    /// The setting does not apply to what served: drop every record of it, launch-time ones
+    /// included, so no report shows a value the server never had.
+    pub fn withdraw(&mut self, name: &str) {
+        self.settings.retain(|setting| setting.name != name);
+        self.derived.retain(|derived| derived != name);
+    }
+
     /// Publish the canonical identity from the engine's validated target configuration.
     pub fn set_family(&mut self, family: &str) {
         self.family = Some(family.to_owned());
@@ -180,6 +187,20 @@ fn publish_resolved(state: &State, name: &str, value: &str) {
             return;
         }
         apply_resolved(&mut slot.settings, name, value);
+    }
+}
+
+/// Withdraw a setting that does not apply to the served checkpoint (see `ServerContext::withdraw`).
+pub fn withdraw(name: &str) {
+    let state = state();
+    if let Ok(mut slot) = state.context.lock() {
+        if state.ready.get().is_some() {
+            tracing::error!(setting = name, "resolved settings are sealed at readiness; withdrawal rejected");
+            drop(slot);
+            debug_assert!(false, "setting {name} withdrawn after readiness");
+            return;
+        }
+        slot.withdraw(name);
     }
 }
 
@@ -369,6 +390,20 @@ mod tests {
             assert_eq!(context.settings[0].value.as_deref(), Some("16"));
             assert_eq!(context.settings[0].default.as_deref(), Some("8"));
         }
+    }
+
+    #[test]
+    fn withdrawn_settings_leave_no_launch_or_resolved_record() {
+        let launch = |name: &str| Setting { name: name.into(), value: Some("original".into()),
+            default: Some("original".into()), source: "default".into() };
+        let mut context = ServerContext { settings: vec![launch("core-view"), launch("slots")], ..Default::default() };
+        context.resolve("core-view", "original");
+        context.require_resolved("core-view-fingerprint");
+        context.withdraw("core-view");
+        context.withdraw("core-view-fingerprint");
+        assert_eq!(context.validate_resolved(), Ok(()));
+        let names: Vec<_> = context.report_settings().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["slots"]);
     }
 
     #[test]

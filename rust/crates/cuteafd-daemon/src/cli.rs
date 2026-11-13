@@ -327,6 +327,29 @@ impl CoreViewArgs {
     }
 }
 
+/// The served core identity a card and fidelity pairing read: `core-view`, its fingerprint and
+/// the FP8 recipe (`none` unless fp8-compact), published only when the checkpoint declares views
+/// (MC). A plain checkpoint has only its own core, so every such record, the `--core-view`
+/// launch default included, is withdrawn rather than reported as `original`.
+pub(crate) fn publish_core_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView) {
+    for (name, value) in core_view_settings(view) {
+        match value {
+            Some(value) => cuteafd_bench::context::set_resolved(name, &value),
+            None => cuteafd_bench::context::withdraw(name),
+        }
+    }
+    tracing::info!(core_view = view.declared_view().map(|v| v.name()), bundle = view.fingerprint(),
+        fp8_recipe = view.fp8_recipe(), "selected immutable dense-core view");
+}
+
+pub(crate) fn core_view_settings(view: &cuteafd_loader::plan::checkpoint::CheckpointView)
+    -> [(&'static str, Option<String>); 3] {
+    let declared = view.declared_view();
+    [("core-view", declared.map(|v| v.name().to_owned())),
+        ("core-view-fingerprint", declared.map(|_| view.fingerprint().to_owned())),
+        ("core-fp8-recipe", declared.map(|_| view.fp8_recipe().unwrap_or("none").to_owned()))]
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
     #[command(flatten)]
@@ -806,6 +829,35 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn core_view_is_reported_only_for_checkpoints_that_declare_views() -> anyhow::Result<()> {
+        use cuteafd_loader::plan::{checkpoint::{CheckpointView, CoreView, view::FP8_RECIPE}, testing};
+        let shapes = std::collections::BTreeMap::from([("lm_head.weight".to_owned(), vec![128, 128])]);
+        let mc = tempfile::tempdir()?;
+        testing::write_mc_snapshot(mc.path(), &serde_json::json!({}), &[], &shapes);
+        for (mode, recipe) in [(CoreView::Original, "none"), (CoreView::K6Compact, "none"),
+            (CoreView::K8Compact, "none"), (CoreView::Fp8Compact, FP8_RECIPE)] {
+            let view = CheckpointView::select(mc.path(), mode)?;
+            assert_eq!(super::core_view_settings(&view), [("core-view", Some(mode.name().to_owned())),
+                ("core-view-fingerprint", Some(view.fingerprint().to_owned())),
+                ("core-fp8-recipe", Some(recipe.to_owned()))]);
+        }
+        // A plain (K4/K6-core, vendor FP8 or BF16) checkpoint has no view to report.
+        let plain = tempfile::tempdir()?;
+        testing::write_snapshot(plain.path(), &testing::kimi_k3_config(), &testing::kimi_k3_tensors(false), None);
+        let view = CheckpointView::select(plain.path(), CoreView::Original)?;
+        assert_eq!(super::core_view_settings(&view),
+            [("core-view", None), ("core-view-fingerprint", None), ("core-fp8-recipe", None)]);
+        let mut context = cuteafd_bench::context::ServerContext { settings: vec![cuteafd_bench::report::Setting {
+            name: "core-view".into(), value: Some("original".into()), default: Some("original".into()),
+            source: "default".into() }], ..Default::default() };
+        for (name, value) in super::core_view_settings(&view) {
+            match value { Some(value) => context.resolve(name, &value), None => context.withdraw(name) }
+        }
+        assert!(context.report_settings().iter().all(|s| !s.name.starts_with("core-")));
+        Ok(())
+    }
+
     #[test]
     fn memory_policy_flags_parse_sizes_and_reject_percentages() {
         use clap::Parser;

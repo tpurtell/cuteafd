@@ -134,6 +134,12 @@ impl CheckpointView {
     pub fn snapshot(&self) -> &Path { &self.snapshot }
     pub fn mode(&self) -> CoreView { self.mode }
     pub fn is_mc(&self) -> bool { self.metadata_digests.contains_key(MC_MANIFEST) }
+    /// The core view this checkpoint serves, when it declares views at all (an MC checkpoint
+    /// with `cuteafd-mc.json`). A plain checkpoint has only its own core: `None`, not
+    /// `original`, so nothing downstream labels it with a view it cannot switch.
+    pub fn declared_view(&self) -> Option<CoreView> { self.is_mc().then_some(self.mode) }
+    /// The FP8 conversion recipe of a load-time `fp8-compact` view, else `None`.
+    pub fn fp8_recipe(&self) -> Option<&'static str> { (self.mode == CoreView::Fp8Compact).then_some(FP8_RECIPE) }
     pub fn config_name(&self) -> &str { &self.config_name }
     pub fn index_name(&self) -> &str { &self.index_name }
     pub fn quant_names(&self) -> &[String] { &self.quant_names }

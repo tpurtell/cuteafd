@@ -159,19 +159,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
     cuteafd_bench::context::set_family(cfg.family_id());
-    let mode = match view.mode() {
-        cuteafd_loader::plan::checkpoint::CoreView::Original => "original",
-        cuteafd_loader::plan::checkpoint::CoreView::K6Compact => "k6-compact", cuteafd_loader::plan::checkpoint::CoreView::K8Compact => "k8-compact",
-        cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact => "fp8-compact",
-    };
-    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
-        cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
-    } else { "none" };
-    cuteafd_bench::context::set_resolved("core-view", mode);
-    cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
-    cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
-    tracing::info!(core_view = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
-        "selected immutable Muse attention bundle");
+    crate::cli::publish_core_view(&view);
     let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
     let device_ids = args.devices();
     let gpus = device_ids.len();

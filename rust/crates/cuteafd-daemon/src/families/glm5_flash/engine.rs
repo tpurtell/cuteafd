@@ -4825,7 +4825,7 @@ impl<'a> GlmfEngine<'a> {
     /// KDA over the layer's only (FP8, per-row x 128-K, K-major scales) in/out
     /// projections: `kda_w8_{cap}`. Decode rows up to `FP8_DECODE_ROWS` (the program's canonical
     /// GEMV capacity, full and half heads alike) run the FP8 GEMV, wider verify steps W8A16;
-    /// prefill runs W8A8 on the `--fp8-prefill kda-*` bits, else W8A16. `rows_at`: the
+    /// prefill runs W8A8 on the `--attention-fp8-prefill kda-*` bits, else W8A16. `rows_at`: the
     /// rows' input, state slots, sequence starts and output.
     #[allow(clippy::too_many_arguments)]
     fn kda_w8(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar,

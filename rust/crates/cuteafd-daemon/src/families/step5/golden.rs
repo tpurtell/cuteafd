@@ -156,7 +156,7 @@ fn save_diagnostics(
         && !positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
         && positions.windows(2).all(|p| p[0] < p[1]), "diagnostic token/scored positions mismatch");
     let identity = serde_json::json!({
-        "core_view": view.mode(), "view_fingerprint": view.fingerprint(),
+        "core_view": view.declared_view(), "view_fingerprint": view.fingerprint(),
     });
     let token_bytes = tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
     if let Some(dir) = &args.save_logits {

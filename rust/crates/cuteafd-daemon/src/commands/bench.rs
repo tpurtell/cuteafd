@@ -244,7 +244,7 @@ const DERIVED_ARGUMENTS: &[DerivedArguments] = &[
     DerivedArguments { family: Some("glm5"), names: &["max-sequences", "draft-context-slots", "draft-window-marks", "draft-fp8"] },
     DerivedArguments { family: Some("glm5_flash"), names: &["max-sequences", "slots", "draft-sequences", "draft-context-slots",
         "index-cache", "prefix-marks", "split-device", "draft-fp8", "kda-output-shard", "kda-prefill-expanded", "kda-fp32-partials", "fp8-head",
-        "kda-fp8", "kda-nvfp4-gate", "fp8-prefill"] },
+        "kda-fp8", "kda-nvfp4-gate", "attention-fp8-prefill", "ffn-fp8-prefill"] },
     DerivedArguments { family: Some("mimo_v2"), names: &["max-sequences", "rings", "draft-sequences", "draft-context-slots",
         "http-queue-depth", "split-device", "embedding-placement", "fp8-head", "fp8-o-proj", "draft-fp8", "draft-representation"] },
     DerivedArguments { family: Some("qwen4"), names: &["slots", "mtp"] },
