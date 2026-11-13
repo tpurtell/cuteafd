@@ -2,12 +2,16 @@ use super::*;
 use crate::plan::{self, testing, PlanOptions};
 
 fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
+    fixture_with_experts(4)
+}
+
+fn fixture_with_experts(experts: usize) -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = crate::families::minimax_m3::config::tests::release_config();
     // Use the checkpoint's real shape recipe without writing 89k sparse records per test.
     let mut small = cfg;
     small["text_config"]["num_hidden_layers"] = 4.into();
-    small["text_config"]["num_local_experts"] = 4.into();
+    small["text_config"]["num_local_experts"] = experts.into();
     for key in ["moe_layer_freq"] {
         small["text_config"][key].as_array_mut().unwrap().truncate(4);
     }
@@ -42,9 +46,9 @@ fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
             plain(format!("{p}self_attn.{norm}.weight"), "BF16", vec![128]);
         }
         if layer == 3 {
-            plain(format!("{p}block_sparse_moe.gate.weight"), "F32", vec![4, 6144]);
-            plain(format!("{p}block_sparse_moe.e_score_correction_bias"), "F32", vec![4]);
-            for e in 0..4 {
+            plain(format!("{p}block_sparse_moe.gate.weight"), "F32", vec![experts, 6144]);
+            plain(format!("{p}block_sparse_moe.e_score_correction_bias"), "F32", vec![experts]);
+            for e in 0..experts {
                 for (w, n, k) in [("w1", 3072, 6144), ("w3", 3072, 6144), ("w2", 6144, 3072)] {
                     let stem = format!("{p}block_sparse_moe.experts.{e}.{w}");
                     plain(format!("{stem}.weight_packed"), "U8", vec![n, k / 2]);
@@ -61,6 +65,23 @@ fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     (dir, small, tensors)
 }
 
+pub(crate) fn concurrency_matrix_snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
+    use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
+    let (dir, config, _) = fixture_with_experts(128);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = MiniMaxM3Config::from_hf(&config).unwrap();
+    let weights = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &[0; 4]).unwrap();
+    let mut programs = dense_manifest(&weights[0])["programs"].as_array().unwrap().clone();
+    for name in ["minimax_msa_programs", "minimax_producer_programs", "minimax_forward_programs"] {
+        let fixture: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!(
+            "{}/../cuteafd-ffi/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap();
+        programs.extend(fixture["programs"].as_array().unwrap().clone());
+    }
+    let manifest = dir.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, serde_json::json!({"programs": programs}).to_string()).unwrap();
+    (dir, manifest)
+}
+
 #[test]
 fn minimax_native_inventory_is_planned_not_executable() {
     let (dir, _, _) = fixture();
@@ -75,6 +96,54 @@ fn minimax_native_inventory_is_planned_not_executable() {
     assert_eq!(spec.moe_layers(), 1);
     assert!(matches!(spec.layers[0].attention, AttentionKind::BlockSparseGqa { block: 128, topk_blocks: 16, .. }));
     assert_eq!(spec.layers[0].rope.unwrap().dims, 64);
+}
+
+#[test]
+fn cache_geometry_preserves_native_fp8_pages_and_physical_layer_owners() {
+    use crate::serving_capacity::{CacheOptions, KvPlacement};
+    use crate::placement::AttentionPlacement;
+    let (dir, config, _) = fixture();
+    let cfg = MiniMaxM3Config::from_hf(&config).unwrap();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = MINIMAX_M3.open(&checkpoint).unwrap();
+    let rows = crate::placement::families::minimax_m3::PAGE_ROWS;
+    let kv = rows * cfg.kv_heads as u64 * cfg.head_dim as u64;
+    let index = rows * (cfg.msa.index_dim as u64 + 4);
+    assert_eq!((kv, kv, index), (32768, 32768, 8448));
+    let manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../cuteafd-ffi/tests/fixtures/minimax_msa_programs.json")).unwrap();
+    let mut cache_operands = 0;
+    for pointer in manifest["programs"].as_array().unwrap().iter()
+        .flat_map(|program| program["pointers"].as_array().unwrap())
+        .filter(|pointer| matches!(pointer["name"].as_str(), Some("key_cache" | "value_cache"))) {
+        assert_eq!(pointer["dtype"], "uint8");
+        assert_eq!(pointer["shape"], "[pool_pages,64,4,128] E4M3 bytes");
+        cache_operands += 1;
+    }
+    assert_eq!(cache_operands, 4);
+    let single = model.cache_geometry(CacheOptions::default()).unwrap().unwrap();
+    assert_eq!(single.logical_unit_rows, rows);
+    assert_eq!(single.placement, KvPlacement::SingleDevice);
+    assert_eq!(single.ranks[0].persistent_unit_bytes, cfg.layers as u64 * (2 * kv + index));
+    for gpus in [1, 2] {
+        let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: gpus, ..Default::default() }).unwrap().unwrap();
+        let owners = crate::placement::families::minimax_m3::layer_owners(cfg.layers, gpus);
+        let native = crate::families::minimax_m3::execution::MsaCache::new(cfg.layers as u32, 1, 1, 64).unwrap();
+        let native = native.buffers().unwrap();
+        for gpu in 0..gpus {
+            let owned: u64 = owners.iter().enumerate().filter(|(_, owner)| usize::from(**owner) == gpu)
+                .map(|(layer, _)| native.iter().filter(|(name, _)| name.starts_with(&format!("layer.{layer}.")))
+                    .map(|(_, bytes)| bytes).sum::<u64>()).sum();
+            assert_eq!(geometry.ranks[gpu].persistent_unit_bytes, owned);
+            assert_eq!(geometry.ranks[gpu].context_table_bytes_per_token, cfg.rotary_dim as u64 * 4);
+        }
+        assert_eq!(geometry.placement, if gpus == 1 { KvPlacement::SingleDevice } else { KvPlacement::PartitionedLayers });
+    }
+    for mode in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+        assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 2, attention_placement: Some(mode),
+            ..Default::default() }).is_err());
+    }
+    assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 3, ..Default::default() }).is_err());
 }
 
 #[test]
@@ -397,59 +466,65 @@ fn installed_minimax_headers_match_native_contract() {
     assert_eq!(report.spark_budget_bytes, 100 << 30);
 }
 
-/// H1 contract: the shared recipe charges each physical owner exactly once on
-/// one RTX and on a pair: one target arena backing per rank, MSA KV/index pages
-/// only on each layer's attention owner, expert arenas and Spark owners only
-/// under their own onboarding count, and the solve never re-derives a policy.
-#[test]
-fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
+fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minimax_m3::MiniMaxInputs {
     use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
     use crate::placement::families::minimax_m3::{self as shared, LayerExperts, LocalPackage, MiniMaxInputs, SparkCharge};
-    use crate::placement::planner::{Context, Location, PrefillShape, ComponentKind, Recipe, serving};
+    use crate::placement::planner::{Context, PrefillShape, serving};
     let (dir, small, _) = fixture();
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = MiniMaxM3Config::from_hf(&small).unwrap();
     let fixture = |name: &str| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(
         format!("{}/../cuteafd-ffi/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap() };
     let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
+    let owners = shared::layer_owners(cfg.layers, gpus);
+    let targets = CoordinatorWeights::plan(&checkpoint, &cfg, gpus,
+        &owners.iter().map(|&g| usize::from(g)).collect::<Vec<_>>()).unwrap();
+    // Programs: MSA, producers, forward and this layout's dense exports.
+    let mut programs = Vec::new();
+    for name in ["minimax_msa_programs", "minimax_producer_programs", "minimax_forward_programs"] {
+        programs.extend(fixture(name)["programs"].as_array().unwrap().clone());
+    }
+    let mut dense = std::collections::BTreeMap::new();
+    for target in &targets {
+        for entry in dense_manifest(target)["programs"].as_array().unwrap() {
+            dense.insert(entry["name"].as_str().unwrap().to_owned(), entry.clone());
+        }
+    }
+    programs.extend(dense.into_values());
+    let manifest = std::sync::Arc::new(serde_json::json!({"programs": programs}));
+    let prefill = PrefillShape { rows: 1024, waves: 3 };
+    let charge = |count: usize| (0..ranks).map(|_| if count == routed.len() {
+        SparkCharge { experts: 0, owners: 0, runtime: 0 } } else {
+        SparkCharge { experts: ((routed.len() - count) as u64) << 30, owners: 1 << 30, runtime: 1 << 30 } }).collect();
+    let budgets = (0..gpus).map(|gpu| shared::planned_budget(gpu as u8, 96 << 30, 96 << 30, 1 << 30))
+        .chain((0..ranks).map(|rank| shared::spark_budget(rank as u8, 100 << 30)))
+        .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
+    // Executor geometry checks are release-exact (E128); the fixture keeps four experts' headers.
+    let mut release = cfg.clone(); release.experts = 128;
+    MiniMaxInputs { cfg: release, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
+        maximum_pool_tokens: 4 << 20, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
+        manifest, routed: routed.clone(), experts: vec![LayerExperts { whole: 1 << 30, half: [1 << 29; 2] }; routed.len()],
+        local: LocalPackage::Installed { workspace: [64 << 20, if gpus == 2 { 64 << 20 } else { 0 }] },
+        spark: (0..=routed.len()).map(charge).collect(),
+        links: shared::spark_link((gpus - 1) as u8, ranks, prefill, Default::default()).unwrap(),
+        spark_reply_formats: Default::default(), drafter: None, vision: None, budgets,
+        code: vec![64 << 20; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
+        host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
+        expert_usage: None, resident_weight_limit: None,
+        mount: targets.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect() }
+}
+
+/// H1 contract: the shared recipe charges each physical owner exactly once on
+/// one RTX and on a pair: one target arena backing per rank, MSA KV/index pages
+/// only on each layer's attention owner, expert arenas and Spark owners only
+/// under their own onboarding count, and the solve never re-derives a policy.
+#[test]
+fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::{Location, ComponentKind, Recipe};
     for gpus in [1usize, 2] {
-        let owners = shared::layer_owners(cfg.layers, gpus);
-        let targets = CoordinatorWeights::plan(&checkpoint, &cfg, gpus,
-            &owners.iter().map(|&g| usize::from(g)).collect::<Vec<_>>()).unwrap();
-        // Programs: MSA, producers, forward and this layout's dense exports.
-        let mut programs = Vec::new();
-        for name in ["minimax_msa_programs", "minimax_producer_programs", "minimax_forward_programs"] {
-            programs.extend(fixture(name)["programs"].as_array().unwrap().clone());
-        }
-        let mut dense = std::collections::BTreeMap::new();
-        for target in &targets {
-            for entry in dense_manifest(target)["programs"].as_array().unwrap() {
-                dense.insert(entry["name"].as_str().unwrap().to_owned(), entry.clone());
-            }
-        }
-        programs.extend(dense.into_values());
-        let manifest = std::sync::Arc::new(serde_json::json!({"programs": programs}));
-        let ranks = 2;
-        let prefill = PrefillShape { rows: 1024, waves: 3 };
-        let charge = |count: usize| (0..ranks).map(|_| if count == routed.len() {
-            SparkCharge { experts: 0, owners: 0, runtime: 0 } } else {
-            SparkCharge { experts: ((routed.len() - count) as u64) << 30, owners: 1 << 30, runtime: 1 << 30 } }).collect();
-        let budgets = (0..gpus).map(|gpu| shared::planned_budget(gpu as u8, 96 << 30, 96 << 30, 1 << 30))
-            .chain((0..ranks).map(|rank| shared::spark_budget(rank as u8, 100 << 30)))
-            .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
-        // Executor geometry checks are release-exact (E128); the fixture keeps four experts' headers.
-        let mut release = cfg.clone(); release.experts = 128;
-        let inputs = MiniMaxInputs { cfg: release, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
-            maximum_pool_tokens: 4 << 20, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
-            manifest, routed: routed.clone(), experts: vec![LayerExperts { whole: 1 << 30, half: [1 << 29; 2] }; routed.len()],
-            local: LocalPackage::Installed { workspace: [64 << 20, if gpus == 2 { 64 << 20 } else { 0 }] },
-            spark: (0..=routed.len()).map(charge).collect(),
-            links: shared::spark_link((gpus - 1) as u8, ranks, prefill, Default::default()).unwrap(),
-            spark_reply_formats: Default::default(), drafter: None, vision: None, budgets,
-            code: vec![64 << 20; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
-            host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
-            expert_usage: None, resident_weight_limit: None,
-            mount: targets.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect() };
+        let inputs = recipe_inputs(gpus, 2);
+        let (owners, targets, prefill) = (&inputs.owners, &inputs.targets, inputs.prefill);
         let request = shared::request(inputs.context, None, crate::placement::Onboard::Auto, prefill,
             crate::placement::planner::Operation::Serving, None, Default::default());
         let contract = inputs.prepare(&request).unwrap();
@@ -478,12 +553,102 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         assert!(admitted.placement.layers.iter().all(|l| shared::MINIMAX_M3.runs(l.mode)));
         if gpus == 2 {
             // Whole owners: each layer's weights live on exactly one rank.
-            for layer in 0..cfg.layers {
+            for layer in 0..inputs.cfg.layers {
                 let stem = format!("{TEXT}layers.{layer}.input_layernorm.weight");
                 let homes = targets.iter().filter(|t| t.arena.view(&stem).is_some()).map(|t| t.rank).collect::<Vec<_>>();
                 assert_eq!(homes, [usize::from(owners[layer])], "layer {layer}");
             }
             assert!(admitted.placement.tp2.is_none_or(|t| t.peak_bytes[0] == t.peak_bytes[1]));
         }
+    }
+}
+
+
+#[test]
+fn shared_recipe_supports_layouts_and_measured_baselines_without_replanning() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::{Baseline, Operation, Phase};
+    use crate::placement::{ExpertHome, Onboard};
+    for (gpus, ranks) in (2..=8).map(|ranks| (1, ranks)).chain([(2, 4), (2, 6)]) {
+        let inputs = recipe_inputs(gpus, ranks);
+        let request = shared::request(inputs.context, Some(32768), Onboard::Layers(0), inputs.prefill,
+            Operation::Serving, None, Default::default());
+        let planned = inputs.admit(request.clone()).unwrap();
+        assert_eq!(planned.placement.pool_tokens, 32768);
+        assert!(planned.placement.layers.iter().filter(|l| l.experts != ExpertHome::Dense)
+            .all(|l| l.experts == ExpertHome::Spark));
+        let mut measured = inputs.clone();
+        for budget in &mut measured.budgets[..gpus] {
+            let Baseline::Forecast { occupied, .. } = budget.baseline else { panic!("forecast") };
+            budget.baseline = Baseline::Sampled { free: budget.physical_bytes - occupied,
+                phase: Phase::Load, source: "same pre-weight sample".into() };
+        }
+        let runtime = measured.admit(request).unwrap();
+        assert_eq!(planned.solved.pool_tokens, runtime.solved.pool_tokens);
+        assert_eq!(planned.solved.decisions, runtime.solved.decisions);
+        assert_eq!(planned.solved.facts, runtime.solved.facts);
+        for gpu in 0..gpus {
+            if gpus == 2 {
+                let hops = planned.solved.facts.allocations.iter()
+                    .filter(|owner| owner.id == shared::Owner::Hops { gpu }.id()).collect::<Vec<_>>();
+                // hop_buffer_bytes owns the slot count; the recipe supplies FP32 residual rows.
+                assert!(hops.iter().all(|owner| owner.bytes % (inputs.cfg.hidden as u64 * 4) == 0));
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_recipe_refuses_invalid_owners_concurrency_and_missing_exports() {
+    use crate::placement::families::minimax_m3::{self as shared, LocalPackage};
+    use crate::placement::planner::{Operation, Recipe, Refusal};
+    let inputs = recipe_inputs(2, 4);
+    let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+        inputs.prefill, Operation::Serving, None, Default::default());
+    for concurrency in [0, 65, 128] {
+        let mut bad = inputs.clone();
+        bad.sequences = concurrency;
+        assert!(matches!(bad.prepare(&request), Err(Refusal::InvalidFact(_))));
+    }
+    let mut bad = inputs.clone();
+    bad.owners.swap(0, 3);
+    assert!(bad.prepare(&request).unwrap_err().to_string().contains("contiguous"));
+    let mut bad = inputs.clone();
+    bad.spark[0].pop();
+    assert!(bad.prepare(&request).unwrap_err().to_string().contains("rank inventory"));
+    let mut bad = inputs.clone();
+    bad.local = LocalPackage::Missing("missing fp8-minimax-nvfp4a4/tp2/libcuteafd_fp8moe.so".into());
+    let mut pinned = request.clone();
+    pinned.onboard = crate::placement::planner::Pin::Exact(1);
+    assert!(bad.prepare(&pinned).unwrap_err().to_string().contains("fp8-minimax-nvfp4a4/tp2"));
+    // Missing local exports never prevent a remote-only layout.
+    bad.admit(request.clone()).unwrap();
+    let mut bad = inputs.clone();
+    let manifest = std::sync::Arc::make_mut(&mut bad.manifest);
+    manifest["programs"].as_array_mut().unwrap().retain(|p|
+        p["name"].as_str() != Some("exlr8_dense_mxfp8_k6144_n8192_s1_a8"));
+    let error = bad.prepare(&request).unwrap_err().to_string();
+    assert!(error.contains("exlr8_dense_mxfp8_k6144_n8192_s1_a8"), "{error}");
+}
+
+#[test]
+fn shared_recipe_onboards_whole_layers_or_tp2_halves() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::Operation;
+    use crate::placement::{ExpertHome, Onboard};
+    for gpus in [1, 2] {
+        let inputs = recipe_inputs(gpus, 0);
+        let request = shared::request(inputs.context, Some(32768), Onboard::Layers(1), inputs.prefill,
+            Operation::Serving, None, Default::default());
+        let admitted = inputs.admit(request).unwrap();
+        assert_eq!(admitted.onboard, 1);
+        assert_eq!(admitted.placement.layers[3].experts,
+            if gpus == 1 { ExpertHome::RtxWhole { gpu: 0 } } else { ExpertHome::RtxTp2 });
+        assert_eq!(admitted.placement.tp2.is_some(), gpus == 2);
+        let bytes = admitted.solved.facts.allocations.iter()
+            .filter(|owner| owner.id.starts_with("minimax.experts."))
+            .map(|owner| owner.bytes).collect::<Vec<_>>();
+        assert_eq!(bytes, vec![if gpus == 1 { (1 << 30) + (64 << 20) }
+            else { (1 << 29) + (64 << 20) }; gpus]);
     }
 }
