@@ -1480,7 +1480,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         let ple_owner = cfg.ple_layers.first().filter(|&&index| index < owners.len()).map(|&index| owners[index]);
         if let (Some(table), Some(owner)) = (&ple, ple_owner) {
-            ensure!(table.scale.buffer.device_id == ranks[owner].0.id,
+            ensure!(table.device == ranks[owner].0.id,
                 "Qwen PLE table must load on its attention owner");
         }
         let (ple_state, ple_replay) = if weights.layers.len() > cfg.ple_layers.first().copied().unwrap_or(usize::MAX) {
@@ -4006,7 +4006,7 @@ impl<'a> Qwen4Engine<'a> {
         let (gathered, local) = w.ple_rows.as_ref().context("PLE layer without gathered-row workspace")?;
         let (ids, gathered) = (local.buffer.ptr, gathered.buffer.ptr);
         self.run(name, &[("streams", w.live(streams, HC * self.cfg.hidden * 2)), ("ids", ids), ("table", gathered),
-            ("scale", table.scale.buffer.ptr), ("w_kv", layer.ptr("ple.w_kv")?),
+            ("scale", layer.ptr("ple.scale")?), ("w_kv", layer.ptr("ple.w_kv")?),
             ("norm_key", layer.ptr("ple.norm_key")?), ("norm_query", layer.ptr("ple.norm_query")?),
             ("norm_conv", layer.ptr("ple.norm_conv")?), ("conv_w", layer.ptr("ple.conv_w")?),
             ("conv_state", state.buffer.ptr), ("slots", w.slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),

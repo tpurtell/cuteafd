@@ -263,7 +263,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         .filter(|tensor| tensor.meta.name.ends_with("embed_tokens.weight")).count() == 1
         && checkpoint.require_untied_embedding("model.language_model.embed_tokens.weight").is_ok();
     let mut loaded_weights = qwen4::single_owner_weights(checkpoint, &cfg, cfg.layers, mtp,
-        options.qwen_representation, host_embedding, cfg.ple_layers.first().is_some_and(|&layer| layer < cfg.layers))?
+        options.qwen_representation, host_embedding)?
         .checked_add(crate::placement::ResidentWeights(options.drafter_bytes))?;
     let all_onboarded = cfg.layers > 0
         && options.resolve_onboard(cfg.layers) == Some(Onboard::Layers(cfg.layers));

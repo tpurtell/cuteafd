@@ -13,8 +13,7 @@ pub(super) fn single_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::pla
     use cuteafd_loader::families::qwen4::resident::Qwen4Representation;
     let mut weights = qwen4::single_owner_weights(checkpoint, cfg, layers, mtp,
         Qwen4Representation { fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head },
-        args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host,
-        cfg.ple_layers.first().is_some_and(|&layer| layer < layers))?;
+        args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host)?;
     if let Some((gpu, media)) = args.planner_media_weights {
         if gpu == args.device { weights = weights.checked_add(media)?; }
         else { media.check(0, crate::shared::memory::budget::resident_weight_limit())?; }
@@ -172,10 +171,6 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let mut future = Vec::new();
     let mut expert_arenas = Vec::new();
-    if cfg.ple_layers.first().is_some_and(|&layer| layer < layers) {
-        future.push(Demand::new(0, Category::Weights, "PLE scale", 256, Basis::Exact)
-            .with_resident_weights(ResidentWeights(256)));
-    }
     if args.fp8_decode {
         future.push(Demand::new(0, Category::Staging, "FP8 projection load staging",
             cuteafd_loader::shared::dense_read::STEP_BYTES as u64, Basis::Exact));
@@ -681,6 +676,7 @@ mod tests {
             if mapped_ple {
                 tensors.push(testing::t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
                     "F8_E4M3", &[100, 160]));
+                tensors.push(testing::t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale", "BF16", &[1]));
             }
             testing::write_snapshot(dir.path(), &config, &tensors, None);
             // Exercise explicit serial and pipelined metadata owners.
@@ -874,8 +870,10 @@ mod tests {
         let extra = qwen4::dual_ple_demands(&cfg, 48, &resident)?;
         // The loader's own arenas from a header-only fixture at the fixed cut.
         let dir = tempfile::tempdir()?;
-        cuteafd_loader::plan::testing::write_snapshot(dir.path(), &config,
-            &cuteafd_loader::plan::testing::qwen4_coordinator(&config, false), None);
+        let mut tensors = cuteafd_loader::plan::testing::qwen4_coordinator(&config, false);
+        tensors.push(cuteafd_loader::plan::testing::t(
+            "model.language_model.layers.23.ple.ple_embedding.ngram_embedding.shard_0.weight", "BF16", &[100, 160]));
+        cuteafd_loader::plan::testing::write_snapshot(dir.path(), &config, &tensors, None);
         let arenas = cuteafd_loader::families::qwen4::weight_layout::dual_arenas(
             &cuteafd_loader::plan::Checkpoint::open(dir.path())?, &cfg, &qwen4::dual_owners(48), false,
             Default::default(), 0)?;
@@ -913,7 +911,7 @@ mod tests {
                 }
                 assert_eq!(mapped.pool_tokens, 2 << 20);
                 assert_eq!(mapped.items.iter().flatten().filter(|i| i.category == Category::Tables)
-                    .map(|i| (i.group.as_str(), i.bytes)).collect::<Vec<_>>(), vec![("PLE scale", 256)]);
+                    .map(|i| (i.group.as_str(), i.bytes)).collect::<Vec<_>>(), Vec::<(&str, u64)>::new());
                 assert!(!mapped.items.iter().flatten().any(|i| i.bytes == resident.ple_table_bytes));
             }
         }
@@ -942,6 +940,7 @@ mod tests {
         let mut tensors = testing::qwen4_coordinator(&config, false);
         tensors.push(testing::t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
             "F8_E4M3", &[100, 160]));
+        tensors.push(testing::t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale", "BF16", &[1]));
         testing::write_snapshot(dir.path(), &config, &tensors, None);
         let checkpoint = cuteafd_loader::plan::Checkpoint::open(dir.path())?;
         let mut args = Cli::try_parse_from(["serve", "--snapshot", dir.path().to_str().unwrap(),

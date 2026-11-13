@@ -1243,6 +1243,9 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
         let (experts, storage) = qwen4_exl3(4, 4);
         tensors.extend(experts);
         tensors.push(t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight", dtype, &[1000, 160]));
+        if dtype == "F8_E4M3" {
+            tensors.push(t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale", "BF16", &[1]));
+        }
         let dir = snapshot(config, &tensors);
         write_quantize_config(dir.path(), &storage);
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
@@ -3331,7 +3334,7 @@ fn observed_zero_ranks_panics() {
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config).unwrap();
     let mtp = cfg.mtp_layers > 0;
     let required = crate::placement::families::qwen4::single_owner_weights(&checkpoint, &cfg, cfg.layers, mtp,
-        layout::LayoutOptions::default().qwen_representation, false, false).unwrap()
+        layout::LayoutOptions::default().qwen_representation, false).unwrap()
         .checked_add(crate::placement::families::qwen4::single_expert_weights(
             &crate::read_expert_catalog(dir.path()).unwrap(), cfg.layers, true, mtp).unwrap()).unwrap().0;
     let report = plan(dir.path(), &tight).unwrap();
@@ -5642,7 +5645,7 @@ fn qwen_native_resident_admission_includes_padding_not_source_inventory() {
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config).unwrap();
     let required = crate::placement::families::qwen4::single_owner_weights(&checkpoint, &cfg, cfg.layers, false,
-        layout::LayoutOptions::default().qwen_representation, false, false).unwrap()
+        layout::LayoutOptions::default().qwen_representation, false).unwrap()
         .checked_add(crate::placement::families::qwen4::single_expert_weights(
             &crate::read_expert_catalog(dir.path()).unwrap(), cfg.layers, true, false).unwrap()).unwrap().0;
     let options = PlanOptions { coordinator_budget_bytes: required, ..sparks(0) };

@@ -726,12 +726,11 @@ impl Opened {
                 engine::DECODE_ROWS)?),
             _ => None,
         };
-        weights::arena::probe(&self.library, &[device.id], &model, &embedding, ple.as_ref())?;
+        weights::arena::probe(&self.library, &[device.id], &model, &embedding)?;
         use cuteafd_loader::placement::ResidentWeights;
         // The physical backings actually retained (the arenas, with the device
         // embedding as a view of the target), not the per-tensor payload.
-        let mut loaded_weights = ResidentWeights(weights::arena::retained_backing_bytes(&[device.id], &model, &embedding)?)
-            .checked_add(ResidentWeights(ple.as_ref().map_or(0, |p| p.scale.buffer.bytes as u64)))?;
+        let mut loaded_weights = ResidentWeights(weights::arena::retained_backing_bytes(&[device.id], &model, &embedding)?);
         if let Some((gpu, weights)) = args.planner_media_weights {
             if gpu == args.device { loaded_weights = loaded_weights.checked_add(weights)?; }
             else { weights.check(0, crate::shared::memory::budget::resident_weight_limit())?; }

@@ -76,7 +76,8 @@ pub fn checkpoint_resident_bytes(checkpoint: &Checkpoint, cfg: &Qwen4Config,
         let selected = projections.iter().map(|p| if representation.fp8_projections {
             super::fp8_block_bytes(p.rows, p.cols) as u64
         } else { super::bf16_bytes(p.rows, p.cols) as u64 }).sum::<u64>();
-        *bytes = bytes.checked_add(padding).and_then(|n| n.checked_sub(bf16))
+        *bytes = bytes.checked_add(padding + if cfg.ple_layers.contains(&layer) { 256 } else { 0 })
+            .and_then(|n| n.checked_sub(bf16))
             .and_then(|n| n.checked_add(selected))
             .ok_or_else(|| anyhow::anyhow!("Qwen projection headers do not cover layer {layer}"))?;
     }

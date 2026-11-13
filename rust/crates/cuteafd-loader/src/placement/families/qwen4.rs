@@ -459,17 +459,17 @@ pub fn admitted(inputs: &QwenInputs<'_>) -> anyhow::Result<(Placement, ResolvedP
 
 /// The single owner's physical weight backings: the target arena (globals,
 /// head and an optional device embedding as views) and the separate MTP
-/// arena, `layout.bytes()` once each, plus the standalone 256 B PLE scale.
+/// arena, `layout.bytes()` once each, including owner-local PLE scale views.
 /// TP1 loads these before its free-memory sample, so the backings and their
 /// SM120 tails are already outside that baseline: this is a resident-weight
 /// declaration only, never a capacity charge (#1462 arena charges, option b).
 pub fn single_owner_weights(checkpoint: &crate::plan::Checkpoint, cfg: &crate::families::qwen4::Qwen4Config,
     layers: usize, mtp: bool, selected: crate::families::qwen4::resident::Qwen4Representation,
-    host_embedding: bool, ple: bool) -> anyhow::Result<ResidentWeights> {
+    host_embedding: bool) -> anyhow::Result<ResidentWeights> {
     use crate::families::qwen4::weight_layout::{embedding_table_bytes, single_arena_bytes};
     let embedding = if host_embedding { 0 } else { embedding_table_bytes(checkpoint)? };
     let arenas = single_arena_bytes(checkpoint, cfg, layers, mtp, selected, embedding)?;
-    Ok(ResidentWeights(arenas).checked_add(ResidentWeights(if ple { 256 } else { 0 }))?)
+    Ok(ResidentWeights(arenas))
 }
 
 /// Native TP1 arenas selected by the single-owner executor. Package scratch
@@ -746,19 +746,17 @@ pub fn dual_projection_load_staging(selected: crate::families::qwen4::resident::
         crate::shared::dense_read::STEP_BYTES as u64, Basis::Exact)).collect()
 }
 
-/// Only the scale follows the owning layer; tables stay mapped and step
-/// workspace accounting includes gathered row staging.
+/// Validate mapped PLE headers without extra demands: the scale belongs to
+/// the target arena and step workspace already includes gathered row staging.
 pub fn dual_ple_demands(cfg: &crate::families::qwen4::Qwen4Config, layers: usize,
     resident: &crate::families::qwen4::resident::Qwen4CheckpointResident) -> anyhow::Result<Vec<Vec<LayerExtraDemand>>> {
     anyhow::ensure!(layers <= cfg.layers && cfg.ple_layers.len() <= 1,
         "Qwen PLE demands need a backbone prefix and at most one table");
-    let mut demands = vec![Vec::new(); layers];
     if let Some(&layer) = cfg.ple_layers.first().filter(|&&layer| layer < layers) {
         anyhow::ensure!(resident.ple_table_bytes > 0, "Qwen PLE layer {layer} has no table backing headers");
-        demands[layer].push(LayerExtraDemand::new(Category::Tables, "PLE scale", 256,
-            LayerResidency::Owner, Basis::Formula).with_resident_weights(ResidentWeights(256)));
     }
-    Ok(demands)
+    // The scale follows its layer inside the target arena, never a second owner.
+    Ok(vec![Vec::new(); layers])
 }
 
 /// Admission contract for the private whole-owner executor. Unlike the legacy
@@ -802,7 +800,7 @@ pub struct QwenDualInputs<'a> {
     /// future allocations, charged once each with their single SM120 tail.
     pub arenas: &'a [(usize, crate::serving_capacity::WeightArenaLayout)],
     pub layer_experts: &'a [Option<ExpertCost>],
-    /// Owner-local side allocations, such as the PLE scale.
+    /// Owner-local allocations outside the already charged weight arenas.
     pub layer_extra: &'a [Vec<LayerExtraDemand>],
     /// Head, MTP weights/experts, embedding and exact transport
     /// buffers. Head/MTP are owner-only groups, not paired rank groups.
@@ -1230,8 +1228,12 @@ mod tests {
         use crate::families::qwen4::{resident::Qwen4Representation, weight_layout::dual_arenas};
         let dir = tempfile::tempdir().unwrap();
         let cfg = Qwen4Config::from_hf(cfg_json).unwrap();
-        crate::plan::testing::write_snapshot(dir.path(), cfg_json,
-            &crate::plan::testing::qwen4_coordinator(cfg_json, mtp), None);
+        let mut tensors = crate::plan::testing::qwen4_coordinator(cfg_json, mtp);
+        for &layer in &cfg.ple_layers {
+            tensors.push(crate::plan::testing::t(format!("model.language_model.layers.{layer}.ple.ple_embedding.ngram_embedding.shard_0.weight"),
+                "BF16", &[100, 160]));
+        }
+        crate::plan::testing::write_snapshot(dir.path(), cfg_json, &tensors, None);
         let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
         let arenas = dual_arenas(&checkpoint, &cfg, &dual_owners(cfg.layers), mtp,
             Qwen4Representation::default(), 0).unwrap();
@@ -1272,19 +1274,18 @@ mod tests {
     }
 
     #[test]
-    fn qwen_dual_ple_demands_charge_only_scale() {
+    fn qwen_dual_ple_demands_do_not_double_charge_arena_scale() {
         use crate::families::qwen4::resident::Qwen4CheckpointResident;
         let mut cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
         cfg.ple_layers = vec![1];
         let resident = Qwen4CheckpointResident { ple_table_bytes: 123_456, ..Default::default() };
         let demands = dual_ple_demands(&cfg, 4, &resident).unwrap();
         assert!(demands.iter().enumerate().all(|(layer, extra)| layer == 1 || extra.is_empty()));
-        assert_eq!(demands[1].iter().map(|d| d.bytes).sum::<u64>(), 256);
-        assert!(demands[1].iter().all(|d| d.category == Category::Tables && d.residency == LayerResidency::Owner));
+        assert!(demands.iter().all(Vec::is_empty));
         assert!(dual_ple_demands(&cfg, 1, &resident).unwrap()[0].is_empty());
         assert!(dual_ple_demands(&cfg, 4, &Qwen4CheckpointResident::default()).is_err());
         let resident = Qwen4CheckpointResident { ple_table_bytes: u64::MAX, ..Default::default() };
-        assert_eq!(dual_ple_demands(&cfg, 4, &resident).unwrap()[1][0].bytes, 256);
+        assert!(dual_ple_demands(&cfg, 4, &resident).unwrap().iter().all(Vec::is_empty));
     }
     /// A fixture TP2 cost with no resident halves: these tests price the
     /// planner's own owners, not checkpoint bytes.
@@ -1327,7 +1328,7 @@ mod tests {
         // family states, never a second search or a replicated copy.
         assert_eq!(placement.layers.iter().take_while(|layer|
             layer.mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }).count(), 2);
-        for (gpu, scales) in [(0, vec![256u64]), (1, Vec::new())] {
+        for (gpu, scales) in [(0, Vec::<u64>::new()), (1, Vec::new())] {
             assert_eq!(placement.items[gpu].iter().filter(|item| item.category == Category::Tables)
                 .map(|item| item.bytes).collect::<Vec<_>>(), scales);
         }

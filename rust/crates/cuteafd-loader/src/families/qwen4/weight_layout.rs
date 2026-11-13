@@ -8,6 +8,29 @@ const PREFIX: &str = "model.language_model.";
 
 pub fn rows_key(names: &[String]) -> String { names.join("+") }
 
+/// Header-only scale recipe for the owning layer's 256-byte FP32 view.
+/// BF16 tables need no checkpoint scalar; E4M3 tables carry exactly one.
+pub fn ple_scale_dtype(checkpoint: &Checkpoint, p: &str) -> Result<Option<DType>> {
+    let prefix = format!("{p}.ple.ple_embedding.ngram_embedding");
+    let table = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{prefix}.shard_0.weight"))
+        .with_context(|| format!("Qwen PLE lacks table headers under {prefix}"))?;
+    ensure!(table.meta.shape.len() == 2, "{prefix}: PLE table must be a matrix");
+    match table.meta.dtype {
+        DType::Bf16 => Ok(None),
+        DType::F8E4M3 => {
+            let name = format!("{prefix}.weight_scale");
+            let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == name)
+                .with_context(|| format!("Qwen PLE lacks table scale {name}"))?;
+            ensure!(tensor.meta.shape.iter().product::<usize>() == 1
+                && matches!(tensor.meta.dtype, DType::Bf16 | DType::F32)
+                && tensor.meta.byte_length == if tensor.meta.dtype == DType::Bf16 { 2 } else { 4 },
+                "{name}: expected one BF16 or FP32 table scale");
+            Ok(Some(tensor.meta.dtype.clone()))
+        }
+        ref dtype => anyhow::bail!("{prefix}: unsupported PLE table dtype {dtype:?}"),
+    }
+}
+
 struct Requests<'a> {
     checkpoint: &'a Checkpoint,
     tensors: Vec<(String, usize)>,
@@ -91,6 +114,8 @@ impl Requests<'_> {
             self.rows(["key_proj", "value_proj"].map(|n| format!("{p}.ple.{n}.weight")).to_vec(), 0, false)?;
             for n in ["norm_key", "norm_query", "norm_conv"] { self.one(format!("{p}.ple.{n}.weight"), false)?; }
             self.one(format!("{p}.ple.conv1d.weight"), true)?;
+            ple_scale_dtype(self.checkpoint, p)?;
+            self.tensors.push((format!("{p}.ple.scale"), 256));
         }
         Ok(())
     }
@@ -228,6 +253,7 @@ mod tests {
                 for n in ["key_proj", "value_proj"] { tensors.push(t(format!("{p}.ple.{n}.weight"), "BF16", &[cfg.hidden, cfg.hidden])); }
                 for n in ["norm_key", "norm_query", "norm_conv"] { tensors.push(t(format!("{p}.ple.{n}.weight"), "BF16", &[cfg.hidden])); }
                 tensors.push(t(format!("{p}.ple.conv1d.weight"), "BF16", &[cfg.hidden, 1, 4]));
+                tensors.push(t(format!("{p}.ple.ple_embedding.ngram_embedding.shard_0.weight"), "BF16", &[100, 160]));
             }
         }
         for (n, shape) in [("pre_fc_norm_hidden", vec![4 * cfg.hidden]), ("pre_fc_norm_embedding", vec![cfg.hidden]),
@@ -295,6 +321,12 @@ mod tests {
                             }
                         }
                     }
+                    let scale = format!("{PREFIX}layers.0.ple.scale");
+                    let scale_owners = layouts.iter().filter(|(_, layout)| layout.view(&scale).is_some())
+                        .collect::<Vec<_>>();
+                    assert_eq!(scale_owners.len(), 1);
+                    assert_eq!(scale_owners[0].0, owners[0]);
+                    assert_eq!(scale_owners[0].1.view(&scale).unwrap().bytes(), 256);
                     let target = &layouts[0].1;
                     assert!(target.view("embedding.table").is_some());
                     assert_eq!(target.view("lm_head.weight.fp8").is_some(), fp8_head);
