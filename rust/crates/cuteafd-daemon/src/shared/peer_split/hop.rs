@@ -22,7 +22,9 @@ use crate::shared::memory::DeviceAllocation;
 use crate::shared::memory::device::{Device, Event, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::placement::{hop_buffer_bytes, Hop, HopSpec, HopStorage, HOP_SLOTS};
+use cuteafd_loader::placement::{Hop, HopLinkLayout, HopSpec, HopStorage, HOP_SLOTS};
+#[cfg(test)]
+use cuteafd_loader::placement::hop_buffer_bytes;
 use std::ffi::c_void;
 use crate::shared::memory::Tag;
 
@@ -182,9 +184,7 @@ impl<'a> HopLink<'a> {
         ensure!(spec.row_bytes % 16 == 0 && spec.lanes > 0, "hop rows must be 16-byte multiples over at least one lane");
         ensure!(hops.iter().all(|h| h.from != h.to && h.from < 2 && h.to < 2 && h.row_bytes == spec.row_bytes),
             "hops must move between GPU0 and GPU1 at the spec's row bytes");
-        hop_buffer_bytes(hops, &spec, 2).context("hop buffer bytes overflow")?;
-        let slot_bytes = usize::try_from(spec.rows * spec.row_bytes)?;
-        let flags = usize::try_from(spec.lanes * HOP_SLOTS)?;
+        let layout = HopLinkLayout::new(hops, &spec).context("hop allocation geometry or extent overflow")?;
         let per_lane = [0u8, 1].map(|gpu| hops.iter().filter(|h| h.charged() && h.to == gpu).count()
             .min(HOP_SLOTS as usize));
         let end = |rank: usize| -> Result<End<'a>> {
@@ -196,10 +196,9 @@ impl<'a> HopLink<'a> {
                     library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                     Ok(allocation)
                 };
-                let slots = usize::try_from(spec.lanes)? * per_lane[rank];
                 Ok(End {
-                    recv: (0..slots).map(|_| zeroed(slot_bytes)).collect::<Result<_>>()?,
-                    control: zeroed((flags + 1) * 16)?,
+                    recv: layout.receive[rank].iter().map(|&bytes| zeroed(usize::try_from(bytes)?)).collect::<Result<_>>()?,
+                    control: zeroed(usize::try_from(layout.control_bytes)?)?,
                     progress: None,
                 })
             })
@@ -440,12 +439,45 @@ mod cuda_tests {
             let link = HopLink::new(&library, ranks, &hops, spec, spec.row_bytes as usize)?;
             let charged = hop_buffer_bytes(&hops, &spec, 2).unwrap();
             assert_eq!([link.receive_bytes(0), link.receive_bytes(1)], [charged[0], charged[1]]);
+            let layout = HopLinkLayout::new(&hops, &spec).unwrap();
+            for rank in 0..2 {
+                assert_eq!(link.ends[rank].recv.iter().map(|owner| owner.buffer.bytes as u64)
+                    .collect::<Vec<_>>(), layout.receive[rank]);
+                assert_eq!(link.ends[rank].control.buffer.bytes as u64, layout.control_bytes);
+            }
+            let empty = HopLink::new(&library, ranks, &[], spec, spec.row_bytes as usize)?;
+            let empty_layout = HopLinkLayout::new(&[], &spec).unwrap();
+            for rank in 0..2 {
+                assert_eq!(empty.receive_bytes(rank), 0);
+                assert_eq!(empty.ends[rank].control.buffer.bytes as u64, empty_layout.control_bytes);
+            }
+
             let private = (0..2).map(|lane| HopLink::new_private_lane(&library, ranks, &hops, spec, lane, spec.row_bytes as usize))
                 .collect::<Result<Vec<_>>>()?;
             let single = hop_buffer_bytes(&hops, &HopSpec { lanes: 1, ..spec }, 2).unwrap();
             for rank in 0..2 {
                 for instance in &private { assert_eq!(instance.receive_bytes(rank), single[rank]); }
                 assert_eq!(private.iter().map(|instance| instance.receive_bytes(rank)).sum::<u64>(), charged[rank]);
+            }
+            // Qualify one independent receive request's driver tail after
+            // first-use allocation bookkeeping has settled on each device.
+            let large_spec = HopSpec { rows: 6144, lanes: 1, ..spec };
+            let large = HopLinkLayout::new(&hops, &large_spec).unwrap();
+            for rank in 0..2 {
+                let bytes = large.receive[rank][0];
+                let expected = cuteafd_loader::placement::planner::sm120_request_backing(bytes)?;
+                on_device(&library, rank as i32, || {
+                    let warm = DeviceAllocation::new(&library, bytes as usize, crate::shared::memory::TEST)?;
+                    drop(warm);
+                    let before = library.cuda_physical_memory_info()?.0;
+                    let slot = DeviceAllocation::new(&library, bytes as usize, crate::shared::memory::TEST)?;
+                    let after = library.cuda_physical_memory_info()?.0;
+                    assert_eq!(before.checked_sub(after), Some(expected as usize),
+                        "rank {rank} independent receive request backing");
+                    assert_eq!(expected - bytes, 1 << 20);
+                    drop(slot);
+                    Ok(())
+                })?;
             }
             let rows = 17;
             let bytes = rows * spec.row_bytes as usize;

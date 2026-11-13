@@ -1083,8 +1083,16 @@ mod tests {
 
     #[test]
     fn admission_reserves_actual_marks_diagnostics_and_independent_startup_peaks() -> Result<()> {
+        let single = run(&inputs(1))?;
+        assert!(!single.fixed.iter().any(|d| d.group == "residual hop control"));
         let mut inputs = inputs(2);
         let base = run(&inputs)?;
+        for rank in 0..2 {
+            let controls = base.fixed.iter().filter(|d| d.gpu == rank && d.group == "residual hop control")
+                .collect::<Vec<_>>();
+            assert_eq!(controls.len(), 1);
+            assert_eq!(controls[0].bytes, 256);
+        }
         inputs.marks.budget_bytes = 32 << 30;
         inputs.marks.entries = 24;
         inputs.peer_diagnostics = true;
@@ -1105,7 +1113,7 @@ mod tests {
                     a.fixed
                         .iter()
                         .filter(|d| {
-                            d.gpu == rank as u8 && d.group == "Step-5 private peer and hop control"
+                            d.gpu == rank as u8 && d.group == "Step-5 private peer control"
                         })
                         .map(|d| d.bytes),
                 )

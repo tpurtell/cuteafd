@@ -1560,7 +1560,7 @@ mod tests {
                     assert_eq!(demand.gpu as usize, rank);
                     assert_eq!(demand.basis, Basis::Exact);
                     assert_eq!(demand.bytes as usize, (rows * HIDDEN * 2).max(256)
-                        + 256 + 256 + 256 + progress);
+                        + 256 + 256 + progress);
                 }
             }
         }

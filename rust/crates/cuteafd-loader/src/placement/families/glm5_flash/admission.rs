@@ -996,6 +996,11 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         add_demand(&mut contract, &Demand::new(gpu as u8, Category::Transport, "residual hops", bytes,
             Basis::Formula), &[], format!("glmf.hops.{gpu}"), p::Activation::always())?;
     }
+    if gpus == 2 && i.attention.mode == AttentionPlacement::Layers {
+        let layout = crate::placement::HopLinkLayout::new(&hops, &hop)
+            .ok_or(p::Refusal::Overflow("GLM Flash hop control"))?;
+        contract.components.extend(layout.control_components("glmf.hops", p::Lifetime::RESIDENT, maximum));
+    }
     if i.drafter_bytes > 0 {
         let nonweights = i.drafter_bytes.checked_sub(i.drafter_weights.0)
             .ok_or_else(|| invalid("draft weights exceed draft owned storage"))?;

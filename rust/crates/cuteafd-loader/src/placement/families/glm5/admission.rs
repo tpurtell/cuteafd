@@ -2251,6 +2251,21 @@ impl Recipe for GlmRecipe<'_> {
                 )],
             )?;
         }
+        if self.gpus == 2 && self.attention.iter().any(|mode| matches!(mode, LayerMode::Whole { .. })) {
+            for &shape in &self.prefill {
+                let spec = crate::placement::HopSpec { storage: crate::placement::HopStorage::ReceiveSlots,
+                    row_bytes: self.cfg.hidden as u64 * 2, rows: shape.rows.max(super::DECODE_ROWS),
+                    lanes: shape.waves, entry_gpu: 0, head_gpu: 0, terminal: crate::placement::TerminalHome::Replicated };
+                let hops = crate::placement::plan_hops(&self.attention, &spec)
+                    .map_err(|error| invalid(&error.to_string()))?;
+                let layout = crate::placement::HopLinkLayout::new(&hops, &spec)
+                    .ok_or(Refusal::Overflow("GLM hop storage"))?;
+                let mut owners = layout.receive_components("glm.hops", Lifetime::TARGET, self.maximum_pages);
+                owners.extend(layout.control_components("glm.hops", Lifetime::TARGET, self.maximum_pages));
+                crate::placement::planner::fixed_request_tails(&mut owners, self.maximum_pages, &[])?;
+                domains.append(&mut contract, &[When::Prefill(shape)], owners)?;
+            }
+        }
         for case in &self.targets {
             let target = &case.value;
             let expected: Vec<_> = self

@@ -802,6 +802,16 @@ impl Recipe for KimiRecipe {
                 let hops = plan_hops(modes, &self.hop_spec).map_err(|error| invalid(&error.to_string()))?;
                 let buffers = hop_buffer_bytes(&hops, &self.hop_spec, self.gpus)
                     .ok_or(Refusal::Overflow("Kimi residual hop buffers"))?;
+                if self.gpus == 2 && self.hop_spec.rows > 0 && self.hop_spec.lanes > 0
+                    && self.hop_spec.storage == crate::placement::HopStorage::ReceiveSlots {
+                    let layout = crate::placement::HopLinkLayout::new(&hops, &self.hop_spec)
+                        .ok_or(Refusal::Overflow("Kimi hop control"))?;
+                    for mut component in layout.control_components(&format!("kimi.hops.{option}"),
+                        Lifetime::RESIDENT, self.maximum_pages) {
+                        if profiled { component.activation = Activation::choice(0, option); }
+                        contract.components.push(component);
+                    }
+                }
                 for (rank, &bytes) in buffers.iter().enumerate() {
                     if bytes == 0 { continue; }
                     let owner = Allocation::buffer(format!("residual hops.{option}.{rank}"),
@@ -1448,6 +1458,52 @@ mod tests {
             assert_eq!(owner.lifetime, Lifetime::RESIDENT);
             assert!(owner.source.starts_with(&format!("kimi/driver-stream-slabs/gpu{rank} ({peak} peak live streams")));
             assert_eq!(component.bytes.at(4).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn hop_control_follows_pair_lifecycle_when_heads_have_only_entry_broadcast() {
+        let mut recipe = recipe();
+        let control_count = |contract: &Contract| contract.components.iter().filter(|component|
+            matches!(&component.kind, ComponentKind::Allocation { template, .. }
+                if template.group == "residual hop control")).count();
+        assert_eq!(control_count(&recipe.prepare(&single()).unwrap()), 0);
+        recipe.gpus = 2;
+        recipe.hop_spec = HopSpec { storage: crate::placement::HopStorage::ReceiveSlots,
+            row_bytes: 16, rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0,
+            terminal: crate::placement::TerminalHome::Replicated };
+        recipe.records_per_page = vec![128; 2];
+        recipe.records_by_layer = vec![[64, 64]; 2];
+        recipe.attention = vec![LayerMode::HeadSplit; 2];
+        recipe.layer_attention = vec![ModeBytes { whole: 100, split: [50; 2] }; 2];
+        recipe.experts = None;
+        recipe.arenas = vec![Arena { count: 0, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] }];
+        toy_weight_owners(&mut recipe);
+        let hops = plan_hops(&recipe.attention, &recipe.hop_spec).unwrap();
+        assert_eq!(hops, [crate::placement::Hop {
+            at: crate::placement::HopPoint::Entry, from: 0, to: 1,
+            kind: crate::placement::HopKind::Broadcast,
+            storage: recipe.hop_spec.storage, row_bytes: recipe.hop_spec.row_bytes,
+        }]);
+        assert!(!hops[0].charged());
+        assert_eq!(hop_buffer_bytes(&hops, &recipe.hop_spec, 2).unwrap(), [0, 0]);
+        let layout = crate::placement::HopLinkLayout::new(&hops, &recipe.hop_spec).unwrap();
+        assert!(layout.receive.iter().all(Vec::is_empty));
+        let contract = recipe.prepare(&single()).unwrap();
+        assert_eq!(control_count(&contract), 2);
+        assert!(!contract.components.iter().any(|component|
+            matches!(&component.kind, ComponentKind::Allocation { template, .. }
+                if template.group == "residual hops")));
+        for rank in 0..2 {
+            let controls = contract.components.iter().filter_map(|component| match &component.kind {
+                ComponentKind::Allocation { template, .. }
+                    if template.id == format!("kimi.hops.0.{rank}.control") => Some(template),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(controls.len(), 1);
+            assert_eq!(controls[0].bytes, layout.control_bytes);
+            assert_eq!(controls[0].location, Location::coordinator(rank));
+            assert_eq!(controls[0].lifetime, Lifetime::RESIDENT);
         }
     }
 

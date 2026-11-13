@@ -538,8 +538,8 @@ pub fn prefill_shape_with(rows: usize, waves: usize, unit: Option<usize>)
 
 pub fn exchange_demand(rows: usize, rank: u8, progress: usize) -> Result<Demand> {
     let recv = super::core::exchange_recv_bytes(rows)?;
-    let bytes = recv + 256 + 256 + (((crate::placement::HOP_SLOTS + 1) * 16) as usize).max(256) + progress;
-    Ok(Demand::new(rank, Category::Workspace, "Kimi peer/abort/hop controls", bytes as u64, Basis::Exact))
+    let bytes = recv + 256 + 256 + progress;
+    Ok(Demand::new(rank, Category::Workspace, "Kimi peer/abort controls", bytes as u64, Basis::Exact))
 }
 
 pub const CODE_OWNER: &str = "Kimi selected-program loaded code";
@@ -805,8 +805,8 @@ mod tests {
             &core, false, 6, 1, cuteafd_core::SparkReplyFormat::Bf16)?;
         let pair = baseline_demands(&cfg, &manifest, 8256, shape, 262144, 16, 8, &core, false, 6, cuteafd_core::SparkReplyFormat::Bf16)?;
         assert!(single.iter().all(|d| d.gpu == 0));
-        assert!(!single.iter().any(|d| d.group == "Kimi peer/abort/hop controls"));
-        assert_eq!(pair.iter().filter(|d| d.group == "Kimi peer/abort/hop controls").count(), 2);
+        assert!(!single.iter().any(|d| d.group == "Kimi peer/abort controls"));
+        assert_eq!(pair.iter().filter(|d| d.group == "Kimi peer/abort controls").count(), 2);
         let bytes = |demands: &[Demand], group: &str| demands.iter().filter(|d| d.group == group)
             .map(|d| d.bytes).sum::<u64>();
         for group in ["Kimi lane 0 token IO", "Kimi KDA replay", "Kimi Spark lane 0 latent intake"] {

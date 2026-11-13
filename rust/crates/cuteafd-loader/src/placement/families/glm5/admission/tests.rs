@@ -468,6 +468,7 @@ fn production_whole_local_has_no_pair_owners_and_rejects_wrong_world() {
         owner.location != Location::coordinator(1)
             && !owner.id.contains(".peer.") && !owner.id.contains(".checks.")
             && !owner.id.ends_with(".rows.payload")));
+    assert!(!admitted.solved.facts.allocations.iter().any(|owner| owner.group == "residual hop control"));
     assert!(admitted.graphs.layers[cfg.first_moe_layer].local);
     let mut input = production_input(&cfg, 2, 4, prefill);
     input.local = Some((&source, physical));
@@ -859,6 +860,7 @@ fn execution_adapter_uses_resolved_homes_and_unique_tp2_prefix_and_backend_bytes
         let resolved = planner::solve(Request { onboard: Pin::Exact(onboard), ..request() }, budgets(), &recipe).unwrap();
         let inventory = if onboard == 0 { Default::default() } else { local.clone() };
         let (placement, working) = recipe.execution(&resolved, &inventory).unwrap();
+        assert!(!resolved.facts.allocations.iter().any(|owner| owner.group == "residual hop control"));
         assert_eq!(placement.pool_tokens, resolved.pool_tokens);
         assert!(placement.pool_limits.0.is_empty());
         assert_eq!(placement.max_pool_tokens_no_onboard, None);
@@ -933,6 +935,14 @@ fn execution_adapter_preserves_whole_expert_range_and_shared_hop_geometry() {
         entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
     assert_eq!(placement.residual, residual_homes(&recipe.attention, &spec).unwrap());
     assert_eq!(placement.hops, plan_hops(&recipe.attention, &spec).unwrap());
+    for rank in 0..2 {
+        let controls = resolved.facts.allocations.iter().filter(|owner|
+            owner.group == "residual hop control" && owner.location == Location::coordinator(rank)).collect::<Vec<_>>();
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].bytes, 256);
+        assert!(resolved.facts.allocations.iter().any(|owner| owner.group == "residual hops"
+            && owner.location == Location::coordinator(rank)));
+    }
 }
 
 #[test]
@@ -1019,9 +1029,38 @@ fn warmup_upload_is_one_exact_successor_per_selected_shape_not_per_rank() {
             let mut choices = vec![0; contract.variables.len()];
             choices[recipe.attention.len()] = selected;
             let facts = contract.facts(&choices, 32).unwrap();
-            assert_eq!(facts.allocations.len(), 1);
-            let owner = &facts.allocations[0];
-            assert_eq!(owner.id, "glm.upload.sync-successor");
+            let uploads = facts.allocations.iter().filter(|owner|
+                owner.id == "glm.upload.sync-successor").collect::<Vec<_>>();
+            assert_eq!(uploads.len(), 1);
+            let owner = uploads[0];
+            let mut expected_hops = Vec::new();
+            if gpus == 2 {
+                let spec = crate::placement::HopSpec {
+                    storage: crate::placement::HopStorage::ReceiveSlots,
+                    row_bytes: cfg.hidden as u64 * 2,
+                    rows: shape.rows.max(super::super::DECODE_ROWS), lanes: shape.waves,
+                    entry_gpu: 0, head_gpu: 0,
+                    terminal: crate::placement::TerminalHome::Replicated,
+                };
+                let hops = crate::placement::plan_hops(&recipe.attention, &spec).unwrap();
+                let layout = crate::placement::HopLinkLayout::new(&hops, &spec).unwrap();
+                for rank in 0..2 {
+                    let location = Location::coordinator(rank as u8);
+                    expected_hops.push((format!("glm.hops.{rank}.control"), location, layout.control_bytes));
+                    for (slot, &bytes) in layout.receive[rank].iter().enumerate() {
+                        expected_hops.push((format!("glm.hops.{rank}.recv.{slot}"), location, bytes));
+                    }
+                }
+            }
+            let mut actual_hops = facts.allocations.iter().filter(|item| item.id != owner.id)
+                .map(|item| {
+                    assert_eq!(item.lifetime, Lifetime::TARGET);
+                    assert_eq!(item.category, Category::Transport);
+                    (item.id.clone(), item.location, item.bytes)
+                }).collect::<Vec<_>>();
+            expected_hops.sort_by(|a, b| a.0.cmp(&b.0));
+            actual_hops.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(actual_hops, expected_hops);
             assert_eq!(owner.bytes, (shape.rows * shape.waves).max(64) * 4);
             assert_eq!(owner.location, Location::PINNED);
             assert_eq!(

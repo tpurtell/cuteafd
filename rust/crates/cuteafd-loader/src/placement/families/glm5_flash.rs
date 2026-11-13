@@ -1705,6 +1705,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn hop_control_exists_only_for_two_rank_layer_executor() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        for mode in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
+            let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+            input.attention.mode = mode;
+            input.index = if mode == AttentionPlacement::Heads { cache::GlmfIndexCache::Keys }
+                else { cache::GlmfIndexCache::Compact };
+            let process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let prepared = admission::prepare(&input, 188, true, process).unwrap();
+            let solved = prepared.admit().unwrap();
+            let count = solved.placement.items.iter().flatten().filter(|item|
+                item.group == "residual hop control").count();
+            assert_eq!(count, if mode == AttentionPlacement::Layers { 2 } else { 0 });
+        }
+    }
+
+    #[test]
     fn unit_admission_keeps_every_shared_policy_wave_without_clamping() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
