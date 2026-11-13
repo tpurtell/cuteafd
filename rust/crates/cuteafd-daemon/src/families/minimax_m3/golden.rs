@@ -262,13 +262,12 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
             &serde_json::json!({"probe":record,"score":scored}))?;
         records.extend(scored.records);
     }
-    let score = Fidelity::from_records(records);
+    let report = cuteafd_bench::fidelity::minimax_golden_report(Fidelity::from_records(records), provenance)?;
     serde_json::to_writer(std::fs::OpenOptions::new().write(true).create_new(true)
-        .open(args.save_logits.join("fidelity.json"))?, &serde_json::json!({
-            "schema":"cuteafd.minimax.golden/1","kl_kind":"top1024+tail", "provenance":provenance,
-            "score":score,"qualified":score.kl <= 0.03 && score.top1 >= 0.95}))?;
-    ensure!(score.kl <= 0.03 && score.top1 >= 0.95,
-        "MiniMax qualification failed: KL={} (<=0.03), top1={} (>=0.95)", score.kl, score.top1);
+        .open(args.save_logits.join("fidelity.json"))?, &report)?;
+    println!("MiniMax generated-aggregate verdict: {}", report["verdict"]);
+    ensure!(report["qualified"] == true,
+        "MiniMax qualification failed: {}", report["verdict"]["reasons"]);
     Ok(())
 }
 

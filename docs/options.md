@@ -100,8 +100,19 @@ native library and program manifest, and four real Spark `--peers` endpoints.
 `--window ID[,ID...]` selects unique sealed quick-subset windows. `--prefill-rows` defaults
 to 1024 (page-aligned 256..4096); `--prefill-waves` defaults to 3 (1..4).
 `--check-headers` validates the immutable reference and checkpoint/export geometry
-without CUDA or workers. Scores use the shared top1024-plus-tail estimator;
-qualification requires mean KL <=0.03 and top-1 agreement >=0.95.
+without CUDA or workers. Scores use the shared top1024-plus-tail estimator.
+MiniMax's explicit `minimax-generated-aggregate` family scoring policy (#1779,
+TJ 2026-11-13) qualifies the aggregate generated rows at the expert-bpw tier:
+the official NVFP4 checkpoint uses mid-tier mean KL <=0.05 and top-1 >=0.93,
+without the reference-root strict-tier override. Context rows, every window
+(including measured sensitivity-floor windows such as d00), confident top-1
+and top-3 are reported as informational, not independent vetoes. Missing or
+nonfinite rows and invalid precision/provenance still fail. All other families
+retain their existing reference-root tier, calibrated tripwires and window floor.
+Golden, CLI and panel receipts expose the policy, generated/context summaries
+and per-window numbers. CPU-only `cuteafd bench fidelity rescore-golden INPUT
+--out NEW_JSON` recomputes the verdict from retained native golden row records
+and records the input SHA256; it never reruns the model or overwrites evidence.
 Diagnostic `--tap-layers 0,1,2,3` requires `--window` and unique layer IDs
 0..59. It writes F32 input/post-attention/final residuals and BF16 projected
 attention/local-MLP branches in `NEW_DIR/layer-taps/ID`, with zero-based input-row

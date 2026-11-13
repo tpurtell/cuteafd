@@ -11,6 +11,8 @@ pub struct Run {
     pub schema: String,
     pub arm: String,
     pub checkpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
     pub set_sha256: String,
     pub reference_sha256: String,
     pub tier: String,
@@ -244,10 +246,46 @@ fn pairs(run: &Run) -> Result<BTreeMap<(String, usize), &Position>> {
     Ok(out)
 }
 
+/// Family-scoped absolute scoring policy. No window IDs are special-cased.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScoringPolicy {
+    #[default]
+    CalibratedGenerated,
+    /// TJ 2026-11-13, #1779: context is unscoreable across HF/reference/native;
+    /// sensitivity-floor windows remain diagnostics, not independent vetoes.
+    #[serde(rename = "minimax-generated-aggregate")]
+    MiniMaxGeneratedAggregate,
+}
+impl ScoringPolicy {
+    pub fn for_family(family: Option<&str>) -> Self {
+        match family {
+            Some("minimax_m3") => Self::MiniMaxGeneratedAggregate,
+            _ => Self::CalibratedGenerated,
+        }
+    }
+    pub fn aggregate_only(self) -> bool { self == Self::MiniMaxGeneratedAggregate }
+    fn precision(self, p: &crate::fidelity_precision::Precision) -> Result<crate::fidelity_precision::Precision> {
+        p.validate()?;
+        // MiniMax's official checkpoint is NVFP4: TJ chose its bpw tier rather
+        // than the otherwise-strict reference-root override. Keep that provenance.
+        Ok(if self.aggregate_only() {
+            crate::fidelity_precision::Precision::new(p.expert_bpw, &p.format, false, &p.source)?
+        } else { p.clone() })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Verdict {
     pub pass: bool,
+    #[serde(default)]
+    pub scoring_policy: ScoringPolicy,
+    #[serde(default)]
+    pub informational: Vec<String>,
     pub generated: Fidelity,
+    /// Informational only, including when it disagrees with generated rows.
+    #[serde(default)]
+    pub context: Fidelity,
     pub top1_min: f64,
     pub kl_max: f64,
     pub confident_top1_min: f64,
@@ -260,9 +298,11 @@ pub struct Verdict {
 /// One calibrated absolute verdict shared by the card, CLI and dashboard.
 /// Bounds apply to generated rows; context/code rows remain in the report.
 pub fn verdict(run: &Run) -> Verdict {
+    let scoring_policy = ScoringPolicy::for_family(run.family.as_deref());
+    let mut context = Fidelity::from_records(run.score.records.iter().filter(|p| p.role == "ctx").cloned().collect());
     let mut generated = Fidelity::from_records(run.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
     let precision = run.precision.as_ref().ok_or("missing routed-expert precision/tier".to_owned())
-        .and_then(|p| p.validate().map(|()| p).map_err(|e| e.to_string()));
+        .and_then(|p| scoring_policy.precision(p).map_err(|e| e.to_string()));
     let (top1_bar, kl_bar) = precision.as_ref().map(|p| p.tier.bars()).unwrap_or((1.0, 0.0));
     let (top1_min, kl_max) = (top1_bar, kl_bar);
     let tier = precision.as_ref().map(|p| p.tier.name()).unwrap_or("unresolved");
@@ -277,11 +317,11 @@ pub fn verdict(run: &Run) -> Verdict {
     }
     if generated.top1 + 1e-12 < top1_min { reasons.push(format!("generated top-1 below {tier} tier bar {top1_bar:.2}")); }
     if !generated.kl.is_finite() || generated.kl > kl_max { reasons.push(format!("generated KL above {tier} tier bar {kl_bar:.2}")); }
-    if generated.confident_top1.is_some_and(|v| v + 1e-12 < confident_top1_min) {
+    if !scoring_policy.aggregate_only() && generated.confident_top1.is_some_and(|v| v + 1e-12 < confident_top1_min) {
         reasons.push("confident top-1 below calibrated tripwire".into());
     }
-    if generated.top3_contained + 1e-12 < top3_min { reasons.push("top-3 below calibrated tripwire".into()); }
-    if generated.groups("window").values().any(|w| w.top1 + 1e-12 < 0.80) {
+    if !scoring_policy.aggregate_only() && generated.top3_contained + 1e-12 < top3_min { reasons.push("top-3 below calibrated tripwire".into()); }
+    if !scoring_policy.aggregate_only() && generated.groups("window").values().any(|w| w.top1 + 1e-12 < 0.80) {
         reasons.push("generated window top-1 below 80% floor".into());
     }
     if let Some(dataset) = &run.dataset {
@@ -292,6 +332,7 @@ pub fn verdict(run: &Run) -> Verdict {
         }
     }
     generated.records.clear();
+    context.records.clear();
     let label = if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference") {
         Some("reference; common policy floor, not engine calibration".into())
     } else if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
@@ -301,16 +342,51 @@ pub fn verdict(run: &Run) -> Verdict {
             run.dataset.as_ref().and_then(|d| d["standard_subset"]["mode"].as_str())
                 .unwrap_or("standard-v2").to_string())
     };
-    Verdict { pass: reasons.is_empty(), generated, top1_min, kl_max, confident_top1_min, top3_min, reasons, label }
+    Verdict { pass: reasons.is_empty(), scoring_policy, informational: if scoring_policy.aggregate_only() {
+        vec!["context rows".into(), "per-window metrics (including sensitivity-floor windows)".into(),
+            "confident top-1 and top-3".into()]
+    } else { vec!["context rows".into()] }, generated, context, top1_min, kl_max, confident_top1_min, top3_min, reasons, label }
+}
+
+/// Shared native-golden report and CPU-only re-verdict of retained MiniMax rows.
+/// The native adapter qualifies the fixed official NVFP4 expert format (4 bpw).
+pub fn minimax_golden_report(score: Fidelity, provenance: serde_json::Value) -> Result<serde_json::Value> {
+    ensure!(provenance["family"] == "minimax_m3", "not a MiniMax native golden report");
+    ensure!(provenance["reference_manifest_sha256"] == crate::fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256,
+        "native golden requires the immutable MiniMax reference");
+    let mut seen = std::collections::BTreeSet::new();
+    ensure!(score.records.iter().all(|p| matches!(p.role.as_str(), "gen" | "ctx")
+        && seen.insert((p.window.as_str(), p.position))), "unknown role or duplicate native golden row");
+    ensure!(score.positions == score.records.len() && score.positions > 0,
+        "native golden record count mismatch");
+    let mut recomputed = Fidelity::from_records(score.records);
+    recomputed.missing = score.missing;
+    recomputed.non_finite = recomputed.non_finite.max(score.non_finite);
+    let reference = provenance["reference_manifest_sha256"].as_str().context("missing reference identity")?;
+    let run = Run { schema: "cuteafd.fidelity.run/2".into(), arm: "native-golden".into(),
+        checkpoint: provenance["snapshot"].as_str().context("missing checkpoint identity")?.into(),
+        family: Some("minimax_m3".into()), set_sha256: reference.into(), reference_sha256: reference.into(),
+        tier: "quick".into(), path_shape: "prefill-shaped".into(), kl_kind: "reference-only-top1024-plus-tail".into(),
+        verify_rows: None, dataset: None, reference_selection: None, standard_balance: None,
+        engine: "cuteafd".into(), settings: provenance.clone(), seconds: 0.0, score: recomputed,
+        floor_top1: 0.95, floor_kl: 0.03,
+        precision: Some(crate::fidelity_precision::Precision::new(4.0, "nvfp4", true,
+            "official MiniMax native NVFP4 W4A4 experts")?), tripwire_expect: None };
+    let decision = verdict(&run);
+    Ok(serde_json::json!({"schema":"cuteafd.minimax.golden/1", "kl_kind":"top1024+tail",
+        "provenance":provenance, "score":run.score, "qualified":decision.pass, "verdict":decision,
+        "per_window":crate::panels::fidelity::window_summaries(&run)}))
 }
 
 fn absolute(run: &Run) -> bool {
     let score = Fidelity::from_records(run.score.records.iter().filter(|p| p.role == "gen").cloned().collect());
     let Some(precision) = &run.precision else { return false; };
-    if precision.validate().is_err() || !run.floor_top1.is_finite() || !run.floor_kl.is_finite() { return false; }
+    let policy = ScoringPolicy::for_family(run.family.as_deref());
+    let Ok(precision) = policy.precision(precision) else { return false; };
+    if !run.floor_top1.is_finite() || !run.floor_kl.is_finite() { return false; }
     let (top1_bar, kl_bar) = precision.tier.bars();
     score.positions > 0 && score.top1 + 1e-12 >= top1_bar && score.kl <= kl_bar
-        && score.groups("window").values().all(|w| w.top1 + 1e-12 >= 0.80)
+        && (policy.aggregate_only() || score.groups("window").values().all(|w| w.top1 + 1e-12 >= 0.80))
 }
 
 /// Precision switches: the only settings a same-checkpoint pair may change. Scheduling,
@@ -486,6 +562,7 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
         ensure!(a.checkpoint == b.checkpoint && a.set_sha256 == b.set_sha256 && a.reference_sha256 == b.reference_sha256,
             "runs use different checkpoints, sets or references");
     }
+    ensure!(a.family == b.family, "runs use different family scoring policies");
     ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows && a.dataset == b.dataset,
         "runs use different tiers, scoring shapes, KL estimators or verify widths");
     ensure!(cross || a.precision == b.precision, "same-checkpoint runs use different routed-expert precision/tier");
@@ -552,7 +629,10 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
     let absolute_pass = absolute(a) && absolute(b);
     let mut tripwires = Vec::new();
     ensure!(a.tripwire_expect == b.tripwire_expect, "runs use different calibrated tripwire expectations");
-    let calibrated_tripwires = if let Some(expect) = &a.tripwire_expect {
+    let aggregate_only = ScoringPolicy::for_family(a.family.as_deref()).aggregate_only();
+    let calibrated_tripwires = if aggregate_only {
+        None
+    } else if let Some(expect) = &a.tripwire_expect {
         ensure!([expect.confident_top1_min, expect.top3_min].iter().all(|x| x.is_finite() && (0.0..=1.0).contains(x))
             && expect.confident_drop_margin == 0.01 && expect.top3_drop_margin == 0.005,
             "invalid calibrated tripwire thresholds or gross margins");
@@ -606,7 +686,7 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
     };
     let code = |r: &Run| Fidelity::from_records(r.score.records.iter().filter(|p| p.block == "C").cloned().collect());
     let (ac, bc) = (code(a), code(b));
-    if ac.positions > 0 && ac.nll - bc.nll > 0.01 { tripwires.push("human code NLL increases >0.01 nat".into()); }
+    if !aggregate_only && ac.positions > 0 && ac.nll - bc.nll > 0.01 { tripwires.push("human code NLL increases >0.01 nat".into()); }
     // One cluster cannot estimate window uncertainty. Never certify by silently treating it as zero.
     let enough_windows = by_window.len() >= 2;
     if !enough_windows { tripwires.push("insufficient windows for clustered uncertainty".into()); }
@@ -629,7 +709,7 @@ mod tests {
             agree: true, confident: true, top3_contained: true, agree_text: true, finite: true,
             kl: 0.01, nll: 0.5, ref_nll: 0.5, argmax: 1, reference_argmax: 1,
         })).collect();
-        Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(), checkpoint: "checkpoint".into(),
+        Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(), checkpoint: "checkpoint".into(), family: None,
             set_sha256: "set".into(), reference_sha256: "reference".into(), tier: "full".into(),
             path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8), dataset: None, reference_selection: None, standard_balance: None,
             engine: "test".into(), settings: serde_json::json!({}), seconds: 0.0,
@@ -647,6 +727,74 @@ mod tests {
             p.kl = if p.position == 0 { kl * 10000.0 } else { 0.0 };
         }
         r
+    }
+
+    #[test]
+    fn minimax_aggregate_policy_does_not_relax_any_other_family() {
+        let mut r = run(10, 100);
+        r.precision = Some(crate::fidelity_precision::Precision::new(4.0, "nvfp4", true, "test").unwrap());
+        for p in &mut r.score.records {
+            p.agree = p.window != "0" || p.position < 60;
+            p.top3_contained = false;
+            p.kl = 0.04;
+        }
+        let mut ctx = r.score.records[0].clone();
+        ctx.role = "ctx".into(); ctx.window = "context".into(); ctx.kl = 100.0; ctx.agree = false;
+        r.score.records.push(ctx);
+        r.score = Fidelity::from_records(r.score.records);
+        for family in [None, Some("deepseek_v41"), Some("deepseek_v4"), Some("glm5"), Some("glm5_flash"),
+            Some("kimi"), Some("mimo_v2"), Some("qwen4"), Some("qwen3_5"), Some("step5"),
+            Some("muse_spark"), Some("mistral_large4"), Some("not-minimax")] {
+            r.family = family.map(str::to_owned);
+            let v = verdict(&r);
+            assert_eq!(v.scoring_policy, ScoringPolicy::CalibratedGenerated);
+            assert!(!v.pass); assert!(!absolute(&r));
+            assert_eq!((v.top1_min, v.kl_max), (0.95, 0.03));
+            assert!(v.reasons.iter().any(|s| s.contains("80% floor")));
+            assert!(v.reasons.iter().any(|s| s.contains("top-3")));
+        }
+        r.family = Some("minimax_m3".into());
+        let v = verdict(&r);
+        assert!(v.pass, "{:?}", v.reasons); assert!(absolute(&r));
+        assert_eq!((v.top1_min, v.kl_max), (0.93, 0.05));
+        assert_eq!(v.context.positions, 1);
+        assert_eq!(v.context.kl, 100.0);
+        assert_eq!(serde_json::to_value(&v).unwrap()["scoring_policy"], "minimax-generated-aggregate");
+        let panel = crate::panels::fidelity::record(&r, None);
+        assert_eq!(panel["verdict"]["pass"], true);
+        assert!(panel["verdict"]["informational"].as_array().unwrap().len() >= 2);
+        assert!(panel["per_window"]["0"]["top1"].as_f64().unwrap() < 0.80);
+        assert!(compare(&r, &r, 0.005, 0.005, 100, 1).unwrap().pass);
+        for error in ["missing", "nonfinite", "precision", "aggregate", "empty"] {
+            let mut bad = r.clone();
+            match error {
+                "missing" => bad.score.missing = 1,
+                "nonfinite" => bad.score.non_finite = 1,
+                "precision" => bad.precision = None,
+                "aggregate" => for p in &mut bad.score.records { p.kl = 0.051; },
+                _ => bad.score = Fidelity::default(),
+            }
+            assert!(!verdict(&bad).pass, "{error}");
+        }
+    }
+
+    #[test]
+    fn native_golden_rescore_recomputes_rows_and_rejects_wrong_family() {
+        let mut r = run(2, 100);
+        for p in &mut r.score.records { p.kl = 0.04; }
+        let provenance = serde_json::json!({"family":"minimax_m3", "snapshot":"snapshot",
+            "reference_manifest_sha256":crate::fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256});
+        r.score.kl = 100.0; // Stored aggregate values are never trusted on replay.
+        let report = minimax_golden_report(r.score.clone(), provenance.clone()).unwrap();
+        assert_eq!(report["qualified"], true);
+        assert_eq!(report["verdict"]["kl_max"], 0.05);
+        assert!(report["verdict"]["generated"]["kl"].as_f64().unwrap() < 0.041);
+        let mut wrong = provenance.clone(); wrong["family"] = "glm5".into();
+        assert!(minimax_golden_report(r.score.clone(), wrong).is_err());
+        r.score.positions += 1;
+        assert!(minimax_golden_report(r.score.clone(), provenance.clone()).is_err());
+        r.score.positions -= 1; r.score.records[0].finite = false;
+        assert_eq!(minimax_golden_report(r.score.clone(), provenance).unwrap()["qualified"], false);
     }
 
     #[test]

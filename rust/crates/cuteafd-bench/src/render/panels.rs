@@ -246,6 +246,17 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
     doc.spans(x, y + 13.0, 12.5, Anchor::Start, &[(&format!("{path} "), t.ink, 600), (status, color, 700),
         (&format!("  {} generated rows{}", score["positions"], seconds_taken.map(|s| format!(" · {}", seconds(s))).unwrap_or_default()), t.ink2, 400)]);
     y += 22.0;
+    let aggregate_only = verdict["scoring_policy"] == "minimax-generated-aggregate";
+    if aggregate_only {
+        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), "MiniMax: generated aggregate only; windows and auxiliary metrics informational");
+        y += 17.0;
+    }
+    if let Some(context) = verdict["context"].as_object().filter(|c| c["positions"].as_u64().unwrap_or(0) > 0) {
+        let line = format!("Context rows (informational): {} rows, KL {:.4}, top-1 {:.2}%",
+            context["positions"], context["kl"].as_f64().unwrap_or(0.0), context["top1"].as_f64().unwrap_or(0.0) * 100.0);
+        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), &line);
+        y += 17.0;
+    }
     // Headline: one cell per metric, measured over its bound.
     let metrics = [("KL", "kl", "kl_max", false), ("top-1", "top1", "top1_min", true),
         ("confident top-1", "confident_top1", "confident_top1_min", true), ("top-3", "top3_contained", "top3_min", true)];
@@ -255,10 +266,10 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
         let cx = x + cell * (i % columns) as f64;
         let cy = y + 40.0 * (i / columns) as f64;
         let value = num(score, metric);
-        let limit = num(verdict, bound);
+        let limit = if aggregate_only && i >= 2 { None } else { num(verdict, bound) };
         let ok = match (value, limit) { (Some(v), Some(l)) => if *metric == "kl" { v <= l } else { v + 1e-12 >= l }, _ => true };
         let show = |v: f64| if *percent { format!("{:.2}%", v * 100.0) } else { format!("{v:.4}") };
-        doc.text(cx, cy + 10.0, Font::new(10.0, t.muted), label);
+        doc.text(cx, cy + 10.0, Font::new(10.0, t.muted), &format!("{label}{}", if aggregate_only && i >= 2 { " (info)" } else { "" }));
         doc.spans(cx, cy + 28.0, 15.0, Anchor::Start, &[(&value.map_or("N/A".into(), show), if ok { t.ink } else { t.bad }, 600),
             (&limit.map(|l| format!("  {} {}", if *metric == "kl" { "≤" } else { "≥" }, show(l))).unwrap_or_default(), t.muted, 400)]);
     }
@@ -267,6 +278,10 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
         let line = reasons.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ");
         doc.text(x, y + 11.0, Font::new(10.0, t.bad), &super::svg::fit(&line, 10.0, w));
         y += 18.0;
+    }
+    if aggregate_only {
+        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), "Per-window numbers: informational, not independent gates");
+        y += 17.0;
     }
     let Some(windows) = windows.as_object().filter(|w| !w.is_empty()) else { return y - y0 + 10.0 };
     // Per-window: two aligned strips on one window axis (never two y-scales):
@@ -300,8 +315,8 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
         let cx = px + step * (i as f64 + 0.5);
         let (kl, top1) = (num(s, "kl").unwrap_or(0.0), num(s, "top1").unwrap_or(0.0));
         doc.titled(&format!("{path} window {id}: KL {kl:.5} nat · top-1 {:.2}% · {} rows", top1 * 100.0, s["positions"]));
-        doc.rect(cx - bw / 2.0, ky(kl), bw, (ktop + kh - ky(kl)).max(1.0), (bw / 4.0).min(2.0), if kl > kl_max { t.bad } else { t.series[0] });
-        doc.circle(cx, ty(top1), 3.2, if top1 + 1e-12 < top1_min { t.bad } else { t.series[1] });
+        doc.rect(cx - bw / 2.0, ky(kl), bw, (ktop + kh - ky(kl)).max(1.0), (bw / 4.0).min(2.0), if !aggregate_only && kl > kl_max { t.bad } else { t.series[0] });
+        doc.circle(cx, ty(top1), 3.2, if !aggregate_only && top1 + 1e-12 < top1_min { t.bad } else { t.series[1] });
         doc.rect_attrs(cx - step / 2.0, ktop, step, ttop + th - ktop, 0.0, r#"fill="transparent""#);
         doc.end();
     }
