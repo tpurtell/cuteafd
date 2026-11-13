@@ -328,18 +328,21 @@ impl FamilyModel for Model {
         })
     }
     /// The exported pack/attention ABI requires E4M3 K/V bytes, not BF16.
-    /// This storage inventory describes whole-layer ownership only; it does
-    /// not qualify serving or imply that heads/context exports exist.
+    /// Storage inventory includes explicit TP2 heads; it does not qualify kernels or serving.
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         use crate::placement::AttentionPlacement;
         use crate::serving_capacity::{CacheGeometryError, FamilyCacheGeometry, KvPlacement, RankCacheGeometry};
         let ranks = options.coordinator_ranks;
-        let attention = if ranks == 1 { AttentionPlacement::Heads } else { AttentionPlacement::Layers };
+        let attention = options.attention_placement.unwrap_or(if ranks == 1 {
+            AttentionPlacement::Heads
+        } else { AttentionPlacement::Layers });
+        let heads = ranks == 2 && attention == AttentionPlacement::Heads;
         if !(1..=2).contains(&ranks) || options.native_mtp_layers != 0
-            || options.attention_placement.is_some_and(|mode| mode != attention) {
+            || attention == AttentionPlacement::Context
+            || (ranks == 1 && attention != AttentionPlacement::Heads) {
             return Err(CacheGeometryError::Unsupported { family: "minimax_m3",
-                what: "only one/two RTX whole-layer native FP8 MSA cache is implemented" });
+                what: "native FP8 MSA cache supports one RTX or a two-RTX layers/heads plan" });
         }
         let overflow = || CacheGeometryError::Overflow("MiniMax MSA page geometry");
         let rows = crate::placement::families::minimax_m3::PAGE_ROWS;
@@ -347,10 +350,11 @@ impl FamilyModel for Model {
             .and_then(|bytes| bytes.checked_mul(self.cfg.head_dim as u64)).ok_or_else(overflow)?;
         let index = (self.cfg.msa.index_dim as u64).checked_add(4)
             .and_then(|bytes| bytes.checked_mul(rows)).ok_or_else(overflow)?;
-        let page = kv.checked_mul(2).and_then(|bytes| bytes.checked_add(index)).ok_or_else(overflow)?;
+        let page = kv.checked_mul(if heads { 1 } else { 2 }).and_then(|bytes| bytes.checked_add(index)).ok_or_else(overflow)?;
         let owners = crate::placement::families::minimax_m3::layer_owners(self.cfg.layers, ranks);
         let ranks = (0..ranks).map(|rank| {
-            let layers = owners.iter().filter(|&&owner| usize::from(owner) == rank).count() as u64;
+            let layers = if heads { self.cfg.layers as u64 } else {
+                owners.iter().filter(|&&owner| usize::from(owner) == rank).count() as u64 };
             Ok(RankCacheGeometry {
                 persistent_unit_bytes: page.checked_mul(layers).ok_or_else(overflow)?,
                 context_table_bytes_per_token: (self.cfg.rotary_dim as u64).checked_mul(4).ok_or_else(overflow)?,
@@ -358,7 +362,7 @@ impl FamilyModel for Model {
             })
         }).collect::<Result<Vec<_>, CacheGeometryError>>()?;
         Ok(Some(FamilyCacheGeometry { logical_unit_rows: rows,
-            placement: if ranks.len() == 1 { KvPlacement::SingleDevice } else { KvPlacement::PartitionedLayers }, ranks }))
+            placement: if ranks.len() == 1 { KvPlacement::SingleDevice } else if heads { KvPlacement::PartitionedHeads } else { KvPlacement::PartitionedLayers }, ranks }))
     }
     fn contract_admission(&self) -> bool { true }
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,

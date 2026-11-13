@@ -12,7 +12,7 @@
 //!   pair) with the installed fp8moe package's executor workspace;
 //! - Spark experts per rank per onboarding count, with their I/O, typed
 //!   execution owners, runtime residual and SM121 arena page tables;
-//! - MSA KV + index pool pages (whole-layer owners: never replicated);
+//! - MSA KV + index pool pages (whole owners, or half-KV/replicated index for heads);
 //! - per-sequence page tables, decode lane and per-slot prefill unit owners,
 //!   TP2 expert exchange and the boundary hop on a pair,
 //!   MSA/producer/dense scratch, head, selector, rotary table;
@@ -86,6 +86,7 @@ impl RequestCapacity {
 pub enum Owner {
     Target { gpu: usize },
     Kv { layer: usize, plane: &'static str },
+    HeadsKv { gpu: usize, layer: usize, plane: &'static str },
     Cache { gpu: usize },
     DecodeTable { gpu: usize },
     Rope { gpu: usize },
@@ -105,6 +106,7 @@ impl Owner {
         match self {
             Self::Target { gpu } => format!("minimax/target/{gpu}"),
             Self::Kv { layer, plane } => format!("minimax.kv.{layer}.{plane}"),
+            Self::HeadsKv { gpu, layer, plane } => format!("minimax.kv.heads.{gpu}.{layer}.{plane}"),
             Self::Cache { gpu } => format!("minimax.cache.{gpu}"),
             Self::DecodeTable { gpu } => format!("minimax.cache.{gpu}.decode_table"),
             Self::Rope { gpu } => format!("minimax.rope.{gpu}"),
@@ -127,16 +129,24 @@ impl Owner {
 
 }
 
-/// What the MiniMax executor runs. One RTX owns every layer. A pair owns
-/// contiguous whole layers (`layers`, the qualified Qwen4 dual pattern):
-/// attention, indexer, router and dense/shared FFN on the owner, one boundary
-/// hop at the cut, routed experts as TP2 halves on both GPUs. A whole owner
-/// never replicates KV or index pages; 4 KV heads make a head split uneven
-/// against the 4 independent index heads, and no context-split MSA program
-/// exists. It runs only the existing whole-width MXFP8 exports.
+/// Qualified whole-layer execution remains the automatic policy. Explicit TP2
+/// heads has a separate planning descriptor and a typed serving refusal until
+/// narrow-head native kernels qualify.
 pub const MINIMAX_M3: ExecutorModes = ExecutorModes { family: "minimax_m3",
     modes: &[WHOLE, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }], hops: true,
     attention: AttentionPlacement::Layers };
+
+const HEADS_PLAN: ExecutorModes = ExecutorModes { family: "minimax_m3",
+    modes: &[LayerMode::HeadSplit], hops: false, attention: AttentionPlacement::Heads };
+
+/// Planning facts may describe unqualified geometry; serving must reject it.
+#[derive(Debug, thiserror::Error)]
+pub enum ServingRefusal {
+    #[error("narrow-head MiniMax kernels not qualified")]
+    NarrowHeadsNotQualified,
+    #[error(transparent)]
+    Plan(#[from] Refusal),
+}
 
 fn invalid(detail: impl std::fmt::Display) -> Refusal {
     Refusal::InvalidFact(format!("MiniMax component contract: {detail}"))
@@ -316,6 +326,7 @@ pub struct Vision {
 pub struct MiniMaxInputs {
     pub cfg: MiniMaxM3Config,
     pub gpus: usize,
+    pub attention: AttentionPlacement,
     pub spark_ranks: usize,
     pub context: Context,
     /// Largest pool the build indexes (KV max), in tokens.
@@ -325,7 +336,7 @@ pub struct MiniMaxInputs {
     pub sequences: u64,
     /// Per-rank target arenas (one per coordinator GPU).
     pub targets: Vec<CoordinatorWeights>,
-    /// Owner GPU of every layer's attention (`0` everywhere on one RTX).
+    /// Whole-layer owner map; empty for TP2 heads (both ranks execute every layer).
     pub owners: Vec<u8>,
     pub manifest: std::sync::Arc<serde_json::Value>,
     /// Routed layer order (the onboarding prefix is `routed[..count]`).
@@ -440,8 +451,28 @@ impl MiniMaxInputs {
         RequestCapacity::new(self.sequences, self.prefill.rows)
     }
 
+    pub fn heads(&self) -> bool { self.gpus == 2 && self.attention == AttentionPlacement::Heads }
+
     fn modes(&self) -> Vec<LayerMode> {
-        self.owners.iter().map(|&gpu| LayerMode::Whole { gpu, ffn: FfnMode::Owner }).collect()
+        if self.heads() { vec![LayerMode::HeadSplit; self.cfg.layers] }
+        else { self.owners.iter().map(|&gpu| LayerMode::Whole { gpu, ffn: FfnMode::Owner }).collect() }
+    }
+
+    fn validate_attention(&self) -> Result<(), Refusal> {
+        let valid = match (self.gpus, self.attention) {
+            (1, AttentionPlacement::Heads) | (2, AttentionPlacement::Layers) =>
+                self.owners == layer_owners(self.cfg.layers, self.gpus),
+            (2, AttentionPlacement::Heads) => self.owners.is_empty(),
+            _ => false,
+        };
+        if !valid { return Err(invalid("attention must be contiguous whole-layer owners or explicit TP2 heads")); }
+        Ok(())
+    }
+
+    pub fn admit_serving(&self, request: Request) -> Result<AdmittedMiniMax, ServingRefusal> {
+        self.validate_attention()?;
+        if self.heads() { return Err(ServingRefusal::NarrowHeadsNotQualified); }
+        Ok(self.admit(request)?)
     }
 
     fn head_gpu(&self) -> u8 { (self.gpus - 1) as u8 }
@@ -450,7 +481,7 @@ impl MiniMaxInputs {
         HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: self.cfg.hidden as u64 * 4,
             rows: self.prefill.rows.max(self.sequences), lanes: LANES, entry_gpu: 0,
             head_gpu: self.head_gpu(),
-            terminal: TerminalHome::AttentionOwner }
+            terminal: if self.heads() { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } }
     }
 
     /// The available onboarding counts: an ordered prefix of the routed layers.
@@ -491,15 +522,16 @@ impl MiniMaxInputs {
         let residual = residual_homes(&modes, &spec).map_err(|error| invalid(error))?;
         let hops = plan_hops(&modes, &spec).map_err(|error| invalid(error))?;
         let placement = Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
-            attention_placement: if pair { AttentionPlacement::Layers } else { AttentionPlacement::Heads },
-            attention_by_kind: vec![(AttentionClass::Gqa,
-                if pair { AttentionPlacement::Layers } else { AttentionPlacement::Heads })],
+            attention_placement: self.attention,
+            attention_by_kind: vec![(AttentionClass::Gqa, self.attention)],
             peer_row_bytes: 0, onboard_layers: count, max_pool_tokens_no_onboard: None, layers,
             movables: solved.decisions.draft_home.map(|gpu| (MovableId::Drafter, gpu)).into_iter().collect(),
             expert_ranges, residual, hops, tp2,
             items: (0..self.gpus).map(|gpu| solved.items(Location::coordinator(gpu as u8)))
                 .collect::<Result<_, _>>()? };
-        MINIMAX_M3.check(&placement).map_err(|error| invalid(error))?;
+        // The heads descriptor validates planning geometry, not native qualification.
+        let descriptor = if self.heads() { HEADS_PLAN } else { MINIMAX_M3 };
+        descriptor.check(&placement).map_err(invalid)?;
         Ok(placement)
     }
 
@@ -524,10 +556,11 @@ impl MiniMaxInputs {
     pub fn execution_components(&self) -> Result<Vec<Component>, Refusal> {
         let maximum = self.maximum_pages();
         if !(1..=2).contains(&self.gpus) || maximum == 0 || maximum == u64::MAX
-            || self.targets.len() != self.gpus || self.owners.len() != self.cfg.layers
+            || self.targets.len() != self.gpus
             || self.graph_reserve.len() != self.gpus || self.code.len() != self.gpus {
             return Err(invalid("invalid execution inventory extent"));
         }
+        self.validate_attention()?;
         cuteafd_core::concurrency::validate("minimax_m3", self.sequences).map_err(invalid)?;
         let mut out = Vec::new();
         for gpu in 0..self.gpus { out.extend(self.rank_execution_components(gpu, maximum)?); }
@@ -556,19 +589,26 @@ impl MiniMaxInputs {
         let context = u32::try_from(self.context.maximum).map_err(|_| Refusal::Overflow("MiniMax context"))?;
         let mut out = Vec::new();
         let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
-        // Whole-owner MSA layers: KV and index pages on the owner only. Each
-        // layer plane is one physical backing that scales with the pool.
-        for (layer, &owner) in self.owners.iter().enumerate() {
-            if usize::from(owner) != gpu { continue; }
-            for (name, stride) in [("keys", 32768u64), ("values", 32768), ("index", 8448)] {
-                out.push(Component::allocation(Allocation::buffer(Owner::Kv { layer, plane: name }.id(), location,
+        // The native cache descriptor is the physical source of page strides.
+        let cache = if self.heads() {
+            MsaCache::for_heads(&HeadsLayout::new(cfg, gpu as u8, rows)?, 1,
+                capacity.decode.requests, context)?
+        } else { MsaCache::new(1, 1, capacity.decode.requests, context)? };
+        let buffers = cache.buffers()?;
+        for layer in 0..cfg.layers {
+            if !self.heads() && usize::from(self.owners[layer]) != gpu { continue; }
+            for plane in ["keys", "values", "index"] {
+                let stride = buffers.iter().find(|(name, _)| name == &format!("layer.0.{plane}"))
+                    .ok_or_else(|| invalid("native cache plane missing"))?.1;
+                let owner = if self.heads() { Owner::HeadsKv { gpu, layer, plane } }
+                    else { Owner::Kv { layer, plane } };
+                out.push(Component::allocation(Allocation::buffer(owner.id(), location,
                     stride, Lifetime::TARGET, Category::Kv, "MSA paged KV and index records"),
                     ByteCurve::linear_rounded(stride, stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
                     false, maximum));
             }
         }
         // Page tables and lengths for every admitted sequence, at the compiled context.
-        let cache = capacity.cache(context)?;
         for (name, bytes) in cache.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
             out.extend(buffer(format!("{}.{name}", Owner::Cache { gpu }.id()), location, bytes, Lifetime::TARGET,
                 Category::Kv, "MSA page tables", maximum));
@@ -595,7 +635,11 @@ impl MiniMaxInputs {
         // One decode lane on every rank (its layers' work), then one owner
         // set per in-flight prefill slot (PrefillHooks unit slots).
         let decode = Owner::Decode { gpu }.id();
-        out.extend(UnitLayout::new(cfg, decode_rows)?.components(&decode, gpu as u8, Lifetime::TARGET, maximum)?);
+        if self.heads() {
+            out.extend(HeadsLayout::new(cfg, gpu as u8, decode_rows)?.components(&decode, Lifetime::TARGET, maximum)?);
+        } else {
+            out.extend(UnitLayout::new(cfg, decode_rows)?.components(&decode, gpu as u8, Lifetime::TARGET, maximum)?);
+        }
         out.extend(capacity.decode.components(&format!("{decode}.metadata"), gpu as u8, maximum)?);
         out.extend(metadata_upload_components(capacity, false, &decode, maximum));
         out.extend(msa.workspace_components(&format!("{decode}.attention"), gpu as u8, false, Lifetime::TARGET, maximum)?);
@@ -605,7 +649,9 @@ impl MiniMaxInputs {
         for slot in 0..self.prefill.waves {
             let prefix = Owner::Unit { gpu, slot }.id();
             let unit = UnitLayout::new(cfg, rows)?;
-            out.extend(unit.components(&prefix, gpu as u8, Lifetime::TARGET, maximum)?);
+            if self.heads() {
+                out.extend(HeadsLayout::new(cfg, gpu as u8, rows)?.components(&prefix, Lifetime::TARGET, maximum)?);
+            } else { out.extend(unit.components(&prefix, gpu as u8, Lifetime::TARGET, maximum)?); }
             if gpu == 0 {
                 // Host tokens enter only the entry rank's prefill units. The
                 // stable U32 upload view shares route_ids' address, not its
@@ -621,6 +667,12 @@ impl MiniMaxInputs {
             // MSA prefill scratch and producers are per slot: units overlap in flight.
             out.extend(msa.workspace_components(&format!("{prefix}.attention"), gpu as u8, true, Lifetime::TARGET, maximum)?);
             out.extend(producers.workspace_components(&format!("{prefix}.attention"), gpu as u8, Lifetime::TARGET, maximum)?);
+        }
+        if self.heads() {
+            let mut slot_rows = vec![decode_rows];
+            slot_rows.extend((0..self.prefill.waves).map(|_| rows));
+            out.extend(HeadsLayout::peer_components(gpu as u8, &slot_rows, false,
+                &format!("minimax.heads.peer.{gpu}"), maximum)?);
         }
         out.extend(allowance(location, self.graph_reserve[gpu], Lifetime { first: Phase::Warmup, last: Phase::Growth },
             crate::placement::graph_reserve::source(&format!("minimax_m3.graphs.{gpu}")), true, maximum));
@@ -640,16 +692,14 @@ impl Recipe for MiniMaxInputs {
         let maximum = self.maximum_pages();
         if !(1..=2).contains(&self.gpus) || self.spark_ranks > 8 || maximum == 0 || maximum == u64::MAX
             || request.context.maximum != self.context.maximum || self.targets.len() != self.gpus
-            || self.owners.len() != cfg.layers || self.graph_reserve.len() != self.gpus
+            || self.graph_reserve.len() != self.gpus
             || self.code.len() != self.gpus || self.expert_backings.len() != self.routed.len() + 1
             || self.spark.len() != self.routed.len() + 1 || self.prefill.rows == 0 || self.prefill.waves == 0
             || self.sequences == 0 {
             return Err(invalid("invalid extent or empty domain"));
         }
         cuteafd_core::concurrency::validate("minimax_m3", self.sequences).map_err(invalid)?;
-        if self.owners != layer_owners(cfg.layers, self.gpus) {
-            return Err(invalid("attention owners must be the contiguous whole-layer cut"));
-        }
+        self.validate_attention()?;
         let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
         if self.routed != routed || self.spark.iter().any(|ranks| ranks.len() != self.spark_ranks) {
             return Err(invalid("routed layer order or Spark rank inventory differs from the executor"));

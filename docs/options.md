@@ -107,7 +107,10 @@ the launcher derives from them.
 
 `cuteafd golden --family minimax_m3` (hidden alias `minimax-golden`) is a
 qualification-only native full-model prefill path; MiniMax serving stays refused.
-It requires `--nll --golden DATASET --save-logits NEW_DIR`, a checkpoint snapshot,
+Explicit two-RTX heads planning is available with half KV and replicated index
+storage; `auto` stays layers. Serve admission refuses heads with
+"narrow-head MiniMax kernels not qualified" until native qualification completes.
+Golden requires `--nll --golden DATASET --save-logits NEW_DIR`, a checkpoint snapshot,
 native library and program manifest, and four real Spark `--peers` endpoints.
 `--window ID[,ID...]` selects unique sealed quick-subset windows. `--prefill-rows` defaults
 to 1024 (page-aligned 256..4096); `--prefill-waves` defaults to 3 (1..4).

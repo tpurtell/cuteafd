@@ -38,13 +38,17 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     report.prefill_reserve_rows = Some(prefill.span_rows);
     let shape = PrefillShape { rows: prefill.unit_rows, waves: prefill.waves };
-    let attention = if gpus == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads };
+    let attention = report.requested_attention.unwrap_or(if gpus == 2 {
+        AttentionPlacement::Layers
+    } else { AttentionPlacement::Heads });
     report.attention_placement = attention;
-    if let Some(requested) = report.requested_attention.filter(|&mode| mode != attention) {
-        report.refuse_placement(format!("MiniMax runs {attention} attention on {gpus} RTX; --attention-placement \
-            {requested} has no MSA program"),
-            "Omit --attention-placement: whole-layer MSA owners never replicate KV or index pages.");
+    if attention == AttentionPlacement::Context || (gpus == 1 && attention != AttentionPlacement::Heads) {
+        report.refuse_placement(format!("MiniMax {attention} attention is not implemented on {gpus} RTX"),
+            "Use heads on one RTX; layers or explicit heads on two RTX.");
         return empty(notes);
+    }
+    if gpus == 2 && attention == AttentionPlacement::Heads {
+        notes.push("Planning only: narrow-head MiniMax kernels not qualified; serving admission refuses heads".into());
     }
     let Some(manifest_path) = opts.workspace_manifest.clone().or_else(|| {
         let path = std::path::PathBuf::from("/opt/cuteafd/share/PROGRAMS.json");
@@ -82,7 +86,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let sequences = opts.resolved_concurrency("minimax_m3");
     let physical_devices = (0..gpus as i32).collect::<Vec<_>>();
     let request = FactsRequest { checkpoint: input.checkpoint(), cfg, catalog, manifest_path: &manifest_path,
-        manifest: manifest.clone(), physical_devices: &physical_devices, coordinator: Coordinator::Planned { cards: cards.clone() }, spark_ranks: ranks,
+        manifest: manifest.clone(), attention: Some(attention), physical_devices: &physical_devices, coordinator: Coordinator::Planned { cards: cards.clone() }, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("minimax_m3"),
         replies: opts.spark_reply_formats, head: opts.bf16_target_head, expert_usage: opts.expert_usage,
@@ -125,7 +129,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     report.bytes_by_owner.insert("routed expert weights".into(), model.routed_bytes);
     notes.push(format!("MiniMax attention {}: {}; pool {} tokens; {onboarded} of {routed} routed layers onboarded \
         ({}); unit {} x {} waves; C{sequences}", placed.attention_summary(),
-        if gpus == 2 { "contiguous whole-layer owners (one boundary hop), routed experts TP2 halves" }
+        if inputs.heads() { "TP2 paired query/KV/index groups, replicated index keys, split FFN neurons" }
+        else if gpus == 2 { "contiguous whole-layer owners (one boundary hop), routed experts TP2 halves" }
         else { "every layer on rtx0" }, placed.pool_tokens, if gpus == 2 { "TP2 halves" } else { "whole layers" },
         shape.rows, shape.waves));
     let mut devices = Vec::new();

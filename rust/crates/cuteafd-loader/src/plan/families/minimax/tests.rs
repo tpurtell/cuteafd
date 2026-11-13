@@ -246,10 +246,8 @@ fn cache_geometry_preserves_native_fp8_pages_and_physical_layer_owners() {
         }
         assert_eq!(geometry.placement, if gpus == 1 { KvPlacement::SingleDevice } else { KvPlacement::PartitionedLayers });
     }
-    for mode in [AttentionPlacement::Heads, AttentionPlacement::Context] {
-        assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 2, attention_placement: Some(mode),
-            ..Default::default() }).is_err());
-    }
+    assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+        attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).is_err());
     assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 3, ..Default::default() }).is_err());
 }
 
@@ -612,7 +610,8 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
     // Executor geometry checks are release-exact (E128); the fixture keeps four experts' headers.
     let mut release = cfg.clone(); release.experts = 128;
-    MiniMaxInputs { cfg: release, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
+    MiniMaxInputs { cfg: release, gpus, attention: if gpus == 2 { crate::placement::AttentionPlacement::Layers }
+        else { crate::placement::AttentionPlacement::Heads }, spark_ranks: ranks, context: Context::automatic(1 << 20),
         maximum_pool_tokens: 4 << 20, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
         manifest, routed: routed.clone(),
         expert_backings: (0..=routed.len()).map(|count| if count == 0 { Vec::new() } else {
@@ -1365,5 +1364,276 @@ fn packed_prefill_can_have_fewer_rows_than_boot_requests_but_exports_must_cover_
         if export == "minimax_attention_extend" && detail.contains("requested rows=32 extent=64")), "{error:?}");
     for (requests, rows) in [(0, 32), (65, 32), (1, 0), (1, 4097)] {
         assert!(RequestCapacity::new(requests, rows).is_err());
+    }
+}
+
+
+fn heads_recipe_inputs() -> crate::placement::families::minimax_m3::MiniMaxInputs {
+    heads_recipe_fixture().1
+}
+
+fn heads_recipe_fixture() -> (tempfile::TempDir, crate::placement::families::minimax_m3::MiniMaxInputs) {
+    heads_recipe_fixture_with_experts(4)
+}
+
+fn heads_recipe_fixture_with_experts(experts: usize) -> (tempfile::TempDir, crate::placement::families::minimax_m3::MiniMaxInputs) {
+    use crate::families::minimax_m3::weight_layout::HeadsWeights;
+    use crate::placement::{AttentionPlacement, planner::EmbeddingHome};
+    let mut inputs = recipe_inputs(2, 4);
+    let (dir, mut config, mut tensors) = fixture_with_experts(experts);
+    config["text_config"]["num_hidden_layers"] = 60.into();
+    config["text_config"]["moe_layer_freq"].as_array_mut().unwrap().resize(60, 0.into());
+    for key in ["sparse_attention_freq", "sparse_disable_index_value"] {
+        let values = config["text_config"]["sparse_attention_config"][key].as_array_mut().unwrap();
+        let fill = values[0].clone();
+        values.resize(60, fill);
+    }
+    let template = tensors.iter().filter(|(name, _, _)| name.starts_with(&format!("{TEXT}layers.0.")))
+        .cloned().collect::<Vec<_>>();
+    for layer in 4..60 {
+        tensors.extend(template.iter().map(|(name, dtype, shape)|
+            (name.replacen("layers.0.", &format!("layers.{layer}."), 1), *dtype, shape.clone())));
+    }
+    testing::write_snapshot(dir.path(), &config, &tensors, None);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
+    let heads = HeadsWeights::plan(&checkpoint, &cfg, EmbeddingHome::Device(0)).unwrap();
+    inputs.cfg = cfg.clone();
+    inputs.cfg.experts = 128;
+    inputs.mount = heads.iter().map(|h| h.mount_load(&checkpoint).unwrap()).collect();
+    inputs.targets = heads.into_iter().map(|h| h.target).collect();
+    inputs.attention = AttentionPlacement::Heads;
+    inputs.owners.clear();
+    let mut manifest = (*inputs.manifest).clone();
+    let programs = manifest["programs"].as_array_mut().unwrap();
+    let mut exports = std::collections::BTreeMap::new();
+    for target in &inputs.targets {
+        for entry in dense_manifest(target)["programs"].as_array().unwrap() {
+            exports.insert(entry["name"].as_str().unwrap().to_owned(), entry.clone());
+        }
+    }
+    programs.retain(|entry| !exports.contains_key(entry["name"].as_str().unwrap()));
+    programs.extend(exports.into_values());
+    inputs.manifest = std::sync::Arc::new(manifest);
+    (dir, inputs)
+}
+
+#[test]
+fn heads_recipe_matches_native_cache_units_peer_slots_and_one_tail_per_backing() {
+    use crate::families::minimax_m3::execution::{HeadsLayout, MsaCache};
+    use crate::placement::families::minimax_m3::{self as shared, Owner};
+    use crate::placement::{AttentionPlacement, LayerMode, planner::*};
+    use std::collections::BTreeMap;
+    for concurrency in [1, 16, 64] {
+        let mut inputs = heads_recipe_inputs();
+        inputs.sequences = concurrency;
+        let maximum = inputs.maximum_pages();
+        let request = shared::request(inputs.context, Some(1 << 20), crate::placement::Onboard::Auto,
+            inputs.prefill, Operation::Serving, None, Default::default());
+        let contract = inputs.prepare(&request).unwrap();
+        let raw = inputs.execution_components().unwrap();
+        assert!(raw.iter().all(|c| !matches!(c.kind,
+            ComponentKind::AllocationGranularity(_) | ComponentKind::DriverPageTables { .. })));
+        let capacity = inputs.request_capacity().unwrap();
+        let allocations = raw.iter().filter_map(|c| match &c.kind {
+            ComponentKind::Allocation { template, .. } => Some((template.id.clone(), (template.location, template.bytes))),
+            _ => None,
+        }).collect::<BTreeMap<_, _>>();
+        assert_eq!(allocations.len(), raw.iter().filter(|c| matches!(c.kind, ComponentKind::Allocation { .. })).count());
+        for gpu in 0..2 {
+            let location = Location::coordinator(gpu as u8);
+            let layout = HeadsLayout::new(&inputs.cfg, gpu as u8, capacity.prefill.rows).unwrap();
+            let cache = MsaCache::for_heads(&layout, 1, capacity.decode.requests, inputs.context.maximum as u32).unwrap();
+            for (name, bytes) in cache.buffers().unwrap() {
+                let id = if let Some(plane) = name.strip_prefix("layer.") {
+                    let (layer, plane) = plane.split_once('.').unwrap();
+                    let plane = match plane { "keys" => "keys", "values" => "values", "index" => "index", _ => panic!() };
+                    assert_eq!(bytes, if plane == "index" { 8448 } else { 16384 });
+                    Owner::HeadsKv { gpu, layer: layer.parse().unwrap(), plane }.id()
+                } else { format!("{}.{}", Owner::Cache { gpu }.id(), name) };
+                assert_eq!(allocations.get(&id), Some(&(location, bytes)), "{id}");
+            }
+            let index = (0..inputs.cfg.layers).map(|layer|
+                allocations[&Owner::HeadsKv { gpu, layer, plane: "index" }.id()].1).sum::<u64>();
+            assert_eq!(index, inputs.cfg.layers as u64 * 8448, "one replicated index per layer per rank");
+            let mut slots = vec![capacity.decode.rows];
+            slots.extend((0..inputs.prefill.waves).map(|_| capacity.prefill.rows));
+            for (name, bytes) in HeadsLayout::peer_buffers(&slots, false).unwrap() {
+                assert_eq!(allocations[&format!("minimax.heads.peer.{gpu}.{name}")], (location, bytes));
+            }
+            for slot in 0..=inputs.prefill.waves {
+                let (prefix, rows) = if slot == 0 { (Owner::Decode { gpu }.id(), capacity.decode.rows) }
+                    else { (Owner::Unit { gpu, slot: slot - 1 }.id(), capacity.prefill.rows) };
+                for (name, bytes) in HeadsLayout::new(&inputs.cfg, gpu as u8, rows).unwrap().buffers() {
+                    let id = format!("{prefix}.{name}");
+                    assert_eq!(allocations[&id], (location, bytes));
+                }
+            }
+        }
+        assert!(!allocations.keys().any(|id| id.starts_with("minimax.kv.") && !id.starts_with("minimax.kv.heads.")));
+        let mut finalized = raw.clone();
+        fixed_request_tails(&mut finalized, maximum, &[]).unwrap();
+        for component in finalized.iter().filter(|c| matches!(c.kind, ComponentKind::AllocationGranularity(_))) {
+            let ComponentKind::AllocationGranularity(tail) = &component.kind else { unreachable!() };
+            assert_eq!(contract.components.iter().filter(|c| matches!(&c.kind,
+                ComponentKind::AllocationGranularity(actual) if actual.id == tail.id)).count(), 1, "{}", tail.id);
+        }
+        let mut measured = inputs.clone();
+        for budget in &mut measured.budgets[..2] {
+            let Baseline::Forecast { occupied, .. } = budget.baseline else { panic!("forecast") };
+            budget.baseline = Baseline::Sampled { free: budget.physical_bytes - occupied,
+                phase: Phase::Load, source: "same heads pre-weight sample".into() };
+        }
+        let runtime = measured.admit(request.clone()).unwrap();
+        let admitted = inputs.admit(request).unwrap();
+        assert_eq!(runtime.solved.facts, admitted.solved.facts);
+        assert_eq!(runtime.solved.decisions, admitted.solved.decisions);
+        assert_eq!(runtime.solved.pool_tokens, admitted.solved.pool_tokens);
+        assert_eq!(admitted.placement.attention_placement, AttentionPlacement::Heads);
+        assert!(admitted.placement.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
+        assert!(admitted.placement.hops.iter().all(|hop| hop.at == crate::placement::HopPoint::Entry));
+    }
+}
+
+#[test]
+fn heads_planning_does_not_qualify_serving_and_auto_keeps_layers() {
+    use crate::placement::families::minimax_m3::{self as shared, ServingRefusal};
+    use crate::placement::{AttentionPlacement, planner::Operation};
+    let heads = heads_recipe_inputs();
+    let request = shared::request(heads.context, Some(1 << 20), crate::placement::Onboard::Auto,
+        heads.prefill, Operation::Serving, None, Default::default());
+    let error = heads.admit_serving(request.clone()).unwrap_err();
+    assert!(matches!(error, ServingRefusal::NarrowHeadsNotQualified));
+    assert_eq!(error.to_string(), "narrow-head MiniMax kernels not qualified");
+    assert!(heads.admit(request).is_ok(), "explicit planning remains available");
+    let layers = recipe_inputs(2, 4);
+    assert_eq!(layers.attention, AttentionPlacement::Layers);
+    let request = shared::request(layers.context, Some(1 << 20), crate::placement::Onboard::Auto,
+        layers.prefill, Operation::Serving, None, Default::default());
+    assert!(layers.admit_serving(request).is_ok());
+    assert_eq!(shared::Owner::Kv { layer: 3, plane: "index" }.id(), "minimax.kv.3.index");
+    for gpu in 0..2 {
+        let owner = shared::Owner::HeadsKv { gpu, layer: 3, plane: "index" };
+        assert_eq!(owner.inventory_name().unwrap(), format!("kv.heads.{gpu}.3.index"));
+    }
+}
+
+#[test]
+fn heads_cache_geometry_keeps_one_replicated_index_per_rank() {
+    use crate::serving_capacity::{CacheOptions, KvPlacement};
+    use crate::placement::AttentionPlacement;
+    let (dir, _, _) = fixture();
+    let model = MINIMAX_M3.open(&Checkpoint::open(dir.path()).unwrap()).unwrap();
+    let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+        attention_placement: Some(AttentionPlacement::Heads), ..Default::default() }).unwrap().unwrap();
+    assert_eq!(geometry.placement, KvPlacement::PartitionedHeads);
+    for rank in geometry.ranks {
+        assert_eq!(rank.persistent_unit_bytes, 4 * (16384 + 16384 + 8448));
+    }
+}
+
+
+#[test]
+fn heads_expert_backend_charges_tp2_exchange_separately_without_weight_replication() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::{ExpertHome, Onboard, planner::*};
+    // One RTX uses a complete local expert backing without any TP2 exchange.
+    // A pair uses two half backings and retains OwnerTp2's independent exchange.
+    for (gpus, heads) in [(1, false), (2, false), (2, true)] {
+        let inputs = if heads { heads_recipe_inputs() } else { recipe_inputs(gpus, 4) };
+        for count in [0, 1] {
+            let mut inputs = inputs.clone();
+            if count > 0 {
+                // This reduced fixture has one routed layer: all-local must
+                // not retain an idle Spark topology.
+                inputs.spark_ranks = 0;
+                inputs.spark.iter_mut().for_each(Vec::clear);
+                inputs.links.clear();
+                inputs.budgets.retain(|budget| !budget.locations.iter().any(|location|
+                    matches!(location.device, Device::Spark(_))));
+            }
+            let request = shared::request(inputs.context, Some(1 << 20), Onboard::Layers(count),
+                inputs.prefill, Operation::Serving, None, Default::default());
+            let admitted = inputs.admit(request).unwrap();
+            let facts = &admitted.solved.facts;
+            let ids = facts.allocations.iter().map(|a| a.id.as_str()).collect::<Vec<_>>();
+            assert_eq!(ids.iter().any(|id| id.starts_with("minimax.tp2.")), gpus == 2 && count > 0);
+            assert_eq!(ids.iter().any(|id| id.starts_with("minimax.heads.peer.")), heads);
+            if count > 0 {
+                let layer = inputs.routed[0];
+                assert_eq!(admitted.placement.layers[layer].experts,
+                    if gpus == 2 { ExpertHome::RtxTp2 } else { ExpertHome::RtxWhole { gpu: 0 } });
+                assert_eq!(admitted.expert_backings.len(), gpus);
+                if gpus == 2 {
+                    let whole = recipe_inputs(1, 4);
+                    let halves = admitted.expert_backings.iter().map(|b| b.arena.payload_bytes()).sum::<usize>();
+                    assert_eq!(halves, whole.expert_backings[1][0].arena.payload_bytes(),
+                        "two native half backings, not two full copies");
+                }
+            }
+        }
+    }
+}
+
+
+#[test]
+fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pages() {
+    use crate::families::minimax_m3::admission::{gather, Coordinator, FactsRequest};
+    use crate::placement::{AttentionPlacement, CoordinatorCard, ResidentWeights};
+    let (dir, expected) = heads_recipe_fixture();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
+    let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+    let manifest_path = dir.path().join("PROGRAMS.json");
+    std::fs::write(&manifest_path, expected.manifest.to_string()).unwrap();
+    let mut request = FactsRequest { checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
+        manifest_path: &manifest_path, manifest: expected.manifest.clone(),
+        coordinator: Coordinator::Planned { cards: vec![CoordinatorCard {
+            physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },
+        attention: Some(AttentionPlacement::Heads), physical_devices: &[0, 1],
+        spark_ranks: 4, spark_bytes: 100 << 30, prefill: expected.prefill,
+        context_tokens: 1 << 20, pool_tokens: Some(1 << 20), sequences: 16,
+        host: (512 << 30, 480 << 30), host_cache_bytes: Some(1 << 30), prefix_entries: 64,
+        replies: Default::default(), head: crate::placement::planner::serving::BlasHead::Gemm,
+        expert_usage: false, resident_weight_limit: ResidentWeights(80 << 30) };
+    let heads = gather(&request).unwrap();
+    assert!(heads.heads() && heads.owners.is_empty());
+    assert_eq!(heads.targets, expected.targets);
+    assert_eq!(heads.mount, expected.mount);
+    request.attention = None;
+    let layers = gather(&request).unwrap();
+    assert_eq!(layers.attention, AttentionPlacement::Layers);
+    assert_eq!(layers.owners, crate::placement::families::minimax_m3::layer_owners(60, 2));
+    let geometry = |bytes: u64| cuteafd_core::prefix::HostCacheGeometry {
+        unit_rows: 64, page_bytes: bytes * 60, mark_bytes: 0, draft_bytes: 0 };
+    assert_eq!(heads.host_prefix.chunk_bytes, geometry(2 * (16384 + 16384 + 8448)).chunk_bytes().min(1 << 30));
+    assert_eq!(layers.host_prefix.chunk_bytes, geometry(32768 + 32768 + 8448).chunk_bytes().min(1 << 30));
+}
+
+
+#[test]
+fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
+    use crate::placement::{AttentionPlacement, OnboardSetting};
+    let (dir, inputs) = heads_recipe_fixture_with_experts(128);
+    let manifest = dir.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, inputs.manifest.to_string()).unwrap();
+    for attention in [Some(AttentionPlacement::Heads), None] {
+        let options = PlanOptions { attention_placement: attention,
+            placement: plan::ExpertPlacement::Sparks { ranks: 4 },
+            layout: Some(plan::layout::LayoutOptions {
+                rtx_bytes: vec![96 << 30; 2], spark_bytes: 100 << 30,
+                workspace_manifest: Some(manifest.clone()), host_memory: Some((512 << 30, 480 << 30)),
+                host_cache_bytes: Some(0), context_tokens: 1 << 20, pool_tokens: Some(32768),
+                prefill_unit_rows: Some(1024), prefill_waves: 3, concurrency: 16,
+                onboard: Some(OnboardSetting::Layers(0)), ..Default::default()
+            }), ..Default::default() };
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.config_error.is_none(), "{:?}", report.config_error);
+        assert!(report.placement_supported, "{:?}", report.hints);
+        assert!(!report.executable());
+        assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+        assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
+        let placed = report.solver_placement.as_ref().expect("shared solved placement");
+        assert_eq!(placed.attention_placement, report.attention_placement);
     }
 }

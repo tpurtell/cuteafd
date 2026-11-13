@@ -57,6 +57,8 @@ pub struct FactsRequest<'a> {
     pub manifest_path: &'a Path,
     pub manifest: Arc<serde_json::Value>,
     pub coordinator: Coordinator,
+    /// Explicit planning mode; None keeps the qualified whole-layer default.
+    pub attention: Option<crate::placement::AttentionPlacement>,
     /// Logical rank to physical CUDA device, shared with runtime arena IDs.
     pub physical_devices: &'a [i32],
     pub spark_ranks: usize,
@@ -158,13 +160,32 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         .map_err(|error| refused(format!("MiniMax request capacities refused: {error}"),
             "Use concurrency 1..64 and prefill unit rows 1..4096."))?;
     let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
-    let owners = shared::layer_owners(cfg.layers, gpus);
-    let targets = CoordinatorWeights::plan(request.checkpoint, cfg, gpus,
-        &owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>())
-        .map_err(|error| refused(format!("MiniMax target arena inventory refused: {error:#}"),
-            "Provide complete native MXFP8 checkpoint headers."))?;
-    let mount = targets.iter().map(|target| target.mount_load(request.checkpoint)).collect::<anyhow::Result<Vec<_>>>()
-        .map_err(|error| refused(format!("MiniMax mount inventory refused: {error:#}"), "Check checkpoint headers."))?;
+    let attention = request.attention.unwrap_or(if gpus == 2 {
+        crate::placement::AttentionPlacement::Layers
+    } else { crate::placement::AttentionPlacement::Heads });
+    let heads = gpus == 2 && attention == crate::placement::AttentionPlacement::Heads;
+    if attention == crate::placement::AttentionPlacement::Context
+        || (gpus == 1 && attention != crate::placement::AttentionPlacement::Heads) {
+        return Err(refused("MiniMax attention placement is not implemented", "Use heads on one RTX; layers or heads on two RTX."));
+    }
+    let owners = if heads { Vec::new() } else { shared::layer_owners(cfg.layers, gpus) };
+    let target_inventory = || -> anyhow::Result<_> {
+        if heads {
+            let weights = super::weight_layout::HeadsWeights::plan(request.checkpoint, cfg,
+                crate::placement::planner::EmbeddingHome::Device(0))?;
+            let mount = weights.iter().map(|weight| weight.mount_load(request.checkpoint))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok((weights.into_iter().map(|weight| weight.target).collect::<Vec<_>>(), mount))
+        } else {
+            let weights = CoordinatorWeights::plan(request.checkpoint, cfg, gpus,
+                &owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>())?;
+            let mount = weights.iter().map(|target| target.mount_load(request.checkpoint))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok((weights, mount))
+        }
+    };
+    let (targets, mount) = target_inventory().map_err(|error| refused(
+        format!("MiniMax target arena inventory refused: {error:#}"), "Provide complete native MXFP8 checkpoint headers."))?;
     let tensors = request.catalog.fp8().ok_or_else(|| refused("MiniMax native expert catalog missing",
         "Provide compressed-tensors NVFP4 expert headers."))?;
     let expert_backings = shared::ExpertInventory::new(tensors, &routed, gpus)
@@ -197,7 +218,9 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, request.spark_bytes)));
     let (host_total, host_available) = request.host;
     budgets.push(crate::placement::families::kimi::host_budget(host_total, host_available));
-    let page_bytes = shared::PAGE_ROWS * (32768 + 32768 + 8448) / shared::PAGE_ROWS * cfg.layers as u64;
+    // A host prefix snapshot retains both replicated index planes for heads.
+    let page_bytes = if heads { 2 * (16384 + 16384 + 8448) } else { 32768 + 32768 + 8448 }
+        * cfg.layers as u64;
     let host_prefix = if request.host_cache_bytes == Some(0) || request.prefix_entries == 0 {
         serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }
     } else {
@@ -210,7 +233,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
         shared::PAGE_ROWS).maximum_tokens();
-    Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks,
+    Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, attention, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, owners,
         manifest: request.manifest.clone(), routed: routed.clone(), expert_backings, local, spark, links,

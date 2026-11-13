@@ -154,7 +154,7 @@ pub(crate) mod serve_admission {
         let inputs = gather(&facts).map_err(|refused| anyhow::anyhow!("{}; {}", refused.what, refused.how))?;
         let request = shared::request(inputs.context, facts.pool_tokens, onboard, facts.prefill,
             cuteafd_loader::placement::planner::Operation::Serving, inputs.resident_weight_limit, facts.replies);
-        let admitted = inputs.admit(request).context("MiniMax serving admission")?;
+        let admitted = inputs.admit_serving(request).context("MiniMax serving admission")?;
         cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "minimax_m3");
         Ok(admitted)
     }
@@ -186,6 +186,79 @@ mod tests {
     use crate::shared::memory::receipts::Inventory;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
     use cuteafd_loader::serving_capacity::WeightArenaLayout;
+
+    #[test]
+    fn explicit_heads_serve_admission_preserves_typed_unqualified_reason() -> Result<()> {
+        use cuteafd_loader::families::minimax_m3::admission::{Coordinator, FactsRequest};
+        use cuteafd_loader::placement::{AttentionPlacement, CoordinatorCard, Onboard, ResidentWeights};
+        use cuteafd_loader::placement::families::minimax_m3::ServingRefusal;
+        let mut config: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?;
+        config.as_object_mut().unwrap().remove("vision_config");
+        config["text_config"]["num_local_experts"] = 4.into();
+        config["text_config"]["moe_layer_freq"] = serde_json::json!((0..60).map(|layer| u8::from(layer == 3)).collect::<Vec<_>>());
+        let cfg = MiniMaxM3Config::from_hf(&config)?;
+        let text = "language_model.model.";
+        let mut headers = vec![(format!("{text}embed_tokens.weight"), "BF16", vec![cfg.vocab_size, cfg.hidden]),
+            ("language_model.lm_head.weight".into(), "BF16", vec![cfg.vocab_size, cfg.hidden]),
+            (format!("{text}norm.weight"), "BF16", vec![cfg.hidden])];
+        for layer in 0..cfg.layers {
+            let prefix = format!("{text}layers.{layer}.");
+            for norm in ["input_layernorm", "post_attention_layernorm"] {
+                headers.push((format!("{prefix}{norm}.weight"), "BF16", vec![6144]));
+            }
+            for norm in ["q_norm", "k_norm", "index_q_norm", "index_k_norm"] {
+                headers.push((format!("{prefix}self_attn.{norm}.weight"), "BF16", vec![128]));
+            }
+            let mut matrix = |stem: String, n, k| {
+                headers.push((format!("{prefix}{stem}.weight"), "F8_E4M3", vec![n, k]));
+                headers.push((format!("{prefix}{stem}.weight_scale_inv"), "U8", vec![n, k / 32]));
+            };
+            for (name, n, k) in [("q_proj", 8192, 6144), ("k_proj", 512, 6144), ("v_proj", 512, 6144),
+                ("o_proj", 6144, 8192), ("index_q_proj", 512, 6144), ("index_k_proj", 128, 6144)] {
+                matrix(format!("self_attn.{name}"), n, k);
+            }
+            let (stem, inter) = if layer == 3 { ("block_sparse_moe.shared_experts", 3072) } else { ("mlp", 12288) };
+            for (name, n, k) in [("gate", inter, 6144), ("up", inter, 6144), ("down", 6144, inter)] {
+                matrix(format!("{stem}.{name}_proj"), n, k);
+            }
+            if layer == 3 {
+                headers.push((format!("{prefix}block_sparse_moe.gate.weight"), "F32", vec![4, 6144]));
+                headers.push((format!("{prefix}block_sparse_moe.e_score_correction_bias"), "F32", vec![4]));
+                for expert in 0..4 {
+                    for (w, n, k) in [("w1", 3072, 6144), ("w3", 3072, 6144), ("w2", 6144, 3072)] {
+                        let stem = format!("{prefix}block_sparse_moe.experts.{expert}.{w}");
+                        headers.push((format!("{stem}.weight_packed"), "U8", vec![n, k / 2]));
+                        headers.push((format!("{stem}.weight_scale"), "F8_E4M3", vec![n, k / 16]));
+                        for name in ["weight_global_scale", "input_global_scale"] {
+                            headers.push((format!("{stem}.{name}"), "F32", vec![]));
+                        }
+                    }
+                }
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_snapshot(dir.path(), &config, &headers, None);
+        let checkpoint = Checkpoint::open(dir.path())?;
+        let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
+        let manifest_path = dir.path().join("PROGRAMS.json");
+        let manifest = std::sync::Arc::new(serde_json::json!({"programs":[]}));
+        let request = FactsRequest { checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
+            manifest_path: &manifest_path, manifest,
+            coordinator: Coordinator::Planned { cards: vec![CoordinatorCard {
+                physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },
+            attention: Some(AttentionPlacement::Heads), physical_devices: &[0, 1],
+            spark_ranks: 4, spark_bytes: 100 << 30, prefill: PrefillShape { rows: 1024, waves: 3 },
+            context_tokens: 1 << 20, pool_tokens: Some(1 << 20), sequences: 16,
+            host: (512 << 30, 480 << 30), host_cache_bytes: Some(0), prefix_entries: 0,
+            replies: Default::default(), head: serving::BlasHead::Gemm,
+            expert_usage: false, resident_weight_limit: ResidentWeights(80 << 30) };
+        let sample = serve_admission::Sample { total: 96 << 30, cap: 96 << 30, free: 94 << 30, pending_code: 0 };
+        let error = serve_admission::admit(request, &[sample; 2], Onboard::Layers(0)).unwrap_err();
+        assert!(matches!(error.downcast_ref::<ServingRefusal>(), Some(ServingRefusal::NarrowHeadsNotQualified)), "{error:#}");
+        assert!(format!("{error:#}").contains("narrow-head MiniMax kernels not qualified"));
+        Ok(())
+    }
 
     #[test]
     fn cold_shape_domains_resolve_before_fixed_owner_facts() -> Result<()> {
