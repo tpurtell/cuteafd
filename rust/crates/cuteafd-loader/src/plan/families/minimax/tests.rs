@@ -709,6 +709,35 @@ fn zero_onboard_pair_has_no_local_expert_or_exchange_owners() {
 }
 
 #[test]
+fn synchronous_upload_chunk_is_one_startup_only_pinned_backing() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::{Lifetime, Location, Operation, Phase};
+    for gpus in [1, 2] {
+        let inputs = recipe_inputs(gpus, 4);
+        let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+            inputs.prefill, Operation::Serving, None, Default::default());
+        let admitted = inputs.admit(request).unwrap();
+        let facts = &admitted.solved.facts;
+        let owners = facts.allocations.iter().filter(|owner| owner.id == "staging/sync-h2d")
+            .collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1, "one NativeLibrary-wide backing, not one per GPU");
+        let owner = owners[0];
+        assert_eq!(owner.location, Location::PINNED);
+        assert_eq!(owner.bytes, crate::shared::dense_read::STEP_BYTES as u64);
+        assert!(owner.view.is_none());
+        assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Warmup });
+        for phase in [Phase::Load, Phase::PostTargetKv, Phase::DraftLoad, Phase::Warmup] {
+            assert!(owner.lifetime.contains(phase, facts.phase_order));
+        }
+        for phase in [Phase::Ready, Phase::Growth] {
+            assert!(!owner.lifetime.contains(phase, facts.phase_order));
+        }
+        assert!(facts.allowances.iter().all(|allowance| !format!("{allowance:?}").contains("sync-h2d")));
+        assert!(facts.allocation_granularity.iter().all(|tail| tail.location != Location::PINNED));
+    }
+}
+
+#[test]
 fn prefix_ordered_uploads_match_each_request_destination() {
     use crate::placement::families::minimax_m3::{self as shared, Owner};
     use crate::placement::planner::{Operation, Location};

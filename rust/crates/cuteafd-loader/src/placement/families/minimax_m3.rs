@@ -724,9 +724,12 @@ impl Recipe for MiniMaxInputs {
                 gemm: self.head.gemm(), lt: self.head.lt(), lifetime: Lifetime::TARGET, activation: Activation::always() }],
                 maximum, PhaseOrder::TARGET_THEN_DRAFT)?);
         }
-        components.extend(allowance(Location::PINNED, 64 << 20, Lifetime::RESIDENT,
-            "MiniMax reusable H2D staging (estimated: library-wide sync-h2d backing, cold golden reconciled)".into(),
-            true, maximum));
+        // #1945: the library streams every synchronous startup copy through
+        // this shared chunk, then releases it before readiness.
+        components.extend(buffer("staging/sync-h2d", Location::PINNED,
+            crate::shared::dense_read::STEP_BYTES as u64,
+            Lifetime { first: Phase::Load, last: Phase::Warmup }, Category::Staging,
+            "library-wide synchronous H2D startup chunk", maximum));
         fixed_request_tails(&mut components, maximum, &[])?;
         let mut contract = Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (self.spark_ranks > 0).then(|| SparkReplyFormats {
