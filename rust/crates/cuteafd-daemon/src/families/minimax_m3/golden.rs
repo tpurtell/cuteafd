@@ -133,16 +133,49 @@ fn run(args: GoldenArgs) -> Result<()> {
             Location::HOST, bytes, Lifetime::TARGET, Category::Workspace, "diagnostic layer download"),
             ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
     }
+    use crate::shared::{experts::rtx::{dense::HostStaging, push::{push_host_envelope, PushPolicy}},
+        token_io::{EmbedPlacement, TokenEmbedding}};
+    use cuteafd_loader::placement::planner::{ByteCurve, Component, ComponentKind};
+    let policy = PushPolicy::for_snapshot(view.snapshot())?;
+    let envelope = if policy == PushPolicy::Required {
+        // Every target operand is a direct native upload; no transform pool or
+        // retained index is needed, only this coordinator's receive ring.
+        let envelope = push_host_envelope(&[None], &[HostStaging::default()])?;
+        contract.components.retain(|component| !matches!(&component.kind,
+            ComponentKind::Allocation { template, .. } if template.group == "target mount"));
+        for allocation in envelope.allocations("minimax.push")? {
+            let bytes = allocation.bytes;
+            contract.components.push(Component::allocation(allocation,
+                ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
+        }
+        contract.add_driver_page_tables();
+        Some(envelope)
+    } else { None };
     let facts = admission::admit(&contract, sample.free_bytes, sample.total_bytes, host)?;
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let exports = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports();
     let executions = cuteafd_loader::plan::spark_executions::admit_family("minimax_m3", &exports,
         None, u64::from(args.prefill_rows), waves as u64)?;
     let model = ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint, rings, 1, executions)?;
-    let pending = SparkAdmission::plan_view(&view, ExpertGeometry::MINIMAX_M3, Some(&catalog),
+    let admission = SparkAdmission::plan_view(&view, ExpertGeometry::MINIMAX_M3, Some(&catalog),
         &SparkWorkingSet { rtx_layers: vec![], spark_layers: (3..cfg.layers).collect(),
-            spark_ranks: args.peers.len(), prefill_lanes: 1 }, args.peers.len(), model, None)?.start(&args.peers)?;
-    let target = TargetWeights::mount(device, &checkpoint, &weights)?;
+            spark_ranks: args.peers.len(), prefill_lanes: 1 }, args.peers.len(), model, None)?;
+    let (target, embedding): (TargetWeights<'_>, Option<TokenEmbedding<'_>>) = if let Some(envelope) = envelope {
+        ensure!(admission.coordinator_pushes(), "MiniMax target and Spark experts must join one push group");
+        let (prepared, membership) = super::weights::push::prepare(&view, &catalog, &[device],
+            args.peers.len(), vec![], envelope, ||
+                TargetWeights::load_with_embedding(device, &checkpoint, &weights, EmbedPlacement::Gpu))?;
+        let pending = admission.start_with(&args.peers, membership)?;
+        let ((target, embedding), experts) = prepared.receive(&catalog)?;
+        ensure!(experts.iter().all(Vec::is_empty), "MiniMax cold golden has no coordinator expert sets");
+        pending.wait()?;
+        (target, Some(embedding))
+    } else {
+        let pending = admission.start(&args.peers)?;
+        let target = TargetWeights::mount(device, &checkpoint, &weights)?;
+        pending.wait()?;
+        (target, None)
+    };
     let kernels = Kernels::bind(device, &programs, &manifest, &cfg, &weights, args.prefill_rows, tokens)?;
     let stream = Rc::new(Stream::new(device)?);
     let mut owners = (0..waves).map(|_| UnitOwner::new(&kernels, Rc::clone(&stream), &cfg, &weights,
@@ -155,6 +188,9 @@ fn run(args: GoldenArgs) -> Result<()> {
     let mut inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax",
         Lifetime::TARGET, Category::Workspace, "cold golden");
     target.inventory(&mut inventory, "target")?;
+    if let Some(embedding) = &embedding {
+        inventory.extend(embedding.allocation_receipts(CoordinatorDevices::new(&devices)?, "embedding")?)?;
+    }
     cache.inventory(&mut inventory, "cache")?;
     head.inventory(&mut inventory, "head")?;
     residual.inventory(&mut inventory, "residual")?;
@@ -164,7 +200,6 @@ fn run(args: GoldenArgs) -> Result<()> {
     let receipts = inventory.receipts.iter().map(|receipt| serde_json::json!({
         "allocation":receipt.allocation, "address":receipt.address })).collect::<Vec<_>>();
     tracing::info!(receipts = %serde_json::to_string(&receipts)?, "MiniMax retained owner inventory");
-    pending.wait()?;
     let mut link = device.run(|| SparkLink::prepared(&library, SparkWorld::canonical(args.peers.len())?,
         &args.peers, config, link_layout))?;
     link.enable_terminal_ownership(Arc::clone(&library))?;
@@ -174,7 +209,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         let mut shape = SparkSessionShape::new(args.prefill_rows, 6144, 4, ExpertV2Dtype::Bf16)?;
         shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         device.run(|| link.bootstrap(&shape))?;
-        score(&args, &view, &cfg, &weights, &target, &kernels, &cache, &head, &residual,
+        score(&args, &view, &cfg, &weights, &target, embedding.as_ref(), &kernels, &cache, &head, &residual,
             &mut owners, &mut metadata, &mut link)
     })();
     let terminal = link.terminal_quiesce().and_then(|_| link.terminal_drain_copies())
@@ -191,7 +226,8 @@ fn run(args: GoldenArgs) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
-    admitted: &CoordinatorWeights, weights: &TargetWeights<'a>, kernels: &Kernels<'a>,
+    admitted: &CoordinatorWeights, weights: &TargetWeights<'a>,
+    embedding: Option<&crate::shared::token_io::TokenEmbedding<'a>>, kernels: &Kernels<'a>,
     cache: &Cache<'a>, head: &Head<'a>, residual: &Allocation<'a>, owners: &mut [UnitOwner<'a>],
     metadata: &mut [super::cache::Metadata<'a>], link: &mut SparkLink<'a>) -> Result<()> {
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
@@ -217,7 +253,9 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
         for first in (0..count).step_by(args.prefill_rows as usize) {
             let end = (first + args.prefill_rows as usize).min(count);
             let span = crate::shared::prefix::view(residual.buffer, first * 6144 * 4, (end - first) * 6144 * 4)?;
-            head.embed(weights, &window.tokens[first..end], span)?;
+            if let Some(embedding) = embedding {
+                head.embed_tokens(embedding, &window.tokens[first..end], span)?;
+            } else { head.embed(weights, &window.tokens[first..end], span)?; }
         }
         let mut taps = if args.tap_layers.is_empty() { None } else {
             let parent = args.save_logits.join("layer-taps");
