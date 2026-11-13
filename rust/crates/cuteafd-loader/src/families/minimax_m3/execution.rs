@@ -294,22 +294,49 @@ impl HeadLayout {
 /// One immutable unit's request metadata. Shared page tables belong to MsaCache;
 /// positions/causal extents differ by unit and must not alias a sibling slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnitMetadata { pub rows: u32 }
+pub struct UnitMetadata { pub rows: u32, pub requests: u32 }
 impl UnitMetadata {
     pub fn new(rows: u32) -> Result<Self, Refusal> {
-        if rows == 0 || rows > 4096 {
-            return Err(Refusal::InvalidFact("MiniMax metadata row capacity".into()));
+        Self::for_requests(rows, 1)
+    }
+    pub fn for_requests(rows: u32, requests: u32) -> Result<Self, Refusal> {
+        if rows == 0 || rows > 4096 || requests == 0 || requests > rows {
+            return Err(Refusal::InvalidFact("MiniMax metadata row/request capacity".into()));
         }
-        Ok(Self { rows })
+        Ok(Self { rows, requests })
+    }
+    /// Row cursor shared by the four rowwise metadata planes. Each segment's
+    /// i32 and i64 views retain the AOT ABI's 16-byte base alignment.
+    pub fn segment_row(self, cursor: u32) -> Result<u32, Refusal> {
+        let row = cursor.checked_add(3).ok_or(Refusal::Overflow("MiniMax metadata row"))? / 4 * 4;
+        if row >= self.metadata_rows() {
+            return Err(Refusal::InvalidFact("MiniMax metadata segment row exceeds owner".into()));
+        }
+        Ok(row)
+    }
+    pub fn metadata_rows(self) -> u32 {
+        if self.requests == 1 { self.rows }
+        else { (self.rows + 3 * (self.requests - 1)).div_ceil(4) * 4 }
+    }
+    /// Per-segment length, local [0, rows] offsets and descale block base.
+    pub fn segment_offset(self, segment: u32) -> Result<u64, Refusal> {
+        if segment >= self.requests {
+            return Err(Refusal::InvalidFact("MiniMax metadata segment exceeds owner".into()));
+        }
+        Ok(u64::from(segment) * 16)
     }
     pub fn buffers(self) -> Vec<(&'static str, u64)> {
-        let rows = u64::from(self.rows);
+        let rows = u64::from(self.metadata_rows());
+        let requests = u64::from(self.requests);
+        let (lengths, offsets) = if self.requests == 1 { (4, 8) }
+            else { (requests * 16, requests * 16) };
         vec![("positions", rows * 8), ("slots", rows * 8), ("batch_ids", rows * 4),
-            ("causal_lengths", rows * 4), ("cache_lengths", 4), ("query_offsets", 8),
-            ("key_descale", 16), ("value_descale", 16)]
+            ("causal_lengths", rows * 4), ("cache_lengths", lengths),
+            ("query_offsets", offsets),
+            ("key_descale", requests * 16), ("value_descale", requests * 16)]
     }
     pub fn components(self, prefix: &str, rank: u8, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
-        Self::new(self.rows)?;
+        Self::for_requests(self.rows, self.requests)?;
         components(self.buffers(), prefix, rank, Lifetime::TARGET, maximum_pages, Category::Workspace)
     }
 }
@@ -361,7 +388,7 @@ impl MsaCache {
             layers,
             pool_pages,
             requests,
-            table_width: max_context.div_ceil(64),
+            table_width: max_context.div_ceil(64).div_ceil(4) * 4,
         })
     }
     pub fn buffers(self) -> Result<Vec<(String, u64)>, Refusal> {
@@ -414,6 +441,37 @@ mod tests {
             &serde_json::from_str(include_str!("fixtures/config.json")).unwrap(),
         )
         .unwrap()
+    }
+    #[test]
+    fn packed_metadata_keeps_segment_views_aligned_and_decode_contiguous() {
+        assert_eq!(UnitMetadata::new(17).unwrap().buffers(), vec![("positions", 136),
+            ("slots", 136), ("batch_ids", 68), ("causal_lengths", 68),
+            ("cache_lengths", 4), ("query_offsets", 8), ("key_descale", 16), ("value_descale", 16)]);
+        for requests in 2..=64 {
+            let layout = UnitMetadata::for_requests(64, requests).unwrap();
+            let buffers = layout.buffers().into_iter().collect::<std::collections::BTreeMap<_, _>>();
+            let mut cursor = 0;
+            for segment in 0..requests {
+                let row = layout.segment_row(cursor).unwrap();
+                assert_eq!((row * 4) % 16, 0);
+                assert_eq!((row * 8) % 16, 0);
+                cursor = row + if segment + 1 == requests { 65 - requests } else { 1 };
+                let block = layout.segment_offset(segment).unwrap();
+                assert_eq!(block % 16, 0);
+                assert!(block + 16 <= buffers["query_offsets"]);
+                assert!(block + 16 <= buffers["cache_lengths"]);
+            }
+            assert!(cursor <= layout.metadata_rows());
+            assert!(buffers["query_offsets"] >= u64::from(requests + 1) * 4);
+            assert!(buffers["cache_lengths"] >= u64::from(requests) * 4);
+            assert_eq!(buffers["positions"], u64::from(layout.metadata_rows()) * 8);
+            assert_eq!(buffers["key_descale"], u64::from(requests) * 16);
+            assert!(layout.segment_offset(requests).is_err());
+            assert!(layout.segment_row(layout.metadata_rows()).is_err());
+        }
+        for (rows, requests) in [(0, 1), (4097, 1), (64, 0), (64, 65)] {
+            assert!(UnitMetadata::for_requests(rows, requests).is_err());
+        }
     }
     #[test]
     fn head_inventory_has_one_owner_per_native_allocation() {
@@ -538,11 +596,11 @@ mod tests {
     #[test]
     fn cache_charges_planar_kv_and_packed_index_once_per_layer() {
         for (context, width) in [
-            (127, 2),
-            (128, 2),
-            (129, 3),
+            (127, 4),
+            (128, 4),
+            (129, 4),
             (2048, 32),
-            (2049, 33),
+            (2049, 36),
             (1048576, 16384),
         ] {
             let cache = MsaCache::new(60, 17, 16, context).unwrap();

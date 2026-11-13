@@ -44,6 +44,21 @@ impl<'a> Kernels<'a> {
     }
 }
 
+fn segment_rows(segments: &[attention::Segment], capacity: usize) -> Result<usize> {
+    packed_rows(segments.iter().map(|segment| (segment.first_row, segment.request.rows)), capacity)
+}
+
+fn packed_rows(spans: impl IntoIterator<Item = (usize, usize)>, capacity: usize) -> Result<usize> {
+    let mut next = 0usize;
+    for (first, rows) in spans {
+        ensure!(first == next && rows > 0, "MiniMax attention segments must partition live rows");
+        next = next.checked_add(rows).context("MiniMax packed row overflow")?;
+        ensure!(next <= capacity, "MiniMax attention segments exceed the admitted owner");
+    }
+    ensure!(next > 0, "MiniMax attention segments are empty");
+    Ok(next)
+}
+
 /// Independent residual/branches for one in-flight slot. The retained stream
 /// drains before any storage retires, including a partially submitted chain.
 pub(crate) struct UnitOwner<'a> {
@@ -51,7 +66,7 @@ pub(crate) struct UnitOwner<'a> {
     pub dense: dense::ExecutionOwner<'a>,
     attention: attention::Workspace<'a>,
     layout: UnitLayout,
-    planes: BTreeMap<String, Allocation<'a>>,
+    planes: BTreeMap<String, Rc<Allocation<'a>>>,
 }
 impl Drop for UnitOwner<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("MiniMax unit arithmetic owners"); }
@@ -59,19 +74,31 @@ impl Drop for UnitOwner<'_> {
 impl<'a> UnitOwner<'a> {
     pub fn new(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
         weights: &CoordinatorWeights, rows: u32) -> Result<Self> {
+        Self::for_mode(kernels, stream, cfg, weights, rows, true)
+    }
+    pub fn new_decode(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
+        weights: &CoordinatorWeights, rows: u32) -> Result<Self> {
+        ensure!(rows <= 64, "MiniMax decode owner exceeds native row capacity");
+        Self::for_mode(kernels, stream, cfg, weights, rows, false)
+    }
+    fn for_mode(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
+        weights: &CoordinatorWeights, rows: u32, prefill: bool) -> Result<Self> {
         ensure!(stream.device.id == kernels.device.id
             && std::ptr::eq(stream.device.library, kernels.device.library), "MiniMax unit stream differs");
         let layout = UnitLayout::new(cfg, rows)?;
         let planes = layout.buffers().into_iter().map(|(name, bytes)| {
-            Ok((name.into(), Allocation::new(kernels.device, usize::try_from(bytes)?,
-                Tag::workspace("minimax/unit"))?))
+            Ok((name.into(), Rc::new(Allocation::new(kernels.device, usize::try_from(bytes)?,
+                Tag::workspace("minimax/unit"))?)))
         }).collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self { dense: dense::ExecutionOwner::new(kernels.device, weights, rows)?,
-            attention: attention::Workspace::new(&kernels.attention)?, stream, layout, planes })
+            attention: if prefill { attention::Workspace::new(&kernels.attention)? }
+                else { attention::Workspace::new_decode(&kernels.attention)? }, stream, layout, planes })
     }
     fn owner(&self, name: &str) -> Result<&Allocation<'a>> {
-        self.planes.get(name).with_context(|| format!("MiniMax unit lacks admitted {name}"))
+        self.planes.get(name).map(Rc::as_ref).with_context(|| format!("MiniMax unit lacks admitted {name}"))
     }
+    /// Prefix tails may use this scratch: begin_unit overwrites it before any model read.
+    pub fn prefix_scratch(&self) -> Rc<Allocation<'a>> { Rc::clone(&self.planes["residual"]) }
     pub fn plane(&self, name: &str) -> Result<Buffer> { Ok(self.owner(name)?.buffer) }
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         self.dense.inventory(inventory, &format!("{prefix}.dense"))?;
@@ -110,37 +137,80 @@ impl<'a> UnitOwner<'a> {
     /// kernels, cache and all request buffers survive the stream's drainage.
     pub unsafe fn attention(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
         admitted: &CoordinatorWeights, layer: usize, request: attention::Request) -> Result<()> {
-        self.normalize(kernels, weights, layer, "input_layernorm.weight", request.rows)?;
+        // SAFETY: the single segment forwards the caller's request contract.
+        unsafe { self.attention_segments(kernels, weights, admitted, layer,
+            &[attention::Segment { first_row: 0, request }]) }
+    }
+    /// # Safety
+    /// Segments partition the live rows, and each request's local metadata and
+    /// cache satisfy Workspace::enqueue. All owners survive stream drainage.
+    pub unsafe fn attention_segments(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+        admitted: &CoordinatorWeights, layer: usize, segments: &[attention::Segment]) -> Result<()> {
+        let rows = segment_rows(segments, self.layout.rows as usize)?;
+        self.project_attention(kernels, weights, admitted, layer, rows)?;
+        for segment in segments {
+            let p = self.projections(weights, layer, segment.first_row, segment.request.rows)?;
+            // SAFETY: each segment owns its metadata/cache, and the stream orders
+            // scratch reuse after copying the preceding output into its row span.
+            let output = unsafe { self.attention.enqueue(&kernels.attention, p, segment.request, &self.stream)? };
+            self.copy_attention(output, segment.first_row, segment.request.rows)?;
+        }
+        self.finish_attention(kernels, weights, admitted, layer, rows)
+    }
+    /// # Safety
+    /// Every decode row owns one request's tables and distinct append slot;
+    /// request/cache operands remain valid until the retained stream drains.
+    pub unsafe fn decode(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+        admitted: &CoordinatorWeights, layer: usize, request: attention::DecodeRequest) -> Result<()> {
+        ensure!(request.batch == request.request.rows, "MiniMax decode rows must equal batch");
+        let rows = request.request.rows;
+        self.project_attention(kernels, weights, admitted, layer, rows)?;
+        let p = self.projections(weights, layer, 0, rows)?;
+        // SAFETY: caller supplies batched metadata; producer planes are retained.
+        let output = unsafe { self.attention.decode(&kernels.attention, p, request, &self.stream)? };
+        self.copy_attention(output, 0, rows)?;
+        self.finish_attention(kernels, weights, admitted, layer, rows)
+    }
+    fn project_attention(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+        admitted: &CoordinatorWeights, layer: usize, rows: usize) -> Result<()> {
+        self.normalize(kernels, weights, layer, "input_layernorm.weight", rows)?;
         let names = [("self_attn.q_proj", "query"), ("self_attn.k_proj", "key"),
             ("self_attn.v_proj", "value"), ("self_attn.index_q_proj", "index_query"),
             ("self_attn.index_k_proj", "index_key")];
         let first = Self::projection(admitted, layer, names[0].0)?;
-        let mut prepared = self.dense.prepare(&kernels.dense, first, request.rows as u32, self.stream.raw)?;
+        let mut prepared = self.dense.prepare(&kernels.dense, first, rows as u32, self.stream.raw)?;
         for (suffix, output) in names {
             let destination = self.planes.get(output).context("MiniMax projection output missing")?;
             prepared.project(weights, Self::projection(admitted, layer, suffix)?)?.narrow(destination)?;
         }
-        drop(prepared);
-        let p = attention::Projections { query: self.plane("query")?, key: self.plane("key")?,
-            value: self.plane("value")?, index_query: self.plane("index_query")?, index_key: self.plane("index_key")?,
+        Ok(())
+    }
+    fn projections(&self, weights: &TargetWeights<'_>, layer: usize, first: usize,
+        rows: usize) -> Result<attention::Projections> {
+        let view = |name, stride| attention::row_view(self.plane(name)?, first, rows, stride);
+        Ok(attention::Projections { query: view("query", 8192 * 2)?, key: view("key", 512 * 2)?,
+            value: view("value", 512 * 2)?, index_query: view("index_query", 512 * 2)?,
+            index_key: view("index_key", 128 * 2)?,
             query_norm: Self::weight(weights, layer, "self_attn.q_norm.weight")?,
             key_norm: Self::weight(weights, layer, "self_attn.k_norm.weight")?,
             index_query_norm: Self::weight(weights, layer, "self_attn.index_q_norm.weight")?,
-            index_key_norm: Self::weight(weights, layer, "self_attn.index_k_norm.weight")? };
-        // SAFETY: the caller retains and validates request metadata/cache, and
-        // all produced branch allocations are retained by this stream owner.
-        let output = unsafe { self.attention.enqueue(&kernels.attention, p, request, &self.stream)? };
+            index_key_norm: Self::weight(weights, layer, "self_attn.index_k_norm.weight")? })
+    }
+    fn copy_attention(&self, output: Buffer, first: usize, rows: usize) -> Result<()> {
+        let destination = attention::row_view(self.dense.producer_destination(), first, rows, 8192 * 2)?;
         let device = self.stream.device;
         device.run(|| {
-            // SAFETY: copy is stream ordered after attention and before dense's
-            // quantization; both owners remain live through drain.
-            unsafe { device.library.copy_d2d_async(self.dense.producer_destination(), output,
-                request.rows * 8192 * 2, self.stream.raw) }
-        })?;
+            // SAFETY: disjoint retained buffers, ordered before scratch reuse and
+            // the batched O projection's activation quantization.
+            unsafe { device.library.copy_d2d_async(destination, output, destination.bytes, self.stream.raw) }
+        })
+    }
+    fn finish_attention(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+        admitted: &CoordinatorWeights, layer: usize, rows: usize) -> Result<()> {
         let projection = Self::projection(admitted, layer, "self_attn.o_proj")?;
-        self.dense.prepare(&kernels.dense, projection, request.rows as u32, self.stream.raw)?
+        self.dense.prepare(&kernels.dense, projection, rows as u32, self.stream.raw)?
             .project(weights, projection)?.narrow(self.planes.get("ffn").context("MiniMax ffn plane")?)?;
-        self.accumulate(request.rows)
+        self.accumulate(rows)
     }
     /// Router and FFN share the exact same normalized BF16 activation.
     pub fn router(&self, kernels: &Kernels<'_>, weights: &TargetWeights<'_>, layer: usize, rows: usize) -> Result<()> {
@@ -207,5 +277,23 @@ impl<'a> UnitOwner<'a> {
             unsafe { device.library.cuda_accumulate_bf16_to_f32_async(self.plane(source)?,
                 self.plane("residual")?, rows * 6144, self.stream.raw) }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_segments_partition_the_live_rows_without_gaps_or_overlap() {
+        for spans in [vec![(0, 1)], vec![(0, 1), (1, 3), (4, 13)], vec![(0, 17)]] {
+            let rows = spans.iter().map(|(_, rows)| rows).sum::<usize>();
+            assert_eq!(packed_rows(spans, 17).unwrap(), rows);
+        }
+        for spans in [vec![], vec![(0, 0)], vec![(1, 3)], vec![(0, 2), (1, 1)],
+            vec![(0, 2), (3, 1)], vec![(0, 18)]] {
+            assert!(packed_rows(spans, 17).is_err());
+        }
+        assert!(packed_rows([(0, usize::MAX), (usize::MAX, 1)], usize::MAX).is_err());
     }
 }
