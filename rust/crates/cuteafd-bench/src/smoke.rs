@@ -312,13 +312,12 @@ const RM_S: u64 = 10;
 /// After a failed `rm` or a still-present container, absence is re-polled for
 /// at most this long in total (dockerd keeps removing in the background under
 /// host load); an iteration starts only if it can finish inside the budget.
-const ABSENT_POLL_S: u64 = 10;
-const POLL_SLEEP_S: u64 = 1;
-const POLL_CHECK_S: u64 = 2;
+const ABSENT_POLL_S: u64 = 60;
+const POLL_SLEEP_S: u64 = 3;
 const KILL_AFTER_S: u64 = 1;
-// The coordinator's steps run one after another (a worker's take less) after the launcher stops.
-const _: () = assert!(LAUNCHER_GRACE_S + 2 * INSPECT_S + (STOP_S + 5) + LOGS_S + RM_S + ABSENT_POLL_S + 5 * KILL_AFTER_S <= CANCEL_TEARDOWN_S);
-const _: () = assert!(POLL_SLEEP_S + POLL_CHECK_S + KILL_AFTER_S <= ABSENT_POLL_S);
+// Cancellation shares its original deadline with polling; do not extend the
+// 60/75/80/90 s smoke/parent/hwlock/systemd stop chain for a slow daemon.
+const _: () = assert!(LAUNCHER_GRACE_S + INSPECT_S + (STOP_S + 5) + LOGS_S + RM_S + 4 * KILL_AFTER_S < CANCEL_TEARDOWN_S);
 
 /// Programs teardown runs (tests substitute logging fakes).
 #[derive(Debug, Clone)]
@@ -326,11 +325,14 @@ struct Tools {
     docker: PathBuf,
     ssh: PathBuf,
     instances: PathBuf,
+    absence_window: Duration,
+    poll_interval: Duration,
 }
 
 impl Default for Tools {
     fn default() -> Self {
-        Self { docker: "docker".into(), ssh: "ssh".into(), instances: expand("~/.cache/cuteafd/instances") }
+        Self { docker: "docker".into(), ssh: "ssh".into(), instances: expand("~/.cache/cuteafd/instances"),
+            absence_window: Duration::from_secs(ABSENT_POLL_S), poll_interval: Duration::from_secs(POLL_SLEEP_S) }
     }
 }
 
@@ -435,6 +437,7 @@ impl Inflight {
     /// groups (running their cleanups), stops launchers, then tears down every
     /// launched entry in parallel. Returns the entries torn down.
     fn cancel_all(&self) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(CANCEL_TEARDOWN_S);
         self.drained.store(true, Ordering::SeqCst);
         let hooks: Vec<(u32, Option<Vec<String>>)> = self.hooks.lock().unwrap_or_else(|e| e.into_inner())
             .iter().map(|(pid, cleanup)| (*pid, cleanup.clone())).collect();
@@ -456,7 +459,7 @@ impl Inflight {
                     };
                     let _ = writeln!(log, "cancelled: tearing down {name}");
                     match read_config(config) {
-                        Ok(config) => match teardown(name, &config, &mut log, &self.tools, true) {
+                        Ok(config) => match teardown_until(name, &config, &mut log, &self.tools, Some(deadline)) {
                             Ok(()) => self.finished(name),
                             Err(error) => {
                                 let _ = writeln!(log, "cancel teardown: {error:#}");
@@ -1264,12 +1267,27 @@ fn tool(program: &Path, args: &[&str], bound: Option<u64>) -> Command {
     command
 }
 
+fn teardown_tool(program: &Path, args: &[&str], seconds: u64, deadline: Option<Instant>) -> Command {
+    let Some(deadline) = deadline else { return tool(program, args, None) };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let run = remaining.saturating_sub(Duration::from_millis(100)).min(Duration::from_secs(seconds));
+    let mut command = Command::new("timeout");
+    command.args(["--kill-after=0.1s".to_string(), format!("{:.3}s", run.as_secs_f64().max(0.001))])
+        .arg(program).args(args);
+    command
+}
+
 /// Removes the entry's coordinator and expert containers; the Spark workers in
 /// parallel with the coordinator. `cancelled` bounds every step (see
 /// [`CANCEL_TEARDOWN_S`]), including a graceful stop's own timeout.
 fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools: &Tools, cancelled: bool) -> Result<()> {
-    let bound = |seconds: u64| cancelled.then_some(seconds);
-    let stop_timeout = cancelled.then_some(STOP_S);
+    teardown_until(name, config, log, tools,
+        cancelled.then(|| Instant::now() + Duration::from_secs(CANCEL_TEARDOWN_S)))
+}
+
+fn teardown_until(name: &str, config: &HashMap<String, String>, log: &mut File, tools: &Tools,
+    deadline: Option<Instant>) -> Result<()> {
+    let stop_timeout = deadline.map(|_| STOP_S);
     let instance = config.get("INSTANCE").filter(|v| !v.is_empty());
     let coordinator = match instance {
         Some(instance) => format!("cuteafd-coordinator-{instance}"),
@@ -1282,7 +1300,7 @@ fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools:
     let ssh = |host: &str, remote: &[&str], seconds: u64| {
         let mut args = vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host];
         args.extend_from_slice(remote);
-        tool(&tools.ssh, &args, bound(seconds))
+        teardown_tool(&tools.ssh, &args, seconds, deadline)
     };
     let failures = Mutex::new(Vec::<Value>::new());
     std::thread::scope(|scope| {
@@ -1295,20 +1313,20 @@ fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools:
                         .stdout(file.try_clone().map(Stdio::from).unwrap_or(Stdio::null()))
                         .stderr(Stdio::from(file)).status();
                 }
-                let script = format!("{}; remaining=$(docker ps -aq --filter name=^{worker}$) || exit $?; test -z \"$remaining\"",
-                    worker_teardown_script(&worker, stop_timeout));
+                let script = worker_teardown_script(&worker, stop_timeout);
                 let removed = ssh(host, &[&script], STOP_S + RM_S + 5)
                     .stdout(Stdio::null()).stderr(Stdio::null()).status();
-                if !matches!(removed, Ok(status) if status.success()) {
+                let absent = wait_container_absent(host, &worker, tools, deadline);
+                if !is_absent(&absent) {
                     failures.lock().unwrap().push(serde_json::json!({"host": host, "container": worker,
-                        "error": format!("removal unconfirmed: {removed:?}")}));
+                        "error": format!("removal unconfirmed: {removed:?}; verification: {absent:?}")}));
                 }
             });
         }
         // A launcher that labels its coordinator cuteafd.graceful-stop=1 (a process
         // that writes output at exit, e.g. under a profiler) gets `docker stop`, with
         // the container's own stop signal and timeout, before the forced removal.
-        let label = tool(&tools.docker, &["inspect", "-f", "{{index .Config.Labels \"cuteafd.graceful-stop\"}}", &coordinator], bound(INSPECT_S))
+        let label = teardown_tool(&tools.docker, &["inspect", "-f", "{{index .Config.Labels \"cuteafd.graceful-stop\"}}", &coordinator], INSPECT_S, deadline)
             .stderr(Stdio::null()).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         if label.as_deref() == Some("1") {
             let timeout = stop_timeout.map(|t| t.to_string());
@@ -1317,25 +1335,18 @@ fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools:
                 args.extend(["-t", timeout]);
             }
             args.push(&coordinator);
-            let stopped = tool(&tools.docker, &args, bound(STOP_S + 5)).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let stopped = teardown_tool(&tools.docker, &args, STOP_S + 5, deadline).stdout(Stdio::null()).stderr(Stdio::null()).status();
             let _ = writeln!(log, "graceful stop {coordinator}: {}", stopped.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
         }
         // The coordinator's own log goes next to the entry's (failures and warnings outlive the container).
         if let Some(file) = base.as_ref().and_then(|p| File::create(p.with_extension("coordinator.log")).ok()) {
-            let _ = tool(&tools.docker, &["logs", &coordinator], bound(LOGS_S)).stdout(file.try_clone().map(Stdio::from)
+            let _ = teardown_tool(&tools.docker, &["logs", &coordinator], LOGS_S, deadline).stdout(file.try_clone().map(Stdio::from)
                 .unwrap_or(Stdio::null())).stderr(Stdio::from(file)).status();
         }
-        let removed = tool(&tools.docker, &["rm", "-f", &coordinator], bound(RM_S))
+        let removed = teardown_tool(&tools.docker, &["rm", "-f", &coordinator], RM_S,
+            Some(deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(RM_S + KILL_AFTER_S))))
             .stdout(Stdio::null()).stderr(Stdio::null()).status();
-        let filter = format!("name=^{coordinator}$");
-        let is_absent = |absent: &std::io::Result<std::process::Output>| matches!(absent, Ok(output) if output.status.success() && output.stdout.is_empty());
-        let mut absent = tool(&tools.docker, &["ps", "-aq", "--filter", &filter], bound(INSPECT_S)).stderr(Stdio::null()).output();
-        // A slow removal (exit 124) is usually finished seconds later; poll before declaring failure.
-        let polling = Instant::now();
-        while !is_absent(&absent) && polling.elapsed() + Duration::from_secs(POLL_SLEEP_S + POLL_CHECK_S + KILL_AFTER_S) <= Duration::from_secs(ABSENT_POLL_S) {
-            std::thread::sleep(Duration::from_secs(POLL_SLEEP_S));
-            absent = tool(&tools.docker, &["ps", "-aq", "--filter", &filter], bound(POLL_CHECK_S)).stderr(Stdio::null()).output();
-        }
+        let absent = wait_container_absent("raptor", &coordinator, tools, deadline);
         if !is_absent(&absent) {
             failures.lock().unwrap().push(serde_json::json!({"host": "raptor", "container": coordinator,
                 "error": format!("removal unconfirmed: {removed:?}; verification: {absent:?}")}));
@@ -1359,18 +1370,50 @@ fn cleanup_marker(config: &HashMap<String, String>, root: &Path) -> PathBuf {
         .join("unconfirmed-containers.json")
 }
 
-/// True only when `docker ps -aq` on the marker entry's host answers and lists
-/// nothing for the container; any failure or timeout counts as still present.
+fn is_absent(output: &std::io::Result<std::process::Output>) -> bool {
+    matches!(output, Ok(output) if output.status.success() && output.stdout.is_empty())
+}
+
+fn container_absence(host: &str, container: &str, tools: &Tools, budget: Duration)
+    -> std::io::Result<std::process::Output> {
+    // Reserve timeout's kill grace inside the caller's absolute deadline.
+    let grace = Duration::from_millis(100);
+    let Some(run) = budget.checked_sub(grace).filter(|run| !run.is_zero()) else {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "absence-check deadline expired"));
+    };
+    let filter = format!("name=^{container}$");
+    let mut command = Command::new("timeout");
+    command.args(["--kill-after=0.1s".to_string(), format!("{:.3}s", run.as_secs_f64().max(0.001))]);
+    if host == "raptor" {
+        command.arg(&tools.docker).args(["ps", "-aq", "--filter", &filter]);
+    } else {
+        command.arg(&tools.ssh).args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host,
+            "docker", "ps", "-aq", "--filter", &filter]);
+    }
+    command.stderr(Stdio::null()).output()
+}
+
+fn wait_container_absent(host: &str, container: &str, tools: &Tools, deadline: Option<Instant>)
+    -> std::io::Result<std::process::Output> {
+    let end = Instant::now() + tools.absence_window;
+    let end = deadline.map_or(end, |deadline| deadline.min(end));
+    let mut output;
+    loop {
+        let remaining = end.saturating_duration_since(Instant::now());
+        output = container_absence(host, container, tools, remaining.min(Duration::from_secs(INSPECT_S)));
+        if is_absent(&output) { return output; }
+        let remaining = end.saturating_duration_since(Instant::now());
+        let Some(sleep) = remaining.checked_sub(Duration::from_millis(100)).filter(|sleep| !sleep.is_zero()) else {
+            return output;
+        };
+        std::thread::sleep(tools.poll_interval.min(sleep));
+    }
+}
+
+/// A bounded launch-time check; failures never count as absence.
 fn marker_container_absent(entry: &Value, tools: &Tools) -> bool {
     let (Some(host), Some(container)) = (entry["host"].as_str(), entry["container"].as_str()) else { return false };
-    let filter = format!("name=^{container}$");
-    let output = if host == "raptor" {
-        tool(&tools.docker, &["ps", "-aq", "--filter", &filter], Some(INSPECT_S)).stderr(Stdio::null()).output()
-    } else {
-        let args = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "docker", "ps", "-aq", "--filter", &filter];
-        tool(&tools.ssh, &args, Some(INSPECT_S + 5)).stderr(Stdio::null()).output()
-    };
-    matches!(output, Ok(o) if o.status.success() && o.stdout.is_empty())
+    is_absent(&container_absence(host, container, tools, Duration::from_secs(INSPECT_S + 5)))
 }
 
 /// Refuses a launch while any instance has an unconfirmed-teardown marker,
@@ -1383,10 +1426,17 @@ fn check_cleanup_markers(tools: &Tools) -> Result<()> {
         let marker = instance?.path().join("unconfirmed-containers.json");
         if marker.exists() {
             let listed = std::fs::read_to_string(&marker).ok().and_then(|text| serde_json::from_str::<Vec<Value>>(&text).ok());
-            if let Some(listed) = listed.filter(|l| !l.is_empty() && l.iter().all(|e| marker_container_absent(e, tools))) {
-                std::fs::remove_file(&marker)?;
-                eprintln!("cleared stale cleanup marker {}: all {} listed containers are now absent", marker.display(), listed.len());
-                continue;
+            if let Some(listed) = listed {
+                let count = listed.len();
+                let remaining: Vec<_> = listed.into_iter().filter(|entry| !marker_container_absent(entry, tools)).collect();
+                if remaining.is_empty() {
+                    std::fs::remove_file(&marker)?;
+                    eprintln!("cleared stale cleanup marker {}: all {count} listed containers are now absent", marker.display());
+                    continue;
+                }
+                if remaining.len() != count {
+                    std::fs::write(&marker, serde_json::to_vec_pretty(&remaining)?)?;
+                }
             }
             bail!("refusing launch: unconfirmed container teardown in {}: {}", marker.display(), std::fs::read_to_string(&marker)?);
         }
@@ -1407,7 +1457,7 @@ fn worker_teardown_script(worker: &str, stop_timeout: Option<u64>) -> String {
     format!("ids=$(docker ps -aq --filter name=^{worker}$); \
         if [ -n \"$ids\" ] && [ \"$(docker inspect -f '{{{{index .Config.Labels \"cuteafd.graceful-stop\"}}}}' {worker} 2>/dev/null)\" = 1 ]; then \
         docker stop {stop}{worker} >/dev/null 2>&1 || true; fi; \
-        [ -z \"$ids\" ] || docker rm -f $ids >/dev/null 2>&1 || true")
+        [ -z \"$ids\" ] || timeout --kill-after={KILL_AFTER_S}s {RM_S}s docker rm -f $ids >/dev/null 2>&1 || true")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1904,7 +1954,8 @@ mod tests {
             std::fs::write(&path, format!("#!/bin/sh\necho \"{name} $*\" >>'{}'\n", log.display())).unwrap();
             std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         }
-        Tools { docker: dir.join("docker"), ssh: dir.join("ssh"), instances: dir.join("instances") }
+        Tools { docker: dir.join("docker"), ssh: dir.join("ssh"), instances: dir.join("instances"),
+            absence_window: Duration::from_millis(300), poll_interval: Duration::from_millis(20) }
     }
 
     fn wait_until(what: &str, done: impl Fn() -> bool) {
@@ -2103,6 +2154,52 @@ mod tests {
         assert!(!cleanup_marker(&config, &tools.instances).exists());
     }
 
+    #[test]
+    fn slow_worker_removal_that_finishes_leaves_no_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = fake_tools(root.path(), &root.path().join("calls.log"));
+        let counter = root.path().join("worker-ps-count");
+        std::fs::write(&tools.ssh, format!(
+            "#!/bin/sh\ncase \"$*\" in\n *'ids='*) exit 124;;\n *'docker ps -aq --filter'*) n=$(cat '{c}' 2>/dev/null || echo 0); echo $((n+1)) >'{c}'; [ \"$n\" -lt 2 ] && echo abc123;;\nesac\nexit 0\n",
+            c = counter.display())).unwrap();
+        let config = HashMap::from([("INSTANCE".into(), "slow-worker".into()),
+            ("SPARK_COUNT".into(), "1".into()), ("SPARK_0_HOST".into(), "kiwi".into())]);
+        let mut log = File::create(root.path().join("entry.log")).unwrap();
+        teardown("slow-worker", &config, &mut log, &tools, false).unwrap();
+        assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "3");
+        assert!(!cleanup_marker(&config, &tools.instances).exists());
+    }
+
+    #[test]
+    fn cancellation_absence_poll_keeps_the_shared_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let mut tools = fake_tools(root.path(), &root.path().join("calls.log"));
+        tools.absence_window = Duration::from_secs(ABSENT_POLL_S);
+        tools.poll_interval = Duration::from_millis(20);
+        slow_docker(&tools, root.path(), 1_000_000);
+        let config = HashMap::from([("INSTANCE".into(), "cancel-slow".into())]);
+        let mut log = File::create(root.path().join("entry.log")).unwrap();
+        let started = Instant::now();
+        // Model the last second of cancel_all's shared 60 s budget: even the
+        // normal 60 s absence window must not restart the cancellation clock.
+        assert!(teardown_until("cancel-slow", &config, &mut log, &tools,
+            Some(started + Duration::from_secs(1))).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(CANCEL_TEARDOWN_S));
+    }
+
+    #[test]
+    fn hung_absence_check_cannot_overrun_the_cancellation_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = fake_tools(root.path(), &root.path().join("calls.log"));
+        std::fs::write(&tools.docker, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        let started = Instant::now();
+        let absent = wait_container_absent("raptor", "hung", &tools,
+            Some(started + Duration::from_millis(250)));
+        assert!(!is_absent(&absent));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     fn write_marker(tools: &Tools, entries: Value) -> PathBuf {
         let marker = tools.instances.join("stale").join("unconfirmed-containers.json");
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
@@ -2119,6 +2216,19 @@ mod tests {
             {"host": "kiwi", "container": "cuteafd-spark-expert-kiwi-19441"}]));
         check_cleanup_markers(&tools).unwrap();
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn mixed_marker_prunes_absent_entries_but_keeps_unverified_workers() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = fake_tools(root.path(), &root.path().join("calls.log"));
+        std::fs::write(&tools.ssh, "#!/bin/sh\nexit 255\n").unwrap();
+        let worker = serde_json::json!({"host": "kiwi", "container": "cuteafd-spark-expert-kiwi-19441"});
+        let marker = write_marker(&tools, serde_json::json!([
+            {"host": "raptor", "container": "cuteafd-coordinator-stale"}, worker]));
+        assert!(check_cleanup_markers(&tools).is_err());
+        let remaining: Vec<Value> = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(remaining, vec![worker]);
     }
 
     #[test]
