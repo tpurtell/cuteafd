@@ -46,7 +46,7 @@ fn nvfp4_weights_reject_compressed_reply_selection_at_startup() {
     }
 }
 
-pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize],
+pub(crate) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize],
     tp: usize, rank: usize, slicing: Slicing) -> Result<()> {
     let shape = tensors.shape();
     ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk

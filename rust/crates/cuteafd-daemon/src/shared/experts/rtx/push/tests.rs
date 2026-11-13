@@ -810,21 +810,31 @@ fn sparknest_model_one_coordinator_rank_beside_spark_ranks() {
 pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: Option<&cuteafd_loader::OfficialV41Catalog>,
     root: &std::path::Path, socket_dir: &std::path::Path, records: &crate::shared::experts::rtx::dense::Records,
     tp2: Option<CoordinatorExpertPlan>, sparks: usize, gpu: usize) -> Result<PushedExperts<'a>> {
+    single_set(receive_pushed_sets(device, catalog, root, socket_dir, records, tp2.into_iter().collect(), sparks, gpu)?)
+}
+
+fn receive_pushed_sets<'a>(device: Device<'a>, catalog: Option<&cuteafd_loader::OfficialV41Catalog>,
+    root: &std::path::Path, _socket_dir: &std::path::Path, records: &crate::shared::experts::rtx::dense::Records,
+    tp2: Vec<CoordinatorExpertPlan>, sparks: usize, gpu: usize) -> Result<Vec<PushedExperts<'a>>> {
     use crate::shared::experts::rtx::dense::RankLayout;
     let rank = sparks + gpu;
     let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), device.id)?
         .with_finishes(&records.finishes).with_hosts(records.host_operands.iter().filter(|h| h.device == device.id).cloned().collect())?;
     let dense_plan = layout.plan();
     let (base, host) = (dense_plan.base, dense_plan.host_bytes);
-    let tp2_bytes = tp2.as_ref().map_or(0, |p| p.logical_bytes());
-    let (host_base, total) = rank_bytes(base, tp2_bytes, host);
+    let set_layout = SetLayout::plans(&tp2)?;
+    let (host_base, total) = rank_bytes(base, set_layout.logical_bytes(), host);
     // The rank's checked plan (built twice: one copy streams from the fake source).
     let build = || -> Result<CheckedPlan> {
         let mut arenas = vec![0; sparks + 2];
         arenas[rank] = total;
         let mut builder = Builder::new(root, arenas);
         (dense_plan.append)(&mut builder, rank as u32, host_base)?;
-        if let Some(plan) = &tp2 { plan.append_at(&mut builder, catalog.context("TP2 replay needs the expert catalog")?, rank as u32, base)?; }
+        for (index, plan) in tp2.iter().enumerate() {
+            let (device, host) = set_layout.offsets(index)?;
+            plan.append_split(&mut builder, catalog.context("expert replay needs the catalog")?, rank as u32,
+                base + device, base + host)?;
+        }
         Ok(builder.finish()?)
     };
     let checked = build()?;
@@ -832,7 +842,10 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: Option<&cuteafd_lo
     let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(
         &layout.checked(root, sparks + 2, rank)?, rank as u32)?;
     let dense = crate::shared::experts::rtx::dense::DenseArena::new(device, layout, expected)?;
-    let socket = socket_dir.join(format!("g{gpu}.sock")).to_string_lossy().into_owned();
+    // Abstract names stay short even when the gate's NVMe fixture path is deep.
+    static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let socket = format!("@cuteafd-push-{}-{}-{gpu}", std::process::id(),
+        NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let (mut coordinator, mut worker) = control_pair()?;
     for stream in [&coordinator, &worker] { stream.set_read_timeout(Some(Duration::from_secs(600)))?; }
@@ -893,9 +906,11 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: Option<&cuteafd_lo
     });
     let client = PushClient::at(socket.clone(), Duration::from_secs(600))?;
     // As the group driver: the TP2 arena's own checked entries (from offset 0).
-    let tp2_checked = tp2.as_ref().map(|plan| plan.checked(catalog.context("TP2 replay needs the expert catalog")?, root, sparks + 2, rank)).transpose()?;
-    let tp2 = match (tp2, tp2_checked.as_ref()) { (Some(plan), Some(checked)) => Some((catalog.context("TP2 catalog")?, plan, checked)), _ => None };
-    let received = receive_rank(device, tp2, Some(DenseRank { destination: dense, base }), rank, &client,
+    let tp2_checked = tp2.iter().map(|plan| plan.checked(catalog.context("expert replay needs the catalog")?, root,
+        sparks + 2, rank)).collect::<Result<Vec<_>>>()?;
+    let tp2 = tp2.into_iter().zip(&tp2_checked).map(|(plan, checked)|
+        Ok((catalog.context("expert catalog")?, plan, checked))).collect::<Result<Vec<_>>>()?;
+    let received = receive_sets_rank(device, tp2, Some(DenseRank { destination: dense, base }), rank, &client,
         &mut worker, (7, 11), 8, DEFAULT_SLOT_BYTES);
     if !server.is_finished() {
         // A rank that failed before joining never connects: wake the fake source.
@@ -954,6 +969,64 @@ fn receive_pushed_replays_dense_records_and_tp2_halves() -> Result<()> {
         library.copy_d2h(&mut actual, cuteafd_ffi::CuteafdDeviceBuffer { bytes: rect.bytes(), ..allocation.buffer })?;
         assert_eq!(actual, expected, "{}", rect.name);
     }
+    Ok(())
+}
+
+#[test]
+fn independent_expert_sets_share_one_ring_and_retire_separately() -> Result<()> {
+    use crate::shared::experts::layer::ExpertLayer::BackboneFull;
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.configure_memory(&library, 0, 64 << 30)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (tensors, _) = qwen4_exl3(2, 4);
+    let tensors = tensors.into_iter().filter(|t| !t.0.contains(".experts.") || t.0.contains(".experts.0."))
+        .collect::<Vec<_>>();
+    let mut config = qwen4_config(2);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    for tensor in catalog.tensors().iter().filter(|t| t.metadata.name.ends_with(".mcg")) {
+        let source = Builder::v41_source(&catalog, &tensor.metadata.name)?;
+        File::options().write(true).open(source.path)?.write_all_at(&0xcbac1fedu32.to_le_bytes(), source.offset)?;
+    }
+    let selections = CoordinatorExperts::Sets((0..2).map(|layer| CoordinatorExperts::Whole {
+        owners: vec![WholeOwner { rank: 0, selections: vec![BackboneFull { layer }], budget: usize::MAX }],
+    }).collect());
+    selections.validate_ranks(1)?;
+    let plans = selections.plans(&catalog, 0)?;
+    let envelope = selections.host_envelope(&catalog, 1, &[])?;
+    assert_eq!(envelope.expert_bytes, [plans.iter().map(|p| p.transient_host_bytes().unwrap() as u64).sum::<u64>()]);
+    assert_eq!(envelope.bytes()?, (128 << 20) + plans.iter().map(|p| p.host_bytes().unwrap() as u64).sum::<u64>());
+    let device = Device { library: &library, id: 0 };
+    let expected = (0..2).map(|layer| crate::shared::experts::exl3::Exl3Weights::load(&library, &catalog,
+        BackboneFull { layer }, usize::MAX)).collect::<Result<Vec<_>>>()?;
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    let mut delivered = receive_pushed_sets(device, Some(&catalog), root.path(), sockets.path(),
+        &Default::default(), plans, 0, 0)?;
+    assert_eq!(delivered.len(), 2);
+    let second = delivered.pop().unwrap().exl3()?;
+    let first = delivered.pop().unwrap().exl3()?;
+    let first_ptr = first[0].buffer(&first[0].layout.buffers[0].name)?.ptr;
+    let second_ptr = second[0].buffer(&second[0].layout.buffers[0].name)?.ptr;
+    assert_ne!(first_ptr, second_ptr, "independent sets have distinct physical backings");
+    let before = fixture.events()?;
+    drop(first);
+    assert_eq!(fixture.events()?[before.len()..].matches('d').count(), 1,
+        "retiring one expert set releases exactly its own arena");
+    for spec in &second[0].layout.buffers {
+        let pushed = second[0].buffer(&spec.name)?;
+        let mounted = expected[1].buffer(&spec.name)?;
+        let mut actual = vec![0; pushed.bytes];
+        let mut baseline = vec![0; mounted.bytes];
+        library.copy_d2h(&mut actual, pushed)?;
+        library.copy_d2h(&mut baseline, mounted)?;
+        assert_eq!(actual, baseline, "surviving set remains mount-exact: {}", spec.name);
+    }
+    let before = fixture.events()?;
+    drop(second);
+    assert_eq!(fixture.events()?[before.len()..].matches('d').count(), 1);
     Ok(())
 }
 

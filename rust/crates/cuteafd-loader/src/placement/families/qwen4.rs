@@ -46,6 +46,14 @@ pub struct QwenInputs<'a> {
     pub resident_weight_limit: Option<ResidentWeights>,
     /// Checkpoint owners already charged to the physical baseline.
     pub loaded_weights: ResidentWeights,
+    /// Future checkpoint backings for callers that sample before uploading.
+    pub arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
+    /// Resident routed-expert backings, distinct from target/draft arenas.
+    pub expert_arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
+    /// Whether the measured baseline predates embeddings and Spark intake.
+    pub preallocation: bool,
+    /// Exact future expert, workspace and load-staging owners.
+    pub future: Vec<Demand>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// Shared model extent and optional operator context pin.
     pub context: crate::placement::planner::Context,
@@ -261,11 +269,9 @@ impl<'a> QwenSingle<'a> {
     pub fn budget(&self) -> Result<Budget, Refusal> {
         let baseline = plan_baseline(&self.inputs.baseline, self.inputs.capacity_bytes,
             "qwen4 single-owner")?;
-        // TP1 loads the portable embedding before sampling; its mapping is
-        // charged by the named driver page-table rows, so the measured owner
-        // excludes it. Validate the same fact the owner needs here.
         measured_occupancy(&self.inputs.baseline, self.inputs.capacity_bytes,
-            crate::placement::planner::driver_page_table_bytes(self.inputs.host.host_embedding))?;
+            if self.inputs.preallocation { 0 } else {
+                crate::placement::planner::driver_page_table_bytes(self.inputs.host.host_embedding) })?;
         Ok(Budget { id: "rtx0".into(), locations: vec![Location::coordinator(0)],
             physical_bytes: self.inputs.capacity_bytes, logical_bytes: self.inputs.capacity_bytes,
             baseline,
@@ -376,9 +382,8 @@ impl Recipe for QwenSingle<'_> {
             components.push(owner("qwen.loaded.code", gpu, inputs.pending_code_bytes,
                 Category::Runtime, "loaded code", PlanLifetime::RESIDENT, self.maximum_pages));
         }
-        if inputs.spark_ranks > 0 && matches!(inputs.baseline, Baseline::Planned { .. }) {
-            // Runtime creates SparkLink before sampling free memory. Only the
-            // header-only planner still reserves its return planes and codec.
+        if inputs.spark_ranks > 0 && (inputs.preallocation || matches!(inputs.baseline, Baseline::Planned { .. })) {
+            // A pre-weight sample cannot already include the future SparkLink.
             let bytes = crate::serving_capacity::prefill_return_bytes_with_format(
                 a.prefill_shape.map_or(1, |shape| shape.waves),
                 a.prefill_shape.map_or(a.prefill_rows.max(64), |shape| shape.unit_rows),
@@ -396,11 +401,33 @@ impl Recipe for QwenSingle<'_> {
         // baseline deduction.
         if let Some(owner) = measured_occupancy_owner("Qwen context and selected modules",
             &inputs.baseline, inputs.capacity_bytes,
-            crate::placement::planner::driver_page_table_bytes(inputs.host.host_embedding),
+            if inputs.preallocation { 0 } else {
+                crate::placement::planner::driver_page_table_bytes(inputs.host.host_embedding) },
             gpu, self.maximum_pages)? {
             components.push(owner);
         }
         components.push(weights("qwen.loaded.owners", gpu, inputs.loaded_weights, self.maximum_pages));
+        for layout in &inputs.arenas {
+            components.extend(weight_arena_components(layout, gpu, PlanLifetime::RESIDENT,
+                self.maximum_pages, if layout.id().contains("/mtp/") {
+                    cuteafd_core::memory_layout::MemoryKind::DrafterWeights
+                } else { cuteafd_core::memory_layout::MemoryKind::Weights })?);
+        }
+        for layout in &inputs.expert_arenas {
+            components.extend(weight_arena_components(layout, gpu, PlanLifetime::RESIDENT,
+                self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::Experts)?);
+        }
+        for (index, demand) in inputs.future.iter().enumerate() {
+            if demand.gpu != 0 {
+                return Err(Refusal::InvalidFact("Qwen single future owner outside rank zero".into()));
+            }
+            let id = format!("qwen.future.{index}");
+            components.push(owner(id.clone(), gpu, demand.bytes, demand.category, &demand.group,
+                PlanLifetime::RESIDENT, self.maximum_pages));
+            if demand.resident_weights.0 > 0 {
+                components.push(weights(id, gpu, demand.resident_weights, self.maximum_pages));
+            }
+        }
         if inputs.host.uploads.len() != 1 {
             return Err(Refusal::InvalidFact("Qwen single-owner host owners must name one upload owner".into()));
         }
@@ -432,17 +459,17 @@ pub fn admitted(inputs: &QwenInputs<'_>) -> anyhow::Result<(Placement, ResolvedP
 
 /// The single owner's physical weight backings: the target arena (globals,
 /// head and an optional device embedding as views) and the separate MTP
-/// arena, `layout.bytes()` once each, plus the standalone 256 B PLE scale.
+/// arena, `layout.bytes()` once each, including owner-local PLE scale views.
 /// TP1 loads these before its free-memory sample, so the backings and their
 /// SM120 tails are already outside that baseline: this is a resident-weight
 /// declaration only, never a capacity charge (#1462 arena charges, option b).
 pub fn single_owner_weights(checkpoint: &crate::plan::Checkpoint, cfg: &crate::families::qwen4::Qwen4Config,
     layers: usize, mtp: bool, selected: crate::families::qwen4::resident::Qwen4Representation,
-    host_embedding: bool, ple: bool) -> anyhow::Result<ResidentWeights> {
+    host_embedding: bool) -> anyhow::Result<ResidentWeights> {
     use crate::families::qwen4::weight_layout::{embedding_table_bytes, single_arena_bytes};
     let embedding = if host_embedding { 0 } else { embedding_table_bytes(checkpoint)? };
     let arenas = single_arena_bytes(checkpoint, cfg, layers, mtp, selected, embedding)?;
-    Ok(ResidentWeights(arenas).checked_add(ResidentWeights(if ple { 256 } else { 0 }))?)
+    Ok(ResidentWeights(arenas))
 }
 
 /// Native TP1 arenas selected by the single-owner executor. Package scratch
@@ -719,19 +746,17 @@ pub fn dual_projection_load_staging(selected: crate::families::qwen4::resident::
         crate::shared::dense_read::STEP_BYTES as u64, Basis::Exact)).collect()
 }
 
-/// Only the scale follows the owning layer; tables stay mapped and step
-/// workspace accounting includes gathered row staging.
+/// Validate mapped PLE headers without extra demands: the scale belongs to
+/// the target arena and step workspace already includes gathered row staging.
 pub fn dual_ple_demands(cfg: &crate::families::qwen4::Qwen4Config, layers: usize,
     resident: &crate::families::qwen4::resident::Qwen4CheckpointResident) -> anyhow::Result<Vec<Vec<LayerExtraDemand>>> {
     anyhow::ensure!(layers <= cfg.layers && cfg.ple_layers.len() <= 1,
         "Qwen PLE demands need a backbone prefix and at most one table");
-    let mut demands = vec![Vec::new(); layers];
     if let Some(&layer) = cfg.ple_layers.first().filter(|&&layer| layer < layers) {
         anyhow::ensure!(resident.ple_table_bytes > 0, "Qwen PLE layer {layer} has no table backing headers");
-        demands[layer].push(LayerExtraDemand::new(Category::Tables, "PLE scale", 256,
-            LayerResidency::Owner, Basis::Formula).with_resident_weights(ResidentWeights(256)));
     }
-    Ok(demands)
+    // The scale follows its layer inside the target arena, never a second owner.
+    Ok(vec![Vec::new(); layers])
 }
 
 /// Admission contract for the private whole-owner executor. Unlike the legacy
@@ -775,7 +800,7 @@ pub struct QwenDualInputs<'a> {
     /// future allocations, charged once each with their single SM120 tail.
     pub arenas: &'a [(usize, crate::serving_capacity::WeightArenaLayout)],
     pub layer_experts: &'a [Option<ExpertCost>],
-    /// Owner-local side allocations, such as the PLE scale.
+    /// Owner-local allocations outside the already charged weight arenas.
     pub layer_extra: &'a [Vec<LayerExtraDemand>],
     /// Head, MTP weights/experts, embedding and exact transport
     /// buffers. Head/MTP are owner-only groups, not paired rank groups.
@@ -1203,8 +1228,12 @@ mod tests {
         use crate::families::qwen4::{resident::Qwen4Representation, weight_layout::dual_arenas};
         let dir = tempfile::tempdir().unwrap();
         let cfg = Qwen4Config::from_hf(cfg_json).unwrap();
-        crate::plan::testing::write_snapshot(dir.path(), cfg_json,
-            &crate::plan::testing::qwen4_coordinator(cfg_json, mtp), None);
+        let mut tensors = crate::plan::testing::qwen4_coordinator(cfg_json, mtp);
+        for &layer in &cfg.ple_layers {
+            tensors.push(crate::plan::testing::t(format!("model.language_model.layers.{layer}.ple.ple_embedding.ngram_embedding.shard_0.weight"),
+                "BF16", &[100, 160]));
+        }
+        crate::plan::testing::write_snapshot(dir.path(), cfg_json, &tensors, None);
         let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
         let arenas = dual_arenas(&checkpoint, &cfg, &dual_owners(cfg.layers), mtp,
             Qwen4Representation::default(), 0).unwrap();
@@ -1245,19 +1274,18 @@ mod tests {
     }
 
     #[test]
-    fn qwen_dual_ple_demands_charge_only_scale() {
+    fn qwen_dual_ple_demands_do_not_double_charge_arena_scale() {
         use crate::families::qwen4::resident::Qwen4CheckpointResident;
         let mut cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
         cfg.ple_layers = vec![1];
         let resident = Qwen4CheckpointResident { ple_table_bytes: 123_456, ..Default::default() };
         let demands = dual_ple_demands(&cfg, 4, &resident).unwrap();
         assert!(demands.iter().enumerate().all(|(layer, extra)| layer == 1 || extra.is_empty()));
-        assert_eq!(demands[1].iter().map(|d| d.bytes).sum::<u64>(), 256);
-        assert!(demands[1].iter().all(|d| d.category == Category::Tables && d.residency == LayerResidency::Owner));
+        assert!(demands.iter().all(Vec::is_empty));
         assert!(dual_ple_demands(&cfg, 1, &resident).unwrap()[0].is_empty());
         assert!(dual_ple_demands(&cfg, 4, &Qwen4CheckpointResident::default()).is_err());
         let resident = Qwen4CheckpointResident { ple_table_bytes: u64::MAX, ..Default::default() };
-        assert_eq!(dual_ple_demands(&cfg, 4, &resident).unwrap()[1][0].bytes, 256);
+        assert!(dual_ple_demands(&cfg, 4, &resident).unwrap().iter().all(Vec::is_empty));
     }
     /// A fixture TP2 cost with no resident halves: these tests price the
     /// planner's own owners, not checkpoint bytes.
@@ -1300,7 +1328,7 @@ mod tests {
         // family states, never a second search or a replicated copy.
         assert_eq!(placement.layers.iter().take_while(|layer|
             layer.mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }).count(), 2);
-        for (gpu, scales) in [(0, vec![256u64]), (1, Vec::new())] {
+        for (gpu, scales) in [(0, Vec::<u64>::new()), (1, Vec::new())] {
             assert_eq!(placement.items[gpu].iter().filter(|item| item.category == Category::Tables)
                 .map(|item| item.bytes).collect::<Vec<_>>(), scales);
         }
@@ -1503,6 +1531,7 @@ mod tests {
         loaded: ResidentWeights, limit: Option<ResidentWeights>) -> QwenInputs<'a> {
         let gib = 1u64 << 30;
         QwenInputs { blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: limit, loaded_weights: loaded,
+            arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg, layers: cfg.layers, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
@@ -1688,6 +1717,52 @@ mod tests {
         let (runtime, _) = intake(Baseline::Measured { free_bytes: 96 << 30 });
         assert!(!runtime.items[0].iter().any(|item| item.group == "Spark intake planes"));
         assert_eq!(runtime.pool_tokens, planned.pool_tokens);
+    }
+
+    #[test]
+    fn preweight_sample_keeps_occupancy_and_charges_future_mapping_and_intake() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        let occupied = 4u64 << 20;
+        let mut inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: (96 << 30) - occupied },
+            4, Some(131072), ResidentWeights(0), None);
+        inputs.preallocation = true;
+        let control = admitted(&inputs).unwrap().1;
+        let planes = control.items(Location::coordinator(0)).unwrap().into_iter()
+            .filter(|item| item.group == "Spark intake planes").collect::<Vec<_>>();
+        assert_eq!(planes.len(), 1);
+        assert_eq!(planes[0].bytes, crate::serving_capacity::prefill_return_bytes_with_format(1, 4096,
+            4, cfg.hidden as u64, cuteafd_core::SparkReplyFormat::Bf16).unwrap());
+        inputs.host.host_embedding = 327_681;
+        let embedded = admitted(&inputs).unwrap().1;
+        let baseline = embedded.facts.allowances.iter().filter(|owner|
+            crate::placement::sampled_baseline::is_source(&owner.source)).collect::<Vec<_>>();
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(baseline[0].bytes, occupied);
+        assert_embedding_charge(&control, &embedded, inputs.host.host_embedding, 1);
+    }
+
+    #[test]
+    fn preweight_expert_arena_has_one_backing_resident_claim_and_tail() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        let mut inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+            0, Some(131072), ResidentWeights(0), None);
+        let layout = crate::serving_capacity::WeightArenaLayout::new("qwen.test.experts",
+            [("first".into(), (3 << 20) + 1), ("second".into(), 17)]).unwrap();
+        let bytes = layout.bytes() as u64;
+        inputs.preallocation = true;
+        inputs.expert_arenas.push(layout);
+        let solved = admitted(&inputs).unwrap().1;
+        let roots = solved.facts.allocations.iter().filter(|owner| owner.id == "qwen.test.experts")
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].bytes, bytes);
+        assert_eq!(roots[0].category, Category::Experts);
+        let claims = solved.facts.resident_weights.iter().filter(|owner| owner.id == "qwen.test.experts")
+            .collect::<Vec<_>>();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].weights, ResidentWeights(bytes));
+        assert_eq!(solved.facts.allocation_granularity.iter().filter(|tail|
+            tail.id == "qwen.test.experts.tail").count(), 1);
     }
 
     fn assert_embedding_charge(control: &ResolvedPlan, embedded: &ResolvedPlan, bytes: u64, gpus: usize) {

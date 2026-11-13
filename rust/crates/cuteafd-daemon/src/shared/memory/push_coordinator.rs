@@ -79,15 +79,6 @@ impl CoordinatorExpertPlan {
     fn native(catalog: &OfficialV41Catalog, layers: &[usize], world: usize, gpu: usize, admitted: usize) -> Result<Self> {
         ensure!((1..=2).contains(&world) && gpu < world && !layers.is_empty()
             && layers.windows(2).all(|ids| ids[0] < ids[1]), "coordinator native layers must be ordered on one or two GPUs");
-        if let Some(tensors) = catalog.fp8() {
-            let tensors = tensors.for_coordinator();
-            let selected = layers.iter().map(|&layer| (layer, tensors.exact_slicing(world))).collect::<Vec<_>>();
-            let plan = super::push_fp8::RankPlan::from_tensors(&tensors, &selected, world, gpu, admitted)?;
-            let validation = ValidationLayout::exl3(&[], plan.layout.bytes() as u64, usize::MAX)?;
-            return Ok(Self { residencies: Vec::new(), exlr8: Vec::new(), native: Vec::new(), native_layers: Vec::new(),
-                layers: layers.to_vec(), gpu, world, layout: plan.layout.clone(), validation,
-                scales: Default::default(), fp8: Some(plan) });
-        }
         use crate::shared::experts::layer::ExpertLayer;
         let selections = layers.iter().map(|&layer| if world == 1 { ExpertLayer::BackboneFull { layer } }
             else { ExpertLayer::BackboneTp2 { layer, rank: gpu } }).collect::<Vec<_>>();
@@ -100,8 +91,35 @@ impl CoordinatorExpertPlan {
     pub fn native_selected(catalog: &OfficialV41Catalog,
         selections: &[crate::shared::experts::layer::ExpertLayer], gpu: usize, admitted: usize) -> Result<Self> {
         use crate::shared::experts::layer::ExpertLayer;
-        ensure!(!selections.is_empty() && catalog.exl3().is_none() && catalog.fp8().is_none(),
-            "coordinator native push takes MXFP4 or NVFP4 selections");
+        ensure!(!selections.is_empty() && catalog.exl3().is_none(),
+            "coordinator native push takes native expert selections");
+        if let Some(tensors) = catalog.fp8() {
+            ensure!(gpu < 2, "coordinator native physical GPU must be 0 or 1");
+            let tensors = tensors.for_coordinator();
+            let mut shard = None;
+            let mut selected = Vec::new();
+            for &selection in selections {
+                let (layer, world, rank) = match selection {
+                    ExpertLayer::BackboneFull { layer } => (layer, 1, 0),
+                    ExpertLayer::BackboneTp2 { layer, rank } => {
+                        ensure!(rank == gpu, "native TP2 selection differs from GPU");
+                        (layer, 2, rank)
+                    }
+                    _ => anyhow::bail!("FP8-family selections require absolute backbone layer IDs, not {selection:?}"),
+                };
+                ensure!(shard.is_none_or(|previous| previous == (world, rank)),
+                    "one native expert set must have homogeneous checkpoint world/rank");
+                shard = Some((world, rank));
+                let view = tensors.for_layer_metadata(layer)?;
+                selected.push((layer, view.exact_slicing(world)));
+            }
+            let (world, rank) = shard.context("native expert set has no checkpoint shard")?;
+            let plan = super::push_fp8::RankPlan::from_tensors(&tensors, &selected, world, rank, admitted)?;
+            let validation = ValidationLayout::exl3(&[], plan.layout.bytes() as u64, usize::MAX)?;
+            return Ok(Self { residencies: Vec::new(), exlr8: Vec::new(), native: Vec::new(),
+                native_layers: selections.to_vec(), layers: selected.iter().map(|&(layer, _)| layer).collect(),
+                gpu, world, layout: plan.layout.clone(), validation, scales: Default::default(), fp8: Some(plan) });
+        }
         let nvfp4 = catalog.nvfp4().is_some();
         let mut seen = Vec::new();
         let native = selections.iter().map(|&selection| {
@@ -209,9 +227,17 @@ impl CoordinatorExpertPlan {
     /// As `append`, with this plan's logical space starting at `base` of the
     /// rank's (the coordinator's dense operands come first).
     pub fn append_at(&self, builder: &mut Builder, catalog: &OfficialV41Catalog, rank: u32, base: u64) -> Result<()> {
+        self.append_split(builder, catalog, rank, base, base + self.layout.bytes() as u64)
+    }
+
+    /// Device planes and host validation/staging have independent rank offsets.
+    /// Multiple separately retired arenas share one contiguous device prefix.
+    pub fn append_split(&self, builder: &mut Builder, catalog: &OfficialV41Catalog,
+        rank: u32, base: u64, host: u64) -> Result<()> {
+        ensure!(host >= base + self.layout.bytes() as u64, "expert host tail overlaps device planes");
         if let Some(plan) = &self.fp8 {
             return plan.append_tensors(builder, &catalog.fp8().context("FP8 expert headers absent")?.for_coordinator(),
-                rank, self.world, self.gpu, base);
+                rank, self.world, if self.world == 1 { 0 } else { self.gpu }, base);
         }
         if !self.exlr8.is_empty() {
             for (index, residency) in self.exlr8.iter().enumerate() {
@@ -226,7 +252,7 @@ impl CoordinatorExpertPlan {
             for (index, (planes, &selection)) in self.native.iter().zip(&self.native_layers).enumerate() {
                 let range = self.layout.region(index)?;
                 let destination = Destination { rank, offset: base + range.start as u64, bytes: range.len() as u64 };
-                let scalars = planes.nvfp4.then_some(Destination { rank, offset: base + scalar_offset,
+                let scalars = planes.nvfp4.then_some(Destination { rank, offset: host + scalar_offset - self.layout.bytes() as u64,
                     bytes: planes.scalar_bytes() as u64 });
                 scalar_offset += planes.scalar_bytes() as u64;
                 for expert in 0..planes.experts {
@@ -237,7 +263,7 @@ impl CoordinatorExpertPlan {
                     builder.v41_resident(catalog, &names, planes, expert, world, checkpoint_rank as u32, destination, scalars)?;
                 }
             }
-            self.scales.append(builder, rank, base + self.scales.base(&self.layout))?;
+            self.scales.append(builder, rank, host + self.scales.base(&self.layout) - self.layout.bytes() as u64)?;
             return Ok(());
         }
         for (index, residency) in self.residencies.iter().enumerate() {
@@ -246,7 +272,7 @@ impl CoordinatorExpertPlan {
             builder.exl3_residency(catalog, residency, &offsets, Destination {
                 rank, offset: base + range.start as u64, bytes: range.len() as u64 })?;
         }
-        let validation = ValidationLayout::exl3(&self.residencies, base + self.layout.bytes() as u64, usize::MAX)?;
+        let validation = ValidationLayout::exl3(&self.residencies, host, usize::MAX)?;
         ensure!(validation.bytes() == self.validation.bytes(), "shifted validation differs");
         validation.append(builder, catalog, rank)
     }

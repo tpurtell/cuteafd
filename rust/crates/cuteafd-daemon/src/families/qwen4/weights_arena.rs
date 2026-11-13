@@ -128,14 +128,13 @@ pub(crate) fn retained_backing_bytes(physical: &[i32], model: &Qwen4Weights<'_>,
 }
 
 pub(crate) fn probe(library: &NativeLibrary, physical: &[i32], model: &Qwen4Weights<'_>,
-    embedding: &crate::shared::token_io::TokenEmbedding<'_>, ple: Option<&super::super::ple::PleTable<'_>>) -> Result<()> {
+    embedding: &crate::shared::token_io::TokenEmbedding<'_>) -> Result<()> {
     use cuteafd_loader::placement::planner::{CoordinatorDevices, PhaseOrder};
     let devices = CoordinatorDevices::new(physical)?;
     let mut census = crate::shared::memory::receipts::Census::default();
     census.owners(model.allocation_receipts(devices)?);
     census.owners(embedding.allocation_receipts(devices, "qwen4.embedding")?);
     embedding.allocation_aliases(&mut census, devices, "qwen4.embedding")?;
-    if let Some(ple) = ple { census.owners(ple.allocation_receipts(devices)?); }
     census.normalize(PhaseOrder::TARGET_THEN_DRAFT)?;
     crate::shared::inventory::startup_probe(library, physical, "qwen4/weights-loaded",
         crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })

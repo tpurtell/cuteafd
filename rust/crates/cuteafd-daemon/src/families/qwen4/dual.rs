@@ -170,7 +170,7 @@ impl Opened {
             Some(layer) => Some(devices[owners[layer]].run(|| ple::PleTable::load(&self.library, &self.checkpoint,
                 &self.cfg, layer, args.prefill_rows, 1, engine::DECODE_ROWS))?), None => None,
         };
-        weights::arena::probe(&self.library, &[devices[0].id, devices[1].id], &model, &embedding, ple.as_ref())?;
+        weights::arena::probe(&self.library, &[devices[0].id, devices[1].id], &model, &embedding)?;
         // Load the independent full-width draft before the target halves, with
         // its admitted arena rather than a post-allocation free-memory guess.
         let draft = if mtp { Some(self.local_mtp_experts(args, layers, streams[0].raw, draft_budget)?) } else { None };

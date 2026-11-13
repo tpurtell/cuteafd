@@ -5,7 +5,6 @@
 //!
 //! Shards stay mapped; each step gathers rows into a shared pinned token-table pipeline.
 use crate::shared::mapped_table::MappedTableDevice;
-use crate::shared::memory::{DeviceAllocation, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::NativeLibrary;
@@ -15,8 +14,8 @@ use std::time::Instant;
 
 pub(crate) struct PleTable<'a> {
     mapped: MappedTableDevice<'a>,
-    /// FP32 [1] table scale on the device (1.0 for BF16 tables).
-    pub scale: DeviceAllocation<'a>,
+    /// The table pipeline and its layer's target-arena scale share this device.
+    pub device: i32,
     pub fp8: bool,
     pub rows: usize,
     pub row_bytes: usize,
@@ -28,16 +27,6 @@ fn i64s(bytes: &[u8]) -> Vec<i64> {
 }
 
 impl<'a> PleTable<'a> {
-    pub(crate) fn allocation_receipts(&self,
-        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
-        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
-        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "qwen4.ple",
-            cuteafd_loader::placement::planner::Lifetime::RESIDENT,
-            cuteafd_core::memory_layout::Category::Weights, "mapped PLE table");
-        self.scale.inventory(&mut inventory, "scale")?;
-        Ok(inventory.receipts)
-    }
-
     pub fn mapped(&self) -> &MappedTableDevice<'a> {
         &self.mapped
     }
@@ -84,18 +73,7 @@ impl<'a> PleTable<'a> {
         ensure!(rows as i64 >= hasher.rows(), "PLE table has {rows} rows, the hash addresses {}", hasher.rows());
         let row_bytes = width * if fp8 { 1 } else { 2 };
         let total = rows * row_bytes;
-        let scale = if fp8 {
-            let (bytes, dtype, _) = loader.raw(&format!("{prefix}ngram_embedding.weight_scale"))?;
-            match dtype {
-                DType::Bf16 => f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16),
-                DType::F32 => f32::from_le_bytes(bytes[..4].try_into().unwrap()),
-                other => anyhow::bail!("PLE table scale dtype {other:?}"),
-            }
-        } else {
-            1.0
-        };
-        let scale_dev = DeviceAllocation::new(library, 256, Tag::tables("qwen4/ple-scale"))?;
-        library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: 4, ..scale_dev.buffer }, &scale.to_le_bytes())?;
+        let device = library.cuda_get_device()?;
         let started = Instant::now();
         let tensors: Vec<_> = shards.iter().map(|s| (s.shard.as_str(), &s.meta)).collect();
         // SAFETY: checkpoint snapshots are immutable while the server runs.
@@ -107,6 +85,6 @@ impl<'a> PleTable<'a> {
             elapsed_ms = started.elapsed().as_millis() as u64, "PLE n-gram table ready");
         cuteafd_bench::context::set_mapped_placement(cuteafd_loader::formats::mapped_preload::MappedPlacement::resolve(
             cfg.ple_layers.len(), 0, 0, cuteafd_loader::formats::mapped_preload::DEFAULT_CAP_BYTES, 0));
-        Ok(Self { mapped, scale: scale_dev, fp8, rows, row_bytes, hasher })
+        Ok(Self { mapped, device, fp8, rows, row_bytes, hasher })
     }
 }

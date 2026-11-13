@@ -175,7 +175,6 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     cuteafd_core::concurrency::validate("qwen4", max_sequences as u64)?;
-    args.budget_admission = true;
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {

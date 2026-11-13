@@ -185,13 +185,8 @@ pub(crate) struct LocalExl3<'a> {
     pub native_lib: std::path::PathBuf,
     pub catalog: &'a cuteafd_loader::OfficialV41Catalog,
     pub resident: RefCell<Option<(Vec<usize>, crate::families::deepseek_v4::local::LocalExperts<'a>)>>,
-    pub window: usize,
     pub layers: usize,
-    /// The MTP layer's experts (draft stage 0) stay resident with every window;
-    /// expert layer `layers` names them.
-    pub mtp: bool,
-    pub max_rows: usize,
-    pub budget: usize,
+    pub admitted: super::admission::Exl3Admission,
     pub base_weights: cuteafd_loader::placement::ResidentWeights,
     pub loads: RefCell<usize>,
 }
@@ -200,7 +195,7 @@ impl LocalExl3<'_> {
     fn admit_weights(&self, layers: &[usize]) -> Result<()> {
         use crate::shared::experts::{exl3::Exl3Weights, layer::ExpertLayer};
         use cuteafd_loader::placement::ResidentWeights;
-        let mut selections = (0..usize::from(self.mtp)).map(|stage| ExpertLayer::Dspark { stage })
+        let mut selections = (0..usize::from(self.admitted.mtp)).map(|stage| ExpertLayer::Dspark { stage })
             .chain(layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }));
         let weights = selections.try_fold(self.base_weights, |sum, selection|
             sum.checked_add(ResidentWeights(Exl3Weights::plan(self.catalog, selection)?.resident_bytes as u64))
@@ -208,19 +203,12 @@ impl LocalExl3<'_> {
         weights.check(0, crate::shared::memory::budget::resident_weight_limit())?;
         Ok(())
     }
-    /// Pushes the first window (layers from 0, and the MTP stage) in a push
-    /// group of this GPU alone, as the first [`Self::ensure`] would load it
-    /// through the mount. Non-namespace windows stay lazy; a Required push
-    /// failure refuses startup. Later windows reload through the mount.
-    /// The first window's selections and coordinator push host envelope, from
-    /// headers only, so the recipe can admit them before any push allocation.
+    /// Reuse the exact selections and byte budget admitted before KV allocation.
     pub(super) fn push_envelope(&self) -> Result<(Vec<crate::shared::experts::layer::ExpertLayer>, usize,
         cuteafd_loader::push_load::PushHostEnvelope)> {
         use crate::shared::experts::rtx::push::{CoordinatorExperts, WholeOwner};
-        let backbone: Vec<_> = (0..self.window.min(self.layers)).collect();
-        let (selections, weights_budget) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
-            &self.native_lib, self.catalog, usize::from(self.mtp), &backbone, self.max_rows, self.budget)?
-            .context("Qwen EXL3 expert window lacks a pushable package")?;
+        let selections = self.admitted.selections.clone();
+        let weights_budget = self.admitted.weights_budget;
         anyhow::ensure!(!selections.is_empty(), "Qwen EXL3 expert window has no selected layers");
         let experts = CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
             selections: selections.clone(), budget: weights_budget }] };
@@ -239,6 +227,7 @@ impl LocalExl3<'_> {
             let selected_layers = selections.iter().filter_map(|s| match s {
                 crate::shared::experts::layer::ExpertLayer::BackboneFull { layer } => Some(*layer), _ => None,
             }).collect::<Vec<_>>();
+            self.admitted.validate_layers(&selected_layers)?;
             self.admit_weights(&selected_layers)?;
             let experts = CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
                 selections: selections.clone(), budget: weights_budget }] };
@@ -261,10 +250,11 @@ impl LocalExl3<'_> {
             .context("Qwen required EXL3 expert window payload")?;
         let weights = ranks.pop().context("one coordinator rank")?.exl3()?;
         let local = crate::families::deepseek_v4::local::LocalExperts::from_exl3_weights(self.library, &self.native_lib,
-            self.catalog, &selections, weights, self.max_rows)?.context("pushed EXL3 expert window")?;
+            self.catalog, &selections, weights, self.admitted.rows)?.context("pushed EXL3 expert window")?;
         let layers = local.layers().to_vec();
+        self.admitted.validate_layers(&layers)?;
         *self.loads.borrow_mut() += layers.len();
-        tracing::info!(layers = layers.len(), stages = usize::from(self.mtp), elapsed_ms = started.elapsed().as_millis() as u64,
+        tracing::info!(layers = layers.len(), stages = usize::from(self.admitted.mtp), elapsed_ms = started.elapsed().as_millis() as u64,
             "Qwen EXL3 expert window pushed");
         *self.resident.borrow_mut() = Some((layers, local));
         Ok(true)
@@ -272,23 +262,19 @@ impl LocalExl3<'_> {
 
     pub(super) fn ensure(&self, layer: usize, stream: *mut c_void) -> Result<()> {
         if self.resident.borrow().as_ref().is_some_and(|(layers, _)| layers.binary_search(&layer).is_ok() || layer == self.layers) {
-            ensure!(layer < self.layers || self.mtp, "MTP experts are not loaded");
+            ensure!(layer < self.layers || self.admitted.mtp, "MTP experts are not loaded");
             return Ok(());
         }
-        let layer = if layer == self.layers { 0 } else { layer };
-        // SAFETY: the engine owns this stream; the old window's launches drain first.
-        unsafe { self.library.cuda_stream_synchronize(stream)? };
-        *self.resident.borrow_mut() = None;
-        let layers: Vec<_> = (layer..layer + self.window.min(self.layers.saturating_sub(layer))).collect();
-        let planned = crate::families::deepseek_v4::local::plan(self.library, &self.native_lib, self.catalog,
-            usize::from(self.mtp), &layers, self.max_rows, self.budget)?;
-        self.admit_weights(&planned.layers)?;
+        ensure!(layer < self.layers || (layer == self.layers && self.admitted.mtp),
+            "EXL3 expert layer {layer} is not admitted");
+        ensure!(self.resident.borrow().is_none(), "admitted EXL3 resident set lost layer {layer}");
+        self.admit_weights(&self.admitted.layers)?;
         let started = std::time::Instant::now();
         let local = crate::families::deepseek_v4::local::LocalExperts::load(self.library, &self.native_lib, self.catalog,
-            usize::from(self.mtp), &layers, self.max_rows, self.budget, stream)?
+            usize::from(self.admitted.mtp), &self.admitted.layers, self.admitted.rows, self.admitted.peak_bytes, stream)?
             .context("no coordinator EXL3 package for this checkpoint (build qwen4:exl3-k45)")?;
         let layers = local.layers().to_vec();
-        ensure!(layers.binary_search(&layer).is_ok(), "EXL3 expert layer {layer} does not fit the budget");
+        self.admitted.validate_layers(&layers)?;
         *self.loads.borrow_mut() += layers.len();
         tracing::debug!(?layers, elapsed_ms = started.elapsed().as_millis() as u64, "EXL3 expert window resident");
         *self.resident.borrow_mut() = Some((layers, local));
@@ -1480,7 +1466,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         let ple_owner = cfg.ple_layers.first().filter(|&&index| index < owners.len()).map(|&index| owners[index]);
         if let (Some(table), Some(owner)) = (&ple, ple_owner) {
-            ensure!(table.scale.buffer.device_id == ranks[owner].0.id,
+            ensure!(table.device == ranks[owner].0.id,
                 "Qwen PLE table must load on its attention owner");
         }
         let (ple_state, ple_replay) = if weights.layers.len() > cfg.ple_layers.first().copied().unwrap_or(usize::MAX) {
@@ -4006,7 +3992,7 @@ impl<'a> Qwen4Engine<'a> {
         let (gathered, local) = w.ple_rows.as_ref().context("PLE layer without gathered-row workspace")?;
         let (ids, gathered) = (local.buffer.ptr, gathered.buffer.ptr);
         self.run(name, &[("streams", w.live(streams, HC * self.cfg.hidden * 2)), ("ids", ids), ("table", gathered),
-            ("scale", table.scale.buffer.ptr), ("w_kv", layer.ptr("ple.w_kv")?),
+            ("scale", layer.ptr("ple.scale")?), ("w_kv", layer.ptr("ple.w_kv")?),
             ("norm_key", layer.ptr("ple.norm_key")?), ("norm_query", layer.ptr("ple.norm_query")?),
             ("norm_conv", layer.ptr("ple.norm_conv")?), ("conv_w", layer.ptr("ple.conv_w")?),
             ("conv_state", state.buffer.ptr), ("slots", w.slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),

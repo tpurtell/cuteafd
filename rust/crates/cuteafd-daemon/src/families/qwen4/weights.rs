@@ -300,6 +300,29 @@ impl<'a> Qwen4Loader<'a> {
         }
     }
 
+    /// The scale is a target-arena view. Initialize its entire native extent,
+    /// including padding, before recording checkpoint conversion for push.
+    fn ple_scale(&self, p: &str) -> Result<Allocation<'a>> {
+        let dtype = cuteafd_loader::families::qwen4::weight_layout::ple_scale_dtype(self.checkpoint, p)?;
+        let out = self.allocate(&format!("{p}.ple.scale"), 256)?;
+        let mut initial = [0u8; 256];
+        if dtype.is_none() { initial[..4].copy_from_slice(&1.0f32.to_le_bytes()); }
+        self.library.copy_h2d(out.buffer, &initial)?;
+        if let Some(dtype) = dtype {
+            let name = format!("{p}.ple.ple_embedding.ngram_embedding.weight_scale");
+            let rect = self.rect(&name, None)?;
+            let dst = cuteafd_ffi::CuteafdDeviceBuffer { bytes: 4, ..out.buffer };
+            match dtype {
+                DType::F32 => self.dense.operand(crate::shared::experts::rtx::dense::Operand {
+                    device: self.device()?.id, buffer: dst, lands: vec![(rect, 0)], bytes: 4 })?,
+                DType::Bf16 => self.step(vec![rect], vec![crate::shared::experts::rtx::dense::Job::Widen {
+                    at: 0, bytes: 2, dst }])?,
+                _ => unreachable!("PLE scale headers already checked"),
+            }
+        }
+        Ok(out)
+    }
+
     /// The row concatenation of BF16 `names` as E4M3 values and FP32 128x128
     /// block scales, quantized on the GPU in whole 128-row windows (the BF16
     /// copy is never resident).
@@ -403,6 +426,7 @@ impl<'a> Qwen4Loader<'a> {
             ops.insert("ple.norm_query", self.one(&e("norm_query.weight"))?);
             ops.insert("ple.norm_conv", self.one(&e("norm_conv.weight"))?);
             ops.insert("ple.conv_w", self.f32(&e("conv1d.weight"))?);
+            ops.insert("ple.scale", self.ple_scale(p)?);
         }
         Ok(Qwen4Layer { attention, operands: ops })
     }
@@ -607,6 +631,97 @@ mod tests {
                     Ok(bytes)
                 };
                 assert_eq!(read(mounted)?, read(pushed)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ple_scale_is_an_owner_arena_view_with_identical_mount_and_push_bytes() -> Result<()> {
+        use crate::shared::experts::rtx::dense::DenseLoad;
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::plan::testing::{qwen4_config, qwen4_coordinator, t, write_snapshot};
+        use std::os::unix::fs::FileExt;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.quiet_events(&library, true)?;
+        for gpu in [0, 1] { fixture.configure_memory(&library, gpu, 1 << 30)?; }
+        let mut config = qwen4_config(2);
+        config["text_config"]["hidden_size"] = 128.into();
+        config["text_config"]["shared_expert_intermediate_size"] = 64.into();
+        config["text_config"]["num_experts"] = 64.into();
+        config["text_config"]["ple_layer_ids"] = serde_json::json!([1]);
+        let cfg = Qwen4Config::from_hf(&config)?;
+        let p = "model.language_model.layers.0";
+        let scale_name = format!("{p}.ple.ple_embedding.ngram_embedding.weight_scale");
+        for (table_dtype, scalar_dtype) in [("BF16", "BF16"), ("F8_E4M3", "BF16"), ("F8_E4M3", "F32")] {
+            let mut headers = qwen4_coordinator(&config, false);
+            headers.push(t(format!("{p}.ple.ple_embedding.ngram_embedding.shard_0.weight"), table_dtype, &[16, 160]));
+            if table_dtype != "BF16" { headers.push(t(&scale_name, scalar_dtype, &[1])); }
+            write_snapshot(fixture.directory(), &config, &headers, None);
+            let checkpoint = Checkpoint::open(fixture.directory())?;
+            let old_scalar = if table_dtype == "BF16" { 1.0f32 } else {
+                let source = checkpoint.tensors.iter().find(|t| t.meta.name == scale_name).unwrap();
+                let bytes = if scalar_dtype == "BF16" { 0x3eabu16.to_le_bytes().to_vec() }
+                    else { 0.3125f32.to_le_bytes().to_vec() };
+                std::fs::File::options().write(true).open(checkpoint.snapshot.join(&source.shard))?
+                    .write_all_at(&bytes, source.meta.byte_offset)?;
+                // The previous standalone scalar's exact conversion, not an approximation.
+                if scalar_dtype == "BF16" { f32::from_bits(u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16) }
+                    else { f32::from_le_bytes(bytes.try_into().unwrap()) }
+            };
+            let mut expected = vec![0; 256];
+            expected[..4].copy_from_slice(&old_scalar.to_le_bytes());
+            for gpu in [0, 1] {
+                let device = Device { library: &library, id: gpu };
+                let ranks = [(Device { library: &library, id: 0 }, std::ptr::null_mut()),
+                    (Device { library: &library, id: 1 }, std::ptr::null_mut())];
+                let load = std::rc::Rc::new(DenseLoad::push(&library));
+                let loader = Qwen4Loader { library: &library, checkpoint: &checkpoint, fp8_decode: false,
+                    fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(),
+                    dense: std::rc::Rc::new(DenseLoad::mount(&library)), arenas: None };
+                let mounted = device.run(|| loader.with_arenas(&cfg, &[gpu as usize, 1 - gpu as usize],
+                    &ranks, false, false, false)?.ple_scale(p))?;
+                let planning = Qwen4Loader { dense: load.clone(), ..loader }
+                    .with_arenas(&cfg, &[gpu as usize, 1 - gpu as usize], &ranks, false, false, false)?;
+                let pushed = device.run(|| planning.ple_scale(p))?;
+                assert_ne!(mounted.buffer.ptr, pushed.buffer.ptr);
+                let records = load.sink.as_ref().unwrap().take_all();
+                if table_dtype != "BF16" {
+                    let sockets = tempfile::tempdir_in(fixture.directory())?;
+                    crate::shared::experts::rtx::push::tests::receive_pushed(device, None,
+                        &checkpoint.snapshot, sockets.path(), &records, None, 0, gpu as usize)?;
+                }
+                for allocation in [&mounted, &pushed] {
+                    let mut actual = vec![0; 256];
+                    device.run(|| library.copy_d2h(&mut actual, allocation.buffer))?;
+                    assert_eq!(actual, expected, "table={table_dtype} scalar={scalar_dtype} gpu={gpu}");
+                    let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&[0, 1])?;
+                    let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "ple-test",
+                        cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+                        cuteafd_core::memory_layout::Category::Weights, "coordinator weights");
+                    allocation.inventory(&mut inventory, "scale")?;
+                    assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);
+                    let view = inventory.receipts.iter().find(|r| r.allocation.view.is_some()).unwrap();
+                    assert_eq!(view.allocation.bytes, 256);
+                    assert!(inventory.receipts.iter().any(|r| r.allocation.id.contains(&format!("qwen4/target/rank{gpu}"))));
+                    assert_eq!(allocation.buffer.device_id, gpu);
+                }
+                // The scalar's widening step must also appear in pre-upload
+                // admission, on precisely the owner that records it.
+                let owners = [gpu as usize, 1 - gpu as usize];
+                let model = planning.model_placed(&cfg, &owners, &ranks, false, false)?;
+                let records = load.sink.as_ref().unwrap().take_all();
+                let charged = super::super::admission::dual_dense_staging(&checkpoint, &cfg, &owners,
+                    false, false, false, &Default::default(), [0, 1])?;
+                for rank in 0..2 {
+                    let actual = crate::shared::experts::rtx::dense::RankLayout::new(
+                        records.operands.clone(), records.steps.clone(), rank as i32)?.host_staging.bytes()?;
+                    assert_eq!(charged[rank], actual as u64,
+                        "table={table_dtype} scalar={scalar_dtype} owner={gpu} rank={rank}");
+                }
+                drop(model);
             }
         }
         Ok(())

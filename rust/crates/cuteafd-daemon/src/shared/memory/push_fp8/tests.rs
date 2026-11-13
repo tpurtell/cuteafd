@@ -234,6 +234,71 @@ fn coordinator_whole_and_tp2_selected_planes_match_mount_after_spark_ranks() -> 
 }
 
 #[test]
+fn qwen_absolute_draft_is_a_full_checkpoint_set_on_either_physical_gpu() -> Result<()> {
+    use crate::shared::{experts::layer::ExpertLayer, memory::push_coordinator::CoordinatorExpertPlan};
+    use cuteafd_loader::plan::testing::{qwen4_config, t};
+    let root = tempfile::tempdir()?;
+    let mut config = qwen4_config(1);
+    config["quantization_config"] = serde_json::json!({"quant_method": "fp8", "weight_block_size": [128, 128]});
+    config["text_config"]["hidden_size"] = 128.into();
+    config["text_config"]["num_experts"] = 64.into();
+    config["text_config"]["moe_intermediate_size"] = 1024.into();
+    config["text_config"]["mtp_num_hidden_layers"] = 1.into();
+    let mut headers = Vec::new();
+    for expert in 0..64 {
+        for (projection, rows, cols) in [("gate", 1024, 128), ("up", 1024, 128), ("down", 128, 1024)] {
+            headers.extend(fp8(&format!("model.language_model.layers.0.mlp.experts.{expert}.{projection}_proj"), rows, cols, None));
+            headers.push(t(format!("mtp.layers.0.mlp.experts.{expert}.{projection}_proj.weight"), "BF16", &[rows, cols]));
+        }
+    }
+    write_snapshot(root.path(), &config, &headers, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let tensors = catalog.fp8().unwrap().for_coordinator();
+    for layer in [0, 1] {
+        let view = tensors.for_layer_metadata(layer)?;
+        for expert in 0..64 { for projection in Fp8Projection::ALL {
+            for name in source_names(&view, layer, expert, projection) {
+                let (source, dtype) = view.push_source(&name)?;
+                let image = if dtype == DType::F32 {
+                    1.25f32.to_le_bytes().into_iter().cycle().take(source.bytes as usize).collect::<Vec<_>>()
+                } else {
+                    (0..source.bytes).map(|i| (i + 7 * expert as u64 + 31 * layer as u64) as u8).collect()
+                };
+                File::options().write(true).open(source.path)?.write_all_at(&image, source.offset)?;
+            }
+        }}
+    }
+    // A role-filtered draft catalog has no backbone headers, but keeps absolute ID 1.
+    let draft = cuteafd_loader::read_qwen4_mtp_expert_catalog(root.path(), 1)?;
+    for gpu in [0, 1] {
+        let backbone = CoordinatorExpertPlan::native_selected(&catalog,
+            &[ExpertLayer::BackboneTp2 { layer: 0, rank: gpu }], gpu, usize::MAX)?;
+        for source in [&catalog, &draft] {
+            let full = CoordinatorExpertPlan::native_selected(source,
+                &[ExpertLayer::BackboneFull { layer: 1 }], gpu, usize::MAX)?;
+            assert_eq!((full.gpu, full.world, full.layers.as_slice()), (gpu, 1, &[1][..]));
+            assert!(CoordinatorExpertPlan::native_selected(source, &[ExpertLayer::BackboneFull { layer: 1 }],
+                gpu, full.layout.bytes() - 1).is_err());
+            for (plan, source, world, shard) in [(&backbone, &catalog, 2, gpu), (&full, source, 1, 0)] {
+                let checked = plan.checked(source, root.path(), 8, 6 + gpu)?;
+                let mut image = landed(&checked, root.path(), 6 + gpu)?;
+                spread_packed(plan.fp8.as_ref().unwrap(), &mut image);
+                // The backbone source is shared by both independently retired sets.
+                compare_tensors(plan.fp8.as_ref().unwrap(), &tensors, world, shard, &image)?;
+            }
+        }
+        for selections in [vec![ExpertLayer::BackboneFull { layer: 1 }, ExpertLayer::BackboneFull { layer: 1 }],
+            vec![ExpertLayer::BackboneFull { layer: 1 }, ExpertLayer::BackboneFull { layer: 0 }],
+            vec![ExpertLayer::BackboneTp2 { layer: 0, rank: gpu }, ExpertLayer::BackboneFull { layer: 1 }],
+            vec![ExpertLayer::BackboneTp2 { layer: 0, rank: 1 - gpu }],
+            vec![ExpertLayer::Dspark { stage: 0 }], vec![ExpertLayer::DsparkTp2 { stage: 0, rank: gpu }]] {
+            assert!(CoordinatorExpertPlan::native_selected(&catalog, &selections, gpu, usize::MAX).is_err());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn planar_rank_images_match_mount_at_tp4_tp6_with_native_scalar_tails() -> Result<()> {
     for format in [ExpertFormat::Fp8Block128, ExpertFormat::Nvfp4] {
         let root = tempfile::tempdir()?;
