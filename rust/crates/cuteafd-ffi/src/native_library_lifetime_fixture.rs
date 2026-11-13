@@ -3,10 +3,12 @@ use crate::*;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::AtomicUsize;
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+// Cargo rebuilds this artifact when any fixture source/header changes. Embedding
+// it keeps relocated test binaries independent of the build machine's OUT_DIR.
+static MODULE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/liblifetime_fixture.so"));
 
 pub struct Fixture {
     module: PathBuf,
@@ -32,15 +34,15 @@ impl Fixture {
             std::env::var_os("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")
                 .context("set CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR under ~/.cache/cuteafd/builds")?,
         );
-        Self::build_at(root, false)
+        Self::build_at(root)
     }
 
-    /// Build a test-owned fixture, taking a shared build slot only for compilation.
+    /// Instantiate a private DSO from the artifact compiled before tests run.
     pub fn build_in(root: &std::path::Path) -> Result<Self> {
-        Self::build_at(root.to_path_buf(), true)
+        Self::build_at(root.to_path_buf())
     }
 
-    fn build_at(root: PathBuf, take_build_slot: bool) -> Result<Self> {
+    fn build_at(root: PathBuf) -> Result<Self> {
         let allowed = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?)
             .join(".cache/cuteafd/builds")
             .canonicalize()?;
@@ -61,13 +63,6 @@ impl Fixture {
             existing.canonicalize()?.starts_with(&allowed),
             "fixture directory's existing parent escapes NVMe build root"
         );
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let assert_path = repo.join("scripts/build/assert-build-filesystem.py");
-        let status = Command::new("python3")
-            .arg(&assert_path)
-            .arg(&root)
-            .status()?;
-        anyhow::ensure!(status.success(), "fixture build filesystem check failed");
         fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
         anyhow::ensure!(
@@ -89,56 +84,9 @@ impl Fixture {
             }
         };
         let module = directory.join("liblifetime_fixture.so");
-        let status = Command::new("python3")
-            .arg(assert_path)
-            .arg(&module)
-            .status()?;
-        anyhow::ensure!(status.success(), "fixture module filesystem check failed");
-        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let (c_object, cc_object) = (directory.join("fixture.o"), directory.join("kernels.o"));
-        let status = Command::new("python3")
-            .arg(repo.join("python/tools/lib/mxfp4_layouts.py"))
-            .arg("--header")
-            .arg(directory.join("cuteafd_mxfp4_layouts.h"))
-            .status()?;
-        anyhow::ensure!(status.success(), "generating CPU fixture MXFP4 layouts failed");
-        let compiler = |program: &str| {
-            if take_build_slot {
-                let mut command = Command::new(repo.join("scripts/build/build-slot.sh"));
-                command.arg(program);
-                command
-            } else {
-                Command::new(program)
-            }
-        };
-        let status = compiler("cc")
-            .args(["-c", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror"])
-            .arg(fixtures.join("native_library_lifetime.c"))
-            .arg("-I")
-            .arg(&directory)
-            .arg("-o")
-            .arg(&c_object)
-            .env("TMPDIR", &directory)
-            .status()?;
-        anyhow::ensure!(status.success(), "building CPU lifetime fixture failed");
-        // Load-only kernels run the shared CUDA rule on the CPU.
-        let status = compiler("c++")
-            .args(["-std=c++17", "-c", "-fPIC", "-O1", "-Wall", "-Wextra", "-Werror"])
-            .arg(fixtures.join("native_library_kernels.cc"))
-            .arg("-o")
-            .arg(&cc_object)
-            .env("TMPDIR", &directory)
-            .status()?;
-        anyhow::ensure!(status.success(), "building CPU fixture kernels failed");
-        let status = compiler("c++")
-            .args(["-shared", "-fPIC"])
-            .arg(&c_object)
-            .arg(&cc_object)
-            .arg("-o")
-            .arg(&module)
-            .env("TMPDIR", &directory)
-            .status()?;
-        anyhow::ensure!(status.success(), "linking CPU lifetime fixture failed");
+        // A different inode per instance is essential: dlopen shares mutable
+        // fake-device globals when callers reuse a pathname or a hard link.
+        fs::write(&module, MODULE)?;
         let events = directory.join("events");
         fs::write(&events, [])?;
         Ok(Self { module, events })
@@ -448,6 +396,27 @@ impl Fixture {
 #[cfg(test)]
 mod device_free_tests {
     use super::*;
+
+    #[test]
+    fn concurrent_fixtures_copy_one_built_module_with_private_state() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let fixtures = std::thread::scope(|scope| {
+            let handles = (0..16).map(|_| scope.spawn(Fixture::build_for_tests))
+                .collect::<Vec<_>>();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Result<Vec<_>>>()
+        })?;
+        let mut inodes = std::collections::HashSet::new();
+        let libraries = fixtures.iter().map(Fixture::load).collect::<Result<Vec<_>>>()?;
+        for (index, (fixture, library)) in fixtures.iter().zip(&libraries).enumerate() {
+            assert_eq!(fs::read(fixture.module_path())?, MODULE);
+            assert!(inodes.insert(fs::metadata(fixture.module_path())?.ino()));
+            fixture.configure_memory(library, 0, 4096 + index)?;
+        }
+        for (index, library) in libraries.iter().enumerate() {
+            assert_eq!(library.physical_memory_query()?.sample(0)?, (4096 + index, 4096 + index));
+        }
+        Ok(())
+    }
 
     #[test]
     fn upload_event_capacity_refuses_overflow_and_reuses_retired_slot() -> Result<()> {
