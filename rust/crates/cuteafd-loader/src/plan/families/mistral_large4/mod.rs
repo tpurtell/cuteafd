@@ -179,6 +179,9 @@ fn routed_shape(cfg: &Ml4Config, stem: &str) -> Option<[usize; 2]> {
 }
 
 impl Family for MistralLarge4 {
+    fn native_head_widths(&self) -> &'static [usize] {
+        crate::families::glm5::core::ML4_CORE_WIDTHS
+    }
     fn id(&self) -> &'static str { "mistral_large4" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {

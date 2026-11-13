@@ -154,6 +154,8 @@ impl Exlr8Execution {
 
 pub trait Family: Sync {
     fn id(&self) -> &'static str;
+    /// Shipping native trellis widths for the resident head borrowed by drafters.
+    fn native_head_widths(&self) -> &'static [usize] { &[] }
     fn exlr8_execution(&self) -> Exlr8Execution { Exlr8Execution::default() }
     /// Base timing estimate and hard executor limits, consumed unchanged by
     /// shared planning, serving and golden. Pins bypass only the estimate.

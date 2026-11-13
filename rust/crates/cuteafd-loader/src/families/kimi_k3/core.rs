@@ -6,6 +6,8 @@ pub use crate::formats::trellis_core::{CoreProjection, CoreSplit, ProjectionScra
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
+pub(crate) const NATIVE_CORE_WIDTHS: &[usize] = &[4, 6, 8];
+
 /// Only this explicit list can replace a BF16 core matrix. Everything else
 /// (including layer-zero dense FFN, kv_b, KDA recurrence, router and embedding)
 /// retains its checkpoint-native precision.
@@ -398,7 +400,7 @@ impl CoreInventory {
             |name| !name.contains(".experts.")
                 && (name.starts_with("language_model.model.") || name.starts_with("language_model.lm_head.")),
             |stem| split(stem).map(|split| crate::formats::trellis_core::CoreContract {
-                family: "Kimi", widths: &[4, 6, 8], split, view_varying: true, padded_outputs: stem.ends_with(".self_attn.kv_a_proj_with_mqa")
+                family: "Kimi", widths: NATIVE_CORE_WIDTHS, split, view_varying: true, padded_outputs: stem.ends_with(".self_attn.kv_a_proj_with_mqa")
                     && expected.get(&format!("{stem}.weight")).is_some_and(|shape|
                         shape.first() == Some(&(cfg.kv_lora_rank + cfg.qk_rope_dim))),
             }))?;

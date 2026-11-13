@@ -963,7 +963,7 @@ pub(crate) fn check_checkpoint(snapshot: &Path, fp8: Option<bool>, context_slots
     check_checkpoint_headers(&cfg, &tensors, file_bytes)
 }
 
-/// Admit the target's single resident BF16 head or native K6 launcher before allocation.
+/// Admit the target's single resident BF16 head or native trellis launcher before allocation.
 pub(crate) fn check_snapshot_target_head(snapshot: &Path, head_stem: &str, hidden: usize, vocab: usize,
     explicit_fp8_head: bool) -> Result<()> {
     let prefix = format!("{head_stem}.");
@@ -988,14 +988,15 @@ fn check_checkpoint_target_head(checkpoint: &cuteafd_loader::plan::Checkpoint, h
     let prefix = format!("{head_stem}.");
     let weight = format!("{prefix}weight");
     let expected = BTreeMap::from([(weight.clone(), vec![vocab, hidden])]);
+    let family = cuteafd_loader::plan::family::detect(checkpoint)
+        .context("DFlash target head has no recognized checkpoint family")?;
     let native = read_projections(&checkpoint, &expected, |name| name.starts_with(&prefix),
         |stem| (stem == head_stem).then_some(CoreContract {
-            family: if head_stem.starts_with("language_model.") { "Kimi" } else { "DFlash target" },
-            widths: if head_stem.starts_with("language_model.") { &[4, 6, 8] } else { &[6] },
+            family: family.id(), widths: family.native_head_widths(),
             split: CoreSplit::Whole, view_varying: true, padded_outputs: false,
         }))?;
     if native.contains_key(head_stem) {
-        ensure!(!explicit_fp8_head, "{head_stem}: --fp8-head cannot replace the shared native K6 target head");
+        ensure!(!explicit_fp8_head, "{head_stem}: --fp8-head cannot replace the shared native trellis target head");
         return Ok(());
     }
     ensure!(!checkpoint.tensor_names().any(|name| name.starts_with(&prefix) && name != weight),
@@ -3146,7 +3147,8 @@ mod checkpoint_header_tests {
         std::fs::create_dir_all(&path).unwrap();
         let fixture = HeaderSnapshot(path);
         let config = serde_json::json!({
-            "model_type": "glm_moe_dsa", "quantization_config": {"quant_method": "fp8"},
+            "model_type": "glm_moe_dsa", "architectures": ["GlmMoeDsaForCausalLM"],
+            "quantization_config": {"quant_method": "fp8"},
             "vocab_size": 16, "hidden_size": 128, "num_hidden_layers": 1,
             "num_attention_heads": 1, "q_lora_rank": 128, "kv_lora_rank": 128,
             "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
@@ -3247,6 +3249,30 @@ mod checkpoint_header_tests {
     }
 
     #[test]
+    fn target_head_widths_follow_the_checkpoint_family_not_the_tensor_stem() {
+        for (architecture, model_type, stem, widths) in [
+            ("GlmMoeDsaForCausalLM", "glm_moe_dsa", "lm_head", &[6, 8][..]),
+            ("Glm5NextForConditionalGeneration", "glm5_next", "lm_head", &[4, 6, 8][..]),
+            ("KimiK3ForConditionalGeneration", "kimi_k3", "language_model.lm_head", &[4, 6, 8][..]),
+            ("MistralLarge4ForConditionalGeneration", "mistral_large4", "output", &[6][..]),
+        ] {
+            for bits in [4, 6, 8] {
+                let fixture = native_head_snapshot_named(bits, stem);
+                let path = fixture.0.join("config.json");
+                let mut config = cuteafd_loader::plan::checkpoint::read_json(&path).unwrap();
+                config["architectures"] = serde_json::json!([architecture]);
+                config["model_type"] = model_type.into();
+                std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+                let result = check_snapshot_target_head(&fixture.0, stem, 128, 256, false);
+                assert_eq!(result.is_ok(), widths.contains(&bits), "{architecture} K{bits}: {result:?}");
+                if let Err(error) = result {
+                    assert!(error.to_string().contains(&format!("shipping widths {widths:?}")), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ml4_target_resolves_real_consolidated_output_bf16_headers() {
         use std::io::Write;
         let fixture = expert_only_snapshot();
@@ -3307,7 +3333,7 @@ mod checkpoint_header_tests {
         assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err());
         let fixture = native_head_snapshot(4);
         let error = check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).unwrap_err().to_string();
-        assert!(error.contains("unsupported dense core width K4") && error.contains("shipping widths [6]"), "{error}");
+        assert!(error.contains("unsupported dense core width K4") && error.contains("shipping widths [6, 8]"), "{error}");
     }
 
     #[test]
