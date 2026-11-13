@@ -56,6 +56,36 @@ def expected_source_identity(runtime_digests):
             "shape_invariant_sha256": digest(ROOT / "python/reference/shape_invariant.py")}
 
 
+def upstream_evidence(path, manifest, pins):
+    """Bind an independently run pure-Torch helper comparison to this panel."""
+    import math
+    report = json.loads(Path(path).read_bytes())
+    if (report.get("passed") is not True or report.get("panel_diagnostic_only")
+            or report.get("panel_set_sha256") != manifest["set_sha256"]
+            or report.get("reference_adapter_sha256") != pins["reference_adapter_sha256"]
+            or report.get("revision") != REVISION
+            or report.get("upstream", {}).get("revision") != VLLM["revision"]):
+        raise ValueError("upstream helper evidence differs from this reference panel")
+    window = next(w for w in manifest["windows"] if len(w["tokens"]) >= 640)
+    if (report.get("window") != window["id"] or report.get("tokens") != len(window["tokens"])
+            or report.get("window_tokens_sha256") != hashlib.sha256(canonical(window["tokens"])).hexdigest()):
+        raise ValueError("upstream helper evidence window differs")
+    for name in ("test_attention.py", "test_core_ops.py", "test_moe.py"):
+        key = "tests/models/inkling2/" + name
+        if report["upstream"].get("files", {}).get(key) != VLLM["files"][key]:
+            raise ValueError("upstream helper evidence source hashes differ")
+    for index in (0, 5):
+        for name in ("static_conv", "l2_clip", "relative_attention_sink_gate", "route_gamma",
+                     "dequant_4608", "dequant_2304"):
+            check = report.get("measurements", {}).get(f"layer{index}/{name}", {})
+            error = check.get("max_abs", float("nan"))
+            if check.get("calls", 0) < 1 or not math.isfinite(error) or error > 2e-5:
+                raise ValueError("upstream helper evidence lacks a passing intermediate")
+    return {**report, "evidence_sha256": digest(path),
+            "comparison": "Pinned unmodified upstream pure-Torch helpers on first real text window, "
+                          "layers 0 and 5; intermediates only, not an independent full decoder"}
+
+
 def sync_directory(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -233,6 +263,14 @@ def execute(a):
         raise ValueError("diagnostic stop layer is outside checkpoint")
     if stop is not None and any((a.out / name).exists() for name in ("meta.json", "prefix-qualification.json")):
         raise ValueError("diagnostic stop cannot reuse a qualified output")
+    evidence = None
+    if stop is None and not getattr(a, "_prefix_probe", False):
+        if not getattr(a, "upstream_evidence", None):
+            raise ValueError("full reference requires real-panel upstream helper evidence")
+        evidence = upstream_evidence(a.upstream_evidence, manifest, pins)
+    harness = os.environ.get("CUTEAFD_REFERENCE_COMMIT", "")
+    if harness and (len(harness) != 40 or any(c not in "0123456789abcdef" for c in harness)):
+        raise ValueError("reference harness commit must be a full Git SHA")
     proof = qualify(a, manifest, execute) if stop is None else None
     windows = manifest["windows"]
     binding = {"set_sha256": manifest["set_sha256"], "source_pin": pins,
@@ -240,7 +278,7 @@ def execute(a):
                "cuda": torch.version.cuda, "device": str(device), "arithmetic": arithmetic,
                "compute_capability": list(torch.cuda.get_device_capability(device)) if device.type == "cuda" else None,
                "image_sha256": os.environ.get("CUTEAFD_REFERENCE_IMAGE_SHA256", ""),
-               "state_dtype": "float32", "diagnostic_stop": stop,
+               "state_dtype": "float32", "harness_commit": harness,
                "state_bytes_per_layer": sum(len(w["tokens"]) * cfg.hidden_size * 4 for w in windows),
                "windows": {w["id"]: hashlib.sha256(canonical(w["tokens"])).hexdigest() for w in windows}}
     state = LayerState(a.out.parent / (a.out.name + "-layer-state"), binding)
@@ -320,6 +358,7 @@ def execute(a):
                     if device.type == "cuda" else {"device": "cpu"})
         finish_golden(a.out, manifest, entries, snapshot_identity=snapshot, source_pin=pins,
             source_identity_provider="families.inkling2.golden",
+            harness_commit=harness, **({"official_forward": evidence} if evidence else {}),
             nll=sum(e["nll"] * e["scored_tokens"] for e in entries) / rows, scored_tokens=rows,
             roles={role: {"scored_rows": s["rows"], "nll": s["loss"] / s["rows"] if s["rows"] else None,
                           "api_text_top1": s["top1"] / s["rows"] if s["rows"] else None}
@@ -341,6 +380,8 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--stop-after-layer", type=int)
+    parser.add_argument("--upstream-evidence", type=Path,
+                        help="passing real-panel pinned pure-Torch helper evidence JSON")
     args = parser.parse_args()
     if not args.check_only and (args.windows is None or args.out is None):
         parser.error("--windows and --out are required for scoring")

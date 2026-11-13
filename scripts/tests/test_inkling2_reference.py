@@ -419,6 +419,66 @@ def test_golden_runs_real_layer_loop_and_resumes_with_aligned_scoring(tmp_path, 
     assert np.array_equal(logits, np.fromfile(args.out / entry["path"] / "logits.bin", dtype="<f4").reshape(5, 34))
 
 
+def test_stopped_full_panel_resumes_without_replaying_layer_zero(tmp_path, monkeypatch):
+    import argparse
+    from fidelity_windows import canonical, set_hash
+    cfg, _ = make_snapshot(tmp_path / "snapshot")
+    panel = {"schema": "cuteafd.fidelity.set/1", "family": "inkling2", "checkpoint": model.CHECKPOINT,
+             "windows": [{"id": "tiny", "tokens": list(range(7)), "roles": ["ctx"] * 3 + ["gen"] * 4,
+                          "score_from": 2, "bucket": "0-2K"}], "quick_windows": ["tiny"]}
+    panel["set_sha256"] = set_hash(panel)
+    path = tmp_path / "windows.json"
+    path.write_bytes(canonical(panel))
+    monkeypatch.setattr(golden, "source_identity", lambda _: {"test_only": True})
+    monkeypatch.setattr(golden, "verify_snapshot", lambda *args: {"snapshot_revision": "test"})
+    monkeypatch.setenv("CUTEAFD_REFERENCE_COMMIT", "a" * 40)
+    args = argparse.Namespace(snapshot=tmp_path / "snapshot", windows=path, out=tmp_path / "resumed",
+                              device="cpu", check_only=False, stop_after_layer=0, _prefix_probe=True)
+    golden.execute(args)
+    assert not (args.out / "meta.json").exists()
+    latest = args.out.with_name("resumed-layer-state") / "latest.json"
+    assert json.loads(latest.read_bytes())["layer"] == 0
+    calls, original = [], golden.layer_forward
+
+    def tracked(*values):
+        calls.append(values[-1])
+        return original(*values)
+
+    monkeypatch.setattr(golden, "layer_forward", tracked)
+    args.stop_after_layer = None
+    golden.execute(args)
+    assert calls == list(range(1, cfg.num_hidden_layers))
+    resumed = args.out / "windows/tiny/logits.bin"
+    meta = json.loads((args.out / "meta.json").read_bytes())
+    assert meta["harness_commit"] == "a" * 40
+    args.out = tmp_path / "uninterrupted"
+    golden.execute(args)
+    assert resumed.read_bytes() == (args.out / "windows/tiny/logits.bin").read_bytes()
+
+
+def test_upstream_evidence_binds_real_panel_model_and_pinned_helpers(tmp_path):
+    import hashlib
+    from families.inkling2.sources import VLLM
+    from fidelity_windows import canonical
+    window = {"id": "a00", "tokens": [0] * 640}
+    panel = {"set_sha256": "panel", "windows": [window]}
+    pins = {"reference_adapter_sha256": "model"}
+    report = {"passed": True, "panel_set_sha256": "panel", "reference_adapter_sha256": "model",
+              "window": "a00", "tokens": 640, "revision": model.REVISION,
+              "window_tokens_sha256": hashlib.sha256(canonical(window["tokens"])).hexdigest(),
+              "upstream": VLLM, "measurements": {f"layer{i}/{name}": {"calls": 1, "max_abs": 0.}
+                  for i in (0, 5) for name in ("static_conv", "l2_clip", "relative_attention_sink_gate",
+                                              "route_gamma", "dequant_4608", "dequant_2304")}}
+    path = tmp_path / "upstream.json"
+    path.write_bytes(canonical(report))
+    assert "not an independent full decoder" in golden.upstream_evidence(path, panel, pins)["comparison"]
+    for key, value in (("panel_set_sha256", "other"), ("reference_adapter_sha256", "other"),
+                       ("window_tokens_sha256", "other"), ("passed", False), ("panel_diagnostic_only", True)):
+        path.write_bytes(canonical({**report, key: value}))
+        with pytest.raises(ValueError, match="evidence"):
+            golden.upstream_evidence(path, panel, pins)
+
+
 def state_binding():
     return {"windows": {"a": "input-hash"}, "state_bytes_per_layer": 128}
 
