@@ -159,7 +159,7 @@ agent needs to finish without asking:
    under `~/Developer/cute-worktrees/<name>`, outside the repo. New CuteAFD
    and SparkInfer worktrees both go in this folder, not directly in
    `~/Developer`; use distinct names such as `cuteafd-<task>` and
-   `sparkinfer-<task>`. Leave existing worktrees where they are. Name the
+   `sparkinfer-<task>`. Leave other agents' worktrees where they are; remove your own (and its `builds/<task>` scratch) once the branch is merged. Name the
    PR/issue number and the preflight command (`hwlock.py --preflight`) for
    any hardware run.
 2. **Context:** the measured numbers and file paths that motivate the task,
