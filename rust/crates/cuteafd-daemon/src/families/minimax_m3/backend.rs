@@ -1,6 +1,6 @@
 //! Text-only MiniMax adapter; admission, lanes and selection stay in the shared scheduler.
 use super::{cache::{Placement, PAGE_ROWS}, engine::{Requests, ServingPrefill, ServingRequest},
-    prefix::MiniMaxPrefix, serve::Owners};
+    prefix::MiniMaxPrefix, owners::Owners};
 use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs, Toggle},
     prefill_packing::{Limits, MemberOutcome}, probe,
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenSelector}};
