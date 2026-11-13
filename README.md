@@ -135,10 +135,10 @@ concurrency point is that limit.
 <td width="27%" valign="top"><a href="benchmarks/kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/card.svg"><img src="benchmarks/kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/card.svg" alt="wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6 on 2× RTX PRO 6000 @ gpu-powerd 450/450 W (325–550) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
-<td width="19%" valign="top"><a href="docs/models/glm5.md"><b>GLM 5.3</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC</sub><br><sub></sub></td>
+<td width="19%" valign="top"><a href="docs/models/glm5.md"><b>GLM 5.3</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
 <td width="27%" valign="top">n/a<br><sub>No 5090 card in this rollout; RTX PRO 6000 columns only.</sub></td>
-<td width="27%" valign="top">pending<br><sub>MC original min card pending K8 kernel pin #1903 and measurement (#1906).</sub></td>
-<td width="27%" valign="top">pending<br><sub>MC original max card pending K8 kernel pin #1903 and measurement (#1906).</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5/2026-11-13-smoke-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-original-min-cand-r1/card.svg"><img src="benchmarks/glm5/2026-11-13-smoke-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-original-min-cand-r1/card.svg" alt="wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 445 W (425–450) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
+<td width="27%" valign="top">pending<br><sub>MC original max card awaiting six-Spark measurement (#1906); K8 pin #1903 merged.</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5.md"><b>GLM 5.3</b></a><br><sub>kindlingai/glm-5.3-exlr8-k2-k3-k4</sub><br><sub></sub></td>
@@ -207,10 +207,10 @@ concurrency point is that limit.
 <td width="27%" valign="top"><a href="benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/card.svg"><img src="benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/card.svg" alt="wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6 on 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
-<td width="19%" valign="top"><a href="docs/models/step5.md"><b>Step-5</b></a><br><sub>wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC</sub><br><sub></sub></td>
+<td width="19%" valign="top"><a href="docs/models/step5.md"><b>Step-5</b></a><br><sub>wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC</sub><br><sub>exl3-k4+exl3-k6</sub></td>
 <td width="27%" valign="top">n/a<br><sub>No 5090 card in this rollout; RTX PRO 6000 columns only.</sub></td>
-<td width="27%" valign="top">pending<br><sub>MC original min card pending K8 kernel pin #1903 and measurement (#1906).</sub></td>
-<td width="27%" valign="top">pending<br><sub>MC original max card pending K8 kernel pin #1903 and measurement (#1906).</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min-cand-r1/card.svg"><img src="benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min-cand-r1/card.svg" alt="wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 445 W (425–450) + 3× DGX Spark"></a><br><sub>1× RTX + 3× Spark</sub></td>
+<td width="27%" valign="top">pending<br><sub>MC original max card awaiting six-Spark measurement (#1906); K8 pin #1903 merged.</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>kindlingai/glm-5.3-flash-exlr8-k2-k3-k4</sub><br><sub></sub></td>

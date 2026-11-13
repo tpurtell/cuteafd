@@ -36,8 +36,8 @@ the MC [min](../../examples/configs/step5-exl3-k4-mc-min.config) and
 [max](../../examples/configs/step5-exl3-k4-mc-max.config) configs, which pin the MC
 publication, revision and `CORE_VIEW=original`. The old K6-core paths remain
 retired historical recipes. The release smoke matrix uses the MC configs;
-MC cards and Standard fidelity
-are pending [#1906](https://github.com/tpurtell/cuteafd/issues/1906).
+MC original min and all three Standard fidelity views are measured; max cards
+remain under [#1906](https://github.com/tpurtell/cuteafd/issues/1906).
 
 ## Core views
 
@@ -54,13 +54,51 @@ supports O projections only; the MC's complete core also selects q/k/v,
 dense/shared FFNs and the head, so role validation refuses it by tensor name.
 The comparison is `na`; no partial conversion is presented as a whole-core view.
 
-Standard fidelity uses the published 32+32 set rooted at
-`stepfun-ai/Step-5-Preview-BF16`, on the min card, for each supported view.
-KL, top-1, generated top-1 and NLL remain pending; the routed-expert 3-6 bpw
-tier requires generated-row KL <= 0.05 and top-1 >= 0.93. Track full-length
-window capacity under [#1899](https://github.com/tpurtell/cuteafd/issues/1899)
-and trellis-core mount reads under [#1849](https://github.com/tpurtell/cuteafd/issues/1849);
-neither is fixed by switching publication rows.
+Standard fidelity (2026-11-13) uses the published 32 decode + 32 prefill
+windows rooted at `stepfun-ai/Step-5-Preview-BF16`, on the min card. Both paths use
+bounded streamed prefill scoring (`full-prefill-logits=false`); every completed
+path scored 16,384 positions with zero missing or non-finite rows. The
+routed-expert 3-6 bpw bar is generated-row KL <= 0.05 and top-1 >= 0.93;
+context-inclusive scores are informational, not the qualification policy.
+
+| View / report | Path | All KL / top-1 | Generated KL / top-1 | All / generated NLL | Tier verdict |
+| --- | --- | --- | --- | --- | --- |
+| [original](../../benchmarks/step5/2026-11-13-custom-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-fidelity-min-cand-r1/report.json) | decode | 0.01725 / 96.28% | 0.01267 / 95.92% | 0.66982 / 0.63749 | pass |
+| [original](../../benchmarks/step5/2026-11-13-custom-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-fidelity-min-cand-r1/report.json) | prefill | 0.02174 / 95.78% | 0.01120 / 96.15% | 0.86380 / 0.59045 | pass |
+| [k8-compact](../../benchmarks/step5/2026-11-13-custom-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-k8-compact-fidelity-min-cand-r1/report.json) | decode | 0.01550 / 96.41% | 0.01272 / 96.02% | 0.66744 / 0.63783 | pass |
+| [k8-compact](../../benchmarks/step5/2026-11-13-custom-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-k8-compact-fidelity-min-cand-r1/report.json) | prefill | 0.02240 / 95.79% | 0.01191 / 96.26% | 0.86576 / 0.59260 | pass |
+| [k6-compact](../../benchmarks/step5/2026-11-13-custom-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-k6-compact-fidelity-min-cand-r1/report.json) | decode | 0.01615 / 96.37% | 0.01311 / 95.97% | 0.66949 / 0.63949 | pass |
+| [k6-compact](../../benchmarks/step5/2026-11-13-custom-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-k6-compact-fidelity-min-cand-r1/report.json) | prefill | 0.02423 / 95.70% | 0.01291 / 96.01% | 0.86608 / 0.59158 | pass |
+
+One launch per view, default speculation, floating 850 W shared budget.
+No software/hardware thermal slowdown occurred. GPU0 panel windows:
+
+| View | Power-cap seconds | Busy SM clock | Max temperature | Min T.Limit headroom |
+| --- | ---: | ---: | ---: | ---: |
+| original | 9.0 s | 2670 MHz | 67 C | 28 C |
+| k8-compact | 13.9 s | 2612 MHz | 68 C | 28 C |
+| k6-compact | 15.9 s | 2613 MHz | 71 C | 28 C |
+
+The published Step reference remains reference-only qualified, not
+engine-calibrated; its reference manifest records a legacy Qwen text-checkpoint
+label, while its root, revision, dataset and hashes identify Step-5 BF16.
+All 32+32 windows completed; [#1899](https://github.com/tpurtell/cuteafd/issues/1899)
+and [#1849](https://github.com/tpurtell/cuteafd/issues/1849) remain separate
+engine work.
+
+## MC original min card
+
+The 2026-11-13 [Release smoke report](../../benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min-cand-r1/report.svg),
+including quick fidelity and exact prefix-cache checks, passes quality.
+C1 / C8 / 8K / 8K-with-tail: 43.03 / 96.70 /
+2405 / 2259 tok/s. This is a single warmed
+candidate run, not an A/B speed claim. Host page-reclaim caveats are retained
+in the run evidence; they do not trigger a repeat campaign.
+
+Baseline GPU0: 7.0 s power-cap, zero thermal slowdown,
+2720 MHz busy SM clock, 68 C maximum temperature,
+25 C minimum T.Limit headroom, floating 850 W shared budget.
+The report completed before a cleanup timeout; later inspection confirmed the serving container absent ([#1948](https://github.com/tpurtell/cuteafd/issues/1948)).
 
 ## Native MTP
 
@@ -96,4 +134,5 @@ automatic, and admission refuses configurations below the 256K context floor.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v5.1 WIP | 2026-11-13 | MC original min Release smoke and published Standard fidelity; max cards pending #1906. | [Original min](../../benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min-cand-r1/report.svg) |
 | v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/report.svg"><img src="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-Core-K6 (exl3-k4+exl3-k6) (1× RTX)"></a> <a href="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/report.svg"><img src="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-Core-K6 (exl3-k4+exl3-k6) (2× RTX)"></a> |

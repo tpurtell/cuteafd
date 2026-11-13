@@ -200,6 +200,10 @@ historical recipe; new release launches use the v5 matrix.
 
 ## GLM 5.3
 
+- 2026-11-13 · Custom · wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 435 W (425–450) + 4× DGX Spark · build 78fdccb955e9+dirty · [report](glm5/2026-11-13-custom-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-k8-compact-fidelity-min-cand-r1/report.svg)
+- 2026-11-13 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 445 W (425–450) + 4× DGX Spark · build 0231a1ad9e0f · [report](glm5/2026-11-13-smoke-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-original-min-cand-r1/report.svg)
+- 2026-11-13 · Custom · wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 440 W (425–450) + 4× DGX Spark · build 0231a1ad9e0f · [report](glm5/2026-11-13-custom-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-k6-compact-fidelity-min-cand-r1/report.svg)
+- 2026-11-13 · Custom · wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 445 W (425–450) + 4× DGX Spark · build 0231a1ad9e0f · [report](glm5/2026-11-13-custom-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-original-fidelity-min-cand-r1/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (380–515) + 6× DGX Spark · build v5.0.0-rc1 · [report](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-hqa-2rtx-6spark-glm53-exl3-k6core-max-fp8-compact/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v5.0.0-rc1 · [report](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-hqa-2rtx-6spark-glm53-exl3-k6core-max-hqa/report.svg)
 - 2026-11-10 · Release smoke · kindlingai/glm-5.3-exlr8-k2-k3-k4 · 1× RTX PRO 6000 @ gpu-powerd 470 W (450–600) + 4× DGX Spark · build v5.0.0-rc1 · [report](glm5/2026-11-10-smoke-glm-5-3-exlr8-k2-k3-k4-1rtx-4spark-glm53-exlr8-min/report.svg)
@@ -465,6 +469,10 @@ historical recipe; new release launches use the v5 matrix.
 
 ## Step-5
 
+- 2026-11-13 · Release smoke · wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 445 W (425–450) + 3× DGX Spark · build 0231a1ad9e0f · [report](step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min-cand-r1/report.svg)
+- 2026-11-13 · Custom · wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 445 W (425–450) + 3× DGX Spark · build 0231a1ad9e0f · [report](step5/2026-11-13-custom-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-k6-compact-fidelity-min-cand-r1/report.svg)
+- 2026-11-13 · Custom · wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 440 W (425–450) + 3× DGX Spark · build 0231a1ad9e0f · [report](step5/2026-11-13-custom-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-k8-compact-fidelity-min-cand-r1/report.svg)
+- 2026-11-13 · Custom · wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 445 W (425–450) + 3× DGX Spark · build 0231a1ad9e0f · [report](step5/2026-11-13-custom-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-fidelity-min-cand-r1/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v5.0.0-rc1 · [report](step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-hqa-2rtx-6spark-step5-exl3-k6core-max-fp8-compact/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 445/450 W (300–550) + 6× DGX Spark · build v5.0.0-rc1 · [report](step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-hqa-2rtx-6spark-step5-exl3-k6core-max-hqa/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6 · 1× RTX PRO 6000 @ gpu-powerd 455 W (450–590) + 3× DGX Spark · build v5.0.0-rc1 · [report](step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/report.svg)

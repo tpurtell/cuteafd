@@ -12,13 +12,14 @@ a top-8 sigmoid router, and a DFlash2 draft speculator.
   `c39486376dee84e5faa4904e014e07d7b6e76405` - EXL3 K4 routed experts
   with original BF16, K8 and K6 core views. This replaces the standalone
   `GLM-5.3-EXL3-K4-v1` and `GLM-5.3-EXL3-K4-Core-K6` release rows;
-  their historical reports remain archived. MC cards and Standard fidelity
-  are pending [#1906](https://github.com/tpurtell/cuteafd/issues/1906).
+  their historical reports remain archived. MC original min and all three
+  Standard fidelity views are measured; max cards remain
+  under [#1906](https://github.com/tpurtell/cuteafd/issues/1906).
 - NVIDIA ModelOpt NVFP4 (`nvidia/GLM-5.3-NVFP4`) — routed experts in NVFP4
   group-16; dense parts run through the FP8-block/W8A8 paths described
   below.
 
-**Starting configs** (MC cards pending; use a matching WIP build and replace the
+**Starting configs** (use a matching WIP build and replace the
 placeholder Spark hosts and addresses): MC original
 [min](../../examples/configs/glm53-exl3-k4-mc-min.config) ·
 [max](../../examples/configs/glm53-exl3-k4-mc-max.config).
@@ -49,10 +50,51 @@ via `scripts/bench/release-smoke-v51-mc-core-comparison.json`.
 whole-core block-FP8 roles by tensor name. Its comparison is `na`, not a
 fallback to BF16 or an attention-only conversion.
 
-Standard fidelity uses the published 32+32 set rooted at
-`zai-org/GLM-5.3-BF16`, on the min card, for each supported view. KL, top-1,
-generated top-1 and NLL remain pending; the routed-expert 3-6 bpw tier requires
-generated-row KL <= 0.05 and top-1 >= 0.93.
+Standard fidelity (2026-11-13) uses the published 32 decode + 32 prefill
+windows rooted at `zai-org/GLM-5.3-BF16`, on the min card. Both paths use
+bounded streamed prefill scoring (`full-prefill-logits=false`); every completed
+path scored 16,384 positions with zero missing or non-finite rows. The
+routed-expert 3-6 bpw bar is generated-row KL <= 0.05 and top-1 >= 0.93;
+context-inclusive scores are informational, not the qualification policy.
+
+| View / report | Path | All KL / top-1 | Generated KL / top-1 | All / generated NLL | Tier verdict |
+| --- | --- | --- | --- | --- | --- |
+| [original](../../benchmarks/glm5/2026-11-13-custom-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-original-fidelity-min-cand-r1/report.json) | decode | 0.37971 / 89.40% | 0.03769 / 94.64% | 1.08586 / 0.21380 | pass |
+| [original](../../benchmarks/glm5/2026-11-13-custom-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-original-fidelity-min-cand-r1/report.json) | prefill | 0.24984 / 91.52% | 0.03105 / 94.93% | 0.84777 / 0.19732 | pass |
+| [k8-compact](../../benchmarks/glm5/2026-11-13-custom-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-k8-compact-fidelity-min-cand-r1/report.json) | decode | 0.38169 / 89.31% | 0.03690 / 94.82% | 1.12098 / 0.21919 | pass |
+| [k8-compact](../../benchmarks/glm5/2026-11-13-custom-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-k8-compact-fidelity-min-cand-r1/report.json) | prefill | 0.25403 / 91.53% | 0.03181 / 95.09% | 0.87328 / 0.19533 | pass |
+| [k6-compact](../../benchmarks/glm5/2026-11-13-custom-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-k6-compact-fidelity-min-cand-r1/report.json) | decode | 0.37460 / 89.56% | 0.03797 / 94.49% | 1.05540 / 0.21935 | pass |
+| [k6-compact](../../benchmarks/glm5/2026-11-13-custom-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-k6-compact-fidelity-min-cand-r1/report.json) | prefill | 0.24913 / 91.67% | 0.03410 / 95.09% | 0.83868 / 0.20053 | pass |
+
+One launch per view, default speculation, floating 850 W shared budget.
+No software/hardware thermal slowdown occurred. GPU0 panel windows:
+
+| View | Power-cap seconds | Busy SM clock | Max temperature | Min T.Limit headroom |
+| --- | ---: | ---: | ---: | ---: |
+| original | 51.9 s | 2478 MHz | 66 C | 30 C |
+| k8-compact | 54.9 s | 2150 MHz | 69 C | 25 C |
+| k6-compact | 52.9 s | 2186 MHz | 69 C | 25 C |
+
+K8 completed after the family-owned DFlash target-head admission fix
+([#1965](https://github.com/tpurtell/cuteafd/pull/1965)); its launch, scoring and
+teardown all exited successfully.
+
+Original fidelity completed before a bounded teardown timeout; subsequent
+inspection confirmed the serving container absent. The report counts; the
+cleanup issue is tracked in [#1948](https://github.com/tpurtell/cuteafd/issues/1948).
+
+## MC original min card
+
+The 2026-11-13 [Release smoke report](../../benchmarks/glm5/2026-11-13-smoke-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-original-min-cand-r1/report.svg),
+including quick fidelity and exact prefix-cache checks, passes quality.
+C1 / C8 / 8K / 8K-with-tail: 44.73 / 79.24 /
+2775 / 2586 tok/s. This is a single warmed
+candidate run, not an A/B speed claim. Host page-reclaim caveats are retained
+in the run evidence; they do not trigger a repeat campaign.
+
+Baseline GPU0: 38.0 s power-cap, zero thermal slowdown,
+2640 MHz busy SM clock, 71 C maximum temperature,
+27 C minimum T.Limit headroom, floating 850 W shared budget.
 
 ## Engineering summary
 
@@ -252,6 +294,7 @@ are not qualified by this two-lane decision pair.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v5.1 WIP | 2026-11-13 | MC original min Release smoke and published Standard fidelity; max cards pending #1906. | [Original min](../../benchmarks/glm5/2026-11-13-smoke-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-original-min-cand-r1/report.svg) |
 | v2 | 2026-10-09 | Thinking-off template correction; exact full-logits fidelity workspace admission; runtime-sized SM120 launches and robust GPU/RDMA selection; shared C8 and fidelity tiers. | <a href="../../benchmarks/glm5/2026-10-09-smoke-glm53-exl3-no-fit-rc3-sim5090/report.svg"><img src="../../benchmarks/glm5/2026-10-09-smoke-glm53-exl3-no-fit-rc3-sim5090/card.svg" width="360" alt="GLM-5.3-EXL3-K4-v1 (exl3-k4) (5090)"></a> <a href="../../benchmarks/glm5/2026-10-09-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min-rc3/report.svg"><img src="../../benchmarks/glm5/2026-10-09-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min-rc3/card.svg" width="360" alt="GLM-5.3-EXL3-K4-v1 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/glm5/2026-10-09-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max-rc3/report.svg"><img src="../../benchmarks/glm5/2026-10-09-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max-rc3/card.svg" width="360" alt="GLM-5.3-EXL3-K4-v1 (exl3-k4) (2× RTX)"></a> <a href="../../benchmarks/glm5/2026-10-09-smoke-glm53-nvfp4-no-fit-rc3-sim5090/report.svg"><img src="../../benchmarks/glm5/2026-10-09-smoke-glm53-nvfp4-no-fit-rc3-sim5090/card.svg" width="360" alt="GLM-5.3-NVFP4 (nvfp4-g16) (5090)"></a> <a href="../../benchmarks/glm5/2026-10-09-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min-rc3/report.svg"><img src="../../benchmarks/glm5/2026-10-09-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min-rc3/card.svg" width="360" alt="GLM-5.3-NVFP4 (nvfp4-g16) (1× RTX)"></a> <a href="../../benchmarks/glm5/2026-10-09-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max-rc3/report.svg"><img src="../../benchmarks/glm5/2026-10-09-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max-rc3/card.svg" width="360" alt="GLM-5.3-NVFP4 (nvfp4-g16) (2× RTX)"></a> |
 | v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/glm5/2026-11-10-smoke-glm-5-3-exlr8-k2-k3-k4-1rtx-4spark-glm53-exlr8-min/report.svg"><img src="../../benchmarks/glm5/2026-11-10-smoke-glm-5-3-exlr8-k2-k3-k4-1rtx-4spark-glm53-exlr8-min/card.svg" width="360" alt="glm-5.3-exlr8-k2-k3-k4 (1× RTX)"></a> <a href="../../benchmarks/glm5/2026-11-10-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-max/report.svg"><img src="../../benchmarks/glm5/2026-11-10-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-max/card.svg" width="360" alt="glm-5.3-exlr8-k2-k3-k4 (2× RTX)"></a> |
 | v4.1 | 2026-10-31 | Spark EXL3 FC1 rotation in-tile on DGX Spark (#913, fixes #912): max 8K prefill 2.6k → 3.5k. | <a href="../../benchmarks/glm5/2026-10-31-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min/report.svg"><img src="../../benchmarks/glm5/2026-10-31-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min/card.svg" width="360" alt="GLM-5.3-EXL3-K4-v1 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/glm5/2026-10-31-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max/report.svg"><img src="../../benchmarks/glm5/2026-10-31-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max/card.svg" width="360" alt="GLM-5.3-EXL3-K4-v1 (exl3-k4) (2× RTX)"></a> <a href="../../benchmarks/glm5/2026-10-30-smoke-glm-5-3-exl3-k4-core-k6-1rtx-4spark-glm53-exl3-k6core-min/report.svg"><img src="../../benchmarks/glm5/2026-10-30-smoke-glm-5-3-exl3-k4-core-k6-1rtx-4spark-glm53-exl3-k6core-min/card.svg" width="360" alt="GLM-5.3-EXL3-K4-Core-K6 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/glm5/2026-10-31-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max/report.svg"><img src="../../benchmarks/glm5/2026-10-31-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max/card.svg" width="360" alt="GLM-5.3-EXL3-K4-Core-K6 (exl3-k4) (2× RTX)"></a> <a href="../../benchmarks/glm5/2026-10-30-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min/report.svg"><img src="../../benchmarks/glm5/2026-10-30-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min/card.svg" width="360" alt="GLM-5.3-NVFP4 (nvfp4-g16) (1× RTX)"></a> <a href="../../benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-1rtx-4spark-glm53-exlr8-min/report.svg"><img src="../../benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-1rtx-4spark-glm53-exlr8-min/card.svg" width="360" alt="glm-5.3-exlr8-k2-k3-k4 (1× RTX)"></a> <a href="../../benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-max/report.svg"><img src="../../benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-max/card.svg" width="360" alt="glm-5.3-exlr8-k2-k3-k4 (2× RTX)"></a> |
