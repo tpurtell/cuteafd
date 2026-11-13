@@ -280,8 +280,10 @@ impl InklingInputs {
     }
 
     /// Shared context exchange geometry for the global layers under `context`:
-    /// one 64-token K+V page per staging unit, BF16 query rows and F32 partial
-    /// outputs of this rank's 24 heads, two parity slots per lane.
+    /// one 64-token K+V page per staging unit, BF16 query rows and this
+    /// rank's 24-head partials as the dimension-generic exchange writes them
+    /// (#1955: `heads x (D*2 + 4)`, BF16 partial plus F32 LSE), two parity
+    /// slots per lane.
     fn context_buffers(&self) -> crate::placement::ContextBuffers {
         let cfg = &self.cfg;
         let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
@@ -289,7 +291,7 @@ impl InklingInputs {
         crate::placement::ContextBuffers {
             staging_unit_bytes: PAGE_ROWS * 2 * kv_row, staging_unit_rows: PAGE_ROWS,
             query_row_bytes: heads * cfg.head_dim as u64 * 2,
-            partial_row_bytes: heads * (cfg.head_dim as u64 * 4 + 8),
+            partial_row_bytes: heads * (cfg.head_dim as u64 * 2 + 4),
             candidate_row_bytes: 0, compiled_extent: self.prefill.rows.max(u64::from(DECODE_ROWS)),
             decode_rows: u64::from(DECODE_ROWS), lanes: LANES, workspace_bytes: 0 }
     }

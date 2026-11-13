@@ -86,7 +86,12 @@ impl Model {
         let mut contracts = BTreeMap::new();
         let mut add = |stem: String, role: TensorRole, shape: Vec<usize>, storage| {
             let scale_member = stem.ends_with("_l2_clip");
-            contracts.insert(stem, Contract { role, shape, storage, companions: Vec::new(), scale_member });
+            // The ViT's LayerNorms and linears carry a bias beside the weight;
+            // its projector (`proj_in`/`proj_out`) and patch embedding do not.
+            let bias = stem.starts_with(VISION) && (stem.ends_with(".ln_pre") || stem.ends_with(".ln_1")
+                || stem.ends_with(".ln_2") || stem.contains(".self_attn.") || stem.contains(".mlp."));
+            contracts.insert(stem, Contract { role, shape, storage, companions: if bias { vec!["bias"] } else { Vec::new() },
+                scale_member });
         };
         add(format!("{TEXT}embed"), TensorRole::new(Component::Embedding), vec![v, h], Storage::Bf16);
         add(format!("{TEXT}unembed"), TensorRole::new(Component::LmHead), vec![v, h], Storage::Bf16);
