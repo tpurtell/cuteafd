@@ -888,7 +888,7 @@ mod tests {
                 peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
                 layers: modes.into_iter().map(|mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
                 movables: vec![], expert_ranges: vec![], residual: vec![], hops: vec![], tp2: None, items: vec![] },
-            solved, onboard: 0, expert_backings: vec![], draft_home: None, encoder: None })
+            solved, onboard: 0, expert_backings: vec![], push_host_envelope: None, draft_home: None, encoder: None })
     }
 
     fn request_streams<'a>(library: &'a cuteafd_ffi::NativeLibrary, ids: &[i32]) -> Result<Vec<RequestStreams<'a>>> {
