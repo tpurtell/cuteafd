@@ -88,7 +88,7 @@ impl CoreInventory {
             let split = split(cfg, stem)?;
             let mtp = stem.strip_prefix("model.layers.").and_then(|s| s.split('.').next())
                 .and_then(|s| s.parse::<usize>().ok()).is_some_and(|layer| layer >= cfg.layers);
-            Some(CoreContract { family: "Step-5", widths: if mtp { &[4] } else { &[6] }, split, padded_outputs: false })
+            Some(CoreContract { family: "Step-5", widths: if mtp { &[4] } else { &[6, 8] }, split, view_varying: !mtp, padded_outputs: false })
         })?;
         let inventory = Self { projections };
         inventory.validate_groups(cfg)?;

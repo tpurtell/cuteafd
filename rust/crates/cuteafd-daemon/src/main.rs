@@ -136,6 +136,14 @@ mod media_defaults_tests {
     use cuteafd_loader::plan::MediaMode;
 
     #[test]
+    fn glm_golden_help_lists_logit_dump_for_sealed_runner() {
+        use clap::CommandFactory;
+        let mut command = super::cli::Cli::command();
+        let golden = command.find_subcommand_mut("glm-golden").unwrap();
+        assert!(golden.render_long_help().to_string().contains("--save-logits"));
+    }
+
+    #[test]
     fn mapped_table_backend_selector_is_removed() {
         use clap::Parser;
         for backend in ["mmap", "uring", "mincore-routed"] {

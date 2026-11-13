@@ -122,7 +122,7 @@ ML4_SHAPES = (
     ("ml4_shared_down_tp2", 3072, 6144, 2),
     ("ml4_lm_head", 6144, 204800, 1),
 )
-# Step-5 (head_dim 192, 64 Q / 4 KV heads): K6 target core with the current
+# Step-5 (head_dim 192, 64 Q / 4 KV heads): K6/K8 target core with the current
 # two-GPU head split (q/k/v rows, o_proj columns) and whole FFNs and heads; its
 # three MTP stages are K4 throughout, each with its own vocabulary head. A fifth
 # element names a width other than K6. Shipping K4 names stay unchanged;
@@ -178,8 +178,8 @@ def shapes_for(families):
     """Canonicalize equal geometries so runtime lookup is never ambiguous."""
     result, seen = [], set()
     for family in families:
-        for item in (*FAMILY_SHAPES[family], *(tuple((*shape[:4], 8) for shape in FAMILY_SHAPES[family])
-                                                if family in ("glmf", "muse") else ())):
+        for item in (*FAMILY_SHAPES[family], *(tuple((*shape[:4], 8) for shape in FAMILY_SHAPES[family] if _bits(shape) == 6)
+                                                if family in ("glm", "glmf", "muse", "step5") else ())):
             if _key(item) not in seen:
                 result.append(item)
                 seen.add(_key(item))

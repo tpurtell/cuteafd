@@ -3,9 +3,13 @@
 use super::GlmDsaConfig;
 use crate::{formats::trellis_core::{CoreContract, read_projections}, plan::Checkpoint};
 
-// GLM 5.3 still binds K6-only programs. ML4 ships its original FP8 core or K6,
-// not K8; both need exporter and runtime dispatch changes before widening.
-pub(crate) const NATIVE_CORE_WIDTHS: &[usize] = &[6];
+// GLM MC targets bind header-selected K6/K8 programs; ML4 remains K6-only.
+pub(crate) const NATIVE_CORE_WIDTHS: &[usize] = &[6, 8];
+pub(crate) const ML4_CORE_WIDTHS: &[usize] = &[6];
+
+fn core_widths(cfg: &GlmDsaConfig) -> &'static [usize] {
+    if cfg.variant.is_glm() { NATIVE_CORE_WIDTHS } else { ML4_CORE_WIDTHS }
+}
 pub use crate::formats::trellis_core::{CoreProjection, CoreSplit, ProjectionScratchLayout};
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
@@ -203,8 +207,8 @@ impl CoreInventory {
             (role, false)
         })?;
         let projections = read_projections(checkpoint, &expected(cfg), selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: NATIVE_CORE_WIDTHS, split,
-                padded_outputs: kv_a.contains(stem) }))?;
+            |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: core_widths(cfg), split,
+                view_varying: true, padded_outputs: kv_a.contains(stem) }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
         let shapes = expected(cfg);
         for layer in 0..cfg.layers {
@@ -394,7 +398,7 @@ impl CoreCharges {
         let mut geometries = std::collections::BTreeSet::new();
         for weight in bodies.iter().flatten().chain(head.iter()) {
             let side = if weight.side == TrellisSide::Input { 2 } else { 1 };
-            if geometries.insert((weight.shape, side, weight.codebook.marker())) {
+            if geometries.insert((weight.shape, side, weight.codebook.marker(), weight.bits)) {
                 for name in policy_programs(weight, manifest)? { programs.insert(name); }
             }
         }
@@ -541,11 +545,11 @@ impl CoreCharges {
 
 fn policy_programs(weight: &crate::formats::trellis_core::CoreWeightLayout,
     manifest: &serde_json::Value) -> Result<[String; 3]> {
-    use cuteafd_ffi::dense_trellis::{validate_package_geometry, TrellisDType};
+    use cuteafd_ffi::dense_trellis::{validate_package_geometry_bits, TrellisDType};
     let book = match weight.codebook { crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
         crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" };
     let side = if weight.side == crate::formats::dense_trellis::TrellisSide::Input { 2 } else { 1 };
-    validate_package_geometry(manifest, weight.shape[1], weight.shape[0], side, book, 4096,
+    validate_package_geometry_bits(manifest, weight.shape[1], weight.shape[0], side, weight.bits, book, 4096,
         // The vocabulary head (GLM `lm_head`, Mistral `output`) produces F32 logits.
         if matches!(weight.stem.as_str(), "lm_head" | "output") { TrellisDType::F32 } else { TrellisDType::Bf16 })
         .with_context(|| format!("{}: GLM native K6 package", weight.stem))
@@ -856,6 +860,47 @@ mod tests {
 
     fn package(cfg: &GlmDsaConfig, core: &CoreInventory) -> Result<serde_json::Value> {
         crate::plan::testing::glm_k6_programs(cfg, core)
+    }
+
+    #[test]
+    fn native_admission_resolves_every_header_width_including_equal_geometries() -> Result<()> {
+        let mut cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
+        cfg.vocab_size = 256;
+        for bits in [6, 8] {
+            let mut checkpoint = checkpoint(&cfg);
+            for tensor in &mut checkpoint.tensors {
+                if tensor.meta.name.ends_with(".trellis") {
+                    tensor.meta.shape[2] = bits * 16;
+                    tensor.meta.byte_length = tensor.meta.shape.iter().product::<usize>() as u64 * 2;
+                }
+            }
+            let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+            assert!(core.projections.values().all(|p| p.bits == bits));
+            let manifest = package(&cfg, &core)?;
+            for ranks in [1, 2] {
+                let charge = CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, None, 2752, 3, None, &manifest)?;
+                assert!(charge.ranks.iter().flat_map(|rank| &rank.body).all(|w| w.bits == bits));
+                assert!(charge.programs.iter().any(|name| name.contains(&format!("_b{bits}"))));
+                let other = if bits == 6 { 8 } else { 6 };
+                let mut wrong = manifest.clone();
+                for program in wrong["programs"].as_array_mut().unwrap() {
+                    if program["geometry"]["bits"].is_number() {
+                        program["geometry"]["bits"] = serde_json::json!(other);
+                    }
+                }
+                assert!(CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, None, 2752, 3, None, &wrong).is_err());
+            }
+        }
+        // Gate/up share geometry but may not share arithmetic-width validation.
+        let mut core = CoreInventory::from_checkpoint(&cfg, &checkpoint(&cfg))?;
+        let stem = cfg.stem(0, Op::Up).unwrap();
+        core.projections.get_mut(&stem).unwrap().bits = 8;
+        let manifest = package(&cfg, &core)?;
+        CoreCharges::from_package(&cfg, &core, cfg.layers, 1, None, 64, 1, None, &manifest)?;
+        let mut missing = manifest.clone();
+        missing["programs"].as_array_mut().unwrap().retain(|program| program["geometry"]["bits"] != 8);
+        assert!(CoreCharges::from_package(&cfg, &core, cfg.layers, 1, None, 64, 1, None, &missing).is_err());
+        Ok(())
     }
 
     #[test]

@@ -68,7 +68,7 @@ impl CoreInventory {
             (role, stem.contains(".self_attn.") && matches!(stem.rsplit('.').next(), Some("q_proj" | "k_proj" | "v_proj" | "o_proj")))
         })?;
         let projections = read_projections(checkpoint, &expected(cfg), selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { family: "Muse", widths: &[4, 6, 8], split, padded_outputs: stem == HEAD }))?;
+            |stem| split(cfg, stem).map(|split| CoreContract { family: "Muse", widths: &[4, 6, 8], split, view_varying: true, padded_outputs: stem == HEAD }))?;
         if let Some(head) = projections.get(HEAD) {
             ensure!(matches!(head.bits, 6 | 8), "Muse {HEAD}: target head requires K6/K8 trellis or BF16");
         } else {

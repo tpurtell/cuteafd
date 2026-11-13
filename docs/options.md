@@ -37,7 +37,10 @@ Stored `k8-compact` and `k6-compact` views are offered by
 `wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC`,
 `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC` and
 `wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`; `cuteafd-mc.json` declares the
-views actually present at the selected revision. Plain checkpoints support only
+views actually present at the selected revision. Step-5 and GLM 5.3 also execute
+header-native K6/K8 target cores (including vocabulary heads); Step-5 shared MTP
+projections stay K4 in every view. ML4 stays K6-only for quantized core storage;
+its FP8 original has no quantized core. Plain checkpoints support only
 `original`, including checkpoints that previously accepted Flash `fp8-compact`.
 MC `fp8-compact` converts exactly the original variant's `core_tensors`; published
 Flash MCs include KDA and the target head. Explicit KDA/head conversion keys apply
@@ -141,6 +144,18 @@ and exercises sparse DSA selection. Full-model reference defaults are unchanged.
 This all-layer dense/attention/DSA diagnostic is **not** a full-model golden.
 K3.1 DSA is admitted only through the explicit golden role;
 serving remains refused until qualification. The flag is unavailable to serve.
+
+`cuteafd glm-golden --nll --save-logits DIR` writes `tokens.bin` and all
+prefill rows as F32 `logits.bin` for same-engine build or core-view comparisons.
+The option is listed in CLI help so the sealed golden runner can validate it.
+
+`cuteafd step5-golden --golden TOKENS_DIR --nll --last-layer 91` accepts a
+`tokens.bin`-only directory for same-engine core-view comparisons (2..4096 U32
+tokens). No `--window` is needed; `--save-logits` retains the actual selected
+view identity. This mode reports finite logits and engine NLL only, not reference
+qualification, and refuses reference-dependent layer, final-norm, FP8 and prefix
+checks. A present `meta.json` always selects the existing pinned-reference path
+and its identity checks; missing or invalid reference fields never fall back.
 
 `cuteafd qwen35-golden --golden DATASET --window ID` also accepts the pinned
 published compact fidelity dataset for graph qualification when decode graphs

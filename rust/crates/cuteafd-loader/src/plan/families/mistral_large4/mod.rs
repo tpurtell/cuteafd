@@ -387,7 +387,7 @@ impl FamilyModel for Model {
         let e = self.expected.get(stem)
             .ok_or_else(|| format!("{stem}: outside the Mistral Large 4 text tensor contract ({})", describe(operand)))?;
         if let Encoding::Exl3 { bits } = operand.encoding {
-            require(crate::families::glm5::core::NATIVE_CORE_WIDTHS.contains(&bits), || format!(
+            require(crate::families::glm5::core::ML4_CORE_WIDTHS.contains(&bits), || format!(
                 "Mistral Large 4 {stem}: unsupported dense core width K{bits}; shipping width K6; \
                 K8 core views need ML4 K8 exports: add trellis_linear exporter program and family dispatch \
                 in python/tools/aot/export_b12x_dense_trellis_k6_aot.py (ML4_SHAPES, bits=8)"))?;

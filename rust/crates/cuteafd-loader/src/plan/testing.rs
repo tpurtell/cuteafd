@@ -507,14 +507,15 @@ pub fn glm_k6_programs(cfg: &crate::families::glm5::GlmDsaConfig, core: &crate::
         let [n, k] = w.shape;
         let side = if w.side == TrellisSide::Input { 2 } else { 1 };
         let book = w.codebook.marker();
-        let shape = format!("k{k}_n{n}_s{side}_{book}");
+        let bits = w.bits;
+        let shape = format!("k{k}_n{n}_s{side}_{book}_b{bits}");
         let routes = [format!("input_{shape}"), format!("core_{shape}"), format!("output_{shape}")];
         policies.insert(shape.clone(), json!({"shape":shape,"input_features":k,"output_features":n,
-            "sharded_side":side,"codebook":book,"native_input":routes[0],"native_program":routes[1],
+            "sharded_side":side,"codebook":book,"bits":bits,"native_input":routes[0],"native_program":routes[1],
             "output_program":routes[2]}));
         let output = if w.stem == cfg.head() { "f32" } else { "bf16" };
         let geometries = [json!({"features":k,"input_dtype":"bf16","max_rows":4096}),
-            json!({"abi_version":1,"input_features":k,"output_features":n,"bits":6,"codebook":book,
+            json!({"abi_version":1,"input_features":k,"output_features":n,"bits":bits,"codebook":book,
                 "sharded_side":side,"rotation_count":1,"max_rows":4096,"split_k_blocks":8,
                 "splits":k.div_ceil(1024),"ctas_per_sm":4}),
             json!({"features":n,"output_dtype":output,"max_rows":4096})];
