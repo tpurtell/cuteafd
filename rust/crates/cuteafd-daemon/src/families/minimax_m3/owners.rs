@@ -347,6 +347,11 @@ mod tests {
 
     fn inputs(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, ids: &[i32], concurrency: u64) -> Result<MiniMaxInputs> {
         let gpus = ids.len();
+        let namespace_error = cuteafd_loader::push_load::namespace(&checkpoint.snapshot)
+            .expect_err("constructor fixture must use mount loading without a push namespace");
+        ensure!(namespace_error.kind() == std::io::ErrorKind::NotFound
+            && namespace_error.raw_os_error().is_none() && checkpoint.snapshot.exists(),
+            "constructor fixture did not resolve the canonical mount route: {namespace_error}");
         let owners = canonical::layer_owners(cfg.layers, gpus);
         let targets = CoordinatorWeights::plan(checkpoint, cfg, gpus,
             &owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>())?;
@@ -374,6 +379,7 @@ mod tests {
             graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
             host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
             expert_usage: None, resident_weight_limit: None,
+            push_host_envelopes: vec![None; routed.len() + 1],
             mount: targets.iter().map(|target| target.mount_load(checkpoint)).collect::<Result<_>>()?, targets })
     }
 
