@@ -11,6 +11,7 @@ from copy import deepcopy
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sys
@@ -20,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts/lib'))
 import mc_manifest
 from core_export import MCG, SUFFIXES, packed_specs
 from kimi_k3.uniform_k2.storage import (
-    assemble_shard, atomic_json, read_header, sha256_file, verify_receipt,
+    assemble_shard, atomic_json, canonical, file_identity, fsync_directory, read_header, sha256_file, verify_receipt,
 )
 
 DTYPES = {'BF16': 'bfloat16', 'F32': 'float32', 'F16': 'float16',
@@ -130,19 +131,82 @@ def shard_groups(names, sizes, target=2_000_000_000):
         yield group
 
 
-def write_shard(root, filename, entries, identity):
+def _assemble_proved_shard(entries, path, *, chunk_bytes=16 << 20):
+    """Hash original tensor spans during their single source-to-output copy.
+
+    Each digest covers the exact byte objects written into the final output;
+    this is a streaming copy proof, not a later payload reread. Source stat
+    identities and aliases bind it to the reviewed immutable source inventory.
+    """
+    path = Path(path)
+    if path.exists() or not entries or not 1 <= chunk_bytes <= 64 << 20:
+        raise ValueError('invalid proved shard output or chunk bound')
+    sources, header, spans, offset = {}, {}, [], 0
+    for name, (source_path, source_name) in sorted(entries.items()):
+        source_path = Path(source_path)
+        if source_path not in sources:
+            sources[source_path] = read_header(source_path)
+        source_header, base = sources[source_path]
+        value = source_header[source_name]
+        start, end = value['data_offsets']
+        header[name] = dict(dtype=value['dtype'], shape=value['shape'],
+                            data_offsets=[offset, offset + end - start])
+        offset += end - start
+        spans.append((name, source_path, source_name, base + start, end - start))
+    encoded = canonical(header).encode()
+    encoded += b' ' * (-len(encoded) % 8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.partial')
+    if temporary.is_symlink():
+        raise ValueError('refuse proved shard temporary symlink')
+    digest, proofs = hashlib.sha256(), {}
+    with temporary.open('wb') as output:
+        prefix = struct.pack('<Q', len(encoded)) + encoded
+        output.write(prefix)
+        digest.update(prefix)
+        for name, source_path, source_name, position, remaining in spans:
+            before = file_identity(source_path)
+            tensor_digest = hashlib.sha256()
+            with source_path.open('rb') as source:
+                source.seek(position)
+                while remaining:
+                    block = source.read(min(remaining, chunk_bytes))
+                    if not block:
+                        raise ValueError('truncated original source tensor')
+                    output.write(block)
+                    digest.update(block)
+                    tensor_digest.update(block)
+                    remaining -= len(block)
+            if file_identity(source_path) != before:
+                raise ValueError('original source changed during streaming copy')
+            proofs[name] = dict(sha256=tensor_digest.hexdigest(), source_name=source_name,
+                                source_path=str(source_path.resolve()), source_file_identity=before)
+        output.flush()
+        os.fsync(output.fileno())
+    if temporary.stat().st_size != 8 + len(encoded) + offset:
+        raise ValueError('proved shard length differs')
+    os.replace(temporary, path)
+    fsync_directory(path.parent)
+    return dict(sha256=digest.hexdigest(), file_identity=file_identity(path), payload_bytes=offset,
+                original_tensor_proofs=proofs)
+
+
+def write_shard(root, filename, entries, identity, *, prove_original=False, verify_checksum=True):
     path = root / filename
     receipt_path = root / (filename + '.receipt.json')
     if receipt_path.exists():
         receipt = load_json(receipt_path)
         if receipt['identity'] != identity or receipt['tensors'] != sorted(entries):
             raise ValueError('package recovery identity differs')
-        verify_receipt(path, receipt, checksum=True)
+        verify_receipt(path, receipt, checksum=verify_checksum)
+        if prove_original and set(receipt.get('original_tensor_proofs', {})) != set(entries):
+            raise ValueError('original streaming proofs missing from committed shard')
     else:
         if path.is_symlink():
             raise ValueError('refuse package output symlink')
         path.unlink(missing_ok=True)
-        receipt = dict(assemble_shard(entries, path), identity=identity, tensors=sorted(entries))
+        assembler = _assemble_proved_shard if prove_original else assemble_shard
+        receipt = dict(assembler(entries, path), identity=identity, tensors=sorted(entries))
         atomic_json(receipt_path, receipt)
     return receipt
 
@@ -528,13 +592,22 @@ def audit_ml4(output):
     return {k:v for k,v in receipt.items() if not k.endswith('tensor_sha256')}
 
 
-def validate(output):
+def validate(output, *, verification='full'):
+    """Validate payloads by default; direct writers may reuse streaming proofs."""
+    if verification not in ('full', 'streaming-receipts'):
+        raise ValueError('unsupported package verification mode')
     output = Path(output)
     state = load_json(output / 'package-state.json')
     if state['identity']['schema'] != 'cuteafd-core-package-v1':
         raise ValueError('unsupported package receipt')
+    if verification == 'streaming-receipts' and (state['identity'].get('family') != 'inkling2'
+            or 'direct_expected_specs' not in state or state.get('copies') != {}):
+        raise ValueError('streaming receipts require an independent direct Inkling package')
+    if (verification == 'streaming-receipts' and set(state['source_tensor_locations'])
+            != set(state['core_tensors']['original'])):
+        raise ValueError('original streaming proof inventory is incomplete')
     for filename, receipt in state['new_shards'].items():
-        verify_receipt(output / filename, receipt, checksum=True)
+        verify_receipt(output / filename, receipt, checksum=verification == 'full')
     if 'direct_expected_specs' in state:
         if set(p.name for p in output.glob('*.safetensors')) != set(state['new_shards']):
             raise ValueError('unowned physical weights in direct package')
@@ -614,17 +687,32 @@ def validate(output):
         source_name = location['source_name'] if isinstance(location, dict) else name
         if Path(shard).name != shard:
             raise ValueError('unsafe original source shard')
-        digest = tensor_hash(source / shard, source_name)
-        if tensor_hash(output / original['mapping'][name], name) != digest:
-            raise ValueError('restored original core payload differs: ' + name)
+        if verification == 'streaming-receipts':
+            receipt = state['new_shards'][original['mapping'][name]]
+            proof = receipt.get('original_tensor_proofs', {}).get(name, {})
+            if (proof.get('source_path') != str((source / shard).resolve())
+                    or proof.get('source_name') != source_name
+                    or not re.fullmatch('[0-9a-f]{64}', proof.get('sha256', ''))):
+                raise ValueError('original streaming copy proof or source alias differs: ' + name)
+            if file_identity(source / shard) != proof.get('source_file_identity'):
+                raise ValueError('original source file changed: ' + name)
+            digest = proof['sha256']
+        else:
+            digest = tensor_hash(source / shard, source_name)
+            if tensor_hash(output / original['mapping'][name], name) != digest:
+                raise ValueError('restored original core payload differs: ' + name)
         proofs[name] = digest
     receipt = dict(schema='cuteafd-package-validation-v1', identity=state['identity'], views=views,
                    original_core_tensor_sha256=proofs,
                    new_file_bytes=sum((output / n).stat().st_size for n in state['new_files']),
-                   new_file_sha256={n: sha256_file(output / n) for n in state['new_files']},
+                   new_file_sha256={n: (state['new_shards'][n]['sha256']
+                       if verification == 'streaming-receipts' and n in state['new_shards']
+                       else sha256_file(output / n)) for n in state['new_files']},
                    copied_file_sha256={n: sha256_file(output / n) for n in state['copies'] if not n.endswith('.safetensors')},
                    copied_files=len(state['copies']), status='validated-headers-and-byte-exactness',
                    k8_calibration_count_key=state.get('k8_calibration_count_key'))
+    if verification == 'streaming-receipts':
+        receipt['verification_mode'] = 'streaming-write-proofs-stat-headers-and-source-aliases'
     atomic_json(output / 'package-validation.json', receipt)
     return receipt
 
@@ -640,13 +728,14 @@ def main():
                         help='Complete producer evidence tree; default K8 export/quantization-errors')
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--validate-only', action='store_true')
+    parser.add_argument('--verification', choices=('full', 'streaming-receipts'), default='full')
     parser.add_argument('--audit-ml4', action='store_true',
                         help='Independently compare every inherited/native tensor payload')
     args = parser.parse_args()
     if args.audit_ml4:
         result = audit_ml4(args.output)
     elif args.validate_only:
-        result = validate(args.output)
+        result = validate(args.output, verification=args.verification)
     else:
         if not args.family or not args.parent or not args.source:
             parser.error('build requires family, parent, source and output')

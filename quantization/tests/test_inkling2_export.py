@@ -188,5 +188,75 @@ def test_original_alias_payload_proof_catches_source_change(tmp_path):
     writer.write_group('layer-000', **entries)
     save_file({'layers.0.self_attn.q_proj.weight': torch.zeros(128, 128, dtype=torch.bfloat16)},
               args['source_snapshot'] / 'mtp.safetensors')
-    with pytest.raises(ValueError, match='restored original core payload differs: mtp'):
+    with pytest.raises(ValueError, match='original source file changed: mtp'):
         writer.finalize(**final)
+
+
+def test_default_direct_finalize_reuses_streaming_hashes_without_payload_rereads(tmp_path, monkeypatch):
+    args, entries, final = fixture(tmp_path)
+    expected = {n: package.tensor_hash(p, source_name) for n, (p, source_name) in entries['original'].items()}
+    writer = DirectMCWriter(**args)
+    writer.write_group('layer-000', **entries)
+    real_sha = package.sha256_file
+
+    def metadata_sha(path):
+        assert not str(path).endswith('.safetensors'), 'whole-shard reread during direct validation'
+        return real_sha(path)
+
+    monkeypatch.setattr(package, 'sha256_file', metadata_sha)
+    monkeypatch.setattr(package, 'tensor_hash', lambda *a: pytest.fail('native tensor reread during direct validation'))
+    receipt = writer.finalize(**final)
+    assert receipt['original_core_tensor_sha256'] == expected
+    assert receipt['verification_mode'] == 'streaming-write-proofs-stat-headers-and-source-aliases'
+    state = package.load_json(args['output'] / 'package-state.json')
+    original_shard = state['direct_expected_mappings']['original']['mtp.layers.0.self_attn.q_proj.weight']
+    proof = state['new_shards'][original_shard]['original_tensor_proofs']['mtp.layers.0.self_attn.q_proj.weight']
+    assert proof['source_name'] == 'layers.0.self_attn.q_proj.weight'
+    assert proof['sha256'] == expected['mtp.layers.0.self_attn.q_proj.weight']
+    assert package.validate(args['output'], verification='streaming-receipts')['views'] == receipt['views']
+
+
+@pytest.mark.parametrize('failure', ['proof', 'alias', 'inventory'])
+def test_streaming_validation_requires_every_source_bound_copy_proof(tmp_path, failure):
+    args, entries, final = fixture(tmp_path)
+    writer = DirectMCWriter(**args)
+    writer.write_group('layer-000', **entries)
+    writer.finalize(**final)
+    path = args['output'] / 'package-state.json'
+    state = package.load_json(path)
+    name = 'mtp.layers.0.self_attn.q_proj.weight'
+    if failure == 'inventory':
+        del state['source_tensor_locations'][name]
+    else:
+        shard = state['direct_expected_mappings']['original'][name]
+        if failure == 'proof':
+            del state['new_shards'][shard]['original_tensor_proofs'][name]
+        else:
+            state['new_shards'][shard]['original_tensor_proofs'][name]['source_name'] = 'unreviewed.weight'
+    package.atomic_json(path, state)
+    with pytest.raises(ValueError, match='original streaming'):
+        package.validate(args['output'], verification='streaming-receipts')
+
+
+def test_historical_full_validation_default_still_reads_payloads(tmp_path, monkeypatch):
+    args, entries, final = fixture(tmp_path)
+    writer = DirectMCWriter(**args)
+    writer.write_group('layer-000', **entries)
+    writer.finalize(**final)
+    real_tensor_hash = package.tensor_hash
+    real_file_sha = package.sha256_file
+    tensor_calls, file_calls = [], []
+
+    def tensor(path, name):
+        tensor_calls.append((Path(path), name))
+        return real_tensor_hash(path, name)
+
+    def whole_file(path):
+        file_calls.append(Path(path))
+        return real_file_sha(path)
+
+    monkeypatch.setattr(package, 'tensor_hash', tensor)
+    monkeypatch.setattr(package, 'sha256_file', whole_file)
+    package.validate(args['output'])
+    assert any(p.parent == args['source_snapshot'] for p, _ in tensor_calls)
+    assert any(p.suffix == '.safetensors' for p in file_calls)

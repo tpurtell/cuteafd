@@ -166,7 +166,7 @@ class DirectMCWriter:
                 sizes[kind][name] = value['data_offsets'][1] - value['data_offsets'][0]
                 if kind == 'original':
                     location = self.source_inventory['locations'].get(name)
-                    if (not location or p != self.source / location['shard']
+                    if (not location or p != (self.source / location['shard']).resolve()
                             or source_name != location['source_name']
                             or specs[kind][name] != self.source_inventory['specs'][name]):
                         raise ValueError('original tensor differs from reviewed source alias')
@@ -182,7 +182,8 @@ class DirectMCWriter:
                 filename = f'{kind}-{label}-{number:04d}.safetensors'
                 receipt = package.write_shard(self.output, filename, {n: values[n] for n in names},
                     dict(producer=self.identity, group=label, kind=kind,
-                         inputs={p: inputs[p] for p in sorted({values[n][0] for n in names})}))
+                         inputs={p: inputs[p] for p in sorted({values[n][0] for n in names})}),
+                    prove_original=kind == 'original', verify_checksum=False)
                 group['shards'].append(dict(filename=filename, kind=kind, names=names, receipt=receipt))
                 atomic_json(self.state_path, self.state)
         # Detect replacement/truncation of a producer input during the write.
@@ -193,12 +194,15 @@ class DirectMCWriter:
         return group
 
     def finalize(self, *, core_selection, configs, quantizes, assets=None,
-                 expected_payload_bytes=None):
-        """Seal indexes and metadata, then run independent header/byte validation.
+                 expected_payload_bytes=None, verification='streaming-receipts'):
+        """Seal indexes and metadata, then validate headers and durable copy proofs.
 
         ``core_selection`` maps module names (including ``mtp.*``) to logical
         geometry. ``configs`` and ``quantizes`` each contain the three VIEWS;
         callers explicitly choose target-head policy and retained-native tables.
+        By default validation reads headers/MCG markers and checks stat-bound
+        streaming write proofs, avoiding a second read of all model payloads.
+        Explicit ``verification='full'`` retains independent readback auditing.
         """
         if set(configs) != set(VIEWS) or set(quantizes) != set(VIEWS) or not core_selection:
             raise ValueError('finalization requires explicit metadata for all three views')
@@ -269,4 +273,4 @@ class DirectMCWriter:
         atomic_json(self.output / 'package-provenance.json', dict(identity=self.identity,
             source_payload_bytes=self.source_inventory['payload_totals'], physical_payload_bytes=payload,
             upstream_activations='k8-compact', views=list(VIEWS), parent_package=None))
-        return package.validate(self.output)
+        return package.validate(self.output, verification=verification)
