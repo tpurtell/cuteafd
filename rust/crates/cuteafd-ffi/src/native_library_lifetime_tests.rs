@@ -421,6 +421,71 @@ fn failed_allocations_keep_the_attempted_tag_and_untagged_requests_are_refused()
 }
 
 #[test]
+fn synchronous_upload_chunks_preserve_bytes_odd_tails_and_fixed_peak_staging() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    let capacity = 2 * SYNC_H2D_CHUNK_BYTES + 19;
+    let mut dst = library.alloc_device_buffer(capacity, memory_ledger::TEST)?;
+    let source = (0..capacity).map(|index| ((index * 17 + index / 251) % 256) as u8).collect::<Vec<_>>();
+    let mut output = vec![0; capacity];
+    let mut peak = 0;
+    for bytes in [1, SYNC_H2D_CHUNK_BYTES - 1, SYNC_H2D_CHUNK_BYTES,
+        SYNC_H2D_CHUNK_BYTES + 1, capacity] {
+        library.copy_h2d(dst, &source[..bytes])?;
+        library.copy_d2h(&mut output[..bytes], dst)?;
+        assert_eq!(&output[..bytes], &source[..bytes], "{bytes} byte upload");
+        peak = peak.max(bytes.min(SYNC_H2D_CHUNK_BYTES));
+        assert_eq!(library.sync_h2d_staging_buffer()?.unwrap().bytes, peak);
+    }
+    let staging = library.sync_h2d_staging_buffer()?.unwrap();
+    let before = fixture.events()?;
+    let short = [0x93; 17];
+    library.copy_h2d(dst, &short)?;
+    library.copy_d2h(&mut output, dst)?;
+    assert_eq!(&output[..short.len()], &short);
+    assert_eq!(&output[short.len()..], &source[short.len()..]);
+    assert_eq!(library.sync_h2d_staging_buffer()?.unwrap().ptr, staging.ptr);
+    assert_eq!(fixture.events()?.matches('A').count(), before.matches('A').count());
+    assert_eq!(library.release_sync_h2d_staging()?, SYNC_H2D_CHUNK_BYTES);
+    assert!(library.sync_h2d_staging_buffer()?.is_none());
+    library.copy_h2d(dst, &short)?;
+    assert_eq!(library.sync_h2d_staging_buffer()?.unwrap().bytes, short.len());
+    library.release_sync_h2d_staging()?;
+    library.free_device_buffer(&mut dst)?;
+    Ok(())
+}
+
+#[test]
+fn sealed_synchronous_uploads_cannot_regrow_but_ordered_uploads_remain_valid() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    let mut dst = library.alloc_device_buffer(8, memory_ledger::TEST)?;
+    assert!(library.copy_h2d(CuteafdDeviceBuffer { bytes: 1, ..dst }, &[1, 2]).is_err());
+    assert!(library.sync_h2d_staging_buffer()?.is_none());
+    library.copy_h2d(dst, &[1; 8])?;
+    assert_eq!(library.seal_sync_h2d_staging()?, 8);
+    assert!(library.sync_h2d_staging_buffer()?.is_none());
+    assert!(library.copy_h2d(dst, &[2]).unwrap_err().to_string().contains("sealed after startup"));
+    assert!(library.sync_h2d_staging_buffer()?.is_none());
+    assert_eq!(library.release_sync_h2d_staging()?, 0);
+    assert!(library.copy_h2d(dst, &[3]).is_err());
+    library.copy_h2d(dst, &[])?;
+    let stream = 1usize as *mut c_void;
+    // SAFETY: CPU fixture owns the destination and accepts this synthetic stream.
+    unsafe { library.copy_h2d_ordered(dst, &[4; 8], stream)?; }
+    library.release_ordered_h2d_staging()?;
+    let mut output = [0; 8];
+    library.copy_d2h(&mut output, dst)?;
+    assert_eq!(output, [4; 8]);
+    library.free_device_buffer(&mut dst)?;
+    Ok(())
+}
+
+#[test]
 fn small_graph_capture_is_typed_and_keeps_native_node_count() -> Result<()> {
     let fixture = native_library_lifetime_fixture::Fixture::build_for_tests()?;
     let library = fixture.load()?;
