@@ -306,6 +306,123 @@ mod tests {
         }).collect()
     }
 
+    fn read_buffer(owner: &UnitOwner<'_>, buffer: Buffer) -> Result<Vec<u8>> {
+        owner.stream.drain()?;
+        let mut bytes = vec![0; buffer.bytes];
+        owner.stream.device.run(|| owner.stream.device.library.copy_d2h(&mut bytes, buffer))?;
+        Ok(bytes)
+    }
+
+    fn bf16_values(bytes: &[u8]) -> Vec<f32> {
+        bytes.chunks_exact(2).map(|v| f32::from_bits(u32::from(u16::from_le_bytes(v.try_into().unwrap())) << 16)).collect()
+    }
+
+    fn e4m3(value: u8) -> f32 {
+        let exponent = (value >> 3) & 15;
+        let fraction = f32::from(value & 7);
+        let magnitude = if exponent == 0 { fraction * 2.0f32.powi(-9) }
+            else { (1.0 + fraction / 8.0) * 2.0f32.powi(i32::from(exponent) - 7) };
+        if value & 128 == 0 { magnitude } else { -magnitude }
+    }
+
+    struct AttentionDiagnostic {
+        query: Vec<f32>,
+        output: Vec<f32>,
+        selections: Vec<Vec<i32>>,
+    }
+
+    fn attention_diagnostic(owner: &UnitOwner<'_>) -> Result<AttentionDiagnostic> {
+        let plane = |name| owner.attention.diagnostic_plane(name);
+        let query = bf16_values(&read_buffer(owner, attention::row_view(plane("attention.query")?, 0, 1, 16384)?)?);
+        let output = bf16_values(&read_buffer(owner, attention::row_view(plane("attention.output")?, 0, 1, 16384)?)?);
+        let bytes = read_buffer(owner, plane("selections")?)?;
+        let stride = bytes.len() / 4;
+        let selections = (0..4).map(|head| bytes[head * stride..head * stride + 64].chunks_exact(4)
+            .map(|v| i32::from_le_bytes(v.try_into().unwrap())).collect()).collect();
+        Ok(AttentionDiagnostic { query, output, selections })
+    }
+
+    fn distance(actual: &[f32], reference: &[f32]) -> (f64, f32) {
+        let squared = actual.iter().zip(reference).map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2)).sum::<f64>();
+        let norm = reference.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>();
+        let peak = reference.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let max = actual.iter().zip(reference).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ((squared / norm).sqrt(), max / peak)
+    }
+
+    fn diagnose_attention(owner: &UnitOwner<'_>, request: attention::Request,
+        extend: &AttentionDiagnostic, decode: &AttentionDiagnostic) -> Result<()> {
+        let integers = |bytes: Vec<u8>| bytes.chunks_exact(4).map(|v| i32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
+        let floats = |bytes: Vec<u8>| bytes.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
+        let pages = integers(read_buffer(owner, request.pages)?);
+        let kd = floats(read_buffer(owner, request.key_descale)?);
+        let vd = floats(read_buffer(owner, request.value_descale)?);
+        let key = read_buffer(owner, request.key_cache)?;
+        let value = read_buffer(owner, request.value_cache)?;
+        let mut outputs = Vec::new();
+        for (route, diagnostic) in [("extend", extend), ("decode", decode)] {
+            let mut reference = vec![0.0f32; 8192];
+            for head in 0..64 {
+                let kv_head = head / 16;
+                let mut scores = vec![f32::NEG_INFINITY; request.context];
+                let mut maximum = f32::NEG_INFINITY;
+                for (token, score) in scores.iter_mut().enumerate() {
+                    if diagnostic.selections[kv_head].contains(&((token / 128) as i32)) {
+                        let base = (usize::try_from(pages[token / 64])? * 64 + token % 64) * 512 + kv_head * 128;
+                        let mut dot = 0.0f32;
+                        for column in 0..128 {
+                            dot += diagnostic.query[head * 128 + column] * (e4m3(key[base + column]) * kd[kv_head]);
+                        }
+                        *score = dot * 128.0f32.sqrt().recip();
+                        maximum = maximum.max(*score);
+                    }
+                }
+                ensure!(maximum.is_finite(), "MiniMax diagnostic has no visible keys");
+                let mut denominator = 0.0f32;
+                for score in &mut scores { *score = (*score - maximum).exp(); denominator += *score; }
+                for (token, score) in scores.into_iter().enumerate() {
+                    let probability = score / denominator;
+                    let base = (usize::try_from(pages[token / 64])? * 64 + token % 64) * 512 + kv_head * 128;
+                    for column in 0..128 {
+                        reference[head * 128 + column] += probability * (e4m3(value[base + column]) * vd[kv_head]);
+                    }
+                }
+            }
+            let (relative, max) = distance(&diagnostic.output, &reference);
+            eprintln!("MiniMax context={} route={route} attention_vs_fp32 rel_l2={relative} max_abs_over_peak={max}", request.context);
+            let heads = (0..64).map(|head| {
+                let span = head * 128..(head + 1) * 128;
+                let (relative, max) = distance(&diagnostic.output[span.clone()], &reference[span.clone()]);
+                eprintln!("MiniMax context={} route={route} head={head} attention_vs_fp32 rel_l2={relative} max_abs_over_peak={max}", request.context);
+                serde_json::json!({ "head": head, "relative_l2": relative, "max_abs_over_peak": max,
+                    "actual": diagnostic.output[span.clone()], "reference": reference[span] })
+            }).collect::<Vec<_>>();
+            outputs.push(serde_json::json!({ "route": route, "relative_l2": relative,
+                "max_abs_over_peak": max, "query": diagnostic.query,
+                "selections": diagnostic.selections, "heads": heads }));
+        }
+        if let Ok(directory) = std::env::var("CUTEAFD_MINIMAX_DIAGNOSTICS") {
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(std::path::Path::new(&directory).join(format!("attention-{}.json", request.context)),
+                serde_json::to_vec(&serde_json::json!({ "context": request.context, "routes": outputs }))?)?;
+        }
+        ensure!(extend.query == decode.query, "MiniMax decode query differs from extend");
+        ensure!(extend.selections == decode.selections, "MiniMax decode selection differs from extend");
+        if request.context == 64 {
+            let expected = std::iter::once(0).chain(std::iter::repeat(-1).take(15)).collect::<Vec<_>>();
+            ensure!(extend.selections.iter().all(|head| *head == expected), "MiniMax context64 must select only forced block0");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn context64_reference_selection_has_only_forced_local_block() {
+        let visible = (0..64).map(|token| token / 128).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(visible, [0].into_iter().collect());
+        assert_eq!((64 - 1) / 128, 0);
+        assert_eq!([e4m3(0), e4m3(0x38), e4m3(0x7e), e4m3(0xfe)], [0.0, 1.0, 448.0, -448.0]);
+    }
+
     fn compare_residual(actual: &[f32], reference: &[f32], label: &str) -> Result<()> {
         ensure!(!actual.is_empty() && actual.len() == reference.len(), "{label}: residual extent");
         ensure!(actual.iter().chain(reference).all(|value| value.is_finite()), "{label}: nonfinite residual");
@@ -417,6 +534,8 @@ mod tests {
             }
             Ok(())
         })?;
+        // Diagnose every context in one hardware turn without weakening any assertion.
+        let mut decode_failures = Vec::new();
         // Rewriting the same final append with identical values lets decode and extend consume identical cache state.
         for (sequence, context) in [64, 130, 270].into_iter().enumerate() {
             let at = sequence * 2;
@@ -426,17 +545,23 @@ mod tests {
             device.run(|| library.copy_h2d(single.plane("residual")?, &input))?;
             // SAFETY: the cache is fully initialized and the one-row append targets its own last slot.
             unsafe { single.attention(&kernels, &target, &weights, 0, request)?; }
+            let extend_attention = attention_diagnostic(&single)?;
             single.ffn(&kernels, &target, &weights, 0, 1, false)?;
             let expected = read_residual(&single, 1)?;
             let expected_cache = device.run(|| cache_bytes(&library, request))?;
             device.run(|| library.copy_h2d(decode.plane("residual")?, &input))?;
             // SAFETY: C1 cold metadata has batch id zero, [0,1] offsets and one padded page-table row.
             unsafe { decode.decode(&kernels, &target, &weights, 0, attention::DecodeRequest { request, batch: 1 })?; }
+            let decode_attention = attention_diagnostic(&decode)?;
+            diagnose_attention(&decode, request, &extend_attention, &decode_attention)?;
             decode.ffn(&kernels, &target, &weights, 0, 1, false)?;
-            compare_residual(&read_residual(&decode, 1)?, &expected, &format!("native decode context={context}"))?;
+            if let Err(error) = compare_residual(&read_residual(&decode, 1)?, &expected, &format!("native decode context={context}")) {
+                decode_failures.push(error.to_string());
+            }
             assert_eq!(device.run(|| cache_bytes(&library, request))?, expected_cache,
                 "native decode must not change cache bytes relative to identical extend");
         }
+        ensure!(decode_failures.is_empty(), "{}", decode_failures.join("; "));
         Ok(())
     }
 

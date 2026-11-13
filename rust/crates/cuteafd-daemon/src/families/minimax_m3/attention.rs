@@ -74,6 +74,8 @@ impl<'a> Workspace<'a> {
         }
         Ok(Self { device: kernels.device, planes, prefill })
     }
+    #[cfg(test)]
+    pub(super) fn diagnostic_plane(&self, name: &str) -> Result<Buffer> { self.plane(name) }
     fn plane(&self, name: &str) -> Result<Buffer> {
         self.planes.get(name).map(|owner| owner.buffer)
             .with_context(|| format!("MiniMax attention lacks admitted plane {name}"))
