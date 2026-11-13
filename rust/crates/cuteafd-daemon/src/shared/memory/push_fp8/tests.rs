@@ -496,3 +496,101 @@ fn coordinator_suffix_preserves_fp8_and_nvfp4_spark_plans() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "requires installed MiniMax headers, a CPU build slot and explicit NVMe fixture directory"]
+fn installed_minimax_nvfp4_push_and_mount_match_with_synthetic_payloads() -> Result<()> {
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use cuteafd_loader::{RoutedExpertShape,
+        plan::{checkpoint::Checkpoint, testing::t}};
+    use crate::shared::memory::{device::Device, weight_arena::{ExpectedCoverage, LoadingArena}};
+    let snapshot = Path::new("/mnt/sparknest/hf-home/hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e");
+    let installed = Checkpoint::open(snapshot)?;
+    let stem = "language_model.model.layers.3.block_sparse_moe.experts.0.";
+    let headers = installed.tensors.iter().filter(|tensor| tensor.meta.name.starts_with(stem))
+        .map(|tensor| {
+            let dtype = match tensor.meta.dtype {
+                DType::U8 => "U8", DType::F8E4M3 => "F8_E4M3", DType::F32 => "F32",
+                ref other => panic!("unexpected vendor NVFP4 dtype {other:?}"),
+            };
+            t(tensor.meta.name.clone(), dtype, &tensor.meta.shape)
+        }).collect::<Vec<_>>();
+    assert_eq!(headers.len(), 12, "use one actual expert's complete vendor headers");
+    let native = Fixture::build()?;
+    let library = native.load()?;
+    let root = tempfile::tempdir_in(native.directory())?;
+    // Replicate the same expert's headers to the smallest aligned planar group.
+    // Payload holes stay sparse; only expert zero receives nonzero matrices.
+    let headers = (0..32).flat_map(|expert| headers.iter().map(move |(name, dtype, shape)|
+        t(name.replace(".experts.0.", &format!(".experts.{expert}.")), dtype, shape))).collect::<Vec<_>>();
+    write_snapshot(root.path(), &installed.config, &headers, None);
+    // Keep the vendor's names, dtypes and full matrix dimensions. Only the
+    // number of fixture experts is reduced; no vendor payload is read.
+    let shape = RoutedExpertShape { layers: 60, first_layer: 3, experts: 32, topk: 1,
+        hidden: 6144, intermediate: 3072, draft_stages: 0, draft_experts: 0 };
+    let tensors = Fp8ExpertTensors::read_layers(root.path(), shape, &[3].into())?;
+    assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
+    for expert in 0..32 {
+    for projection in Fp8Projection::ALL {
+        let names = tensors.projection_source_names(3, expert, projection);
+        assert!(names[0].ends_with(".weight_packed"));
+        assert!(names[1].ends_with(".weight_scale"));
+        assert!(names[2].ends_with(".weight_global_scale"));
+        assert!(names[3].ends_with(".input_global_scale"));
+        for (index, name) in names.iter().enumerate() {
+            if expert != 0 && index < 2 { continue; }
+            let (source, _) = tensors.push_source(name)?;
+            let image = if index >= 2 {
+                // Non-unit divisors catch a missing or double reciprocal.
+                (if index == 3 { 8.0f32 } else { 3.0f32 + projection as u8 as f32 }).to_le_bytes().to_vec()
+            } else { (0..source.bytes).map(|i| (i.wrapping_mul(17) + projection as u8 as u64 * 7) as u8).collect() };
+            File::options().write(true).open(source.path)?.write_all_at(&image, source.offset)?;
+        }
+    }
+    }
+    for rank in 0..4 {
+        let slicing = tensors.exact_slicing(4);
+        let admitted = tensors.layer_load(3, 4, rank, slicing)?.resident;
+        let plan = RankPlan::from_tensors(&tensors, &[(3, slicing)], 4, rank, admitted)?;
+        let mut builder = Builder::new(root.path(), vec![admitted as u64]);
+        plan.append_tensors(&mut builder, &tensors, 0, 4, rank, 0)?;
+        let checked = builder.finish()?;
+        let image = landed(&checked, root.path(), 0)?;
+        let device = Device { library: &library, id: 0 };
+        let mut arena = LoadingArena::new(device, plan.layout.clone(),
+            ExpectedCoverage::from_plan(&checked, 0)?, crate::shared::memory::TEST_ARENA)?;
+        for entry in &checked.plan.entries {
+            let pattern = &checked.plan.patterns[entry.pattern as usize];
+            for (_, offset) in pattern.runs() {
+                let start = entry.dst_base + offset;
+                let bytes = &image[start as usize..start as usize + pattern.run as usize];
+                library.copy_h2d(arena.destination(start as usize, bytes.len())?, bytes)?;
+                arena.copied(start, bytes.len() as u64)?;
+            }
+        }
+        let ready = push_initialize::initialize(arena.done()?, &[plan.layers.into_iter().next().unwrap().initialize], None, 0)?;
+        let mut actual = vec![0; image.len()];
+        library.copy_d2h(&mut actual, ready.region(0)?.buffer())?;
+        let plan = RankPlan::from_tensors(&tensors, &[(3, slicing)], 4, rank, admitted)?;
+        compare_tensors(&plan, &tensors, 4, rank, &actual)?;
+        // The per-expert builder lands the same expert-zero source bytes,
+        // with its scalar pair adjacent rather than in rank-wide scalar vectors.
+        for (index, projection) in Fp8Projection::ALL.into_iter().enumerate() {
+            let (w, s) = tensors.slice_bytes_with(projection, 4, rank, slicing)?;
+            let mut builder = Builder::new(root.path(), vec![(w + s + 8) as u64]);
+            builder.fp8_projection(&tensors, 3, 0, projection, 4, rank, slicing,
+                Destination { rank: 0, offset: 0, bytes: w as u64 },
+                Destination { rank: 0, offset: w as u64, bytes: (s + 8) as u64 })?;
+            let single = landed(&builder.finish()?, root.path(), 0)?;
+            let weight = &plan.layers[0].planes[2 * index];
+            let scale = &plan.layers[0].planes[2 * index + 1];
+            assert_eq!(&single[..w], &image[weight.start..weight.start + w]);
+            assert_eq!(&single[w..w + s], &image[scale.start..scale.start + s]);
+            let alpha = scale.start + 32 * s;
+            let input = alpha + 32 * 4;
+            assert_eq!(&single[w + s..w + s + 4], &image[alpha..alpha + 4]);
+            assert_eq!(&single[w + s + 4..], &image[input..input + 4]);
+        }
+    }
+    Ok(())
+}

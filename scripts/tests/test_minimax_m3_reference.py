@@ -268,11 +268,41 @@ def panel(tokens):
     return result
 
 
+def test_final_norm_tap_preserves_bf16_words_and_scored_input_offset(tmp_path):
+    from families.minimax_m3.golden import write_final_norm
+    import numpy as np
+    window = panel([1, 7, 3, 9, 11, 5, 2])["windows"][0]
+    values = torch.arange(4 * 32).reshape(4, 32).bfloat16() / 3
+    write_final_norm(tmp_path, window, values)
+    target = tmp_path / "windows/sample"
+    np.testing.assert_array_equal(np.fromfile(target / "final_norm.bf16.bin", dtype="<u2"),
+                                  values.view(torch.uint16).numpy().ravel())
+    assert json.loads((target / "final_norm.json").read_text()) == {
+        "dtype": "BF16", "hidden": 32, "first_input_row": 2, "rows": 4, "diagnostic_only": True}
+    with pytest.raises(ValueError, match="dtype/rows"):
+        write_final_norm(tmp_path, window, values.float())
+    with pytest.raises(ValueError, match="dtype/rows"):
+        write_final_norm(tmp_path, window, values[:3])
+
+
 @pytest.mark.parametrize("activation", ["served", "served-cache", "bf16"])
 def test_layer_resume_is_byte_exact_and_loads_only_remaining_layer(snapshot, tmp_path, monkeypatch, activation):
     from families.minimax_m3.golden import run_layers
     manifest = panel([1, 7, 3, 9, 11, 5, 2])
     complete, complete_times = run_layers(snapshot, manifest, tmp_path / "complete", activation=activation)
+    traced, _ = run_layers(snapshot, manifest, tmp_path / "traced", activation=activation, layers=[0, 1])
+    assert traced[0].path.read_bytes() == complete[0].path.read_bytes()
+    trace = tmp_path / "traced/windows/sample"
+    assert (trace / "layer00.input.bin").stat().st_size == 7 * 32 * 4
+    assert (trace / "layer00.attention_projected.bin").stat().st_size == 7 * 32 * 4
+    assert (trace / "layer01.router_ids.bin").stat().st_size == 7 * 2 * 4
+    assert (trace / "layer01.residual.bin").read_bytes() == (trace / "layer01.bin").read_bytes()
+    residuals, _ = run_layers(snapshot, manifest, tmp_path / "residuals", activation=activation,
+                              layers=[0, 1], residual_only=True)
+    assert residuals[0].path.read_bytes() == complete[0].path.read_bytes()
+    residual_trace = tmp_path / "residuals/windows/sample"
+    assert sorted(p.name for p in residual_trace.iterdir()) == ["layer00.bin", "layer01.bin"]
+    assert (residual_trace / "layer01.bin").read_bytes() == (trace / "layer01.bin").read_bytes()
     stopped, times = run_layers(snapshot, manifest, tmp_path / "partial", activation=activation, stop_after_layer=0)
     assert [t["layer"] for t in times] == [0]
     assert not (tmp_path / "partial/meta.json").exists()
@@ -410,3 +440,33 @@ def test_one_token_dense_forward_matches_hand_computed_native_qdq(snapshot):
     # SwiGLU(1,1)=2*sigmoid(1.702), BF16=1.6953125, MXFP8 QDQ=1.75.
     actual = model.layer_forward(hidden, weights, cfg, 0, "served")
     torch.testing.assert_close(actual, torch.full_like(hidden, 3.75), rtol=0, atol=0)
+
+
+def test_isolated_nvfp4_scratch_contract_and_oai_plain_separation(tmp_path):
+    import importlib.util
+    path = ROOT / 'native/tests/minimax_nvfp4_expert_selftest.py'
+    spec = importlib.util.spec_from_file_location('minimax_expert_oracle', path)
+    oracle = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oracle)
+    payload = bytes([0, 1, 7, 128, 255, 0])
+    manifest = oracle.write_payload(tmp_path, 'scales', payload, (2, 3), 'e4m3fn-u8')
+    assert manifest == {'path': 'scales.bin', 'shape': [2, 3], 'dtype': 'e4m3fn-u8',
+                        'bytes': len(payload), 'sha256': oracle.digest(tmp_path / 'scales.bin')}
+    assert (tmp_path / manifest['path']).read_bytes() == payload
+    with pytest.raises(FileExistsError):
+        oracle.write_payload(tmp_path, 'scales', b'changed', (7,), 'u8')
+    assert (tmp_path / manifest['path']).read_bytes() == payload
+    for rows, capacity in [(1, 1), (16, 16), (64, 80)]:
+        offsets, sizes, extent = oracle.scratch_regions(128, 6144, 3072, rows, capacity)
+        assert all(offset % 1024 == 0 for offset in offsets)
+        assert all(b >= a + oracle.aligned(size) for a, b, size in zip(offsets, offsets[1:], sizes))
+        assert extent == offsets[-1] + oracle.aligned(sizes[-1])
+        assert sizes[5:7] == [0, 0]  # fused preactivations are not exported
+    gate = torch.tensor([[-10., -1., 0., 1., 10.]], dtype=torch.bfloat16)
+    up = torch.tensor([[10., -10., 0., 2., 10.]], dtype=torch.bfloat16)
+    clipped_gate, clipped_up = gate.float().clamp(max=7), up.float().clamp(-7, 7)
+    expected = (clipped_gate * torch.sigmoid(1.702 * clipped_gate) * (clipped_up + 1)).bfloat16()
+    assert torch.equal(model.swiglu_oai(gate, up), expected)
+    plain = (torch.nn.functional.silu(clipped_gate) * clipped_up).bfloat16()
+    assert not torch.equal(plain, expected)
+    assert model.swiglu_oai(gate, up)[0, 0] != model.swiglu_oai(gate.clamp(min=-7), up)[0, 0]

@@ -134,11 +134,13 @@ fn receive<'a>(
                 push_initialize::Layer::Fp8 {
                     widen,
                     scalars,
+                    scalar_convention,
                     inputs,
                     expand,
                 } => push_initialize::Layer::Fp8 {
                     widen: widen.clone(),
                     scalars: scalars.clone(),
+                    scalar_convention: *scalar_convention,
                     inputs: inputs.clone(),
                     expand: expand.clone(),
                 },

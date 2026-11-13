@@ -188,16 +188,8 @@ mod tests {
                 let refused = DeploymentOptions { rtx_gpus: gpus,
                     peers: (0..8).map(|rank| format!("192.0.2.{}:9100", rank + 1)).collect(),
                     speculator: "off".into(), ..Default::default() };
-                if key == "minimax:nvfp4" {
-                    // Planned inventory has no admitted expert package to deploy. The
-                    // exact runtime refusal above distinguishes this from a broken plan.
-                    let error = DeploymentSpec::from_report(&report, &refused).unwrap_err();
-                    assert_eq!(error.to_string(), "Spark deployment requires an expert package", "{key}");
-                    assert!(!report.executable(), "{key}: a planned family must be refused at deployment");
-                } else {
-                    let deployment = DeploymentSpec::from_report(&report, &refused)?;
-                    assert!(!report.executable() && !deployment.executable, "{key}: a planned family must be refused at deployment");
-                }
+                let deployment = DeploymentSpec::from_report(&report, &refused)?;
+                assert!(!report.executable() && !deployment.executable, "{key}: a planned family must be refused at deployment");
                 eprintln!("N8 launch-chain: {key} planned; refused at deployment");
                 tested.push(key.clone());
                 continue;

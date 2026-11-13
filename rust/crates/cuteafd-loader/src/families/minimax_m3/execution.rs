@@ -50,6 +50,48 @@ impl ProducerPrograms {
     }
 }
 
+/// Stateless forward kernels add no private scratch owner. Their outputs live
+/// in the lane/unit activation owners; gather reuses the MSA prefill staging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardPrograms {
+    pub layouts: [cuteafd_ffi::minimax_m3::forward::ForwardLayout; 3],
+    pub gather: cuteafd_ffi::index_cache::Layout,
+}
+impl ForwardPrograms {
+    pub fn resolve(manifest: &serde_json::Value, rows: u32) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        use cuteafd_ffi::minimax_m3::forward::{Kind, validate_entry};
+        let entries = manifest["programs"].as_array()
+            .ok_or_else(|| Refusal::InvalidFact("MiniMax PROGRAMS.json has no program list".into()))?;
+        let mut specs = Vec::new();
+        let mut layouts = Vec::new();
+        let mut gather = None;
+        for name in Kind::ALL.map(Kind::name).into_iter().chain(["minimax_index_cache_gather"]) {
+            let missing = |detail| Refusal::MissingExport { export: name.into(),
+                geometry: "MiniMax residual norm/FP32 router/paged KV and bounded index staging".into(), context: 0, detail };
+            let mut found = entries.iter().filter(|entry| entry["name"] == name);
+            let entry = found.next().ok_or_else(|| missing("absent from PROGRAMS.json".into()))?;
+            if found.next().is_some() { return Err(missing("duplicate program".into())); }
+            let parsed = ProgramEntry::from_manifest(entry).map_err(|e| missing(e.to_string()))?;
+            let capacity = if name == "minimax_index_cache_gather" {
+                let layout = cuteafd_ffi::index_cache::validate_entry(&parsed.spec, entry)
+                    .map_err(|e| missing(e.to_string()))?;
+                gather = Some(layout);
+                layout.rows as u32
+            } else {
+                let layout = validate_entry(&parsed.spec, entry).map_err(|e| missing(e.to_string()))?;
+                layouts.push(layout);
+                layout.rows
+            };
+            if rows == 0 || rows > capacity {
+                return Err(missing(format!("compiled rows={capacity}, requested rows={rows}")));
+            }
+            specs.push(parsed.spec);
+        }
+        Ok((Self { layouts: layouts.try_into().expect("three forward kernels"),
+            gather: gather.expect("bounded gather") }, specs))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MsaPrograms {
     pub layouts: [Layout; 4],
@@ -150,9 +192,12 @@ impl MsaPrograms {
         let mut buffers = vec![
             ("index.query", rows * 512),
             ("index.scales", rows * 16),
+            ("index.produced_keys", rows * 128),
+            ("index.produced_scales", rows * 4),
             ("selections", rows * 256),
             ("index.scratch", index.scratch),
             ("attention.query", rows * 16384),
+            ("attention.key", rows * 1024),
             ("attention.output", rows * 16384),
             ("attention.lse", rows * 256),
             ("attention.scratch", attention.scratch),
@@ -190,6 +235,102 @@ impl MsaPrograms {
             maximum_pages,
             Category::Workspace,
         )
+    }
+}
+
+/// Retained arithmetic outputs for one in-flight shared prefill unit. Dense
+/// quantization and MSA scratch are separate owners, not repeated charges here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitLayout { pub rows: u32 }
+impl UnitLayout {
+    pub fn new(cfg: &MiniMaxM3Config, rows: u32) -> Result<Self, Refusal> {
+        if rows == 0 || rows > 4096 || (cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim,
+            cfg.dense_intermediate, cfg.shared_intermediate, cfg.experts, cfg.topk)
+                != (6144, 64, 4, 128, 12288, 3072, 128, 4)
+            || cfg.routed_scale != 2.0 || cfg.rms_norm_eps != 1e-6
+            || cfg.swiglu_alpha != 1.702 || cfg.swiglu_limit != 7.0 {
+            return Err(Refusal::InvalidFact("MiniMax native unit arithmetic geometry".into()));
+        }
+        Ok(Self { rows })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        let rows = u64::from(self.rows);
+        [("residual", 6144 * 4), ("query", 8192 * 2), ("key", 512 * 2),
+            ("value", 512 * 2), ("index_query", 512 * 2), ("index_key", 128 * 2),
+            ("gate", 12288 * 2), ("up", 12288 * 2), ("ffn", 6144 * 2),
+            ("routed", 6144 * 2), ("combined", 6144 * 2), ("logits", 128 * 4), ("route_ids", 4 * 4),
+            ("route_weights", 4 * 4)].into_iter().map(|(name, stride)| (name, rows * stride)).collect()
+    }
+    pub fn components(self, prefix: &str, rank: u8, lifetime: Lifetime,
+        maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if self.rows == 0 || self.rows > 4096 {
+            return Err(Refusal::InvalidFact("MiniMax native unit row capacity".into()));
+        }
+        components(self.buffers(), prefix, rank, lifetime, maximum_pages, Category::Workspace)
+    }
+}
+
+/// Embedding/final-norm and shared vocabulary-head storage for bounded scoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadLayout { pub rows: u32, pub vocab: u32 }
+impl HeadLayout {
+    pub fn new(cfg: &MiniMaxM3Config, rows: u32) -> Result<Self, Refusal> {
+        if rows == 0 || rows > 4096 || cfg.hidden != 6144 || cfg.vocab_size != 200064 {
+            return Err(Refusal::InvalidFact("MiniMax target head geometry".into()));
+        }
+        Ok(Self { rows, vocab: cfg.vocab_size as u32 })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        let rows = u64::from(self.rows);
+        vec![("tokens", rows * 4), ("normalized", rows * 6144 * 2),
+            ("logits", rows * u64::from(self.vocab) * 4),
+            ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64)]
+    }
+    pub fn components(self, prefix: &str, rank: u8, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.buffers(), prefix, rank, Lifetime::TARGET, maximum_pages, Category::Workspace)
+    }
+}
+
+/// One immutable unit's request metadata. Shared page tables belong to MsaCache;
+/// positions/causal extents differ by unit and must not alias a sibling slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitMetadata { pub rows: u32 }
+impl UnitMetadata {
+    pub fn new(rows: u32) -> Result<Self, Refusal> {
+        if rows == 0 || rows > 4096 {
+            return Err(Refusal::InvalidFact("MiniMax metadata row capacity".into()));
+        }
+        Ok(Self { rows })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        let rows = u64::from(self.rows);
+        vec![("positions", rows * 8), ("slots", rows * 8), ("batch_ids", rows * 4),
+            ("causal_lengths", rows * 4), ("cache_lengths", 4), ("query_offsets", 8),
+            ("key_descale", 16), ("value_descale", 16)]
+    }
+    pub fn components(self, prefix: &str, rank: u8, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        Self::new(self.rows)?;
+        components(self.buffers(), prefix, rank, Lifetime::TARGET, maximum_pages, Category::Workspace)
+    }
+}
+
+/// Native producers read one interleaved [positions, cos32 + sin32] FP32 table.
+/// This is intentionally not the shared two-plane BF16 rotary representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsaRope { pub positions: u32 }
+impl MsaRope {
+    pub fn new(cfg: &MiniMaxM3Config, positions: u32) -> Result<Self, Refusal> {
+        if positions == 0 || u64::from(positions) > cfg.max_position as u64
+            || cfg.rotary_dim != 64 || cfg.rope_theta != 10_000_000.0 {
+            return Err(Refusal::InvalidFact("MiniMax FP32 partial rotary geometry".into()));
+        }
+        Ok(Self { positions })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        vec![("cos_sin", u64::from(self.positions) * 64 * 4)]
+    }
+    pub fn components(self, prefix: &str, rank: u8, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.buffers(), prefix, rank, Lifetime::TARGET, maximum_pages, Category::Workspace)
     }
 }
 
@@ -273,6 +414,40 @@ mod tests {
             &serde_json::from_str(include_str!("fixtures/config.json")).unwrap(),
         )
         .unwrap()
+    }
+    #[test]
+    fn head_inventory_has_one_owner_per_native_allocation() {
+        let config = cfg();
+        let head = HeadLayout::new(&config, 1024).unwrap();
+        assert_eq!(head.buffers(), vec![("tokens", 4096), ("normalized", 1024 * 6144 * 2),
+            ("logits", 1024 * 200064 * 4),
+            ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64)]);
+        assert!(HeadLayout::new(&config, 0).is_err());
+        assert!(HeadLayout::new(&config, 4097).is_err());
+        let mut wrong = config.clone(); wrong.vocab_size -= 1;
+        assert!(HeadLayout::new(&wrong, 1024).is_err());
+    }
+
+    #[test]
+    fn forward_inventory_validates_all_kernels_without_private_scratch() {
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-ffi/tests/fixtures/minimax_forward_programs.json")).unwrap();
+        let (programs, specs) = ForwardPrograms::resolve(&manifest, 2048).unwrap();
+        assert_eq!(specs.len(), 4);
+        assert_eq!(programs.gather.rows, 4096);
+        assert!(specs.iter().all(|spec| spec.scratch.is_empty()));
+        assert!(ForwardPrograms::resolve(&manifest, 0).is_err());
+        assert!(ForwardPrograms::resolve(&manifest, 4097).is_err());
+        for i in 0..4 {
+            let mut bad = manifest.clone(); bad["programs"].as_array_mut().unwrap().remove(i);
+            assert!(ForwardPrograms::resolve(&bad, 1).is_err());
+            let mut bad = manifest.clone(); bad["programs"].as_array_mut().unwrap().push(manifest["programs"][i].clone());
+            assert!(ForwardPrograms::resolve(&bad, 1).is_err());
+            for field in ["dtype", "shape", "role"] {
+                let mut bad = manifest.clone(); bad["programs"][i]["pointers"][0][field] = json!("wrong");
+                assert!(ForwardPrograms::resolve(&bad, 1).is_err());
+            }
+        }
     }
     #[test]
     fn producer_inventory_charges_each_scratch_owner_once() {

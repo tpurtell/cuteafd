@@ -14,6 +14,12 @@ pub struct Args {
 }
 #[derive(Debug, clap::Subcommand)]
 pub enum Action {
+    /// Recompute the family verdict from a retained native golden report, CPU only.
+    RescoreGolden {
+        input: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Score a pinned family reference on the served engine (cold, drafts off).
     Run(RunArgs),
     /// Gate a full precision decision on both decode and prefill with fixed margins.
@@ -264,11 +270,17 @@ fn run_series(args: &RunArgs, full_prefill: bool,
 }
 
 fn run_output(args: &RunArgs, runs: &[Run]) -> Value {
+    let aggregate_only = runs.iter().any(|r|
+        crate::fidelity::ScoringPolicy::for_family(r.family.as_deref()).aggregate_only());
+    if aggregate_only && args.verify_rows.len() > 1 {
+        return json!({"schema":"cuteafd.fidelity.width-sweep/1", "verify_rows":args.verify_rows,
+            "runs":runs, "reports":runs.iter().map(|r| crate::panels::fidelity::record(r, None)).collect::<Vec<_>>()});
+    }
     if args.verify_rows.len() > 1 {
         return json!({"schema": "cuteafd.fidelity.width-sweep/1", "verify_rows": args.verify_rows,
             "runs": runs});
     }
-    let mut output = if args.tier == "standard" { crate::panels::fidelity::record(&runs[0], None) }
+    let mut output = if args.tier == "standard" || aggregate_only { crate::panels::fidelity::record(&runs[0], None) }
         else { json!(runs[0]) };
     if let Some(prefill) = runs.get(1) {
         for (key, value) in crate::panels::fidelity::record(prefill, None).as_object().unwrap() {
@@ -439,6 +451,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
     let make_run = |records: Vec<crate::reference::Position>, missing, engine: String, settings: Value, shape: String| {
         let mut score = Fidelity::from_records(records); score.missing = missing;
         Run { schema: "cuteafd.fidelity.run/2".into(), arm: args.arm.clone(), checkpoint: model.into(),
+            family: settings["family"].as_str().map(str::to_owned),
             set_sha256: if reference.set_sha256.is_empty() { digest.clone() } else { reference.set_sha256.clone() },
             reference_sha256: digest.clone(), tier: if standard { crate::fidelity_dataset::STANDARD_TIER.into() } else { args.tier.clone() }, path_shape: shape,
             kl_kind: if dataset_identity.as_ref().is_some_and(|d| d["qualification"] == "reference") {
@@ -531,6 +544,18 @@ fn cross_checkpoint_line(c: &CrossCheckpoints) -> String {
 /// Exit 0 pass / 3 gate failure / 1 error is handled at the daemon edge.
 pub fn execute(args: Args) -> Result<bool> {
     match args.action {
+        Action::RescoreGolden { input, out } => {
+            let bytes = std::fs::read(&input)?;
+            let saved: Value = serde_json::from_slice(&bytes)?;
+            ensure!(saved["schema"] == "cuteafd.minimax.golden/1", "unsupported native golden schema");
+            let mut report = crate::fidelity::minimax_golden_report(
+                serde_json::from_value(saved["score"].clone())?, saved["provenance"].clone())?;
+            report["rescore"] = json!({"input":input, "sha256":format!("{:x}", Sha256::digest(&bytes)),
+                "cpu_only":true, "previous_qualified":saved["qualified"]});
+            serde_json::to_writer_pretty(std::fs::OpenOptions::new().write(true).create_new(true).open(out)?, &report)?;
+            eprintln!("{}", report["verdict"]);
+            Ok(report["qualified"] == true)
+        }
         Action::Run(args) => {
             let runs = run(&args)?;
             for run in &runs {
@@ -763,6 +788,31 @@ mod tests {
     }
 
     #[test]
+    fn minimax_output_keeps_both_paths_and_explicit_policy() {
+        for extra in [vec![], vec!["--verify-rows", "4,16"]] {
+            let args = parse(&[vec!["--tier", "standard"], extra].concat());
+            let runs = run_series(&args, true, |one| {
+                let mut run = fixture_run(one);
+                run.family = Some("minimax_m3".into());
+                Ok(run)
+            }).unwrap();
+            let output = run_output(&args, &runs);
+            if args.verify_rows.len() > 1 {
+                let reports = output["reports"].as_array().unwrap();
+                assert_eq!(reports.len(), 3);
+                assert_eq!(reports[2]["prefill_verdict"]["scoring_policy"], "minimax-generated-aggregate");
+            } else {
+                assert!(output["decode"].is_object());
+                assert!(output["prefill"].is_object());
+                for key in ["verdict", "prefill_verdict"] {
+                    assert_eq!(output[key]["scoring_policy"], "minimax-generated-aggregate");
+                    assert!(output[key]["context"].is_object());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn api_key_file_validates_without_disclosing_contents() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("key");
@@ -894,7 +944,7 @@ mod tests {
             position: 1, agree: true, confident: true, top3_contained: true, agree_text: true,
             finite: true, kl: 0.0, nll: 0.5, ref_nll: 0.5, argmax: 1, reference_argmax: 1,
         }]);
-        let mut run = Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(),
+        let mut run = Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(), family: None,
             checkpoint: "test".into(), set_sha256: "set".into(), reference_sha256: "ref".into(),
             tier: "quick".into(), path_shape: "decode-shaped".into(), kl_kind: "top32-plus-tail".into(),
             verify_rows: None, dataset: None, reference_selection: None, standard_balance: None, engine: "test".into(), settings: json!({}), seconds: 0.0,

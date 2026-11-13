@@ -482,7 +482,7 @@ pub fn full_report() -> Report {
             role: "gen".into(), position, agree: true, confident: true, top3_contained: true, agree_text: true,
             finite: true, kl: 0.005, nll: 0.5, ref_nll: 0.5, argmax: 1, reference_argmax: 1 })).collect());
     let mut fidelity_run = crate::fidelity::Run { schema: "cuteafd.fidelity.run/2".into(), arm: "synthetic".into(),
-        checkpoint: "synthetic".into(), set_sha256: "synthetic".into(), reference_sha256: "synthetic".into(),
+        checkpoint: "synthetic".into(), family: None, set_sha256: "synthetic".into(), reference_sha256: "synthetic".into(),
         tier: "standard".into(), path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(),
         verify_rows: None, reference_selection: None, standard_balance: None, dataset: Some(json!({"config": "synthetic-long-config-for-responsive-layout",
             "revision": "a".repeat(40)})), engine: "synthetic".into(), settings: json!({}), seconds: 346.0,

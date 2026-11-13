@@ -161,7 +161,7 @@ def admission(weights, cfg, length, layer=None):
 
 
 def run_layers(snapshot, manifest, out, *, device="cpu", activation="served", resume=None,
-               stop_after_layer=None, layers=None):
+               stop_after_layer=None, layers=None, residual_only=False):
     import torch
     import torch.nn.functional as F
     cfg = model.Config.from_dict(json.loads((snapshot / "config.json").read_bytes()))
@@ -223,7 +223,8 @@ def run_layers(snapshot, manifest, out, *, device="cpu", activation="served", re
             next_states = []
             for window, previous in zip(windows, states, strict=True):
                 hidden = torch.from_numpy(previous.load()).view(residual_dtype).to(weights.device)
-                hidden = model.layer_forward(hidden, layer, cfg, index, activation)
+                trace = {} if layers and index in layers and not residual_only else None
+                hidden = model.layer_forward(hidden, layer, cfg, index, activation, trace=trace)
                 if not torch.isfinite(hidden).all():
                     raise ValueError(f"non-finite MiniMax hidden at layer {index}")
                 bits = hidden.cpu().view(torch.uint16).numpy()
@@ -232,7 +233,10 @@ def run_layers(snapshot, manifest, out, *, device="cpu", activation="served", re
                     target = out / "windows" / window["id"]
                     target.mkdir(parents=True, exist_ok=True)
                     hidden.float().cpu().numpy().astype("<f4").tofile(target / f"layer{index:02d}.bin")
-                del hidden, bits
+                    for name, value in (trace or {}).items():
+                        dtype = "<i4" if name == "router_ids" else "<f4"
+                        value.float().cpu().numpy().astype(dtype).tofile(target / f"layer{index:02d}.{name}.bin")
+                del hidden, bits, trace
             del layer
             weights.close()
             times.append({"layer": index, "seconds": time.monotonic() - started,
@@ -243,6 +247,20 @@ def run_layers(snapshot, manifest, out, *, device="cpu", activation="served", re
                 shutil.rmtree(state.root / "embedding")
             print(f"layer {index}: committed; {times[-1]['seconds']:.3f}s", flush=True)
     return states, times
+
+
+def write_final_norm(out, window, normalized):
+    import torch
+    rows = len(window["tokens"]) - window["score_from"]
+    if normalized.dtype != torch.bfloat16 or normalized.ndim != 2 or normalized.shape[0] != rows:
+        raise ValueError("MiniMax final norm diagnostic dtype/rows")
+    target = out / "windows" / window["id"]
+    target.mkdir(parents=True, exist_ok=True)
+    normalized.cpu().view(torch.uint16).numpy().astype("<u2").tofile(target / "final_norm.bf16.bin")
+    (target / "final_norm.json").write_bytes(canonical({
+        "dtype": "BF16", "hidden": normalized.shape[1],
+        "first_input_row": window["score_from"] - 1,
+        "rows": rows, "diagnostic_only": True}) + b"\n")
 
 
 def execute(args):
@@ -266,7 +284,8 @@ def execute(args):
     if args.prefix_only and not probing:
         return
     states, times = run_layers(args.snapshot, manifest, args.out, device=args.device,
-                              activation=args.activation, resume=None if probing else args.resume, layers=args.layers)
+                              activation=args.activation, resume=None if probing else args.resume,
+                              layers=args.layers, residual_only=getattr(args, "residual_only", False))
     admission(weights, cfg, max(len(w["tokens"]) for w in manifest["windows"]))
     with torch.inference_mode():
         norm = weights.tensor(model.TEXT + "norm.weight")
@@ -280,6 +299,8 @@ def execute(args):
             hidden = torch.from_numpy(state.load()).view(dtype).to(weights.device)
             selected = hidden[window["score_from"] - 1:len(window["tokens"]) - 1]
             normalized = model.gemma_norm(selected, norm, cfg.rms_norm_eps).bfloat16()
+            if args.layers and not probing:
+                write_final_norm(args.out, window, normalized)
             logits = (linear(normalized.float(), head) if args.activation == "served-cache"
                       else linear(normalized, head).float())
             entry = write_scored_logits(args.out, window, logits.cpu().numpy())
@@ -313,7 +334,8 @@ def main():
     parser.add_argument("--activation", choices=("served-cache", "served", "bf16"), default="served")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--resume", type=Path, help="previous run's state directory; use a fresh output")
-    parser.add_argument("--layers", type=int, nargs="*", help="also export selected full layer states")
+    parser.add_argument("--layers", type=int, nargs="*", help="also export selected full layer states and scored final norm")
+    parser.add_argument("--residual-only", action="store_true", help="with --layers, omit sublayer branch traces")
     parser.add_argument("--prefix-only", action="store_true")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--backfill-meta", action="store_true",
@@ -326,6 +348,8 @@ def main():
         return
     if args.windows is None or args.run_platform is not None:
         parser.error("a golden run needs --windows; --run-platform only goes with --backfill-meta")
+    if args.residual_only and not args.layers:
+        parser.error("--residual-only requires --layers")
     execute(args)
 
 

@@ -26,15 +26,18 @@ pub const NOT_RECOMMENDED: &str = "FAIL: not recommended.";
 /// their weights (W4A4) and the checkpoint is calibrated for that arithmetic,
 /// so its absolute fidelity against a BF16 golden reference — measured and
 /// shown — is not a gate: a miss is informational, and the gates for such a
-/// card are the exact prefix-cache restore and lossless speculation. Every
-/// other checkpoint keeps the calibrated bar.
+/// card are the exact prefix-cache restore and lossless speculation. MiniMax's
+/// explicit generated-aggregate policy remains gated, including native W4A4;
+/// every other checkpoint keeps the calibrated bar.
 pub fn apply_fidelity(info: &ServerInfo, check: &mut Check) {
     if matches!(check.status, CheckStatus::Unsupported | CheckStatus::Skipped | CheckStatus::Pending) {
         // Nothing was measured (no reference, no server hook): the check keeps
         // its own outcome.
         return;
     }
-    if calibrated_w4a4(info) {
+    // MiniMax has an explicit generated-aggregate gate even for native W4A4.
+    let aggregate_only = crate::fidelity::ScoringPolicy::for_family(info.family.as_deref()).aggregate_only();
+    if !aggregate_only && calibrated_w4a4(info) {
         check.status = CheckStatus::Info;
         check.note = Some(CALIBRATED_W4A4.into());
         return;
@@ -204,6 +207,31 @@ mod tests {
         assert_eq!(check.note.as_deref(), Some(CALIBRATED_W4A4));
         assert_eq!(check.metrics["verdict"]["pass"], false);
         assert!(crate::render::card::card_svg(&report).contains("4.0 bpw"));
+    }
+
+    #[test]
+    fn minimax_generated_aggregate_is_a_gate_even_with_w4a4_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut report = nvfp4_card(tmp.path(), experts("NVFP4"));
+        report.server.family = Some("minimax_m3".into());
+        assert!(calibrated_w4a4(&report.server));
+        let panel = crate::sample::full_report();
+        let mut run: crate::fidelity::Run = serde_json::from_value(
+            panel.panel("fidelity").unwrap().latest().unwrap()["decode"].clone()).unwrap();
+        run.family = report.server.family.clone();
+        run.precision = Some(crate::fidelity_precision::Precision::new(4.0, "nvfp4", true, "test").unwrap());
+        for (kl, expected) in [(0.04, CheckStatus::Pass), (0.051, CheckStatus::Fail)] {
+            for p in &mut run.score.records { p.kl = kl; }
+            let check = report.baseline.as_mut().unwrap().quality.checks.iter_mut()
+                .find(|c| c.id == "fidelity").unwrap();
+            check.set("run", json!(run));
+            check.status = CheckStatus::Info;
+            check.note = Some(CALIBRATED_W4A4.into());
+            reconcile(&mut report);
+            let check = report.baseline.as_ref().unwrap().quality.check("fidelity").unwrap();
+            assert_eq!(check.status, expected);
+            assert_eq!(check.note, None);
+        }
     }
 
     #[test]

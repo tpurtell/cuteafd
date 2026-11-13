@@ -93,6 +93,38 @@ keys below onto, and `cuteafd serve --family ID --help` lists a family's serve
 flags. Users set keys, not these flags or the `CUTEAFD_*` environment variables
 the launcher derives from them.
 
+`cuteafd golden --family minimax_m3` (hidden alias `minimax-golden`) is a
+qualification-only native full-model prefill path; MiniMax serving stays refused.
+It requires `--nll --golden DATASET --save-logits NEW_DIR`, a checkpoint snapshot,
+native library and program manifest, and four real Spark `--peers` endpoints.
+`--window ID[,ID...]` selects unique sealed quick-subset windows. `--prefill-rows` defaults
+to 1024 (page-aligned 256..4096); `--prefill-waves` defaults to 3 (1..4).
+`--check-headers` validates the immutable reference and checkpoint/export geometry
+without CUDA or workers. Scores use the shared top1024-plus-tail estimator.
+MiniMax's explicit `minimax-generated-aggregate` family scoring policy (#1779,
+TJ 2026-11-13) qualifies the aggregate generated rows at the expert-bpw tier:
+the official NVFP4 checkpoint uses mid-tier mean KL <=0.05 and top-1 >=0.93,
+without the reference-root strict-tier override. Context rows, every window
+(including measured sensitivity-floor windows such as d00), confident top-1
+and top-3 are reported as informational, not independent vetoes. Missing or
+nonfinite rows and invalid precision/provenance still fail. Report publication
+keeps this aggregate gated even for native W4A4, rather than applying the general
+NVFP4 informational override. All other families retain their existing
+reference-root tier, calibrated tripwires, window floor and W4A4 report policy.
+Golden, CLI and panel receipts expose the policy, generated/context summaries
+and per-window numbers. CPU-only `cuteafd bench fidelity rescore-golden INPUT
+--out NEW_JSON` recomputes the verdict from retained native golden row records
+and records the input SHA256; it never reruns the model or overwrites evidence.
+Diagnostic `--tap-layers 0,1,2,3` requires `--window` and unique layer IDs
+0..59. It writes F32 input/post-attention/final residuals and BF16 projected
+attention/local-MLP branches in `NEW_DIR/layer-taps/ID`, with zero-based input-row
+suffixes and explicit diagnostic metadata. `--tap-residual-only` omits sublayer
+branches. Both modes also export the final BF16 normalized hidden before the
+head. Copies drain the issuing stream and reuse one admitted host buffer; taps
+are off by default and do not waive scoring. The family reference CLI's
+`--layers 0 1 ...` exports residuals, branches and scored final norm;
+`--residual-only` omits branches without bypassing ordinary prefix qualification.
+
 `cuteafd kimi-golden --rtx-expert-layers auto|all|N` defaults to `auto`, using
 startup's real-device admission rather than forcing zero coordinator layers.
 Golden's expert-layer hint must cover the planner-selected Spark layers under

@@ -75,6 +75,32 @@ pub enum ExpertFormat {
     Nvfp4,
 }
 
+/// ModelOpt globals are multipliers; compressed-tensors NVFP4 globals are divisors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nvfp4ScaleConvention {
+    Multiplier,
+    Divisor,
+}
+
+impl Nvfp4ScaleConvention {
+    pub fn normalize(self, value: f32) -> Result<f32> {
+        ensure!(value.is_finite() && value > 0.0, "{value} is not a positive finite NVFP4 scale");
+        let multiplier = match self { Self::Multiplier => value, Self::Divisor => value.recip() };
+        ensure!(multiplier.is_finite() && multiplier > 0.0,
+            "normalized NVFP4 scale {multiplier} is not positive and finite");
+        Ok(multiplier)
+    }
+
+    pub fn normalize_bytes(self, image: &mut [u8]) -> Result<()> {
+        ensure!(image.len() % 4 == 0, "partial NVFP4 scalar");
+        for bytes in image.chunks_exact_mut(4) {
+            let value = self.normalize(f32::from_le_bytes((&*bytes).try_into().unwrap()))?;
+            bytes.copy_from_slice(&value.to_le_bytes());
+        }
+        Ok(())
+    }
+}
+
 impl ExpertFormat {
     /// Native input rows: calibrated NVFP4 and BF16 weights consume BF16.
     pub fn bf16_input(self) -> bool {
@@ -274,6 +300,22 @@ impl Fp8ExpertTensors {
             return format!("mtp.layers.{stage}.mlp.experts.{expert}.{}.weight", projection.stem());
         }
         format!("{}layers.{layer}.mlp.experts.{expert}.{}.weight", self.prefix, projection.stem())
+    }
+
+    /// Source headers in execution-plane order: weight, block scale, alpha, input scale.
+    pub fn projection_source_names(&self, layer: usize, expert: usize, projection: Fp8Projection) -> Vec<String> {
+        let weight = self.name(layer, expert, projection);
+        let mut names = vec![weight.clone()];
+        if self.format != ExpertFormat::Bf16 { names.push(self.scale_name(&weight)); }
+        if self.format == ExpertFormat::Nvfp4 {
+            names.push(self.alpha_name(&weight));
+            names.push(self.activation_scale_name(&weight));
+        }
+        names
+    }
+
+    pub fn nvfp4_scale_convention(&self) -> Nvfp4ScaleConvention {
+        if self.compressed_nvfp4 { Nvfp4ScaleConvention::Divisor } else { Nvfp4ScaleConvention::Multiplier }
     }
 
     fn scale_name(&self, weight: &str) -> String {
@@ -829,12 +871,8 @@ impl Fp8ExpertTensors {
         if self.format != ExpertFormat::Nvfp4 {
             return Ok(1.0);
         }
-        let value = f32::from_le_bytes(self.read_scalar_bytes(name)?);
-        ensure!(value.is_finite() && value > 0.0, "{name}: {value} is not a positive finite scale");
-        let multiplier = if self.compressed_nvfp4 { value.recip() } else { value };
-        ensure!(multiplier.is_finite() && multiplier > 0.0,
-            "{name}: reciprocal scale {multiplier} is not positive and finite");
-        Ok(multiplier)
+        self.nvfp4_scale_convention().normalize(f32::from_le_bytes(self.read_scalar_bytes(name)?))
+            .with_context(|| format!("reading {name}"))
     }
 
     /// The raw bytes of one FP32 scalar tensor, so a comparison is bit-exact.
@@ -1485,6 +1523,11 @@ mod tests {
         for projection in Fp8Projection::ALL {
             let name = tensors.name(0, 0, projection);
             assert!(name.ends_with(".weight_packed"));
+            let stem = name.strip_suffix(".weight_packed").unwrap();
+            assert_eq!(tensors.projection_source_names(0, 0, projection), [name.clone(),
+                format!("{stem}.weight_scale"), format!("{stem}.weight_global_scale"),
+                format!("{stem}.input_global_scale")]);
+            assert_eq!(tensors.nvfp4_scale_convention(), Nvfp4ScaleConvention::Divisor);
             let write_scalar = |name: &str, value: f32| {
                 let loc = tensors.located(name).unwrap();
                 std::fs::File::options().write(true).open(dir.path().join(&loc.shard)).unwrap()
@@ -1510,6 +1553,22 @@ mod tests {
     }
 
     #[test]
+    fn nvfp4_scalar_normalization_rejects_invalid_values_and_reciprocal_overflow() {
+        for convention in [Nvfp4ScaleConvention::Multiplier, Nvfp4ScaleConvention::Divisor] {
+            for value in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+                assert!(convention.normalize(value).is_err());
+                assert!(convention.normalize_bytes(&mut value.to_le_bytes()).is_err());
+            }
+            assert!(convention.normalize_bytes(&mut [0; 3]).is_err());
+        }
+        assert!(Nvfp4ScaleConvention::Divisor.normalize(f32::from_bits(1)).is_err());
+        assert_eq!(Nvfp4ScaleConvention::Multiplier.normalize(f32::from_bits(1)).unwrap().to_bits(), 1);
+        let mut bytes = [4.0f32.to_le_bytes(), 8.0f32.to_le_bytes()].concat();
+        Nvfp4ScaleConvention::Divisor.normalize_bytes(&mut bytes).unwrap();
+        assert_eq!(bytes, [0.25f32.to_le_bytes(), 0.125f32.to_le_bytes()].concat());
+    }
+
+    #[test]
     fn modelopt_nvfp4_names_and_multiplier_bits_stay_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let tensors = nvfp4_snapshot(dir.path(), 2);
@@ -1520,6 +1579,13 @@ mod tests {
         assert_eq!(tensors.scale_name(&name), format!("{name}_scale"));
         assert_eq!(tensors.alpha_name(&name), format!("{name}_scale_2"));
         assert_eq!(tensors.activation_scale_name(&name), "model.layers.0.mlp.experts.0.gate_proj.input_scale");
+        assert_eq!(tensors.projection_source_names(0, 0, Fp8Projection::Gate), [name.clone(),
+            format!("{name}_scale"), format!("{name}_scale_2"),
+            "model.layers.0.mlp.experts.0.gate_proj.input_scale".into()]);
+        assert_eq!(tensors.nvfp4_scale_convention(), Nvfp4ScaleConvention::Multiplier);
+        let mut image = 0.3f32.to_le_bytes();
+        tensors.nvfp4_scale_convention().normalize_bytes(&mut image).unwrap();
+        assert_eq!(image, 0.3f32.to_le_bytes());
         assert_eq!(tensors.read_input_scale(0, 0, Fp8Projection::Gate).unwrap().to_bits(), 0.3f32.to_bits());
     }
 

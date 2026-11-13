@@ -422,8 +422,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     census.sample("after_expert_modules_before_weights", Some(&library))?;
     let loaded = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
-        load_weights(&library, &catalog, &config, &mut modules,
-            selection.push_weights().then_some(&mut stream))
+        super::push::catch_startup("weight loading", || load_weights(&library, &catalog, &config, &mut modules,
+            selection.push_weights().then_some(&mut stream)))
     };
     catalog.finish_expert_reads();
     let (weights, remaining) = match loaded {

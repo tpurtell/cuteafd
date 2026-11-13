@@ -584,6 +584,12 @@ fn write(stream: &mut TcpStream, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("worker selection rejected: {reason}")]
+pub struct WorkerSelectionRejected {
+    pub reason: String,
+}
+
 /// Read one bounded control message without consuming the following bootstrap.
 fn read<T: serde::de::DeserializeOwned>(stream: &TcpStream) -> Result<T> {
     let mut reader = BufReader::with_capacity(1, stream.try_clone()?);
@@ -592,7 +598,8 @@ fn read<T: serde::de::DeserializeOwned>(stream: &TcpStream) -> Result<T> {
     ensure!(bytes > 0 && bytes <= CONTROL_LIMIT && line.last() == Some(&b'\n'), "invalid worker selection control frame");
     let value: serde_json::Value = serde_json::from_slice(&line)?;
     if value["message"] == "protocol_v2_bootstrap_error" {
-        anyhow::bail!("worker selection rejected: {}", value["error"]);
+        return Err(WorkerSelectionRejected { reason: value["error"].as_str()
+            .context("worker rejection lacks a reason")?.to_owned() }.into());
     }
     if matches!(value["message"].as_str(), Some("worker_selection_start" | "worker_selection_ready")) {
         check_version(value["selection"]["version"].as_u64().context("missing worker selection version")?, VERSION)?;

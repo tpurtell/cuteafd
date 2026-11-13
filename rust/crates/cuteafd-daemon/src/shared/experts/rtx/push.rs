@@ -267,8 +267,8 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
         let Some(((catalog, plan, _), delivered)) = tp2.zip(delivered) else { return Ok(PushedExperts::default()) };
         if let Some(fp8) = &plan.fp8 {
             let initialize = fp8.layers.iter().map(|layer| match &layer.initialize {
-                push_initialize::Layer::Fp8 { widen, scalars, inputs, expand } => push_initialize::Layer::Fp8 {
-                    widen: widen.clone(), scalars: scalars.clone(), inputs: inputs.clone(), expand: expand.clone(),
+                push_initialize::Layer::Fp8 { widen, scalars, scalar_convention, inputs, expand } => push_initialize::Layer::Fp8 {
+                    widen: widen.clone(), scalars: scalars.clone(), scalar_convention: *scalar_convention, inputs: inputs.clone(), expand: expand.clone(),
                 },
                 _ => unreachable!("FP8 planner only emits FP8 initializers"),
             }).collect::<Vec<_>>();

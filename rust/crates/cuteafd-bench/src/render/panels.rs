@@ -163,7 +163,11 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let mut notes = Vec::new();
     if let Some(precision) = v["decode"]["precision"].as_object().or_else(|| v["prefill"]["precision"].as_object())
         .and_then(|p| serde_json::from_value::<crate::fidelity_precision::Precision>(Value::Object(p.clone())).ok()) {
-        notes.push(precision.label());
+        let aggregate_only = v["verdict"]["scoring_policy"] == "minimax-generated-aggregate"
+            || v["prefill_verdict"]["scoring_policy"] == "minimax-generated-aggregate";
+        notes.push(if aggregate_only {
+            format!("{} bpw experts; MiniMax generated-aggregate policy", precision.expert_bpw)
+        } else { precision.label() });
     }
     if dataset["qualification"] == "reference" {
         notes.push("reference".to_string());
@@ -246,6 +250,17 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
     doc.spans(x, y + 13.0, 12.5, Anchor::Start, &[(&format!("{path} "), t.ink, 600), (status, color, 700),
         (&format!("  {} generated rows{}", score["positions"], seconds_taken.map(|s| format!(" · {}", seconds(s))).unwrap_or_default()), t.ink2, 400)]);
     y += 22.0;
+    let aggregate_only = verdict["scoring_policy"] == "minimax-generated-aggregate";
+    if aggregate_only {
+        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), "MiniMax: generated aggregate only");
+        y += 17.0;
+    }
+    if let Some(context) = verdict["context"].as_object().filter(|c| c["positions"].as_u64().unwrap_or(0) > 0) {
+        let line = format!("Context rows (informational): {} rows, KL {:.4}, top-1 {:.2}%",
+            context["positions"], context["kl"].as_f64().unwrap_or(0.0), context["top1"].as_f64().unwrap_or(0.0) * 100.0);
+        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), &super::svg::fit(&line, 10.0, w));
+        y += 17.0;
+    }
     // Headline: one cell per metric, measured over its bound.
     let metrics = [("KL", "kl", "kl_max", false), ("top-1", "top1", "top1_min", true),
         ("confident top-1", "confident_top1", "confident_top1_min", true), ("top-3", "top3_contained", "top3_min", true)];
@@ -255,10 +270,10 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
         let cx = x + cell * (i % columns) as f64;
         let cy = y + 40.0 * (i / columns) as f64;
         let value = num(score, metric);
-        let limit = num(verdict, bound);
+        let limit = if aggregate_only && i >= 2 { None } else { num(verdict, bound) };
         let ok = match (value, limit) { (Some(v), Some(l)) => if *metric == "kl" { v <= l } else { v + 1e-12 >= l }, _ => true };
         let show = |v: f64| if *percent { format!("{:.2}%", v * 100.0) } else { format!("{v:.4}") };
-        doc.text(cx, cy + 10.0, Font::new(10.0, t.muted), label);
+        doc.text(cx, cy + 10.0, Font::new(10.0, t.muted), &format!("{label}{}", if aggregate_only && i >= 2 { " (info)" } else { "" }));
         doc.spans(cx, cy + 28.0, 15.0, Anchor::Start, &[(&value.map_or("N/A".into(), show), if ok { t.ink } else { t.bad }, 600),
             (&limit.map(|l| format!("  {} {}", if *metric == "kl" { "≤" } else { "≥" }, show(l))).unwrap_or_default(), t.muted, 400)]);
     }
@@ -267,6 +282,10 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
         let line = reasons.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ");
         doc.text(x, y + 11.0, Font::new(10.0, t.bad), &super::svg::fit(&line, 10.0, w));
         y += 18.0;
+    }
+    if aggregate_only {
+        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), "Per-window numbers: informational only");
+        y += 17.0;
     }
     let Some(windows) = windows.as_object().filter(|w| !w.is_empty()) else { return y - y0 + 10.0 };
     // Per-window: two aligned strips on one window axis (never two y-scales):
@@ -300,17 +319,19 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
         let cx = px + step * (i as f64 + 0.5);
         let (kl, top1) = (num(s, "kl").unwrap_or(0.0), num(s, "top1").unwrap_or(0.0));
         doc.titled(&format!("{path} window {id}: KL {kl:.5} nat · top-1 {:.2}% · {} rows", top1 * 100.0, s["positions"]));
-        doc.rect(cx - bw / 2.0, ky(kl), bw, (ktop + kh - ky(kl)).max(1.0), (bw / 4.0).min(2.0), if kl > kl_max { t.bad } else { t.series[0] });
-        doc.circle(cx, ty(top1), 3.2, if top1 + 1e-12 < top1_min { t.bad } else { t.series[1] });
+        doc.rect(cx - bw / 2.0, ky(kl), bw, (ktop + kh - ky(kl)).max(1.0), (bw / 4.0).min(2.0), if !aggregate_only && kl > kl_max { t.bad } else { t.series[0] });
+        doc.circle(cx, ty(top1), 3.2, if !aggregate_only && top1 + 1e-12 < top1_min { t.bad } else { t.series[1] });
         doc.rect_attrs(cx - step / 2.0, ktop, step, ttop + th - ktop, 0.0, r#"fill="transparent""#);
         doc.end();
     }
-    for (gy, label, anchor_x, anchor) in [(ky(kl_max), format!("floor {kl_max:.3}"), px + pw, Anchor::End),
-        (ty(top1_min), format!("floor {:.0}%", top1_min * 100.0), px + pw, Anchor::End)] {
+    let bound_label = if aggregate_only { "aggregate bar" } else { "floor" };
+    for (gy, label, anchor_x, anchor) in [(ky(kl_max), format!("{bound_label} {kl_max:.3}"), px + pw, Anchor::End),
+        (ty(top1_min), format!("{bound_label} {:.0}%", top1_min * 100.0), px + pw, Anchor::End)] {
         doc.raw(&format!(r#"<line x1="{px}" x2="{}" y1="{gy}" y2="{gy}" stroke="{}" stroke-width="1" stroke-dasharray="4 3"/>"#, px + pw, t.ink2));
         doc.text(anchor_x, gy - 4.0, Font::new(9.5, t.ink2).anchor(anchor), &label);
     }
-    let note = if w < 480.0 { format!("{} windows · red: past its floor", windows.len()) }
+    let note = if aggregate_only { format!("{} informational windows · hover for values", windows.len()) }
+        else if w < 480.0 { format!("{} windows · red: past its floor", windows.len()) }
         else { format!("{} windows · red: past its floor · hover a window for values", windows.len()) };
     doc.text(px, ttop + th + 14.0, Font::new(9.5, t.muted), &super::svg::fit(&note, 9.5, pw));
     ttop + th + 24.0 - y0
@@ -867,6 +888,34 @@ mod context_load_tests {
             assert!(svg.contains(label), "{label}");
         }
         assert!(!svg.contains("Window text from"), "no ambiguous source line");
+    }
+
+    #[test]
+    fn minimax_panel_labels_window_and_auxiliary_metrics_informational() {
+        let verdict = serde_json::json!({"pass":true, "scoring_policy":"minimax-generated-aggregate",
+            "kl_max":0.05, "top1_min":0.93, "context":{"positions":2020,"kl":1.99,"top1":0.58},
+            "generated":{"positions":2076,"kl":0.026,"top1":0.953,"confident_top1":0.96,"top3_contained":0.98}});
+        let precision = crate::fidelity_precision::Precision::new(4.0, "nvfp4", true, "test").unwrap();
+        let value = serde_json::json!({"decode":{"precision":precision}, "verdict":verdict,
+            "per_window":{"d00":{"positions":512,"kl":0.9,"top1":0.6}}});
+        for width in [360.0, 900.0] {
+            let mut doc = super::Doc::new(width, 900.0);
+            super::fidelity(&mut doc, &super::super::theme::NORMAL, &value, width);
+            let svg = doc.finish();
+            for label in ["generated aggregate only", "Context rows (informational)", "confident top-1 (info)",
+                "top-3 (info)", "Per-window numbers: informational only", "aggregate bar 0.050"] {
+                assert!(svg.contains(label), "{label}");
+            }
+            assert!(!svg.contains("red: past its floor"));
+            assert!(!svg.contains("reference-root format"));
+            if let Some(directory) = std::env::var_os("CUTEAFD_MINIMAX_PANEL_TEST_OUTPUT") {
+                let directory = std::path::PathBuf::from(directory);
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join(format!("minimax-{width}.png")),
+                    super::super::png::png(&svg, 1.0).unwrap()).unwrap();
+                std::fs::write(directory.join(format!("minimax-{width}.svg")), &svg).unwrap();
+            }
+        }
     }
 
     #[test]

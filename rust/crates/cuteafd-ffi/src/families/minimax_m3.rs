@@ -6,6 +6,7 @@ use crate::{
 };
 use std::ffi::c_void;
 pub mod producers;
+pub mod forward;
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid MiniMax MSA program: {0}")]

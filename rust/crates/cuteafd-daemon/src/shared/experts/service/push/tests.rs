@@ -141,6 +141,51 @@ fn namespace_access_failure_declines_all_spark_ranks_before_typed_startup_error(
 }
 
 #[test]
+fn planning_panic_declines_before_typed_rejection_and_releases_peer() -> Result<()> {
+    use cuteafd_transport::worker_selection::{push::coordinate_outcome, WorkerSelectionRejected};
+    let (first_driver, mut first) = control_pair()?;
+    let (second_driver, mut second) = control_pair()?;
+    let driver = std::thread::spawn(move || -> Result<()> {
+        let mut streams = [first_driver, second_driver];
+        let outcome = coordinate_outcome(&mut streams, |_| panic!("declined plan must not prepare"))?;
+        let cuteafd_core::push_outcome::Outcome::Fallback { failures, .. } = outcome else {
+            panic!("panicked rank must decline");
+        };
+        assert!(failures[0].1.contains("fixture planning panic"));
+        // Read through the same typed decoder used during coordinator admission.
+        let error = push::offer_with(&mut streams[0], Err("unused".into())).unwrap_err();
+        let rejected = error.downcast_ref::<WorkerSelectionRejected>().context("typed worker rejection")?;
+        assert!(rejected.reason.contains("Spark push planning panicked: fixture planning panic"));
+        Ok(())
+    });
+    let peer = std::thread::spawn(move || -> Result<()> {
+        assert!(push::offer_with(&mut second, Ok(Offer { rank: 1, host: "peer".into(), arena_bytes: 1,
+            placement: vec![] }))?.is_none());
+        Ok(())
+    });
+    let error = plan_offer_namespace::<()>(std::path::Path::new("/fixture"), &mut first,
+        Ok(("/fixture".into(), "spark".into())), |_, _| panic!("fixture planning panic")).unwrap_err();
+    assert!(error.downcast_ref::<StartupPanic>().is_some());
+    cuteafd_transport::worker_selection::reject_worker_selection(&mut first, &error)?;
+    peer.join().map_err(|_| anyhow::anyhow!("peer panicked"))??;
+    driver.join().map_err(|_| anyhow::anyhow!("driver panicked"))??;
+    Ok(())
+}
+
+#[test]
+fn loading_panic_becomes_typed_bootstrap_rejection() -> Result<()> {
+    let (mut driver, mut worker) = control_pair()?;
+    let error = catch_startup::<()>("weight loading", || panic!("fixture loading panic")).unwrap_err();
+    assert!(error.downcast_ref::<StartupPanic>().is_some());
+    cuteafd_transport::worker_selection::reject_worker_selection(&mut worker, &error)?;
+    let error = push::offer_with(&mut driver, Err("unused".into())).unwrap_err();
+    let rejected = error.downcast_ref::<cuteafd_transport::worker_selection::WorkerSelectionRejected>()
+        .context("typed coordinator rejection")?;
+    assert_eq!(rejected.reason, "Spark weight loading panicked: fixture loading panic");
+    Ok(())
+}
+
+#[test]
 fn required_receive_reports_failure_only_after_the_peer_drain_barrier() -> Result<()> {
     use crate::shared::experts::rtx::push::PushStartupError;
     let (mut driver, mut worker) = control_pair()?;
