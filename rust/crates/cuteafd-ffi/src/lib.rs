@@ -2412,8 +2412,8 @@ impl NativeLibrary {
         let artifact_root = path.as_ref().parent().context("native library has no parent")?.to_owned();
         // The host-ISA variant beside `path` when one is installed (host_isa.rs).
         let path = host_isa::native_library(path.as_ref());
-        let lib = unsafe { Library::new(&path) }
-            .with_context(|| format!("loading native library {}", path.display()))?;
+        let lib = Arc::new(unsafe { Library::new(&path) }
+            .with_context(|| format!("loading native library {}", path.display()))?);
         let rdma_rc_endpoint_try_poll_fn =
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
         sync_expert_hidden(&lib)?;
@@ -2421,7 +2421,7 @@ impl NativeLibrary {
         Ok(Self {
             artifact_root,
             loaded_path: path,
-            lib: ManuallyDrop::new(Arc::new(lib)),
+            lib: ManuallyDrop::new(lib),
             symbols: NativeSymbols::default(),
             quarantine_after_failed_drain: AtomicBool::new(false),
             sync_h2d_staging: Mutex::new(SyncH2DStagingBuffer::default()),

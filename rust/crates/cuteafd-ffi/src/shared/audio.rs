@@ -1,6 +1,6 @@
 //! Resident MiMo audio owner, confined to the shared encoder CUDA thread.
 use libloading::Library;
-use std::{ffi::c_void, fmt, marker::PhantomData, path::Path, rc::Rc};
+use std::{ffi::c_void, fmt, marker::PhantomData, path::Path, rc::Rc, sync::Arc};
 
 pub const AUDIO_ABI: u32 = 1;
 pub const AUDIO_FP32_NUMERICS: u32 = 1;
@@ -173,7 +173,7 @@ type Ledger = unsafe extern "C" fn(*mut c_void, *mut AudioLedger) -> i32;
 type Backend = unsafe extern "C" fn(*mut u8, u64) -> i32;
 
 pub struct NativeAudio {
-    _library: Library,
+    _library: Arc<Library>,
     owner: *mut c_void,
     encode: Encode,
     ledger: Ledger,
@@ -210,7 +210,7 @@ impl NativeAudio {
     pub fn required(path: &Path, spec: &AudioSpec) -> Result<AudioLedger, AudioError> {
         // SAFETY: trusted versioned native ABI, no CUDA context or payload read.
         unsafe {
-            let library = Library::new(crate::host_isa::native_library(path))?;
+            let library = Arc::new(Library::new(crate::host_isa::native_library(path))?);
             crate::memory_ledger::fault::install(&library);
             let required = library.get::<Required>(b"cuteafd_audio_required")?;
             let mut ledger = AudioLedger::default();
@@ -223,7 +223,7 @@ impl NativeAudio {
         let mut buffer = [0u8; 256];
         // SAFETY: exact backend symbol ABI and bounded caller-owned output.
         unsafe {
-            let library = Library::new(crate::host_isa::native_library(path))?;
+            let library = Arc::new(Library::new(crate::host_isa::native_library(path))?);
             crate::memory_ledger::fault::install(&library);
             let backend = library.get::<Backend>(b"cuteafd_audio_backend")?;
             check(backend(buffer.as_mut_ptr(), buffer.len() as u64))?;
@@ -305,7 +305,7 @@ impl NativeAudio {
         // SAFETY: checked immutable host extents, exact ABI symbols and library
         // retained until native owner destruction. Native create/upload drain errors.
         unsafe {
-            let library = Library::new(crate::host_isa::native_library(path))?;
+            let library = Arc::new(Library::new(crate::host_isa::native_library(path))?);
             crate::memory_ledger::fault::install(&library);
             let required = *library.get::<Required>(b"cuteafd_audio_required")?;
             let create = *library.get::<Create>(b"cuteafd_audio_create")?;

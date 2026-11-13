@@ -1,6 +1,6 @@
 //! Resident ViT owner. Construct, use and drop on its dedicated CUDA thread.
 use libloading::Library;
-use std::{ffi::c_void, fmt, marker::PhantomData, path::Path, rc::Rc};
+use std::{ffi::c_void, fmt, marker::PhantomData, path::Path, rc::Rc, sync::Arc};
 
 pub const ENCODER_NUMERICS: u32 = 1;
 pub const NO_VISION_OFFSET: u64 = u64::MAX;
@@ -240,7 +240,7 @@ type Encode = unsafe extern "C" fn(
 type Ledger = unsafe extern "C" fn(*mut c_void, *mut VisionLedger) -> i32;
 
 pub struct NativeVision {
-    _library: Library,
+    _library: Arc<Library>,
     owner: *mut c_void,
     encode: Encode,
     ledger: Ledger,
@@ -259,7 +259,7 @@ impl NativeVision {
     pub fn required(path: &Path, spec: &VisionSpec) -> Result<VisionLedger, VisionError> {
         // SAFETY: trusted library and versioned header ABI; query initializes no CUDA state.
         unsafe {
-            let library = Library::new(crate::host_isa::native_library(path))?;
+            let library = Arc::new(Library::new(crate::host_isa::native_library(path))?);
             crate::memory_ledger::fault::install(&library);
             let required = library.get::<Required>(b"cuteafd_vision_required")?;
             let mut ledger = VisionLedger::default();
@@ -313,7 +313,7 @@ impl NativeVision {
         // SAFETY: caller selects a trusted native library. Every symbol has the
         // versioned header's exact ABI; the library outlives the native owner.
         unsafe {
-            let library = Library::new(crate::host_isa::native_library(path))?;
+            let library = Arc::new(Library::new(crate::host_isa::native_library(path))?);
             crate::memory_ledger::fault::install(&library);
             let required = *library.get::<Required>(b"cuteafd_vision_required")?;
             let create = *library.get::<Create>(b"cuteafd_vision_create")?;

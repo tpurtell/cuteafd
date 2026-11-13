@@ -1,7 +1,7 @@
 //! Failure-only streaming evidence, captured before native constructors clean up.
 use super::{state, Context, Space, CONTEXT};
 use serde::{ser::{SerializeMap, SerializeSeq}, Serialize, Serializer};
-use std::{cell::{Cell, RefCell}, ffi::{c_char, CStr}, fs::{File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock}};
+use std::{cell::{Cell, RefCell}, ffi::{c_char, CStr}, fs::{File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock, RwLock, Weak}};
 use cuteafd_core::memory_layout::{Category, MemoryKind};
 
 const LIMITS: &[&str] = &[
@@ -169,25 +169,65 @@ fn sanitize(text: &str) -> String { text.chars().map(|c| if c.is_ascii_alphanume
 /// Install after loading each native DSO; old native binaries remain usable but
 /// explicitly lack the pre-cleanup hook.
 type LastTag = unsafe extern "C" fn(*mut u32, *mut c_char, usize, *mut usize) -> i32;
-/// Resolved once at install: failure records read the attempted tag without allocating.
-static LAST_TAG: OnceLock<LastTag> = OnceLock::new();
+struct TagModule {
+    library: Weak<libloading::Library>,
+    last: LastTag,
+    ranges: Vec<std::ops::Range<usize>>,
+}
+static TAG_MODULES: RwLock<Vec<TagModule>> = RwLock::new(Vec::new());
+
+/// Discover only at install; the failure path never calls the loader or allocates
+/// registry storage. A native __FILE__ literal identifies its owning DSO.
+fn module_ranges(last: LastTag) -> Vec<std::ops::Range<usize>> {
+    struct Search { address: usize, ranges: Vec<std::ops::Range<usize>> }
+    unsafe extern "C" fn visit(info: *mut libc::dl_phdr_info, _: usize, data: *mut std::ffi::c_void) -> i32 {
+        // SAFETY: dl_iterate_phdr supplies a live header array and our stack Search.
+        let (info, search) = unsafe { (&*info, &mut *data.cast::<Search>()) };
+        // SAFETY: the loader retains all dlpi_phnum headers during this callback.
+        let headers = unsafe { std::slice::from_raw_parts(info.dlpi_phdr, info.dlpi_phnum as usize) };
+        let range = |header: &libc::Elf64_Phdr| {
+            let start = (info.dlpi_addr as usize).checked_add(header.p_vaddr as usize)?;
+            Some(start..start.checked_add(header.p_memsz as usize)?)
+        };
+        if !headers.iter().filter(|h| h.p_type == libc::PT_LOAD)
+            .filter_map(range).any(|r| r.contains(&search.address)) { return 0; }
+        search.ranges.extend(headers.iter().filter(|h| h.p_type == libc::PT_LOAD).filter_map(range));
+        1
+    }
+    let mut search = Search { address: last as usize, ranges: Vec::new() };
+    // SAFETY: visit uses only loader-owned headers and this live, exclusive Search.
+    unsafe { libc::dl_iterate_phdr(Some(visit), (&mut search as *mut Search).cast()); }
+    search.ranges
+}
 
 /// The tag the failing thread last attempted: kind label, owner (in `buffer`),
 /// and whether that owner exceeded the fixed failure-path buffer.
-fn attempted_tag(buffer: &mut [u8; 512]) -> (Option<&'static str>, Option<&str>, bool) {
-    let Some(last) = LAST_TAG.get() else { return (None, None, false) };
+fn attempted_tag(file: *const c_char, buffer: &mut [u8; 512]) -> (Option<&'static str>, Option<&str>, bool) {
+    // Never wait behind install-time allocation (or a reentrant allocator failure).
+    // Unknown/busy source is null, not another module's most recent owner.
+    let source = TAG_MODULES.try_read().ok().and_then(|modules| modules.iter().rev()
+        .filter(|module| module.ranges.iter().any(|range| range.contains(&(file as usize))))
+        .find_map(|module| module.library.upgrade().map(|library| (library, module.last))));
+    let Some((library, last)) = source else { return (None, None, false) };
     let (mut kind, mut required) = (0u32, 0usize);
-    // SAFETY: native writes the kind, the required size and at most `buffer.len()` bytes.
+    // SAFETY: library keeps this function mapped for its entire call. Native
+    // writes the kind, required size and at most buffer.len() bytes.
     let status = unsafe { last(&mut kind, buffer.as_mut_ptr().cast(), buffer.len(), &mut required) };
+    drop(library);
     let kind = MemoryKind::from_raw(kind).map(MemoryKind::label);
     if status != 0 { return (kind, None, required > buffer.len()); }
     let end = buffer.iter().position(|&b| b == 0).unwrap_or(0);
     (kind, std::str::from_utf8(&buffer[..end]).ok().filter(|o| !o.is_empty()), false)
 }
 
-pub(crate) fn install(library: &libloading::Library) {
+pub(crate) fn install(library: &Arc<libloading::Library>) {
     // SAFETY: optional versioned export; a library without it reports no attempted tag.
-    if let Ok(last) = unsafe { library.get::<LastTag>(b"cuteafd_last_allocation_tag") } { let _ = LAST_TAG.set(*last); }
+    if let Ok(last) = unsafe { library.get::<LastTag>(b"cuteafd_last_allocation_tag") } {
+        let module = TagModule { library: Arc::downgrade(library), last: *last, ranges: module_ranges(*last) };
+        let mut modules = TAG_MODULES.write().unwrap_or_else(|e| e.into_inner());
+        modules.retain(|entry| entry.library.strong_count() != 0 && !Weak::ptr_eq(&entry.library, &module.library));
+        modules.push(module);
+    }
     type Install = unsafe extern "C" fn(extern "C" fn(*const NativeFailure));
     // SAFETY: optional symbol implements the bundled POD callback ABI. The
     // callback is process-static and never unwinds into the native caller.
@@ -269,7 +309,7 @@ fn trigger_record(raw: &NativeFailure, id: u64, linked: Option<u64>, status: &st
         code: i32, requested_bytes: Option<usize>, status: &'a str,
         attempted_kind: Option<&'static str>, attempted_owner: Option<&'a str>, attempted_owner_truncated: bool }
     let mut owner = [0u8; 512];
-    let (attempted_kind, attempted_owner, attempted_owner_truncated) = attempted_tag(&mut owner);
+    let (attempted_kind, attempted_owner, attempted_owner_truncated) = attempted_tag(raw.file, &mut owner);
     let record = Record { sequence: id, linked_to: linked, api: native_text(raw.api),
         domain: native_text(raw.domain), code: raw.code,
         requested_bytes: (raw.bytes_known != 0).then_some(raw.bytes), status,
@@ -628,6 +668,99 @@ mod tests {
             .join(format!("memory-failure-tests-{}", std::process::id()));
         initialize(&root, "fixture-host", "rank3").unwrap();
     }
+    #[test]
+    fn tag_callback_survives_module_retirement_and_attributes_only_its_source() -> anyhow::Result<()> {
+        const CHILD: &str = "CUTEAFD_TEST_TAG_MODULE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "memory_ledger::fault::tests::tag_callback_survives_module_retirement_and_attributes_only_its_source", "--nocapture"])
+                .env(CHILD, "1").output()?;
+            assert!(output.status.success(), "{:?}\n{}\n{}", output.status,
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return Ok(());
+        }
+        let _guard = super::super::test_guard();
+        setup(); clear_failure();
+        let first = crate::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = first.load()?;
+        drop(library);
+        assert!(!first.resident()?, "diagnostics must not permanently pin the first DSO");
+        trigger_record(&fixture(c"retired-module", c"cuda", 2, Some(1), 0), sequence(), None, "fixture");
+        let second = crate::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = second.load()?;
+        // SAFETY: private fixture exports synchronously copy the tag and emit a
+        // POD failure whose __FILE__ literal lives in this module.
+        unsafe {
+            let tag = library.lib.get::<unsafe extern "C" fn(u32, *const c_char) -> i32>(b"fixture_attempt_tag")?;
+            assert_eq!(tag(MemoryKind::Kv.as_raw(), c"test/second-library".as_ptr()), 1);
+            library.lib.get::<unsafe extern "C" fn()>(b"fixture_emit_memory_failure")?();
+        }
+        let report = take_failure().expect("second DSO failure is captured");
+        // A Rust-origin failure cannot inherit even the most recent live DSO's tag.
+        trigger_record(&fixture(c"unknown-module", c"cuda", 2, Some(1), 0), sequence(), None, "fixture");
+        let text = std::fs::read_to_string(&TRIGGERS.get().unwrap().1)?;
+        let rows: Vec<serde_json::Value> = text.lines().map(serde_json::from_str).collect::<Result<_, _>>()?;
+        let native = rows.iter().find(|r| r["api"] == "fixture-allocator").unwrap();
+        assert_eq!(native["attempted_owner"], "test/second-library");
+        assert_eq!(native["attempted_kind"], "kv");
+        let unknown = rows.iter().find(|r| r["api"] == "unknown-module").unwrap();
+        assert!(unknown["attempted_owner"].is_null());
+        assert!(unknown["attempted_kind"].is_null());
+        drop(library);
+        assert!(!second.resident()?, "diagnostics must not permanently pin the second DSO");
+        let _ = std::fs::remove_file(&report.path);
+        Ok(())
+    }
+
+    #[test]
+    fn tag_callback_holds_module_across_concurrent_last_owner_drop() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let _guard = super::super::test_guard();
+        let fixture = crate::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        for _ in 0..16 {
+            // SAFETY: this test just compiled the trusted CPU-only ABI fixture.
+            let library = Arc::new(unsafe { libloading::Library::new(fixture.module_path())? });
+            install(&library);
+            let entered = AtomicI32::new(0);
+            let release = AtomicI32::new(0);
+            // SAFETY: gate storage outlives the joined thread and the entire DSO call.
+            let file = unsafe {
+                library.get::<unsafe extern "C" fn(*const AtomicI32, *const AtomicI32)>(b"fixture_tag_call_gate")?(&entered, &release);
+                library.get::<unsafe extern "C" fn() -> *const c_char>(b"fixture_failure_file")?() as usize
+            };
+            let weak = Arc::downgrade(&library);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let mut bytes = [0u8; 512];
+                    assert_eq!(attempted_tag(file as *const c_char, &mut bytes), (None, None, false));
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while entered.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let called = entered.load(Ordering::Acquire) != 0;
+                drop(library);
+                let retained = weak.strong_count();
+                release.store(1, Ordering::Release);
+                worker.join().unwrap();
+                assert!(called, "last-tag call did not enter before deadline");
+                assert_eq!(retained, 1, "the in-flight call alone retains the module");
+            });
+            assert!(weak.upgrade().is_none());
+            assert!(!fixture.resident()?, "module must unload after last-tag returns");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tag_callback_returns_unknown_without_waiting_for_registry_writer() {
+        let _guard = super::super::test_guard();
+        let _writer = TAG_MODULES.write().unwrap();
+        let mut bytes = [0u8; 512];
+        assert_eq!(attempted_tag(c"unknown".as_ptr(), &mut bytes), (None, None, false));
+    }
+
     #[test]
     fn native_failures_preserve_live_backings_raw_status_and_timestamp() {
         let _guard = super::super::test_guard();
