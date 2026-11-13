@@ -2,12 +2,16 @@ use super::*;
 use crate::plan::{self, testing, PlanOptions};
 
 fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
+    fixture_with_experts(4)
+}
+
+fn fixture_with_experts(experts: usize) -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = crate::families::minimax_m3::config::tests::release_config();
     // Use the checkpoint's real shape recipe without writing 89k sparse records per test.
     let mut small = cfg;
     small["text_config"]["num_hidden_layers"] = 4.into();
-    small["text_config"]["num_local_experts"] = 4.into();
+    small["text_config"]["num_local_experts"] = experts.into();
     for key in ["moe_layer_freq"] {
         small["text_config"][key].as_array_mut().unwrap().truncate(4);
     }
@@ -42,9 +46,9 @@ fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
             plain(format!("{p}self_attn.{norm}.weight"), "BF16", vec![128]);
         }
         if layer == 3 {
-            plain(format!("{p}block_sparse_moe.gate.weight"), "F32", vec![4, 6144]);
-            plain(format!("{p}block_sparse_moe.e_score_correction_bias"), "F32", vec![4]);
-            for e in 0..4 {
+            plain(format!("{p}block_sparse_moe.gate.weight"), "F32", vec![experts, 6144]);
+            plain(format!("{p}block_sparse_moe.e_score_correction_bias"), "F32", vec![experts]);
+            for e in 0..experts {
                 for (w, n, k) in [("w1", 3072, 6144), ("w3", 3072, 6144), ("w2", 6144, 3072)] {
                     let stem = format!("{p}block_sparse_moe.experts.{e}.{w}");
                     plain(format!("{stem}.weight_packed"), "U8", vec![n, k / 2]);
@@ -59,6 +63,23 @@ fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     small.as_object_mut().unwrap().remove("vision_config");
     testing::write_snapshot(dir.path(), &small, &tensors, None);
     (dir, small, tensors)
+}
+
+pub(crate) fn concurrency_matrix_snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
+    use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
+    let (dir, config, _) = fixture_with_experts(128);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = MiniMaxM3Config::from_hf(&config).unwrap();
+    let weights = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &[0; 4]).unwrap();
+    let mut programs = dense_manifest(&weights[0])["programs"].as_array().unwrap().clone();
+    for name in ["minimax_msa_programs", "minimax_producer_programs", "minimax_forward_programs"] {
+        let fixture: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!(
+            "{}/../cuteafd-ffi/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap();
+        programs.extend(fixture["programs"].as_array().unwrap().clone());
+    }
+    let manifest = dir.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, serde_json::json!({"programs": programs}).to_string()).unwrap();
+    (dir, manifest)
 }
 
 #[test]

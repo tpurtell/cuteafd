@@ -734,8 +734,21 @@ fn check_concurrency_plan_cell(
         let cache = report.cache_requirements.as_ref().unwrap();
         assert_eq!(u64::from(cache.concurrency), c);
         assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
-        assert!(report.fits && report.placement_supported && report.executable(),
+        assert!(report.fits && report.placement_supported,
             "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+        let status = family::registry().iter().find(|entry| entry.id() == family).unwrap().runtime();
+        assert_eq!(report.runtime, Some(status));
+        assert_eq!(report.executable(), status == family::RuntimeStatus::Serving,
+            "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+    }
+}
+
+#[test]
+fn release_matrix_excludes_planned_families() {
+    let matrix: Value = serde_json::from_str(include_str!("../../../../../benchmarks/current-matrix.json")).unwrap();
+    for entry in family::registry().iter().filter(|entry| entry.runtime() == family::RuntimeStatus::Planned) {
+        assert!(matrix["cells"].as_array().unwrap().iter().all(|cell| cell["family"] != entry.id()),
+            "Planned family {} must not have a release card", entry.id());
     }
 }
 
@@ -753,6 +766,15 @@ fn boot_concurrency_full_plan_matrix() {
     }
     type Builder = Box<dyn FnOnce() -> Case + Send>;
     let builders: Vec<Builder> = vec![
+        Box::new(|| {
+            let (dir, manifest) = families::minimax::tests::concurrency_matrix_snapshot();
+            let mut options = wave_plan_options(dir.path(), 4);
+            options.attention_placement = None;
+            options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
+            Case { family: "minimax_m3", label: "minimax_m3", dir,
+                topologies: &[(1, 2), (2, 2), (1, 4), (2, 4), (1, 6), (2, 6), (1, 8), (2, 8)],
+                concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: Some(options) }
+        }),
         Box::new(|| {
             let dir = tempfile::tempdir().unwrap();
             write_kimi_snapshot(dir.path(), true);
@@ -835,6 +857,7 @@ fn boot_concurrency_full_plan_matrix() {
                         for &c in case.concurrencies {
                             let mut options = case.base_options.clone()
                                 .unwrap_or_else(|| wave_plan_options(case.dir.path(), ranks));
+                            options.placement = ExpertPlacement::from_spark_ranks(ranks);
                             if family == "qwen4" && gpus == 2 && ranks == 0 {
                                 options.attention_placement = Some(AttentionPlacement::Layers);
                             }
@@ -869,7 +892,7 @@ fn boot_concurrency_full_plan_matrix() {
     });
     let seen = seen.into_inner().unwrap();
     for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2",
-        "qwen4", "qwen3_5", "kimi_k3", "step5", "muse_spark", "mistral_large4"] {
+        "qwen4", "qwen3_5", "kimi_k3", "step5", "muse_spark", "mistral_large4", "minimax_m3"] {
         assert!(seen.contains(family), "missing concurrency family {family}");
     }
     for entry in family::registry() {

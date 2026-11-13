@@ -12,7 +12,7 @@ use crate::families::minimax_m3::config::{MiniMaxM3Config, MiniMaxM3DsparkConfig
 use crate::plan::{checkpoint::Checkpoint, family::*, format::{self, QuantOperand, ScaleEncoding}, names::indexed, spec::*};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub struct MiniMaxM3;
 pub static MINIMAX_M3: MiniMaxM3 = MiniMaxM3;
