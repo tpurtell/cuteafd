@@ -117,8 +117,22 @@ pub(crate) struct ServingRequest<'p> {
     pub identity: u64,
     pub kind: ExpertV2SourceKind,
     pub placement: &'p mut Placement,
-    /// Full token positions, including any restored prefix.
+    /// Absolute first position of this append; tokens contain no dummy history.
+    pub start: usize,
     pub tokens: &'p [u32],
+    /// Absolute rows whose heads the caller consumes before scratch reuse.
+    pub heads: Range<usize>,
+}
+
+impl ServingRequest<'_> {
+    fn end(&self) -> Result<usize> {
+        self.start.checked_add(self.tokens.len()).context("MiniMax append extent overflow")
+    }
+    fn tokens_at(&self, span: Range<usize>) -> Result<&[u32]> {
+        ensure!(span.start >= self.start && span.end <= self.end()? && span.start <= span.end,
+            "MiniMax append slice differs from absolute positions");
+        Ok(&self.tokens[span.start - self.start..span.end - self.start])
+    }
 }
 
 fn ordered_rank(streams: &[Vec<usize>]) -> Result<()> {
@@ -132,7 +146,7 @@ fn appends<'p>(unit: &Unit, requests: &'p [ServingRequest<'_>]) -> Result<Vec<Pl
     unit.segments.iter().map(|segment| {
         let request = requests.get(segment.sequence).context("MiniMax packed sequence missing")?;
         ensure!(request.identity != 0 && request.placement.len <= segment.tokens.start
-            && segment.tokens.end <= request.tokens.len(), "MiniMax packed request frontier/tokens differ");
+            && request.start <= segment.tokens.start && segment.tokens.end <= request.end()?, "MiniMax packed request frontier/tokens differ");
         Ok(Placement { len: segment.tokens.start, ..request.placement.clone() })
     }).collect()
 }
@@ -167,7 +181,7 @@ trait SlotArithmetic {
     fn router(&mut self, layer: usize, unit: &Unit) -> Result<()>;
     fn ffn(&mut self, layer: usize, unit: &Unit, shared: bool) -> Result<()>;
     fn join(&mut self, unit: &Unit) -> Result<()>;
-    fn head(&mut self, unit: &Unit) -> Result<()>;
+    fn head(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()>;
     fn commit(&mut self, unit: &Unit, requests: &mut [ServingRequest<'_>]) -> Result<()>;
 }
 
@@ -175,6 +189,7 @@ struct NativeSlots<'s, 'a, F> {
     storage: &'s Storage<'a>,
     cfg: &'s MiniMaxM3Config,
     consume: F,
+    publish: bool,
 }
 impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic for NativeSlots<'_, '_, F> {
     fn begin(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()> {
@@ -182,8 +197,9 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         let rank = &mut state.ranks[0];
         prepare_unit(&rank.bank, &mut rank.prefill[unit.slot], unit, requests)?;
         let owner = self.storage.ranks[0].prefill[unit.slot].borrow();
-        let tokens = unit.segments.iter().flat_map(|segment|
-            requests[segment.sequence].tokens[segment.tokens.clone()].iter().copied()).collect::<Vec<_>>();
+        let tokens = unit.segments.iter().map(|segment|
+            requests[segment.sequence].tokens_at(segment.tokens.clone())).collect::<Result<Vec<_>>>()?
+            .into_iter().flatten().copied().collect::<Vec<_>>();
         let capacity = state.capacity.prefill.rows as usize;
         Head::embed_tokens(self.cfg, capacity, &self.storage.embedding, &tokens, &owner.stream,
             super::cache::view(owner.plane("route_ids")?, 0, capacity * 4)?,
@@ -201,7 +217,17 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
     }
     fn router(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let rank = &self.storage.ranks[0];
-        rank.prefill[unit.slot].borrow_mut().router(&rank.kernels, &rank.weights, layer, unit.rows.len())
+        let owner = rank.prefill[unit.slot].borrow();
+        owner.router(&rank.kernels, &rank.weights, layer, unit.rows.len())?;
+        if let Some(usage) = &self.storage.usage {
+            let tally = usage.routes(owner.stream.device.id, layer,
+                cuteafd_ffi::expert_usage::UsagePhase::Prefill)?;
+            // SAFETY: router initialized retained route ids on this tally's
+            // ordered owner stream; the shared executor pins the unit.
+            unsafe { tally.record(owner.plane("route_ids")?.ptr, unit.rows.len(), None,
+                u32::MAX, true, owner.stream.raw)?; }
+        }
+        Ok(())
     }
     fn ffn(&mut self, layer: usize, unit: &Unit, shared: bool) -> Result<()> {
         let rank = &self.storage.ranks[0];
@@ -212,15 +238,18 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         let rank = &self.storage.ranks[0];
         rank.prefill[unit.slot].borrow().join_routed(&rank.kernels, unit.rows.len())
     }
-    fn head(&mut self, unit: &Unit) -> Result<()> {
+    fn head(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()> {
         let rank = &self.storage.ranks[0];
         let residual = rank.prefill[unit.slot].borrow().plane("residual")?;
         for segment in &unit.segments {
             if !segment.head { continue; }
-            let input = super::cache::view(residual, segment.rows.start * self.cfg.hidden * 4,
-                segment.rows.len() * self.cfg.hidden * 4)?;
-            self.storage.head.project_spans(&rank.weights, input, segment.rows.len(), &mut |offset, logits| {
-                let first = segment.tokens.start + offset;
+            let requested = &requests[segment.sequence].heads;
+            let span = segment.tokens.start.max(requested.start)..segment.tokens.end.min(requested.end);
+            if span.is_empty() { continue; }
+            let row = segment.rows.start + span.start - segment.tokens.start;
+            let input = super::cache::view(residual, row * self.cfg.hidden * 4, span.len() * self.cfg.hidden * 4)?;
+            self.storage.head.project_spans(&rank.weights, input, span.len(), &mut |offset, logits| {
+                let first = span.start + offset;
                 (self.consume)(segment.sequence, first..first + logits.rows, logits)
             })?;
         }
@@ -231,7 +260,9 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
             let request = &mut requests[segment.sequence];
             ensure!(request.placement.len == segment.tokens.start, "MiniMax packed commit is out of order");
             let mut next = Placement { len: segment.tokens.end, ..request.placement.clone() };
-            self.storage.prefix.bind(&mut next).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if self.publish {
+                self.storage.prefix.bind(&mut next).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
             *request.placement = next;
         }
         Ok(())
@@ -282,7 +313,7 @@ impl<'t, 'a, A: SlotArithmetic> PrefillHooks for ServingHooks<'_, '_, 't, 'a, A>
         ticket.land()?;
         self.arithmetic.join(unit)
     }
-    fn end_unit(&mut self, unit: &Unit) -> Result<()> { self.arithmetic.head(unit) }
+    fn end_unit(&mut self, unit: &Unit) -> Result<()> { self.arithmetic.head(unit, self.requests) }
     fn commit_unit(&mut self, unit: &Unit) -> Result<()> { self.arithmetic.commit(unit, self.requests) }
 }
 
@@ -306,7 +337,7 @@ impl<'a> ServingPrefill<'a> {
         Ok(Self { dispatchers, bindings, next_identity: 1, version, terminal: false })
     }
     pub fn execute(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
-        schedule: &Requests, requests: &mut [ServingRequest<'_>],
+        schedule: &Requests, requests: &mut [ServingRequest<'_>], publish: bool,
         consume: impl FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>) -> Result<()> {
         ensure!(!self.terminal, "MiniMax packed serving is terminal");
         ordered_rank(&storage.ranks.iter().map(|rank| std::iter::once(rank.decode.borrow().stream.raw as usize)
@@ -314,22 +345,26 @@ impl<'a> ServingPrefill<'a> {
         ensure!(schedule.capacity == storage.requests.borrow().capacity && schedule.layers == cfg.layers
             && schedule.waves == storage.ranks[0].prefill.len() && self.bindings.len() == cfg.layers,
             "MiniMax packed schedule differs from retained owners");
-        let rows = requests.iter().map(|request| RequestRows { slot: request.placement.slot,
-            start: request.placement.len, rows: request.tokens.len().saturating_sub(request.placement.len) }).collect::<Vec<_>>();
+        let rows = requests.iter().map(|request| {
+            ensure!(request.start == request.placement.len && request.heads.start >= request.start
+                && request.heads.end <= request.end()? && request.heads.start <= request.heads.end,
+                "MiniMax append/head frontier differs from placement");
+            Ok(RequestRows { slot: request.placement.slot, start: request.start, rows: request.tokens.len() })
+        }).collect::<Result<Vec<_>>>()?;
         let units = schedule.verify_units(&rows)?;
         let mut identities = BTreeSet::new();
         let mut writable = BTreeSet::new();
         for request in requests.iter() {
             ensure!(request.identity != 0 && identities.insert(request.identity), "MiniMax duplicate request identity");
-            storage.requests.borrow().ranks[0].bank.validate(request.placement, request.tokens.len())?;
-            for position in request.placement.len..request.tokens.len() {
+            storage.requests.borrow().ranks[0].bank.validate(request.placement, request.end()?)?;
+            for position in request.start..request.end()? {
                 ensure!(writable.insert((request.placement.units[position / super::cache::PAGE_ROWS],
                     position % super::cache::PAGE_ROWS)), "MiniMax requests alias writable cache slots");
             }
         }
         let sources = units.iter().map(|unit|
             storage.ranks[0].prefill[unit.slot].borrow().routed_rows(unit.rows.len())).collect::<Result<Vec<_>>>()?;
-        let mut arithmetic = NativeSlots { storage, cfg, consume };
+        let mut arithmetic = NativeSlots { storage, cfg, consume, publish };
         let result = run_prefill_units(&mut ServingHooks { arithmetic: &mut arithmetic, sources: &sources,
             dispatchers: &self.dispatchers, bindings: &self.bindings, requests,
             next_identity: &mut self.next_identity, version: self.version }, &units, schedule.waves);
@@ -342,6 +377,90 @@ impl<'a> ServingPrefill<'a> {
             unit.borrow().stream.drain_or_abort("MiniMax packed serving submission");
         }
         result
+    }
+
+    /// Native one-token decode on admitted boot-C storage. Attention and the
+    /// routed sections remain eager: Boundary performs host-side lease state
+    /// transitions that must execute on every replay, not only during capture.
+    pub fn decode(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
+        schedule: &Requests, requests: &[ServingRequest<'_>]) -> Result<DeviceLogits> {
+        ensure!(!self.terminal, "MiniMax decode serving is terminal");
+        ordered_rank(&storage.ranks.iter().map(|rank| std::iter::once(rank.decode.borrow().stream.raw as usize)
+            .chain(rank.prefill.iter().map(|owner| owner.borrow().stream.raw as usize)).collect()).collect::<Vec<_>>())?;
+        let rows = schedule.decode_rows(&requests.iter().map(|request| RequestRows {
+            slot: request.placement.slot, start: request.start, rows: request.tokens.len(),
+        }).collect::<Vec<_>>())?;
+        let rank = &storage.ranks[0];
+        let result = (|| {
+            let mut state = storage.requests.borrow_mut();
+            ensure!(state.capacity == schedule.capacity, "MiniMax decode capacity differs from storage");
+            let mut identities = BTreeSet::new();
+            for request in requests {
+                ensure!(request.start == request.placement.len && request.identity != 0
+                    && identities.insert(request.identity), "MiniMax decode identity/frontier differs");
+            }
+            let placements = requests.iter().map(|request| &*request.placement).collect::<Vec<_>>();
+            let cache = &mut state.ranks[0];
+            cache.bank.prepare_decode(&mut cache.decode, &placements)?;
+            let ids = state.tokens.upload(&requests.iter().map(|request| request.tokens[0]).collect::<Vec<_>>())?;
+            {
+                let owner = rank.decode.borrow();
+                // SAFETY: dedicated retained ids and scratch are ordered on the
+                // single decode stream; all supplied token rows are initialized.
+                unsafe { Head::embed_device_ids(cfg, state.capacity.decode.rows as usize,
+                    &storage.embedding, rows, &owner.stream, ids, owner.dense.producer_destination(),
+                    owner.plane("residual")?)?; }
+            }
+            let source = rank.decode.borrow().routed_rows(rows)?;
+            for layer in 0..cfg.layers {
+                let cache = &state.ranks[0];
+                let request = cache.bank.decode_request(&cache.decode, layer)?;
+                // SAFETY: metadata covers private writable rows on this ordered
+                // retained stream; the backend validates actual shared-pool refs.
+                unsafe { rank.decode.borrow_mut().decode(&rank.kernels, &rank.weights,
+                    &rank.layout, layer, request)?; }
+                if let Some(binding) = self.bindings[layer] {
+                    rank.decode.borrow().router(&rank.kernels, &rank.weights, layer, rows)?;
+                    if let Some(usage) = &storage.usage {
+                        let owner = rank.decode.borrow();
+                        let tally = usage.routes(owner.stream.device.id, layer,
+                            cuteafd_ffi::expert_usage::UsagePhase::Decode)?;
+                        // SAFETY: router initialized retained route ids; the tally
+                        // and this arithmetic owner share the same ordered stream.
+                        unsafe { tally.record(owner.plane("route_ids")?.ptr, rows, None, u32::MAX, true, owner.stream.raw)?; }
+                    }
+                    let identity = self.next_identity;
+                    self.next_identity = identity.checked_add(1).context("MiniMax dispatch identity exhausted")?;
+                    let dispatch = DispatchRows { request_id: identity, placement_version: self.version,
+                        rows: requests.iter().enumerate().map(|(row, request)| ExpertProtocolV2RowDescriptor {
+                            row_id: row as u64, source_kind: request.kind, source_request_id: request.identity,
+                            token_position: request.start as u64, route_offset: (row * 4) as u32, route_count: 4,
+                        }).collect() };
+                    let ticket = self.dispatchers[binding.dispatcher].begin(layer, &source, dispatch)?;
+                    rank.decode.borrow_mut().ffn(&rank.kernels, &rank.weights, &rank.layout, layer, rows, true)?;
+                    ticket.land()?;
+                    rank.decode.borrow().join_routed(&rank.kernels, rows)?;
+                } else {
+                    rank.decode.borrow_mut().ffn(&rank.kernels, &rank.weights, &rank.layout, layer, rows, false)?;
+                }
+            }
+            let residual = rank.decode.borrow().plane("residual")?;
+            storage.head.project_device(&rank.weights, residual, rows)
+        })();
+        if result.is_err() {
+            self.terminal = true;
+            self.dispatchers.clear();
+        }
+        rank.decode.borrow().stream.drain_or_abort("MiniMax eager decode submission");
+        result
+    }
+
+    pub fn drain(&self, storage: &Storage<'a>) -> Result<()> {
+        for rank in &storage.ranks {
+            rank.decode.borrow().stream.drain()?;
+            for owner in &rank.prefill { owner.borrow().stream.drain()?; }
+        }
+        storage.prefix.drain().map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 }
 
@@ -424,8 +543,9 @@ mod tests {
         fn begin(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()> {
             ensure!(self.live.insert(unit.slot, unit.index).is_none(), "model slot reused before commit");
             prepare_unit(&self.bank, &mut self.metadata[unit.slot], unit, requests)?;
-            self.slots[unit.slot].values = unit.segments.iter().flat_map(|segment|
-                requests[segment.sequence].tokens[segment.tokens.clone()].iter().map(|&token| token as u8)).collect();
+            self.slots[unit.slot].values = unit.segments.iter().map(|segment|
+                requests[segment.sequence].tokens_at(segment.tokens.clone())).collect::<Result<Vec<_>>>()?
+                .into_iter().flatten().map(|&token| token as u8).collect();
             Ok(())
         }
         fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
@@ -487,7 +607,7 @@ mod tests {
             slot.boundary.joined();
             Ok(())
         }
-        fn head(&mut self, unit: &Unit) -> Result<()> {
+        fn head(&mut self, unit: &Unit, _: &[ServingRequest<'_>]) -> Result<()> {
             for segment in &unit.segments {
                 for tile in crate::shared::probe::head_spans(segment.rows.len(), 3)? {
                     let first = segment.tokens.start + tile.start;
@@ -536,11 +656,12 @@ mod tests {
         let tokens = [vec![37; 270], vec![71; 133], vec![113; 2]];
         let starts = placements.iter().map(|placement| placement.len).collect::<Vec<_>>();
         let mut requests = placements.iter_mut().zip(&tokens).enumerate().map(|(index, (placement, tokens))|
-            ServingRequest { identity: 19 + index as u64, kind: ExpertV2SourceKind::Prefill, placement, tokens }).collect::<Vec<_>>();
+            ServingRequest { identity: 19 + index as u64, kind: ExpertV2SourceKind::Prefill,
+                start: placement.len, tokens: &tokens[placement.len..], heads: placement.len..tokens.len(), placement }).collect::<Vec<_>>();
         let schedule = Requests::new(capacity, 320, 2, 3)?;
         let units = schedule.verify_units(&requests.iter().map(|request| RequestRows {
             slot: request.placement.slot, start: request.placement.len,
-            rows: request.tokens.len() - request.placement.len }).collect::<Vec<_>>())?;
+            rows: request.tokens.len() }).collect::<Vec<_>>())?;
         ensure!(units.len() > 3 && units.iter().any(|unit| unit.segments.len() == 3), "model lacks packing/slot reuse");
         let slots = (0..3).map(|_| ModelSlot::new(device, 64)).collect::<Result<Vec<_>>>()?;
         let sources = units.iter().map(|unit| slots[unit.slot].source(stream.clone(), unit.rows.len())).collect::<Result<Vec<_>>>()?;
