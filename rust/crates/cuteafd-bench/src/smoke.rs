@@ -2182,8 +2182,10 @@ mod tests {
         let e = Entry { name: "cold".into(), config: Some(config.display().to_string()),
             prelaunch: Some(Hook { argv: vec!["false".into()], timeout_s: 2, required: true,
                 cleanup: None, finish_timeout_s: None }), ..Entry::default() };
-        // No run.sh exists: the hook failure must precede any spawn attempt.
-        let outcome = run_entry(&e, root.path(), root.path(), &configs, &logs, "smoke", "test", false, &Arc::new(Inflight::default()));
+        // No run.sh exists: the hook failure must precede any spawn attempt. Fake tools keep
+        // the cleanup-marker check off the host's real instances directory.
+        let inflight = Arc::new(Inflight { tools: fake_tools(root.path(), &root.path().join("calls.log")), ..Inflight::default() });
+        let outcome = run_entry(&e, root.path(), root.path(), &configs, &logs, "smoke", "test", false, &inflight);
         assert_eq!(outcome.status, "failed");
         assert!(outcome.error.unwrap().contains("prelaunch hook failed before launcher"));
         assert!(outcome.launch_s.is_none());
