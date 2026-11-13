@@ -118,6 +118,35 @@ pub(crate) fn admit(contract: &Contract, free: u64, total: u64, host: (u64, u64)
     Ok(facts)
 }
 
+/// Serving admission (#1856 H1): the same fact gatherer and shared recipe as
+/// `cuteafd plan --layout`, with one measured CUDA sample per coordinator GPU
+/// in place of the planned forecast. Startup (stream D) calls this before any
+/// target, cache, lane or link allocation and allocates exactly the admitted
+/// owners; serve itself stays refused until the minimum serving contract
+/// qualifies (`commands/family.rs`).
+pub(crate) mod serve_admission {
+    use anyhow::{Context, Result};
+    use cuteafd_loader::families::minimax_m3::admission::{gather, Coordinator, FactsRequest};
+    use cuteafd_loader::placement::families::minimax_m3::{self as shared, AdmittedMiniMax};
+
+    /// One GPU's pre-weight sample: (physical total, logical cap, free, code not yet loaded).
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Sample { pub total: u64, pub cap: u64, pub free: u64, pub pending_code: u64 }
+
+    pub(crate) fn admit(mut facts: FactsRequest<'_>, samples: &[Sample],
+        onboard: cuteafd_loader::placement::Onboard) -> Result<AdmittedMiniMax> {
+        facts.coordinator = Coordinator::Measured {
+            samples: samples.iter().map(|s| (s.total, s.cap, s.free)).collect(),
+            loaded_code: samples.iter().map(|s| s.pending_code).collect() };
+        let inputs = gather(&facts).map_err(|refused| anyhow::anyhow!("{}; {}", refused.what, refused.how))?;
+        let request = shared::request(inputs.context, facts.pool_tokens, onboard, facts.prefill,
+            cuteafd_loader::placement::planner::Operation::Serving, inputs.resident_weight_limit, facts.replies);
+        let admitted = inputs.admit(request).context("MiniMax serving admission")?;
+        cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "minimax_m3");
+        Ok(admitted)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
