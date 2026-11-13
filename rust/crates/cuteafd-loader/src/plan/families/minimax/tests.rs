@@ -468,7 +468,7 @@ fn installed_minimax_headers_match_native_contract() {
 
 fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minimax_m3::MiniMaxInputs {
     use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
-    use crate::placement::families::minimax_m3::{self as shared, LayerExperts, LocalPackage, MiniMaxInputs, SparkCharge};
+    use crate::placement::families::minimax_m3::{self as shared, ExpertBacking, LocalPackage, MiniMaxInputs, SparkCharge};
     use crate::placement::planner::{Context, PrefillShape, serving};
     let (dir, small, _) = fixture();
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
@@ -503,8 +503,13 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
     let mut release = cfg.clone(); release.experts = 128;
     MiniMaxInputs { cfg: release, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
         maximum_pool_tokens: 4 << 20, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
-        manifest, routed: routed.clone(), experts: vec![LayerExperts { whole: 1 << 30, half: [1 << 29; 2] }; routed.len()],
-        local: LocalPackage::Installed { workspace: [64 << 20, if gpus == 2 { 64 << 20 } else { 0 }] },
+        manifest, routed: routed.clone(),
+        expert_backings: (0..=routed.len()).map(|count| if count == 0 { Vec::new() } else {
+            let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+            (0..gpus).map(|gpu| ExpertBacking::plan(catalog.fp8().unwrap(), &routed[..count],
+                gpus, gpu, gpu as i32).unwrap()).collect()
+        }).collect(),
+        local: LocalPackage::Installed { scratch: 64 << 20, output: prefill.rows * cfg.hidden as u64 * 2 },
         spark: (0..=routed.len()).map(charge).collect(),
         links: shared::spark_link((gpus - 1) as u8, ranks, prefill, Default::default()).unwrap(),
         spark_reply_formats: Default::default(), drafter: None, vision: None, budgets,
@@ -538,7 +543,8 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         // One target arena backing per rank.
         for gpu in 0..gpus {
             let arenas = contract.components.iter().filter(|c| matches!(&c.kind, ComponentKind::Allocation { template, .. }
-                if template.group == "weight arena" && template.location == Location::coordinator(gpu as u8))).count();
+                if template.group == "weight arena" && template.location == Location::coordinator(gpu as u8)
+                    && template.id == inputs.targets[gpu].arena.id())).count();
             assert_eq!(arenas, 1, "rtx{gpu}");
         }
         // KV/index pages live only on each layer's attention owner.
@@ -645,11 +651,60 @@ fn shared_recipe_onboards_whole_layers_or_tp2_halves() {
         assert_eq!(admitted.placement.layers[3].experts,
             if gpus == 1 { ExpertHome::RtxWhole { gpu: 0 } } else { ExpertHome::RtxTp2 });
         assert_eq!(admitted.placement.tp2.is_some(), gpus == 2);
-        let bytes = admitted.solved.facts.allocations.iter()
-            .filter(|owner| owner.id.starts_with("minimax.experts."))
-            .map(|owner| owner.bytes).collect::<Vec<_>>();
-        assert_eq!(bytes, vec![if gpus == 1 { (1 << 30) + (64 << 20) }
-            else { (1 << 29) + (64 << 20) }; gpus]);
+        assert_eq!(admitted.expert_backings.len(), gpus);
+        for backing in &admitted.expert_backings {
+            let root = admitted.solved.facts.allocations.iter().find(|owner| owner.id == backing.arena.id()).unwrap();
+            assert_eq!(root.bytes, backing.arena.bytes() as u64);
+            assert!(root.view.is_none());
+            let owners = admitted.solved.facts.allocations.iter().filter(|owner|
+                owner.id.starts_with(&format!("minimax.expert_workspace.{}.1.", backing.gpu))).collect::<Vec<_>>();
+            assert_eq!(owners.len(), 2);
+            assert!(owners.iter().any(|owner| owner.id.ends_with(".scratch") && owner.bytes == 64 << 20));
+            assert!(owners.iter().any(|owner| owner.id.ends_with(".output")
+                && owner.bytes == inputs.prefill.rows * inputs.cfg.hidden as u64 * 2));
+            assert!(admitted.solved.facts.allocations.iter().all(|owner| owner.id != backing.inventory_prefix));
+        }
+    }
+}
+
+#[test]
+fn zero_onboard_pair_has_no_local_expert_or_exchange_owners() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::Operation;
+    for count in [0, 1] {
+        // This fixture has one routed layer; onboarding it requires the
+        // all-local topology rather than a linked layout with idle Sparks.
+        let ranks = if count == 0 { 4 } else { 0 };
+        let inputs = recipe_inputs(2, ranks);
+        let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(count),
+            inputs.prefill, Operation::Serving, None, Default::default());
+        let admitted = inputs.admit(request).unwrap();
+        let owners = &admitted.solved.facts.allocations;
+        let exchange = owners.iter().filter(|owner| owner.id.starts_with("minimax.tp2.")).count();
+        let workspace = owners.iter().filter(|owner| owner.id.starts_with("minimax.expert_workspace.")).count();
+        assert_eq!(exchange, if count == 0 { 0 } else { 10 });
+        assert_eq!(workspace, if count == 0 { 0 } else { 4 });
+        assert_eq!(admitted.expert_backings.len(), if count == 0 { 0 } else { 2 });
+        let rows = crate::serving_capacity::OwnerTp2Rows::new(inputs.cfg.hidden as u64,
+            inputs.cfg.topk as u64, inputs.prefill.rows.max(u64::from(shared::DECODE_ROWS)), false).unwrap();
+        for demand in rows.demands().unwrap() {
+            let id = format!("{}.{}", shared::Owner::Tp2 { gpu: demand.gpu as usize }.id(),
+                demand.group.replace(' ', "_"));
+            let matches = owners.iter().filter(|owner| owner.id == id).collect::<Vec<_>>();
+            assert_eq!(matches.len(), usize::from(count > 0), "{id}");
+            if count > 0 { assert_eq!(matches[0].bytes, demand.bytes, "{id}"); }
+        }
+        for backing in &inputs.expert_backings[1] {
+            let roots = owners.iter().filter(|owner| owner.id == backing.arena.id()).collect::<Vec<_>>();
+            assert_eq!(roots.len(), usize::from(count > 0), "gpu {} expert arena", backing.gpu);
+            if count > 0 { assert_eq!(roots[0].bytes, backing.arena.bytes() as u64); }
+        }
+        if count == 0 {
+            assert!(owners.iter().all(|owner| !owner.id.starts_with("minimax.experts.")
+                && !owner.id.starts_with("minimax.expert_")));
+        }
+        assert!(owners.iter().any(|owner| owner.id.starts_with("minimax.hops.")));
+        assert_eq!(owners.iter().any(|owner| owner.id.starts_with("minimax.spark.")), ranks > 0);
     }
 }
 

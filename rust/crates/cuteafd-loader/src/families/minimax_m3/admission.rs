@@ -5,7 +5,7 @@
 //! [`MiniMaxInputs`](crate::placement::families::minimax_m3::MiniMaxInputs),
 //! which `placement::planner::solve` admits. No family code samples memory or
 //! sizes a pool here.
-use crate::placement::families::minimax_m3::{self as shared, LayerExperts, LocalPackage, MiniMaxInputs, SparkCharge};
+use crate::placement::families::minimax_m3::{self as shared, ExpertBacking, LocalPackage, MiniMaxInputs, SparkCharge};
 use crate::placement::planner::{serving, Budget, Context, PrefillShape};
 use crate::placement::{ArchContext, ResidentWeights, SparkWorkingSet};
 use anyhow::{ensure, Context as _};
@@ -75,21 +75,17 @@ pub struct FactsRequest<'a> {
     pub resident_weight_limit: ResidentWeights,
 }
 
-/// Header-exact coordinator residency of one routed layer, whole and as TP2
-/// halves, from the checkpoint's own compressed NVFP4 headers.
-pub fn layer_experts(catalog: &crate::OfficialV41Catalog) -> anyhow::Result<Vec<LayerExperts>> {
-    crate::placement::rtx_onboard::expert_costs(catalog, true)?.into_iter().map(|cost| {
-        ensure!(cost.whole_supported && cost.tp2, "MiniMax RTX expert layer lacks a whole or TP2 package layout");
-        Ok(LayerExperts { whole: cost.whole.resident, half: [cost.half[0].resident, cost.half[1].resident] })
-    }).collect()
-}
-
 /// The installed coordinator package's executor workspace at the unit rows.
 pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: &Path, rows: u64, gpus: usize) -> LocalPackage {
-    match crate::placement::rtx_onboard::expert_workspace(catalog, Some(manifest), rows, gpus, "minimax") {
-        Ok(bytes) => LocalPackage::Installed { workspace: if gpus == 2 { [bytes, bytes] } else { [bytes, 0] } },
-        Err(error) => LocalPackage::Missing(format!("{error:#}")),
-    }
+    let workspace = || -> anyhow::Result<_> {
+        let rows = rows.max(u64::from(shared::DECODE_ROWS));
+        let requests = crate::placement::rtx_onboard::expert_workspace_requests(catalog, Some(manifest), rows, gpus, "minimax")?;
+        let package = usize::try_from(*requests.first().context("missing expert package scratch")?)?;
+        let (scratch, output, _) = crate::serving_capacity::fp8moe_tp2_workspace(package,
+            catalog.routed_experts().hidden, usize::try_from(rows)?)?;
+        Ok(LocalPackage::Installed { scratch: scratch as u64, output: output as u64 })
+    };
+    workspace().unwrap_or_else(|error| LocalPackage::Missing(format!("{error:#}")))
 }
 
 /// Spark charges per onboarding count and rank: header-exact native NVFP4
@@ -165,8 +161,14 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
             "Provide complete native MXFP8 checkpoint headers."))?;
     let mount = targets.iter().map(|target| target.mount_load(request.checkpoint)).collect::<anyhow::Result<Vec<_>>>()
         .map_err(|error| refused(format!("MiniMax mount inventory refused: {error:#}"), "Check checkpoint headers."))?;
-    let experts = layer_experts(request.catalog).map_err(|error| refused(
-        format!("MiniMax RTX expert residency refused: {error:#}"), "Provide the compressed-tensors NVFP4 expert headers."))?;
+    let tensors = request.catalog.fp8().ok_or_else(|| refused("MiniMax native expert catalog missing",
+        "Provide compressed-tensors NVFP4 expert headers."))?;
+    let expert_backings = (0..=routed.len()).map(|count| {
+        if count == 0 { return Ok(Vec::new()); }
+        (0..gpus).map(|gpu| ExpertBacking::plan(tensors, &routed[..count], gpus, gpu,
+            request.physical_devices[gpu])).collect::<anyhow::Result<Vec<_>>>()
+    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(
+        format!("MiniMax expert backing inventory refused: {error:#}"), "Provide complete native expert headers."))?;
     let local = local_package(request.catalog, request.manifest_path, shape.rows, gpus);
     let spark = spark_charges(request.checkpoint, request.catalog, &routed, ranks, shape)
         .map_err(|error| refused(format!("MiniMax Spark inventory refused: {error:#}"),
@@ -210,7 +212,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, owners,
-        manifest: request.manifest.clone(), routed: routed.clone(), experts, local, spark, links,
+        manifest: request.manifest.clone(), routed: routed.clone(), expert_backings, local, spark, links,
         spark_reply_formats: request.replies, drafter: None, vision: None, budgets, code, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
