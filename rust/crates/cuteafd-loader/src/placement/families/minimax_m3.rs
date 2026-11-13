@@ -361,6 +361,8 @@ pub struct MiniMaxInputs {
     pub device_sampling: bool,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub resident_weight_limit: Option<ResidentWeights>,
+    /// Selected startup route for each onboarding count; None means mount.
+    pub push_host_envelopes: Vec<Option<crate::push_load::PushHostEnvelope>>,
     /// Mount source per rank (Load only), header-bounded.
     pub mount: Vec<crate::shared::dense_read::MountLoad>,
 }
@@ -373,6 +375,8 @@ pub struct AdmittedMiniMax {
     pub onboard: usize,
     /// The exact selected rank backings; runtime never derives IDs or offsets.
     pub expert_backings: Vec<ExpertBacking>,
+    /// Exact selected push receive owners; None means mount loading.
+    pub push_host_envelope: Option<crate::push_load::PushHostEnvelope>,
     pub draft_home: Option<u8>,
     pub encoder: Option<usize>,
 }
@@ -469,6 +473,19 @@ impl MiniMaxInputs {
         Ok(())
     }
 
+    /// This milestone has no embedding-home choice: the only embedding view
+    /// aliases coordinator GPU 0's target arena, never host or another rank.
+    fn validate_embedding(&self) -> Result<(), Refusal> {
+        let bytes = self.cfg.vocab_size.checked_mul(self.cfg.hidden).and_then(|n| n.checked_mul(2))
+            .ok_or(Refusal::Overflow("MiniMax embedding"))?;
+        let name = "language_model.model.embed_tokens.weight";
+        if self.targets.iter().enumerate().any(|(gpu, target)| target.rank != gpu
+            || target.arena.view(name).map(|view| view.bytes()) != (gpu == 0).then_some(bytes)) {
+            return Err(invalid("embedding home = coordinator GPU 0"));
+        }
+        Ok(())
+    }
+
     pub fn admit_serving(&self, request: Request) -> Result<AdmittedMiniMax, ServingRefusal> {
         self.validate_attention()?;
         if self.heads() { return Err(ServingRefusal::NarrowHeadsNotQualified); }
@@ -491,7 +508,8 @@ impl MiniMaxInputs {
         let solved = solve(request, self.budgets.clone(), self)?;
         let placement = self.execution(&solved)?;
         let onboard = placement.onboard_layers;
-        Ok(AdmittedMiniMax { placement, onboard, expert_backings: self.expert_backings[onboard].clone(), draft_home: solved.decisions.draft_home,
+        Ok(AdmittedMiniMax { placement, onboard, expert_backings: self.expert_backings[onboard].clone(),
+            push_host_envelope: self.push_host_envelopes[onboard].clone(), draft_home: solved.decisions.draft_home,
             encoder: solved.decisions.encoder, solved })
     }
 
@@ -561,6 +579,7 @@ impl MiniMaxInputs {
             return Err(invalid("invalid execution inventory extent"));
         }
         self.validate_attention()?;
+        self.validate_embedding()?;
         cuteafd_core::concurrency::validate("minimax_m3", self.sequences).map_err(invalid)?;
         let mut out = Vec::new();
         for gpu in 0..self.gpus { out.extend(self.rank_execution_components(gpu, maximum)?); }
@@ -694,7 +713,9 @@ impl Recipe for MiniMaxInputs {
             || request.context.maximum != self.context.maximum || self.targets.len() != self.gpus
             || self.graph_reserve.len() != self.gpus
             || self.code.len() != self.gpus || self.expert_backings.len() != self.routed.len() + 1
-            || self.spark.len() != self.routed.len() + 1 || self.prefill.rows == 0 || self.prefill.waves == 0
+            || self.spark.len() != self.routed.len() + 1
+            || self.push_host_envelopes.len() != self.routed.len() + 1
+            || self.mount.len() != self.gpus || self.prefill.rows == 0 || self.prefill.waves == 0
             || self.sequences == 0 {
             return Err(invalid("invalid extent or empty domain"));
         }
@@ -703,6 +724,18 @@ impl Recipe for MiniMaxInputs {
         let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
         if self.routed != routed || self.spark.iter().any(|ranks| ranks.len() != self.spark_ranks) {
             return Err(invalid("routed layer order or Spark rank inventory differs from the executor"));
+        }
+        let push = self.push_host_envelopes[0].is_some();
+        for envelope in &self.push_host_envelopes {
+            if envelope.is_some() != push {
+                return Err(invalid("startup route differs between onboarding candidates"));
+            }
+            if let Some(envelope) = envelope {
+                envelope.bytes()?;
+                if envelope.expert_bytes.len() != self.gpus {
+                    return Err(invalid("push host envelope rank inventory differs from coordinator"));
+                }
+            }
         }
         for (count, backings) in self.expert_backings.iter().enumerate() {
             if backings.len() != if count == 0 { 0 } else { self.gpus } {
@@ -732,9 +765,11 @@ impl Recipe for MiniMaxInputs {
         let mut components = self.execution_components()?;
         for gpu in 0..self.gpus {
             components.extend(self.targets[gpu].weight_components(maximum)?);
-            for owner in self.mount.get(gpu).copied().unwrap_or_default().allocations(&Owner::Mount { gpu }.id()) {
-                let bytes = ByteCurve::fixed(owner.bytes, maximum);
-                components.push(Component::allocation(owner, bytes, false, maximum));
+            if !push {
+                for owner in self.mount[gpu].allocations(&Owner::Mount { gpu }.id()) {
+                    let bytes = ByteCurve::fixed(owner.bytes, maximum);
+                    components.push(Component::allocation(owner, bytes, false, maximum));
+                }
             }
         }
         // Head-rank owners: vocabulary head workspace and the shared selector.
@@ -777,9 +812,18 @@ impl Recipe for MiniMaxInputs {
             let remote = count == self.routed.len() || self.spark_ranks > 0;
             // A linked executor needs at least one remote layer; all-local is a separate qualification.
             let linked = self.spark_ranks == 0 || count < self.routed.len();
-            if !local || !remote || !linked {
+            let push_compatible = !push || self.expert_backings[count].iter()
+                .all(|backing| backing.storage == ExpertStorage::Push);
+            if !local || !remote || !linked || !push_compatible {
                 requires.push(Requires { when: Choice { variable: onboard, option }, any_of: vec![] });
                 continue;
+            }
+            if let Some(envelope) = &self.push_host_envelopes[count] {
+                for owner in envelope.allocations("minimax.push")? {
+                    let bytes = ByteCurve::fixed(owner.bytes, maximum);
+                    let component = Component::allocation(owner, bytes, false, maximum);
+                    components.extend(with(vec![component], &activation));
+                }
             }
             if count > 0 {
                 if pair {

@@ -626,6 +626,7 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         code: vec![64 << 20; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
         expert_usage: None, resident_weight_limit: None,
+        push_host_envelopes: vec![None; routed.len() + 1],
         mount: targets.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect() }
 }
 
@@ -1619,6 +1620,22 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
         unit_rows: 64, page_bytes: bytes * 60, mark_bytes: 0, draft_bytes: 0 };
     assert_eq!(heads.host_prefix.chunk_bytes, geometry(2 * (16384 + 16384 + 8448)).chunk_bytes().min(1 << 30));
     assert_eq!(layers.host_prefix.chunk_bytes, geometry(32768 + 32768 + 8448).chunk_bytes().min(1 << 30));
+    assert!(layers.push_host_envelopes.iter().all(Option::is_none));
+    // A namespace requires push even when expert candidates are mount-only.
+    // Count zero can still load the target through the admitted ring-only route.
+    rustix::fs::setxattr(dir.path(), "user.sparknest.cluster", br#"{"me":"fixture"}"#,
+        rustix::fs::XattrFlags::empty()).unwrap();
+    let push = gather(&request).unwrap();
+    for (count, envelope) in push.push_host_envelopes.iter().enumerate() {
+        let expected = crate::families::minimax_m3::weight_layout::push_host_envelope(
+            catalog.fp8().unwrap(), &push.expert_backings[count], 2).unwrap();
+        assert_eq!(envelope.as_ref(), Some(&expected));
+    }
+    rustix::fs::setxattr(dir.path(), "user.sparknest.cluster", b"invalid",
+        rustix::fs::XattrFlags::empty()).unwrap();
+    let error = gather(&request).unwrap_err();
+    assert!(error.what.contains("storage namespace refused"), "{error}");
+    assert!(error.how.contains("cannot fall back to mount"));
 }
 
 
@@ -1648,3 +1665,100 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
         assert_eq!(placed.attention_placement, report.attention_placement);
     }
 }
+
+#[test]
+fn selected_push_envelope_replaces_mount_until_commit() {
+    use crate::placement::families::minimax_m3::{self as shared, ExpertStorage};
+    use crate::placement::{Onboard, planner::*};
+    use crate::push_load::PushHostEnvelope;
+    for gpus in [1, 2] {
+        for count in [0, 1] {
+            let mut inputs = recipe_inputs(gpus, 4);
+            for backings in &mut inputs.expert_backings {
+                for backing in backings { backing.storage = ExpertStorage::Push; }
+            }
+            inputs.push_host_envelopes = (0..inputs.expert_backings.len()).map(|selected|
+                Some(PushHostEnvelope::new(vec![selected as u64 * 64; gpus],
+                    vec![0; gpus], 128, 1 << 20).unwrap())).collect();
+            if count > 0 {
+                inputs.spark_ranks = 0;
+                inputs.spark.iter_mut().for_each(Vec::clear);
+                inputs.links.clear();
+                inputs.budgets.retain(|budget| !budget.locations.iter().any(|location|
+                    matches!(location.device, Device::Spark(_))));
+            }
+            let request = shared::request(inputs.context, Some(1 << 20), Onboard::Layers(count),
+                inputs.prefill, Operation::Serving, None, Default::default());
+            let admitted = inputs.admit(request.clone()).unwrap();
+            let expected = inputs.push_host_envelopes[count].as_ref().unwrap();
+            assert_eq!(admitted.push_host_envelope.as_ref(), Some(expected));
+            let owners = &admitted.solved.facts.allocations;
+            assert!(!owners.iter().any(|owner| owner.id.starts_with("minimax.mount.")));
+            let actual = owners.iter().filter(|owner| owner.id.starts_with("minimax.push.")).collect::<Vec<_>>();
+            assert_eq!(actual.iter().map(|owner| owner.bytes).sum::<u64>(), expected.bytes().unwrap());
+            for expected in expected.allocations("minimax.push").unwrap() {
+                assert_eq!(actual.iter().filter(|owner| ***owner == expected).count(), 1);
+                assert_eq!(expected.location, Location::PINNED);
+                assert_eq!(expected.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+            }
+            let mut mount = inputs.clone();
+            mount.push_host_envelopes.fill(None);
+            let mounted = mount.admit(request).unwrap();
+            assert!(mounted.push_host_envelope.is_none());
+            assert!(!mounted.solved.facts.allocations.iter().any(|owner| owner.id.starts_with("minimax.push.")));
+            assert!(mounted.solved.facts.allocations.iter().any(|owner| owner.id.starts_with("minimax.mount.")));
+        }
+    }
+}
+
+#[test]
+fn push_envelope_refuses_mixed_routes_bad_topology_and_mount_candidates() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::{Onboard, planner::*};
+    use crate::push_load::PushHostEnvelope;
+    for gpus in [1, 2] {
+        let mut inputs = recipe_inputs(gpus, 4);
+        let request = shared::request(inputs.context, Some(1 << 20), Onboard::Layers(0),
+            inputs.prefill, Operation::Serving, None, Default::default());
+        inputs.push_host_envelopes.clear();
+        assert!(inputs.prepare(&request).is_err());
+        inputs.push_host_envelopes = vec![Some(PushHostEnvelope::new(vec![0; gpus], vec![0; gpus], 128, 1 << 20).unwrap()); 2];
+        inputs.push_host_envelopes[1] = None;
+        assert!(inputs.prepare(&request).is_err());
+        inputs.push_host_envelopes.fill(Some(PushHostEnvelope::new(vec![0; 3 - gpus], vec![0; 3 - gpus], 128, 1 << 20).unwrap()));
+        assert!(inputs.prepare(&request).is_err());
+        inputs.push_host_envelopes.fill(Some(PushHostEnvelope::new(vec![0; gpus], vec![0; gpus], 128, 1 << 20).unwrap()));
+        assert!(inputs.admit(request.clone()).is_ok(), "count zero retains ring-only push");
+        let mut local = request;
+        local.onboard = Pin::Exact(1);
+        assert!(inputs.admit(local).is_err(), "required push cannot select mount experts");
+    }
+}
+
+#[test]
+fn recipe_asserts_embedding_home_is_coordinator_gpu_zero() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::{Onboard, planner::*};
+    for gpus in [1, 2] {
+        let mut inputs = recipe_inputs(gpus, 4);
+        let request = shared::request(inputs.context, Some(1 << 20), Onboard::Layers(0),
+            inputs.prefill, Operation::Serving, None, Default::default());
+        assert!(inputs.prepare(&request).is_ok());
+        let target = &mut inputs.targets[0];
+        target.arena = crate::serving_capacity::WeightArenaLayout::new(target.arena.id(),
+            target.arena.views().iter().filter(|(name, _)| name.as_str() != "language_model.model.embed_tokens.weight")
+                .map(|(name, view)| (name.clone(), view.bytes()))).unwrap();
+        let error = inputs.prepare(&request).unwrap_err();
+        assert!(error.to_string().contains("embedding home = coordinator GPU 0"), "{error}");
+        if gpus == 2 {
+            let mut inputs = recipe_inputs(gpus, 4);
+            let embedding = inputs.targets[0].arena.view("language_model.model.embed_tokens.weight").unwrap();
+            let target = &mut inputs.targets[1];
+            target.arena = crate::serving_capacity::WeightArenaLayout::new(target.arena.id(),
+                target.arena.views().iter().map(|(name, view)| (name.clone(), view.bytes()))
+                    .chain([("language_model.model.embed_tokens.weight".into(), embedding.bytes())])).unwrap();
+            assert!(inputs.prepare(&request).unwrap_err().to_string().contains("embedding home = coordinator GPU 0"));
+        }
+    }
+}
+
