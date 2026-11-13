@@ -41,6 +41,9 @@ const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 
 /// Shared constructor/admission capacities. Native decode consumes one token
 /// per request; multi-token verification uses packed prefill units instead.
+/// Verify never launches more than one prefill unit's rows; the constructor
+/// must partition, preserve causal sequence order and consume head tiles before
+/// reusing a unit. Speculative batch totals are not dispatcher extents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestCapacity {
     pub decode: UnitMetadata,
@@ -54,6 +57,9 @@ impl RequestCapacity {
         Ok(Self { decode: UnitMetadata::for_requests(requests, requests)?,
             prefill: UnitMetadata::for_requests(rows, requests.min(rows))? })
     }
+
+    /// Native expert workspace and serial dispatch capacity for either mode.
+    pub fn execution_rows(self) -> u32 { self.decode.rows.max(self.prefill.rows) }
 
     pub fn metadata(self, prefill: bool) -> UnitMetadata {
         if prefill { self.prefill } else { self.decode }
@@ -577,9 +583,9 @@ impl MiniMaxInputs {
         }
         out.extend(MsaRope::new(cfg, context)?.components(&Owner::Rope { gpu }.id(), gpu as u8, maximum)?);
         let (msa, _) = MsaPrograms::resolve(cfg, &self.manifest, decode_rows, rows, context)?;
-        let (producers, _) = ProducerPrograms::resolve(&self.manifest, rows.max(decode_rows))?;
-        ForwardPrograms::resolve(&self.manifest, rows.max(decode_rows))?;
-        target.resolve_dense_programs(&self.manifest, rows.max(decode_rows))?;
+        let (producers, _) = ProducerPrograms::resolve(&self.manifest, capacity.execution_rows())?;
+        ForwardPrograms::resolve(&self.manifest, capacity.execution_rows())?;
+        target.resolve_dense_programs(&self.manifest, capacity.execution_rows())?;
         // One decode lane on every rank (its layers' work), then one owner
         // set per in-flight prefill slot (PrefillHooks unit slots).
         let decode = Owner::Decode { gpu }.id();
@@ -724,7 +730,7 @@ impl Recipe for MiniMaxInputs {
                     // No local halves means no OwnerTp2 exchange. Boundary
                     // hops retain their own storage independently of onboarding.
                     let rows = crate::serving_capacity::OwnerTp2Rows::new(cfg.hidden as u64,
-                        cfg.topk as u64, self.prefill.rows.max(u64::from(decode_rows)), false).map_err(refusal)?;
+                        cfg.topk as u64, u64::from(capacity.execution_rows()), false).map_err(refusal)?;
                     for demand in rows.demands().map_err(refusal)? {
                         components.extend(with(buffer(format!("{}.{}", Owner::Tp2 { gpu: demand.gpu as usize }.id(),
                             demand.group.replace(' ', "_")), Location::coordinator(demand.gpu), demand.bytes,

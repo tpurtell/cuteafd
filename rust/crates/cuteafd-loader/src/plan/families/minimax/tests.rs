@@ -1136,6 +1136,8 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
             let capacity = inputs.request_capacity().unwrap();
             assert_eq!((capacity.decode.rows, capacity.decode.requests), (concurrency as u32, concurrency as u32));
             assert_eq!(capacity.prefill.requests, (concurrency as u32).min(capacity.prefill.rows));
+            assert_eq!(capacity.execution_rows(), capacity.decode.rows.max(capacity.prefill.rows),
+                "native expert workspace covers the largest single bounded invocation");
             let context = inputs.context.maximum as u32;
             let (msa, _) = MsaPrograms::resolve(&inputs.cfg, &inputs.manifest,
                 capacity.decode.rows, capacity.prefill.rows, context).unwrap();
@@ -1214,6 +1216,7 @@ fn packed_prefill_can_have_fewer_rows_than_boot_requests_but_exports_must_cover_
     let capacity = RequestCapacity::new(64, 32).unwrap();
     assert_eq!((capacity.decode.rows, capacity.decode.requests), (64, 64));
     assert_eq!((capacity.prefill.rows, capacity.prefill.requests), (32, 32));
+    assert_eq!(capacity.execution_rows(), 64);
     assert!(MsaPrograms::resolve(&inputs.cfg, &inputs.manifest, capacity.decode.rows,
         capacity.prefill.rows, inputs.context.maximum as u32).is_ok());
     // A valid but smaller AttentionExtend batch ABI must still be refused.

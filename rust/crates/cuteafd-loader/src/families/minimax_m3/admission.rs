@@ -76,7 +76,9 @@ pub struct FactsRequest<'a> {
 }
 
 /// The installed coordinator package's executor workspace at the unit rows.
-pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: &Path, rows: u64, gpus: usize) -> LocalPackage {
+pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: &Path,
+    capacity: shared::RequestCapacity, gpus: usize) -> LocalPackage {
+    let rows = u64::from(capacity.execution_rows());
     let workspace = || -> anyhow::Result<_> {
         let requests = crate::placement::rtx_onboard::expert_workspace_requests(catalog, Some(manifest), rows, gpus, "minimax")?;
         let package = usize::try_from(*requests.first().context("missing expert package scratch")?)?;
@@ -168,7 +170,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     let expert_backings = shared::ExpertInventory::new(tensors, &routed, gpus)
         .and_then(|inventory| inventory.prefixes(request.physical_devices)).map_err(|error| refused(
             format!("MiniMax expert backing inventory refused: {error:#}"), "Provide complete native expert headers."))?;
-    let local = local_package(request.catalog, request.manifest_path, u64::from(capacity.prefill.rows.max(capacity.decode.rows)), gpus);
+    let local = local_package(request.catalog, request.manifest_path, capacity, gpus);
     let spark = spark_charges(request.checkpoint, request.catalog, &routed, ranks, shape)
         .map_err(|error| refused(format!("MiniMax Spark inventory refused: {error:#}"),
             format!("Use a Spark world with a minimax:nvfp4 package ({:?}).",
