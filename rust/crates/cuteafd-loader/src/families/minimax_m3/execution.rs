@@ -1,5 +1,5 @@
 //! Exact MSA program and backing inventory shared by admission and execution.
-//! This describes the one-GPU coordinator; it is not a placement policy.
+//! Whole-layer and TP2 heads geometry; neither chooses a placement policy.
 use super::MiniMaxM3Config;
 use crate::placement::{
     inventory::ProgramEntry,
@@ -270,6 +270,83 @@ impl UnitLayout {
     }
 }
 
+/// One TP2 rank executes every layer, owning two paired KV/index groups and
+/// their 32 query heads. Shared index keys and the residual remain replicated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadsLayout {
+    rank: u8,
+    rows: u32,
+    layers: u32,
+}
+impl HeadsLayout {
+    pub fn new(cfg: &MiniMaxM3Config, rank: u8, rows: u32) -> Result<Self, Refusal> {
+        cfg.release_geometry().map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+        UnitLayout::new(cfg, rows)?;
+        if rank > 1 {
+            return Err(Refusal::InvalidFact("MiniMax heads requires TP2 rank 0 or 1".into()));
+        }
+        Ok(Self { rank, rows, layers: cfg.layers as u32 })
+    }
+    pub fn rank(self) -> u8 { self.rank }
+    pub fn rows(self) -> u32 { self.rows }
+    pub fn layers(self) -> u32 { self.layers }
+    pub fn query_head_offset(self) -> u32 { u32::from(self.rank) * self.query_heads() }
+    pub fn query_heads(self) -> u32 { 32 }
+    pub fn kv_head_offset(self) -> u32 { u32::from(self.rank) * self.kv_heads() }
+    pub fn kv_heads(self) -> u32 { 2 }
+    // Checkpoint index head h selects the blocks consumed by KV group h.
+    pub fn index_head_offset(self) -> u32 { self.kv_head_offset() }
+    pub fn index_heads(self) -> u32 { self.kv_heads() }
+    pub fn dense_neuron_offset(self) -> u32 { u32::from(self.rank) * self.dense_neurons() }
+    pub fn dense_neurons(self) -> u32 { 6144 }
+    pub fn shared_neuron_offset(self) -> u32 { u32::from(self.rank) * self.shared_neurons() }
+    pub fn shared_neurons(self) -> u32 { 1536 }
+
+    /// Unit arithmetic only; compiled MSA/producer/dense scratch is separate.
+    /// One FP32 local partial serves both reductions. Native BF16 routed outputs
+    /// are promoted before the fixed-order FFN fold.
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        let rows = u64::from(self.rows);
+        [("residual", 6144 * 4), ("query", 4096 * 2), ("key", 256 * 2),
+            ("value", 256 * 2), ("index_query", 256 * 2), ("index_key", 128 * 2),
+            ("gate", 6144 * 2), ("up", 6144 * 2), ("ffn", 6144 * 2),
+            ("routed", 6144 * 2), ("reduction", 6144 * 4), ("logits", 128 * 4),
+            ("route_ids", 4 * 4), ("route_weights", 4 * 4)]
+            .into_iter().map(|(name, stride)| (name, rows * stride)).collect()
+    }
+    pub fn components(self, prefix: &str, lifetime: Lifetime,
+        maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.buffers(), prefix, self.rank, lifetime, maximum_pages, Category::Workspace)
+    }
+
+    /// One exchange per rank, not per layer or reduction. Independent lanes and
+    /// units supply separate receive slots, each reused for O and FFN. Includes
+    /// the abort word allocated by PeerExchange::new_abortable_sized.
+    pub fn peer_buffers(slot_rows: &[u32], diagnostics: bool) -> Result<Vec<(String, u64)>, Refusal> {
+        let mut out = Vec::new();
+        for (slot, &rows) in slot_rows.iter().enumerate() {
+            UnitMetadata::new(rows)?;
+            out.push((format!("recv.{slot}"), u64::from(rows) * 6144 * 4));
+        }
+        let largest = out.iter().map(|(_, bytes)| *bytes).max()
+            .ok_or_else(|| Refusal::InvalidFact("MiniMax heads peer exchange has no slots".into()))?;
+        let storage = crate::serving_capacity::PeerStorageLayout::new(
+            slot_rows.len(), largest as usize, diagnostics)
+            .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+        out.push(("control".into(), storage.control_bytes as u64));
+        out.push(("abort".into(), 256));
+        if storage.progress_bytes != 0 {
+            out.push(("progress".into(), storage.progress_bytes as u64));
+        }
+        Ok(out)
+    }
+    pub fn peer_components(rank: u8, slot_rows: &[u32], diagnostics: bool,
+        prefix: &str, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        components(Self::peer_buffers(slot_rows, diagnostics)?, prefix, rank,
+            Lifetime::TARGET, maximum_pages, Category::Transport)
+    }
+}
+
 /// Embedding/final-norm and shared vocabulary-head storage for bounded scoring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeadLayout { pub rows: u32, pub vocab: u32 }
@@ -367,6 +444,7 @@ pub struct MsaCache {
     pub pool_pages: u32,
     pub requests: u32,
     pub table_width: u32,
+    kv_heads: u32,
 }
 impl MsaCache {
     pub fn new(
@@ -389,12 +467,21 @@ impl MsaCache {
             pool_pages,
             requests,
             table_width: max_context.div_ceil(64).div_ceil(4) * 4,
+            kv_heads: 4,
         })
     }
+    pub fn for_heads(layout: &HeadsLayout, pool_pages: u32, requests: u32,
+        max_context: u32) -> Result<Self, Refusal> {
+        let mut cache = Self::new(layout.layers(), pool_pages, requests, max_context)?;
+        cache.kv_heads = layout.kv_heads();
+        Ok(cache)
+    }
+    pub fn kv_heads(self) -> u32 { self.kv_heads }
     pub fn buffers(self) -> Result<Vec<(String, u64)>, Refusal> {
         let mut out = Vec::new();
         for layer in 0..self.layers {
-            for (name, stride) in [("keys", 32768u64), ("values", 32768), ("index", 8448)] {
+            let kv_stride = u64::from(self.kv_heads) * 64 * 128;
+            for (name, stride) in [("keys", kv_stride), ("values", kv_stride), ("index", 8448)] {
                 let bytes = u64::from(self.pool_pages)
                     .checked_mul(stride)
                     .filter(|&n| n <= isize::MAX as u64)
@@ -441,6 +528,114 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn heads_layout_partitions_paired_queries_index_groups_and_ffn_neurons() {
+        let cfg = cfg();
+        let ranks = [HeadsLayout::new(&cfg, 0, 17).unwrap(), HeadsLayout::new(&cfg, 1, 17).unwrap()];
+        for (rank, layout) in ranks.into_iter().enumerate() {
+            assert_eq!((layout.rank(), layout.rows(), layout.layers()), (rank as u8, 17, 60));
+            assert_eq!((layout.query_heads(), layout.kv_heads(), layout.index_heads()), (32, 2, 2));
+            assert_eq!(layout.index_head_offset(), layout.kv_head_offset());
+            for local_kv in 0..layout.kv_heads() {
+                let global_kv = layout.kv_head_offset() + local_kv;
+                for local_query in local_kv * 16..(local_kv + 1) * 16 {
+                    assert_eq!((layout.query_head_offset() + local_query) / 16, global_kv);
+                }
+            }
+        }
+        let ranges = |start: fn(HeadsLayout) -> u32, count: fn(HeadsLayout) -> u32| {
+            ranks.into_iter().flat_map(|layout| start(layout)..start(layout) + count(layout)).collect::<Vec<_>>()
+        };
+        assert_eq!(ranges(HeadsLayout::query_head_offset, HeadsLayout::query_heads), (0..64).collect::<Vec<_>>());
+        assert_eq!(ranges(HeadsLayout::kv_head_offset, HeadsLayout::kv_heads), (0..4).collect::<Vec<_>>());
+        assert_eq!(ranges(HeadsLayout::index_head_offset, HeadsLayout::index_heads), (0..4).collect::<Vec<_>>());
+        assert_eq!(ranges(HeadsLayout::dense_neuron_offset, HeadsLayout::dense_neurons), (0..12288).collect::<Vec<_>>());
+        assert_eq!(ranges(HeadsLayout::shared_neuron_offset, HeadsLayout::shared_neurons), (0..3072).collect::<Vec<_>>());
+        for (rank, rows) in [(2, 1), (0, 0), (1, 4097)] {
+            assert!(HeadsLayout::new(&cfg, rank, rows).is_err());
+        }
+        let mut wrong = cfg.clone(); wrong.msa.index_heads = 2;
+        assert!(HeadsLayout::new(&wrong, 0, 1).is_err());
+    }
+
+    #[test]
+    fn heads_cache_halves_only_kv_and_retains_all_layers_and_one_shared_index() {
+        for rank in 0..2 {
+            let layout = HeadsLayout::new(&cfg(), rank, 64).unwrap();
+            for context in [63, 64, 65, 270, 1048576] {
+                let whole = MsaCache::new(60, 17, 16, context).unwrap();
+                let local = MsaCache::for_heads(&layout, 17, 16, context).unwrap();
+                assert_eq!((whole.kv_heads(), local.kv_heads()), (4, 2));
+                assert_eq!(local.table_width, whole.table_width);
+                let whole = whole.buffers().unwrap().into_iter().collect::<std::collections::BTreeMap<_, _>>();
+                let local = local.buffers().unwrap().into_iter().collect::<std::collections::BTreeMap<_, _>>();
+                assert_eq!(whole.len(), local.len());
+                for (name, bytes) in &whole {
+                    let split_kv = name.ends_with(".keys") || name.ends_with(".values");
+                    assert_eq!(local[name], if split_kv { bytes / 2 } else { *bytes }, "{name}");
+                }
+                assert_eq!(local["layer.59.keys"], 17 * 16384);
+                assert_eq!(local["layer.59.values"], 17 * 16384);
+                assert_eq!(local["layer.59.index"], 17 * 8448);
+            }
+        }
+    }
+
+    #[test]
+    fn heads_unit_inventory_has_one_fp32_partial_and_exact_allocation_tails() {
+        use crate::placement::planner::ComponentKind;
+        for rows in [1, 64, 4096] {
+            let layout = HeadsLayout::new(&cfg(), 1, rows).unwrap();
+            let buffers = layout.buffers().into_iter().collect::<std::collections::BTreeMap<_, _>>();
+            let rows = u64::from(rows);
+            for (name, stride) in [("query", 8192), ("key", 512), ("value", 512),
+                ("index_query", 512), ("index_key", 256), ("gate", 12288), ("up", 12288),
+                ("residual", 24576), ("reduction", 24576), ("routed", 12288), ("logits", 512)] {
+                assert_eq!(buffers[name], rows * stride, "{name}");
+            }
+            assert!(!buffers.contains_key("combined"));
+            let mut components = layout.components("minimax.heads.unit", Lifetime::TARGET, 17).unwrap();
+            assert_eq!(components.len(), buffers.len());
+            assert!(components.iter().all(|component| matches!(component.kind, ComponentKind::Allocation { .. })));
+            crate::placement::planner::fixed_request_tails(&mut components, 17, &[]).unwrap();
+            assert_eq!(components.len(), buffers.len() + buffers.values().filter(|&&bytes| bytes > 1 << 20).count());
+            for (name, bytes) in &buffers {
+                let id = format!("minimax.heads.unit.{name}");
+                assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+                    ComponentKind::Allocation { template, .. } if template.id == id
+                        && template.bytes == *bytes && template.location == Location::coordinator(1)
+                        && template.view.is_none())).count(), 1);
+                assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+                    ComponentKind::AllocationGranularity(tail) if tail.id == format!("{id}.tail")))
+                    .count(), usize::from(*bytes > 1 << 20));
+            }
+        }
+    }
+
+    #[test]
+    fn heads_peer_slots_are_fp32_reused_by_both_reductions_and_count_flags_once() {
+        for diagnostics in [false, true] {
+            let rows = [64, 2048, 4096];
+            let buffers = HeadsLayout::peer_buffers(&rows, diagnostics).unwrap()
+                .into_iter().collect::<std::collections::BTreeMap<_, _>>();
+            let storage = crate::serving_capacity::PeerStorageLayout::new(3, 4096 * 6144 * 4, diagnostics).unwrap();
+            for (slot, rows) in rows.into_iter().enumerate() {
+                assert_eq!(buffers[&format!("recv.{slot}")], u64::from(rows) * 6144 * 4);
+            }
+            assert_eq!(buffers["control"], storage.control_bytes as u64);
+            assert_eq!(buffers["abort"], 256);
+            assert_eq!(buffers.get("progress").copied().unwrap_or(0), storage.progress_bytes as u64);
+            assert_eq!(buffers.len(), 5 + usize::from(diagnostics));
+            for rank in 0..2 {
+                assert!(HeadsLayout::peer_components(rank, &rows, diagnostics, "minimax.heads.peer", 17).is_ok());
+            }
+        }
+        for rows in [vec![], vec![0], vec![4097]] {
+            assert!(HeadsLayout::peer_buffers(&rows, false).is_err());
+        }
+        assert!(HeadsLayout::peer_components(2, &[1], false, "minimax.heads.peer", 17).is_err());
+    }
+
     #[test]
     fn decode_table_has_a_distinct_admitted_backing_without_reordering_canonical_rows() {
         for requests in [1, 3, 16, 64] {
