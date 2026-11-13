@@ -19,12 +19,18 @@ pub struct ProducerPrograms {
 }
 impl ProducerPrograms {
     pub fn resolve(manifest: &serde_json::Value, rows: u32) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        Self::resolve_kinds(manifest, rows, false)
+    }
+    pub fn resolve_heads(manifest: &serde_json::Value, rows: u32) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        Self::resolve_kinds(manifest, rows, true)
+    }
+    fn resolve_kinds(manifest: &serde_json::Value, rows: u32, heads: bool) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
         use cuteafd_ffi::minimax_m3::producers::{Kind, validate_producer_entry};
         let entries = manifest["programs"].as_array()
             .ok_or_else(|| Refusal::InvalidFact("MiniMax PROGRAMS.json has no program list".into()))?;
         let mut specs = Vec::new();
         let mut layouts = Vec::new();
-        for kind in Kind::ALL {
+        for kind in if heads { Kind::HEADS } else { Kind::ALL } {
             let missing = |detail| Refusal::MissingExport { export: kind.name().into(),
                 geometry: "MiniMax native norm/partial-NeoX/index/OAI producers".into(), context: 0, detail };
             let mut found = entries.iter().filter(|entry| entry["name"] == kind.name());
@@ -59,13 +65,20 @@ pub struct ForwardPrograms {
 }
 impl ForwardPrograms {
     pub fn resolve(manifest: &serde_json::Value, rows: u32) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        Self::resolve_kinds(manifest, rows, false)
+    }
+    pub fn resolve_heads(manifest: &serde_json::Value, rows: u32) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        Self::resolve_kinds(manifest, rows, true)
+    }
+    fn resolve_kinds(manifest: &serde_json::Value, rows: u32, heads: bool) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
         use cuteafd_ffi::minimax_m3::forward::{Kind, validate_entry};
         let entries = manifest["programs"].as_array()
             .ok_or_else(|| Refusal::InvalidFact("MiniMax PROGRAMS.json has no program list".into()))?;
         let mut specs = Vec::new();
         let mut layouts = Vec::new();
         let mut gather = None;
-        for name in Kind::ALL.map(Kind::name).into_iter().chain(["minimax_index_cache_gather"]) {
+        let kinds = if heads { Kind::HEADS } else { Kind::ALL };
+        for name in kinds.map(Kind::name).into_iter().chain(["minimax_index_cache_gather"]) {
             let missing = |detail| Refusal::MissingExport { export: name.into(),
                 geometry: "MiniMax residual norm/FP32 router/paged KV and bounded index staging".into(), context: 0, detail };
             let mut found = entries.iter().filter(|entry| entry["name"] == name);
@@ -104,6 +117,16 @@ impl MsaPrograms {
         prefill_rows: u32,
         max_context: u32,
     ) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        Self::resolve_geometry(cfg, manifest, decode_rows, prefill_rows, max_context, false)
+    }
+    pub fn resolve_heads(cfg: &MiniMaxM3Config, manifest: &serde_json::Value,
+        decode_rows: u32, prefill_rows: u32, max_context: u32,
+    ) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        Self::resolve_geometry(cfg, manifest, decode_rows, prefill_rows, max_context, true)
+    }
+    fn resolve_geometry(cfg: &MiniMaxM3Config, manifest: &serde_json::Value,
+        decode_rows: u32, prefill_rows: u32, max_context: u32, heads: bool,
+    ) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
         let bad = |message: &str| Refusal::InvalidFact(message.into());
         if (
             cfg.heads,
@@ -139,13 +162,15 @@ impl MsaPrograms {
         let mut specs = Vec::new();
         let mut layouts = Vec::new();
         for (mode, rows, extent) in expected {
+            let name = if heads { mode.heads_name() } else { mode.name() };
             let refusal = |detail| Refusal::MissingExport {
-                export: mode.name().into(),
-                geometry: "MiniMax native MSA 64Q/4KV/D128, top16/block128".into(),
+                export: name.into(),
+                geometry: if heads { "MiniMax native MSA 32Q/2KV/D128, top16/block128" }
+                    else { "MiniMax native MSA 64Q/4KV/D128, top16/block128" }.into(),
                 context: u64::from(max_context),
                 detail,
             };
-            let mut found = entries.iter().filter(|entry| entry["name"] == mode.name());
+            let mut found = entries.iter().filter(|entry| entry["name"] == name);
             let entry = found
                 .next()
                 .ok_or_else(|| refusal("absent from PROGRAMS.json".into()))?;
@@ -155,6 +180,9 @@ impl MsaPrograms {
             let parsed = ProgramEntry::from_manifest(entry).map_err(|e| refusal(e.to_string()))?;
             let layout = cuteafd_ffi::minimax_m3::validate_entry(&parsed.spec, entry)
                 .map_err(|e| refusal(e.to_string()))?;
+            if layout.kv_heads() != if heads { 2 } else { 4 } {
+                return Err(refusal("compiled head geometry differs".into()));
+            }
             if layout.rows < rows || layout.extent < extent {
                 return Err(refusal(format!(
                     "compiled capacities rows={} extent={}, requested rows={rows} extent={extent}",
@@ -189,20 +217,22 @@ impl MsaPrograms {
         };
         let rows = u64::from(index.rows);
         let batch = u64::from(attention.extent);
+        let h = u64::from(index.kv_heads());
+        let q = u64::from(attention.query_heads());
         let mut buffers = vec![
-            ("index.query", rows * 512),
-            ("index.scales", rows * 16),
+            ("index.query", rows * h * 128),
+            ("index.scales", rows * h * 4),
             ("index.produced_keys", rows * 128),
             ("index.produced_scales", rows * 4),
-            ("selections", rows * 256),
+            ("selections", rows * h * 64),
             ("index.scratch", index.scratch),
-            ("attention.query", rows * 16384),
-            ("attention.key", rows * 1024),
-            ("attention.output", rows * 16384),
-            ("attention.lse", rows * 256),
+            ("attention.query", rows * q * 256),
+            ("attention.key", rows * h * 256),
+            ("attention.output", rows * q * 256),
+            ("attention.lse", rows * q * 4),
             ("attention.scratch", attention.scratch),
-            ("attention.k_descale", batch * 16),
-            ("attention.v_descale", batch * 16),
+            ("attention.k_descale", batch * h * 4),
+            ("attention.v_descale", batch * h * 4),
             ("attention.query_offsets", (batch + 1) * 4),
         ];
         if prefill {
@@ -757,6 +787,90 @@ mod tests {
         let mut bad = manifest.clone(); bad["programs"][2]["pointers"][5]["dtype"] = json!("int32");
         assert!(ProducerPrograms::resolve(&bad, 1).is_err());
     }
+    fn narrow_manifest() -> Value {
+        let mut manifest = manifest();
+        for entry in manifest["programs"].as_array_mut().unwrap() {
+            let name = entry["name"].as_str().unwrap();
+            let mode = [Mode::IndexDecode, Mode::IndexPrefill, Mode::AttentionDecode, Mode::AttentionExtend]
+                .into_iter().find(|m| m.name() == name).unwrap();
+            let index = matches!(mode, Mode::IndexDecode | Mode::IndexPrefill);
+            let extent = entry["geometry"][if index { "max_pages" } else { "max_batch" }].as_u64().unwrap() as u32;
+            let rows = entry["capacity_rows"].as_u64().unwrap() as u32;
+            let layout = Layout::for_heads(mode, rows, extent).unwrap();
+            entry["name"] = layout.name().into();
+            if index { entry["geometry"]["heads"] = 2.into(); }
+            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); }
+            entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
+            for p in entry["pointers"].as_array_mut().unwrap() {
+                let shape = p["shape"].as_str().unwrap();
+                p["shape"] = if p["name"] == "scratch" { format!("[{}]", layout.scratch) }
+                    else if p["name"] == "q2k_indices" { shape.replacen("[4,", "[2,", 1) }
+                    else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]")
+                        .replace("[rows,64", "[rows,32") }.into();
+            }
+        }
+        manifest
+    }
+
+    #[test]
+    fn narrow_resolve_refuses_absent_exports_without_whole_fallback() {
+        assert!(matches!(MsaPrograms::resolve_heads(&cfg(), &manifest(), 16, 2048, 2049),
+            Err(Refusal::MissingExport { export, .. }) if export == "minimax_index_decode_h2"));
+        let producer: Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-ffi/tests/fixtures/minimax_producer_programs.json")).unwrap();
+        assert!(matches!(ProducerPrograms::resolve_heads(&producer, 2048),
+            Err(Refusal::MissingExport { export, .. }) if export == "minimax_norm_rope_h32"));
+        let forward: Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-ffi/tests/fixtures/minimax_forward_programs.json")).unwrap();
+        assert!(matches!(ForwardPrograms::resolve_heads(&forward, 2048),
+            Err(Refusal::MissingExport { export, .. }) if export == "minimax_kv_pack_h2"));
+    }
+
+    #[test]
+    fn narrow_workspace_uses_compiled_scratch_and_head_strides_with_replicated_index_keys() {
+        let narrow = narrow_manifest();
+        let (programs, specs) = MsaPrograms::resolve_heads(&cfg(), &narrow, 16, 2048, 2049).unwrap();
+        assert_eq!(specs.len(), 4);
+        assert!(programs.layouts.iter().all(|l| l.kv_heads() == 2 && l.query_heads() == 32));
+        assert!(matches!(MsaPrograms::resolve(&cfg(), &narrow, 16, 2048, 2049), Err(Refusal::MissingExport { .. })));
+        for prefill in [false, true] {
+            let narrow = programs.workspace(prefill).into_iter().collect::<std::collections::BTreeMap<_, _>>();
+            let (whole, _) = MsaPrograms::resolve(&cfg(), &manifest(), 16, 2048, 2049).unwrap();
+            let whole = whole.workspace(prefill).into_iter().collect::<std::collections::BTreeMap<_, _>>();
+            for name in ["index.query", "index.scales", "selections", "attention.query", "attention.key",
+                "attention.output", "attention.lse", "attention.k_descale", "attention.v_descale"] {
+                assert_eq!(narrow[name] * 2, whole[name], "{name}");
+            }
+            for name in ["index.produced_keys", "index.produced_scales", "attention.query_offsets"] {
+                assert_eq!(narrow[name], whole[name], "replicated {name}");
+            }
+            let index = if prefill { programs.layouts[1] } else { programs.layouts[0] };
+            let attention = if prefill { programs.layouts[3] } else { programs.layouts[2] };
+            assert_eq!(narrow["index.scratch"], index.scratch);
+            assert_eq!(narrow["attention.scratch"], attention.scratch);
+            assert_ne!(narrow["index.scratch"] * 2, whole["index.scratch"]);
+            assert_ne!(narrow["attention.scratch"] * 2, whole["attention.scratch"]);
+            if prefill {
+                assert_eq!(narrow["index.keys"], whole["index.keys"]);
+                assert_eq!(narrow["index.key_scales"], whole["index.key_scales"]);
+            }
+            for rank in 0..2 {
+                let components = programs.workspace_components("minimax.heads.msa", rank, prefill,
+                    Lifetime::TARGET, 16).unwrap();
+                assert_eq!(components.len(), narrow.len());
+                assert!(components.iter().all(|c| matches!(&c.kind,
+                    crate::placement::planner::ComponentKind::Allocation { template, .. }
+                        if template.location == Location::coordinator(rank) && template.view.is_none())));
+            }
+        }
+        for i in 0..4 {
+            let mut bad = narrow.clone(); bad["programs"].as_array_mut().unwrap().remove(i);
+            assert!(matches!(MsaPrograms::resolve_heads(&cfg(), &bad, 16, 2048, 2049), Err(Refusal::MissingExport { .. })));
+            let mut bad = narrow.clone(); bad["programs"].as_array_mut().unwrap().push(narrow["programs"][i].clone());
+            assert!(matches!(MsaPrograms::resolve_heads(&cfg(), &bad, 16, 2048, 2049), Err(Refusal::MissingExport { .. })));
+        }
+    }
+
     #[test]
     fn executable_inventory_requires_every_mode_and_exact_selection_strides() {
         let manifest = manifest();

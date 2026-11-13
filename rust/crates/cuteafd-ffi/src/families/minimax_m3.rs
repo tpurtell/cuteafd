@@ -32,6 +32,14 @@ impl Mode {
             Self::AttentionExtend => "minimax_attention_extend",
         }
     }
+    pub fn heads_name(self) -> &'static str {
+        match self {
+            Self::IndexDecode => "minimax_index_decode_h2",
+            Self::IndexPrefill => "minimax_index_prefill_h2",
+            Self::AttentionDecode => "minimax_attention_decode_h32",
+            Self::AttentionExtend => "minimax_attention_extend_h32",
+        }
+    }
     fn mode(self) -> &'static str {
         match self {
             Self::IndexDecode | Self::AttentionDecode => "decode",
@@ -92,30 +100,43 @@ pub struct Layout {
     pub rows: u32,
     pub extent: u32,
     pub scratch: u64,
+    kv_heads: u32,
 }
 impl Layout {
     pub fn new(mode: Mode, rows: u32, extent: u32) -> Result<Self> {
+        Self::with_heads(mode, rows, extent, 4)
+    }
+    /// A rank-local 32Q/2KV ABI, never a strided slice of a whole-owner operand.
+    pub fn for_heads(mode: Mode, rows: u32, extent: u32) -> Result<Self> {
+        Self::with_heads(mode, rows, extent, 2)
+    }
+    pub fn kv_heads(self) -> u32 { self.kv_heads }
+    pub fn query_heads(self) -> u32 { 16 * self.kv_heads }
+    pub fn name(self) -> &'static str {
+        if self.kv_heads == 2 { self.mode.heads_name() } else { self.mode.name() }
+    }
+    fn with_heads(mode: Mode, rows: u32, extent: u32, kv_heads: u32) -> Result<Self> {
         if rows == 0 || extent == 0 || rows > i32::MAX as u32 || extent > i32::MAX as u32 {
             return Err(invalid("positive signed-int32 capacities required"));
         }
-        let (r, e) = (u64::from(rows), u64::from(extent));
+        let (r, e, h) = (u64::from(rows), u64::from(extent), u64::from(kv_heads));
         let sizes = if mode.index() {
             let blocks = e.div_ceil(2);
-            if 4 * r * blocks >= 1 << 31 {
+            if h * r * blocks >= 1 << 31 {
                 return Err(invalid("index score signed indexing extent"));
             }
             vec![
-                4 * r * 4,
-                4 * r * blocks * 4,
+                h * r * 4,
+                h * r * blocks * 4,
                 if mode == Mode::IndexDecode {
-                    4 * r * e * 4
+                    h * r * e * 4
                 } else {
                     0
                 },
-                4 * r * 4,
-                4 * r * 4,
-                4 * r * 16 * 4,
-                4 * r * 16 * 4,
+                h * r * 4,
+                h * r * 4,
+                h * r * 16 * 4,
+                h * r * 16 * 4,
                 (r + 1) * 2 * 4,
                 256,
             ]
@@ -126,7 +147,7 @@ impl Layout {
                 r.div_ceil(8) + e
             };
             let union = if mode == Mode::AttentionExtend {
-                work * 4 * 128 * 4
+                work * h * 128 * 4
             } else {
                 0
             };
@@ -138,7 +159,7 @@ impl Layout {
                 union,
                 union,
                 if mode == Mode::AttentionExtend {
-                    work * 4 * 4
+                    work * h * 4
                 } else {
                     0
                 },
@@ -160,13 +181,16 @@ impl Layout {
             rows,
             extent,
             scratch,
+            kv_heads,
         })
     }
     fn operands(self) -> Vec<Operand> {
+        let h = self.kv_heads;
+        let q = self.query_heads();
         let mut out = if self.mode.index() {
             let mut out = vec![
-                operand("q_fp8", "float8_e4m3fn", "[rows,4,128]", "in"),
-                operand("q_scale", "float32", "[rows,4]", "in"),
+                operand("q_fp8", "float8_e4m3fn", format!("[rows,{h},128]"), "in"),
+                operand("q_scale", "float32", format!("[rows,{h}]"), "in"),
             ];
             if self.mode == Mode::IndexDecode {
                 out.extend([
@@ -190,27 +214,27 @@ impl Layout {
             out.push(operand(
                 "q2k_indices",
                 "int32",
-                format!("[4,{},16]", self.rows),
+                format!("[{h},{},16]", self.rows),
                 "out",
             ));
             out
         } else {
             vec![
-                operand("query", "bfloat16", "[rows,64,128]", "in"),
+                operand("query", "bfloat16", format!("[rows,{q},128]"), "in"),
                 operand(
                     "key_cache",
                     "uint8",
-                    "[pool_pages,64,4,128] E4M3 bytes",
+                    format!("[pool_pages,64,{h},128] E4M3 bytes"),
                     "in",
                 ),
                 operand(
                     "value_cache",
                     "uint8",
-                    "[pool_pages,64,4,128] E4M3 bytes",
+                    format!("[pool_pages,64,{h},128] E4M3 bytes"),
                     "in",
                 ),
-                operand("k_descale", "float32", "[batch,4]", "in"),
-                operand("v_descale", "float32", "[batch,4]", "in"),
+                operand("k_descale", "float32", format!("[batch,{h}]"), "in"),
+                operand("v_descale", "float32", format!("[batch,{h}]"), "in"),
                 operand("page_table", "int32", "[batch,table_stride]", "in"),
                 operand(
                     "cache_lengths",
@@ -227,11 +251,11 @@ impl Layout {
                 operand(
                     "q2k_indices",
                     "int32",
-                    format!("[4,{},16]", self.rows),
+                    format!("[{h},{},16]", self.rows),
                     "in",
                 ),
-                operand("output", "bfloat16", "[rows,64,128]", "out"),
-                operand("lse", "float32", "[rows,64] base-2", "out"),
+                operand("output", "bfloat16", format!("[rows,{q},128]"), "out"),
+                operand("lse", "float32", format!("[rows,{q}] base-2"), "out"),
             ]
         };
         out.push(operand(
@@ -250,7 +274,7 @@ impl Layout {
             Mode::AttentionExtend,
         ]
         .into_iter()
-        .find(|mode| spec.name == mode.name())
+        .find(|mode| spec.name == mode.name() || spec.name == mode.heads_name())
         .ok_or_else(|| invalid("unknown program name"))?;
         let g = &spec.geometry;
         let field = |name: &str| {
@@ -259,7 +283,8 @@ impl Layout {
                 .and_then(|n| u32::try_from(n).ok())
                 .ok_or_else(|| invalid(format!("geometry.{name}")))
         };
-        let layout = Self::new(
+        let kv_heads = if spec.name == mode.heads_name() { 2 } else { 4 };
+        let layout = Self::with_heads(
             mode,
             field("max_rows")?,
             field(if mode.index() {
@@ -267,10 +292,11 @@ impl Layout {
             } else {
                 "max_batch"
             })?,
+            kv_heads,
         )?;
         let fixed: &[(&str, u32)] = if mode.index() {
             &[
-                ("heads", 4),
+                ("heads", kv_heads),
                 ("head_dim", 128),
                 ("block_tokens", 128),
                 ("topk", 16),
@@ -278,8 +304,8 @@ impl Layout {
         } else {
             &[
                 ("page_rows", 64),
-                ("query_heads", 64),
-                ("kv_heads", 4),
+                ("query_heads", 16 * kv_heads),
+                ("kv_heads", kv_heads),
                 ("head_dim", 128),
                 ("block_tokens", 128),
                 ("topk", 16),
@@ -449,12 +475,12 @@ impl Layout {
         self.validate(
             buffers,
             [
-                bytes(b.rows, 512)?,
-                bytes(b.rows, 16)?,
+                bytes(b.rows, self.kv_heads as usize * 128)?,
+                bytes(b.rows, self.kv_heads as usize * 4)?,
                 bytes(b.pool_pages, 8448)?,
                 bytes(bytes(b.rows, b.table_stride)?, 4)?,
                 bytes(b.rows, 4)?,
-                bytes(self.rows as usize, 256)?,
+                bytes(self.rows as usize, self.kv_heads as usize * 64)?,
                 self.scratch as usize,
             ],
         )?;
@@ -483,13 +509,13 @@ impl Layout {
         self.validate(
             buffers,
             [
-                bytes(b.rows, 512)?,
-                bytes(b.rows, 16)?,
+                bytes(b.rows, self.kv_heads as usize * 128)?,
+                bytes(b.rows, self.kv_heads as usize * 4)?,
                 bytes(padded, 128)?,
                 bytes(padded, 4)?,
                 bytes(b.rows, 4)?,
                 bytes(b.rows, 4)?,
-                bytes(self.rows as usize, 256)?,
+                bytes(self.rows as usize, self.kv_heads as usize * 64)?,
                 self.scratch as usize,
             ],
         )?;
@@ -523,17 +549,17 @@ impl Layout {
         self.validate(
             buffers,
             [
-                bytes(b.rows, 16384)?,
-                bytes(b.pool_pages, 32768)?,
-                bytes(b.pool_pages, 32768)?,
-                bytes(b.batch, 16)?,
-                bytes(b.batch, 16)?,
+                bytes(b.rows, self.query_heads() as usize * 256)?,
+                bytes(b.pool_pages, self.kv_heads as usize * 8192)?,
+                bytes(b.pool_pages, self.kv_heads as usize * 8192)?,
+                bytes(b.batch, self.kv_heads as usize * 4)?,
+                bytes(b.batch, self.kv_heads as usize * 4)?,
                 bytes(bytes(b.batch, b.table_stride)?, 4)?,
                 bytes(b.batch, 4)?,
                 bytes(b.batch + 1, 4)?,
-                bytes(self.rows as usize, 256)?,
-                bytes(b.rows, 16384)?,
-                bytes(b.rows, 256)?,
+                bytes(self.rows as usize, self.kv_heads as usize * 64)?,
+                bytes(b.rows, self.query_heads() as usize * 256)?,
+                bytes(b.rows, self.query_heads() as usize * 4)?,
                 self.scratch as usize,
             ],
         )?;
@@ -581,6 +607,118 @@ mod tests {
             "pointers":operands.iter().map(|o| json!({"name":o.name,"dtype":o.dtype,"shape":o.shape,"role":o.role})).collect::<Vec<_>>(),
             "scalars":mode.scalars().iter().map(|(name,kind)| json!({"name":name,"type":kind})).collect::<Vec<_>>()});
         (spec, entry)
+    }
+
+    #[test]
+    fn whole_contract_is_identical_to_pinned_compiler_manifest() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/minimax_msa_programs.json")).unwrap();
+        for entry in manifest["programs"].as_array().unwrap() {
+            let spec = ProgramSpec {
+                name: entry["name"].as_str().unwrap().into(),
+                pointers: entry["pointers"].as_array().unwrap().iter()
+                    .map(|p| p["name"].as_str().unwrap().into()).collect(),
+                scalar_kinds: entry["scalars"].as_array().unwrap().iter()
+                    .map(|s| if s["type"] == "int64" { b'l' } else { b'i' }).collect(),
+                capacity_rows: entry["capacity_rows"].as_u64().unwrap() as u32,
+                geometry: entry["geometry"].clone(),
+                scratch: entry["scratch_bytes_at_capacity"].as_object().unwrap().iter()
+                    .map(|(k,v)| (k.clone(), v.as_u64().unwrap())).collect(),
+            };
+            let layout = validate_entry(&spec, entry).unwrap();
+            assert_eq!(layout, Layout::new(layout.mode, layout.rows, layout.extent).unwrap());
+            assert_eq!(layout.name(), spec.name);
+            assert_eq!(layout.kv_heads(), 4);
+            assert_eq!(layout.query_heads(), 64);
+        }
+    }
+
+    #[test]
+    fn narrow_scratch_uses_each_compiled_region_not_half_the_whole_workspace() {
+        // Independent values from the pinned fork's _layout(..., heads=2).
+        for (mode, rows, extent, scratch) in [
+            (Mode::IndexDecode, 1, 1, 2304),
+            (Mode::IndexPrefill, 1, 1, 2048),
+            (Mode::AttentionDecode, 1, 1, 1024),
+            (Mode::AttentionExtend, 1, 1, 5376),
+            (Mode::IndexDecode, 64, 16384, 12601856),
+            (Mode::IndexPrefill, 4096, 16384, 269615616),
+            (Mode::AttentionDecode, 64, 64, 1280),
+            (Mode::AttentionExtend, 4096, 64, 1193472),
+        ] {
+            let narrow = Layout::for_heads(mode, rows, extent).unwrap();
+            assert_eq!(narrow.scratch, scratch, "{mode:?}");
+            assert_ne!(narrow.scratch, Layout::new(mode, rows, extent).unwrap().scratch / 2);
+        }
+        assert!(Layout::for_heads(Mode::IndexPrefill, 4096, 1048576).is_err());
+        assert!(Layout::for_heads(Mode::AttentionDecode, 0, 1).is_err());
+    }
+
+    #[test]
+    fn narrow_names_and_geometry_must_agree_and_match_the_full_operand_contract() {
+        for mode in [Mode::IndexDecode, Mode::IndexPrefill, Mode::AttentionDecode, Mode::AttentionExtend] {
+            let (whole, _) = fixture(mode);
+            let layout = Layout::for_heads(mode, 64, if mode.index() { 33 } else { 16 }).unwrap();
+            let mut spec = whole.clone();
+            spec.name = layout.name().into();
+            if mode.index() { spec.geometry["heads"] = json!(2); }
+            else {
+                spec.geometry["query_heads"] = json!(32);
+                spec.geometry["kv_heads"] = json!(2);
+            }
+            spec.scratch.insert("scratch".into(), layout.scratch);
+            let entry = json!({"op":if mode.index() { "minimax_index" } else { "minimax_attention" },
+                "pointers":layout.operands().iter().map(|o| json!({"name":o.name,"dtype":o.dtype,
+                    "shape":o.shape,"role":o.role})).collect::<Vec<_>>(),
+                "scalars":mode.scalars().iter().map(|(name,kind)| json!({"name":name,"type":kind})).collect::<Vec<_>>()});
+            assert_eq!(validate_entry(&spec, &entry).unwrap(), layout);
+            let mut bad = spec.clone(); bad.name = mode.name().into();
+            assert!(validate_entry(&bad, &entry).is_err());
+            let mut bad = whole; bad.name = mode.heads_name().into();
+            assert!(validate_entry(&bad, &entry).is_err());
+            let mut bad = spec.clone(); bad.scratch.insert("scratch".into(), layout.scratch / 2);
+            assert!(validate_entry(&bad, &entry).is_err());
+            for field in ["name", "dtype", "shape", "role"] {
+                let mut bad = entry.clone(); bad["pointers"][0][field] = json!("wrong");
+                assert!(validate_entry(&spec, &bad).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_attention_requires_packed_rank_local_descales_and_exact_extents() {
+        for mode in [Mode::AttentionDecode, Mode::AttentionExtend] {
+            for rows in [1, 2, 63, 64] {
+                let layout = Layout::for_heads(mode, 64, 64).unwrap();
+                let [query, keys, values, key_scales, value_scales, pages, lengths, query_offsets, selections, output, lse, scratch] = buffers();
+                let exact = |b: Buffer, bytes| Buffer { bytes, ..b };
+                let batch = rows;
+                let b = AttentionBatch { rows, batch, table_stride: 33, pool_pages: 2,
+                    query: exact(query, rows * 8192), keys: exact(keys, 2 * 16384),
+                    values: exact(values, 2 * 16384), key_scales: exact(key_scales, batch * 8),
+                    value_scales: exact(value_scales, batch * 8), pages: exact(pages, batch * 33 * 4),
+                    lengths: exact(lengths, batch * 4), query_offsets: exact(query_offsets, (batch + 1) * 4),
+                    selections: exact(selections, 2 * 64 * 16 * 4), output: exact(output, rows * 8192),
+                    lse: exact(lse, rows * 128), scratch: exact(scratch, layout.scratch as usize) };
+                assert!(layout.attention(b).is_ok());
+                assert!(Layout::new(mode, 64, 64).unwrap().attention(b).is_err());
+                for i in 0..12 {
+                    let mut short = b;
+                    let target = match i { 0 => &mut short.query, 1 => &mut short.keys,
+                        2 => &mut short.values, 3 => &mut short.key_scales, 4 => &mut short.value_scales,
+                        5 => &mut short.pages, 6 => &mut short.lengths, 7 => &mut short.query_offsets,
+                        8 => &mut short.selections, 9 => &mut short.output, 10 => &mut short.lse,
+                        _ => &mut short.scratch };
+                    target.bytes -= 1;
+                    assert!(layout.attention(short).is_err(), "{mode:?} operand {i}");
+                }
+                let offset = Buffer { ptr: (key_scales.ptr as usize + 8) as *mut c_void, ..b.key_scales };
+                assert!(layout.attention(AttentionBatch { key_scales: offset, ..b }).is_err());
+                assert!(layout.attention(AttentionBatch { value_scales: offset, ..b }).is_err());
+                assert!(layout.attention(AttentionBatch { output: b.query, ..b }).is_err());
+                assert!(layout.attention(AttentionBatch { keys: Buffer { device_id: 1, ..b.keys }, ..b }).is_err());
+            }
+        }
     }
 
     #[test]
@@ -797,14 +935,20 @@ pub struct Msa<'a> {
 }
 impl<'a> Msa<'a> {
     pub fn bind(programs: &'a Programs<'a>, mode: Mode) -> Result<Self> {
+        Self::bind_name(programs, mode.name())
+    }
+    pub fn bind_heads(programs: &'a Programs<'a>, mode: Mode) -> Result<Self> {
+        Self::bind_name(programs, mode.heads_name())
+    }
+    fn bind_name(programs: &'a Programs<'a>, name: &str) -> Result<Self> {
         let spec = programs
-            .spec(mode.name())
+            .spec(name)
             .map_err(|e| invalid(e.to_string()))?;
         let layout = Layout::from_spec(spec)?;
         let operands = layout.operands();
         let names = operands.iter().map(|o| o.name).collect::<Vec<_>>();
         let program = programs
-            .program(mode.name(), &names)
+            .program(name, &names)
             .map_err(|e| invalid(e.to_string()))?;
         Ok(Self { program, layout })
     }
