@@ -3,6 +3,7 @@ pub(crate) mod weights;
 pub(crate) mod dense;
 pub(crate) mod attention;
 pub(crate) mod layer;
+mod experts;
 pub(crate) mod cache;
 pub(crate) mod prefix;
 pub(crate) mod prefill;
