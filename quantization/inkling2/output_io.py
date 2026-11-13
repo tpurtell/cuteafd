@@ -16,6 +16,7 @@ import fcntl
 import hashlib
 import json
 import os
+import operator
 from pathlib import Path
 import re
 
@@ -413,11 +414,22 @@ class _Reader(_Backend):
 
     def __getitem__(self, selection):
         self._unchanged()
-        if (not isinstance(selection, slice) or selection.step not in (None, 1)
-                or (selection.start is not None and (type(selection.start) is not int or not 0 <= selection.start <= self.shape[0]))
-                or (selection.stop is not None and (type(selection.stop) is not int or not 0 <= selection.stop <= self.shape[0]))):
+        if not isinstance(selection, slice):
             raise ValueError("prompt output reads require a bounded unit-step token slice")
-        start, stop, _ = selection.indices(self.shape[0])
+        def integer(value, default):
+            if value is None:
+                return default
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError("prompt output slice bounds must be integers, not booleans")
+            try:
+                return operator.index(value)
+            except TypeError as error:
+                raise ValueError("prompt output slice bounds must be integers") from error
+        start = integer(selection.start, 0)
+        stop = integer(selection.stop, self.shape[0])
+        step = integer(selection.step, 1)
+        if step != 1 or not 0 <= start <= self.shape[0] or not 0 <= stop <= self.shape[0]:
+            raise ValueError("prompt output reads require a bounded unit-step token slice")
         if stop < start:
             raise ValueError("reversed prompt output slice")
         values = np.empty((stop - start, 8, self.shape[2]), dtype=np.uint16)

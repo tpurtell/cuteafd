@@ -137,6 +137,28 @@ def test_new_layer_sparse_placeholder_and_zero_route_experts(tmp_path):
     assert not json.loads((f.layer / BACKEND_DIRECTORY / "manifest.json").read_text())["legacy_receipts"]
 
 
+def test_frozen_cumsum_numpy_integer_prompt_bounds(tmp_path):
+    f = Fixture(tmp_path)
+    writer = f.writer()
+    f.fill(writer)
+    writer.close()
+    reader = f.reader()
+    bounds = f.proxy.cumsum([0, 1, 5, 7])
+    assert isinstance(bounds[0], np.integer)
+    for index in range(len(bounds) - 1):
+        actual = reader[bounds[index]:bounds[index + 1]:np.int64(1)]
+        expected = f.expected[bounds[index]:bounds[index + 1]]
+        assert actual.tobytes() == expected.tobytes()
+        assert bf16_rank_sum(actual).tobytes() == bf16_rank_sum(expected).tobytes()
+    for invalid in (slice(True, 3), slice(0, np.bool_(True)), slice(0, 3, True),
+                    slice(np.bool_(False), 3), slice(0, 3, np.bool_(True)),
+                    slice(0.0, 3), slice(0, 3.0), slice(0, 3, 1.0),
+                    slice(np.int64(-1), 3), slice(0, np.int64(14)), slice(0, 3, np.int64(2))):
+        with pytest.raises(ValueError):
+            reader[invalid]
+    reader.close()
+
+
 def test_chunk_values_are_copied_when_appended(tmp_path):
     f = Fixture(tmp_path, legacy=())
     writer = f.writer()
