@@ -3537,7 +3537,8 @@ def test_launch_and_preflight_refuse_unconfirmed_cleanup_marker(tmp_path):
         assert marker.exists()
     # A marker whose containers are now absent is stale: cleared, launch goes on
     # (and fails later for lack of a config, not on the marker).
-    for ssh_body in ('', None):
+    for ssh_body in (None, ''):
+        marker.write_text(json.dumps([dict(host='kiwi', container='cuteafd-spark-expert-kiwi-19441')]))
         path = fake_bin(tmp_path / ('absent' if ssh_body is not None else 'broken'), '', ssh_fails=ssh_body is None)
         result = subprocess.run(['bash', str(ROOT / 'scripts/launch/run-family.sh'), '--dry-run', '--total-capacity'],
                                 env={**os.environ, 'HOME': str(home), 'PATH': f'{path}:{os.environ["PATH"]}'},
