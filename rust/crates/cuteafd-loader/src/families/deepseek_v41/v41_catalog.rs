@@ -997,9 +997,9 @@ fn exl3_catalog_or_read(snapshot: &Path, shape: RoutedExpertShape, tiers: &[usiz
 }
 
 fn kimi_catalog_config(config: &serde_json::Value) -> bool {
-    matches!(config["model_type"].as_str(), Some("kimi_k3" | "kimi_linear"))
+    matches!(config["model_type"].as_str(), Some("kimi_k3" | "kimi_k31" | "kimi_linear"))
         || config["architectures"].as_array().is_some_and(|architectures| architectures.iter().any(|name|
-            matches!(name.as_str(), Some("KimiK3ForConditionalGeneration" | "KimiLinearForCausalLM"))))
+            matches!(name.as_str(), Some("KimiK3ForConditionalGeneration" | "KimiK31ForConditionalGeneration" | "KimiLinearForCausalLM"))))
 }
 
 fn read_kimi_expert_catalog(snapshot: &Path, config: &serde_json::Value,
@@ -1785,14 +1785,32 @@ mod tests {
         let direct = format!("{:#}", read_official_v41_catalog(dir.path()).unwrap_err());
         let dispatched = format!("{:#}", read_expert_catalog(dir.path()).unwrap_err());
         assert_eq!(dispatched, direct, "V4.1 must retain its official catalog route");
-        let mut kimi = crate::plan::testing::kimi_k3_config();
-        assert!(kimi_catalog_config(&kimi));
-        kimi["quantization_config"]["quant_method"] = "unsupported".into();
-        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&kimi)?)?;
-        let error = format!("{:#}", read_expert_catalog(dir.path()).unwrap_err());
-        assert!(error.contains("Kimi Spark experts require"), "{error}");
-        kimi.as_object_mut().unwrap().remove("model_type");
-        assert!(kimi_catalog_config(&kimi), "declared architecture also identifies Kimi");
+        for (model_type, architecture) in [
+            ("kimi_k3", "KimiK3ForConditionalGeneration"),
+            ("kimi_k31", "KimiK31ForConditionalGeneration"),
+        ] {
+            let mut kimi = crate::plan::testing::kimi_k3_config();
+            kimi["model_type"] = model_type.into();
+            kimi["architectures"] = serde_json::json!([architecture]);
+            if model_type == "kimi_k31" {
+                kimi["text_config"]["dsa_config"] = serde_json::json!({
+                    "dsa_layers": kimi["text_config"]["linear_attn_config"]["full_attn_layers"],
+                    "index_num_heads": 32, "index_head_dim": 128, "index_topk": 2048,
+                    "index_rope_dim": 0, "index_k_norm_type": "layernorm",
+                    "index_topk_freq": 1, "index_skip_topk_offset": 1,
+                });
+            }
+            assert!(kimi_catalog_config(&kimi), "{model_type} must route to Kimi catalog");
+            kimi["quantization_config"]["quant_method"] = "unsupported".into();
+            std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&kimi)?)?;
+            let error = format!("{:#}", read_expert_catalog(dir.path()).unwrap_err());
+            assert!(error.contains("Kimi Spark experts require"), "{model_type}: {error}");
+            kimi.as_object_mut().unwrap().remove("model_type");
+            assert!(kimi_catalog_config(&kimi), "declared architecture {architecture} also identifies Kimi");
+            std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&kimi)?)?;
+            let arch_error = format!("{:#}", read_expert_catalog(dir.path()).unwrap_err());
+            assert!(arch_error.contains("Kimi Spark experts require"), "{architecture}: {arch_error}");
+        }
         assert!(!kimi_catalog_config(&serde_json::json!({"text_config": {"hidden_size": 7168}})),
             "nested shape alone cannot choose Kimi");
         Ok(())

@@ -47,6 +47,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         return MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(),
             notes: vec!["Kimi K3.1 compact core placement remains gated pending core-view qualification (#1777)".into()] };
     }
+    if cfg.dsa.is_some() {
+        report.runtime = Some(crate::plan::RuntimeStatus::Planned);
+        if !report.hints.iter().any(|h| h.what.contains("Kimi K3.1 serving remains gated")) {
+            report.hints.push(crate::plan::Hint {
+                what: "Kimi K3.1 serving remains gated pending full-model qualification (#1777)".into(),
+                how: "Placement and memory accounting are computed above; run kimi-golden in Stage 1 and unlock serve-kimi in Stage 4.".into(),
+            });
+        }
+    }
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![

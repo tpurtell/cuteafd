@@ -250,22 +250,29 @@ impl GoldenArgs {
     fn reference_receipt(&self) -> Result<Value> {
         let bytes = std::fs::read(self.golden.as_ref().context("golden reference missing")?.join("manifest.json"))?;
         let manifest: Value = serde_json::from_slice(&bytes)?;
+        let partial = self.skip_routed_experts && self.last_layer.is_some();
+        let comparable = !self.skip_routed_experts && self.last_layer.is_none();
         let treatment = match (self.skip_routed_experts, self.last_layer) {
             (true, Some(last)) => format!(
-                "PARTIAL gate: dense/attention/DSA prefix layers 0..={last} with routed experts skipped; not a full-model golden"
+                "diagnostic partial prefix (layers 0..={last}, routed experts skipped) scored against full-model F32 reference; NLL/KL are non-comparable and never a pass/fail gate"
             ),
-            (true, None) => "dense/attention/DSA golden with routed experts skipped; not a full-model golden".into(),
+            (true, None) => "diagnostic dense/attention/DSA run with routed experts skipped against full-model F32 reference; NLL/KL are non-comparable and never a pass/fail gate".into(),
             (false, _) => "full-model".into(),
         };
         Ok(serde_json::json!({"config":manifest["config"], "revision":manifest["revision"], "tier":"quick",
-            "manifest_sha256":digest(&bytes), "partial_gate": self.skip_routed_experts && self.last_layer.is_some(),
+            "manifest_sha256":digest(&bytes), "diagnostic_only": !comparable,
+            "partial_prefix": partial, "nll_kl_comparable": comparable,
             "treatment":treatment}))
     }
 
     fn provenance(&self) -> Value {
+        let comparable = self.nll && !self.skip_routed_experts && self.last_layer.is_none();
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
-            "rtx_expert_layers":self.rtx_expert_layers.to_string(), "attention_placement": self.attention_placement, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll || self.skip_routed_experts,
+            "rtx_expert_layers":self.rtx_expert_layers.to_string(), "attention_placement": self.attention_placement, "window": self.window, "last_layer": self.last_layer,
+            "diagnostic_only": !comparable,
+            "partial_prefix": self.last_layer.is_some(),
+            "nll_kl_comparable": comparable,
             "skip_routed_experts": self.skip_routed_experts,
             "resolved_attention_placement": self.resolved_attention(),
             "decode": self.decode,
@@ -288,7 +295,12 @@ impl GoldenArgs {
         let mut provenance = self.selected_provenance(view);
         provenance["resolved_ownership"] = serde_json::json!(ownership);
         if self.last_layer.is_some() {
-            provenance["partial_gate"] = serde_json::json!(true);
+            provenance["diagnostic_only"] = serde_json::json!(true);
+            provenance["partial_prefix"] = serde_json::json!(true);
+            provenance["nll_kl_comparable"] = serde_json::json!(false);
+            provenance["nll_kl_note"] = serde_json::json!(
+                "truncated BF16 prefix with routed experts skipped scored against full-model F32 reference; NLL/KL are diagnostic only, non-comparable, and never a pass/fail gate"
+            );
             provenance["dsa_layers_included"] = serde_json::json!(
                 cfg.dsa.is_some().then(|| cfg.mla_layers()).unwrap_or(0));
             provenance["dsa_layers_total"] = serde_json::json!(
@@ -604,7 +616,12 @@ fn full_run(args: GoldenArgs) -> Result<()> {
     let mut provenance = args.selected_provenance(checkpoint.view.as_ref()
         .context("Kimi golden requires the immutable selected checkpoint view")?);
     if args.last_layer.is_some() {
-        provenance["partial_gate"] = serde_json::json!(true);
+        provenance["diagnostic_only"] = serde_json::json!(true);
+        provenance["partial_prefix"] = serde_json::json!(true);
+        provenance["nll_kl_comparable"] = serde_json::json!(false);
+        provenance["nll_kl_note"] = serde_json::json!(
+            "truncated BF16 prefix with routed experts skipped scored against full-model F32 reference; NLL/KL are diagnostic only, non-comparable, and never a pass/fail gate"
+        );
         provenance["dsa_layers_included"] = serde_json::json!(
             cfg.dsa.is_some().then(|| cfg.mla_layers()).unwrap_or(0));
         provenance["dsa_layers_total"] = serde_json::json!(
@@ -1706,6 +1723,21 @@ mod tests {
         assert!(prefill.skip_routed_experts && !prefill.decode && prefill.verify_rows.is_none());
         assert!(!prefill.startup_graphs()?);
         assert_eq!(prefill.provenance()["diagnostic_only"], true);
+        assert_eq!(prefill.provenance()["partial_prefix"], true);
+        assert_eq!(prefill.provenance()["nll_kl_comparable"], false);
+
+        let ref_dir = tempfile::tempdir()?;
+        std::fs::write(
+            ref_dir.path().join("manifest.json"),
+            r#"{"config":"kimi-k31-v1_20261105_own-text-effort-matched-mxfp4-f32","revision":"a09a542737757710542b2460b5e1334ef6f79853"}"#,
+        )?;
+        let mut with_ref = prefill;
+        with_ref.golden = Some(ref_dir.path().to_path_buf());
+        let receipt = with_ref.reference_receipt()?;
+        assert_eq!(receipt["diagnostic_only"], true);
+        assert_eq!(receipt["partial_prefix"], true);
+        assert_eq!(receipt["nll_kl_comparable"], false);
+        assert!(receipt["treatment"].as_str().unwrap_or_default().contains("non-comparable"));
 
         let crate::cli::Commands::KimiGolden(decode) = crate::cli::Cli::try_parse_from(
             partial.into_iter().chain(["--decode", "--graphs", "on"]))?.command

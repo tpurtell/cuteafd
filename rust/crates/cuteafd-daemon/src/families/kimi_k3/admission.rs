@@ -3047,11 +3047,22 @@ pub(super) mod tests {
             }
         }
         let best = max_dsa_last_layer.context("at least one DSA prefix must admit on 1x RTX PRO 6000")?;
-        eprintln!("K3.1 1-GPU max admitted DSA last_layer={best} dsa_layers={}/24",
-            prefix(&full, best + 1)?.mla_layers());
+        assert_eq!(best, 63, "1x RTX PRO 6000 80 GiB resident weight cap bounds K3.1 prefix at last_layer=63 (16/24 DSA layers)");
+        let next_refusal = format!("{:#}", try_prefix(67).err().context("last_layer=67 must refuse on 1x RTX PRO 6000")?);
         let mut admitted = try_prefix(best)?;
+        let weights_bytes: u64 = admitted.placement.items[0].iter()
+            .filter(|item| item.category == Category::Weights)
+            .map(|item| item.bytes)
+            .sum();
+        let used_bytes: u64 = admitted.placement.items[0].iter()
+            .map(|item| item.bytes)
+            .sum();
         let mla_bytes = admitted.mla_layouts[0].mla_reserved_bytes();
         let index_bytes = admitted.mla_layouts[0].index_reserved_bytes();
+        eprintln!(
+            "K3.1 1-GPU max admitted DSA last_layer={best} dsa_layers={}/24 weights_bytes={weights_bytes} mla_bytes={mla_bytes} index_bytes={index_bytes} used_bytes={used_bytes} next_67_refusal={next_refusal}",
+            prefix(&full, best + 1)?.mla_layers(),
+        );
         assert!(mla_bytes > 0 && index_bytes > 0);
         assert_eq!(admitted.mla_layouts[0].reserved_bytes(), mla_bytes + index_bytes);
         admitted.check_mla(0, 0)?;
