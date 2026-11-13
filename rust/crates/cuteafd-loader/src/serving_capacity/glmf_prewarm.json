@@ -280,12 +280,12 @@
     },
     "2-sparks": {
       "measured_bytes": [
-        125829120,
-        117440512
+        60817408,
+        58720256
       ],
       "measured_executables": [
-        644,
-        630
+        388,
+        381
       ],
       "reserve_extra_bytes": 2097152,
       "entries": [
@@ -296,16 +296,7 @@
           "pool_width": 0,
           "page_stride": 64,
           "pool_stride": 0,
-          "pin": false
-        },
-        {
-          "rows": 1,
-          "spec": false,
-          "long": true,
-          "pool_width": 64,
-          "page_stride": 256,
-          "pool_stride": 64,
-          "pin": false
+          "pin": true
         },
         {
           "rows": 2,
@@ -332,7 +323,7 @@
           "pool_width": 0,
           "page_stride": 64,
           "pool_stride": 0,
-          "pin": true
+          "pin": false
         },
         {
           "rows": 4,
