@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn hop_control_follows_pair_lifecycle_even_when_heads_have_no_hops() {
+    fn hop_control_follows_pair_lifecycle_when_heads_have_only_entry_broadcast() {
         let mut recipe = recipe();
         let control_count = |contract: &Contract| contract.components.iter().filter(|component|
             matches!(&component.kind, ComponentKind::Allocation { template, .. }
@@ -1479,8 +1479,32 @@ mod tests {
         recipe.experts = None;
         recipe.arenas = vec![Arena { count: 0, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] }];
         toy_weight_owners(&mut recipe);
-        assert!(plan_hops(&recipe.attention, &recipe.hop_spec).unwrap().is_empty());
-        assert_eq!(control_count(&recipe.prepare(&single()).unwrap()), 2);
+        let hops = plan_hops(&recipe.attention, &recipe.hop_spec).unwrap();
+        assert_eq!(hops, [crate::placement::Hop {
+            at: crate::placement::HopPoint::Entry, from: 0, to: 1,
+            kind: crate::placement::HopKind::Broadcast,
+            storage: recipe.hop_spec.storage, row_bytes: recipe.hop_spec.row_bytes,
+        }]);
+        assert!(!hops[0].charged());
+        assert_eq!(hop_buffer_bytes(&hops, &recipe.hop_spec, 2).unwrap(), [0, 0]);
+        let layout = crate::placement::HopLinkLayout::new(&hops, &recipe.hop_spec).unwrap();
+        assert!(layout.receive.iter().all(Vec::is_empty));
+        let contract = recipe.prepare(&single()).unwrap();
+        assert_eq!(control_count(&contract), 2);
+        assert!(!contract.components.iter().any(|component|
+            matches!(&component.kind, ComponentKind::Allocation { template, .. }
+                if template.group == "residual hops")));
+        for rank in 0..2 {
+            let controls = contract.components.iter().filter_map(|component| match &component.kind {
+                ComponentKind::Allocation { template, .. }
+                    if template.id == format!("kimi.hops.0.{rank}.control") => Some(template),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(controls.len(), 1);
+            assert_eq!(controls[0].bytes, layout.control_bytes);
+            assert_eq!(controls[0].location, Location::coordinator(rank));
+            assert_eq!(controls[0].lifetime, Lifetime::RESIDENT);
+        }
     }
 
     #[test]

@@ -1029,9 +1029,38 @@ fn warmup_upload_is_one_exact_successor_per_selected_shape_not_per_rank() {
             let mut choices = vec![0; contract.variables.len()];
             choices[recipe.attention.len()] = selected;
             let facts = contract.facts(&choices, 32).unwrap();
-            assert_eq!(facts.allocations.len(), 1);
-            let owner = &facts.allocations[0];
-            assert_eq!(owner.id, "glm.upload.sync-successor");
+            let uploads = facts.allocations.iter().filter(|owner|
+                owner.id == "glm.upload.sync-successor").collect::<Vec<_>>();
+            assert_eq!(uploads.len(), 1);
+            let owner = uploads[0];
+            let mut expected_hops = Vec::new();
+            if gpus == 2 {
+                let spec = crate::placement::HopSpec {
+                    storage: crate::placement::HopStorage::ReceiveSlots,
+                    row_bytes: cfg.hidden as u64 * 2,
+                    rows: shape.rows.max(super::super::DECODE_ROWS), lanes: shape.waves,
+                    entry_gpu: 0, head_gpu: 0,
+                    terminal: crate::placement::TerminalHome::Replicated,
+                };
+                let hops = crate::placement::plan_hops(&recipe.attention, &spec).unwrap();
+                let layout = crate::placement::HopLinkLayout::new(&hops, &spec).unwrap();
+                for rank in 0..2 {
+                    let location = Location::coordinator(rank as u8);
+                    expected_hops.push((format!("glm.hops.{rank}.control"), location, layout.control_bytes));
+                    for (slot, &bytes) in layout.receive[rank].iter().enumerate() {
+                        expected_hops.push((format!("glm.hops.{rank}.recv.{slot}"), location, bytes));
+                    }
+                }
+            }
+            let mut actual_hops = facts.allocations.iter().filter(|item| item.id != owner.id)
+                .map(|item| {
+                    assert_eq!(item.lifetime, Lifetime::TARGET);
+                    assert_eq!(item.category, Category::Transport);
+                    (item.id.clone(), item.location, item.bytes)
+                }).collect::<Vec<_>>();
+            expected_hops.sort_by(|a, b| a.0.cmp(&b.0));
+            actual_hops.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(actual_hops, expected_hops);
             assert_eq!(owner.bytes, (shape.rows * shape.waves).max(64) * 4);
             assert_eq!(owner.location, Location::PINNED);
             assert_eq!(

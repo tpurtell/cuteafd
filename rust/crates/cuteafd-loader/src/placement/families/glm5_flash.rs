@@ -1710,6 +1710,8 @@ pub(crate) mod tests {
         for mode in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
             let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
             input.attention.mode = mode;
+            input.index = if mode == AttentionPlacement::Heads { cache::GlmfIndexCache::Keys }
+                else { cache::GlmfIndexCache::Compact };
             let process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
             let prepared = admission::prepare(&input, 188, true, process).unwrap();
             let solved = prepared.admit().unwrap();
