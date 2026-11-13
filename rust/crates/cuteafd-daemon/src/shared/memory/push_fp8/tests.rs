@@ -709,11 +709,7 @@ fn installed_snapshot(repo: &str) -> Result<std::path::PathBuf> {
 
 #[test]
 #[ignore = "requires installed native family headers; header-only, no CUDA or payload reads"]
-fn installed_native_scratch_matches_legacy_and_minimax_recipe() -> Result<()> {
-    use cuteafd_loader::{families::minimax_m3::weight_layout::push_host_envelope,
-        placement::families::minimax_m3::ExpertBacking};
-    use crate::shared::experts::{layer::ExpertLayer, rtx::{dense::HostStaging,
-        push::{CoordinatorExperts, WholeOwner}}};
+fn installed_native_scratch_matches_legacy() -> Result<()> {
     // Kimi's shipping coordinator is EXL3-only, but its FP8 headers still
     // exercise the shared Spark RankPlan; no native coordinator claim is made.
     for repo in ["zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash", "nvidia/GLM-5.3-NVFP4",
@@ -733,24 +729,6 @@ fn installed_native_scratch_matches_legacy_and_minimax_recipe() -> Result<()> {
                     assert_eq!(plan.host_scratch, legacy_host_scratch(&plan),
                         "{repo} TP{world} rank{rank} exact={exact}");
                 }
-            }
-        }
-        if repo == "MiniMaxAI/MiniMax-M3.1-Flash" {
-            for gpus in [1, 2] {
-                let layers = [layer, layer + 1];
-                let backings = (0..gpus).map(|gpu| ExpertBacking::plan(tensors, &layers,
-                    gpus, gpu, (1 - gpu) as i32)).collect::<Result<Vec<_>>>()?;
-                let budgets = backings.iter().map(|backing| backing.arena.bytes()).collect::<Vec<_>>();
-                let set = if gpus == 2 { CoordinatorExperts::Tp2 { layers: layers.to_vec(), budgets } }
-                    else { CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
-                        selections: layers.into_iter().map(|layer| ExpertLayer::BackboneFull { layer }).collect(),
-                        budget: budgets[0] }] } };
-                let dense = vec![HostStaging::default(); gpus];
-                assert_eq!(push_host_envelope(tensors, &backings, gpus)?,
-                    set.host_envelope(&catalog, gpus, &dense)?);
-                let empty = vec![None; gpus];
-                assert_eq!(push_host_envelope(tensors, &[], gpus)?,
-                    crate::shared::experts::rtx::push::push_host_envelope(&empty, &dense)?);
             }
         }
         eprintln!("{repo}: legacy scratch exact; native header geometry TP1/2/4/6");

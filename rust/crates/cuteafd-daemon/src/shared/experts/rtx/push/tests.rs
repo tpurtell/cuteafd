@@ -17,6 +17,36 @@ fn packed_head_push_delivers_transient_source_before_arena_pack() -> Result<()> 
 }
 
 #[test]
+#[ignore = "requires installed MiniMax headers; header-only, no CUDA or payload reads"]
+fn installed_minimax_recipe_push_envelope_matches_coordinator() -> Result<()> {
+    use cuteafd_loader::{families::minimax_m3::weight_layout::push_host_envelope as recipe_envelope,
+        placement::families::minimax_m3::ExpertBacking};
+    use crate::shared::experts::layer::ExpertLayer;
+    let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from).unwrap_or_else(||
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
+    let model = home.join("hub/models--MiniMaxAI--MiniMax-M3.1-Flash");
+    let revision = std::fs::read_to_string(model.join("refs/main"))?;
+    let catalog = cuteafd_loader::read_expert_catalog(&model.join("snapshots").join(revision.trim()))?;
+    let tensors = catalog.fp8().context("MiniMax native expert headers absent")?;
+    let layer = tensors.shape().first_layer;
+    for gpus in [1, 2] {
+        let layers = [layer, layer + 1];
+        let backings = (0..gpus).map(|gpu| ExpertBacking::plan(tensors, &layers,
+            gpus, gpu, (1 - gpu) as i32)).collect::<Result<Vec<_>>>()?;
+        let budgets = backings.iter().map(|backing| backing.arena.bytes()).collect::<Vec<_>>();
+        let set = if gpus == 2 { CoordinatorExperts::Tp2 { layers: layers.to_vec(), budgets } }
+            else { CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
+                selections: layers.into_iter().map(|layer| ExpertLayer::BackboneFull { layer }).collect(),
+                budget: budgets[0] }] } };
+        let dense = vec![super::super::dense::HostStaging::default(); gpus];
+        assert_eq!(recipe_envelope(tensors, &backings, gpus)?, set.host_envelope(&catalog, gpus, &dense)?);
+        let empty = vec![None; gpus];
+        assert_eq!(recipe_envelope(tensors, &[], gpus)?, push_host_envelope(&empty, &dense)?);
+    }
+    Ok(())
+}
+
+#[test]
 fn join_stage_errors_name_rank_device_stage_and_requested_bytes() {
     for (stage, bytes) in [("expert arena", 8 << 30), ("host-ring registration", 128 << 20)] {
         let error = join_stage::<()>(7, 6, 0, stage, bytes,
