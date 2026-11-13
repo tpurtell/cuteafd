@@ -797,7 +797,7 @@ mod tests {
             else { parse(&["--url", &url, "--api-key", "unit-test-key"]) };
         let error = run(&args).unwrap_err();
         server.join().unwrap();
-        assert!(error.to_string().contains("base_model unknown"), "{error:#}");
+        assert!(error.to_string().contains("no verified published fidelity config for test/model; missing base_model card"), "{error:#}");
     }
 
     #[test]
