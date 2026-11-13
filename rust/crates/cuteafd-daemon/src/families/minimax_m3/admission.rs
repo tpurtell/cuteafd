@@ -84,11 +84,10 @@ pub(crate) fn contract(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, weights: 
         if bytes > 0 { raw.push(Allocation::buffer(format!("mount.{name}"), location, bytes,
             Lifetime { first: Phase::Load, last: Phase::Load }, Category::Staging, "target mount")); }
     }
-    let mut buffers = raw.into_iter().map(|owner| {
+    let buffers = raw.into_iter().map(|owner| {
         let bytes = owner.bytes;
         Component::allocation(owner, ByteCurve::fixed(bytes, pages), false, pages)
     }).collect();
-    fixed_request_tails(&mut buffers, pages, &[])?;
     c.extend(buffers);
     c.extend(link.components(pages)?);
     let head = crate::shared::target_head::TargetHead::configured().blas_head(true);
@@ -99,6 +98,7 @@ pub(crate) fn contract(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, weights: 
     let stream = Allocation::buffer("driver.stream-slabs", Location::coordinator(0), cuda_stream_slab_bytes(1)?,
         Lifetime::RESIDENT, Category::Runtime, "one ordered golden stream");
     c.push(Component::allocation(stream.clone(), ByteCurve::fixed(stream.bytes, pages), false, pages));
+    fixed_request_tails(c, pages, &[])?;
     contract.add_driver_page_tables();
     Ok(contract)
 }
@@ -194,6 +194,7 @@ mod tests {
                 endpoint, rings: spark_rings(TcpTransportConfig::default().max_frame_bytes)? },
             waves, true, true, SparkIntakeCandidates::Probed, SparkReplyFormat::Bf16, Lifetime::TARGET)?;
         let contract = contract(&checkpoint, &cfg, &weights, &manifest, rows, tokens, waves, &link, "sm_120")?;
+        assert_cold_finalization_move(&contract)?;
         let decision = contract.decisions(&vec![0; contract.variables.len()])?;
         assert_eq!(decision.prefill, PrefillShape { rows: u64::from(rows), waves: waves as u64 });
         assert_eq!(decision.lanes, 1);
@@ -244,6 +245,56 @@ mod tests {
             usize::try_from(metadata.bytes)?, cuteafd_core::memory_layout::Tag::workspace("minimax/metadata"))?;
         assert_eq!(allocated.buffer.bytes as u64, metadata.bytes);
         assert!(!allocated.buffer.ptr.is_null());
+        Ok(())
+    }
+
+    fn assert_cold_finalization_move(after: &Contract) -> Result<()> {
+        let maximum = after.maximum_pages;
+        let mut before = Vec::new();
+        for component in &after.components {
+            match &component.kind {
+                ComponentKind::AllocationGranularity(tail) => {
+                    // Weight arenas retain their existing explicit tail.
+                    if tail.backings.iter().any(|backing| after.components.iter().any(|component|
+                        matches!(&component.kind, ComponentKind::ResidentWeight(owner)
+                            if owner.id == backing.backing))) {
+                        before.push(component.clone());
+                    }
+                }
+                ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm120Portable, .. } => {},
+                _ => {
+                    let mut helper = vec![component.clone()];
+                    if let ComponentKind::Allocation { template, .. } = &component.kind {
+                        // Before extraction only descriptor helpers and raw
+                        // buffers finalized. Links/stream slabs did not.
+                        if !template.id.starts_with("spark.") && template.id != "driver.stream-slabs"
+                            && !after.components.iter().any(|component| matches!(&component.kind,
+                                ComponentKind::ResidentWeight(owner) if owner.id == template.id)) {
+                            fixed_request_tails(&mut helper, maximum, &[])?;
+                        }
+                    }
+                    before.extend(helper);
+                }
+            }
+        }
+        let mut legacy = after.clone();
+        legacy.components = before;
+        legacy.add_driver_page_tables();
+        let added = after.components.iter().filter_map(|component| match &component.kind {
+            ComponentKind::AllocationGranularity(tail) if tail.id.starts_with("spark.")
+                || tail.id == "driver.stream-slabs.tail" => Some((tail.id.clone(), tail.bytes().unwrap())),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(added, (0..4).map(|rank| (format!("spark.intake.rank.{rank}.storage.tail"),
+            (2 << 20) - 4096)).collect::<Vec<_>>());
+        // Removing exactly the four newly charged intake tails recovers every
+        // legacy structural field, not just the total number of bytes.
+        let mut corrected = after.components.iter().filter(|component| !matches!(&component.kind,
+            ComponentKind::AllocationGranularity(tail) if added.iter().any(|(id, _)| id == &tail.id)))
+            .map(|component| format!("{component:?}")).collect::<Vec<_>>();
+        let mut original = legacy.components.iter().map(|component| format!("{component:?}")).collect::<Vec<_>>();
+        corrected.sort(); original.sort();
+        assert_eq!(corrected, original, "cold finalization changes only the listed transport tails");
         Ok(())
     }
 

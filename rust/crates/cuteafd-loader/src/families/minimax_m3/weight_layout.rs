@@ -61,16 +61,15 @@ impl DenseWorkspace {
 
     pub fn components(self, prefix: &str, rank: u8, lifetime: crate::placement::planner::Lifetime,
         maximum_pages: u64) -> std::result::Result<Vec<crate::placement::planner::Component>, crate::placement::planner::Refusal> {
-        use crate::placement::planner::{ByteCurve, Component, Refusal, fixed_request_tails};
+        use crate::placement::planner::{ByteCurve, Component, Refusal};
         if prefix.is_empty() || rank > 1 || maximum_pages == 0 || self.rows == 0 || self.rows > 4096
             || self.records == 0 || self.output == 0 {
             return Err(Refusal::InvalidFact("invalid MiniMax dense workspace owner".into()));
         }
-        let mut components = self.allocations(prefix, rank, lifetime).into_iter().map(|allocation| {
+        let components = self.allocations(prefix, rank, lifetime).into_iter().map(|allocation| {
             let bytes = ByteCurve::fixed(allocation.bytes, maximum_pages);
             Component::allocation(allocation, bytes, false, maximum_pages)
         }).collect();
-        fixed_request_tails(&mut components, maximum_pages, &[])?;
         Ok(components)
     }
 }
@@ -95,14 +94,13 @@ impl DenseInput {
 
     pub fn components(self, prefix: &str, rank: u8, lifetime: crate::placement::planner::Lifetime,
         maximum_pages: u64) -> std::result::Result<Vec<crate::placement::planner::Component>, crate::placement::planner::Refusal> {
-        use crate::placement::planner::{ByteCurve, Component, Refusal, fixed_request_tails};
+        use crate::placement::planner::{ByteCurve, Component, Refusal};
         if prefix.is_empty() || rank > 1 || maximum_pages == 0 || self.rows == 0 || self.rows > 4096
             || self.width == 0 || u64::from(self.rows).checked_mul(self.width).and_then(|n| n.checked_mul(2)) != Some(self.bytes) {
             return Err(Refusal::InvalidFact("invalid MiniMax dense BF16 producer destination".into()));
         }
-        let mut components = vec![Component::allocation(self.allocation(prefix, rank, lifetime),
+        let components = vec![Component::allocation(self.allocation(prefix, rank, lifetime),
             ByteCurve::fixed(self.bytes, maximum_pages), false, maximum_pages)];
-        fixed_request_tails(&mut components, maximum_pages, &[])?;
         Ok(components)
     }
 }

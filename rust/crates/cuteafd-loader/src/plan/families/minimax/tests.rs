@@ -75,6 +75,29 @@ fn execution_inventory_is_exact_recipe_partition_before_shared_finalization() {
                 };
                 if included { combined.push(component.clone()); }
             }
+            // Legacy helpers finalized their allocations separately before the
+            // recipe's combined pass. Reproduce that ordering independently.
+            let mut legacy = Vec::new();
+            for component in &combined {
+                let mut helper = vec![component.clone()];
+                if matches!(component.kind, ComponentKind::Allocation { .. }) {
+                    fixed_request_tails(&mut helper, maximum, &[]).unwrap();
+                }
+                // Weight arenas already carry their explicit canonical tail.
+                helper.retain(|item| !matches!(&item.kind, ComponentKind::AllocationGranularity(tail)
+                    if combined.iter().any(|existing| matches!(&existing.kind,
+                        ComponentKind::AllocationGranularity(owner) if owner.id == tail.id))));
+                legacy.extend(helper);
+            }
+            // Restore the canonical arena tails omitted by the helper filter.
+            legacy.extend(combined.iter().filter(|component| matches!(component.kind,
+                ComponentKind::AllocationGranularity(_))).cloned());
+            fixed_request_tails(&mut legacy, maximum, &[]).unwrap();
+            let mut before = actual.clone();
+            before.components = legacy;
+            before.add_driver_page_tables();
+            assert_eq!(signatures(&actual.components), signatures(&before.components),
+                "{gpus} RTX C{concurrency}: moving helper finalization changes no recipe charge");
             fixed_request_tails(&mut combined, maximum, &[]).unwrap();
             let mut expected = actual.clone();
             expected.components = combined;
@@ -307,7 +330,7 @@ fn structural_open_reports_exact_header_drift_and_unknown_tensors_by_name() {
 #[test]
 fn coordinator_native_dense_workspace_prices_each_serial_owner_once() {
     use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
-    use crate::placement::planner::{ComponentKind, Lifetime};
+    use crate::placement::planner::{ComponentKind, Lifetime, fixed_request_tails, independent_request};
     let (dir, _, _) = fixture();
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
@@ -323,13 +346,7 @@ fn coordinator_native_dense_workspace_prices_each_serial_owner_once() {
             ComponentKind::Allocation { template, .. } => Some(template), _ => None }).collect::<Vec<_>>();
         assert_eq!(allocations, owners.iter().collect::<Vec<_>>());
         assert!(!components.iter().any(|c| matches!(c.kind, ComponentKind::ResidentWeight(_))));
-        for component in &components {
-            if let ComponentKind::AllocationGranularity(tail) = &component.kind {
-                assert_eq!(tail.backings.len(), 1);
-                let backing = owners.iter().find(|a| a.id == tail.backings[0].backing).unwrap();
-                assert_eq!(tail.requests(), [backing.bytes]);
-            }
-        }
+        assert!(components.iter().all(|c| !matches!(c.kind, ComponentKind::AllocationGranularity(_))));
         let input = weights.dense_input(rows).unwrap();
         assert_eq!((input.width, input.bytes), (12288, u64::from(rows) * 12288 * 2));
         let input_components = input.components("minimax.dense", 0, Lifetime::TARGET, 1024).unwrap();
@@ -338,11 +355,21 @@ fn coordinator_native_dense_workspace_prices_each_serial_owner_once() {
             ComponentKind::Allocation { template, .. } => Some(template), _ => None }).collect::<Vec<_>>();
         assert_eq!(input_allocations, [&owner]);
         assert!(!owners.iter().any(|a| a.id == owner.id));
-        for component in &input_components {
-            if let ComponentKind::AllocationGranularity(tail) = &component.kind {
+        assert!(input_components.iter().all(|c| !matches!(c.kind, ComponentKind::AllocationGranularity(_))));
+        let mut combined = components;
+        combined.extend(input_components);
+        fixed_request_tails(&mut combined, 1024, &[]).unwrap();
+        let tails = combined.iter().filter_map(|component| match &component.kind {
+            ComponentKind::AllocationGranularity(tail) => Some(tail), _ => None }).collect::<Vec<_>>();
+        let all = owners.iter().chain(std::iter::once(&owner)).collect::<Vec<_>>();
+        assert_eq!(tails.len(), all.iter().filter(|allocation| independent_request(allocation.bytes)).count());
+        for allocation in all {
+            let matching = tails.iter().filter(|tail| tail.backings.iter()
+                .any(|backing| backing.backing == allocation.id)).collect::<Vec<_>>();
+            assert_eq!(matching.len(), usize::from(independent_request(allocation.bytes)), "{}", allocation.id);
+            if let Some(tail) = matching.first() {
                 assert_eq!(tail.backings.len(), 1);
-                assert_eq!(tail.backings[0].backing, owner.id);
-                assert_eq!(tail.requests(), [owner.bytes]);
+                assert_eq!(tail.requests(), [allocation.bytes]);
             }
         }
         assert!(input.components("", 0, Lifetime::TARGET, 1024).is_err());
