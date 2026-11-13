@@ -243,14 +243,15 @@ pub(crate) struct EngineArgs {
     pub exl3_window: usize,
     /// Attention prefill projections over FP8 weights (vendor FP8, CORE_VIEW=fp8-compact or a
     /// --kda-fp8 copy) that run W8A8 block-FP8 GEMMs (E4M3 activations per row and 128-K block,
-    /// FP32 scales): `mla` (q_a|kv_a, q_b, o_proj), `kda-in` / `kda-o` (the KDA in-projection and
-    /// o_proj; need FP8 KDA weights), `all`, or `none` (the default: every one W8A16, the shared
-    /// native-attention contract). BF16, K6/K8 and EXLR8 native cores are unaffected.
-    #[arg(long, value_enum, value_delimiter = ',', default_value = "none")]
+    /// FP32 scales): `mla` (q_a|kv_a, q_b, o_proj; the default: FP8 weights are an explicit
+    /// choice of FP8 numerics), `kda-in` / `kda-o` (the KDA in-projection and o_proj; opt-in,
+    /// need FP8 KDA weights), `all`, or `none` (every one W8A16). BF16, K6/K8 and EXLR8 native
+    /// cores are unaffected.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "mla")]
     pub attention_fp8_prefill: Vec<Fp8PrefillGroup>,
-    /// Dense and shared-expert MLP prefill projections over FP8 weights: W8A8 (`true`) or W8A16
-    /// (`false`, the default). Routed experts have their own formats.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    /// Dense and shared-expert MLP prefill projections over FP8 weights: W8A8 (`true`, the
+    /// default) or W8A16 (`false`). Routed experts have their own formats.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub ffn_fp8_prefill: bool,
     /// Profiling only: MoE layers run the router, the expert wire rows and the
     /// shared expert; the routed experts contribute nothing.
@@ -883,19 +884,24 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn fp8_prefill_defaults_to_w8a16_and_groups_select_w8a8() {
+    fn fp8_prefill_defaults_to_w8a8_mla_ffn_and_kda_stays_opt_in() {
         let policy = |extra: &[&str], kda: bool| { let p = fp8_prefill_policy(&parse(extra), kda); (p.mla, p.ffn, p.kda_bits) };
-        // Default: every FP8-weight prefill projection W8A16 (the shared native-attention contract).
-        assert_eq!(policy(&[], true), (false, false, 0));
-        assert_eq!(policy(&["--attention-fp8-prefill", "none"], true), (false, false, 0));
-        assert_eq!(policy(&["--attention-fp8-prefill", "mla"], true), (true, false, 0));
-        assert_eq!(policy(&["--attention-fp8-prefill", "kda-in"], true), (false, false, 1));
-        assert_eq!(policy(&["--attention-fp8-prefill", "kda-o"], true), (false, false, 2));
-        assert_eq!(policy(&["--attention-fp8-prefill", "all"], true), (true, false, 3));
+        // Default (TJ 2026-11-13): FP8 weights are an explicit choice, so MLA and dense/shared FFN
+        // prefill run W8A8 over them; KDA W8A8 stays opt-in even over FP8 KDA weights.
+        assert_eq!(policy(&[], true), (true, true, 0));
+        assert_eq!(policy(&[], false), (true, true, 0));
+        // KDA FP8 conversion itself is never on by default (`auto` resolves to off in the launcher).
+        assert_eq!(parse(&[]).kda_fp8, fp8::KdaFp8::Off);
+        // `none` + FFN false: every prefill projection over FP8 weights W8A16.
+        assert_eq!(policy(&["--attention-fp8-prefill", "none", "--ffn-fp8-prefill", "false"], true), (false, false, 0));
+        assert_eq!(policy(&["--attention-fp8-prefill", "none"], true), (false, true, 0));
+        assert_eq!(policy(&["--ffn-fp8-prefill", "false"], true), (true, false, 0));
+        assert_eq!(policy(&["--attention-fp8-prefill", "kda-in", "--ffn-fp8-prefill", "false"], true), (false, false, 1));
+        assert_eq!(policy(&["--attention-fp8-prefill", "kda-o", "--ffn-fp8-prefill", "false"], true), (false, false, 2));
+        assert_eq!(policy(&["--attention-fp8-prefill", "all"], true), (true, true, 3));
         // BF16 KDA has no FP8 weights to run W8A8 over.
-        assert_eq!(policy(&["--attention-fp8-prefill", "all"], false), (true, false, 0));
-        assert_eq!(policy(&["--ffn-fp8-prefill", "true"], true), (false, true, 0));
-        assert_eq!(policy(&["--attention-fp8-prefill", "mla,kda-in,kda-o", "--ffn-fp8-prefill", "true"], true), (true, true, 3));
+        assert_eq!(policy(&["--attention-fp8-prefill", "all"], false), (true, true, 0));
+        assert_eq!(policy(&["--attention-fp8-prefill", "mla,kda-in,kda-o"], true), (true, true, 3));
         assert!(Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l", "--attention-fp8-prefill", "ffn"]).is_err());
         assert!(Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l", "--fp8-prefill", "mla"]).is_err());
         // The fp8-compact (load-converted) core path and the legacy FP8 checkpoint path both read

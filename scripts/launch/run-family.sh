@@ -2107,12 +2107,13 @@ fi
 # old split path. Explicit keys override either default.
 # Each weight has one resident copy; the DFlash2 drafter stays FP8 by default.
 # Its MLA pools hold POOL_TOKENS tokens (a key every
-# family with a paged KV pool reads). Prefill projections over FP8 weights run
-# W8A16 by default; GLM5_FLASH_ATTENTION_FP8_PREFILL lists the attention groups
-# that run W8A8 instead (E4M3 activations per 128-K block): mla, kda-in, kda-o,
-# all (kda-* need FP8 KDA weights: GLM5_FLASH_KDA_FP8 row128/channel or
-# CORE_VIEW=fp8-compact) or off; GLM5_FLASH_FFN_FP8_PREFILL=on does the same for
-# the dense and shared-expert MLPs.
+# family with a paged KV pool reads). FP8 weights (a vendor FP8 checkpoint or
+# CORE_VIEW=fp8-compact) are an explicit choice of FP8 numerics, so prefill over
+# them runs W8A8 (E4M3 activations per 128-K block) by default:
+# GLM5_FLASH_ATTENTION_FP8_PREFILL lists the attention groups (default mla;
+# kda-in/kda-o opt-in and need FP8 KDA weights: GLM5_FLASH_KDA_FP8 row128/channel
+# or CORE_VIEW=fp8-compact; all; off for W8A16), GLM5_FLASH_FFN_FP8_PREFILL
+# (default on, off for W8A16) the dense and shared-expert MLPs.
 if [[ $family == glm5_flash ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   [[ -z "$local_layers" ]] || family_args+=(--rtx-expert-layers "$local_layers")
@@ -2199,7 +2200,7 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--target-head tensor) ;;
     *) echo "GLM5_FLASH_TARGET_HEAD must be auto, exact or tensor" >&2; exit 2 ;;
   esac
-  attention_fp8_prefill="$(get GLM5_FLASH_ATTENTION_FP8_PREFILL off)"
+  attention_fp8_prefill="$(get GLM5_FLASH_ATTENTION_FP8_PREFILL mla)"
   if [[ " ${family_args[*]} " == *" --kda-output-shard "* ]]; then
     case ",$attention_fp8_prefill," in
       *,all,*|*,kda-o,*)
@@ -2215,12 +2216,13 @@ if [[ $family == glm5_flash ]]; then
       fi ;;
   esac
   case "$attention_fp8_prefill" in
-    off) ;;
+    mla) ;;
+    off) family_args+=(--attention-fp8-prefill none) ;;
     *) family_args+=(--attention-fp8-prefill "$attention_fp8_prefill") ;;
   esac
-  case "$(get GLM5_FLASH_FFN_FP8_PREFILL off)" in
-    off) ;;
-    on) family_args+=(--ffn-fp8-prefill true) ;;
+  case "$(get GLM5_FLASH_FFN_FP8_PREFILL on)" in
+    on) ;;
+    off) family_args+=(--ffn-fp8-prefill false) ;;
     *) echo "GLM5_FLASH_FFN_FP8_PREFILL must be on or off" >&2; exit 2 ;;
   esac
   # GLM5_FLASH_EXL3_WORKER_PATH: how a Spark EXL3 worker uploads a call's inputs and waits for its

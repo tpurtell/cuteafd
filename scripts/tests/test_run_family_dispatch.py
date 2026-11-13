@@ -2551,7 +2551,8 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     assert launch.count("--snapshot ") == 1
     assert "--kda-output-shard" not in launch
     assert "--kda-prefill-expanded" not in launch
-    # Prefill over FP8 weights defaults to W8A16: nothing forwarded, the daemon default is none/false.
+    # Prefill over FP8 weights defaults to W8A8 MLA + FFN: nothing forwarded (daemon default mla/true),
+    # KDA W8A8 stays opt-in, and KDA FP8 conversion stays off.
     assert "fp8-prefill" not in launch
 
 
@@ -2618,9 +2619,12 @@ def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, a
      ["--attention-fp8-prefill all"]),
     ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_ATTENTION_FP8_PREFILL=mla,kda-in\n", ["--attention-fp8-prefill mla,kda-in"]),
     ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_ATTENTION_FP8_PREFILL=kda-o\n"
-     "GLM5_FLASH_FFN_FP8_PREFILL=on\n", ["--attention-fp8-prefill kda-o", "--ffn-fp8-prefill true"]),
-    ("GLM5_FLASH_ATTENTION_FP8_PREFILL=mla\n", ["--attention-fp8-prefill mla"]),
-    ("GLM5_FLASH_FFN_FP8_PREFILL=on\n", ["--ffn-fp8-prefill true"]),
+     "GLM5_FLASH_FFN_FP8_PREFILL=off\n", ["--attention-fp8-prefill kda-o", "--ffn-fp8-prefill false"]),
+    # off selects W8A16 for that group set.
+    ("GLM5_FLASH_ATTENTION_FP8_PREFILL=off\n", ["--attention-fp8-prefill none"]),
+    ("GLM5_FLASH_FFN_FP8_PREFILL=off\n", ["--ffn-fp8-prefill false"]),
+    ("GLM5_FLASH_ATTENTION_FP8_PREFILL=off\nGLM5_FLASH_FFN_FP8_PREFILL=off\n",
+     ["--attention-fp8-prefill none", "--ffn-fp8-prefill false"]),
 ])
 def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
