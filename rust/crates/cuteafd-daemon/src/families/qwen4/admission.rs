@@ -136,6 +136,23 @@ impl ExpertSource {
     }
 }
 
+pub(super) struct Exl3Admission {
+    pub layers: Vec<usize>,
+    pub peak_bytes: usize,
+    pub rows: usize,
+    pub mtp: bool,
+    pub selections: Vec<crate::shared::experts::layer::ExpertLayer>,
+    pub weights_budget: usize,
+}
+
+impl Exl3Admission {
+    pub fn validate_layers(&self, actual: &[usize]) -> Result<()> {
+        anyhow::ensure!(actual == self.layers,
+            "Qwen EXL3 runtime layers differ from pre-upload admission: {actual:?} != {:?}", self.layers);
+        Ok(())
+    }
+}
+
 /// Solve from the pre-weight inventory. Header/package queries below must not
 /// allocate target, table, expert or KV storage.
 pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
@@ -143,7 +160,7 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     catalog: Option<&cuteafd_loader::OfficialV41Catalog>, layers: usize, mtp: bool,
     manifest: Option<&serde_json::Value>, context: cuteafd_loader::placement::planner::Context,
     media: &crate::shared::experts::rtx::dense::Records,
-    inventory: &crate::shared::inventory::RuntimeInventory) -> Result<(usize, qwen4::QwenHost)> {
+    inventory: &crate::shared::inventory::RuntimeInventory) -> Result<(usize, qwen4::QwenHost, Option<Exl3Admission>)> {
     use anyhow::{ensure, Context};
     use cuteafd_core::memory_layout::{Basis, Category};
     use cuteafd_loader::families::qwen4::{resident::Qwen4Representation, weight_layout};
@@ -176,6 +193,7 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
             cuteafd_loader::shared::dense_read::STEP_BYTES as u64, Basis::Exact));
     }
     let mut window_push = Vec::new();
+    let mut exl3 = None;
     if !args.shared_only {
         if let Some(catalog) = catalog {
             if source == ExpertSource::LocalExl3 {
@@ -183,24 +201,27 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
                 let planned = crate::families::deepseek_v4::local::plan(library, &args.native_lib,
                     catalog, usize::from(mtp), &backbone, rows, usize::MAX)?;
                 ensure!(planned.layers == backbone, "Qwen EXL3 header plan omits admitted layers");
-                let selections = (0..usize::from(mtp)).map(|stage| ExpertLayer::Dspark { stage })
+                let expected = (0..usize::from(mtp)).map(|stage| ExpertLayer::Dspark { stage })
                     .chain(backbone.iter().map(|&layer| ExpertLayer::BackboneFull { layer }))
                     .collect::<Vec<_>>();
+                let (selections, weights_budget) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
+                    &args.native_lib, catalog, usize::from(mtp), &backbone, rows, planned.peak_bytes)?
+                    .context("Qwen EXL3 admitted package")?;
+                ensure!(selections == expected, "Qwen EXL3 push plan omits admitted layers");
                 expert_arenas.push(crate::shared::experts::weight_layout::layout(args.device, "exl3",
-                    crate::shared::experts::exl3::regions(catalog, selections)?)?);
+                    crate::shared::experts::exl3::regions(catalog, selections.iter().copied())?)?);
                 future.push(Demand::new(0, Category::Workspace, "EXL3 execution and load workspace",
                     planned.peak_bytes.checked_sub(planned.resident_weights)
                         .context("Qwen EXL3 peak below resident weights")? as u64, Basis::Exact));
                 if PushPolicy::for_snapshot(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot))?
                     == PushPolicy::Required {
                     use crate::shared::experts::rtx::push::{CoordinatorExperts, WholeOwner};
-                    let (selections, budget) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
-                        &args.native_lib, catalog, usize::from(mtp), &backbone, rows, planned.peak_bytes)?
-                        .context("Qwen EXL3 admitted package")?;
                     window_push.push(("qwen.host.push.exl3", CoordinatorExperts::Whole {
-                        owners: vec![WholeOwner { rank: 0, selections, budget }]
+                        owners: vec![WholeOwner { rank: 0, selections: selections.clone(), budget: weights_budget }]
                     }.host_envelope(catalog, 1, &[])?));
                 }
+                exl3 = Some(Exl3Admission { layers: planned.layers, peak_bytes: planned.peak_bytes,
+                    rows, mtp, selections, weights_budget });
             } else if source == ExpertSource::LocalFp8 {
                 let tensors = catalog.fp8().context("Qwen native expert headers")?;
                 let mut sets = vec![(0..layers).collect::<Vec<_>>()];
@@ -259,7 +280,7 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     tracing::info!(pool_tokens = placement.pool_tokens,
         ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
         "Qwen shared solver admission before allocation");
-    Ok((usize::try_from(placement.pool_tokens)?, inputs.host))
+    Ok((usize::try_from(placement.pool_tokens)?, inputs.host, exl3))
 }
 
 /// Qwen's KV pool from one sample of free memory after weights, the PLE table and resident experts:
@@ -588,6 +609,27 @@ pub(super) fn dual_push_envelope(dense: [u64; 2]) -> Result<cuteafd_loader::push
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::serving_capacity::qwen_graphs::*;
+
+    #[test]
+    fn exl3_runtime_requires_the_complete_preupload_admitted_window() -> anyhow::Result<()> {
+        use crate::shared::experts::layer::ExpertLayer;
+        let layers = (0..48).collect::<Vec<_>>();
+        let selections = std::iter::once(ExpertLayer::Dspark { stage: 0 })
+            .chain(layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer })).collect();
+        let admitted = super::Exl3Admission { layers: layers.clone(), peak_bytes: 70 << 30,
+            rows: 4096, mtp: true, selections, weights_budget: 69 << 30 };
+        let runtime_layers = admitted.selections.iter().filter_map(|selection| match selection {
+            ExpertLayer::BackboneFull { layer } => Some(*layer), _ => None,
+        }).collect::<Vec<_>>();
+        admitted.validate_layers(&runtime_layers)?;
+        assert_eq!(runtime_layers, layers);
+        assert!(admitted.validate_layers(&runtime_layers[..39]).is_err(),
+            "a post-KV free-memory sample must not silently shrink the resident window");
+        assert!(admitted.validate_layers(&runtime_layers[1..]).is_err());
+        assert_eq!(admitted.peak_bytes, 70 << 30);
+        assert_eq!(admitted.weights_budget, 69 << 30);
+        Ok(())
+    }
 
     #[test]
     fn local_media_weight_owner_follows_sparse_and_reversed_cuda_ordinals() -> anyhow::Result<()> {

@@ -647,7 +647,7 @@ impl Opened {
                 }
             }
         }
-        let (pool_tokens, admitted_host) = admission::preallocate(&self.library, args, &self.checkpoint,
+        let (pool_tokens, admitted_host, admitted_exl3) = admission::preallocate(&self.library, args, &self.checkpoint,
             &self.cfg, self.experts.as_ref(), layers, with_mtp, manifest_json.as_ref(),
             cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context),
             &media, &inventory)?;
@@ -747,15 +747,17 @@ impl Opened {
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
-        if let Some(experts) = self.experts(args, layers, stream, loaded_weights)? {
+        if let Some(experts) = self.experts(args, layers, stream, loaded_weights, admitted_exl3)? {
             loaded_weights.checked_add(admission::expert_weights(Some(&experts))?)?
                 .check(0, crate::shared::memory::budget::resident_weight_limit())?;
-            // Local EXL3 experts load their first window by push when the
-            // checkpoint is SparkNest's (a group of this GPU alone), else lazily.
+            // Establish the entire admitted resident set before serving, by
+            // push for SparkNest checkpoints and by mount otherwise.
             if let engine::Experts::LocalExl3(local) = &experts {
-                local.push_window(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot), self.library.cuda_get_device()?,
+                if !local.push_window(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot), self.library.cuda_get_device()?,
                     admitted_host.push.iter()
-                        .find(|(name, _)| *name == "qwen.host.push.exl3").map(|(_, envelope)| envelope))?;
+                        .find(|(name, _)| *name == "qwen.host.push.exl3").map(|(_, envelope)| envelope))? {
+                    local.ensure(0, stream)?;
+                }
             }
             engine.set_experts(experts);
         }
@@ -778,7 +780,8 @@ impl Opened {
     }
 
     fn experts<'s>(&'s self, args: &EngineArgs, layers: usize, stream: *mut std::ffi::c_void,
-        base_weights: cuteafd_loader::placement::ResidentWeights) -> Result<Option<engine::Experts<'s>>> {
+        base_weights: cuteafd_loader::placement::ResidentWeights,
+        admitted_exl3: Option<admission::Exl3Admission>) -> Result<Option<engine::Experts<'s>>> {
         if args.mtp > 0 && layers == self.cfg.layers
             && self.checkpoint.module_numerics("mtp.layers.0.mlp.experts.0.gate_proj")?
                 == cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8 {
@@ -834,13 +837,11 @@ impl Opened {
             })));
         }
         if let Some(catalog) = self.experts.as_ref().filter(|c| args.local_experts && c.exl3().is_some()) {
-            let (free, _) = self.library.cuda_memory_info()?;
+            let admitted = admitted_exl3.context("Qwen EXL3 runtime requires pre-upload admission")?;
+            admitted.validate_layers(&(0..layers).collect::<Vec<_>>())?;
             return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
-                resident: std::cell::RefCell::new(None), window: args.exl3_window.max(1), layers,
-                mtp: args.mtp > 0 && layers == self.cfg.layers,
-                max_rows: args.prefill_rows,
-                budget: free.saturating_sub(args.expert_reserve_gib << 30), base_weights,
+                resident: std::cell::RefCell::new(None), layers, admitted, base_weights,
                 loads: std::cell::RefCell::new(0),
             })));
         }
