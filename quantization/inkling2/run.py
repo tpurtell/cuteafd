@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
@@ -47,6 +48,8 @@ def git(*args, cwd=REPO):
 def plan(source, corpus):
     if os.environ.get('INKLING_GPTQMODEL_ROOT'):
         raise ValueError('production requires the committed engine submodule pin')
+    if git('status', '--porcelain', '--', *NUMERICAL_FILES):
+        raise ValueError('numerical producer files must be committed before production')
     fork = REPO/'third_party/gptqmodel'
     pin = git('rev-parse', 'HEAD', cwd=fork)
     if git('status', '--porcelain', cwd=fork):
@@ -586,7 +589,20 @@ def main():
     torch.set_num_threads(8)
     if torch.cuda.is_available():
         torch.cuda.set_per_process_memory_fraction(.90, torch.device(args.device))
-    Runner(args).run()
+    args.root.mkdir(parents=True, exist_ok=True)
+    with (args.root/'producer.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        failure = args.root/'failure.json'
+        if failure.exists():
+            raise ValueError('prior producer failure requires diagnosis before numerical recovery')
+        try:
+            Runner(args).run()
+        except BaseException as error:
+            record = dict(status='failed', phase='producer_failure',
+                time=datetime.now(timezone.utc).isoformat(), error=f'{type(error).__name__}: {error}')
+            atomic_json(failure, record)
+            atomic_json(args.root/'status.json', record)
+            raise
 
 
 if __name__ == '__main__':
