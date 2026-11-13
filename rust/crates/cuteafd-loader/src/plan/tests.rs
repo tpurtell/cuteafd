@@ -731,13 +731,26 @@ fn check_concurrency_plan_cell(
         assert!(report.hints.iter().any(|hint| hint.what.contains(&error.to_string())),
             "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
     } else {
-        let cache = report.cache_requirements.as_ref().unwrap();
+        let cache = report.cache_requirements.as_ref().unwrap_or_else(|| panic!(
+            "{label} C{c} GPUs={gpus} Sparks={ranks}: missing cache requirements: {}", render(&report)));
         assert_eq!(u64::from(cache.concurrency), c);
         assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
-        assert!(report.fits && report.placement_supported,
-            "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
         let status = family::registry().iter().find(|entry| entry.id() == family).unwrap().runtime();
         assert_eq!(report.runtime, Some(status));
+        if status == family::RuntimeStatus::Planned && !report.native_serving_admitted {
+            assert!(!report.fits && !report.placement_supported && !report.wip_launchable(),
+                "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+            assert!(report.hints.iter().any(|hint|
+                hint.what == "planned family has no executable serving admission in this build"),
+                "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+        } else {
+            assert!(report.fits && report.placement_supported,
+                "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
+        }
+        if family == "minimax_m3" {
+            assert!(report.phase_ledger.is_some() && report.solver_placement.is_some(),
+                "{label} C{c} GPUs={gpus} Sparks={ranks}: missing solved admission: {}", render(&report));
+        }
         assert_eq!(report.executable(), status == family::RuntimeStatus::Serving,
             "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
     }
