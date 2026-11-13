@@ -821,9 +821,13 @@ fn shared_recipe_refuses_valid_but_undersized_native_exports() {
                         entry[section][extent_key] = extent.into();
                     }
                     entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
-                    let scratch = entry["pointers"].as_array_mut().unwrap().iter_mut()
-                        .find(|pointer| pointer["name"] == "scratch").unwrap();
-                    scratch["shape"] = serde_json::json!(format!("[{}]", layout.scratch));
+                    for pointer in entry["pointers"].as_array_mut().unwrap() {
+                        if pointer["name"] == "scratch" {
+                            pointer["shape"] = serde_json::json!(format!("[{}]", layout.scratch));
+                        } else if pointer["name"] == "q2k_indices" {
+                            pointer["shape"] = serde_json::json!(format!("[4,{rows},16]"));
+                        }
+                    }
                 } else {
                     entry["capacity_rows"] = serde_json::json!(512);
                     if let Some(kind) = Kind::ALL.into_iter().find(|kind| kind.name() == name) {
