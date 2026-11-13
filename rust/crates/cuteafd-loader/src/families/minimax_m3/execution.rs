@@ -402,10 +402,9 @@ impl MsaCache {
                 out.push((format!("layer.{layer}.{name}"), bytes));
             }
         }
-        out.push((
-            "page_table".into(),
-            u64::from(self.requests) * u64::from(self.table_width) * 4,
-        ));
+        for name in ["page_table", "decode_table"] {
+            out.push((name.into(), u64::from(self.requests) * u64::from(self.table_width) * 4));
+        }
         out.push(("lengths".into(), u64::from(self.requests) * 4));
         Ok(out)
     }
@@ -442,6 +441,21 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn decode_table_has_a_distinct_admitted_backing_without_reordering_canonical_rows() {
+        for requests in [1, 3, 16, 64] {
+            let cache = MsaCache::new(1, 5, requests, 270).unwrap();
+            assert_eq!(cache.table_width, 8);
+            let buffers = cache.buffers().unwrap().into_iter().collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(buffers["page_table"], u64::from(requests) * 8 * 4);
+            assert_eq!(buffers["decode_table"], buffers["page_table"]);
+            let components = cache.components("minimax.cache.0", 0, 5).unwrap();
+            use crate::placement::planner::ComponentKind;
+            assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+                ComponentKind::AllocationGranularity(tail) if tail.id.ends_with("decode_table.tail"))).count(), 1);
+        }
+    }
+
     #[test]
     fn packed_metadata_keeps_segment_views_aligned_and_decode_contiguous() {
         assert_eq!(UnitMetadata::new(17).unwrap().buffers(), vec![("positions", 136),
