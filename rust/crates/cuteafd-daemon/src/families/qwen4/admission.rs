@@ -544,7 +544,12 @@ pub(super) fn dual_dense_staging(checkpoint: &cuteafd_loader::plan::Checkpoint, 
                 for (parts, _) in windows_with_tail(&rects, 128)? { out.push(parts); }
             }
         }
-        if ple { widen(&format!("{p}.ple.conv1d.weight"), out)?; }
+        if ple {
+            widen(&format!("{p}.ple.conv1d.weight"), out)?;
+            if cuteafd_loader::families::qwen4::weight_layout::ple_scale_dtype(checkpoint, p)?.is_some() {
+                widen(&format!("{p}.ple.ple_embedding.ngram_embedding.weight_scale"), out)?;
+            }
+        }
         Ok(())
     };
     for (index, &owner) in owners.iter().enumerate() {

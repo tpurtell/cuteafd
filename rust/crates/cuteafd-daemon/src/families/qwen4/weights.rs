@@ -708,6 +708,20 @@ mod tests {
                     assert!(inventory.receipts.iter().any(|r| r.allocation.id.contains(&format!("qwen4/target/rank{gpu}"))));
                     assert_eq!(allocation.buffer.device_id, gpu);
                 }
+                // The scalar's widening step must also appear in pre-upload
+                // admission, on precisely the owner that records it.
+                let owners = [gpu as usize, 1 - gpu as usize];
+                let model = planning.model_placed(&cfg, &owners, &ranks, false, false)?;
+                let records = load.sink.as_ref().unwrap().take_all();
+                let charged = super::super::admission::dual_dense_staging(&checkpoint, &cfg, &owners,
+                    false, false, false, &Default::default(), [0, 1])?;
+                for rank in 0..2 {
+                    let actual = crate::shared::experts::rtx::dense::RankLayout::new(
+                        records.operands.clone(), records.steps.clone(), rank as i32)?.host_staging.bytes()?;
+                    assert_eq!(charged[rank], actual as u64,
+                        "table={table_dtype} scalar={scalar_dtype} owner={gpu} rank={rank}");
+                }
+                drop(model);
             }
         }
         Ok(())
