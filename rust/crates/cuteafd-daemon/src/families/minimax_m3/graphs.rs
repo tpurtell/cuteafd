@@ -5,7 +5,7 @@
 //! `graph-prewarm-from-trace.py --family minimax_m3` depends on #1938's generic
 //! row-sites support. No family-local trace parser or memory model belongs here.
 use crate::shared::{decode_graph::{self, device::{self, Basis, Cycle, Estimate, Preference, Site},
-    GraphBank, GraphOwner, GraphPolicy}, memory::device::Stream};
+    GraphBank, GraphOwner}, memory::device::Stream};
 use anyhow::{ensure, Result};
 use std::{collections::HashSet, rc::Rc};
 
@@ -81,7 +81,7 @@ impl<'a, P> Graphs<'a, P> {
             && sites.iter().all(|&(layer, _)| layer < layers), "MiniMax graph admitted geometry");
         let unique = sites.iter().copied().collect::<HashSet<_>>();
         ensure!(unique.len() == sites.len(), "MiniMax duplicate graph site");
-        let mut bank = GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "minimax_m3");
+        let mut bank = GraphBank::with_family("minimax_m3");
         bank.attach_device(stream.device.library, stream.device.id, config.reserve, config.site())?;
         Ok(Self { bank, stream, pins, rank, layers, capacity, sites: unique,
             touched: HashSet::new(), eager: HashSet::new(), first_touch_pending: false,
@@ -133,15 +133,15 @@ impl<'a, P> Graphs<'a, P> {
             let raw = graph.raw;
             return self.stream.device.run(|| {
                 // SAFETY: P retains captured storage and this owner's exact stream.
-                unsafe { self.stream.device.library.cuda_graph_launch(raw, self.stream.raw) }
+                unsafe { decode_graph::launch(self.stream.device.library, raw, self.stream.raw) }
             });
         }
         let Some(ticket) = self.bank.cache_ticket(&key, false, estimate) else { return work() };
         let device = self.stream.device;
         device.run(|| {
             let library = device.library;
-            // SAFETY: work records only launches on the persistent owner stream.
-            if let Err(error) = unsafe { library.cuda_graph_begin_capture(self.stream.raw) } {
+            // SAFETY: the shared ticket admits this persistent-stream recording.
+            if let Err(error) = unsafe { decode_graph::begin_capture(library, self.stream.raw, &ticket) } {
                 if self.bank.cache_ticket_failed(ticket, &error) {
                     tracing::warn!(%error, ?key, "MiniMax capture unavailable; running eagerly");
                 }
@@ -178,7 +178,7 @@ impl<'a, P> Graphs<'a, P> {
             self.bank.census_capture_key("section", key.rank as i32, None, &key, raw);
             self.bank.cache_commit(key, graph, ticket, nodes as u64, width, spans || self.spans_devices);
             // SAFETY: newly committed executable and storage remain retained.
-            unsafe { library.cuda_graph_launch(raw, self.stream.raw) }
+            unsafe { decode_graph::launch(library, raw, self.stream.raw) }
         })
     }
 
@@ -249,7 +249,7 @@ mod tests {
     fn fixture_bank<'a, P>(stream: Rc<Stream<'a>>, pins: Rc<P>, synthetic: i32) -> Result<Graphs<'a, P>> {
         let config = Config { reserve: 64 << 20, bootstrap: 2 << 20,
             basis: Basis::Bytes, spans_devices: false };
-        let mut bank = GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "minimax_m3");
+        let mut bank = GraphBank::with_family("minimax_m3");
         bank.attach_device_for_test(synthetic, config.reserve, config.site())?;
         Ok(Graphs { bank, stream, pins, rank: 1, layers: 2, capacity: 16,
             sites: [(1, Op::Attention), (1, Op::Ffn)].into_iter().collect(), touched: HashSet::new(),
@@ -336,7 +336,7 @@ mod tests {
         let raw = stream.device.run(|| {
             // SAFETY: fixture recording has no real kernels or pointers.
             unsafe {
-                library.cuda_graph_begin_capture(stream.raw)?;
+                decode_graph::begin_capture(&library, stream.raw, &ticket)?;
                 library.cuda_graph_end_capture(stream.raw)
             }
         })?;
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn zero_reserve_uses_shared_eager_decision_without_capture() -> Result<()> {
         let config = Config { reserve: 0, bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false };
-        let mut bank = GraphBank::<Key, ()>::with_family(GraphPolicy::Budgeted { bytes: None }, "minimax_m3");
+        let mut bank = GraphBank::<Key, ()>::with_family("minimax_m3");
         bank.attach_device_for_test(-1945, config.reserve, config.site())?;
         let keys = bootstrap_keys(0, 64, &[(0, Op::Attention), (0, Op::Ffn)])?;
         for cycle in [Cycle::Other, Cycle::Decode, Cycle::Prefill] {
