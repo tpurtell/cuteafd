@@ -133,8 +133,21 @@ pub(crate) mod serve_admission {
     #[derive(Debug, Clone, Copy)]
     pub(crate) struct Sample { pub total: u64, pub cap: u64, pub free: u64, pub pending_code: u64 }
 
+    pub(crate) fn validate_prefill(shape: cuteafd_loader::placement::planner::PrefillShape)
+        -> std::result::Result<(), cuteafd_loader::families::minimax_m3::admission::Refused> {
+        if shape.rows == 0 || shape.rows % shared::PAGE_ROWS != 0 || shape.waves == 0 {
+            return Err(cuteafd_loader::families::minimax_m3::admission::Refused {
+                what: format!("MiniMax admitted prefill unit {} rows x {} waves is not positive and 64-row aligned",
+                    shape.rows, shape.waves),
+                how: "select a positive multiple-of-64 prefill unit and positive wave count before serving".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn admit(mut facts: FactsRequest<'_>, samples: &[Sample],
         onboard: cuteafd_loader::placement::Onboard) -> Result<AdmittedMiniMax> {
+        validate_prefill(facts.prefill)?;
         facts.coordinator = Coordinator::Measured {
             samples: samples.iter().map(|s| (s.total, s.cap, s.free)).collect(),
             loaded_code: samples.iter().map(|s| s.pending_code).collect() };
@@ -144,6 +157,26 @@ pub(crate) mod serve_admission {
         let admitted = inputs.admit(request).context("MiniMax serving admission")?;
         cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "minimax_m3");
         Ok(admitted)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use cuteafd_loader::placement::planner::PrefillShape;
+
+        #[test]
+        fn non_aligned_units_have_a_typed_refusal_before_serving() -> Result<()> {
+            for rows in [0, 1, 20, 63, 65, 2753] {
+                let refused = validate_prefill(PrefillShape { rows, waves: 3 }).unwrap_err();
+                assert!(refused.what.contains("64-row aligned"));
+                assert!(refused.how.contains("before serving"));
+            }
+            assert!(validate_prefill(PrefillShape { rows: 64, waves: 0 }).is_err());
+            for rows in [64, 128, 2752, 4096] {
+                validate_prefill(PrefillShape { rows, waves: 3 })?;
+            }
+            Ok(())
+        }
     }
 }
 
