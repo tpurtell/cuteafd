@@ -473,17 +473,6 @@ impl MiniMaxInputs {
             out.extend(msa.workspace_components(&format!("{prefix}.attention"), gpu as u8, true, Lifetime::TARGET, maximum)?);
             out.extend(producers.workspace_components(&format!("{prefix}.attention"), gpu as u8, Lifetime::TARGET, maximum)?);
         }
-        if self.gpus == 2 {
-            // TP2 expert exchange (shared `OwnerTp2Rows` ABI: BF16 rows, two
-            // abortable slots, reduction, peer control and abort word), one
-            // unit wide; decode rows fit within it.
-            let rows = crate::serving_capacity::OwnerTp2Rows::new(cfg.hidden as u64, cfg.topk as u64,
-                self.prefill.rows.max(u64::from(DECODE_ROWS)), false).map_err(refusal)?;
-            for demand in rows.demands().map_err(refusal)?.into_iter().filter(|d| usize::from(d.gpu) == gpu) {
-                out.extend(buffer(format!("{}.{}", Owner::Tp2 { gpu }.id(), demand.group.replace(' ', "_")), location,
-                    demand.bytes, Lifetime::TARGET, demand.category, &demand.group, maximum));
-            }
-        }
         out.extend(allowance(location, self.graph_reserve[gpu], Lifetime { first: Phase::Warmup, last: Phase::Growth },
             crate::placement::graph_reserve::source(&format!("minimax_m3.graphs.{gpu}")), true, maximum));
         out.extend(allowance(location, self.code[gpu], Lifetime::RESIDENT,
@@ -595,6 +584,17 @@ impl Recipe for MiniMaxInputs {
                 continue;
             }
             if count > 0 {
+                if pair {
+                    // No local halves means no OwnerTp2 exchange. Boundary
+                    // hops retain their own storage independently of onboarding.
+                    let rows = crate::serving_capacity::OwnerTp2Rows::new(cfg.hidden as u64,
+                        cfg.topk as u64, self.prefill.rows.max(u64::from(DECODE_ROWS)), false).map_err(refusal)?;
+                    for demand in rows.demands().map_err(refusal)? {
+                        components.extend(with(buffer(format!("{}.{}", Owner::Tp2 { gpu: demand.gpu as usize }.id(),
+                            demand.group.replace(' ', "_")), Location::coordinator(demand.gpu), demand.bytes,
+                            Lifetime::TARGET, demand.category, &demand.group, maximum).into_iter().collect(), &activation));
+                    }
+                }
                 let LocalPackage::Installed { scratch, output } = self.local else { unreachable!() };
                 for backing in &self.expert_backings[count] {
                     let gpu = backing.gpu;

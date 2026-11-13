@@ -668,6 +668,33 @@ fn shared_recipe_onboards_whole_layers_or_tp2_halves() {
 }
 
 #[test]
+fn zero_onboard_pair_has_no_local_expert_or_exchange_owners() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::Operation;
+    for count in [0, 1] {
+        let inputs = recipe_inputs(2, 4);
+        let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(count),
+            inputs.prefill, Operation::Serving, None, Default::default());
+        let admitted = inputs.admit(request).unwrap();
+        let owners = &admitted.solved.facts.allocations;
+        let exchange = owners.iter().filter(|owner| owner.id.starts_with("minimax.tp2.")).count();
+        let workspace = owners.iter().filter(|owner| owner.id.starts_with("minimax.expert_workspace.")).count();
+        assert_eq!(exchange, if count == 0 { 0 } else { 10 });
+        assert_eq!(workspace, if count == 0 { 0 } else { 4 });
+        assert_eq!(admitted.expert_backings.len(), if count == 0 { 0 } else { 2 });
+        if count == 0 {
+            assert!(owners.iter().all(|owner| !owner.id.starts_with("minimax.experts.")
+                && !owner.id.starts_with("minimax.expert_")));
+            for backing in &inputs.expert_backings[1] {
+                assert!(owners.iter().all(|owner| owner.id != backing.arena.id()));
+            }
+        }
+        assert!(owners.iter().any(|owner| owner.id.starts_with("minimax.hops.")));
+        assert!(owners.iter().any(|owner| owner.id.starts_with("minimax.spark.")));
+    }
+}
+
+#[test]
 fn prefix_ordered_uploads_match_each_request_destination() {
     use crate::placement::families::minimax_m3::{self as shared, Owner};
     use crate::placement::planner::{Operation, Location};
