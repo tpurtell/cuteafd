@@ -106,6 +106,16 @@ impl HeadPlan {
 
     pub fn bytes(&self) -> u64 { self.bytes }
 
+    /// Cold golden packs head weights into the chain's one target arena.
+    /// Only independent head workspace backings remain to be charged here.
+    pub(super) fn cold_workspace_bytes(&self) -> Result<u64> {
+        let mut requests = self.planes.iter().map(|&bytes| bytes as u64).collect::<Vec<_>>();
+        let native = self.private_scratch_bytes()?;
+        if native > 0 { requests.push(native); }
+        super::chain::physical_bytes(&requests)
+    }
+
+
     pub(super) fn workspace_bytes(&self) -> u64 {
         self.planes.iter().map(|&n| n as u64).sum()
     }

@@ -58,22 +58,57 @@ impl Layer<'_> {
 }
 
 fn weight_layout(layout: &RankWeightLayout, rope: &cuteafd_loader::plan::rope::Tables,
-    device: i32, count: usize) -> Result<cuteafd_loader::serving_capacity::WeightArenaLayout> {
+    device: i32, count: usize, head: bool) -> Result<cuteafd_loader::serving_capacity::WeightArenaLayout> {
     // The separately admitted vocabulary head is not part of the prefix owner.
     let mut prefix = layout.clone();
     let selected = |name: &str| name.strip_prefix("model.layers.")
         .and_then(|rest| rest.split_once('.')).and_then(|(layer, _)| layer.parse::<usize>().ok())
         .is_some_and(|layer| layer < count);
+    let selected = |name: &str| selected(name) || (head && matches!(name, "model.norm.weight" | "lm_head.weight"));
     prefix.operands.retain(|operand| selected(&operand.name));
     prefix.core.retain(|name, _| selected(name));
     prefix.target_arena(Some(rope), device, count, false)
+}
+
+fn workspace_requests(layout: &RankWeightLayout,
+    layer: &cuteafd_loader::plan::families::step5::coordinator::LayerContract,
+    rows: usize) -> Result<Vec<u64>> {
+    use cuteafd_loader::{formats::trellis_core::ProjectionScratchLayout,
+        plan::families::step5::native};
+    let mut requests = if layer.sliding.is_some() {
+        native::swa_planes(rows, layer.geometry.query_heads)?.to_vec()
+    } else { native::csa_planes(rows)?.to_vec() };
+    requests.extend(if layer.dense_activation.is_some() {
+        native::dense_planes(rows)?.to_vec()
+    } else { native::routed_planes(rows)?.to_vec() });
+    // Cold owners allocate every plane independently, unlike serving's
+    // serialized arena. Native attention and FFN each retain packed scratch.
+    let mut scratch = std::collections::BTreeMap::<bool, ProjectionScratchLayout>::new();
+    let prefix = format!("model.layers.{}.", layer.layer);
+    for (name, core) in layout.core.iter().filter(|(name, _)| name.starts_with(&prefix)) {
+        let next = ProjectionScratchLayout::new(core.shape[1], core.shape[0], rows)?;
+        let attention = name.contains(".self_attn.");
+        match scratch.get_mut(&attention) {
+            Some(owner) => owner.merge(&next)?,
+            None => { scratch.insert(attention, next); }
+        }
+    }
+    for layout in scratch.values() { requests.push(layout.packed_bytes()?); }
+    Ok(requests.into_iter().map(|bytes| bytes as u64).collect())
+}
+
+pub(super) fn physical_bytes(requests: &[u64]) -> Result<u64> {
+    let payload = requests.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(bytes))
+        .context("Step-5 cold allocation payload overflow")?;
+    payload.checked_add(cuteafd_loader::placement::planner::allocation_granularity_forecast(requests)?)
+        .context("Step-5 cold allocation tail overflow")
 }
 
 pub(super) struct TargetChain<'a> {
     layers: Vec<Layer<'a>>,
     rows: usize,
     bytes: u64,
-    weights: crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
+    _weights: crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
 }
 impl<'a> TargetChain<'a> {
     fn plan(
@@ -81,6 +116,7 @@ impl<'a> TargetChain<'a> {
         checkpoint: &'a Checkpoint,
         count: usize,
         rows: usize,
+        head: bool,
     ) -> Result<(u64, Vec<Option<RoutedPlan>>)> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         ensure!(
@@ -88,24 +124,18 @@ impl<'a> TargetChain<'a> {
             "Step-5 target prefix count/rows"
         );
         let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
-        let arena = weight_layout(&layout, &contract.rope_tables, 0, count)?;
+        let arena = weight_layout(&layout, &contract.rope_tables, 0, count, head)?;
         let weights = arena.bytes() as u64;
         let tail = cuteafd_loader::placement::planner::allocation_granularity_forecast(&[weights])?;
-        let mut bytes = weights.checked_add(tail).context("chain arena overflow")?;
+        let mut requests = vec![weights];
         tracing::info!(weights, tail, count, "Step-5 cold chain weight arena");
         let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog_view(
             checkpoint.view.as_ref().context("Step-5 target chain requires its selected checkpoint view")?)).transpose()?;
         let mut routed = Vec::new();
         for layer in &contract.layers[..count] {
-            let workspace = if layer.sliding.is_some() {
-                SwaLayer::workspace_bytes(rows)?
-            } else {
-                CsaLayer::workspace_bytes(rows)?
-            };
-            let ffn = if layer.dense_activation.is_some() {
+            if layer.dense_activation.is_some() {
                 routed.push(None);
-                DensePlan::prepare(programs, checkpoint, layer.layer, rows, u64::MAX, &[])?
-                    .workspace_bytes()
+                DensePlan::prepare(programs, checkpoint, layer.layer, rows, u64::MAX, &[])?;
             } else {
                 let plan =
                     RoutedPlan::prepare(programs, checkpoint, layer.layer, rows, u64::MAX, &[])?
@@ -113,31 +143,11 @@ impl<'a> TargetChain<'a> {
                             let catalog = catalog.as_ref().context("Step-5 routed expert headers missing")?;
                             super::experts::StepExperts::from_catalog(catalog)?.layer_bf16_input(catalog, layer.layer)?
                         });
-                let workspace = plan.workspace_bytes();
                 routed.push(Some(plan));
-                workspace
-            };
-            // Cold owners have independent attention and FFN projection scratch.
-            // Unlike serving's serialized lane scratch, these cannot be charged once.
-            let mut scratch = std::collections::BTreeMap::<bool, cuteafd_loader::formats::trellis_core::ProjectionScratchLayout>::new();
-            let prefix = format!("model.layers.{}.", layer.layer);
-            for (name, core) in layout.core.iter().filter(|(name, _)| name.starts_with(&prefix)) {
-                let next = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(core.shape[1], core.shape[0], rows)?;
-                let attention = name.contains(".self_attn.");
-                match scratch.get_mut(&attention) {
-                    Some(owner) => owner.merge(&next)?,
-                    None => { scratch.insert(attention, next); }
-                }
             }
-            let projection = scratch.values().map(|layout| -> Result<u64> {
-                let bytes = layout.packed_bytes()? as u64;
-                bytes.checked_add(cuteafd_loader::placement::planner::allocation_granularity_forecast(&[bytes])?)
-                    .context("chain projection overflow")
-            }).collect::<Result<Vec<_>>>()?.into_iter().sum::<u64>();
-            bytes = bytes.checked_add(workspace).and_then(|n| n.checked_add(ffn))
-                .and_then(|n| n.checked_add(projection)).context("chain workspace overflow")?;
+            requests.extend(workspace_requests(&layout, layer, rows)?);
         }
-        Ok((bytes, routed))
+        Ok((physical_bytes(&requests)?, routed))
     }
     pub fn required_bytes(
         programs: &'a Programs<'a>,
@@ -145,8 +155,17 @@ impl<'a> TargetChain<'a> {
         count: usize,
         rows: usize,
     ) -> Result<u64> {
-        Ok(Self::plan(programs, checkpoint, count, rows)?.0)
+        Ok(Self::plan(programs, checkpoint, count, rows, false)?.0)
     }
+    pub(super) fn required_with_head(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        count: usize, rows: usize, head: bool) -> Result<u64> {
+        Ok(Self::plan(programs, checkpoint, count, rows, head)?.0)
+    }
+
+    pub(super) fn weight_arena(&self) -> &crate::shared::memory::weight_arena::DeviceWeightArena<'a> {
+        &self._weights
+    }
+
     pub fn load(
         device: Device<'a>,
         programs: &'a Programs<'a>,
@@ -157,7 +176,12 @@ impl<'a> TargetChain<'a> {
         reservations: &[u64],
         kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     ) -> Result<Self> {
-        let (bytes, routed) = Self::plan(programs, checkpoint, count, rows)?;
+        Self::load_with_head(device, programs, checkpoint, count, rows, available, reservations, kv_format, false)
+    }
+    pub(super) fn load_with_head(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        count: usize, rows: usize, available: u64, reservations: &[u64],
+        kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, head: bool) -> Result<Self> {
+        let (bytes, routed) = Self::plan(programs, checkpoint, count, rows, head)?;
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let total = reservations
             .iter()
@@ -169,7 +193,7 @@ impl<'a> TargetChain<'a> {
         );
         let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
         let weights = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
-            weight_layout(&layout, &contract.rope_tables, device.id, count)?,
+            weight_layout(&layout, &contract.rope_tables, device.id, count, head)?,
             cuteafd_core::memory_layout::ArenaTag::weights("step5/target"))?;
         let rope = Rc::new(TargetTables::load_in(
             device,
@@ -222,10 +246,9 @@ impl<'a> TargetChain<'a> {
             layers,
             rows,
             bytes,
-            weights,
+            _weights: weights,
         })
     }
-    pub(super) fn weight_arena(&self) -> &crate::shared::memory::weight_arena::DeviceWeightArena<'a> { &self.weights }
 
     pub fn bytes(&self) -> u64 {
         self.bytes
@@ -348,6 +371,59 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::{cell::RefCell, path::Path};
     use super::super::routed::GateRequest;
+
+    #[test]
+    fn cold_mc_views_charge_selected_core_backing_once() -> Result<()> {
+        use cuteafd_loader::plan::{testing, checkpoint::{CheckpointView, CoreView},
+            families::step5::{Config, exl3}};
+        let root = tempfile::tempdir()?;
+        testing::write_step5_exl3_snapshot(root.path());
+        let source = Checkpoint::open(root.path())?;
+        let cfg = Config::parse(&source)?;
+        let tensors = source.tensors.iter().map(|t| (t.meta.name.clone(),
+            match t.meta.dtype {
+                cuteafd_core::DType::Bf16 => "BF16", cuteafd_core::DType::F16 => "F16",
+                cuteafd_core::DType::F32 => "F32", cuteafd_core::DType::I16 => "I16",
+                cuteafd_core::DType::I32 => "I32", cuteafd_core::DType::U8 => "U8",
+                _ => panic!("fixture dtype"),
+            }, t.meta.shape.clone())).collect::<Vec<_>>();
+        let target = exl3::expected(&cfg).into_iter().filter(|(name, _)|
+            name == "lm_head.weight" || name.strip_prefix("model.layers.")
+                .and_then(|s| s.split('.').next()).and_then(|s| s.parse::<usize>().ok())
+                .is_some_and(|layer| layer < cfg.layers)).collect();
+        let mc = tempfile::tempdir()?;
+        testing::write_mc_snapshot(mc.path(), &source.config, &tensors, &target);
+        let mut charges = Vec::new();
+        for view in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact] {
+            let checkpoint = Checkpoint::open_view(&CheckpointView::select(mc.path(), view)?)?;
+            let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+            let layout = RankWeightLayout::from_checkpoint(&checkpoint, 0, 1)?;
+            let arena = weight_layout(&layout, &contract.rope_tables, 0, cfg.layers, true)?;
+            let mut tensors = layout.arena_tensors(|name| name == "model.norm.weight"
+                || name == "lm_head.weight" || name.strip_prefix("model.layers.")
+                    .and_then(|s| s.split('.').next()).and_then(|s| s.parse::<usize>().ok())
+                    .is_some_and(|layer| layer < cfg.layers))?;
+            for (index, recipe) in contract.rope_tables.recipes.iter().enumerate() {
+                let bytes = usize::try_from(recipe.allocation_bytes(contract.rope_tables.extent)? / 2)?;
+                for part in ["cos", "sin"] { tensors.push((format!("rope.{index}.{part}"), bytes)); }
+            }
+            let expected = cuteafd_loader::serving_capacity::PackedWeightRegions::new(
+                tensors.iter().map(|(_, bytes)| *bytes))?.bytes as u64;
+            assert_eq!(arena.bytes() as u64, expected, "{view:?}");
+            assert_eq!(physical_bytes(&[expected])?, expected +
+                cuteafd_loader::placement::planner::allocation_granularity_forecast(&[expected])?);
+            if view != CoreView::Original {
+                assert!(!layout.core.is_empty());
+                assert!(arena.payload_bytes() as u64 > layout.operands.iter()
+                    .filter(|operand| operand.name != "model.embed_tokens.weight")
+                    .map(|operand| operand.allocation_bytes).sum::<u64>());
+            }
+            charges.push(expected);
+        }
+        assert!(charges[0] > charges[2] && charges[2] > charges[1], "{charges:?}");
+        Ok(())
+    }
+
 
     const H: usize = 4096;
     const REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
