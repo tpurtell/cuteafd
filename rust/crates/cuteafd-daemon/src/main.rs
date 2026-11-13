@@ -312,6 +312,8 @@ fn main() -> Result<()> {
         .init();
     tracing::info!("{host_isa}");
     tracing::info!("{malloc}");
+    // Opt-in only (CUTEAFD_DIAG_STACK_ON_TIMEOUT=1): its handler is installed before any worker thread.
+    shared::stack_dump::install();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = shared::memory_report::finish(runtime.block_on(run()));
     shared::decode_graph::device::shutdown_traces();

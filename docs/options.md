@@ -499,6 +499,18 @@ route, context and draft exchanges, come out of the release memory padding
 (`MEMORY_PADDING`, 100 MiB by default). The per-issue host logging slows decode,
 so leave it off for measurements.
 
+`CUTEAFD_DIAG_STACK_ON_TIMEOUT=1` is a private coordinator-only diagnostic for any
+family, not a launch configuration key; pass it through
+`wip-cards --arm-env ARM:CUTEAFD_DIAG_STACK_ON_TIMEOUT=1`. A watcher thread dumps every
+thread's stack to the coordinator log (`stall stack` lines) in two cases: when a
+submission has issued no peer push or wait for 20 s while it is in flight, which
+catches a blocked host thread while the stall is still live, and the first time a
+peer wait times out on the device. Each line gives the thread's name, scheduler state
+and kernel wait channel, plus its return addresses as `module+offset`. Resolve them
+offline with `addr2line -f -C -e <module> <offset>` against the sealed slot binaries.
+Collection uses a `SIGUSR1` handler that writes into pre-allocated slots; no ptrace
+is involved. Unset or any value other than `1`: no thread, no handler, no counters.
+
 ## Family support: option values
 
 Attention placement (`ATTENTION_PLACEMENT`; `auto` resolves through the

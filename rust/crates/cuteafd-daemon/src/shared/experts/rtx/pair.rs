@@ -259,6 +259,7 @@ fn run_submission<T>(
     body: impl FnOnce(&SubmissionScope<'_>) -> Result<T>,
 ) -> Result<T> {
     require_live()?;
+    let _in_flight = crate::shared::stack_dump::in_flight();
     let mut guard = SubmissionGuard(Some(shutdown));
     // Test-only (`shared::fault`): fail a recoverable boundary before its body
     // queues anything, exercising the same request-local path every adopter uses.

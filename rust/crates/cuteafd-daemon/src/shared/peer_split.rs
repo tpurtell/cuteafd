@@ -335,6 +335,11 @@ impl<'a> PeerExchange<'a> {
                 })
             })
         };
+        if crate::shared::stack_dump::enabled() {
+            if let Some(probe) = library.peer_wait_timeout_probe() {
+                crate::shared::stack_dump::watch_timeout_record(probe);
+            }
+        }
         exchange.abort = Some(TerminalAbort {
             sides: [side(0)?, side(1)?],
             state: Cell::new(TerminalState::Active),
@@ -605,6 +610,7 @@ impl<'a> PeerExchange<'a> {
         bytes: usize,
     ) -> Result<()> {
         self.require_live()?;
+        crate::shared::stack_dump::progress();
         let flag = self.flag_index(slot)?;
         tracing::trace!(from, flag, bytes, "peer push");
         let (mine, theirs) = (&self.ends[from], &self.ends[1 - from]);
@@ -692,6 +698,7 @@ impl<'a> PeerExchange<'a> {
     /// Queues on `at`'s stream: wait for the other GPU's next push on flag `slot`.
     pub fn wait(&self, at: usize, slot: usize) -> Result<()> {
         self.require_live()?;
+        crate::shared::stack_dump::progress();
         let flag = self.flag_index(slot)?;
         tracing::trace!(at, flag, "peer wait");
         let end = &self.ends[at];
