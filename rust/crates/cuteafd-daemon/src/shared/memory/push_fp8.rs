@@ -52,6 +52,22 @@ pub(crate) fn slice(
 }
 
 impl RankPlan {
+    /// The physical device, not the push rank, names the mount-compatible owner.
+    pub(crate) fn arena_layout(&self, device: i32) -> Result<ArenaLayout> {
+        let regions = self.layers.iter().flat_map(|layer| layer.planes.iter().enumerate()
+            .filter(|(_, plane)| !plane.is_empty())
+            .map(move |(index, plane)| (format!("{}.{index}", layer.layer), plane.len())))
+            .collect::<Vec<_>>();
+        let weights = crate::shared::experts::weight_layout::layout(device, "fp8", regions)?;
+        for layer in &self.layers {
+            for (index, plane) in layer.planes.iter().enumerate().filter(|(_, plane)| !plane.is_empty()) {
+                let view = weights.view(&format!("{}.{index}", layer.layer)).context("missing push weight view")?;
+                ensure!(view.offset() == plane.start && view.bytes() == plane.len(),
+                    "push weight plane differs from mount arena");
+            }
+        }
+        self.layout.clone().with_weights(weights)
+    }
     pub fn new(
         catalog: &OfficialV41Catalog,
         layers: &[(usize, Slicing)],

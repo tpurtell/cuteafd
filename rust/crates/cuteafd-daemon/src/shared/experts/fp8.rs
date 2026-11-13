@@ -257,7 +257,7 @@ impl<'a> Fp8Layer<'a> {
                 let name = format!("{name}.plane.{index}");
                 match &region._storage {
                     Fp8Storage::Owned { _allocation } => _allocation.inventory(inventory, &name)?,
-                    Fp8Storage::Shared { _arena } => inventory.backed_device(&name, region.buffer, _arena.allocation_buffer())?,
+                    Fp8Storage::Shared { _arena } => _arena.inventory_view(inventory, &name, region.buffer)?,
                 }
             }
         }
@@ -1024,6 +1024,180 @@ mod tests {
                         drop(layers);
                     }
                 }
+            }
+        }
+        assert_eq!(native.device_free_mismatch(&library)?.0, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pushed_native_receipts_and_bytes_match_mount_arena() -> anyhow::Result<()> {
+        use super::*;
+        use crate::shared::{experts::rtx::{push::tests::receive_pushed, dense::Records},
+            memory::{device::Device, push_coordinator::CoordinatorExpertPlan, receipts::Inventory}};
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
+        let native = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = native.load()?;
+        native.immediate_copies(&library)?;
+        native.strict_device_free(&library, true)?;
+        let device = Device { library: &library, id: 1 };
+        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
+            let root = tempfile::tempdir()?;
+            let catalog = crate::shared::memory::push_fp8::tests::fixture(root.path(), format, false)?;
+            let tensors = catalog.fp8().unwrap().for_coordinator();
+            for world in [1, 2] {
+                for rank in 0..world {
+                    let slicing = tensors.exact_slicing(world);
+                    let arena = super::super::weight_layout::arena(device, "fp8",
+                        regions(&tensors, &[1, 2], world, rank, slicing)?)?;
+                    let layout = arena.layout().clone();
+                    let mounted = device.run(|| [1, 2].into_iter().map(|layer|
+                        Fp8Layer::load_into(&library, &tensors.for_layer_metadata(layer)?, layer,
+                            world, rank, slicing, &arena)).collect::<Result<Vec<_>>>())?;
+                    let plan = if world == 1 { CoordinatorExpertPlan::whole_native(&catalog, &[1, 2], usize::MAX)? }
+                        else { CoordinatorExpertPlan::new(&catalog, &[1, 2], rank, usize::MAX)? };
+                    let sockets = tempfile::tempdir()?;
+                    let pushed = receive_pushed(device, Some(&catalog), root.path(), sockets.path(),
+                        &Records::default(), Some(plan), 0, rank)?;
+                    let pushed = pushed.fp8()?;
+                    let mut inventory = Inventory::new(CoordinatorDevices::new(&[1])?, "fixture",
+                        Lifetime::TARGET, cuteafd_core::memory_layout::Category::Experts, "expert fixture");
+                    for (mount, push) in mounted.iter().zip(pushed) {
+                        push.allocation_receipts(&mut inventory, &format!("layer.{}", push.layer))?;
+                        for (mount, push) in mount.regions.iter().zip(&push.regions) {
+                            assert_eq!(mount.is_some(), push.is_some());
+                            if let (Some(mount), Some(push)) = (mount, push) {
+                                let mut expected = vec![0; mount.buffer.bytes];
+                                let mut actual = vec![0; push.buffer.bytes];
+                                device.run(|| {
+                                    library.copy_d2h(&mut expected, mount.buffer)?;
+                                    library.copy_d2h(&mut actual, push.buffer)
+                                })?;
+                                assert_eq!(actual, expected, "{format:?} TP{world} rank {rank}");
+                            }
+                        }
+                    }
+                    super::super::weight_layout::assert_receipts(&inventory.receipts, &[layout])?;
+                }
+            }
+        }
+        assert_eq!(native.device_free_mismatch(&library)?.0, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed GLM 5.3 and MiMo V2.6 Pro native headers"]
+    fn installed_native_headers_push_bytes_and_receipts_match_mount() -> anyhow::Result<()> {
+        use super::*;
+        use crate::shared::memory::{device::Device, push_fp8::RankPlan,
+            weight_arena::{ExpectedCoverage, LoadingArena}, push_initialize, receipts::Inventory};
+        use cuteafd_loader::{plan::testing::{t, write_snapshot}, placement::planner::{CoordinatorDevices, Lifetime}};
+        use std::os::unix::fs::FileExt;
+        let native = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = native.load()?;
+        native.immediate_copies(&library)?;
+        native.strict_device_free(&library, true)?;
+        let device = Device { library: &library, id: 1 };
+        for (repo, format) in [("zai-org/GLM-5.3", ExpertFormat::Fp8Block128),
+            ("nvidia/GLM-5.3-NVFP4", ExpertFormat::Nvfp4), ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", ExpertFormat::Mxfp4)] {
+            let home = std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(||
+                PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
+            let model = home.join("hub").join(format!("models--{}", repo.replace('/', "--")));
+            let revision = std::fs::read_to_string(model.join("refs/main"))?;
+            let snapshot = model.join("snapshots").join(revision.trim());
+            let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+            let installed = cuteafd_loader::read_expert_catalog(&snapshot)?;
+            let tensors = installed.fp8().context("installed native expert headers missing")?;
+            assert_eq!(tensors.format(), format, "{repo}");
+            let layer = tensors.shape().first_layer;
+            let names = Fp8Projection::ALL.into_iter().flat_map(|projection|
+                tensors.projection_source_names(layer, 0, projection)).collect::<std::collections::BTreeSet<_>>();
+            // The general catalog excludes routed experts; inspect their source headers directly.
+            let shards = names.iter().map(|name| tensors.push_source(name).map(|(source, _)| source.path))
+                .collect::<Result<std::collections::BTreeSet<_>>>()?;
+            let headers = shards.iter().map(|path| cuteafd_loader::read_safetensors_metadata(path))
+                .collect::<Result<Vec<_>>>()?.into_iter().flatten().filter(|tensor| names.contains(&tensor.name))
+                .map(|tensor| {
+                    let dtype = match tensor.dtype {
+                        cuteafd_core::DType::U8 => "U8", cuteafd_core::DType::F8E4M3 => "F8_E4M3",
+                        cuteafd_core::DType::F8E8M0 => "F8_E8M0", cuteafd_core::DType::F32 => "F32",
+                        ref other => panic!("unexpected installed native dtype {other:?}"),
+                    };
+                    t(tensor.name.clone(), dtype, &tensor.shape)
+                }).collect::<Vec<_>>();
+            let expected_headers = if format == ExpertFormat::Nvfp4 { 12 } else { 6 };
+            assert_eq!(names.len(), expected_headers, "unexpected native projection planes: {repo}");
+            assert_eq!(headers.len(), expected_headers, "incomplete installed expert headers: {repo}");
+            let root = tempfile::tempdir()?;
+            // Preserve vendor names/dtypes/full dimensions, reducing only expert count.
+            // Sparse synthetic payloads avoid reading or copying checkpoint weights.
+            let headers = (0..32).flat_map(|expert| headers.iter().map(move |(name, dtype, shape)|
+                t(name.replace(".experts.0.", &format!(".experts.{expert}.")), dtype, shape))).collect::<Vec<_>>();
+            write_snapshot(root.path(), &config, &headers, None);
+            let mut shape = *tensors.shape();
+            shape.experts = 32;
+            shape.topk = 1;
+            shape.layers = layer + 1;
+            let tensors = Fp8ExpertTensors::read_layers(root.path(), shape, &[layer].into())?.for_coordinator();
+            for expert in 0..32 {
+                for projection in Fp8Projection::ALL {
+                    for name in tensors.projection_source_names(layer, expert, projection) {
+                        let (source, dtype) = tensors.push_source(&name)?;
+                        let scalar = dtype == cuteafd_core::DType::F32 && source.bytes == 4;
+                        if expert != 0 && !scalar { continue; }
+                        let image = if scalar { 2.0f32.to_le_bytes().to_vec() }
+                            else if name.ends_with("weight_scale_inv") {
+                                1.0f32.to_le_bytes().into_iter().cycle().take(source.bytes as usize).collect()
+                            } else if name.contains("scale") { vec![127; source.bytes as usize] }
+                            else { (0..source.bytes).map(|i| (i as u8).wrapping_mul(17)).collect() };
+                        std::fs::File::options().write(true).open(source.path)?.write_all_at(&image, source.offset)?;
+                    }
+                }
+            }
+            for rank in 0..2 {
+                let slicing = tensors.exact_slicing(2);
+                let arena = super::super::weight_layout::arena(device, "fp8",
+                    regions(&tensors, &[layer], 2, rank, slicing)?)?;
+                let layout = arena.layout().clone();
+                let mounted = device.run(|| Fp8Layer::load_into(&library, &tensors, layer, 2, rank, slicing, &arena))?;
+                let plan = RankPlan::from_tensors(&tensors, &[(layer, slicing)], 2, rank, usize::MAX)?;
+                let mut builder = cuteafd_loader::push_load::builder::Builder::new(root.path(), vec![plan.layout.bytes() as u64]);
+                plan.append_tensors(&mut builder, &tensors, 0, 2, rank, 0)?;
+                let checked = builder.finish()?;
+                let mut loading = LoadingArena::new(device, plan.arena_layout(device.id)?,
+                    ExpectedCoverage::from_plan(&checked, 0)?, cuteafd_core::memory_layout::ArenaTag::experts("experts/fixture"))?;
+                for entry in &checked.plan.entries {
+                    let source = std::fs::File::open(root.path().join(&checked.plan.files[entry.file as usize]))?;
+                    let pattern = &checked.plan.patterns[entry.pattern as usize];
+                    let mut bytes = vec![0; pattern.run as usize];
+                    for (offset, destination) in pattern.runs() {
+                        source.read_exact_at(&mut bytes, entry.src_base + offset)?;
+                        let destination = entry.dst_base + destination;
+                        library.copy_h2d(loading.destination(destination as usize, bytes.len())?, &bytes)?;
+                        loading.copied(destination, bytes.len() as u64)?;
+                    }
+                }
+                let initializer = match &plan.layers[0].initialize {
+                    push_initialize::Layer::Fp8 { widen, scalars, scalar_convention, inputs, expand } =>
+                        push_initialize::Layer::Fp8 { widen: widen.clone(), scalars: scalars.clone(),
+                            scalar_convention: *scalar_convention, inputs: inputs.clone(), expand: expand.clone() },
+                    _ => unreachable!("native planner emits FP8 initializers"),
+                };
+                let ready = Rc::new(push_initialize::initialize(loading.done()?, &[initializer], None, 0)?);
+                let pushed = Fp8Layer::from_push(ready, 0, &plan.layers[0], 0)?;
+                let mut inventory = Inventory::new(CoordinatorDevices::new(&[1])?, "fixture", Lifetime::TARGET,
+                    cuteafd_core::memory_layout::Category::Experts, "expert fixture");
+                pushed.allocation_receipts(&mut inventory, "weight")?;
+                super::super::weight_layout::assert_receipts(&inventory.receipts, &[layout])?;
+                for (mount, push) in mounted.regions.iter().zip(&pushed.regions) {
+                    if let (Some(mount), Some(push)) = (mount, push) {
+                        let mut expected = vec![0; mount.buffer.bytes];
+                        let mut actual = vec![0; push.buffer.bytes];
+                        device.run(|| { library.copy_d2h(&mut expected, mount.buffer)?; library.copy_d2h(&mut actual, push.buffer) })?;
+                        assert_eq!(actual, expected, "{repo} {format:?} TP2 rank {rank}");
+                    }
+                }
+                eprintln!("{repo}@{} {format:?} TP2 rank {rank}: mount/push bytes and canonical receipts match", revision.trim());
             }
         }
         assert_eq!(native.device_free_mismatch(&library)?.0, 0);

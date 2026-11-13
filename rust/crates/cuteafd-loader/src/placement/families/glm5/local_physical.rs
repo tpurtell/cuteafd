@@ -177,7 +177,8 @@ impl LocalPhysicalSource {
             let layers = input.layers.iter().map(|layer| self.weights[rank].get(layer)
                 .with_context(|| format!("GLM local physical layer {layer} not parsed"))).collect::<Result<Vec<_>>>()?;
             let packed = PackedWeightRegions::new(layers.iter().map(|layer| layer.bytes))?;
-            let arena = if input.storage == LocalStorage::Mount && self.format != GlmLocalFormat::Exlr8 {
+            let arena = if matches!(self.format, GlmLocalFormat::Nvfp4 { .. })
+                || (input.storage == LocalStorage::Mount && self.format == GlmLocalFormat::Exl3) {
                 let mut regions = Vec::new();
                 for (&layer, weight) in input.layers.iter().zip(&layers) {
                     match self.format {
@@ -223,6 +224,14 @@ impl LocalPhysicalSource {
                             for (suffix, offset, bytes) in &weight.views {
                                 out.add_view(suffix_name(&name, suffix), location, *bytes, backing.clone(), *offset)?;
                             }
+                        }
+                    }
+                    LocalStorage::Push if arena.is_some() => {
+                        let arena = arena.as_ref().unwrap();
+                        for (suffix, _, bytes) in &weight.views {
+                            let view = arena.view(&format!("{layer}.{}", suffix.strip_prefix("plane.")
+                                .context("NVFP4 plane missing")?)).context("NVFP4 plane view missing")?;
+                            out.add_view(suffix_name(&name, suffix), location, *bytes, arena.id().into(), view.offset())?;
                         }
                     }
                     LocalStorage::Push => {

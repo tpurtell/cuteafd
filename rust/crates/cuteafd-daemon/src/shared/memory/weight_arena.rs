@@ -25,17 +25,7 @@ impl<'a, C: arena_class::Class> DeviceArena<'a, C> {
     #[track_caller]
     pub fn new(device: Device<'a>, layout: cuteafd_loader::serving_capacity::WeightArenaLayout,
         tag: ArenaTag<C>) -> Result<Self> {
-        // The failure dump's arena registry reads the same kind the ledger records.
-        let registration = cuteafd_ffi::memory_ledger::fault::register_arena(cuteafd_ffi::memory_ledger::fault::Arena {
-            id: layout.id().into(), kind: tag.kind(),
-            device: device.id, bytes: layout.bytes(), padding_bytes: layout.padding_bytes(), tail_bytes: None,
-            views: layout.views().iter().map(|(name, view)| cuteafd_ffi::memory_ledger::fault::ArenaView {
-                name: name.clone(), offset: view.offset(), bytes: view.bytes(),
-            }).collect(),
-        });
-        let mut allocation = Allocation::weight_arena(device, layout.bytes(), layout.id(), tag.tag())?;
-        registration.bind(allocation.buffer.ptr as usize);
-        allocation.register_weight_arena(registration);
+        let allocation = allocate_weight_arena(device, &layout, tag.tag())?;
         let allocation = std::rc::Rc::new(allocation);
         ensure!(allocation.buffer.bytes == layout.bytes(), "weight arena allocation differs from admitted backing");
         Ok(Self { layout, allocation, tag })
@@ -48,6 +38,22 @@ impl<'a, C: arena_class::Class> DeviceArena<'a, C> {
         ensure!(view.bytes() == bytes, "{name}: weight view differs from admitted extent");
         Allocation::view(&self.allocation, view.offset(), view.bytes())
     }
+}
+
+fn allocate_weight_arena<'a>(device: Device<'a>,
+    layout: &cuteafd_loader::serving_capacity::WeightArenaLayout, tag: Tag) -> Result<Allocation<'a>> {
+    // The failure dump's arena registry reads the same kind the ledger records.
+    let registration = cuteafd_ffi::memory_ledger::fault::register_arena(cuteafd_ffi::memory_ledger::fault::Arena {
+        id: layout.id().into(), kind: tag.kind,
+        device: device.id, bytes: layout.bytes(), padding_bytes: layout.padding_bytes(), tail_bytes: None,
+        views: layout.views().iter().map(|(name, view)| cuteafd_ffi::memory_ledger::fault::ArenaView {
+            name: name.clone(), offset: view.offset(), bytes: view.bytes(),
+        }).collect(),
+    });
+    let mut allocation = Allocation::weight_arena(device, layout.bytes(), layout.id(), tag)?;
+    registration.bind(allocation.buffer.ptr as usize);
+    allocation.register_weight_arena(registration);
+    Ok(allocation)
 }
 
 /// Independent workspace sets retain their own backing through every plane view.
@@ -106,6 +112,7 @@ pub(crate) struct ArenaLayout {
     bytes: usize,
     validation_bytes: usize,
     generated: Vec<Range<usize>>,
+    weights: Option<cuteafd_loader::serving_capacity::WeightArenaLayout>,
 }
 
 impl ArenaLayout {
@@ -123,11 +130,17 @@ impl ArenaLayout {
             bytes,
             validation_bytes: 0,
             generated: Vec::new(),
+            weights: None,
         })
     }
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+    pub fn with_weights(mut self, weights: cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<Self> {
+        ensure!(weights.bytes() == self.bytes, "named weight backing differs from push arena");
+        self.weights = Some(weights);
+        Ok(self)
     }
     pub fn with_validation(mut self, bytes: usize, admitted_host: usize) -> Result<Self> {
         ensure!(
@@ -487,7 +500,10 @@ impl<'a> LoadingArena<'a> {
         ensure!(layout.generated.iter().all(|r| !expected.overlaps(r.start as u64, r.end as u64)),
             "generated region overlaps delivered source bytes");
         let validation = vec![0; layout.validation_bytes];
-        let allocation = Allocation::new(device, layout.bytes(), tag.tag())?;
+        let allocation = match &layout.weights {
+            Some(weights) => allocate_weight_arena(device, weights, tag.tag())?,
+            None => Allocation::new(device, layout.bytes(), tag.tag())?,
+        };
         let initialized = if layout.generated.is_empty() { Ok(()) } else { device.run(|| {
             let queued = layout.generated.iter().try_for_each(|range| {
                 let buffer = slice(allocation.buffer, range.clone())?;
@@ -666,6 +682,14 @@ impl<'a> DeliveredArena<'a> {
 
 impl ReadyArena<'_> {
     pub(crate) fn allocation_buffer(&self) -> CuteafdDeviceBuffer { self.allocation.buffer }
+
+    pub(crate) fn inventory_view(&self, inventory: &mut super::receipts::Inventory<'_>,
+        name: &str, buffer: CuteafdDeviceBuffer) -> Result<()> {
+        match self.allocation.weight_backing() {
+            Some(backing) => inventory.weight_view(name, buffer, backing),
+            None => inventory.backed_device(name, buffer, self.allocation.buffer),
+        }
+    }
 
     pub fn region(&self, index: usize) -> Result<WeightView<'_>> {
         Ok(WeightView {
