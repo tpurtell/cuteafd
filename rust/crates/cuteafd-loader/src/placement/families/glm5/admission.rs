@@ -2262,6 +2262,7 @@ impl Recipe for GlmRecipe<'_> {
                     .ok_or(Refusal::Overflow("GLM hop storage"))?;
                 let mut owners = layout.receive_components("glm.hops", Lifetime::TARGET, self.maximum_pages);
                 owners.extend(layout.control_components("glm.hops", Lifetime::TARGET, self.maximum_pages));
+                crate::placement::planner::fixed_request_tails(&mut owners, self.maximum_pages, &[])?;
                 domains.append(&mut contract, &[When::Prefill(shape)], owners)?;
             }
         }

@@ -431,6 +431,16 @@ mod pipeline_lane_tests {
         let layout = HopLinkLayout::new(&[hop], &spec).unwrap();
         assert_eq!(layout.receive, [vec![], vec![256; 4]]);
         assert_eq!(layout.control_components("test.hop", super::super::planner::Lifetime::RESIDENT, 1).len(), 2);
+        let large = HopLinkLayout::new(&[hop], &HopSpec { rows: 196608, lanes: 1, ..spec }).unwrap();
+        let mut owners = large.receive_components("test.large", super::super::planner::Lifetime::RESIDENT, 1);
+        super::super::planner::fixed_request_tails(&mut owners, 1, &[]).unwrap();
+        let tails = owners.iter().filter_map(|component| match &component.kind {
+            super::super::planner::ComponentKind::AllocationGranularity(tail) => Some(tail),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(tails.len(), 1);
+        assert_eq!(tails[0].bytes().unwrap(), 1 << 20);
+        assert_eq!(tails[0].backings[0].requests, [3 << 20]);
         for bad in [HopSpec { storage: HopStorage::DirectInput, ..spec },
             HopSpec { rows: 0, ..spec }, HopSpec { lanes: 0, ..spec },
             HopSpec { row_bytes: 15, ..spec }, HopSpec { rows: u64::MAX, ..spec },

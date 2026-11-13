@@ -459,6 +459,26 @@ mod cuda_tests {
                 for instance in &private { assert_eq!(instance.receive_bytes(rank), single[rank]); }
                 assert_eq!(private.iter().map(|instance| instance.receive_bytes(rank)).sum::<u64>(), charged[rank]);
             }
+            // Qualify one independent receive request's driver tail after
+            // first-use allocation bookkeeping has settled on each device.
+            let large_spec = HopSpec { rows: 6144, lanes: 1, ..spec };
+            let large = HopLinkLayout::new(&hops, &large_spec).unwrap();
+            for rank in 0..2 {
+                let bytes = large.receive[rank][0];
+                let expected = cuteafd_loader::placement::planner::sm120_request_backing(bytes)?;
+                on_device(&library, rank as i32, || {
+                    let warm = DeviceAllocation::new(&library, bytes as usize, crate::shared::memory::TEST)?;
+                    drop(warm);
+                    let before = library.cuda_physical_memory_info()?.0;
+                    let slot = DeviceAllocation::new(&library, bytes as usize, crate::shared::memory::TEST)?;
+                    let after = library.cuda_physical_memory_info()?.0;
+                    assert_eq!(before.checked_sub(after), Some(expected as usize),
+                        "rank {rank} independent receive request backing");
+                    assert_eq!(expected - bytes, 1 << 20);
+                    drop(slot);
+                    Ok(())
+                })?;
+            }
             let rows = 17;
             let bytes = rows * spec.row_bytes as usize;
             for lane in 0..2 {
