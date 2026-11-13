@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import tempfile
 import time
 
 # Keep in sync with release_lan_seed_hosts (scripts/lib/release-common.sh) and
@@ -105,6 +106,22 @@ def acquire(directory: Path, host: str, slots: int):
     return None
 
 
+def publish_grant(path: Path, grant: dict):
+    # Readers treat existence as readiness, so never expose a partial document.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix=f'.{path.name}.',
+                                         delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(grant, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def take_export_turn(stack: contextlib.ExitStack, directory: Path, host: str, args, cancelled,
                      handles: list | None = None) -> str:
     """The seed's GPU-export turn for this lease: the fair hwlock SEED-export lock
@@ -127,7 +144,7 @@ def take_export_turn(stack: contextlib.ExitStack, directory: Path, host: str, ar
         except TimeoutError as error:
             (args.lease_dir / 'export-failed').write_text(str(error))
             return 'failed'
-    (args.lease_dir / 'export-granted').write_text(json.dumps({'host': host, 'waited_s': round(time.monotonic() - started)}))
+    publish_grant(args.lease_dir / 'export-granted', {'host': host, 'waited_s': round(time.monotonic() - started)})
     return 'held'
 
 
@@ -225,13 +242,20 @@ def main():
     try:
         if stopping or not owner_alive(args.owner, start):
             return
-        (args.lease_dir / 'granted').write_text(json.dumps({'host': host, 'slots': slots or 1}))
+        grant = {'host': host, 'slots': slots or 1}
+        if host in LAN_SEEDS:
+            grant['slot'] = int(Path(handles[-1].name).name.split('.')[-2])
+        publish_grant(args.lease_dir / 'granted', grant)
         fd = os.open(args.lease_dir / 'release', os.O_RDONLY | os.O_NONBLOCK)
         # No lease expiry: each phase has its own terminating timeout. Stop
         # the instance's build container before *any* mutex release.
         export_state = 'idle'
         while not stopping and owner_alive(args.owner, start):
-            if os.read(fd, 1):
+            try:
+                released = os.read(fd, 1)
+            except BlockingIOError:
+                released = b''
+            if released:
                 break
             if export_state == 'idle' and (args.lease_dir / 'export-request').exists():
                 export_state = take_export_turn(export_turn, directory, host, args,
