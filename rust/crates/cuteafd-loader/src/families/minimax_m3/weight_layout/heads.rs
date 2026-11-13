@@ -158,7 +158,7 @@ mod tests {
         let heads = HeadsWeights::plan(checkpoint, cfg, EmbeddingHome::Device(0))?;
         for rank in 0..2 {
             assert_eq!(split[rank].target.layers, whole[rank].layers);
-            assert_eq!(split[rank].target.arena.bytes(), split[rank].slices.values().map(TensorSlice::bytes).sum());
+            assert_eq!(split[rank].target.arena.bytes(), split[rank].slices.values().map(TensorSlice::bytes).sum::<usize>());
             assert_eq!(split[rank].target.arena.padding_bytes(), 0);
             let components = split[rank].target.weight_components(1024)?;
             assert_eq!(components.iter().filter(|c| matches!(c.kind, ComponentKind::AllocationGranularity(_))).count(), 1);
