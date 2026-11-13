@@ -102,7 +102,8 @@ add_custom_command(
   OUTPUT ${CUTEAFD_VISION_ATTENTION_OUTPUTS}
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-    ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
+    ${CUTEAFD_EXPORT_CACHE_COMMAND} --output "${CUTEAFD_VISION_ATTENTION_DIR}/vision_attention_d64.h" --output "${CUTEAFD_VISION_ATTENTION_DIR}/vision_attention_d64.o" --output "${CUTEAFD_VISION_ATTENTION_DIR}/vision_attention_d64.json" --output "${CUTEAFD_VISION_ATTENTION_DIR}/vision_attention_d72.h" --output "${CUTEAFD_VISION_ATTENTION_DIR}/vision_attention_d72.o" --output "${CUTEAFD_VISION_ATTENTION_DIR}/vision_attention_d72.json"
+    -- "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
     --output-dir "${CUTEAFD_VISION_ATTENTION_DIR}" --capability ${CUTEAFD_VISION_CAPABILITY}
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}

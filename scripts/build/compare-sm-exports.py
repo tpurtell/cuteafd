@@ -745,11 +745,8 @@ def worker(payload):
         from b12x._lib.compiler import b12x_package_fingerprint
         b12x_package_fingerprint()
         records_module = load_file("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
-        backend_cache = None
-        if payload.get("backend_cache"):
-            identity = records_module.compiler_identity(ROOT, payload, capability)
-            backend_cache = records_module.BackendCache(payload["backend_cache"], identity)
-        recorder = records_module.Recorder(ROOT, output, backend_cache).install()
+        backend_cache = records_module.install_backend_cache(payload.get("backend_cache"))
+        recorder = records_module.Recorder(ROOT, output).install()
         PROGRAM_RECORDER = recorder
         # runpy exporters receive a worker-local hook, not a serving dependency.
     start = time.monotonic()
@@ -800,8 +797,8 @@ def worker(payload):
         program_records = recorder.finish(inspector, summary, plans)
         summary["source_reads_sha256"] = recorder.reads()
         summary["stage0_inputs"] = records_module.stage0_inputs(ROOT, payload, capability)
-        if recorder.backend_cache is not None:
-            summary["backend_reuse"] = {"hits": recorder.backend_cache.hits, "misses": recorder.backend_cache.misses}
+        if backend_cache is not None:
+            summary["backend_reuse"] = {"hits": backend_cache.hits, "misses": backend_cache.misses}
     (Path(payload["output"]) / "comparison-context.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 

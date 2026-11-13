@@ -83,7 +83,7 @@ print("exported", value)
     return source, build
 
 
-def run(tree, *extra, env=None, mode="plain"):
+def run(tree, *extra, env=None, mode="plain", outputs=()):
     source, build = tree
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith(("CUTEAFD_", "B12X_", "TRITON_", "CUTE_"))}
@@ -92,13 +92,75 @@ def run(tree, *extra, env=None, mode="plain"):
                         "CUTEAFD_EXPORT_CACHE_STATS": str(build.parent / "stats.jsonl"),
                         "PYTHONDONTWRITEBYTECODE": "1", **(env or {})})
     result = subprocess.run([sys.executable, str(source / "scripts/build/export-cache.py"), "run",
-                             "--build-dir", str(build), "--", sys.executable,
+                             "--build-dir", str(build), *[arg for path in outputs for arg in ("--output", str(path))], "--", sys.executable,
                              str(source / "python/tools/aot/export_fake.py"),
                              "--output-dir", str(build / "out"), "--mode", mode, *extra],
                             env=environment, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     events = re.findall(r"^export cache ([a-z-]+): (.*)$", result.stdout, re.M)
     return events[-1] if events else ("none", "")
+
+
+def test_file_probe_records_its_real_input_and_still_reuses(tree):
+    source, build = tree
+    exporter = source / "python/tools/aot/export_fake.py"
+    exporter.write_text(exporter.read_text() + '''
+import subprocess
+probe = subprocess.check_output(["file", "-b", str(Path(kern.used.__file__))], text=True)
+(args.output_dir / "probe.txt").write_text(probe)
+''')
+    assert run(tree)[0] == "miss"
+    assert run(tree)[0] == "hit"
+    (source / "third_party/sparkinfer/kern/used.py").write_text("SCALE = 4\n")
+    assert run(tree)[0] == "miss"
+    assert (build / "out/kernel.o").read_text() == "4"
+
+
+def test_file_probe_missing_input_becoming_present_invalidates(tree):
+    source, build = tree
+    exporter = source / "python/tools/aot/export_fake.py"
+    exporter.write_text(exporter.read_text() + '''
+import subprocess
+probe = subprocess.check_output(["file", "-b", str(Path(kern.used.__file__).with_name("optional.dat"))], text=True)
+(args.output_dir / "probe.txt").write_text(probe)
+''')
+    assert run(tree)[0] == "miss"
+    assert run(tree)[0] == "hit"
+    (source / "third_party/sparkinfer/kern/optional.dat").write_text("now present")
+    assert run(tree)[0] == "miss"
+
+
+def test_file_probe_alternate_database_fails_closed(tree):
+    source, _ = tree
+    exporter = source / "python/tools/aot/export_fake.py"
+    exporter.write_text(exporter.read_text() + '''
+import subprocess
+subprocess.run(["file", "--mime", str(Path(kern.used.__file__))], check=True)
+''')
+    assert run(tree)[0] == "uncacheable"
+
+
+def test_shared_output_directory_ignores_siblings_but_records_own_files(tree):
+    source, build = tree
+    exporter = source / "python/tools/aot/export_fake.py"
+    # Emulate a parallel job's native write without allowing it into this entry.
+    exporter.write_text(exporter.read_text() + '''
+import ctypes
+libc = ctypes.CDLL(None)
+libc.fopen.restype = ctypes.c_void_p
+libc.fputs.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+libc.fclose.argtypes = [ctypes.c_void_p]
+handle = libc.fopen(str(args.output_dir / "sibling_bridge.cc").encode(), b"w")
+libc.fputs(b"sibling", handle)
+libc.fclose(handle)
+''')
+    outputs = [build / "out/kernel.o", build / "out/manifest.json"]
+    assert run(tree, outputs=outputs)[0] == "miss"
+    assert run(tree, outputs=outputs)[0] == "hit"
+    (source / "third_party/sparkinfer/kern/used.py").write_text("SCALE = 4\n")
+    assert run(tree, outputs=outputs)[0] == "miss"
+    # Without exact ownership the same native write remains uncacheable.
+    assert run(tree)[0] == "uncacheable"
 
 
 def test_second_run_hits_and_restores_outputs(tree):
@@ -258,7 +320,7 @@ def test_every_cmake_export_runs_through_the_launcher():
         text = path.read_text()
         for match in re.finditer(r"-E env \$\{CUTEAFD_SPARKINFER_PYTHON_ENV\}[^\n]*\n?\s*(\S+)", text):
             exports += 1
-            assert match.group(1) == "${CUTEAFD_EXPORT_LAUNCHER}", f"{path}: {match.group(0)}"
+            assert match.group(1) in ("${CUTEAFD_EXPORT_LAUNCHER}", "${CUTEAFD_EXPORT_CACHE_COMMAND}"), f"{path}: {match.group(0)}"
     assert exports >= 22
     cmake = (ROOT / "native/CMakeLists.txt").read_text()
     assert 'scripts/build/export-cache.py" run' in cmake

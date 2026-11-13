@@ -124,12 +124,20 @@ CUTEAFD_EXPORT_CONTEXT_SPACING_S HF_HUB_CACHE HF_HOME XDG_CACHE_HOME TRITON_DISA
 """.split())
 
 
+PROVENANCE_ENVIRONMENT_NAMES = frozenset({
+        "CUTEAFD_EXPORT_HOST_CLASS", "CUTEAFD_EXPORT_HOST_CONTEXTS", "CUTEAFD_EXPORT_HOST_WORKERS",
+        "CUTEAFD_EXPORT_JOBS", "CUTEAFD_EXPORT_SLOT_DIR", "CUTEAFD_EXPORT_HOST_SLOT_DIR",
+        "CUTEAFD_EXPORT_GPU_SLOT_DIR", "CUTEAFD_EXPORT_GPU_BUDGET_MIB",
+        "CUTEAFD_EXPORT_WORKER_GPU_MIB", "CUTEAFD_EXPORT_WORKER_RAM_MIB",
+        "CUTEAFD_EXPORT_CONTEXT_SPACING_S", "HF_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME",
+})
+
+
 def export_environment():
+    # Only settings read by exporters belong here, not arbitrary CUTEAFD_ launch
+    # settings. New reads require classification in the source-scan regression.
     values = {name: os.environ.get(name) for name in sorted(EXPORT_ENVIRONMENT_NAMES)}
-    # The export cache's launcher variables name per-run paths (its read records,
-    # stats, build and output directories): control, never export semantics.
-    values.update({name: value for name, value in sorted(os.environ.items())
-                   if name.startswith("CUTEAFD_") and not name.startswith("CUTEAFD_EXPORT_CACHE_")})
+    values.update({name: "<provenance>" for name in PROVENANCE_ENVIRONMENT_NAMES})
     # These are forced by the offline worker, not inherited policy. Paths name
     # verified sources or disposable compiler storage rather than semantic inputs.
     values.update(CUTEAFD_BUILD_KIND=os.environ.get("CUTEAFD_BUILD_KIND", "development"),
@@ -175,7 +183,8 @@ def stage0_inputs(root, payload, capability):
             relative = path.relative_to(root).as_posix()
             if not path.is_file() or any(fnmatch.fnmatch(relative, pattern) for pattern in rules["ignore"]):
                 continue
-            if any(fnmatch.fnmatch(relative, pattern) for pattern in rules["global"]):
+            if (any(fnmatch.fnmatch(relative, pattern) for pattern in rules["global"])
+                    and not any(fnmatch.fnmatch(relative, pattern) for pattern in rules.get("global_ignore", []))):
                 hashes[relative] = digest(path.read_bytes())
     return json.loads(json.dumps({"identity": identity, "global_sources": hashes,
                                   "rules": digest(rules_path.read_bytes())}, sort_keys=True))
@@ -198,6 +207,62 @@ def job_candidates(root, previous, current_inputs):
         if not source.is_file() or digest(source.read_bytes()) != checksum:
             changed.append(relative)
     return changed
+
+
+def backend_identity():
+    """Lowering inputs only; target, ABI and recipes are in IR/options, not placement."""
+    import platform
+    from b12x._lib import compiler
+    image = os.environ.get("CUTEAFD_EXPORT_IMAGE_ID", "")
+    ptxas = shutil.which("ptxas")
+    if not image.startswith("sha256:") or not ptxas:
+        return None
+    from _export_cache import static_environment
+    return {"schema": 2, "image": image, "machine": platform.machine(),
+            "runtime": compiler._runtime_toolchain_key(),
+            "environment": compiler._compile_environment_key(),
+            "static_environment": static_environment(),
+            "host_target": os.environ.get("CUTEAFD_CUTE_HOST_TARGET", "<portable-default>"),
+            "ptxas_sha256": digest(Path(ptxas).read_bytes())}
+
+
+def install_backend_cache(directory=None):
+    """Shared hook for CMake exporters and offline placement workers, including children."""
+    store = os.environ.get("CUTEAFD_EXPORT_CACHE", "")
+    if directory is None:
+        if not store or store == "off":
+            return
+        directory = Path(store) / "backend"
+    try:
+        from cutlass.base_dsl.dsl import BaseDSL
+    except ModuleNotFoundError:
+        return  # source verification and host-only tools do not have CuTe
+    if not os.environ.get("CUTEAFD_EXPORT_IMAGE_ID", "").startswith("sha256:"):
+        return
+    previous = getattr(BaseDSL, "_cuteafd_backend_cache", None)
+    if previous is not None and previous.directory == Path(directory):
+        return previous
+    cache = BackendCache(directory, None)
+    BaseDSL._cuteafd_backend_cache = cache
+    import atexit
+    def report():
+        if cache.hits or cache.misses:
+            from _export_cache import stats
+            stats("backend", layer="backend", hits=cache.hits, misses=cache.misses)
+    atexit.register(report)
+    if getattr(BaseDSL.compile_and_cache, "_cuteafd_backend_cache", False):
+        return cache
+    original = BaseDSL.compile_and_cache
+
+    @functools.wraps(original)
+    def compile_cached(dsl, module, *args, **kwargs):
+        cache = BaseDSL._cuteafd_backend_cache
+        cache.identity = backend_identity()
+        return cache.compile(dsl, original, module, args, kwargs, digest(str(module).encode()))
+
+    compile_cached._cuteafd_backend_cache = True
+    BaseDSL.compile_and_cache = compile_cached
+    return cache
 
 
 class BackendCache:
@@ -235,10 +300,14 @@ class BackendCache:
         metadata = self.directory / (str(key) + ".json")
         bytecode = self.directory / (str(key) + ".mlirbc")
         if key and metadata.is_file() and bytecode.is_file():
-            saved = json.loads(metadata.read_text())
-            blob = bytecode.read_bytes()
-            if saved == {"key": key, "sha256": digest(blob)}:
-                restored = ir.Module.parse(blob, context=module.context)
+            try:
+                saved = json.loads(metadata.read_text())
+                blob = bytecode.read_bytes()
+                restored = (ir.Module.parse(blob, context=module.context)
+                            if saved == {"key": key, "sha256": digest(blob)} else None)
+            except (OSError, ValueError, RuntimeError):
+                restored = None
+            if restored is not None:
                 provider = dsl.compiler_provider
                 compile_method = provider.compile
                 def already_compiled(current, *unused_args, **unused_kwargs):
