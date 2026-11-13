@@ -27,6 +27,7 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "meta-models/Muse-Spark-Open-816B-A42B", siblings: &["meta-models/Muse-Spark-Open-816B-A42B"], revision: dataset::MUSE_SPARK_REVISION, config: dataset::MUSE_SPARK_CONFIG },
     // Official native NVFP4/MXFP8 release; MiniMax publishes no BF16 master.
     Publication { root: "MiniMaxAI/MiniMax-M3.1-Flash", siblings: &["MiniMaxAI/MiniMax-M3.1-Flash"], revision: dataset::MINIMAX_M3_REVISION, config: dataset::MINIMAX_M3_CONFIG },
+    Publication { root: "thinkingmachines/Inkling-2-Small-MXFP8", siblings: &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"], revision: dataset::INKLING2_REVISION, config: dataset::INKLING2_CONFIG },
     // Official FP8 block-128 release; Mistral publishes no BF16 master.
     Publication { root: "mistralai/Mistral-Large-4-1T-A52B", siblings: &["mistralai/Mistral-Large-4-1T-A52B"], revision: dataset::MISTRAL_LARGE4_REVISION, config: dataset::MISTRAL_LARGE4_CONFIG },
     Publication { root: "stepfun-ai/Step-5-Preview-BF16", siblings: &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"], revision: dataset::STEP5_REVISION, config: dataset::STEP5_CONFIG },
@@ -49,6 +50,7 @@ pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("mistralai/Mistral-Large-4-1T-A52B", &["mistralai/Mistral-Large-4-1T-A52B"]),
     ("MiniMaxAI/MiniMax-M3.1-Flash", &["MiniMaxAI/MiniMax-M3.1-Flash"]),
     ("moonshotai/Kimi-K3.1-Pro", &["moonshotai/Kimi-K3.1-Pro"]),
+    ("thinkingmachines/Inkling-2-Small-MXFP8", &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"]),
 ];
 
 pub fn official_root(model: &str) -> Option<&'static str> {
@@ -398,6 +400,31 @@ mod tests {
         assert_eq!((r.reference_root.as_str(), r.revision.as_str(), r.config.as_str()),
             (root, dataset::MISTRAL_LARGE4_REVISION, dataset::MISTRAL_LARGE4_CONFIG));
         assert!(resolve_in("someone/Mistral-Large-4-1T-A52B-EXL3", None, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn inkling2_official_siblings_and_declared_quants_resolve_to_mxfp8_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = "thinkingmachines/Inkling-2-Small-MXFP8";
+        let sibling = "thinkingmachines/Inkling-2-Small";
+        for model in [root, sibling] {
+            assert_eq!(official_root(model), Some(root));
+            let reference = resolve_in(model, None, tmp.path()).unwrap();
+            assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+                (root, dataset::INKLING2_REVISION, dataset::INKLING2_CONFIG));
+        }
+        for (model, parent) in [("test/inkling-mxfp8-quant", root), ("test/inkling-nvfp4-quant", sibling)] {
+            let quant = add(tmp.path(), model, &format!("base_model: {parent}\nbase_model_relation: quantized"));
+            let reference = resolve_in(model, Some(&quant), tmp.path()).unwrap();
+            assert_eq!(reference.reference_match, "base_model");
+            assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+                (root, dataset::INKLING2_REVISION, dataset::INKLING2_CONFIG));
+            let mut chain = vec![model.to_string(), parent.to_string()];
+            if parent != root { chain.push(root.to_string()); }
+            assert_eq!(reference.resolved_chain, vec![chain]);
+        }
+        assert!(resolve_in("someone/Inkling-2-Small-EXL3", None, tmp.path()).is_err());
+        assert!(official_root("thinkingmachines/Inkling-2-Small-BF16").is_none());
     }
 
     #[test]

@@ -57,6 +57,9 @@ pub const MISTRAL_LARGE4_MANIFEST_SHA256: &str = "2b5e0490bf433bf62adeaade9c1d4c
 pub const MINIMAX_M3_REVISION: &str = "87e0e905e8cf787e4471dfb1ae92eb9219c90fbf";
 pub const MINIMAX_M3_CONFIG: &str = "minimax-m3_1-flash-v1_20261105_own-text-native";
 pub const MINIMAX_M3_MANIFEST_SHA256: &str = "6bb6ea8153f0484aa711ed932573092ea781f955cc34a7e3b48d4ac84b9465da";
+pub const INKLING2_REVISION: &str = "a09a542737757710542b2460b5e1334ef6f79853";
+pub const INKLING2_CONFIG: &str = "inkling2-small-v1_20261113_own-text-mxfp8-f32";
+pub const INKLING2_MANIFEST_SHA256: &str = "68449d10abf27137a7ab805f74cf9f618303d6eaf33a5a1351a81f3a3d5af4ce";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -365,6 +368,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG) => Some(MUSE_SPARK_MANIFEST_SHA256),
             (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG) => Some(MISTRAL_LARGE4_MANIFEST_SHA256),
             (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG) => Some(MINIMAX_M3_MANIFEST_SHA256),
+            (INKLING2_REVISION, INKLING2_CONFIG) => Some(INKLING2_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -1210,7 +1214,7 @@ mod tests {
             (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG),
             (KIMI_K31_REVISION, KIMI_K31_CONFIG),
             (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG), (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG),
-            (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG)] {
+            (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG), (INKLING2_REVISION, INKLING2_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -1282,6 +1286,16 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 11435);
             assert_eq!(balance["prefill"]["generated_positions"], 10678);
+        }
+        if commit == INKLING2_REVISION && config == INKLING2_CONFIG {
+            assert_eq!(reference.checkpoint, "thinkingmachines/Inkling-2-Small-MXFP8");
+            assert_eq!(reference.windows.len(), 64);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "thinkingmachines/Inkling-2-Small-MXFP8");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 11754);
+            assert_eq!(balance["prefill"]["generated_positions"], 11205);
         }
         if commit == MINIMAX_M3_REVISION && config == MINIMAX_M3_CONFIG {
             assert_eq!(reference.checkpoint, "MiniMaxAI/MiniMax-M3.1-Flash");
