@@ -18,6 +18,19 @@ mod tests {
     use cuteafd_loader::plan::testing::{t, write_safetensors};
 
     #[test]
+    fn native_shared_owners_are_retained_across_the_recorded_group_commit() {
+        let source = include_str!("mod.rs");
+        let native = source.split("fn load_native<'s>").nth(1).unwrap()
+            .split("/// The row-FP8 embedding").next().unwrap();
+        let recorder = native.find("Recorder::start(push.is_some())").unwrap();
+        let shared = native.find("NativeExperts::load_admitted").unwrap();
+        let finish = native.find("native push recorder").unwrap();
+        let delivery = native.find("push.receive_with").unwrap();
+        assert!(recorder < shared && shared < finish && finish < delivery);
+        assert!(native.contains("planned_drafter, shared)"));
+    }
+
+    #[test]
     fn glm_dflash_source_plan_joins_target_and_draft_repositories_on_one_rank() -> Result<()> {
         let root = tempfile::tempdir()?;
         let target = root.path().join("models--glm53/snapshots/target");

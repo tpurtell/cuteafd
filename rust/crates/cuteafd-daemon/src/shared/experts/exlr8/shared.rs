@@ -237,7 +237,8 @@ mod receipt_tests {
     #[test]
     fn shared_layers_retain_one_rank_backing_and_rebase_descriptors() -> Result<()> {
         use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
-        use cuteafd_loader::placement::planner::{Category, ComponentKind, CoordinatorDevices, Lifetime};
+        use cuteafd_loader::placement::planner::{ComponentKind, CoordinatorDevices, Lifetime};
+        use cuteafd_core::memory_layout::Category;
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
@@ -304,6 +305,59 @@ mod receipt_tests {
                 assert_eq!(tails[0].backings[0].requests, [layout.bytes() as u64]);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_shared_arena_payload_matches_mount_through_committed_ring() -> Result<()> {
+        use crate::shared::experts::rtx::{dense, push};
+        use crate::shared::memory::device::Device;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::exlr8::fixture(root.path(), false);
+        let sockets = tempfile::tempdir()?;
+        for world in [1, 2] {
+            for rank in 0..world {
+                let device = Device { library: &library, id: rank as i32 };
+                device.run(|| -> Result<()> {
+                    let first = Residency::plan(root.path(), "mixed", 3, world, rank, ExpertSet::Shared)?;
+                    let mut second = first.clone();
+                    second.layer += 1;
+                    let plans = vec![first, second];
+                    let plan = || NativePlan { plans: plans.clone(), family: KernelFamily::Glm,
+                        resident: plans.iter().map(|p| p.resident_bytes as u64).sum(), workspace: 0, host_peak: 0 };
+                    let mounted = NativeExperts::load_validated(&library, plan(), |_| Ok(()))?;
+                    let before = fixture.events()?.matches('D').count();
+                    let timing = crate::shared::memory::load_timing::Split::start();
+                    let (pushed, records) = dense::recording(||
+                        NativeExperts::load_validated(&library, plan(), |_| Ok(())))?;
+                    assert_eq!(fixture.events()?.matches('D').count() - before, 1);
+                    assert_eq!(timing.read_bytes(), 0, "recording must not read shared payloads");
+                    assert!(!records.operands.is_empty());
+                    push::tests::receive_pushed(device, None, root.path(), sockets.path(), &records, None, 0, rank)?;
+                    for (mount, push) in mounted.weights.iter().zip(&pushed.weights) {
+                        for unit in &mount.layout.loads {
+                            for (source, &offset) in unit.source.iter().zip(&unit.destination) {
+                                let mut expected = vec![0; source.bytes];
+                                let mut actual = expected.clone();
+                                library.copy_d2h(&mut expected, view(mount.buffer, offset, source.bytes)?)?;
+                                library.copy_d2h(&mut actual, view(push.buffer, offset, source.bytes)?)?;
+                                assert_eq!(actual, expected);
+                            }
+                        }
+                        let (pointers, _) = push.layout.descriptors(push.buffer.ptr as u64)?;
+                        let mut actual = vec![0; pointers.len() * 8];
+                        library.copy_d2h(&mut actual, push.pointers()?)?;
+                        assert_eq!(actual, pointers.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<_>>());
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
         Ok(())
     }
 

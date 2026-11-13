@@ -295,7 +295,10 @@ def test_native_shared_owner_is_family_neutral_and_glm_keeps_its_buffers():
     assert "family: KernelFamily" in shared
     assert "shared_workspace_bytes(programs, family, ROWS)" in shared
     assert "programs, self.family, ROWS, self.workspace" in shared
-    assert "Workspace" not in shared and "KernelFamily::Glm" not in shared
+    production = shared.split("#[cfg(test)]", 1)[0]
+    assert "Workspace" not in production and "KernelFamily::Glm" not in production
+    assert "residency::shared_arena(&plans)" in production
+    assert "Exlr8Weights::load_into" in production
     assert "execution.seal_graph_storage()?" in shared
     assert "w.x.buffer,\n                w.shared.buffer" in engine
     assert "cuteafd_ffi::exlr8::KernelFamily::Glm,\n                devices.len(), rank" in family

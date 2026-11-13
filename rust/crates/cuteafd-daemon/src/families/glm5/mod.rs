@@ -1083,7 +1083,7 @@ impl Opened {
             cuteafd_loader::plan::Checkpoint::coordinator_view(view, false, false)
         }).transpose()?;
         // The EXLR8 checkpoint's own dense records, per coordinator rank.
-        let native_plans = if native {
+        let mut native_plans = if native {
             (0..devices.len()).map(|rank| crate::shared::experts::exlr8::NativePlan::new(&self.snapshot,
                 args.exlr8_manifest.as_deref().context("EXLR8 manifest")?,
                 self.cfg.first_moe_layer, layers, &programs, cuteafd_ffi::exlr8::KernelFamily::Glm,
@@ -1559,11 +1559,14 @@ impl Opened {
         };
         let mut whole_weights = None;
         let mut exl3_whole_weights = None;
+        let mut native_owners = Vec::new();
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
             if let Some(records) = &native_records {
                 let loaded = self.load_native(args, native_load.as_ref().context("native loader admission absent")?, records, &native_dense_records, owners.as_deref(), layers, &programs, &manifest, &loader, &devices, stream,
-                    peer_stream, native_push.take(), &media, &ml4_draft, &mut draft_file, &draft_home)?;
+                    peer_stream, native_push.take(), &media, &ml4_draft, &mut draft_file, &draft_home,
+                    std::mem::take(&mut native_plans))?;
                 planned_drafter = loaded.3;
+                native_owners = loaded.4;
                 let tp2 = if let Some(range) = tp2_range.clone() {
                     Some(tp2_weights(range, loaded.2)?)
                 } else {
@@ -1623,11 +1626,6 @@ impl Opened {
             };
             Ok((embedding, (model, tp2)))
         })?;
-        let native_owners = native_plans.into_iter().zip(&devices).map(|(plan, &device)| {
-            self.library.cuda_set_device(device)?;
-            crate::shared::experts::exlr8::NativeExperts::load_admitted(&self.library, plan,
-                native_load.as_ref().context("native shared admission absent")?)
-        }).collect::<Result<Vec<_>>>()?;
         self.library.cuda_set_device(args.device)?;
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
             + model.norm.buffer.bytes + model.head.bytes();
@@ -1975,9 +1973,11 @@ impl Opened {
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
         media: &crate::shared::experts::rtx::dense::Records,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
-        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>, draft_home: &DraftHome)
+        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>, draft_home: &DraftHome,
+        shared_plans: Vec<crate::shared::experts::exlr8::NativePlan>)
         -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>),
-            Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>, Option<Option<drafter::GlmDrafter<'s>>>)> {
+            Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>, Option<Option<drafter::GlmDrafter<'s>>>,
+            Vec<crate::shared::experts::exlr8::NativeExperts<'s>>)> {
         use crate::shared::token_io::native::{NativeVocabulary, VocabularyPlan};
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
         let world = devices.len();
@@ -1987,6 +1987,13 @@ impl Opened {
         let config = self.view.config()?;
         let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
         let recorder = crate::shared::experts::rtx::dense::Recorder::start(push.is_some())?;
+        ensure!(shared_plans.len() == world, "native shared plans require one owner per coordinator");
+        // Retain the shared backings through delivery; their payloads join the
+        // same recorder as the vocabulary, target body and drafter.
+        let shared = shared_plans.into_iter().zip(devices).map(|(plan, &id)| {
+            crate::shared::memory::device::Device { library: &self.library, id }
+                .run(|| crate::shared::experts::exlr8::NativeExperts::load_admitted(&self.library, plan, admitted))
+        }).collect::<Result<Vec<_>>>()?;
         let vocabulary_plan = VocabularyPlan::new(records, &selection, world, 0, self.cfg.hidden, self.cfg.vocab_size)?;
         let staging_bytes = vocabulary_plan.staging_bytes() as u64;
         admitted.validate_vocabulary(staging_bytes)?;
@@ -2025,7 +2032,7 @@ impl Opened {
         };
         self.library.cuda_set_device(args.device)?;
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "GLM native dense weights resident");
-        Ok((embedding, (model, shares), pushed, planned_drafter))
+        Ok((embedding, (model, shares), pushed, planned_drafter, shared))
     }
 
     /// The row-FP8 embedding's identity (vocabulary file, payload offset).
