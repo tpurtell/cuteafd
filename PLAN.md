@@ -33,6 +33,9 @@ and legacy output receipts. The operational `io_resume` entry patches only the
 frozen runner's output memmap interface: new expert outputs append sequentially,
 and reads combine committed legacy slots with new files byte for byte. Its
 code/provenance is tracked separately; no numerical state or source is rewritten.
+New expert-output scratch uses streamed XXH3-128 without a readback hash pass.
+Forecasts use post-recovery cycles and exclude the mixed interrupted layer from
+full-layer averages; original projection receipts remain unchanged.
 
 Source header audit: `thinkingmachines/Inkling-2-Small-MXFP8` at
 `3febc62259ee92ea36e2fb6e8303371c4eb3922c`, 48 indexed model shards plus
