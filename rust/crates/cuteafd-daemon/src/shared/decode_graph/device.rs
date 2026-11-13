@@ -551,6 +551,35 @@ pub(crate) struct DeviceCache {
     last_trace: Instant,
 }
 
+/// Set once the serving engine is ready (`memory_report::log("ready")`), after every
+/// family's startup prewarm: from then on, graph sites spanning both GPUs run eagerly
+/// instead of capturing mid-request (#1878).
+static CROSS_DEVICE_SEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn seal_cross_device_capture() {
+    if !CROSS_DEVICE_SEALED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        tracing::info!("serving: cross-device graph sites run eagerly on a miss (startup prewarm stays captured)");
+    }
+}
+
+fn cross_device_capture_sealed() -> bool {
+    // Tests run in parallel threads, and any of them may reach a readiness log:
+    // only a thread's own explicit seal applies there.
+    #[cfg(test)]
+    return TEST_SEAL.with(|seal| seal.get()).unwrap_or(false);
+    #[cfg(not(test))]
+    CROSS_DEVICE_SEALED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+// Tests run in parallel threads: each seals only its own thread.
+#[cfg(test)]
+thread_local! { static TEST_SEAL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+pub(crate) fn seal_cross_device_capture_on_this_thread(sealed: bool) {
+    TEST_SEAL.with(|seal| seal.set(Some(sealed)));
+}
+
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
         Self { device, reserve, reserve_policy: None, charged: 0, level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
@@ -813,7 +842,13 @@ impl DeviceCache {
         };
         let growth = projected.saturating_sub(self.pending_growth);
         let reuse = chain && projected == 0 && !self.unmeasured;
-        let allowed = site.preference != Preference::Eager && estimate > 0;
+        // #1878: once serving, a graph spanning both GPUs is never captured. Its first
+        // instantiation runs while the other GPU spins on a peer wait whose push this
+        // thread queues only after the instantiation returns (cudaGraphInstantiate then
+        // waits for that GPU forever). The miss runs eagerly and stays a remembered
+        // key, so a GRAPH_TRACE run still lists it for the layout's prewarm set.
+        let sealed = site.spans_devices && cross_device_capture_sealed();
+        let allowed = site.preference != Preference::Eager && estimate > 0 && !sealed;
         let room = may_capture(site.preference, growth, headroom, self.reserve,
             self.charged, self.pending_growth, self.pending_bytes, reuse);
         if allowed && room && old.is_none_or(|id| !self.records[&id].pending_destroy && !self.records[&id].pending_capture) {

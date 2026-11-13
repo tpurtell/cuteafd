@@ -584,6 +584,34 @@ mod device_tests {
         assert!(bank.cache_ticket(&2, false, None).is_some(), "non-OOM has no cooldown");
     }
 
+    /// #1878: once serving, a site spanning both GPUs never captures (its first
+    /// instantiation would wait on the other GPU's spinning peer wait); the miss
+    /// runs eagerly and stays a remembered key. Single-GPU sites still capture,
+    /// and before readiness (startup prewarm) spanning sites capture as before.
+    #[test]
+    fn serving_never_captures_a_cross_device_graph() {
+        use super::super::device::seal_cross_device_capture_on_this_thread as seal;
+        seal(false);
+        let mut prewarm: GraphBank<u32, u32> = GraphBank::new();
+        prewarm.attach_device_for_test(-401, 1000, Site { spans_devices: true, ..site() }).unwrap();
+        let ticket = prewarm.cache_ticket(&1, false, None).expect("startup prewarm captures cross-device graphs");
+        drop(prewarm.cache_ticket_failed(ticket, &anyhow::anyhow!("fixture")));
+        seal(true);
+        let mut spanning: GraphBank<u32, u32> = GraphBank::new();
+        spanning.attach_device_for_test(-402, 1000, Site { spans_devices: true, ..site() }).unwrap();
+        for _ in 0..8 {
+            assert!(spanning.cache_ticket(&7, true, None).is_none(), "serving must not capture across devices");
+            spanning.cache_measured(0);
+            spanning.cache_tick();
+        }
+        let traced = super::super::device::snapshots().into_iter().find(|row| row.device == -402).unwrap();
+        assert_eq!(traced.charged, 0, "an eager cross-device miss reserves nothing");
+        let mut local: GraphBank<u32, u32> = GraphBank::new();
+        local.attach_device_for_test(-403, 1000, site()).unwrap();
+        assert!(local.cache_ticket(&7, false, None).is_some(), "single-GPU sites still capture while serving");
+        seal(false);
+    }
+
     #[test]
     fn small_capture_remains_eager_across_boundaries_and_ghost_pressure() {
         for nodes in 0..=2 {
