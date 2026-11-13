@@ -8,6 +8,30 @@ use std::ffi::c_void;
 pub mod producers;
 pub mod forward;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EntryValidator { Producer, Forward }
+
+/// Producer stems are family-owned; unrecognized MiniMax entries retain the
+/// strict MSA validator rather than being accepted by a prefix alone.
+pub(crate) fn entry_validator(name: &str) -> Option<EntryValidator> {
+    if producers::Kind::ALL.into_iter().chain(producers::Kind::HEADS)
+        .any(|kind| kind.name() == name) {
+        Some(EntryValidator::Producer)
+    } else if forward::Kind::ALL.into_iter().chain(forward::Kind::HEADS)
+        .any(|kind| kind.name() == name) {
+        Some(EntryValidator::Forward)
+    } else { None }
+}
+
+impl EntryValidator {
+    pub(crate) fn validate(self, spec: &ProgramSpec, entry: &serde_json::Value) -> Result<()> {
+        match self {
+            Self::Producer => producers::validate_producer_entry(spec, entry).map(|_| ()),
+            Self::Forward => forward::validate_entry(spec, entry).map(|_| ()),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("invalid MiniMax MSA program: {0}")]
 pub struct MsaError(String);
@@ -571,6 +595,78 @@ impl Layout {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[ignore = "requires installed placement PROGRAMS.json; run explicitly by name"]
+    fn installed_manifest_validates_every_stem_and_minimax_dispatch_partition() -> anyhow::Result<()> {
+        let path = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"))
+                .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let entries = manifest["programs"].as_array().expect("installed programs array");
+        assert_eq!(entries.len(), 1724);
+        let mut partition = Vec::new();
+        for entry in entries {
+            let name = entry["name"].as_str().expect("installed program name");
+            if !name.starts_with("minimax_") { continue; }
+            let route = if entry["op"] == "index_cache_gather" {
+                assert_eq!(entry_validator(name), None);
+                "gather"
+            } else {
+                match entry_validator(name) {
+                    Some(EntryValidator::Producer) => "producer",
+                    Some(EntryValidator::Forward) => "forward",
+                    None => "msa",
+                }
+            };
+            partition.push((name, route));
+        }
+        partition.sort_unstable();
+        assert_eq!(partition, vec![
+            ("minimax_attention_decode", "msa"),
+            ("minimax_attention_extend", "msa"),
+            ("minimax_index_cache_gather", "gather"),
+            ("minimax_index_decode", "msa"),
+            ("minimax_index_prefill", "msa"),
+            ("minimax_index_producer", "producer"),
+            ("minimax_kv_pack", "forward"),
+            ("minimax_norm_rope_h4", "producer"),
+            ("minimax_norm_rope_h64", "producer"),
+            ("minimax_oai_split_i12288", "producer"),
+            ("minimax_oai_split_i3072", "producer"),
+            ("minimax_residual_norm", "forward"),
+            ("minimax_router_scores", "forward"),
+        ]);
+        let fixture = crate::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.register_programs(&library, entries)?;
+        let programs = library.programs()?.with_manifest(&path)?;
+        assert_eq!(programs.names().count(), 1724);
+        for entry in entries {
+            assert!(programs.contains(entry["name"].as_str().unwrap()));
+        }
+        println!("validated 1724 installed stems; MiniMax: 4 MSA, 5 Producer, 3 Forward, 1 gather");
+        Ok(())
+    }
+
+    #[test]
+    fn whole_and_narrow_producer_stems_never_dispatch_to_msa_validation() {
+        for kind in producers::Kind::ALL.into_iter().chain(producers::Kind::HEADS) {
+            assert_eq!(entry_validator(kind.name()), Some(EntryValidator::Producer), "{}", kind.name());
+        }
+        for kind in forward::Kind::ALL.into_iter().chain(forward::Kind::HEADS) {
+            assert_eq!(entry_validator(kind.name()), Some(EntryValidator::Forward), "{}", kind.name());
+        }
+        for mode in [Mode::IndexDecode, Mode::IndexPrefill, Mode::AttentionDecode, Mode::AttentionExtend] {
+            assert_eq!(entry_validator(mode.name()), None);
+            assert_eq!(entry_validator(mode.heads_name()), None);
+        }
+        for unknown in ["minimax_norm_rope_h3", "minimax_index_producer_h3",
+            "minimax_oai_split_i1", "minimax_kv_pack_h3"] {
+            assert_eq!(entry_validator(unknown), None);
+        }
+    }
 
     fn fixture(mode: Mode) -> (ProgramSpec, serde_json::Value) {
         let layout = Layout::new(mode, 64, if mode.index() { 33 } else { 16 }).unwrap();

@@ -8,6 +8,9 @@ use cuteafd_loader::families::minimax_m3::{MiniMaxM3Config,
     execution::{MsaPrograms, ProducerPrograms, ForwardPrograms}};
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadLayout { Whole, Narrow }
+
 /// Handles only: admission resolves every manifest before any module loads.
 pub(crate) struct Kernels<'a> {
     device: Device<'a>,
@@ -27,10 +30,35 @@ pub(crate) struct Kernels<'a> {
 impl<'a> Kernels<'a> {
     pub fn bind(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
         cfg: &MiniMaxM3Config, rows: u32, context: u32) -> Result<Self> {
+        Self::bind_heads(device, programs, manifest, cfg, rows, context, HeadLayout::Whole)
+    }
+    pub fn bind_heads(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
+        cfg: &MiniMaxM3Config, rows: u32, context: u32, layout: HeadLayout) -> Result<Self> {
+        Self::bind_geometry(device, programs, manifest, cfg, rows, context, layout)
+    }
+    fn bind_geometry(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
+        cfg: &MiniMaxM3Config, rows: u32, context: u32, layout: HeadLayout) -> Result<Self> {
         ensure!(std::ptr::eq(device.library, programs.library()), "MiniMax attention library differs");
-        let (msa_layout, msa) = MsaPrograms::resolve(cfg, manifest, rows.min(64), rows, context)?;
-        let (producer_layout, producers) = ProducerPrograms::resolve(manifest, rows)?;
-        let (_, forward) = ForwardPrograms::resolve(manifest, rows)?;
+        let (msa_layout, msa) = match layout {
+            HeadLayout::Whole => MsaPrograms::resolve(cfg, manifest, rows.min(64), rows, context)?,
+            HeadLayout::Narrow => MsaPrograms::resolve_heads(cfg, manifest, rows.min(64), rows, context)?,
+        };
+        let (producer_layout, producers) = match layout {
+            HeadLayout::Whole => ProducerPrograms::resolve(manifest, rows)?,
+            HeadLayout::Narrow => ProducerPrograms::resolve_heads(manifest, rows)?,
+        };
+        let (_, forward) = match layout {
+            HeadLayout::Whole => ForwardPrograms::resolve(manifest, rows)?,
+            HeadLayout::Narrow => ForwardPrograms::resolve_heads(manifest, rows)?,
+        };
+        let (query_heads, kv_heads, index, kv) = match layout {
+            HeadLayout::Whole => (64, 4, producers::Kind::Index, forward::Kind::KvPack),
+            HeadLayout::Narrow => (32, 2, producers::Kind::IndexHeads, forward::Kind::KvPackHeads),
+        };
+        let bind_msa = |mode| match layout {
+            HeadLayout::Whole => Msa::bind(programs, mode),
+            HeadLayout::Narrow => Msa::bind_heads(programs, mode),
+        };
         for expected in msa.iter().chain(&producers).chain(&forward) {
             let actual = programs.spec(&expected.name)?;
             ensure!(actual.pointers == expected.pointers && actual.scalar_kinds == expected.scalar_kinds
@@ -40,15 +68,15 @@ impl<'a> Kernels<'a> {
         }
         device.run(|| Ok(Self {
             device,
-            query: producers::Producer::bind(programs, producers::Kind::NormRope { heads: 64 })?,
-            key: producers::Producer::bind(programs, producers::Kind::NormRope { heads: 4 })?,
-            index: producers::Producer::bind(programs, producers::Kind::Index)?,
-            kv: forward::ForwardProducer::bind(programs, forward::Kind::KvPack)?,
+            query: producers::Producer::bind(programs, producers::Kind::NormRope { heads: query_heads })?,
+            key: producers::Producer::bind(programs, producers::Kind::NormRope { heads: kv_heads })?,
+            index: producers::Producer::bind(programs, index)?,
+            kv: forward::ForwardProducer::bind(programs, kv)?,
             gather: index_cache::Gather::bind(programs, "minimax_index_cache_gather")?,
-            select: Msa::bind(programs, Mode::IndexPrefill)?,
-            attention: Msa::bind(programs, Mode::AttentionExtend)?,
-            decode_select: Msa::bind(programs, Mode::IndexDecode)?,
-            decode_attention: Msa::bind(programs, Mode::AttentionDecode)?,
+            select: bind_msa(Mode::IndexPrefill)?,
+            attention: bind_msa(Mode::AttentionExtend)?,
+            decode_select: bind_msa(Mode::IndexDecode)?,
+            decode_attention: bind_msa(Mode::AttentionDecode)?,
             msa_layout, producer_layout,
         }))
     }
@@ -233,12 +261,12 @@ impl Workspace<'_> {
                 kernels.query.norm_rope(producers::NormRopeBatch {
                     rows: r.rows, positions_capacity: r.positions_capacity, input: p.query,
                     weight: p.query_norm, positions: r.positions, cos_sin: r.cos_sin,
-                    output: query, scratch: self.plane("minimax_norm_rope_h64")?,
+                    output: query, scratch: self.plane(kernels.query.layout.kind.name())?,
                 }, stream.raw)?;
                 kernels.key.norm_rope(producers::NormRopeBatch {
                     rows: r.rows, positions_capacity: r.positions_capacity, input: p.key,
                     weight: p.key_norm, positions: r.positions, cos_sin: r.cos_sin,
-                    output: key, scratch: self.plane("minimax_norm_rope_h4")?,
+                    output: key, scratch: self.plane(kernels.key.layout.kind.name())?,
                 }, stream.raw)?;
                 kernels.kv.kv(forward::KvBatch {
                     rows: r.rows, batch, pool_pages: r.pool_pages,
@@ -253,7 +281,7 @@ impl Workspace<'_> {
                     cos_sin: r.cos_sin, query_fp8: index_query, query_scale: index_scales,
                     key_fp8: self.plane("index.produced_keys")?,
                     key_scale: self.plane("index.produced_scales")?, cache: r.index_cache,
-                    scratch: self.plane("minimax_index_producer")?,
+                    scratch: self.plane(kernels.index.layout.kind.name())?,
                 }, stream.raw)?;
                 if decode {
                     kernels.decode_select.index_decode(self.decode_batch(r, decode_pages)?, stream.raw)?;
@@ -330,6 +358,139 @@ mod tests {
         let mut drift = manifest.clone();
         drift["programs"][0]["geometry"]["admission_marker"] = 1.into();
         assert!(Kernels::bind(device, &programs, &drift, &config(), 17, 2049).is_err());
+        assert_eq!(fixture.events()?.matches('D').count(), 0);
+        Ok(())
+    }
+
+    fn binding_names(kernels: &Kernels<'_>) -> Vec<&'static str> {
+        vec![kernels.query.layout.kind.name(), kernels.key.layout.kind.name(),
+            kernels.index.layout.kind.name(), kernels.kv.layout.kind.name(),
+            kernels.select.layout.name(), kernels.attention.layout.name(),
+            kernels.decode_select.layout.name(), kernels.decode_attention.layout.name()]
+    }
+
+    fn narrow_manifest() -> serde_json::Value {
+        let mut manifest = manifest();
+        for entry in manifest["programs"].as_array_mut().unwrap() {
+            let name = entry["name"].as_str().unwrap().to_owned();
+            if let Some(mode) = [Mode::IndexDecode, Mode::IndexPrefill, Mode::AttentionDecode,
+                Mode::AttentionExtend].into_iter().find(|mode| mode.name() == name) {
+                let index = matches!(mode, Mode::IndexDecode | Mode::IndexPrefill);
+                let extent = entry["geometry"][if index { "max_pages" } else { "max_batch" }].as_u64().unwrap();
+                let layout = minimax_m3::Layout::for_heads(mode,
+                    entry["capacity_rows"].as_u64().unwrap() as u32, extent as u32).unwrap();
+                entry["name"] = layout.name().into();
+                if index { entry["geometry"]["heads"] = 2.into(); }
+                else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); }
+                entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
+                for pointer in entry["pointers"].as_array_mut().unwrap() {
+                    let shape = pointer["shape"].as_str().unwrap();
+                    pointer["shape"] = if pointer["name"] == "scratch" { format!("[{}]", layout.scratch) }
+                        else if pointer["name"] == "q2k_indices" { shape.replacen("[4,", "[2,", 1) }
+                        else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]")
+                            .replace("[rows,64", "[rows,32") }.into();
+                }
+                continue;
+            }
+            let pair = producers::Kind::ALL.into_iter().zip(producers::Kind::HEADS)
+                .find(|(whole, _)| whole.name() == name);
+            if let Some((_, kind)) = pair {
+                let layout = producers::ProducerLayout::new(kind,
+                    entry["capacity_rows"].as_u64().unwrap() as u32).unwrap();
+                entry["name"] = kind.name().into();
+                let (from, to) = match kind {
+                    producers::Kind::NormRope { heads } => {
+                        let whole = entry["geometry"]["heads"].as_u64().unwrap();
+                        entry["geometry"]["heads"] = heads.into();
+                        (format!(",{whole},128]"), format!(",{heads},128]"))
+                    }
+                    producers::Kind::IndexHeads => {
+                        entry["geometry"]["heads"] = 2.into();
+                        (String::new(), String::new())
+                    }
+                    producers::Kind::Oai { width } => {
+                        let whole = entry["geometry"]["width"].as_u64().unwrap();
+                        entry["geometry"]["width"] = width.into();
+                        (format!(",{whole}]"), format!(",{width}]"))
+                    }
+                    _ => unreachable!(),
+                };
+                if layout.scratch() != 0 { entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch().into(); }
+                for pointer in entry["pointers"].as_array_mut().unwrap() {
+                    let shape = pointer["shape"].as_str().unwrap();
+                    pointer["shape"] = if kind == producers::Kind::IndexHeads {
+                        shape.replace(",4,128]", ",2,128]").replace(",4]", ",2]")
+                            .replace(",9,128]", ",5,128]")
+                    } else { shape.replace(&from, &to) }.into();
+                }
+            } else if name == "minimax_kv_pack" {
+                entry["name"] = "minimax_kv_pack_h2".into();
+                entry["geometry"]["heads"] = 2.into();
+                for pointer in entry["pointers"].as_array_mut().unwrap() {
+                    pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").into();
+                }
+            }
+        }
+        manifest
+    }
+
+    #[test]
+    fn narrow_binding_selects_exact_stems_and_refuses_each_missing_export() -> Result<()> {
+        use cuteafd_loader::placement::planner::Refusal;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 1 };
+        let manifest = narrow_manifest();
+        fixture.register_programs(&library, manifest["programs"].as_array().unwrap())?;
+        let path = fixture.directory().join("PROGRAMS.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        let programs = library.programs()?.with_manifest(&path)?;
+        let kernels = Kernels::bind_heads(device, &programs, &manifest, &config(), 17, 2049, HeadLayout::Narrow)?;
+        assert_eq!(binding_names(&kernels), vec!["minimax_norm_rope_h32", "minimax_norm_rope_h2",
+            "minimax_index_producer_h2", "minimax_kv_pack_h2", "minimax_index_prefill_h2",
+            "minimax_attention_extend_h32", "minimax_index_decode_h2", "minimax_attention_decode_h32"]);
+        let scratch = kernels.producer_layout.workspace().into_iter().collect::<BTreeMap<_, _>>();
+        for producer in [&kernels.query, &kernels.key, &kernels.index] {
+            assert_eq!(scratch[producer.layout.kind.name()], producer.layout.scratch());
+        }
+        for (index, entry) in manifest["programs"].as_array().unwrap().iter().enumerate() {
+            let mut missing = manifest.clone();
+            missing["programs"].as_array_mut().unwrap().remove(index);
+            let error = Kernels::bind_heads(device, &programs, &missing, &config(), 17, 2049,
+                HeadLayout::Narrow).err().expect("every selected entry is required");
+            assert!(matches!(error.downcast_ref::<Refusal>(), Some(Refusal::MissingExport { export, .. })
+                if export == entry["name"].as_str().unwrap()));
+        }
+        assert_eq!(library.cuda_get_device()?, 0);
+        assert_eq!(fixture.events()?.matches('D').count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_whole_binding_preserves_entries_and_scratch_names() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 1 };
+        let manifest = manifest();
+        fixture.register_programs(&library, manifest["programs"].as_array().unwrap())?;
+        let path = fixture.directory().join("PROGRAMS.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        let programs = library.programs()?.with_manifest(&path)?;
+        let original = Kernels::bind(device, &programs, &manifest, &config(), 17, 2049)?;
+        let explicit = Kernels::bind_heads(device, &programs, &manifest, &config(), 17, 2049, HeadLayout::Whole)?;
+        assert_eq!(binding_names(&original), binding_names(&explicit));
+        assert_eq!(binding_names(&original), vec!["minimax_norm_rope_h64", "minimax_norm_rope_h4",
+            "minimax_index_producer", "minimax_kv_pack", "minimax_index_prefill",
+            "minimax_attention_extend", "minimax_index_decode", "minimax_attention_decode"]);
+        assert_eq!(original.producer_layout.workspace(), explicit.producer_layout.workspace());
+        for prefill in [false, true] {
+            assert_eq!(original.msa_layout.workspace(prefill), explicit.msa_layout.workspace(prefill));
+        }
+        let error = Kernels::bind_heads(device, &programs, &manifest, &config(), 17, 2049,
+            HeadLayout::Narrow).err().expect("whole entries cannot satisfy narrow binding");
+        assert!(matches!(error.downcast_ref::<cuteafd_loader::placement::planner::Refusal>(),
+            Some(cuteafd_loader::placement::planner::Refusal::MissingExport { export, .. })
+                if export == "minimax_index_decode_h2"));
         assert_eq!(fixture.events()?.matches('D').count(), 0);
         Ok(())
     }
