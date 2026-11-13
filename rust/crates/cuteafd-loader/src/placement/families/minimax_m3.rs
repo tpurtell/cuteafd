@@ -496,9 +496,6 @@ impl MiniMaxInputs {
             out.extend(buffer(format!("{}.{name}", Owner::Cache { gpu }.id()), location, bytes, Lifetime::TARGET,
                 Category::Kv, "MSA page tables", maximum));
         }
-        let table_stride = u64::from(cache.table_width).div_ceil(4) * 4;
-        out.extend(buffer(Owner::DecodeTable { gpu }.id(), location, self.sequences * table_stride * 4,
-            Lifetime::TARGET, Category::Kv, "decode active page-table rows", maximum));
         // Ordered H2D staging is keyed by destination and copy stream, not a
         // ring: each retained request table and length has its own pinned owner.
         // Shared pinned accounting charges exact payload; no device rounding.
