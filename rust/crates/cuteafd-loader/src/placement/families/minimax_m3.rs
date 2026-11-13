@@ -736,7 +736,7 @@ impl Recipe for MiniMaxInputs {
         // #1945: the library streams every synchronous startup copy through
         // this shared chunk, then releases it before readiness.
         components.extend(buffer("staging/sync-h2d", Location::PINNED,
-            crate::shared::dense_read::STEP_BYTES as u64,
+            cuteafd_ffi::SYNC_H2D_CHUNK_BYTES as u64,
             Lifetime { first: Phase::Load, last: Phase::Warmup }, Category::Staging,
             "library-wide synchronous H2D startup chunk", maximum));
         fixed_request_tails(&mut components, maximum, &[])?;
