@@ -1313,7 +1313,7 @@ mod tests {
         use crate::shared::memory::receipts::Inventory;
         use cuteafd_core::memory_layout::Category;
         use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
-        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, SelectorOwners};
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, serving::SelectorOwners};
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.configure_memory(&library, 1, 1 << 30)?;
