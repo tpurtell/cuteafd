@@ -231,8 +231,18 @@ impl<'a> CsaLayer<'a> {
         reservations: &[u64],
         kv_format: Qwen4KvCache,
     ) -> Result<Self> {
+        Self::load_weights_in(device, programs, checkpoint, layer_id, rows, rope, available,
+            reservations, kv_format, None)
+    }
+
+    pub(super) fn load_weights_in(
+        device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        layer_id: usize, rows: usize, rope: Option<std::rc::Rc<TargetTables<'a>>>,
+        available: u64, reservations: &[u64], kv_format: Qwen4KvCache,
+        weight_arena: Option<&DeviceWeightArena<'a>>,
+    ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None, kv_format, None, None, None)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None, kv_format, None, None, weight_arena)
     }
 
     pub fn for_execution(
