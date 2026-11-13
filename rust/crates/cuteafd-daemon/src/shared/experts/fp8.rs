@@ -1110,16 +1110,22 @@ mod tests {
             let layer = tensors.shape().first_layer;
             let names = Fp8Projection::ALL.into_iter().flat_map(|projection|
                 tensors.projection_source_names(layer, 0, projection)).collect::<std::collections::BTreeSet<_>>();
-            let headers = installed.tensors().iter().filter(|tensor| names.contains(&tensor.metadata.name))
+            // The general catalog excludes routed experts; inspect their source headers directly.
+            let shards = names.iter().map(|name| tensors.push_source(name).map(|(source, _)| source.path))
+                .collect::<Result<std::collections::BTreeSet<_>>>()?;
+            let headers = shards.iter().map(|path| cuteafd_loader::read_safetensors_metadata(path))
+                .collect::<Result<Vec<_>>>()?.into_iter().flatten().filter(|tensor| names.contains(&tensor.name))
                 .map(|tensor| {
-                    let dtype = match tensor.metadata.dtype {
+                    let dtype = match tensor.dtype {
                         cuteafd_core::DType::U8 => "U8", cuteafd_core::DType::F8E4M3 => "F8_E4M3",
                         cuteafd_core::DType::F8E8M0 => "F8_E8M0", cuteafd_core::DType::F32 => "F32",
                         ref other => panic!("unexpected installed native dtype {other:?}"),
                     };
-                    t(tensor.metadata.name.clone(), dtype, &tensor.metadata.shape)
+                    t(tensor.name.clone(), dtype, &tensor.shape)
                 }).collect::<Vec<_>>();
-            assert_eq!(headers.len(), names.len(), "incomplete installed expert headers: {repo}");
+            let expected_headers = if format == ExpertFormat::Nvfp4 { 12 } else { 6 };
+            assert_eq!(names.len(), expected_headers, "unexpected native projection planes: {repo}");
+            assert_eq!(headers.len(), expected_headers, "incomplete installed expert headers: {repo}");
             let root = tempfile::tempdir()?;
             // Preserve vendor names/dtypes/full dimensions, reducing only expert count.
             // Sparse synthetic payloads avoid reading or copying checkpoint weights.
