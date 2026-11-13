@@ -43,7 +43,10 @@ impl<'a> Cache<'a> {
             Tag::workspace("minimax/rope"))?;
         let owner = Self { stream, layout, rope, pool, pages, planes, cos_sin, tokens };
         // Tables are immutable after construction; per-unit lengths are separate.
-        let table = owner.pages.iter().flat_map(|page| (*page as i32).to_le_bytes()).collect::<Vec<_>>();
+        let mut table = vec![0; owner.layout.table_width as usize * 4];
+        for (entry, page) in table.chunks_exact_mut(4).zip(&owner.pages) {
+            entry.copy_from_slice(&(*page as i32).to_le_bytes());
+        }
         device.run(|| {
             device.library.copy_h2d(owner.plane("page_table")?, &table)?;
             device.library.copy_h2d(owner.plane("lengths")?, &0i32.to_le_bytes())?;
@@ -111,6 +114,161 @@ impl<'a> Cache<'a> {
             value_cache: self.plane(&format!("layer.{layer}.values"))?,
             index_cache: self.plane(&format!("layer.{layer}.index"))? })
     }
+}
+
+pub(crate) const PAGE_ROWS: usize = 64;
+pub(crate) const PAGE_PLANES: [(&str, usize); 3] =
+    [("keys", 32768), ("values", 32768), ("index", 8448)];
+
+/// Request state contains references and a logical frontier, never device storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Placement {
+    pub units: Vec<u32>,
+    pub slot: usize,
+    pub len: usize,
+}
+
+impl crate::shared::qwen::scheduler::Placement for Placement {
+    fn len(&self) -> usize { self.len }
+    fn set_len(&mut self, len: usize) { self.len = len; }
+    fn units(&self) -> &[u32] { &self.units }
+    fn slot(&self) -> i32 { self.slot as i32 }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+}
+
+/// One admitted rank's cache planes. Logical page IDs are shared between ranks;
+/// each rank stores only the layers it actually executes (no KV replication).
+pub(crate) struct PageBank<'a> {
+    pub stream: Rc<Stream<'a>>,
+    readers: Vec<Rc<Stream<'a>>>,
+    pub layout: MsaCache,
+    pub rope: MsaRope,
+    pub layers: Range<usize>,
+    pub model_layers: usize,
+    planes: BTreeMap<String, Rc<Allocation<'a>>>,
+    cos_sin: Rc<Allocation<'a>>,
+}
+
+impl Drop for PageBank<'_> {
+    fn drop(&mut self) {
+        for reader in &self.readers { reader.drain_or_abort("MiniMax page bank retirement"); }
+    }
+}
+
+impl<'a> PageBank<'a> {
+    /// Every stream touching pages must be retained before Ready. Cache/rope
+    /// extents are passed from admission, never selected by the runtime.
+    pub fn new(readers: Vec<Rc<Stream<'a>>>, cfg: &MiniMaxM3Config,
+        layout: MsaCache, rope: MsaRope, layers: Range<usize>) -> Result<Self> {
+        let stream = Rc::clone(readers.first().context("MiniMax cache has no reader")?);
+        let device = stream.device;
+        ensure!(!layers.is_empty() && layers.end <= cfg.layers && layers.len() == layout.layers as usize
+            && readers.iter().all(|reader| reader.device.id == device.id
+                && std::ptr::eq(reader.device.library, device.library)),
+            "MiniMax page bank layers/readers differ from admission");
+        ensure!(MsaCache::new(layout.layers, layout.pool_pages, layout.requests, rope.positions)? == layout
+            && MsaRope::new(cfg, rope.positions)? == rope,
+            "MiniMax page bank geometry differs from admission");
+        let mut planes = BTreeMap::new();
+        for (local, bytes) in layout.buffers()? {
+            let name = if let Some(suffix) = local.strip_prefix("layer.") {
+                let (layer, plane) = suffix.split_once('.').context("MiniMax cache plane name")?;
+                format!("layer.{}.{}", layers.start + layer.parse::<usize>()?, plane)
+            } else { local };
+            let tag = if name.starts_with("layer.") { Tag::kv("minimax/kv") }
+                else { Tag::workspace("minimax/cache") };
+            planes.insert(name, Rc::new(Allocation::new(device, usize::try_from(bytes)?, tag)?));
+        }
+        let cos_sin = Rc::new(Allocation::new(device, usize::try_from(rope.buffers()[0].1)?,
+            Tag::workspace("minimax/rope"))?);
+        let bank = Self { stream, readers, layout, rope, layers, model_layers: cfg.layers, planes, cos_sin };
+        device.run(|| {
+            for allocation in bank.planes.values() {
+                // SAFETY: new admitted backing and retained stream; no request
+                // can read pages before initialization has completed.
+                unsafe { device.library.cuda_zero_bytes_async(allocation.buffer,
+                    allocation.buffer.bytes, bank.stream.raw)?; }
+            }
+            Ok(())
+        })?;
+        bank.stream.drain()?;
+        device.run(|| device.library.copy_h2d(bank.cos_sin.buffer,
+            &rotary_bytes(rope.positions as usize, cfg.rope_theta as f32)))?;
+        Ok(bank)
+    }
+
+    pub fn readers(&self) -> &[Rc<Stream<'a>>] { &self.readers }
+    pub fn owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        self.planes.values().cloned().chain([Rc::clone(&self.cos_sin)]).collect()
+    }
+    pub fn plane(&self, name: &str) -> Result<Buffer> {
+        self.planes.get(name).map(|owner| owner.buffer)
+            .with_context(|| format!("MiniMax page bank lacks {name}"))
+    }
+    pub fn page(&self, layer: usize, plane: &str, page: u32) -> Result<Buffer> {
+        ensure!(self.layers.contains(&layer) && page < self.layout.pool_pages,
+            "MiniMax page outside resident layer/pool");
+        let stride = PAGE_PLANES.iter().find(|&&(name, _)| name == plane)
+            .context("MiniMax unknown page plane")?.1;
+        view(self.plane(&format!("layer.{layer}.{plane}"))?, page as usize * stride, stride)
+    }
+    pub fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
+        ensure!(placement.slot < self.layout.requests as usize && len <= self.rope.positions as usize
+            && !placement.units.is_empty() && placement.units.len() <= self.layout.table_width as usize
+            && len.div_ceil(PAGE_ROWS) <= placement.units.len(), "MiniMax request slot/context/pages");
+        let mut unique = std::collections::BTreeSet::new();
+        ensure!(placement.units.iter().all(|&page| page < self.layout.pool_pages && unique.insert(page)),
+            "MiniMax request has duplicate or out-of-pool page refs");
+        Ok(())
+    }
+    pub fn reserve_tables(&self, stream: *mut std::ffi::c_void) -> Result<()> {
+        self.stream.device.run(|| {
+            for slot in 0..self.layout.requests as usize {
+                let width = self.layout.table_width as usize;
+                for buffer in [view(self.plane("page_table")?, slot * width * 4, width * 4)?,
+                    view(self.plane("lengths")?, slot * 4, 4)?] {
+                    // SAFETY: retained fixed table backing and live copy stream,
+                    // reserved before requests or graph capture can begin.
+                    unsafe { self.stream.device.library.reserve_h2d_ordered(buffer, stream)?; }
+                }
+            }
+            Ok(())
+        })
+    }
+    /// The caller fences every reader onto `stream` before updating the table.
+    pub fn install(&self, placement: &Placement, stream: *mut std::ffi::c_void) -> Result<()> {
+        self.validate(placement, placement.len)?;
+        let width = self.layout.table_width as usize;
+        let mut table = vec![0; width * 4];
+        for (entry, &page) in table.chunks_exact_mut(4).zip(&placement.units) {
+            entry.copy_from_slice(&(page as i32).to_le_bytes());
+        }
+        let pages = view(self.plane("page_table")?, placement.slot * width * 4, width * 4)?;
+        let length = view(self.plane("lengths")?, placement.slot * 4, 4)?;
+        self.stream.device.run(|| {
+            // SAFETY: fixed retained tables, all readers joined by the caller;
+            // outside capture, and ordered staging retains the host bytes.
+            unsafe {
+                self.stream.device.library.copy_h2d_ordered(pages, &table, stream)?;
+                self.stream.device.library.copy_h2d_ordered(length, &(placement.len as i32).to_le_bytes(), stream)
+            }
+        })
+    }
+    pub fn inventory(&self, inventory: &mut Inventory<'_>, gpu: u8) -> Result<()> {
+        for (name, allocation) in &self.planes {
+            let id = if let Some(suffix) = name.strip_prefix("layer.") {
+                format!("minimax.kv.{suffix}")
+            } else { format!("minimax.cache.{gpu}.{name}") };
+            allocation.inventory(inventory, &id)?;
+        }
+        self.cos_sin.inventory(inventory, &format!("minimax.rope.{gpu}.cos_sin"))
+    }
+}
+
+pub(crate) fn view(buffer: Buffer, offset: usize, bytes: usize) -> Result<Buffer> {
+    ensure!(bytes > 0 && offset.checked_add(bytes).is_some_and(|end| end <= buffer.bytes),
+        "MiniMax buffer view exceeds admitted owner");
+    Ok(Buffer { ptr: buffer.ptr.wrapping_byte_add(offset), bytes, ..buffer })
 }
 
 pub(crate) struct Metadata<'a> {
