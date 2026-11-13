@@ -15,6 +15,7 @@ from kimi_k3.uniform_k2.storage import atomic_json, sha256_file
 
 DESTINATIONS = {
     'glmf': 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC',
+    'glmf-k325': 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC',
     'muse': 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC',
     'kimi-k31': 'wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC',
     'ml4': 'wrldsuksgo2mars/Mistral-Large-4-EXL3-K4',

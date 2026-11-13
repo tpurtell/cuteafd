@@ -26,6 +26,7 @@ DTYPES = {'BF16': 'bfloat16', 'F32': 'float32', 'F16': 'float16',
           'F8_E4M3': 'float8_e4m3fn', 'I16': 'int16', 'I32': 'int32'}
 PARENTS = {
     'glmf': ('GLM-5.3-Flash-EXL3-K4-Core-K6', '5d3fffe1df9c4a109bbbdafb60dc19df9fac019d'),
+    'glmf-k325': ('GLM-5.3-Flash-EXL3-K4-MC', '91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d'),
     'muse': ('Muse-Spark-Open-EXL3-K4-Core-K6', '89998fb177acd9a862ac8bd4fb79bfd50e940c97'),
     'ml4': ('Mistral-Large-4-EXL3-K4-Core-K6', '03c80aebaa483d55760703ae5bc0c9734c9d67d6'),
     'step5': ('Step-5-Preview-EXL3-K4-Core-K6', '83d47a384eabc07ea6fcfaac4779b0e5f013ce89'),
