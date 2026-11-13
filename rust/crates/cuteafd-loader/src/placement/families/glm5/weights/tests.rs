@@ -603,6 +603,15 @@ fn checkpoint_owners_refuse_missing_sources_and_invalid_block_splits() {
     let mut inventory = check(&tensors, 2, None, EmbeddingHome::Device(0)).unwrap();
     inventory.add_peer_routers(&[1]).unwrap();
     assert_eq!(bytes(&inventory, "gpu.1.layer.1.operand.gate.bias"), 256);
+    let arena = inventory.coordinator_arenas().unwrap().remove(1);
+    let id = "glm.weights.gpu.1.layer.1.operand.gate.bias";
+    let offset = arena.view(id).unwrap().offset() as u64;
+    let components = inventory.components(1).unwrap();
+    assert!(components.iter().any(|component| matches!(&component.kind,
+        ComponentKind::Allocation { template, .. } if template.id == id
+            && template.view.as_ref().is_some_and(|view| view.backing == arena.id() && view.offset == offset))));
+    assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+        ComponentKind::AllocationGranularity(tail) if tail.location == Location::coordinator(1))).count(), 1);
     assert!(inventory.add_peer_routers(&[1]).is_err());
     assert!(inventory.add_peer_routers(&[0]).is_err());
 }

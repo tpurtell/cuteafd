@@ -1213,10 +1213,8 @@ impl Opened {
             TargetFacts::native(&selection, layers, &native_dense_records.iter().map(|owned| owned.plan.clone()).collect::<Vec<_>>(),
                 &vocabulary, &shared, &native_scratch, &workspace, storage)?
         };
-        let arena_layouts = target.weights[0].1.coordinator_arenas()?;
+        let mut selected_target = target.clone();
         let native_load = target.native_load.clone();
-        let reserved_weights = target.device_weight_bytes(if host_embedding { EmbeddingHome::HostPinned }
-            else { EmbeddingHome::Device(0) })?;
         let physical = LocalPhysicalInput { layers: (self.cfg.first_moe_layer..layers).collect(),
             max_rows: args.prefill_rows.max(engine::DECODE_ROWS), lanes: prefill_lanes, storage,
             route_checks: true, peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1"),
@@ -1376,6 +1374,14 @@ impl Opened {
             }
         };
         let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);
+        if let Some(range) = &tp2_range {
+            for (_, weights) in &mut selected_target.weights {
+                weights.add_peer_routers(&range.clone().collect::<Vec<_>>())?;
+            }
+        }
+        let arena_layouts = selected_target.weights[0].1.coordinator_arenas()?;
+        let reserved_weights = selected_target.device_weight_bytes(if host_embedding { EmbeddingHome::HostPinned }
+            else { EmbeddingHome::Device(0) })?;
         let whole_range = (devices.len() == 1).then(|| placement.expert_ranges.first().copied())
             .flatten().filter(|range| range.layers > 0);
         let max_rows = args.prefill_rows.max(engine::DECODE_ROWS);
@@ -1443,7 +1449,11 @@ impl Opened {
                 let (embedding, model) = crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     self.embed_source()?, args.token_io.embed_placement, || {
                         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                        planning.model(&self.cfg, layers, owners.as_deref(), native)
+                        let mut model = planning.model(&self.cfg, layers, owners.as_deref(), native)?;
+                        if let Some(range) = &tp2_range {
+                            planning.peer_routers(&self.cfg, model.1.first_mut().context("peer layers")?, range.clone())?;
+                        }
+                        Ok(model)
                     }, |_, bytes| planning.allocate_owner("embedding", bytes))?;
                 let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home, &model.0.head)?;
                 Ok((embedding, model, drafter))
@@ -1564,7 +1574,7 @@ impl Opened {
             if let Some(records) = &native_records {
                 let loaded = self.load_native(args, native_load.as_ref().context("native loader admission absent")?, records, &native_dense_records, owners.as_deref(), layers, &programs, &manifest, &loader, &devices, stream,
                     peer_stream, native_push.take(), &media, &ml4_draft, &mut draft_file, &draft_home,
-                    std::mem::take(&mut native_plans))?;
+                    std::mem::take(&mut native_plans), tp2_range.clone())?;
                 planned_drafter = loaded.3;
                 native_owners = loaded.4;
                 let tp2 = if let Some(range) = tp2_range.clone() {
@@ -1600,7 +1610,11 @@ impl Opened {
                 let (embedding, model) = crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     self.embed_source()?, args.token_io.embed_placement, || {
                         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                        loader.model(&self.cfg, layers, owners.as_deref(), native)
+                        let mut model = loader.model(&self.cfg, layers, owners.as_deref(), native)?;
+                        if let Some(range) = &tp2_range {
+                            loader.peer_routers(&self.cfg, model.1.first_mut().context("peer layers")?, range.clone())?;
+                        }
+                        Ok(model)
                     }, |_, bytes| loader.allocate_owner("embedding", bytes))?;
                 (embedding, model, None)
             };
@@ -1674,8 +1688,7 @@ impl Opened {
             engine.set_tp2_exchange(crate::shared::experts::rtx::ExchangeDtype::F32);
         }
         if let Some((device, stream)) = peer_stream {
-            let mut peer_layers = shares.pop().context("head-split shares")?;
-            if let Some(range) = &tp2_range { loader.peer_routers(&self.cfg, &mut peer_layers, range.clone())?; }
+            let peer_layers = shares.pop().context("head-split shares")?;
             engine.attach_peer(device, stream, peer_layers)?;
         }
         if owners.is_some() { engine.bind_layer_execution(&placement)?; }
@@ -1974,7 +1987,7 @@ impl Opened {
         media: &crate::shared::experts::rtx::dense::Records,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>, draft_home: &DraftHome,
-        shared_plans: Vec<crate::shared::experts::exlr8::NativePlan>)
+        shared_plans: Vec<crate::shared::experts::exlr8::NativePlan>, peer_routers: Option<std::ops::Range<usize>>)
         -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>),
             Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>, Option<Option<drafter::GlmDrafter<'s>>>,
             Vec<crate::shared::experts::exlr8::NativeExperts<'s>>)> {
@@ -2009,7 +2022,10 @@ impl Opened {
         let ((model, shares), pushed) = match push {
             Some((push, sparks)) => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::push(&self.library);
-                let model = loader.native_model(&self.cfg, layers, &per_rank, owners, &load, vocabulary.clone())?;
+                let mut model = loader.native_model(&self.cfg, layers, &per_rank, owners, &load, vocabulary.clone())?;
+                if let Some(range) = &peer_routers {
+                    loader.peer_routers(&self.cfg, model.1.first_mut().context("native peer layers")?, range.clone())?;
+                }
                 planned_drafter = Some(self.load_drafter(args, programs, &embedding, stream, ml4_draft, draft_file, draft_home, &model.0.head)?);
                 let mut records = recorder.context("native push recorder")?.finish();
                 records.extend(load.sink.as_ref().context("push sink")?.take_all());
@@ -2027,7 +2043,11 @@ impl Opened {
             }
             None => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library);
-                (loader.native_model(&self.cfg, layers, &per_rank, owners, &load, vocabulary.clone())?, None)
+                let mut model = loader.native_model(&self.cfg, layers, &per_rank, owners, &load, vocabulary.clone())?;
+                if let Some(range) = &peer_routers {
+                    loader.peer_routers(&self.cfg, model.1.first_mut().context("native peer layers")?, range.clone())?;
+                }
+                (model, None)
             }
         };
         self.library.cuda_set_device(args.device)?;

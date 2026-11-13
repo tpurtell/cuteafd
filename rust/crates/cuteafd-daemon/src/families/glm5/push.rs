@@ -31,6 +31,21 @@ mod tests {
     }
 
     #[test]
+    fn peer_router_replicas_join_dense_delivery_before_engine_publication() {
+        let source = include_str!("mod.rs");
+        let planning = source.split("let mut plan_dense =").nth(1).unwrap()
+            .split("let admission =").next().unwrap();
+        assert!(planning.find("planning.peer_routers").unwrap() < planning.find("sink.take()").unwrap());
+        let native = source.split("fn load_native<'s>").nth(1).unwrap();
+        assert!(native.find("loader.peer_routers").unwrap() < native.find("native push recorder").unwrap());
+        let publication = source.split("let mut engine = engine::GlmEngine::new").nth(1).unwrap()
+            .split("if owners.is_some()").next().unwrap();
+        assert!(!publication.contains("peer_routers"));
+        assert!(!include_str!("weights.rs").split("pub(crate) fn peer_routers").nth(1).unwrap()
+            .split("fn raw").next().unwrap().contains("arenas: None"));
+    }
+
+    #[test]
     fn glm_dflash_source_plan_joins_target_and_draft_repositories_on_one_rank() -> Result<()> {
         let root = tempfile::tempdir()?;
         let target = root.path().join("models--glm53/snapshots/target");

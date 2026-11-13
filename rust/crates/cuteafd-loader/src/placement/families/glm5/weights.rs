@@ -161,7 +161,7 @@ pub struct WeightInventory {
 impl WeightInventory {
     /// Final target operands only, excluding separate native shared-expert
     /// backings and host-pinned embeddings. Ordinary/K6 shared FFNs remain
-    /// target-owned. Call before appending onboarding peer-router replicas.
+    /// target-owned, including the selected onboarding peer-router replicas.
     pub fn coordinator_arenas(&self) -> Result<Vec<crate::serving_capacity::WeightArenaLayout>> {
         (0..self.ranks).map(|rank| {
             let location = Location::coordinator(u8::try_from(rank)?);

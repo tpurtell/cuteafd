@@ -233,13 +233,26 @@ fn arena_inventory(label: &str, inventory: &WeightInventory) -> Result<()> {
                 offset: arena.view(&expected.id).context("target alias recipe")?.offset() as u64 });
             assert_eq!(matches, [&expected], "noncharging alias preserves its physical operand");
         }
-        for shared in inventory.owners.iter().filter(|owner| owner.allocation.location == location
-            && owner.allocation.id.contains(".shared.layer.")) {
-            let owner = &shared.allocation;
-            tail += arena_charge(&components, &owner.id, location, owner.bytes, owner.bytes, MemoryKind::Weights)?;
-            backing += owner.bytes;
-            old += owner.bytes;
+        let shared = inventory.owners.iter().filter(|owner| owner.allocation.location == location
+            && owner.allocation.id.contains(".shared.layer.")).collect::<Vec<_>>();
+        if !shared.is_empty() {
+            let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/shared/{rank}"),
+                shared.iter().map(|owner| (owner.allocation.id.clone(), owner.allocation.bytes as usize)))?;
+            tail += arena_charge(&components, layout.id(), location, layout.bytes() as u64,
+                layout.payload_bytes() as u64, MemoryKind::Weights)?;
+            backing += layout.bytes() as u64;
+            old += layout.payload_bytes() as u64;
             roots += 1;
+            for owner in shared {
+                let aliases = components.iter().filter_map(|component| match &component.kind {
+                    ComponentKind::Allocation { template, .. } if template.id == owner.allocation.id => Some(template),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                let mut expected = owner.allocation.clone();
+                expected.view = Some(View { backing: layout.id().into(),
+                    offset: layout.view(&expected.id).context("shared alias recipe")?.offset() as u64 });
+                assert_eq!(aliases, [&expected], "shared layers alias the single rank backing");
+            }
         }
         assert_eq!(components.iter().filter(|component| matches!(&component.kind,
             ComponentKind::Allocation { template, .. } if template.location == location && template.view.is_none())).count(), roots);
@@ -687,6 +700,72 @@ fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacemen
         signatures(expected.owners.into_iter().map(|o| o.allocation)),
         signatures(actual)
     );
+    Ok(())
+}
+
+#[test]
+fn peer_routers_use_one_target_backing_and_replay_identical_push_bytes() -> Result<()> {
+    use crate::shared::experts::rtx::{dense, push};
+    use std::os::unix::fs::FileExt;
+    let (fixture, library) = compact_dso()?;
+    fixture.immediate_copies(&library)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (config, tensors) = fixture::glm5_compact_weights();
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let cfg = GlmDsaConfig::read(root.path())?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+    let range = cfg.first_moe_layer..cfg.layers;
+    let mut inventory = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None,
+        false, false, EmbeddingHome::Device(0))?;
+    inventory.add_peer_routers(&range.clone().collect::<Vec<_>>())?;
+    let components = inventory.components(1)?;
+    let peer_arena = inventory.coordinator_arenas()?.remove(1);
+    assert!(components.iter().any(|component| matches!(&component.kind,
+        cuteafd_loader::placement::planner::ComponentKind::Allocation { template, .. }
+            if template.id == "glm.weights.gpu.1.layer.1.operand.gate"
+                && template.view.as_ref().is_some_and(|view| view.backing == peer_arena.id()))));
+    let arenas = inventory.coordinator_arenas()?.into_iter().enumerate().map(|(rank, layout)| {
+        Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            Device { library: &library, id: rank as i32 }, layout, crate::shared::memory::TEST_ARENA)?))
+    }).collect::<Result<BTreeMap<_, _>>>()?;
+    for index in range.clone() {
+        for (_, name) in super::peer_router_names(&cfg, index) {
+            let tensor = catalog.tensor(&name)?;
+            let bytes = (0..tensor.metadata.byte_length).map(|i| (i as u8).wrapping_mul(17).wrapping_add(3)).collect::<Vec<_>>();
+            std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+                .write_all_at(&bytes, tensor.metadata.byte_offset)?;
+        }
+    }
+    let sink = std::rc::Rc::new(super::landing::PushSink::default());
+    let loader = GlmLoader { library: &library, catalog: &catalog, device: 0,
+        stream: std::ptr::null_mut(), peers: vec![crate::shared::peer_split::RankDevice {
+            device: 1, stream: std::ptr::null_mut() }], arenas: Some(std::rc::Rc::new(arenas)),
+        allocation_prefix: String::new(), push: Some(sink.clone()) };
+    let (_, mut peers) = loader.model(&cfg, cfg.layers, None, false)?;
+    let _ = sink.take();
+    fixture.quiet_events(&library, false)?;
+    let before = fixture.events()?.matches('D').count();
+    let timing = crate::shared::memory::load_timing::Split::start();
+    let ((), mut records) = dense::recording(|| loader.peer_routers(&cfg, &mut peers[0], range.clone()))?;
+    records.extend(sink.take().0);
+    assert_eq!(timing.read_bytes(), 0, "router recording must not mount-read payloads");
+    assert_eq!(fixture.events()?.matches('D').count(), before, "router replicas are arena views");
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    let device = Device { library: &library, id: 1 };
+    device.run(|| push::tests::receive_pushed(device, None, root.path(), sockets.path(), &records, None, 0, 1))?;
+    for index in range {
+        for (key, name) in super::peer_router_names(&cfg, index) {
+            let land = super::landing::Land::whole(&catalog, &name, 0)?;
+            let expected = super::landing::read(&catalog, &[land.clone()], land.bytes())?;
+            let buffer = peers[0][index].allocation_buffers().into_iter()
+                .find(|(name, _)| name == &format!("operand.{key}"))
+                .context("peer router allocation")?.1;
+            let mut actual = vec![0; expected.len()];
+            library.copy_d2h(&mut actual, buffer)?;
+            assert_eq!(actual, expected, "peer router {name}");
+        }
+    }
     Ok(())
 }
 

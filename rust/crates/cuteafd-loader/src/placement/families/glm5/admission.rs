@@ -994,7 +994,6 @@ impl<'a> ProductionInput<'a> {
             recipe.owners.push(Case { when: vec![], value: load.components(maximum_pages) });
         }
         for (home, weights) in &weights {
-            recipe.weights.push(Case { when: vec![When::Embedding(*home)], value: weights.clone() });
             let filler = embedding_read.filter(|_| *home == EmbeddingHome::Device(0));
             let sync = self.sync_upload_bytes.max(self.draft.sync_upload_bytes)
                 .max(native_load.as_ref().map_or(0, |load| load.sync_upload_bytes))
@@ -1057,22 +1056,17 @@ impl<'a> ProductionInput<'a> {
                     crate::placement::ResidentWeights(owner.bytes)), ByteCurve::fixed(owner.bytes, maximum_pages)));
             }
             recipe.owners.push(Case { when: when.clone(), value: components });
-            if count > 0 && self.gpus == 2 {
-                for (home, weights) in &weights {
-                    let mut replicated = weights.clone();
-                    let start = replicated.owners.len();
-                    replicated.add_peer_routers(&(self.cfg.first_moe_layer..self.cfg.first_moe_layer + count)
+            // Router replicas extend the selected target backing, rather than
+            // adding separately charged allocations beside its original extent.
+            for (home, weights) in &weights {
+                let mut selected = weights.clone();
+                if count > 0 && self.gpus == 2 {
+                    selected.add_peer_routers(&(self.cfg.first_moe_layer..self.cfg.first_moe_layer + count)
                         .collect::<Vec<_>>()).map_err(|error| invalid(&error.to_string()))?;
-                    replicated.owners.drain(..start);
-                    replicated.core_loading = Default::default();
-                    replicated.kv_b_loading = Default::default();
-                    replicated.row_loading = Default::default();
-                    replicated.attention_mount = Default::default();
-                    let mut condition = when.clone();
-                    condition.push(When::Embedding(*home));
-                    recipe.owners.push(Case { when: condition,
-                        value: WeightInventory::standalone_components(&replicated.owners, maximum_pages) });
                 }
+                let mut condition = when.clone();
+                condition.push(When::Embedding(*home));
+                recipe.weights.push(Case { when: condition, value: selected });
             }
             for device in 0..self.gpus as u8 {
                 recipe.targets.push(Case { when: {

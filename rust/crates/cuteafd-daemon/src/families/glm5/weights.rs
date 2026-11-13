@@ -273,7 +273,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
     out
 }
 
-fn peer_router_names(cfg: &GlmDsaConfig, layer: usize) -> impl Iterator<Item = (&'static str, String)> + '_ {
+pub(super) fn peer_router_names(cfg: &GlmDsaConfig, layer: usize) -> impl Iterator<Item = (&'static str, String)> + '_ {
     [("gate", Op::Router), ("gate.bias", Op::RouterBias)].into_iter()
         .filter_map(move |(operand, role)| cfg.weight(layer, role).map(|name| (operand, name)))
 }
@@ -295,7 +295,7 @@ impl<'a> GlmLoader<'a> {
 
     fn scoped(&self, prefix: String) -> Self { Self { allocation_prefix: prefix, ..self.clone() } }
 
-    /// Replicate only admitted local routers; their bytes are charged to the TP2 expert arena.
+    /// Replicate only admitted local routers into the peer's target arena.
     pub(crate) fn peer_routers(&self, cfg: &GlmDsaConfig, layers: &mut [GlmLayer<'a>], range: std::ops::Range<usize>) -> Result<()> {
         let peer = *self.peers.first().context("TP2 router replica needs peer")?;
         let native = (self.catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8)
@@ -304,19 +304,16 @@ impl<'a> GlmLoader<'a> {
             for (operand, name) in peer_router_names(cfg, index) {
                 let allocation = crate::shared::peer_split::on_device(self.library, peer.device, || {
                     let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 router replica");
+                    let scoped = self.scoped(format!("layer.{index}.operand."));
                     if let Some(records) = &native {
                         let record = records.iter().find(|record| record.tensor == name)
                             .with_context(|| format!("EXLR8 local router missing {name}"))?;
                         ensure!(record.components.len() == 1, "EXLR8 router must be one native tensor");
-                        let source = &record.components[0].source;
-                        let mut bytes = vec![0u8; source.bytes];
-                        crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(&source.path)?
-                            .read_exact_at(&mut bytes, source.offset))?;
-                        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256),
-                            Tag::weights("glm/tp2-router"))?;
-                        self.library.copy_h2d(allocation.buffer, &bytes)?;
-                        Ok(allocation)
-                    } else { GlmLoader { arenas: None, ..self.clone() }.one(operand, &name) }
+                        let load = crate::shared::experts::rtx::dense::DenseLoad::mount(self.library);
+                        crate::shared::experts::exlr8::dense_weights::landed_with(self.library, &load,
+                            &name, &record.components[0], cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity,
+                            peer.stream, |_, bytes| scoped.allocate_owner(operand, bytes))
+                    } else { scoped.one(operand, &name) }
                 })?;
                 layers[index].operands.insert(operand, allocation);
             }
