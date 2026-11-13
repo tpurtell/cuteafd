@@ -16,6 +16,8 @@ pub mod step5;
 pub mod step5_graphs;
 mod spark_intake;
 pub mod prefill_waves;
+mod owner_tp2;
+pub use owner_tp2::OwnerTp2Rows;
 mod fp8moe_workspace;
 pub use fp8moe_workspace::fp8moe_tp2_workspace;
 mod weight_storage;

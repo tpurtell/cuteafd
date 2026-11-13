@@ -27,8 +27,10 @@ pub(crate) mod fp8moe;
 pub(crate) mod landed;
 pub(crate) mod native;
 pub(crate) mod pair;
+pub(crate) mod owner_tp2;
 pub(crate) mod push;
 pub(crate) mod routes;
+pub(crate) mod whole;
 #[cfg(test)]
 mod local_physical_tests;
 

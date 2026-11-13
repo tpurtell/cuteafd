@@ -483,7 +483,7 @@ pub(super) fn dual_experts(args: &EngineArgs, catalog: &cuteafd_loader::Official
             "Qwen TP2 manifest workspace disagrees with backend rank {rank}");
     }
     let shape = catalog.routed_experts();
-    let transport = qwen4::QwenTp2Rows::new(shape.hidden as u64, shape.topk as u64, rows as u64, wire)?.demands()?;
+    let transport = cuteafd_loader::serving_capacity::OwnerTp2Rows::new(shape.hidden as u64, shape.topk as u64, rows as u64, wire)?.demands()?;
     Ok(DualExpertPlan { packages, costs, workspace, transport, wire })
 }
 
