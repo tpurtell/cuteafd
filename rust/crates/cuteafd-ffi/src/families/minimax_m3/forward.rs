@@ -4,21 +4,29 @@ use crate::{programs::{Program, ProgramSpec, Programs, Scalar}, CuteafdDeviceBuf
 use std::ffi::c_void;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind { ResidualNorm, RouterScores, KvPack }
+pub enum Kind { ResidualNorm, RouterScores, KvPack, KvPackHeads }
 impl Kind {
     pub const ALL: [Self; 3] = [Self::ResidualNorm, Self::RouterScores, Self::KvPack];
+    pub const HEADS: [Self; 3] = [Self::ResidualNorm, Self::RouterScores, Self::KvPackHeads];
+    fn kv_heads(self) -> Option<u32> {
+        match self { Self::KvPack => Some(4), Self::KvPackHeads => Some(2), _ => None }
+    }
+    fn op(self) -> &'static str {
+        if self == Self::KvPackHeads { "minimax_kv_pack" } else { self.name() }
+    }
     pub fn name(self) -> &'static str {
         match self {
             Self::ResidualNorm => "minimax_residual_norm",
             Self::RouterScores => "minimax_router_scores",
             Self::KvPack => "minimax_kv_pack",
+            Self::KvPackHeads => "minimax_kv_pack_h2",
         }
     }
     fn names(self) -> &'static [&'static str] {
         match self {
             Self::ResidualNorm => &["x", "weight", "bias", "cos", "sin", "positions", "out"],
             Self::RouterScores => &["x", "weight", "logits"],
-            Self::KvPack => &["k", "v", "slots", "batch_ids", "k_descale", "v_descale", "key_cache", "value_cache"],
+            Self::KvPack | Self::KvPackHeads => &["k", "v", "slots", "batch_ids", "k_descale", "v_descale", "key_cache", "value_cache"],
         }
     }
 }
@@ -27,7 +35,7 @@ impl Kind {
 pub struct ForwardLayout { pub kind: Kind, pub rows: u32 }
 impl ForwardLayout {
     pub fn from_spec(spec: &ProgramSpec) -> Result<Self> {
-        let kind = Kind::ALL.into_iter().find(|k| spec.name == k.name())
+        let kind = Kind::ALL.into_iter().chain([Kind::KvPackHeads]).find(|k| spec.name == k.name())
             .ok_or_else(|| invalid("unknown forward producer"))?;
         let g = &spec.geometry;
         let geometry = match kind {
@@ -35,7 +43,7 @@ impl ForwardLayout {
                 && g["eps"].as_f64() == Some(1e-6) && g["zero_centered"] == true
                 && g["subtract_mean"] == false && g["bias"] == false && g["rotary"] == 0,
             Kind::RouterScores => g["hidden"] == 6144 && g["experts"] == 128,
-            Kind::KvPack => g["heads"] == 4 && g["head_dim"] == 128 && g["page_rows"] == 64,
+            Kind::KvPack | Kind::KvPackHeads => g["heads"] == kind.kv_heads().unwrap() && g["head_dim"] == 128 && g["page_rows"] == 64,
         };
         if !geometry || spec.capacity_rows == 0 || spec.capacity_rows > 4096
             || spec.scalar_kinds != b"i" || !spec.scratch.is_empty()
@@ -64,19 +72,29 @@ impl ForwardLayout {
             (b.output, bytes(b.rows, 128 * 4)?)], [16; 3], &[2])
     }
     fn kv(self, b: KvBatch) -> Result<[Buffer; 8]> {
-        if self.kind != Kind::KvPack || b.batch == 0 || b.pool_pages == 0 {
+        let h = self.kind.kv_heads().ok_or_else(|| invalid("not a KV producer"))? as usize;
+        if b.batch == 0 || b.pool_pages == 0 {
             return Err(invalid("KV producer geometry"));
         }
-        self.validate(b.rows, [(b.key, bytes(b.rows, 1024)?), (b.value, bytes(b.rows, 1024)?),
+        self.validate(b.rows, [(b.key, bytes(b.rows, h * 256)?), (b.value, bytes(b.rows, h * 256)?),
             (b.slots, bytes(b.rows, 8)?), (b.batch_ids, bytes(b.rows, 4)?),
-            (b.key_descale, bytes(b.batch, 16)?), (b.value_descale, bytes(b.batch, 16)?),
-            (b.key_cache, bytes(b.pool_pages, 64 * 512)?),
-            (b.value_cache, bytes(b.pool_pages, 64 * 512)?)], [16; 8], &[6, 7])
+            (b.key_descale, bytes(b.batch, h * 4)?), (b.value_descale, bytes(b.batch, h * 4)?),
+            (b.key_cache, bytes(b.pool_pages, 64 * h * 128)?),
+            (b.value_cache, bytes(b.pool_pages, 64 * h * 128)?)], [16; 8], &[6, 7])
     }
 }
 
 pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<ForwardLayout> {
     let layout = ForwardLayout::from_spec(spec)?;
+    let h = layout.kind.kv_heads().unwrap_or(0);
+    let kv = [("bfloat16", format!("[rows,{h},128]"), "in"),
+        ("bfloat16", format!("[rows,{h},128]"), "in"),
+        ("int64", "[rows] (physical slots; negative skips writes)".into(), "in"),
+        ("int32", "[rows]".into(), "in"),
+        ("float32", format!("[batch,{h}]"), "in"), ("float32", format!("[batch,{h}]"), "in"),
+        ("uint8", format!("[pages,64,{h},128]"), "out"),
+        ("uint8", format!("[pages,64,{h},128]"), "out")];
+    let kv_refs = kv.iter().map(|(d, s, r)| (*d, s.as_str(), *r)).collect::<Vec<_>>();
     let operands: &[(&str, &str, &str)] = match layout.kind {
         Kind::ResidualNorm => &[("float32", "[rows,1,6144]", "in"), ("bfloat16", "[6144]", "in"),
             ("bfloat16", "[6144] (ignored unless bias)", "in"),
@@ -85,13 +103,10 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<F
             ("int64", "[rows] (ignored unless rotary)", "in"), ("bfloat16", "[rows,1,6144]", "out")],
         Kind::RouterScores => &[("bfloat16", "[rows,6144]", "in"),
             ("float32", "[128,6144]", "in"), ("float32", "[rows,128]", "out")],
-        Kind::KvPack => &[("bfloat16", "[rows,4,128]", "in"), ("bfloat16", "[rows,4,128]", "in"),
-            ("int64", "[rows] (physical slots; negative skips writes)", "in"), ("int32", "[rows]", "in"),
-            ("float32", "[batch,4]", "in"), ("float32", "[batch,4]", "in"),
-            ("uint8", "[pages,64,4,128]", "out"), ("uint8", "[pages,64,4,128]", "out")],
+        Kind::KvPack | Kind::KvPackHeads => &kv_refs,
     };
     let pointers = entry["pointers"].as_array().ok_or_else(|| invalid("forward pointer metadata"))?;
-    if entry["op"] != layout.kind.name() || pointers.len() != operands.len()
+    if entry["op"] != layout.kind.op() || pointers.len() != operands.len()
         || pointers.iter().zip(layout.kind.names().iter().zip(operands))
             .any(|(p, (name, (dtype, shape, role)))| p["name"] != *name || p["dtype"] != *dtype
                 || p["shape"] != *shape || p["role"] != *role)
@@ -167,7 +182,7 @@ mod tests {
             Kind::ResidualNorm => serde_json::json!({"width":6144,"heads":1,"eps":1e-6,
                 "zero_centered":true,"subtract_mean":false,"bias":false,"rotary":0}),
             Kind::RouterScores => serde_json::json!({"hidden":6144,"experts":128}),
-            Kind::KvPack => serde_json::json!({"heads":4,"head_dim":128,"page_rows":64}),
+            Kind::KvPack | Kind::KvPackHeads => serde_json::json!({"heads":kind.kv_heads().unwrap(),"head_dim":128,"page_rows":64}),
         };
         ProgramSpec { name: kind.name().into(), pointers: kind.names().iter().map(|s| (*s).into()).collect(),
             scalar_kinds: b"i".to_vec(), scratch: Default::default(), capacity_rows: 4096, geometry }
@@ -204,6 +219,7 @@ mod tests {
                     ("int64", "[rows] (physical slots; negative skips writes)"), ("int32", "[rows]"),
                     ("float32", "[batch,4]"), ("float32", "[batch,4]"),
                     ("uint8", "[pages,64,4,128]"), ("uint8", "[pages,64,4,128]")],
+                Kind::KvPackHeads => unreachable!("whole fixture"),
             };
             let entry = serde_json::json!({"op":kind.name(),
                 "scalars":[{"name":"rows","type":"int32"}],
@@ -232,6 +248,46 @@ mod tests {
             assert!(validate_entry(&spec, &wrong).is_err());
         }
     }
+    #[test]
+    fn narrow_kv_pack_validates_rank_local_shapes_extents_and_aligned_descales() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/minimax_forward_programs.json")).unwrap();
+        let mut entry = fixture["programs"].as_array().unwrap().iter()
+            .find(|e| e["name"] == "minimax_kv_pack").unwrap().clone();
+        entry["name"] = "minimax_kv_pack_h2".into();
+        entry["geometry"]["heads"] = 2.into();
+        for p in entry["pointers"].as_array_mut().unwrap() {
+            p["shape"] = p["shape"].as_str().unwrap().replace(",4", ",2").into();
+        }
+        let spec = spec(Kind::KvPackHeads);
+        let layout = validate_entry(&spec, &entry).unwrap();
+        let mut bad = spec.clone(); bad.name = Kind::KvPack.name().into();
+        assert!(validate_entry(&bad, &entry).is_err());
+        let mut bad = spec.clone(); bad.geometry["heads"] = 4.into();
+        assert!(validate_entry(&bad, &entry).is_err());
+        for rows in [1, 63, 64, 2049, 4096] {
+            let b = KvBatch { rows, batch: 3, pool_pages: 11,
+                key: Buffer { bytes: rows * 512, ..buffer(0) }, value: Buffer { bytes: rows * 512, ..buffer(1) },
+                slots: Buffer { bytes: rows * 8, ..buffer(2) }, batch_ids: Buffer { bytes: rows * 4, ..buffer(3) },
+                key_descale: Buffer { bytes: 24, ..buffer(4) }, value_descale: Buffer { bytes: 24, ..buffer(5) },
+                key_cache: Buffer { bytes: 11 * 16384, ..buffer(6) },
+                value_cache: Buffer { bytes: 11 * 16384, ..buffer(7) } };
+            assert!(layout.kv(b).is_ok());
+            assert!(ForwardLayout::from_spec(&spec_for_whole_kv()).unwrap().kv(b).is_err());
+            for i in 0..8 {
+                let mut short = b;
+                let target = match i { 0 => &mut short.key, 1 => &mut short.value,
+                    2 => &mut short.slots, 3 => &mut short.batch_ids, 4 => &mut short.key_descale,
+                    5 => &mut short.value_descale, 6 => &mut short.key_cache, _ => &mut short.value_cache };
+                target.bytes -= 1;
+                assert!(layout.kv(short).is_err(), "operand {i}");
+            }
+            assert!(layout.kv(KvBatch { key_descale: Buffer {
+                ptr: (b.key_descale.ptr as usize + 8) as *mut c_void, ..b.key_descale }, ..b }).is_err());
+            assert!(layout.kv(KvBatch { value_cache: b.key_cache, ..b }).is_err());
+        }
+    }
+    fn spec_for_whole_kv() -> ProgramSpec { spec(Kind::KvPack) }
     #[test]
     fn checks_native_operand_extents_devices_and_writable_aliases() {
         let norm = ForwardLayout::from_spec(&spec(Kind::ResidualNorm)).unwrap();
