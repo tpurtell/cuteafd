@@ -275,6 +275,9 @@ fn spec(cfg: &KimiK3Config, checkpoint: &Checkpoint) -> ModelSpec {
 }
 
 impl Family for KimiK3 {
+    fn native_head_widths(&self) -> &'static [usize] {
+        crate::families::kimi_k3::core::NATIVE_CORE_WIDTHS
+    }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "large experts and dense core: compute-heavy Spark waves leave little round trip to hide (predicted loss, #744)" }

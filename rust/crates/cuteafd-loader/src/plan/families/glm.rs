@@ -53,6 +53,10 @@ fn strip_model_prefix(name: &str) -> Option<&str> {
 }
 
 impl Family for Glm {
+    fn native_head_widths(&self) -> &'static [usize] {
+        if self.id == "glm5_flash" { crate::families::glm5_flash::core::NATIVE_CORE_WIDTHS }
+        else { crate::families::glm5::core::NATIVE_CORE_WIDTHS }
+    }
     fn exlr8_execution(&self) -> Exlr8Execution { self.exlr8 }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
