@@ -212,7 +212,7 @@ support draft/MTP comparisons or `--save-logits`.
 | `RDMA_BOND_BALANCE` | `off` | `off`, `labels`, `probe` | RoCE v2 flow-label placement on a coordinator bond. |
 | `MAPPED_SCALE_PRELOAD_GIB` | `0` | GiB | Host-RAM cap for preloading mapped tables (V4.1 Engram); 0 keeps all mapped. |
 | `ENGRAM_WARM` | `off` | `on`, `off` | V4.1 only: read both Engram tables into page cache after readiness. |
-| `CUDA_MODULE_LOADING` | CUDA default (`LAZY`) | `LAZY`, `EAGER` | V4.1 only; `EAGER` costs startup time and memory, avoids first-shape hangs. |
+| `CUDA_MODULE_LOADING` | CUDA default (`LAZY`) | `LAZY`, `EAGER` | V4.1 and GLM Flash; `EAGER` costs startup time and memory, avoids first-shape hangs. |
 | `SPARK_INTAKE` | `auto` | `auto`, `gpu`, `pinned`, `host` | How routed partials reach the coordinator GPU. |
 | `SPARK_PREFILL_REPLY_FORMAT` | unset (BF16) | `bf16`, `fp8`, `nvfp4` | Spark prefill replies; FP8/NVFP4 exported only in release builds. |
 | `SPARK_DECODE_REPLY_FORMAT` | unset (BF16) | `bf16`, `fp8`, `nvfp4` | Same for decode replies. |
@@ -616,7 +616,7 @@ original core is already FP8, not an MC publication.
 | `RDMA_BOND_BALANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `MAPPED_SCALE_PRELOAD_GIB` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ENGRAM_WARM` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `CUDA_MODULE_LOADING` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `CUDA_MODULE_LOADING` | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `SPARK_INTAKE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `MIMO_WEIGHT_POLICY` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `MIMO_HOST_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
