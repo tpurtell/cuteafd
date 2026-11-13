@@ -1,6 +1,6 @@
 //! One caller-admitted serial projection workspace per lane or prefill owner.
-use crate::shared::memory::{device::{Allocation, Device}, receipts::Inventory};
-use anyhow::{ensure, Result};
+use crate::shared::memory::{device::{Allocation, Device, Event, Stream}, receipts::Inventory};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{native_dense::Mxfp8A8, programs::Programs, CuteafdDeviceBuffer};
 use super::weights::TargetWeights;
 use std::ffi::c_void;
@@ -157,13 +157,120 @@ impl<'o, 'p, 'a> Prepared<'o, 'p, 'a> {
 
 /// No raw-buffer accessor or Copy implementation: retaining an output retains
 /// the mutable Prepared borrow, so another projection cannot overwrite it.
-#[must_use = "consume the projection into an admitted BF16 destination or explicitly discard it"]
+#[must_use = "consume the projection into an admitted destination or explicitly discard it"]
 pub(crate) struct ProjectionOutput<'r, 'o, 'p, 'a> {
     prepared: &'r mut Prepared<'o, 'p, 'a>,
     linear: &'p Mxfp8A8<'a>,
 }
 
+/// Wire precision is selected by numerical qualification, not by topology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PartialPrecision { Bf16, F32 }
+impl PartialPrecision {
+    pub fn bytes(self) -> usize { match self { Self::Bf16 => 2, Self::F32 => 4 } }
+}
+
+/// Retains an admitted partial destination and its two ordering streams. This
+/// owns no device storage: the unit inventories the destination exactly once.
+/// The consumer must finish using the slot before staging its next partial.
+pub(crate) struct PartialDestination<'a> {
+    destination: Rc<Allocation<'a>>,
+    producer: Rc<Stream<'a>>,
+    consumer: Rc<Stream<'a>>,
+    ready: Event<'a>,
+    consumed: Event<'a>,
+    precision: PartialPrecision,
+}
+impl<'a> PartialDestination<'a> {
+    pub fn new(destination: Rc<Allocation<'a>>, producer: Rc<Stream<'a>>,
+        consumer: Rc<Stream<'a>>, precision: PartialPrecision) -> Result<Self> {
+        let device = destination.device;
+        for stream in [&producer, &consumer] {
+            ensure!(stream.device.id == device.id
+                && std::ptr::eq(stream.device.library, device.library),
+                "MiniMax partial destination stream device/library differs");
+        }
+        Ok(Self { destination, producer, consumer, ready: Event::new(device)?,
+            consumed: Event::new(device)?, precision })
+    }
+    pub fn buffer(&self) -> CuteafdDeviceBuffer { self.destination.buffer }
+}
+impl Drop for PartialDestination<'_> {
+    fn drop(&mut self) {
+        self.consumer.drain_or_abort("MiniMax partial consumer");
+        self.producer.drain_or_abort("MiniMax partial producer");
+    }
+}
+
+fn validate_partial(source: CuteafdDeviceBuffer, destination: CuteafdDeviceBuffer,
+    count: usize, precision: PartialPrecision) -> Result<usize> {
+    let source_bytes = count.checked_mul(4).filter(|&bytes| bytes > 0)
+        .ok_or_else(|| anyhow::anyhow!("MiniMax partial source extent overflow"))?;
+    let bytes = count.checked_mul(precision.bytes()).context("MiniMax partial extent overflow")?;
+    ensure!(source.device_id >= 0 && source.device_id == destination.device_id,
+        "MiniMax partial device differs");
+    for (buffer, extent, alignment) in [(source, source_bytes, 4), (destination, bytes, precision.bytes())] {
+        ensure!(!buffer.ptr.is_null() && buffer.flags == 0 && buffer.bytes >= extent
+            && buffer.ptr as usize % alignment == 0
+            && (buffer.ptr as usize).checked_add(extent).is_some(),
+            "MiniMax partial extent/alignment/device differs");
+    }
+    let (source, destination) = (source.ptr as usize, destination.ptr as usize);
+    ensure!(source + source_bytes <= destination || destination + bytes <= source,
+        "MiniMax partial destination overlaps dense output");
+    Ok(bytes)
+}
+
 impl ProjectionOutput<'_, '_, '_, '_> {
+    /// Keep the exclusive workspace borrow until the consumer records completion
+    /// and the producer waits on it. Only the retained destination escapes.
+    pub fn stage_partial(self, destination: &mut PartialDestination<'_>) -> Result<()> {
+        let prepared = self.prepared;
+        let device = prepared.programs.device;
+        ensure!(prepared.stream == destination.producer.raw
+            && device.id == destination.producer.device.id
+            && std::ptr::eq(device.library, destination.producer.device.library),
+            "MiniMax partial producer differs from prepared projection");
+        let count = usize::try_from(self.linear.geometry().output_features)?
+            .checked_mul(prepared.rows as usize).context("MiniMax partial count overflow")?;
+        let source = prepared.owner.workspace.output.buffer;
+        let target = destination.buffer();
+        let bytes = validate_partial(source, target, count, destination.precision)?;
+        // The slot must be independent of every writable serial-owner plane.
+        for other in [prepared.owner.activation.buffer, prepared.owner.workspace.records.buffer,
+            prepared.owner.workspace.inputs.buffer] {
+            let (start, slot) = (other.ptr as usize, target.ptr as usize);
+            ensure!(start.checked_add(other.bytes).is_some_and(|end| end <= slot)
+                || slot.checked_add(bytes).is_some_and(|end| end <= start),
+                "MiniMax partial destination overlaps serial workspace");
+        }
+        let result = device.run(|| {
+            destination.ready.record(&destination.producer)?;
+            // SAFETY: retained same-device streams/events, ready recorded above;
+            // checked disjoint source/slot survive both streams and graph replay.
+            unsafe { device.library.cuda_stream_wait_event(destination.consumer.raw, destination.ready.raw)?; }
+            match destination.precision {
+                PartialPrecision::Bf16 => self.linear.narrow(prepared.rows, source, target, destination.consumer.raw)?,
+                PartialPrecision::F32 => {
+                    // SAFETY: checked F32 ranges and ordered producer completion.
+                    unsafe { device.library.copy_d2d_async(target, source, bytes, destination.consumer.raw)?; }
+                }
+            }
+            destination.consumed.record(&destination.consumer)?;
+            // SAFETY: consumption was recorded; no later projection may replace
+            // the serial workspace until this producer-stream dependency passes.
+            unsafe { device.library.cuda_stream_wait_event(destination.producer.raw, destination.consumed.raw)?; }
+            Ok(())
+        });
+        if result.is_err() {
+            // A partial enqueue may already read workspace. Do not release its
+            // exclusive borrow on error until all possible reads have drained.
+            destination.consumer.drain_or_abort("MiniMax failed partial consumption");
+            destination.producer.drain_or_abort("MiniMax failed partial producer");
+        }
+        result
+    }
+
     /// MiniMax reference project() narrows gate/up separately before SwiGLU.
     /// This enqueues the existing BF16-RNE conversion, not a new epilogue.
     pub fn narrow(self, destination: &Allocation<'_>) -> Result<()> {
@@ -183,6 +290,51 @@ mod tests {
     use cuteafd_loader::{families::minimax_m3::weight_layout::Mxfp8Projection,
         placement::planner::{ComponentKind, CoordinatorDevices, Lifetime}, serving_capacity::WeightArenaLayout};
     use cuteafd_core::memory_layout::Category;
+
+    #[test]
+    fn partial_wire_extents_and_aliases_are_checked_before_enqueue() -> Result<()> {
+        let buffer = |address, bytes| CuteafdDeviceBuffer {
+            ptr: address as *mut c_void, bytes, device_id: 1, flags: 0 };
+        let source = buffer(0x10000usize, 6144 * 4);
+        for precision in [PartialPrecision::Bf16, PartialPrecision::F32] {
+            let target = buffer(0x20000usize, 6144 * precision.bytes());
+            assert_eq!(validate_partial(source, target, 6144, precision)?, target.bytes);
+            assert!(validate_partial(source, target, 6145, precision).is_err());
+            assert!(validate_partial(source, target, 0, precision).is_err());
+            assert!(validate_partial(source, target, usize::MAX, precision).is_err());
+            for invalid in [CuteafdDeviceBuffer { bytes: target.bytes - 1, ..target },
+                CuteafdDeviceBuffer { ptr: (0x10000usize - 2) as *mut c_void, ..target },
+                CuteafdDeviceBuffer { ptr: (0x10000usize + 8) as *mut c_void, ..target },
+                CuteafdDeviceBuffer { device_id: 0, ..target },
+                CuteafdDeviceBuffer { flags: 1, ..target },
+                CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), ..target },
+                CuteafdDeviceBuffer { ptr: 1usize as *mut c_void, ..target }] {
+                assert!(validate_partial(source, invalid, 6144, precision).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_destination_retains_admitted_storage_without_allocating_a_second_owner() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 1, 1 << 20)?;
+        let device = Device { library: &library, id: 1 };
+        let storage = Rc::new(Allocation::new(device, 6144 * 4, Tag::workspace("minimax/partial"))?);
+        let producer = Rc::new(Stream::new(device)?);
+        let consumer = Rc::new(Stream::new(device)?);
+        let boundary = PartialDestination::new(storage.clone(), producer.clone(), consumer.clone(), PartialPrecision::F32)?;
+        assert_eq!(boundary.buffer().ptr, storage.buffer.ptr);
+        assert_eq!(Rc::strong_count(&storage), 2);
+        assert_eq!(fixture.events()?.matches('D').count(), 1);
+        assert_eq!(library.cuda_get_device()?, 0);
+        let other = Rc::new(Stream::new(Device { library: &library, id: 0 })?);
+        assert!(PartialDestination::new(storage.clone(), producer, other, PartialPrecision::Bf16).is_err());
+        drop(boundary);
+        assert_eq!(Rc::strong_count(&storage), 1);
+        Ok(())
+    }
 
     fn weights() -> Result<CoordinatorWeights> {
         Ok(CoordinatorWeights { rank: 0, layers: vec![0],
