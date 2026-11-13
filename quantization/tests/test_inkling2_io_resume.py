@@ -30,6 +30,27 @@ def test_completed_job_does_not_activate_adapter(tmp_path,monkeypatch,capsys):
     assert not (tmp_path/'output-io-wrapper.json').exists()
 
 
+def test_btrfs_virtual_stat_device_may_differ_from_lock_device(tmp_path,monkeypatch):
+    from pathlib import Path
+    original=Path.read_text
+    def changed_device(path,*args,**kwargs):
+        value=original(path,*args,**kwargs)
+        if str(path).startswith('/proc/self/fdinfo/'):
+            lines=[]
+            for line in value.splitlines():
+                if line.startswith('lock:'):
+                    parts=line.split()
+                    parts[6]='ff:ff:'+parts[6].rsplit(':',1)[1]
+                    line=' '.join(parts)
+                lines.append(line)
+            return '\n'.join(lines)
+        return value
+    with (tmp_path/'producer.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        monkeypatch.setattr(Path,'read_text',changed_device)
+        io_resume.assert_producer_lock(tmp_path)
+
+
 def test_wrapper_keeps_original_run_module_and_calls_unchanged_main(tmp_path,monkeypatch):
     from inkling2 import run
     identity={'frozen':'identity'}

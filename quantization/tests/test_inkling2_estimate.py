@@ -61,3 +61,28 @@ def test_missing_measurements_and_blockers_are_explicit(tmp_path):
     value=estimate(tmp_path)
     assert value['remaining_seconds_range'] is None
     assert value['blocked']
+
+
+def test_io_recovery_uses_new_cycles_and_excludes_partial_restart_layer(tmp_path):
+    start=datetime(2026,11,13,tzinfo=timezone.utc)
+    events=[dict(event='attention_input_capture',time=start.isoformat())]
+    for expert in range(6):
+        events.append(dict(bits=4,module=f'model.llm.layers.0.mlp.experts.{expert}.down_proj',
+            time=datetime.fromtimestamp(start.timestamp()+300+expert*100,timezone.utc).isoformat()))
+    epoch=datetime.fromtimestamp(start.timestamp()+1200,timezone.utc)
+    write(tmp_path/'io-recovery.json',dict(resumed_at=epoch.isoformat(),resumed_layer=0))
+    for expert in range(6,13):
+        events.append(dict(bits=4,module=f'model.llm.layers.0.mlp.experts.{expert}.down_proj',
+            time=datetime.fromtimestamp(epoch.timestamp()+(expert-6)*10,timezone.utc).isoformat()))
+    (tmp_path/'events.jsonl').write_text('\n'.join(map(json.dumps,events))+'\n')
+    write(tmp_path/'layers/layer-000/complete.json',dict(layer=0,seconds=100))
+    value=estimate(tmp_path,epoch)
+    assert value['seconds_per_expert']==10
+    assert value['mixed_layer_excluded']==0
+    assert value['unfinished_expert_sets']==48*384-13
+    assert value['layer_remaining_seconds_estimate']==(48*384-13)*10+46*290+47*180
+    write(tmp_path/'layers/layer-001/complete.json',dict(layer=1,seconds=7200))
+    value=estimate(tmp_path,epoch)
+    assert value['basis']=='mean of recent completed layers'
+    assert value['sample_layers']==1
+    assert value['seconds_per_layer']==7200

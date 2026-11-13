@@ -238,7 +238,9 @@ def test_payload_fsync_precedes_commit_receipt_and_checksums_written_bytes(tmp_p
     f.append(writer, 0, commit=False)
     payload = f.layer / BACKEND_DIRECTORY / "expert-000.bf16"
     receipt = json.loads(payload.with_suffix(".json").read_text())
-    assert receipt["sha256"] == hashlib.sha256(payload.read_bytes()).hexdigest()
+    import xxhash
+    assert receipt["xxh3_128"] == xxhash.xxh3_128(payload.read_bytes()).hexdigest()
+    assert 'sha256' not in receipt
     data_sync = next(n for n, (kind, path) in enumerate(events) if kind == "fsync" and path.endswith("expert-000.partial"))
     proof = next(n for n, (kind, path) in enumerate(events) if kind == "receipt" and path.endswith("expert-000.json"))
     assert data_sync < proof

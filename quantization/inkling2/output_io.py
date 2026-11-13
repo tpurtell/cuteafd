@@ -21,11 +21,12 @@ from pathlib import Path
 import re
 
 import numpy as np
+import xxhash
 
 from kimi_k3.uniform_k2.storage import (atomic_json, canonical, file_identity,
     fsync_directory, sha256_file, verify_receipt)
 
-SCHEMA = "inkling2-sequential-expert-outputs-v1"
+SCHEMA = "inkling2-sequential-expert-outputs-v2"
 BACKEND_DIRECTORY = "output-sequential"
 OPERATIONAL_MARKER = "output-io-code.json"
 
@@ -49,7 +50,7 @@ def _fingerprint(path):
 
 
 def _rows_hash(rows):
-    return hashlib.sha256(rows.astype("<i8", copy=False).tobytes()).hexdigest()
+    return xxhash.xxh3_128(rows.astype("<i8", copy=False).tobytes()).hexdigest()
 
 
 def _json(path):
@@ -98,6 +99,7 @@ class OutputNumpyProxy:
     def _record_code(self):
         path = self.root / OPERATIONAL_MARKER
         expected = dict(schema=SCHEMA, code_sha256=code_sha256(), identity=self.identity,
+            payload_checksum='xxh3-128', checksum_seed=0,
             activation_requirement="frozen-producer-lock-held-and-legacy-writer-quiescent")
         if path.exists():
             if _json(path) != expected:
@@ -264,10 +266,10 @@ class _Backend:
             return None
         saved = _json(receipt_path)
         expected = dict(schema=SCHEMA, backend=self.backend_digest, expert=expert,
-            natural_rows=len(self.natural[expert]), row_order_sha256=_rows_hash(self.natural[expert]),
+            natural_rows=len(self.natural[expert]), row_order_xxh3_128=_rows_hash(self.natural[expert]),
             shape=[len(self.natural[expert]), self.shape[2]], dtype="uint16")
         if (any(saved.get(k) != v for k, v in expected.items())
-                or not re.fullmatch(r"[0-9a-f]{64}", saved.get("sha256", ""))):
+                or not re.fullmatch(r"[0-9a-f]{32}", saved.get("xxh3_128", ""))):
             raise ValueError("sequential output receipt geometry/identity differs")
         verify_receipt(payload, saved)
         if payload.stat().st_size != len(self.natural[expert]) * self.shape[2] * 2:
@@ -353,7 +355,7 @@ class _Writer(_Backend):
             if payload.exists():
                 payload.unlink()
             self.stream = partial.open("xb")
-        self.active, self.count, self.hasher = expert, 0, hashlib.sha256()
+        self.active, self.count, self.hasher = expert, 0, xxhash.xxh3_128()
 
     def flush(self):
         self._unchanged()
@@ -367,7 +369,7 @@ class _Writer(_Backend):
         payload, receipt_path, partial = self._paths(expert)
         checksum = self.hasher.hexdigest()
         if self.replay is not None:
-            if self.replay.read(1) or checksum != self.replay_saved["sha256"]:
+            if self.replay.read(1) or checksum != self.replay_saved["xxh3_128"]:
                 raise ValueError("regenerated orphan output checksum differs")
             self.replay.close()
             self.replay = None
@@ -379,8 +381,8 @@ class _Writer(_Backend):
             os.replace(partial, payload)
             fsync_directory(self.directory)
             atomic_json(receipt_path, dict(schema=SCHEMA, backend=self.backend_digest, expert=expert,
-                natural_rows=self.count, row_order_sha256=_rows_hash(self.natural[expert]),
-                shape=[self.count, self.shape[2]], dtype="uint16", sha256=checksum,
+                natural_rows=self.count, row_order_xxh3_128=_rows_hash(self.natural[expert]),
+                shape=[self.count, self.shape[2]], dtype="uint16", xxh3_128=checksum,
                 file_identity=file_identity(payload)))
         self.active, self.count = None, 0
 

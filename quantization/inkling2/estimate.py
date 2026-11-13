@@ -46,13 +46,18 @@ def estimate(root, now=None):
     handed = load(root/'handoff-complete.json').get('status') == 'passed'
     cleaned = load(root/'handoff-cleanup-complete.json').get('status') == 'passed'
     failure = load(root/'failure.json')
+    recovery = load(root/'io-recovery.json')
+    io_epoch = stamp(recovery['resumed_at']) if recovery.get('resumed_at') else None
+    mixed_layer = recovery.get('resumed_layer') if io_epoch is not None else None
     result = dict(as_of=now.astimezone(TAIPEI).isoformat(), timezone='Asia/Taipei',
         provisional=True, completed_layers=len(layers), blocked=bool(failure),
         assumption='continuous progress; failure or hardware downtime moves the calendar estimate')
     remaining_layers = max(0, 48-len(layers))
     base_seconds = None
-    if layers:
-        samples = [r['seconds'] for r in layers[-6:]]
+    count_based = None
+    clean_layers = [r for r in layers if r.get('layer') != mixed_layer]
+    if clean_layers:
+        samples = [r['seconds'] for r in clean_layers[-6:]]
         base_seconds = statistics.mean(samples)
         margins = (.80, 1.25) if len(samples) < 3 else (.90, 1.15)
         result.update(basis='mean of recent completed layers', sample_layers=len(samples),
@@ -60,6 +65,11 @@ def estimate(root, now=None):
     else:
         downs = [e for e in events if e.get('bits') == 4 and
                  e.get('module', '').endswith('.down_proj') and '.mlp.experts.' in e['module']]
+        all_downs = {e['module']:e for e in downs}
+        post_io = [e for e in downs if io_epoch is not None and stamp(e['time']) >= io_epoch]
+        using_io_rate = len(post_io) >= 6
+        if using_io_rate:
+            downs = post_io
         cycles = [stamp(b['time'])-stamp(a['time']) for a,b in zip(downs, downs[1:])
                   if a['module'].split('.layers.')[1].split('.')[0] ==
                      b['module'].split('.layers.')[1].split('.')[0]]
@@ -67,7 +77,8 @@ def estimate(root, now=None):
             cycle = statistics.mean(cycles)
             entries = [e for e in events if e.get('event') == 'attention_input_capture']
             first = stamp(entries[0]['time']) if entries else stamp(downs[0]['time'])
-            setup = max(0, stamp(downs[0]['time'])-first-cycle)
+            first_down = min(stamp(e['time']) for e in all_downs.values())
+            setup = max(0, first_down-first-cycle)
             export_allowance = 180
             base_seconds = cycle*384+setup+export_allowance
             margins = (.75, 1.30)
@@ -75,6 +86,12 @@ def estimate(root, now=None):
                 sample_expert_cycles=len(cycles), seconds_per_expert=cycle,
                 observed_setup_seconds=setup, unmeasured_successor_export_allowance_seconds=export_allowance,
                 seconds_per_layer=base_seconds)
+            if using_io_rate:
+                count_based = (max(0,48*384-len(all_downs))*cycle+
+                    max(0,remaining_layers-1)*setup+remaining_layers*export_allowance)
+                result.update(basis='post-recovery sequential-output expert throughput; mixed restart layer excluded',
+                    io_rate_since=recovery['resumed_at'],mixed_layer_excluded=mixed_layer,
+                    unfinished_expert_sets=max(0,48*384-len(all_downs)))
     starts = [e for e in events if e.get('event') == 'layer_complete']
     if starts:
         started = stamp(starts[-1]['time'])
@@ -85,7 +102,8 @@ def estimate(root, now=None):
     if remaining_layers == 0 or complete or published or handed:
         layer_range = [0., 0.]
     elif base_seconds is not None:
-        layer_range = [max(0., remaining_layers*base_seconds*factor-elapsed) for factor in margins]
+        layer_range = ([count_based*factor for factor in margins] if count_based is not None else
+                       [max(0., remaining_layers*base_seconds*factor-elapsed) for factor in margins])
     else:
         result.update(basis='insufficient measured work; retain the previous forecast until more receipts exist',
                       remaining_seconds_range=None, completion_time_range=None)
@@ -101,7 +119,8 @@ def estimate(root, now=None):
         tails = {k:[0., 0.] for k in tails}
         result['provisional'] = False
     total = [layer_range[i]+sum(v[i] for v in tails.values()) for i in (0,1)]
-    layer_point = 0. if layer_range == [0., 0.] else max(0., remaining_layers*base_seconds-elapsed)
+    layer_point = (0. if layer_range == [0., 0.] else count_based if count_based is not None
+                   else max(0., remaining_layers*base_seconds-elapsed))
     point = layer_point+sum(statistics.mean(v) for v in tails.values())
     result.update(layer_remaining_seconds_range=layer_range, tail_allowance_seconds=tails,
         tail_basis='planning allowances, not measured Inkling phase durations; upload allowance informed by prior Kimi publication',

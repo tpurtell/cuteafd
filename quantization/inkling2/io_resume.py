@@ -15,13 +15,24 @@ from .output_io import OutputNumpyProxy, code_sha256
 def assert_producer_lock(root):
     """Require the unchanged runner's flock to belong to this exact process."""
     stat = (Path(root)/'producer.lock').stat()
-    for line in Path('/proc/locks').read_text().splitlines():
-        fields = line.split()
-        if len(fields) < 6 or fields[1] != 'FLOCK' or fields[3] != 'WRITE' or fields[4] != str(os.getpid()):
+    for descriptor in Path('/proc/self/fd').iterdir():
+        try:
+            own = os.fstat(int(descriptor.name))
+            if (own.st_dev,own.st_ino) != (stat.st_dev,stat.st_ino):
+                continue
+            info = (Path('/proc/self/fdinfo')/descriptor.name).read_text()
+        except (OSError,ValueError):
             continue
-        major,minor,inode = fields[5].split(':')
-        if (int(major,16),int(minor,16),int(inode)) == (os.major(stat.st_dev),os.minor(stat.st_dev),stat.st_ino):
-            return
+        # Btrfs exposes a virtual st_dev for subvolumes, while lock reports may
+        # name its superblock device. fstat of this owned descriptor establishes
+        # file identity; fdinfo establishes the lock without that ambiguous dev.
+        for line in info.splitlines():
+            if not line.startswith('lock:'):
+                continue
+            fields = line.split(':',1)[1].split()
+            if (len(fields)>=6 and fields[1]=='FLOCK' and fields[3]=='WRITE'
+                    and fields[4]==str(os.getpid()) and int(fields[5].rsplit(':',1)[1])==stat.st_ino):
+                return
     raise ValueError('sequential output activation requires the frozen producer lock in this process')
 
 
