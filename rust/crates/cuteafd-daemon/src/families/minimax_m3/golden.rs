@@ -168,6 +168,9 @@ fn run(args: GoldenArgs) -> Result<()> {
     let admission = SparkAdmission::plan_view(&view, ExpertGeometry::MINIMAX_M3, Some(&catalog),
         &SparkWorkingSet { rtx_layers: vec![], spark_layers: (3..cfg.layers).collect(),
             spark_ranks: args.peers.len(), prefill_lanes: 1 }, args.peers.len(), model, None)?;
+    let weight_load = crate::shared::memory::load_timing::Split::start();
+    let target_load = crate::shared::memory::load_timing::Split::start();
+    tracing::info!("MiniMax weight transaction start");
     let (target, embedding): (TargetWeights<'_>, Option<TokenEmbedding<'_>>) = if let Some(envelope) = envelope {
         ensure!(admission.coordinator_pushes(), "MiniMax target and Spark experts must join one push group");
         let (prepared, membership) = super::weights::push::prepare(&view, &catalog, &[device],
@@ -176,14 +179,25 @@ fn run(args: GoldenArgs) -> Result<()> {
         let pending = admission.start_with(&args.peers, membership)?;
         let ((target, embedding), experts) = prepared.receive(&catalog)?;
         ensure!(experts.iter().all(Vec::is_empty), "MiniMax cold golden has no coordinator expert sets");
+        target_load.log("minimax.target-resident");
+        tracing::info!(resident_bytes = weights.arena.bytes(), "MiniMax target weights resident");
+        let spark_wait = crate::shared::memory::load_timing::Split::start();
+        tracing::info!("MiniMax pending Spark wait start");
         pending.wait()?;
+        spark_wait.log("minimax.experts-resident.wait");
         (target, Some(embedding))
     } else {
         let pending = admission.start(&args.peers)?;
         let target = TargetWeights::mount(device, &checkpoint, &weights)?;
+        target_load.log("minimax.target-resident");
+        tracing::info!(resident_bytes = weights.arena.bytes(), "MiniMax target weights resident");
+        let spark_wait = crate::shared::memory::load_timing::Split::start();
+        tracing::info!("MiniMax pending Spark wait start");
         pending.wait()?;
+        spark_wait.log("minimax.experts-resident.wait");
         (target, None)
     };
+    weight_load.log("minimax.experts-resident.total");
     let kernels = Kernels::bind(device, &programs, &manifest, &cfg, &weights, args.prefill_rows, tokens)?;
     let stream = Rc::new(Stream::new(device)?);
     let mut owners = (0..waves).map(|_| UnitOwner::new(&kernels, Rc::clone(&stream), &cfg, &weights,
