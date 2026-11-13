@@ -124,8 +124,8 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
         for (rank, bank) in self.0.banks.iter().enumerate() {
             for layer in bank.layers.clone() {
                 for (plane, _) in PAGE_PLANES {
-                    // K/V are head-major, and index keys/scales are separate
-                    // subplanes. Copy the entire physical page, not rows*stride.
+                    // K/V are token-major; index keys/scales are separate
+                    // subplanes. Copy the entire physical page, including its tail.
                     copies.push((rank, bank.page(layer, plane, copy.to)?,
                         bank.page(layer, plane, copy.from)?));
                 }
