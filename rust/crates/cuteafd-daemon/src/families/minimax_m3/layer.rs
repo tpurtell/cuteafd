@@ -44,6 +44,76 @@ impl<'a> Kernels<'a> {
     }
 }
 
+/// The topology chooses transport and fold ownership; both topologies use the
+/// same rank-ordered arithmetic and the same whole-down BF16 boundary.
+pub(crate) struct PartialFold<'a> {
+    stream: Rc<Stream<'a>>,
+    rank0: Rc<Allocation<'a>>,
+    rank1: Rc<Allocation<'a>>,
+    meeting: Rc<Allocation<'a>>,
+    precision: dense::PartialPrecision,
+    capacity: usize,
+    f32_add: cuteafd_ffi::F32Add<'a>,
+    bf16_add: cuteafd_ffi::Bf16F32Add<'a>,
+    narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
+}
+impl<'a> PartialFold<'a> {
+    /// All three backings are caller-admitted. Rank order is physical rank order,
+    /// regardless of which GPU owns this layer's residual.
+    pub fn new(stream: Rc<Stream<'a>>, rank0: Rc<Allocation<'a>>, rank1: Rc<Allocation<'a>>,
+        meeting: Rc<Allocation<'a>>, precision: dense::PartialPrecision, capacity: usize) -> Result<Self> {
+        let device = stream.device;
+        ensure!(capacity > 0 && capacity <= 4096, "MiniMax partial fold capacity differs");
+        let count = capacity.checked_mul(6144).context("MiniMax partial fold overflow")?;
+        for owner in [&rank0, &rank1, &meeting] {
+            ensure!(owner.device.id == device.id && std::ptr::eq(owner.device.library, device.library),
+                "MiniMax partial fold owner device/library differs");
+        }
+        validate_fold([rank0.buffer, rank1.buffer, meeting.buffer], None, count, precision)?;
+        let (f32_add, bf16_add, narrow) = device.run(|| Ok((device.library.f32_add()?,
+            device.library.bf16_f32_add()?, device.library.f32_bf16_narrow()?)))?;
+        Ok(Self { stream, rank0, rank1, meeting, precision, capacity, f32_add, bf16_add, narrow })
+    }
+}
+impl Drop for PartialFold<'_> {
+    fn drop(&mut self) { self.stream.drain_or_abort("MiniMax partial fold owners"); }
+}
+
+fn validate_fold(buffers: [Buffer; 3], whole: Option<Buffer>, count: usize,
+    precision: dense::PartialPrecision) -> Result<()> {
+    let partial_bytes = count.checked_mul(precision.bytes()).filter(|&bytes| bytes > 0)
+        .context("MiniMax fold partial overflow")?;
+    let meeting_bytes = count.checked_mul(4).context("MiniMax fold meeting overflow")?;
+    let mut ranges = [(0usize, 0usize); 4];
+    for (index, (buffer, bytes, alignment)) in [(buffers[0], partial_bytes, precision.bytes()),
+        (buffers[1], partial_bytes, precision.bytes()), (buffers[2], meeting_bytes, 4)]
+        .into_iter().chain(whole.map(|buffer| (buffer, count * 2, 2))).enumerate() {
+        ensure!(buffer.device_id >= 0 && buffer.device_id == buffers[2].device_id && buffer.flags == 0
+            && !buffer.ptr.is_null() && buffer.ptr as usize % alignment == 0 && buffer.bytes >= bytes,
+            "MiniMax fold extent/alignment/device differs");
+        let start = buffer.ptr as usize;
+        let end = start.checked_add(bytes).context("MiniMax fold pointer overflow")?;
+        ensure!(ranges[..index].iter().all(|&(a, b)| end <= a || b <= start), "MiniMax fold owners overlap");
+        ranges[index] = (start, end);
+    }
+    Ok(())
+}
+
+fn validate_fold_exclusions(buffers: [Buffer; 3], protected: impl IntoIterator<Item = Buffer>) -> Result<()> {
+    let mut ranges = [(0usize, 0usize); 3];
+    for (range, buffer) in ranges.iter_mut().zip(buffers) {
+        let start = buffer.ptr as usize;
+        *range = (start, start.checked_add(buffer.bytes).context("MiniMax fold backing overflow")?);
+    }
+    for buffer in protected {
+        let start = buffer.ptr as usize;
+        let end = start.checked_add(buffer.bytes).context("MiniMax protected backing overflow")?;
+        ensure!(ranges.iter().all(|&(a, b)| end <= a || b <= start),
+            "MiniMax fold owner overlaps unit storage");
+    }
+    Ok(())
+}
+
 fn segment_rows(segments: &[attention::Segment], capacity: usize) -> Result<usize> {
     packed_rows(segments.iter().map(|segment| (segment.first_row, segment.request.rows)), capacity)
 }
@@ -269,6 +339,41 @@ impl<'a> UnitOwner<'a> {
         if !shared { self.accumulate(rows)?; }
         Ok(())
     }
+    /// # Safety
+    /// Both rank slots have landed and their producers precede this unit stream.
+    /// No transport or producer may replace either slot until the fold completes.
+    pub unsafe fn fold_partials(&self, kernels: &Kernels<'_>, fold: &PartialFold<'_>,
+        rows: usize, shared: bool) -> Result<()> {
+        self.check(kernels, rows)?;
+        ensure!(rows <= fold.capacity && std::ptr::eq(self.stream.as_ref(), fold.stream.as_ref()),
+            "MiniMax partial fold stream/capacity differs from unit");
+        let whole = self.plane("ffn")?;
+        let count = rows.checked_mul(6144).context("MiniMax partial fold count overflow")?;
+        let buffers = [fold.rank0.buffer, fold.rank1.buffer, fold.meeting.buffer];
+        validate_fold(buffers, Some(whole), count, fold.precision)?;
+        validate_fold_exclusions(buffers, self.planes.values().map(|owner| owner.buffer).chain([
+            self.dense.activation.buffer, self.dense.workspace.inputs.buffer,
+            self.dense.workspace.records.buffer, self.dense.workspace.output.buffer]))?;
+        if shared { self.routed_boundary.before_join(self.stream.raw)?; }
+        else { self.routed_boundary.idle()?; }
+        self.stream.device.run(|| {
+            // SAFETY: caller orders landed rank slots; checked typed disjoint
+            // retained planes survive this stream and every captured replay.
+            unsafe {
+                match fold.precision {
+                    dense::PartialPrecision::F32 => fold.f32_add.launch(fold.rank0.buffer,
+                        fold.rank1.buffer, fold.meeting.buffer, count, self.stream.raw)?,
+                    dense::PartialPrecision::Bf16 => fold.bf16_add.launch(fold.rank0.buffer,
+                        fold.rank1.buffer, fold.meeting.buffer, count, self.stream.raw)?,
+                }
+                fold.narrow.launch(fold.meeting.buffer.ptr, whole.ptr, count, self.stream.raw)?;
+            }
+            Ok(())
+        })?;
+        // Preserve the whole-down narrowing before routed addition. The existing
+        // routed boundary owns exactly-once combination, not this transport fold.
+        if shared { self.join_routed(kernels, rows) } else { self.accumulate(rows) }
+    }
     /// Official served-cache math rounds routed reduction to BF16 before adding
     /// the shared expert, then rounds that sum before the FP32 residual update.
     pub fn join_routed(&self, kernels: &Kernels<'_>, rows: usize) -> Result<()> {
@@ -298,6 +403,54 @@ impl<'a> UnitOwner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_wire_precisions_require_disjoint_rank_meeting_and_whole_planes() -> Result<()> {
+        let buffer = |pointer, bytes| Buffer { ptr: pointer as *mut std::ffi::c_void,
+            bytes, device_id: 0, flags: 0 };
+        for precision in [dense::PartialPrecision::Bf16, dense::PartialPrecision::F32] {
+            let count = 6144;
+            let rank0 = buffer(0x10000usize, count * precision.bytes());
+            let rank1 = buffer(0x20000usize, count * precision.bytes());
+            let meeting = buffer(0x30000usize, count * 4);
+            let whole = buffer(0x40000usize, count * 2);
+            validate_fold([rank0, rank1, meeting], Some(whole), count, precision)?;
+            for index in 0..3 {
+                let mut invalid = [rank0, rank1, meeting];
+                invalid[index].bytes -= 1;
+                assert!(validate_fold(invalid, Some(whole), count, precision).is_err());
+                invalid = [rank0, rank1, meeting];
+                invalid[index].device_id = 1;
+                assert!(validate_fold(invalid, Some(whole), count, precision).is_err());
+            }
+            for invalid in [rank0, rank1, meeting, Buffer { bytes: whole.bytes - 1, ..whole },
+                Buffer { flags: 1, ..whole }, Buffer { ptr: std::ptr::null_mut(), ..whole }] {
+                assert!(validate_fold([rank0, rank1, meeting], Some(invalid), count, precision).is_err());
+            }
+            assert!(validate_fold([rank0, rank0, meeting], Some(whole), count, precision).is_err());
+            assert!(validate_fold([rank0, rank1, meeting], Some(whole), 0, precision).is_err());
+            assert!(validate_fold([rank0, rank1, meeting], Some(whole), usize::MAX, precision).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_fold_cannot_alias_any_unit_plane_or_its_unused_tail() -> Result<()> {
+        let buffer = |pointer, bytes| Buffer { ptr: pointer as *mut std::ffi::c_void,
+            bytes, device_id: 0, flags: 0 };
+        let buffers = [buffer(0x10000usize, 0x1000), buffer(0x20000, 0x1000), buffer(0x30000, 0x2000)];
+        validate_fold_exclusions(buffers, [buffer(0x40000, 0x1000)])?;
+        validate_fold_exclusions(buffers, [buffer(0x11000, 0x1000)])?;
+        for slot in buffers {
+            for protected in [slot, buffer(slot.ptr as usize + slot.bytes - 1, 4),
+                buffer(slot.ptr as usize - 1, 2)] {
+                assert!(validate_fold_exclusions(buffers, [protected]).is_err());
+            }
+        }
+        assert!(validate_fold_exclusions(buffers, [buffer(usize::MAX, 2)]).is_err());
+        assert!(validate_fold_exclusions([buffer(usize::MAX, 2), buffers[1], buffers[2]], []).is_err());
+        Ok(())
+    }
 
     fn residual_bytes(sequence: usize, positions: std::ops::Range<usize>) -> Vec<u8> {
         positions.flat_map(|position| (0..6144).flat_map(move |column| {
