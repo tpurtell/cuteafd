@@ -38,7 +38,7 @@ class Tokenizer:
 
 @pytest.fixture
 def api(tmp_path):
-    state = {"calls": [], "failures": 0}
+    state = {"calls": [], "wire": [], "failures": 0}
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -46,7 +46,9 @@ def api(tmp_path):
         def do_POST(self):
             assert self.path == "/chat/completions"
             assert self.headers["Authorization"] == "Bearer test-private-value"
-            state["calls"].append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            payload = self.rfile.read(int(self.headers["Content-Length"]))
+            state["wire"].append(payload)
+            state["calls"].append(json.loads(payload))
             if state["failures"]:
                 state["failures"] -= 1
                 self.send_response(429)
@@ -184,6 +186,38 @@ def test_openrouter_reasoning_budget_only_on_uncached_requests(api, monkeypatch)
     assert "reasoning_effort" not in state["calls"][-1]
     client(changed)
     assert len(state["calls"]) == 2
+
+
+@pytest.mark.parametrize("family", ["inkling2", "qwen3_5", "kimi_k3", "minimax_m3"])
+def test_openrouter_explicit_inkling_effort_preserves_other_family_wire_bytes(api, monkeypatch, family):
+    import urllib.request
+    client, state = api
+    local_endpoint = client.endpoint
+    client.family = family
+    client.endpoint = "https://openrouter.ai/api/v1/chat/completions"
+    client.identity["endpoint"] = client.endpoint
+    client.extra_body = {"provider": {"order": ["cloudflare"], "allow_fallbacks": False},
+                         "reasoning": {"effort": "high"}}
+    urlopen = urllib.request.urlopen
+
+    def local_request(request, **kwargs):
+        assert request.full_url == client.endpoint
+        return urlopen(urllib.request.Request(local_endpoint, data=request.data,
+                       headers=dict(request.header_items())), **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", local_request)
+    original = body()
+    expected = {**original, **client.extra_body}
+    expected.pop("reasoning_effort")
+    if family != "inkling2":
+        expected["reasoning"] = {"max_tokens": 1024}
+    result = client(original)
+    expected_bytes = json.dumps(expected, ensure_ascii=False, separators=(",", ":")).encode()
+    assert state["wire"] == [expected_bytes]
+    assert state["calls"] == [expected]
+    assert result["generation_provenance"]["recipe_options"]["reasoning"] == expected["reasoning"]
+    assert client(original) == result and len(state["wire"]) == 1
+    assert original == body()
 
 
 def test_api_retry_and_request_identity(api, monkeypatch):

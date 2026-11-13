@@ -464,3 +464,256 @@ def test_config_rejects_unsupported_geometry_and_semantics(field, value):
     config["text_config"][field] = value
     with pytest.raises(ValueError):
         model.Config.from_dict(config)
+
+
+@pytest.fixture
+def official_inkling_snapshot():
+    import os
+    value = os.environ.get("INKLING2_REFERENCE_SNAPSHOT")
+    if not value:
+        pytest.skip("set INKLING2_REFERENCE_SNAPSHOT for pinned release checks")
+    snapshot = Path(value)
+    golden.source_identity(snapshot)
+    return snapshot
+
+
+@pytest.fixture
+def inkling_chat(official_inkling_snapshot):
+    import hashlib
+    pytest.importorskip("transformers")
+    from checkpoint_tokenizer import load_tokenizer
+    snapshot = official_inkling_snapshot
+    assert hashlib.sha256((snapshot / "tokenizer.json").read_bytes()).hexdigest() == (
+        "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6")
+    assert hashlib.sha256((snapshot / "chat_template.jinja").read_bytes()).hexdigest() == (
+        "74eb94918c5410bfab8d0af83ce1204fa8af08531f742c18ff4758b92b602d37")
+    tokenizer = load_tokenizer(snapshot, chat=True)
+    assert tokenizer.get_chat_template() == (snapshot / "chat_template.jinja").read_text()
+    return tokenizer
+
+
+def inkling_request():
+    return {"messages": [{"role": "system", "content": "Inspect the repository."},
+                         {"role": "user", "content": "Read README.md, then explain it."}],
+            "reasoning_effort": "high",
+            "tools": [{"type": "function", "function": {"name": "read_file",
+                "description": "Read a file", "parameters": {"type": "object",
+                    "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]}
+
+
+def test_official_inkling_tokenizer_keeps_serialized_bpe_and_effort(inkling_chat, official_inkling_snapshot):
+    from tokenizers import Tokenizer
+    from fidelity_generation import ChatRenderer, token_ids
+    native = Tokenizer.from_file(str(official_inkling_snapshot / "tokenizer.json"))
+    text = '# A plan\n\n  Keep spaces, tabs\tand punctuation.\n{"z":2,"a":1}\n' * 30
+    assert token_ids(inkling_chat, text) == native.encode(text, add_special_tokens=False).ids
+    assert inkling_chat.decode(token_ids(inkling_chat, text), skip_special_tokens=False,
+                               clean_up_tokenization_spaces=False) == text
+    renderer, request = ChatRenderer(inkling_chat), inkling_request()
+    assert renderer.template_options(request) == {"reasoning_effort": "high"}
+    assert "Thinking effort level: 0.9<|end_message|>" in renderer.render(request)
+    default = copy.deepcopy(request)
+    default.pop("reasoning_effort")
+    assert renderer.prompt(default) == renderer.prompt(request)
+    request["reasoning_effort"] = "low"
+    assert "Thinking effort level: 0.2<|end_message|>" in renderer.render(request)
+
+
+@pytest.mark.parametrize("kind", ["plain", "reasoning", "tool"])
+def test_official_inkling_native_completion_is_exact_prefix(inkling_chat, kind):
+    from fidelity_generation import ChatRenderer, token_ids
+    request, renderer = inkling_request(), ChatRenderer(inkling_chat)
+    assistant = {"role": "assistant", "content": "A short answer.\n"}
+    if kind != "plain":
+        assistant["reasoning_content"] = "First inspect the repository.\n"
+    if kind == "tool":
+        assistant.update(content=None, tool_calls=[{"id": "call0", "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path":"README.md","end":5}'}}])
+    before = copy.deepcopy(assistant)
+    generated = renderer.completion(request, assistant)
+    prompt = renderer.prompt(request)
+    full = renderer.render(request, assistant)
+    assert prompt + generated == token_ids(inkling_chat, full)
+    assert inkling_chat.decode(prompt + generated, skip_special_tokens=False,
+                               clean_up_tokenization_spaces=False) == full
+    span = inkling_chat.decode(generated, skip_special_tokens=False,
+                               clean_up_tokenization_spaces=False)
+    assert span.endswith("<|content_model_end_sampling|>")
+    if kind != "plain":
+        assert "<|content_thinking|>First inspect the repository.\n<|end_message|>" in span
+    if kind == "tool":
+        assert '<|message_model|>read_file<|content_invoke_tool_json|>' in span
+        assert '{"name":"read_file","args":{"end":5,"path":"README.md"}}' in span
+    assert assistant == before
+
+
+def test_official_inkling_tool_reply_and_next_turn_preserve_prior_tokens(inkling_chat):
+    from fidelity_generation import ChatRenderer, token_ids
+    renderer, request = ChatRenderer(inkling_chat), inkling_request()
+    assistant = {"role": "assistant", "content": None, "reasoning_content": "Read the file.",
+        "tool_calls": [{"id": "call0", "type": "function", "function": {
+            "name": "read_file", "arguments": '{"path":"README.md"}'}}]}
+    prior = renderer.prompt(request) + renderer.completion(request, assistant)
+    messages = request["messages"] + [assistant,
+        {"role": "tool", "tool_call_id": "call0", "content": "# Project\n"},
+        {"role": "user", "content": "Explain that title."}]
+    ids = renderer.conversation_ids(request, messages)
+    assert ids[:len(prior)] == prior
+    continued = {**request, "messages": messages}
+    text = renderer.render(continued)
+    assert ids == renderer.prompt(continued) == token_ids(inkling_chat, text)
+    assert "<|message_tool|>read_file<|content_text|># Project\n<|end_message|>" in text
+    assert text.count("Thinking effort level:") == 1
+
+
+def pinned_torch_helpers(root):
+    """Compile unchanged helper bodies only after validating every source file."""
+    import ast
+    import hashlib
+    from families.inkling2.sources import VLLM
+    selections = {
+        "tests/models/inkling2/test_attention.py": ("_ref_attention",),
+        "tests/models/inkling2/test_core_ops.py": ("_clip", "_dense_conv"),
+        "tests/models/inkling2/test_moe.py": ("dequant_mxfp8", "_torch_select_experts"),
+    }
+    namespace = {"torch": torch, "REL_EXTENT": 1024}
+    sources = {name: (root / name).read_bytes() for name in selections}
+    for name, raw in sources.items():
+        assert hashlib.sha256(raw).hexdigest() == VLLM["files"][name]
+    for name, functions in selections.items():
+        path = root / name
+        tree = ast.parse(sources[name], filename=str(path))
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in functions]
+        assert {node.name for node in nodes} == set(functions)
+        assert all(not node.decorator_list for node in nodes)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    return namespace
+
+
+def test_official_inkling_first_window_matches_pinned_torch_helpers(official_inkling_snapshot, monkeypatch):
+    import os
+    import torch.nn.functional as F
+    from fidelity_windows import load_set
+    helpers_root = os.environ.get("INKLING2_UPSTREAM_VLLM")
+    windows_path = os.environ.get("INKLING2_REFERENCE_WINDOWS")
+    if not helpers_root or not windows_path:
+        pytest.skip("set INKLING2_UPSTREAM_VLLM and INKLING2_REFERENCE_WINDOWS for real intermediates")
+    helpers = pinned_torch_helpers(Path(helpers_root))
+    cfg = model.Config.from_dict(json.loads((official_inkling_snapshot / "config.json").read_bytes()))
+    manifest = load_set(Path(windows_path), "inkling2")
+    assert manifest["checkpoint"] == model.CHECKPOINT
+    window = manifest["windows"][0]
+    assert not window.get("media") and 640 <= len(window["tokens"]) <= 2048
+    device = torch.device(os.environ.get("INKLING2_REFERENCE_DEVICE", "cuda:0"))
+    golden.configure_f32()
+    weights = model.Weights(official_inkling_snapshot, device)
+    weights.validate(cfg)
+    layer_index, measurements, decoded = -1, {}, set()
+
+    def compare(name, actual, expected, *, exact=False):
+        assert actual.shape == expected.shape and torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, atol=0 if exact else 2e-5,
+                                   rtol=0 if exact else 2e-5)
+        key = f"layer{layer_index}/{name}"
+        entry = measurements.setdefault(key, {"calls": 0, "max_abs": 0.})
+        entry["calls"] += 1
+        entry["max_abs"] = max(entry["max_abs"], (actual - expected).abs().max().item())
+
+    originals = {name: getattr(model, name) for name in
+                 ("short_conv", "l2_clip", "relative_attention", "route", "dequant_mxfp8")}
+
+    def conv(x, weight, dynamic=None):
+        actual = originals["short_conv"](x, weight, dynamic)
+        if layer_index in (0, 5):
+            shape = (x.shape[-1], -1) if dynamic is None else weight.shape
+            expected = helpers["_dense_conv"](x, weight.reshape(shape), dynamic)
+            compare("static_conv" if dynamic is None else "dynamic_conv", actual, expected, exact=True)
+        return actual
+
+    def clip(x, threshold, eps, scale=None):
+        actual = originals["l2_clip"](x, threshold, eps, scale)
+        if layer_index in (0, 5):
+            value = x.float() if scale is None else x.float() * scale.float()
+            compare("l2_clip", actual, helpers["_clip"](value, threshold, eps), exact=True)
+        return actual
+
+    def attention(q, k, v, relative, gate, sinks, *, window=None):
+        actual = originals["relative_attention"](q, k, v, relative, gate, sinks, window=window)
+        if layer_index in (0, 5):
+            block = 64
+            blocks = (len(q) + block - 1) // block
+            caches = [F.pad(value, (0, 0, 0, 0, 0, blocks * block - len(q))).reshape(
+                blocks, block, *value.shape[1:]) for value in (k, v)]
+            table = torch.arange(blocks, device=q.device).reshape(1, -1)
+            attended, lse = helpers["_ref_attention"](q, *caches, relative, [(len(q), len(q))],
+                table, q.shape[-1] ** -.5, None if window is None else window - 1)
+            expected = attended * (lse - torch.logaddexp(lse, sinks)).exp()[..., None] * gate.sigmoid()
+            compare("relative_attention_sink_gate", actual, expected)
+        return actual
+
+    def route(logits, bias, topk, scale):
+        ids, gamma = originals["route"](logits, bias, topk, scale)
+        if layer_index in (0, 5):
+            expected_gamma, expected_ids = helpers["_torch_select_experts"](logits, bias, topk, scale)
+            same = (ids == expected_ids).all(-1)
+            scores = logits.sigmoid() + bias
+            # The upstream Torch helper leaves exact ties to torch.topk; the
+            # native kernel and our synthetic oracle choose the lower expert ID.
+            compare("route_choice_scores", scores.gather(-1, ids), scores.gather(-1, expected_ids), exact=True)
+            assert same.any()
+            compare("route_gamma", gamma[same], expected_gamma[same], exact=True)
+            measurements[f"layer{layer_index}/route_tie_rows"] = int((~same).sum())
+        return ids, gamma
+
+    def dequant(weight, scale):
+        actual = originals["dequant_mxfp8"](weight, scale)
+        key = (layer_index, tuple(weight.shape))
+        if layer_index in (0, 5) and key not in decoded:
+            compare("dequant_" + str(weight.shape[-1]), actual,
+                    helpers["dequant_mxfp8"](weight, scale), exact=True)
+            decoded.add(key)
+        return actual
+
+    for name, function in (("short_conv", conv), ("l2_clip", clip),
+            ("relative_attention", attention), ("route", route), ("dequant_mxfp8", dequant)):
+        monkeypatch.setattr(model, name, function)
+    with torch.inference_mode():
+        embedding = weights.tensor(model.TEXT + "embed.weight").float()
+        norm = weights.tensor(model.TEXT + "embed_norm.weight").float()
+        tokens = torch.tensor(window["tokens"], device=device)
+        hidden = model.rms_norm(F.embedding(tokens, embedding), norm, cfg.rms_norm_eps)
+        del embedding, norm, tokens
+        weights.close()
+        golden.release(device)
+        blocks = []
+        for layer_index in range(6):
+            if device.type == "cuda":
+                from fidelity_windows import admit_reference_memory
+                contract = model.tensor_contract(cfg, layer_index)
+                native = sum(weights.descriptor(name)["data_offsets"][1]
+                             - weights.descriptor(name)["data_offsets"][0] for name in contract)
+                dense = sum(2 * math.prod(shape) for shape, dtype in contract.values() if dtype == "BF16")
+                admit_reference_memory(torch.cuda, native + dense
+                                       + golden.execution_memory(cfg, len(window["tokens"]), layer_index))
+            layer = weights.load_layer(layer_index, cfg)
+            result = model.layer_forward(hidden, blocks, layer, cfg, layer_index)
+            if layer_index % cfg.n_layers_per_attn_res_block == 0:
+                blocks.append(hidden)
+            hidden = result
+            assert torch.isfinite(hidden).all()
+            del layer
+            golden.release(device)
+    for index in (0, 5):
+        for name in ("static_conv", "l2_clip", "relative_attention_sink_gate", "route_gamma",
+                     "dequant_" + str(cfg.hidden_size), "dequant_" + str(cfg.intermediate_size)):
+            assert measurements[f"layer{index}/{name}"]["calls"] > 0
+    assert measurements["layer5/dynamic_conv"]["calls"] == 2
+    from families.inkling2.sources import VLLM
+    print("pinned upstream first-window checks " + json.dumps({"window": window["id"],
+        "tokens": len(window["tokens"]), "revision": model.REVISION,
+        "panel_diagnostic_only": manifest.get("diagnostic_only", False),
+        "upstream": {"revision": VLLM["revision"], "files": {
+            name: VLLM["files"][name] for name in (
+                "tests/models/inkling2/test_attention.py", "tests/models/inkling2/test_core_ops.py",
+                "tests/models/inkling2/test_moe.py")}}, "measurements": measurements}, sort_keys=True))
