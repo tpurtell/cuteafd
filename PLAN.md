@@ -5,6 +5,65 @@
 K2/Core-K6 and original-default MC checkpoint publication, native placement
 and guarded cleanup are complete; receipts are recorded in PR #1783.
 Serving and full-model generation/fidelity qualification remain pending #1777.
+## Inkling 2 Small K4 MC quantization (maxq, 2026-11-13)
+
+TJ's brief is `~/Developer/cuteafd/inkling2-small-mc-quant.md`; task branch
+`quant/inkling2-k4-mc`, worktree `~/Developer/cute-worktrees/inkling2-k4-mc`,
+based on `origin/dev@cc92a8d1e`. Deliver one directly written MC package as
+`wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC`: shared K4 routed experts and
+native tensors, original BF16 core/default drafter, and K8/K6 compact cores
+including both drafter encodes. K8 reconstruction feeds the single causal
+pass; K6 reuses those Hessians. Record K8-upstream capture in K6 provenance.
+
+Latest user overrides: keep the target/core/expert pilot quick (10-minute
+GPU smoke cap, a few local/global prompts and representative projections).
+No drafter pilot or drafter heldout quality gate; full-engine drafter
+evaluation comes later. Quantizer code lands on `tpurtell/GPTQModel` main
+before encoding; publish/upload, no-copy SparkNest import, native eight-place
+`--factor 1/8` spread and task-only cleanup are authorized. A durable user
+timer `cuteafd-inkling2-progress.timer` queues this conversation every 30 min;
+receipts live under `~/.cache/cuteafd/quantization/inkling2-k4-mc/`.
+TJ also requests remaining time and an estimated completion date/time in every
+update (Asia/Taipei). Start with a clearly provisional range from measured
+partial expert throughput; replace it with completed-layer timing as available.
+Keep layer ETA separate from head/MTP, upload and placement allowances.
+TJ explicitly authorized interrupt/fix/resume for the scratch I/O defect on
+2026-11-13. Preserve the original numerical files, identity, committed weights
+and legacy output receipts. The operational `io_resume` entry patches only the
+frozen runner's output memmap interface: new expert outputs append sequentially,
+and reads combine committed legacy slots with new files byte for byte. Its
+code/provenance is tracked separately; no numerical state or source is rewritten.
+New expert-output scratch uses streamed XXH3-128 without a readback hash pass.
+Forecasts use post-recovery cycles and exclude the mixed interrupted layer from
+full-layer averages; original projection receipts remain unchanged.
+
+Source header audit: `thinkingmachines/Inkling-2-Small-MXFP8` at
+`3febc62259ee92ea36e2fb6e8303371c4eb3922c`, 48 indexed model shards plus
+unindexed `mtp.safetensors`, 1,694 tensors / 622,803,317,088 payload bytes.
+MXFP8 remains the explicitly approved highest-precision fidelity source.
+Vendor's native NVFP4 sibling retains MXFP8 in its last eight layers; no
+evidence establishes that this MXFP8 release is merely an NVFP4 upcast.
+
+Correct the brief's expert estimate: K4 experts are 274.087 GiB including
+standard EXL3 side tensors, not 141 GiB. With the head selected, 55,296 expert
+encodes plus 334 core modules at each width yield 55,964 operations. Estimated
+view payloads: original 290.282 GiB, K8 283.510 GiB, K6 281.816 GiB; one
+physical MC package 302.155 GiB. The 1 RTX + 2 Spark minimum needs about
+101-105 GiB/Spark before runtime overhead; qualify fit with planner arithmetic.
+
+Native interpretation must follow pinned official Inkling2 reference code:
+expert scale tensors are per output row / 32 input elements despite the
+declared `[32,32]` metadata; fused gate/up rows are interleaved, and route
+weights precede down-input activation QDQ. Eight FP32 AttnRes queries have
+shape `[3,4608]`. The unindexed drafter's bare names become `mtp.*`; its
+nonselected native parts stay shared. Preserve the source vision tower.
+
+Use reviewed MC writer/validation helpers from `quant/mc-package@d36ebe450`
+without post-hoc packages or parent-repository copies. maxq alone owns GPU
+work, with its hardware lease, 80 GiB container RAM, no swap, task UV venv,
+read-only borrowed base packages and task NVMe build paths. Main checkout and
+venv stay unchanged. Numerical state is resumable only under a frozen explicit
+source/code/package/recipe/token identity. Never restart a completed job.
 
 TJ additionally authorized the post-publication storage handoff on Nov 12:
 native SparkNest `hf import --offline --no-copy`, then an even one-copy spread
