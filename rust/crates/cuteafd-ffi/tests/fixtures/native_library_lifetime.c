@@ -187,7 +187,8 @@ static int native_initializations;
 int fixture_native_initializations(void) { return native_initializations; }
 int cuteafd_tp2_native_initialize(void) { ++native_initializations; return 0; }
 int cuteafd_peer_exchange_initialize(void) { return 0; }
-
+/* Binding-only: CPU ownership fixtures never implement BF16 arithmetic. */
+int32_t cuteafd_add_tp2_shared_async(const uint16_t *a, const uint16_t *b, uint16_t *out, size_t count, void *stream) { (void)a; (void)b; (void)out; (void)count; (void)stream; return 1; }
 
 /* Head fixture records the scratch selected by the real Rust handle binding. */
 struct fixture_head { void *workspace; int width, rows, vocab; };
