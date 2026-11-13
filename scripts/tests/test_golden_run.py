@@ -1338,3 +1338,34 @@ def test_hidden_diagnostic_flags_are_accepted():
     assert parser.parse_args(['--snapshot', '/m', '--skip-routed-experts']).skip_routed_experts
     with pytest.raises(ValueError, match='--not-a-flag'):
         parser.parse_args(['--snapshot', '/m', '--not-a-flag'])
+
+
+def test_hidden_flag_lists_cover_every_hidden_daemon_arg():
+    """Every `#[arg(long, hide = true)]` daemon field must be in exactly one list
+    (or be a launcher-only option golden runs never pass)."""
+    import re as _re
+    root = Path(__file__).resolve().parents[2] / 'rust/crates/cuteafd-daemon/src'
+    launcher_only = {'--peer-expert-ranges', '--deprecated-peer-expert-ranges'}
+    found = {}
+    for path in root.rglob('*.rs'):
+        text = path.read_text()
+        for m in _re.finditer(r'#\[arg\(([^\]]*hide = true[^\]]*)\)\]\s*(?:///[^\n]*\n\s*)*pub (\w+): ([^,\n]+)', text):
+            attrs, name, ty = m.groups()
+            explicit = _re.search(r'long = "([\w-]+)"', attrs)
+            flag = '--' + (explicit[1] if explicit else name.replace('_', '-'))
+            found[flag] = ty.strip()
+    assert found, 'no hidden daemon args found (pattern drift)'
+    for flag, ty in found.items():
+        if flag in launcher_only:
+            continue
+        expected = golden.HIDDEN_FLAGS if ty == 'bool' else golden.HIDDEN_OPTIONS
+        assert flag in expected, f'{flag} ({ty}) is hidden in the daemon but missing from golden-run'
+    for flag in golden.HIDDEN_FLAGS + golden.HIDDEN_OPTIONS:
+        assert flag in found, f'{flag} is listed in golden-run but no daemon declares it hidden'
+
+
+def test_hidden_options_take_an_operand():
+    text = 'Usage: cuteafd glmf-golden --snapshot <SNAPSHOT>\nOptions:\n      --snapshot <SNAPSHOT>\n'
+    parser, _ = golden.cli_from_help(text)
+    parsed = parser.parse_args(['--snapshot', '/m', '--save-logits', '/out/l', '--skip-experts'])
+    assert parsed.save_logits == '/out/l' and parsed.skip_experts
