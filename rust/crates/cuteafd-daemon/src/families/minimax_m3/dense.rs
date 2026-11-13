@@ -4,7 +4,7 @@ use anyhow::{ensure, Result};
 use cuteafd_ffi::{native_dense::Mxfp8A8, programs::Programs, CuteafdDeviceBuffer};
 use super::weights::TargetWeights;
 use std::ffi::c_void;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, rc::Rc};
 use cuteafd_core::memory_layout::Tag;
 use cuteafd_loader::families::minimax_m3::weight_layout::{CoordinatorWeights, DenseInput, DenseWorkspace};
 
@@ -79,15 +79,15 @@ impl<'a> Workspace<'a> {
 pub(crate) struct ExecutionOwner<'a> {
     pub workspace: Workspace<'a>,
     pub input_layout: DenseInput,
-    pub activation: Allocation<'a>,
+    pub activation: Rc<Allocation<'a>>,
 }
 
 impl<'a> ExecutionOwner<'a> {
     pub fn new(device: Device<'a>, weights: &CoordinatorWeights, rows: u32) -> Result<Self> {
         let input_layout = weights.dense_input(rows)?;
         weights.dense_workspace(rows)?;
-        let activation = Allocation::new(device, usize::try_from(input_layout.bytes)?,
-            Tag::workspace("minimax/dense/activation"))?;
+        let activation = Rc::new(Allocation::new(device, usize::try_from(input_layout.bytes)?,
+            Tag::workspace("minimax/dense/activation"))?);
         let workspace = Workspace::new(device, weights, rows)?;
         // Fresh storage only, before capture or enqueue: no per-call host table
         // uploads, nor copies from a second producer destination, are required.

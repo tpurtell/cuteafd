@@ -67,6 +67,7 @@ pub(crate) struct UnitOwner<'a> {
     attention: attention::Workspace<'a>,
     layout: UnitLayout,
     planes: BTreeMap<String, Rc<Allocation<'a>>>,
+    routed_boundary: Rc<super::experts::Boundary<'a>>,
 }
 impl Drop for UnitOwner<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("MiniMax unit arithmetic owners"); }
@@ -91,6 +92,7 @@ impl<'a> UnitOwner<'a> {
                 Tag::workspace("minimax/unit"))?)))
         }).collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self { dense: dense::ExecutionOwner::new(kernels.device, weights, rows)?,
+            routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
             attention: if prefill { attention::Workspace::new(&kernels.attention)? }
                 else { attention::Workspace::new_decode(&kernels.attention)? }, stream, layout, planes })
     }
@@ -100,6 +102,12 @@ impl<'a> UnitOwner<'a> {
     /// Prefix tails may use this scratch: begin_unit overwrites it before any model read.
     pub fn prefix_scratch(&self) -> Rc<Allocation<'a>> { Rc::clone(&self.planes["residual"]) }
     pub fn plane(&self, name: &str) -> Result<Buffer> { Ok(self.owner(name)?.buffer) }
+    pub(crate) fn routed_rows(&self, rows: usize) -> Result<super::experts::RoutedRows<'a>> {
+        ensure!(rows <= self.layout.rows as usize, "MiniMax routed rows exceed unit");
+        super::experts::RoutedRows::new(self.dense.activation.clone(), self.planes["route_ids"].clone(),
+            self.planes["route_weights"].clone(), self.planes["routed"].clone(), self.stream.clone(),
+            self.routed_boundary.clone(), rows)
+    }
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         self.dense.inventory(inventory, &format!("{prefix}.dense"))?;
         self.attention.inventory(inventory, &format!("{prefix}.attention"))?;
@@ -173,6 +181,7 @@ impl<'a> UnitOwner<'a> {
     }
     fn project_attention(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
         admitted: &CoordinatorWeights, layer: usize, rows: usize) -> Result<()> {
+        self.routed_boundary.idle()?;
         self.normalize(kernels, weights, layer, "input_layernorm.weight", rows)?;
         let names = [("self_attn.q_proj", "query"), ("self_attn.k_proj", "key"),
             ("self_attn.v_proj", "value"), ("self_attn.index_q_proj", "index_query"),
@@ -214,6 +223,7 @@ impl<'a> UnitOwner<'a> {
     }
     /// Router and FFN share the exact same normalized BF16 activation.
     pub fn router(&self, kernels: &Kernels<'_>, weights: &TargetWeights<'_>, layer: usize, rows: usize) -> Result<()> {
+        self.routed_boundary.idle()?;
         self.normalize(kernels, weights, layer, "post_attention_layernorm.weight", rows)?;
         let device = self.stream.device;
         let weight = Self::weight(weights, layer, "block_sparse_moe.gate.weight")?;
@@ -235,6 +245,8 @@ impl<'a> UnitOwner<'a> {
     pub fn ffn(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>, admitted: &CoordinatorWeights,
         layer: usize, rows: usize, shared: bool) -> Result<()> {
         self.check(kernels, rows)?;
+        if shared { self.routed_boundary.before_ffn(self.stream.raw)?; }
+        else { self.routed_boundary.idle()?; }
         if !shared { self.normalize(kernels, weights, layer, "post_attention_layernorm.weight", rows)?; }
         let stem = if shared { "block_sparse_moe.shared_experts" } else { "mlp" };
         let gate = Self::projection(admitted, layer, &format!("{stem}.gate_proj"))?;
@@ -261,12 +273,15 @@ impl<'a> UnitOwner<'a> {
     /// the shared expert, then rounds that sum before the FP32 residual update.
     pub fn join_routed(&self, kernels: &Kernels<'_>, rows: usize) -> Result<()> {
         self.check(kernels, rows)?;
+        self.routed_boundary.before_join(self.stream.raw)?;
         self.stream.device.run(|| {
             // SAFETY: distinct retained planes, same stream as the landed wave.
             unsafe { kernels.add.launch(self.plane("routed")?, self.plane("ffn")?,
                 self.plane("combined")?, rows * 6144, self.stream.raw) }
         })?;
-        self.accumulate_from("combined", rows)
+        self.accumulate_from("combined", rows)?;
+        self.routed_boundary.joined();
+        Ok(())
     }
     fn accumulate(&self, rows: usize) -> Result<()> { self.accumulate_from("ffn", rows) }
     fn accumulate_from(&self, source: &str, rows: usize) -> Result<()> {
