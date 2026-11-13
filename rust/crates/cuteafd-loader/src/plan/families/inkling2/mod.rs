@@ -191,8 +191,12 @@ impl Model {
                     ensure!(present, "Inkling 2 checkpoint lacks {stem} (routed_expert)");
                 }
                 _ => {
+                    // Members stored without a `.weight` suffix: the relative projection,
+                    // conv taps, layer-scale gammas, residual queries and the ViT's
+                    // class/position embeddings (its patch embedding is a linear weight).
                     let bare = stem.ends_with(".proj") || stem.ends_with(".static_w") || stem.ends_with(".weight_proj")
-                        || stem.ends_with(".gamma") || stem.contains(".attn_res.") || stem.ends_with("_embedding");
+                        || stem.ends_with(".gamma") || stem.contains(".attn_res.")
+                        || (stem.ends_with("_embedding") && !stem.ends_with("patch_embedding"));
                     let name = if contract.scale_member { format!("{stem}.scale") } else if bare { stem.clone() }
                         else { format!("{stem}.weight") };
                     ensure!(checkpoint.contains_tensor(&name), "Inkling 2 checkpoint lacks {name} ({:?})", contract.role.component);

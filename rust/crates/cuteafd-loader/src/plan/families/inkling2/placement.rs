@@ -37,14 +37,18 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     report.prefill_reserve_rows = Some(prefill.span_rows);
     let shape = PrefillShape { rows: prefill.unit_rows, waves: prefill.waves };
-    let attention = if gpus == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads };
+    // The shared mechanism resolves `auto` (heads on a pair: KV, rings and
+    // lag rows partition by head with nothing replicated) and refuses modes
+    // this executor does not list.
+    let attention = match crate::placement::families::inkling2::INKLING2.check_attention(report.requested_attention, gpus, gpus == 2) {
+        Ok(attention) => attention,
+        Err(error) => {
+            report.refuse_placement(format!("Inkling 2 attention placement refused: {error}"),
+                "Use ATTENTION_PLACEMENT=auto, heads, context or layers on two RTX; one RTX runs heads.");
+            return empty(notes);
+        }
+    };
     report.attention_placement = attention;
-    if let Some(requested) = report.requested_attention.filter(|&mode| mode != attention) {
-        report.refuse_placement(format!("Inkling 2 runs {attention} attention on {gpus} RTX; --attention-placement \
-            {requested} has no biased-sink attention program"),
-            "Omit --attention-placement: whole-layer owners never replicate KV pages, window rings or conv lag rows.");
-        return empty(notes);
-    }
     // The program manifest is optional in stage 1: no Inkling 2 program is
     // installed yet, so the loaded-code allowance uses the shared estimate.
     let manifest_path = opts.workspace_manifest.clone().or_else(|| {
@@ -70,7 +74,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         .min(opts.spark_bytes);
     let sequences = opts.resolved_concurrency("inkling2");
     let request = FactsRequest { checkpoint: input.checkpoint(), cfg, manifest_path: manifest_path.as_deref(),
-        manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, spark_ranks: ranks,
+        manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, attention, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.mimo_prefix_entries,
         replies: opts.spark_reply_formats, head: opts.bf16_target_head, expert_usage: opts.expert_usage,
@@ -110,20 +114,25 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         ExpertStorage::Nvfp4 => "native NVFP4 W4A4".to_string(),
         ExpertStorage::Exl3 { bits } => format!("EXL3 K{bits}"),
     }).collect::<Vec<_>>().join(" + ");
-    notes.push(format!("Inkling 2 attention {}: {}; pool {} tokens (global layers only; {} sliding-window layers keep \
-        per-sequence rings); {onboarded} of {routed} routed layers onboarded ({}); experts {storage_note}; unit {} x {} \
-        waves; C{sequences}", placed.attention_summary(),
-        if gpus == 2 { "contiguous whole-layer owners (24/24, one boundary hop), routed experts TP2 halves" }
-        else { "every layer on rtx0" }, placed.pool_tokens, cfg.local_layers(),
-        if gpus == 2 { "TP2 halves" } else { "whole layers" }, shape.rows, shape.waves));
+    let mode_note = match (gpus, attention) {
+        (1, _) => "every layer on rtx0",
+        (_, AttentionPlacement::Heads) => "24/4 heads per GPU on every layer; KV pages, window rings and conv lags split by head, residual replicated",
+        (_, AttentionPlacement::Context) => "global layers page-parity KV with the shared context exchange, window layers head-split",
+        (_, AttentionPlacement::Layers) => "contiguous whole-layer owners (24/24, one boundary hop)",
+    };
+    notes.push(format!("Inkling 2 attention {}: {mode_note}; routed experts {}; pool {} tokens (global layers only; {} \
+        sliding-window layers keep per-sequence rings); {onboarded} of {routed} routed layers onboarded; experts {storage_note}; \
+        unit {} x {} waves; C{sequences}", placed.attention_summary(), if gpus == 2 { "TP2 halves" } else { "whole layers" },
+        placed.pool_tokens, cfg.local_layers(), shape.rows, shape.waves));
     let mut devices = Vec::new();
     for gpu in 0..gpus {
         let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32,
             capacity_bytes: cards[gpu].physical_bytes.min(cards[gpu].logical_bytes), worker_budget_bytes: 0,
             items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
         device.items.extend(crate::placement::reserve::gpu_item("inkling2"));
-        notes.push(format!("rtx{gpu}: target arena {} B ({} views); attention layers {:?}",
-            inputs.targets[gpu].arena.bytes(), inputs.targets[gpu].arena.views().len(), inputs.targets[gpu].layers));
+        notes.push(format!("rtx{gpu}: target arena {} B ({} views); attention layers {}",
+            inputs.targets[gpu].arena.bytes(), inputs.targets[gpu].arena.views().len(),
+            if inputs.targets[gpu].layers.len() == cfg.layers { "all (split)".to_string() } else { format!("{:?}", inputs.targets[gpu].layers) }));
         devices.push(device);
     }
     let mut widest = 0u64;

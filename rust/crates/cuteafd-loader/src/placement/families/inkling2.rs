@@ -13,10 +13,12 @@
 //!   pair) with the installed package's executor workspace;
 //! - Spark experts per rank per onboarding count, with their I/O, typed
 //!   execution owners, runtime residual and SM121 arena page tables;
-//! - KV pool pages for the eight global layers only (whole-layer owners:
-//!   never replicated); the forty sliding-window layers keep per-sequence
-//!   append rings, and every layer keeps its short-conv lag rows, both in the
-//!   prefix-mark arena that scales with concurrency, not context;
+//! - KV pool pages for the eight global layers only, charged by the layer's
+//!   attention mode (heads: half the KV heads per rank; context: page parity,
+//!   plus the shared context exchange; layers: the whole owner); the forty
+//!   sliding-window layers keep per-sequence append rings, and every layer
+//!   keeps its short-conv lag rows, both in the prefix-mark arena that scales
+//!   with concurrency, not context, and split or replicated the same way;
 //! - per-sequence page tables, decode lane and per-slot prefill unit owners
 //!   (projections, relative logits, attention, residual stack, router, expert
 //!   activation staging), TP2 expert exchange and the boundary hop on a pair,
@@ -46,15 +48,37 @@ pub const LANES: u64 = 1;
 pub const DECODE_ROWS: u32 = 64;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 
-/// What the Inkling 2 executor runs. One RTX owns every layer. A pair owns
-/// contiguous whole layers (the qualified Qwen4/MiniMax dual pattern):
-/// attention, convolutions, residual mixes and router on the owner, one
-/// boundary hop at the cut, routed experts as TP2 halves on both GPUs. Whole
-/// owners never replicate KV pages, sliding-window rings or conv lag rows,
-/// which a head split would have to shard across 8 KV heads per layer.
+/// What the Inkling 2 executor runs, on the shared attention-placement
+/// mechanism (`ATTENTION_PLACEMENT`): every layer is GQA 48/8, so all three
+/// placements partition it.
+/// - `heads` (auto on a pair): 24 query and 4 KV heads per GPU; KV pages,
+///   SWA rings and conv lag rows split by head with no replication; the
+///   relative logits, sinks and output gate are per-head and split with them;
+///   the residual is replicated (one all-reduce per layer, no boundary hop).
+/// - `context`: head-split projections with page-parity KV on the eight
+///   global layers (the forty window layers keep head-split rings), plus the
+///   shared context exchange per lane.
+/// - `layers`: contiguous whole owners (24/24, one boundary hop), routed
+///   experts as TP2 halves; nothing replicated.
+/// Plan admits all three; serve runs the ones with a qualified executor
+/// (stage 4) and names the rest as refusals.
 pub const INKLING2: ExecutorModes = ExecutorModes { family: "inkling2",
-    modes: &[WHOLE, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }], hops: true,
-    attention: AttentionPlacement::Layers };
+    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }],
+    hops: true, attention: AttentionPlacement::Heads };
+
+/// Per-layer modes for a resolved placement: one GPU runs whole layers;
+/// `heads` splits every layer; `context` page-splits the global layers and
+/// head-splits the window layers (a bounded ring gains nothing from parity);
+/// `layers` cuts contiguous whole owners in the middle, head on GPU1.
+pub fn layer_modes(cfg: &Inkling2Config, gpus: usize, placement: AttentionPlacement) -> Vec<LayerMode> {
+    if gpus == 1 { return vec![WHOLE; cfg.layers]; }
+    let cut = cfg.layers.div_ceil(2);
+    (0..cfg.layers).map(|layer| match placement {
+        AttentionPlacement::Heads => LayerMode::HeadSplit,
+        AttentionPlacement::Context => if cfg.local[layer] { LayerMode::HeadSplit } else { LayerMode::ContextSplit },
+        AttentionPlacement::Layers => LayerMode::Whole { gpu: u8::from(layer >= cut), ffn: FfnMode::Owner },
+    }).collect()
+}
 
 fn invalid(detail: impl std::fmt::Display) -> Refusal {
     Refusal::InvalidFact(format!("Inkling 2 component contract: {detail}"))
@@ -113,8 +137,9 @@ pub struct InklingInputs {
     pub sequences: u64,
     /// Per-rank target arenas (one per coordinator GPU).
     pub targets: Vec<CoordinatorWeights>,
-    /// Owner GPU of every layer's attention (`0` everywhere on one RTX).
-    pub owners: Vec<u8>,
+    /// The resolved attention placement and every layer's mode under it.
+    pub placement: AttentionPlacement,
+    pub modes: Vec<LayerMode>,
     /// Routed layer order (the onboarding prefix is `routed[..count]`).
     pub routed: Vec<usize>,
     pub experts: Vec<LayerExperts>,
@@ -198,14 +223,6 @@ pub fn spark_executions(prefill: PrefillShape, exl3: bool) -> anyhow::Result<cut
     crate::plan::spark_executions::admit_family("inkling2", &backend.exports(), None, prefill.rows, prefill.waves)
 }
 
-/// Balanced whole-layer attention owners for a pair: a contiguous cut that
-/// gives GPU1 the head, so the embedding GPU gets the extra layer.
-pub fn layer_owners(layers: usize, gpus: usize) -> Vec<u8> {
-    if gpus == 1 { return vec![0; layers]; }
-    let cut = layers.div_ceil(2);
-    (0..layers).map(|layer| u8::from(layer >= cut)).collect()
-}
-
 /// Per-sequence sliding-window ring and conv-lag bytes of one layer, the
 /// prefix-mark region a whole owner keeps beside its global-layer pages.
 pub struct SequenceState {
@@ -214,6 +231,8 @@ pub struct SequenceState {
     /// `(kernel - 1)` lag rows of the K, V, attention-output and MLP-output
     /// convolution inputs; dynamic global taps are recomputed per token.
     pub lag_bytes: u64,
+    /// The K and V part of `lag_bytes` (split by head; the rest replicates).
+    pub kv_lag_bytes: u64,
 }
 
 impl SequenceState {
@@ -224,8 +243,9 @@ impl SequenceState {
                 .ok_or_else(|| invalid("sliding-window ring geometry"))?;
             ring.rows.checked_mul(2 * kv_row).ok_or(Refusal::Overflow("Inkling 2 SWA ring"))?
         } else { 0 };
-        let lags = (cfg.sconv_kernel as u64 - 1) * (2 * kv_row + 2 * cfg.hidden as u64 * 2);
-        Ok(Self { ring_bytes: ring, lag_bytes: lags })
+        let kv_lags = (cfg.sconv_kernel as u64 - 1) * 2 * kv_row;
+        let lags = kv_lags + (cfg.sconv_kernel as u64 - 1) * 2 * cfg.hidden as u64 * 2;
+        Ok(Self { ring_bytes: ring, lag_bytes: lags, kv_lag_bytes: kv_lags })
     }
 }
 
@@ -248,21 +268,43 @@ fn with(mut components: Vec<Component>, activation: &Activation) -> Vec<Componen
 }
 
 impl InklingInputs {
-    pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(PAGE_ROWS) }
+    pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(self.page_rows()) }
 
-    fn modes(&self) -> Vec<LayerMode> {
-        self.owners.iter().map(|&gpu| LayerMode::Whole { gpu, ffn: FfnMode::Owner }).collect()
-    }
+    fn modes(&self) -> Vec<LayerMode> { self.modes.clone() }
 
     fn head_gpu(&self) -> u8 { (self.gpus - 1) as u8 }
+
+    /// Context pages are parity-interleaved over the pair: twice the rows per page.
+    pub fn page_rows(&self) -> u64 {
+        if self.modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { 2 * PAGE_ROWS } else { PAGE_ROWS }
+    }
+
+    /// Shared context exchange geometry for the global layers under `context`:
+    /// one 64-token K+V page per staging unit, BF16 query rows and F32 partial
+    /// outputs of this rank's 24 heads, two parity slots per lane.
+    fn context_buffers(&self) -> crate::placement::ContextBuffers {
+        let cfg = &self.cfg;
+        let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
+        let heads = (cfg.heads / 2) as u64;
+        crate::placement::ContextBuffers {
+            staging_unit_bytes: PAGE_ROWS * 2 * kv_row, staging_unit_rows: PAGE_ROWS,
+            query_row_bytes: heads * cfg.head_dim as u64 * 2,
+            partial_row_bytes: heads * (cfg.head_dim as u64 * 4 + 8),
+            candidate_row_bytes: 0, compiled_extent: self.prefill.rows.max(u64::from(DECODE_ROWS)),
+            decode_rows: u64::from(DECODE_ROWS), lanes: LANES, workspace_bytes: 0 }
+    }
 
     fn hop_spec(&self) -> HopSpec {
         // The hop carries the partial residual block and the completed blocks
         // the next owner mixes: at most (blocks + 1) hidden rows per token.
         let rows = self.cfg.residual_blocks() as u64 + 1;
+        // Whole owners hand the residual to the last owner; split layers keep
+        // a replicated residual on both ranks (no hop).
+        let terminal = if self.modes.iter().all(|mode| matches!(mode, LayerMode::Whole { .. })) {
+            TerminalHome::AttentionOwner } else { TerminalHome::Replicated };
         HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: rows * self.cfg.hidden as u64 * 2,
             rows: self.prefill.rows.max(u64::from(DECODE_ROWS)), lanes: LANES, entry_gpu: 0,
-            head_gpu: self.head_gpu(), terminal: TerminalHome::AttentionOwner }
+            head_gpu: self.head_gpu(), terminal }
     }
 
     /// The available onboarding counts: an ordered prefix of the routed layers.
@@ -301,11 +343,17 @@ impl InklingInputs {
         let spec = self.hop_spec();
         let residual = residual_homes(&modes, &spec).map_err(|error| invalid(error))?;
         let hops = plan_hops(&modes, &spec).map_err(|error| invalid(error))?;
-        let attention = if pair { AttentionPlacement::Layers } else { AttentionPlacement::Heads };
+        let attention = if pair { self.placement } else { AttentionPlacement::Heads };
+        let context = modes.iter().any(|mode| *mode == LayerMode::ContextSplit);
+        let buffers = self.context_buffers();
         let placement = Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
             attention_placement: attention,
-            attention_by_kind: vec![(AttentionClass::Swa, attention), (AttentionClass::Gqa, attention)],
-            peer_row_bytes: 0, onboard_layers: count, max_pool_tokens_no_onboard: None, layers,
+            // Window layers never page-split: under `context` they stay head-split.
+            attention_by_kind: vec![(AttentionClass::Swa, if context { AttentionPlacement::Heads } else { attention }),
+                (AttentionClass::Gqa, attention)],
+            peer_row_bytes: if context { (buffers.query_row_bytes + buffers.partial_row_bytes)
+                * modes.iter().filter(|m| **m == LayerMode::ContextSplit).count() as u64 } else { 0 },
+            onboard_layers: count, max_pool_tokens_no_onboard: None, layers,
             movables: solved.decisions.draft_home.map(|gpu| (MovableId::Drafter, gpu)).into_iter().collect(),
             expert_ranges, residual, hops, tp2,
             items: (0..self.gpus).map(|gpu| solved.items(Location::coordinator(gpu as u8)))
@@ -382,21 +430,42 @@ impl InklingInputs {
         // physical backing per plane that scales with the pool. Local layers
         // keep no pool pages: their window lives in the per-sequence ring.
         let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
+        let page_rows = self.page_rows();
         let mut marks = 0u64;
-        for (layer, &owner) in self.owners.iter().enumerate() {
-            if usize::from(owner) != gpu { continue; }
+        for (layer, &mode) in self.modes.iter().enumerate() {
+            // This rank's share of the layer's KV heads: all of a whole layer it
+            // owns, half of a split layer, none of a layer another GPU owns.
+            let share = match mode {
+                LayerMode::Whole { gpu: owner, .. } if usize::from(owner) == gpu => Some((1u64, 1u64)),
+                LayerMode::Whole { .. } => None,
+                LayerMode::HeadSplit | LayerMode::ContextSplit => Some((1, 2)),
+            };
+            let Some((num, den)) = share else { continue };
             if !cfg.local[layer] {
+                // One page of records on this rank: heads split the row; context
+                // parity interleaves whole pages (page_rows doubles, half land here).
+                let stride = page_rows * kv_row * num / den;
                 for name in ["keys", "values"] {
-                    let stride = PAGE_ROWS * kv_row;
-                    out.push(Component::allocation(Allocation::buffer(format!("inkling2.kv.{layer}.{name}"), location,
+                    out.push(Component::allocation(Allocation::buffer(format!("inkling2.kv.{layer}.{gpu}.{name}"), location,
                         stride, Lifetime::TARGET, Category::Kv, "global-layer paged KV records"),
                         ByteCurve::linear_rounded(stride, stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
                         false, maximum));
                 }
             }
             let state = SequenceState::new(cfg, cfg.local[layer])?;
-            marks = marks.checked_add((state.ring_bytes + state.lag_bytes).checked_mul(sequences)
+            // Rings split by KV head; the hidden-stream conv lags are replicated
+            // under a split (the residual is replicated), the K/V lags split.
+            let ring = state.ring_bytes * num / den;
+            let lags = if den == 1 { state.lag_bytes } else { state.kv_lag_bytes / 2 + (state.lag_bytes - state.kv_lag_bytes) };
+            marks = marks.checked_add((ring + lags).checked_mul(sequences)
                 .ok_or(Refusal::Overflow("Inkling 2 sequence state"))?).ok_or(Refusal::Overflow("Inkling 2 sequence state"))?;
+        }
+        if self.modes.iter().any(|mode| *mode == LayerMode::ContextSplit) {
+            for demand in self.context_buffers().demands().map_err(|error| invalid(error))?
+                .into_iter().filter(|d| usize::from(d.gpu) == gpu) {
+                out.extend(buffer(format!("inkling2.context.{gpu}.{}", demand.group.replace(' ', "_")), location,
+                    demand.bytes, Lifetime::TARGET, demand.category, &demand.group, maximum));
+            }
         }
         // Sliding-window rings and short-conv lag rows for every admitted
         // sequence: the prefix-mark arena a snapshot copies (byte-identical
@@ -404,7 +473,7 @@ impl InklingInputs {
         out.extend(buffer(format!("inkling2.marks.{gpu}"), location, marks, Lifetime::TARGET, Category::Prefix,
             "sliding-window rings and conv lag rows per sequence (geometry formula)", maximum));
         // Page tables for every admitted sequence at the compiled context (global layers only).
-        let pages = u64::from(context).div_ceil(PAGE_ROWS);
+        let pages = u64::from(context).div_ceil(page_rows);
         out.extend(buffer(format!("inkling2.cache.{gpu}.page_table"), location, sequences * pages * 4 + sequences * 8,
             Lifetime::TARGET, Category::Kv, "global-layer page tables and lengths", maximum));
         // One decode lane on every rank (its layers' work), then one owner set
@@ -462,14 +531,19 @@ impl Recipe for InklingInputs {
         let maximum = self.maximum_pages();
         if !(1..=2).contains(&self.gpus) || self.spark_ranks > 8 || maximum == 0 || maximum == u64::MAX
             || request.context.maximum != self.context.maximum || self.targets.len() != self.gpus
-            || self.owners.len() != cfg.layers || self.graph_reserve.len() != self.gpus
+            || self.modes.len() != cfg.layers || self.graph_reserve.len() != self.gpus
             || self.code.len() != self.gpus || self.experts.len() != self.routed.len()
             || self.spark.len() != self.routed.len() + 1 || self.prefill.rows == 0 || self.prefill.waves == 0
             || self.sequences == 0 {
             return Err(invalid("invalid extent or empty domain"));
         }
-        if self.owners.iter().any(|&gpu| usize::from(gpu) >= self.gpus) {
-            return Err(invalid("attention owner outside the coordinator ranks"));
+        if self.modes.iter().any(|mode| match mode {
+            LayerMode::Whole { gpu, .. } => usize::from(*gpu) >= self.gpus,
+            LayerMode::HeadSplit | LayerMode::ContextSplit => self.gpus != 2 }) {
+            return Err(invalid("attention mode outside the coordinator ranks"));
+        }
+        if self.modes != layer_modes(cfg, self.gpus, self.placement) {
+            return Err(invalid("layer modes differ from the resolved attention placement"));
         }
         let pair = self.gpus == 2;
         let head = self.head_gpu();
@@ -607,8 +681,9 @@ impl Recipe for InklingInputs {
             spark_reply_formats: (self.spark_ranks > 0).then(|| SparkReplyFormats {
                 prefill: Some(request.spark_reply_formats.prefill(false)),
                 decode: Some(request.spark_reply_formats.decode()) }),
-            resident_weight_limit: request.resident_weight_limit, page_rows: PAGE_ROWS, pool_page_multiple: 1,
+            resident_weight_limit: request.resident_weight_limit, page_rows: self.page_rows(), pool_page_multiple: 1,
             maximum_pages: maximum, gpus: self.gpus, variables: contract_variables, requires, components };
+        // `page_rows` is the parity-doubled page under context; one backing per plane either way.
         contract.add_driver_page_tables();
         Ok(contract)
     }
@@ -642,16 +717,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn executor_runs_whole_owner_layers_only() {
+    fn executor_admits_every_shared_attention_placement() {
         assert!(INKLING2.runs(WHOLE) && INKLING2.runs(LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }));
+        assert!(INKLING2.runs(LayerMode::HeadSplit) && INKLING2.runs(LayerMode::ContextSplit));
         assert!(!INKLING2.runs(LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }));
-        assert!(!INKLING2.runs(LayerMode::HeadSplit));
-        assert!(!INKLING2.runs(LayerMode::ContextSplit));
-        assert_eq!(INKLING2.attention, AttentionPlacement::Layers);
-        assert_eq!(layer_owners(48, 1), vec![0; 48]);
-        let pair = layer_owners(48, 2);
-        assert_eq!(pair.iter().filter(|&&gpu| gpu == 0).count(), 24);
-        assert!(pair.windows(2).filter(|w| w[0] != w[1]).count() == 1 && pair[47] == 1);
+        assert_eq!(INKLING2.attention_default(), AttentionPlacement::Heads);
+        for placement in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
+            assert_eq!(INKLING2.check_attention(Some(placement), 2, true).unwrap(), placement);
+        }
+        assert_eq!(INKLING2.check_attention(None, 1, false).unwrap(), AttentionPlacement::Heads);
+        let cfg = Inkling2Config::from_hf(&crate::families::inkling2::config::tests::release_config()).unwrap();
+        assert_eq!(layer_modes(&cfg, 1, AttentionPlacement::Context), vec![WHOLE; 48]);
+        assert!(layer_modes(&cfg, 2, AttentionPlacement::Heads).iter().all(|m| *m == LayerMode::HeadSplit));
+        let context = layer_modes(&cfg, 2, AttentionPlacement::Context);
+        assert_eq!(context.iter().filter(|m| **m == LayerMode::ContextSplit).count(), 8);
+        assert!(cfg.global_layers().iter().all(|&layer| context[layer] == LayerMode::ContextSplit));
+        let layers = layer_modes(&cfg, 2, AttentionPlacement::Layers);
+        assert_eq!(layers.iter().filter(|m| matches!(m, LayerMode::Whole { gpu: 0, .. })).count(), 24);
+        assert!(matches!(layers[47], LayerMode::Whole { gpu: 1, .. }));
     }
 
     #[test]
@@ -675,5 +758,6 @@ mod tests {
         let global = SequenceState::new(&cfg, false).unwrap();
         assert_eq!(global.ring_bytes, 0);
         assert_eq!(global.lag_bytes, local.lag_bytes);
+        assert_eq!(local.kv_lag_bytes, 3 * 2 * 2048);
     }
 }

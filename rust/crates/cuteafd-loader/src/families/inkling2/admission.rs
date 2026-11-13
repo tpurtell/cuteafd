@@ -57,6 +57,9 @@ pub struct FactsRequest<'a> {
     pub manifest_path: Option<&'a Path>,
     pub manifest: Option<Arc<serde_json::Value>>,
     pub coordinator: Coordinator,
+    /// The resolved attention placement (`check_attention` on the plan edge,
+    /// the launcher's resolved value at serve).
+    pub attention: crate::placement::AttentionPlacement,
     pub spark_ranks: usize,
     pub spark_bytes: u64,
     pub prefill: PrefillShape,
@@ -171,9 +174,9 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     }
     let shape = request.prefill;
     let routed = (0..cfg.layers).collect::<Vec<_>>();
-    let owners = shared::layer_owners(cfg.layers, gpus);
-    let targets = CoordinatorWeights::plan(request.checkpoint, cfg, gpus,
-        &owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>())
+    let placement = if gpus == 1 { crate::placement::AttentionPlacement::Heads } else { request.attention };
+    let modes = shared::layer_modes(cfg, gpus, placement);
+    let targets = CoordinatorWeights::plan(request.checkpoint, cfg, gpus, &modes)
         .map_err(|error| refused(format!("Inkling 2 target arena inventory refused: {error:#}"),
             "Provide complete BF16 core headers (every shard of the selected view)."))?;
     let mount = targets.iter().map(|target| target.mount_load(request.checkpoint)).collect::<anyhow::Result<Vec<_>>>()
@@ -214,6 +217,8 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, request.spark_bytes)));
     let (host_total, host_available) = request.host;
     budgets.push(crate::placement::families::kimi::host_budget(host_total, host_available));
+    let page_rows = if modes.iter().any(|mode| *mode == crate::placement::LayerMode::ContextSplit) { 2 * shared::PAGE_ROWS }
+        else { shared::PAGE_ROWS };
     // Host prefix pages hold the global layers' K/V; marks hold the rings and
     // conv lags of every layer (byte-identical restores).
     let kv_row = (cfg.kv_heads * cfg.head_dim * 2) as u64;
@@ -224,17 +229,18 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<InklingInputs, Refused> {
     let host_prefix = if request.host_cache_bytes == Some(0) || request.prefix_entries == 0 {
         serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }
     } else {
-        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: shared::PAGE_ROWS, page_bytes, mark_bytes, draft_bytes: 0 };
+        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: page_rows,
+            page_bytes: page_bytes * page_rows / shared::PAGE_ROWS, mark_bytes, draft_bytes: 0 };
         let quota = geometry.resolve(request.host_cache_bytes, context, request.sequences, host_total,
             geometry.chunk_bytes()).unwrap_or(0);
         serving::HostPrefixOwners { quota_bytes: quota, chunk_bytes: geometry.chunk_bytes().min(quota.max(1)) }
     };
     let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
-        shared::PAGE_ROWS).maximum_tokens();
+        page_rows).maximum_tokens();
     Ok(InklingInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
-        maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, owners,
+        maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, placement, modes,
         routed: routed.clone(), experts, local, spark, links,
         spark_reply_formats: request.replies, drafter: None, vision: None, budgets, code, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,

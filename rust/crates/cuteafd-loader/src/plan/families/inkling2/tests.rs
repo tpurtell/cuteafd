@@ -192,10 +192,12 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = Inkling2Config::from_hf(&small).unwrap();
     let routed = (0..cfg.layers).collect::<Vec<_>>();
-    for gpus in [1usize, 2] {
-        let owners = shared::layer_owners(cfg.layers, gpus);
-        let targets = CoordinatorWeights::plan(&checkpoint, &cfg, gpus,
-            &owners.iter().map(|&g| usize::from(g)).collect::<Vec<_>>()).unwrap();
+    use crate::placement::{AttentionPlacement, LayerMode};
+    for (gpus, placement) in [(1usize, AttentionPlacement::Heads), (2, AttentionPlacement::Heads),
+        (2, AttentionPlacement::Context), (2, AttentionPlacement::Layers)] {
+        let modes = shared::layer_modes(&cfg, gpus, placement);
+        let owners = modes.iter().map(|mode| match mode { LayerMode::Whole { gpu, .. } => Some(*gpu), _ => None }).collect::<Vec<_>>();
+        let targets = CoordinatorWeights::plan(&checkpoint, &cfg, gpus, &modes).unwrap();
         let experts = layer_experts(&checkpoint, &cfg).unwrap();
         let ranks = 2;
         let prefill = PrefillShape { rows: 1024, waves: 3 };
@@ -206,7 +208,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             .chain((0..ranks).map(|rank| shared::spark_budget(rank as u8, 100 << 30)))
             .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
         let inputs = InklingInputs { cfg: cfg.clone(), gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
-            maximum_pool_tokens: 4 << 20, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
+            maximum_pool_tokens: 4 << 20, prefill, sequences: 16, targets: targets.clone(), placement, modes: modes.clone(),
             routed: routed.clone(), experts,
             local: LocalPackage::Installed { workspace: [64 << 20, if gpus == 2 { 64 << 20 } else { 0 }] },
             spark: (0..=routed.len()).map(charge).collect(),
@@ -232,13 +234,19 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
                 if template.group == "weight arena" && template.location == Location::coordinator(gpu as u8))).count();
             assert_eq!(arenas, 1, "rtx{gpu}");
         }
-        // KV pages exist for the global layer only, on its attention owner; local layers have none.
-        for (layer, &owner) in owners.iter().enumerate() {
+        // KV pages exist for the global layer only: on its owner under `layers`, on both ranks under a split.
+        for (layer, owner) in owners.iter().enumerate() {
             let homes = contract.components.iter().filter_map(|c| match &c.kind {
                 ComponentKind::Allocation { template, .. } if template.id.starts_with(&format!("inkling2.kv.{layer}.")) =>
                     Some(template.location), _ => None }).collect::<std::collections::BTreeSet<_>>();
             if cfg.local[layer] { assert!(homes.is_empty(), "layer {layer} is sliding-window"); }
-            else { assert_eq!(homes, [Location::coordinator(owner)].into(), "layer {layer}"); }
+            else if let Some(owner) = owner { assert_eq!(homes, [Location::coordinator(*owner)].into(), "layer {layer}"); }
+            else { assert_eq!(homes.len(), 2, "layer {layer} split over the pair: {homes:?}"); }
+        }
+        if placement == AttentionPlacement::Context && gpus == 2 {
+            assert_eq!(contract.page_rows, 2 * shared::PAGE_ROWS, "context parity doubles the page");
+            assert!(contract.components.iter().any(|c| matches!(&c.kind, ComponentKind::Allocation { template, .. }
+                if template.id.starts_with("inkling2.context.0."))), "context exchange owners");
         }
         // The per-sequence ring/lag marks exist on every rank that owns a layer.
         for gpu in 0..gpus {
@@ -246,15 +254,26 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
                 if template.id == format!("inkling2.marks.{gpu}"))), "rtx{gpu} marks");
         }
         let admitted = inputs.admit(request).unwrap();
-        assert!(admitted.solved.pool_tokens >= 1 << 20);
+        assert!(admitted.solved.pool_tokens >= 1 << 20, "{placement:?} on {gpus} GPUs: {}", admitted.solved.pool_tokens);
         assert!(admitted.placement.layers.iter().all(|l| shared::INKLING2.runs(l.mode)));
+        assert_eq!(admitted.placement.attention_placement, if gpus == 2 { placement } else { AttentionPlacement::Heads });
         if gpus == 2 {
             for layer in 0..cfg.layers {
                 let stem = format!("{TEXT}layers.{layer}.mlp_norm.weight");
                 let homes = targets.iter().filter(|t| t.arena.view(&stem).is_some()).map(|t| t.rank).collect::<Vec<_>>();
-                assert_eq!(homes, [usize::from(owners[layer])], "layer {layer}");
+                match owners[layer] {
+                    Some(owner) => assert_eq!(homes, [usize::from(owner)], "layer {layer}"),
+                    None => assert_eq!(homes, [0, 1], "split layer {layer} replicates its norms"),
+                }
+                if owners[layer].is_none() {
+                    // Half the heads' projections per rank, named per rank.
+                    let q = format!("{TEXT}layers.{layer}.attn.wq_du.weight");
+                    assert!(targets[0].arena.view(&format!("{q}#rank0")).is_some() && targets[1].arena.view(&format!("{q}#rank1")).is_some());
+                    assert_eq!(targets[0].arena.view(&format!("{q}#rank0")).unwrap().bytes(), 6144 * 4608 * 2 / 2);
+                }
             }
             assert!(admitted.placement.tp2.is_none_or(|t| t.peak_bytes[0] >= t.peak_bytes[1]));
+            assert_eq!(admitted.placement.peer_row_bytes > 0, placement == AttentionPlacement::Context);
         }
     }
 }
