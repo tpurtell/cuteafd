@@ -14,7 +14,28 @@ source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/cdi-gpus.sh"
 # A failed bounded smoke teardown must be resolved before another launch or
 # dry-run preflight can reuse this coordinator/fabric.
+# A marker whose listed containers are all verifiably absent now (a slow
+# removal finished after teardown gave up) is stale: delete it and go on.
+marker_stale() {
+  local line host container out
+  line="$(python3 -I -c 'import json,sys
+for e in json.load(open(sys.argv[1])): print(e["host"], e["container"])' "$1" 2>/dev/null)" || return 1
+  [[ -n "$line" ]] || return 1
+  while read -r host container; do
+    if [[ "$host" == raptor ]]; then
+      out="$(timeout 10 docker ps -aq --filter "name=^${container}\$" 2>/dev/null)" || return 1
+    else
+      out="$(timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" docker ps -aq --filter "name=^${container}\$" 2>/dev/null)" || return 1
+    fi
+    [[ -z "$out" ]] || return 1
+  done <<<"$line"
+}
 for cleanup_marker in "$HOME"/.cache/cuteafd/instances/*/unconfirmed-containers.json; do
+  [[ -e "$cleanup_marker" ]] || continue
+  if marker_stale "$cleanup_marker"; then
+    echo "cleared stale cleanup marker $cleanup_marker: listed containers are absent" >&2
+    rm -f "$cleanup_marker"
+  fi
   [[ ! -e "$cleanup_marker" ]] || release_die "unconfirmed container teardown: $cleanup_marker: $(cat "$cleanup_marker")"
 done
 namespace_root="$(readlink -f "${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}")"

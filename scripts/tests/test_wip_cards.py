@@ -3529,10 +3529,35 @@ def test_launch_and_preflight_refuse_unconfirmed_cleanup_marker(tmp_path):
     # including the launcher's CPU-only dry-run used by card preflight.
     for args in ([], ['--dry-run', '--total-capacity']):
         result = subprocess.run(['bash', str(ROOT / 'scripts/launch/run-family.sh'), *args],
-                                env={**os.environ, 'HOME': str(home)}, capture_output=True, text=True, timeout=5)
+                                env={**os.environ, 'HOME': str(home), 'PATH': f'{fake_bin(tmp_path, "abc123")}:{os.environ["PATH"]}'},
+                                capture_output=True, text=True, timeout=5)
         assert result.returncode != 0
         assert str(marker) in result.stderr and 'kiwi' in result.stderr
         assert 'unconfirmed container teardown' in result.stderr
+        assert marker.exists()
+    # A marker whose containers are now absent is stale: cleared, launch goes on
+    # (and fails later for lack of a config, not on the marker).
+    for ssh_body in (None, ''):
+        marker.write_text(json.dumps([dict(host='kiwi', container='cuteafd-spark-expert-kiwi-19441')]))
+        path = fake_bin(tmp_path / ('absent' if ssh_body is not None else 'broken'), '', ssh_fails=ssh_body is None)
+        result = subprocess.run(['bash', str(ROOT / 'scripts/launch/run-family.sh'), '--dry-run', '--total-capacity'],
+                                env={**os.environ, 'HOME': str(home), 'PATH': f'{path}:{os.environ["PATH"]}'},
+                                capture_output=True, text=True, timeout=5)
+        if ssh_body is None:  # failed verification keeps refusing
+            assert marker.exists() and 'unconfirmed container teardown' in result.stderr
+        else:
+            assert not marker.exists() and 'cleared stale cleanup marker' in result.stderr
+            assert 'unconfirmed container teardown' not in result.stderr
+
+
+def fake_bin(root, listed, ssh_fails=False):
+    bindir = Path(root) / 'fakebin'
+    bindir.mkdir(parents=True, exist_ok=True)
+    for name in ('ssh', 'docker'):
+        (bindir / name).write_text('#!/bin/sh\nexit 255\n' if ssh_fails and name == 'ssh'
+                                   else f'#!/bin/sh\necho "{listed}"\n')
+        (bindir / name).chmod(0o755)
+    return bindir
 
 
 def test_spark_memory_stream_has_bytes_no_cuda_and_stops_on_eof():
