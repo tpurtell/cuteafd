@@ -807,6 +807,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cuteafd-core",
+ "cuteafd-ffi",
  "libc",
  "libloading",
  "serde",
