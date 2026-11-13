@@ -89,12 +89,12 @@
         "reason": "No 5090 card in this rollout; RTX PRO 6000 columns only."
       },
       "1rtx": {
-        "status": "pending",
-        "reason": "MC original min card pending K8 kernel pin #1903 and measurement (#1906)."
+        "status": "current",
+        "report": "benchmarks/glm5/2026-11-13-smoke-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-original-min-cand-r1"
       },
       "2rtx": {
         "status": "pending",
-        "reason": "MC original max card pending K8 kernel pin #1903 and measurement (#1906)."
+        "reason": "MC original max card awaiting six-Spark measurement (#1906); K8 pin #1903 merged."
       }
     },
     {
@@ -281,12 +281,12 @@
         "reason": "No 5090 card in this rollout; RTX PRO 6000 columns only."
       },
       "1rtx": {
-        "status": "pending",
-        "reason": "MC original min card pending K8 kernel pin #1903 and measurement (#1906)."
+        "status": "current",
+        "report": "benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min-cand-r1"
       },
       "2rtx": {
         "status": "pending",
-        "reason": "MC original max card pending K8 kernel pin #1903 and measurement (#1906)."
+        "reason": "MC original max card awaiting six-Spark measurement (#1906); K8 pin #1903 merged."
       }
     },
     {
