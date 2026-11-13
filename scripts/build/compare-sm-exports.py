@@ -239,6 +239,15 @@ def jobs(scope):
             names.append("scored_index_topk_prefill_m4096")
         result.append((f"dsa-prefill-{geometry}", "export_b12x_dsv4_aot.py",
                        ["--geometry", geometry, "--prefill-rows", "4096", "--only", ",".join(names)]))
+    for label, names in (
+        ("attention", "attention_decode,attention_extend"),
+        ("kv-pack", "kv_pack"),
+        ("index-producer", "index_producer"),
+        ("indexer", "index_decode,index_prefill"),
+    ):
+        result.append((f"minimax-{label}", "export_b12x_dsv4_aot.py",
+                       ["--geometry", "minimax", "--decode-rows", "64",
+                        "--prefill-rows", "4096", "--only", names]))
     if scope == "suspects":
         return result
     for geometry in ("mimo", "mimof"):

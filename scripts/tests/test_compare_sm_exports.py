@@ -16,6 +16,20 @@ compare_sm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(compare_sm)
 
 
+@pytest.mark.parametrize("scope", ["all", "suspects"])
+def test_minimax_adapter_groups_select_only_existing_four_head_programs(scope):
+    jobs = {name: (script, args) for name, script, args in compare_sm.jobs(scope)}
+    for label, selectors in {
+        "attention": "attention_decode,attention_extend",
+        "kv-pack": "kv_pack",
+        "index-producer": "index_producer",
+        "indexer": "index_decode,index_prefill",
+    }.items():
+        assert jobs[f"minimax-{label}"] == ("export_b12x_dsv4_aot.py", [
+            "--geometry", "minimax", "--decode-rows", "64", "--prefill-rows", "4096",
+            "--only", selectors])
+
+
 def cuda_elf(payload=b"kernel"):
     # Minimal CUDA ELF64 with one file-backed section, matching CuTe's images.
     data = bytearray(128 + len(payload))
