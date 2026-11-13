@@ -501,7 +501,7 @@ pub(super) fn request(
 
 fn expert_admission(args: &GoldenArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
     rows: usize, layers: &[usize])
-    -> Result<(SparkWorld, TcpTransportConfig, super::experts::StepExperts)> {
+    -> Result<(SparkAdmission, SparkWorld, TcpTransportConfig, super::experts::StepExperts)> {
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
     let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
@@ -526,7 +526,7 @@ fn expert_admission(args: &GoldenArgs, view: &cuteafd_loader::plan::checkpoint::
     };
     let unit = args.prefill_units.unwrap_or(rows);
     let config = TcpTransportConfig::default();
-    SparkAdmission::plan_view(
+    let admission = SparkAdmission::plan_view(
         view,
         ExpertGeometry::STEP5,
         Some(&catalog),
@@ -541,21 +541,66 @@ fn expert_admission(args: &GoldenArgs, view: &cuteafd_loader::plan::checkpoint::
             SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: format.ingress(), partial_reply_bytes: None },
             u64::from(args.prefill_waves), 1, config.max_frame_bytes)?,
         None,
-    )?
-    .select(&args.peers)?;
-    cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
-        SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: format.ingress(), partial_reply_bytes: None }, 1)?;
-    Ok((world, config, format))
+    )?;
+    Ok((admission, world, config, format))
 }
 
-fn link<'a>(device: Device<'a>, args: &GoldenArgs,
-    view: &cuteafd_loader::plan::checkpoint::CheckpointView, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
-    let (world, config, format) = expert_admission(args, view, rows, layers)?;
-    let warm = super::execution::bootstrap_shape(rows, &format)?;
-    // The widest wave sizes every rank's rings and the exchange staging.
-    let mut link = SparkLink::new_waves(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2, 1, u32::try_from(rows)?)?;
-    link.bootstrap(&warm)?;
-    Ok(RefCell::new(link))
+/// Goldens and serving join the same admitted Spark push group. The load
+/// closure allocates/records final owners before membership; no mount retry.
+fn load_with_experts<'a, T>(args: &GoldenArgs, checkpoint: &Checkpoint,
+    devices: &[Device<'a>], rows: usize, layers: &[usize], load: impl FnOnce() -> Result<T>)
+    -> Result<(T, SparkWorld, TcpTransportConfig, super::experts::StepExperts)> {
+    use crate::shared::experts::rtx::{dense, push::{CoordinatorPush, PushPolicy}};
+    let view = checkpoint.view.as_ref().context("Step-5 golden selected view")?;
+    let (admission, world, config, format) = expert_admission(args, view, rows, layers)?;
+    let policy = PushPolicy::for_snapshot(view.snapshot())?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
+    let mut load = Some(load);
+    let planned = policy.plan(|| -> Result<_> {
+        ensure!(admission.coordinator_pushes(), "Step-5 golden requires admitted coordinator push");
+        let (owners, records) = dense::recording(load.take().context("golden load closure")?)?;
+        let dense = dense::plan_records(view.snapshot(), records, devices, args.peers.len())?;
+        let contract = cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
+        let cfg = Config::parse(checkpoint)?;
+        let envelope = cuteafd_loader::plan::families::step5::admission::push_host_envelope(&contract, &cfg, devices.len())?;
+        let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view, Some(&catalog), devices.len(), None, envelope)?;
+        Ok((owners, dense, push, (streams, ranks)))
+    })?;
+    let (loaded, pending) = match planned {
+        Some((owners, dense, push, ranks)) => {
+            let pending = admission.start_with(&args.peers, Some(ranks))?;
+            let loaded = crate::shared::placement::load_while_admitting(Some(pending), || {
+                let (received, ()) = push.receive_with(devices.to_vec(), Some(&catalog), args.peers.len(), Some(Ok(dense)), || ());
+                policy.committed(received)?;
+                Ok(owners)
+            })?;
+            (loaded, None)
+        }
+        None => (load.take().context("golden mount load closure")?()?, Some(admission.start(&args.peers)?)),
+    };
+    if let Some(pending) = pending { crate::shared::placement::load_while_admitting(Some(pending), || Ok(()))?; }
+    cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
+        SparkEndpoint { ring_depth: None, capacity: args.prefill_units.unwrap_or(rows) as u32,
+            ingress: format.ingress(), partial_reply_bytes: None }, 1)?;
+    Ok((loaded, world, config, format))
+}
+
+fn load_embedding_rows(device: Device<'_>, checkpoint: &Checkpoint, tokens: &[u32],
+    vocab: usize, input: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+    use crate::shared::experts::rtx::dense::{DenseLoad, Job, Rect, Step};
+    ensure!(!tokens.is_empty() && tokens.iter().all(|&token| (token as usize) < vocab)
+        && input.bytes >= tokens.len() * H * 4, "Step-5 golden embedding extent");
+    let dense = DenseLoad::mount(device.library);
+    for (row, &token) in tokens.iter().enumerate() {
+        let source = Rect::tensor(checkpoint, "model.embed_tokens.weight",
+            Some(token as usize..token as usize + 1), None)?;
+        ensure!(source.bytes() == H * 2, "Step-5 golden BF16 embedding row");
+        let dst = cuteafd_ffi::CuteafdDeviceBuffer { ptr: input.ptr.wrapping_byte_add(row * H * 4),
+            bytes: H * 4, ..input };
+        device.run(|| dense.step(Step { device: device.id, rects: vec![source],
+            jobs: vec![Job::Widen { at: 0, bytes: H * 2, dst }] }, std::ptr::null_mut()))?;
+    }
+    Ok(())
 }
 
 const PREFIX_FRONTIERS: [usize; 5] = [63, 64, 65, 575, 576];
@@ -934,8 +979,14 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         RefCell::new(CacheRank::new(devices[1], layout, 1, 1, slots, pages, cache_bytes[1] as usize)?)];
     let stages = [Staging::new_for_units(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize, 1, unit)?,
         Staging::new_for_units(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize, 1, unit)?];
-    let (world, config, format) = expert_admission(args,
-        checkpoint.view.as_ref().context("Step-5 golden requires its selected checkpoint view")?, rows, layers)?;
+    let ((native, input), world, config, format) = load_with_experts(args, checkpoint, &devices, rows, layers, || {
+        let native = Execution::load_native(&programs, checkpoint, &ownership,
+            &[&caches[0], &caches[1]], &[&stages[0], &stages[1]], unit, rows, rows,
+            &available, &reservations, 92)?;
+        let input = Allocation::new(devices[0], rows * H * 4, Tag::workspace("step5/golden-input"))?;
+        load_embedding_rows(devices[0], checkpoint, &reference.tokens, cfg.vocab, input.buffer)?;
+        Ok((native, input))
+    })?;
     let transport = devices[0].own(|| {
         let mut link = SparkLink::new_waves(&library, world, &args.peers, unit as u32,
             config, H * 2, waves, unit as u32)?;
@@ -948,15 +999,12 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 }, None)?);
     let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1,
         |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
-    let mut execution = Execution::load_units(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
-        vec![&stages[0], &stages[1]], unit, rows, available.to_vec(), reservations.to_vec(), Some(transport), 17)?;
+    let mut execution = Execution::bind_native(checkpoint, ownership, native,
+        vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], rows, Some(transport), 92, 17)?;
     if args.poison_scratch { execution.poison_scratch_between_layers(); }
     let retained_layers = reference.hidden.iter().map(|(layer, _)| *layer).chain(args.dump_layers.iter().copied())
         .collect::<Vec<_>>();
     execution.retain_diagnostic_outputs(&retained_layers)?;
-    let embeddings = embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?;
-    let input = Allocation::new(devices[0], rows * H * 4, Tag::workspace("step5/golden-input"))?;
-    devices[0].run(|| library.copy_h2d(input.buffer, &embeddings))?;
     tracing::info!(seconds=started.elapsed().as_secs_f64(), "Step-5 shared readiness");
     if args.graph_oracle {
         execution.configure_graphs(true, None)?;
@@ -1196,22 +1244,41 @@ fn run(args: GoldenArgs) -> Result<()> {
     let prefix_bytes = if args.prefix_state {
         prefix_state_bytes(&layout, rows)?
     } else { 0 };
-    let cache_bytes = layout.ranks[0]
-        .bytes
-        .checked_add(layout.geometry.ranks[0].persistent_unit_bytes * pages)
-        .and_then(|n| n.checked_add(prefix_bytes))
-        .context("golden cache bytes")?;
-    let staging_bytes = Staging::bytes(&layout, 0)? as u64;
-    let input_bytes = (rows * H * 4) as u64;
-    let chain_bytes =
-        TargetChain::required_bytes(&programs, &checkpoint, args.last_layer + 1, rows)?;
+    let cache = super::cache::Reservation::new(&layout, 0, 1, 0, pages, usize::MAX)?;
+    let cache_bytes = super::chain::physical_bytes(&[cache.active as u64, cache.pages as u64])?
+        .checked_add(prefix_bytes).context("golden cache bytes")?;
+    let staging_bytes = super::chain::physical_bytes(&[Staging::bytes(&layout, 0)? as u64])?;
+    let input_bytes = super::chain::physical_bytes(&[(rows * H * 4) as u64])?;
+    let chain_bytes = TargetChain::required_with_head(&programs, &checkpoint,
+        args.last_layer + 1, rows, args.nll)?;
     let head_plan = args.nll.then(|| HeadPlan::prepare(&programs, &checkpoint, rows)).transpose()?;
-    let head_bytes = head_plan.as_ref().map_or(0, HeadPlan::bytes);
-    // Reserve transport construction, transient library use and a separate 2 GiB headroom.
-    let transport = 2u64 << 30;
-    let reserve = pending
-        .checked_add(transport)
-        .and_then(|n| n.checked_add(2u64 << 30))
+    let head_bytes = head_plan.as_ref().map(HeadPlan::cold_workspace_bytes).transpose()?.unwrap_or(0);
+    use cuteafd_loader::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates,
+        planner::{Lifetime, Location}};
+    let config = TcpTransportConfig::default();
+    let link_layout = PreparedSparkLink::endpoint("step5.golden.spark", 0,
+        SparkEndpointOwners { ranks: args.peers.len(), geometry: ExpertGeometry::STEP5,
+            endpoint: SparkEndpoint { ring_depth: None, capacity: rows as u32,
+                ingress: format.ingress(), partial_reply_bytes: None },
+            rings: spark_rings(config.max_frame_bytes)? },
+        1, true, true, SparkIntakeCandidates::from_setting(
+            &std::env::var("CUTEAFD_SPARK_INTAKE").unwrap_or_else(|_| "auto".into()))?,
+        cuteafd_core::SparkReplyFormat::Bf16, Lifetime::TARGET)?;
+    // Charge only physical device backings; endpoint rings and wave controls
+    // are pinned host owners. The existing landing probe selects a candidate.
+    let transport = link_layout.candidates().iter().map(|candidate| {
+        let requests = candidate.owners.iter().filter(|owner|
+            owner.view.is_none() && owner.location == Location::coordinator(0))
+            .map(|owner| owner.bytes).collect::<Vec<_>>();
+        super::chain::physical_bytes(&requests)
+    }).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
+    // Recorded trellis transforms retain one bounded device scratch until
+    // the dense receiver drops; BF16 cores do not allocate this owner.
+    let rank_weights = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::from_checkpoint(&checkpoint, 0, 1)?;
+    let transform_bytes = if rank_weights.core.is_empty() { 0 } else {
+        super::chain::physical_bytes(&[crate::shared::experts::rtx::dense::STEP_BYTES as u64])?
+    };
+    let reserve = pending.checked_add(transport).and_then(|n| n.checked_add(transform_bytes))
         .context("golden reserve")?;
     let total = [
         chain_bytes,
@@ -1224,7 +1291,6 @@ fn run(args: GoldenArgs) -> Result<()> {
     .into_iter()
     .try_fold(0u64, |a, b| a.checked_add(b))
     .context("golden admission overflow")?;
-    ensure!(total <= available, "Step-5 golden needs {total} bytes including weights/workspaces/cache/code/transport/headroom, available {available}");
     tracing::info!(
         rows,
         last_layer = args.last_layer,
@@ -1232,19 +1298,18 @@ fn run(args: GoldenArgs) -> Result<()> {
         head_bytes,
         cache_bytes,
         staging_bytes,
+        input_bytes,
+        pending_code_bytes = pending,
+        transport_bytes = transport,
+        transform_bytes,
         reserve,
         total,
         available,
         "Step-5 cold prefix admission"
     );
+    ensure!(total <= available, "Step-5 golden needs {total} bytes including weights/workspaces/cache/code/transport, available {available}");
     let started = std::time::Instant::now();
-    let link = device.run(|| link(device, &args, &view, rows, &layers))?;
-    let (remaining, _) = library.cuda_memory_info()?;
-    let owners = chain_bytes + head_bytes + cache_bytes + staging_bytes + input_bytes + pending + (2u64 << 30);
-    ensure!(
-        owners <= remaining as u64,
-        "Step-5 golden live transport left insufficient admitted owner storage"
-    );
+    let remaining = available as usize;
     let cache = RefCell::new(CacheRank::new(device, layout, 0, 1, 0, pages, remaining)?);
     let staging = Staging::new(device, &programs, &cache.borrow(), remaining)?;
     let family = Step5Prefix::new(vec![&cache])?;
@@ -1265,21 +1330,21 @@ fn run(args: GoldenArgs) -> Result<()> {
             committed: 0,
         })?
         .placement;
-    let mut chain = TargetChain::load(
-        device,
-        &programs,
-        &checkpoint,
-        args.last_layer + 1,
-        rows,
-        available,
-        &[head_bytes, cache_bytes, staging_bytes, input_bytes, reserve], args.kv_cache)?;
-    let head = head_plan.map(|plan| TargetHeadOwner::load(device, &programs, &checkpoint, plan,
-        available, &[chain_bytes, cache_bytes, staging_bytes, input_bytes, reserve])).transpose()?;
-    let input = Allocation::new(device, rows * H * 4, Tag::workspace("step5/golden-input"))?;
-    library.copy_h2d(
-        input.buffer,
-        &embedding_rows(&checkpoint, &tokens, cfg.vocab)?,
-    )?;
+    let ((mut chain, head, input), world, config, format) = load_with_experts(&args, &checkpoint,
+        &[device], rows, &layers, || {
+        let chain = TargetChain::load_with_head(device, &programs, &checkpoint, args.last_layer + 1, rows,
+            available, &[head_bytes, cache_bytes, staging_bytes, input_bytes, reserve], args.kv_cache, args.nll)?;
+        let head = head_plan.map(|plan| TargetHeadOwner::load_in(device, &programs, &checkpoint, plan,
+            available, &[], None, Some(chain.weight_arena()))).transpose()?;
+        let input = Allocation::new(device, rows * H * 4, Tag::workspace("step5/golden-input"))?;
+        load_embedding_rows(device, &checkpoint, &tokens, cfg.vocab, input.buffer)?;
+        Ok((chain, head, input))
+    })?;
+    let link = device.run(|| {
+        let mut link = SparkLink::prepared(device.library, world, &args.peers, config, link_layout)?;
+        link.bootstrap(&super::execution::bootstrap_shape(rows, &format)?)?;
+        Ok(RefCell::new(link))
+    })?;
     tracing::info!(
         seconds = started.elapsed().as_secs_f64(),
         "Step-5 cold prefix readiness"
