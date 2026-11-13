@@ -11,6 +11,7 @@ pub mod deepseek_v41;
 pub mod glm5;
 pub mod glm5_flash;
 pub mod kimi;
+pub mod minimax_m3;
 pub mod qwen4;
 pub mod qwen3_5;
 pub mod mimo_v2;
