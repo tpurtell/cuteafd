@@ -255,7 +255,11 @@ fn receive_sets_rank<'a, D: PushDestination<Delivered = ()>>(
         let arena = tp2.iter().map(|(_, plan, checked)| {
             join_stage(group, rank, device.id, "expert arena", plan.layout.bytes(), || {
                 let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank)?)?;
-                plan.scales.destination(device, plan.layout.clone(), expected)
+                let layout = match &plan.fp8 {
+                    Some(fp8) => fp8.arena_layout(device.id)?,
+                    None => plan.layout.clone(),
+                };
+                plan.scales.destination(device, layout, expected)
             })
         }).collect::<Result<Vec<_>>>()?;
         let arena = if arena.is_empty() { None } else { Some(Sets::new(arena)?) };

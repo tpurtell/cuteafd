@@ -257,7 +257,7 @@ impl<'a> Fp8Layer<'a> {
                 let name = format!("{name}.plane.{index}");
                 match &region._storage {
                     Fp8Storage::Owned { _allocation } => _allocation.inventory(inventory, &name)?,
-                    Fp8Storage::Shared { _arena } => inventory.backed_device(&name, region.buffer, _arena.allocation_buffer())?,
+                    Fp8Storage::Shared { _arena } => _arena.inventory_view(inventory, &name, region.buffer)?,
                 }
             }
         }
@@ -1023,6 +1023,61 @@ mod tests {
                         }
                         drop(layers);
                     }
+                }
+            }
+        }
+        assert_eq!(native.device_free_mismatch(&library)?.0, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pushed_native_receipts_and_bytes_match_mount_arena() -> anyhow::Result<()> {
+        use super::*;
+        use crate::shared::{experts::rtx::push::{tests::receive_pushed, dense::Records},
+            memory::{device::Device, push_coordinator::CoordinatorExpertPlan, receipts::Inventory}};
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
+        let native = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = native.load()?;
+        native.immediate_copies(&library)?;
+        native.strict_device_free(&library, true)?;
+        let device = Device { library: &library, id: 1 };
+        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
+            let root = tempfile::tempdir()?;
+            let catalog = crate::shared::memory::push_fp8::tests::fixture(root.path(), format, false)?;
+            let tensors = catalog.fp8().unwrap().for_coordinator();
+            for world in [1, 2] {
+                for rank in 0..world {
+                    let slicing = tensors.exact_slicing(world);
+                    let arena = super::super::weight_layout::arena(device, "fp8",
+                        regions(&tensors, &[1, 2], world, rank, slicing)?)?;
+                    let layout = arena.layout().clone();
+                    let mounted = device.run(|| [1, 2].into_iter().map(|layer|
+                        Fp8Layer::load_into(&library, &tensors.for_layer_metadata(layer)?, layer,
+                            world, rank, slicing, &arena)).collect::<Result<Vec<_>>>())?;
+                    let plan = if world == 1 { CoordinatorExpertPlan::whole_native(&catalog, &[1, 2], usize::MAX)? }
+                        else { CoordinatorExpertPlan::new(&catalog, &[1, 2], rank, usize::MAX)? };
+                    let sockets = tempfile::tempdir()?;
+                    let pushed = receive_pushed(device, Some(&catalog), root.path(), sockets.path(),
+                        &Records::default(), Some(plan), 0, rank)?;
+                    let pushed = pushed.fp8()?;
+                    let mut inventory = Inventory::new(CoordinatorDevices::new(&[1])?, "fixture",
+                        Lifetime::TARGET, cuteafd_core::memory_layout::Category::Experts, "expert fixture");
+                    for (mount, push) in mounted.iter().zip(pushed) {
+                        push.allocation_receipts(&mut inventory, &format!("layer.{}", push.layer))?;
+                        for (mount, push) in mount.regions.iter().zip(&push.regions) {
+                            assert_eq!(mount.is_some(), push.is_some());
+                            if let (Some(mount), Some(push)) = (mount, push) {
+                                let mut expected = vec![0; mount.buffer.bytes];
+                                let mut actual = vec![0; push.buffer.bytes];
+                                device.run(|| {
+                                    library.copy_d2h(&mut expected, mount.buffer)?;
+                                    library.copy_d2h(&mut actual, push.buffer)
+                                })?;
+                                assert_eq!(actual, expected, "{format:?} TP{world} rank {rank}");
+                            }
+                        }
+                    }
+                    super::super::weight_layout::assert_receipts(&inventory.receipts, &[layout])?;
                 }
             }
         }

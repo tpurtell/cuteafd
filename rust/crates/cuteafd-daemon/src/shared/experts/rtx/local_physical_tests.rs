@@ -326,10 +326,9 @@ fn glm_fp8_package_physical_weights_equal_mount_and_push() -> Result<()> {
                 } else {
                     let plan = RankPlan::from_tensors(&tensors,
                         &selected.layers.iter().map(|&layer| (layer,slicing)).collect::<Vec<_>>(), 2, rank, usize::MAX)?;
-                    let sizes = plan.layers.iter().map(|layer| layer.planes.iter().map(|plane| plane.end).max().unwrap()
-                        - layer.planes.iter().filter(|plane| !plane.is_empty()).map(|plane| plane.start).min().unwrap())
-                        .collect::<Vec<_>>();
-                    let arena = ready(device, sizes)?;
+                    let arena = Rc::new(LoadingArena::new(device, plan.arena_layout(device.id)?,
+                        ExpectedCoverage::default(), cuteafd_core::memory_layout::ArenaTag::experts("experts/fixture"))?
+                        .done()?.initialize(|_| Ok(()))?);
                     plan.layers.iter().enumerate().map(|(index, layer)| Fp8Layer::from_push(arena.clone(), index, layer,
                         plan.layout.region(index)?.start)).collect::<Result<Vec<_>>>()?
                 };

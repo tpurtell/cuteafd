@@ -104,7 +104,7 @@ fn receive<'a>(
     let joined = (|| -> Result<_> {
         let started = std::time::Instant::now();
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
-        let arena = LoadingArena::new(device, plan.layout.clone(), expected, ArenaTag::experts("experts/spark-fp8"))?;
+        let arena = LoadingArena::new(device, plan.arena_layout(device.id)?, expected, ArenaTag::experts("experts/spark-fp8"))?;
         let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, Tag::staging("experts/spark-push-ring"))?;
         let allocated = started.elapsed();
         let rank = client.join(JoinArgs {
