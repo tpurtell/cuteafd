@@ -5864,7 +5864,10 @@ mod prefill_lane_tests {
             // Fork 417f09fc appends an optional runtime SM scalar in the Python launch helper
             // only for flagged indexer programs; decode projections set no such metadata.
             // Projection shapes, arithmetic routes and capacity thresholds are unchanged.
-            ("integration/cuteafd/_common.py", 0x47fa_7c5a_585a_eb49),
+            // Fork #293 adds Inkling2Geometry and INKLING2_SMALL only (+51/-0);
+            // GLM Flash geometry, projection routes and thresholds are unchanged,
+            // and the all-family audit shows every glmf object identical.
+            ("integration/cuteafd/_common.py", 0x6d86_10c4_6149_d019),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
             // Fork #71 adds Step-5 DECODE_TMA_TILES keys (4096,12288), (4096,6144), (384,4096) and
