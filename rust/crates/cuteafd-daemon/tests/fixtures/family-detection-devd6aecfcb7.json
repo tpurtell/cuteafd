@@ -82,6 +82,11 @@
       "family": "glm5"
     },
     {
+      "model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
+      "revision": "c39486376dee84e5faa4904e014e07d7b6e76405",
+      "family": "glm5"
+    },
+    {
       "model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
       "revision": "47af23347db743b4666d952e2eb48f2b01c3fede",
       "family": "glm5"
@@ -129,6 +134,11 @@
     {
       "model": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6",
       "revision": "83d47a384eabc07ea6fcfaac4779b0e5f013ce89",
+      "family": "step5"
+    },
+    {
+      "model": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
+      "revision": "4483a4bd874e8c360aec486ea72bd31d1ad7a247",
       "family": "step5"
     },
     {

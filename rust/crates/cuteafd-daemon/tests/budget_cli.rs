@@ -972,7 +972,7 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
     let matrix: serde_json::Value = serde_json::from_slice(
         &std::fs::read(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
     let retired = retired_configs(&matrix);
-    // Captured by running this detector test on the actual devd6aecfcb7 tree.
+    // Original detector baseline, extended with verified published MC configurations.
     let baseline: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/family-detection-devd6aecfcb7.json")).unwrap();
     let expected = baseline["results"].as_array().unwrap().iter().map(|entry|
@@ -1028,7 +1028,7 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
     assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
         .collect::<std::collections::BTreeSet<_>>(), expected_installed);
-    assert_eq!(tested, 27, "installed checkpoint revision set changed");
+    assert_eq!(tested, 29, "installed checkpoint revision set changed");
     eprintln!("family detection baselined6aecfcb7: {tested} installed checkpoint revisions unchanged");
 }
 
