@@ -33,6 +33,20 @@ impl Tp2Rows {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Destination {
+    Routed(*mut c_void),
+    Shared { shared: *const c_void, output: *mut c_void },
+}
+impl Destination {
+    fn reduction(self, scratch: *mut c_void) -> *mut c_void {
+        match self { Self::Routed(output) => output, Self::Shared { .. } => scratch }
+    }
+    fn shared_add(self) -> Option<(*const c_void, *mut c_void)> {
+        match self { Self::Routed(_) => None, Self::Shared { shared, output } => Some((shared, output)) }
+    }
+}
+
 /// TP2 routed halves reduce only onto the whole-attention owner. The next
 /// broadcast cannot overtake that owner's sum, so both rank workspaces are
 /// serialized without a host synchronization on the request path.
@@ -148,9 +162,27 @@ impl<'a> OwnerTp2<'a> {
     /// except the read-only operands, and stay live until both streams drain.
     pub(crate) unsafe fn enqueue(&mut self, owner: usize, layer: usize, rows: usize, input: *const c_void,
         routes: crate::shared::experts::rtx::Routes, shared: *const c_void, output: *mut c_void) -> Result<()> {
-        self.exchange.require_live()?;
         // SAFETY: forwards the retained input/output and ordering contract.
-        let result = unsafe { self.enqueue_live(owner, layer, rows, input, routes, shared, output) };
+        unsafe { self.enqueue_destination(owner, layer, rows, input, routes, Destination::Shared { shared, output }) }
+    }
+
+    /// Routed-only reduction; the family owns its single shared add and residual update.
+    ///
+    /// # Safety
+    /// Input/routes/output belong to owner, cover rows and are disjoint. All
+    /// operands stay live until both exchange streams drain; order their producer
+    /// and consumer against exchange.stream(owner).
+    pub(crate) unsafe fn enqueue_routed(&mut self, owner: usize, layer: usize, rows: usize,
+        input: *const c_void, routes: crate::shared::experts::rtx::Routes, output: *mut c_void) -> Result<()> {
+        // SAFETY: forwards the same retained operands without a shared-add operand.
+        unsafe { self.enqueue_destination(owner, layer, rows, input, routes, Destination::Routed(output)) }
+    }
+
+    unsafe fn enqueue_destination(&mut self, owner: usize, layer: usize, rows: usize, input: *const c_void,
+        routes: crate::shared::experts::rtx::Routes, destination: Destination) -> Result<()> {
+        self.exchange.require_live()?;
+        // SAFETY: caller retains and orders the selected reduction/add destination.
+        let result = unsafe { self.enqueue_live(owner, layer, rows, input, routes, destination) };
         if result.is_err() {
             // Publish independently, but the whole-engine boundary owns drainage.
             let aborted = match self.exchange.terminal_state() {
@@ -163,7 +195,7 @@ impl<'a> OwnerTp2<'a> {
     }
 
     unsafe fn enqueue_live(&mut self, owner: usize, layer: usize, rows: usize, input: *const c_void,
-        routes: crate::shared::experts::rtx::Routes, shared: *const c_void, output: *mut c_void) -> Result<()> {
+        routes: crate::shared::experts::rtx::Routes, destination: Destination) -> Result<()> {
         use crate::shared::experts::rtx::PartialDtype;
         ensure!(owner < 2 && (1..=self.max_rows).contains(&rows), "invalid owner TP2 owner/rows");
         let peer = 1 - owner;
@@ -209,8 +241,12 @@ impl<'a> OwnerTp2<'a> {
         self.ranks[owner].run(|| {
             // SAFETY: rank partials arrived on owner; reduction/output storage is disjoint and retained.
             unsafe {
-                self.combine[owner].sum(rank0, rank1, self.reduced[owner].buffer.ptr.cast(), rows * self.hidden, dtype, stream)?;
-                self.library.peer_add_bf16(self.reduced[owner].buffer.ptr, shared, output, rows * self.hidden, stream)
+                let reduced = destination.reduction(self.reduced[owner].buffer.ptr);
+                self.combine[owner].sum(rank0, rank1, reduced.cast(), rows * self.hidden, dtype, stream)?;
+                if let Some((shared, output)) = destination.shared_add() {
+                    self.library.peer_add_bf16(reduced, shared, output, rows * self.hidden, stream)?;
+                }
+                Ok(())
             }
         })
     }
@@ -248,6 +284,19 @@ impl Drop for OwnerTp2<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_destination_is_direct_and_never_adds_the_shared_expert() {
+        let scratch = 16usize as *mut c_void;
+        let output = 32usize as *mut c_void;
+        let shared = 48usize as *const c_void;
+        let routed = Destination::Routed(output);
+        assert_eq!(routed.reduction(scratch), output);
+        assert!(routed.shared_add().is_none());
+        let combined = Destination::Shared { shared, output };
+        assert_eq!(combined.reduction(scratch), scratch);
+        assert_eq!(combined.shared_add(), Some((shared, output)));
+    }
 
     #[test]
     fn tp2_payloads_pad_routes_and_check_extents() -> Result<()> {

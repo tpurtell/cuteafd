@@ -97,6 +97,40 @@ impl<'a> Whole<'a> {
         Ok(Self { completion, device, layers, max_rows, workspace_bytes: plan.workspace_bytes,
             experts, output })
     }
+
+    /// Routed-only BF16 output, ordered before the family's shared add on stream.
+    ///
+    /// # Safety
+    /// The trait's enqueue contract applies. Output is disjoint, rank-local,
+    /// holds rows*hidden BF16 elements and survives the stream's drainage.
+    pub(crate) unsafe fn enqueue_routed(&mut self, layer: usize, rows: usize, input: ExpertInput,
+        routes: Routes, output: *mut c_void, stream: *mut c_void, abort: &mut dyn FnMut()) -> Result<()> {
+        // SAFETY: caller retains input/routes and serializes this backend's scratch.
+        let result = unsafe { self.run(layer, rows, input, routes, stream) }.and_then(|()| {
+            let bytes = rows.checked_mul(self.experts.module.info().hidden).and_then(|n| n.checked_mul(2))
+                .context("whole routed output extent")?;
+            let source = cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..self.output.buffer };
+            let destination = cuteafd_ffi::CuteafdDeviceBuffer { ptr: output, ..source };
+            self.device.run(|| {
+                // SAFETY: caller retains the distinct output, on the producer's ordered stream.
+                unsafe { crate::shared::memory::device::copy_device_ordered(self.device.library,
+                    destination, source, bytes, stream) }
+            })
+        });
+        // Retire neither the source nor the package before its final copy has drained.
+        self.completion.finish(result, stream, abort)
+    }
+
+    unsafe fn run(&mut self, layer: usize, rows: usize, input: ExpertInput, routes: Routes,
+        stream: *mut c_void) -> Result<()> {
+        ensure!((1..=self.max_rows).contains(&rows), "whole expert rows exceed admitted capacity");
+        let index = super::resident_index(&self.layers, layer)?;
+        let ExpertInput::Bf16(input) = input else { bail!("whole FP8-family experts require BF16 input") };
+        self.device.run(|| {
+            // SAFETY: caller retains rank-local input/routes and serializes scratch/output reuse.
+            unsafe { self.experts.run_bf16(index, rows, input, routes.ids, routes.weights, self.output(), stream) }
+        })
+    }
 }
 
 impl RtxExpertLayer for Whole<'_> {
@@ -131,15 +165,8 @@ impl RtxExpertLayer for Whole<'_> {
 
     unsafe fn enqueue(&mut self, layer: usize, rows: usize, input: ExpertInput, routes: Routes,
         stream: *mut c_void, abort: &mut dyn FnMut()) -> Result<()> {
-        let result = (|| {
-            ensure!((1..=self.max_rows).contains(&rows), "whole expert rows exceed admitted capacity");
-            let index = super::resident_index(&self.layers, layer)?;
-            let ExpertInput::Bf16(input) = input else { bail!("whole FP8-family experts require BF16 input") };
-            self.device.run(|| {
-                // SAFETY: caller retains rank-local input/routes and serializes scratch/output reuse.
-                unsafe { self.experts.run_bf16(index, rows, input, routes.ids, routes.weights, self.output(), stream) }
-            })
-        })();
+        // SAFETY: forwards the trait's retained rank-local operand contract.
+        let result = unsafe { self.run(layer, rows, input, routes, stream) };
         self.completion.finish(result, stream, abort)
     }
 }
