@@ -224,8 +224,8 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
                 cuteafd_ffi::expert_usage::UsagePhase::Prefill)?;
             // SAFETY: router initialized retained route ids on this tally's
             // ordered owner stream; the shared executor pins the unit.
-            unsafe { tally.record(owner.plane("route_ids")?.ptr, unit.rows.len(), None,
-                u32::MAX, true, owner.stream.raw)?; }
+            owner.stream.device.run(|| unsafe { tally.record(owner.plane("route_ids")?.ptr,
+                unit.rows.len(), None, u32::MAX, true, owner.stream.raw) })?;
         }
         Ok(())
     }
@@ -427,7 +427,8 @@ impl<'a> ServingPrefill<'a> {
                             cuteafd_ffi::expert_usage::UsagePhase::Decode)?;
                         // SAFETY: router initialized retained route ids; the tally
                         // and this arithmetic owner share the same ordered stream.
-                        unsafe { tally.record(owner.plane("route_ids")?.ptr, rows, None, u32::MAX, true, owner.stream.raw)?; }
+                        owner.stream.device.run(|| unsafe { tally.record(owner.plane("route_ids")?.ptr,
+                            rows, None, u32::MAX, true, owner.stream.raw) })?;
                     }
                     let identity = self.next_identity;
                     self.next_identity = identity.checked_add(1).context("MiniMax dispatch identity exhausted")?;

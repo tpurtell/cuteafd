@@ -12,6 +12,8 @@ use cuteafd_loader::families::minimax_m3::MiniMaxM3Config;
 use cuteafd_transport::ExpertV2SourceKind;
 use std::{cell::{Cell, RefCell}, collections::{BTreeMap, BTreeSet}, ops::Range, path::Path};
 
+const MESSAGE_STARTS: &[&str] = &["]~b]"];
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum BackendError {
     #[error("MiniMax neural/speculative drafts are not qualified")]
@@ -111,7 +113,11 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     fn identity(&self, placement: &Placement) -> Result<u64> {
         self.identities.borrow().get(&placement.slot).copied().context("MiniMax request is not bound")
     }
-    fn drain(&self) -> Result<()> { self.execution.borrow().drain(&self.owners.storage) }
+    fn drain(&self) -> Result<()> {
+        let result = self.execution.borrow().drain(&self.owners.storage);
+        if result.is_err() { self.terminal.set(true); }
+        result
+    }
     fn completed<T>(&self, result: Result<T>) -> Result<T> {
         if result.is_err() { self.terminal.set(true); }
         let drain = self.drain();
@@ -162,12 +168,15 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             &mut requests, false, consume);
         self.completed(result)?;
         drop(requests);
-        for ((placement, _), next) in sequences.iter_mut().zip(placements) {
-            let mut next = next;
-            self.owners.storage.prefix.bind(&mut next).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            **placement = next;
-        }
-        self.drain()
+        let published = (|| {
+            for ((placement, _), next) in sequences.iter_mut().zip(placements) {
+                let mut next = next;
+                self.owners.storage.prefix.bind(&mut next).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                **placement = next;
+            }
+            Ok(())
+        })();
+        self.completed(published)
     }
 
     fn decode(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
@@ -191,8 +200,8 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
 }
 impl Drop for MiniMaxBackend<'_, '_> {
     fn drop(&mut self) {
-        self.pending.get_mut().take();
         let _ = self.drain();
+        self.pending.get_mut().take();
     }
 }
 
@@ -211,7 +220,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             slots: state.capacity.decode.requests as usize, prefill_rows: state.capacity.prefill.rows as usize,
             decode_rows: state.capacity.decode.rows as usize, full_prefill_logits: false }
     }
-    fn message_starts(&self) -> &[&str] { &["]~b]"] }
+    fn message_starts(&self) -> &[&str] { MESSAGE_STARTS }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.owners.storage.ranks[0].decode.borrow().stream.device.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
@@ -384,6 +393,15 @@ mod tests {
         placement::families::minimax_m3::RequestCapacity};
     use std::rc::Rc;
 
+    #[test]
+    fn message_start_is_the_served_checkpoints_single_added_token() -> Result<()> {
+        assert_eq!(MESSAGE_STARTS, &["]~b]"]);
+        let snapshot = Path::new("/mnt/sparknest/hf-home/hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e");
+        if !snapshot.join("tokenizer.json").is_file() { return Ok(()); }
+        assert_eq!(crate::shared::prefix::marker_ids(snapshot, MESSAGE_STARTS)?, vec![200_019]);
+        Ok(())
+    }
+
     fn family(library: &NativeLibrary) -> Result<(Rc<super::super::cache::PageBank<'_>>, MiniMaxPrefix<'_>)> {
         let mut cfg = MiniMaxM3Config::from_hf(&serde_json::from_str(include_str!(
             "../../../../cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?)?;
@@ -407,7 +425,7 @@ mod tests {
         let local = position % PAGE_ROWS;
         let (offset, bytes) = if plane == "index" {
             (if head == 0 { local * 128 } else { 8192 + local * 4 }, if head == 0 { 128 } else { 4 })
-        } else { (head * PAGE_ROWS * 128 + local * 128, 128) };
+        } else { ((local * 4 + head) * 128, 128) };
         super::super::cache::view(page, offset, bytes)
     }
     // Explicit CPU arithmetic model, not a successful CUDA-kernel stub. Each
@@ -470,51 +488,111 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn deepest_prompt_turn_snapshot_plus_suffix_matches_cold_prefill_byte_exactly() -> Result<()> {
+    fn assert_live_rows_equal(bank: &super::super::cache::PageBank<'_>, a: &Placement,
+        b: &Placement, positions: Range<usize>) -> Result<()> {
+        assert_eq!(a.len, b.len);
+        for layer in bank.layers.clone() {
+            for position in positions.clone() {
+                for plane in ["keys", "values", "index"] {
+                    for head in 0..if plane == "index" { 2 } else { 4 } {
+                        assert_eq!(read(bank, row(bank, a, layer, plane, position, head)?)?,
+                            read(bank, row(bank, b, layer, plane, position, head)?)?,
+                            "layer {layer} plane {plane} row {position} head {head}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    // CPU-model logits deliberately depend on every plane of the last causal
+    // row. This exercises snapshot continuation, not native CUDA numerics.
+    fn model_logits(bank: &super::super::cache::PageBank<'_>, placement: &Placement) -> Result<Vec<u8>> {
+        let mut output = vec![0u8; 32];
+        for layer in bank.layers.clone() {
+            for plane in ["keys", "values", "index"] {
+                for head in 0..if plane == "index" { 2 } else { 4 } {
+                    for (column, byte) in read(bank, row(bank, placement, layer, plane, placement.len - 1, head)?)?
+                        .into_iter().enumerate() {
+                        let index = (column + layer + head) % output.len();
+                        output[index] = output[index].wrapping_mul(17).wrapping_add(byte);
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+    fn continuation(resume: usize, end: usize) -> Result<()> {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
         let (bank, family) = family(&library)?;
         let mut cache: PrefixCache<CudaCopyEngine<'_>> = PrefixCache::new(family.layout(), PrefixConfig {
             entries: 8, mark_slots: 0, keep_logits: true, min_tokens: 1 }, None)?;
-        let tokens = (0..201).map(|i| (i * 73 + i / 7) as u32 % 251).collect::<Vec<_>>();
+        let tokens = (0..end).map(|i| (i * 73 + i / 7) as u32 % 251).collect::<Vec<_>>();
         let mut original = cache.admit(&family, &tokens[..65], 256, false,
             |units| Placement { units, slot: 0, len: 0 })?.placement;
         append(&family, &bank, &mut original, &tokens[..65])?;
         assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens[..65], &original,
             After::from_logits(&[0.0, 1.0], true))?);
-        append(&family, &bank, &mut original, &tokens[65..129])?;
-        assert!(cache.capture(&family, SnapshotKind::Turn, &tokens[..129], &original,
-            After::from_logits(&[1.0, 0.0], true))?);
-        // The live turn writes a different tail after the retained snapshot.
+        let kind = if resume == 129 {
+            append(&family, &bank, &mut original, &tokens[65..129])?;
+            assert!(cache.capture(&family, SnapshotKind::Turn, &tokens[..129], &original,
+                After::from_logits(&[1.0, 0.0], true))?);
+            SnapshotKind::Turn
+        } else { assert_eq!(resume, 65); SnapshotKind::Prompt };
+        // The old live request dirties more than forty rows after its snapshot.
         append(&family, &bank, &mut original, &[239; 41])?;
         cache.release(&family, &original.units)?;
         let hit = cache.admit(&family, &tokens, 256, false,
             |units| Placement { units, slot: 1, len: 0 })?;
-        assert_eq!(hit.resume, 129);
-        assert_eq!(hit.source.as_ref().unwrap().kind, SnapshotKind::Turn);
+        assert_eq!(hit.resume, resume);
+        assert_eq!(hit.source.as_ref().unwrap().kind, kind);
         assert!(hit.source.as_ref().unwrap().plan.exact());
         let mut restored = hit.placement;
         binding(&bank, &restored)?;
-        append(&family, &bank, &mut restored, &tokens[hit.resume..])?;
         let mut cold = cache.admit_cold(&family, tokens.len(), 256,
             |units| Placement { units, slot: 2, len: 0 })?.placement;
-        append(&family, &bank, &mut cold, &tokens)?;
-        for (&restored, &cold) in restored.units.iter().zip(&cold.units) {
-            for layer in bank.layers.clone() {
-                for (plane, _) in super::super::cache::PAGE_PLANES {
-                    assert_eq!(read(&bank, bank.page(layer, plane, restored)?)?,
-                        read(&bank, bank.page(layer, plane, cold)?)?, "layer {layer} plane {plane}");
+        append(&family, &bank, &mut cold, &tokens[..resume])?;
+        assert_live_rows_equal(&bank, &restored, &cold, 0..resume)?;
+        assert_eq!(model_logits(&bank, &restored)?, model_logits(&bank, &cold)?);
+        assert!(end - resume > 40 && end / PAGE_ROWS > resume / PAGE_ROWS);
+        for position in resume..end {
+            append(&family, &bank, &mut restored, &tokens[position..position + 1])?;
+            append(&family, &bank, &mut cold, &tokens[position..position + 1])?;
+            assert_eq!(model_logits(&bank, &restored)?, model_logits(&bank, &cold)?, "position {position}");
+            assert_live_rows_equal(&bank, &restored, &cold, position..position + 1)?;
+        }
+        assert_live_rows_equal(&bank, &restored, &cold, 0..end)?;
+        // Noncausal recycled tails are not logical state. The native scalar-K
+        // poison oracle qualifies their masking separately; never zero on restore.
+        // At an aligned end, every byte is live and the complete pages must match.
+        if end % PAGE_ROWS == 0 {
+            for (&restored, &cold) in restored.units.iter().zip(&cold.units) {
+                for layer in bank.layers.clone() {
+                    for (plane, _) in super::super::cache::PAGE_PLANES {
+                        assert_eq!(read(&bank, bank.page(layer, plane, restored)?)?,
+                            read(&bank, bank.page(layer, plane, cold)?)?, "layer {layer} plane {plane}");
+                    }
                 }
             }
         }
-        assert_eq!((restored.len, cold.len), (tokens.len(), tokens.len()));
+        assert_eq!((restored.len, cold.len), (end, end));
         cache.release(&family, &restored.units)?;
         cache.release(&family, &cold.units)?;
         cache.clear(&family)?;
         assert_eq!(cache.pool().used(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn cpu_model_prompt65_continuation_matches_cold_per_step_and_aligned_pages() -> Result<()> {
+        continuation(65, 201)?;
+        continuation(65, 256)
+    }
+    #[test]
+    fn cpu_model_deepest_turn129_continuation_matches_cold_per_step_and_aligned_pages() -> Result<()> {
+        continuation(129, 201)?;
+        continuation(129, 256)
     }
 
     #[test]
