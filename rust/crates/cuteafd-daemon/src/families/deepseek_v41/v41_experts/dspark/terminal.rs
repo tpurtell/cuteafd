@@ -368,9 +368,7 @@ impl DsparkTerminal<'_, '_> {
             return unsafe { self.execute(requests) };
         };
         unsafe {
-            self.stream
-                .library
-                .cuda_graph_launch(graph, self.stream.raw)?;
+            crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw)?;
         }
         self.synchronize()?;
         self.ready_requests = Some(requests);

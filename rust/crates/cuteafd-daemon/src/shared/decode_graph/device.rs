@@ -2370,7 +2370,7 @@ mod observer_tests {
         let weak = controllers.each_ref().map(Arc::downgrade);
         let mut lanes = Vec::new();
         for (rank, &device) in devices.iter().enumerate() {
-            let mut lane = GraphBank::<u64, ()>::new(None);
+            let mut lane = GraphBank::<u64, ()>::new();
             let site = Site { name: "kimi_k3.step", cycle: Cycle::Other,
                 preference: Preference::Adaptive, bootstrap: 10, basis: Basis::Bytes,
                 spans_devices: true };

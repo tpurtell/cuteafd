@@ -1,7 +1,7 @@
 //! CSA2 source weights, immutable proposal execution and accepted-prefix state.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::shared::memory::row_window::RowWindow;
-use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphPolicy};
+use crate::shared::decode_graph::{GraphBank, GraphOwner};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Compressor, V41Kv};
@@ -363,7 +363,7 @@ impl<'a> CompressorWeights<'a> {
             staging: HostAllocation::new(self.library, unit * if self.ratio == 2 { 16 } else { 8 }, Tag::staging("v41/compressor"))?,
             capacity: unit,
             graph: None,
-            retained_graphs: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
+            retained_graphs: GraphBank::with_family("deepseek_v41"),
             ready: None,
             pending_query: None,
             pending_commit: None,
@@ -1002,7 +1002,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             // Capture records proposal kernels only, without execution/commit.
             let Some(mut ticket) = self.retained_graphs.cache_ticket(&(row, state.owner),
                 super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, row as u32), None) else { continue };
-            unsafe { ticket.capture_result(library.cuda_graph_begin_capture(stream))?; }
+            unsafe { ticket.capture_result(crate::shared::decode_graph::begin_capture(&library, stream, &ticket))?; }
             let queued = unsafe { self.enqueue(state, row) };
             let captured = unsafe { ticket.capture_result(library.cuda_graph_end_capture_topology(stream)) };
             match (queued, captured) {
@@ -1062,7 +1062,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             let ticket = if *capture { self.retained_graphs.cache_ticket(&(prepared.rows, state.owner),
                 super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) } else { None };
             if let Some(mut ticket) = ticket {
-                unsafe { ticket.capture_result(self.stream().library.cuda_graph_begin_capture(self.stream().raw))?; }
+                unsafe { ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream().library, self.stream().raw, &ticket))?; }
                 let queued = unsafe { self.enqueue(state, prepared.rows) };
                 let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
                 match (queued, captured) {
@@ -1188,9 +1188,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 return Ok(());
             };
         unsafe {
-            ticket.capture_result(self.stream()
-                .library
-                .cuda_graph_begin_capture(self.stream().raw))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream().library, self.stream().raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue(state, prepared.rows) };
         let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };

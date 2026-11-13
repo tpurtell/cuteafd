@@ -181,7 +181,7 @@ impl<'w,'a> Tp2FfnGraphs<'w,'a> {
             let Some(mut ticket)=self.bank.cache_ticket(&(binding.layer(),rows as u32),
                 super::graph_policy::pinned_shape(self.device.id, rows as u32),None) else {return Ok(())};
             block.restore_ffn_graph_warmup(binding,rows)?;
-            ticket.capture_result(self.device.library.cuda_graph_begin_capture(stream))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.device.library, stream, &ticket))?;
             let queued=block.enqueue_ffn(binding,rows,projected,stream);
             let captured=ticket.capture_result(self.device.library.cuda_graph_end_capture_topology(stream));
             match (queued,captured) {

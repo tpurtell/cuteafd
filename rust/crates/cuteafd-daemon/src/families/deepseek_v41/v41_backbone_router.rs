@@ -662,9 +662,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         };
         self.invalidate();
         unsafe {
-            ticket.capture_result(self.stream()
-                .library
-                .cuda_graph_begin_capture(self.stream().raw))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream().library, self.stream().raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue(rows) };
         let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
@@ -702,9 +700,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         };
         ensure!(count == rows, "backbone router captured rows differ");
         let launched = unsafe {
-            self.stream()
-                .library
-                .cuda_graph_launch(graph, self.stream().raw)
+            crate::shared::decode_graph::launch(&self.stream().library, graph, self.stream().raw)
         };
         // Device-read routes ([`Self::device_read`]): later stages join the
         // chain; the remote layer's collect is its host wait.

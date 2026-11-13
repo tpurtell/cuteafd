@@ -183,7 +183,7 @@ impl<'library> DsparkWeights<'library> {
                 self.stage(1, requests, bytes)?,
                 self.stage(2, requests, bytes)?,
             ],
-            graphs: GraphBank::new(None),
+            graphs: GraphBank::new(),
             ready: None,
             pending: None,
             download: HostAllocation::new(library, requests as usize * (2 * self.draft_width + 1) * 4, Tag::staging("v41/draft-chain"))?,
@@ -484,9 +484,7 @@ impl DsparkChain<'_, '_> {
         let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), self.tokens.buffer.device_id as usize, count, self.width);
         let Some(mut ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
         unsafe {
-            ticket.capture_result(self.stream
-                .library
-                .cuda_graph_begin_capture(self.stream.raw))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream.library, self.stream.raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue_geometry(reads, count) };
         let captured = unsafe { ticket.capture_result(self.stream.library.cuda_graph_end_capture_topology(self.stream.raw)) };
@@ -536,9 +534,7 @@ impl DsparkChain<'_, '_> {
         );
         self.upload(&reads, bindings)?;
         let launched = unsafe {
-            self.stream
-                .library
-                .cuda_graph_launch(graph, self.stream.raw)
+            crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw)
         };
         let drained = self.synchronize();
         settle(launched, drained)?;
@@ -582,7 +578,7 @@ impl DsparkChain<'_, '_> {
         unsafe {
             let span = self.timing.begin("graph_forward_terminal", None, count * self.width, self.stream.raw)?;
             if let Some(graph) = graph {
-                self.stream.library.cuda_graph_launch(graph, self.stream.raw)?;
+                crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw)?;
             }
             self.timing.end(span, self.stream.raw)?;
             let bytes = self.download.bytes_mut();
@@ -649,12 +645,7 @@ impl Drop for DsparkChain<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark chain");
         if let Some(pending) = &mut self.pending { pending.armed = false; }
         self.pending = None; // GPU work has drained before read reservations release.
-        if self.graphs.cache_attached() {
-            self.graphs.cache_clear_drained();
-        } else {
-            self.graphs.retire_all();
-            fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "dSpark chain graphs");
-        }
+        self.graphs.cache_clear_drained();
     }
 }
 
@@ -664,7 +655,7 @@ mod failure_tests {
     #[test]
     fn dspark_full_reserve_miss_runs_eager_without_refusal() -> Result<()> {
         use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
-        let mut bank = GraphBank::<(usize, usize), usize>::new(None);
+        let mut bank = GraphBank::<(usize, usize), usize>::new();
         bank.attach_device_for_test(-164_401, 200, Site {
             name: "dspark_chain", cycle: Cycle::Wave, preference: Preference::Capture,
             bootstrap: 100, basis: Basis::Bytes, spans_devices: false,
@@ -689,7 +680,7 @@ mod failure_tests {
     #[test]
     fn dspark_failed_capture_cancels_ticket_and_preserves_eager_fallback() -> Result<()> {
         use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
-        let mut bank = GraphBank::<(usize, usize), usize>::new(None);
+        let mut bank = GraphBank::<(usize, usize), usize>::new();
         bank.attach_device_for_test(-164_402, 200, Site {
             name: "dspark_chain", cycle: Cycle::Other, preference: Preference::Capture,
             bootstrap: 100, basis: Basis::Bytes, spans_devices: true,

@@ -27,7 +27,7 @@ pub(crate) struct Graphs<'a> {
 impl<'a> Graphs<'a> {
     pub(crate) fn new(device: Device<'a>, rank: usize, ranks: usize, onboard_layers: usize) -> Result<Self> {
         let reserve = cuteafd_loader::serving_capacity::muse_graphs::policy(ranks, onboard_layers, rank)?;
-        let mut bank = GraphBank::new(None);
+        let mut bank = GraphBank::new();
         bank.attach_device(device.library, device.id, reserve.bytes, Site {
             name: "muse_spark.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
             bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false,
@@ -43,12 +43,12 @@ impl<'a> Graphs<'a> {
     pub(crate) fn run(&self, key: Key, stream: *mut c_void, mut segment: impl FnMut() -> Result<()>) -> Result<()> {
         if let Some(raw) = self.bank.borrow_mut().cached_launch(&key).map(|graph| graph.raw) {
             // SAFETY: the backend retains rank storage and drains before dropping the banks.
-            return unsafe { self.device.library.cuda_graph_launch(raw, stream) };
+            return unsafe { crate::shared::decode_graph::launch(&self.device.library, raw, stream) };
         }
         if self.singleton.borrow().contains(&key) { return segment(); }
         let Some(ticket) = self.bank.borrow_mut().cache_ticket(&key, self.pins.borrow().contains(&key.rows), None) else { return segment() };
         // SAFETY: callers submit only device work on this stream, using persistent storage.
-        if let Err(error) = unsafe { self.device.library.cuda_graph_begin_capture(stream) } {
+        if let Err(error) = unsafe { crate::shared::decode_graph::begin_capture(&self.device.library, stream, &ticket) } {
             if self.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, "Muse graph capture unavailable; running eagerly");
             }
@@ -89,7 +89,7 @@ impl<'a> Graphs<'a> {
         let graph = unsafe { GraphOwner::new(self.device.library, self.device.id, raw, ())? };
         self.bank.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         // SAFETY: newly captured executable, with the same persistent operands.
-        unsafe { self.device.library.cuda_graph_launch(raw, stream) }
+        unsafe { crate::shared::decode_graph::launch(&self.device.library, raw, stream) }
     }
 
     pub(crate) fn retains_rows(&self, rows: usize) -> bool {

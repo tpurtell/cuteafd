@@ -1,33 +1,10 @@
 //! Exact-key graph storage. Persistent-buffer executables may be evicted without
 //! draining; owners of per-graph storage require explicit drained retirement.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::Hash;
-use cuteafd_loader::placement::inventory::DeclaredGraphSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GraphPolicy {
-    FixedStartup,
-    Budgeted { bytes: Option<u64> },
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GraphStats {
-    pub captures: u64,
-    pub recaptures: u64,
-    pub evictions: u64,
-    pub eager_runs: u64,
-}
-
-/// A bank miss is not implicit permission to capture on a live request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GraphDecision {
-    Replay,
-    Capture,
-    Eager,
-}
-
-/// One distinct shape a sealed startup set did not contain, with every eager
-/// execution of it. Kept process-wide rather than per bank so /v1/stats reports
+/// One distinct shape that ran eagerly, with every reported execution of it.
+/// Kept process-wide rather than per bank so /v1/stats reports
 /// it without threading a bank handle through the scheduler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MissingVariant {
@@ -40,9 +17,7 @@ static MISSING: std::sync::Mutex<Vec<MissingVariant>> = std::sync::Mutex::new(Ve
 
 /// Counts one eager execution of `shape` and reports whether it is the first,
 /// which is the only occurrence that warns. Every caller goes through
-/// `note_eager`, so misses are recorded and warned about in one place; a miss is
-/// a mismatch between the sealed startup inventory and real traffic, so it is
-/// rare by construction.
+/// `note_eager`, so reported misses are recorded and warned about in one place.
 fn note_missing(family: &'static str, shape: &str) -> bool {
     let mut missing = MISSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match missing.iter_mut().find(|entry| entry.family == family && entry.shape == shape) {
@@ -56,12 +31,9 @@ pub(crate) fn missing_variants() -> Vec<MissingVariant> {
     MISSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
 }
 
-/// Counts one eager execution of `shape` outside a sealed startup set and
-/// reports whether it is the first for this family, which is the only one that
-/// warns. This is the single entry point for eager work: owners that hold their
-/// own executable and decide eager themselves (Qwen) call it directly, and
-/// `GraphBank::enqueue_with_context` calls it too, so every path lands in the
-/// same /v1/stats entry. The `context` is built only on a first miss.
+/// Counts one eager execution of a shape the device cache could not retain.
+/// The context is built only on its first miss; family owners share this
+/// diagnostic entry point and /v1/stats inventory.
 pub(crate) fn note_eager(family: &'static str, shape: &str, context: impl FnOnce() -> String) -> bool {
     if !note_missing(family, shape) { return false; }
     // Built outside the macro so the description is produced even when the
@@ -69,13 +41,12 @@ pub(crate) fn note_eager(family: &'static str, shape: &str, context: impl FnOnce
     let context = context();
     tracing::warn!(target: "cuteafd::graph_capture", family = family, key = %shape,
         context = %context,
-        "graph shape outside the startup set ran eagerly; consider adding it to the startup graph set");
+        "graph cache selected eager; consider adding this shape to prewarm");
     true
 }
 
 struct Entry<E> {
     exec: E,
-    launched: u64,
     cached: Option<(u64, bool)>,
     pinned_slot: Option<usize>,
 }
@@ -120,6 +91,11 @@ fn capture_failed(cache: &super::device::SharedCache, id: u64, error: &anyhow::E
 }
 
 impl CaptureTicket {
+    pub(super) fn require_active(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.committed, "graph capture ticket already settled");
+        Ok(())
+    }
+
     /// Keep native results and error precedence; settle failure before Drop can
     /// discard an OOM ghost. `committed` also prevents reporting twice.
     pub fn capture_result<T>(&mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
@@ -151,35 +127,18 @@ pub(crate) struct GraphBank<K, E> {
     next_cache_key: u64,
     cache_key_generation: u64,
     cache_keys_dirty: bool,
-    seen: HashSet<K>,
-    policy: GraphPolicy,
     family: &'static str,
-    startup: Option<DeclaredGraphSet<K>>,
-    startup_sealed: bool,
-    clock: u64,
-    stats: GraphStats,
-    measured_bytes: u64,
-    measured: u64,
-    frozen: Option<u64>,
     retired: Vec<E>,
     device: Option<DeviceBinding>,
 }
 
 impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
-    pub fn new(budget: Option<u64>) -> Self {
-        Self::with_policy(GraphPolicy::Budgeted { bytes: budget })
-    }
+    pub fn new() -> Self { Self::with_family("shared") }
 
-    pub fn with_policy(policy: GraphPolicy) -> Self {
-        Self::with_family(policy, "shared")
-    }
-
-    /// Names the owning family in startup-miss warnings and /v1/stats, so a
-    /// shared bank's miss is attributable without looking up its construction.
-    pub fn with_family(policy: GraphPolicy, family: &'static str) -> Self {
-        Self { entries: HashMap::new(), cache_keys: HashMap::new(), next_cache_key: 0, cache_key_generation: 0, cache_keys_dirty: false, seen: HashSet::new(), policy, family, startup: None, startup_sealed: false,
-            clock: 0, stats: GraphStats::default(), measured_bytes: 0, measured: 0,
-            frozen: None, retired: Vec::new(), device: None }
+    pub fn with_family(family: &'static str) -> Self {
+        Self { entries: HashMap::new(), cache_keys: HashMap::new(), next_cache_key: 0,
+            cache_key_generation: 0, cache_keys_dirty: false, family,
+            retired: Vec::new(), device: None }
     }
 
     pub fn attach_device(&mut self, library: &cuteafd_ffi::NativeLibrary, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
@@ -241,7 +200,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         binding.cache.lock().unwrap_or_else(|p| p.into_inner()).miss(identity, binding.site, node_estimate, pinned)
     }
 
-    pub fn cache_insert(&mut self, key: K, exec: E, id: u64, pinned: bool) {
+    fn cache_insert(&mut self, key: K, exec: E, id: u64, pinned: bool) {
         let pinned_slot = if pinned {
             self.device.as_mut().map(|binding| {
                 let slot = binding.pinned_counts.len();
@@ -249,7 +208,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
                 slot
             })
         } else { None };
-        self.entries.insert(key, Entry { exec, launched: 0, cached: Some((id, pinned)), pinned_slot });
+        self.entries.insert(key, Entry { exec, cached: Some((id, pinned)), pinned_slot });
     }
 
     pub fn cache_attached(&self) -> bool { self.device.is_some() }
@@ -263,6 +222,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     pub fn cache_commit(&mut self, key: K, exec: E, mut ticket: CaptureTicket,
         nodes: u64, width: usize, spans_devices: bool) {
+        let binding = self.device.as_ref().expect("graph capture requires an attached device cache");
+        assert!(std::sync::Arc::ptr_eq(&binding.cache, &ticket.cache), "graph ticket belongs to a different device cache");
+        assert!(!ticket.committed, "graph capture ticket already settled");
         self.cache_topology(ticket.id, nodes, width, spans_devices);
         self.cache_insert(key, exec, ticket.id, ticket.pinned);
         ticket.committed = true;
@@ -270,7 +232,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     /// Cancel a failed capture, backing off allocation failures by exact key.
     /// Returns whether the caller should emit the failure warning.
-    pub fn cache_capture_failed(&mut self, id: u64, error: &anyhow::Error) -> bool {
+    fn cache_capture_failed(&mut self, id: u64, error: &anyhow::Error) -> bool {
         let Some(binding) = &self.device else { return true };
         capture_failed(&binding.cache, id, error)
     }
@@ -286,7 +248,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         if let Some(binding) = &self.device { binding.cache.lock().unwrap_or_else(|p| p.into_inner()).cancel_capture(id); }
     }
 
-    pub fn cache_topology(&mut self, id: u64, nodes: u64, width: usize, spans_devices: bool) {
+    fn cache_topology(&mut self, id: u64, nodes: u64, width: usize, spans_devices: bool) {
         if let Some(binding) = &self.device {
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).captured_topology(id, nodes, width, spans_devices);
         }
@@ -395,20 +357,6 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         Ok(())
     }
 
-    /// Declare the planner's exact inventory before owner-local capture begins.
-    /// Until sealed, only declared keys may capture; after sealing every miss is
-    /// eager, including a retired hot key. Capture permission is never inferred
-    /// from an empty slot on a live request.
-    pub fn declare_startup(&mut self, keys: &[K]) -> anyhow::Result<()> {
-        anyhow::ensure!(self.entries.is_empty() && self.startup.is_none(), "graph bank already warmed");
-        let expected = DeclaredGraphSet::new(keys).map_err(anyhow::Error::msg)?;
-        self.policy = GraphPolicy::FixedStartup;
-        self.startup = Some(expected);
-        Ok(())
-    }
-
-    pub fn startup_declared(&self) -> bool { self.startup.is_some() }
-
     pub fn census_capture_key(&self, bank: &str, rank: i32, lane: Option<usize>, key: &K,
         exec: *mut std::ffi::c_void) {
         super::census::capture_key(self.family, bank, self as *const Self as usize, rank, lane, key, exec);
@@ -420,167 +368,13 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             device, None, key, exec);
     }
 
-    pub fn capture_allowed(&self, key: &K) -> bool {
-        !self.startup_sealed && self.startup.as_ref().map_or(
-            self.policy != GraphPolicy::FixedStartup, |keys| keys.contains(key))
-    }
-
-    /// Validate the declared inventory against actual retained executables.
-    pub fn finish_startup(&mut self) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.startup_sealed, "startup graph bank already sealed");
-        let expected = self.startup.as_ref().ok_or_else(|| anyhow::anyhow!("startup graph inventory undeclared"))?;
-        expected.verify(self.entries.keys()).map_err(anyhow::Error::msg)?;
-        self.startup_sealed = true;
-        Ok(())
-    }
-
-    /// Warm exactly the planner's key set. Duplicate keys, missing captures or
-    /// unexpected captures fail startup rather than merely logging a mismatch.
-    pub fn warm(&mut self, keys: &[K], mut capture: impl FnMut(&K) -> anyhow::Result<(E, Option<u64>)>) -> anyhow::Result<()> {
-        anyhow::ensure!(self.entries.is_empty() && self.startup.is_none(), "graph bank already warmed");
-        let expected = DeclaredGraphSet::new(keys).map_err(anyhow::Error::msg)?;
-        for key in keys {
-            let (exec, bytes) = capture(key)?;
-            self.insert(key.clone(), exec, bytes);
-        }
-        expected.verify(self.entries.keys()).map_err(anyhow::Error::msg)?;
-        self.startup = Some(expected);
-        self.policy = GraphPolicy::FixedStartup;
-        self.startup_sealed = true;
-        Ok(())
-    }
-
-    /// Seal a family-driven warm-up (some captures encompass a whole step).
-    pub fn seal_startup(&mut self, keys: &[K]) -> anyhow::Result<()> {
-        let expected = DeclaredGraphSet::new(keys).map_err(anyhow::Error::msg)?;
-        anyhow::ensure!(self.startup.is_none(), "startup graph bank already sealed");
-        expected.verify(self.entries.keys()).map_err(anyhow::Error::msg)?;
-        self.startup = Some(expected);
-        self.policy = GraphPolicy::FixedStartup;
-        self.startup_sealed = true;
-        Ok(())
-    }
-
-    pub fn enqueue(&mut self, key: &K) -> (GraphDecision, Option<&E>) {
-        self.enqueue_with_context(key, String::new)
-    }
-
-    /// A sealed startup miss runs eagerly and already costs the request its
-    /// graphed path, so it warns once per distinct variant with the family, the
-    /// shape key and the caller's request context. `context` is evaluated only
-    /// on that first miss, leaving replay and warm-startup paths untouched.
-    pub fn enqueue_with_context(&mut self, key: &K, context: impl FnOnce() -> String)
-        -> (GraphDecision, Option<&E>) {
-        let decision = if self.entries.contains_key(key) { GraphDecision::Replay }
-            else if self.capture_allowed(key) { GraphDecision::Capture }
-            else { GraphDecision::Eager };
-        if decision == GraphDecision::Eager {
-            self.stats.eager_runs += 1;
-            // Eager requires a sealed (or declared) startup set, so every miss
-            // is a shape the planner's inventory lacked.
-            note_eager(self.family, &format!("{key:?}"), context);
-        }
-        (decision, self.launch(key))
-    }
-
-    pub fn set_budget(&mut self, budget: Option<u64>) {
-        if matches!(self.policy, GraphPolicy::Budgeted { .. }) {
-            self.policy = GraphPolicy::Budgeted { bytes: budget };
-        }
-    }
-
-    pub fn budget(&self) -> Option<u64> {
-        match self.policy { GraphPolicy::Budgeted { bytes } => bytes, GraphPolicy::FixedStartup => None }
-    }
-
-    pub fn calibrating(&self) -> bool { self.frozen.is_none() }
-    pub fn each(&self) -> u64 {
-        self.frozen.unwrap_or_else(|| self.measured_bytes.div_ceil(self.measured.max(1)))
-    }
-
-    pub fn launch(&mut self, key: &K) -> Option<&E> {
-        self.clock += 1;
-        let clock = self.clock;
-        self.entries.get_mut(key).map(|entry| { entry.launched = clock; &entry.exec })
-    }
-
     pub fn get(&self, key: &K) -> Option<&E> { self.entries.get(key).map(|entry| &entry.exec) }
-    pub fn seen(&self, key: &K) -> bool { self.seen.contains(key) }
-
-    /// Retired executables remain owned here until drain_retired. The mean
-    /// physical-memory charge freezes at first retirement: later captures can
-    /// reuse allocator chunks and no longer report their real size as a delta.
-    pub fn insert(&mut self, key: K, exec: E, measured: Option<u64>) {
-        self.clock += 1;
-        self.stats.captures += 1;
-        if !self.seen.insert(key.clone()) { self.stats.recaptures += 1; }
-        if let (None, Some(bytes)) = (self.frozen, measured) {
-            self.measured_bytes += bytes;
-            self.measured += 1;
-        }
-        if let Some(old) = self.entries.insert(key.clone(), Entry { exec, launched: self.clock, cached: None, pinned_slot: None }) {
-            self.freeze();
-            self.retired.push(old.exec);
-        }
-        let Some(budget) = self.budget() else { return };
-        if self.bytes() <= budget { return }
-        self.freeze();
-        let mut order: Vec<(u64, K)> = self.entries.iter().filter(|(k, _)| **k != key)
-            .map(|(k, entry)| (entry.launched, k.clone())).collect();
-        order.sort_unstable_by_key(|(launched, _)| *launched);
-        for (_, victim) in order {
-            if self.bytes() <= budget { break }
-            if let Some(entry) = self.entries.remove(&victim) {
-                self.stats.evictions += 1;
-                self.retired.push(entry.exec);
-            }
-        }
-    }
-
-    fn freeze(&mut self) { self.frozen.get_or_insert(self.measured_bytes.div_ceil(self.measured.max(1))); }
-
-    pub fn retire(&mut self, key: &K) {
-        if let Some(entry) = self.entries.remove(key) {
-            self.freeze();
-            self.retired.push(entry.exec);
-        }
-    }
-
-    pub fn retire_oldest(&mut self, matches: impl Fn(&K) -> bool) {
-        if let Some(key) = self.entries.iter().filter(|(key, _)| matches(key))
-            .min_by_key(|(_, entry)| entry.launched).map(|(key, _)| key.clone()) {
-            self.retire(&key);
-        }
-    }
-
-    pub fn retire_matching(&mut self, matches: impl Fn(&K) -> bool) {
-        let keys: Vec<_> = self.entries.keys().filter(|key| matches(key)).cloned().collect();
-        for key in keys { self.retire(&key); }
-    }
-
-    pub fn retire_all(&mut self) {
-        self.freeze();
-        self.retired.extend(self.entries.drain().map(|(_, entry)| entry.exec));
-    }
-
-    pub fn retired_len(&self) -> usize { self.retired.len() }
-
-    /// Call only after every launch referencing a retired executable drained.
-    /// A drain failure leaves all resource owners in the bank for a later retry.
-    pub fn drain_retired(&mut self, drain: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<Vec<E>> {
-        if self.retired.is_empty() { return Ok(Vec::new()) }
-        drain()?;
-        Ok(std::mem::take(&mut self.retired))
-    }
-
-    pub fn bytes(&self) -> u64 { self.entries.len() as u64 * self.each() }
     pub fn len(&self) -> usize { self.entries.len() }
     pub fn contains(&self, key: &K) -> bool { self.entries.contains_key(key) }
     pub fn keys(&self) -> Vec<K> { self.entries.keys().cloned().collect() }
     pub fn count(&self, matches: impl Fn(&K) -> bool) -> usize {
         self.entries.keys().filter(|key| matches(key)).count()
     }
-    pub fn stats(&self) -> GraphStats { self.stats }
 }
 
 impl<K, E> Drop for GraphBank<K, E> {
@@ -592,276 +386,7 @@ impl<K, E> Drop for GraphBank<K, E> {
             binding.pinned_counts.clear();
             cache.remove_bank(binding.bank);
         }
-        if self.policy == GraphPolicy::FixedStartup && self.stats.eager_runs > 0 {
-            tracing::info!(target: "cuteafd::graph_capture", family = self.family, bank = self as *const Self as usize,
-                eager_runs = self.stats.eager_runs, captures = self.stats.captures,
-                "fixed startup graph bank final counters");
-        }
-    }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn fixed_startup_warms_exact_keys_and_misses_execute_eagerly() {
-        let mut bank = GraphBank::with_policy(GraphPolicy::FixedStartup);
-        bank.warm(&[1, 6, 16], |key| Ok((*key, Some(10)))).unwrap();
-        assert_eq!(bank.enqueue(&6), (GraphDecision::Replay, Some(&6)));
-        assert_eq!(bank.enqueue(&3), (GraphDecision::Eager, None));
-        assert_eq!(bank.stats().captures, 3);
-        assert_eq!(bank.stats().eager_runs, 1);
-        bank.enqueue(&3);
-        assert_eq!(bank.stats().eager_runs, 2);
-        bank.set_budget(Some(100));
-        assert_eq!(bank.enqueue(&4), (GraphDecision::Eager, None));
-        assert_eq!(bank.stats().eager_runs, 3);
-        assert!(bank.warm(&[], |_| Ok((0, None))).is_err());
-        let mut duplicate = GraphBank::with_policy(GraphPolicy::FixedStartup);
-        assert!(duplicate.warm(&[1, 1], |key| Ok((*key, None))).is_err());
-    }
-    #[test]
-    fn sealed_miss_counts_once_per_variant_and_builds_context_only_for_the_first() {
-        const FAMILY: &str = "bank-test-startup-miss";
-        let mut bank = GraphBank::with_family(GraphPolicy::FixedStartup, FAMILY);
-        bank.warm(&[1u32], |key| Ok((*key, Some(10)))).unwrap();
-        assert_eq!(bank.enqueue_with_context(&1, || panic!("replay must not build a context")).0,
-            GraphDecision::Replay);
-        let contexts = std::cell::Cell::new(0);
-        for _ in 0..3 {
-            assert_eq!(bank.enqueue_with_context(&2, || { contexts.set(contexts.get() + 1); "batch=2".into() }),
-                (GraphDecision::Eager, None));
-        }
-        assert_eq!(bank.enqueue(&3).0, GraphDecision::Eager);
-        assert_eq!(contexts.get(), 1, "only a variant's first miss describes its request");
-        let ours: Vec<_> = missing_variants().into_iter().filter(|miss| miss.family == FAMILY).collect();
-        assert_eq!(ours.iter().map(|miss| (miss.shape.as_str(), miss.runs)).collect::<Vec<_>>(),
-            vec![("2", 3), ("3", 1)]);
-        assert_eq!(bank.stats().eager_runs, 4);
-    }
-
-    #[test]
-    fn startup_inventory_fails_closed_on_missing_or_extra_keys() {
-        let mut bank = GraphBank::new(None);
-        bank.insert(1, 1, None);
-        assert!(bank.seal_startup(&[1, 2]).is_err());
-        assert!(bank.seal_startup(&[]).is_err());
-        bank.seal_startup(&[1]).unwrap();
-    }
-    #[test]
-    fn declared_inventory_only_admits_hot_keys_until_sealed() {
-        let mut bank = GraphBank::new(Some(1));
-        bank.declare_startup(&[1, 2]).unwrap();
-        assert_eq!(bank.enqueue(&1), (GraphDecision::Capture, None));
-        assert_eq!(bank.enqueue(&3), (GraphDecision::Eager, None));
-        bank.insert(1, 10, None);
-        assert!(bank.finish_startup().is_err());
-        bank.insert(2, 20, None);
-        bank.finish_startup().unwrap();
-        assert_eq!(bank.enqueue(&1), (GraphDecision::Replay, Some(&10)));
-        assert_eq!(bank.enqueue(&3), (GraphDecision::Eager, None));
-        bank.retire(&1);
-        assert_eq!(bank.enqueue(&1), (GraphDecision::Eager, None));
-        assert!(!bank.capture_allowed(&2));
-        assert!(bank.finish_startup().is_err());
-        assert!(bank.declare_startup(&[1, 2]).is_err());
-    }
-
-    #[test]
-    fn sealed_prefill_inventory_retains_alternating_tails_and_rejects_cold_shapes() {
-        let mut bank = GraphBank::new(Some(1));
-        let keys: Vec<_> = (0..40).flat_map(|layer| (1..=64).map(move |rows| (layer, rows))).collect();
-        bank.declare_startup(&keys).unwrap();
-        for &key in &keys { bank.insert(key, key, None); }
-        bank.finish_startup().unwrap();
-        for rows in [54, 52, 54, 52, 56, 53, 2752, 579, 4, 128, 65] {
-            for layer in 0..40 {
-                let key = (layer, rows);
-                if rows <= 64 {
-                    assert_eq!(bank.enqueue(&key), (GraphDecision::Replay, Some(&key)));
-                } else {
-                    assert_eq!(bank.enqueue(&key), (GraphDecision::Eager, None));
-                }
-                assert!(!bank.capture_allowed(&key));
-            }
-        }
-        assert_eq!(bank.len(), keys.len());
-        assert_eq!(bank.retired_len(), 0);
-        assert_eq!(bank.stats().captures, keys.len() as u64);
-        assert_eq!(bank.stats().recaptures, 0);
-        assert_eq!(bank.stats().evictions, 0);
-    }
-
-    #[test]
-    fn sealed_empty_prefill_inventory_never_captures_arbitrary_tails() {
-        let mut bank = GraphBank::<(usize, usize), usize>::new(None);
-        bank.declare_startup(&[]).unwrap();
-        bank.finish_startup().unwrap();
-        for rows in (1..=128).chain([301, 552, 808, 810, 2723, 2752]) {
-            for layer in 0..40 {
-                let key = (layer, rows);
-                assert_eq!(bank.enqueue(&key), (GraphDecision::Eager, None));
-                assert!(!bank.capture_allowed(&key));
-            }
-        }
-        assert_eq!(bank.len(), 0);
-        assert_eq!(bank.stats().captures, 0);
-        assert_eq!(bank.stats().evictions, 0);
-    }
-
-    #[test]
-    fn sealed_family_warmup_disallows_live_capture() {
-        let mut bank = GraphBank::new(None);
-        bank.insert(1, 10, None);
-        bank.seal_startup(&[1]).unwrap();
-        bank.set_budget(Some(0));
-        assert_eq!(bank.enqueue(&2), (GraphDecision::Eager, None));
-        assert!(!bank.capture_allowed(&1));
-        let mut duplicate: GraphBank<u32, u32> = GraphBank::new(None);
-        assert!(duplicate.declare_startup(&[1, 1]).is_err());
-        assert_eq!(duplicate.enqueue(&1), (GraphDecision::Capture, None));
-    }
-
-    #[test]
-    fn retirement_keeps_owners_when_stream_drain_fails() {
-        let mut bank = GraphBank::new(Some(20));
-        for key in 0..3 { bank.insert(key, key, Some(10)); }
-        assert_eq!((bank.len(), bank.retired_len()), (2, 1));
-        assert!(bank.drain_retired(|| anyhow::bail!("pending")).is_err());
-        assert_eq!(bank.retired_len(), 1);
-        assert_eq!(bank.drain_retired(|| Ok(())).unwrap(), vec![0]);
-        bank.retire_all();
-        assert_eq!(bank.len(), 0);
-        assert_eq!(bank.drain_retired(|| Ok(())).unwrap().len(), 2);
-    }
-    #[test]
-    fn replacement_freezes_mean_before_allocator_reuse() {
-        let mut bank = GraphBank::new(None);
-        bank.insert(1, 10, Some(4));
-        bank.insert(1, 11, Some(6));
-        assert_eq!(bank.each(), 5);
-        bank.insert(2, 12, Some(0));
-        assert_eq!(bank.each(), 5);
-        assert_eq!(bank.drain_retired(|| Ok(())).unwrap(), vec![10]);
-    }
-    #[test]
-    fn budget_uses_frozen_mean_and_lru() {
-        let mut bank = GraphBank::new(Some(30));
-        for key in 0..3 { bank.insert(key, key, Some(10)); }
-        bank.launch(&0);
-        bank.insert(3, 3, Some(10));
-        assert_eq!(bank.drain_retired(|| Ok(())).unwrap(), vec![1]);
-        for key in 4..1000 {
-            bank.insert(key, key, Some(0));
-            bank.drain_retired(|| Ok(())).unwrap();
-            assert_eq!((bank.len(), bank.bytes(), bank.each()), (3, 30, 10));
-        }
-        assert_eq!(bank.enqueue(&1), (GraphDecision::Capture, None));
-    }
-}
-
-#[cfg(test)]
-mod budget_tests {
-    use super::*;
-
-    fn insert<K: Hash + Eq + Clone + std::fmt::Debug, E>(bank: &mut GraphBank<K, E>, key: K, exec: E, bytes: Option<u64>) -> Vec<E> {
-        bank.insert(key, exec, bytes);
-        bank.drain_retired(|| Ok(())).unwrap()
-    }
-
-    const MIB: u64 = 1 << 20;
-
-    #[test]
-    fn unbounded_caches_keep_every_executable() {
-        let mut cache = GraphBank::new(None);
-        for key in 0..100u32 {
-            assert!(insert(&mut cache, key, key, Some(if key % 14 == 0 { 2 * MIB } else { 0 })).is_empty());
-        }
-        assert_eq!(cache.len(), 100);
-        assert_eq!(cache.each(), (8 * 2 * MIB).div_ceil(100));
-        assert_eq!(cache.bytes(), 100 * cache.each());
-        assert_eq!(cache.launch(&7), Some(&7));
-        assert_eq!(cache.stats(), GraphStats { captures: 100, ..Default::default() });
-        assert!(cache.calibrating());
-    }
-
-    #[test]
-    fn executables_are_charged_the_mean_of_chunked_free_memory_deltas() {
-        // Free memory moves in 2 MiB chunks: of 14 executables of ~146 KiB, one capture takes a
-        // chunk and 13 take none. Charging each its own delta would let the 13 stay free of charge.
-        let mut cache = GraphBank::new(None);
-        for key in 0..1400u32 {
-            insert(&mut cache, key, key, Some(if key % 14 == 13 { 2 * MIB } else { 0 }));
-        }
-        assert_eq!(cache.each(), (2 * MIB * 100).div_ceil(1400));
-        assert_eq!(cache.bytes(), 1400 * cache.each());
-        assert!(cache.bytes() >= 200 * MIB && cache.bytes() < 200 * MIB + 1400);
-    }
-
-    #[test]
-    fn evictions_bound_the_executables_even_when_new_captures_reuse_freed_memory() {
-        // The measured failure: once evictions free room inside the allocator's chunks, new
-        // captures fill it and their free-memory deltas read 0. The cache must keep counting them.
-        let (budget, each) = (64 * MIB, 147_000u64);
-        let mut cache = GraphBank::new(Some(budget));
-        let mut key = 0u32;
-        let mut evicted = 0usize;
-        while cache.calibrating() {
-            evicted += insert(&mut cache, key, key, Some(each)).len();
-            key += 1;
-        }
-        assert_eq!(cache.each(), each);
-        let held = cache.len();
-        assert_eq!(held as u64, budget / each);
-        for _ in 0..20_000 {
-            evicted += insert(&mut cache, key, key, Some(0)).len();
-            key += 1;
-            assert!(cache.bytes() <= budget && cache.len() == held, "held {} executables", cache.len());
-        }
-        assert_eq!(evicted as u64, cache.stats().evictions);
-        assert_eq!(cache.stats().captures, u64::from(key));
-        assert_eq!(cache.each(), each, "the size stays frozen at the first eviction");
-    }
-
-    #[test]
-    fn the_least_recently_launched_leave_first_and_never_the_new_one() {
-        let mut cache = GraphBank::new(Some(3 * MIB));
-        for key in 0..3u32 {
-            assert!(insert(&mut cache, key, key, Some(MIB)).is_empty());
-        }
-        // Launching 0 makes 1 the least recently launched.
-        assert_eq!(cache.launch(&0), Some(&0));
-        assert_eq!(insert(&mut cache, 3, 3, Some(MIB)), vec![1]);
-        assert_eq!(cache.launch(&1), None);
-        assert_eq!((cache.len(), cache.bytes(), cache.each()), (3, 3 * MIB, MIB));
-        // Frozen: a capture that measures more is still charged one executable.
-        assert_eq!(insert(&mut cache, 4, 4, Some(8 * MIB)), vec![2]);
-        assert_eq!((cache.len(), cache.bytes()), (3, 3 * MIB));
-        assert_eq!(cache.stats(), GraphStats { captures: 5, recaptures: 0, evictions: 2, eager_runs: 0 });
-    }
-
-    #[test]
-    fn a_key_captured_again_after_eviction_is_a_recapture() {
-        let mut cache = GraphBank::new(Some(2 * MIB));
-        insert(&mut cache, 1u32, 1, Some(MIB));
-        insert(&mut cache, 2, 2, Some(MIB));
-        assert_eq!(insert(&mut cache, 3, 3, Some(MIB)), vec![1]);
-        assert!(cache.launch(&1).is_none());
-        assert!(cache.seen(&1) && !cache.seen(&4));
-        assert_eq!(insert(&mut cache, 1, 1, None), vec![2]);
-        assert_eq!(cache.stats().recaptures, 1);
-        assert_eq!(cache.count(|key| *key % 2 == 1), 2);
-        cache.set_budget(None);
-        assert!(insert(&mut cache, 10, 10, None).is_empty());
-        assert_eq!(cache.budget(), None);
-    }
-
-    #[test]
-    fn replacing_a_key_returns_the_old_executable() {
-        let mut cache = GraphBank::new(None);
-        insert(&mut cache, 1u32, 10, Some(4));
-        assert_eq!(insert(&mut cache, 1, 11, Some(6)), vec![10]);
-        assert_eq!((cache.len(), cache.launch(&1)), (1, Some(&11)));
     }
 }
 
@@ -876,7 +401,7 @@ mod device_tests {
         struct Exec(Rc<Cell<usize>>);
         impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
         let drops = Rc::new(Cell::new(0));
-        let mut bank = GraphBank::new(None);
+        let mut bank = GraphBank::new();
         bank.attach_device_for_test(-301, 20, site()).unwrap();
         let Miss::Capture(id) = bank.cache_miss(&1, false, None) else { panic!() };
         bank.cache_insert(1, Exec(drops.clone()), id, false);
@@ -894,7 +419,7 @@ mod device_tests {
 
     #[test]
     fn persistent_eviction_without_victims_preserves_pending_capture() {
-        let mut bank = GraphBank::new(None);
+        let mut bank = GraphBank::new();
         bank.attach_device_for_test(-319, 1000, site()).unwrap();
         let ticket = bank.cache_ticket(&1, false, None).unwrap();
         bank.cache_commit(1, 42, ticket, 1, 1, false);
@@ -917,7 +442,7 @@ mod device_tests {
         struct Exec(Rc<Cell<usize>>);
         impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
         let drops = Rc::new(Cell::new(0));
-        let mut bank = GraphBank::new(None);
+        let mut bank = GraphBank::new();
         bank.attach_device_for_test(-318, 20, site()).unwrap();
         let ticket = bank.cache_ticket(&1, false, None).unwrap();
         bank.cache_commit(1, Exec(drops.clone()), ticket, 1, 1, false);
@@ -936,7 +461,7 @@ mod device_tests {
 
     #[test]
     fn cached_graph_hits_follow_the_current_cycle_including_pinned_fast_path() {
-        let mut bank = GraphBank::new(None);
+        let mut bank = GraphBank::new();
         bank.attach_device_for_test(-303, 100, site()).unwrap();
         for (key, pinned) in [(1, true), (2, false)] {
             let Miss::Capture(id) = bank.cache_miss(&key, pinned, None) else { panic!() };
@@ -978,7 +503,7 @@ mod device_tests {
                 f.write_str("identical display")
             }
         }
-        let mut bank: GraphBank<Key, u32> = GraphBank::new(None);
+        let mut bank: GraphBank<Key, u32> = GraphBank::new();
         bank.attach_device_for_test(-304, 100, Site { preference: Preference::Eager, ..site() }).unwrap();
         assert!(matches!(bank.cache_miss(&Key(1), false, None), Miss::Eager));
         assert!(matches!(bank.cache_miss(&Key(2), false, None), Miss::Eager));
@@ -1002,7 +527,7 @@ mod device_tests {
         impl std::fmt::Debug for Key {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("same display") }
         }
-        let mut bank: GraphBank<Key, u32> = GraphBank::new(None);
+        let mut bank: GraphBank<Key, u32> = GraphBank::new();
         bank.attach_device_for_test(-320, 1000, Site { spans_devices: true, ..site() }).unwrap();
         let oom = anyhow::Error::new(cuteafd_ffi::NativeStatusError {
             context: "end capture".into(), status: cuteafd_ffi::CUTEAFD_STATUS_ALLOCATION_FAILED,
@@ -1039,7 +564,7 @@ mod device_tests {
 
     #[test]
     fn raii_allocation_failure_retains_ghost_but_other_errors_cancel() {
-        let mut bank: GraphBank<u32, u32> = GraphBank::new(None);
+        let mut bank: GraphBank<u32, u32> = GraphBank::new();
         bank.attach_device_for_test(-321, 1000, Site { spans_devices: true, ..site() }).unwrap();
         let oom = anyhow::Error::new(cuteafd_ffi::NativeStatusError {
             context: "end capture".into(), status: cuteafd_ffi::CUTEAFD_STATUS_ALLOCATION_FAILED,
@@ -1062,7 +587,7 @@ mod device_tests {
     #[test]
     fn small_capture_remains_eager_across_boundaries_and_ghost_pressure() {
         for nodes in 0..=2 {
-            let mut bank: GraphBank<u32, u32> = GraphBank::new(None);
+            let mut bank: GraphBank<u32, u32> = GraphBank::new();
             bank.attach_device_for_test(-330 - nodes as i32, 1000,
                 Site { spans_devices: true, ..site() }).unwrap();
             let mut ticket = bank.cache_ticket(&1, true, None).unwrap();
@@ -1086,7 +611,7 @@ mod device_tests {
 
     #[test]
     fn successful_begin_then_oom_end_reports_ticket_once() {
-        let mut bank: GraphBank<u32, u32> = GraphBank::new(None);
+        let mut bank: GraphBank<u32, u32> = GraphBank::new();
         bank.attach_device_for_test(-322, 1000, Site { spans_devices: true, ..site() }).unwrap();
         let mut ticket = bank.cache_ticket(&1, false, None).unwrap();
         ticket.capture_result(Ok(())).unwrap();
@@ -1113,7 +638,7 @@ mod device_tests {
 
     #[test]
     fn transient_interned_keys_are_pruned_at_boundary() {
-        let mut bank: GraphBank<u32, u32> = GraphBank::new(None);
+        let mut bank: GraphBank<u32, u32> = GraphBank::new();
         bank.attach_device_for_test(-305, 1, site()).unwrap();
         assert!(matches!(bank.cache_miss(&1, false, None), Miss::Eager));
         assert_eq!(bank.cache_keys.len(), 1);
@@ -1125,7 +650,7 @@ mod device_tests {
     #[ignore = "CPU microbenchmark; run explicitly with --nocapture"]
     fn cache_replay_nanoseconds() {
         use std::{hint::black_box, time::Instant};
-        let mut bank = GraphBank::new(None);
+        let mut bank = GraphBank::new();
         bank.attach_device_for_test(-302, 1 << 20, site()).unwrap();
         for key in [1, 2] {
             let Miss::Capture(id) = bank.cache_miss(&key, key == 1, None) else { panic!() };

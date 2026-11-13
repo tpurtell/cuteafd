@@ -97,7 +97,7 @@ impl<'a> DualAttentionWave<'a> {
         Ok(Self {
             halves,
             capacity: storage.capacity, storage, window: crate::shared::memory::row_window::RowWindow::NONE,
-            pending: None, tails: GraphBank::new(None),
+            pending: None, tails: GraphBank::new(),
         })
     }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
@@ -197,7 +197,7 @@ impl<'a> DualAttentionWave<'a> {
         let owner=wave.halves[0].device;
         owner.run(||unsafe {
             tail.restore_warmup()?;
-            ticket.capture_result(library.cuda_graph_begin_capture(stream))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&library, stream, &ticket))?;
             let queued=tail.enqueue(&attention,stream);
             let captured=ticket.capture_result(library.cuda_graph_end_capture_topology(stream));
             let (graph,nodes,width,_spans,inspection)=match (queued,captured) {
@@ -217,7 +217,7 @@ impl<'a> DualAttentionWave<'a> {
                 layer,rows,device=owner.id,key=?key,bank=?(&wave.tails as *const _),
                 "captured graph binding");
             wave.tails.cache_commit((layer,key),exec,ticket,nodes as u64,width,true);
-            library.cuda_graph_launch(graph,stream)
+            crate::shared::decode_graph::launch(&library, graph,stream)
         })?;
         owner.future(wave.halves[0].wait_chain()).await?;
         guard.wave=None;

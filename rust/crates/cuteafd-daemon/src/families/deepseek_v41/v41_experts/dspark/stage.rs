@@ -176,7 +176,7 @@ impl<'a> DsparkStage<'_, 'a> {
             return unsafe { self.execute(window, requests) };
         };
         self.attention.upload(&read, requests)?;
-        let launched = unsafe { self.library.cuda_graph_launch(graph, self.ffn.stream()?) };
+        let launched = unsafe { crate::shared::decode_graph::launch(&self.library, graph, self.ffn.stream()?) };
         let drained = self.ffn.synchronize();
         crate::families::deepseek_v41::v41_experts::dspark::settle(launched, drained)?;
         unsafe {

@@ -52,7 +52,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         Ok(Self {
             terminal: devices[1].own(|| weights.terminal_storage(None, capacity, required[1] - head_bytes[1]))?,
             head,
-            graphs: crate::shared::decode_graph::GraphBank::new(None), ready: None, pending: None,
+            graphs: crate::shared::decode_graph::GraphBank::new(), ready: None, pending: None,
         })
     }
     pub(crate) fn capture_startup(&mut self, capacity: usize, maximum: usize) -> Result<()> {
@@ -114,7 +114,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
             let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), 1, requests, width);
             let Some(mut ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
             let capture = device.run(|| unsafe {
-                ticket.capture_result(device.library.cuda_graph_begin_capture(terminal.stream.raw))?;
+                ticket.capture_result(crate::shared::decode_graph::begin_capture(&device.library, terminal.stream.raw, &ticket))?;
                 // Capture records commands only; runtime begin/enqueue retain
                 // sampling validation before any execution or graph replay.
                 let queued = if sampling { terminal.enqueue_sampling_geometry(requests, terminal.stream.raw) }
@@ -335,12 +335,7 @@ impl Drop for DistributedDsparkTerminal<'_, '_> {
         self.cancel();
         let device = self.terminal.device;
         fatal_drain(device.run(|| self.terminal.synchronize()), "distributed terminal");
-        if self.graphs.cache_attached() {
-            self.graphs.cache_clear_drained();
-        } else {
-            self.graphs.retire_all();
-            fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "distributed terminal graphs");
-        }
+        self.graphs.cache_clear_drained();
     }
 }
 

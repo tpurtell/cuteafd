@@ -1,6 +1,6 @@
 //! Persistent layer sections; transactional KV writes and host joins stay eager.
 use crate::shared::{decode_graph::{device::{self, Basis, Cycle, Preference, Site}, GraphBank,
-    GraphOwner, GraphPolicy}, memory::device::Stream};
+    GraphOwner}, memory::device::Stream};
 use anyhow::Result;
 use std::{cell::{Cell, RefCell}, collections::HashSet};
 use cuteafd_loader::serving_capacity::step5_graphs::{self, Step5GraphLayout};
@@ -24,7 +24,7 @@ pub(super) struct Graphs<'a> {
 
 impl<'a> Graphs<'a> {
     pub(super) fn new() -> Self {
-        Self { bank: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "step5")),
+        Self { bank: RefCell::new(GraphBank::with_family("step5")),
             eager: RefCell::new(HashSet::new()), touched: RefCell::new(HashSet::new()), device: -1,
             pins: HashSet::new(), warming: Cell::new(false), first_touch_pending: Cell::new(false) }
     }
@@ -77,14 +77,14 @@ impl<'a> Graphs<'a> {
             return stream.device.run(|| {
                 // SAFETY: containing execution and staging owners retain every captured buffer;
                 // all rank streams drain before retirement or scratch reuse by another step.
-                unsafe { stream.device.library.cuda_graph_launch(raw, stream.raw) }
+                unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw) }
             });
         }
         let Some(ticket) = self.bank.borrow_mut().cache_ticket(&key, self.pins.contains(&key.rows), None) else { return work() };
         stream.device.run(|| {
             let library = stream.device.library;
             // SAFETY: sections contain only ordered launches on this stream, with persistent storage.
-            if let Err(error) = unsafe { library.cuda_graph_begin_capture(stream.raw) } {
+            if let Err(error) = unsafe { crate::shared::decode_graph::begin_capture(&library, stream.raw, &ticket) } {
                 if self.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
                     tracing::warn!(%error, ?key, "Step-5 capture unavailable; running eagerly");
                 }
@@ -121,7 +121,7 @@ impl<'a> Graphs<'a> {
             }
             self.bank.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
             // SAFETY: the committed executable retains the same persistent pointer contract.
-            unsafe { library.cuda_graph_launch(raw, stream.raw) }
+            unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw) }
         })
     }
 }
@@ -142,8 +142,7 @@ mod tests {
     fn untraced_zero_reserve_runs_every_section_eagerly_without_capture() {
         let policy = cuteafd_loader::placement::graph_reserve::resolve(None, 0, false, 0, 0).unwrap();
         assert_eq!(policy.bytes, 0);
-        let mut bank: GraphBank<Key, ()> = GraphBank::with_family(
-            GraphPolicy::Budgeted { bytes: None }, "step5");
+        let mut bank: GraphBank<Key, ()> = GraphBank::with_family("step5");
         bank.attach_device_for_test(-1639, policy.bytes, Site {
             name: "step5.section", cycle: Cycle::Decode, preference: Preference::Adaptive,
             bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false,

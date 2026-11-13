@@ -632,6 +632,19 @@ high-water for the admitted reserve; it is not a current-residency measurement.
 Current-level reconciliation, while retaining high-water for admission, is
 pending [#1702](https://github.com/tpurtell/cuteafd/pull/1702).
 
+### Single capture path
+
+Every graph-using family is attached: V4.1 through its heterogeneous bank
+visitor, GLM/ML4, GLM Flash, V4 and MiMo through their rank banks, Kimi and
+Step-5 through their section owners, and Muse/dense Qwen at construction.
+MiniMax currently executes eagerly and owns no decode graphs. There is no
+unattached insertion, per-bank budget, fixed-startup seal or legacy retirement
+path. Empty owners may be constructed before attachment, but cannot capture or
+populate a bank until the device controller grants a cancellable ticket.
+`begin_capture` requires a live ticket, and production CUDA capture/replay
+entry points live in `shared/decode_graph`; the source contract test allows
+raw calls only in test/oracle code (`scripts/tests/test_decode_graph_cache_contract.py`).
+
 ### Porting a family
 
 Paths below use the prefixes defined at the top of this page; checklist items
@@ -640,7 +653,7 @@ name the implementing code or regression-test location.
 1. Attach every bank before capture through `CacheAttached` or `attach_device`, even with empty prewarm, with stable site names, cycle, preference, bootstrap bytes and explicit peer span (`daemon/shared/decode_graph.rs`, `decode_graph/native.rs`, `decode_graph/binding.rs`, `daemon/families/kimi_k3/engine.rs`).
 2. Use the same reserve and basis on each device: calibrated node rates only on their measured family/architecture/route, otherwise device-wide bytes with a warning; unknown node counts stay eager (`daemon/shared/decode_graph/device.rs`).
 3. Retain a strong controller per device across temporary startup banks until persistent banks attach; the registry is Weak and seeds the observer only on creation (`daemon/families/kimi_k3/startup.rs`, `daemon/shared/decode_graph/device.rs`).
-4. Key captures by exact typed geometry and retained resource owners; take a cancellable ticket before capture, report native nodes/width/span before insertion, and never use legacy `insert` after attachment (`daemon/shared/decode_graph/bank.rs`, `decode_graph/native.rs`).
+4. Key captures by exact typed geometry and retained resource owners; take a cancellable ticket before capture, report native nodes/width/span before insertion, and commit only through that ticket (`daemon/shared/decode_graph/bank.rs`, `decode_graph/native.rs`).
 5. Set `cache_cycle` at decode/verify/prefill/wave entry, attribute startup to Other, and first-touch eagerly before measuring capture growth (`daemon/families/glm5/engine.rs`, `daemon/shared/decode_graph/bank.rs`).
 6. Queue all ranks before any sync; call `observe_completed` once at the outer completed-step boundary, measure each device once, and drain all consumers before dropping executables/resources, including errors (`daemon/shared/decode_graph/device.rs`, `decode_graph/bank.rs`).
 7. Remove sealing, declared-key refusals, per-bank lazy budgets, census replacement of admission and family graph margins; charge exactly one `graph reserve` per device (`loader/placement/graph_reserve.rs`, `daemon/shared/memory_report/reconcile.rs` tests).

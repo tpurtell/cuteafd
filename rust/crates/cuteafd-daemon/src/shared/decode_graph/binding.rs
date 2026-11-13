@@ -56,7 +56,7 @@ impl<'a, K: Hash + Eq + Clone + std::fmt::Debug> BindingGraphs<'a, K> {
     }
 
     pub fn new(library: &'a NativeLibrary, site: &'static str) -> Result<Self> {
-        Ok(Self { library, site, device: library.cuda_get_device()?, bank: GraphBank::new(None), current: None })
+        Ok(Self { library, site, device: library.cuda_get_device()?, bank: GraphBank::new(), current: None })
     }
     pub fn is_none(&self) -> bool { self.current.is_none() }
     pub fn get(&self) -> Option<(*mut c_void, K)> {
@@ -64,58 +64,10 @@ impl<'a, K: Hash + Eq + Clone + std::fmt::Debug> BindingGraphs<'a, K> {
         Some((self.bank.get(key)?.raw, key.clone()))
     }
     /// # Safety
-    /// The containing wave pins every captured allocation and drains before
-    /// clearing or replacing this binding. Capture itself enqueues no execution.
-    pub unsafe fn insert(&mut self, key: K, raw: *mut c_void) -> Result<()> {
-        anyhow::ensure!(!self.bank.cache_attached(), "attached binding bank requires cache_insert");
-        // SAFETY: the containing wave retains weights, buffers and workspace.
-        let owner = unsafe { GraphOwner::new(self.library, self.device, raw, ())? };
-        super::census::capture_device_key("deepseek_v41", self.site,
-            self as *const Self as usize, self.device, None, &key, raw);
-        self.bank.insert(key.clone(), owner, None);
-        self.current = Some(key.clone());
-        tracing::debug!(target: "cuteafd::graph_capture", site="dspark_binding", ?key,
-            device=self.device, bank=self as *const Self as usize, "draft graph captured");
-        Ok(())
-    }
-    /// # Safety
     /// Every stream using these captured pointers has successfully drained.
     pub unsafe fn clear(&mut self) -> Result<()> {
-        if self.bank.cache_attached() {
-            self.bank.cache_clear_drained();
-        } else {
-            self.bank.retire_all();
-        }
+        self.bank.cache_clear_drained();
         self.current = None;
-        drop(self.bank.drain_retired(|| Ok(()))?);
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unattached_binding_keeps_selection_and_capture_stats() -> Result<()> {
-        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
-        let library = fixture.load()?;
-        let mut graphs = BindingGraphs::new(&library, "fixture")?;
-        assert!(graphs.is_none() && graphs.get().is_none());
-        // SAFETY: fake DSO graphs have no work or device pointers and never launch.
-        unsafe {
-            for key in [1, 2] {
-                library.cuda_graph_begin_capture(std::ptr::null_mut())?;
-                graphs.insert(key, library.cuda_graph_end_capture(std::ptr::null_mut())?)?;
-                assert_eq!(graphs.get().unwrap().1, key);
-            }
-        }
-        assert_eq!(graphs.bank.len(), 2);
-        assert_eq!(graphs.bank.stats(), super::super::GraphStats { captures: 2, ..Default::default() });
-        assert!(!graphs.bank.cache_attached());
-        // SAFETY: the fixture never submitted a graph launch.
-        unsafe { graphs.clear()?; }
-        assert!(graphs.is_none() && graphs.get().is_none());
         Ok(())
     }
 }

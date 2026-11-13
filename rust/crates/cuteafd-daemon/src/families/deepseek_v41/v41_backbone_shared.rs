@@ -310,9 +310,7 @@ impl<'a> BackboneSharedWave<'_, 'a> {
         };
         self.invalidate();
         unsafe {
-            ticket.capture_result(self.stream()
-                .library
-                .cuda_graph_begin_capture(self.stream().raw))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream().library, self.stream().raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue(rows) };
         let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
@@ -347,9 +345,7 @@ impl<'a> BackboneSharedWave<'_, 'a> {
         };
         ensure!(count == rows, "shared FFN captured rows differ");
         let launched = unsafe {
-            self.stream()
-                .library
-                .cuda_graph_launch(graph, self.stream().raw)
+            crate::shared::decode_graph::launch(&self.stream().library, graph, self.stream().raw)
         };
         launched.and(unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw) })?;
         self.ready = Some(rows);
