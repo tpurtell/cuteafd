@@ -710,10 +710,10 @@ fn installed_snapshot(repo: &str) -> Result<std::path::PathBuf> {
 #[test]
 #[ignore = "requires installed native family headers; header-only, no CUDA or payload reads"]
 fn installed_native_scratch_matches_legacy() -> Result<()> {
-    // Kimi's shipping coordinator is EXL3-only, but its FP8 headers still
-    // exercise the shared Spark RankPlan; no native coordinator claim is made.
+    // Kimi's supported Spark path is EXL3, so its official FP8 catalog is not
+    // a native push candidate and is covered by the EXL3 loader tests instead.
     for repo in ["zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash", "nvidia/GLM-5.3-NVFP4",
-        "nvidia/GLM-5.3-Flash-NVFP4", "stepfun-ai/Step-5-Preview", "moonshotai/Kimi-K3",
+        "nvidia/GLM-5.3-Flash-NVFP4", "stepfun-ai/Step-5-Preview",
         "Qwen/Qwen3.8-Flash-Next-FP8", "nvidia/Qwen3.8-Flash-Next-NVFP4",
         "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "MiniMaxAI/MiniMax-M3.1-Flash"] {
         let snapshot = installed_snapshot(repo)?;
