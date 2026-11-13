@@ -1634,13 +1634,13 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
             layout: Some(plan::layout::LayoutOptions {
                 rtx_bytes: vec![96 << 30; 2], spark_bytes: 100 << 30,
                 workspace_manifest: Some(manifest.clone()), host_memory: Some((512 << 30, 480 << 30)),
-                host_cache_bytes: Some(0), context_tokens: 1 << 20, pool_tokens: Some(32768),
+                host_cache_bytes: Some(0), context_tokens: 32768, pool_tokens: Some(32768),
                 prefill_unit_rows: Some(1024), prefill_waves: 3, concurrency: 16,
                 onboard: Some(OnboardSetting::Layers(0)), ..Default::default()
             }), ..Default::default() };
         let report = plan::plan(dir.path(), &options).unwrap();
         assert!(report.config_error.is_none(), "{:?}", report.config_error);
-        assert!(report.placement_supported, "{:?}", report.hints);
+        assert!(!report.placement_supported, "planning is not serving qualification");
         assert!(!report.executable());
         assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
         assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
