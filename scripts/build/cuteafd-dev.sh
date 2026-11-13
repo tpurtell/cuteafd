@@ -126,6 +126,12 @@ if [[ -n "${CUTEAFD_DEV_MEMORY:-}" ]]; then
   [[ "$CUTEAFD_DEV_MEMORY" =~ ^[0-9]+[kmg]?$ ]] || { echo "CUTEAFD_DEV_MEMORY must be a docker size such as 16g: $CUTEAFD_DEV_MEMORY" >&2; exit 2; }
   docker_args+=(--memory "$CUTEAFD_DEV_MEMORY" --memory-swap "$CUTEAFD_DEV_MEMORY")
 fi
+# Name the container so a lease holder (build-resource.py --container) can stop
+# it by name before releasing the hardware mutex it runs under.
+if [[ -n "${CUTEAFD_DEV_CONTAINER_NAME:-}" ]]; then
+  [[ "$CUTEAFD_DEV_CONTAINER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo "CUTEAFD_DEV_CONTAINER_NAME must be a docker container name: $CUTEAFD_DEV_CONTAINER_NAME" >&2; exit 2; }
+  docker_args+=(--name "$CUTEAFD_DEV_CONTAINER_NAME")
+fi
 source "$repo_root/scripts/build/compiler-cache.sh"
 source "$repo_root/scripts/build/build-caches.sh"
 export CUTEAFD_KACHE="${CUTEAFD_KACHE-}" CUTEAFD_SCCACHE_CUDA="${CUTEAFD_SCCACHE_CUDA-0}"

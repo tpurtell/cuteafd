@@ -160,6 +160,48 @@ def test_dev_shell_execs_docker_with_the_group(tmp_path):
         assert f"{common_dir}:{common_dir}:ro" in tokens
 
 
+def _dev_shell_tokens(tmp_path, extra_env: dict[str, str]) -> tuple[int, list[str], str]:
+    binary = tmp_path / "bin"
+    binary.mkdir(parents=True)
+    log = tmp_path / "docker.log"
+    stub = binary / "docker"
+    stub.write_text(DOCKER_STUB)
+    stub.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CUTEAFD_KACHE", "CUTEAFD_DEV_"))}
+    env.update(
+        PATH=f"{binary}{os.pathsep}{os.environ['PATH']}",
+        HOME=str(tmp_path / "home"),
+        MOCK_DOCKER_LOG=str(log),
+        HF_HOME=str(tmp_path / "hf"),
+        **extra_env,
+    )
+    result = subprocess.run(
+        ["bash", str(DEV_SHELL), "expert", "--", "true"],
+        cwd=REPO, env=env, capture_output=True, text=True, timeout=60, check=False,
+    )
+    tokens = [line[2:] for line in (log.read_text().splitlines() if log.exists() else [])
+              if line.startswith("A\t")]
+    return result.returncode, tokens, result.stderr
+
+
+def test_dev_shell_names_the_container_only_when_asked(tmp_path):
+    """A lease holder stops the container by the name it was given."""
+    code, tokens, stderr = _dev_shell_tokens(tmp_path / "named", {"CUTEAFD_DEV_CONTAINER_NAME": "duel-sm121.r1"})
+    assert code == 0, stderr
+    run = tokens[tokens.index("run"):]
+    assert any(run[i:i + 2] == ["--name", "duel-sm121.r1"] for i in range(len(run) - 1))
+    code, tokens, stderr = _dev_shell_tokens(tmp_path / "plain", {})
+    assert code == 0, stderr
+    assert "--name" not in tokens[tokens.index("run"):]
+
+
+def test_dev_shell_refuses_an_invalid_container_name(tmp_path):
+    code, tokens, stderr = _dev_shell_tokens(tmp_path, {"CUTEAFD_DEV_CONTAINER_NAME": "bad name;rm"})
+    assert code == 2
+    assert "CUTEAFD_DEV_CONTAINER_NAME" in stderr
+    assert "run" not in tokens
+
+
 def _alternate_stores(git_dir: str) -> list[str]:
     stores: list[str] = []
     for path in Path(git_dir).rglob("objects/info/alternates"):
