@@ -16,6 +16,7 @@ pub(super) struct SetLayout {
 }
 
 fn separated(end: u64) -> Result<u64> {
+    // Leave a fragment guard even when the previous span is already aligned.
     end.checked_add(256).map(|n| n / 256 * 256).context("expert-set logical extent overflow")
 }
 

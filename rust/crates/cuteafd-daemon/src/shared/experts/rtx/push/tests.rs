@@ -814,7 +814,7 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: Option<&cuteafd_lo
 }
 
 fn receive_pushed_sets<'a>(device: Device<'a>, catalog: Option<&cuteafd_loader::OfficialV41Catalog>,
-    root: &std::path::Path, socket_dir: &std::path::Path, records: &crate::shared::experts::rtx::dense::Records,
+    root: &std::path::Path, _socket_dir: &std::path::Path, records: &crate::shared::experts::rtx::dense::Records,
     tp2: Vec<CoordinatorExpertPlan>, sparks: usize, gpu: usize) -> Result<Vec<PushedExperts<'a>>> {
     use crate::shared::experts::rtx::dense::RankLayout;
     let rank = sparks + gpu;
@@ -842,7 +842,10 @@ fn receive_pushed_sets<'a>(device: Device<'a>, catalog: Option<&cuteafd_loader::
     let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(
         &layout.checked(root, sparks + 2, rank)?, rank as u32)?;
     let dense = crate::shared::experts::rtx::dense::DenseArena::new(device, layout, expected)?;
-    let socket = socket_dir.join(format!("g{gpu}.sock")).to_string_lossy().into_owned();
+    // Abstract names stay short even when the gate's NVMe fixture path is deep.
+    static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let socket = format!("@cuteafd-push-{}-{}-{gpu}", std::process::id(),
+        NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let (mut coordinator, mut worker) = control_pair()?;
     for stream in [&coordinator, &worker] { stream.set_read_timeout(Some(Duration::from_secs(600)))?; }
