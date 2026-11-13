@@ -1217,7 +1217,7 @@ impl Opened {
         let native_load = target.native_load.clone();
         let physical = LocalPhysicalInput { layers: (self.cfg.first_moe_layer..layers).collect(),
             max_rows: args.prefill_rows.max(engine::DECODE_ROWS), lanes: prefill_lanes, storage,
-            route_checks: true, peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1"),
+            route_checks: true, peer_diagnostics: cuteafd_loader::serving_capacity::peer_wait_diagnostics(),
             activations: args.exlr8_prefill_activations };
         let metadata = args.exlr8_manifest.as_deref().map(|selected|
             cuteafd_loader::plan::exlr8::residency::MetadataInput::open(&self.snapshot, selected)).transpose()?;

@@ -217,7 +217,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let context_programs = context_programs.try_into()
         .map_err(|_| anyhow::anyhow!("Kimi context program rank inventory"))?;
     memory.sample("modules-context-attention")?;
-    let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
+    let diagnostics = cuteafd_loader::serving_capacity::peer_wait_diagnostics();
     let inventory = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PreWeight, |_| {
         if RANKS == 2 {
             library.peer_exchange_initialize()?;

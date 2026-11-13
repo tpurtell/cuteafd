@@ -59,7 +59,7 @@ mod expert_weight_arena_id_tests {
 }
 
 mod peer_storage;
-pub use peer_storage::PeerStorageLayout;
+pub use peer_storage::{peer_wait_diagnostics, PeerStorageLayout, PEER_WAIT_DIAGNOSTIC};
 pub use spark_intake::{prefill_return_bytes, prefill_return_bytes_with_format,
     prefill_return_requests_with_format, spark_intake_bytes, spark_intake_requests, PrefillShape};
 mod exl3_workspace;

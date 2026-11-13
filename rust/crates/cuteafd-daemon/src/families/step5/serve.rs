@@ -317,7 +317,7 @@ fn with_backend<T>(args: &ServeArgs,
             library.cuda_enable_peer(other)?;
             library.peer_exchange_initialize()?;
             library.peer_abort_initialize()?;
-            if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1") {
+            if cuteafd_loader::serving_capacity::peer_wait_diagnostics() {
                 library.peer_diagnostic_initialize()?;
             }
         }
@@ -341,7 +341,7 @@ fn with_backend<T>(args: &ServeArgs,
         sequences: usize::from(args.max_sequences), context: args.max_context, serving_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
-        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code,
+        peer_diagnostics: cuteafd_loader::serving_capacity::peer_wait_diagnostics(), pending_code,
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
             args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };

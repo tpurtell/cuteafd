@@ -1152,7 +1152,7 @@ impl<'a> MimoEngine<'a> {
                     &self.cfg, 2, rank, rows, prefill_lanes, 0, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false))?.iter().map(|r| r.bytes).sum::<u64>();
                 let actual = ledger.by_owner(cuteafd_ffi::memory_ledger::Space::Device, gpu)
                     .get("mimo/transport/peer").copied().unwrap_or(0) as u64;
-                let diagnostics = if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1") {
+                let diagnostics = if cuteafd_loader::serving_capacity::peer_wait_diagnostics() {
                     ((cuteafd_loader::families::mimo_v2::admission::peer_slots(prefill_lanes) + 1)
                         * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256) as u64
                 } else { 0 };

@@ -259,7 +259,7 @@ impl<'a> PeerExchange<'a> {
         validate_decode_extent(decode_lane_bytes)?;
         let slots = sizes.len();
         validate_slot_sizes(ranks.map(|rank| rank.device), sizes)?;
-        let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
+        let diagnostics = cuteafd_loader::serving_capacity::peer_wait_diagnostics();
         let storage = cuteafd_loader::serving_capacity::PeerStorageLayout::new(slots, *sizes.iter().max().context("empty peer slots")?, diagnostics)?;
         let end = |rank: usize| -> Result<End<'a>> {
             on_device(library, ranks[rank].device, || {

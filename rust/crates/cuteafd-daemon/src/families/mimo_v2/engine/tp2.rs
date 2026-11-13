@@ -19,7 +19,7 @@ impl<'a> MimoEngine<'a> {
             &route_sizes, (DECODE_ROWS * self.cfg.topk * 4).next_multiple_of(16) * 2)?;
             let planned = cuteafd_loader::placement::families::mimo_v2::route_exchange_bytes(
                 rows as u64, self.cfg.topk as u64, self.prefill_waves() as u64)?;
-            let diagnostics = if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1") {
+            let diagnostics = if cuteafd_loader::serving_capacity::peer_wait_diagnostics() {
                 ((route_sizes.len() + 1) * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256) as u64
             } else { 0 };
             let ledger = cuteafd_ffi::memory_ledger::snapshot();

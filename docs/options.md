@@ -486,6 +486,19 @@ at most 64 synchronized phase boundaries, logs signed used/tracked/unclassified
 deltas, then intentionally exits before target graph capture or Ready. It adds
 no external observer, request probes, admission adjustment or automatic allowance.
 
+`CUTEAFD_DIAG_PEER_WAIT=1` is a private coordinator-only diagnostic for every
+family with a two-GPU head split, not a launch configuration key. Pass it through
+`wip-cards --arm-env ARM:CUTEAFD_DIAG_PEER_WAIT=1`; the launcher forwards every
+`CUTEAFD_DIAG_*` variable to the coordinator unchanged. Each peer exchange then
+keeps one 48-byte progress record per flag on each GPU (`max(256, 48 × (slots + 1))`
+bytes per exchange per GPU). Every push and wait logs its host issue, and a wait
+that times out dumps both ranks' per-flag frontiers before ending the engine.
+GLM 5.3, Step-5 and Qwen4 admission charge those records as transport bytes.
+GLM Flash admission does not: its records, a few KiB per GPU over the target,
+route, context and draft exchanges, come out of the release memory padding
+(`MEMORY_PADDING`, 100 MiB by default). The per-issue host logging slows decode,
+so leave it off for measurements.
+
 ## Family support: option values
 
 Attention placement (`ATTENTION_PLACEMENT`; `auto` resolves through the
