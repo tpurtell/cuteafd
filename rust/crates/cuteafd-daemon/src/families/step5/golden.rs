@@ -569,7 +569,7 @@ fn load_with_experts<'a, T>(args: &GoldenArgs, checkpoint: &Checkpoint,
     let (loaded, pending) = match planned {
         Some((owners, dense, push, ranks)) => {
             let pending = admission.start_with(&args.peers, Some(ranks))?;
-            let loaded = crate::shared::placement::load_while_admitting(pending, || {
+            let loaded = crate::shared::placement::load_while_admitting(Some(pending), || {
                 let (received, ()) = push.receive_with(devices.to_vec(), Some(&catalog), args.peers.len(), Some(Ok(dense)), || ());
                 policy.committed(received)?;
                 Ok(owners)
@@ -578,7 +578,7 @@ fn load_with_experts<'a, T>(args: &GoldenArgs, checkpoint: &Checkpoint,
         }
         None => (load.take().context("golden mount load closure")?()?, Some(admission.start(&args.peers)?)),
     };
-    if let Some(pending) = pending { crate::shared::placement::load_while_admitting(pending, || Ok(()))?; }
+    if let Some(pending) = pending { crate::shared::placement::load_while_admitting(Some(pending), || Ok(()))?; }
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
         SparkEndpoint { ring_depth: None, capacity: args.prefill_units.unwrap_or(rows) as u32,
             ingress: format.ingress(), partial_reply_bytes: None }, 1)?;
@@ -1272,7 +1272,14 @@ fn run(args: GoldenArgs) -> Result<()> {
             .map(|owner| owner.bytes).collect::<Vec<_>>();
         super::chain::physical_bytes(&requests)
     }).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
-    let reserve = pending.checked_add(transport).context("golden reserve")?;
+    // Recorded trellis transforms retain one bounded device scratch until
+    // the dense receiver drops; BF16 cores do not allocate this owner.
+    let rank_weights = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::from_checkpoint(&checkpoint, 0, 1)?;
+    let transform_bytes = if rank_weights.core.is_empty() { 0 } else {
+        super::chain::physical_bytes(&[crate::shared::experts::rtx::dense::STEP_BYTES as u64])?
+    };
+    let reserve = pending.checked_add(transport).and_then(|n| n.checked_add(transform_bytes))
+        .context("golden reserve")?;
     let total = [
         chain_bytes,
         head_bytes,
@@ -1295,6 +1302,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         input_bytes,
         pending_code_bytes = pending,
         transport_bytes = transport,
+        transform_bytes,
         reserve,
         total,
         available,
