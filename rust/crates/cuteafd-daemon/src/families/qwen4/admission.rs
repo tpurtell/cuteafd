@@ -1023,10 +1023,16 @@ mod tests {
                     .all(|d| d.gpu == 0));
                 let plan = super::dual_weights(&args, &checkpoint, &cfg, 2, false)?;
                 assert_eq!(plan.layer_extra.len(), 2);
-                assert!(plan.layer_extra[0].is_empty());
-                assert_eq!(plan.layer_extra[1].iter().map(|d| d.bytes).sum::<u64>(), 256);
-                assert!(plan.layer_extra[1].iter().all(|d| d.category == cuteafd_core::memory_layout::Category::Tables
-                    && d.residency == cuteafd_loader::placement::LayerResidency::Owner));
+                assert!(plan.layer_extra.iter().all(Vec::is_empty));
+                let scales = plan.arenas.iter().flat_map(|(owner, arena)| arena.views().iter()
+                    .filter(|(name, _)| name.ends_with(".ple.scale"))
+                    .map(move |(name, view)| (*owner, arena.id(), name.as_str(), view.bytes(), view.offset())))
+                    .collect::<Vec<_>>();
+                assert_eq!(scales.len(), 1);
+                let (owner, arena, name, bytes, offset) = scales[0];
+                assert_eq!((owner, arena, name, bytes), (1, "qwen4/target/rank1",
+                    "model.language_model.layers.1.ple.scale", 256));
+                assert_eq!(offset % 256, 0);
             }
         }
         Ok(())
