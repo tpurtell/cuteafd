@@ -672,7 +672,10 @@ fn zero_onboard_pair_has_no_local_expert_or_exchange_owners() {
     use crate::placement::families::minimax_m3 as shared;
     use crate::placement::planner::Operation;
     for count in [0, 1] {
-        let inputs = recipe_inputs(2, 4);
+        // This fixture has one routed layer; onboarding it requires the
+        // all-local topology rather than a linked layout with idle Sparks.
+        let ranks = if count == 0 { 4 } else { 0 };
+        let inputs = recipe_inputs(2, ranks);
         let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(count),
             inputs.prefill, Operation::Serving, None, Default::default());
         let admitted = inputs.admit(request).unwrap();
@@ -682,15 +685,26 @@ fn zero_onboard_pair_has_no_local_expert_or_exchange_owners() {
         assert_eq!(exchange, if count == 0 { 0 } else { 10 });
         assert_eq!(workspace, if count == 0 { 0 } else { 4 });
         assert_eq!(admitted.expert_backings.len(), if count == 0 { 0 } else { 2 });
+        let rows = crate::serving_capacity::OwnerTp2Rows::new(inputs.cfg.hidden as u64,
+            inputs.cfg.topk as u64, inputs.prefill.rows.max(u64::from(shared::DECODE_ROWS)), false).unwrap();
+        for demand in rows.demands().unwrap() {
+            let id = format!("{}.{}", shared::Owner::Tp2 { gpu: demand.gpu as usize }.id(),
+                demand.group.replace(' ', "_"));
+            let matches = owners.iter().filter(|owner| owner.id == id).collect::<Vec<_>>();
+            assert_eq!(matches.len(), usize::from(count > 0), "{id}");
+            if count > 0 { assert_eq!(matches[0].bytes, demand.bytes, "{id}"); }
+        }
+        for backing in &inputs.expert_backings[1] {
+            let roots = owners.iter().filter(|owner| owner.id == backing.arena.id()).collect::<Vec<_>>();
+            assert_eq!(roots.len(), usize::from(count > 0), "gpu {} expert arena", backing.gpu);
+            if count > 0 { assert_eq!(roots[0].bytes, backing.arena.bytes() as u64); }
+        }
         if count == 0 {
             assert!(owners.iter().all(|owner| !owner.id.starts_with("minimax.experts.")
                 && !owner.id.starts_with("minimax.expert_")));
-            for backing in &inputs.expert_backings[1] {
-                assert!(owners.iter().all(|owner| owner.id != backing.arena.id()));
-            }
         }
         assert!(owners.iter().any(|owner| owner.id.starts_with("minimax.hops.")));
-        assert!(owners.iter().any(|owner| owner.id.starts_with("minimax.spark.")));
+        assert_eq!(owners.iter().any(|owner| owner.id.starts_with("minimax.spark.")), ranks > 0);
     }
 }
 
