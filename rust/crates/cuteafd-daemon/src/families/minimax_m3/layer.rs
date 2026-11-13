@@ -99,6 +99,21 @@ fn validate_fold(buffers: [Buffer; 3], whole: Option<Buffer>, count: usize,
     Ok(())
 }
 
+fn validate_fold_exclusions(buffers: [Buffer; 3], protected: impl IntoIterator<Item = Buffer>) -> Result<()> {
+    let mut ranges = [(0usize, 0usize); 3];
+    for (range, buffer) in ranges.iter_mut().zip(buffers) {
+        let start = buffer.ptr as usize;
+        *range = (start, start.checked_add(buffer.bytes).context("MiniMax fold backing overflow")?);
+    }
+    for buffer in protected {
+        let start = buffer.ptr as usize;
+        let end = start.checked_add(buffer.bytes).context("MiniMax protected backing overflow")?;
+        ensure!(ranges.iter().all(|&(a, b)| end <= a || b <= start),
+            "MiniMax fold owner overlaps unit storage");
+    }
+    Ok(())
+}
+
 fn segment_rows(segments: &[attention::Segment], capacity: usize) -> Result<usize> {
     packed_rows(segments.iter().map(|segment| (segment.first_row, segment.request.rows)), capacity)
 }
@@ -334,7 +349,11 @@ impl<'a> UnitOwner<'a> {
             "MiniMax partial fold stream/capacity differs from unit");
         let whole = self.plane("ffn")?;
         let count = rows.checked_mul(6144).context("MiniMax partial fold count overflow")?;
-        validate_fold([fold.rank0.buffer, fold.rank1.buffer, fold.meeting.buffer], Some(whole), count, fold.precision)?;
+        let buffers = [fold.rank0.buffer, fold.rank1.buffer, fold.meeting.buffer];
+        validate_fold(buffers, Some(whole), count, fold.precision)?;
+        validate_fold_exclusions(buffers, self.planes.values().map(|owner| owner.buffer).chain([
+            self.dense.activation.buffer, self.dense.workspace.inputs.buffer,
+            self.dense.workspace.records.buffer, self.dense.workspace.output.buffer]))?;
         if shared { self.routed_boundary.before_join(self.stream.raw)?; }
         else { self.routed_boundary.idle()?; }
         self.stream.device.run(|| {
@@ -412,6 +431,24 @@ mod tests {
             assert!(validate_fold([rank0, rank1, meeting], Some(whole), 0, precision).is_err());
             assert!(validate_fold([rank0, rank1, meeting], Some(whole), usize::MAX, precision).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_fold_cannot_alias_any_unit_plane_or_its_unused_tail() -> Result<()> {
+        let buffer = |pointer, bytes| Buffer { ptr: pointer as *mut std::ffi::c_void,
+            bytes, device_id: 0, flags: 0 };
+        let buffers = [buffer(0x10000usize, 0x1000), buffer(0x20000, 0x1000), buffer(0x30000, 0x2000)];
+        validate_fold_exclusions(buffers, [buffer(0x40000, 0x1000)])?;
+        validate_fold_exclusions(buffers, [buffer(0x11000, 0x1000)])?;
+        for slot in buffers {
+            for protected in [slot, buffer(slot.ptr as usize + slot.bytes - 1, 4),
+                buffer(slot.ptr as usize - 1, 2)] {
+                assert!(validate_fold_exclusions(buffers, [protected]).is_err());
+            }
+        }
+        assert!(validate_fold_exclusions(buffers, [buffer(usize::MAX, 2)]).is_err());
+        assert!(validate_fold_exclusions([buffer(usize::MAX, 2), buffers[1], buffers[2]], []).is_err());
         Ok(())
     }
 
