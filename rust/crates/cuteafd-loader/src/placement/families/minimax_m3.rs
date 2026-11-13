@@ -564,7 +564,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn executor_runs_whole_owners_and_pair_split_ffn_only() {
+    fn executor_runs_whole_owner_layers_only() {
         assert!(MINIMAX_M3.runs(WHOLE) && MINIMAX_M3.runs(LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }));
         assert!(!MINIMAX_M3.runs(LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }));
         assert!(!MINIMAX_M3.runs(LayerMode::HeadSplit));
