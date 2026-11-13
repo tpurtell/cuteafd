@@ -391,6 +391,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     if let Some(dump) = super::dsa_dump::DsaDump::from_env()? {
         engine.attach_dsa_dump(dump)?;
     }
+    if let Some(dump) = super::score_dump::ScoreDump::from_env()? {
+        engine.attach_dsa_scores(dump)?;
+    }
     memory.sample("pre-capture")?;
     stop_before_capture(memory.enabled())?;
     if let Some(set) = graph_set {

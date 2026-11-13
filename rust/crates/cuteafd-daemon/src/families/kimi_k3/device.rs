@@ -617,6 +617,7 @@ pub(crate) struct LocalLane<'a> {
     context_units: Vec<Option<ContextUnit>>,
     pub(super) capture: Option<Rc<super::golden::Capture>>,
     pub(super) dsa_dump: Option<Rc<super::dsa_dump::DsaDump>>,
+    pub(super) dsa_scores: Option<Rc<super::score_dump::ScoreDump>>,
 }
 
 #[derive(Clone, Copy)]
@@ -674,7 +675,7 @@ impl<'a> LocalLane<'a> {
         let banks = lane.layout.metadata_banks();
         Ok(Self { lane, programs, cfg, layers, global, lane_index, rank, kda, mla, attention: None, graphs: None,
             replay_enabled: true, context: None, context_pages: vec![0; banks], context_units: vec![None; banks],
-            capture: None, dsa_dump: None })
+            capture: None, dsa_dump: None, dsa_scores: None })
     }
 
     pub(crate) fn bind_context(&mut self, owner: Rc<super::context::ContextOwner<'a>>,
@@ -945,7 +946,8 @@ impl<'a> LocalLane<'a> {
     /// leaves that geometry lazy.
     pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize,
         reserve: u64) -> Result<usize> {
-        ensure!(self.dsa_dump.is_none(), "CUTEAFD_KIMI_DSA_DUMP refuses startup CUDA graph capture");
+        ensure!(!self.diagnostics_active(),
+            "CUTEAFD_KIMI_DSA_DUMP/CUTEAFD_KIMI_DSA_SCORES refuse startup CUDA graph capture");
         self.check_startup_keys(keys, rank)?;
         let stream = self.stream().clone();
         let staged = self.attention.take();
@@ -1032,6 +1034,12 @@ impl<'a> LocalLane<'a> {
         Ok(())
     }
 
+    /// A diagnostic readback adds host-visible host copies inside the step,
+    /// so it excludes every recorded stream.
+    fn diagnostics_active(&self) -> bool {
+        self.dsa_dump.is_some() || self.dsa_scores.is_some()
+    }
+
     /// Run one step body through the bounded graph cache: replay a resident
     /// executable, capture and launch a miss, or run the body eagerly. The
     /// body owns the whole recorded segment, so nested sites run eagerly.
@@ -1041,16 +1049,16 @@ impl<'a> LocalLane<'a> {
             return body(self);
         }
         let Some(mut graphs) = self.graphs.take() else { return body(self) };
-        if self.dsa_dump.is_some() {
+        if self.diagnostics_active() {
             self.graphs = Some(graphs);
-            bail!("CUTEAFD_KIMI_DSA_DUMP refuses CUDA graph replay");
+            bail!("CUTEAFD_KIMI_DSA_DUMP/CUTEAFD_KIMI_DSA_SCORES refuse CUDA graph replay");
         }
         let stream = self.stream().clone();
         let key = super::graphs::Key { lane: self.lane_index, rank: self.rank, rows, op };
         let pinned = super::graphs::pinned(self.programs.graph_core(), self.programs.ranks, key);
         // A golden capture records its own sites inside the body; a recorded
         // stream cannot contain those reads.
-        let allow_capture = self.capture.is_none() && self.dsa_dump.is_none();
+        let allow_capture = self.capture.is_none() && !self.diagnostics_active();
         let result = graphs.graph(&stream, key, allow_capture, pinned, || body(self));
         self.graphs = Some(graphs);
         result
@@ -1453,6 +1461,15 @@ impl<'a> LocalLane<'a> {
         let head_weights = self.lane.buffer("DSA head weights")?;
         let indices = self.lane.buffer("DSA indices")?;
         let weights = self.layer(layer)?.indexer()?;
+        // Scored-twin diagnostic: run the checkpoint's own scored selector
+        // beside the live plain route so its retained sort values can be read
+        // back. `DSA producer scratch` is dead for this step and large enough
+        // for `rows * 2048 * 4`; `DSA scores` and `DSA selector scratch` are
+        // separate admitted owners. Context staging reads `DSA scores` as its
+        // global candidate set, so the twin never runs there.
+        let scores_dump = self.dsa_scores.as_deref()
+            .filter(|dump| !staging && dump.enabled(layer));
+        let table_width = self.lane.layout.max_context.div_ceil(64);
         let stream = self.stream();
         stream.device.run(|| {
             programs.producer[unit].launch(weights, cuteafd_ffi::KimiIndexBatch {
@@ -1474,6 +1491,22 @@ impl<'a> LocalLane<'a> {
                 scores: if staging { self.lane.buffer("DSA scores")? } else { indices },
                 scratch: self.lane.buffer("DSA selector scratch")?,
             }, stream.raw)?;
+            if scores_dump.is_some() {
+                // SAFETY: writer aliases and extents checked by the selector
+                // launch; the producer scratch view, `DSA scores` and the
+                // selector scratch are disjoint from the live route's output,
+                // and every operand is retained by this lane.
+                programs.scored[unit].launch(cuteafd_ffi::KimiIndexSelection {
+                    rows: batch.rows, cache_pages: self.mla.pages(),
+                    table_width, table_stride: table_width,
+                    query_fp8: query, head_weights, cache, table: self.lane.buffer("DSA page table")?,
+                    lengths: self.lane.buffer("DSA lengths")?,
+                    indices: view(self.lane.buffer("DSA producer scratch")?,
+                        0, batch.rows * super::score_dump::WIDTH * 4)?,
+                    scores: self.lane.buffer("DSA scores")?,
+                    scratch: self.lane.buffer("DSA selector scratch")?,
+                }, stream.raw)?;
+            }
             self.mla_program(layer, batch.rows, speculative)?.selected(layer, cuteafd_ffi::KimiSparseBatch {
                 rows: batch.rows, cache_tokens: batch.cache_pages * 64,
                 query: batch.query, cache: batch.cache, indices,
@@ -1484,7 +1517,22 @@ impl<'a> LocalLane<'a> {
         })?;
         super::dsa_dump::record_selected(self.dsa_dump.as_deref(), self.rank, stream, layer, batch.rows, || {
             Ok((self.lane.buffer("DSA positions")?, self.lane.buffer("DSA selected lengths")?, indices))
-        })
+        })?;
+        if let Some(dump) = scores_dump {
+            super::score_dump::record_scores(dump, self.rank, stream, layer, batch.rows, table_width,
+                batch.rows <= 64, || Ok(super::score_dump::ScoreBuffers {
+                    positions: self.lane.buffer("DSA positions")?,
+                    lengths: self.lane.buffer("DSA selected lengths")?,
+                    frontiers: self.lane.buffer("DSA lengths")?,
+                    plain: indices,
+                    twin: view(self.lane.buffer("DSA producer scratch")?,
+                        0, batch.rows * super::score_dump::WIDTH * 4)?,
+                    scores: self.lane.buffer("DSA scores")?,
+                    table: self.lane.buffer("DSA page table")?,
+                }))
+        } else {
+            Ok(())
+        }
     }
 
     fn mla_output(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
