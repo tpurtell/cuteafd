@@ -66,7 +66,13 @@ pub(super) struct Model {
     spec: ModelSpec,
     /// Logical weights by stem.
     contracts: BTreeMap<String, Contract>,
+    /// Checkpoint bytes of every routed-expert tensor (headers only).
+    routed_bytes: u64,
+    /// The checkpoint's own header (dtype, shape) for each contract member.
+    headers: BTreeMap<String, (cuteafd_core::DType, Vec<usize>)>,
 }
+
+mod placement;
 
 fn text(name: &str) -> Option<&str> { name.strip_prefix(TEXT) }
 
@@ -145,23 +151,25 @@ impl Model {
                 add(stem.into(), vision_role.clone(), vec![n, k], Storage::Bf16, true);
             }
         }
-        let model = Self { spec: spec(&cfg, vision.is_some(), draft.as_ref(), checkpoint), cfg, contracts };
-        // Validate the exact standard-HF text inventory, not only projection stems.
-        // Absent shard headers remain the checkpoint reader's explicit missing-shard result.
-        let mut expected_names = std::collections::BTreeSet::new();
+        let routed_bytes = checkpoint.tensors.iter()
+            .filter(|tensor| tensor.meta.name.contains(".block_sparse_moe.experts."))
+            .map(|tensor| tensor.meta.byte_length).sum();
+        let headers = contracts.iter().flat_map(|(stem, contract)| contract.headers().into_iter()
+            .map(move |(suffix, _, _)| if suffix.is_empty() { stem.clone() } else { format!("{stem}.{suffix}") }))
+            .filter_map(|name| checkpoint.header(&name).map(|h| (name, (h.dtype.clone(), h.shape.clone()))))
+            .collect();
+        let model = Self { spec: spec(&cfg, vision.is_some(), draft.as_ref(), checkpoint), cfg, contracts, routed_bytes,
+            headers };
+        // Open is structural (M1): every contract member must be present by
+        // name, so a missing tensor is a typed open error that names it. Exact
+        // dtype/shape agreement and unknown tensors are `accepts` verdicts:
+        // a drifted quant reports each refused tensor and its reason in the
+        // census (`--files` keeps working) instead of failing the whole open.
         for (stem, contract) in &model.contracts {
-            for (suffix, dtype, shape) in contract.headers() {
+            for (suffix, _, _) in contract.headers() {
                 let name = if suffix.is_empty() { stem.clone() } else { format!("{stem}.{suffix}") };
                 ensure!(checkpoint.contains_tensor(&name), "MiniMax M3 checkpoint lacks {name} ({:?})", contract.role.component);
-                if let Some(header) = checkpoint.header(&name) {
-                    ensure!(header.dtype == dtype && header.shape == shape,
-                        "MiniMax M3 {name}: expected {dtype:?} {shape:?}, found {:?} {:?}", header.dtype, header.shape);
-                }
-                expected_names.insert(name);
             }
-        }
-        for name in checkpoint.tensor_names() {
-            ensure!(expected_names.contains(name), "MiniMax M3 unexpected tensor {name}");
         }
         Ok(model)
     }
@@ -294,7 +302,19 @@ impl FamilyModel for Model {
             Storage::Nvfp4 => operand.is_compressed_nvfp4() && operand.input_scale.is_some(),
         };
         super::require(ok, || format!("{stem}: expected {:?} {:?}{}, found {}", contract.storage, contract.shape,
-            if contract.bias { " with bias" } else { "" }, super::describe(operand)))
+            if contract.bias { " with bias" } else { "" }, super::describe(operand)))?;
+        // Exact member headers (the loaders' byte contract), named per member.
+        let stem = self.contracts.get_key_value(stem).or_else(|| stem.strip_suffix(".weight")
+            .and_then(|s| self.contracts.get_key_value(s))).map(|(stem, _)| stem.as_str()).unwrap_or(stem);
+        for (suffix, dtype, header_shape) in contract.headers() {
+            let member = if suffix.is_empty() { stem.to_owned() } else { format!("{stem}.{suffix}") };
+            let found = self.headers.get(&member);
+            super::require(found.is_some_and(|(d, s)| *d == dtype && *s == header_shape), || match found {
+                Some((d, s)) => format!("{member}: expected {dtype:?} {header_shape:?}, found {d:?} {s:?}"),
+                None => format!("{member}: header absent"),
+            })?;
+        }
+        Ok(())
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         if !operand.is_compressed_nvfp4() { return None; }
@@ -302,7 +322,15 @@ impl FamilyModel for Model {
         Some(ExpertContract {
             package: package.into(), block: 16,
             spark_worlds: crate::plan::experts::spark_worlds(package, self.cfg.moe_intermediate),
-            local: Err("MiniMax RTX expert onboarding is not qualified; serving remains refused".into()),
+            // H1 admits whole and TP2 RTX layers in the shared recipe; the
+            // executor (stream C, H6) and serve stay unqualified.
+            local: Ok("MiniMax fp8moe NVFP4 W4A4 coordinator package (fp8-minimax-nvfp4a4 tp1/tp2)".into()),
         })
+    }
+    fn contract_admission(&self) -> bool { true }
+    fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
+        options: &mut crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
+        -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
+        Some(Ok(placement::layout(self, input, report, options, requested)))
     }
 }

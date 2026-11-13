@@ -63,7 +63,7 @@ fn native_groups(input: &super::super::PlanInput, family: &str, working: &SparkW
         let view = tensors.for_layer_metadata(layer)?;
         let format = view.format();
         let package_family = match family {
-            "glm5" => "glm", "glm5_flash" => "glmf",
+            "glm5" => "glm", "glm5_flash" => "glmf", "minimax_m3" => "minimax",
             "mimo_v2" => if format == ExpertFormat::Mxfp4 {
                 if shape.hidden == 6144 { "mimop" } else { "mimof" }
             } else { "mimo" },
@@ -113,6 +113,14 @@ fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats
     }
     Ok(cuteafd_core::OwnerBytes { scratch, io,
         pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 * formats.len() as u64 + address_staging })
+}
+
+/// One native NVFP4 owner on the shared FP8-family worker: the installed
+/// package's measured scratch at the compiled export (census), BF16 ingress
+/// I/O at the owner's capacity, and packed route staging per queued unit.
+pub(crate) fn nvfp4_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, width: u32,
+    extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    fp8_owner_bytes(family, geometry, &[(ExpertFormat::Nvfp4, width)], extent)
 }
 
 /// EXL3 owner bytes. Prefill-scale exports charge the calibrated retained

@@ -90,7 +90,8 @@ fn minimax_spark_recipe_uses_compressed_divisor_headers_without_opening_serving(
     assert_eq!(contract.package, "minimax:nvfp4a4");
     assert_eq!(contract.block, 16);
     assert_eq!(contract.spark_worlds, (2..=8).collect::<Vec<_>>());
-    assert!(contract.local.is_err());
+    // H1: RTX onboarding is an admitted contract owner; serve stays refused.
+    assert!(contract.local.as_ref().is_ok_and(|package| package.contains("fp8-minimax-nvfp4a4")));
     for world in 2..=8 {
         assert_eq!(crate::plan::experts::checkpoint_spark_recipe(&checkpoint, world, &[3]).unwrap(),
             crate::plan::experts::spark_recipe(&contract.package, 3072, world).unwrap());
@@ -122,6 +123,32 @@ fn generic_native_validation_rejects_missing_and_drifted_minimax_tensors_early()
         error => panic!("expected generic checkpoint validation, got {error:?}"),
     };
     assert!(diagnostic.contains(&name), "{diagnostic}");
+}
+
+/// M1: open is structural. A consistent but drifted header (here a norm
+/// stored F32 instead of BF16) and an extra tensor both open, then report a
+/// named census rejection on the exact tensor, instead of failing the whole
+/// open with one message.
+#[test]
+fn structural_open_reports_exact_header_drift_and_unknown_tensors_by_name() {
+    let (dir, cfg, mut tensors) = fixture();
+    let norm = format!("{TEXT}layers.1.input_layernorm.weight");
+    tensors.iter_mut().find(|t| t.0 == norm).unwrap().1 = "F32";
+    tensors.push((format!("{TEXT}layers.0.self_attn.extra_norm.weight"), "BF16", vec![128]));
+    testing::write_snapshot(dir.path(), &cfg, &tensors, None);
+    let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();
+    assert!(report.config_error.is_none(), "{:?}", report.config_error);
+    let rejections = report.components.iter().flat_map(|c| &c.rejections).collect::<Vec<_>>();
+    assert!(rejections.iter().any(|r| r.tensor.contains("layers.1.input_layernorm")
+        && r.reason.contains("expected Bf16")), "{rejections:?}");
+    assert!(rejections.iter().any(|r| r.tensor.contains("extra_norm")
+        && r.reason.contains("outside the MiniMax M3 tensor contract")), "{rejections:?}");
+    assert!(!report.executable());
+    // A missing contract member is still a typed open error naming it.
+    tensors.retain(|t| t.0 != norm);
+    testing::write_snapshot(dir.path(), &cfg, &tensors, None);
+    let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();
+    assert!(report.config_error.as_deref().is_some_and(|e| e.contains(&norm)), "{:?}", report.config_error);
 }
 
 #[test]
@@ -368,4 +395,95 @@ fn installed_minimax_headers_match_native_contract() {
     assert!(routed_bytes > 121 << 30, "one GB10 cannot hold the native experts");
     eprintln!("MiniMax installed routed expert bytes={routed_bytes}; one GB10 is physically insufficient");
     assert_eq!(report.spark_budget_bytes, 100 << 30);
+}
+
+/// H1 contract: the shared recipe charges each physical owner exactly once on
+/// one RTX and on a pair: one target arena backing per rank, MSA KV/index pages
+/// only on each layer's attention owner, expert arenas and Spark owners only
+/// under their own onboarding count, and the solve never re-derives a policy.
+#[test]
+fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
+    use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
+    use crate::placement::families::minimax_m3::{self as shared, LayerExperts, LocalPackage, MiniMaxInputs, SparkCharge};
+    use crate::placement::planner::{Context, Location, PrefillShape, ComponentKind, Recipe, serving};
+    let (dir, small, _) = fixture();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = MiniMaxM3Config::from_hf(&small).unwrap();
+    let fixture = |name: &str| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(
+        format!("{}/../cuteafd-ffi/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap() };
+    let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
+    for gpus in [1usize, 2] {
+        let owners = shared::layer_owners(cfg.layers, gpus);
+        let targets = CoordinatorWeights::plan(&checkpoint, &cfg, gpus,
+            &owners.iter().map(|&g| usize::from(g)).collect::<Vec<_>>()).unwrap();
+        // Programs: MSA, producers, forward and this layout's dense exports.
+        let mut programs = Vec::new();
+        for name in ["minimax_msa_programs", "minimax_producer_programs", "minimax_forward_programs"] {
+            programs.extend(fixture(name)["programs"].as_array().unwrap().clone());
+        }
+        let mut dense = std::collections::BTreeMap::new();
+        for target in &targets {
+            for entry in dense_manifest(target)["programs"].as_array().unwrap() {
+                dense.insert(entry["name"].as_str().unwrap().to_owned(), entry.clone());
+            }
+        }
+        programs.extend(dense.into_values());
+        let manifest = std::sync::Arc::new(serde_json::json!({"programs": programs}));
+        let ranks = 2;
+        let prefill = PrefillShape { rows: 1024, waves: 3 };
+        let charge = |count: usize| (0..ranks).map(|_| if count == routed.len() {
+            SparkCharge { experts: 0, owners: 0, runtime: 0 } } else {
+            SparkCharge { experts: ((routed.len() - count) as u64) << 30, owners: 1 << 30, runtime: 1 << 30 } }).collect();
+        let budgets = (0..gpus).map(|gpu| shared::planned_budget(gpu as u8, 96 << 30, 96 << 30, 1 << 30))
+            .chain((0..ranks).map(|rank| shared::spark_budget(rank as u8, 100 << 30)))
+            .chain([crate::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
+        // Executor geometry checks are release-exact (E128); the fixture keeps four experts' headers.
+        let mut release = cfg.clone(); release.experts = 128;
+        let inputs = MiniMaxInputs { cfg: release, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
+            maximum_pool_tokens: 4 << 20, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
+            manifest, routed: routed.clone(), experts: vec![LayerExperts { whole: 1 << 30, half: [1 << 29; 2] }; routed.len()],
+            local: LocalPackage::Installed { workspace: [64 << 20, if gpus == 2 { 64 << 20 } else { 0 }] },
+            spark: (0..=routed.len()).map(charge).collect(),
+            links: shared::spark_link((gpus - 1) as u8, ranks, prefill, Default::default()).unwrap(),
+            spark_reply_formats: Default::default(), drafter: None, vision: None, budgets,
+            code: vec![64 << 20; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
+            host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
+            expert_usage: None, resident_weight_limit: None,
+            mount: targets.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect() };
+        let request = shared::request(inputs.context, None, crate::placement::Onboard::Auto, prefill,
+            crate::placement::planner::Operation::Serving, None, Default::default());
+        let contract = inputs.prepare(&request).unwrap();
+        // Every allocation id is unique within one activation class.
+        let mut seen = std::collections::BTreeSet::new();
+        for component in &contract.components {
+            if let ComponentKind::Allocation { template, .. } = &component.kind {
+                assert!(seen.insert((template.id.clone(), format!("{:?}", component.activation))), "{} twice", template.id);
+            }
+        }
+        // One target arena backing per rank.
+        for gpu in 0..gpus {
+            let arenas = contract.components.iter().filter(|c| matches!(&c.kind, ComponentKind::Allocation { template, .. }
+                if template.group == "weight arena" && template.location == Location::coordinator(gpu as u8))).count();
+            assert_eq!(arenas, 1, "rtx{gpu}");
+        }
+        // KV/index pages live only on each layer's attention owner.
+        for (layer, &owner) in owners.iter().enumerate() {
+            let homes = contract.components.iter().filter_map(|c| match &c.kind {
+                ComponentKind::Allocation { template, .. } if template.id.starts_with(&format!("minimax.kv.{layer}.")) =>
+                    Some(template.location), _ => None }).collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(homes, [Location::coordinator(owner)].into(), "layer {layer}");
+        }
+        let admitted = inputs.admit(request).unwrap();
+        assert!(admitted.solved.pool_tokens >= 1 << 20);
+        assert!(admitted.placement.layers.iter().all(|l| shared::MINIMAX_M3.runs(l.mode)));
+        if gpus == 2 {
+            // Whole owners: each layer's weights live on exactly one rank.
+            for layer in 0..cfg.layers {
+                let stem = format!("{TEXT}layers.{layer}.input_layernorm.weight");
+                let homes = targets.iter().filter(|t| t.arena.view(&stem).is_some()).map(|t| t.rank).collect::<Vec<_>>();
+                assert_eq!(homes, [usize::from(owners[layer])], "layer {layer}");
+            }
+            assert!(admitted.placement.tp2.is_none_or(|t| t.peak_bytes[0] == t.peak_bytes[1]));
+        }
+    }
 }
