@@ -161,6 +161,79 @@ libc.fclose(handle)
     assert run(tree, outputs=outputs)[0] == "miss"
     # Without exact ownership the same native write remains uncacheable.
     assert run(tree)[0] == "uncacheable"
+@pytest.mark.parametrize("byproduct", ["__pycache__", "unrelated.cpython-312.pyc"])
+def test_listing_ignores_bytecode_but_keys_real_names(tmp_path, byproduct):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("listing_cache", ROOT / "python/tools/lib/_export_cache.py")
+    cache = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cache)
+    before = cache.listing(tmp_path)
+    if byproduct == "__pycache__":
+        (tmp_path / byproduct).mkdir()
+    else:
+        (tmp_path / byproduct).write_bytes(b"bytecode")
+    assert cache.listing(tmp_path) == before
+    (tmp_path / "real_input.py").write_text("SCALE = 4\n")
+    assert cache.listing(tmp_path) != before
+
+
+def test_worktrees_reuse_metadata_scan_despite_bytecode(tree, tmp_path):
+    source, build = tree
+    exporter = source / "python/tools/aot/export_fake.py"
+    exporter.write_text(exporter.read_text() + '''
+import importlib.metadata
+list(importlib.metadata.distributions(path=[str(Path(__file__).resolve().parents[3] / "python/tools/lib")]))
+''')
+    (source / "python/tools/lib/__pycache__").mkdir()
+    (source / "python/tools/lib/stale.pyc").write_bytes(b"bytecode")
+    assert run(tree)[0] == "miss"
+    other = tmp_path / "other-worktree"
+    shutil.copytree(source, other, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    assert run((other, build))[0] == "hit"
+    (other / "third_party/sparkinfer/kern/used.py").write_text("SCALE = 4\n")
+    assert run((other, build))[0] == "miss"
+    assert (build / "out/kernel.o").read_text() == "4"
+    (other / "python/tools/lib/new_input.py").write_text("SCALE = 9\n")
+    assert run((other, build))[0] == "miss"
+
+
+def test_programs_reuse_metadata_scan_across_worktrees(tree, tmp_path):
+    source, build = tree
+    exporter = source / "python/tools/aot/export_fake.py"
+    exporter.write_text(exporter.read_text() + '''
+import importlib.metadata
+import _export_cache as cache
+root = Path(__file__).resolve().parents[3]
+list(importlib.metadata.distributions(path=[str(root / "python/tools/lib")]))
+programs = cache.ProgramCache(args.output_dir)
+programs.start()
+identity = {"label": "fake-kernel"}
+if programs.lookup(identity) is None:
+    with programs.scope() as scope:
+        value = (root / "third_party/sparkinfer/kern/used.py").read_text()
+        (args.output_dir / "program.o").write_text(value)
+    programs.store_program(identity, scope, ["program.o"], {"ok": True})
+programs.report()
+# Force the invocation to miss independently of the program's dependencies.
+(root / "rust/lib.rs").read_text()
+''')
+    (source / "python/tools/lib/__pycache__").mkdir()
+    assert run(tree)[0] == "miss"
+    other = tmp_path / "other-worktree"
+    shutil.copytree(source, other, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    (other / "rust/lib.rs").write_text("// force invocation miss\n")
+    (build / "out/program.o").unlink()
+    assert run((other, build))[0] == "miss"
+    events = [json.loads(line) for line in (tmp_path / "stats.jsonl").read_text().splitlines()]
+    programs = [event for event in events if event["event"] == "programs"]
+    assert [(event["hits"], event["misses"]) for event in programs] == [(0, 1), (1, 0)]
+    assert (build / "out/program.o").read_text() == "SCALE = 3\n"
+    (other / "third_party/sparkinfer/kern/used.py").write_text("SCALE = 4\n")
+    assert run((other, build))[0] == "miss"
+    events = [json.loads(line) for line in (tmp_path / "stats.jsonl").read_text().splitlines()]
+    program = [event for event in events if event["event"] == "programs"][-1]
+    assert (program["hits"], program["misses"]) == (0, 1)
+    assert (build / "out/program.o").read_text() == "SCALE = 4\n"
 
 
 def test_second_run_hits_and_restores_outputs(tree):
