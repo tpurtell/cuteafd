@@ -423,7 +423,8 @@ mod tests {
                     assert_eq!(&bytes, expected, "rank {rank} {name}");
                 }
             }
-            let mut inventory = Inventory::new(CoordinatorDevices::new(&[rank as i32])?, "minimax",
+            let devices = [rank as i32];
+            let mut inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax",
                 Lifetime::TARGET, Category::Weights, "heads fixture");
             pushed.inventory(&mut inventory, "target")?;
             let roots = inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
