@@ -563,8 +563,8 @@ mod tests {
             assert_live_rows_equal(&bank, &restored, &cold, position..position + 1)?;
         }
         assert_live_rows_equal(&bank, &restored, &cold, 0..end)?;
-        // Noncausal recycled tails are not logical state. The native scalar-K
-        // poison oracle qualifies their masking separately; never zero on restore.
+        // Noncausal recycled tails are not logical state. Native scalar-K tail
+        // masking passed fork PR #297 (722d4963); never zero pages on restore.
         // At an aligned end, every byte is live and the complete pages must match.
         if end % PAGE_ROWS == 0 {
             for (&restored, &cold) in restored.units.iter().zip(&cold.units) {
