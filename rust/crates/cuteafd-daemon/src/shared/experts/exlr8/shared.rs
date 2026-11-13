@@ -137,11 +137,17 @@ impl<'a> NativeExperts<'a> {
                 .all(|(i, plan)| plan.layer == first + i),
             "EXLR8 shared residency must cover consecutive routed layers"
         );
+        let layout = cuteafd_loader::plan::exlr8::residency::shared_arena(&plans)?;
+        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout,
+            cuteafd_core::memory_layout::ArenaTag::weights("glm/shared"))?;
         let weights = plans
             .into_iter()
             .map(|plan| {
                 let bytes = plan.resident_bytes;
-                Exlr8Weights::load(library, plan, bytes)
+                let name = Exlr8Weights::shared_request(&plan)?.id;
+                let allocation = crate::shared::memory::DeviceAllocation::from_allocation(arena.view(&name, bytes)?);
+                Exlr8Weights::load_into(library, plan, bytes, allocation)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -226,6 +232,81 @@ impl<'a> NativeExperts<'a> {
 
 #[cfg(test)]
 mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn shared_layers_retain_one_rank_backing_and_rebase_descriptors() -> Result<()> {
+        use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
+        use cuteafd_loader::placement::planner::{Category, ComponentKind, CoordinatorDevices, Lifetime};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::exlr8::fixture(root.path(), false);
+        for world in [1, 2] {
+            for rank in 0..world {
+                library.cuda_set_device(rank as i32)?;
+                let first = Residency::plan(root.path(), "mixed", 3, world, rank, ExpertSet::Shared)?;
+                let mut second = first.clone();
+                second.layer += 1;
+                let plans = vec![first, second];
+                let layout = cuteafd_loader::plan::exlr8::residency::shared_arena(&plans)?;
+                let before = fixture.events()?.matches('D').count();
+                let shared = NativeExperts::load_validated(&library, NativePlan {
+                    plans: plans.clone(), family: KernelFamily::Glm, resident: layout.payload_bytes() as u64,
+                    workspace: 0, host_peak: 0,
+                }, |_| Ok(()))?;
+                assert_eq!(fixture.events()?.matches('D').count() - before, 1);
+                assert_eq!(shared.resident_bytes(), layout.payload_bytes());
+                let mut inventory = crate::shared::memory::receipts::Inventory::new(
+                    CoordinatorDevices::new(&[0, 1])?, "shared", Lifetime::RESIDENT,
+                    Category::Weights, "shared weights");
+                shared.allocation_receipts(&mut inventory, "weights")?;
+                let roots = inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
+                assert_eq!(roots.len(), 1);
+                assert_eq!((roots[0].allocation.id.as_str(), roots[0].allocation.bytes),
+                    (layout.id(), layout.bytes() as u64));
+                for weights in &shared.weights {
+                    for unit in &weights.layout.loads {
+                        for (source, &offset) in unit.source.iter().zip(&unit.destination) {
+                            let mut expected = vec![0; source.bytes];
+                            use std::os::unix::fs::FileExt;
+                            std::fs::File::open(&source.path)?.read_exact_at(&mut expected, source.offset)?;
+                            let mut actual = vec![0; source.bytes];
+                            library.copy_d2h(&mut actual, view(weights.buffer, offset, source.bytes)?)?;
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                    let (pointers, _) = weights.layout.descriptors(weights.buffer.ptr as u64)?;
+                    let mut actual = vec![0; pointers.len() * 8];
+                    library.copy_d2h(&mut actual, weights.pointers()?)?;
+                    assert_eq!(actual, pointers.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<_>>());
+                }
+                let mut weights = cuteafd_loader::placement::families::glm5::weights::WeightInventory {
+                    ranks: world, owners: vec![], core_loading: Default::default(), kv_b_loading: Default::default(),
+                    row_loading: Default::default(), attention_mount: Default::default(),
+                };
+                let all = (0..world).map(|r| {
+                    let mut rank_plans = plans.clone();
+                    for plan in &mut rank_plans { plan.rank = r; }
+                    rank_plans
+                }).collect::<Vec<_>>();
+                weights.extend_shared(&all)?;
+                let components = weights.components(1)?;
+                let tails = components.iter().filter_map(|component| match &component.kind {
+                    ComponentKind::AllocationGranularity(tail) if tail.location
+                        == cuteafd_loader::placement::planner::Location::coordinator(rank as u8) => Some(tail),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(tails.len(), 1);
+                assert_eq!(tails[0].backings.len(), 1);
+                assert_eq!(tails[0].backings[0].requests, [layout.bytes() as u64]);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn validated_shared_load_checks_receipt_before_allocating_without_resampling() {
         let source = include_str!("shared.rs").split("\n#[cfg(test)]\nmod receipt_tests").next().unwrap();

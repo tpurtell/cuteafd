@@ -324,8 +324,7 @@ impl WeightInventory {
         if maximum_pages == 0 {
             return Err(Refusal::InvalidFact("empty GLM weight page domain".into()));
         }
-        use crate::placement::planner::{Device, ResidentWeight, View, weight_arena_components,
-            weight_arena_extent_components};
+        use crate::placement::planner::{Device, ResidentWeight, View, weight_arena_components};
         let mut out = Vec::new();
         for rank in 0..self.ranks {
             let location = Location::coordinator(rank as u8);
@@ -353,14 +352,26 @@ impl WeightInventory {
                     false, maximum_pages));
             }
         }
-        for owner in self.owners.iter().filter(|owner| !matches!(owner.allocation.location.device,
-            Device::Coordinator(_)) || owner.allocation.id.contains(".shared.layer.")) {
-            if matches!(owner.allocation.location.device, Device::Coordinator(_)) {
-                out.extend(weight_arena_extent_components(&owner.allocation.id, owner.allocation.bytes,
-                    owner.allocation.location, owner.allocation.lifetime, maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)?);
-            } else {
-                out.extend(Self::standalone_components(std::slice::from_ref(owner), maximum_pages));
+        for rank in 0..self.ranks {
+            let location = Location::coordinator(rank as u8);
+            let owners = self.owners.iter().filter(|owner| owner.allocation.location == location
+                && owner.allocation.id.contains(".shared.layer.")).collect::<Vec<_>>();
+            if owners.is_empty() { continue; }
+            let layout = crate::serving_capacity::WeightArenaLayout::new(format!("glm/shared/{rank}"),
+                owners.iter().map(|owner| Ok((owner.allocation.id.clone(), usize::try_from(owner.allocation.bytes)
+                    .map_err(|_| Refusal::Overflow("GLM shared arena view"))?)))
+                    .collect::<Result<Vec<_>, Refusal>>()?).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+            out.extend(weight_arena_components(&layout, location, Lifetime::RESIDENT, maximum_pages,
+                cuteafd_core::memory_layout::MemoryKind::Weights)?);
+            for owner in owners {
+                let mut alias = owner.allocation.clone();
+                alias.view = Some(View { backing: layout.id().into(),
+                    offset: layout.view(&alias.id).expect("arena built from shared owners").offset() as u64 });
+                out.push(Component::allocation(alias.clone(), ByteCurve::fixed(alias.bytes, maximum_pages), false, maximum_pages));
             }
+        }
+        for owner in self.owners.iter().filter(|owner| !matches!(owner.allocation.location.device, Device::Coordinator(_))) {
+            out.extend(Self::standalone_components(std::slice::from_ref(owner), maximum_pages));
         }
         Ok(out)
     }
