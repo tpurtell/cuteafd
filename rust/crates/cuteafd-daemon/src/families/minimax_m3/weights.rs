@@ -5,7 +5,7 @@ use crate::shared::{
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::ArenaTag;
-use cuteafd_loader::{families::minimax_m3::weight_layout::CoordinatorWeights, plan::Checkpoint};
+use cuteafd_loader::{families::minimax_m3::weight_layout::{CoordinatorWeights, HeadsWeights, TensorSlice}, plan::Checkpoint};
 use std::collections::BTreeMap;
 use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
 
@@ -55,17 +55,54 @@ impl<'a> TargetWeights<'a> {
         Ok((target, embedding))
     }
 
+    /// Native head/neuron slices use the same admitted mount/recorded-push path.
+    pub fn load_heads(device: Device<'a>, checkpoint: &Checkpoint, layout: &HeadsWeights) -> Result<Self> {
+        let arena = DeviceWeightArena::new(device, layout.target.arena.clone(), ArenaTag::weights("minimax/target"))?;
+        Self::load_selected(device, checkpoint, &layout.target, &arena, false, Some(layout))
+    }
+
+    pub fn load_heads_with_embedding(device: Device<'a>, checkpoint: &Checkpoint,
+        layout: &HeadsWeights, placement: EmbedPlacement) -> Result<(Self, TokenEmbedding<'a>)> {
+        ensure!(layout.target.rank == 0, "MiniMax heads embedding must load on entry rank");
+        ensure!(layout.target.arena.view(EMBEDDING).is_some() == (placement == EmbedPlacement::Gpu),
+            "MiniMax heads embedding placement differs from admission");
+        let tensor = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == EMBEDDING)
+            .context("MiniMax embedding header")?;
+        let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta,
+            *tensor.meta.shape.get(1).context("MiniMax embedding shape")?)?;
+        let arena = DeviceWeightArena::new(device, layout.target.arena.clone(), ArenaTag::weights("minimax/target"))?;
+        let (embedding, target) = device.run(|| TokenEmbedding::load_with(device.library, source, placement,
+            || Self::load_selected(device, checkpoint, &layout.target, &arena, true, Some(layout)),
+            |_, bytes| arena.view(EMBEDDING, bytes)))?;
+        Ok((target, embedding))
+    }
+
     fn load_into(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights,
         arena: &DeviceWeightArena<'a>, embedding_loaded: bool) -> Result<Self> {
+        Self::load_selected(device, checkpoint, layout, arena, embedding_loaded, None)
+    }
+
+    fn load_selected(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights,
+        arena: &DeviceWeightArena<'a>, embedding_loaded: bool, heads: Option<&HeadsWeights>) -> Result<Self> {
         let mut rects = BTreeMap::new();
         for (name, view) in layout.arena.views() {
             if embedding_loaded && name == EMBEDDING { continue; }
-            let rect = Rect::tensor(checkpoint, name, None, None)?;
+            let rect = match heads {
+                Some(heads) => {
+                    let TensorSlice { rows, columns, .. } = heads.slices.get(name)
+                        .context("MiniMax heads source slice missing")?;
+                    Rect::tensor(checkpoint, name, Some(rows.clone()), Some(columns.clone()))?
+                }
+                None => Rect::tensor(checkpoint, name, None, None)?,
+            };
             ensure!(rect.bytes() == view.bytes(), "MiniMax mount {name}: source differs from admitted view");
             rects.insert(name.clone(), rect);
         }
         let dense = DenseLoad::mount(device.library);
-        dense.admit_mount(layout.mount_load(checkpoint)?)?;
+        dense.admit_mount(match heads {
+            Some(heads) => heads.mount_load(checkpoint)?,
+            None => layout.mount_load(checkpoint)?,
+        })?;
         let mut operands = BTreeMap::new();
         for (name, rect) in rects {
             let bytes = rect.bytes();

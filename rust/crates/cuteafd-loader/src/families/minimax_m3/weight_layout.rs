@@ -9,6 +9,9 @@ use std::collections::BTreeSet;
 
 const TEXT: &str = "language_model.model.";
 
+mod heads;
+pub use heads::{HeadsWeights, TensorSlice};
+
 /// One native W8A8 projection. Values and UE8M0 scales remain as shipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mxfp8Projection {
