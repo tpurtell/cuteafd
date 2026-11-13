@@ -305,13 +305,20 @@ const LAUNCHER_GRACE_S: u64 = 5;
 /// Bounds (seconds) on each cancelled-teardown step: `docker inspect`, the
 /// graceful `docker stop -t`, `docker logs` and `docker rm -f`; `timeout`
 /// adds [`KILL_AFTER_S`] to each.
-const INSPECT_S: u64 = 5;
-const STOP_S: u64 = 15;
-const LOGS_S: u64 = 10;
+const INSPECT_S: u64 = 4;
+const STOP_S: u64 = 12;
+const LOGS_S: u64 = 5;
 const RM_S: u64 = 10;
+/// After a failed `rm` or a still-present container, absence is re-polled for
+/// at most this long in total (dockerd keeps removing in the background under
+/// host load); an iteration starts only if it can finish inside the budget.
+const ABSENT_POLL_S: u64 = 10;
+const POLL_SLEEP_S: u64 = 1;
+const POLL_CHECK_S: u64 = 2;
 const KILL_AFTER_S: u64 = 1;
 // The coordinator's steps run one after another (a worker's take less) after the launcher stops.
-const _: () = assert!(LAUNCHER_GRACE_S + 2 * INSPECT_S + (STOP_S + 5) + LOGS_S + RM_S + 5 * KILL_AFTER_S <= CANCEL_TEARDOWN_S);
+const _: () = assert!(LAUNCHER_GRACE_S + 2 * INSPECT_S + (STOP_S + 5) + LOGS_S + RM_S + ABSENT_POLL_S + 5 * KILL_AFTER_S <= CANCEL_TEARDOWN_S);
+const _: () = assert!(POLL_SLEEP_S + POLL_CHECK_S + KILL_AFTER_S <= ABSENT_POLL_S);
 
 /// Programs teardown runs (tests substitute logging fakes).
 #[derive(Debug, Clone)]
@@ -1320,9 +1327,16 @@ fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools:
         }
         let removed = tool(&tools.docker, &["rm", "-f", &coordinator], bound(RM_S))
             .stdout(Stdio::null()).stderr(Stdio::null()).status();
-        let absent = tool(&tools.docker, &["ps", "-aq", "--filter", &format!("name=^{coordinator}$")], bound(INSPECT_S))
-            .stderr(Stdio::null()).output();
-        if !matches!(&absent, Ok(output) if output.status.success() && output.stdout.is_empty()) {
+        let filter = format!("name=^{coordinator}$");
+        let is_absent = |absent: &std::io::Result<std::process::Output>| matches!(absent, Ok(output) if output.status.success() && output.stdout.is_empty());
+        let mut absent = tool(&tools.docker, &["ps", "-aq", "--filter", &filter], bound(INSPECT_S)).stderr(Stdio::null()).output();
+        // A slow removal (exit 124) is usually finished seconds later; poll before declaring failure.
+        let polling = Instant::now();
+        while !is_absent(&absent) && polling.elapsed() + Duration::from_secs(POLL_SLEEP_S + POLL_CHECK_S + KILL_AFTER_S) <= Duration::from_secs(ABSENT_POLL_S) {
+            std::thread::sleep(Duration::from_secs(POLL_SLEEP_S));
+            absent = tool(&tools.docker, &["ps", "-aq", "--filter", &filter], bound(POLL_CHECK_S)).stderr(Stdio::null()).output();
+        }
+        if !is_absent(&absent) {
             failures.lock().unwrap().push(serde_json::json!({"host": "raptor", "container": coordinator,
                 "error": format!("removal unconfirmed: {removed:?}; verification: {absent:?}")}));
         }
@@ -1345,11 +1359,35 @@ fn cleanup_marker(config: &HashMap<String, String>, root: &Path) -> PathBuf {
         .join("unconfirmed-containers.json")
 }
 
-fn check_cleanup_markers(root: &Path) -> Result<()> {
+/// True only when `docker ps -aq` on the marker entry's host answers and lists
+/// nothing for the container; any failure or timeout counts as still present.
+fn marker_container_absent(entry: &Value, tools: &Tools) -> bool {
+    let (Some(host), Some(container)) = (entry["host"].as_str(), entry["container"].as_str()) else { return false };
+    let filter = format!("name=^{container}$");
+    let output = if host == "raptor" {
+        tool(&tools.docker, &["ps", "-aq", "--filter", &filter], Some(INSPECT_S)).stderr(Stdio::null()).output()
+    } else {
+        let args = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "docker", "ps", "-aq", "--filter", &filter];
+        tool(&tools.ssh, &args, Some(INSPECT_S + 5)).stderr(Stdio::null()).output()
+    };
+    matches!(output, Ok(o) if o.status.success() && o.stdout.is_empty())
+}
+
+/// Refuses a launch while any instance has an unconfirmed-teardown marker,
+/// unless every container it lists is now verifiably absent (the marker was
+/// stale: a slow removal finished after teardown gave up); then it is deleted.
+fn check_cleanup_markers(tools: &Tools) -> Result<()> {
+    let root = &tools.instances;
     if !root.exists() { return Ok(()); }
     for instance in std::fs::read_dir(root)? {
         let marker = instance?.path().join("unconfirmed-containers.json");
         if marker.exists() {
+            let listed = std::fs::read_to_string(&marker).ok().and_then(|text| serde_json::from_str::<Vec<Value>>(&text).ok());
+            if let Some(listed) = listed.filter(|l| !l.is_empty() && l.iter().all(|e| marker_container_absent(e, tools))) {
+                std::fs::remove_file(&marker)?;
+                eprintln!("cleared stale cleanup marker {}: all {} listed containers are now absent", marker.display(), listed.len());
+                continue;
+            }
             bail!("refusing launch: unconfirmed container teardown in {}: {}", marker.display(), std::fs::read_to_string(&marker)?);
         }
     }
@@ -1411,7 +1449,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
     let result = (|| -> Result<Option<Report>> {
         let config_path = write_config(entry, repo, configs, parallel)?;
         let config = read_config(&config_path)?;
-        check_cleanup_markers(&inflight.tools.instances)?;
+        check_cleanup_markers(&inflight.tools)?;
         let port = entry.port(&config);
         let mut command = Command::new(repo.join("run.sh"));
         command.arg("--config").arg(&config_path).arg("--restart").args(entry.run_args.clone().unwrap_or_default())
@@ -2014,7 +2052,7 @@ mod tests {
         assert!(error.contains("kiwi") && error.contains("cuteafd-spark-expert-kiwi-19441"), "{error}");
         let marker = cleanup_marker(&config, &inflight.tools.instances);
         assert!(marker.exists());
-        assert!(check_cleanup_markers(&inflight.tools.instances).unwrap_err().to_string().contains("kiwi"));
+        assert!(check_cleanup_markers(&inflight.tools).unwrap_err().to_string().contains("kiwi"));
         // The bounded retry cannot silently unregister a still-unconfirmed host.
         assert!(inflight.cancel_all().is_empty());
         assert!(inflight.launches.lock().unwrap().contains_key("failed"));
@@ -2027,7 +2065,7 @@ mod tests {
         inflight.cancel_all();
         assert!(inflight.launches.lock().unwrap().is_empty());
         assert!(!marker.exists());
-        check_cleanup_markers(&inflight.tools.instances).unwrap();
+        check_cleanup_markers(&inflight.tools).unwrap();
     }
 
     #[test]
@@ -2043,6 +2081,59 @@ mod tests {
         assert!(error.contains("raptor") && error.contains("cuteafd-coordinator-timed-out"), "{error}");
         let marker = cleanup_marker(&config, &tools.instances);
         assert!(std::fs::read_to_string(marker).unwrap().contains("raptor"));
+    }
+
+    /// A docker whose `rm` times out (124) and whose `ps` lists the container
+    /// until `present_until` polls have happened.
+    fn slow_docker(tools: &Tools, dir: &Path, present_polls: usize) {
+        let counter = dir.join("ps-count");
+        std::fs::write(&tools.docker, format!(
+            "#!/bin/sh\ncase \"$1\" in\n rm) exit 124;;\n ps) n=$(cat '{c}' 2>/dev/null || echo 0); echo $((n+1)) >'{c}'; [ \"$n\" -lt {p} ] && echo abc123; exit 0;;\nesac\nexit 0\n",
+            c = counter.display(), p = present_polls)).unwrap();
+    }
+
+    #[test]
+    fn slow_coordinator_removal_that_finishes_leaves_no_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = fake_tools(root.path(), &root.path().join("calls.log"));
+        slow_docker(&tools, root.path(), 2);
+        let config = HashMap::from([("INSTANCE".into(), "slow-rm".into())]);
+        let mut log = File::create(root.path().join("entry.log")).unwrap();
+        teardown("slow", &config, &mut log, &tools, true).unwrap();
+        assert!(!cleanup_marker(&config, &tools.instances).exists());
+    }
+
+    fn write_marker(tools: &Tools, entries: Value) -> PathBuf {
+        let marker = tools.instances.join("stale").join("unconfirmed-containers.json");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, serde_json::to_vec(&entries).unwrap()).unwrap();
+        marker
+    }
+
+    #[test]
+    fn stale_marker_with_absent_containers_is_cleared() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = fake_tools(root.path(), &root.path().join("calls.log"));
+        let marker = write_marker(&tools, serde_json::json!([
+            {"host": "raptor", "container": "cuteafd-coordinator-stale"},
+            {"host": "kiwi", "container": "cuteafd-spark-expert-kiwi-19441"}]));
+        check_cleanup_markers(&tools).unwrap();
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn marker_with_present_container_or_failed_verification_still_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = fake_tools(root.path(), &root.path().join("calls.log"));
+        let marker = write_marker(&tools, serde_json::json!([{"host": "raptor", "container": "cuteafd-coordinator-stale"}]));
+        std::fs::write(&tools.docker, "#!/bin/sh\necho abc123\n").unwrap();
+        assert!(check_cleanup_markers(&tools).unwrap_err().to_string().contains("refusing launch"));
+        assert!(marker.exists());
+        // Failed verification (ssh unreachable) is not evidence of absence.
+        let marker = write_marker(&tools, serde_json::json!([{"host": "kiwi", "container": "cuteafd-spark-expert-kiwi-19441"}]));
+        std::fs::write(&tools.ssh, "#!/bin/sh\nexit 255\n").unwrap();
+        assert!(check_cleanup_markers(&tools).is_err());
+        assert!(marker.exists());
     }
 
     #[test]
