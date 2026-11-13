@@ -594,7 +594,10 @@ mod tests {
                 assert_eq!(buffers[name], rows * stride, "{name}");
             }
             assert!(!buffers.contains_key("combined"));
-            let components = layout.components("minimax.heads.unit", Lifetime::TARGET, 17).unwrap();
+            let mut components = layout.components("minimax.heads.unit", Lifetime::TARGET, 17).unwrap();
+            assert_eq!(components.len(), buffers.len());
+            assert!(components.iter().all(|component| matches!(component.kind, ComponentKind::Allocation { .. })));
+            crate::placement::planner::fixed_request_tails(&mut components, 17, &[]).unwrap();
             assert_eq!(components.len(), buffers.len() + buffers.values().filter(|&&bytes| bytes > 1 << 20).count());
             for (name, bytes) in &buffers {
                 let id = format!("minimax.heads.unit.{name}");
@@ -602,6 +605,9 @@ mod tests {
                     ComponentKind::Allocation { template, .. } if template.id == id
                         && template.bytes == *bytes && template.location == Location::coordinator(1)
                         && template.view.is_none())).count(), 1);
+                assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+                    ComponentKind::AllocationGranularity(tail) if tail.id == format!("{id}.tail")))
+                    .count(), usize::from(*bytes > 1 << 20));
             }
         }
     }
