@@ -18,6 +18,8 @@ pub(crate) struct Kernels<'a> {
     gather: index_cache::Gather<'a>,
     select: Msa<'a>,
     attention: Msa<'a>,
+    decode_select: Msa<'a>,
+    decode_attention: Msa<'a>,
     msa_layout: MsaPrograms,
     producer_layout: ProducerPrograms,
 }
@@ -26,7 +28,7 @@ impl<'a> Kernels<'a> {
     pub fn bind(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
         cfg: &MiniMaxM3Config, rows: u32, context: u32) -> Result<Self> {
         ensure!(std::ptr::eq(device.library, programs.library()), "MiniMax attention library differs");
-        let (msa_layout, msa) = MsaPrograms::resolve(cfg, manifest, 1, rows, context)?;
+        let (msa_layout, msa) = MsaPrograms::resolve(cfg, manifest, rows.min(64), rows, context)?;
         let (producer_layout, producers) = ProducerPrograms::resolve(manifest, rows)?;
         let (_, forward) = ForwardPrograms::resolve(manifest, rows)?;
         for expected in msa.iter().chain(&producers).chain(&forward) {
@@ -45,6 +47,8 @@ impl<'a> Kernels<'a> {
             gather: index_cache::Gather::bind(programs, "minimax_index_cache_gather")?,
             select: Msa::bind(programs, Mode::IndexPrefill)?,
             attention: Msa::bind(programs, Mode::AttentionExtend)?,
+            decode_select: Msa::bind(programs, Mode::IndexDecode)?,
+            decode_attention: Msa::bind(programs, Mode::AttentionDecode)?,
             msa_layout, producer_layout,
         }))
     }
@@ -55,18 +59,23 @@ impl<'a> Kernels<'a> {
 pub(crate) struct Workspace<'a> {
     device: Device<'a>,
     planes: BTreeMap<String, Allocation<'a>>,
+    prefill: bool,
 }
 impl<'a> Workspace<'a> {
-    pub fn new(kernels: &Kernels<'a>) -> Result<Self> {
+    pub fn new(kernels: &Kernels<'a>) -> Result<Self> { Self::for_mode(kernels, true) }
+    pub fn new_decode(kernels: &Kernels<'a>) -> Result<Self> { Self::for_mode(kernels, false) }
+    fn for_mode(kernels: &Kernels<'a>, prefill: bool) -> Result<Self> {
         let mut planes = BTreeMap::new();
-        for (name, bytes) in kernels.msa_layout.workspace(true).into_iter()
+        for (name, bytes) in kernels.msa_layout.workspace(prefill).into_iter()
             .chain(kernels.producer_layout.workspace()) {
             ensure!(!planes.contains_key(name), "duplicate MiniMax attention scratch owner");
             planes.insert(name.into(), Allocation::new(kernels.device, usize::try_from(bytes)?,
                 Tag::workspace("minimax/attention"))?);
         }
-        Ok(Self { device: kernels.device, planes })
+        Ok(Self { device: kernels.device, planes, prefill })
     }
+    #[cfg(test)]
+    pub(super) fn diagnostic_plane(&self, name: &str) -> Result<Buffer> { self.plane(name) }
     fn plane(&self, name: &str) -> Result<Buffer> {
         self.planes.get(name).map(|owner| owner.buffer)
             .with_context(|| format!("MiniMax attention lacks admitted plane {name}"))
@@ -116,6 +125,29 @@ pub(crate) struct Request {
     pub index_cache: Buffer,
 }
 
+/// One sequence's attention inside an otherwise batched rowwise forward.
+#[derive(Clone, Copy)]
+pub(crate) struct Segment {
+    pub first_row: usize,
+    pub request: Request,
+}
+
+/// Native decode has exactly one row per sequence; multi-token verification
+/// uses prefill segments so each query retains its own causal frontier.
+#[derive(Clone, Copy)]
+pub(crate) struct DecodeRequest {
+    pub request: Request,
+    pub batch: usize,
+}
+
+pub(crate) fn row_view(buffer: Buffer, first: usize, rows: usize, stride: usize) -> Result<Buffer> {
+    let offset = first.checked_mul(stride).context("MiniMax row offset overflow")?;
+    let bytes = rows.checked_mul(stride).context("MiniMax row extent overflow")?;
+    ensure!(rows != 0 && offset.checked_add(bytes).is_some_and(|end| end <= buffer.bytes),
+        "MiniMax row view exceeds retained owner");
+    Ok(Buffer { ptr: buffer.ptr.wrapping_byte_add(offset), bytes, ..buffer })
+}
+
 impl Workspace<'_> {
     /// # Safety
     /// Positions/slots/page IDs, query offsets and lengths must describe one
@@ -124,22 +156,39 @@ impl Workspace<'_> {
     /// operands, arena views and this workspace survive the stream's drain.
     pub unsafe fn enqueue(&self, kernels: &Kernels<'_>, p: Projections, r: Request,
         stream: &Stream<'_>) -> Result<Buffer> {
+        ensure!(self.prefill, "MiniMax prefill requires a prefill workspace");
+        // SAFETY: the caller supplies the documented retained request operands.
+        unsafe { self.enqueue_impl(kernels, p, r, 1, false, stream) }
+    }
+
+    /// # Safety
+    /// As `enqueue`, with one query per sequence, distinct append slots and
+    /// batch-sized tables, lengths, descales and arange query offsets.
+    pub unsafe fn decode(&self, kernels: &Kernels<'_>, p: Projections, decode: DecodeRequest,
+        stream: &Stream<'_>) -> Result<Buffer> {
+        ensure!(!self.prefill && decode.batch == decode.request.rows,
+            "MiniMax native decode requires one row per request and a decode workspace");
+        // SAFETY: caller retains the batch metadata and all cache records.
+        unsafe { self.enqueue_impl(kernels, p, decode.request, decode.batch, true, stream) }
+    }
+
+    unsafe fn enqueue_impl(&self, kernels: &Kernels<'_>, p: Projections, r: Request,
+        batch: usize, decode: bool, stream: &Stream<'_>) -> Result<Buffer> {
         ensure!(self.device.id == kernels.device.id && self.device.id == stream.device.id
             && std::ptr::eq(self.device.library, kernels.device.library)
             && std::ptr::eq(self.device.library, stream.device.library),
             "MiniMax attention owner device/library differs");
-        ensure!(r.rows > 0 && r.rows <= r.context && r.context <= r.positions_capacity
-            && r.context.div_ceil(64) <= r.table_width && r.table_width <= r.table_stride,
+        let attention = if decode { &kernels.decode_attention } else { &kernels.attention };
+        ensure!(r.rows > 0 && r.rows <= attention.layout.rows as usize && batch > 0
+            && batch <= attention.layout.extent as usize && (decode || r.rows <= r.context)
+            && r.context > 0 && r.context <= r.positions_capacity && r.context.div_ceil(64) <= r.table_width
+            && r.table_width <= r.table_stride,
             "MiniMax attention request extents");
         let padded = r.context.checked_add(255).context("MiniMax staging overflow")? / 256 * 256;
         let query = self.plane("attention.query")?;
         let key = self.plane("attention.key")?;
         let index_query = self.plane("index.query")?;
         let index_scales = self.plane("index.scales")?;
-        let keys = self.plane("index.keys")?;
-        let scales = self.plane("index.key_scales")?;
-        let starts = self.plane("index.starts")?;
-        let ends = self.plane("index.ends")?;
         let selections = self.plane("selections")?;
         let output = self.plane("attention.output")?;
         let mut drain = stream.cancellation_guard("MiniMax attention submission error");
@@ -158,7 +207,7 @@ impl Workspace<'_> {
                     output: key, scratch: self.plane("minimax_norm_rope_h4")?,
                 }, stream.raw)?;
                 kernels.kv.kv(forward::KvBatch {
-                    rows: r.rows, batch: 1, pool_pages: r.pool_pages,
+                    rows: r.rows, batch, pool_pages: r.pool_pages,
                     key, value: p.value, slots: r.slots, batch_ids: r.batch_ids,
                     key_descale: r.key_descale, value_descale: r.value_descale,
                     key_cache: r.key_cache, value_cache: r.value_cache,
@@ -172,19 +221,32 @@ impl Workspace<'_> {
                     key_scale: self.plane("index.produced_scales")?, cache: r.index_cache,
                     scratch: self.plane("minimax_index_producer")?,
                 }, stream.raw)?;
-                kernels.gather.launch(index_cache::Batch {
-                    rows: r.rows, table_width: r.table_width, page_begin: 0,
-                    pool_pages: r.pool_pages, live_tokens: r.context, output_tokens: padded,
-                    cache: r.index_cache, pages: r.pages, lengths: r.causal_lengths,
-                    keys, scales, starts, ends,
-                }, stream.raw)?;
-                kernels.select.index_prefill(minimax_m3::IndexPrefillBatch {
-                    rows: r.rows, k_rows: r.context, query: index_query, scales: index_scales,
-                    keys, key_scales: scales, starts, ends, selections,
-                    scratch: self.plane("index.scratch")?,
-                }, stream.raw)?;
-                kernels.attention.attention(minimax_m3::AttentionBatch {
-                    rows: r.rows, batch: 1, table_stride: r.table_stride, pool_pages: r.pool_pages,
+                if decode {
+                    kernels.decode_select.index_decode(minimax_m3::IndexDecodeBatch {
+                        rows: r.rows, table_width: r.context.div_ceil(64), table_stride: r.table_stride,
+                        pool_pages: r.pool_pages, query: index_query, scales: index_scales,
+                        cache: r.index_cache, pages: r.pages, lengths: r.cache_lengths,
+                        selections, scratch: self.plane("index.scratch")?,
+                    }, stream.raw)?;
+                } else {
+                    let keys = self.plane("index.keys")?;
+                    let scales = self.plane("index.key_scales")?;
+                    let starts = self.plane("index.starts")?;
+                    let ends = self.plane("index.ends")?;
+                    kernels.gather.launch(index_cache::Batch {
+                        rows: r.rows, table_width: r.table_width, page_begin: 0,
+                        pool_pages: r.pool_pages, live_tokens: r.context, output_tokens: padded,
+                        cache: r.index_cache, pages: r.pages, lengths: r.causal_lengths,
+                        keys, scales, starts, ends,
+                    }, stream.raw)?;
+                    kernels.select.index_prefill(minimax_m3::IndexPrefillBatch {
+                        rows: r.rows, k_rows: r.context, query: index_query, scales: index_scales,
+                        keys, key_scales: scales, starts, ends, selections,
+                        scratch: self.plane("index.scratch")?,
+                    }, stream.raw)?;
+                }
+                attention.attention(minimax_m3::AttentionBatch {
+                    rows: r.rows, batch, table_stride: r.table_stride, pool_pages: r.pool_pages,
                     query, keys: r.key_cache, values: r.value_cache,
                     key_scales: r.key_descale, value_scales: r.value_descale,
                     pages: r.pages, lengths: r.cache_lengths, query_offsets: r.query_offsets,
@@ -247,6 +309,57 @@ mod tests {
         drift["programs"][0]["geometry"]["admission_marker"] = 1.into();
         assert!(Kernels::bind(device, &programs, &drift, &config(), 17, 2049).is_err());
         assert_eq!(fixture.events()?.matches('D').count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn row_views_preserve_device_and_slice_only_live_rows() {
+        let buffer = Buffer { ptr: 4096usize as *mut std::ffi::c_void, bytes: 17 * 1024,
+            device_id: 1, ..Default::default() };
+        for first in [0, 1, 3, 16] {
+            let view = row_view(buffer, first, 1, 1024).unwrap();
+            assert_eq!(view.ptr as usize, 4096 + first * 1024);
+            assert_eq!(view.bytes, 1024);
+            assert_eq!(view.device_id, 1);
+            assert_eq!(view.flags, buffer.flags);
+        }
+        for (first, rows, stride) in [(17, 1, 1024), (0, 18, 1024), (0, 0, 1024),
+            (usize::MAX, 1, 1024), (0, usize::MAX, 1024)] {
+            assert!(row_view(buffer, first, rows, stride).is_err());
+        }
+    }
+
+    #[test]
+    fn decode_owner_uses_only_admitted_decode_scratch() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.extent_only(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        fixture.configure_memory(&library, 1, 8usize << 30)?;
+        let device = Device { library: &library, id: 1 };
+        let manifest = manifest();
+        fixture.register_programs(&library, manifest["programs"].as_array().unwrap())?;
+        let path = fixture.directory().join("PROGRAMS.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        let programs = library.programs()?.with_manifest(&path)?;
+        let kernels = Kernels::bind(device, &programs, &manifest, &config(), 64, 2049)?;
+        let workspace = Workspace::new_decode(&kernels)?;
+        assert!(!workspace.prefill);
+        assert!(workspace.plane("index.keys").is_err());
+        assert!(workspace.plane("index.starts").is_err());
+        assert_eq!(workspace.plane("selections")?.bytes, 64 * 256);
+        assert_eq!(workspace.plane("attention.query")?.bytes, 64 * 16384);
+        let ids = [1];
+        let mut inventory = Inventory::new(CoordinatorDevices::new(&ids)?, "minimax", Lifetime::TARGET,
+            Category::Workspace, "MiniMax native decode MSA");
+        workspace.inventory(&mut inventory, "decode.1")?;
+        let expected = kernels.msa_layout.workspace(false).into_iter()
+            .chain(kernels.producer_layout.workspace()).collect::<BTreeMap<_, _>>();
+        assert_eq!(inventory.receipts.len(), expected.len());
+        for (name, bytes) in expected { assert_eq!(workspace.plane(name)?.bytes as u64, bytes); }
+        drop(workspace);
+        assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, 8usize << 30);
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
         Ok(())
     }
 
