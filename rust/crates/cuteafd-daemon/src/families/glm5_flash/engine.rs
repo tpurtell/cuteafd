@@ -2130,7 +2130,7 @@ impl<'a> GlmfEngine<'a> {
                 let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
                 home.run(|| self.publish_tp2_abort())
             },
-            ranks: || self.synchronize(),
+            ranks: || self.drain_streams(),
             links: || self.terminal_links(|link| link.terminal_quiesce()),
             copies: || self.terminal_links(|link| link.terminal_drain_copies()),
             graphs: || {
@@ -2911,12 +2911,20 @@ impl<'a> GlmfEngine<'a> {
 
     /// Drains every rank's stream.
     pub(crate) fn synchronize(&self) -> Result<()> {
-        let result = drain_ranks(self.ranks() + usize::from(self.drafter.is_some()), |rank| {
+        self.drain_streams()?;
+        // A drained step whose peer wait timed out skipped that wait: its results are void.
+        if self.exchange.is_some() || self.tp2.is_some() { self.library.check_peer_wait_timeout()?; }
+        Ok(())
+    }
+
+    /// Both ranks' (and a remote drafter's) streams drained, without judging their results:
+    /// terminal teardown's completion proof.
+    fn drain_streams(&self) -> Result<()> {
+        drain_ranks(self.ranks() + usize::from(self.drafter.is_some()), |rank| {
             if rank == self.ranks() { return self.drafter.as_ref().unwrap().synchronize_remote(); }
             // SAFETY: the engine owns these streams and retains all queued operands.
             self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })
-        });
-        result
+        })
     }
 
     /// Replay-only discriminator: drain even streams outside the engine's inventory.
@@ -4611,12 +4619,12 @@ impl<'a> GlmfEngine<'a> {
         // Before the prewarm, and through its eager pass, every segment runs eagerly.
         if self.prewarming_graphs.get()
             || (!self.graphs_warmed.get() && !self.warming_graphs.get()) {
-            return self.eager_segment(segment);
+            return self.masked_segment(segment);
         }
         let pinned = self.graph_pinned(&key);
         let Some(ticket) =
             graphs.borrow_mut().cache_ticket(&key, pinned, None) else {
-            return self.eager_segment(segment);
+            return self.masked_segment(segment);
         };
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
@@ -4624,9 +4632,12 @@ impl<'a> GlmfEngine<'a> {
             if graphs.borrow_mut().cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, "graph capture unavailable; running eagerly");
             }
-            return self.eager_segment(segment);
+            return self.masked_segment(segment);
         }
-        let captured = segment();
+        // The captured segment keeps the same masked/shared-FFN boundary as the eager one:
+        // rank 1's routed-layer shared FFN and its publication stay in `peer_segment`'s
+        // host wrapper, so eager, captured and replayed steps queue the same pushes.
+        let captured = self.masked_segment(&segment);
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
         if let Err(error) = captured {
             graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
@@ -4642,7 +4653,7 @@ impl<'a> GlmfEngine<'a> {
                 if graphs.borrow_mut().cache_ticket_failed(ticket, &error) {
                     tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
                 }
-                return self.eager_segment(segment);
+                return self.masked_segment(segment);
             }
         };
         if let Some(error) = inspection_error {
@@ -4664,8 +4675,11 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    /// `segment` eagerly, with the masked/shared-FFN boundary a capture would bake in.
-    fn eager_segment(&self, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    /// `segment` with the masked/shared-FFN boundary every decode segment has, eager or
+    /// captured: [`Self::peer_attention`] leaves a routed layer's shared FFN and its peer
+    /// publication to [`Self::peer_segment`]'s wrapper. Capture and the eager pass both run
+    /// through here, so a capture never adds a push the eager pass did not queue.
+    fn masked_segment(&self, segment: impl FnOnce() -> Result<()>) -> Result<()> {
         self.capturing.set(true);
         let result = segment();
         self.capturing.set(false);

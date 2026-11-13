@@ -49,7 +49,7 @@ int32_t cuteafd_peer_push_planes(const cuteafd_peer_plane_t* planes, uint32_t co
 // On B's stream: one warp spins until `flag` reaches the next expected
 // sequence (acquire), so later work on the stream sees the pushed bytes. After
 // 60 s without it (the peer's stream failed or was never fed) the kernel traps:
-// the stream faults instead of hanging.
+// the stream faults instead of hanging. Abortable waits never trap (below).
 int32_t cuteafd_peer_wait(const uint32_t* flag, uint32_t* recv_state, void* stream);
 
 // Opt-in peer issue diagnostics. Records belong to the exchange, one per
@@ -110,6 +110,16 @@ int32_t cuteafd_peer_abort_initialize(void);
 int32_t cuteafd_peer_wait_abortable(const uint32_t* flag, uint32_t* recv_state,
     const uint32_t* aborted, void* stream);
 int32_t cuteafd_peer_abort_publish(uint32_t* aborted, void* independent_stream);
+// An abortable wait (non-null `aborted`) that times out (60 s without its push)
+// never traps once `cuteafd_peer_abort_initialize` ran on its device: it records the timeout in
+// one process-wide mapped host record, publishes its own `aborted` word and
+// exits without advancing its receive sequence; every other abortable wait on
+// any device then exits too. Returns 1 once a timeout was recorded (0: none;
+// the record is sticky), with its expected/observed sequence and flag address.
+// The owner must treat it as terminal: reject reuse and drain.
+int32_t cuteafd_peer_wait_timeout(uint32_t* expected, uint32_t* observed, uint64_t* flag);
+// Test-only: the abortable wait timeout of the current device (default 60 s).
+int32_t cuteafd_peer_wait_timeout_configure(uint64_t timeout_ns);
 
 // On the stream: copy `count` (1..4) byte regions (`bytes[i]` from
 // `sources[i]` to `destinations[i]`, any alignment; device pointers or the

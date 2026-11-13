@@ -594,7 +594,7 @@ case "${V41_FP8_HEAD:-}" in
   *) release_die "V41_FP8_HEAD must be auto, off, draft, all or packed" ;;
 esac
 # CUDA_MODULE_LOADING (LAZY or EAGER; unset: the CUDA default, LAZY), coordinator
-# only. A lazily loaded kernel's first launch waits for the device to idle, which
+# only (V4.1 here; GLM Flash at its coordinator launch below). A lazily loaded kernel's first launch waits for the device to idle, which
 # never happens behind a stream wait only the engine thread releases (a cold 5090
 # card hung in a first-shape cuBLAS draft GEMM). EAGER loads every library kernel
 # at startup instead: about 17 s and 212 MiB more on an RTX 5090.
@@ -2938,11 +2938,19 @@ release_serving_docker_args
 release_coordinator_device_args "${coordinator_uuids[@]}"
 # Automatic context passes unchanged through planner and serve admission.
 context_args=(--max-context-tokens "$(get MAX_CONTEXT_TOKENS auto)")
+# CUDA_MODULE_LOADING (GLM Flash; LAZY or EAGER, unset: the CUDA default) reaches the
+# coordinator only, as for V4.1 above (family-keys.sh refuses it for other families).
+coordinator_module_loading_args=()
+case "$(get CUDA_MODULE_LOADING "")" in
+  "") ;;
+  LAZY|EAGER) coordinator_module_loading_args=(-e "CUDA_MODULE_LOADING=$(get CUDA_MODULE_LOADING)") ;;
+  *) release_die "CUDA_MODULE_LOADING must be LAZY or EAGER" ;;
+esac
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${RELEASE_COORDINATOR_DEVICE_ARGS[@]}" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e "RUST_LOG=${RUST_LOG:-info}" "${shared_env_args[@]:0:4}" \
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
-  "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
+  "${shared_env_args[@]:4}" ${coordinator_module_loading_args[@]+"${coordinator_module_loading_args[@]}"} -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   "${generic_worker_mounts[@]}" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${memory_policy_args[@]}" $serve --snapshot "$snapshot" --coordinator-weight-budget-gib "$coordinator_weight_budget_gib" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \

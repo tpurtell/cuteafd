@@ -403,6 +403,9 @@ impl<'a> PeerExchange<'a> {
         if state != TerminalState::Active {
             return Err(TerminalPeerError::Closed(state).into());
         }
+        // A timed-out abortable wait skipped itself instead of faulting: this
+        // exchange's sequences no longer match, so no further step may queue.
+        if self.abort.is_some() { self.library.check_peer_wait_timeout()?; }
         Ok(())
     }
 
@@ -893,6 +896,59 @@ mod tests {
             unsafe { landed.wait(streams[terminal].raw)?; }
         }
         Ok(())
+    }
+
+    /// #1878: a missing push times out an abortable wait without a device fault (no
+    /// Xid 43 / CUDA 719): the stream drains, the exchange reports a typed terminal
+    /// timeout, later waits on either GPU exit, and the abort/drain teardown succeeds.
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and two peer-capable CUDA GPUs; one process per run (the timeout record is sticky)"]
+    fn missing_push_times_out_cleanly_and_terminal_teardown_drains() -> Result<()> {
+        // SAFETY: every stream, exchange and buffer is dropped before the loaded library.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let s0 = on_device(&library, 0, || library.cuda_stream_create())?;
+        let s1 = on_device(&library, 1, || library.cuda_stream_create())?;
+        let ranks = [RankDevice { device: 0, stream: s0 }, RankDevice { device: 1, stream: s1 }];
+        let result = (|| -> Result<()> {
+            let exchange = PeerExchange::new_abortable(&library, ranks, 2, 256, 256)?;
+            for device in [0, 1] {
+                on_device(&library, device, || library.peer_wait_timeout_configure(std::time::Duration::from_millis(200)))?;
+            }
+            assert!(library.peer_wait_timeout().is_none());
+            let source = on_device(&library, 0, || DeviceAllocation::new(&library, 256, crate::shared::memory::TEST))?;
+            // A matched generation first: one push and its wait complete normally.
+            exchange.push(0, 0, source.buffer.ptr, 256)?;
+            exchange.wait(1, 0)?;
+            // Rank 1 waits for a second push rank 0 never queues, then a later wait behind it
+            // (a captured step's next exchange); rank 0 waits on a flag rank 1 never feeds.
+            exchange.wait(1, 0)?;
+            exchange.wait(1, 1)?;
+            exchange.wait(0, 1)?;
+            for (rank, stream) in [(0, s0), (1, s1)] {
+                // SAFETY: the exchange's live streams; nothing faults, so both drain.
+                on_device(&library, rank, || unsafe { library.cuda_stream_synchronize(stream) })
+                    .with_context(|| format!("rank {rank} drained without a device fault"))?;
+            }
+            let timeout = library.peer_wait_timeout().context("timed-out wait was recorded")?;
+            assert_eq!((timeout.expected, timeout.observed), (2, 1), "{timeout:?}");
+            let error = exchange.require_live().unwrap_err();
+            assert!(error.downcast_ref::<cuteafd_ffi::peer_exchange::PeerWaitTimeout>().is_some(), "{error:#}");
+            // Terminal teardown: publish both abort words, drain compute, finish.
+            exchange.publish_abort()?;
+            exchange.drain_compute()?;
+            exchange.finish_terminal(true);
+            assert_eq!(exchange.terminal_state(), TerminalState::Drained);
+            // The devices stay healthy: ordinary work still runs on both.
+            for device in [0, 1] {
+                on_device(&library, device, || library.cuda_device_synchronize())?;
+            }
+            Ok(())
+        })();
+        for (device, stream) in [(0, s0), (1, s1)] {
+            // SAFETY: drained above (or the test failed before queuing anything blocking).
+            let _ = on_device(&library, device, || unsafe { library.cuda_stream_destroy(stream) });
+        }
+        result
     }
 
     #[test]

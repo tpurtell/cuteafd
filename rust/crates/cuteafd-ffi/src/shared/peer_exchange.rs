@@ -7,6 +7,17 @@ use std::ffi::c_void;
 /// (`cuteafd_peer_plane_t`): `rows` rows of `row_bytes`, pitches in bytes,
 /// everything 16-byte aligned.
 #[repr(C)]
+/// A peer wait gave up after its timeout without its push or a terminal abort:
+/// the exchange it belongs to is terminal (its streams drain; nothing faulted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("peer wait timed out without its push or a terminal abort: expected sequence {expected}, observed {observed} \
+    (flag {flag:#x}); the head split is terminal")]
+pub struct PeerWaitTimeout {
+    pub expected: u32,
+    pub observed: u32,
+    pub flag: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PeerPlane {
     pub destination: *mut c_void,
@@ -259,6 +270,38 @@ impl NativeLibrary {
                     b"cuteafd_peer_abort_publish",
                 )?;
         }
+        Ok(())
+    }
+
+    /// A recorded abortable-wait timeout (see `cuteafd_peer_wait_timeout`): the
+    /// process's peer exchanges are terminal. Lock-free; a library without the
+    /// record (fixtures) never reports one.
+    pub fn peer_wait_timeout(&self) -> Option<PeerWaitTimeout> {
+        type F = unsafe extern "C" fn(*mut u32, *mut u32, *mut u64) -> i32;
+        // SAFETY: lookup only.
+        let f = unsafe { self.lib.get::<F>(b"cuteafd_peer_wait_timeout") }.ok()?;
+        let (mut expected, mut observed, mut flag) = (0, 0, 0);
+        // SAFETY: three live outputs; the entry point reads mapped host memory only.
+        (unsafe { f(&mut expected, &mut observed, &mut flag) } != 0)
+            .then_some(PeerWaitTimeout { expected, observed, flag })
+    }
+
+    /// An error once any abortable peer wait in this process timed out.
+    pub fn check_peer_wait_timeout(&self) -> Result<()> {
+        match self.peer_wait_timeout() {
+            Some(timeout) => Err(anyhow::Error::new(timeout)),
+            None => Ok(()),
+        }
+    }
+
+    /// Test-only: this device's abortable wait timeout.
+    #[doc(hidden)]
+    pub fn peer_wait_timeout_configure(&self, timeout: std::time::Duration) -> Result<()> {
+        type F = unsafe extern "C" fn(u64) -> i32;
+        // SAFETY: writes one device symbol of the current device.
+        let status = unsafe { self.lib.get::<F>(b"cuteafd_peer_wait_timeout_configure")?(
+            u64::try_from(timeout.as_nanos())?) };
+        ensure!(status == 0, "configuring the peer wait timeout failed with CUDA error {status}");
         Ok(())
     }
 

@@ -149,6 +149,34 @@ def test_original_core_view_is_not_forwarded_to_unsupported_workers(tmp_path, fa
     assert all("--core-view" not in line for line in workers), result.stderr
 
 
+@pytest.mark.parametrize("value", [None, "LAZY", "EAGER", "eager"])
+def test_glm_flash_module_loading_reaches_only_the_coordinator(tmp_path, value):
+    """#1878: GLM Flash accepts CUDA_MODULE_LOADING=LAZY|EAGER like V4.1; it sets the
+    coordinator container's environment only, and other spellings fail before launch."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    keys = "SPARK_COUNT=1\nRTX_GPUS=2\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    if value is not None:
+        keys += f"CUDA_MODULE_LOADING={value}\n"
+    result = _family_launch_result(tmp_path, config, "test/flash-loading", keys)
+    if value == "eager":
+        assert result.returncode != 0
+        assert "CUDA_MODULE_LOADING must be LAZY or EAGER" in result.stderr
+        assert "cuteafd serve-glmf --snapshot" not in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    coordinators = [line for line in lines if "cuteafd serve-glmf --snapshot" in line]
+    others = [line for line in lines if "cuteafd plan" in line or "cuteafd expertd-native" in line]
+    assert coordinators and others, result.stderr
+    if value is None:
+        assert "CUDA_MODULE_LOADING" not in coordinators[0]
+    else:
+        assert shlex.split(coordinators[0]).count(f"CUDA_MODULE_LOADING={value}") == 1, coordinators[0]
+    assert all("CUDA_MODULE_LOADING" not in line for line in others)
+
+
 @pytest.mark.parametrize("activations", [None, "a16", "a8"])
 @pytest.mark.parametrize("wip", [False, True])
 def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, activations, wip):
