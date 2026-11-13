@@ -941,11 +941,16 @@ mod tests {
                 };
                 let first = inventory()?;
                 let second = inventory()?;
-                assert_eq!(first.receipts, second.receipts, "inventory is a stable observation");
+                let observed = |inventory: &Inventory<'_>| inventory.receipts.iter().map(|receipt| {
+                    let owner = &receipt.allocation;
+                    (owner.id.clone(), owner.bytes, owner.location, owner.lifetime, receipt.address)
+                }).collect::<Vec<_>>();
+                assert_eq!(observed(&first), observed(&second), "inventory is a stable observation");
                 let actual = first.receipts.iter().map(|receipt| (receipt.allocation.id.clone(),
                     (receipt.allocation.bytes, receipt.allocation.location, receipt.allocation.lifetime)))
                     .collect::<BTreeMap<_, _>>();
                 assert_eq!(actual.len(), first.receipts.len());
+                let mut expected_owners = 0;
                 for (gpu, rank) in state.ranks.iter().enumerate() {
                     let location = Location::coordinator(gpu as u8);
                     let mut expected = Vec::new();
@@ -974,10 +979,12 @@ mod tests {
                             expected.push((format!("{}.metadata.{name}.upload", owner.id()), bytes, Location::PINNED));
                         }
                     }
+                    expected_owners += expected.len();
                     for (id, bytes, location) in expected {
                         assert_eq!(actual.get(&id), Some(&(bytes, location, Lifetime::TARGET)), "{id}");
                     }
                 }
+                assert_eq!(actual.len(), expected_owners, "no extra physical request owners");
                 drop(banks); drop(state);
                 for &id in &ids {
                     assert_eq!(Device { library: &library, id }.run(|| library.cuda_physical_memory_info())?.0, 64 << 20);
