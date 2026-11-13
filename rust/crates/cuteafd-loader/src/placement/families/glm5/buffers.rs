@@ -473,12 +473,6 @@ impl TargetBuffers {
                 self.maximum_pages,
             )?);
         }
-        b.fixed(
-            "rope",
-            mul(mul(self.context, cfg.qk_rope_head_dim as u64)?, 4)?,
-            Lifetime::TARGET,
-            Category::Weights,
-        )?;
         let tables = mul(self.page_tokens / PAGE_ROWS, 4)?;
         if let Some(scratch) = self.decode {
             b.workspace(

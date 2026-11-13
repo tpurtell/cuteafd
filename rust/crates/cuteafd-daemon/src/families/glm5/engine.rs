@@ -661,7 +661,7 @@ pub(crate) struct GlmEngine<'a> {
 /// pool, zeroed, and the RoPE table, on the current device.
 #[allow(clippy::type_complexity)]
 fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize,
-    rope_alpha: Option<&super::weights::RopeAlpha<'_>>)
+    rope_alpha: Option<&super::weights::RopeAlpha<'_>>, cos_sin: Dev<'a>)
     -> Result<(Vec<Dev<'a>>, Vec<Option<Dev<'a>>>, Dev<'a>)> {
     let zeroed = |bytes: usize| -> Result<Dev<'a>> {
         let allocation = DeviceAllocation::new(library, bytes.max(256), Tag::kv("glm/kv-pools"))?;
@@ -677,6 +677,20 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
     let index = layers.iter()
         .map(|l| (owns(l) && l.full_indexer).then(|| zeroed((pages + 1) * INDEX_PAGE_BYTES)).transpose())
         .collect::<Result<Vec<_>>>()?;
+    fill_rotary(library, cfg, rope_alpha, max_context, &cos_sin)?;
+    Ok((kv, index, cos_sin))
+}
+
+pub(super) fn fill_rotary(library: &NativeLibrary, cfg: &GlmDsaConfig,
+    rope_alpha: Option<&super::weights::RopeAlpha<'_>>, max_context: usize, cos_sin: &Dev<'_>) -> Result<()> {
+    let table = rotary_table(cfg, rope_alpha, max_context)?;
+    ensure!(table.len().checked_mul(4).is_some_and(|bytes| bytes <= cos_sin.buffer.bytes),
+        "GLM rotary table exceeds admitted target view");
+    library.copy_h2d(cos_sin.buffer, bytes_of(&table))
+}
+
+fn rotary_table(cfg: &GlmDsaConfig, rope_alpha: Option<&super::weights::RopeAlpha<'_>>,
+    max_context: usize) -> Result<Vec<f32>> {
     // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq;
     // Mistral Large 4: interleaved YaRN with the checkpoint's LeRoPE scale.
     let dim = cfg.qk_rope_head_dim;
@@ -694,9 +708,7 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
     }
     table
     };
-    let cos_sin = DeviceAllocation::new(library, table.len() * 4, Tag::weights("glm/rope"))?;
-    library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
-    Ok((kv, index, cos_sin))
+    Ok(table)
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -762,7 +774,7 @@ impl<'a> GlmEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmDsaConfig,
         weights: GlmWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
         embedding: TokenEmbedding<'a>, depth: crate::shared::prefill_depth::PrefillDepth,
-        context_mode: Option<GlmContext>) -> Result<Self> {
+        context_mode: Option<GlmContext>, cos_sin: Dev<'a>) -> Result<Self> {
         let prefill_lanes = depth.waves;
         ensure!((1..=4).contains(&prefill_lanes), "GLM prefill lanes must match admitted inventory");
         ensure!(depth.unit_rows == prefill_rows, "GLM prefill depth runs {}-row units, the engine {prefill_rows}",
@@ -771,7 +783,7 @@ impl<'a> GlmEngine<'a> {
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         let local = if context_mode.is_some() { pages / 2 } else { pages };
-        let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context, weights.rope_alpha.as_ref())?;
+        let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context, weights.rope_alpha.as_ref(), cos_sin)?;
         let device = library.cuda_get_device()?;
         Ok(Self { admitted_host_config: None, max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), native_scratch: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, whole: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
@@ -923,7 +935,7 @@ impl<'a> GlmEngine<'a> {
     /// `layers` (every layer's rank-1 share, see `GlmLoader::model`). Enables
     /// peer access both ways, loads the programs there, and allocates its
     /// caches, RoPE table and the exchange (four slots per prefill lane).
-    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmLayer<'a>>) -> Result<()> {
+    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmLayer<'a>>, cos_sin: Dev<'a>) -> Result<()> {
         ensure!(layers.len() == self.weights.layers.len() && layers.iter().chain(&self.weights.layers).all(|l| l.split),
             "attach_peer needs the head-split shares of every loaded layer");
         let rows = self.prefill_rows.max(DECODE_ROWS);
@@ -941,7 +953,7 @@ impl<'a> GlmEngine<'a> {
                 split_family: self.cfg.split_program_family() };
             self.programs.load_matching(|name| selected.contains(name))?;
             let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.local_pages(), self.max_context,
-                self.weights.rope_alpha.as_ref())?;
+                self.weights.rope_alpha.as_ref(), cos_sin)?;
             let released = crate::shared::memory::device::Event::new(
                 crate::shared::memory::device::Device { library: self.library, id: device })?;
             Ok(GlmPeer { device, stream, released, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),

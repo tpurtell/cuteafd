@@ -742,6 +742,88 @@ fn ml4_alpha_records_without_reads_and_decodes_only_after_group_commit() -> Resu
 }
 
 #[test]
+fn rotary_tables_are_exact_target_arena_views_with_no_new_device_allocation() -> Result<()> {
+    let (fixture, library) = compact_dso()?;
+    fixture.immediate_copies(&library)?;
+    for ml4 in [false, true] {
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let (config, mut tensors) = fixture::glm5_compact_weights();
+        let mut cfg = GlmDsaConfig::from_hf(&config)?;
+        if ml4 {
+            cfg.variant = GlmDsaConfig::from_hf(&fixture::mistral_large4_config())?.variant;
+            tensors.push(fixture::t("lerope.alpha", "BF16", &[cfg.qk_rope_head_dim / 2]));
+        }
+        fixture::write_snapshot(root.path(), &config, &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        if ml4 {
+            use std::os::unix::fs::FileExt;
+            let tensor = catalog.tensor("lerope.alpha")?;
+            let alpha = (0..cfg.qk_rope_head_dim / 2).flat_map(|i|
+                (0x3f00u16 + i as u16).to_le_bytes()).collect::<Vec<_>>();
+            std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+                .write_all_at(&alpha, tensor.metadata.byte_offset)?;
+        }
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+        for ranks in [1, 2] {
+            let mut inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers, None,
+                false, false, EmbeddingHome::Device(0))?;
+            let bytes = inventory.add_rotary(64, cfg.qk_rope_head_dim)? as usize;
+            inventory.add_rotary(64, cfg.qk_rope_head_dim)?;
+            assert!(inventory.add_rotary(65, cfg.qk_rope_head_dim).is_err());
+            let components = inventory.components(1)?;
+            for rank in 0..ranks {
+                assert!(components.iter().any(|component| matches!(&component.kind,
+                    cuteafd_loader::placement::planner::ComponentKind::Allocation { template, .. }
+                        if template.id == format!("glm.weights.gpu.{rank}.rope")
+                            && template.bytes == bytes as u64 && template.view.as_ref()
+                                .is_some_and(|view| view.backing == format!("glm/coordinator/{rank}")))));
+            }
+            let arenas = inventory.coordinator_arenas()?.into_iter().enumerate().map(|(rank, layout)| {
+                Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+                    Device { library: &library, id: rank as i32 }, layout, crate::shared::memory::TEST_ARENA)?))
+            }).collect::<Result<BTreeMap<_, _>>>()?;
+            let loader = GlmLoader { library: &library, catalog: &catalog, device: 0,
+                stream: std::ptr::null_mut(), peers: vec![], arenas: Some(std::rc::Rc::new(arenas)),
+                allocation_prefix: String::new(), push: None };
+            let alpha = ml4.then(|| loader.rope_alpha(&cfg)).transpose()?;
+            let active = 37;
+            let expected = if let Some(variant) = cfg.variant.ml4() {
+                variant.rope_table(&alpha.as_ref().unwrap().values()?, active)?
+            } else {
+                let dim = cfg.qk_rope_head_dim;
+                let mut table = vec![0f32; active * dim];
+                let inv = (0..dim / 2).map(|i|
+                    1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / dim as f32)).collect::<Vec<_>>();
+                for position in 0..active {
+                    for (i, frequency) in inv.iter().enumerate() {
+                        let angle = position as f32 * frequency;
+                        table[position * dim + i] = angle.cos();
+                        table[position * dim + dim / 2 + i] = angle.sin();
+                    }
+                }
+                table
+            };
+            fixture.quiet_events(&library, false)?;
+            let before = fixture.events()?.matches('D').count();
+            for rank in 0..ranks {
+                Device { library: &library, id: rank as i32 }.run(|| -> Result<()> {
+                    let rotary = loader.allocate("rope", bytes)?;
+                    engine::fill_rotary(&library, &cfg, alpha.as_ref(), active, &rotary)?;
+                    assert_eq!(rotary.buffer.bytes, bytes, "retain full admitted extent");
+                    let mut actual = vec![0; expected.len() * 4];
+                    library.copy_d2h(&mut actual, rotary.buffer)?;
+                    assert_eq!(actual, expected.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>());
+                    assert!(engine::fill_rotary(&library, &cfg, alpha.as_ref(), 65, &rotary).is_err());
+                    Ok(())
+                })?;
+            }
+            assert_eq!(fixture.events()?.matches('D').count(), before, "rotary views must not allocate");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn peer_routers_use_one_target_backing_and_replay_identical_push_bytes() -> Result<()> {
     use crate::shared::experts::rtx::{dense, push};
     use std::os::unix::fs::FileExt;

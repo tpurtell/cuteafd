@@ -1379,6 +1379,9 @@ impl Opened {
                 weights.add_peer_routers(&range.clone().collect::<Vec<_>>())?;
             }
         }
+        for (_, weights) in &mut selected_target.weights {
+            weights.add_rotary(args.max_context as u64, self.cfg.qk_rope_head_dim)?;
+        }
         let arena_layouts = selected_target.weights[0].1.coordinator_arenas()?;
         let reserved_weights = selected_target.device_weight_bytes(if host_embedding { EmbeddingHome::HostPinned }
             else { EmbeddingHome::Device(0) })?;
@@ -1641,12 +1644,18 @@ impl Opened {
             Ok((embedding, (model, tp2)))
         })?;
         self.library.cuda_set_device(args.device)?;
+        let rotary_bytes = args.max_context.checked_mul(self.cfg.qk_rope_head_dim)
+            .and_then(|bytes| bytes.checked_mul(4)).context("GLM rotary extent overflow")?;
+        let mut rotary = devices.iter().map(|&id| {
+            crate::shared::memory::device::Device { library: &self.library, id }
+                .run(|| loader.allocate("rope", rotary_bytes))
+        }).collect::<Result<Vec<_>>>()?;
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
             + model.norm.buffer.bytes + model.head.bytes();
         let embedding_bytes = embedding.device_owner_bytes();
         let actual_weights = std::iter::once((bytes + embedding_bytes) as u64)
             .chain(shares.iter().map(|rank| rank.iter().map(|layer| layer.bytes() as u64).sum()))
-            .enumerate().map(|(rank, bytes)| bytes
+            .enumerate().map(|(rank, bytes)| bytes + rotary[rank].buffer.bytes as u64
                 + native_owners.get(rank).map_or(0, |owner| owner.resident_bytes() as u64))
             .collect::<Vec<_>>();
         ensure!(actual_weights == reserved_weights,
@@ -1673,7 +1682,7 @@ impl Opened {
         self.startup_probe(&devices, "glm/draft-before-kv", None, false)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill_lanes, args.prefill_rows)?;
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv))?;
+            max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv), rotary.remove(0))?;
         engine.initialize_usage(admitted.expert_usage.clone(), args.expert_usage_reader.clone())?;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         engine.admitted_host_config = host_config;
@@ -1689,7 +1698,7 @@ impl Opened {
         }
         if let Some((device, stream)) = peer_stream {
             let peer_layers = shares.pop().context("head-split shares")?;
-            engine.attach_peer(device, stream, peer_layers)?;
+            engine.attach_peer(device, stream, peer_layers, rotary.remove(0))?;
         }
         // Both rotary tables now own the generated values; release the load-only source.
         engine.weights.rope_alpha = None;

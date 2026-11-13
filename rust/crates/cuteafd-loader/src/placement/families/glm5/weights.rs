@@ -159,6 +159,22 @@ pub struct WeightInventory {
 }
 
 impl WeightInventory {
+    /// Generated immutable rotary operands share the checkpoint target backing.
+    pub fn add_rotary(&mut self, context: u64, dim: usize) -> Result<u64> {
+        ensure!(context > 0 && dim > 0 && dim % 2 == 0, "invalid GLM rotary geometry");
+        let bytes = product(&[context, u64::try_from(dim)?, 4])?;
+        for rank in 0..self.ranks {
+            let id = format!("glm.weights.gpu.{rank}.rope");
+            if let Some(owner) = self.owners.iter().find(|owner| owner.allocation.id == id) {
+                ensure!(owner.allocation.bytes == bytes && owner.group == "rotary",
+                    "GLM rotary owner differs from admitted geometry");
+            } else {
+                self.add(rank, "rope", "rotary", "f32", bytes)?;
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Final target operands only, excluding separate native shared-expert
     /// backings and host-pinned embeddings. Ordinary/K6 shared FFNs remain
     /// target-owned, including the selected onboarding peer-router replicas.

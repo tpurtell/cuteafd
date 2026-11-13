@@ -166,7 +166,7 @@ fn named_target_buffers_match_independent_pool_geometry_and_aliases() {
                 .allocations
                 .iter()
                 .any(|a| a.id == format!("{prefix}.index.1")));
-            assert_eq!(get("rope").bytes, 4096 * 64 * 4);
+            assert!(!facts.allocations.iter().any(|a| a.id == format!("{prefix}.rope")));
             assert_eq!(get("decode.page_table.0").bytes, 64 * pages * 2 * 4);
             assert_eq!(get("prefill.page_table.2").bytes, (pages * 2 * 4).max(256));
             assert_eq!(

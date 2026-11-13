@@ -913,7 +913,11 @@ impl<'a> ProductionInput<'a> {
         {
             return Err(invalid("incomplete production geometry"));
         }
-        let TargetFacts { weights, hooks, embedding_read, native_load } = self.target;
+        let TargetFacts { mut weights, hooks, embedding_read, native_load } = self.target;
+        for (_, inventory) in &mut weights {
+            inventory.add_rotary(self.context, self.cfg.qk_rope_head_dim)
+                .map_err(|error| invalid(&error.to_string()))?;
+        }
         let partitioned = self.attention == AttentionPlacement::Context;
         if self.attention != AttentionPlacement::Heads && self.gpus != 2
             || partitioned != self.context_scratch.is_some()
@@ -1000,6 +1004,8 @@ impl<'a> ProductionInput<'a> {
                 .max(weights.core_loading.sync_upload_bytes)
                 .max(weights.kv_b_loading.sync_upload_bytes)
                 .max(weights.row_loading.sync_upload_bytes)
+                .max(self.context.checked_mul(self.cfg.qk_rope_head_dim as u64)
+                    .and_then(|bytes| bytes.checked_mul(4)).ok_or_else(|| invalid("rotary upload overflow"))?)
                 .max(filler.map_or(0, |batch| batch.packed_bytes as u64));
             let lifetime = Lifetime { first: Phase::Load, last: Phase::PostTargetKv };
             let owners = [
@@ -2302,8 +2308,11 @@ impl Recipe for GlmRecipe<'_> {
             if case.value.ranks != self.gpus {
                 return Err(invalid("weight rank count differs from contract"));
             }
-            let mut components = case.value.components(self.maximum_pages)?;
-            components.extend(case.value.loading_components(self.maximum_pages)?);
+            let mut weights = case.value.clone();
+            weights.add_rotary(self.context, self.cfg.qk_rope_head_dim)
+                .map_err(|error| invalid(&error.to_string()))?;
+            let mut components = weights.components(self.maximum_pages)?;
+            components.extend(weights.loading_components(self.maximum_pages)?);
             domains.append(&mut contract, &case.when, components)?;
         }
         for case in &self.graphs {
