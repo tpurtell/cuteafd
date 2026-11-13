@@ -57,17 +57,25 @@ def job_id(result):
     return value
 
 
-def wait_job(number, *, importing=False, files=0):
+def wait_job(number, *, importing=False, files=0, eviction_files=None):
     result = native("jobs", number, "--wait")
     job = result.get("job", {})
     if (job.get("finished") is not True or job.get("error") or job.get("cancelled")
             or job.get("pending", 0) or any(": failed" in n for n in job.get("notes", []))
-            or any(not h.get("finished") or h.get("failed") or h.get("cancelled")
+            or any((eviction_files is None and not h.get("finished"))
+                   or h.get("failed") or h.get("cancelled")
                    or h.get("done_files", 0) != h.get("total_files", 0)
                    or (h.get("total_bytes", 0) > 0
                        and h.get("done_bytes", 0) != h["total_bytes"])
                    for h in job.get("hosts", {}).values())):
         raise ValueError("native SparkNest job failed or is incomplete")
+    # Native pure-eviction plans set the terminal job flag and file counters,
+    # but do not set per-host transfer `finished` (placer.rs EvictExact path).
+    # Accept only an already terminal, failure-free job with every planned
+    # eviction counted; authoritative one-copy residency is checked afterward.
+    if eviction_files is not None and sum(h.get("done_files", 0)
+            for h in job.get("hosts", {}).values()) != eviction_files:
+        raise ValueError("native SparkNest eviction count differs from its plan")
     if importing:
         counts = result.get("import", {})
         if (counts.get("finished") is not True or counts.get("errors") != []
@@ -340,7 +348,9 @@ def handoff(root):
             if not state.get("offgrid_job"):
                 state["offgrid_job"] = job_id(native("plan", "apply", offgrid["id"]))
                 atomic_json(state_path, state)
-            atomic_json(root / "sparknest-offgrid-complete.json", wait_job(state["offgrid_job"]))
+            count = sum(len(step["copies"]) for step in offgrid["steps"])
+            atomic_json(root / "sparknest-offgrid-complete.json",
+                        wait_job(state["offgrid_job"], eviction_files=count))
         distribution = verify_managed(files, published["revision"])
         atomic_json(root / "sparknest-placement-verified.json", dict(identity=identity,
             distribution_bytes=distribution, files=len(files), one_copy_per_file=True))

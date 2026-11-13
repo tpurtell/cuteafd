@@ -87,6 +87,8 @@ def artifact(tmp_path, monkeypatch):
                                         files=len(files), adopted=0, skipped=0)
             if args[1] == 13 and not error:
                 behavior['offgrid'] = False
+                result['job']['hosts'] = dict(maxq=dict(finished=False, done_files=1,
+                    total_files=1, done_bytes=0, total_bytes=0, failed=[]))
             return result
         assert args[0] == 'ls'
         if Path(args[1]).name == 'refs':
@@ -235,3 +237,22 @@ def test_incomplete_native_host_job_is_not_success(monkeypatch):
         done_files=1, total_files=1, done_bytes=3, total_bytes=7)})))
     with pytest.raises(ValueError, match='job failed or is incomplete'):
         storage.wait_job(12)
+
+
+def test_terminal_eviction_requires_all_planned_files_and_no_failures(monkeypatch):
+    host = dict(finished=False, done_files=208, total_files=208,
+                done_bytes=0, total_bytes=0, failed=[])
+    result = dict(job=dict(finished=True, pending=0, error=None, hosts={'maxq': host}))
+    monkeypatch.setattr(storage, 'native', lambda *a: result)
+    assert storage.wait_job(13, eviction_files=208) == result
+    with pytest.raises(ValueError, match='job failed or is incomplete'):
+        storage.wait_job(13)  # Still reject this flag for imports/transfers.
+    with pytest.raises(ValueError, match='eviction count differs'):
+        storage.wait_job(13, eviction_files=209)
+    host['done_files'] = 207
+    with pytest.raises(ValueError, match='job failed or is incomplete'):
+        storage.wait_job(13, eviction_files=208)
+    host['done_files'] = 208
+    host['failed'] = ['refused last copy']
+    with pytest.raises(ValueError, match='job failed or is incomplete'):
+        storage.wait_job(13, eviction_files=208)
