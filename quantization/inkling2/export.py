@@ -247,16 +247,25 @@ class DirectMCWriter:
         reserved = set(metadata_files) | set(shards) | {'package-state.json', 'package-validation.json',
                     'package-provenance.json', 'direct-write-state.json', package.mc_manifest.MANIFEST}
         for name, source_path in (assets or {}).items():
-            _basename(name)
+            if not isinstance(name, str) or Path(name).is_absolute() or not Path(name).parts:
+                raise ValueError('unsafe package asset path')
+            for component in Path(name).parts:
+                _basename(component)
+            if Path(name).as_posix() != name:
+                raise ValueError('asset path must be canonical and relative')
             if (name in reserved or name.endswith(('.safetensors', '.receipt.json'))
                     or Path(source_path).stat().st_size > 64 * 1024 * 1024):
                 raise ValueError('assets must be small non-weight package files')
             destination = self.output / name
+            if any(parent.is_symlink() for parent in destination.parents
+                   if parent == self.output or self.output in parent.parents):
+                raise ValueError('refuse asset directory symlink')
             if destination.is_symlink():
                 raise ValueError('refuse asset output symlink')
             if destination.exists() and destination.read_bytes() != Path(source_path).read_bytes():
                 raise ValueError('existing package asset differs')
             if not destination.exists():
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source_path, destination)
             metadata_files.append(name)
         manifest = package.mc_manifest.build(self.output, source_repo=self.identity['source_repo'],

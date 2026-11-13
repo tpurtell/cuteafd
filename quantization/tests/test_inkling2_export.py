@@ -91,6 +91,18 @@ def test_direct_views_mtp_byte_proof_and_retired_encode_resume(tmp_path, monkeyp
     assert writer.finalize(**final)['views'] == receipt['views']
 
 
+def test_nested_tokenizer_asset_preserved_without_escaping_output(tmp_path):
+    args, entries, final = fixture(tmp_path)
+    tokenizer = tmp_path/'tokenizer.model'
+    tokenizer.write_bytes(b'native tokenizer asset')
+    writer = DirectMCWriter(**args)
+    writer.write_group('layer-000', **entries)
+    writer.finalize(**final, assets={'tiktoken/tokenizer.model':tokenizer})
+    assert (args['output']/'tiktoken/tokenizer.model').read_bytes() == tokenizer.read_bytes()
+    with pytest.raises(ValueError, match='unsafe'):
+        writer.finalize(**final, assets={'../escape':tokenizer})
+
+
 @pytest.mark.parametrize('kind', ['count', 'bytes', 'physical', 'alias'])
 def test_source_inventory_guards(tmp_path, kind):
     args, _, _ = fixture(tmp_path)

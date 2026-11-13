@@ -35,6 +35,12 @@ def worker(mode):
             repr(str(REPO/'scripts/build/build-slot.sh'))+',sys.executable,"-c",'+repr(code)+'],check=True)']
     elif mode != 'pilot':
         raise ValueError('unknown worker mode')
+    if mode == 'production':
+        prewarm = 'from inkling2.numerical import fork_module; fork_module("exllamav3.ext").prewarm_exllamav3_extension()'
+        run_arguments = repr(arguments)
+        arguments = ['-c', 'import subprocess,sys,runpy; subprocess.run(['+
+            repr(str(REPO/'scripts/build/build-slot.sh'))+',sys.executable,"-c",'+repr(prewarm)+
+            '],check=True);sys.argv='+run_arguments+'[1:];runpy.run_module("inkling2.run",run_name="__main__")']
     argv = command(arguments, name=name, fork=Path.home()/'Developer/GPTQModel' if mode != 'production' else None)
     child = None
     def terminate(signum, frame):

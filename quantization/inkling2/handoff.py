@@ -192,7 +192,7 @@ def verify_managed(files, revision, *, call=native, managed=MANAGED, allow_offgr
         raise ValueError('managed main ref revision differs')
     refs = call('ls', NAMESPACE / MODEL / 'refs')['entries']
     if (len(refs) != 1 or refs[0].get('name') != 'main' or refs[0].get('kind') != 'regular'
-            or refs[0].get('sealed') is not True or refs[0].get('writing_on') is not None
+            or refs[0].get('size') != len(revision) or refs[0].get('writing_on') is not None
             or len(set(refs[0].get('hosts', [])) & set(TARGETS)) != 1
             or (not allow_offgrid and len(refs[0]['hosts']) != 1)):
         raise ValueError('managed main ref placement differs')
@@ -338,7 +338,8 @@ def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused):
     if output.exists() and load(output / 'package-state.json').get('identity') != published['identity']:
         raise ValueError('standalone output ownership differs before retirement')
     paths = [output, stage]
-    allowed = {'frontier', 'stages', 'projections', 'expert-projections', 'banks', 'candidates'}
+    allowed = {'frontier', 'stages', 'projections', 'expert-projections', 'banks', 'candidates',
+               'packed', 'activations', 'target-taps', 'routes'}
     for value in intermediates:
         p = Path(value).absolute()
         if root not in p.parents or p.name not in allowed:
@@ -348,7 +349,8 @@ def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused):
         build = Path(build_root).absolute()
         if build.parent != Path.home() / '.cache/cuteafd/builds' or not build.name.startswith('inkling2-'):
             raise ValueError('build cleanup requires this task build root')
-        paths.extend(p for p in build.iterdir() if p.name.startswith('target') or p.name in ('exllamav3', 'tmp', 'release-staging'))
+        paths.extend(p for p in build.iterdir() if p.name.startswith('target') or p.name in
+                     ('exllamav3', 'tmp', 'release-staging', 'torch-extensions', 'cuda-cache'))
     protected = [Path(published['source_snapshot']).resolve(), MANAGED.resolve(), root]
     present = []
     for path in paths:

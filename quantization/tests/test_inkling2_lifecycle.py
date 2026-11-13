@@ -230,7 +230,7 @@ class Nest:
             return self.plans[number]
         if args[0] == 'ls':
             if Path(args[1]).name == 'refs':
-                return {'entries': [dict(name='main', kind='regular', size=len(REVISION), sealed=True,
+                return {'entries': [dict(name='main', kind='regular', size=len(REVISION), sealed=False,
                     writing_on=None, hosts=[handoff.TARGETS[0]] + ([] if self.offgrid else ['maxq']))]}
             return {'entries': [dict(name=n, size=row['bytes'], kind='regular', sealed=True, writing_on=None,
                 hosts=[handoff.TARGETS[i]] + ([] if self.offgrid else ['maxq']))

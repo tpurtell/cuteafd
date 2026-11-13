@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
@@ -54,6 +55,7 @@ def plan(source, corpus):
         raise ValueError('production fork differs from engine pin')
     return dict(schema='inkling2-causal-mc-v1', source_repo=recipe.BASE_REPO,
         source_revision=recipe.BASE_REVISION, source_specs=digest(source.specs),
+        source_files=source.source_fingerprints,
         corpus_manifest=digest(json.loads((corpus/'manifest.json').read_text())), fork=pin,
         numerical_files={p: hashlib.sha256((REPO/p).read_bytes()).hexdigest() for p in NUMERICAL_FILES},
         numerical=dict(expert_bits=4, core_bits=[8, 6], upstream_core_bits=8, seed=787,
@@ -65,13 +67,13 @@ class Progress:
     def __init__(self, root):
         self.root = root
         self.started = time.time()
-        self.count = 0
+        self.count = sum(1 for _ in (root/'errors').glob('*/*.json'))
 
     def emit(self, event, **values):
         if event == 'projection_committed':
             self.count += 1
         row = dict(time=datetime.now(timezone.utc).isoformat(), event=event,
-            committed_encodes_this_attempt=self.count, **values)
+            committed_encodes=self.count, total_encode_operations=recipe.ENCODE_COUNT, **values)
         with (self.root/'events.jsonl').open('a') as stream:
             stream.write(json.dumps(row) + '\n')
         atomic_json(self.root/'status.json', dict(status='running', phase=event, **row))
@@ -520,6 +522,32 @@ class Runner:
             and p.name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja',
                 'generation_config.json', 'special_tokens_map.json', 'preprocessor_config.json',
                 'processor_config.json')}
+        assets['tiktoken/tokenizer.model'] = self.header.snapshot/'tiktoken/tokenizer.model'
+        card = self.root/'model-card.md'
+        card.write_text('---\nlibrary_name: cuteafd\nlicense: apache-2.0\nbase_model: '+recipe.BASE_REPO+
+            '\ntags:\n- exl3\n- mixture-of-experts\n---\n\n# Inkling 2 Small EXL3 K4 MC\n\n'
+            'One multi-core package with shared K4 MCG experts and three indexed views: '
+            '`original` (default BF16 core and bundled drafter), `k8-compact`, and `k6-compact`. '
+            'Both compact views include the corresponding encoded drafter. Native vision, '
+            'router, norm, convolution, attention-residual and remaining drafter tensors are preserved.\n\n'
+            'Source: `'+recipe.BASE_REPO+'@'+recipe.BASE_REVISION+'`. '
+            'Calibration uses the standard own-text panel, the checkpoint tokenizer/template, '
+            'and a single causal pass with reconstructed K8 core and K4 expert activations. '
+            'K6 reuses the same captured Hessians. The drafter uses the last complete block per '
+            'untruncated calibration prompt, with K8 target features. No drafter quality evaluation '
+            'is claimed; evaluation and engine support are separate work.\n\n'
+            'MXFP8 activation rounding follows the official source path. Expert source scales '
+            'are per output row and 32 input values; gate/up source rows are interleaved. '
+            'EXL3 weights use standard MCG storage and per-module header-derived geometry.\n')
+        assets['README.md'] = card
+        with (self.root/'per-module-errors.csv').open('w', newline='') as stream:
+            writer = csv.writer(stream)
+            writer.writerow(['module','bits','hessian_weighted_relative_error','natural_rows','augmented_rows','identity_rows'])
+            for path in sorted((self.root/'errors').glob('*/*.json')):
+                row = json.loads(path.read_text())
+                evidence = row['evidence']
+                writer.writerow([row['module'],row['bits'],row['metrics']['hessian_weighted_relative_error'],
+                    evidence.get('natural_rows',''),evidence.get('augmented_rows',''),evidence.get('identity_rows',0)])
         receipt = self.writer.finalize(core_selection=selected, configs=configs,
             quantizes=quantizes, assets=assets, expected_payload_bytes=recipe.TARGET_PAYLOAD_BYTES)
         atomic_json(self.root/'quantization-complete.json', dict(status='passed', identity=self.identity,
