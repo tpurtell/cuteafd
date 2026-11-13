@@ -14,6 +14,7 @@ import math
 from pathlib import Path
 import re
 import sys
+import struct
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts/lib'))
 import mc_manifest
@@ -534,6 +535,14 @@ def validate(output):
         raise ValueError('unsupported package receipt')
     for filename, receipt in state['new_shards'].items():
         verify_receipt(output / filename, receipt, checksum=True)
+    if 'direct_expected_specs' in state:
+        if set(p.name for p in output.glob('*.safetensors')) != set(state['new_shards']):
+            raise ValueError('unowned physical weights in direct package')
+        payload = sum(sum(v['data_offsets'][1] - v['data_offsets'][0]
+                          for n, v in read_header(output / filename)[0].items() if n != '__metadata__')
+                      for filename in state['new_shards'])
+        if payload != state['direct_payload_bytes']:
+            raise ValueError('direct physical payload differs from committed inventory')
     family = state['identity']['family']
     if family != 'ml4':
         mc_manifest.validate(load_json(output / mc_manifest.MANIFEST), output)
@@ -542,6 +551,29 @@ def validate(output):
         index, config, quantize, _ = mc_manifest.FILES[view]
         inv = inventory(output, index)
         q = load_json(output / quantize)
+        if 'direct_expected_specs' in state:
+            expected = {n: (s[0], s[1]) for n, s in state['direct_expected_specs'][view].items()}
+            if inv['specs'] != expected or inv['mapping'] != state['direct_expected_mappings'][view]:
+                raise ValueError('direct selected index differs from committed tensor inventory')
+            selected = state['direct_core_selection']
+            for module, geometry in selected.items():
+                if view == 'original':
+                    if module in q['tensor_storage']:
+                        raise ValueError('original direct view still declares quantized core')
+                    continue
+                bits = mc_manifest.FILES[view][3]
+                entry = q['tensor_storage'].get(module, {})
+                if entry.get('bits_per_weight') != bits:
+                    raise ValueError('direct compact core metadata width differs')
+                required = packed_specs(module, dict(geometry, bits=bits))
+                if set(entry.get('stored_tensors', {})) != set(required):
+                    raise ValueError('direct compact core metadata inventory differs')
+                marker = module + '.mcg'
+                header, base = read_header(output / inv['mapping'][marker])
+                with (output / inv['mapping'][marker]).open('rb') as stream:
+                    stream.seek(base + header[marker]['data_offsets'][0])
+                    if struct.unpack('<I', stream.read(4))[0] != MCG:
+                        raise ValueError('direct compact core MCG multiplier differs')
         declared = {}
         for module, entry in q['tensor_storage'].items():
             for name, tensor in entry['stored_tensors'].items():
@@ -564,7 +596,9 @@ def validate(output):
                            core_tensors=len(core))
     original = inventory(output)
     original_native_specs = original['specs']
-    _, reviewed_selection = family_recipe(family)
+    reviewed_selection = state.get('direct_core_selection')
+    if reviewed_selection is None:
+        _, reviewed_selection = family_recipe(family)
     for module, geometry in reviewed_selection.items():
         if family == 'ml4':
             recipe, _ = family_recipe(family)
@@ -574,8 +608,13 @@ def validate(output):
                 raise ValueError('restored FP8 scales missing or malformed')
     proofs = {}
     source = Path(state['source_snapshot'])
-    for name, shard in sorted(state['source_tensor_locations'].items()):
-        digest = tensor_hash(source / shard, name)
+    for name, location in sorted(state['source_tensor_locations'].items()):
+        # Direct sources can carry unindexed, bare-name MTP tensors.
+        shard = location['shard'] if isinstance(location, dict) else location
+        source_name = location['source_name'] if isinstance(location, dict) else name
+        if Path(shard).name != shard:
+            raise ValueError('unsafe original source shard')
+        digest = tensor_hash(source / shard, source_name)
         if tensor_hash(output / original['mapping'][name], name) != digest:
             raise ValueError('restored original core payload differs: ' + name)
         proofs[name] = digest
