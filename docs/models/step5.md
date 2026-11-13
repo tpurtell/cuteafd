@@ -32,9 +32,11 @@ TP2 through the shared pair and `rtx-tp2`, with F32 partial exchange. The
 prior K6 96 GiB header-fixture maximum onboards 24 layers; its minimum prioritizes
 its roughly 1.81M-token pool and onboards none. These are planner results,
 not hardware qualification. Start from
-`examples/configs/step5-exl3-k6core-{min,max}.config`, overriding `MODEL_ID`
-and `MODEL_REVISION` with the MC publication and selecting `CORE_VIEW=original`.
-The release smoke matrix pins these overrides; MC cards and Standard fidelity
+the MC [min](../../examples/configs/step5-exl3-k4-mc-min.config) and
+[max](../../examples/configs/step5-exl3-k4-mc-max.config) configs, which pin the MC
+publication, revision and `CORE_VIEW=original`. The old K6-core paths remain
+retired historical recipes. The release smoke matrix uses the MC configs;
+MC cards and Standard fidelity
 are pending [#1906](https://github.com/tpurtell/cuteafd/issues/1906).
 
 ## Core views

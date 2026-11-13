@@ -18,11 +18,16 @@ a top-8 sigmoid router, and a DFlash2 draft speculator.
   group-16; dense parts run through the FP8-block/W8A8 paths described
   below.
 
-**Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
-placeholder Spark hosts and addresses): EXL3 K4 [min](../../examples/configs/glm53-exl3-min.config) · [max](../../examples/configs/glm53-exl3-max.config); NVFP4 [min](../../examples/configs/glm53-nvfp4-min.config) · [max](../../examples/configs/glm53-nvfp4-max.config).
-
-Native EXL3 K4 + K6-core starting configs:
-[min](../../examples/configs/glm53-exl3-k6core-min.config) ·
+**Starting configs** (MC cards pending; use a matching WIP build and replace the
+placeholder Spark hosts and addresses): MC original
+[min](../../examples/configs/glm53-exl3-k4-mc-min.config) ·
+[max](../../examples/configs/glm53-exl3-k4-mc-max.config).
+NVFP4 [min](../../examples/configs/glm53-nvfp4-min.config) ·
+[max](../../examples/configs/glm53-nvfp4-max.config) remains supported.
+Historical, retired standalone recipes remain available: EXL3
+[min](../../examples/configs/glm53-exl3-min.config) /
+[max](../../examples/configs/glm53-exl3-max.config), and K6 core
+[min](../../examples/configs/glm53-exl3-k6core-min.config) /
 [max](../../examples/configs/glm53-exl3-k6core-max.config).
 
 ## Core views
@@ -34,9 +39,9 @@ attention, dense/shared FFNs and the vocabulary head. Experts and non-core
 tensors are shared unchanged. Plain checkpoints refuse compact selectors.
 Selected metadata and fingerprints are immutable across planning and serving.
 
-Use the EXL3 min/max configs above with `MODEL_ID` and `MODEL_REVISION` set to
-the MC publication and `CORE_VIEW=original`. The release smoke matrix pins
-these overrides explicitly: 1 RTX PRO 6000 + 4 Sparks and 2 RTX + 6 Sparks,
+The MC min/max configs above pin `MODEL_ID`, `MODEL_REVISION` and
+`CORE_VIEW=original`. The release smoke matrix selects the same publication
+explicitly: 1 RTX PRO 6000 + 4 Sparks and 2 RTX + 6 Sparks,
 with DFlash2. Compact comparisons run on max, separately from the release table,
 via `scripts/bench/release-smoke-v51-mc-core-comparison.json`.
 

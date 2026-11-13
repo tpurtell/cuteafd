@@ -24,7 +24,8 @@ STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|n
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
 ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-{size}.config" for size in ("min", "max")}
 NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
-                    ("mistral-large4-exl3-k4", "glm53-flash-exl3-k4-mc") for size in ("min", "max")}
+                    ("mistral-large4-exl3-k4", "glm53-flash-exl3-k4-mc",
+                     "glm53-exl3-k4-mc", "step5-exl3-k4-mc") for size in ("min", "max")}
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
                  "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
                  "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION | NEW_PUBLICATIONS
@@ -772,17 +773,25 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         assert values["SPARK_COUNT"] == ("5" if minimum else "6")
         assert values["RTX_GPUS"] == ("1" if minimum else "2")
         assert values["SPECULATOR"] == "dspark" and values["POOL_TOKENS"] == "auto"
+    elif name.startswith("glm53-exl3-k4-mc-"):
+        expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-"))
+    elif name.startswith("step5-exl3-k4-mc-"):
+        expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6core-"))
     else:
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6-"))
-    expected.update(MODEL_ID=("wrldsuksgo2mars/Mistral-Large-4-EXL3-K4" if ml4
-                              else "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC"),
-                    MODEL_REVISION=("9c354cee78cd6feddb057549b8edde6e3b319822" if ml4
-                                    else "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d"),
+    publication = next((model, revision, doc) for stem, model, revision, doc in [
+        ("mistral-", "Mistral-Large-4-EXL3-K4", "9c354cee78cd6feddb057549b8edde6e3b319822", "mistral_large4"),
+        ("glm53-flash-", "GLM-5.3-Flash-EXL3-K4-MC", "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d", "glm5_flash"),
+        ("glm53-exl3-k4-mc-", "GLM-5.3-EXL3-K4-MC", "c39486376dee84e5faa4904e014e07d7b6e76405", "glm5"),
+        ("step5-exl3-k4-mc-", "Step-5-Preview-EXL3-K4-MC", "4483a4bd874e8c360aec486ea72bd31d1ad7a247", "step5"),
+    ] if name.startswith(stem))
+    model, revision, family_doc = publication
+    expected.update(MODEL_ID="wrldsuksgo2mars/" + model, MODEL_REVISION=revision,
                     CORE_VIEW="original")
     assert values == expected
     assert not any(needle in path.read_text().lower() for needle in PRIVATE)
-    assert f"./run.sh --config examples/configs/{name} --dry-run" in path.read_text()
-    doc = ROOT / "docs/models" / ("mistral_large4.md" if ml4 else "glm5_flash.md")
+    assert re.search(rf"\./run\.sh --config examples/configs/{re.escape(name)} (?:--wip SLOT )?--dry-run", path.read_text())
+    doc = ROOT / "docs/models" / (family_doc + ".md")
     assert f"../../examples/configs/{name}" in doc.read_text()
     assert f"({name})" in (EXAMPLES / "README.md").read_text()
     if not ml4:
@@ -1059,8 +1068,13 @@ def test_glm53_step5_mc_rollout_pins_original_and_separates_comparisons(
     entries = [entry for entry in release["entries"] if entry["set"].get("MODEL_ID") == repo]
     assert len(entries) == 2
     assert {tuple(entry["gpus"]) for entry in entries} == {(1,), (0, 1)}
+    retired_configs = {entry["config"] for entry in published["retired"]}
     for entry in entries:
-        values = {**keys(ROOT / entry["config"]), **entry["set"]}
+        assert entry["config"] not in retired_configs
+        config = keys(ROOT / entry["config"])
+        assert config["MODEL_ID"] == repo and config["MODEL_REVISION"] == revision
+        assert config["CORE_VIEW"] == "original"
+        values = {**config, **entry["set"]}
         assert values["MODEL_REVISION"] == revision
         assert values["CORE_VIEW"] == "original"
         assert len(entry["sparks"]) == (sparks if len(entry["gpus"]) == 1 else 6)
@@ -1068,6 +1082,8 @@ def test_glm53_step5_mc_rollout_pins_original_and_separates_comparisons(
     compact = [entry for entry in comparisons["entries"] if entry["family"] == family]
     assert {entry["set"]["CORE_VIEW"] for entry in compact} == {"k8-compact", "k6-compact"}
     for entry in compact:
+        assert entry["config"] not in retired_configs
+        assert keys(ROOT / entry["config"])["MODEL_ID"] == repo
         assert entry["set"]["MODEL_ID"] == repo
         assert entry["set"]["MODEL_REVISION"] == revision
         assert entry["gpus"] == [0, 1] and len(entry["sparks"]) == 6

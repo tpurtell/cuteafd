@@ -465,7 +465,7 @@
     {
       "name": "glm53-mc-original-min",
       "family": "glm5",
-      "config": "examples/configs/glm53-exl3-min.config",
+      "config": "examples/configs/glm53-exl3-k4-mc-min.config",
       "gpus": [
         1
       ],
@@ -500,7 +500,7 @@
     {
       "name": "glm53-mc-original-max",
       "family": "glm5",
-      "config": "examples/configs/glm53-exl3-max.config",
+      "config": "examples/configs/glm53-exl3-k4-mc-max.config",
       "gpus": [
         0,
         1
@@ -962,7 +962,7 @@
     {
       "name": "step5-mc-original-min",
       "family": "step5",
-      "config": "examples/configs/step5-exl3-k6core-min.config",
+      "config": "examples/configs/step5-exl3-k4-mc-min.config",
       "gpus": [
         1
       ],
@@ -993,7 +993,7 @@
     {
       "name": "step5-mc-original-max",
       "family": "step5",
-      "config": "examples/configs/step5-exl3-k6core-max.config",
+      "config": "examples/configs/step5-exl3-k4-mc-max.config",
       "gpus": [
         0,
         1

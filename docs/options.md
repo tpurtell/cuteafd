@@ -60,7 +60,7 @@ only beyond that metadata-selected scope. No precision lever changes KV defaults
 A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
 
 ```sh
-./run.sh --config examples/configs/glm53-exl3-min.config
+./run.sh --config examples/configs/glm53-exl3-k4-mc-min.config --wip SLOT
 ./run.sh --config my.config --set CONCURRENCY=16 --set SPARK_COUNT=4
 ./run.sh --config my.config --dry-run --total-capacity   # validate and print the plan
 ```
