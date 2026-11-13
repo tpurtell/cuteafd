@@ -297,8 +297,13 @@ class APIClient(TextGenerator):
         request = copy.deepcopy(body)
         request["model"] = self.model
         request.update(self.extra_body)
+        explicit_inkling_effort = (self.family == "inkling2"
+            and (request.get("reasoning") or {}).get("effort") is not None)
+        if explicit_inkling_effort:
+            request.pop("reasoning_effort", None)
         record = self.cache.find(request)
-        if record is None and urllib.parse.urlsplit(self.endpoint).hostname == "openrouter.ai":
+        if (record is None and not explicit_inkling_effort
+                and urllib.parse.urlsplit(self.endpoint).hostname == "openrouter.ai"):
             # Reuse old exact requests first; budget only newly purchased responses.
             reasoning_options = copy.deepcopy(request.get("reasoning") or {})
             reasoning_options.pop("effort", None)

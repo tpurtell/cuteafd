@@ -63,7 +63,9 @@ def test_malformed_windows_are_not_silently_skipped(tmp_path, tokens, roles):
 def test_config_inventory_is_pinned_and_excludes_media_and_retired():
     registry = ROOT / "rust/crates/cuteafd-bench/src/fidelity_dataset.rs"
     configs = list(harness.registered_configs(registry))
-    assert len(configs) == 17
+    assert len(configs) == 18
+    assert ("inkling2-small-v1_20261113_own-text-mxfp8-f32",
+            "a09a542737757710542b2460b5e1334ef6f79853") in configs
     assert ("kimi-k31-v1_20261105_own-text-effort-matched-mxfp4-f32",
             "777591fb926da184844a9d44fa95017cd9128133") in configs
     assert ("minimax-m3_1-flash-v1_20261105_own-text-native",
