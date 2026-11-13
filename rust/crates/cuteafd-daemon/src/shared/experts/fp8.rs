@@ -1057,7 +1057,7 @@ mod tests {
                 for rank in 0..world {
                     let slicing = tensors.exact_slicing(world);
                     let arena = super::super::weight_layout::arena(device, "fp8",
-                        regions(&tensors, &[1, 2], world, rank, slicing)?)?;
+                        cuteafd_loader::serving_capacity::fp8_expert_regions(&tensors, &[1, 2], world, rank, slicing)?)?;
                     let layout = arena.layout().clone();
                     let mounted = device.run(|| [1, 2].into_iter().map(|layer|
                         Fp8Layer::load_into(&library, &tensors.for_layer_metadata(layer)?, layer,
@@ -1165,7 +1165,7 @@ mod tests {
             for rank in 0..2 {
                 let slicing = tensors.exact_slicing(2);
                 let arena = super::super::weight_layout::arena(device, "fp8",
-                    regions(&tensors, &[layer], 2, rank, slicing)?)?;
+                    cuteafd_loader::serving_capacity::fp8_expert_regions(&tensors, &[layer], 2, rank, slicing)?)?;
                 let layout = arena.layout().clone();
                 let mounted = device.run(|| Fp8Layer::load_into(&library, &tensors, layer, 2, rank, slicing, &arena))?;
                 let plan = RankPlan::from_tensors(&tensors, &[(layer, slicing)], 2, rank, usize::MAX)?;
