@@ -78,7 +78,7 @@ fn k8_core_refusal_names_the_missing_ml4_export() {
     for (stem, expected) in &model.expected {
         if !matches!(expected.form, Form::CoreOrFp8 | Form::CoreOrBf16 { .. }) { continue; }
         let operand = |bits, logical| QuantOperand { encoding: Encoding::Exl3 { bits }, container: "I16".into(),
-            logical, stored: vec![], scale: None, global_scale: None, input_scale: None, companions: vec![] };
+            logical, stored: vec![], scale: None, global_scale: None, input_scale: None, companions: vec![], expert_scale: None };
         let role = TensorRole::new(Component::Attention);
         model.accepts(&role, stem, &mut operand(6, expected.shape.clone())).unwrap();
         let error = model.accepts(&role, stem, &mut operand(8, expected.shape.clone())).unwrap_err();

@@ -309,6 +309,9 @@ impl ExpertGeometry {
     pub const MISTRAL_LARGE4: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 6144, layers: 72 };
     /// MiniMax M3.1 Flash: native NVFP4 routed layers 3..60, SwiGLU-OAI.
     pub const MINIMAX_M3: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 3072, layers: 60 };
+    /// Inkling 2 Small: every layer routed (48), sigmoid top-8, SiTU (4/25);
+    /// experts MXFP8, native NVFP4 or EXL3 K4 by checkpoint and layer.
+    pub const INKLING2: Self = Self { hidden: 4608, experts: 384, topk: 8, intermediate: 2304, layers: 48 };
 
     /// Step-5 routed target layers 3..91 (layer 91 is dense).
     pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91 };
@@ -389,6 +392,7 @@ impl ExpertGeometry {
             (Self::MUSE_SPARK, "muse"),
             (Self::MISTRAL_LARGE4, "ml4"),
             (Self::MINIMAX_M3, "minimax"),
+            (Self::INKLING2, "inkling2"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
@@ -414,14 +418,15 @@ impl ExpertGeometry {
         if self.same_shape(&Self::STEP5) || self.same_shape(&Self::MINIMAX_M3) { return Some(7.0); }
         (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
             && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)
-            && !self.same_shape(&Self::KIMI_K3) && !self.same_shape(&Self::MUSE_SPARK) && !self.same_shape(&Self::MISTRAL_LARGE4)).then_some(10.0)
+            && !self.same_shape(&Self::KIMI_K3) && !self.same_shape(&Self::MUSE_SPARK) && !self.same_shape(&Self::MISTRAL_LARGE4)
+            && !self.same_shape(&Self::INKLING2)).then_some(10.0)
     }
 
     /// Expert arithmetic; existing families retain their legacy rounding exactly.
     pub fn activation(&self) -> crate::FfnActivation {
         if self.same_shape(&Self::MINIMAX_M3) {
             crate::FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 }
-        } else if self.same_shape(&Self::KIMI_K3) {
+        } else if self.same_shape(&Self::KIMI_K3) || self.same_shape(&Self::INKLING2) {
             crate::FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) }
         } else if self.same_shape(&Self::STEP5) {
             crate::FfnActivation::SiluPostClampFp32Product { limit: 7.0 }

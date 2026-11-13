@@ -205,16 +205,18 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let exl3 = format.strip_prefix("exl3-k").is_some_and(|bits| (1..=2).contains(&bits.len())
         && bits.bytes().all(|bit| (b'2'..=b'6').contains(&bit))
         && (bits.len() == 1 || bits.as_bytes()[0] != bits.as_bytes()[1]))
-        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3" | "step5" | "muse" | "ml4");
-    let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4" | "minimax"))
+        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3" | "step5" | "muse" | "ml4" | "inkling2");
+    let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4" | "minimax" | "inkling2"))
         || (family == "step5" && format == "nvfp4");
+    // Inkling 2 MXFP8 experts (E4M3 + UE8M0 K32, W8A8) are an FP8-family package with a K32 wire.
+    let mxfp8 = format == "mxfp8" && family == "inkling2";
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
     let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4" | "step5");
     let bf16 = family == "step5" && format == "bf16";
-    if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16) {
+    if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16 || mxfp8) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
-    let block = if nvfp4 { 16 } else if native && mxfp4 {
+    let block = if nvfp4 { 16 } else if mxfp8 { 32 } else if native && mxfp4 {
         cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world)
     } else if mxfp4 { 32 } else { 128 };
     if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {

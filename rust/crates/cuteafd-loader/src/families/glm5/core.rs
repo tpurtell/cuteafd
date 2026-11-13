@@ -1025,7 +1025,7 @@ mod tests {
         let checkpoint = checkpoint(&cfg);
         let model = crate::plan::families::glm::GLM5.open(&checkpoint)?;
         let operand = |logical| QuantOperand { encoding: Encoding::Exl3 { bits: 6 }, container: "I16".into(), logical,
-            stored: vec![], scale: None, global_scale: None, input_scale: None, companions: vec![] };
+            stored: vec![], scale: None, global_scale: None, input_scale: None, companions: vec![], expert_scale: None };
         for (name, shape) in expected(&cfg) {
             let stem = name.strip_suffix(".weight").unwrap();
             let role = crate::plan::families::glm::GLM5.classify(model.spec(), &name).unwrap();

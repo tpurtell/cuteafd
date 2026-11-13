@@ -33,7 +33,7 @@ fn core_contract_follows_header_width_and_charges_native_payload() {
         assert_eq!(model.core.projections.len(), 373);
         let operand = |width, logical: Vec<usize>| QuantOperand {
             encoding: Encoding::Exl3 { bits: width }, container: "I16".into(), logical,
-            stored: vec![], scale: None, global_scale: None, input_scale: None, companions: vec![],
+            stored: vec![], scale: None, global_scale: None, input_scale: None, companions: vec![], expert_scale: None,
         };
         for (stem, projection) in &model.core.projections {
             assert_eq!(projection.bits, bits, "{stem}");
