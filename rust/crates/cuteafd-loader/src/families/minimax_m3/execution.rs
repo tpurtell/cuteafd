@@ -122,7 +122,7 @@ impl MsaPrograms {
         if max_context == 0
             || max_context as usize > cfg.max_position
             || decode_rows == 0
-            || decode_rows > prefill_rows
+            || prefill_rows == 0
             || prefill_rows > 4096
         {
             return Err(bad("MiniMax MSA requested row or context capacity"));

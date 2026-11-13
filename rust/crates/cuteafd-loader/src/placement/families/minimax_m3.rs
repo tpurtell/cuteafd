@@ -37,9 +37,40 @@ use cuteafd_core::spark_reply::SparkReplyFormats;
 pub const PAGE_ROWS: u64 = 64;
 /// Prefill transport endpoints: one shared link (LaneSupport::One).
 pub const LANES: u64 = 1;
-/// Decode/verify rows per step, the Spark decode owner's admitted extent.
-pub const DECODE_ROWS: u32 = 64;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
+
+/// Shared constructor/admission capacities. Native decode consumes one token
+/// per request; multi-token verification uses packed prefill units instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestCapacity {
+    pub decode: UnitMetadata,
+    pub prefill: UnitMetadata,
+}
+impl RequestCapacity {
+    pub fn new(concurrency: u64, unit_rows: u64) -> Result<Self, Refusal> {
+        cuteafd_core::concurrency::validate("minimax_m3", concurrency).map_err(invalid)?;
+        let requests = u32::try_from(concurrency).map_err(|_| Refusal::Overflow("MiniMax requests"))?;
+        let rows = u32::try_from(unit_rows).map_err(|_| Refusal::Overflow("MiniMax unit rows"))?;
+        Ok(Self { decode: UnitMetadata::for_requests(requests, requests)?,
+            prefill: UnitMetadata::for_requests(rows, requests.min(rows))? })
+    }
+
+    pub fn metadata(self, prefill: bool) -> UnitMetadata {
+        if prefill { self.prefill } else { self.decode }
+    }
+
+    /// Retained ordered H2D payloads, one per mutable metadata destination.
+    /// Decode batch IDs/offsets are startup iotas; descales are startup ones.
+    pub fn metadata_uploads(self, prefill: bool) -> Vec<(&'static str, u64)> {
+        self.metadata(prefill).buffers().into_iter().filter(|(name, _)| matches!(*name,
+            "positions" | "slots" | "causal_lengths" | "cache_lengths")
+            || (prefill && matches!(*name, "batch_ids" | "query_offsets"))).collect()
+    }
+
+    pub fn cache(self, context: u32) -> Result<MsaCache, Refusal> {
+        MsaCache::new(1, 1, self.decode.requests, context)
+    }
+}
 
 /// Stable recipe/runtime owner identity. `id` is the full planner identity;
 /// `inventory_name` omits the `minimax.` prefix supplied by runtime Inventory.
@@ -377,6 +408,13 @@ fn buffer(id: impl Into<String>, location: Location, bytes: u64, lifetime: Lifet
         ByteCurve::fixed(bytes, maximum), false, maximum))
 }
 
+fn metadata_upload_components(capacity: RequestCapacity, prefill: bool, prefix: &str, maximum: u64)
+    -> Vec<Component> {
+    capacity.metadata_uploads(prefill).into_iter().filter_map(|(name, bytes)|
+        buffer(format!("{prefix}.metadata.{name}.upload"), Location::PINNED, bytes,
+            Lifetime::TARGET, Category::Staging, "metadata ordered H2D staging", maximum)).collect()
+}
+
 fn allowance(location: Location, bytes: u64, lifetime: Lifetime, source: String, assumed: bool, maximum: u64)
     -> Option<Component> {
     (bytes > 0).then(|| Component { activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum),
@@ -391,6 +429,10 @@ fn with(mut components: Vec<Component>, activation: &Activation) -> Vec<Componen
 impl MiniMaxInputs {
     pub fn maximum_pages(&self) -> u64 { self.maximum_pool_tokens.div_ceil(PAGE_ROWS) }
 
+    pub fn request_capacity(&self) -> Result<RequestCapacity, Refusal> {
+        RequestCapacity::new(self.sequences, self.prefill.rows)
+    }
+
     fn modes(&self) -> Vec<LayerMode> {
         self.owners.iter().map(|&gpu| LayerMode::Whole { gpu, ffn: FfnMode::Owner }).collect()
     }
@@ -399,7 +441,7 @@ impl MiniMaxInputs {
 
     fn hop_spec(&self) -> HopSpec {
         HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: self.cfg.hidden as u64 * 4,
-            rows: self.prefill.rows.max(u64::from(DECODE_ROWS)), lanes: LANES, entry_gpu: 0,
+            rows: self.prefill.rows.max(self.sequences), lanes: LANES, entry_gpu: 0,
             head_gpu: self.head_gpu(),
             terminal: TerminalHome::AttentionOwner }
     }
@@ -501,9 +543,10 @@ impl MiniMaxInputs {
     fn rank_execution_components(&self, gpu: usize, maximum: u64) -> Result<Vec<Component>, Refusal> {
         let location = Location::coordinator(gpu as u8);
         let cfg = &self.cfg;
-        let rows = u32::try_from(self.prefill.rows).map_err(|_| Refusal::Overflow("MiniMax unit rows"))?;
+        let capacity = self.request_capacity()?;
+        let rows = capacity.prefill.rows;
+        let decode_rows = capacity.decode.rows;
         let context = u32::try_from(self.context.maximum).map_err(|_| Refusal::Overflow("MiniMax context"))?;
-        let sequences = u32::try_from(self.sequences).map_err(|_| Refusal::Overflow("MiniMax sequences"))?;
         let mut out = Vec::new();
         let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
         // Whole-owner MSA layers: KV and index pages on the owner only. Each
@@ -518,7 +561,7 @@ impl MiniMaxInputs {
             }
         }
         // Page tables and lengths for every admitted sequence, at the compiled context.
-        let cache = MsaCache::new(1, 1, sequences, context)?;
+        let cache = capacity.cache(context)?;
         for (name, bytes) in cache.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
             out.extend(buffer(format!("{}.{name}", Owner::Cache { gpu }.id()), location, bytes, Lifetime::TARGET,
                 Category::Kv, "MSA page tables", maximum));
@@ -533,19 +576,20 @@ impl MiniMaxInputs {
             }
         }
         out.extend(MsaRope::new(cfg, context)?.components(&Owner::Rope { gpu }.id(), gpu as u8, maximum)?);
-        let (msa, _) = MsaPrograms::resolve(cfg, &self.manifest, DECODE_ROWS, rows, context)?;
-        let (producers, _) = ProducerPrograms::resolve(&self.manifest, rows)?;
-        ForwardPrograms::resolve(&self.manifest, rows)?;
-        target.resolve_dense_programs(&self.manifest, rows)?;
+        let (msa, _) = MsaPrograms::resolve(cfg, &self.manifest, decode_rows, rows, context)?;
+        let (producers, _) = ProducerPrograms::resolve(&self.manifest, rows.max(decode_rows))?;
+        ForwardPrograms::resolve(&self.manifest, rows.max(decode_rows))?;
+        target.resolve_dense_programs(&self.manifest, rows.max(decode_rows))?;
         // One decode lane on every rank (its layers' work), then one owner
         // set per in-flight prefill slot (PrefillHooks unit slots).
         let decode = Owner::Decode { gpu }.id();
-        out.extend(UnitLayout::new(cfg, DECODE_ROWS)?.components(&decode, gpu as u8, Lifetime::TARGET, maximum)?);
-        out.extend(UnitMetadata::new(DECODE_ROWS)?.components(&format!("{decode}.metadata"), gpu as u8, maximum)?);
+        out.extend(UnitLayout::new(cfg, decode_rows)?.components(&decode, gpu as u8, Lifetime::TARGET, maximum)?);
+        out.extend(capacity.decode.components(&format!("{decode}.metadata"), gpu as u8, maximum)?);
+        out.extend(metadata_upload_components(capacity, false, &decode, maximum));
         out.extend(msa.workspace_components(&format!("{decode}.attention"), gpu as u8, false, Lifetime::TARGET, maximum)?);
         out.extend(producers.workspace_components(&format!("{decode}.attention"), gpu as u8, Lifetime::TARGET, maximum)?);
-        out.extend(target.dense_input(DECODE_ROWS).map_err(refusal)?.components(&format!("{decode}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
-        out.extend(target.dense_workspace(DECODE_ROWS).map_err(refusal)?.components(&format!("{decode}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
+        out.extend(target.dense_input(decode_rows).map_err(refusal)?.components(&format!("{decode}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
+        out.extend(target.dense_workspace(decode_rows).map_err(refusal)?.components(&format!("{decode}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
         for slot in 0..self.prefill.waves {
             let prefix = Owner::Unit { gpu, slot }.id();
             let unit = UnitLayout::new(cfg, rows)?;
@@ -558,7 +602,8 @@ impl MiniMaxInputs {
                     u64::from(unit.rows) * 4, Lifetime::TARGET, Category::Staging,
                     "entry prefill ordered token IDs", maximum));
             }
-            out.extend(UnitMetadata::new(rows)?.components(&format!("{prefix}.metadata"), gpu as u8, maximum)?);
+            out.extend(capacity.prefill.components(&format!("{prefix}.metadata"), gpu as u8, maximum)?);
+            out.extend(metadata_upload_components(capacity, true, &prefix, maximum));
             out.extend(target.dense_input(rows).map_err(refusal)?.components(&format!("{prefix}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
             out.extend(target.dense_workspace(rows).map_err(refusal)?.components(&format!("{prefix}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
             // MSA prefill scratch and producers are per slot: units overlap in flight.
@@ -618,6 +663,8 @@ impl Recipe for MiniMaxInputs {
                 }
             }
         }
+        let capacity = self.request_capacity()?;
+        let decode_rows = capacity.decode.rows;
         let pair = self.gpus == 2;
         let head = self.head_gpu();
         let mut components = self.execution_components()?;
@@ -629,11 +676,10 @@ impl Recipe for MiniMaxInputs {
             }
         }
         // Head-rank owners: vocabulary head workspace and the shared selector.
-        components.extend(HeadLayout::new(cfg, DECODE_ROWS)?.components(&Owner::Head.id(), head, maximum)?);
+        components.extend(HeadLayout::new(cfg, decode_rows)?.components(&Owner::Head.id(), head, maximum)?);
         components.extend(serving::ServingOwners {
             selector: serving::SelectorOwners { location: Location::coordinator(head),
-                capacity: usize::try_from(self.sequences).map_err(|_| Refusal::Overflow("MiniMax selector"))?
-                    .max(DECODE_ROWS as usize), vocab: cfg.vocab_size, device_sampling: self.device_sampling },
+                capacity: decode_rows as usize, vocab: cfg.vocab_size, device_sampling: self.device_sampling },
             prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 } }.components(maximum)?);
         // Transport: coordinator intake planes are fixed owners on the link's
         // GPU; host/pinned candidates join the host budget as one envelope.
@@ -678,7 +724,7 @@ impl Recipe for MiniMaxInputs {
                     // No local halves means no OwnerTp2 exchange. Boundary
                     // hops retain their own storage independently of onboarding.
                     let rows = crate::serving_capacity::OwnerTp2Rows::new(cfg.hidden as u64,
-                        cfg.topk as u64, self.prefill.rows.max(u64::from(DECODE_ROWS)), false).map_err(refusal)?;
+                        cfg.topk as u64, self.prefill.rows.max(u64::from(decode_rows)), false).map_err(refusal)?;
                     for demand in rows.demands().map_err(refusal)? {
                         components.extend(with(buffer(format!("{}.{}", Owner::Tp2 { gpu: demand.gpu as usize }.id(),
                             demand.group.replace(' ', "_")), Location::coordinator(demand.gpu), demand.bytes,
