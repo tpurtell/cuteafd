@@ -1,6 +1,7 @@
 //! BF16 embedding and zero-centered final norm through the shared target head.
 use super::weights::TargetWeights;
-use crate::shared::{memory::{device::{Allocation, Stream}, receipts::Inventory}, target_head::{self, TargetHead}};
+use crate::shared::{memory::{device::{Allocation, Stream}, receipts::Inventory},
+    target_head::{self, TargetHead}, token_io::DeviceLogits};
 use anyhow::{ensure, Result};
 use cuteafd_core::memory_layout::Tag;
 use cuteafd_ffi::{minimax_m3::forward::{ForwardProducer, Kind, NormBatch},
@@ -76,8 +77,11 @@ impl<'a> Head<'a> {
         self.stream.drain()?;
         self.stream.device.run(|| self.stream.device.library.copy_d2h(bytes, self.normalized.buffer))
     }
-    pub fn project(&self, weights: &TargetWeights<'_>, residual: Buffer, rows: usize) -> Result<Vec<f32>> {
-        ensure!(rows > 0 && rows <= self.rows, "MiniMax head live rows");
+    /// Logits borrow this admitted head until the next projection. Selection or
+    /// scoring must consume them on the producing stream before scratch reuse.
+    pub fn project_device(&self, weights: &TargetWeights<'_>, residual: Buffer, rows: usize) -> Result<DeviceLogits> {
+        ensure!(rows > 0 && rows <= self.rows && residual.device_id == self.stream.device.id
+            && residual.bytes >= rows * 6144 * 4, "MiniMax head live rows/device");
         let norm = weights.operand("language_model.model.norm.weight")?.buffer;
         let weight = weights.operand("language_model.lm_head.weight")?.buffer;
         let device = self.stream.device;
@@ -92,11 +96,98 @@ impl<'a> Head<'a> {
             }
             Ok(())
         })?;
+        Ok(DeviceLogits { ptr: self.logits.buffer.ptr, rows, vocab: self.vocab,
+            stride: self.vocab, stream: self.stream.raw, greedy: None })
+    }
+    /// Stream head tiles without altering the transformer's prefill units.
+    /// `consume` finishes reading each tile before the next overwrites logits.
+    pub fn project_spans(&self, weights: &TargetWeights<'_>, residual: Buffer, rows: usize,
+        consume: &mut dyn FnMut(usize, DeviceLogits) -> Result<()>) -> Result<()> {
+        ensure!(self.rows <= 64 && rows > 0 && residual.device_id == self.stream.device.id
+            && rows.checked_mul(6144 * 4).is_some_and(|bytes| bytes <= residual.bytes),
+            "MiniMax serving head must use an admitted <=64-row owner and bounded residual");
+        for span in crate::shared::probe::head_spans(rows, self.rows)? {
+            let input = super::cache::view(residual, span.start * 6144 * 4, span.len() * 6144 * 4)?;
+            consume(span.start, self.project_device(weights, input, span.len())?)?;
+        }
+        Ok(())
+    }
+    pub fn project_scoring(&self, weights: &TargetWeights<'_>, residual: Buffer, rows: usize,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<crate::shared::probe::ScoreLogits> {
+        self.project_spans(weights, residual, rows, &mut |offset, logits|
+            scoring.record(self.stream.device.library, offset, &logits))?;
+        Ok(crate::shared::probe::ScoreLogits::Recorded)
+    }
+    /// Cold golden alone materializes complete host rows; serving consumes
+    /// project_device/project_spans through the shared sampler or probe.
+    pub fn project(&self, weights: &TargetWeights<'_>, residual: Buffer, rows: usize) -> Result<Vec<f32>> {
+        self.project_device(weights, residual, rows)?;
         self.stream.drain()?;
         let mut bytes = vec![0; rows * self.vocab * 4];
-        device.run(|| device.library.copy_d2h(&mut bytes, self.logits.buffer))?;
+        self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut bytes, self.logits.buffer))?;
         let logits = bytes.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
         ensure!(logits.iter().all(|value| value.is_finite()), "MiniMax nonfinite head logits");
         Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::memory::device::Device;
+    use cuteafd_core::memory_layout::Category;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
+
+    #[test]
+    fn serving_head_has_one_fixed_bounded_owner_set_and_retires_on_its_device() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        fixture.configure_memory(&library, 1, 128 << 20)?;
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-ffi/tests/fixtures/minimax_forward_programs.json"))?;
+        fixture.register_programs(&library, manifest["programs"].as_array().unwrap())?;
+        let path = fixture.directory().join("PROGRAMS.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        let programs = library.programs()?.with_manifest(&path)?;
+        let cfg = MiniMaxM3Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?)?;
+        let device = Device { library: &library, id: 1 };
+        let stream = Rc::new(Stream::new(device)?);
+        let head = Head::new(Rc::clone(&stream), &programs, &cfg, 64)?;
+        let devices = [1];
+        let mut inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax",
+            Lifetime::TARGET, Category::Workspace, "bounded serving head");
+        head.inventory(&mut inventory, "head")?;
+        let buffers = cuteafd_loader::families::minimax_m3::execution::HeadLayout::new(&cfg, 64)?.buffers();
+        assert_eq!(inventory.receipts.len(), buffers.len());
+        for (receipt, (name, bytes)) in inventory.receipts.iter().zip(&buffers) {
+            assert_eq!(receipt.allocation.id, format!("minimax.head.{name}"));
+            assert_eq!(receipt.allocation.bytes, *bytes);
+        }
+        let bytes = buffers.iter().map(|(_, bytes)| *bytes).sum::<u64>() as usize;
+        assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, (128 << 20) - bytes);
+        assert!(head.copy_normalized(&mut [0; 2]).is_err());
+        assert_eq!(library.cuda_get_device()?, 0);
+        drop(head);
+        drop(stream);
+        assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, 128 << 20);
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_head_tiles_keep_prediction_positions_and_fixed_capacity() -> Result<()> {
+        for rows in [1, 63, 64, 65, 128, 129, 2752, 4096] {
+            let spans = crate::shared::probe::head_spans(rows, 64)?.collect::<Vec<_>>();
+            assert!(spans.iter().all(|span| !span.is_empty() && span.len() <= 64));
+            assert_eq!(spans.iter().cloned().flatten().collect::<Vec<_>>(), (0..rows).collect::<Vec<_>>());
+            let prediction = 193;
+            assert_eq!(spans.iter().flat_map(|span| span.clone().map(|row| prediction + row))
+                .collect::<Vec<_>>(), (prediction..prediction + rows).collect::<Vec<_>>());
+        }
+        Ok(())
     }
 }
