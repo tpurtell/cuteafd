@@ -704,6 +704,44 @@ fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacemen
 }
 
 #[test]
+fn ml4_alpha_records_without_reads_and_decodes_only_after_group_commit() -> Result<()> {
+    use crate::shared::experts::rtx::{dense, push};
+    use std::os::unix::fs::FileExt;
+    let (fixture, library) = compact_dso()?;
+    fixture.immediate_copies(&library)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (config, mut tensors) = fixture::glm5_compact_weights();
+    let mut cfg = GlmDsaConfig::from_hf(&config)?;
+    cfg.variant = GlmDsaConfig::from_hf(&fixture::mistral_large4_config())?.variant;
+    tensors.push(fixture::t("lerope.alpha", "BF16", &[cfg.qk_rope_head_dim / 2]));
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let tensor = catalog.tensor("lerope.alpha")?;
+    let bits = (0..cfg.qk_rope_head_dim / 2).map(|i|
+        [0x0000u16, 0x8000, 0x3f80, 0xbf80, 0x0001, 0x7f80, 0x7fc1][i % 7]).collect::<Vec<_>>();
+    let bytes = bits.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+    std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+        .write_all_at(&bytes, tensor.metadata.byte_offset)?;
+    let loader = GlmLoader { library: &library, catalog: &catalog, device: 0,
+        stream: std::ptr::null_mut(), peers: vec![], arenas: None,
+        allocation_prefix: String::new(), push: None };
+    let mount = loader.rope_alpha(&cfg)?;
+    let timing = crate::shared::memory::load_timing::Split::start();
+    let (pushed, records) = dense::recording(|| loader.rope_alpha(&cfg))?;
+    assert_eq!(timing.read_bytes(), 0, "alpha planning must not mount-read its payload");
+    assert!(pushed.values().unwrap_err().to_string().contains("before load-group commit"));
+    assert_eq!(records.host_operands.len(), 1);
+    assert!(records.operands.is_empty() && records.steps.is_empty());
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    let device = Device { library: &library, id: 0 };
+    device.run(|| push::tests::receive_pushed(device, None, root.path(), sockets.path(), &records, None, 0, 0))?;
+    let actual = pushed.values()?.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+    assert_eq!(actual, bits.iter().map(|&value| u32::from(value) << 16).collect::<Vec<_>>());
+    assert_eq!(actual, mount.values()?.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+    Ok(())
+}
+
+#[test]
 fn peer_routers_use_one_target_backing_and_replay_identical_push_bytes() -> Result<()> {
     use crate::shared::experts::rtx::{dense, push};
     use std::os::unix::fs::FileExt;

@@ -425,7 +425,6 @@ impl GlmEngine<'_> {
                 }
             }
         }
-        if let Some(alpha) = &self.weights.rope_alpha { inventory.host("rope_alpha", alpha)?; }
         inventory.receipts.extend(self.embedding.allocation_receipts(devices, "glm.embedding")?);
         Ok(inventory.receipts)
     }

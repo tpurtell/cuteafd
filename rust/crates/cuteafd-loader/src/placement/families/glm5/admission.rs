@@ -2082,6 +2082,13 @@ impl Recipe for GlmRecipe<'_> {
             requires: vec![],
             components: vec![],
         };
+        if self.cfg.variant.ml4().is_some() {
+            let bytes = self.cfg.qk_rope_head_dim as u64;
+            contract.components.push(Component::allocation(Allocation::buffer("glm.load.rope_alpha",
+                Location::PINNED, bytes, Lifetime { first: Phase::Load, last: Phase::PostTargetKv },
+                cuteafd_core::memory_layout::Category::Staging, "ML4 committed LeRoPE source"),
+                ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
+        }
         let prefill = contract.variables.len();
         contract
             .variables

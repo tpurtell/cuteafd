@@ -1691,6 +1691,8 @@ impl Opened {
             let peer_layers = shares.pop().context("head-split shares")?;
             engine.attach_peer(device, stream, peer_layers)?;
         }
+        // Both rotary tables now own the generated values; release the load-only source.
+        engine.weights.rope_alpha = None;
         if owners.is_some() { engine.bind_layer_execution(&placement)?; }
         engine.bind_core(core)?;
         if native {

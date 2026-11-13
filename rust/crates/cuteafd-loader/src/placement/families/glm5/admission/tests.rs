@@ -61,6 +61,24 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
 }
 
 #[test]
+fn ml4_alpha_is_one_pinned_load_owner_not_a_host_rss_subset() {
+    let mut cfg = cfg();
+    cfg.variant = GlmDsaConfig::from_hf(&crate::plan::testing::mistral_large4_config()).unwrap().variant;
+    let recipe = recipe(&cfg);
+    let contract = recipe.prepare(&request()).unwrap();
+    let owners = contract.components.iter().filter_map(|component| match &component.kind {
+        ComponentKind::Allocation { template, .. } if template.id == "glm.load.rope_alpha" => Some(template),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0].location, Location::PINNED);
+    assert_eq!(owners[0].bytes, cfg.qk_rope_head_dim as u64);
+    assert_eq!(owners[0].lifetime, Lifetime { first: Phase::Load, last: Phase::PostTargetKv });
+    assert_eq!(owners[0].category, Category::Staging);
+    assert!(owners[0].view.is_none());
+}
+
+#[test]
 fn blas_target_and_bridge_share_root_while_media_owns_its_thread() {
     use crate::plan::encoder::{EncoderKind, EncoderPlacement};
     let cfg = cfg();
