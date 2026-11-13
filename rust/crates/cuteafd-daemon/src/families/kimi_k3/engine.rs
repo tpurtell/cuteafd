@@ -547,6 +547,19 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    pub(crate) fn attach_dsa_dump(&self, dump: Rc<super::dsa_dump::DsaDump>) -> Result<()> {
+        self.require_live()?;
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        ensure!(self.provisional.borrow().is_none(), "Kimi DSA dump requires idle lanes at startup");
+        for lane in &mut lanes.local {
+            for local in lane {
+                ensure!(local.graph_device().is_none(), "CUTEAFD_KIMI_DSA_DUMP refuses attached CUDA graphs");
+                local.dsa_dump = Some(dump.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn graph_replays(&self) -> Result<u64> {
         Ok(self.lanes.try_borrow()?.local.iter().flatten().map(LocalLane::graph_replays).sum())
     }

@@ -616,6 +616,7 @@ pub(crate) struct LocalLane<'a> {
     context_pages: Vec<usize>,
     context_units: Vec<Option<ContextUnit>>,
     pub(super) capture: Option<Rc<super::golden::Capture>>,
+    pub(super) dsa_dump: Option<Rc<super::dsa_dump::DsaDump>>,
 }
 
 #[derive(Clone, Copy)]
@@ -672,7 +673,8 @@ impl<'a> LocalLane<'a> {
         mla.check_reader(lane_index, &lane.stream)?;
         let banks = lane.layout.metadata_banks();
         Ok(Self { lane, programs, cfg, layers, global, lane_index, rank, kda, mla, attention: None, graphs: None,
-            replay_enabled: true, context: None, context_pages: vec![0; banks], context_units: vec![None; banks], capture: None })
+            replay_enabled: true, context: None, context_pages: vec![0; banks], context_units: vec![None; banks],
+            capture: None, dsa_dump: None })
     }
 
     pub(crate) fn bind_context(&mut self, owner: Rc<super::context::ContextOwner<'a>>,
@@ -943,6 +945,7 @@ impl<'a> LocalLane<'a> {
     /// leaves that geometry lazy.
     pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize,
         reserve: u64) -> Result<usize> {
+        ensure!(self.dsa_dump.is_none(), "CUTEAFD_KIMI_DSA_DUMP refuses startup CUDA graph capture");
         self.check_startup_keys(keys, rank)?;
         let stream = self.stream().clone();
         let staged = self.attention.take();
@@ -1038,12 +1041,16 @@ impl<'a> LocalLane<'a> {
             return body(self);
         }
         let Some(mut graphs) = self.graphs.take() else { return body(self) };
+        if self.dsa_dump.is_some() {
+            self.graphs = Some(graphs);
+            bail!("CUTEAFD_KIMI_DSA_DUMP refuses CUDA graph replay");
+        }
         let stream = self.stream().clone();
         let key = super::graphs::Key { lane: self.lane_index, rank: self.rank, rows, op };
         let pinned = super::graphs::pinned(self.programs.graph_core(), self.programs.ranks, key);
         // A golden capture records its own sites inside the body; a recorded
         // stream cannot contain those reads.
-        let allow_capture = self.capture.is_none();
+        let allow_capture = self.capture.is_none() && self.dsa_dump.is_none();
         let result = graphs.graph(&stream, key, allow_capture, pinned, || body(self));
         self.graphs = Some(graphs);
         result
@@ -1474,6 +1481,9 @@ impl<'a> LocalLane<'a> {
                 query_offsets: self.lane.buffer("DSA query offsets")?, output: batch.attention,
                 lse: batch.lse, scratch: batch.attention_scratch,
             }, stream.raw)
+        })?;
+        super::dsa_dump::record_selected(self.dsa_dump.as_deref(), self.rank, stream, layer, batch.rows, || {
+            Ok((self.lane.buffer("DSA positions")?, self.lane.buffer("DSA selected lengths")?, indices))
         })
     }
 

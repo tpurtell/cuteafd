@@ -388,6 +388,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, options.expert_usage_reader.clone(), checkpoint, native, context_programs, peer, hops,
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules, &mut memory)?
         .with_served_context(options.max_context)?;
+    if let Some(dump) = super::dsa_dump::DsaDump::from_env()? {
+        engine.attach_dsa_dump(dump)?;
+    }
     memory.sample("pre-capture")?;
     stop_before_capture(memory.enabled())?;
     if let Some(set) = graph_set {

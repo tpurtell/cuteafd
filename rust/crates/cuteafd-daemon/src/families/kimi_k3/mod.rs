@@ -7,6 +7,7 @@ pub(crate) mod admission;
 pub(crate) mod block;
 pub(crate) mod context;
 pub(crate) mod device;
+pub(crate) mod dsa_dump;
 pub(crate) mod engine;
 pub(crate) mod golden;
 pub(crate) mod serve;
