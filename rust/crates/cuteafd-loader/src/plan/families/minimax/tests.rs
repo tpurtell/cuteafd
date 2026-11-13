@@ -1761,4 +1761,3 @@ fn recipe_asserts_embedding_home_is_coordinator_gpu_zero() {
         }
     }
 }
-
