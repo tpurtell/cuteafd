@@ -93,6 +93,47 @@ impl HeadsWeights {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires installed MiniMax M3.1 native checkpoint headers"]
+    fn installed_heads_arenas_match_native_header_payloads_and_one_tail() -> Result<()> {
+        use crate::placement::planner::ComponentKind;
+        let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from).unwrap_or_else(||
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
+        let checkpoint = Checkpoint::open(&home.join("hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e"))?;
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+        cfg.release_geometry()?;
+        let owners = (0..cfg.layers).map(|layer| usize::from(layer >= cfg.layers / 2)).collect::<Vec<_>>();
+        for embedding in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
+            let heads = HeadsWeights::plan(&checkpoint, &cfg, embedding)?;
+            let whole = CoordinatorWeights::plan_with_embedding(&checkpoint, &cfg, 2, &owners, embedding)?;
+            let unique = whole.iter().flat_map(|w| w.arena.views().keys())
+                .map(|name| (name.clone(), checkpoint.header(name).unwrap().byte_length as usize))
+                .collect::<BTreeMap<_, _>>();
+            let replicated = unique.iter().filter(|(name, bytes)| heads.iter().all(|h|
+                h.slices.get(*name).is_some_and(|s| s.bytes() == **bytes)))
+                .map(|(_, bytes)| bytes).sum::<usize>();
+            let actual = heads.iter().map(|h| h.target.arena.payload_bytes()).sum::<usize>();
+            assert_eq!(actual, unique.values().sum::<usize>() + replicated);
+            for h in heads {
+                assert_eq!(h.target.layers.len(), 60);
+                assert_eq!(h.target.arena.padding_bytes(), 0);
+                assert_eq!(h.target.arena.bytes(), h.slices.values().map(TensorSlice::bytes).sum::<usize>());
+                let components = h.target.weight_components(1024)?;
+                assert_eq!(components.iter().filter(|c| matches!(c.kind,
+                    ComponentKind::AllocationGranularity(_))).count(), 1);
+                h.mount_load(&checkpoint)?;
+                eprintln!("MiniMax heads rank {} embedding {embedding:?}: payload={} arena={} single tail",
+                    h.target.rank, h.target.arena.payload_bytes(), h.target.arena.bytes());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Shard { Rows, Columns, Replicated }
 fn shard(name: &str) -> Shard {

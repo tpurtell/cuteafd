@@ -379,6 +379,62 @@ mod tests {
     }
 
     #[test]
+    fn heads_rectangles_preserve_bytes_and_read_source_once_per_gpu() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let (checkpoint, _, source) = checkpoint(dir.path())?;
+        for rank in 0..2 {
+            let mut slices = BTreeMap::new();
+            let mut expected = BTreeMap::new();
+            for tensor in &checkpoint.tensors {
+                let name = &tensor.meta.name;
+                let rows = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
+                let row_bytes = source[name].len() / rows;
+                let columns = if name.starts_with("q.") {
+                    rank * (row_bytes / 2)..(rank + 1) * (row_bytes / 2)
+                } else { 0..row_bytes };
+                let bytes = source[name].chunks_exact(row_bytes)
+                    .flat_map(|row| row[columns.clone()].iter().copied()).collect::<Vec<_>>();
+                expected.insert(name.clone(), bytes);
+                slices.insert(name.clone(), TensorSlice { rows: 0..rows, columns, row_bytes });
+            }
+            let layout = HeadsWeights { target: CoordinatorWeights { rank, layers: vec![2, 5],
+                arena: WeightArenaLayout::new(format!("minimax/target/{rank}"), expected.iter()
+                    .map(|(name, bytes)| (name.clone(), bytes.len())))?, projections: Vec::new() }, slices };
+            let device = Device { library: &library, id: rank as i32 };
+            let phase = crate::shared::memory::load_timing::Split::start();
+            let mounted = TargetWeights::load_heads(device, &checkpoint, &layout)?;
+            assert_eq!(phase.read_bytes(), source.values().map(|bytes| bytes.len() as u64).sum::<u64>(),
+                "partial-column row windows read each source byte once per GPU");
+            drop(phase);
+            let (pushed, records) = crate::shared::experts::rtx::dense::recording(||
+                TargetWeights::load_heads(device, &checkpoint, &layout))?;
+            assert!(records.steps.is_empty(), "heads loads must not transform weights");
+            let phase = crate::shared::memory::load_timing::Split::start();
+            crate::shared::experts::rtx::push::tests::receive_pushed(device, None,
+                dir.path(), dir.path(), &records, None, 0, 0)?;
+            assert_eq!(phase.read_bytes(), 0, "push receiver must not reread checkpoint");
+            for (name, expected) in &expected {
+                for weights in [&mounted, &pushed] {
+                    let mut bytes = vec![0; expected.len()];
+                    device.run(|| library.copy_d2h(&mut bytes, weights.operand(name)?.buffer))?;
+                    assert_eq!(&bytes, expected, "rank {rank} {name}");
+                }
+            }
+            let mut inventory = Inventory::new(CoordinatorDevices::new(&[rank as i32])?, "minimax",
+                Lifetime::TARGET, Category::Weights, "heads fixture");
+            pushed.inventory(&mut inventory, "target")?;
+            let roots = inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].allocation.id, layout.target.arena.id());
+            assert_eq!(roots[0].allocation.bytes, layout.target.arena.bytes() as u64);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn raw_mount_rejects_recording_before_allocating() -> Result<()> {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;

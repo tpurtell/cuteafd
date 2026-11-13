@@ -742,8 +742,11 @@ fn heads_target_slices_match_headers_and_charge_one_arena_per_rank() -> anyhow::
         for (rank, h) in heads.iter().enumerate() {
             assert_eq!(h.target.rank, rank);
             assert_eq!(h.target.layers, [0, 1, 2, 3]);
-            assert_eq!(h.target.arena.bytes(), h.slices.values().map(|s| s.bytes()).sum::<usize>());
-            assert_eq!(h.target.arena.padding_bytes(), 0);
+            assert_eq!(h.target.arena.bytes(), h.slices.values().map(|s| s.bytes()).sum::<usize>()
+                + h.target.arena.padding_bytes());
+            // The reduced four-expert bias has 16 bytes, unlike the release's
+            // aligned 128-expert bias. Its next view needs 240 padding bytes.
+            assert_eq!(h.target.arena.padding_bytes(), 240);
             h.mount_load(&checkpoint)?;
             let components = h.target.weight_components(1024)?;
             assert_eq!(components.iter().filter(|c| matches!(&c.kind,
