@@ -1,7 +1,7 @@
 //! Checkpoint-native target operands, packed once per physical coordinator.
 //! Layer ownership is supplied by placement; this module does not choose it.
 use super::MiniMaxM3Config;
-use crate::{plan::checkpoint::Checkpoint, serving_capacity::WeightArenaLayout};
+use crate::{plan::checkpoint::Checkpoint, placement::planner::EmbeddingHome, serving_capacity::WeightArenaLayout};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::native_dense::{DenseGeometry, Encoding};
@@ -130,7 +130,19 @@ impl CoordinatorWeights {
     /// the final GPU owns the head, and every GPU owns its final norm.
     pub fn plan(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, ranks: usize,
         layer_owners: &[usize]) -> Result<Vec<Self>> {
+        Self::plan_with_embedding(checkpoint, cfg, ranks, layer_owners, EmbeddingHome::Device(0))
+    }
+
+    /// Host placement has exactly one mapped pinned table, outside every device
+    /// arena. Device placement aliases rank zero's target backing.
+    pub fn plan_with_embedding(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, ranks: usize,
+        layer_owners: &[usize], embedding: EmbeddingHome) -> Result<Vec<Self>> {
         ensure!(matches!(ranks, 1 | 2), "MiniMax coordinator ranks must be 1 or 2");
+        ensure!(matches!(embedding, EmbeddingHome::Device(0) | EmbeddingHome::HostPinned),
+            "MiniMax embedding belongs on the entry rank or pinned host");
+        if embedding == EmbeddingHome::HostPinned {
+            checkpoint.require_untied_embedding(&format!("{TEXT}embed_tokens.weight"))?;
+        }
         ensure!(layer_owners.len() == cfg.layers && layer_owners.iter().all(|rank| *rank < ranks),
             "MiniMax target layer owners must cover every layer exactly once");
         ensure!(MiniMaxM3Config::from_hf(&checkpoint.config)? == *cfg,
@@ -141,7 +153,9 @@ impl CoordinatorWeights {
             let mut builder = Builder { checkpoint, tensors: Vec::new(), projections: Vec::new() };
             builder.plain(format!("{TEXT}norm.weight"), DType::Bf16, &[cfg.hidden])?;
             if rank == 0 {
-                builder.plain(format!("{TEXT}embed_tokens.weight"), DType::Bf16, &[cfg.vocab_size, cfg.hidden])?;
+                let name = format!("{TEXT}embed_tokens.weight");
+                builder.plain(name, DType::Bf16, &[cfg.vocab_size, cfg.hidden])?;
+                if embedding == EmbeddingHome::HostPinned { builder.tensors.pop(); }
             }
             if rank + 1 == ranks {
                 builder.plain("language_model.lm_head.weight".into(), DType::Bf16, &[cfg.vocab_size, cfg.hidden])?;
