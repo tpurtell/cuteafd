@@ -73,6 +73,7 @@ impl RequestCapacity {
             || (prefill && matches!(*name, "batch_ids" | "query_offsets"))).collect()
     }
 
+    /// Globals only; the constructor derives the physical per-layer pool separately.
     pub fn cache(self, context: u32) -> Result<MsaCache, Refusal> {
         MsaCache::new(1, 1, self.decode.requests, context)
     }
