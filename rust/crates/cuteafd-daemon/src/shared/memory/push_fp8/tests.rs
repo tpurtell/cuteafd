@@ -725,6 +725,13 @@ fn installed_native_scratch_matches_legacy() -> Result<()> {
                 for exact in [false, true] {
                     let slicing = if exact { tensors.for_layer_metadata(layer)?.exact_slicing(world) }
                         else { Slicing::Padded };
+                    let view = tensors.for_layer_metadata(layer)?;
+                    if let Err(error) = view.rank_range_with(world, rank, slicing) {
+                        ensure!(RankPlan::new(&catalog, &[(layer, slicing)], world, rank, usize::MAX).is_err(),
+                            "invalid source slicing must not produce a native push plan");
+                        eprintln!("{repo} TP{world} rank{rank} exact={exact}: unsupported source slice: {error}");
+                        continue;
+                    }
                     let plan = RankPlan::new(&catalog, &[(layer, slicing)], world, rank, usize::MAX)?;
                     assert_eq!(plan.host_scratch, legacy_host_scratch(&plan),
                         "{repo} TP{world} rank{rank} exact={exact}");
