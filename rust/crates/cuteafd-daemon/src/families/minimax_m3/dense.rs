@@ -1,6 +1,6 @@
 //! One caller-admitted serial projection workspace per lane or prefill owner.
 use crate::shared::memory::{device::{Allocation, Device, Event, Stream}, receipts::Inventory};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{native_dense::Mxfp8A8, programs::Programs, CuteafdDeviceBuffer};
 use super::weights::TargetWeights;
 use std::ffi::c_void;
