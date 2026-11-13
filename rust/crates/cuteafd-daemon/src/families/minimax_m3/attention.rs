@@ -140,6 +140,14 @@ pub(crate) struct DecodeRequest {
     pub batch: usize,
 }
 
+fn decode_page_bound(request: Request, exported_pages: u32) -> Result<usize> {
+    let pages = request.positions_capacity.div_ceil(64);
+    ensure!(pages > 0 && pages <= exported_pages as usize
+        && pages <= request.table_width && request.table_width <= request.table_stride,
+        "MiniMax decode capacity exceeds admitted index pages/table");
+    Ok(pages)
+}
+
 pub(crate) fn row_view(buffer: Buffer, first: usize, rows: usize, stride: usize) -> Result<Buffer> {
     let offset = first.checked_mul(stride).context("MiniMax row offset overflow")?;
     let bytes = rows.checked_mul(stride).context("MiniMax row extent overflow")?;
@@ -149,6 +157,26 @@ pub(crate) fn row_view(buffer: Buffer, first: usize, rows: usize, stride: usize)
 }
 
 impl Workspace<'_> {
+    fn decode_batch(&self, r: Request, page_bound: usize) -> Result<minimax_m3::IndexDecodeBatch> {
+        Ok(minimax_m3::IndexDecodeBatch {
+            rows: r.rows, table_width: page_bound, table_stride: r.table_stride,
+            pool_pages: r.pool_pages, query: self.plane("index.query")?, scales: self.plane("index.scales")?,
+            cache: r.index_cache, pages: r.pages, lengths: r.cache_lengths,
+            selections: self.plane("selections")?, scratch: self.plane("index.scratch")?,
+        })
+    }
+
+    fn attention_batch(&self, r: Request, batch: usize) -> Result<minimax_m3::AttentionBatch> {
+        Ok(minimax_m3::AttentionBatch {
+            rows: r.rows, batch, table_stride: r.table_stride, pool_pages: r.pool_pages,
+            query: self.plane("attention.query")?, keys: r.key_cache, values: r.value_cache,
+            key_scales: r.key_descale, value_scales: r.value_descale,
+            pages: r.pages, lengths: r.cache_lengths, query_offsets: r.query_offsets,
+            selections: self.plane("selections")?, output: self.plane("attention.output")?,
+            lse: self.plane("attention.lse")?, scratch: self.plane("attention.scratch")?,
+        })
+    }
+
     /// # Safety
     /// Positions/slots/page IDs, query offsets and lengths must describe one
     /// nonempty causal request. Newly appended slots are unique, belong to this
@@ -184,7 +212,13 @@ impl Workspace<'_> {
             && r.context > 0 && r.context <= r.positions_capacity && r.context.div_ceil(64) <= r.table_width
             && r.table_width <= r.table_stride,
             "MiniMax attention request extents");
-        let padded = r.context.checked_add(255).context("MiniMax staging overflow")? / 256 * 256;
+        // Decode graphs keep this launch bound fixed; the native scheduler and
+        // scorer read cache_lengths on device to visit only this step's pages.
+        let decode_pages = if decode { decode_page_bound(r, kernels.decode_select.layout.extent)? } else { 0 };
+        // Prefill still uses live host bounds and must remain an eager graph site.
+        let padded = if decode { 0 } else {
+            r.context.checked_add(255).context("MiniMax staging overflow")? / 256 * 256
+        };
         let query = self.plane("attention.query")?;
         let key = self.plane("attention.key")?;
         let index_query = self.plane("index.query")?;
@@ -222,12 +256,7 @@ impl Workspace<'_> {
                     scratch: self.plane("minimax_index_producer")?,
                 }, stream.raw)?;
                 if decode {
-                    kernels.decode_select.index_decode(minimax_m3::IndexDecodeBatch {
-                        rows: r.rows, table_width: r.context.div_ceil(64), table_stride: r.table_stride,
-                        pool_pages: r.pool_pages, query: index_query, scales: index_scales,
-                        cache: r.index_cache, pages: r.pages, lengths: r.cache_lengths,
-                        selections, scratch: self.plane("index.scratch")?,
-                    }, stream.raw)?;
+                    kernels.decode_select.index_decode(self.decode_batch(r, decode_pages)?, stream.raw)?;
                 } else {
                     let keys = self.plane("index.keys")?;
                     let scales = self.plane("index.key_scales")?;
@@ -245,14 +274,7 @@ impl Workspace<'_> {
                         scratch: self.plane("index.scratch")?,
                     }, stream.raw)?;
                 }
-                attention.attention(minimax_m3::AttentionBatch {
-                    rows: r.rows, batch, table_stride: r.table_stride, pool_pages: r.pool_pages,
-                    query, keys: r.key_cache, values: r.value_cache,
-                    key_scales: r.key_descale, value_scales: r.value_descale,
-                    pages: r.pages, lengths: r.cache_lengths, query_offsets: r.query_offsets,
-                    selections, output, lse: self.plane("attention.lse")?,
-                    scratch: self.plane("attention.scratch")?,
-                }, stream.raw)?;
+                attention.attention(self.attention_batch(r, batch)?, stream.raw)?;
             }
             Ok(output)
         });
@@ -327,6 +349,218 @@ mod tests {
             (usize::MAX, 1, 1024), (0, usize::MAX, 1024)] {
             assert!(row_view(buffer, first, rows, stride).is_err());
         }
+    }
+
+    #[test]
+    fn decode_page_bound_ignores_context_and_excludes_table_padding() -> Result<()> {
+        let buffer = Buffer::default();
+        let mut request = Request { rows: 1, context: 1, positions_capacity: 4097,
+            table_width: 68, table_stride: 68, pool_pages: 65,
+            positions: buffer, slots: buffer, batch_ids: buffer, cos_sin: buffer,
+            pages: buffer, causal_lengths: buffer, cache_lengths: buffer,
+            query_offsets: buffer, key_descale: buffer, value_descale: buffer,
+            key_cache: buffer, value_cache: buffer, index_cache: buffer };
+        for context in [1, 63, 64, 65, 4095, 4096, 4097] {
+            request.context = context;
+            assert_eq!(decode_page_bound(request, 65)?, 65);
+        }
+        assert!(decode_page_bound(request, 64).is_err());
+        request.table_width = 64;
+        assert!(decode_page_bound(request, 65).is_err());
+        request.table_width = 68;
+        request.table_stride = 67;
+        assert!(decode_page_bound(request, 65).is_err());
+        request.positions_capacity = 0;
+        assert!(decode_page_bound(request, 65).is_err());
+        Ok(())
+    }
+
+    fn native_read(device: Device<'_>, buffer: Buffer, bytes: usize) -> Result<Vec<u8>> {
+        let mut out = vec![0; bytes];
+        device.run(|| device.library.copy_d2h(&mut out, buffer))?;
+        Ok(out)
+    }
+
+    fn native_capture<'a>(stream: &Stream<'a>, launch: impl FnOnce() -> Result<()>)
+        -> Result<crate::shared::decode_graph::GraphOwner<'a, ()>> {
+        let device = stream.device;
+        stream.drain()?;
+        // SAFETY: the test retains every captured allocation and drains each replay before retirement.
+        device.run(|| unsafe { device.library.cuda_graph_begin_capture(stream.raw) })?;
+        let launched = launch();
+        // End even a failed capture before returning, so the stream never remains in capture mode.
+        // SAFETY: capture began on this owned stream, with retained compiled programs and operands.
+        let raw = device.run(|| unsafe { device.library.cuda_graph_end_capture_for_test(stream.raw) })?;
+        // SAFETY: all external storage owners outlive the executable and every drained replay.
+        let graph = unsafe { crate::shared::decode_graph::GraphOwner::new(device.library, device.id, raw, ())? };
+        launched?;
+        Ok(graph)
+    }
+
+    fn native_seed(device: Device<'_>, request: Request, tokens: usize) -> Result<()> {
+        let pages = tokens.div_ceil(64);
+        for (buffer, stride) in [(request.key_cache, 32768), (request.value_cache, 32768),
+            (request.index_cache, 8448)] {
+            let mut bytes = vec![0; pages * stride];
+            for (page, record) in bytes.chunks_exact_mut(stride).enumerate() {
+                let key_bytes = if stride == 8448 { 8192 } else { stride };
+                for (at, value) in record[..key_bytes].iter_mut().enumerate() {
+                    *value = [0x28, 0xb0, 0x38, 0xa8][(page * 7 + at * 3 + at / 128) % 4];
+                }
+                if stride == 8448 {
+                    for value in record[key_bytes..].chunks_exact_mut(4) { value.copy_from_slice(&1f32.to_le_bytes()); }
+                }
+            }
+            device.run(|| {
+                device.library.cuda_zero_bytes(buffer, buffer.bytes)?;
+                device.library.copy_h2d(buffer, &bytes)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn native_projections(device: Device<'_>) -> Result<(Vec<Allocation<'_>>, Projections)> {
+        let shapes = [8192, 512, 512, 512, 128, 128, 128, 128, 128];
+        let owners = shapes.into_iter().enumerate().map(|(plane, elements)| {
+            let owner = Allocation::new(device, elements * 2, Tag::workspace("minimax/replay-oracle"))?;
+            let bytes = (0..elements).flat_map(|column| {
+                let value = if plane >= 5 { 0.0 } else { ((column * 17 + plane * 13) % 251) as f32 / 128.0 - 1.0 };
+                ((value.to_bits() >> 16) as u16).to_le_bytes()
+            }).collect::<Vec<_>>();
+            device.run(|| device.library.copy_h2d(owner.buffer, &bytes))?;
+            Ok(owner)
+        }).collect::<Result<Vec<_>>>()?;
+        let p = Projections { query: owners[0].buffer, key: owners[1].buffer, value: owners[2].buffer,
+            index_query: owners[3].buffer, index_key: owners[4].buffer, query_norm: owners[5].buffer,
+            key_norm: owners[6].buffer, index_query_norm: owners[7].buffer, index_key_norm: owners[8].buffer };
+        Ok((owners, p))
+    }
+
+    #[test]
+    #[ignore = "requires native SM120 exports through golden-run --native-test"]
+    fn native_decode_graph_replays_live_metadata_and_bounds_cost() -> Result<()> {
+        use super::super::cache::Cache;
+        use crate::shared::memory::device::Event;
+        use std::{path::Path, rc::Rc};
+        // SAFETY: golden-run supplies a sealed native library; every owner retires before it.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = Device { library: &library, id: std::env::var("CUTEAFD_CACHE_TEST_DEVICE")
+            .unwrap_or_else(|_| "0".into()).parse()? };
+        let path = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?;
+        let manifest = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let programs = library.programs()?.with_manifest(Path::new(&path))?;
+        let mut cfg = config();
+        cfg.layers = 1;
+        let kernels = Kernels::bind(device, &programs, &manifest, &cfg, 1, 1048576)?;
+        let stream = Rc::new(Stream::new(device)?);
+        let (_operands, p) = native_projections(device)?;
+        let decode = |workspace: &Workspace<'_>, request| {
+            // SAFETY: the cold cache and metadata retain unique initialized pages on this stream.
+            unsafe { workspace.decode(&kernels, p, DecodeRequest { request, batch: 1 }, &stream).map(|_| ()) }
+        };
+        {
+            let eager = Workspace::new_decode(&kernels)?;
+            let replay = Workspace::new_decode(&kernels)?;
+            let a = Cache::new(Rc::clone(&stream), &cfg, 8193)?;
+            let b = Cache::new(Rc::clone(&stream), &cfg, 8193)?;
+            let mut ma = a.metadata(1)?;
+            let mut mb = b.metadata(1)?;
+            a.prepare(&mut ma, 62..63)?;
+            b.prepare(&mut mb, 62..63)?;
+            native_seed(device, a.request(&ma, 0)?, 8193)?;
+            native_seed(device, b.request(&mb, 0)?, 8193)?;
+            decode(&replay, b.request(&mb, 0)?)?;
+            stream.drain()?;
+            let graph = native_capture(&stream, || decode(&replay, b.request(&mb, 0)?))?;
+            // Undo warm-up's append so both caches begin from identical state.
+            native_seed(device, b.request(&mb, 0)?, 8193)?;
+            for context in [63, 64, 65, 4095, 4096, 4097, 8191, 8192, 8193] {
+                a.prepare(&mut ma, context - 1..context)?;
+                b.prepare(&mut mb, context - 1..context)?;
+                decode(&eager, a.request(&ma, 0)?)?;
+                // SAFETY: all captured pointers are unchanged; only retained device metadata changes.
+                let result = device.run(|| unsafe { library.cuda_graph_launch(graph.raw, stream.raw) });
+                stream.drain_or_abort("MiniMax live-metadata graph oracle");
+                result?;
+                let actual = native_read(device, replay.plane("attention.output")?, 16384)?;
+                assert_eq!(actual, native_read(device, eager.plane("attention.output")?, 16384)?,
+                    "context={context}: graph output bytes");
+                let values = actual.chunks_exact(2).map(|v| f32::from_bits(
+                    u32::from(u16::from_le_bytes(v.try_into().unwrap())) << 16)).collect::<Vec<_>>();
+                ensure!(values.iter().all(|v| v.is_finite()) && values.iter().any(|v| *v != 0.0),
+                    "context={context}: nonfinite or empty attention output");
+                for head in 0..4 {
+                    let first = head * kernels.decode_select.layout.rows as usize;
+                    assert_eq!(native_read(device, row_view(replay.plane("selections")?, first, 1, 64)?, 64)?,
+                        native_read(device, row_view(eager.plane("selections")?, first, 1, 64)?, 64)?,
+                        "context={context} head={head}: graph selection bytes");
+                }
+                for (x, y) in [(a.request(&ma, 0)?.key_cache, b.request(&mb, 0)?.key_cache),
+                    (a.request(&ma, 0)?.value_cache, b.request(&mb, 0)?.value_cache),
+                    (a.request(&ma, 0)?.index_cache, b.request(&mb, 0)?.index_cache)] {
+                    assert_eq!(native_read(device, x, x.bytes)?, native_read(device, y, y.bytes)?,
+                        "context={context}: graph changed persistent cache bytes");
+                }
+                eprintln!("MiniMax graph context={context}: output, four selections and complete K/V/index caches byte-exact");
+            }
+        }
+        // Ceiling hypothesis: only the native device-live scheduler sees the wider bound;
+        // clear/selector grids already cover compiled capacity. Stop outside a +/-3% delta.
+        let workspace = Workspace::new_decode(&kernels)?;
+        let cache = Cache::new(Rc::clone(&stream), &cfg, 1048576)?;
+        let mut metadata = cache.metadata(1)?;
+        cache.prepare(&mut metadata, 8191..8192)?;
+        let request = cache.request(&metadata, 0)?;
+        native_seed(device, request, 8192)?;
+        decode(&workspace, request)?;
+        stream.drain()?;
+        let launch = |pages| device.run(|| {
+            // SAFETY: index/attention arguments refer to retained, initialized C1 operands and scratch.
+            unsafe {
+                kernels.decode_select.index_decode(workspace.decode_batch(request, pages)?, stream.raw)?;
+                kernels.decode_attention.attention(workspace.attention_batch(request, 1)?, stream.raw)?;
+            }
+            Ok(())
+        });
+        launch(128)?;
+        stream.drain()?;
+        let expected = native_read(device, workspace.plane("attention.output")?, 16384)?;
+        launch(16384)?;
+        stream.drain()?;
+        assert_eq!(native_read(device, workspace.plane("attention.output")?, 16384)?, expected,
+            "8K-live/1M-capacity: fixed bound changes output");
+        let exact = native_capture(&stream, || launch(128))?;
+        let fixed = native_capture(&stream, || launch(16384))?;
+        crate::shared::thermal::monitor("minimax-replay-test");
+        let mut elapsed = Vec::new();
+        for (label, graph) in [("exact", &exact), ("fixed", &fixed)] {
+            // One untimed warm batch per arm, excluding capture and first-use work.
+            for _ in 0..32 {
+                // SAFETY: this scope retains both executables and all captured operands.
+                device.run(|| unsafe { library.cuda_graph_launch(graph.raw, stream.raw) })?;
+            }
+            stream.drain()?;
+            let from = cuteafd_core::thermal::now_s();
+            let mut start = Event::timing(device)?;
+            let mut end = Event::timing(device)?;
+            start.record(&stream)?;
+            for _ in 0..8192 {
+                // SAFETY: serial replays share retained scratch on this owned stream.
+                device.run(|| unsafe { library.cuda_graph_launch(graph.raw, stream.raw) })?;
+            }
+            end.record(&stream)?;
+            stream.drain_or_abort("MiniMax admitted-bound timing");
+            // SAFETY: both timing events completed on the same retained device/stream.
+            let ms = device.run(|| unsafe { library.cuda_event_elapsed_ms(start.raw, end.raw) })?;
+            let window = cuteafd_core::thermal::window(from, cuteafd_core::thermal::now_s());
+            eprintln!("MiniMax bound={label} C1 live=8192 capacity=1048576 us={}; thermal={window}", ms * 1000.0 / 8192.0);
+            elapsed.push(ms);
+        }
+        let ratio = elapsed[1] / elapsed[0];
+        eprintln!("MiniMax fixed/exact admitted-bound latency ratio={ratio}");
+        ensure!(ratio.is_finite() && (0.97..=1.03).contains(&ratio),
+            "MiniMax admitted-bound cost exceeds the declared +/-3% stop bar: ratio={ratio}");
+        Ok(())
     }
 
     #[test]
