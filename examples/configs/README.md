@@ -66,12 +66,16 @@ These pinned recipes need a matching WIP build and have no benchmark cards yet.
 Layouts, speculators and image keys match their earlier Core-K6 examples; this
 is not a claim that the restored original core has the same memory or speed.
 `CORE_VIEW=original` is explicit in each config. Mistral is a plain checkpoint;
-GLM Flash MC also offers `k8-compact` and `k6-compact`, but not `fp8-compact`.
+GLM Flash, GLM 5.3 and Step-5 MCs also offer `k8-compact` and `k6-compact`,
+but not whole-core `fp8-compact`. Their standalone GLM/Step EXL3 config paths
+remain archived recipes; current MC cards use the dedicated files here.
 
 | Model | Config | Layout |
 | --- | --- | --- |
 | [Mistral Large 4, EXL3 K4 + original mixed FP8/BF16 core](../../docs/models/mistral_large4.md) | [min](mistral-large4-exl3-k4-min.config) · [max](mistral-large4-exl3-k4-max.config) | 1 RTX + 5 Spark / 2 RTX + 6 Spark; bundled dSpark |
 | [GLM 5.3 Flash, EXL3 K4 MC](../../docs/models/glm5_flash.md) | [min](glm53-flash-exl3-k4-mc-min.config) · [max](glm53-flash-exl3-k4-mc-max.config) | 1 RTX + 2 Spark / 2 RTX, no Sparks; DFlash2 |
+| [GLM 5.3, EXL3 K4 MC](../../docs/models/glm5.md) | [min](glm53-exl3-k4-mc-min.config) · [max](glm53-exl3-k4-mc-max.config) | 1 RTX + 4 Spark / 2 RTX + 6 Spark; DFlash2 |
+| [Step-5-Preview, EXL3 K4 MC](../../docs/models/step5.md) | [min](step5-exl3-k4-mc-min.config) · [max](step5-exl3-k4-mc-max.config) | 1 RTX + 3 Spark / 2 RTX + 6 Spark; native MTP3 |
 
 ## Families under qualification
 

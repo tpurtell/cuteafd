@@ -1654,6 +1654,25 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
     assert len(names) == len(jobs)
 
 
+@pytest.mark.parametrize('stem,package', [
+    ('glm53-exl3-k4-mc', 'exl3/exl3-glm-k45'),
+    ('step5-exl3-k4-mc', 'exl3/exl3-step5-k46'),
+])
+def test_mc_examples_keep_native_expert_placement_exports_live(monkeypatch, stem, package):
+    publisher = compare_sm.load_file('test_mc_placement_jobs', ROOT / 'scripts/build/export-placement-inputs.py')
+    live = publisher.live_configs()
+    configs = [f'examples/configs/{stem}-{size}.config' for size in ('min', 'max')]
+    assert set(configs) <= set(live)
+    retired = {entry['config'] for entry in json.loads((ROOT / 'benchmarks/current-matrix.json').read_text())['retired']}
+    assert not retired.intersection(configs)
+    monkeypatch.setattr(publisher, 'live_configs', lambda: configs)
+    jobs = {name: (exporter, extra) for name, exporter, extra in publisher.export_jobs()}
+    exporter, extra = jobs[package]
+    assert exporter == 'package_exl3_aot.py'
+    assert extra[extra.index('--bits') + 1] == ('4,5' if stem.startswith('glm53') else '4,6')
+    assert extra[extra.index('--role') + 1] == 'coordinator'
+
+
 def test_native_placement_jobs_follow_fp8_recipe_not_exl3_policy(monkeypatch):
     publisher = compare_sm.load_file('test_native_capacity_recipe', ROOT / 'scripts/build/export-placement-inputs.py')
     capacities = publisher.fp8_capacities()

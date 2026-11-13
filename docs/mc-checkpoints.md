@@ -129,6 +129,22 @@ is published at `91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d`, with BF16
 `fp8-compact` selector converts the published original core as described above.
 See its [min](../examples/configs/glm53-flash-exl3-k4-mc-min.config) and
 [max](../examples/configs/glm53-flash-exl3-k4-mc-max.config) configs.
+The GLM 5.3 and Step-5 publications are also available:
+
+| Repository (`wrldsuksgo2mars/`) | Pinned revision | Views |
+| --- | --- | --- |
+| `GLM-5.3-EXL3-K4-MC` | `c39486376dee84e5faa4904e014e07d7b6e76405` | original BF16 (default), k8-compact, k6-compact |
+| `Step-5-Preview-EXL3-K4-MC` | `4483a4bd874e8c360aec486ea72bd31d1ad7a247` | original BF16 (default), k8-compact, k6-compact |
+
+Both replace their standalone original/K6 release rows while keeping historical
+reports. See [GLM 5.3](models/glm5.md#core-views) and
+[Step-5](models/step5.md#core-views) for launch overrides and pending Standard
+fidelity. Whole-core `fp8-compact` is `na` for both: GLM refuses all selected
+block-FP8 roles; Step-5 implements only O projections, not the whole MC core.
+The main smoke entries use `original`; max K8/K6 comparisons live separately in
+`scripts/bench/release-smoke-v51-mc-core-comparison.json` and do not add
+release-table rows. Card measurements wait for kernel pin #1903.
+
 The other intended MC repositories are Kimi-K3.1-Pro-EXL3-K2-MC and
 Muse-Spark-Open-EXL3-K4-MC under `wrldsuksgo2mars`.
 

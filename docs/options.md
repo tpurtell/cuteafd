@@ -35,13 +35,22 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 
 Stored `k8-compact` and `k6-compact` views are offered by
 `wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC`,
-`wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC` and
-`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`; `cuteafd-mc.json` declares the
+`wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC`,
+`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`,
+`wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC` and
+`wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC`; `cuteafd-mc.json` declares the
 views actually present at the selected revision. Step-5 and GLM 5.3 also execute
 header-native K6/K8 target cores (including vocabulary heads); Step-5 shared MTP
 projections stay K4 in every view. ML4 stays K6-only for quantized core storage;
 its FP8 original has no quantized core. Plain checkpoints support only
 `original`, including checkpoints that previously accepted Flash `fp8-compact`.
+GLM 5.3 MC (`c39486376dee84e5faa4904e014e07d7b6e76405`) and Step-5 MC
+(`4483a4bd874e8c360aec486ea72bd31d1ad7a247`) support `original`,
+`k8-compact` and `k6-compact`. Their release cards select `original`;
+compact-view performance and Standard fidelity are pending #1906.
+Both refuse whole-core `fp8-compact`: GLM has no selected block-FP8 roles,
+and Step-5 supports only O projections, not its complete MC core.
+
 MC `fp8-compact` converts exactly the original variant's `core_tensors`; published
 Flash MCs include KDA and the target head. Explicit KDA/head conversion keys apply
 only beyond that metadata-selected scope. No precision lever changes KV defaults.
@@ -51,7 +60,7 @@ only beyond that metadata-selected scope. No precision lever changes KV defaults
 A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
 
 ```sh
-./run.sh --config examples/configs/glm53-exl3-min.config
+./run.sh --config examples/configs/glm53-exl3-k4-mc-min.config --wip SLOT
 ./run.sh --config my.config --set CONCURRENCY=16 --set SPARK_COUNT=4
 ./run.sh --config my.config --dry-run --total-capacity   # validate and print the plan
 ```
