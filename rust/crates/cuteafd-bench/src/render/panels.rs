@@ -163,7 +163,11 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     let mut notes = Vec::new();
     if let Some(precision) = v["decode"]["precision"].as_object().or_else(|| v["prefill"]["precision"].as_object())
         .and_then(|p| serde_json::from_value::<crate::fidelity_precision::Precision>(Value::Object(p.clone())).ok()) {
-        notes.push(precision.label());
+        let aggregate_only = v["verdict"]["scoring_policy"] == "minimax-generated-aggregate"
+            || v["prefill_verdict"]["scoring_policy"] == "minimax-generated-aggregate";
+        notes.push(if aggregate_only {
+            format!("{} bpw experts; MiniMax generated-aggregate policy", precision.expert_bpw)
+        } else { precision.label() });
     }
     if dataset["qualification"] == "reference" {
         notes.push("reference".to_string());
@@ -891,7 +895,8 @@ mod context_load_tests {
         let verdict = serde_json::json!({"pass":true, "scoring_policy":"minimax-generated-aggregate",
             "kl_max":0.05, "top1_min":0.93, "context":{"positions":2020,"kl":1.99,"top1":0.58},
             "generated":{"positions":2076,"kl":0.026,"top1":0.953,"confident_top1":0.96,"top3_contained":0.98}});
-        let value = serde_json::json!({"decode":{}, "verdict":verdict,
+        let precision = crate::fidelity_precision::Precision::new(4.0, "nvfp4", true, "test").unwrap();
+        let value = serde_json::json!({"decode":{"precision":precision}, "verdict":verdict,
             "per_window":{"d00":{"positions":512,"kl":0.9,"top1":0.6}}});
         for width in [360.0, 900.0] {
             let mut doc = super::Doc::new(width, 900.0);
@@ -902,6 +907,14 @@ mod context_load_tests {
                 assert!(svg.contains(label), "{label}");
             }
             assert!(!svg.contains("red: past its floor"));
+            assert!(!svg.contains("reference-root format"));
+            if let Some(directory) = std::env::var_os("CUTEAFD_MINIMAX_PANEL_TEST_OUTPUT") {
+                let directory = std::path::PathBuf::from(directory);
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join(format!("minimax-{width}.png")),
+                    super::super::png::png(&svg, 1.0).unwrap()).unwrap();
+                std::fs::write(directory.join(format!("minimax-{width}.svg")), &svg).unwrap();
+            }
         }
     }
 
