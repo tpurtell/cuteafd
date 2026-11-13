@@ -485,10 +485,10 @@ impl InklingInputs {
             out.extend(self.unit_owners(&format!("inkling2.unit.{gpu}.{slot}"), gpu, rows, maximum)?);
         }
         if self.gpus == 2 {
-            // TP2 expert exchange (shared `QwenTp2Rows` ABI: BF16 rows, two
+            // TP2 expert exchange (shared `OwnerTp2Rows` ABI: BF16 rows, two
             // abortable slots, reduction, peer control and abort word), one
             // unit wide; decode rows fit within it.
-            let rows = crate::placement::families::qwen4::QwenTp2Rows::new(cfg.hidden as u64, cfg.topk as u64,
+            let rows = crate::serving_capacity::OwnerTp2Rows::new(cfg.hidden as u64, cfg.topk as u64,
                 self.prefill.rows.max(u64::from(DECODE_ROWS)), false).map_err(refusal)?;
             for demand in rows.demands().map_err(refusal)?.into_iter().filter(|d| usize::from(d.gpu) == gpu) {
                 out.extend(buffer(format!("inkling2.tp2.{gpu}.{}", demand.group.replace(' ', "_")), location,
