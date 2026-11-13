@@ -573,6 +573,11 @@ impl MiniMaxInputs {
             out.extend(buffer(format!("{}.{name}", Owner::Cache { gpu }.id()), location, bytes, Lifetime::TARGET,
                 Category::Kv, "MSA page tables", maximum));
         }
+        // Compact decode tables have their own retained full-table upload,
+        // separate from prefix restores into individual page-table slots.
+        out.extend(buffer(format!("{}.upload", Owner::DecodeTable { gpu }.id()), Location::PINNED,
+            u64::from(cache.requests) * u64::from(cache.table_width) * 4, Lifetime::TARGET,
+            Category::Staging, "decode page table ordered H2D staging", maximum));
         // Ordered H2D staging is keyed by destination and copy stream, not a
         // ring: each retained request table and length has its own pinned owner.
         // Shared pinned accounting charges exact payload; no device rounding.
