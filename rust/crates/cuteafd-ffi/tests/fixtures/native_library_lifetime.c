@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include "../../../../../native/shared/cuda/expert_pack_layout.h"
 #include "cuteafd_mxfp4_layouts.h"
+#include "../../../../../native/shared/include/memory_failure.h"
 
 struct host_buffer { void *ptr; size_t bytes; uint64_t flags; };
 static char *event_path;
@@ -309,8 +310,31 @@ static int valid_tag(uint32_t kind, const char *owner) {
     attempted_owner = strdup(owner);
     return attempted_owner != NULL;
 }
+int fixture_attempt_tag(uint32_t kind, const char *owner) { return valid_tag(kind, owner); }
+static cuteafd_memory_failure_callback_t memory_failure_callback;
+void cuteafd_set_memory_failure_callback(cuteafd_memory_failure_callback_t callback) {
+    memory_failure_callback = callback;
+}
+const char *fixture_failure_file(void) { return __FILE__; }
+void fixture_emit_memory_failure(void) {
+    const cuteafd_memory_failure_t failure = {
+        "fixture-allocator", "cuda", __FILE__, __LINE__, 2, 4096, 1, 0};
+    if (memory_failure_callback) memory_failure_callback(&failure);
+}
+static _Atomic int *tag_call_entered, *tag_call_release;
+void fixture_tag_call_gate(_Atomic int *entered, _Atomic int *release) {
+    tag_call_entered = entered;
+    tag_call_release = release;
+}
 /* Native returns 2 (CUTEAFD_STATUS_BUFFER_TOO_SMALL) with the required size. */
 int cuteafd_last_allocation_tag(uint32_t *kind, char *owner, size_t owner_bytes, size_t *required) {
+    if (tag_call_entered) {
+        atomic_store_explicit(tag_call_entered, 1, memory_order_release);
+        while (!atomic_load_explicit(tag_call_release, memory_order_acquire)) {
+            const struct timespec pause = {0, 1000000};
+            nanosleep(&pause, NULL);
+        }
+    }
     if (!kind || !required || (!owner && owner_bytes)) return 1;
     const char *value = attempted_owner ? attempted_owner : "";
     *kind = attempted_kind;

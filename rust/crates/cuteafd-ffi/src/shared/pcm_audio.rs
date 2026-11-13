@@ -1,7 +1,7 @@
 //! Shared BF16 PCM owner. Confined to the encoder CUDA thread; no unsafe Send.
 use super::audio::AudioError;
 use libloading::Library;
-use std::{ffi::c_void, marker::PhantomData, path::Path, rc::Rc};
+use std::{ffi::c_void, marker::PhantomData, path::Path, rc::Rc, sync::Arc};
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PcmBlock {
@@ -68,7 +68,7 @@ fn check(code: i32) -> Result<(), AudioError> {
     }
 }
 pub struct NativePcmAudio {
-    _library: Library,
+    _library: Arc<Library>,
     owner: *mut c_void,
     encode: Encode,
     ledger: Ledger,
@@ -83,7 +83,7 @@ impl NativePcmAudio {
         // SAFETY: the library stays live through the versioned ABI call and the
         // output ledger is writable for its exact C layout.
         unsafe {
-            let library = Library::new(path)?;
+            let library = Arc::new(Library::new(path)?);
             crate::memory_ledger::fault::install(&library);
             let required: Required = *library.get(b"cuteafd_pcm_required\0")?;
             let mut ledger = PcmLedger::default();
@@ -131,7 +131,7 @@ impl NativePcmAudio {
         // SAFETY: symbols have the versioned C header ABI, and Library is held
         // until the owner has drained and destroyed all of its CUDA work.
         unsafe {
-            let library = Library::new(path)?;
+            let library = Arc::new(Library::new(path)?);
             crate::memory_ledger::fault::install(&library);
             let required: Required = *library.get(b"cuteafd_pcm_required\0")?;
             let create: Create = *library.get(b"cuteafd_pcm_create\0")?;
