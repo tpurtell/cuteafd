@@ -112,8 +112,10 @@ impl<'a, P> Graphs<'a, P> {
 
     /// # Safety
     /// `work` launches only on this retained stream, using persistent storage
-    /// retained by P. Its pointers, shapes and workspaces are stable for `key`
-    /// until clear/drop. Host joins, uploads and allocation stay outside sections.
+    /// retained by P. Its pointers, shapes, workspaces and launch scalars are
+    /// invariant for `key` until clear/drop. Changing context-dependent values
+    /// must be device metadata uploaded before the section, never captured host
+    /// scalars. Host joins, uploads and allocation stay outside sections.
     pub(crate) unsafe fn run(&mut self, key: Key, estimate: Option<Estimate>,
         mut work: impl FnMut() -> Result<()>) -> Result<()> {
         self.validate(key)?;
@@ -124,6 +126,9 @@ impl<'a, P> Graphs<'a, P> {
             self.first_touch_pending = true;
             return work();
         }
+        // Prefill still has live-context launch scalars; fixed-cap decode needs
+        // its exact-replay oracle before either attention route may capture.
+        if key.op == Op::Attention { return work(); }
         if let Some(graph) = self.bank.cached_launch(&key) {
             let raw = graph.raw;
             return self.stream.device.run(|| {
@@ -179,7 +184,7 @@ impl<'a, P> Graphs<'a, P> {
 
     /// Unpinned startup bootstrap. Declined keys remain ordinary lazy misses.
     /// # Safety
-    /// Every supplied body satisfies run's stable-storage contract for its key.
+    /// Every supplied body satisfies run's stable-storage/scalar contract.
     pub(crate) unsafe fn prewarm(&mut self, keys: &[Key],
         mut estimate: impl FnMut(Key) -> Option<Estimate>, mut work: impl FnMut(Key) -> Result<()>) -> Result<()> {
         for &key in keys { self.validate(key)?; }
@@ -247,7 +252,7 @@ mod tests {
         let mut bank = GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "minimax_m3");
         bank.attach_device_for_test(synthetic, config.reserve, config.site())?;
         Ok(Graphs { bank, stream, pins, rank: 1, layers: 2, capacity: 16,
-            sites: [(1, Op::Attention)].into_iter().collect(), touched: HashSet::new(),
+            sites: [(1, Op::Attention), (1, Op::Ffn)].into_iter().collect(), touched: HashSet::new(),
             eager: HashSet::new(), first_touch_pending: false, spans_devices: false })
     }
 
@@ -259,7 +264,7 @@ mod tests {
         let library = fixture.load()?;
         let stream = Rc::new(Stream::new(Device { library: &library, id: 1 })?);
         let mut graphs = fixture_bank(Rc::clone(&stream), Rc::new(()), -1955)?;
-        let key = Key { rank: 1, layer: 1, rows: 16, op: Op::Attention };
+        let key = Key { rank: 1, layer: 1, rows: 16, op: Op::Ffn };
         let mut calls = 0;
         // SAFETY: fake DSO captures no real pointers or device work.
         unsafe { graphs.run(key, None, || { calls += 1; Ok(()) })?; }
@@ -281,11 +286,37 @@ mod tests {
         }
         assert_eq!(fixture.events()?.matches('G').count(), captures);
         for invalid in [Key { rank: 0, ..key }, Key { layer: 0, ..key },
-            Key { rows: 0, ..key }, Key { rows: 17, ..key }, Key { op: Op::Ffn, ..key }] {
+            Key { rows: 0, ..key }, Key { rows: 17, ..key }, Key { op: Op::Router, ..key }] {
             // SAFETY: invalid keys are rejected without recording this closure.
             assert!(unsafe { graphs.run(invalid, None, || panic!("invalid graph body")) }.is_err());
         }
         graphs.clear()?;
+        Ok(())
+    }
+
+    #[test]
+    fn attention_with_changing_context_stays_eager_in_every_cycle() -> Result<()> {
+        use crate::shared::memory::device::Device;
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let stream = Rc::new(Stream::new(Device { library: &library, id: 1 })?);
+        let mut graphs = fixture_bank(stream, Rc::new(()), -1960)?;
+        let key = Key { rank: 1, layer: 1, rows: 16, op: Op::Attention };
+        let contexts = [1, 63, 64, 65, 128, 513, 4096];
+        let mut seen = Vec::new();
+        for cycle in [Cycle::Other, Cycle::Decode, Cycle::Prefill] {
+            graphs.cycle(cycle);
+            for context in contexts {
+                // SAFETY: fake body submits no native launches or device pointers.
+                unsafe { graphs.run(key, None, || { seen.push(context); Ok(()) })?; }
+                graphs.observed();
+            }
+        }
+        assert_eq!(seen, contexts.repeat(3));
+        assert_eq!(graphs.bank.len(), 0);
+        assert!(!fixture.events()?.contains('G'));
+        assert!(!fixture.events()?.contains('L'));
         Ok(())
     }
 
@@ -299,7 +330,7 @@ mod tests {
         let pins = Rc::new(());
         let weak = Rc::downgrade(&pins);
         let mut graphs = fixture_bank(Rc::clone(&stream), Rc::clone(&pins), -1956)?;
-        let key = Key { rank: 1, layer: 1, rows: 16, op: Op::Attention };
+        let key = Key { rank: 1, layer: 1, rows: 16, op: Op::Ffn };
         graphs.touched.insert(key);
         let ticket = graphs.bank.cache_ticket(&key, false, None).expect("shared admission");
         let raw = stream.device.run(|| {
