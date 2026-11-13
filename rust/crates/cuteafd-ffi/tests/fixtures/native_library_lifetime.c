@@ -585,14 +585,15 @@ int cuteafd_cuda_stream_create(void **out) {
     pthread_mutex_unlock(&upload_mutex);
     event('V'); return 0;
 }
-static void *upload_events[128];
+#define UPLOAD_EVENT_CAPACITY 4096
+static void *upload_events[UPLOAD_EVENT_CAPACITY];
 static size_t upload_event_count;
 
 int cuteafd_cuda_event_create_ordering(void **out) {
     pthread_mutex_lock(&upload_mutex);
     size_t slot = 0;
-    while (slot < upload_event_count && upload_events[slot]) ++slot;
-    if (slot == 128) { pthread_mutex_unlock(&upload_mutex); return 1; }
+    while (slot < upload_event_count && slot < UPLOAD_EVENT_CAPACITY && upload_events[slot]) ++slot;
+    if (slot == UPLOAD_EVENT_CAPACITY) { pthread_mutex_unlock(&upload_mutex); return 1; }
     *out = calloc(1, sizeof(struct upload_event));
     if (!*out) { pthread_mutex_unlock(&upload_mutex); return 1; }
     upload_events[slot] = *out;
@@ -751,7 +752,7 @@ int cuteafd_cuda_event_synchronize(void *handle) {
 
 int cuteafd_cuda_event_destroy(void *handle) {
     pthread_mutex_lock(&upload_mutex);
-    for (size_t i = 0; i < upload_event_count; ++i) {
+    for (size_t i = 0; i < upload_event_count && i < UPLOAD_EVENT_CAPACITY; ++i) {
         if (upload_events[i] == handle) { free(handle); upload_events[i] = NULL; }
     }
     pthread_mutex_unlock(&upload_mutex);
@@ -773,7 +774,7 @@ int cuteafd_cuda_stream_synchronize(void *stream) {
     pthread_mutex_lock(&upload_mutex);
     int status = ++drain_calls > drain_after ? drain_status : 0;
     if (status) { pthread_mutex_unlock(&upload_mutex); return status; }
-    for (size_t i = 0; i < upload_event_count; ++i) {
+    for (size_t i = 0; i < upload_event_count && i < UPLOAD_EVENT_CAPACITY; ++i) {
         if (upload_events[i] && ((struct upload_event *)upload_events[i])->stream == stream)
             finish_uploads(upload_events[i]);
     }
