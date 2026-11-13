@@ -6,8 +6,8 @@ use cuteafd_core::memory_layout::Tag;
 use cuteafd_engine::prefix::RefPagePool;
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::{families::minimax_m3::{MiniMaxM3Config,
-    execution::{MsaCache, MsaRope, UnitMetadata}}, placement::families::minimax_m3::Owner};
-use std::{collections::BTreeMap, ops::Range, rc::Rc};
+    execution::{MsaCache, MsaRope, UnitMetadata}}, placement::families::minimax_m3::{Owner, RequestCapacity}};
+use std::{collections::{BTreeMap, BTreeSet}, ops::Range, rc::Rc};
 
 /// One cold sequence, with all pages reserved before the first producer launch.
 /// This does not publish prefix state or reconstruct any cached model state.
@@ -153,7 +153,10 @@ impl<'a> PageBank<'a> {
     /// Every stream touching pages must be retained before Ready. Cache/rope
     /// extents are passed from admission, never selected by the runtime.
     pub fn new(readers: Vec<Rc<Stream<'a>>>, cfg: &MiniMaxM3Config,
-        layout: MsaCache, rope: MsaRope, layers: Range<usize>) -> Result<Self> {
+        capacity: RequestCapacity, layout: MsaCache, rope: MsaRope, layers: Range<usize>) -> Result<Self> {
+        let globals = checked_capacity(capacity)?.cache(rope.positions)?;
+        ensure!(layout.requests == globals.requests && layout.table_width == globals.table_width,
+            "MiniMax cache globals differ from admitted request capacity");
         let stream = Rc::clone(readers.first().context("MiniMax cache has no reader")?);
         let device = stream.device;
         ensure!(!layers.is_empty() && layers.end <= cfg.layers && layers.len() == layout.layers as usize
@@ -222,9 +225,7 @@ impl<'a> PageBank<'a> {
     pub fn reserve_tables(&self, stream: *mut std::ffi::c_void) -> Result<()> {
         self.stream.device.run(|| {
             for slot in 0..self.layout.requests as usize {
-                let width = self.layout.table_width as usize;
-                for buffer in [view(self.plane("page_table")?, slot * width * 4, width * 4)?,
-                    view(self.plane("lengths")?, slot * 4, 4)?] {
+                for (_, buffer) in self.table_destinations(slot)? {
                     // SAFETY: retained fixed table backing and live copy stream,
                     // reserved before requests or graph capture can begin.
                     unsafe { self.stream.device.library.reserve_h2d_ordered(buffer, stream)?; }
@@ -232,6 +233,25 @@ impl<'a> PageBank<'a> {
             }
             Ok(())
         })
+    }
+    fn table_destinations(&self, slot: usize) -> Result<[(&'static str, Buffer); 2]> {
+        ensure!(slot < self.layout.requests as usize, "MiniMax table slot outside admission");
+        let width = self.layout.table_width as usize;
+        Ok([("table", view(self.plane("page_table")?, slot * width * 4, width * 4)?),
+            ("length", view(self.plane("lengths")?, slot * 4, 4)?)])
+    }
+    /// Prefix-copy staging is keyed by interior destination and copy stream.
+    /// Observe existing owners without reserving a second copy.
+    pub fn prefix_upload_inventory(&self, inventory: &mut Inventory<'_>, gpu: u8,
+        stream: *mut std::ffi::c_void) -> Result<()> {
+        for slot in 0..self.layout.requests as usize {
+            for (plane, destination) in self.table_destinations(slot)? {
+                let name = Owner::PrefixH2d { gpu: gpu.into(), slot: slot as u64, plane }
+                    .inventory_name().unwrap();
+                upload_inventory(inventory, &name, self.stream.device.library, destination, stream)?;
+            }
+        }
+        Ok(())
     }
     /// The caller fences every reader onto `stream` before updating the table.
     pub fn install(&self, placement: &Placement, stream: *mut std::ffi::c_void) -> Result<()> {
@@ -276,7 +296,7 @@ impl<'a> PageBank<'a> {
             && (!decode || Rc::ptr_eq(&metadata.stream, &self.stream)),
             "MiniMax metadata request count or decode stream differs from admission");
         let mut planes = metadata.layout.buffers().into_iter()
-            .filter(|(name, _)| metadata.mode.uploads(name))
+            .filter(|(name, _)| metadata.uploads.contains(name))
             .map(|(name, bytes)| Ok((name, vec![0; usize::try_from(bytes)?])))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let width = self.layout.table_width as usize;
@@ -392,7 +412,10 @@ impl<'a> PageBank<'a> {
             allocation.inventory(inventory, &id)?;
         }
         self.cos_sin.inventory(inventory,
-            &format!("{}.cos_sin", Owner::Rope { gpu: gpu.into() }.inventory_name().unwrap()))
+            &format!("{}.cos_sin", Owner::Rope { gpu: gpu.into() }.inventory_name().unwrap()))?;
+        upload_inventory(inventory,
+            &format!("{}.upload", Owner::DecodeTable { gpu: gpu.into() }.inventory_name().unwrap()),
+            self.stream.device.library, self.plane("decode_table")?, self.stream.raw)
     }
 }
 
@@ -419,21 +442,12 @@ struct PreparedSegment {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MetadataMode { Cold, Prefill, Decode }
-impl MetadataMode {
-    fn uploads(self, name: &str) -> bool {
-        match self {
-            Self::Cold => false,
-            Self::Prefill => matches!(name, "positions" | "slots" | "batch_ids"
-                | "causal_lengths" | "cache_lengths" | "query_offsets"),
-            Self::Decode => matches!(name, "positions" | "slots" | "causal_lengths" | "cache_lengths"),
-        }
-    }
-}
 
 pub(crate) struct Metadata<'a> {
     stream: Rc<Stream<'a>>,
     pub layout: UnitMetadata,
     mode: MetadataMode,
+    uploads: BTreeSet<&'static str>,
     capacity: usize,
     span: Option<Range<usize>>,
     segments: Vec<PreparedSegment>,
@@ -447,17 +461,18 @@ impl Drop for Metadata<'_> {
 impl<'a> Metadata<'a> {
     /// Cold golden uses synchronous uploads, with no retained ordered staging.
     pub fn new(stream: Rc<Stream<'a>>, layout: UnitMetadata) -> Result<Self> {
-        Self::for_mode(stream, layout, MetadataMode::Cold)
+        Self::for_mode(stream, layout, MetadataMode::Cold, Vec::new())
     }
-    pub fn new_prefill(stream: Rc<Stream<'a>>, layout: UnitMetadata) -> Result<Self> {
-        Self::for_mode(stream, layout, MetadataMode::Prefill)
+    pub fn new_prefill(stream: Rc<Stream<'a>>, capacity: RequestCapacity) -> Result<Self> {
+        let capacity = checked_capacity(capacity)?;
+        Self::for_mode(stream, capacity.metadata(true), MetadataMode::Prefill, capacity.metadata_uploads(true))
     }
-    pub fn new_decode(stream: Rc<Stream<'a>>, layout: UnitMetadata) -> Result<Self> {
-        ensure!(layout.rows <= 64 && layout.requests == layout.rows,
-            "MiniMax decode metadata must match admitted concurrency");
-        Self::for_mode(stream, layout, MetadataMode::Decode)
+    pub fn new_decode(stream: Rc<Stream<'a>>, capacity: RequestCapacity) -> Result<Self> {
+        let capacity = checked_capacity(capacity)?;
+        Self::for_mode(stream, capacity.metadata(false), MetadataMode::Decode, capacity.metadata_uploads(false))
     }
-    fn for_mode(stream: Rc<Stream<'a>>, layout: UnitMetadata, mode: MetadataMode) -> Result<Self> {
+    fn for_mode(stream: Rc<Stream<'a>>, layout: UnitMetadata, mode: MetadataMode,
+        uploads: Vec<(&'static str, u64)>) -> Result<Self> {
         ensure!(UnitMetadata::for_requests(layout.rows, layout.requests)? == layout
             && (mode != MetadataMode::Cold || layout.requests == 1),
             "MiniMax metadata differs from admission");
@@ -466,6 +481,7 @@ impl<'a> Metadata<'a> {
                 Tag::workspace("minimax/metadata"))?))
         }).collect::<Result<BTreeMap<_, _>>>()?;
         let metadata = Self { stream, layout, mode, capacity: layout.rows as usize, span: None,
+            uploads: uploads.iter().map(|&(name, _)| name).collect(),
             segments: Vec::new(), bank_table: None, decode: false, planes };
         metadata.stream.device.run(|| {
             let library = metadata.stream.device.library;
@@ -481,11 +497,11 @@ impl<'a> Metadata<'a> {
                     library.copy_h2d(dst, &bytes)?;
                 }
             }
-            for (name, owner) in &metadata.planes {
-                if mode.uploads(name) {
-                    // SAFETY: private fixed destination/stream, reserved before Ready.
-                    unsafe { library.reserve_h2d_ordered(owner.buffer, metadata.stream.raw)?; }
-                }
+            for (name, bytes) in uploads {
+                let buffer = metadata.plane(name)?;
+                ensure!(buffer.bytes as u64 == bytes, "MiniMax upload differs from admitted metadata");
+                // SAFETY: private fixed destination/stream, reserved before Ready.
+                unsafe { library.reserve_h2d_ordered(buffer, metadata.stream.raw)?; }
             }
             Ok(())
         })?;
@@ -494,7 +510,7 @@ impl<'a> Metadata<'a> {
     fn upload(&self, planes: &BTreeMap<&str, Vec<u8>>) -> Result<()> {
         self.stream.device.run(|| {
             for (name, bytes) in planes {
-                ensure!(self.mode.uploads(name), "MiniMax attempted upload to constant metadata {name}");
+                ensure!(self.uploads.contains(name), "MiniMax attempted upload to constant metadata {name}");
                 // SAFETY: validated full planes retain stable backing and staging;
                 // the helper orders reuse after the previous transfer on this stream.
                 unsafe { self.stream.device.library.copy_h2d_ordered(self.plane(name)?, bytes, self.stream.raw)?; }
@@ -507,9 +523,31 @@ impl<'a> Metadata<'a> {
             .with_context(|| format!("MiniMax metadata lacks {name}"))
     }
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
-        for (name, owner) in &self.planes { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }
+        for (name, owner) in &self.planes {
+            owner.inventory(inventory, &format!("{prefix}.{name}"))?;
+            if self.uploads.contains(name.as_str()) {
+                upload_inventory(inventory, &format!("{prefix}.{name}.upload"),
+                    self.stream.device.library, owner.buffer, self.stream.raw)?;
+            }
+        }
         Ok(())
     }
+}
+
+fn checked_capacity(capacity: RequestCapacity) -> Result<RequestCapacity> {
+    ensure!(RequestCapacity::new(u64::from(capacity.decode.rows), u64::from(capacity.prefill.rows))? == capacity,
+        "MiniMax request capacity differs from admitted descriptor");
+    Ok(capacity)
+}
+
+fn upload_inventory(inventory: &mut Inventory<'_>, name: &str, library: &cuteafd_ffi::NativeLibrary,
+    destination: Buffer, stream: *mut std::ffi::c_void) -> Result<()> {
+    let staging = library.ordered_h2d_staging_buffer(destination, stream)?
+        .with_context(|| format!("MiniMax admitted ordered upload missing: {name}"))?;
+    ensure!(staging.bytes == destination.bytes
+        && staging.flags & cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED != 0,
+        "MiniMax ordered upload extent/type differs from admission: {name}");
+    inventory.pinned(name, staging)
 }
 
 fn put(planes: &mut BTreeMap<&str, Vec<u8>>, name: &str, offset: usize, bytes: &[u8]) -> Result<()> {
@@ -546,7 +584,8 @@ mod tests {
         let device = Device { library: &library, id: 1 };
         let stream = Rc::new(Stream::new(device)?);
         let mut cfg = config(); cfg.layers = 2;
-        let bank = PageBank::new(vec![Rc::clone(&stream)], &cfg,
+        let capacity = RequestCapacity::new(4, 16)?;
+        let bank = PageBank::new(vec![Rc::clone(&stream)], &cfg, capacity,
             MsaCache::new(2, 16, 4, 257)?, MsaRope::new(&cfg, 257)?, 0..2)?;
         bank.reserve_tables(stream.raw)?;
         let placements = [Placement { units: vec![7, 2, 9], slot: 3, len: 63 },
@@ -557,12 +596,12 @@ mod tests {
         let canonical = device.run(|| read(&library, bank.plane("page_table")?, bank.plane("page_table")?.bytes))?;
         let lengths = device.run(|| read(&library, bank.plane("lengths")?, bank.plane("lengths")?.bytes))?;
         let original = placements.clone();
-        let mut metadata = Metadata::new_prefill(Rc::clone(&stream), UnitMetadata::for_requests(16, 4)?)?;
-        let mut decode_metadata = Metadata::new_decode(Rc::clone(&stream), UnitMetadata::for_requests(4, 4)?)?;
+        let mut metadata = Metadata::new_prefill(Rc::clone(&stream), capacity)?;
+        let mut decode_metadata = Metadata::new_decode(Rc::clone(&stream), capacity)?;
         for owner in [&metadata, &decode_metadata] {
             for (name, allocation) in &owner.planes {
                 assert_eq!(device.run(|| library.ordered_h2d_staging_buffer(allocation.buffer, stream.raw))?
-                    .is_some(), owner.mode.uploads(name), "{name} {:?}", owner.mode);
+                    .is_some(), owner.uploads.contains(name.as_str()), "{name} {:?}", owner.mode);
             }
         }
         let requests = [Append { first_row: 0, placement: &placements[0], rows: 3 },
@@ -656,14 +695,14 @@ mod tests {
         let device = Device { library: &library, id: 1 };
         let stream = Rc::new(Stream::new(device)?);
         for concurrency in [1, 16, 64] {
-            let layout = UnitMetadata::for_requests(concurrency, concurrency)?;
-            for owner in [Metadata::new_decode(Rc::clone(&stream), layout)?,
-                Metadata::new_prefill(Rc::clone(&stream), layout)?,
+            let capacity = RequestCapacity::new(u64::from(concurrency), u64::from(concurrency))?;
+            for owner in [Metadata::new_decode(Rc::clone(&stream), capacity)?,
+                Metadata::new_prefill(Rc::clone(&stream), capacity)?,
                 Metadata::new(Rc::clone(&stream), UnitMetadata::new(concurrency)?)?] {
                 let mut pinned = 0;
                 for (name, allocation) in &owner.planes {
                     let staging = device.run(|| library.ordered_h2d_staging_buffer(allocation.buffer, stream.raw))?;
-                    assert_eq!(staging.is_some(), owner.mode.uploads(name));
+                    assert_eq!(staging.is_some(), owner.uploads.contains(name.as_str()));
                     if let Some(staging) = staging {
                         assert_eq!(staging.bytes, allocation.buffer.bytes);
                         pinned += staging.bytes;
@@ -688,9 +727,118 @@ mod tests {
                 assert_eq!(pinned as u64, expected);
             }
         }
-        assert!(Metadata::new_decode(Rc::clone(&stream), UnitMetadata::new(16)?).is_err());
-        assert!(Metadata::new_decode(Rc::clone(&stream), UnitMetadata::for_requests(65, 65)?).is_err());
+        let mut capacity = RequestCapacity::new(16, 32)?;
+        capacity.decode = UnitMetadata::new(16)?;
+        assert!(Metadata::new_decode(Rc::clone(&stream), capacity).is_err());
+        capacity.decode = UnitMetadata::for_requests(65, 65)?;
+        assert!(Metadata::new_decode(Rc::clone(&stream), capacity).is_err());
+        capacity = RequestCapacity::new(64, 32)?;
+        capacity.prefill = UnitMetadata::for_requests(32, 16)?;
+        assert!(Metadata::new_prefill(Rc::clone(&stream), capacity).is_err());
         drop(stream);
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    #[test]
+    fn retained_request_owners_equal_shared_descriptor_on_one_and_two_ranks() -> Result<()> {
+        use super::super::prefix::MiniMaxPrefix;
+        use cuteafd_loader::placement::planner::Location;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        for device in 0..2 { fixture.configure_memory(&library, device, 64 << 20)?; }
+        let mut cfg = config(); cfg.layers = 2;
+        let context = 257;
+        let pool_pages = 8;
+        for ranks in [1, 2] {
+            let ids = (0..ranks).collect::<Vec<i32>>();
+            for concurrency in [1, 16, 64] {
+                for unit_rows in [32, 128] {
+                    let capacity = RequestCapacity::new(concurrency, unit_rows)?;
+                    let mut banks = Vec::new();
+                    let mut metadata = Vec::new();
+                    let mut expected = BTreeMap::new();
+                    let mut add = |id: String, bytes, location| {
+                        assert!(expected.insert(id, (bytes, location, Lifetime::TARGET)).is_none());
+                    };
+                    for (rank, &id) in ids.iter().enumerate() {
+                        let location = Location::coordinator(rank as u8);
+                        let device = Device { library: &library, id };
+                        let readers = (0..4).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<Vec<_>>>()?;
+                        let first = rank * cfg.layers / ranks as usize;
+                        let end = (rank + 1) * cfg.layers / ranks as usize;
+                        let layout = MsaCache::new((end - first) as u32, pool_pages,
+                            capacity.decode.requests, context)?;
+                        let bank = Rc::new(PageBank::new(readers.clone(), &cfg, capacity, layout,
+                            MsaRope::new(&cfg, context)?, first..end)?);
+                        for layer in first..end {
+                            for (plane, stride) in PAGE_PLANES {
+                                add(Owner::Kv { layer, plane }.id(), u64::from(pool_pages) * stride as u64, location);
+                            }
+                        }
+                        for (name, bytes) in capacity.cache(context)?.buffers()?.into_iter()
+                            .filter(|(name, _)| !name.starts_with("layer.")) {
+                            add(format!("{}.{name}", Owner::Cache { gpu: rank }.id()), bytes, location);
+                        }
+                        add(format!("{}.upload", Owner::DecodeTable { gpu: rank }.id()),
+                            u64::from(capacity.decode.requests) * u64::from(layout.table_width) * 4, Location::PINNED);
+                        for (name, bytes) in bank.rope.buffers() {
+                            add(format!("{}.{name}", Owner::Rope { gpu: rank }.id()), bytes, location);
+                        }
+                        for slot in 0..concurrency {
+                            for (plane, bytes) in [("table", u64::from(layout.table_width) * 4), ("length", 4)] {
+                                add(Owner::PrefixH2d { gpu: rank, slot, plane }.id(), bytes, Location::PINNED);
+                            }
+                        }
+                        for (stream_index, stream) in readers.iter().enumerate() {
+                            let prefill = stream_index != 0;
+                            let owner = if prefill { Owner::Unit { gpu: rank, slot: (stream_index - 1) as u64 } }
+                                else { Owner::Decode { gpu: rank } };
+                            let prefix = format!("{}.metadata", owner.id());
+                            for (name, bytes) in capacity.metadata(prefill).buffers() {
+                                add(format!("{prefix}.{name}"), bytes, location);
+                            }
+                            for (name, bytes) in capacity.metadata_uploads(prefill) {
+                                add(format!("{prefix}.{name}.upload"), bytes, Location::PINNED);
+                            }
+                            let metadata_owner = if prefill { Metadata::new_prefill(Rc::clone(stream), capacity)? }
+                                else { Metadata::new_decode(Rc::clone(stream), capacity)? };
+                            metadata.push((metadata_owner, format!("{}.metadata", owner.inventory_name().unwrap())));
+                        }
+                        banks.push(bank);
+                    }
+                    let scratch = Rc::new(Allocation::new(banks[0].stream.device, 256,
+                        Tag::workspace("minimax/unit"))?);
+                    let prefix = MiniMaxPrefix::new(banks.clone(), scratch)?;
+                    let collect = || -> Result<Inventory<'_>> {
+                        let mut inventory = Inventory::new(CoordinatorDevices::new(&ids)?, "minimax",
+                            Lifetime::TARGET, Category::Workspace, "retained request owners");
+                        for (rank, bank) in banks.iter().enumerate() { bank.inventory(&mut inventory, rank as u8)?; }
+                        for (owner, name) in &metadata { owner.inventory(&mut inventory, name)?; }
+                        prefix.upload_inventory(&mut inventory)?;
+                        Ok(inventory)
+                    };
+                    let inventory = collect()?;
+                    let actual = inventory.receipts.iter().map(|receipt| {
+                        let owner = &receipt.allocation;
+                        assert!(owner.view.is_none() && receipt.address != 0);
+                        (owner.id.clone(), (owner.bytes, owner.location, owner.lifetime))
+                    }).collect::<BTreeMap<_, _>>();
+                    assert_eq!(actual.len(), inventory.receipts.len(), "duplicate physical owner ID");
+                    assert_eq!(actual, expected, "{ranks} ranks C{concurrency} unit{unit_rows}");
+                    let second = collect()?;
+                    assert_eq!(inventory.receipts.iter().map(|r| (&r.allocation.id, r.address)).collect::<Vec<_>>(),
+                        second.receipts.iter().map(|r| (&r.allocation.id, r.address)).collect::<Vec<_>>(),
+                        "inventory must only observe stable retained backing");
+                    drop(prefix); drop(metadata); drop(banks);
+                    for &id in &ids {
+                        assert_eq!(Device { library: &library, id }.run(|| library.cuda_physical_memory_info())?.0, 64 << 20);
+                    }
+                }
+            }
+        }
         assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
         Ok(())
     }

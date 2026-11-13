@@ -60,6 +60,17 @@ impl<'a> MiniMaxPrefix<'a> {
         self.0.banks.iter().flat_map(|bank| bank.owners()).chain([Rc::clone(&self.0.scratch)]).collect()
     }
 
+    pub fn upload_inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for (rank, bank) in self.0.banks.iter().enumerate() {
+            let gpu = match inventory.location(bank.stream.device.id)?.device {
+                cuteafd_loader::placement::planner::Device::Coordinator(gpu) => gpu,
+                _ => anyhow::bail!("MiniMax prefix bank is not coordinator-owned"),
+            };
+            self.0.copies.ordered(rank, |stream| bank.prefix_upload_inventory(inventory, gpu, stream))?;
+        }
+        Ok(())
+    }
+
     fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
         for bank in &self.0.banks { bank.validate(placement, len)?; }
         Ok(())
@@ -145,7 +156,8 @@ mod tests {
     use cuteafd_core::memory_layout::Tag;
     use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
     use cuteafd_ffi::{native_library_lifetime_fixture::Fixture, NativeLibrary};
-    use cuteafd_loader::families::minimax_m3::{MiniMaxM3Config, execution::{MsaCache, MsaRope}};
+    use cuteafd_loader::{families::minimax_m3::{MiniMaxM3Config, execution::{MsaCache, MsaRope}},
+        placement::families::minimax_m3::RequestCapacity};
     use cuteafd_hostcache::copy::{CopyEngine, Stream as CopyStream};
 
     fn cfg() -> MiniMaxM3Config {
@@ -159,7 +171,7 @@ mod tests {
         let mut banks = Vec::new();
         for rank in 0..2 {
             let stream = Rc::new(Stream::new(Device { library, id: rank })?);
-            banks.push(Rc::new(PageBank::new(vec![stream], &cfg,
+            banks.push(Rc::new(PageBank::new(vec![stream], &cfg, RequestCapacity::new(4, 16)?,
                 MsaCache::new(1, pages, 4, 256)?, MsaRope::new(&cfg, 256)?,
                 rank as usize..rank as usize + 1)?));
         }
