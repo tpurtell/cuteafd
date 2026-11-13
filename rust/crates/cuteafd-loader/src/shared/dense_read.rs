@@ -1,7 +1,7 @@
 //! Loading-only row windows shared by native dense admission and the mount reader.
 use anyhow::{ensure, Context, Result};
 
-pub const STEP_BYTES: usize = 32 << 20;
+pub use cuteafd_ffi::SYNC_H2D_CHUNK_BYTES as STEP_BYTES;
 pub const PINNED_FLOOR_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

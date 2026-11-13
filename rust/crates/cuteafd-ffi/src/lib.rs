@@ -2301,18 +2301,20 @@ struct OrderedH2DStaging {
 // SAFETY: the library mutex serializes access; each entry retains its device id.
 unsafe impl Send for OrderedH2DStaging {}
 
+/// One reusable pinned window for blocking uploads, shared with dense mount readers.
+pub const SYNC_H2D_CHUNK_BYTES: usize = 32 << 20;
+
 struct SyncH2DStagingBuffer {
     // Released explicitly by NativeLibrary while its module is loaded. Do not
     // add an automatic release here: failed-drain quarantine retains this raw
     // pinned allocation even after the Rust wrapper is dropped.
     buffer: CuteafdHostBuffer,
+    sealed: bool,
 }
 
 impl Default for SyncH2DStagingBuffer {
     fn default() -> Self {
-        Self {
-            buffer: CuteafdHostBuffer::default(),
-        }
+        Self { buffer: CuteafdHostBuffer::default(), sealed: false }
     }
 }
 
@@ -2320,6 +2322,7 @@ unsafe impl Send for SyncH2DStagingBuffer {}
 
 impl SyncH2DStagingBuffer {
     fn ensure(&mut self, library: &NativeLibrary, bytes: usize) -> Result<CuteafdHostBuffer> {
+        anyhow::ensure!(!self.sealed, "synchronous H2D uploads are sealed after startup; use copy_h2d_ordered");
         if self.buffer.ptr.is_null() || self.buffer.bytes < bytes {
             if !self.buffer.ptr.is_null() {
                 library
@@ -3125,8 +3128,9 @@ impl NativeLibrary {
 
 
     /// Blocking default-stream upload for fresh storage or a destination whose
-    /// prior consumers have completed. This does not join nonblocking streams;
-    /// use `copy_h2d_ordered` for queued workspace reuse.
+    /// prior consumers have completed. A reusable pinned window is bounded by
+    /// [`SYNC_H2D_CHUNK_BYTES`], regardless of source size. This does not join
+    /// nonblocking streams; use `copy_h2d_ordered` for queued workspace reuse.
     pub fn copy_h2d(&self, dst: CuteafdDeviceBuffer, src: &[u8]) -> Result<()> {
         if src.is_empty() {
             return Ok(());
@@ -3142,11 +3146,19 @@ impl NativeLibrary {
             .sync_h2d_staging
             .lock()
             .map_err(|_| anyhow::anyhow!("synchronous H2D pinned staging lock is poisoned"))?;
-        let staging = staging.ensure(self, src.len())?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), staging.ptr.cast::<u8>(), src.len());
+        let staging = staging.ensure(self, src.len().min(SYNC_H2D_CHUNK_BYTES))?;
+        for (index, chunk) in src.chunks(SYNC_H2D_CHUNK_BYTES).enumerate() {
+            let offset = index * SYNC_H2D_CHUNK_BYTES;
+            let destination = CuteafdDeviceBuffer { ptr: dst.ptr.wrapping_byte_add(offset),
+                bytes: dst.bytes - offset, ..dst };
+            // SAFETY: the private pinned window holds this chunk; the blocking
+            // native copy finishes before the next chunk reuses that window.
+            unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), staging.ptr.cast::<u8>(), chunk.len());
+                self.copy_h2d_raw_ptr(destination, staging.ptr.cast(), chunk.len())?;
+            }
         }
-        unsafe { self.copy_h2d_raw_ptr(dst, staging.ptr as *const c_void, src.len()) }
+        Ok(())
     }
 
     /// Create the pinned staging and fence for ordered uploads into `dst` on
@@ -3453,8 +3465,8 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_copy_d2h", status)
     }
 
-    /// Frees the pinned staging buffer [`Self::copy_h2d`] grows to its largest
-    /// upload. Loaders call this once their weights are resident: the buffer
+    /// Frees the pinned staging buffer [`Self::copy_h2d`] grows up to
+    /// [`SYNC_H2D_CHUNK_BYTES`]. Loaders call this once their weights are resident: the buffer
     /// otherwise stays pinned for the life of the process (on GB10 it is the
     /// same unified memory the experts live in). Later copies reallocate it.
     pub fn release_sync_h2d_staging(&self) -> Result<usize> {
@@ -3468,6 +3480,21 @@ impl NativeLibrary {
         let bytes = staging.buffer.bytes;
         self.free_host_buffer(&mut staging.buffer)
             .context("freeing synchronous H2D pinned staging buffer")?;
+        staging.buffer = CuteafdHostBuffer::default();
+        Ok(bytes)
+    }
+
+    /// End startup's synchronous-upload lifetime. Nonempty [`Self::copy_h2d`]
+    /// calls then fail instead of recreating unadmitted pinned storage. Ordered
+    /// uploads and direct uploads from separately admitted pinned owners remain valid.
+    pub fn seal_sync_h2d_staging(&self) -> Result<usize> {
+        let mut staging = self.sync_h2d_staging.lock()
+            .map_err(|_| anyhow::anyhow!("synchronous H2D pinned staging lock is poisoned"))?;
+        staging.sealed = true;
+        if staging.buffer.ptr.is_null() { return Ok(0); }
+        let bytes = staging.buffer.bytes;
+        self.free_host_buffer(&mut staging.buffer)
+            .context("freeing startup synchronous H2D pinned staging buffer")?;
         staging.buffer = CuteafdHostBuffer::default();
         Ok(bytes)
     }
