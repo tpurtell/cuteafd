@@ -9,7 +9,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'quantization'))
-from kimi_k31.k2_core_k6 import handoff as storage
+from kimi_k31 import handoff_k2_core_k6 as storage
 
 
 def write(path, value):

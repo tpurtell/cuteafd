@@ -18,6 +18,11 @@ After successful placement, retire only this quant's off-grid managed copies,
 standalone export/cache, obsolete recovery payloads and build staging, checking
 process/container use first. Preserve managed source checkpoints, logs, scalar
 receipts and shared stores. Keep the progress timer until the handoff finishes.
+Keep the handoff helper at `quantization/kimi_k31/handoff_k2_core_k6.py`,
+outside the frozen producer's `k2_core_k6/*.py` identity scan. Quantization and
+head completed Nov 13 00:22 UTC. Its original GPU supervisor is stopped and
+disabled; a separate CPU-only publication service carries the verified output
+through audit/upload without restarting numerical work.
 
 One attention/FFN-disaggregated engine for the open-weights MoE models that
 soar on consumer Blackwell: strong RTX PRO 6000 head(s) for attention, dense

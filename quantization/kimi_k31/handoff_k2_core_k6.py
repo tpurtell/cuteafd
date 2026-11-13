@@ -18,15 +18,13 @@ import subprocess
 import sys
 import time
 
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "quantization"))
-if __package__ in (None, ""):
-    __package__ = "kimi_k31.k2_core_k6"
 
 from kimi_k3.uniform_k2.storage import atomic_json, file_identity
 from step5.core_k6.publish import _manifest_digest
-from .publish import _collect_local, _complete_plan
-from .recipe import TARGET_REPO
+from kimi_k31.k2_core_k6.publish import _collect_local, _complete_plan
+from kimi_k31.k2_core_k6.recipe import TARGET_REPO
 
 BASE = Path.home() / ".cache/cuteafd/quantization/kimi-k31-k2-core-k6"
 ROOT = BASE / "production"
@@ -367,8 +365,9 @@ def main():
         # The publisher's hardlinks must be closed and its supervisor finished.
         while True:
             result = subprocess.run(["systemctl", "--user", "show", PRODUCER_UNIT,
+                "cuteafd-kimi-k31-publish.service",
                 "-p", "ActiveState", "--value"], check=True, capture_output=True, text=True, timeout=30)
-            if result.stdout.strip() == "inactive":
+            if result.stdout.split() == ["inactive", "inactive"]:
                 break
             time.sleep(60)
     print(json.dumps(handoff(args.root)), flush=True)
@@ -376,6 +375,8 @@ def main():
     subprocess.run([sys.executable, str(BASE / "progress-updates/notify.py")],
                    check=True, timeout=120)
     subprocess.run(["systemctl", "--user", "disable", PRODUCER_UNIT], check=True, timeout=30)
+    subprocess.run(["systemctl", "--user", "disable", "cuteafd-kimi-k31-publish.service"],
+                   check=True, timeout=30)
     subprocess.run(["systemctl", "--user", "disable", "--now",
                     "cuteafd-kimi-k31-progress.timer"], check=True, timeout=30)
     subprocess.run(["systemctl", "--user", "disable", HANDOFF_UNIT], check=True, timeout=30)
