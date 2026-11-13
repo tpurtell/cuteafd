@@ -469,8 +469,36 @@ impl MiniMaxInputs {
         Ok(out)
     }
 
-    /// Fixed owners of one coordinator rank that do not depend on any domain.
-    fn rank_owners(&self, gpu: usize, maximum: u64) -> Result<Vec<Component>, Refusal> {
+    /// Pure execution inventory before allocation-tail and driver-page-table
+    /// finalization. Target/head weights, expert choices and transport stay with
+    /// their own constructors; `prepare` finalizes the combined set once.
+    pub fn execution_components(&self) -> Result<Vec<Component>, Refusal> {
+        let maximum = self.maximum_pages();
+        if !(1..=2).contains(&self.gpus) || maximum == 0 || maximum == u64::MAX
+            || self.targets.len() != self.gpus || self.owners.len() != self.cfg.layers
+            || self.graph_reserve.len() != self.gpus || self.code.len() != self.gpus {
+            return Err(invalid("invalid execution inventory extent"));
+        }
+        cuteafd_core::concurrency::validate("minimax_m3", self.sequences).map_err(invalid)?;
+        let mut out = Vec::new();
+        for gpu in 0..self.gpus { out.extend(self.rank_execution_components(gpu, maximum)?); }
+        for owner in self.host_prefix.allocations("host.prefix", serving::ServingOwners::LIFETIME)? {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum);
+            out.push(Component::allocation(owner, bytes, false, maximum));
+        }
+        if let Some(geometry) = &self.expert_usage {
+            let devices = (0..self.gpus.min(geometry.routed_layers.len())).map(|gpu| gpu as u8).collect::<Vec<_>>();
+            out.extend(crate::placement::expert_usage::components(geometry, &devices, maximum)?);
+        }
+        // The library releases this shared startup copy chunk before readiness.
+        out.extend(buffer("staging/sync-h2d", Location::PINNED,
+            cuteafd_ffi::SYNC_H2D_CHUNK_BYTES as u64,
+            Lifetime { first: Phase::Load, last: Phase::Warmup }, Category::Staging,
+            "library-wide synchronous H2D startup chunk", maximum));
+        Ok(out)
+    }
+
+    fn rank_execution_components(&self, gpu: usize, maximum: u64) -> Result<Vec<Component>, Refusal> {
         let location = Location::coordinator(gpu as u8);
         let cfg = &self.cfg;
         let rows = u32::try_from(self.prefill.rows).map_err(|_| Refusal::Overflow("MiniMax unit rows"))?;
@@ -478,7 +506,6 @@ impl MiniMaxInputs {
         let sequences = u32::try_from(self.sequences).map_err(|_| Refusal::Overflow("MiniMax sequences"))?;
         let mut out = Vec::new();
         let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
-        out.extend(target.weight_components(maximum)?);
         // Whole-owner MSA layers: KV and index pages on the owner only. Each
         // layer plane is one physical backing that scales with the pool.
         for (layer, &owner) in self.owners.iter().enumerate() {
@@ -546,10 +573,6 @@ impl MiniMaxInputs {
         out.extend(allowance(location, cuda_stream_slab_bytes(peak)?, Lifetime::RESIDENT,
             format!("minimax/driver-stream-slabs/gpu{gpu} ({peak} peak live streams: model + push copies + rotary)"),
             false, maximum));
-        for owner in self.mount.get(gpu).copied().unwrap_or_default().allocations(&Owner::Mount { gpu }.id()) {
-            let bytes = ByteCurve::fixed(owner.bytes, maximum);
-            out.push(Component::allocation(owner, bytes, false, maximum));
-        }
         Ok(out)
     }
 }
@@ -597,19 +620,21 @@ impl Recipe for MiniMaxInputs {
         }
         let pair = self.gpus == 2;
         let head = self.head_gpu();
-        let mut components = Vec::new();
-        for gpu in 0..self.gpus { components.extend(self.rank_owners(gpu, maximum)?); }
+        let mut components = self.execution_components()?;
+        for gpu in 0..self.gpus {
+            components.extend(self.targets[gpu].weight_components(maximum)?);
+            for owner in self.mount.get(gpu).copied().unwrap_or_default().allocations(&Owner::Mount { gpu }.id()) {
+                let bytes = ByteCurve::fixed(owner.bytes, maximum);
+                components.push(Component::allocation(owner, bytes, false, maximum));
+            }
+        }
         // Head-rank owners: vocabulary head workspace and the shared selector.
         components.extend(HeadLayout::new(cfg, DECODE_ROWS)?.components(&Owner::Head.id(), head, maximum)?);
         components.extend(serving::ServingOwners {
             selector: serving::SelectorOwners { location: Location::coordinator(head),
                 capacity: usize::try_from(self.sequences).map_err(|_| Refusal::Overflow("MiniMax selector"))?
                     .max(DECODE_ROWS as usize), vocab: cfg.vocab_size, device_sampling: self.device_sampling },
-            prefix: self.host_prefix }.components(maximum)?);
-        if let Some(geometry) = &self.expert_usage {
-            let devices = (0..self.gpus.min(geometry.routed_layers.len())).map(|gpu| gpu as u8).collect::<Vec<_>>();
-            components.extend(crate::placement::expert_usage::components(geometry, &devices, maximum)?);
-        }
+            prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 } }.components(maximum)?);
         // Transport: coordinator intake planes are fixed owners on the link's
         // GPU; host/pinned candidates join the host budget as one envelope.
         let mut contract_variables = Vec::new();
@@ -733,12 +758,6 @@ impl Recipe for MiniMaxInputs {
                 gemm: self.head.gemm(), lt: self.head.lt(), lifetime: Lifetime::TARGET, activation: Activation::always() }],
                 maximum, PhaseOrder::TARGET_THEN_DRAFT)?);
         }
-        // #1945: the library streams every synchronous startup copy through
-        // this shared chunk, then releases it before readiness.
-        components.extend(buffer("staging/sync-h2d", Location::PINNED,
-            cuteafd_ffi::SYNC_H2D_CHUNK_BYTES as u64,
-            Lifetime { first: Phase::Load, last: Phase::Warmup }, Category::Staging,
-            "library-wide synchronous H2D startup chunk", maximum));
         fixed_request_tails(&mut components, maximum, &[])?;
         let mut contract = Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (self.spark_ranks > 0).then(|| SparkReplyFormats {
