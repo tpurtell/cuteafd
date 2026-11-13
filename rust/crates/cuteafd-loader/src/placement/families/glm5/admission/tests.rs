@@ -229,7 +229,7 @@ fn draft_facts_preserve_owner_ids_resources_and_serial_fp8_sources() {
             assert!(solved.facts.allocations.contains(owner));
         }
         assert_eq!(solved.facts.allocations.iter().find(|owner| owner.id == "glm.load.sync_h2d").unwrap().bytes,
-            facts.sync_upload_bytes);
+            facts.sync_upload_bytes.max(4096 * cfg.qk_rope_head_dim as u64 * 4));
         assert_eq!(solved.facts.sequential.iter().filter(|group| group.id == "glm.draft.load.sources").count(),
             usize::from(representation == Fp8Only));
     }
@@ -394,7 +394,7 @@ fn production_native_sync_bank_is_one_maximum_not_one_copy_per_rank_or_layer() {
     let banks = solved.facts.allocations.iter().filter(|owner| owner.id == "glm.load.sync_h2d")
         .collect::<Vec<_>>();
     assert_eq!(banks.len(), 1);
-    assert_eq!(banks[0].bytes, 8192);
+    assert_eq!(banks[0].bytes, 8192.max(4096 * cfg.qk_rope_head_dim as u64 * 4));
 }
 
 #[test]
@@ -553,7 +553,8 @@ fn glm_draft_first_peak_excludes_target_kv_and_changes_tight_pool_admission() {
         prefill: Pin::Exact(recipe.prefill[0]),
         ..request()
     };
-    let actual = recipe.prepare(&req).unwrap();
+    let mut actual = recipe.prepare(&req).unwrap();
+    actual.add_driver_page_tables();
     assert_eq!(actual.phase_order, PhaseOrder::DRAFT_THEN_TARGET);
     let mut target_first = actual.clone();
     target_first.phase_order = PhaseOrder::TARGET_THEN_DRAFT;
@@ -590,8 +591,11 @@ fn glm_draft_first_peak_excludes_target_kv_and_changes_tight_pool_admission() {
         assert_eq!(peak.phase, Phase::DraftLoad);
     }
     let mut tight = room;
-    tight[0].physical_bytes = draft_peak(&before);
-    tight[0].logical_bytes = draft_peak(&before);
+    // Include the packed arena's physical tail, not only logical owner bytes.
+    let required = before.iter().find(|row|
+        row.budget == "physical.0" && row.phase == Phase::DraftLoad).unwrap();
+    tight[0].physical_bytes = required.owned + required.opaque;
+    tight[0].logical_bytes = tight[0].physical_bytes;
     let old = planner::solve(req.clone(), tight.clone(), &Prepared(target_first)).unwrap();
     let new = planner::solve(req, tight, &Prepared(actual)).unwrap();
     assert_eq!(old.pool_tokens, 4096);
@@ -1774,6 +1778,10 @@ fn auto_embedding_can_move_without_shrinking_fixed_prefix_quota_or_pool() {
 
     let cfg = cfg();
     let mut recipe = recipe(&cfg);
+    // A whole-block embedding still costs device memory beside packed RoPE.
+    for case in &mut recipe.weights {
+        case.value.owners[0].allocation.bytes = 2 << 20;
+    }
     let host = HostFigures::for_layout(2, MAX_LAYOUT).unwrap();
     recipe.host = Some(host.clone());
     let request = Request { onboard: Pin::Exact(0), prefill: Pin::Exact(recipe.prefill[0]),
@@ -1783,7 +1791,7 @@ fn auto_embedding_can_move_without_shrinking_fixed_prefix_quota_or_pool() {
     let embedding = without_prefix.facts.allocations.iter()
         .find(|owner| owner.id == "glm.weights.embedding").unwrap();
     assert_eq!(embedding.location, Location::PINNED);
-    assert_eq!(embedding.bytes, 8192);
+    assert_eq!(embedding.bytes, 2 << 20);
     let pinned = without_prefix.phases.iter().find(|phase|
         phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap().owned;
     // Serving prefill lanes allocate their pinned H2B staging on the first live
@@ -2086,6 +2094,7 @@ fn resident_cap_counts_target_draft_and_asymmetric_expert_owners_not_storage() {
     use crate::placement::ResidentWeights;
     let cfg = cfg();
     let mut recipe = recipe(&cfg);
+    let rotary = recipe.context * cfg.qk_rope_head_dim as u64 * 4;
     recipe.embedding = vec![EmbeddingHome::Device(0)];
     recipe.weights.retain(|case| {
         matches!(
@@ -2125,7 +2134,7 @@ fn resident_cap_counts_target_draft_and_asymmetric_expert_owners_not_storage() {
         ],
     });
     let mut req = Request {
-        resident_weight_limit: Some(ResidentWeights(12288)),
+        resident_weight_limit: Some(ResidentWeights(rotary + 12288)),
         ..request()
     };
     let plan = planner::solve(req.clone(), budgets(), &recipe).unwrap();
@@ -2145,14 +2154,14 @@ fn resident_cap_counts_target_draft_and_asymmetric_expert_owners_not_storage() {
             .filter(|a| a.location == Location::coordinator(0))
             .map(|a| a.weights.0)
             .sum::<u64>(),
-        8192 + 4096
+        rotary + 8192 + 4096
     );
     req.onboard = Pin::Exact(1);
     assert!(matches!(
         planner::solve(req.clone(), budgets(), &recipe),
         Err(Refusal::ResidentWeightLimit { .. })
     ));
-    req.resident_weight_limit = Some(ResidentWeights(8192 + 4096 + 16384));
+    req.resident_weight_limit = Some(ResidentWeights(rotary + 8192 + 4096 + 16384));
     let admitted = planner::solve(req.clone(), budgets(), &recipe).unwrap();
     assert_eq!(admitted.decisions.onboard_layers, vec![vec![1], vec![1]]);
     assert_eq!(admitted.pool_tokens, plan.pool_tokens);
@@ -2164,16 +2173,16 @@ fn resident_cap_counts_target_draft_and_asymmetric_expert_owners_not_storage() {
             .filter(|a| a.location == Location::coordinator(1))
             .map(|a| a.weights.0)
             .sum::<u64>(),
-        16384 + 1024
+        rotary + 16384 + 1024
     );
-    req.resident_weight_limit = Some(ResidentWeights(8192 + 4096 + 16384 - 1));
+    req.resident_weight_limit = Some(ResidentWeights(rotary + 8192 + 4096 + 16384 - 1));
     assert!(matches!(
         planner::solve(req, budgets(), &recipe),
         Err(Refusal::ResidentWeightLimit {
             gpu: 0,
-            required: 28672,
-            limit: 28671
-        })
+            required,
+            limit
+        }) if required == rotary + 28672 && limit == rotary + 28671
     ));
 }
 

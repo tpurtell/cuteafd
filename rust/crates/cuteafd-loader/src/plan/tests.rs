@@ -3036,9 +3036,11 @@ fn glm5_actual_plan_preserves_exact_resident_weight_refusal_with_and_without_lay
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, rows, columns| fp8(name, rows, columns, None)));
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
-    let required = layout::glm5::device_bytes(&checkpoint, 1, cfg.layers, false, None).unwrap()[0];
-    assert!(required > 0);
+    let checkpoint_bytes = layout::glm5::device_bytes(&checkpoint, 1, cfg.layers, false, None).unwrap()[0];
+    assert!(checkpoint_bytes > 0);
     for full_layout in [false, true] {
+        let context = if full_layout { 32768 } else { 1 << 20 };
+        let required = checkpoint_bytes + context * cfg.qk_rope_head_dim as u64 * 4;
         let options = PlanOptions { coordinator_budget_bytes: required,
             layout: full_layout.then(|| layout::LayoutOptions {
                 rtx_bytes: vec![96 << 30], context_tokens: 32768, pool_tokens: Some(32768),
@@ -6344,9 +6346,10 @@ fn glm_tied_embedding_keeps_device_owner_in_shared_admission() {
     assert!(memory.notes.iter().any(|note| note.contains("GPU residency retained")));
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
-    let weights = crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
+    let mut weights = crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
         &checkpoint, 1, cfg.layers, None, crate::families::glm5::native_bf16(), false,
         crate::placement::planner::EmbeddingHome::Device(0)).unwrap();
+    weights.add_rotary(65536, cfg.qk_rope_head_dim).unwrap();
     let embedding = weights.owners.iter().find(|owner| owner.allocation.id == "glm.weights.embedding").unwrap();
     assert_eq!(embedding.allocation.location, crate::placement::planner::Location::coordinator(0));
     let arenas = weights.coordinator_arenas().unwrap();
