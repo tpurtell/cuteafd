@@ -11,6 +11,7 @@ import importlib.util
 import json
 import math
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -44,7 +45,26 @@ def successful(report):
     return all(checks.get(name, {}).get('passed') is True for name in REQUIRED)
 
 
-def run_bounded(command, output, timeout_seconds, *, run=subprocess.run):
+def _run_process_group(command, *, timeout, stdout, stderr, check=False):
+    """Kill the worker and any compiler/quantizer children at the same cap."""
+    with subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True) as process:
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # start_new_session makes this worker its own process-group leader;
+            # the group contains only processes launched by this bounded worker.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+    if check and returncode:
+        raise subprocess.CalledProcessError(returncode, command)
+    return subprocess.CompletedProcess(command, returncode)
+
+
+def run_bounded(command, output, timeout_seconds, *, run=_run_process_group):
     """Hard bound; timeout/incomplete/worker failure always produces failed JSON."""
     if not 0 < timeout_seconds <= 600:
         raise ValueError('GPU pilot wall-clock budget must be in (0,600] seconds')

@@ -65,3 +65,28 @@ def test_check_exception_is_named_in_durable_failure_receipt(tmp_path):
     row=json.loads(output.read_text())['checks'][0]
     assert row['name']=='source_global_attention' and row['passed'] is False
     assert row['error']=='ValueError: shape mismatch'
+
+
+def test_timeout_kills_only_the_new_worker_process_group(monkeypatch):
+    import signal
+    from inkling2 import pilot
+    calls=[]
+    class Process:
+        pid=12345
+        def __enter__(self):
+            return self
+        def __exit__(self,*args):
+            return False
+        def wait(self,timeout=None):
+            calls.append(('wait',timeout))
+            if timeout is not None:
+                raise subprocess.TimeoutExpired('worker',timeout)
+            return -9
+    def popen(*args,**kwargs):
+        assert kwargs['start_new_session'] is True
+        return Process()
+    monkeypatch.setattr(pilot.subprocess,'Popen',popen)
+    monkeypatch.setattr(pilot.os,'killpg',lambda pid,sig:calls.append(('killpg',pid,sig)))
+    with pytest.raises(subprocess.TimeoutExpired):
+        pilot._run_process_group(['worker'],timeout=600,stdout=None,stderr=None)
+    assert calls==[('wait',600),('killpg',12345,signal.SIGKILL),('wait',None)]
