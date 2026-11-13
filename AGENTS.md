@@ -13,7 +13,11 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
 - Disk: builds live on raptor's root NVMe and fill it fast (1.4 TB of
   `builds/` once filled the disk and crashed runs). When a task finishes,
   delete its Cargo `target*` directories and release staging; keep sources,
-  logs and results. Check `df -h /` before large builds. `cpu-gate` deletes
+  logs and results. Once the branch is merged (or abandoned), also remove
+  its worktree (`git worktree remove --force` after checking it is clean;
+  worktrees with submodules need `--force`) and its whole
+  `builds/<task>` scratch, including raw logit/golden dumps whose verdicts
+  are recorded; keep the small receipts. Check `df -h /` before large builds. `cpu-gate` deletes
   its scratch and targets on exit (`--keep` to inspect); `scripts/dev/cache-gc`
   runs daily and deletes `builds/` entries, cpu-gate leftovers and WIP run
   layouts idle for 7 days, never anything a running container mounts or a
