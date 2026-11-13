@@ -484,6 +484,58 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
 const MINIMAX_SOURCE_DIGESTS: [&str; 7] = ["model_sha256", "golden_sha256", "shape_invariant_sha256",
     "fidelity_windows_sha256", "transformers_sources_sha256", "vllm_sources_sha256", "cache_programs_sha256"];
 
+fn inkling_reference_sources(provenance: &Value, manifest: &Value) -> bool {
+    let hash = |v: &Value, n| v.as_str().is_some_and(|s| s.len() == n
+        && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    let source = &provenance["source_pin"];
+    let identity = &provenance["snapshot_identity"];
+    let helper = &provenance["official_forward"];
+    let upstreams = [("vllm", "d664cd1e96052857aea2aa844eeba571c24758b4", 13),
+        ("sglang", "ec5e7ff575beb33e54509fe01934d6a4483b5830", 8)];
+    let upstream_valid = upstreams.iter().all(|(name, revision, count)|
+        source[*name]["revision"] == *revision
+            && source[*name]["files"].as_object().is_some_and(|files|
+                files.len() == *count && files.values().all(|value| hash(value, 64))));
+    let helper_sources = ["test_attention.py", "test_core_ops.py", "test_moe.py"];
+    let helpers_valid = helper_sources.iter().all(|name| {
+        let key = format!("tests/models/inkling2/{name}");
+        hash(&source["vllm"]["files"][&key], 64)
+            && helper["upstream"]["files"][&key] == source["vllm"]["files"][&key]
+    });
+    let intermediates_valid = [0, 5].iter().all(|index| {
+        let mut names = vec!["static_conv", "l2_clip", "relative_attention_sink_gate",
+            "route_choice_scores", "route_gamma", "dequant_4608", "dequant_2304"];
+        if *index == 5 { names.push("dynamic_conv"); }
+        names.iter().all(|name| {
+            let check = &helper["measurements"][format!("layer{index}/{name}")];
+            check["calls"].as_u64().is_some_and(|n| n > 0)
+                && check["max_abs"].as_f64().is_some_and(|error| error.is_finite()
+                    && error >= 0.0 && error <= if *name == "relative_attention_sink_gate" { 2e-5 } else { 0.0 })
+        })
+    });
+    manifest["root_checkpoint"]["id"] == "thinkingmachines/Inkling-2-Small-MXFP8"
+        && identity["snapshot_revision"] == "3febc62259ee92ea36e2fb6e8303371c4eb3922c"
+        && manifest["vocab"] == 200058
+        && provenance["source_identity_provider"] == "families.inkling2.golden"
+        && ["reference_adapter_sha256", "reference_runner_sha256", "arithmetic_sources_sha256",
+            "shape_invariant_sha256"].iter().all(|key| hash(&source[key], 64))
+        && ["config.json", "hf_quant_config.json", "model.safetensors.index.json"].iter()
+            .all(|key| hash(&source["snapshot"][key], 64))
+        && source["snapshot"]["config.json"] == identity["config_sha256"]
+        && upstream_valid && helpers_valid && intermediates_valid
+        && hash(&provenance["harness_commit"], 40)
+        && helper["passed"] == true && helper["panel_diagnostic_only"] == false
+        && helper["panel_set_sha256"] == manifest["set_sha256"]
+        && helper["reference_adapter_sha256"] == source["reference_adapter_sha256"]
+        && helper["revision"] == identity["snapshot_revision"]
+        && helper["upstream"]["revision"] == source["vllm"]["revision"]
+        && helper["window"].as_str().is_some_and(|name| !name.is_empty())
+        && helper["tokens"].as_u64().is_some_and(|n| (640..=16384).contains(&n))
+        && ["window_tokens_sha256", "evidence_sha256", "log_sha256"].iter()
+            .all(|key| hash(&helper[key], 64))
+        && hash(&helper["helper_harness_commit"], 40)
+}
+
 fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'static str> {
     ensure!(qualification["set_sha256"] == manifest["set_sha256"] && qualification["qualifies"] == true,
         "unqualified or mismatched dataset set");
@@ -513,6 +565,8 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                 && launch["official_launch_configuration"] == false && launch["num_stages"] == 1
                 && launch["block_regions"] == 16 && launch["kernel"] == "_sparse_attn_prefill_kernel"
                 && manifest["reference_execution"]["sparse_attention_launch"] == *launch
+        } else if manifest["family"] == "inkling2" {
+            inkling_reference_sources(provenance, manifest)
         } else if manifest["family"] == "deepseek_v41" {
             // The checkpoint's own inference/model.py, the kernel emulation and the harness.
             source["revision"] == manifest["root_checkpoint"]["revision"]
@@ -576,7 +630,11 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
         } else {
             hash(&source["modeling_sha256"], 64) && hash(&source["source_tree_sha256"], 64)
         };
-        ensure!(source_valid && hash(&source["revision"], 40)
+        // The independent Inkling adapter pins multiple upstream trees, not one model.py revision.
+        let source_revision = if manifest["family"] == "inkling2" {
+            &provenance["snapshot_identity"]["snapshot_revision"]
+        } else { &source["revision"] };
+        ensure!(source_valid && hash(source_revision, 40)
             && provenance["tokenizers"].as_str().is_some_and(|s| !s.is_empty())
             && provenance["platform"]["gpu"].as_str().is_some_and(|s| !s.is_empty())
             && provenance["mtp"] == false && provenance["use_cache"] == false
@@ -716,6 +774,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inkling_reference_requires_native_root_and_real_pinned_helper_evidence() {
+        let (mut qualification, mut manifest) = kimi_reference_qualification();
+        let root = "thinkingmachines/Inkling-2-Small-MXFP8";
+        let revision = "3febc62259ee92ea36e2fb6e8303371c4eb3922c";
+        manifest["family"] = json!("inkling2");
+        manifest["vocab"] = json!(200058);
+        manifest["root_checkpoint"] = json!({"id": root, "revision": revision});
+        for path in ["reference_provenance", "prefix_qualification"] {
+            qualification[path]["snapshot_identity"]["checkpoint"] = json!(root);
+            qualification[path]["snapshot_identity"]["snapshot_revision"] = json!(revision);
+        }
+        qualification["prefix_qualification"]["vocab"] = json!(200058);
+        let mut source = json!({});
+        for key in ["reference_adapter_sha256", "reference_runner_sha256", "arithmetic_sources_sha256",
+            "shape_invariant_sha256"] { source[key] = json!("d".repeat(64)); }
+        source["snapshot"] = json!({"config.json": "b".repeat(64), "hf_quant_config.json": "d".repeat(64),
+            "model.safetensors.index.json": "d".repeat(64)});
+        for (name, revision, count) in [("vllm", "d664cd1e96052857aea2aa844eeba571c24758b4", 13),
+            ("sglang", "ec5e7ff575beb33e54509fe01934d6a4483b5830", 8)] {
+            let files: serde_json::Map<_, _> = (0..count).map(|i| (format!("file{i}"), json!("e".repeat(64)))).collect();
+            source[name] = json!({"revision": revision, "files": files});
+        }
+        for (index, name) in ["test_attention.py", "test_core_ops.py", "test_moe.py"].iter().enumerate() {
+            let files = source["vllm"]["files"].as_object_mut().unwrap();
+            files.remove(&format!("file{index}"));
+            files.insert(format!("tests/models/inkling2/{name}"), json!("e".repeat(64)));
+        }
+        let mut helper_files = json!({});
+        for name in ["test_attention.py", "test_core_ops.py", "test_moe.py"] {
+            helper_files[format!("tests/models/inkling2/{name}")] = json!("e".repeat(64));
+        }
+        let mut measurements = json!({});
+        for index in [0, 5] {
+            for name in ["static_conv", "l2_clip", "relative_attention_sink_gate", "route_choice_scores",
+                "route_gamma", "dequant_4608", "dequant_2304", "dynamic_conv"] {
+                measurements[format!("layer{index}/{name}")] = json!({"calls": 1, "max_abs": 0.0});
+            }
+        }
+        let provenance = &mut qualification["reference_provenance"];
+        provenance["source_pin"] = source;
+        provenance["source_identity_provider"] = json!("families.inkling2.golden");
+        provenance["harness_commit"] = json!("f".repeat(40));
+        provenance["official_forward"] = json!({"passed": true, "panel_diagnostic_only": false,
+            "panel_set_sha256": "sealed", "reference_adapter_sha256": "d".repeat(64), "revision": revision,
+            "upstream": {"revision": "d664cd1e96052857aea2aa844eeba571c24758b4", "files": helper_files},
+            "window": "a00", "tokens": 2103, "window_tokens_sha256": "e".repeat(64),
+            "evidence_sha256": "e".repeat(64), "log_sha256": "e".repeat(64),
+            "helper_harness_commit": "f".repeat(40), "measurements": measurements});
+        for (kind, label) in [("reference", "reference"), ("reference_only", "reference-only qualified")] {
+            qualification["kind"] = json!(kind);
+            assert_eq!(qualification_label(&qualification, &manifest).unwrap(), label);
+        }
+        assert!(qualification["reference_provenance"]["source_pin"]["revision"].is_null());
+        for path in ["/reference_provenance/source_pin/vllm/revision",
+            "/reference_provenance/source_pin/sglang/revision",
+            "/reference_provenance/source_pin/reference_adapter_sha256",
+            "/reference_provenance/source_pin/reference_runner_sha256",
+            "/reference_provenance/source_pin/shape_invariant_sha256",
+            "/reference_provenance/source_pin/arithmetic_sources_sha256",
+            "/reference_provenance/source_pin/snapshot/config.json",
+            "/reference_provenance/harness_commit",
+            "/reference_provenance/official_forward/passed",
+            "/reference_provenance/official_forward/panel_set_sha256",
+            "/reference_provenance/official_forward/reference_adapter_sha256",
+            "/reference_provenance/official_forward/window_tokens_sha256",
+            "/reference_provenance/official_forward/evidence_sha256",
+            "/reference_provenance/official_forward/log_sha256",
+            "/reference_provenance/official_forward/helper_harness_commit",
+            "/reference_provenance/official_forward/measurements/layer5~1dynamic_conv"] {
+            let mut bad = qualification.clone();
+            *bad.pointer_mut(path).unwrap() = Value::Null;
+            assert!(qualification_label(&bad, &manifest).is_err(), "{path}");
+        }
+        for (path, value) in [("/reference_provenance/official_forward/panel_diagnostic_only", json!(true)),
+            ("/reference_provenance/official_forward/measurements/layer0~1relative_attention_sink_gate/max_abs", json!(0.001)),
+            ("/reference_provenance/official_forward/measurements/layer5~1route_gamma/max_abs", json!(0.000001)),
+            ("/reference_provenance/official_forward/upstream/files/tests~1models~1inkling2~1test_moe.py", json!("f".repeat(64)))] {
+            let mut bad = qualification.clone();
+            *bad.pointer_mut(path).unwrap() = value;
+            assert!(qualification_label(&bad, &manifest).is_err(), "{path}");
+        }
+        for root in ["thinkingmachines/Inkling-2-Small", "someone/Inkling-2-Small-MXFP8"] {
+            let mut bad = manifest.clone();
+            bad["root_checkpoint"]["id"] = json!(root);
+            assert!(qualification_label(&qualification, &bad).is_err());
+        }
+    }
     #[test]
     fn kimi_k31_qualification_requires_its_root_sources_and_dependencies() {
         let (mut qualification, mut manifest) = kimi_reference_qualification();
