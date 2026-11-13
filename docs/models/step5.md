@@ -36,8 +36,8 @@ the MC [min](../../examples/configs/step5-exl3-k4-mc-min.config) and
 [max](../../examples/configs/step5-exl3-k4-mc-max.config) configs, which pin the MC
 publication, revision and `CORE_VIEW=original`. The old K6-core paths remain
 retired historical recipes. The release smoke matrix uses the MC configs;
-MC original min and all three Standard fidelity views are measured; max cards
-remain under [#1906](https://github.com/tpurtell/cuteafd/issues/1906).
+MC original min/max, all three max core views and all three min Standard
+fidelity views are measured ([#1906](https://github.com/tpurtell/cuteafd/issues/1906)).
 
 ## Core views
 
@@ -100,6 +100,39 @@ Baseline GPU0: 7.0 s power-cap, zero thermal slowdown,
 25 C minimum T.Limit headroom, floating 850 W shared budget.
 The report completed before a cleanup timeout; later inspection confirmed the serving container absent ([#1948](https://github.com/tpurtell/cuteafd/issues/1948)).
 
+## MC max core-view cards
+
+Measured 2026-11-13 on two RTX PRO 6000 GPUs plus six Sparks, with a
+2,097,152-token pool, default speculation and one warmed launch per view.
+All six campaign jobs completed with exit 0 and passed quick fidelity and
+speculation losslessness. These smoke checks complement, not replace, the
+published Standard fidelity panels above.
+
+| View / report | C1 | C8 | 8K | 8K with tail |
+| --- | ---: | ---: | ---: | ---: |
+| [original](../../benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-2rtx-6spark-step5-mc-original-max-cand-r1/report.svg) | 61.50 | 154.46 | 2635 | 2467 |
+| [k8-compact](../../benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-2rtx-6spark-step5-mc-k8-compact-max-cand-r1/report.svg) | 67.25 | 153.20 | 2598 | 2579 |
+| [k6-compact](../../benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-2rtx-6spark-step5-mc-k6-compact-max-cand-r1/report.svg) | 63.74 | 155.43 | 2666 | 2550 |
+
+Rates are tok/s. Host page-reclaim and CPU/memory-pressure caveats remain
+in the raw campaign evidence (`ab_verdict=rerun`); there is **no causal
+core-view speed claim** and no extra comparison run. Original selects the
+release-table cell; compact views remain supplementary reports.
+
+No software/hardware thermal slowdown occurred in any recorded window.
+Baseline windows below use GPU0 / GPU1 order; floating daemon budget 850 W.
+Power-cap throttling reflects that budget, not thermal slowdown.
+
+| View | Power-cap seconds | Busy SM clock (MHz) | Max temperature (C) | Min T.Limit headroom (C) |
+| --- | ---: | ---: | ---: | ---: |
+| original | 10.0 / 2.0 | 2733 / 2828 | 64 / 70 | 31 / 26 |
+| k8-compact | 13.9 / 3.0 | 2693 / 2799 | 66 / 73 | 29 / 24 |
+| k6-compact | 14.0 / 7.0 | 2691 / 2796 | 69 / 75 | 31 / 24 |
+
+Prompt-end and turn-end restored rows and cold recomputes were byte-identical
+for every view. The cache check remains informational: the short fresh
+continuation path was not covered, so this is not a claim of that coverage.
+
 ## Native MTP
 
 Native MTP is enabled by default at depth 3 for both layouts. The three
@@ -134,5 +167,5 @@ automatic, and admission refuses configurations below the 256K context floor.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
-| v5.1 WIP | 2026-11-13 | MC original min Release smoke and published Standard fidelity; max cards pending #1906. | [Original min](../../benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min-cand-r1/report.svg) |
+| v5.1 WIP | 2026-11-13 | MC original min/max Release smoke, max K8/K6 cards and published Standard fidelity (#1906). | [Original min](../../benchmarks/step5/2026-11-13-smoke-step-5-preview-exl3-k4-mc-1rtx-3spark-step5-mc-original-min-cand-r1/report.svg) |
 | v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/report.svg"><img src="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-Core-K6 (exl3-k4+exl3-k6) (1× RTX)"></a> <a href="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/report.svg"><img src="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-Core-K6 (exl3-k4+exl3-k6) (2× RTX)"></a> |
