@@ -1151,6 +1151,8 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
                 add(&mut expected, &Owner::Cache { gpu }.id(), location,
                     cache.buffers().unwrap().into_iter().filter(|(name, _)| !name.starts_with("layer.")));
                 assert_eq!(cache.requests, concurrency as u32);
+                add(&mut expected, &Owner::DecodeTable { gpu }.id(), Location::PINNED,
+                    [("upload", u64::from(cache.requests) * u64::from(cache.table_width) * 4)]);
                 for slot in 0..concurrency {
                     for (plane, bytes) in [("table", u64::from(cache.table_width) * 4), ("length", 4)] {
                         assert!(expected.insert(Owner::PrefixH2d { gpu, slot, plane }.id(),
@@ -1203,6 +1205,37 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
                     (owner.id.clone(), (owner.bytes, owner.location, owner.lifetime))
                 }).collect::<BTreeMap<_, _>>();
             assert_eq!(actual, expected, "{gpus} RTX C{concurrency}: constructor allocation inputs vs recipe");
+        }
+    }
+}
+
+#[test]
+fn compact_decode_table_upload_is_one_exact_pinned_owner_per_rank() {
+    use crate::placement::families::minimax_m3::{self as shared, Owner};
+    use crate::placement::planner::{Lifetime, Location, Operation};
+    for gpus in [1, 2] {
+        for concurrency in [1, 16, 64] {
+            let mut inputs = recipe_inputs(gpus, 4);
+            inputs.sequences = concurrency;
+            let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+                inputs.prefill, Operation::Serving, None, Default::default());
+            let admitted = inputs.admit(request).unwrap();
+            let allocations = &admitted.solved.facts.allocations;
+            for gpu in 0..gpus {
+                let id = format!("{}.upload", Owner::DecodeTable { gpu }.id());
+                let uploads = allocations.iter().filter(|owner| owner.id == id).collect::<Vec<_>>();
+                assert_eq!(uploads.len(), 1, "{gpus} RTX C{concurrency}: {id}");
+                let upload = uploads[0];
+                let device = allocations.iter().find(|owner| owner.id == Owner::DecodeTable { gpu }.id()).unwrap();
+                let table_width = inputs.context.maximum.div_ceil(64).div_ceil(4) * 4;
+                assert_eq!(upload.bytes, concurrency * table_width * 4);
+                assert_eq!(upload.bytes, device.bytes);
+                assert_eq!(upload.location, Location::PINNED);
+                assert_eq!(upload.lifetime, Lifetime::TARGET);
+                assert!(upload.view.is_none());
+                assert!(!allocations.iter().any(|owner| owner.id.starts_with(&format!("{id}."))),
+                    "pinned payload has no invented driver-allocation tail");
+            }
         }
     }
 }
