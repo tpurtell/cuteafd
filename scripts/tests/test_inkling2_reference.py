@@ -395,6 +395,9 @@ def test_golden_runs_real_layer_loop_and_resumes_with_aligned_scoring(tmp_path, 
     meta = json.loads((args.out / "meta.json").read_bytes())
     assert meta["scored_tokens"] == 5 and meta["roles"]["gen"]["scored_rows"] == 4
     assert meta["roles"]["ctx"]["scored_rows"] == 1
+    from importlib.metadata import version
+    assert meta["tokenizers"] == version("tokenizers")
+    assert meta["transformers"] == "not used; independent text forward"
     entry = meta["windows"][0]
     assert entry["positions"] == [2, 3, 4, 5, 6] and entry["vocab"] == 34
     logits = np.fromfile(args.out / entry["path"] / "logits.bin", dtype="<f4").reshape(5, 34)

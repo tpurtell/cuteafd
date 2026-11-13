@@ -202,6 +202,7 @@ def release(device):
 
 
 def execute(a):
+    import importlib.metadata
     import numpy as np
     import torch
     import torch.nn.functional as F
@@ -324,7 +325,8 @@ def execute(a):
                           "api_text_top1": s["top1"] / s["rows"] if s["rows"] else None}
                    for role, s in role_stats.items()},
             seconds=time.monotonic() - started, seconds_per_layer=state.latest["seconds_per_layer"][1:],
-            torch=torch.__version__, attention="eager", mtp=False, use_cache=False,
+            torch=torch.__version__, tokenizers=importlib.metadata.version("tokenizers"),
+            transformers="not used; independent text forward", attention="eager", mtp=False, use_cache=False,
             prefix_qualification=proof, fixed_rows=128, arithmetic=arithmetic, platform=platform,
             root_arithmetic={"source": "Independent F32 port of two pinned vendor Inkling 2 integrations",
                              "arithmetic": "; ".join(ARITHMETIC.values())})
