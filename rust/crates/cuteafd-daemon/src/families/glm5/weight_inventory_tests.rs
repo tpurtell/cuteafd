@@ -1,5 +1,6 @@
 //! Installed-header replay and compact real uploads share production dispatch.
 use super::*;
+use super::super::engine;
 use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
 use cuteafd_core::memory_layout::{Category, MemoryKind};
 use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
