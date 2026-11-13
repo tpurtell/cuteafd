@@ -1761,3 +1761,32 @@ fn recipe_asserts_embedding_home_is_coordinator_gpu_zero() {
         }
     }
 }
+
+#[test]
+fn decode_token_upload_is_one_exact_entry_rank_pair() {
+    use crate::placement::families::minimax_m3::{self as shared, Owner};
+    use crate::placement::planner::{Lifetime, Location, Operation};
+    for gpus in [1, 2] {
+        for concurrency in [1, 16, 64] {
+            let mut inputs = recipe_inputs(gpus, 4);
+            inputs.sequences = concurrency;
+            let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+                inputs.prefill, Operation::Serving, None, Default::default());
+            let admitted = inputs.admit(request).unwrap();
+            let id = Owner::DecodeTokenIds { gpu: 0 };
+            assert_eq!(id.inventory_name().unwrap(), "decode.token_ids.0");
+            let prefix = id.id();
+            let owners = admitted.solved.facts.allocations.iter().filter(|owner|
+                owner.id.starts_with("minimax.decode.token_ids.")).collect::<Vec<_>>();
+            assert_eq!(owners.len(), 2);
+            for (name, location) in [(prefix.clone(), Location::coordinator(0)),
+                (format!("{prefix}.upload"), Location::PINNED)] {
+                let owner = owners.iter().find(|owner| owner.id == name).unwrap();
+                assert_eq!(owner.bytes, concurrency * 4);
+                assert_eq!(owner.location, location);
+                assert_eq!(owner.lifetime, Lifetime::TARGET);
+                assert!(owner.view.is_none());
+            }
+        }
+    }
+}

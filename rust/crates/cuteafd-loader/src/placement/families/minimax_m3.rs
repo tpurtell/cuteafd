@@ -89,6 +89,7 @@ pub enum Owner {
     HeadsKv { gpu: usize, layer: usize, plane: &'static str },
     Cache { gpu: usize },
     DecodeTable { gpu: usize },
+    DecodeTokenIds { gpu: usize },
     Rope { gpu: usize },
     Decode { gpu: usize },
     Unit { gpu: usize, slot: u64 },
@@ -109,6 +110,7 @@ impl Owner {
             Self::HeadsKv { gpu, layer, plane } => format!("minimax.kv.heads.{gpu}.{layer}.{plane}"),
             Self::Cache { gpu } => format!("minimax.cache.{gpu}"),
             Self::DecodeTable { gpu } => format!("minimax.cache.{gpu}.decode_table"),
+            Self::DecodeTokenIds { gpu } => format!("minimax.decode.token_ids.{gpu}"),
             Self::Rope { gpu } => format!("minimax.rope.{gpu}"),
             Self::Decode { gpu } => format!("minimax.decode.{gpu}"),
             Self::Unit { gpu, slot } => format!("minimax.unit.{gpu}.{slot}"),
@@ -582,6 +584,13 @@ impl MiniMaxInputs {
         self.validate_embedding()?;
         cuteafd_core::concurrency::validate("minimax_m3", self.sequences).map_err(invalid)?;
         let mut out = Vec::new();
+        // Host decode IDs enter only the embedding rank; peers receive residuals.
+        let token_ids = Owner::DecodeTokenIds { gpu: 0 }.id();
+        let token_bytes = self.sequences.checked_mul(4).ok_or(Refusal::Overflow("MiniMax decode token IDs"))?;
+        out.extend(buffer(token_ids.clone(), Location::coordinator(0), token_bytes, Lifetime::TARGET,
+            Category::Workspace, "decode token IDs", maximum));
+        out.extend(buffer(format!("{token_ids}.upload"), Location::PINNED, token_bytes, Lifetime::TARGET,
+            Category::Staging, "decode token IDs ordered H2D staging", maximum));
         for gpu in 0..self.gpus { out.extend(self.rank_execution_components(gpu, maximum)?); }
         for owner in self.host_prefix.allocations("host.prefix", serving::ServingOwners::LIFETIME)? {
             let bytes = ByteCurve::fixed(owner.bytes, maximum);
