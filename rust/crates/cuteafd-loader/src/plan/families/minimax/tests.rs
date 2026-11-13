@@ -1115,7 +1115,7 @@ fn cached_expert_prefixes_match_independent_legacy_inventory() {
 fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
     use crate::families::minimax_m3::execution::{HeadLayout, MsaPrograms, MsaRope, ProducerPrograms, UnitLayout};
     use crate::placement::families::minimax_m3::{self as shared, Owner};
-    use crate::placement::planner::{Allocation, Lifetime, Location, Operation};
+    use crate::placement::planner::{serving, Allocation, Lifetime, Location, Operation};
     use std::collections::BTreeMap;
 
     fn add(expected: &mut BTreeMap<String, (u64, Location, Lifetime)>, prefix: &str,
@@ -1224,9 +1224,9 @@ fn packed_prefill_can_have_fewer_rows_than_boot_requests_but_exports_must_cover_
     entry["geometry"]["max_batch"] = serde_json::json!(32);
     let layout = cuteafd_ffi::minimax_m3::Layout::new(cuteafd_ffi::minimax_m3::Mode::AttentionExtend, 4096, 32).unwrap();
     entry["scratch_bytes_at_capacity"]["scratch"] = serde_json::json!(layout.scratch);
-    for (pointer, operand) in entry["pointers"].as_array_mut().unwrap().iter_mut().zip(layout.operands()) {
-        pointer["shape"] = serde_json::json!(operand.shape);
-    }
+    let scratch = entry["pointers"].as_array_mut().unwrap().iter_mut()
+        .find(|pointer| pointer["name"] == "scratch").unwrap();
+    scratch["shape"] = serde_json::json!(format!("[{}]", layout.scratch));
     let error = MsaPrograms::resolve(&inputs.cfg, &manifest, capacity.decode.rows,
         capacity.prefill.rows, inputs.context.maximum as u32).unwrap_err();
     assert!(matches!(error, Refusal::MissingExport { ref export, ref detail, .. }
