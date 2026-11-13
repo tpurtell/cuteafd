@@ -635,6 +635,26 @@ impl Drop for LocalLane<'_> {
     }
 }
 
+pub(super) fn layer_attention_resident(cfg: &KimiK3Config, layer: usize, lane_index: usize,
+    weights: &super::weights::LayerWeights<'_>, kda: &super::state::KdaBank<'_>,
+    mla: &super::mla::CacheBank<'_>) -> Result<(bool, bool, Option<bool>)> {
+    use cuteafd_loader::families::kimi_k3::config::KimiAttention;
+    Ok(match cfg.attention.get(layer) {
+        Some(KimiAttention::Kda) => (
+            weights.kda().is_ok() || weights.is_core("kda.output") || weights.native.contains_key("kda.output"),
+            kda.layer(layer, lane_index).is_ok(),
+            None,
+        ),
+        Some(KimiAttention::Mla) => (
+            (weights.mla().is_ok() || weights.is_core("mla.output") || weights.native.contains_key("mla.output"))
+                && (cfg.dsa.is_none() || weights.indexer().is_ok()),
+            mla.layer(layer).is_ok(),
+            cfg.dsa.is_some().then(|| weights.indexer().is_ok() && mla.index(layer).is_ok()),
+        ),
+        None => bail!("Kimi attention census layer outside inventory"),
+    })
+}
+
 impl<'a> LocalLane<'a> {
     pub(super) fn new(lane: Lane<'a>, programs: Rc<NativePrograms<'a>>, cfg: KimiK3Config,
         layers: Vec<Rc<super::weights::LayerWeights<'a>>>, global: Rc<GlobalWeights<'a>>,
@@ -693,14 +713,8 @@ impl<'a> LocalLane<'a> {
     }
 
     /// Report resident operands and banks, not just the intended placement.
-    pub(super) fn attention_resident(&self, layer: usize) -> Result<(bool, bool)> {
-        use cuteafd_loader::families::kimi_k3::config::KimiAttention;
-        let weights = self.layer(layer)?;
-        Ok(match self.config().attention.get(layer) {
-            Some(KimiAttention::Kda) => (weights.kda().is_ok() || weights.is_core("kda.output") || weights.native.contains_key("kda.output"), self.kda.layer(layer, self.lane_index).is_ok()),
-            Some(KimiAttention::Mla) => (weights.mla().is_ok() || weights.is_core("mla.output") || weights.native.contains_key("mla.output"), self.mla.layer(layer).is_ok()),
-            None => bail!("Kimi attention census layer outside inventory"),
-        })
+    pub(super) fn attention_resident(&self, layer: usize) -> Result<(bool, bool, Option<bool>)> {
+        layer_attention_resident(&self.cfg, layer, self.lane_index, self.layer(layer)?, &self.kda, &self.mla)
     }
 
     /// Copies a completed peer/local result into a fixed admitted operand.

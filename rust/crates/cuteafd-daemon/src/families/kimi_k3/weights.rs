@@ -474,7 +474,7 @@ impl<'a> LayerWeights<'a> {
     pub(crate) fn is_core(&self,name:&str)->bool { self.core.contains_key(name) }
 
     pub(crate) fn kda(&self) -> Result<KimiKdaWeights> {
-        ensure!(self.attention == AttentionShare::Split, "Kimi KDA weights are not TP2 split");
+        ensure!(self.attention.present(), "Kimi KDA weights absent on this nonowner");
         Ok(KimiKdaWeights { input: self.buffer("kda.input")?, forget: self.buffer("kda.forget")?,
             convolution: self.buffer("kda.conv")?, a_log: self.buffer("kda.a_log")?,
             dt_bias: self.buffer("kda.dt_bias")?, norm: self.buffer("kda.norm")?, output: self.buffer("kda.output")? })
