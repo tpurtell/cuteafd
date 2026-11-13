@@ -12,6 +12,59 @@ const TEXT: &str = "language_model.model.";
 mod heads;
 pub use heads::{HeadsWeights, TensorSlice};
 
+/// Header-only receive owners for one onboarding candidate. Storage routing is
+/// checked by the recipe, not here: an inactive mount-only count must not poison
+/// a valid push count. Native dense operands require no transform/index storage.
+pub fn push_host_envelope(tensors: &crate::formats::fp8_experts::Fp8ExpertTensors,
+    backings: &[crate::placement::families::minimax_m3::ExpertBacking], gpus: usize)
+    -> Result<crate::push_load::PushHostEnvelope> {
+    use crate::formats::fp8_experts::{ExpertFormat, Fp8Projection};
+    ensure!(matches!(gpus, 1 | 2) && (backings.is_empty() || backings.len() == gpus),
+        "MiniMax push backing ranks differ from coordinator geometry");
+    let tensors = tensors.for_coordinator();
+    let mut scratch = vec![0; gpus];
+    for (gpu, backing) in backings.iter().enumerate() {
+        ensure!(backing.gpu == gpu && backing.count == backing.layers.len() && backing.count > 0
+            && backing.layers.windows(2).all(|pair| pair[0].layer < pair[1].layer),
+            "MiniMax push backing layer/rank identity differs");
+        let mut regions = Vec::new();
+        for layer in &backing.layers {
+            let view = tensors.for_layer_metadata(layer.layer)?;
+            ensure!(view.format() == ExpertFormat::Nvfp4, "MiniMax push requires calibrated NVFP4 experts");
+            let experts = view.shape().experts;
+            let mut scalars = Vec::new();
+            let mut expand = Vec::new();
+            for (index, projection) in Fp8Projection::ALL.into_iter().enumerate() {
+                let (weight, grid) = view.slice_bytes_with(projection, gpus, gpu, layer.slicing)?;
+                let scale = view.scale_region_bytes_with(projection, gpus, gpu, layer.slicing)?;
+                for (plane, bytes) in [(2 * index, experts.checked_mul(weight).context("MiniMax push weight overflow")?),
+                    (2 * index + 1, scale)] {
+                    ensure!(layer.planes[plane].len() == bytes, "MiniMax push plane differs from headers");
+                    regions.push((format!("{}.{plane}", layer.layer), bytes));
+                }
+                let scalar = scale.checked_sub(experts.checked_mul(grid).context("MiniMax scale extent overflow")?)
+                    .context("MiniMax scalar region precedes scale grid")?;
+                scalars.push(scalar);
+                let [_, image] = view.projection_slices(projection, gpus, gpu, layer.slicing)?;
+                if image.rows > 0 && image.width > 0 && image.width < image.destination_pitch {
+                    expand.push((image.width, image.destination_pitch));
+                }
+            }
+            let input = experts.checked_mul(4).context("MiniMax input scale extent overflow")?;
+            scratch[gpu] = scratch[gpu].max(crate::push_load::fp8_host_scratch(
+                [], scalars, Some([input, input]), expand)? as u64);
+        }
+        let canonical = WeightArenaLayout::new(crate::serving_capacity::expert_weight_arena_id(
+            "fp8", backing.physical_device, &regions)?, regions)?;
+        ensure!(canonical == backing.arena && backing.layers.iter().all(|layer|
+            layer.planes.iter().enumerate().all(|(plane, range)| canonical.view(&format!("{}.{plane}", layer.layer))
+                .is_some_and(|view| view.offset() == range.start && view.bytes() == range.len()))),
+            "MiniMax push backing differs from canonical shared arena");
+    }
+    Ok(crate::push_load::PushHostEnvelope::new(scratch, vec![0; gpus],
+        cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?)
+}
+
 /// One native W8A8 projection. Values and UE8M0 scales remain as shipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mxfp8Projection {

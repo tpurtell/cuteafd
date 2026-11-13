@@ -659,3 +659,101 @@ fn installed_minimax_nvfp4_push_and_mount_match_with_synthetic_payloads() -> Res
     }
     Ok(())
 }
+
+// Frozen pre-extraction arithmetic: this oracle must not call the shared helper.
+fn legacy_host_scratch(plan: &RankPlan) -> usize {
+    plan.layers.iter().map(|layer| match &layer.initialize {
+        push_initialize::Layer::Fp8 { widen, scalars, inputs, expand, .. } => {
+            let widening = widen.iter().map(|range|
+                range.len().min(1024 * 1024) + range.len().min(1024 * 1024) / 2).max().unwrap_or(0);
+            let scalar = scalars.iter().map(|range| range.len()).max().unwrap_or(0);
+            let inputs = inputs.as_ref().map_or(0, |(gate, up, _)| gate.len() + up.len());
+            let expanding = expand.iter().map(|(_, _, width, pitch)|
+                (1024 * 1024 / pitch).max(1) * (width + pitch)).max().unwrap_or(0);
+            widening.max(scalar).max(inputs).max(expanding)
+        }
+        _ => 0,
+    }).max().unwrap_or(0)
+}
+
+#[test]
+fn extracted_native_scratch_matches_legacy_for_all_storage_geometries() -> Result<()> {
+    for (format, bf16_scales) in [(ExpertFormat::Fp8Block128, false),
+        (ExpertFormat::Fp8Block128, true), (ExpertFormat::Nvfp4, false), (ExpertFormat::Mxfp4, false)] {
+        let root = tempfile::tempdir()?;
+        let catalog = fixture(root.path(), format, bf16_scales)?;
+        for world in [1, 2, 3, 4, 6, 8] {
+            for rank in 0..world {
+                for exact in [false, true] {
+                    let tensors = catalog.fp8().unwrap();
+                    let layers = [1, 2].into_iter().map(|layer| Ok((layer,
+                        if exact { tensors.for_layer_metadata(layer)?.exact_slicing(world) }
+                        else { Slicing::Padded }))).collect::<Result<Vec<_>>>()?;
+                    let plan = RankPlan::new(&catalog, &layers, world, rank, usize::MAX)?;
+                    assert_eq!(plan.host_scratch, legacy_host_scratch(&plan),
+                        "{format:?} bf16_scales={bf16_scales} TP{world} rank{rank} exact={exact}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn installed_snapshot(repo: &str) -> Result<std::path::PathBuf> {
+    let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from).unwrap_or_else(||
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
+    let model = home.join("hub").join(format!("models--{}", repo.replace('/', "--")));
+    let revision = std::fs::read_to_string(model.join("refs/main"))?;
+    Ok(model.join("snapshots").join(revision.trim()))
+}
+
+#[test]
+#[ignore = "requires installed native family headers; header-only, no CUDA or payload reads"]
+fn installed_native_scratch_matches_legacy_and_minimax_recipe() -> Result<()> {
+    use cuteafd_loader::{families::minimax_m3::weight_layout::push_host_envelope,
+        placement::families::minimax_m3::ExpertBacking};
+    use crate::shared::experts::{layer::ExpertLayer, rtx::{dense::HostStaging,
+        push::{CoordinatorExperts, WholeOwner}}};
+    // Kimi's shipping coordinator is EXL3-only, but its FP8 headers still
+    // exercise the shared Spark RankPlan; no native coordinator claim is made.
+    for repo in ["zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash", "nvidia/GLM-5.3-NVFP4",
+        "nvidia/GLM-5.3-Flash-NVFP4", "stepfun-ai/Step-5-Preview", "moonshotai/Kimi-K3",
+        "Qwen/Qwen3.8-Flash-Next-FP8", "nvidia/Qwen3.8-Flash-Next-NVFP4",
+        "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "MiniMaxAI/MiniMax-M3.1-Flash"] {
+        let snapshot = installed_snapshot(repo)?;
+        let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        let tensors = catalog.fp8().with_context(|| format!("{repo}: native headers absent"))?;
+        let layer = tensors.shape().first_layer;
+        for world in [1, 2, 4, 6] {
+            for rank in 0..world {
+                for exact in [false, true] {
+                    let slicing = if exact { tensors.for_layer_metadata(layer)?.exact_slicing(world) }
+                        else { Slicing::Padded };
+                    let plan = RankPlan::new(&catalog, &[(layer, slicing)], world, rank, usize::MAX)?;
+                    assert_eq!(plan.host_scratch, legacy_host_scratch(&plan),
+                        "{repo} TP{world} rank{rank} exact={exact}");
+                }
+            }
+        }
+        if repo == "MiniMaxAI/MiniMax-M3.1-Flash" {
+            for gpus in [1, 2] {
+                let layers = [layer, layer + 1];
+                let backings = (0..gpus).map(|gpu| ExpertBacking::plan(tensors, &layers,
+                    gpus, gpu, (1 - gpu) as i32)).collect::<Result<Vec<_>>>()?;
+                let budgets = backings.iter().map(|backing| backing.arena.bytes()).collect::<Vec<_>>();
+                let set = if gpus == 2 { CoordinatorExperts::Tp2 { layers: layers.to_vec(), budgets } }
+                    else { CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
+                        selections: layers.into_iter().map(|layer| ExpertLayer::BackboneFull { layer }).collect(),
+                        budget: budgets[0] }] } };
+                let dense = vec![HostStaging::default(); gpus];
+                assert_eq!(push_host_envelope(tensors, &backings, gpus)?,
+                    set.host_envelope(&catalog, gpus, &dense)?);
+                let empty = vec![None; gpus];
+                assert_eq!(push_host_envelope(tensors, &[], gpus)?,
+                    crate::shared::experts::rtx::push::push_host_envelope(&empty, &dense)?);
+            }
+        }
+        eprintln!("{repo}: legacy scratch exact; native header geometry TP1/2/4/6");
+    }
+    Ok(())
+}
