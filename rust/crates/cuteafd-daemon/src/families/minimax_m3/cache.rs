@@ -130,6 +130,121 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
     fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
 }
 
+/// Streams are provided by startup and retained by every metadata/cache reader.
+pub(crate) struct RequestStreams<'a> {
+    pub decode: Rc<Stream<'a>>,
+    pub prefill: Vec<Rc<Stream<'a>>>,
+}
+
+pub(crate) struct RequestRank<'a> {
+    pub decode: Metadata<'a>,
+    pub prefill: Vec<Metadata<'a>>,
+    pub bank: Rc<PageBank<'a>>,
+}
+
+/// Retained request storage only, not arithmetic, transport or a serving loop.
+/// Prefix-copy staging is inventoried by MiniMaxPrefix after it is attached.
+pub(crate) struct RequestState<'a> {
+    pub capacity: RequestCapacity,
+    pub ranks: Vec<RequestRank<'a>>,
+}
+
+impl<'a> RequestState<'a> {
+    pub fn new(cfg: &MiniMaxM3Config, capacity: RequestCapacity,
+        admitted: &cuteafd_loader::placement::families::minimax_m3::AdmittedMiniMax,
+        streams: Vec<RequestStreams<'a>>) -> Result<Self> {
+        use cuteafd_loader::placement::{FfnMode, LayerMode};
+        let capacity = checked_capacity(capacity)?;
+        let solved = &admitted.solved;
+        ensure!(matches!(streams.len(), 1 | 2) && solved.decisions.lanes == 1
+            && solved.decisions.prefill.rows == u64::from(capacity.prefill.rows)
+            && solved.decisions.prefill.waves > 0,
+            "MiniMax request storage differs from admitted lane/unit capacity");
+        let waves = usize::try_from(solved.decisions.prefill.waves)?;
+        let context = u32::try_from(solved.request.context.maximum)?;
+        ensure!(context > 0 && solved.pool_page_rows == PAGE_ROWS as u64
+            && solved.pool_tokens > 0 && solved.pool_tokens % PAGE_ROWS as u64 == 0
+            && solved.served_context() > 0 && solved.served_context() <= u64::from(context)
+            && solved.served_context() <= solved.pool_tokens
+            && admitted.placement.pool_tokens == solved.pool_tokens,
+            "MiniMax request storage differs from admitted pool/context");
+        let pages = u32::try_from(solved.pool_tokens / PAGE_ROWS as u64)?;
+        let modes = &solved.decisions.attention;
+        ensure!(modes.len() == cfg.layers && admitted.placement.layers.len() == cfg.layers
+            && admitted.placement.layers.iter().map(|layer| layer.mode).eq(modes.iter().copied()),
+            "MiniMax request storage differs from admitted attention modes");
+        let mut layers = vec![Vec::new(); streams.len()];
+        for (layer, mode) in modes.iter().enumerate() {
+            let LayerMode::Whole { gpu, ffn: FfnMode::Owner } = mode else {
+                anyhow::bail!("MiniMax request storage requires whole-layer owners");
+            };
+            layers.get_mut(usize::from(*gpu)).context("MiniMax attention rank is not admitted")?.push(layer);
+        }
+        let globals = capacity.cache(context)?;
+        let library = streams[0].decode.device.library;
+        let mut devices = BTreeSet::new();
+        for (rank, readers) in streams.iter().enumerate() {
+            for (name, bytes) in globals.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
+                let id = format!("{}.{name}", Owner::Cache { gpu: rank }.id());
+                let charged = solved.facts.allocations.iter().filter(|owner| owner.id == id).collect::<Vec<_>>();
+                ensure!(charged.len() == 1 && charged[0].view.is_none() && charged[0].bytes == bytes
+                    && charged[0].location == cuteafd_loader::placement::planner::Location::coordinator(rank as u8)
+                    && charged[0].lifetime == cuteafd_loader::placement::planner::Lifetime::TARGET,
+                    "MiniMax request capacity differs from admitted cache owner {id}");
+            }
+            let owned = &layers[rank];
+            ensure!(!owned.is_empty() && owned.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "MiniMax request storage requires a nonempty contiguous whole-layer range per rank");
+            let device = readers.decode.device;
+            ensure!(devices.insert(device.id) && std::ptr::eq(device.library, library)
+                && readers.prefill.len() == waves
+                && readers.prefill.iter().all(|stream| stream.device.id == device.id
+                    && std::ptr::eq(stream.device.library, library)),
+                "MiniMax request streams differ from admitted physical ranks/waves");
+        }
+        // Validate every rank before the first allocation: a later malformed
+        // reader or split mode cannot leave a partially constructed request set.
+        let rope = MsaRope::new(cfg, context)?;
+        let mut ranks = Vec::with_capacity(streams.len());
+        for (readers, owned) in streams.into_iter().zip(layers) {
+            let range = owned[0]..owned[owned.len() - 1] + 1;
+            let layout = MsaCache::new(u32::try_from(range.len())?, pages, capacity.decode.requests, context)?;
+            let all = std::iter::once(Rc::clone(&readers.decode))
+                .chain(readers.prefill.iter().cloned()).collect();
+            let bank = Rc::new(PageBank::new(all, cfg, capacity, layout, rope, range)?);
+            let decode = Metadata::new_decode(readers.decode, capacity)?;
+            let prefill = readers.prefill.into_iter().map(|stream| Metadata::new_prefill(stream, capacity))
+                .collect::<Result<Vec<_>>>()?;
+            ranks.push(RequestRank { decode, prefill, bank });
+        }
+        Ok(Self { capacity, ranks })
+    }
+
+    pub fn banks(&self) -> Vec<Rc<PageBank<'a>>> {
+        self.ranks.iter().map(|rank| Rc::clone(&rank.bank)).collect()
+    }
+
+    pub fn inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
+        use cuteafd_loader::placement::planner::{Lifetime, Location};
+        ensure!(inventory.lifetime() == Lifetime::TARGET,
+            "MiniMax request inventory lifetime differs from admission");
+        for (gpu, rank) in self.ranks.iter().enumerate() {
+            ensure!(inventory.location(rank.bank.stream.device.id)? == Location::coordinator(gpu as u8),
+                "MiniMax request inventory rank mapping differs from construction");
+        }
+        for (gpu, rank) in self.ranks.iter().enumerate() {
+            rank.bank.inventory(inventory, u8::try_from(gpu)?)?;
+            rank.decode.inventory(inventory,
+                &format!("{}.metadata", Owner::Decode { gpu }.inventory_name().unwrap()))?;
+            for (slot, metadata) in rank.prefill.iter().enumerate() {
+                metadata.inventory(inventory,
+                    &format!("{}.metadata", Owner::Unit { gpu, slot: slot as u64 }.inventory_name().unwrap()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One admitted rank's cache planes. Logical page IDs are shared between ranks;
 /// each rank stores only the layers it actually executes (no KV replication).
 pub(crate) struct PageBank<'a> {
@@ -737,6 +852,180 @@ mod tests {
         assert!(Metadata::new_prefill(Rc::clone(&stream), capacity).is_err());
         drop(stream);
         assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    fn request_admission(cfg: &MiniMaxM3Config, ranks: usize, capacity: RequestCapacity)
+        -> Result<cuteafd_loader::placement::families::minimax_m3::AdmittedMiniMax> {
+        use cuteafd_loader::placement::{AttentionPlacement, ExpertHome, FfnMode, LayerAssignment,
+            LayerMode, Placement as ModelPlacement, PoolLimits};
+        use cuteafd_loader::placement::planner::*;
+        let modes = cuteafd_loader::placement::families::minimax_m3::layer_owners(cfg.layers, ranks)
+            .into_iter().map(|gpu| LayerMode::Whole { gpu, ffn: FfnMode::Owner }).collect::<Vec<_>>();
+        let shape = PrefillShape { rows: capacity.prefill.rows.into(), waves: 3 };
+        let pages = u64::from(capacity.decode.requests).max(8);
+        let pool_tokens = pages * PAGE_ROWS as u64;
+        let allocations = (0..ranks).map(|rank| -> Result<Vec<_>> {
+            Ok(capacity.cache(257)?.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer."))
+                .map(|(name, bytes)| cuteafd_loader::placement::planner::Allocation::buffer(
+                    format!("{}.{name}", Owner::Cache { gpu: rank }.id()), Location::coordinator(rank as u8),
+                    bytes, Lifetime::TARGET, Category::Kv, "admitted cache globals")).collect())
+        }).collect::<Result<Vec<_>>>()?.into_iter().flatten().collect();
+        let solved = ResolvedPlan { encoder_diagnostics: vec![],
+            request: cuteafd_loader::placement::families::minimax_m3::request(Context::automatic(257),
+                Some(pool_tokens), cuteafd_loader::placement::Onboard::Layers(0), shape,
+                Operation::Serving, None, Default::default()),
+            decisions: Decisions { attention: modes.clone(), onboard_layers: vec![vec![]; ranks],
+                expert_homes: Default::default(), embedding: None, draft_home: None, head_home: None,
+                intake_home: None, encoder: None, prefill: shape, lanes: 1, spark_reply_formats: None },
+            pool_tokens, pool_page_rows: PAGE_ROWS as u64, budgets: vec![], phases: vec![],
+            facts: Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations,
+                deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
+                driver_page_tables: vec![], allocation_granularity: vec![] } };
+        Ok(cuteafd_loader::placement::families::minimax_m3::AdmittedMiniMax {
+            placement: ModelPlacement { pool_tokens, pool_limits: PoolLimits(vec![]),
+                attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![],
+                peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
+                layers: modes.into_iter().map(|mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
+                movables: vec![], expert_ranges: vec![], residual: vec![], hops: vec![], tp2: None, items: vec![] },
+            solved, onboard: 0, expert_backings: vec![], draft_home: None, encoder: None })
+    }
+
+    fn request_streams<'a>(library: &'a cuteafd_ffi::NativeLibrary, ids: &[i32]) -> Result<Vec<RequestStreams<'a>>> {
+        ids.iter().map(|&id| {
+            let device = Device { library, id };
+            Ok(RequestStreams { decode: Rc::new(Stream::new(device)?),
+                prefill: (0..3).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<Vec<_>>>()? })
+        }).collect()
+    }
+
+    #[test]
+    fn request_state_retains_admitted_whole_layer_banks_and_every_metadata_slot() -> Result<()> {
+        use cuteafd_loader::placement::planner::Location;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        for id in 0..2 { fixture.configure_memory(&library, id, 64 << 20)?; }
+        let mut cfg = config(); cfg.layers = 2;
+        for ids in [vec![1], vec![1, 0]] {
+            for concurrency in [1, 16, 64] {
+                let capacity = RequestCapacity::new(concurrency, 128)?;
+                let admitted = request_admission(&cfg, ids.len(), capacity)?;
+                let mut state = RequestState::new(&cfg, capacity, &admitted, request_streams(&library, &ids)?)?;
+                assert_eq!(state.capacity, capacity);
+                assert_eq!(state.ranks.len(), ids.len());
+                let banks = state.banks();
+                for (gpu, rank) in state.ranks.iter_mut().enumerate() {
+                    assert!(Rc::ptr_eq(&banks[gpu], &rank.bank));
+                    assert_eq!(rank.bank.layout.pool_pages as u64 * PAGE_ROWS as u64, admitted.solved.pool_tokens);
+                    assert_eq!(rank.prefill.len(), 3);
+                    assert!(Rc::ptr_eq(&rank.decode.stream, &rank.bank.readers()[0]));
+                    for (slot, metadata) in rank.prefill.iter().enumerate() {
+                        assert_eq!(metadata.layout, capacity.prefill);
+                        assert!(Rc::ptr_eq(&metadata.stream, &rank.bank.readers()[slot + 1]));
+                    }
+                    let placement = Placement { units: vec![0], slot: 0, len: 0 };
+                    rank.bank.prepare_decode(&mut rank.decode, &[&placement])?;
+                    assert_eq!(rank.bank.decode_request(&rank.decode, rank.bank.layers.start)?.batch, 1);
+                    for metadata in &mut rank.prefill {
+                        rank.bank.prepare_segments(metadata, &[Append { first_row: 0, placement: &placement, rows: 1 }])?;
+                        assert_eq!(rank.bank.segments(metadata, rank.bank.layers.start)?.len(), 1);
+                    }
+                }
+                let inventory = || -> Result<Inventory<'_>> {
+                    let mut actual = Inventory::new(CoordinatorDevices::new(&ids)?, "minimax", Lifetime::TARGET,
+                        Category::Workspace, "retained request bundle");
+                    state.inventory(&mut actual)?;
+                    Ok(actual)
+                };
+                let first = inventory()?;
+                let second = inventory()?;
+                let observed = |inventory: &Inventory<'_>| inventory.receipts.iter().map(|receipt| {
+                    let owner = &receipt.allocation;
+                    (owner.id.clone(), owner.bytes, owner.location, owner.lifetime, receipt.address)
+                }).collect::<Vec<_>>();
+                assert_eq!(observed(&first), observed(&second), "inventory is a stable observation");
+                let actual = first.receipts.iter().map(|receipt| (receipt.allocation.id.clone(),
+                    (receipt.allocation.bytes, receipt.allocation.location, receipt.allocation.lifetime)))
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(actual.len(), first.receipts.len());
+                let mut expected_owners = 0;
+                for (gpu, rank) in state.ranks.iter().enumerate() {
+                    let location = Location::coordinator(gpu as u8);
+                    let mut expected = Vec::new();
+                    for layer in rank.bank.layers.clone() {
+                        for (plane, stride) in PAGE_PLANES {
+                            expected.push((Owner::Kv { layer, plane }.id(), stride as u64
+                                * u64::from(rank.bank.layout.pool_pages), location));
+                        }
+                    }
+                    for (name, bytes) in capacity.cache(257)?.buffers()?.into_iter()
+                        .filter(|(name, _)| !name.starts_with("layer.")) {
+                        expected.push((format!("{}.{name}", Owner::Cache { gpu }.id()), bytes, location));
+                    }
+                    expected.push((format!("{}.upload", Owner::DecodeTable { gpu }.id()),
+                        u64::from(capacity.decode.requests) * u64::from(capacity.cache(257)?.table_width) * 4, Location::PINNED));
+                    for (name, bytes) in MsaRope::new(&cfg, 257)?.buffers() {
+                        expected.push((format!("{}.{name}", Owner::Rope { gpu }.id()), bytes, location));
+                    }
+                    for mode in 0..4 {
+                        let prefill = mode > 0;
+                        let owner = if prefill { Owner::Unit { gpu, slot: mode - 1 } } else { Owner::Decode { gpu } };
+                        for (name, bytes) in capacity.metadata(prefill).buffers() {
+                            expected.push((format!("{}.metadata.{name}", owner.id()), bytes, location));
+                        }
+                        for (name, bytes) in capacity.metadata_uploads(prefill) {
+                            expected.push((format!("{}.metadata.{name}.upload", owner.id()), bytes, Location::PINNED));
+                        }
+                    }
+                    expected_owners += expected.len();
+                    for (id, bytes, location) in expected {
+                        assert_eq!(actual.get(&id), Some(&(bytes, location, Lifetime::TARGET)), "{id}");
+                    }
+                }
+                assert_eq!(actual.len(), expected_owners, "no extra physical request owners");
+                drop(banks); drop(state);
+                for &id in &ids {
+                    assert_eq!(Device { library: &library, id }.run(|| library.cuda_physical_memory_info())?.0, 64 << 20);
+                }
+            }
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    #[test]
+    fn request_state_rejects_non_whole_or_mismatched_admission_before_allocating() -> Result<()> {
+        use cuteafd_loader::placement::{FfnMode, LayerMode};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let mut cfg = config(); cfg.layers = 2;
+        let capacity = RequestCapacity::new(16, 128)?;
+        for case in 0..10 {
+            let mut admitted = request_admission(&cfg, 2, capacity)?;
+            let mut streams = request_streams(&library, &[1, 0])?;
+            match case {
+                0 => admitted.solved.decisions.attention[0] = LayerMode::HeadSplit,
+                1 => admitted.solved.decisions.attention[0] = LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+                2 => admitted.solved.decisions.prefill.waves = 2,
+                3 => admitted.solved.pool_tokens += 1,
+                4 => admitted.placement.pool_tokens += PAGE_ROWS as u64,
+                5 => streams[1].decode = Rc::clone(&streams[0].decode),
+                6 => admitted.solved.decisions.lanes = 2,
+                7 => admitted.solved.facts.allocations[0].bytes += 4,
+                8 => admitted.solved.facts.allocations.clear(),
+                9 => admitted.solved.decisions.prefill.rows = 64,
+                _ => unreachable!(),
+            }
+            let before = fixture.events()?;
+            assert!(RequestState::new(&cfg, capacity, &admitted, streams).is_err(), "case {case}");
+            let after = fixture.events()?;
+            assert!(!after[before.len()..].contains('D'), "case {case} allocated before validating");
+        }
+        let admitted = request_admission(&cfg, 1, capacity)?;
+        assert!(RequestState::new(&cfg, capacity, &admitted, vec![]).is_err());
         Ok(())
     }
 
