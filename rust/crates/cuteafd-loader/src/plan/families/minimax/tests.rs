@@ -652,3 +652,64 @@ fn shared_recipe_onboards_whole_layers_or_tp2_halves() {
             else { (1 << 29) + (64 << 20) }; gpus]);
     }
 }
+
+#[test]
+fn prefix_ordered_uploads_match_each_request_destination() {
+    use crate::placement::families::minimax_m3::{self as shared, Owner};
+    use crate::placement::planner::{Operation, Location};
+    for gpus in [1, 2] {
+        for concurrency in [1, 4, 16, 64] {
+            let mut inputs = recipe_inputs(gpus, 4);
+            inputs.sequences = concurrency;
+            let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+                inputs.prefill, Operation::Serving, None, Default::default());
+            let admitted = inputs.admit(request).unwrap();
+            let mut bytes = 0;
+            for gpu in 0..gpus {
+                for slot in 0..concurrency {
+                    for (plane, expected) in [("table", inputs.context.maximum.div_ceil(64) * 4), ("length", 4)] {
+                        let owner = Owner::PrefixH2d { gpu, slot, plane };
+                        assert_eq!(format!("minimax.{}", owner.inventory_name().unwrap()), owner.id());
+                        let allocation = admitted.solved.facts.allocations.iter().find(|a| a.id == owner.id()).unwrap();
+                        assert_eq!(allocation.location, Location::PINNED);
+                        assert_eq!(allocation.bytes, expected);
+                        assert!(allocation.view.is_none());
+                        bytes += expected;
+                    }
+                }
+            }
+            assert_eq!(bytes, gpus as u64 * concurrency * (4 * inputs.context.maximum.div_ceil(64) + 4));
+        }
+    }
+}
+
+#[test]
+fn expert_backing_descriptor_uses_canonical_mount_regions_and_physical_ids() {
+    use crate::placement::families::minimax_m3::{ExpertBacking, ExpertStorage};
+    let (root, cfg, _) = fixture();
+    let cfg = MiniMaxM3Config::from_hf(&cfg).unwrap();
+    let catalog = crate::read_expert_catalog(root.path()).unwrap();
+    let tensors = catalog.fp8().unwrap();
+    let layers = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
+    for gpus in [1, 2] {
+        for gpu in 0..gpus {
+            for count in 1..=layers.len() {
+                let backing = ExpertBacking::plan(tensors, &layers[..count], gpus, gpu, (1 - gpu) as i32).unwrap();
+                assert_eq!(backing.storage, ExpertStorage::Mount);
+                assert_eq!(backing.layers.len(), count);
+                let regions = crate::serving_capacity::fp8_expert_regions(&tensors.for_coordinator(),
+                    &layers[..count], gpus, gpu, crate::formats::fp8_experts::Slicing::Blocks(128)).unwrap();
+                assert_eq!(backing.arena.id(), crate::serving_capacity::expert_weight_arena_id("fp8",
+                    (1 - gpu) as i32, &regions).unwrap());
+                for layer in &backing.layers {
+                    for (plane, range) in layer.planes.iter().enumerate() {
+                        let view = backing.arena.view(&format!("{}.{plane}", layer.layer)).unwrap();
+                        assert_eq!(range, &(view.offset()..view.offset() + view.bytes()));
+                        assert!(range.start >= layer.region.start && range.end <= layer.region.end);
+                    }
+                }
+                assert_eq!(backing.validation_bytes, 0);
+            }
+        }
+    }
+}
