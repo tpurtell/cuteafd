@@ -806,7 +806,7 @@ fn check_selector_device(output: i32, stream: i32) -> Result<()> {
 impl<'a> TokenSelector<'a> {
     pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
         name: &str) -> Result<()> {
-        inventory.device(&format!("{name}.greedy"), self.out.buffer)?;
+        inventory.device(&format!("{name}.output"), self.out.buffer)?;
         inventory.pinned(&format!("{name}.landing"), self.landing.buffer)?;
         if let Some(wave) = &self.wave { wave.allocation_receipts(inventory, &format!("{name}.sampler"))?; }
         Ok(())
@@ -1306,6 +1306,43 @@ mod tests {
         let wait = memory.split("pub(crate) unsafe fn wait(").nth(1).unwrap().split("impl Drop for BlockingWait").next().unwrap();
         assert!(wait.find("cuda_stream_device(stream)").unwrap() < wait.find("cuda_event_create_blocking()").unwrap());
         assert!(!wait.contains("cuda_get_device()"));
+    }
+
+    #[test]
+    fn selector_receipts_match_shared_admitted_output_owners() -> Result<()> {
+        use crate::shared::memory::receipts::Inventory;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, SelectorOwners};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        fixture.strict_device_free(&library, true)?;
+        library.cuda_set_device(1)?;
+        let physical = [1];
+        let devices = CoordinatorDevices::new(&physical)?;
+        for capacity in [1, 16, 64] {
+            for placement in [SelectPlacement::Device, SelectPlacement::Host] {
+                let selector = TokenSelector::new(&library, placement, 257, capacity)?;
+                let mut inventory = Inventory::new(devices, "selector", Lifetime::RESIDENT,
+                    Category::Workspace, "token selector");
+                selector.allocation_receipts(&mut inventory, "next")?;
+                let expected = SelectorOwners { location: devices.location(1)?, capacity, vocab: 257,
+                    device_sampling: false }.allocations("selector.next", Lifetime::RESIDENT)?;
+                assert_eq!(inventory.receipts.len(), expected.len());
+                for (receipt, allocation) in inventory.receipts.iter().zip(expected) {
+                    let actual = &receipt.allocation;
+                    assert_eq!((&actual.id, actual.bytes, actual.location, actual.lifetime),
+                        (&allocation.id, allocation.bytes, allocation.location, allocation.lifetime));
+                    assert!(actual.view.is_none() && receipt.address != 0);
+                }
+                assert_eq!(inventory.receipts[0].address, selector.out.buffer.ptr as u64);
+                assert_eq!(inventory.receipts[1].address, selector.landing.buffer.ptr as u64);
+                drop(selector);
+            }
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
     }
 
     #[test]
