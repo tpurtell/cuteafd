@@ -85,6 +85,169 @@ fn packed_head_push_delivers_one_transient_source_before_arena_pack() -> Result<
 }
 
 #[test]
+fn mixed_fp8_push_matches_host_bytes_on_each_rank_and_split() -> Result<()> {
+    use cuteafd_loader::plan::testing::{t, write_snapshot};
+    use std::os::unix::fs::FileExt;
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 1 << 30)?; }
+    fixture.immediate_copies(&library)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let names = ["gate.weight".to_string(), "up.weight".to_string()];
+    write_snapshot(root.path(), &serde_json::json!({}), &[
+        t(&names[0], "F8_E4M3", &[256, 256]), t("gate.weight_scale_inv", "F32", &[2, 2]),
+        t(&names[1], "BF16", &[256, 256])], None);
+    let checkpoint = Checkpoint::open(root.path())?;
+    let raw = |name: &str| -> Vec<u8> {
+        if name.ends_with("_scale_inv") { [0.25f32, 0.5, 1.0, 2.0].into_iter().flat_map(f32::to_le_bytes).collect() }
+        else if name == names[0] { (0..256 * 256).map(|i| (i % 127) as u8).collect() }
+        else { (0..256 * 256).flat_map(|i| ((i % 17) as f32 - 8.0).to_bits().to_le_bytes()[2..].to_vec()).collect() }
+    };
+    for tensor in &checkpoint.tensors {
+        std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+            .write_all_at(&raw(&tensor.meta.name), tensor.meta.byte_offset)?;
+    }
+    let read = |buffer: CuteafdDeviceBuffer, bytes| -> Result<Vec<u8>> {
+        let mut out = vec![0; bytes]; library.copy_d2h(&mut out, buffer)?; Ok(out)
+    };
+    for rule in [crate::shared::fp8_linear::Fp8Scales::Pow2, crate::shared::fp8_linear::Fp8Scales::Amax] {
+        let (q, grid) = super::super::fp8::quantize(&raw(&names[1]), 256, 256, super::super::fp8::Layout::Block, rule);
+        let host_q = [raw(&names[0]), q].concat();
+        let host_s = [raw("gate.weight_scale_inv"), grid.into_iter().flat_map(f32::to_le_bytes).collect()].concat();
+        for split in [None, Some((Axis::Rows, 2))] {
+            let rows = if split.is_some() { 256 } else { 512 };
+            let make = |dense| -> Result<_> {
+                let layouts = (0..2).map(|rank| cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                    format!("glmf/mixed/{rank}"), [(format!("{}.payload", joined(&names)), rows * 256),
+                        (format!("{}.scales", joined(&names)), rows / 128 * 2 * 4)])).collect::<Result<Vec<_>>>()?;
+                Ok(GlmfLoader { arenas: arenas(&library, layouts)?, library: &library, checkpoint: &checkpoint,
+                    stream: std::ptr::null_mut(), kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Off,
+                    kda_output_shard: false, fp8_head: false, packed_head: false, kda_nvfp4: None,
+                    fp8_scales: rule, device: 0, peers: vec![crate::shared::peer_split::RankDevice {
+                        device: 1, stream: std::ptr::null_mut() }], dense })
+            };
+            let mount = make(std::rc::Rc::new(DenseLoad::mount(&library)))?;
+            let expected = (0..2).map(|rank| mount.mixed_blocks(rank, &names, split)).collect::<Result<Vec<_>>>()?;
+            let load = std::rc::Rc::new(DenseLoad::push(&library));
+            let push = make(load.clone())?;
+            let shard = root.path().join(&checkpoint.tensors[0].shard);
+            let saved = shard.with_extension("held");
+            std::fs::rename(&shard, &saved)?;
+            let actual = if split.is_some() { push.fp8_split(&names, Axis::Rows, 2)? }
+                else { (0..2).map(|rank| push.fp8_on(rank, &names, super::super::fp8::Layout::Block)).collect::<Result<Vec<_>>>()? };
+            std::fs::rename(&saved, &shard)?;
+            let records = load.sink.as_ref().context("mixed push sink")?.take_all();
+            let sockets = tempfile::Builder::new().prefix("glmf-").tempdir_in("/tmp")?;
+            for rank in 0..2 {
+                crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: rank as i32 },
+                    None, root.path(), sockets.path(), &records, None, 0, rank)?;
+                let host_part = |bytes: &[u8], part_bytes: usize| -> Vec<u8> {
+                    if split.is_none() { return bytes.to_vec(); }
+                    let half = part_bytes / 2;
+                    [0, part_bytes].into_iter().flat_map(|base|
+                        bytes[base + rank * half..base + (rank + 1) * half].iter().copied()).collect()
+                };
+                for (want, got, reference, bytes) in [
+                    (expected[rank].0.buffer, actual[rank].0.buffer, host_part(&host_q, 256 * 256), rows * 256),
+                    (expected[rank].1.buffer, actual[rank].1.buffer, host_part(&host_s, 16), rows / 128 * 8)] {
+                    assert_eq!(read(want, bytes)?, reference, "mount rank={rank} split={split:?}");
+                    assert_eq!(read(got, bytes)?, reference, "push rank={rank} split={split:?}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn nvfp4_dense_push_matches_mount_operands_and_checks_fc1_scales() -> Result<()> {
+    use cuteafd_loader::plan::testing::{t, write_snapshot};
+    use std::os::unix::fs::FileExt;
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 1 << 30)?; }
+    fixture.immediate_copies(&library)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(1))?;
+    cfg.hidden = 128;
+    cfg.dense_intermediate = 256;
+    let mlp = "model.layers.0.mlp";
+    let mut tensors = Vec::new();
+    let mut views = Vec::new();
+    for (proj, rows, cols) in [("gate_proj", 256, 128), ("up_proj", 256, 128), ("down_proj", 128, 256)] {
+        let stem = format!("{mlp}.{proj}");
+        tensors.extend([t(format!("{stem}.weight"), "U8", &[rows, cols / 2]),
+            t(format!("{stem}.weight_scale"), "F8_E4M3", &[rows, cols / 16]),
+            t(format!("{stem}.weight_scale_2"), "F32", &[]),
+            t(format!("{stem}.input_scale"), "F32", &[])]);
+        views.extend([(format!("{stem}.weight"), rows * cols / 2),
+            (format!("{stem}.weight_scale"), rows * cols / 16 + 8)]);
+    }
+    write_snapshot(root.path(), &serde_json::json!({}), &tensors, None);
+    let checkpoint = Checkpoint::open(root.path())?;
+    for tensor in &checkpoint.tensors {
+        let bytes = if tensor.meta.name.ends_with(".input_scale") { 0.5f32.to_le_bytes().to_vec() }
+            else if tensor.meta.name.ends_with(".weight_scale_2") { 2.0f32.to_le_bytes().to_vec() }
+            else { (0..tensor.meta.byte_length).map(|i| (i as u8).wrapping_mul(29) ^ tensor.meta.name.len() as u8).collect() };
+        std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+            .write_all_at(&bytes, tensor.meta.byte_offset)?;
+    }
+    let make = |dense| -> Result<_> {
+        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("glmf/nvfp4", views.clone())?;
+        Ok(GlmfLoader { arenas: arenas(&library, vec![layout])?, library: &library,
+            checkpoint: &checkpoint, stream: std::ptr::null_mut(),
+            kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Off, kda_output_shard: false,
+            fp8_head: false, packed_head: false, kda_nvfp4: None,
+            fp8_scales: crate::shared::fp8_linear::Fp8Scales::Pow2, device: 0,
+            peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream: std::ptr::null_mut() }], dense })
+    };
+    let mounted = make(std::rc::Rc::new(DenseLoad::mount(&library)))?;
+    let mut expected = HashMap::new();
+    assert!(mounted.nvfp4_dense(&cfg, mlp, &mut expected)?);
+    let load = std::rc::Rc::new(DenseLoad::push(&library));
+    let pushed = make(load.clone())?;
+    let before = fixture.events()?.chars().filter(|&c| c == 'D').count();
+    // The constructors must use headers only, even for the scalar agreement check.
+    let shard = root.path().join(&checkpoint.tensors[0].shard);
+    let saved = shard.with_extension("held");
+    std::fs::rename(&shard, &saved)?;
+    let mut actual = HashMap::new();
+    assert!(pushed.nvfp4_dense(&cfg, mlp, &mut actual)?);
+    std::fs::rename(&saved, &shard)?;
+    let records = load.sink.as_ref().context("NVFP4 push sink")?.take_all();
+    assert_eq!(records.operands.len(), 6);
+    assert_eq!(records.steps.len(), 2);
+    assert!(records.operands.iter().all(|o| o.device == 0));
+    // Keep the Unix socket path below the platform limit.
+    let sockets = tempfile::Builder::new().prefix("glmf-").tempdir_in("/tmp")?;
+    crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: 0 },
+        None, root.path(), sockets.path(), &records, None, 0, 0)?;
+    assert_eq!(fixture.events()?.chars().filter(|&c| c == 'D').count(), before,
+        "NVFP4 delivery must not allocate another device owner");
+    for (key, expected) in &expected {
+        let bytes = if key.starts_with("nvfp4_w") { cfg.hidden * cfg.dense_intermediate / 2 }
+            else { cfg.hidden * cfg.dense_intermediate / 16 + 8 };
+        let (mut mount_bytes, mut push_bytes) = (vec![0; bytes], vec![0; bytes]);
+        library.copy_d2h(&mut mount_bytes, expected.buffer)?;
+        library.copy_d2h(&mut push_bytes, actual[key].buffer)?;
+        assert_eq!(push_bytes, mount_bytes, "{key}");
+    }
+    let step = records.steps.iter().find(|s| s.jobs.iter().any(|j| matches!(j, Job::Equal { .. })))
+        .context("FC1 scalar check")?;
+    let mut kernels = crate::shared::fp8_load_quant::LoadKernels::new(&library)?;
+    let mut scratch = None;
+    for (gate, up, valid) in [(0u32, 0x8000_0000u32, false), (0x7fc0_1234, 0x7fc0_1234, true),
+        (1.0f32.to_bits(), 0.5f32.to_bits(), false)] {
+        let staged: Vec<u8> = [2.0f32.to_bits(), gate, 2.0f32.to_bits(), up].into_iter()
+            .flat_map(u32::to_le_bytes).collect();
+        let result = step.run(&mut kernels, &library, &staged, std::ptr::null_mut(), &mut scratch);
+        assert_eq!(result.is_ok(), valid, "gate={gate:x}, up={up:x}");
+    }
+    assert!(scratch.is_none());
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn native_k6_core_and_head_records_match_host_pack() -> Result<()> {
     use cuteafd_loader::{formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook,

@@ -245,6 +245,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 }
 
 /// FP32 scales `[n, kb]` (little-endian bytes) transposed to `[kb, n]`.
+#[cfg(test)]
 fn kmajor_scales(scales: &[u8], n: usize, kb: usize) -> Vec<u8> {
     assert_eq!(scales.len(), n * kb * 4);
     let mut kmajor = vec![0u8; scales.len()];
@@ -352,41 +353,50 @@ impl<'a> GlmfLoader<'a> {
             return Ok(false);
         }
         let (h, i) = (cfg.hidden, cfg.dense_intermediate);
-        let mut gate_input_scale = None;
+        let mut fc1_scalars = Vec::new();
+        let mut fc1_uploads = Vec::new();
         for (proj, w_key, s_key, rows, cols) in [("gate_proj", "nvfp4_w1", "nvfp4_s1", i, h),
             ("up_proj", "nvfp4_w3", "nvfp4_s3", i, h), ("down_proj", "nvfp4_w2", "nvfp4_s2", h, i)] {
             let name = format!("{mlp}.{proj}");
-            let (weight, dtype, shape) = self.raw(&format!("{name}.weight"))?;
-            ensure!(dtype == DType::U8 && shape == [rows, cols / 2], "{name}.weight: expected packed E2M1 U8 [{rows}, {}], \
-                found {dtype:?} {shape:?}", cols / 2);
-            let (mut scales, dtype, shape) = self.raw(&format!("{name}.weight_scale"))?;
-            ensure!(dtype == DType::F8E4M3 && shape == [rows, cols / 16], "{name}.weight_scale: expected E4M3 \
-                [{rows}, {}], found {dtype:?} {shape:?}", cols / 16);
-            let mut input_scale = [0u8; 4];
+            let weight_name = format!("{name}.weight");
+            let weight = self.tensor(&weight_name)?;
+            ensure!(weight.meta.dtype == DType::U8 && weight.meta.shape == [rows, cols / 2],
+                "{weight_name}: expected packed E2M1 U8 [{rows}, {}]", cols / 2);
+            let scale_name = format!("{name}.weight_scale");
+            let scale = self.tensor(&scale_name)?;
+            ensure!(scale.meta.dtype == DType::F8E4M3 && scale.meta.shape == [rows, cols / 16],
+                "{scale_name}: expected E4M3 [{rows}, {}]", cols / 16);
+            let scale_bytes = rows * (cols / 16);
+            let mut scalars = Vec::new();
             for scalar in ["weight_scale_2", "input_scale"] {
-                let (bytes, dtype, _) = self.raw(&format!("{name}.{scalar}"))?;
-                ensure!(dtype == DType::F32 && bytes.len() == 4, "{name}.{scalar}: expected one FP32 value");
-                if scalar == "input_scale" {
-                    input_scale.copy_from_slice(&bytes);
-                }
-                scales.extend_from_slice(&bytes);
+                let key = format!("{name}.{scalar}");
+                let tensor = self.tensor(&key)?;
+                ensure!(tensor.meta.dtype == DType::F32 && tensor.meta.byte_length == 4,
+                    "{key}: expected one FP32 value");
+                scalars.push(Rect::tensor(self.checkpoint, &key, None, None)?);
             }
-            // The W4A4 dense FC1 kernel quantizes with the gate projection's
-            // input_scale and dequantizes the up half with the up projection's;
-            // require them bit-identical, as for the routed experts.
-            match proj {
-                "gate_proj" => gate_input_scale = Some(input_scale),
-                "up_proj" => {
-                    let gate = gate_input_scale.expect("gate_proj is packed before up_proj");
-                    ensure!(gate == input_scale, "{mlp}: NVFP4 dense gate input_scale {} and up input_scale {} differ; \
-                        the W4A4 FC1 kernel needs them bit-identical",
-                        f32::from_le_bytes(gate), f32::from_le_bytes(input_scale));
-                }
-                _ => {}
+            ops.insert(w_key, self.whole(0, &weight_name)?);
+            let scales = self.allocation(0, &scale_name, scale_bytes + 8)?;
+            self.dense.operand(crate::shared::experts::rtx::dense::Operand {
+                device: self.device, buffer: scales.buffer,
+                lands: vec![(Rect::tensor(self.checkpoint, &scale_name, None, None)?, 0)], bytes: scale_bytes })?;
+            let tail = CuteafdDeviceBuffer {
+                // SAFETY: the two FP32 scalars are the final eight bytes of the admitted scale view.
+                ptr: unsafe { scales.buffer.ptr.cast::<u8>().add(scale_bytes) }.cast(),
+                bytes: 8, ..scales.buffer };
+            if proj == "down_proj" {
+                self.step(0, scalars, vec![Job::Upload { at: 0, bytes: 8, dst: tail }])?;
+            } else {
+                fc1_uploads.push(Job::Upload { at: fc1_scalars.len() * 4, bytes: 8, dst: tail });
+                fc1_scalars.extend(scalars);
             }
-            ops.insert(w_key, self.upload(&format!("{name}.weight"), &weight)?);
-            ops.insert(s_key, self.upload(&format!("{name}.weight_scale"), &scales)?);
+            ops.insert(s_key, scales);
         }
+        // One bounded step owns both input scales, so push and mount enforce
+        // the same bitwise FC1 contract without a host read or device round trip.
+        let mut jobs = vec![Job::Equal { at: 4, with: 12, bytes: 4 }];
+        jobs.extend(fc1_uploads);
+        self.step(0, fc1_scalars, jobs)?;
         Ok(true)
     }
 
@@ -409,8 +419,8 @@ impl<'a> GlmfLoader<'a> {
             let parts = names.iter().map(|n| QuantPart::Tensor(n)).collect::<Vec<_>>();
             return self.gpu_fp8(&parts, layout, false, 0);
         }
-        let (values, scales, _) = self.fp8_host(names, layout)?;
-        Ok((self.upload(&format!("{}.payload", joined(names)), &values)?, self.upload(&format!("{}.scales", joined(names)), &scales)?))
+        ensure!(layout == super::fp8::Layout::Block, "{names:?}: non-block FP8 copies require BF16 sources");
+        self.mixed_blocks(0, names, None)
     }
 
     /// Whether every name is a native E4M3 matrix with FP32 128x128 `_scale_inv`
@@ -604,7 +614,10 @@ impl<'a> GlmfLoader<'a> {
         if layout == super::fp8::Layout::Block && self.all_native_blocks(names)? {
             return self.native_blocks(rank, names, None);
         }
-        ensure!(self.all_bf16(names)?, "{names:?}: FP8 {layout:?} replicas take BF16 or native block sources");
+        if !self.all_bf16(names)? {
+            ensure!(layout == super::fp8::Layout::Block, "{names:?}: non-block FP8 copies require BF16 sources");
+            return self.mixed_blocks(rank, names, None);
+        }
         let parts = names.iter().map(|n| QuantPart::Tensor(n)).collect::<Vec<_>>();
         self.on_rank(rank, || self.gpu_fp8(&parts, layout, false, rank))
     }
@@ -648,37 +661,81 @@ impl<'a> GlmfLoader<'a> {
             let parts = names.iter().map(|n| QuantPart::Tensor(n)).collect::<Vec<_>>();
             return self.gpu_fp8(&parts, layout, true, 0);
         }
-        let (values, scales, cols) = self.fp8_host(names, layout)?;
-        Ok((self.upload(&format!("{}.payload", joined(names)), &values)?, self.upload(&format!("{}.scales", joined(names)), &kmajor_scales(&scales, values.len() / cols, cols / 128))?))
+        anyhow::bail!("{names:?}: non-block FP8 copies require BF16 sources")
     }
 
-    /// Host bytes of [`Self::fp8`]: E4M3 values, FP32 scales, and the column count.
-    fn fp8_host(&self, names: &[String], layout: super::fp8::Layout) -> Result<(Vec<u8>, Vec<u8>, usize)> {
-        use super::fp8::{quantize, Layout};
-        let (mut values, mut scales) = (Vec::new(), Vec::<u8>::new());
-        let mut cols = None;
+    /// Mixed native E4M3/BF16 block sources share final arena views. Native
+    /// blocks land unchanged; BF16 blocks use the same bounded GPU jobs as an
+    /// all-BF16 load, never an eager host conversion.
+    fn mixed_blocks(&self, rank: usize, names: &[String], split: Option<(Axis, usize)>)
+        -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let mut selected = Vec::new();
+        let mut total = 0;
+        let mut width = None;
         for name in names {
-            let (bytes, dtype, shape) = self.raw(name)?;
-            ensure!(shape.len() == 2 && cols.is_none_or(|c| c == shape[1]), "{name}: FP8 rows must share columns");
-            cols = Some(shape[1]);
-            match dtype {
-                DType::F8E4M3 if layout == Layout::Block => {
-                    let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
-                    ensure!(scale_dtype == DType::F32 && shape[0] % 128 == 0
-                        && scale_shape == [shape[0] / 128, shape[1].div_ceil(128)],
-                        "{name}: expected FP32 128x128 block scales, found {scale_dtype:?} {scale_shape:?}");
-                    values.extend_from_slice(&bytes);
-                    scales.extend_from_slice(&scale);
-                }
-                DType::Bf16 => {
-                    let (q, s) = quantize(&bytes, shape[0], shape[1], layout, self.fp8_scales);
-                    values.extend_from_slice(&q);
-                    scales.extend(s.iter().flat_map(|v| v.to_le_bytes()));
-                }
-                other => anyhow::bail!("{name}: cannot make an FP8 {layout:?} copy of {other:?}"),
-            }
+            let tensor = self.tensor(name)?;
+            ensure!(matches!(tensor.meta.dtype, DType::Bf16 | DType::F8E4M3)
+                && tensor.meta.shape.len() == 2, "{name}: expected BF16 or native E4M3 blocks");
+            let (rows, cols) = (tensor.meta.shape[0], tensor.meta.shape[1]);
+            ensure!(rows % 128 == 0 && cols % 128 == 0,
+                "{name}: mixed FP8 sources require whole 128x128 blocks");
+            let (rr, cr) = if let Some((axis, ranks)) = split {
+                let along = if axis == Axis::Rows { rows } else { cols };
+                ensure!(ranks > 0 && rank < ranks && along % (128 * ranks) == 0,
+                    "{name}: mixed FP8 blocks do not split over {ranks} ranks");
+                let share = along / ranks;
+                let window = rank * share..(rank + 1) * share;
+                if axis == Axis::Rows { (window, 0..cols) } else { (0..rows, window) }
+            } else { (0..rows, 0..cols) };
+            ensure!(width.is_none_or(|w| w == cr.len()), "{names:?}: FP8 rows must share columns");
+            width = Some(cr.len());
+            total += rr.len();
+            selected.push((name, tensor.meta.dtype == DType::Bf16, rr, cr));
         }
-        Ok((values, scales, cols.context("no FP8 rows")?))
+        let cols = width.context("no mixed FP8 sources")?;
+        let (values, scales) = self.on_rank(rank, || Ok((
+            self.allocation(rank, &format!("{}.payload", joined(names)), total * cols)?,
+            self.allocation(rank, &format!("{}.scales", joined(names)), total / 128 * (cols / 128) * 4)?,
+        )))?;
+        let mut row = 0;
+        for (name, bf16, rr, cr) in selected {
+            let base = row;
+            let value_bytes = rr.len() * cols;
+            let scale_bytes = rr.len() / 128 * (cols / 128) * 4;
+            if bf16 {
+                let source = rect(self.checkpoint, name, rr.clone(), 0..self.tensor(name)?.meta.shape[1] * 2)?;
+                self.quant_steps(&[source], super::fp8::Layout::Block, rank, |rows| Target {
+                    q: CuteafdDeviceBuffer {
+                        // SAFETY: the selected source rows occupy this disjoint part of the final values.
+                        ptr: unsafe { values.buffer.ptr.cast::<u8>().add((base + rows.start) * cols) }.cast(),
+                        bytes: rows.len() * cols, ..values.buffer }, q_stride: cols,
+                    scales: CuteafdDeviceBuffer {
+                        // SAFETY: whole 128-row blocks occupy this disjoint part of the final scale grid.
+                        ptr: unsafe { scales.buffer.ptr.cast::<u8>().add((base + rows.start) / 128 * (cols / 128) * 4) }.cast(),
+                        bytes: rows.len() / 128 * (cols / 128) * 4, ..scales.buffer }, kmajor: None,
+                }, cr.start, cols)?;
+            } else {
+                let scale_name = format!("{name}_scale_inv");
+                let source = self.tensor(name)?;
+                let grid = self.tensor(&scale_name)?;
+                ensure!(grid.meta.dtype == DType::F32
+                    && grid.meta.shape == [source.meta.shape[0] / 128, source.meta.shape[1] / 128],
+                    "{name}: expected FP32 128x128 block scales");
+                let value = rect(self.checkpoint, name, rr.clone(), cr.clone())?;
+                let scale = rect(self.checkpoint, &scale_name, rr.start / 128..rr.end / 128,
+                    cr.start / 128 * 4..cr.end / 128 * 4)?;
+                for (buffer, offset, bytes, source) in [(values.buffer, base * cols, value_bytes, value),
+                    (scales.buffer, base / 128 * (cols / 128) * 4, scale_bytes, scale)] {
+                    self.dense.operand(crate::shared::experts::rtx::dense::Operand {
+                        device: self.rank_device(rank)?, buffer: CuteafdDeviceBuffer {
+                            // SAFETY: the selected tensor's whole blocks fit the disjoint destination view.
+                            ptr: unsafe { buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..buffer },
+                        lands: vec![(source, 0)], bytes })?;
+                }
+            }
+            row += rr.len();
+        }
+        Ok((values, scales))
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> { self.one_on(0, name) }
@@ -1180,8 +1237,10 @@ impl<'a> GlmfLoader<'a> {
         if self.all_bf16(names)? {
             return self.gpu_fp8_split(names, axis, ranks);
         }
-        ensure!(self.all_native_blocks(names)?, "{names:?}: split FP8 blocks require BF16 or native E4M3 sources");
-        (0..ranks).map(|rank| self.native_blocks(rank, names, Some((axis, ranks)))).collect()
+        if self.all_native_blocks(names)? {
+            return (0..ranks).map(|rank| self.native_blocks(rank, names, Some((axis, ranks)))).collect();
+        }
+        (0..ranks).map(|rank| self.mixed_blocks(rank, names, Some((axis, ranks)))).collect()
     }
 
     /// The load stream of rank `rank` (its device is current inside `on_rank`).

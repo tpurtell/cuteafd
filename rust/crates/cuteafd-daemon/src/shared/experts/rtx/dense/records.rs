@@ -132,6 +132,8 @@ pub(crate) fn host_operand(operand: HostOperand, policy: super::super::push::Pus
 pub(crate) enum Job {
     /// Staged bytes `at..at + bytes` copied unchanged to `dst`.
     Upload { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// Two staged regions must agree bit for bit before subsequent jobs publish them.
+    Equal { at: usize, with: usize, bytes: usize },
     /// V4.1 raw UE8M0 TP2 projection grid packed from bounded staging.
     V41Scales { k: u32, n: u32, packed: CuteafdDeviceBuffer },
     /// Raw UE8M0 block grid expanded by the family's existing AOT program.
@@ -412,6 +414,13 @@ impl Step {
                         library.copy_h2d(alpha, &a)?;
                         library.copy_h2d(beta, &b)
                     })?;
+                }
+                Job::Equal { at, with, bytes } => {
+                    let region = |start: usize| -> Result<&[u8]> {
+                        let end = start.checked_add(bytes).context("staged equality extent overflow")?;
+                        staged.get(start..end).context("staged equality outside its step")
+                    };
+                    ensure!(region(at)? == region(with)?, "staged regions differ; bit-identical values required");
                 }
                 Job::Upload { at, bytes, dst } => {
                     ensure!(at + bytes <= staged.len() && bytes <= dst.bytes, "upload outside its step");
