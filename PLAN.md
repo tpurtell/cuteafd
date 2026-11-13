@@ -6,6 +6,31 @@ K2/Core-K6 and original-default MC checkpoint publication, native placement
 and guarded cleanup are complete; receipts are recorded in PR #1783.
 Serving and full-model generation/fidelity qualification remain pending #1777.
 
+TJ additionally authorized the post-publication storage handoff on Nov 12:
+native SparkNest `hf import --offline --no-copy`, then an even one-copy spread
+with `plan --place --factor 1/8` across `raptor:d2`, `raptor:d3`, ostrich, emu,
+dodo, kiwi, rhea and moa. A separate durable CPU service waits for verified
+publication and producer exit; the numerical producer remains frozen. Mandatory
+local reflinks bridge the /home and /srv Btrfs subvolumes without copying weight
+data. Reuse existing checksum receipts and native job/placement metadata; TJ
+explicitly declined an additional full-model hash or network weight reread.
+After successful placement, retire only this quant's off-grid managed copies,
+standalone export/cache, obsolete recovery payloads and build staging, checking
+process/container use first. Preserve managed source checkpoints, logs, scalar
+receipts and shared stores. Keep the progress timer until the handoff finishes.
+Keep the handoff helper at `quantization/kimi_k31/handoff_k2_core_k6.py`,
+outside the frozen producer's `k2_core_k6/*.py` identity scan. Quantization and
+head completed Nov 13 00:22 UTC. Its original GPU supervisor is stopped and
+disabled; a separate CPU-only publication service carries the verified output
+through audit/upload without restarting numerical work.
+Publication and storage handoff finished Nov 13 03:11 UTC at Hub revision
+`5c9ce425432e07a32ce468e0bbf7ad6a2269148f`. All 248,222 projections and
+94 shards passed final audit; native import copied zero bytes. Exactly one
+managed copy spans the eight requested places (80.9-88.1 GiB of whole shards
+per place). Process/container checks preceded retirement of 288 task-owned
+staging/recovery leaves. Logs, scalar receipts and managed source remain;
+production, publication, handoff units and the progress timer are disabled.
+
 One attention/FFN-disaggregated engine for the open-weights MoE models that
 soar on consumer Blackwell: strong RTX PRO 6000 head(s) for attention, dense
 projections, routing, shared experts, sampling and speculation; a pool of DGX
