@@ -41,6 +41,43 @@ pub const LANES: u64 = 1;
 pub const DECODE_ROWS: u32 = 64;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 
+/// Stable recipe/runtime owner identity. Component descriptors append their
+/// field names to these prefixes; a physical backing has exactly one owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    Target { gpu: usize },
+    Kv { layer: usize, plane: &'static str },
+    Cache { gpu: usize },
+    Rope { gpu: usize },
+    Decode { gpu: usize },
+    Unit { gpu: usize, slot: u64 },
+    Tp2 { gpu: usize },
+    Hops { gpu: usize },
+    Head,
+    Experts { gpu: usize, count: usize },
+    Spark { rank: usize, kind: &'static str, count: usize },
+    Mount { gpu: usize },
+}
+
+impl Owner {
+    pub fn id(self) -> String {
+        match self {
+            Self::Target { gpu } => format!("minimax/target/{gpu}"),
+            Self::Kv { layer, plane } => format!("minimax.kv.{layer}.{plane}"),
+            Self::Cache { gpu } => format!("minimax.cache.{gpu}"),
+            Self::Rope { gpu } => format!("minimax.rope.{gpu}"),
+            Self::Decode { gpu } => format!("minimax.decode.{gpu}"),
+            Self::Unit { gpu, slot } => format!("minimax.unit.{gpu}.{slot}"),
+            Self::Tp2 { gpu } => format!("minimax.tp2.{gpu}"),
+            Self::Hops { gpu } => format!("minimax.hops.{gpu}"),
+            Self::Head => "minimax.head".into(),
+            Self::Experts { gpu, count } => format!("minimax.experts.{gpu}.{count}"),
+            Self::Spark { rank, kind, count } => format!("minimax.spark.{rank}.{kind}.{count}"),
+            Self::Mount { gpu } => format!("minimax.mount.{gpu}"),
+        }
+    }
+}
+
 /// What the MiniMax executor runs. One RTX owns every layer. A pair owns
 /// contiguous whole layers (`layers`, the qualified Qwen4 dual pattern):
 /// attention, indexer, router and dense/shared FFN on the owner, one boundary
@@ -225,7 +262,7 @@ impl MiniMaxInputs {
     fn head_gpu(&self) -> u8 { (self.gpus - 1) as u8 }
 
     fn hop_spec(&self) -> HopSpec {
-        HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: self.cfg.hidden as u64 * 2,
+        HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: self.cfg.hidden as u64 * 4,
             rows: self.prefill.rows.max(u64::from(DECODE_ROWS)), lanes: LANES, entry_gpu: 0,
             head_gpu: self.head_gpu(),
             terminal: TerminalHome::AttentionOwner }
@@ -312,7 +349,7 @@ impl MiniMaxInputs {
         for (layer, &owner) in self.owners.iter().enumerate() {
             if usize::from(owner) != gpu { continue; }
             for (name, stride) in [("keys", 32768u64), ("values", 32768), ("index", 8448)] {
-                out.push(Component::allocation(Allocation::buffer(format!("minimax.kv.{layer}.{name}"), location,
+                out.push(Component::allocation(Allocation::buffer(Owner::Kv { layer, plane: name }.id(), location,
                     stride, Lifetime::TARGET, Category::Kv, "MSA paged KV and index records"),
                     ByteCurve::linear_rounded(stride, stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
                     false, maximum));
@@ -321,17 +358,17 @@ impl MiniMaxInputs {
         // Page tables and lengths for every admitted sequence, at the compiled context.
         let cache = MsaCache::new(1, 1, sequences, context)?;
         for (name, bytes) in cache.buffers()?.into_iter().filter(|(name, _)| !name.starts_with("layer.")) {
-            out.extend(buffer(format!("minimax.cache.{gpu}.{name}"), location, bytes, Lifetime::TARGET,
+            out.extend(buffer(format!("{}.{name}", Owner::Cache { gpu }.id()), location, bytes, Lifetime::TARGET,
                 Category::Kv, "MSA page tables", maximum));
         }
-        out.extend(MsaRope::new(cfg, context)?.components(&format!("minimax.rope.{gpu}"), gpu as u8, maximum)?);
+        out.extend(MsaRope::new(cfg, context)?.components(&Owner::Rope { gpu }.id(), gpu as u8, maximum)?);
         let (msa, _) = MsaPrograms::resolve(cfg, &self.manifest, DECODE_ROWS, rows, context)?;
         let (producers, _) = ProducerPrograms::resolve(&self.manifest, rows)?;
         ForwardPrograms::resolve(&self.manifest, rows)?;
         target.resolve_dense_programs(&self.manifest, rows)?;
         // One decode lane on every rank (its layers' work), then one owner
         // set per in-flight prefill slot (PrefillHooks unit slots).
-        let decode = format!("minimax.decode.{gpu}");
+        let decode = Owner::Decode { gpu }.id();
         out.extend(UnitLayout::new(cfg, DECODE_ROWS)?.components(&decode, gpu as u8, Lifetime::TARGET, maximum)?);
         out.extend(UnitMetadata::new(DECODE_ROWS)?.components(&format!("{decode}.metadata"), gpu as u8, maximum)?);
         out.extend(msa.workspace_components(&format!("{decode}.attention"), gpu as u8, false, Lifetime::TARGET, maximum)?);
@@ -339,7 +376,7 @@ impl MiniMaxInputs {
         out.extend(target.dense_input(DECODE_ROWS).map_err(refusal)?.components(&format!("{decode}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
         out.extend(target.dense_workspace(DECODE_ROWS).map_err(refusal)?.components(&format!("{decode}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
         for slot in 0..self.prefill.waves {
-            let prefix = format!("minimax.unit.{gpu}.{slot}");
+            let prefix = Owner::Unit { gpu, slot }.id();
             out.extend(UnitLayout::new(cfg, rows)?.components(&prefix, gpu as u8, Lifetime::TARGET, maximum)?);
             out.extend(UnitMetadata::new(rows)?.components(&format!("{prefix}.metadata"), gpu as u8, maximum)?);
             out.extend(target.dense_input(rows).map_err(refusal)?.components(&format!("{prefix}.dense"), gpu as u8, Lifetime::TARGET, maximum)?);
@@ -355,7 +392,7 @@ impl MiniMaxInputs {
             let rows = crate::placement::families::qwen4::QwenTp2Rows::new(cfg.hidden as u64, cfg.topk as u64,
                 self.prefill.rows.max(u64::from(DECODE_ROWS)), false).map_err(refusal)?;
             for demand in rows.demands().map_err(refusal)?.into_iter().filter(|d| usize::from(d.gpu) == gpu) {
-                out.extend(buffer(format!("minimax.tp2.{gpu}.{}", demand.group.replace(' ', "_")), location,
+                out.extend(buffer(format!("{}.{}", Owner::Tp2 { gpu }.id(), demand.group.replace(' ', "_")), location,
                     demand.bytes, Lifetime::TARGET, demand.category, &demand.group, maximum));
             }
         }
@@ -367,7 +404,7 @@ impl MiniMaxInputs {
         out.extend(allowance(location, cuda_stream_slab_bytes(peak)?, Lifetime::RESIDENT,
             format!("minimax/driver-stream-slabs/gpu{gpu} ({peak} peak live streams: model + push copies + rotary)"),
             false, maximum));
-        for owner in self.mount.get(gpu).copied().unwrap_or_default().allocations(&format!("minimax.mount.{gpu}")) {
+        for owner in self.mount.get(gpu).copied().unwrap_or_default().allocations(&Owner::Mount { gpu }.id()) {
             let bytes = ByteCurve::fixed(owner.bytes, maximum);
             out.push(Component::allocation(owner, bytes, false, maximum));
         }
@@ -387,15 +424,30 @@ impl Recipe for MiniMaxInputs {
             || self.sequences == 0 {
             return Err(invalid("invalid extent or empty domain"));
         }
-        if self.owners.iter().any(|&gpu| usize::from(gpu) >= self.gpus) {
-            return Err(invalid("attention owner outside the coordinator ranks"));
+        cuteafd_core::concurrency::validate("minimax_m3", self.sequences).map_err(invalid)?;
+        if self.owners != layer_owners(cfg.layers, self.gpus) {
+            return Err(invalid("attention owners must be the contiguous whole-layer cut"));
+        }
+        let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
+        if self.routed != routed || self.spark.iter().any(|ranks| ranks.len() != self.spark_ranks) {
+            return Err(invalid("routed layer order or Spark rank inventory differs from the executor"));
+        }
+        if let Pin::Exact(count) = request.onboard {
+            if count > self.routed.len() as u64 {
+                return Err(invalid(format!("requested {count} onboarded layers, but only {} routed layers exist", self.routed.len())));
+            }
+            if count > 0 {
+                if let LocalPackage::Missing(reason) = &self.local {
+                    return Err(invalid(format!("missing native fp8-minimax-nvfp4a4 coordinator exports: {reason}")));
+                }
+            }
         }
         let pair = self.gpus == 2;
         let head = self.head_gpu();
         let mut components = Vec::new();
         for gpu in 0..self.gpus { components.extend(self.rank_owners(gpu, maximum)?); }
         // Head-rank owners: vocabulary head workspace and the shared selector.
-        components.extend(HeadLayout::new(cfg, DECODE_ROWS)?.components("minimax.head", head, maximum)?);
+        components.extend(HeadLayout::new(cfg, DECODE_ROWS)?.components(&Owner::Head.id(), head, maximum)?);
         components.extend(serving::ServingOwners {
             selector: serving::SelectorOwners { location: Location::coordinator(head),
                 capacity: usize::try_from(self.sequences).map_err(|_| Refusal::Overflow("MiniMax selector"))?
@@ -420,7 +472,7 @@ impl Recipe for MiniMaxInputs {
         let hop_bytes = crate::placement::hop_buffer_bytes(&hops, &spec, self.gpus)
             .ok_or(Refusal::Overflow("MiniMax residual hop buffers"))?;
         for (gpu, &bytes) in hop_bytes.iter().enumerate() {
-            components.extend(buffer(format!("minimax.hops.{gpu}"), Location::coordinator(gpu as u8), bytes,
+            components.extend(buffer(Owner::Hops { gpu }.id(), Location::coordinator(gpu as u8), bytes,
                 Lifetime::TARGET, Category::Transport, "residual hops", maximum));
         }
         // Onboarding: one ordered count profile; destination both GPUs (TP2) or GPU0.
@@ -450,7 +502,7 @@ impl Recipe for MiniMaxInputs {
                     LocalPackage::Installed { workspace } => workspace[gpu], LocalPackage::Missing(_) => 0 };
                 let group = if pair { format!("TP2 expert layer halves 0..{count}") }
                     else { format!("resident routed layers 0..{count}") };
-                let id = format!("minimax.experts.{gpu}.{count}");
+                let id = Owner::Experts { gpu, count }.id();
                 let location = Location::coordinator(gpu as u8);
                 let owner = Allocation::buffer(&id, location, arenas[gpu], Lifetime::RESIDENT, Category::Experts, group);
                 let mut resident = Component::resident_weight(
@@ -469,14 +521,14 @@ impl Recipe for MiniMaxInputs {
                         ("owners", "Spark rank I/O and execution owners", charge.owners, Category::Workspace),
                         ("startup", cuteafd_core::memory_layout::spark_runtime_reserve_group(), charge.runtime, Category::Runtime),
                     ] {
-                        components.extend(buffer(format!("minimax.spark.{rank}.{kind}.{count}"), location, bytes,
+                        components.extend(buffer(Owner::Spark { rank, kind, count }.id(), location, bytes,
                             Lifetime::RESIDENT, category, group, maximum).map(|mut c| { c.activation = activation.clone(); c }));
                     }
                     if charge.experts > 0 {
                         components.push(Component { activation: activation.clone(),
                             bytes: ByteCurve::fixed(charge.experts, maximum),
                             kind: ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm121Arena, location,
-                                lifetime: Lifetime::RESIDENT, backing: format!("minimax.spark.{rank}.experts.{count}") } });
+                                lifetime: Lifetime::RESIDENT, backing: Owner::Spark { rank, kind: "experts", count }.id() } });
                     }
                 }
                 for link in &self.links {

@@ -29,7 +29,7 @@ pub struct ConcurrencyError {
 pub fn validate(family: &str, concurrency: u64) -> Result<(), ConcurrencyError> {
     let (capacity, cause) = match family {
         "deepseek_v41" => (MAX_CONCURRENCY, "native request/descriptor program"),
-        "deepseek_v4" | "glm5" | "glm5_flash" | "mimo_v2" | "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark" | "mistral_large4" =>
+        "deepseek_v4" | "glm5" | "glm5_flash" | "mimo_v2" | "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark" | "mistral_large4" | "minimax_m3" =>
             (64, "decode program"),
         _ => (MAX_CONCURRENCY, "boot-time concurrency"),
     };
@@ -61,7 +61,7 @@ mod tests {
     #[test]
     fn every_family_has_explicit_capacity_at_all_concurrencies() {
         for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5",
-            "kimi_k3", "step5", "muse_spark", "mistral_large4"] {
+            "kimi_k3", "step5", "muse_spark", "mistral_large4", "minimax_m3"] {
             for c in [1, 4, 16, 17, 32, 64, 65, 128] {
                 assert_eq!(state_slots(c), c);
                 assert_eq!(prefix_entries(c), 20.max((c * 5).div_ceil(4)));

@@ -8,7 +8,8 @@ use crate::placement::families::minimax_m3::LocalPackage;
 use crate::placement::planner::{Operation, PrefillShape};
 use crate::placement::{AttentionPlacement, Onboard, ResidentWeights};
 use crate::plan::{ExpertPlacement, PlanReport};
-use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
+use cuteafd_core::memory_layout::{DeviceKind, DeviceLayout, MemoryLayout};
+use crate::placement::planner::{Device, Domain, Location};
 
 const GIB: f64 = (1u64 << 30) as f64;
 
@@ -82,7 +83,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let request = FactsRequest { checkpoint: input.checkpoint(), cfg, catalog, manifest_path: &manifest_path,
         manifest: manifest.clone(), coordinator: Coordinator::Planned { cards: cards.clone() }, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
-        host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.mimo_prefix_entries,
+        host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("minimax_m3"),
         replies: opts.spark_reply_formats, head: opts.bf16_target_head, expert_usage: opts.expert_usage,
         resident_weight_limit: ResidentWeights(opts.weight_budget_bytes) };
     let inputs = match gather(&request) {
@@ -96,6 +97,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         arenas; this build has no executor for either, so the plan charges neither".into());
     let routed = inputs.routed.len();
     let onboard = opts.resolve_onboard(routed).unwrap_or(Onboard::Auto);
+    if matches!(onboard, Onboard::Layers(count) if count > 0) {
+        if let LocalPackage::Missing(reason) = &inputs.local {
+            report.refuse_placement(format!("MiniMax RTX expert onboarding refused: {reason}"),
+                "Install the native fp8-minimax-nvfp4a4 tp1/tp2 exports beside PROGRAMS.json, or use automatic onboarding.");
+            return empty(notes);
+        }
+    }
     let solve_request = crate::placement::families::minimax_m3::request(inputs.context, opts.pool_tokens, onboard,
         shape, if opts.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
         inputs.resident_weight_limit, opts.spark_reply_formats);
@@ -116,7 +124,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     report.bytes_by_owner.insert("routed expert weights".into(), model.routed_bytes);
     notes.push(format!("MiniMax attention {}: {}; pool {} tokens; {onboarded} of {routed} routed layers onboarded \
         ({}); unit {} x {} waves; C{sequences}", placed.attention_summary(),
-        if gpus == 2 { "contiguous whole-layer owners (30/30, one boundary hop), routed experts TP2 halves" }
+        if gpus == 2 { "contiguous whole-layer owners (one boundary hop), routed experts TP2 halves" }
         else { "every layer on rtx0" }, placed.pool_tokens, if gpus == 2 { "TP2 halves" } else { "whole layers" },
         shape.rows, shape.waves));
     let mut devices = Vec::new();
@@ -133,12 +141,17 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for rank in 0..ranks {
         let charge = inputs.spark[onboarded][rank];
         widest = widest.max(charge.experts);
+        let location = Location { device: Device::Spark(rank as u8), domain: Domain::Managed };
+        let items = match admitted.solved.items(location) {
+            Ok(items) => items,
+            Err(error) => {
+                report.refuse_placement(format!("MiniMax Spark ledger refused: {error}"),
+                    "Supply complete MiniMax admission owner facts.");
+                return empty(notes);
+            }
+        };
         devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: spark_bytes,
-            worker_budget_bytes: spark_bytes, kv_tokens: 0, items: vec![
-                Item::new(Category::Experts, "routed experts (native NVFP4 intermediate slices)", "nvfp4a4",
-                    charge.experts, Basis::Exact),
-                Item::new(Category::Workspace, "Spark rank I/O and execution owners", "", charge.owners,
-                    Basis::Calibrated)] });
+            worker_budget_bytes: spark_bytes, kv_tokens: 0, items });
     }
     report.spark_rank_share = if model.routed_bytes == 0 { 0.0 } else { widest as f64 / model.routed_bytes as f64 };
     if ranks > 0 {
