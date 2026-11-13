@@ -93,25 +93,9 @@ impl<'a> NativeLayer<'a> {
 }
 
 fn read_core<'a>(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoreWeightLayout, arena: Option<&DeviceWeightArena<'a>>) -> Result<CoreWeights<'a>> {
-    let loaded = layout.read(|name| {
-        let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
-            .map_err(|_| anyhow::anyhow!("Step-5 native core header {name} not loaded"))?;
-        let tensor = &checkpoint.tensors[at];
-        let path = checkpoint.snapshot.join(&tensor.shard);
-        let mut bytes = vec![0u8; usize::try_from(tensor.meta.byte_length)?];
-        crate::shared::memory::load_timing::read(bytes.len(), || {
-            use std::os::unix::fs::FileExt;
-            std::fs::File::open(&path)?.read_exact_at(&mut bytes, tensor.meta.byte_offset)
-        }).with_context(|| format!("reading {name}"))?;
-        Ok(cuteafd_loader::LoadedTensor {
-            info: cuteafd_core::TensorInfo { name: name.into(), file: tensor.shard.clone(), dtype: tensor.meta.dtype.clone(),
-                shape: tensor.meta.shape.clone(), byte_offset: tensor.meta.byte_offset,
-                byte_length: tensor.meta.byte_length, role: cuteafd_core::TensorRole::Other, layer_id: None,
-                expert_id: None, is_quantization_metadata: false },
-            source_path: path, bytes, elapsed_micros: 0, sha256: String::new(),
-        })
-    })?;
-    device.run(|| layout.upload_with(device, loaded, |name, bytes| weight_allocation(device, arena, name, bytes, ArenaTag::weights("step5/target"))))
+    let dense = crate::shared::experts::rtx::dense::DenseLoad::mount(device.library);
+    device.run(|| layout.load_recorded_with(device, checkpoint, &dense, std::ptr::null_mut(),
+        |name, bytes| weight_allocation(device, arena, name, bytes, ArenaTag::weights("step5/target"))))
 }
 
 /// Per-device lane scratch shared by every native projection on that lane.

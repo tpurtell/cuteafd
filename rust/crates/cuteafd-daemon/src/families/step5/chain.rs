@@ -57,10 +57,23 @@ impl Layer<'_> {
     }
 }
 
+fn weight_layout(layout: &RankWeightLayout, rope: &cuteafd_loader::plan::rope::Tables,
+    device: i32, count: usize) -> Result<cuteafd_loader::serving_capacity::WeightArenaLayout> {
+    // The separately admitted vocabulary head is not part of the prefix owner.
+    let mut prefix = layout.clone();
+    let selected = |name: &str| name.strip_prefix("model.layers.")
+        .and_then(|rest| rest.split_once('.')).and_then(|(layer, _)| layer.parse::<usize>().ok())
+        .is_some_and(|layer| layer < count);
+    prefix.operands.retain(|operand| selected(&operand.name));
+    prefix.core.retain(|name, _| selected(name));
+    prefix.target_arena(Some(rope), device, count, false)
+}
+
 pub(super) struct TargetChain<'a> {
     layers: Vec<Layer<'a>>,
     rows: usize,
     bytes: u64,
+    weights: crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
 }
 impl<'a> TargetChain<'a> {
     fn plan(
@@ -75,17 +88,11 @@ impl<'a> TargetChain<'a> {
             "Step-5 target prefix count/rows"
         );
         let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
-        let weights = layout
-            .operands
-            .iter()
-            .filter(|w| {
-                (0..count).any(|layer| w.name.starts_with(&format!("model.layers.{layer}.")))
-            })
-            .try_fold(0u64, |n, w| n.checked_add(w.allocation_bytes))
-            .context("chain weight overflow")?;
-        let mut bytes = weights
-            .checked_add(contract.rope_tables.allocation_bytes)
-            .context("chain rope overflow")?;
+        let arena = weight_layout(&layout, &contract.rope_tables, 0, count)?;
+        let weights = arena.bytes() as u64;
+        let tail = cuteafd_loader::placement::planner::allocation_granularity_forecast(&[weights])?;
+        let mut bytes = weights.checked_add(tail).context("chain arena overflow")?;
+        tracing::info!(weights, tail, count, "Step-5 cold chain weight arena");
         let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog_view(
             checkpoint.view.as_ref().context("Step-5 target chain requires its selected checkpoint view")?)).transpose()?;
         let mut routed = Vec::new();
@@ -110,10 +117,25 @@ impl<'a> TargetChain<'a> {
                 routed.push(Some(plan));
                 workspace
             };
-            bytes = bytes
-                .checked_add(workspace)
-                .and_then(|n| n.checked_add(ffn))
-                .context("chain workspace overflow")?;
+            // Cold owners have independent attention and FFN projection scratch.
+            // Unlike serving's serialized lane scratch, these cannot be charged once.
+            let mut scratch = std::collections::BTreeMap::<bool, cuteafd_loader::formats::trellis_core::ProjectionScratchLayout>::new();
+            let prefix = format!("model.layers.{}.", layer.layer);
+            for (name, core) in layout.core.iter().filter(|(name, _)| name.starts_with(&prefix)) {
+                let next = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(core.shape[1], core.shape[0], rows)?;
+                let attention = name.contains(".self_attn.");
+                match scratch.get_mut(&attention) {
+                    Some(owner) => owner.merge(&next)?,
+                    None => { scratch.insert(attention, next); }
+                }
+            }
+            let projection = scratch.values().map(|layout| -> Result<u64> {
+                let bytes = layout.packed_bytes()? as u64;
+                bytes.checked_add(cuteafd_loader::placement::planner::allocation_granularity_forecast(&[bytes])?)
+                    .context("chain projection overflow")
+            }).collect::<Result<Vec<_>>>()?.into_iter().sum::<u64>();
+            bytes = bytes.checked_add(workspace).and_then(|n| n.checked_add(ffn))
+                .and_then(|n| n.checked_add(projection)).context("chain workspace overflow")?;
         }
         Ok((bytes, routed))
     }
@@ -145,18 +167,23 @@ impl<'a> TargetChain<'a> {
             total <= available,
             "Step-5 target prefix needs {total} bytes, available {available}"
         );
-        let rope = Rc::new(TargetTables::load(
+        let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
+        let weights = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+            weight_layout(&layout, &contract.rope_tables, device.id, count)?,
+            cuteafd_core::memory_layout::ArenaTag::weights("step5/target"))?;
+        let rope = Rc::new(TargetTables::load_in(
             device,
             programs,
             &contract,
             "step5_",
             available,
             reservations,
+            Some(&weights),
         )?);
         let mut layers = Vec::new();
         for (id, plan) in routed.into_iter().enumerate() {
             let attention = if contract.layers[id].sliding.is_some() {
-                Attention::Sliding(SwaLayer::load(
+                Attention::Sliding(SwaLayer::load_weights_in(
                     device,
                     programs,
                     checkpoint,
@@ -164,9 +191,9 @@ impl<'a> TargetChain<'a> {
                     rows,
                     Some(rope.clone()),
                     available,
-                    &[], kv_format)?)
+                    &[], kv_format, Some(&weights))?)
             } else {
-                Attention::Sparse(CsaLayer::load(
+                Attention::Sparse(CsaLayer::load_weights_in(
                     device,
                     programs,
                     checkpoint,
@@ -174,10 +201,10 @@ impl<'a> TargetChain<'a> {
                     rows,
                     Some(rope.clone()),
                     available,
-                    &[], kv_format)?)
+                    &[], kv_format, Some(&weights))?)
             };
             let routed = plan
-                .map(|p| RoutedFfn::load(device, programs, checkpoint, id, p))
+                .map(|p| RoutedFfn::load_shared(device, programs, checkpoint, id, p, None, None, Some(&weights)))
                 .transpose()?;
             let dense_owned = match &attention {
                 Attention::Sliding(owner) => owner.has_dense_ffn(),
@@ -195,8 +222,11 @@ impl<'a> TargetChain<'a> {
             layers,
             rows,
             bytes,
+            weights,
         })
     }
+    pub(super) fn weight_arena(&self) -> &crate::shared::memory::weight_arena::DeviceWeightArena<'a> { &self.weights }
+
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
