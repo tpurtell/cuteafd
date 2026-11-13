@@ -19,6 +19,20 @@ pub struct UsageDevice {
     pub cuda: i32,
 }
 
+/// A retained backing, not a reconstructed allocation-history record.
+#[derive(Clone, Copy, Debug)]
+pub enum UsageStorage {
+    Device(CuteafdDeviceBuffer),
+    Pinned(CuteafdHostBuffer),
+}
+
+#[derive(Clone, Debug)]
+pub struct UsageAllocation {
+    pub owner: String,
+    pub device: UsageDevice,
+    pub storage: UsageStorage,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsagePhase {
     Prefill,
@@ -366,6 +380,21 @@ impl<'a> ExpertUsage<'a> {
     pub fn reader(&self) -> Reader {
         self.reader.clone()
     }
+    /// Physical counter/snapshot/pinned owners, with logical and CUDA identities.
+    /// Host history, worker stack and metadata are separate host-budget charges,
+    /// not a single backing that this inventory could truthfully report.
+    /// Descriptors borrow no ownership; their buffers stay live only with `self`.
+    pub fn allocation_receipts(&self) -> Vec<UsageAllocation> {
+        self.raw.as_ref().into_iter().flat_map(|owners| owners.iter()).flat_map(|raw| {
+            [
+                ("counters", UsageStorage::Device(raw.counters)),
+                ("snapshot", UsageStorage::Device(raw.snapshot)),
+                ("pinned", UsageStorage::Pinned(raw.host)),
+            ].map(|(kind, storage)| UsageAllocation {
+                owner: device_owner(raw.device.logical, kind), device: raw.device, storage,
+            })
+        }).collect()
+    }
     /// No CUDA query/device switch: safe to resolve inside a captured router path.
     pub fn routes(&self, device: i32, layer: usize, phase: UsagePhase) -> Result<RouteTally<'_>> {
         let raw = self
@@ -409,6 +438,95 @@ impl Drop for ExpertUsage<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_usage_receipts_are_canonical_physical_backings_on_reversed_devices() -> Result<()> {
+        use crate::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        for cuda in [0, 1] { fixture.configure_memory(&library, cuda, 1 << 30)?; }
+        let geometry = Geometry { layers: 4, experts: 8, topk: 2, routed_layers: vec![1, 3] };
+        let devices = [UsageDevice { logical: 0, cuda: 1 }, UsageDevice { logical: 1, cuda: 0 }];
+        for devices in [&devices[..1], &devices[..]] {
+            library.cuda_set_device(0)?;
+            let usage = ExpertUsage::new(&library, geometry.clone(), devices, Reader::default())?;
+            assert_eq!(library.cuda_get_device()?, 0, "constructor restores the caller's device");
+            let receipts = usage.allocation_receipts();
+            assert_eq!(receipts.len(), 3 * devices.len());
+            let mut addresses = std::collections::BTreeSet::new();
+            for (raw, receipts) in usage.raw.as_ref().unwrap().iter().zip(receipts.chunks_exact(3)) {
+                for (receipt, (kind, address)) in receipts.iter().zip([
+                    ("counters", raw.counters.ptr as usize),
+                    ("snapshot", raw.snapshot.ptr as usize),
+                    ("pinned", raw.host.ptr as usize),
+                ]) {
+                    assert_eq!(receipt.owner, device_owner(raw.device.logical, kind));
+                    assert_eq!(receipt.device, raw.device);
+                    let (actual, bytes) = match receipt.storage {
+                        UsageStorage::Device(buffer) => {
+                            assert_ne!(kind, "pinned");
+                            assert_eq!(buffer.device_id, raw.device.cuda);
+                            (buffer.ptr as usize, buffer.bytes)
+                        }
+                        UsageStorage::Pinned(buffer) => {
+                            assert_eq!(kind, "pinned");
+                            assert_ne!(buffer.flags & CUTEAFD_HOST_BUFFER_FLAG_PINNED, 0);
+                            (buffer.ptr as usize, buffer.bytes)
+                        }
+                    };
+                    assert_eq!(actual, address);
+                    assert_eq!(bytes, geometry.table_bytes().unwrap());
+                    assert!(actual != 0 && addresses.insert(actual), "each receipt names one distinct live backing");
+                }
+                library.cuda_set_device(raw.device.cuda)?;
+                assert_eq!(library.cuda_memory_info()?.0, (1 << 30) - 2 * geometry.table_bytes().unwrap());
+            }
+            library.cuda_set_device(0)?;
+            drop(usage);
+            assert_eq!(library.cuda_get_device()?, 0, "retirement restores the caller's device");
+            for device in devices {
+                library.cuda_set_device(device.cuda)?;
+                assert_eq!(library.cuda_memory_info()?, (1 << 30, 1 << 30));
+            }
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    #[test]
+    fn usage_fixture_tallies_and_snapshots_real_rows_and_rejects_invalid_arguments() -> Result<()> {
+        use crate::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let geometry = Arc::new(Geometry { layers: 2, experts: 4, topk: 2, routed_layers: vec![1] });
+        let raw = RawOwner::new(&library, Arc::clone(&geometry), UsageDevice { logical: 1, cuda: 0 })?;
+        let ids = [0u32, 1, 0x10001, 3, 2, 2];
+        let real_rows = 2;
+        // SAFETY: fixture operands are live host-backed CPU buffers and the stream is retained by raw.
+        unsafe {
+            assert_eq!((raw.tally)(ids.as_ptr(), raw.counters.ptr.cast(), 3, 2, 4, 0xffff,
+                &real_rows, raw.stream), 0);
+            assert_ne!((raw.tally)(ids.as_ptr(), raw.counters.ptr.cast(), 1, 0, 4, 0xffff,
+                std::ptr::null(), raw.stream), 0);
+            assert_ne!((raw.tally)(ids.as_ptr(), raw.counters.ptr.cast(), u32::MAX, 2, 4, 0xffff,
+                std::ptr::null(), raw.stream), 0);
+            assert_ne!((raw.tally)(ids.as_ptr(), std::ptr::null_mut(), 1, 2, 4, 0xffff,
+                std::ptr::null(), raw.stream), 0);
+            assert_ne!((raw.read)(raw.counters.ptr.cast(), raw.snapshot.ptr.cast(), 0, raw.stream), 0);
+            assert_ne!((raw.read)(raw.counters.ptr.cast(), raw.snapshot.ptr.cast(), 4,
+                usize::MAX as *mut c_void), 0);
+        }
+        raw.begin_snapshot()?;
+        let mut merged = Snapshot { elapsed_s: 0.0, prefill: vec![0; 8], decode: vec![0; 8] };
+        raw.merge_snapshot(&mut merged, Instant::now() + SNAPSHOT_TIMEOUT)?;
+        assert_eq!(merged.prefill, [1, 2, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(merged.decode, [0; 8]);
+        Ok(())
+    }
+
     #[test]
     fn merged_device_matrices_are_exact_and_overflow_is_rejected() {
         let mut merged = Snapshot {

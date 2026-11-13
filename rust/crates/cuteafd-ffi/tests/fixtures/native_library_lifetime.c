@@ -585,6 +585,33 @@ int cuteafd_cuda_stream_create(void **out) {
     pthread_mutex_unlock(&upload_mutex);
     event('V'); return 0;
 }
+/* Immediate CPU counterparts of expert_usage.cu, never allocation-only success. */
+int cuteafd_expert_usage_tally(const uint32_t *ids, uint64_t *counts,
+    uint32_t rows, uint32_t topk, uint32_t experts, uint32_t mask,
+    const int32_t *valid_rows, void *stream) {
+    if (!immediate_copies || extent_only || !ids || !counts || !topk || !experts
+            || rows > UINT32_MAX / topk || !stream
+            || (uintptr_t)stream > atomic_load(&next_stream)) return 1;
+    uint32_t real = rows;
+    if (valid_rows) {
+        real = *valid_rows < 0 ? 0 : (uint32_t)*valid_rows;
+        if (real > rows) real = rows;
+    }
+    for (uint32_t i = 0; i < real * topk; ++i) {
+        uint32_t expert = ids[i] & mask;
+        if (expert < experts) __atomic_fetch_add(counts + expert, 1, __ATOMIC_RELAXED);
+    }
+    return 0;
+}
+int cuteafd_expert_usage_snapshot(uint64_t *source, uint64_t *target,
+    uint32_t cells, void *stream) {
+    if (!immediate_copies || extent_only || !source || !target || !cells || !stream
+            || (uintptr_t)stream > atomic_load(&next_stream)) return 1;
+    for (uint32_t i = 0; i < cells; ++i)
+        target[i] = __atomic_load_n(source + i, __ATOMIC_RELAXED);
+    return 0;
+}
+
 #define UPLOAD_EVENT_CAPACITY 4096
 static void *upload_events[UPLOAD_EVENT_CAPACITY];
 static size_t upload_event_count;
