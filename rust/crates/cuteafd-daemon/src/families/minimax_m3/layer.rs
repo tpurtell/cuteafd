@@ -284,6 +284,162 @@ impl<'a> UnitOwner<'a> {
 mod tests {
     use super::*;
 
+    fn residual_bytes(sequence: usize, positions: std::ops::Range<usize>) -> Vec<u8> {
+        positions.flat_map(|position| (0..6144).flat_map(move |column| {
+            let value = ((sequence * 101 + position * 37 + column * 17) % 257) as f32 / 128.0 - 1.0;
+            value.to_le_bytes()
+        })).collect()
+    }
+
+    fn read_residual(owner: &UnitOwner<'_>, rows: usize) -> Result<Vec<f32>> {
+        owner.stream.drain()?;
+        let mut bytes = vec![0; rows * 6144 * 4];
+        owner.stream.device.run(|| owner.stream.device.library.copy_d2h(&mut bytes, owner.plane("residual")?))?;
+        Ok(bytes.chunks_exact(4).map(|value| f32::from_le_bytes(value.try_into().unwrap())).collect())
+    }
+
+    fn cache_bytes(library: &cuteafd_ffi::NativeLibrary, request: attention::Request) -> Result<Vec<Vec<u8>>> {
+        [request.key_cache, request.value_cache, request.index_cache].into_iter().map(|buffer| {
+            let mut bytes = vec![0; buffer.bytes];
+            library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes)
+        }).collect()
+    }
+
+    fn compare_residual(actual: &[f32], reference: &[f32], label: &str) -> Result<()> {
+        ensure!(!actual.is_empty() && actual.len() == reference.len(), "{label}: residual extent");
+        ensure!(actual.iter().chain(reference).all(|value| value.is_finite()), "{label}: nonfinite residual");
+        let squared = actual.iter().zip(reference).map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2)).sum::<f64>();
+        let norm = reference.iter().map(|value| f64::from(*value).powi(2)).sum::<f64>();
+        let peak = reference.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
+        let max = actual.iter().zip(reference).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ensure!(norm > 0.0 && peak > 0.0, "{label}: empty residual signal");
+        let relative = (squared / norm).sqrt();
+        eprintln!("MiniMax {label}: rows={} rel_l2={relative} max_abs_over_peak={}", actual.len() / 6144, max / peak);
+        ensure!(relative <= 0.002 && max / peak <= 0.01, "{label}: native residual differs from independent extend");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires MiniMax checkpoint and native SM120 exports through golden-run --native-test"]
+    fn native_layer_packed_segments_and_decode_match_independent_extend() -> Result<()> {
+        use super::super::cache::Cache;
+        use cuteafd_loader::{plan::Checkpoint, serving_capacity::WeightArenaLayout};
+        use std::path::Path;
+        let snapshot = std::env::var("CUTEAFD_MINIMAX_SNAPSHOT").context("set CUTEAFD_MINIMAX_SNAPSHOT")?;
+        let checkpoint = Checkpoint::coordinator(Path::new(&snapshot), false, false)?;
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+        cfg.release_geometry()?;
+        let mut weights = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &vec![0; cfg.layers])?
+            .into_iter().next().context("MiniMax native layer layout")?;
+        // Keep the real layer's native operands, without loading the other 59 layers or vocabulary head.
+        let prefix = "language_model.model.layers.0.";
+        weights.arena = WeightArenaLayout::new("minimax/native-layer-oracle", weights.arena.views().iter()
+            .filter(|(name, _)| name.starts_with(prefix)).map(|(name, view)| (name.clone(), view.bytes())))?;
+        weights.layers = vec![0];
+        weights.projections.retain(|projection| projection.stem.starts_with(prefix));
+        // SAFETY: the golden runner supplies the sealed native library; all owners retire before it.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = Device { library: &library, id: std::env::var("CUTEAFD_CACHE_TEST_DEVICE")
+            .unwrap_or_else(|_| "0".into()).parse()? };
+        let path = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let programs = library.programs()?.with_manifest(Path::new(&path))?;
+        let target = TargetWeights::mount(device, &checkpoint, &weights)?;
+        let kernels = Kernels::bind(device, &programs, &manifest, &cfg, &weights, 257, 270)?;
+        let stream = Rc::new(Stream::new(device)?);
+        let mut single = UnitOwner::new(&kernels, Rc::clone(&stream), &cfg, &weights, 257)?;
+        let mut packed = UnitOwner::new(&kernels, Rc::clone(&stream), &cfg, &weights, 17)?;
+        let mut decode = UnitOwner::new_decode(&kernels, Rc::clone(&stream), &cfg, &weights, 1)?;
+        let mut cache_cfg = cfg.clone();
+        cache_cfg.layers = 1;
+        let mut reference = Vec::new();
+        let mut segments = Vec::new();
+        let mut inputs = Vec::new();
+        let mut caches = Vec::new();
+        let mut metadata = Vec::new();
+        for (sequence, (begin, rows)) in [(63, 1), (127, 3), (257, 13)].into_iter().enumerate() {
+            for _ in 0..2 {
+                let cache = Cache::new(Rc::clone(&stream), &cache_cfg, begin + rows)?;
+                let mut meta = cache.metadata(257)?;
+                cache.prepare(&mut meta, 0..begin)?;
+                let request = cache.request(&meta, 0)?;
+                device.run(|| {
+                    for buffer in [request.key_cache, request.value_cache, request.index_cache] {
+                        library.cuda_zero_bytes(buffer, buffer.bytes)?;
+                    }
+                    Ok(())
+                })?;
+                device.run(|| library.copy_h2d(single.plane("residual")?, &residual_bytes(sequence, 0..begin)))?;
+                // SAFETY: cold Cache owns unique pages; metadata and every arithmetic owner retain the stream.
+                unsafe { single.attention(&kernels, &target, &weights, 0, cache.request(&meta, 0)?)?; }
+                stream.drain()?;
+                caches.push(cache);
+                metadata.push(meta);
+            }
+            let at = sequence * 2;
+            device.run(|| {
+                assert_eq!(cache_bytes(&library, caches[at].request(&metadata[at], 0)?)?,
+                    cache_bytes(&library, caches[at + 1].request(&metadata[at + 1], 0)?)?,
+                    "identical cold prefixes must write byte-identical cache state");
+                Ok(())
+            })?;
+            caches[at].prepare(&mut metadata[at], begin..begin + rows)?;
+            let input = residual_bytes(sequence, begin..begin + rows);
+            device.run(|| library.copy_h2d(single.plane("residual")?, &input))?;
+            // SAFETY: this sequence's prefix has completed, and tail metadata references only its initialized pages.
+            unsafe { single.attention(&kernels, &target, &weights, 0, caches[at].request(&metadata[at], 0)?)?; }
+            single.ffn(&kernels, &target, &weights, 0, rows, false)?;
+            reference.extend(read_residual(&single, rows)?);
+            caches[at + 1].prepare(&mut metadata[at + 1], begin..begin + rows)?;
+            segments.push(attention::Segment { first_row: inputs.len() / (6144 * 4),
+                request: caches[at + 1].request(&metadata[at + 1], 0)? });
+            inputs.extend(input);
+        }
+        device.run(|| library.copy_h2d(packed.plane("residual")?, &inputs))?;
+        // SAFETY: the three disjoint cold-cache requests partition packed residual rows; no host packer is used.
+        unsafe { packed.attention_segments(&kernels, &target, &weights, 0, &segments)?; }
+        packed.ffn(&kernels, &target, &weights, 0, 17, false)?;
+        let actual = read_residual(&packed, 17)?;
+        let mut first = 0;
+        for (sequence, rows) in [1, 3, 13].into_iter().enumerate() {
+            let end = first + rows * 6144;
+            compare_residual(&actual[first..end], &reference[first..end], &format!("packed tail sequence={sequence} rows={rows}"))?;
+            first = end;
+        }
+        // Rowwise cache producers are shared, so batching cannot alter persistent state.
+        device.run(|| {
+            for sequence in 0..3 {
+                let at = sequence * 2;
+                assert_eq!(cache_bytes(&library, caches[at].request(&metadata[at], 0)?)?,
+                    cache_bytes(&library, caches[at + 1].request(&metadata[at + 1], 0)?)?,
+                    "packed sequence {sequence} cache differs from independent extend");
+            }
+            Ok(())
+        })?;
+        // Rewriting the same final append with identical values lets decode and extend consume identical cache state.
+        for (sequence, context) in [64, 130, 270].into_iter().enumerate() {
+            let at = sequence * 2;
+            caches[at].prepare(&mut metadata[at], context - 1..context)?;
+            let request = caches[at].request(&metadata[at], 0)?;
+            let input = residual_bytes(sequence, context - 1..context);
+            device.run(|| library.copy_h2d(single.plane("residual")?, &input))?;
+            // SAFETY: the cache is fully initialized and the one-row append targets its own last slot.
+            unsafe { single.attention(&kernels, &target, &weights, 0, request)?; }
+            single.ffn(&kernels, &target, &weights, 0, 1, false)?;
+            let expected = read_residual(&single, 1)?;
+            let expected_cache = device.run(|| cache_bytes(&library, request))?;
+            device.run(|| library.copy_h2d(decode.plane("residual")?, &input))?;
+            // SAFETY: C1 cold metadata has batch id zero, [0,1] offsets and one padded page-table row.
+            unsafe { decode.decode(&kernels, &target, &weights, 0, attention::DecodeRequest { request, batch: 1 })?; }
+            decode.ffn(&kernels, &target, &weights, 0, 1, false)?;
+            compare_residual(&read_residual(&decode, 1)?, &expected, &format!("native decode context={context}"))?;
+            assert_eq!(device.run(|| cache_bytes(&library, request))?, expected_cache,
+                "native decode must not change cache bytes relative to identical extend");
+        }
+        Ok(())
+    }
+
     #[test]
     fn packed_segments_partition_the_live_rows_without_gaps_or_overlap() {
         for spans in [vec![(0, 1)], vec![(0, 1), (1, 3), (4, 13)], vec![(0, 17)]] {

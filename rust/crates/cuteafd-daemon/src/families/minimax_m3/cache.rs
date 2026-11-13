@@ -43,7 +43,10 @@ impl<'a> Cache<'a> {
             Tag::workspace("minimax/rope"))?;
         let owner = Self { stream, layout, rope, pool, pages, planes, cos_sin, tokens };
         // Tables are immutable after construction; per-unit lengths are separate.
-        let table = owner.pages.iter().flat_map(|page| (*page as i32).to_le_bytes()).collect::<Vec<_>>();
+        let mut table = vec![0; owner.layout.table_width as usize * 4];
+        for (entry, page) in table.chunks_exact_mut(4).zip(&owner.pages) {
+            entry.copy_from_slice(&(*page as i32).to_le_bytes());
+        }
         device.run(|| {
             device.library.copy_h2d(owner.plane("page_table")?, &table)?;
             device.library.copy_h2d(owner.plane("lengths")?, &0i32.to_le_bytes())?;
