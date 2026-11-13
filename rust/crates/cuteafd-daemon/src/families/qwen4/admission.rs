@@ -236,7 +236,7 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
                     crate::shared::experts::fp8::validate_checkpoint_contract(&metadata.info, &tensors,
                         &ids, 1, 0, cuteafd_loader::formats::fp8_experts::Slicing::Padded)?;
                     let layout = crate::shared::experts::weight_layout::layout(args.device, "fp8",
-                        crate::shared::experts::fp8::regions(&tensors, &ids, 1, 0,
+                        cuteafd_loader::serving_capacity::fp8_expert_regions(&tensors, &ids, 1, 0,
                             cuteafd_loader::formats::fp8_experts::Slicing::Padded)?)?;
                     expert_arenas.push(layout);
                     future.push(Demand::new(0, Category::Workspace, "native expert scratch",

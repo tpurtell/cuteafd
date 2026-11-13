@@ -21,7 +21,7 @@ pub use owner_tp2::OwnerTp2Rows;
 mod fp8moe_workspace;
 pub use fp8moe_workspace::fp8moe_tp2_workspace;
 mod weight_storage;
-pub use weight_storage::{PackedWeightRegions, WeightArenaLayout, WeightArenaView};
+pub use weight_storage::{fp8_expert_regions, PackedWeightRegions, WeightArenaLayout, WeightArenaView};
 
 /// Stable physical owner ID for one independently retired expert selection.
 /// Both admission planners and runtime loaders pass the same ordered final views.

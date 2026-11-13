@@ -63,9 +63,95 @@ impl PackedWeightRegions {
     }
 }
 
+/// Final weight and scale views shared by package admission and runtime mounts.
+pub fn fp8_expert_regions(tensors: &crate::formats::fp8_experts::Fp8ExpertTensors,
+    layers: &[usize], tp: usize, rank: usize,
+    slicing: crate::formats::fp8_experts::Slicing) -> Result<Vec<(String, usize)>> {
+    use crate::formats::fp8_experts::Fp8Projection;
+    let mut regions = Vec::new();
+    for &layer in layers {
+        let tensors = tensors.for_layer_metadata(layer)?;
+        for (index, projection) in Fp8Projection::ALL.into_iter().enumerate() {
+            let (weights, _) = tensors.slice_bytes_with(projection, tp, rank, slicing)?;
+            for (plane, bytes) in [(index * 2, weights * tensors.shape().experts),
+                (index * 2 + 1, tensors.scale_region_bytes_with(projection, tp, rank, slicing)?)] {
+                if bytes > 0 { regions.push((format!("{layer}.{plane}"), bytes)); }
+            }
+        }
+    }
+    Ok(regions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn package_formats_selected_tp1_tp2_planes_match_load_extent() -> Result<()> {
+        use crate::formats::fp8_experts::{ExpertFormat, Slicing};
+        use crate::plan::testing::{fp8, mimo_flash_config, mxfp4, nvfp4, t, write_snapshot};
+        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
+            for bf16_scales in [false, true] {
+                let root = tempfile::tempdir()?;
+                let mut config = mimo_flash_config();
+                config["hidden_size"] = 128.into();
+                config["n_routed_experts"] = 2.into();
+                config["num_experts_per_tok"] = 2.into();
+                config["moe_intermediate_size"] = 1024.into();
+                config["num_hidden_layers"] = 3.into();
+                config["hybrid_layer_pattern"] = serde_json::json!([0, 1, 1]);
+                config["moe_layer_freq"] = serde_json::json!([0, 1, 1]);
+                if format == ExpertFormat::Nvfp4 {
+                    config["quantization_config"]["producer"] = serde_json::json!({"name": "modelopt"});
+                    config["quantization_config"]["config_groups"] = serde_json::json!({"group_0": {
+                        "targets": ["Linear"],
+                        "weights": {"dynamic": false, "group_size": 16, "num_bits": 4, "type": "float"},
+                        "input_activations": {"dynamic": false, "group_size": 16, "num_bits": 4, "type": "float"}
+                    }});
+                }
+                let mut headers = Vec::new();
+                for expert in 0..2 {
+                    for (projection, rows, columns) in [("gate", 1024, 128), ("up", 1024, 128), ("down", 128, 1024)] {
+                        let name = format!("model.layers.1.mlp.experts.{expert}.{projection}_proj");
+                        headers.extend(match format {
+                            ExpertFormat::Nvfp4 => nvfp4(&name, rows, columns),
+                            ExpertFormat::Mxfp4 => mxfp4(&name, rows, columns),
+                            _ => fp8(&name, rows, columns, None),
+                        });
+                        headers.push(t(format!("model.layers.2.mlp.experts.{expert}.{projection}_proj.weight"),
+                            "BF16", &[rows, columns]));
+                    }
+                }
+                if bf16_scales {
+                    for (name, dtype, _) in &mut headers {
+                        if name.ends_with("_scale_inv") { *dtype = "BF16"; }
+                    }
+                }
+                write_snapshot(root.path(), &config, &headers, None);
+                let catalog = crate::read_expert_catalog(root.path())?;
+                let tensors = catalog.fp8().context("package inventory missing")?;
+                for world in [1, 2] {
+                    for rank in 0..world {
+                        for slicing in [Slicing::Padded, Slicing::Blocks(128)] {
+                            let regions = fp8_expert_regions(tensors, &[1, 2], world, rank, slicing)?;
+                            let layout = WeightArenaLayout::new("fixture", regions.clone())?;
+                            for (name, bytes) in &regions {
+                                let view = layout.view(name).unwrap();
+                                assert_eq!(view.offset() % 256, 0);
+                                assert_eq!(view.bytes(), *bytes);
+                            }
+                            for layer in [1, 2] {
+                                let expected = tensors.for_layer_metadata(layer)?.layer_load(layer, world, rank, slicing)?.resident;
+                                assert_eq!(regions.iter().filter(|(name, _)| name.starts_with(&format!("{layer}.")))
+                                    .map(|(_, bytes)| bytes).sum::<usize>(), expected);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn preserves_plane_order_alignment_and_final_extent() {
         let layout = PackedWeightRegions::new([3, 0, 257, 16]).unwrap();

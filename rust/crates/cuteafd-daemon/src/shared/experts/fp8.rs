@@ -314,7 +314,7 @@ impl<'a> Fp8Layer<'a> {
         slicing: Slicing) -> Result<Self> {
         let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
         let arena = super::weight_layout::arena(device, "fp8",
-            super::fp8::regions(tensors, &[layer], tp, rank, slicing)?)?;
+            cuteafd_loader::serving_capacity::fp8_expert_regions(tensors, &[layer], tp, rank, slicing)?)?;
         Self::load_into(library, tensors, layer, tp, rank, slicing, &arena)
     }
 
@@ -482,7 +482,7 @@ impl<'a> Fp8Weights<'a> {
         let slicing = tensors.slicing_for_directory(directory, tp);
         if !layers.is_empty() {
             let layout = super::weight_layout::layout(library.cuda_get_device()?, "fp8",
-                super::fp8::regions(tensors, layers, tp, rank, slicing)?)?;
+                cuteafd_loader::serving_capacity::fp8_expert_regions(tensors, layers, tp, rank, slicing)?)?;
             super::weight_layout::admit(&layout, 0, 0, budget)?;
         }
         experts.load_mount(library, tensors, layers, slicing)?;
@@ -514,7 +514,7 @@ impl<'a> Fp8Weights<'a> {
         if layers.is_empty() { return Ok(()); }
         let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
         let arena = super::weight_layout::arena(device, "fp8",
-            super::fp8::regions(tensors, layers, self.tp, self.rank, slicing)?)?;
+            cuteafd_loader::serving_capacity::fp8_expert_regions(tensors, layers, self.tp, self.rank, slicing)?)?;
         self.load_mount_into(library, tensors, layers, slicing, &arena)
     }
 
@@ -604,7 +604,7 @@ impl<'a> Fp8Weights<'a> {
         ];
         let layouts = (0..2).map(|rank| {
             let layout = super::weight_layout::layout(devices[rank].id, "fp8",
-                super::fp8::regions(tensors, layers, 2, rank, slicing[rank])?)?;
+                cuteafd_loader::serving_capacity::fp8_expert_regions(tensors, layers, 2, rank, slicing[rank])?)?;
             super::weight_layout::admit(&layout, 0, 0, budgets[rank])?;
             Ok(layout)
         }).collect::<Result<Vec<_>>>()?;
@@ -888,7 +888,7 @@ impl<'a> Fp8Experts<'a> {
             ensure!(bytes <= budget, "empty expert window scratch exceeds budget");
         } else {
             let layout = super::weight_layout::layout(library.cuda_get_device()?, "fp8",
-                super::fp8::regions(tensors, layers, tp, rank, tensors.slicing_for_directory(directory, tp))?)?;
+                cuteafd_loader::serving_capacity::fp8_expert_regions(tensors, layers, tp, rank, tensors.slicing_for_directory(directory, tp))?)?;
             super::weight_layout::admit(&layout, 0, bytes, budget)?;
         }
         let scratch = Self::allocate_scratch(library, bytes)?;
@@ -987,7 +987,7 @@ mod tests {
                         let slicing = Slicing::Padded;
                         let before = native.events()?.matches('D').count();
                         let arena = super::super::weight_layout::arena(device, "fp8",
-                            regions(tensors, &[1, 2], world, rank, slicing)?)?;
+                            cuteafd_loader::serving_capacity::fp8_expert_regions(tensors, &[1, 2], world, rank, slicing)?)?;
                         let layers = device.run(|| [1, 2].into_iter().map(|layer|
                             Fp8Layer::load_into(&library, &tensors.for_layer(layer)?, layer,
                                 world, rank, slicing, &arena)).collect::<Result<Vec<_>>>())?;
@@ -1057,7 +1057,7 @@ mod tests {
                 for rank in 0..world {
                     let slicing = tensors.exact_slicing(world);
                     let arena = super::super::weight_layout::arena(device, "fp8",
-                        regions(&tensors, &[1, 2], world, rank, slicing)?)?;
+                        cuteafd_loader::serving_capacity::fp8_expert_regions(&tensors, &[1, 2], world, rank, slicing)?)?;
                     let layout = arena.layout().clone();
                     let mounted = device.run(|| [1, 2].into_iter().map(|layer|
                         Fp8Layer::load_into(&library, &tensors.for_layer_metadata(layer)?, layer,
@@ -1165,7 +1165,7 @@ mod tests {
             for rank in 0..2 {
                 let slicing = tensors.exact_slicing(2);
                 let arena = super::super::weight_layout::arena(device, "fp8",
-                    regions(&tensors, &[layer], 2, rank, slicing)?)?;
+                    cuteafd_loader::serving_capacity::fp8_expert_regions(&tensors, &[layer], 2, rank, slicing)?)?;
                 let layout = arena.layout().clone();
                 let mounted = device.run(|| Fp8Layer::load_into(&library, &tensors, layer, 2, rank, slicing, &arena))?;
                 let plan = RankPlan::from_tensors(&tensors, &[(layer, slicing)], 2, rank, usize::MAX)?;
@@ -1502,22 +1502,4 @@ mod tests {
             assert!(validate_bf16_package(&primary, &incompatible, 64).is_err(), "{incompatible:?}");
         }
     }
-}
-
-pub(crate) fn regions(tensors: &cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors,
-    layers: &[usize], tp: usize, rank: usize,
-    slicing: cuteafd_loader::formats::fp8_experts::Slicing) -> Result<Vec<(String, usize)>> {
-    use cuteafd_loader::formats::fp8_experts::Fp8Projection;
-    let mut regions = Vec::new();
-    for &layer in layers {
-        let tensors = tensors.for_layer_metadata(layer)?;
-        for (index, projection) in Fp8Projection::ALL.into_iter().enumerate() {
-            let (weights, _) = tensors.slice_bytes_with(projection, tp, rank, slicing)?;
-            for (plane, bytes) in [(index * 2, weights * tensors.shape().experts),
-                (index * 2 + 1, tensors.scale_region_bytes_with(projection, tp, rank, slicing)?)] {
-                if bytes > 0 { regions.push((format!("{layer}.{plane}"), bytes)); }
-            }
-        }
-    }
-    Ok(regions)
 }

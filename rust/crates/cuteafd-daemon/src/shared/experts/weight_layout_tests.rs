@@ -70,34 +70,6 @@ fn exl3_selected_tp1_tp2_regions_preserve_composite_layers() -> Result<()> {
 }
 
 #[test]
-fn package_formats_selected_tp1_tp2_planes_match_load_extent() -> Result<()> {
-    use crate::shared::{experts::fp8, memory::push_fp8::tests::fixture};
-    use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Slicing};
-    for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
-        for bf16_scales in [false, true] {
-            let root = tempfile::tempdir()?;
-            let catalog = fixture(root.path(), format, bf16_scales)?;
-            for world in [1, 2] {
-                for rank in 0..world {
-                    for slicing in [Slicing::Padded, Slicing::Blocks(128)] {
-                        let tensors = catalog.fp8().unwrap();
-                        let regions = fp8::regions(tensors, &[1, 2], world, rank, slicing)?;
-                        let planned = layout(rank as i32, "fp8", regions.clone())?;
-                        check(&planned, &regions);
-                        for layer in [1, 2] {
-                            let expected = tensors.for_layer_metadata(layer)?.layer_load(layer, world, rank, slicing)?.resident;
-                            assert_eq!(regions.iter().filter(|(name, _)| name.starts_with(&format!("{layer}.")))
-                                .map(|(_, bytes)| bytes).sum::<usize>(), expected);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-#[test]
 fn native_final_planes_exclude_raw_scales_and_preserve_vector_tail() -> Result<()> {
     use cuteafd_loader::push_load::native::NativePlanes;
     for nvfp4 in [false, true] {
@@ -163,7 +135,7 @@ fn native_plane_receipts_charge_each_rank_backing_once() -> Result<()> {
 #[test]
 #[ignore = "CPU inventory of installed checkpoints; run explicitly with --nocapture"]
 fn installed_format_inventory() -> Result<()> {
-    use crate::shared::experts::{exl3, fp8, layer::ExpertLayer};
+    use crate::shared::experts::{exl3, layer::ExpertLayer};
     use anyhow::Context;
     use cuteafd_loader::{formats::fp8_experts::Slicing,
         plan::exlr8::residency::{ExpertSet, Residency}, push_load::native::NativePlanes};
@@ -199,7 +171,7 @@ fn installed_format_inventory() -> Result<()> {
         let tensors = catalog.fp8().context("package inventory catalog missing")?;
         let layers = (0..catalog.routed_experts().layers).filter(|&layer| tensors.has_layer(layer)).collect::<Vec<_>>();
         for world in [1, 2] {
-            report(&format!("{label}-tp{world}"), fp8::regions(tensors, &layers, world, 0, Slicing::Padded)?)?;
+            report(&format!("{label}-tp{world}"), cuteafd_loader::serving_capacity::fp8_expert_regions(tensors, &layers, world, 0, Slicing::Padded)?)?;
         }
     }
     let root = snapshot("kindlingai/glm-5.3-flash-exlr8-k2-k3-k4")?;

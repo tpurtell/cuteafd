@@ -703,7 +703,7 @@ pub(super) fn load_fp8<'a>(
     } else {
         // Failed candidates have crossed the all-rank drain barrier. Reuse the
         // original modules; no second package preparation on fallback.
-        let regions = groups.iter().map(|group| super::super::fp8::regions(
+        let regions = groups.iter().map(|group| cuteafd_loader::serving_capacity::fp8_expert_regions(
             &group.tensors, &group.layers, config.world, config.rank, group.slicing))
             .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
         let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
