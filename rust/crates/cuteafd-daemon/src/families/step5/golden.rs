@@ -1291,7 +1291,6 @@ fn run(args: GoldenArgs) -> Result<()> {
     .into_iter()
     .try_fold(0u64, |a, b| a.checked_add(b))
     .context("golden admission overflow")?;
-    ensure!(total <= available, "Step-5 golden needs {total} bytes including weights/workspaces/cache/code/transport, available {available}");
     tracing::info!(
         rows,
         last_layer = args.last_layer,
@@ -1308,6 +1307,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         available,
         "Step-5 cold prefix admission"
     );
+    ensure!(total <= available, "Step-5 golden needs {total} bytes including weights/workspaces/cache/code/transport, available {available}");
     let started = std::time::Instant::now();
     let remaining = available as usize;
     let cache = RefCell::new(CacheRank::new(device, layout, 0, 1, 0, pages, remaining)?);
