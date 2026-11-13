@@ -99,6 +99,54 @@ fn minimax_native_inventory_is_planned_not_executable() {
 }
 
 #[test]
+fn cache_geometry_preserves_native_fp8_pages_and_physical_layer_owners() {
+    use crate::serving_capacity::{CacheOptions, KvPlacement};
+    use crate::placement::AttentionPlacement;
+    let (dir, config, _) = fixture();
+    let cfg = MiniMaxM3Config::from_hf(&config).unwrap();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = MINIMAX_M3.open(&checkpoint).unwrap();
+    let rows = crate::placement::families::minimax_m3::PAGE_ROWS;
+    let kv = rows * cfg.kv_heads as u64 * cfg.head_dim as u64;
+    let index = rows * (cfg.msa.index_dim as u64 + 4);
+    assert_eq!((kv, kv, index), (32768, 32768, 8448));
+    let manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../cuteafd-ffi/tests/fixtures/minimax_msa_programs.json")).unwrap();
+    let mut cache_operands = 0;
+    for pointer in manifest["programs"].as_array().unwrap().iter()
+        .flat_map(|program| program["pointers"].as_array().unwrap())
+        .filter(|pointer| matches!(pointer["name"].as_str(), Some("key_cache" | "value_cache"))) {
+        assert_eq!(pointer["dtype"], "uint8");
+        assert_eq!(pointer["shape"], "[pool_pages,64,4,128] E4M3 bytes");
+        cache_operands += 1;
+    }
+    assert_eq!(cache_operands, 4);
+    let single = model.cache_geometry(CacheOptions::default()).unwrap().unwrap();
+    assert_eq!(single.logical_unit_rows, rows);
+    assert_eq!(single.placement, KvPlacement::SingleDevice);
+    assert_eq!(single.ranks[0].persistent_unit_bytes, cfg.layers as u64 * (2 * kv + index));
+    for gpus in [1, 2] {
+        let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: gpus, ..Default::default() }).unwrap().unwrap();
+        let owners = crate::placement::families::minimax_m3::layer_owners(cfg.layers, gpus);
+        let native = crate::families::minimax_m3::execution::MsaCache::new(cfg.layers as u32, 1, 1, 64).unwrap();
+        let native = native.buffers().unwrap();
+        for gpu in 0..gpus {
+            let owned: u64 = owners.iter().enumerate().filter(|(_, owner)| usize::from(**owner) == gpu)
+                .map(|(layer, _)| native.iter().filter(|(name, _)| name.starts_with(&format!("layer.{layer}.")))
+                    .map(|(_, bytes)| bytes).sum::<u64>()).sum();
+            assert_eq!(geometry.ranks[gpu].persistent_unit_bytes, owned);
+            assert_eq!(geometry.ranks[gpu].context_table_bytes_per_token, cfg.rotary_dim as u64 * 4);
+        }
+        assert_eq!(geometry.placement, if gpus == 1 { KvPlacement::SingleDevice } else { KvPlacement::PartitionedLayers });
+    }
+    for mode in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+        assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 2, attention_placement: Some(mode),
+            ..Default::default() }).is_err());
+    }
+    assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 3, ..Default::default() }).is_err());
+}
+
+#[test]
 fn minimax_spark_recipe_uses_compressed_divisor_headers_without_opening_serving() {
     use crate::plan::format::{ScaleDirection, detect, group_by_stem};
     let (dir, _, _) = fixture();
