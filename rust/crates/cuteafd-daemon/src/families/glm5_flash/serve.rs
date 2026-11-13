@@ -1146,7 +1146,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     |placement, chunk, rows, position| {
                         if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring("glm5_flash") {
                             engine.prefill_streamed_scoring(placement, chunk, &request_media,
-                                probe::ScoringRows { probe: &job.probe, position })
+                                probe::ScoringRows { consumer: &job.probe, position })
                         } else if rows > 1 {
                             engine.prefill_scoring_media(placement, chunk, &request_media)
                         } else {

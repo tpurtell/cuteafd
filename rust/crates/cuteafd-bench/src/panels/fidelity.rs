@@ -14,9 +14,8 @@ pub static FULL: FidelityPanel = FidelityPanel { full: true };
 pub struct FidelityPanel { full: bool }
 
 pub fn prefill_unavailable(info: &ServerInfo) -> Option<String> {
-    let admitted = crate::fidelity_dataset::full_prefill_logits(info.family.as_deref(),
-        crate::fidelity_dataset::prefill_admitted(&info.configuration.settings));
-    (!admitted).then(|| "Prefill scoring not admitted at launch; restart with FULL_PREFILL_LOGITS=on (--full-prefill-logits).".into())
+    let admitted = crate::fidelity_dataset::prefill_admitted(&info.configuration.settings);
+    (!admitted).then(|| "Server does not advertise bounded streamed prefill scoring.".into())
 }
 
 /// Runtime scratch rows are consumed window-by-window, then the private run directory is removed.
@@ -34,7 +33,7 @@ pub fn score(client: &Client, info: &ServerInfo, tier: &str, path: &str, progres
         verify_rows: Vec::new(), api_key: None, api_key_file: None };
     let mut model_record = client.model_record()?;
     model_record["max_context"] = json!(max_context);
-    model_record["full_prefill_logits"] = json!(prefill_unavailable(info).is_none());
+    model_record["prefill_scoring"] = json!(prefill_unavailable(info).is_none().then_some("streamed"));
     model_record["snapshot"] = json!(info.configuration.snapshot);
     model_record["settings"] = json!(info.configuration.settings);
     let checkpoint = info.checkpoint();
@@ -150,32 +149,17 @@ impl Panel for FidelityPanel {
 mod tests {
     use super::*;
     #[test]
-    fn native_v41_sparse_prefill_is_admitted_in_old_and_new_arms_without_cli_flag() {
-        let info = ServerInfo { model: "deepseek-ai/DeepSeek-V4.1-Flash".into(),
-            family: Some("deepseek_v41".into()), ..Default::default() };
-        assert!(info.configuration.settings.is_empty());
-        assert!(prefill_unavailable(&info).is_none());
-        assert!(FULL.unavailable(&info).is_none());
-        for family in ["deepseek_v4", "glm5", "glm5_flash", "qwen4", "mimo_v2"] {
-            let info = ServerInfo { family: Some(family.into()), ..Default::default() };
+    fn every_family_requires_the_same_resolved_capability() {
+        for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "qwen4", "mimo_v2", "kimi_k3"] {
+            let mut info = ServerInfo { model: "Qwen/Qwen3.8-Flash-Next-FP8".into(),
+                family: Some(family.into()), ..Default::default() };
             assert!(prefill_unavailable(&info).is_some(), "{family}");
+            assert!(STANDARD.unavailable(&info).is_none(), "decode remains available");
+            assert!(FULL.unavailable(&info).is_some(), "{family}");
+            info.configuration.settings.push(crate::report::Setting { name: "prefill-scoring".into(),
+                value: Some("streamed".into()), source: "resolved".into(), ..Default::default() });
+            assert!(prefill_unavailable(&info).is_none(), "{family}");
+            assert!(FULL.unavailable(&info).is_none(), "{family}");
         }
-    }
-
-    #[test]
-    fn full_requires_launch_admission_and_standard_does_not() {
-        let mut info = ServerInfo {model:"Qwen/Qwen3.8-Flash-Next-FP8".into(),..Default::default()};
-        assert!(STANDARD.unavailable(&info).is_none());
-        assert!(FULL.unavailable(&info).unwrap().contains("FULL_PREFILL_LOGITS=on"));
-        info.configuration.settings.push(crate::report::Setting {name:"full-prefill-logits".into(),
-            value:Some("true".into()),default:Some("false".into()),source:"cli".into()});
-        assert!(FULL.unavailable(&info).is_none());
-        for model in ["XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"] {
-            info.model = model.into();
-            assert!(STANDARD.unavailable(&info).is_none());
-            assert!(FULL.unavailable(&info).is_none());
-        }
-        info.configuration.settings.clear();
-        assert!(FULL.unavailable(&info).unwrap().contains("FULL_PREFILL_LOGITS=on"));
     }
 }

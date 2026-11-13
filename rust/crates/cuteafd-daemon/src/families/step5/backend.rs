@@ -568,7 +568,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
                 cuteafd_transport::ExpertV2SourceKind::Prefill, Some(0))?)?;
             let rank = self.execution.ownership().execution().spec().head_gpu as usize;
             let head = self.execution.head()?;
-            let scoring = crate::shared::probe::ScoringRows { probe, position };
+            let scoring = crate::shared::probe::ScoringRows { consumer: probe, position };
             // The complete transformer call stays intact. Its terminal residual
             // was retained in the independent input owner before head scratch reuse.
             step.compose(rank, head, |head, meta| {

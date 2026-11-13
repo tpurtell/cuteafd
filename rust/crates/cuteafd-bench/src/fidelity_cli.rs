@@ -239,7 +239,7 @@ fn validate_widths(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_series(args: &RunArgs, full_prefill: bool,
+fn run_series(args: &RunArgs, streamed_prefill: bool,
     mut score: impl FnMut(&RunArgs) -> Result<Run>) -> Result<Vec<Run>> {
     validate_widths(args)?;
     let widths = if args.verify_rows.is_empty() { vec![None] }
@@ -255,7 +255,7 @@ fn run_series(args: &RunArgs, full_prefill: bool,
         }
         runs.push(score(&one)?);
     }
-    if args.tier == "standard" && full_prefill {
+    if args.tier == "standard" && streamed_prefill {
         let mut prefill = args.clone();
         prefill.score_path = "prefill".into();
         prefill.verify_rows.clear();
@@ -290,34 +290,8 @@ fn run_output(args: &RunArgs, runs: &[Run]) -> Value {
     output
 }
 
-pub(crate) fn discovered_prefill_logits(status: &Value) -> Result<bool> {
-    discovered_prefill_logits_at(status, &cuteafd_loader::default_hf_home())
-}
-
-fn discovered_prefill_logits_at(status: &Value, hf_home: &std::path::Path) -> Result<bool> {
-    use cuteafd_loader::plan::{checkpoint::{read_json, Checkpoint}, family};
-    let advertised = status["snapshot"].as_str().map(PathBuf::from)
-        .context("fidelity family discovery: server did not advertise a snapshot")?;
-    // run.sh mounts the host's HF hub at /hf/hub inside the server container.
-    let snapshot = if advertised.join("config.json").exists() {
-        advertised.clone()
-    } else if let Ok(relative) = advertised.strip_prefix("/hf/hub") {
-        ensure!(relative.components().all(|part| matches!(part, std::path::Component::Normal(_))),
-            "fidelity family discovery: invalid container snapshot path {}", advertised.display());
-        hf_home.join("hub").join(relative)
-    } else {
-        advertised.clone()
-    };
-    let path = snapshot.join("config.json");
-    let config = read_json(&path)
-        .with_context(|| format!("fidelity family discovery: cannot read {} (server advertised {})",
-            path.display(), advertised.display()))?;
-    let checkpoint = Checkpoint { view: None, snapshot, config, quantize_config: None,
-        weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
-    let detected = family::registry().iter().find(|f| f.detect(&checkpoint))
-        .context("fidelity family discovery: snapshot has no registered family")?;
-    Ok(crate::fidelity_dataset::full_prefill_logits(Some(detected.id()),
-        status["full_prefill_logits"] == true))
+pub(crate) fn discovered_prefill_scoring(status: &Value) -> bool {
+    status["prefill_scoring"].as_str() == Some("streamed")
 }
 
 pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
@@ -335,10 +309,10 @@ pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
     let status = get(&agent, &format!("{base}/v1/bench/status"), &key)?;
     let model = status["checkpoint"].as_str().unwrap_or(served);
     let mut model_record = models["data"][0].clone();
-    model_record["full_prefill_logits"] = json!(discovered_prefill_logits(&status)?);
+    model_record["prefill_scoring"] = status["prefill_scoring"].clone();
     model_record["snapshot"] = status["snapshot"].clone();
     model_record["settings"] = status["settings"].clone();
-    let runs = run_series(args, model_record["full_prefill_logits"] == true, |one| {
+    let runs = run_series(args, discovered_prefill_scoring(&model_record), |one| {
         run_with(one, model, &model_record, |body| {
             request(&agent, &format!("{base}/v1/bench/probe"), &key, &body)
         }, |_, _, _| {})
@@ -401,7 +375,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
     let precision = crate::fidelity_precision::resolve(model, snapshot, &model_record["settings"],
         selection.as_ref().map(|s| s.reference_root.as_str()).unwrap_or(&reference.checkpoint), selection.as_ref())?;
     let standard = args.tier == "standard";
-    let admitted = model_record["full_prefill_logits"] == true;
+    let admitted = discovered_prefill_scoring(&model_record);
     let windows = if standard {
         ensure!(dataset_identity.is_some(), "Standard-v2 requires a sealed published dataset");
         crate::fidelity_dataset::standard_windows(&reference, &args.score_path, admitted)?
@@ -640,67 +614,14 @@ mod tests {
     fn discovery_sends_file_api_key() { discovery_authentication(true); }
 
     #[test]
-    fn family_discovery_fails_closed_even_when_status_admits_prefill() {
-        assert!(discovered_prefill_logits(&json!({"full_prefill_logits": true}))
-            .unwrap_err().to_string().contains("did not advertise a snapshot"));
-        let snapshot = tempfile::tempdir().unwrap();
-        let status = json!({"snapshot": snapshot.path(), "full_prefill_logits": true});
-        assert!(discovered_prefill_logits(&status).unwrap_err().to_string().contains("cannot read"));
-        std::fs::write(snapshot.path().join("config.json"), "not json").unwrap();
-        assert!(discovered_prefill_logits(&status).unwrap_err().to_string().contains("cannot read"));
-        std::fs::write(snapshot.path().join("config.json"), r#"{"architectures":["Unregistered"]}"#).unwrap();
-        assert!(discovered_prefill_logits(&status).unwrap_err().to_string().contains("no registered family"));
-        std::fs::write(snapshot.path().join("config.json"), r#"{"architectures":["DeepseekV4ForCausalLM"]}"#).unwrap();
-        assert!(discovered_prefill_logits(&status).unwrap());
-        let mut denied = status;
-        denied["full_prefill_logits"] = json!(false);
-        assert!(!discovered_prefill_logits(&denied).unwrap());
-    }
-
-    #[test]
-    fn family_discovery_maps_container_hub_and_still_fails_closed() {
-        let home = tempfile::tempdir().unwrap();
-        let relative = "models--unit--model/snapshots/pinned";
-        let snapshot = home.path().join("hub").join(relative);
-        std::fs::create_dir_all(&snapshot).unwrap();
-        let status = json!({"snapshot": format!("/hf/hub/{relative}"), "full_prefill_logits": false});
-        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap_err().to_string().contains("cannot read"));
-        std::fs::write(snapshot.join("config.json"), "not json").unwrap();
-        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap_err().to_string().contains("cannot read"));
-        std::fs::write(snapshot.join("config.json"), r#"{"architectures":["Unregistered"]}"#).unwrap();
-        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap_err().to_string().contains("no registered family"));
-        std::fs::write(snapshot.join("config.json"), r#"{"architectures":["DeepseekV41ForCausalLM"]}"#).unwrap();
-        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap());
-        let local = json!({"snapshot": snapshot, "full_prefill_logits": false});
-        assert!(discovered_prefill_logits_at(&local, &home.path().join("unused")).unwrap());
-        let traversal = json!({"snapshot": "/hf/hub/../escape", "full_prefill_logits": true});
-        assert!(discovered_prefill_logits_at(&traversal, home.path()).unwrap_err().to_string().contains("invalid container snapshot path"));
-        let unrelated = json!({"snapshot": "/other/hub/models--unit--model/snapshots/pinned", "full_prefill_logits": true});
-        assert!(discovered_prefill_logits_at(&unrelated, home.path()).unwrap_err().to_string().contains("cannot read"));
-    }
-
-    #[test]
-    #[ignore = "requires the pinned Muse quant snapshot and its official base model card"]
-    fn family_discovery_real_muse_snapshot_and_reference() {
-        use cuteafd_loader::plan::{checkpoint::{read_json, Checkpoint}, family};
-        let home = cuteafd_loader::default_hf_home();
-        let model = "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6";
-        let relative = "models--wrldsuksgo2mars--Muse-Spark-Open-EXL3-K4-Core-K6/snapshots/89998fb177acd9a862ac8bd4fb79bfd50e940c97";
-        let snapshot = home.join("hub").join(relative);
-        let checkpoint = Checkpoint { view: None, snapshot: snapshot.clone(), config: read_json(&snapshot.join("config.json")).unwrap(),
-            quantize_config: None, weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
-        let detected = family::registry().iter().find(|f| f.detect(&checkpoint)).unwrap();
-        assert_eq!(detected.id(), "muse_spark");
-        for advertised in [snapshot.clone(), PathBuf::from("/hf/hub").join(relative)] {
-            let mut status = json!({"snapshot": advertised, "full_prefill_logits": true});
-            assert!(discovered_prefill_logits_at(&status, &home).unwrap());
-            status["full_prefill_logits"] = json!(false);
-            assert!(!discovered_prefill_logits_at(&status, &home).unwrap());
-            let reference = crate::fidelity_match::resolve_in(model, Some(&advertised), &home.join("hub")).unwrap();
-            assert_eq!(reference.reference_root, "meta-models/Muse-Spark-Open-816B-A42B");
-            assert_eq!(reference.revision, "d18a3b292cc0a279998123f2ddd16999869bb658");
-            assert_eq!(reference.config, "muse-spark-v1_20261031_own-text-bf16");
+    fn scoring_discovery_requires_an_explicit_streamed_capability() {
+        for family in ["deepseek_v41", "kimi_k3", "glm5", "unknown"] {
+            for capability in [Value::Null, json!(false), json!(true), json!("unknown")] {
+                assert!(!discovered_prefill_scoring(&json!({"family": family, "prefill_scoring": capability})));
+            }
+            assert!(discovered_prefill_scoring(&json!({"family": family, "prefill_scoring": "streamed"})));
         }
+        assert!(!discovered_prefill_scoring(&json!({})));
     }
 
     fn fixture_run(args: &RunArgs) -> Run {
@@ -876,7 +797,7 @@ mod tests {
             else { parse(&["--url", &url, "--api-key", "unit-test-key"]) };
         let error = run(&args).unwrap_err();
         server.join().unwrap();
-        assert!(error.to_string().contains("fidelity family discovery: server did not advertise a snapshot"), "{error:#}");
+        assert!(error.to_string().contains("base_model unknown"), "{error:#}");
     }
 
     #[test]

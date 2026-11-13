@@ -513,7 +513,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         -> Result<Option<crate::shared::probe::ScoreLogits>> {
         let legacy = self.ranks.last().is_some_and(|rank| rank.prefill_logits.is_some());
         self.prefill_with(placement, tokens, logit_rows,
-            (logit_rows > 1 && !legacy).then_some(crate::shared::probe::ScoringRows { probe, position }))
+            (logit_rows > 1 && !legacy).then_some(crate::shared::probe::ScoringRows { consumer: probe, position }))
     }
 
     /// Scores every row of every sequence (an anchor and its drafts) from its

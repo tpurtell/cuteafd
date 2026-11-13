@@ -434,34 +434,69 @@ pub(crate) fn host_row(probe: &ProbeRef, position: usize, logits: &[f32]) {
     }
 }
 
+/// A host consumer shared by probes and golden diagnostics. Each row is consumed
+/// before the bounded device head scratch can be overwritten.
+pub(crate) trait RowConsumer {
+    fn wants(&self, position: usize) -> bool;
+    fn row(&self, position: usize, values: &[f32]) -> Result<()>;
+}
+
+impl RowConsumer for ProbeRef {
+    fn wants(&self, position: usize) -> bool {
+        self.as_ref().is_some_and(|probe| probe.wants(position))
+    }
+    fn row(&self, position: usize, values: &[f32]) -> Result<()> {
+        host_row(self, position, values);
+        Ok(())
+    }
+}
+
+/// Golden callbacks may update metrics, write raw rows, or hash their exact bits.
+pub(crate) struct CallbackRows<F>(std::cell::RefCell<F>);
+
+impl<F> CallbackRows<F> {
+    pub(crate) fn new(callback: F) -> Self { Self(std::cell::RefCell::new(callback)) }
+}
+
+impl<F: FnMut(usize, &[f32]) -> Result<()>> RowConsumer for CallbackRows<F> {
+    fn wants(&self, _position: usize) -> bool { true }
+    fn row(&self, position: usize, values: &[f32]) -> Result<()> {
+        (self.0.borrow_mut())(position, values)
+    }
+}
+
 /// Records device rows `first..first + n` as predicting tokens `position..`.
 pub(crate) fn device_rows(library: &NativeLibrary, probe: &ProbeRef, logits: &DeviceLogits, first: usize, n: usize,
     position: usize) -> Result<()> {
-    let Some(probe) = probe else { return Ok(()) };
-    anyhow::ensure!(logits.vocab > 0 && logits.stride >= logits.vocab, "invalid scoring vocabulary/stride");
-    anyhow::ensure!(first.checked_add(n).is_some_and(|end| end <= logits.rows),
-        "scoring needs {n} logits rows at {first}, got {}", logits.rows);
-    let selected = (0..n).filter(|&j| probe.wants(position + j)).collect::<Vec<_>>();
-    let spans = selected.iter().map(|&j| (first + j, 1)).collect::<Vec<_>>();
-    if spans.is_empty() { return Ok(()); }
-    let host = logits.download(library, &spans)?;
-    for (j, row) in selected.into_iter().zip(host.chunks_exact(logits.vocab)) {
-        probe.row(position + j, row);
-    }
-    Ok(())
+    ScoringRows { consumer: probe, position }.record_range(library, logits, first, n)
 }
 
-/// A selected-row consumer; device scratch may be reused as soon as `record` returns.
 #[derive(Clone, Copy)]
 pub(crate) struct ScoringRows<'p> {
-    pub probe: &'p ProbeRef,
+    pub consumer: &'p dyn RowConsumer,
     pub position: usize,
 }
 
 impl ScoringRows<'_> {
     pub(crate) fn record(self, library: &NativeLibrary, offset: usize, logits: &DeviceLogits) -> Result<()> {
         let position = self.position.checked_add(offset).ok_or_else(|| anyhow::anyhow!("scoring position overflow"))?;
-        device_rows(library, self.probe, logits, 0, logits.rows, position)
+        Self { position, ..self }.record_range(library, logits, 0, logits.rows)
+    }
+
+    fn record_range(self, library: &NativeLibrary, logits: &DeviceLogits, first: usize, n: usize) -> Result<()> {
+        anyhow::ensure!(logits.vocab > 0 && logits.stride >= logits.vocab, "invalid scoring vocabulary/stride");
+        anyhow::ensure!(first.checked_add(n).is_some_and(|end| end <= logits.rows),
+            "scoring needs {n} logits rows at {first}, got {}", logits.rows);
+        let end = self.position.checked_add(n).ok_or_else(|| anyhow::anyhow!("scoring position overflow"))?;
+        let selected = (self.position..end).enumerate().filter_map(|(j, position)|
+            self.consumer.wants(position).then_some(j)).collect::<Vec<_>>();
+        let spans = selected.iter().map(|&j| (first + j, 1)).collect::<Vec<_>>();
+        if spans.is_empty() { return Ok(()); }
+        let host = logits.download(library, &spans)?;
+        for (j, row) in selected.into_iter().zip(host.chunks_exact(logits.vocab)) {
+            self.consumer.row(self.position + j, row)?;
+        }
+        Ok(())
     }
 }
 
@@ -626,6 +661,26 @@ pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32]
 mod tests {
     use super::*;
     use cuteafd_api::openai::probe::ProbeSpec;
+
+    #[test]
+    fn callback_rows_keep_positions_bits_and_propagate_failure() -> Result<()> {
+        let recorded = std::cell::RefCell::new(Vec::new());
+        let consumer = CallbackRows::new(|position, values: &[f32]| {
+            anyhow::ensure!(position < 4, "consumer stopped");
+            recorded.borrow_mut().push((position, values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()));
+            Ok(())
+        });
+        let values = [0.0, -0.0, f32::from_bits(0x7fc01234)];
+        assert!(consumer.wants(3));
+        consumer.row(3, &values)?;
+        assert_eq!(*recorded.borrow(), [(3, values.map(f32::to_bits).to_vec())]);
+        assert_eq!(consumer.row(4, &values).unwrap_err().to_string(), "consumer stopped");
+        assert_eq!(recorded.borrow().len(), 1);
+        let absent: ProbeRef = None;
+        assert!(!absent.wants(1));
+        absent.row(1, &values)?;
+        Ok(())
+    }
 
     #[test]
     fn streamed_scoring_activation_requires_a_proven_family() {

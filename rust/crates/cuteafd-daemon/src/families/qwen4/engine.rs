@@ -2435,7 +2435,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         ensure!(logit_rows <= tokens.len(), "Qwen scoring logits extent");
         crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
-            let scoring = crate::shared::probe::ScoringRows { probe, position };
+            let scoring = crate::shared::probe::ScoringRows { consumer: probe, position };
             if self.prefill_shape.is_some() {
                 if self.prefill_units_with(placement, tokens, logit_rows, Some(scoring))?.is_none() { return Ok(None); }
             } else {

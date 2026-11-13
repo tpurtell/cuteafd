@@ -175,14 +175,8 @@ pub fn standard_balance(reference: &Reference) -> Value {
 }
 
 pub fn prefill_admitted(settings: &[crate::report::Setting]) -> bool {
-    settings.iter().any(|s| (s.name == "full-prefill-logits"
-        && s.value.as_deref().is_some_and(|v| matches!(v, "true" | "on" | "1")))
-        || (s.name == "prefill-scoring" && s.source == "resolved" && s.value.as_deref() == Some("streamed")))
-}
-
-/// V4.1 scores selected prefill rows without the all-row workspace switch.
-pub fn full_prefill_logits(family: Option<&str>, admitted: bool) -> bool {
-    family == Some("deepseek_v41") || admitted
+    settings.iter().any(|s| s.name == "prefill-scoring" && s.source == "resolved"
+        && s.value.as_deref() == Some("streamed"))
 }
 
 /// Fail closed unless the set's windows are exactly its declared block counts under
@@ -1043,10 +1037,10 @@ mod tests {
                 source: source.into(), ..Default::default() };
             assert_eq!(prefill_admitted(&[setting]), source == "resolved");
         }
-        for value in ["false", "off", "0", "true", "on", "1"] {
-            let setting = Setting { name:"full-prefill-logits".into(), value:Some(value.into()),
-                default:Some("false".into()), source:"cli".into() };
-            assert_eq!(prefill_admitted(&[setting]), matches!(value,"true"|"on"|"1"));
+        for value in ["", "unknown", "true", "false"] {
+            let setting = Setting { name: "prefill-scoring".into(), value: Some(value.into()),
+                source: "resolved".into(), ..Default::default() };
+            assert!(!prefill_admitted(&[setting]));
         }
     }
 
@@ -1094,8 +1088,8 @@ mod tests {
         let snapshot = tempfile::tempdir().unwrap();
         std::fs::write(snapshot.path().join("config.json"),
             r#"{"architectures":["DeepseekV41ForCausalLM"]}"#).unwrap();
-        let status = json!({"snapshot": snapshot.path(), "full_prefill_logits": false});
-        let admitted = crate::fidelity_cli::discovered_prefill_logits(&status).unwrap();
+        let status = json!({"snapshot": snapshot.path(), "prefill_scoring": "streamed"});
+        let admitted = crate::fidelity_cli::discovered_prefill_scoring(&status);
         assert_eq!((standard_windows(&reference, "decode", admitted).unwrap().len(),
             standard_windows(&reference, "prefill", admitted).unwrap().len()), (32, 32));
         let ids: BTreeSet<_> = decode.iter().chain(&prefill).map(|w| &w.id).collect();
