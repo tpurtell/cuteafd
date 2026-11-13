@@ -479,7 +479,7 @@ def minimax_forward_fixture():
         "compile_program": lambda launch, **kwargs: kwargs,
         "_dtype": lambda dtype: dtype, "AffineNorm": lambda *args: None,
         "_ResidualNorm": lambda **kwargs: None,
-        "_RouterScores": lambda: None, "_KvPack": lambda: None, "_IndexCacheGather": lambda: None,
+        "_RouterScores": lambda: None, "_KvPack": lambda heads=4: None, "_IndexCacheGather": lambda: None,
     }
     modules = {}
     for source, names in (("pointwise", ("compile_affine_norm_aot",)),
@@ -531,7 +531,7 @@ def test_minimax_producer_fixture_matches_pinned_fork_without_cuda():
             dict(name=name, dtype=dtype, shape=shape, role=role),
         "Scalar": lambda name, kind="int32": dict(name=name, type=kind),
         "compile_program": lambda launch, **kwargs: kwargs,
-        "_NormRope": lambda heads: None, "_Index": lambda: None, "_OaiSplit": lambda width: None,
+        "_NormRope": lambda heads: None, "_Index": lambda heads=4: None, "_OaiSplit": lambda width: None,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     exporter = ast.parse((ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text())
