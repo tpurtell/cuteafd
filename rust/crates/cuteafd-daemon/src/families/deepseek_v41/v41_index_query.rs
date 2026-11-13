@@ -393,9 +393,7 @@ impl IndexQueryWave<'_, '_> {
             return Ok(());
         };
         unsafe {
-            ticket.capture_result(self.storage.stream
-                .library
-                .cuda_graph_begin_capture(self.storage.stream.raw))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, self.storage.stream.raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue(rows) };
         let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
@@ -431,9 +429,7 @@ impl IndexQueryWave<'_, '_> {
         };
         ensure!(count == rows, "index query capture row count differs");
         let launched = unsafe {
-            self.storage.stream
-                .library
-                .cuda_graph_launch(graph, self.storage.stream.raw)
+            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw)
         };
         launched.and(self.synchronize())?;
         self.ready = Some(rows);

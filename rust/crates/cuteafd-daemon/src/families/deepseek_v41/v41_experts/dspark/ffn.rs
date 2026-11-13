@@ -132,7 +132,7 @@ impl<'a> DsparkFfn<'_, 'a> {
             // SAFETY: replay and eager execution have the same input contract.
             return unsafe { self.execute(rows) };
         };
-        let launched = unsafe { self.library.cuda_graph_launch(graph, self.stream()?) };
+        let launched = unsafe { crate::shared::decode_graph::launch(&self.library, graph, self.stream()?) };
         let drained = self.synchronize();
         crate::families::deepseek_v41::v41_experts::dspark::settle(launched, drained)?;
         unsafe { self.boundary.complete_replay(rows as usize) }

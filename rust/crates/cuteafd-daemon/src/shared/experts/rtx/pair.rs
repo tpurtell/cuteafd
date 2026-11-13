@@ -1499,7 +1499,7 @@ mod tests {
             bootstrap: 10, basis: Basis::Bytes, spans_devices: true };
         use std::cell::Cell;
         for failed_rank in 0..2 {
-            let mut banks = [GraphBank::new(None), GraphBank::new(None)];
+            let mut banks = [GraphBank::new(), GraphBank::new()];
             for (rank, bank) in banks.iter_mut().enumerate() {
                 bank.attach_device_for_test(-920 - (failed_rank * 2 + rank) as i32, 1000,
                     site).unwrap();

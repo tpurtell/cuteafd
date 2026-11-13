@@ -420,9 +420,7 @@ impl AttentionOutputWave<'_, '_> {
         self.ready = None;
         self.origin = None;
         unsafe {
-            ticket.capture_result(self.storage.stream
-                .library
-                .cuda_graph_begin_capture(stream))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, stream, &ticket))?;
         }
         let launched = unsafe { self.enqueue_on(rows, stream) };
         let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(stream)) };
@@ -458,9 +456,7 @@ impl AttentionOutputWave<'_, '_> {
         };
         ensure!(count == rows, "attention output capture row count differs");
         let launched = unsafe {
-            self.storage.stream
-                .library
-                .cuda_graph_launch(graph, self.storage.stream.raw)
+            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw)
         };
         launched.and(self.synchronize())?;
         self.ready = Some(rows);

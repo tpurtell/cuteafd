@@ -1,7 +1,7 @@
 //! Backbone FP8 window KV production, private proposals and accepted ring writes.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::shared::memory::row_window::RowWindow;
-use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner, GraphPolicy};
+use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Fp8Plan, V41Kv};
@@ -336,7 +336,7 @@ impl<'a> WindowWeights<'a> {
             commit_staging: HostAllocation::new(self.library, commit::staging_bytes(unit), Tag::staging("v41/window-proposal"))?,
             capacity: unit,
             graph: None,
-            graphs: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
+            graphs: GraphBank::with_family("deepseek_v41"),
             ready: None,
             pending_query: None,
             pending_commit: None,
@@ -710,7 +710,7 @@ impl WindowWave<'_, '_> {
             // buffers; it neither executes them nor commits cache storage.
             let Some(mut ticket) = self.graphs.cache_ticket(&(row, state.owner),
                 super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, row as u32), None) else { continue };
-            unsafe { ticket.capture_result(library.cuda_graph_begin_capture(stream))?; }
+            unsafe { ticket.capture_result(crate::shared::decode_graph::begin_capture(&library, stream, &ticket))?; }
             let queued = unsafe { self.enqueue(row) };
             let captured = unsafe { ticket.capture_result(library.cuda_graph_end_capture_topology(stream)) };
             match (queued, captured) {
@@ -751,7 +751,7 @@ impl WindowWave<'_, '_> {
             self.upload(&prepared)?;
             let dispatch = || unsafe {
                 if capture || forced_eager { self.enqueue(prepared.rows) }
-                else { self.stream().library.cuda_graph_launch(self.current_graph().unwrap().0, self.stream().raw) }
+                else { crate::shared::decode_graph::launch(&self.stream().library, self.current_graph().unwrap().0, self.stream().raw) }
             };
             if crate::shared::decode_graph::census::enabled() {
                 unsafe { self.stream().library.cuda_graph_census_call(self.stream().raw, c"window", prepared.rows,
@@ -773,7 +773,7 @@ impl WindowWave<'_, '_> {
             let ticket = if *capture { self.graphs.cache_ticket(&(prepared.rows, state.owner),
                 super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) } else { None };
             if let Some(mut ticket) = ticket {
-                unsafe { ticket.capture_result(self.stream().library.cuda_graph_begin_capture(self.stream().raw))?; }
+                unsafe { ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream().library, self.stream().raw, &ticket))?; }
                 let queued = unsafe { self.enqueue(prepared.rows) };
                 let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
                 match (queued, captured) {
@@ -893,9 +893,7 @@ impl WindowWave<'_, '_> {
                 return Ok(());
             };
         unsafe {
-            ticket.capture_result(self.stream()
-                .library
-                .cuda_graph_begin_capture(self.stream().raw))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream().library, self.stream().raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue(p.rows) };
         let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
@@ -930,7 +928,7 @@ impl WindowWave<'_, '_> {
         let launched = self.upload(&p).and_then(|()| {
             let eager = crate::shared::decode_graph::census::eager("window");
             let dispatch = || unsafe {
-                if eager { self.enqueue(p.rows) } else { self.stream().library.cuda_graph_launch(g, self.stream().raw) }
+                if eager { self.enqueue(p.rows) } else { crate::shared::decode_graph::launch(&self.stream().library, g, self.stream().raw) }
             };
             if crate::shared::decode_graph::census::enabled() {
                 unsafe { self.stream().library.cuda_graph_census_call(self.stream().raw, c"window", p.rows, !eager,

@@ -6,7 +6,7 @@
 //! that first needs it, or run eagerly when the controller declines. A step
 //! never refuses for a missing executable.
 use crate::shared::{decode_graph::{device::{Basis, Cycle, Preference, Site}, CacheAttached,
-        CaptureTicket, GraphBank, GraphOwner, GraphPolicy},
+        CaptureTicket, GraphBank, GraphOwner},
     memory::device::Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
@@ -274,7 +274,7 @@ pub(crate) struct Graphs<'a> {
 
 impl<'a> Graphs<'a> {
     pub(crate) fn new() -> Self {
-        Self { bank: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "kimi_k3"),
+        Self { bank: GraphBank::with_family("kimi_k3"),
             replays: 0, captured: 0, device: -1, spans_devices: false }
     }
 
@@ -351,7 +351,7 @@ impl<'a> Graphs<'a> {
             ensure!(device == stream.device.id, "Kimi graph replay device changed");
             // SAFETY: the bank owns immutable capture pointers and LocalLane
             // retains this exact stream until every launch has drained.
-            stream.device.run(|| unsafe { stream.device.library.cuda_graph_launch(raw, stream.raw) })?;
+            stream.device.run(|| unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw) })?;
             self.replays += 1;
             return Ok(());
         }
@@ -365,7 +365,7 @@ impl<'a> Graphs<'a> {
         let (device, raw) = (owner.device(), owner.raw);
         ensure!(device == stream.device.id, "Kimi graph captured a foreign device");
         // SAFETY: just instantiated on this device and not yet launched.
-        stream.device.run(|| unsafe { stream.device.library.cuda_graph_launch(raw, stream.raw) })?;
+        stream.device.run(|| unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw) })?;
         self.replays += 1;
         Ok(())
     }
@@ -378,7 +378,7 @@ impl<'a> Graphs<'a> {
         // SAFETY: the lane is the only writer on this persistent stream for the
         // duration of the step body; every captured pointer is pinned by LocalLane.
         if let Err(error) = stream.device.run(|| unsafe {
-            stream.device.library.cuda_graph_begin_capture(stream.raw) }) {
+            crate::shared::decode_graph::begin_capture(&stream.device.library, stream.raw, &ticket) }) {
             if self.bank.cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, ?key, "Kimi graph capture unavailable; running eagerly");
             }

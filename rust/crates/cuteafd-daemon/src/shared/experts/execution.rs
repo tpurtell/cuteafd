@@ -150,7 +150,6 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     output: Option<DeviceAllocation<'library>>,
     pub(crate) shared: Option<DeviceAllocation<'library>>,
     slots: [*mut c_void; 44],
-    graph: Option<(*mut c_void, u32, bool, u32, u32)>,
     alternate_widths: Vec<NativeWidthState<'library>>,
     /// Mapped requests return queued; the owner emits each reply after its unit fence.
     deferred: bool,
@@ -378,7 +377,6 @@ impl<'library> ExpertWeights<'library> {
             slots,
             deferred: false,
             pending: timing::PendingUnits::new(library, 1)?,
-            graph: None,
             alternate_widths: Vec::new(),
             live_capacity: live,
             budget,
@@ -426,10 +424,6 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Rebind uncaptured launch arguments; the stream orders shared workspace use.
     /// Captured graphs retain weight addresses and cannot be rebound.
     pub fn bind_layer(&mut self, weights: &'weights ExpertWeights<'library>) -> Result<()> {
-        ensure!(
-            self.graph.is_none(),
-            "cannot rebind a captured expert graph"
-        );
         ensure!(
             std::ptr::eq(self.library, weights.buffers[0].library),
             "expert layer belongs to a different native library"
@@ -686,26 +680,14 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         }
         Ok(())
     }
-    /// # Safety
-    /// The captured rows' inputs (and optional shared output) must satisfy launch's
-    /// contract, with writes ordered before replay and reads ordered after it.
-    pub unsafe fn replay(&mut self) -> Result<()> {
-        let (graph, _, _, role, width) = self.graph.context("expert graph has not been captured")?;
-        ensure!(role == self.kernel.info().role && width == self.kernel.info().logical_intermediate,
-            "captured expert graph belongs to a different width state");
-        unsafe { self.library.cuda_graph_launch(graph, self.stream()) }
-    }
+
 }
 impl Drop for ExpertExecution<'_, '_> {
     fn drop(&mut self) {
         if let Err(error) = self.synchronize() {
             tracing::error!(%error,"draining V4.1 expert execution");
         }
-        if let Some((graph, _, _, _, _)) = self.graph.take() {
-            if let Err(error) = unsafe { self.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error,"destroying V4.1 expert execution graph");
-            }
-        }
+
     }
 }
 

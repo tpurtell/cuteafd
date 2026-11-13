@@ -1351,7 +1351,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 active = active.len(), steps = steps_seen, all_steps = lane.steps, dflash, dflash_ok, draft_calls,
                 draft_s = lane.draft_s, verify_s = lane.verify_s, emit_s = lane.emit_s, gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
-                graph_held = graphs.held, graph_shapes = graphs.shapes, graph_bytes = graphs.bytes,
+                graph_held = graphs.held, graph_shapes = graphs.shapes,
                 draft_ring_misses = ring_misses, "request complete");
             (lane.steps, lane.draft_s, lane.verify_s, lane.emit_s) = (0, 0.0, 0.0, 0.0);
             prefix_state_probe(engine, &family, &request.placement, &request.job.probe, "finished")?;

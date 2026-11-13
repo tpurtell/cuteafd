@@ -1057,7 +1057,7 @@ mod anchor_fallback_tests {
         fixture.configure_memory(&lib, 0, 1 << 30)?;
         for independent in [false, true] {
             let mut runtime = runtime(&lib, At::Never, false)?;
-            let mut bank = GraphBank::new(None);
+            let mut bank = GraphBank::new();
             bank.attach_device(&lib, 0, 4096, Site { name: "draft_completion_fixture", cycle: Cycle::Other,
                 preference: Preference::Adaptive, bootstrap: 16, basis: Basis::Bytes, spans_devices: false })?;
             let ticket = bank.cache_ticket(&1, false, None).context("fixture admission")?;

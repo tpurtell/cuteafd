@@ -46,9 +46,28 @@ mod binding;
 pub(crate) use binding::BindingGraphs;
 mod watch;
 pub(crate) use watch::CaptureWatch;
-pub(crate) use native::{LayerGraphs, RowGraphs, LARGE_SHAPES};
-pub(crate) use bank::{missing_variants, note_eager, CaptureTicket, GraphBank, GraphDecision, GraphPolicy, GraphStats};
+pub(crate) use native::{LayerGraphs, RowGraphs};
+pub(crate) use bank::{missing_variants, note_eager, CaptureTicket, GraphBank};
 pub(crate) use owner::GraphOwner;
+
+/// # Safety
+/// The ticket admits this capture; the caller owns the stream and pins every
+/// recorded operand through the joined drain of all consuming launches.
+pub(crate) unsafe fn begin_capture(library: &cuteafd_ffi::NativeLibrary,
+    stream: *mut std::ffi::c_void, ticket: &CaptureTicket) -> anyhow::Result<()> {
+    ticket.require_active()?;
+    // SAFETY: forwarded stream ownership and captured-storage contract.
+    unsafe { library.cuda_graph_begin_capture(stream) }
+}
+
+/// # Safety
+/// The executable comes from an attached bank. Its captured allocations and
+/// stream remain live until every queued consumer has drained.
+pub(crate) unsafe fn launch(library: &cuteafd_ffi::NativeLibrary,
+    graph: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> anyhow::Result<()> {
+    // SAFETY: forwarded executable, stream and captured-storage contract.
+    unsafe { library.cuda_graph_launch(graph, stream) }
+}
 
 pub(crate) fn fatal_drain(result: anyhow::Result<()>, site: &str) {
     if let Err(error) = result {

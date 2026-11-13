@@ -164,6 +164,14 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
     };
     if captured {
         for rank in 0..2 {
+            use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+            let bank = if rank == 0 { &engine.graphs } else { &engine.peer.as_ref().unwrap().graphs };
+            bank.borrow_mut().attach_device(&library, rank as i32, 64 << 20, Site {
+                name: "mimo-terminal-fixture", cycle: Cycle::Other, preference: Preference::Capture,
+                bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: true,
+            })?;
+            let key = GraphKey { layer: 0, rows: lanes, table_stride: 1, previous: Previous::First, head: false };
+            let ticket = bank.borrow_mut().cache_ticket(&key, false, None).context("fault fixture graph ticket")?;
             let exec = engine.on(rank, || {
                 // SAFETY: capture is confined to this owned stream; every
                 // pointer is persistent engine storage, including abort words.
@@ -173,25 +181,8 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
                 queue(rank)?;
                 unsafe { library.cuda_graph_end_capture_for_test(engine.stream_of(rank)) }
             })?;
-            let key = GraphKey {
-                layer: 0,
-                rows: lanes,
-                table_stride: 1,
-                previous: Previous::First,
-                head: false,
-            };
             let graph = GraphExec(exec, &library);
-            if rank == 0 {
-                engine.graphs.borrow_mut().insert(key, graph, None);
-            } else {
-                engine
-                    .peer
-                    .as_ref()
-                    .unwrap()
-                    .graphs
-                    .borrow_mut()
-                    .insert(key, graph, None);
-            }
+            bank.borrow_mut().cache_commit(key, graph, ticket, 2, 1, true);
             engine.on(rank, || {
                 // SAFETY: captured exec and bound owners remain in the engine.
                 unsafe { library.cuda_graph_launch(exec, engine.stream_of(rank)) }

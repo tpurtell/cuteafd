@@ -256,9 +256,7 @@ impl<'a> TargetHeadWave<'a, '_> {
         let Some(mut ticket) = self.graphs.cache_ticket(&rows,
             super::graph_policy::pinned_shape(self.b(0).device_id, rows as u32), None) else { return Ok(()) };
         unsafe {
-            ticket.capture_result(self.stream
-                .library
-                .cuda_graph_begin_capture(self.stream.raw))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream.library, self.stream.raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue(rows) };
         let captured = unsafe { ticket.capture_result(self.stream.library.cuda_graph_end_capture_topology(self.stream.raw)) };
@@ -288,9 +286,7 @@ impl<'a> TargetHeadWave<'a, '_> {
         self.validate(rows)?;
         let graph = self.graphs.cached_launch(rows).context("target head graph missing")?;
         let launched = unsafe {
-            self.stream
-                .library
-                .cuda_graph_launch(graph, self.stream.raw)
+            crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw)
         };
         launched.and(self.synchronize())?;
         self.ready = Some(rows);
@@ -412,7 +408,7 @@ impl<'a> TargetHeadWave<'a, '_> {
         self.invalidate();
         let launched = if warmed { Ok(()) }
         else if let Some(graph) = self.graphs.cached_launch(selected.len()).filter(|_| captured) {
-            unsafe { self.stream.library.cuda_graph_launch(graph, self.stream.raw) }
+            unsafe { crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw) }
         } else { unsafe { self.enqueue(selected.len()) } };
         let drained = self.stream.wait().await;
         launched.and(drained)?;
@@ -437,7 +433,7 @@ impl<'a> TargetHeadWave<'a, '_> {
         let scores = Self::slice(self.b(6), 0, rows * 4)?;
         let launched = (|| -> Result<()> { unsafe {
             let lib = self.stream.library;
-            if let Some(graph) = graph { lib.cuda_graph_launch(graph, self.stream.raw)?; }
+            if let Some(graph) = graph { crate::shared::decode_graph::launch(&lib, graph, self.stream.raw)?; }
             else if !warmed { self.enqueue(rows)?; }
             lib.cuda_logits_argmax_checked_f32_async(logits, indices, scores, rows, 129280, self.stream.raw)?;
             let host = self.greedy_staging.bytes_mut();
@@ -496,7 +492,7 @@ impl<'a> TargetHeadWave<'a, '_> {
             .upload(requests, mask_staging, mask_words, self.stream.raw);
         let launched: Result<()> = staged.and_then(|()| {
             (|| -> Result<()> { unsafe {
-                if let Some(graph) = graph { self.stream.library.cuda_graph_launch(graph, self.stream.raw)?; }
+                if let Some(graph) = graph { crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw)?; }
                 else if !warmed { self.enqueue(rows)?; }
                 self.sampling.launch(logits, rows, ordered_rows, self.stream.raw)?;
                 Ok(())

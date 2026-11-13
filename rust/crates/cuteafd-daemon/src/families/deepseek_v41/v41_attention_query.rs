@@ -456,9 +456,7 @@ impl AttentionQueryWave<'_, '_> {
             return Ok(());
         };
         unsafe {
-            ticket.capture_result(self.storage.stream
-                .library
-                .cuda_graph_begin_capture(self.storage.stream.raw))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, self.storage.stream.raw, &ticket))?;
         }
         let launched = unsafe { if prefix { self.enqueue_rank(rows) } else { self.enqueue(rows) } };
         let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
@@ -494,9 +492,7 @@ impl AttentionQueryWave<'_, '_> {
         };
         ensure!(count == rows, "attention query capture row count differs");
         let launched = unsafe {
-            self.storage.stream
-                .library
-                .cuda_graph_launch(graph, self.storage.stream.raw)
+            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw)
         };
         launched.and(unsafe { crate::shared::memory::chain::finish(self.storage.stream.library, self.storage.stream.raw) })?;
         self.ready = Some(rows);
@@ -1013,7 +1009,7 @@ mod bounded_graph_tests {
             // Only count the production declarations, excluding CPU fixture
             // captures and this source-inventory test itself.
             let production = source.split("#[cfg(test)]\nmod bounded_graph_tests").next().unwrap();
-            assert_eq!(production.matches(".cuda_graph_begin_capture(").count(), count);
+            assert_eq!(production.matches("decode_graph::begin_capture(").count(), count);
             assert_eq!(production.matches(".cuda_graph_end_capture_topology(").count(), count);
             assert_eq!(production.matches(".cache_ticket(").count(), count);
             assert_eq!(production.matches(".cache_insert(").count(), count);

@@ -162,7 +162,7 @@ impl<'w,'a> Rank<'w,'a> {
             return Ok(());
         };
         device.run(||unsafe {
-            ticket.capture_result(device.library.cuda_graph_begin_capture(self.storage.stream.raw))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&device.library, self.storage.stream.raw, &ticket))?;
             let queued=self.enqueue(weights,rows);
             let captured=ticket.capture_result(device.library.cuda_graph_end_capture_topology(self.storage.stream.raw));
             match (queued,captured) {
@@ -317,7 +317,7 @@ impl<'w,'a> Wave<'w,'a> {
             return Ok(());
         };
         device.run(||unsafe {
-            ticket.capture_result(device.library.cuda_graph_begin_capture(stream))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&device.library, stream, &ticket))?;
             let queued=self.enqueue_gather(rows);
             let captured=ticket.capture_result(device.library.cuda_graph_end_capture_topology(stream));
             match (queued,captured) {

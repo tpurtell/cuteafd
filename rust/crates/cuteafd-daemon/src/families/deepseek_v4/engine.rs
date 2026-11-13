@@ -530,7 +530,7 @@ impl<'a> Engine<'a> {
             Ok(V4Peer { device, stream, layers, pools, rope_window: kv_arena.view("rope.window")?,
                 rope_compressed: kv_arena.view("rope.compressed")?, kv_arena,
                 prefill_workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-                graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)) })
+                graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -650,7 +650,7 @@ impl<'a> Engine<'a> {
             packed_programs: Default::default(),
             decode_workspace: RefCell::new(None),
             profile: RefCell::new(Profile::default()),
-            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)),
+            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()),
             graph_pinned: RefCell::new(Vec::new()),
             graph_sparks: Cell::new(false),
             local: RefCell::new(None),
@@ -1340,12 +1340,12 @@ impl<'a> Engine<'a> {
             if self.capture_only.get() { return Ok(()); }
             self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::Replay, "hit");
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
+            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) });
         }
         let pinned = self.graph_pinned(&key);
-        let ticket = match graphs.borrow_mut().cache_miss(&key, pinned, None) {
-            crate::shared::decode_graph::device::Miss::Capture(id) => id,
-            crate::shared::decode_graph::device::Miss::Eager => {
+        let ticket = match graphs.borrow_mut().cache_ticket(&key, pinned, None) {
+            Some(ticket) => ticket,
+            None => {
                 self.graph_eager.set(self.graph_eager.get() + 1);
                 // Warming captures only: running the body here would execute
                 // uninitialized routes or wait for peer work nobody queued.
@@ -1356,8 +1356,8 @@ impl<'a> Engine<'a> {
         };
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
-        if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
-            if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+        if let Err(error) = self.on(rank, || unsafe { crate::shared::decode_graph::begin_capture(&self.library, stream, &ticket) }) {
+            if graphs.borrow_mut().cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, "graph capture unavailable; running eagerly");
             }
             if self.capture_only.get() { return Ok(()); }
@@ -1366,14 +1366,14 @@ impl<'a> Engine<'a> {
         let captured = segment();
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
         if let Err(error) = captured {
-            graphs.borrow_mut().cache_capture_failed(ticket, exec.as_ref().err().unwrap_or(&error));
+            graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }
             return Err(error);
         }
         let (raw, nodes, width, spans_devices, inspection_error) = match exec {
             Ok(info) => info,
             Err(error) => {
-                if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+                if graphs.borrow_mut().cache_ticket_failed(ticket, &error) {
                     tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
                 }
                 if self.capture_only.get() { return Ok(()); }
@@ -1388,10 +1388,9 @@ impl<'a> Engine<'a> {
         let graph = GraphExec(raw, self.library);
         crate::shared::decode_graph::census::capture_key("deepseek_v4", "decode",
             graphs.as_ptr() as usize, rank as i32, None, &key, graph.0);
-        graphs.borrow_mut().cache_topology(ticket, nodes as u64, width, spans_devices);
         // Own the executable and ticket before launch: a launch error is drained
         // by the submission guard before either its pointers or owner can retire.
-        graphs.borrow_mut().cache_insert(key, graph, ticket, pinned);
+        graphs.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         self.graph_captures.set(self.graph_captures.get() + 1);
         if key.attention.starts_with("tp2-") {
             self.expert_graph_captures.set(self.expert_graph_captures.get() + 1);
@@ -1400,7 +1399,7 @@ impl<'a> Engine<'a> {
         self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::CaptureLaunch, "first-miss");
         let bank = graphs.borrow();
         let graph = bank.get(&key).context("inserted graph")?;
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) })
+        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) })
     }
 
     /// Rank 1's decode segment of `layer`: the previous layer's FFN close, then this

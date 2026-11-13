@@ -391,9 +391,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         self.ready_rows = None;
         ensure!(!self.window.is_windowed(), "windowed gate cannot capture");
         unsafe {
-            ticket.capture_result(self.weights
-                .library
-                .cuda_graph_begin_capture(self.storage.stream.raw))?;
+            ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.weights.library, self.storage.stream.raw, &ticket))?;
         }
         let launched = unsafe { self.enqueue(rows) };
         // End on both paths so a failed enqueue cannot leave the stream capturing.
@@ -435,9 +433,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         };
         let launched = unsafe {
             self.stage_inputs(residual, gathered)?;
-            self.weights
-                .library
-                .cuda_graph_launch(graph, self.storage.stream.raw)
+            crate::shared::decode_graph::launch(&self.weights.library, graph, self.storage.stream.raw)
         };
         launched.and(self.synchronize())?;
         self.ready_rows = Some(rows);

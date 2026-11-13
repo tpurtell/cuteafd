@@ -188,7 +188,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             replay_staging: LayerStaging::new(library, capacity * 8, 40, "v41/sparse-replay")?,
             storage, window: crate::shared::memory::row_window::RowWindow::NONE,
             capacity, batch_rows: batch, attention_plan: None, decode: false,
-            graphs: GraphBank::new(None), spans_devices: false, warmed_kernels: 0, cold: None,
+            graphs: GraphBank::new(), spans_devices: false, warmed_kernels: 0, cold: None,
         })
     }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
@@ -294,7 +294,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let plan = self.attention_plan.context("sparse startup reduction plan absent")?;
         let recipe = self.storage.kernel.startup_batch_recipe(plan, rows, layer >= 2, aligned)?;
         // SAFETY: this owner is drained and the caller retains every bound plane.
-        unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw))?; }
+        unsafe { ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, self.storage.stream.raw, &ticket))?; }
         let queued = (|| unsafe {
             self.storage.kernel.record_startup_batch(&recipe, self.storage.query.buffer, sink,
                 self.storage.metadata.buffer, selected, self.storage.output.buffer, self.storage.descriptors.buffer,
@@ -511,13 +511,13 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         };
         self.insert_graph((plan.layer, plan.fingerprint), graph.0, plan.ticket, graph.1, graph.2, graph.3)?;
         let graph = graph.0;
-        let launched = unsafe { self.storage.stream.library.cuda_graph_launch(graph, self.storage.stream.raw) };
+        let launched = unsafe { crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw) };
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         Ok(QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)),
             layer: plan.layer, rows: plan.rows })
     }
     unsafe fn capture_plan(&self, plan: &mut ColdSparse, tail: &mut Option<&mut dyn AttentionGraphTail>) -> Result<(*mut c_void, usize, usize, bool)> {
-        unsafe { plan.ticket.capture_result(self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw))?; }
+        unsafe { plan.ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, self.storage.stream.raw, &plan.ticket))?; }
         let launched = (|| unsafe {
             self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;
             if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&QueuedSparseAttention {
@@ -834,7 +834,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             if crate::shared::decode_graph::census::enabled() {
                 unsafe {
                     self.storage.stream.library.cuda_graph_census_call(self.storage.stream.raw, c"sparse", rows, true,
-                        crate::shared::decode_graph::census::arm(), || self.storage.stream.library.cuda_graph_launch(graph, self.storage.stream.raw))?;
+                        crate::shared::decode_graph::census::arm(), || crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw))?;
                 }
                 return Ok(Some(queued));
             }
@@ -889,9 +889,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             graph.0
         };
         let launched = unsafe {
-            self.storage.stream
-                .library
-                .cuda_graph_launch(graph, self.storage.stream.raw)
+            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw)
         };
         launched?;
         Ok(Some(QueuedSparseAttention {
@@ -1086,7 +1084,7 @@ mod bounded_cache_tests {
 
     #[test]
     fn sparse_full_reserve_miss_runs_eager_without_refusal() -> Result<()> {
-        let mut bank = GraphBank::<(usize, Vec<usize>), usize>::new(None);
+        let mut bank = GraphBank::<(usize, Vec<usize>), usize>::new();
         bank.attach_device_for_test(-164_411, 200, site(false))?;
         let hot = (0, vec![1]);
         let cold = (0, vec![7]);
@@ -1107,7 +1105,7 @@ mod bounded_cache_tests {
 
     #[test]
     fn sparse_failed_capture_cancels_ticket() -> Result<()> {
-        let mut bank = GraphBank::<(usize, Vec<usize>), usize>::new(None);
+        let mut bank = GraphBank::<(usize, Vec<usize>), usize>::new();
         bank.attach_device_for_test(-164_412, 200, site(true))?;
         let key = (0, vec![7]);
         let ticket = bank.cache_ticket(&key, false, None).expect("initial capture fits");

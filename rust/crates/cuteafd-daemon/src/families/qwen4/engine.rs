@@ -1266,7 +1266,7 @@ impl<'a> Qwen4Engine<'a> {
         } else {
             (None, None)
         };
-        let graphs = (0..gdn_banks.len()).map(|_| GraphBank::new(None)).collect::<Vec<_>>();
+        let graphs = (0..gdn_banks.len()).map(|_| GraphBank::new()).collect::<Vec<_>>();
         Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, admitted_host: None, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)),
@@ -3605,7 +3605,7 @@ impl<'a> Qwen4Engine<'a> {
         let owner = self.active_owner.get();
         if let Some(graph) = self.graphs.borrow_mut()[owner].cached_launch(&key).map(|graph| graph.0) {
             // SAFETY: the graph's pointers are persistent engine buffers.
-            unsafe { self.library.cuda_graph_launch(graph, self.execution_stream())?; }
+            unsafe { crate::shared::decode_graph::launch(&self.library, graph, self.execution_stream())?; }
             return self.ple_consumed(&key);
         }
         // Graphs unconfigured, or a step before the prewarm: run the segment
@@ -3625,7 +3625,7 @@ impl<'a> Qwen4Engine<'a> {
         };
         // SAFETY: capture records this stream's launches; nothing in a segment
         // synchronizes the host or allocates.
-        if let Err(error) = unsafe { self.library.cuda_graph_begin_capture(self.execution_stream()) } {
+        if let Err(error) = unsafe { crate::shared::decode_graph::begin_capture(&self.library, self.execution_stream(), &ticket) } {
             if self.graphs.borrow_mut()[owner].cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, "Qwen graph capture unavailable; running eagerly");
             }
@@ -3664,7 +3664,7 @@ impl<'a> Qwen4Engine<'a> {
         self.graphs.borrow_mut()[owner].cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         let graph = self.graphs.borrow()[owner].get(&key).context("inserted Qwen graph")?.0;
         // SAFETY: the new graph reads and writes persistent engine buffers.
-        unsafe { self.library.cuda_graph_launch(graph, self.execution_stream())?; }
+        unsafe { crate::shared::decode_graph::launch(&self.library, graph, self.execution_stream())?; }
         self.ple_consumed(&key)
     }
 

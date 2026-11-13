@@ -281,9 +281,7 @@ impl DsparkAttentionWave<'_, '_> {
         };
         self.upload(&read, requests)?;
         let launched = unsafe {
-            self.standalone.device
-                .library
-                .cuda_graph_launch(graph, self.standalone.get()?.raw)
+            crate::shared::decode_graph::launch(&self.standalone.device.library, graph, self.standalone.get()?.raw)
         };
         let drained = self.synchronize();
         launched.and(drained)?;

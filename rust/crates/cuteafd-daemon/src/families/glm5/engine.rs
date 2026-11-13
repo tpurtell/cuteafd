@@ -783,7 +783,7 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_before: RefCell::new(None), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_before: RefCell::new(None), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
 
     pub(super) fn initialize_usage(&mut self, geometry: Option<cuteafd_core::expert_usage::Geometry>,
@@ -945,7 +945,7 @@ impl<'a> GlmEngine<'a> {
             let released = crate::shared::memory::device::Event::new(
                 crate::shared::memory::device::Device { library: self.library, id: device })?;
             Ok(GlmPeer { device, stream, released, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),
-                prefill_slots: RefCell::new(Vec::new()), graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)),
+                prefill_slots: RefCell::new(Vec::new()), graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()),
                 l2: None })
         })?;
         self.peer = Some(peer);
@@ -2356,22 +2356,21 @@ impl<'a> GlmEngine<'a> {
         let stream = self.stream_of(rank);
         if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
+            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) });
         }
         if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
         let pinned = self.prewarm_pins(&key);
-        let ticket = graphs.borrow_mut().cache_miss(&key, pinned, self.graph_estimate(&key));
-        let crate::shared::decode_graph::device::Miss::Capture(ticket) = ticket else { return segment() };
+        let Some(ticket) = graphs.borrow_mut().cache_ticket(&key, pinned, self.graph_estimate(&key)) else { return segment() };
         if self.graph_before.borrow().is_none() {
             match self.graph_free_samples() {
                 Ok(samples) => *self.graph_before.borrow_mut() = Some(samples),
-                Err(error) => { graphs.borrow_mut().cache_cancel(ticket); return Err(error); }
+                Err(error) => { drop(ticket); return Err(error); }
             }
         }
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
-        if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
-            if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+        if let Err(error) = self.on(rank, || unsafe { crate::shared::decode_graph::begin_capture(&self.library, stream, &ticket) }) {
+            if graphs.borrow_mut().cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, "graph capture unavailable; running eagerly");
             }
             return segment();
@@ -2379,14 +2378,14 @@ impl<'a> GlmEngine<'a> {
         let captured = segment();
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
         if let Err(error) = captured {
-            graphs.borrow_mut().cache_capture_failed(ticket, exec.as_ref().err().unwrap_or(&error));
+            graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }
             return Err(error);
         }
         let (raw, nodes, width, spans_devices, inspection_error) = match exec {
             Ok(info) => info,
             Err(error) => {
-                if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+                if graphs.borrow_mut().cache_ticket_failed(ticket, &error) {
                     tracing::warn!(%error, rank, ?key, "graph instantiation unavailable; running eagerly");
                 }
                 return segment();
@@ -2400,13 +2399,12 @@ impl<'a> GlmEngine<'a> {
         let graph = GraphExec(raw, self.library);
         crate::shared::decode_graph::census::capture_key("glm5", "decode",
             graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.0);
-        graphs.borrow_mut().cache_topology(ticket, nodes as u64, width, spans_devices);
         // Own the executable and ticket before launch: a launch error is drained
         // by the submission guard before either its pointers or owner can retire.
-        graphs.borrow_mut().cache_insert(key, graph, ticket, pinned);
+        graphs.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         let bank = graphs.borrow();
         let graph = bank.get(&key).context("inserted graph")?;
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) })?;
+        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) })?;
         Ok(())
     }
 

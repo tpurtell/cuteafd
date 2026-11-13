@@ -42,7 +42,7 @@ impl<'a> Graphs<'a> {
     pub(super) fn new(device: Device<'a>, variant: String) -> Result<Self> {
         let enabled = qwen35_graphs::enabled();
         let reserve = qwen35_graphs::configured_reserve(&variant, enabled)?;
-        let mut bank = GraphBank::new(None);
+        let mut bank = GraphBank::new();
         bank.attach_device(device.library, device.id, reserve.bytes, Site {
             name: "qwen3_5.segment", cycle: Cycle::Other, preference: Preference::Adaptive,
             bootstrap: qwen35_graphs::BOOTSTRAP_BYTES, basis: Basis::Bytes, spans_devices: false,
@@ -114,7 +114,7 @@ impl DenseEngine<'_> {
         let library = self.stream.device.library;
         if let Some(raw) = self.graphs.bank.borrow_mut().cached_launch(&key).map(|exec| exec.raw) {
             // SAFETY: all captured pointers retain the same engine-owned backing.
-            return unsafe { library.cuda_graph_launch(raw, self.stream.raw) };
+            return unsafe { crate::shared::decode_graph::launch(&library, raw, self.stream.raw) };
         }
         let pinned = qwen35_graphs::layout(&self.graphs.variant).is_some_and(|layout|
             layout.traced && layout.entries.iter().any(|entry|
@@ -123,7 +123,7 @@ impl DenseEngine<'_> {
             return segment();
         };
         // SAFETY: blocks only enqueue launches over persistent engine storage.
-        if let Err(error) = unsafe { library.cuda_graph_begin_capture(self.stream.raw) } {
+        if let Err(error) = unsafe { crate::shared::decode_graph::begin_capture(&library, self.stream.raw, &ticket) } {
             if self.graphs.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, "Dense Qwen capture unavailable; eager fallback");
             }
@@ -159,7 +159,7 @@ impl DenseEngine<'_> {
         }
         self.graphs.bank.borrow_mut().cache_commit(key, exec, ticket, nodes as u64, width, spans);
         // SAFETY: successful insertion retains the executable until a drained boundary.
-        unsafe { library.cuda_graph_launch(raw, self.stream.raw) }
+        unsafe { crate::shared::decode_graph::launch(&library, raw, self.stream.raw) }
     }
 
     pub(super) fn graph_completed(&self) -> Result<()> {

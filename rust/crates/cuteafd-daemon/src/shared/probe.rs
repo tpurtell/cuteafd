@@ -163,11 +163,8 @@ mod graph_stats_tests {
 
     #[test]
     fn stats_publish_each_startup_miss_variant_with_its_runs() {
-        use crate::shared::decode_graph::{GraphBank, GraphPolicy};
-        let mut bank = GraphBank::<u32, ()>::with_family(GraphPolicy::FixedStartup, "probe-test-miss");
-        bank.warm(&[1], |_| Ok(((), None))).unwrap();
-        bank.enqueue(&9);
-        bank.enqueue(&9);
+        crate::shared::decode_graph::note_eager("probe-test-miss", "9", String::new);
+        crate::shared::decode_graph::note_eager("probe-test-miss", "9", String::new);
         let mut stats = serde_json::json!({});
         graph_capture_stats(&mut stats);
         let variants = stats["graph_missing_variants"].as_array().expect("variant array");
@@ -182,10 +179,7 @@ mod graph_stats_tests {
     /// eager variant is described only on its first miss.
     #[test]
     fn stats_publish_qwen4_and_bank_misses_together() {
-        use crate::shared::decode_graph::{GraphBank, GraphPolicy};
-        let mut bank = GraphBank::<u32, ()>::with_family(GraphPolicy::FixedStartup, "probe-test-bank");
-        bank.warm(&[1], |_| Ok(((), None))).unwrap();
-        bank.enqueue(&9);
+        crate::shared::decode_graph::note_eager("probe-test-bank", "9", String::new);
         let shape = "rows=6 spec=false long=false pool_width=64 page_stride=8192 pool_stride=524288";
         crate::shared::decode_graph::note_eager("qwen4", shape, || "segment=11 max_context=4096 slots=8 pages=4".into());
         crate::shared::decode_graph::note_eager("qwen4", shape,

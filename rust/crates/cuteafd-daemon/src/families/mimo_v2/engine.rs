@@ -961,7 +961,7 @@ impl<'a> MimoEngine<'a> {
             drafter: None, mtp: None, l2: None, embedding,
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20, Tag::staging("mimo/mtp-staging"))?, 0)), prefill_w8a8: true,
             output_fp8_decode: true, kv_cache,
-            decode_graphs: false, graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)),
+            decode_graphs: false, graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()),
             graph_layout: None, graphs_warming: Cell::new(false), graphs_warmed: Cell::new(false),
             graph_before: RefCell::new(None), graphs_first_touch: Cell::new(false) })
     }
@@ -1183,7 +1183,7 @@ impl<'a> MimoEngine<'a> {
                 prefill_kv_wide: RefCell::new(None), unit_done: (0..self.prefill_waves()).map(|_|
                     crate::shared::memory::device::Event::new(Device { library, id: device })).collect::<Result<Vec<_>>>()?,
                 decode_workspace: RefCell::new(None),
-                graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)) })
+                graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(Rc::new(exchange));
@@ -2484,24 +2484,24 @@ impl<'a> MimoEngine<'a> {
         let stream = self.stream_of(rank);
         if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
+            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) });
         }
         // Before the startup prewarm every segment runs eagerly: the prewarm
         // pass, and then serving misses, are the only capture paths.
         if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
         let pinned = self.graph_pinned(key.rows);
-        let crate::shared::decode_graph::device::Miss::Capture(ticket) =
-            graphs.borrow_mut().cache_miss(&key, pinned, None) else { return segment() };
+        let Some(ticket) =
+            graphs.borrow_mut().cache_ticket(&key, pinned, None) else { return segment() };
         if self.graph_before.borrow().is_none() {
             match self.graph_allocation_samples() {
                 Ok(samples) => *self.graph_before.borrow_mut() = Some(samples),
-                Err(error) => { graphs.borrow_mut().cache_cancel(ticket); return Err(error); }
+                Err(error) => { drop(ticket); return Err(error); }
             }
         }
         // No synchronization here: the other rank's segments may not be queued
         // yet. SAFETY: capture records launches on this rank's persistent stream.
-        if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
-            if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+        if let Err(error) = self.on(rank, || unsafe { crate::shared::decode_graph::begin_capture(&self.library, stream, &ticket) }) {
+            if graphs.borrow_mut().cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, "graph capture unavailable; running eagerly");
             }
             return segment();
@@ -2509,14 +2509,14 @@ impl<'a> MimoEngine<'a> {
         let captured = segment();
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
         if let Err(error) = captured {
-            graphs.borrow_mut().cache_capture_failed(ticket, exec.as_ref().err().unwrap_or(&error));
+            graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }
             return Err(error);
         }
         let (raw, nodes, width, spans_devices, inspection_error) = match exec {
             Ok(info) => info,
             Err(error) => {
-                if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+                if graphs.borrow_mut().cache_ticket_failed(ticket, &error) {
                     tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
                 }
                 return segment();
@@ -2530,13 +2530,12 @@ impl<'a> MimoEngine<'a> {
         let graph = GraphExec(raw, self.library);
         crate::shared::decode_graph::census::capture_key("mimo_v2", "decode",
             graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.0);
-        graphs.borrow_mut().cache_topology(ticket, nodes as u64, width, spans_devices);
         // Own the executable and its ticket before launch: a launch error is
         // drained by the submission guard before either pointers or owner retire.
-        graphs.borrow_mut().cache_insert(key, graph, ticket, pinned);
+        graphs.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         let bank = graphs.borrow();
         let graph = bank.get(&key).context("inserted graph")?;
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) })?;
+        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) })?;
         Ok(())
     }
 
@@ -3510,7 +3509,7 @@ mod tests {
         // consume the capture's original allocation baseline on reattachment.
         let before_free = engine.graph_before.borrow().as_ref().unwrap()[0].free;
         for _ in 0..2 {
-            let mut temporary = crate::shared::decode_graph::GraphBank::<GraphKey, ()>::new(None);
+            let mut temporary = crate::shared::decode_graph::GraphBank::<GraphKey, ()>::new();
             temporary.attach_device(&library, 7, engine.graph_layout.as_ref().unwrap().reserves[0],
                 crate::shared::decode_graph::device::Site {
                     name: "mimo_v2.segment", cycle: crate::shared::decode_graph::device::Cycle::Decode,

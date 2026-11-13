@@ -1,6 +1,5 @@
 //! Bounded, captured index selection and snapshot-checked candidate sharing.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
-use crate::shared::decode_graph::GraphPolicy;
 use crate::families::deepseek_v41::v41_compressor::{IndexBinding, IndexProposal, IndexScoreGeometry};
 use crate::families::deepseek_v41::v41_index_query::{IndexQueryOutput, IndexQueryGeometry};
 use crate::shared::memory::Tag;
@@ -283,7 +282,7 @@ impl<'a> IndexSelectionWave<'a> {
         Ok(Self {
             storage, window: RowWindow::NONE, shared_scratch_busy: None,
             staging: LayerStaging::new(library, metadata_staging_bytes(capacity), 40, "v41/index-metadata")?, capacity,
-            graph: None, graphs: crate::shared::decode_graph::GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
+            graph: None, graphs: crate::shared::decode_graph::GraphBank::with_family("deepseek_v41"),
             capture_ticket: None,
             ready: None, pending: None, in_flight: false, warmed: false,
             audit: std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "1"),
@@ -381,7 +380,7 @@ impl<'a> IndexSelectionWave<'a> {
     pub(crate) unsafe fn capture_startup(&mut self, query: &IndexQueryGeometry,
         source: IndexScoreGeometry, shared: Option<CuteafdDeviceBuffer>, rows: usize) -> Result<()> {
         let key = self.startup_key(query, source, shared, rows)?;
-        ensure!(!self.in_flight && self.ready.is_none() && self.graphs.capture_allowed(&key)
+        ensure!(!self.in_flight && self.ready.is_none()
             && self.graphs.get(&key).is_none(), "startup index key unavailable");
         self.storage.stream.require_complete()?;
         let mut groups = Vec::new();
@@ -389,7 +388,7 @@ impl<'a> IndexSelectionWave<'a> {
         let Some(mut ticket) = self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(self.storage.buffers[0].buffer.device_id, rows as u32), None)
             else { return Ok(()) };
         // SAFETY: only commands are recorded; real metadata is uploaded before replay.
-        unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw))?; }
+        unsafe { ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, self.storage.stream.raw, &ticket))?; }
         let recorded = unsafe { self.enqueue(query, &[source], &groups, shared, rows, 1, DECODE_WIDTH_BUCKET, false) };
         let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
         match (recorded, captured) {
@@ -735,9 +734,7 @@ impl<'a> IndexSelectionWave<'a> {
         if capture && self.graph.is_none() {
             let mut ticket = ticket.context("index capture ticket missing")?;
             unsafe {
-                ticket.capture_result(self.storage.stream
-                    .library
-                    .cuda_graph_begin_capture(self.storage.stream.raw))?;
+                ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.storage.stream.library, self.storage.stream.raw, &ticket))?;
             }
             let launched = unsafe {
                 self.enqueue(&geometry, &sources, &groups, shared_blocks, rows, tiles, width, use_candidates)
@@ -764,7 +761,7 @@ impl<'a> IndexSelectionWave<'a> {
         let dispatch = || unsafe {
             if capture {
                 let g = self.graph.as_ref().context("selection graph missing")?.0;
-                self.storage.stream.library.cuda_graph_launch(g, self.storage.stream.raw)
+                crate::shared::decode_graph::launch(&self.storage.stream.library, g, self.storage.stream.raw)
             } else { self.enqueue(&geometry, &sources, &groups, shared_blocks, rows, tiles, width, use_candidates) }
         };
         let launched = if crate::shared::decode_graph::census::enabled() {
@@ -1197,7 +1194,7 @@ mod graph_tests {
             ptr: address as *mut c_void, bytes, device_id: 0, flags: 0 };
         let query = IndexQueryGeometry { layer: 2, packed: buffer(0x1000, 2048),
             scales: buffer(0x2000, 128), head_weights: buffer(0x3000, 64) };
-        let mut bank = GraphBank::<Vec<usize>, ()>::new(None);
+        let mut bank = GraphBank::<Vec<usize>, ()>::new();
         bank.attach_device_for_test(-164_404, 48, Site { name: "index_selection", cycle: Cycle::Decode,
             preference: Preference::Capture, bootstrap: 16, basis: Basis::Bytes, spans_devices: false })?;
         let key = |length: usize| selection_fingerprint(&query, &[], None, 1,

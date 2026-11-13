@@ -41,7 +41,7 @@
 //! homes. The LM head stays on rank 0; the drafter follows its admitted movable placement.
 //! Explicit per-layer placement keeps KDA/FFNs split and assigns each MLA layer
 //! (complete operands, KV and index state) to one owner with BF16 residual handoff.
-use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphPolicy};
+use crate::shared::decode_graph::{GraphBank, GraphOwner};
 use super::packing;
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
@@ -1633,10 +1633,9 @@ impl GraphKey {
 /// What the decode graph caches did and hold.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GraphCounts {
-    /// Executables held, the step shapes they belong to (segment 0's), and their charged bytes.
+    /// Executables held and the step shapes they belong to (segment 0's).
     pub held: usize,
     pub shapes: usize,
-    pub bytes: u64,
 }
 
 type GraphExec<'a> = GraphOwner<'a, ()>;
@@ -1787,7 +1786,7 @@ impl<'a> GlmfEngine<'a> {
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             prefill_slots: RefCell::new(Vec::new()),
-            experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "glm5_flash")),
+            experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::with_family("glm5_flash")),
             use_graphs: Self::graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false),
             prewarming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
@@ -2139,7 +2138,7 @@ impl<'a> GlmfEngine<'a> {
                 self.layer_waves.borrow_mut().clear();
                 for rank in 0..self.ranks() {
                     self.on(rank, || { *self.graphs_of(rank).borrow_mut() =
-                    GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "glm5_flash"); Ok(()) })?;
+                    GraphBank::with_family("glm5_flash"); Ok(()) })?;
                 }
                 Ok(())
             },
@@ -2825,7 +2824,7 @@ impl<'a> GlmfEngine<'a> {
                 self.caches.pool_marks)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
-                graphs: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: self.graphs.borrow().budget() }, "glm5_flash")), l2: None })
+                graphs: RefCell::new(GraphBank::with_family("glm5_flash")), l2: None })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(std::rc::Rc::new(exchange));
@@ -4607,7 +4606,7 @@ impl<'a> GlmfEngine<'a> {
         let stream = self.stream_of(rank);
         if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.raw, stream) });
+            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.raw, stream) });
         }
         // Before the prewarm, and through its eager pass, every segment runs eagerly.
         if self.prewarming_graphs.get()
@@ -4615,14 +4614,14 @@ impl<'a> GlmfEngine<'a> {
             return self.eager_segment(segment);
         }
         let pinned = self.graph_pinned(&key);
-        let crate::shared::decode_graph::device::Miss::Capture(ticket) =
-            graphs.borrow_mut().cache_miss(&key, pinned, None) else {
+        let Some(ticket) =
+            graphs.borrow_mut().cache_ticket(&key, pinned, None) else {
             return self.eager_segment(segment);
         };
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
-        if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
-            if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+        if let Err(error) = self.on(rank, || unsafe { crate::shared::decode_graph::begin_capture(&self.library, stream, &ticket) }) {
+            if graphs.borrow_mut().cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, "graph capture unavailable; running eagerly");
             }
             return self.eager_segment(segment);
@@ -4630,7 +4629,7 @@ impl<'a> GlmfEngine<'a> {
         let captured = segment();
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
         if let Err(error) = captured {
-            graphs.borrow_mut().cache_capture_failed(ticket, exec.as_ref().err().unwrap_or(&error));
+            graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec {
                 // SAFETY: the capture failed; this executable owns no live launch.
                 let _ = self.on(rank, || unsafe { self.library.cuda_graph_exec_destroy(raw) });
@@ -4640,7 +4639,7 @@ impl<'a> GlmfEngine<'a> {
         let (raw, nodes, width, spans_devices, inspection_error) = match exec {
             Ok(info) => info,
             Err(error) => {
-                if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+                if graphs.borrow_mut().cache_ticket_failed(ticket, &error) {
                     tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
                 }
                 return self.eager_segment(segment);
@@ -4656,13 +4655,12 @@ impl<'a> GlmfEngine<'a> {
         let graph = unsafe { GraphOwner::new(self.library, device, raw, ())? };
         crate::shared::decode_graph::census::capture_key("glm5_flash", "decode",
             graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.raw);
-        graphs.borrow_mut().cache_topology(ticket, nodes as u64, width, spans_devices);
         // Own the executable and ticket before launch: a launch error is drained by the
         // submission guard before either its pointers or owner can retire.
-        graphs.borrow_mut().cache_insert(key, graph, ticket, pinned);
+        graphs.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         let bank = graphs.borrow();
         let graph = bank.get(&key).context("inserted graph")?;
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.raw, stream) })?;
+        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.raw, stream) })?;
         Ok(())
     }
 
@@ -4681,13 +4679,12 @@ impl<'a> GlmfEngine<'a> {
         }
     }
 
-    /// Decode graph cache occupancy: executables held, their step shapes and charged bytes.
+    /// Decode graph cache occupancy; physical bytes belong to the shared device cache.
     pub(crate) fn graph_stats(&self) -> GraphCounts {
         (0..self.ranks()).fold(GraphCounts::default(), |total, rank| {
             let graphs = self.graphs_of(rank).borrow();
             GraphCounts { held: total.held + graphs.len(),
-                shapes: total.shapes + graphs.count(|key| key.segment == 0),
-                bytes: total.bytes + graphs.bytes() }
+                shapes: total.shapes + graphs.count(|key| key.segment == 0) }
         })
     }
 
@@ -5505,8 +5502,8 @@ impl Drop for GlmfEngine<'_> {
         // Every rank can still read graph operands, weights and workspaces.
         // Abort before any owner releases storage when drainage is unproved.
         crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "GLM Flash engine");
-        self.graphs = RefCell::new(GraphBank::new(None));
-        if let Some(peer) = &mut self.peer { peer.graphs = RefCell::new(GraphBank::new(None)); }
+        self.graphs = RefCell::new(GraphBank::new());
+        if let Some(peer) = &mut self.peer { peer.graphs = RefCell::new(GraphBank::new()); }
         if let Some(ops) = self.ops.take() {
             let ops = ops.into_inner();
             for event in ops.pool.into_iter().chain(ops.pending.into_iter().flat_map(|(_, a, b)| [a, b])) {
