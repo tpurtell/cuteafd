@@ -444,15 +444,25 @@ mod tests {
     #[test]
     fn decode_table_has_a_distinct_admitted_backing_without_reordering_canonical_rows() {
         for requests in [1, 3, 16, 64] {
-            let cache = MsaCache::new(1, 5, requests, 270).unwrap();
-            assert_eq!(cache.table_width, 8);
-            let buffers = cache.buffers().unwrap().into_iter().collect::<std::collections::BTreeMap<_, _>>();
-            assert_eq!(buffers["page_table"], u64::from(requests) * 8 * 4);
-            assert_eq!(buffers["decode_table"], buffers["page_table"]);
-            let components = cache.components("minimax.cache.0", 0, 5).unwrap();
-            use crate::placement::planner::ComponentKind;
-            assert_eq!(components.iter().filter(|component| matches!(&component.kind,
-                ComponentKind::AllocationGranularity(tail) if tail.id.ends_with("decode_table.tail"))).count(), 1);
+            for context in [270, 1048576] {
+                let cache = MsaCache::new(1, 5, requests, context).unwrap();
+                let buffers = cache.buffers().unwrap().into_iter().collect::<std::collections::BTreeMap<_, _>>();
+                let bytes = u64::from(requests) * u64::from(cache.table_width) * 4;
+                assert_eq!(buffers["page_table"], bytes);
+                assert_eq!(buffers["decode_table"], bytes);
+                let components = cache.components("minimax.cache.0", 0, 5).unwrap();
+                use crate::placement::planner::ComponentKind;
+                for name in ["page_table", "decode_table"] {
+                    let id = format!("minimax.cache.0.{name}");
+                    assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+                        ComponentKind::Allocation { template, .. } if template.id == id
+                            && template.bytes == bytes && template.view.is_none())).count(), 1);
+                    // Small allocations share driver blocks, so only large owners have a tail.
+                    assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+                        ComponentKind::AllocationGranularity(tail) if tail.id == format!("{id}.tail"))).count(),
+                        usize::from(bytes > 1 << 20));
+                }
+            }
         }
     }
 
@@ -624,7 +634,8 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .collect::<std::collections::BTreeMap<_, _>>();
-            assert_eq!(buffers.len(), 60 * 3 + 2);
+            let globals = ["page_table", "decode_table", "lengths"];
+            assert_eq!(buffers.len(), cache.layers as usize * 3 + globals.len());
             assert_eq!(buffers["layer.59.keys"], 17 * 32768);
             assert_eq!(buffers["layer.0.values"], 17 * 32768);
             assert_eq!(buffers["layer.17.index"], 17 * 8448);
