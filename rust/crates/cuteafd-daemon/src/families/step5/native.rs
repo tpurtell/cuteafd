@@ -242,6 +242,9 @@ mod push_tests {
         fixture.configure_memory(&library, 0, 1 << 30)?;
         fixture.immediate_copies(&library)?;
         let device = Device { library: &library, id: 0 };
+        // Deep Cargo target paths exceed sockaddr_un's 107-byte path limit.
+        let sockets = tempfile::tempdir_in(std::path::PathBuf::from(
+            std::env::var_os("HOME").context("HOME is unset")?).join(".cache/cuteafd/builds"))?;
         for bits in [6, 8] {
             let root = tempfile::tempdir_in(fixture.directory())?;
             let stem = "model.layers.0.self_attn.q_proj";
@@ -273,7 +276,6 @@ mod push_tests {
                     let (actual, records) = dense::recording(|| read_core(device, &checkpoint, &layout, Some(&arena)))?;
                     assert!(!records.steps.is_empty(), "native payload bypassed recording");
                     assert_eq!(records.operands.len(), 2, "both H128 vectors must be recorded");
-                    let sockets = tempfile::tempdir_in(fixture.directory())?;
                     let timing = cuteafd_ffi::load_timing::Split::start();
                     receive_pushed(device, None, root.path(), sockets.path(), &records, None, 0, 0)?;
                     assert_eq!(timing.read_bytes(), 0, "receiver read the checkpoint mount");
