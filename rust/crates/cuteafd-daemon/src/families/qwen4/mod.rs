@@ -126,9 +126,6 @@ pub(crate) struct EngineArgs {
     /// all routed experts stay on the GPU; checkpoints that do not fit need Sparks.
     #[arg(long, requires = "local_experts")]
     pub expert_window: Option<usize>,
-    /// Most EXL3 expert layers resident at once (the free memory decides first).
-    #[arg(long, default_value_t = 48)]
-    pub exl3_window: usize,
     /// GPU memory (GiB) kept free of local experts for step workspaces
     /// (logits alone are 4 GiB at 4096 rows).
     #[arg(long, default_value_t = 12)]

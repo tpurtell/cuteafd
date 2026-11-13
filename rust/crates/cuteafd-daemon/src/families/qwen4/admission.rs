@@ -169,8 +169,6 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     let rows = args.prefill_rows.max(super::engine::DECODE_ROWS);
     ensure!(args.shared_only || args.expert_window.is_none(),
         "Qwen placement requires resident experts; diagnostic expert paging is not admitted");
-    ensure!(args.shared_only || !args.local_experts || catalog.is_none_or(|c| c.exl3().is_none())
-        || args.exl3_window >= layers, "Qwen placement requires the complete EXL3 backbone window");
     let source = if args.shared_only { ExpertSource::None }
         else if args.local_experts {
             if catalog.context("Qwen local expert headers")?.exl3().is_some() { ExpertSource::LocalExl3 }
