@@ -709,6 +709,64 @@ fn zero_onboard_pair_has_no_local_expert_or_exchange_owners() {
 }
 
 #[test]
+fn synchronous_upload_chunk_is_one_startup_only_pinned_backing() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::{Lifetime, Location, Operation, Phase};
+    for gpus in [1, 2] {
+        let inputs = recipe_inputs(gpus, 4);
+        let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+            inputs.prefill, Operation::Serving, None, Default::default());
+        let admitted = inputs.admit(request).unwrap();
+        let facts = &admitted.solved.facts;
+        let owners = facts.allocations.iter().filter(|owner| owner.id == "staging/sync-h2d")
+            .collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1, "one NativeLibrary-wide backing, not one per GPU");
+        let owner = owners[0];
+        assert_eq!(owner.location, Location::PINNED);
+        assert_eq!(owner.bytes, cuteafd_ffi::SYNC_H2D_CHUNK_BYTES as u64);
+        assert!(owner.view.is_none());
+        assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Warmup });
+        for phase in [Phase::Load, Phase::PostTargetKv, Phase::DraftLoad, Phase::Warmup] {
+            assert!(owner.lifetime.contains(phase, facts.phase_order));
+        }
+        for phase in [Phase::Ready, Phase::Growth] {
+            assert!(!owner.lifetime.contains(phase, facts.phase_order));
+        }
+        assert!(facts.allowances.iter().all(|allowance| !format!("{allowance:?}").contains("sync-h2d")));
+        assert!(facts.allocation_granularity.iter().all(|tail| tail.location != Location::PINNED));
+    }
+}
+
+#[test]
+fn prefill_token_uploads_match_entry_units_only() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::{Lifetime, Location, Operation};
+    for gpus in [1, 2] {
+        for concurrency in [1, 4, 16, 64] {
+            let mut inputs = recipe_inputs(gpus, 4);
+            inputs.sequences = concurrency;
+            let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+                inputs.prefill, Operation::Serving, None, Default::default());
+            let admitted = inputs.admit(request).unwrap();
+            let owners = admitted.solved.facts.allocations.iter()
+                .filter(|owner| owner.id.ends_with(".route_ids.upload"))
+                .collect::<Vec<_>>();
+            let expected = (0..inputs.prefill.waves)
+                .map(|slot| format!("minimax.unit.0.{slot}.route_ids.upload"))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(owners.iter().map(|owner| owner.id.clone()).collect::<std::collections::BTreeSet<_>>(), expected);
+            assert_eq!(owners.len(), inputs.prefill.waves as usize);
+            for owner in owners {
+                assert_eq!(owner.location, Location::PINNED);
+                assert_eq!(owner.bytes, inputs.prefill.rows * 4);
+                assert_eq!(owner.lifetime, Lifetime::TARGET);
+                assert!(owner.view.is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn prefix_ordered_uploads_match_each_request_destination() {
     use crate::placement::families::minimax_m3::{self as shared, Owner};
     use crate::placement::planner::{Operation, Location};
