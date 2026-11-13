@@ -100,6 +100,14 @@ mod tests {
                 config["num_hidden_layers"] = 3.into();
                 config["hybrid_layer_pattern"] = serde_json::json!([0, 1, 1]);
                 config["moe_layer_freq"] = serde_json::json!([0, 1, 1]);
+                if format == ExpertFormat::Nvfp4 {
+                    config["quantization_config"]["producer"] = serde_json::json!({"name": "modelopt"});
+                    config["quantization_config"]["config_groups"] = serde_json::json!({"group_0": {
+                        "targets": ["Linear"],
+                        "weights": {"dynamic": false, "group_size": 16, "num_bits": 4, "type": "float"},
+                        "input_activations": {"dynamic": false, "group_size": 16, "num_bits": 4, "type": "float"}
+                    }});
+                }
                 let mut headers = Vec::new();
                 for expert in 0..2 {
                     for (projection, rows, columns) in [("gate", 1024, 128), ("up", 1024, 128), ("down", 128, 1024)] {
