@@ -110,9 +110,13 @@ KEY_LINE = re.compile(r'(?i)(admission|prefill logits|decode logits|logits diges
 TEST_RESULT = re.compile(r'test result: (\w+)\. (\d+) passed; (\d+) failed')
 GPU_CHECK_EXIT = 86
 # Golden flags that write files: only the arm's {out} directory is writable.
-# Diagnostic switches the daemons declare with `#[arg(long, hide = true)]`: Clap's
-# --help omits them, so the help-derived schema adds them as booleans.
-HIDDEN_FLAGS = ('--skip-routed-experts',)
+# Diagnostic options the daemons declare with `#[arg(long, hide = true)]`: Clap's
+# --help omits them, so the help-derived schema adds them here. Booleans take no
+# operand; the rest take one. scripts/tests/test_golden_run.py checks this list
+# against every `hide = true` field in rust/crates/cuteafd-daemon/src.
+HIDDEN_FLAGS = ('--skip-routed-experts', '--skip-experts', '--full-prefill-logits', '--resume-cold',
+                '--resume-poison-unit0', '--independent-decode-lanes')
+HIDDEN_OPTIONS = ('--save-logits', '--kda-nvfp4-gate', '--draft-window-marks')
 WRITERS = ('--dump-dir', '--save-logits', '--bench-dump', '--replay-dump', '--geometry-trace')
 CONTAINER_HOME = '/tmp/cuteafd-home'
 OUT = '/out'
@@ -849,6 +853,9 @@ def cli_from_help(text):
     for flag in HIDDEN_FLAGS:
         if flag not in defaults:
             parser.add_argument(flag, action='store_true')
+    for flag in HIDDEN_OPTIONS:
+        if flag not in defaults:
+            parser.add_argument(flag)
     return parser, defaults
 
 
