@@ -22,8 +22,8 @@ the launcher configuration). This script turns each window's rows into
 
 Paths (``--path``): ``decode`` scores in verify steps of ``--verify-rows`` rows (the decode
 kernels); ``prefill`` in the prompt chunks a prefill runs (GLM 5.3 Flash: the chunked KDA
-recurrence, prefill GEMMs and lanes). Prefill-path scoring is admitted at launch only
-(``FULL_PREFILL_LOGITS=on``); without it the script stops before the first window.
+recurrence, prefill GEMMs and lanes). Prefill-path scoring requires the server to advertise
+``prefill_scoring="streamed"``; without that capability the script stops before the first window.
 
 Plan (JSON): ``{"vocab": V, "windows": [{"window_id", "tokens": [ids], "tokens_sha256",
 "positions": [rows]}]}`` where row ``r`` is the distribution after ``tokens[0..r]`` (inclusive),
@@ -193,9 +193,8 @@ def main() -> int:
         raise SystemExit(f"windows not in the plan: {sorted(wanted - {w['window_id'] for w in windows})}")
     if args.path == "prefill":
         status = request(f"{args.url}/v1/bench/status", None, args.timeout, args.api_key)
-        if status.get("full_prefill_logits") is not True:
-            raise SystemExit("prefill-path scoring is admitted at launch only: restart the server with "
-                             "FULL_PREFILL_LOGITS=on (--full-prefill-logits)")
+        if status.get("prefill_scoring") != "streamed":
+            raise SystemExit("prefill-path scoring requires server capability prefill_scoring=streamed")
     os.makedirs(args.out, exist_ok=True)
     run_path = os.path.join(args.out, "run.json")
     run = {"plan": args.plan, "plan_sha256": plan_sha256, "url": args.url, "score_path": args.path,

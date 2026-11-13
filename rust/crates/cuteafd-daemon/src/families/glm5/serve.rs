@@ -876,7 +876,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         let experts = transport.as_deref_mut().map(|t| (t, runtime));
                         if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring(engine.cfg.family_id()) {
                             engine.prefill_streamed_scoring(placement, chunk, experts, &request_media,
-                                probe::ScoringRows { probe: &job.probe, position })
+                                probe::ScoringRows { consumer: &job.probe, position })
                         } else if rows > 1 {
                             Ok(engine.prefill_scoring_media(placement, chunk, experts, rows, &request_media)?
                                 .map(|values| probe::ScoreLogits::Host { values, vocab: engine.cfg.vocab_size }))

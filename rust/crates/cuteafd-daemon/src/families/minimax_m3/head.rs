@@ -382,7 +382,7 @@ mod tests {
             let actual = Probe::new(spec);
             let probe = Some(actual.clone());
             assert!(matches!(bounded.project_scoring(&weights, residual.buffer, rows,
-                ScoringRows { probe: &probe, position })?, ScoreLogits::Recorded));
+                ScoringRows { consumer: &probe, position })?, ScoreLogits::Recorded));
             let actual = actual.record();
             let expected_probe = reference.record();
             assert!(actual.error.is_none());

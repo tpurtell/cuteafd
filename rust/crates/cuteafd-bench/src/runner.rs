@@ -422,7 +422,7 @@ impl Bench {
             "active": active.as_ref().map(|a| json!({"id": a.id, "panel": a.panel, "fraction": a.fraction,
                 "eta_s": a.eta_s, "elapsed_s": a.started.elapsed().as_secs_f64()})),
             "readiness_s": crate::context::readiness_s(),
-            "full_prefill_logits": crate::fidelity_dataset::prefill_admitted(&crate::context::get().settings),
+            "prefill_scoring": if crate::fidelity_dataset::prefill_admitted(&crate::context::get().settings) { Some("streamed") } else { None },
             "draft": crate::context::get().draft_mode(),
             "snapshot": crate::context::get().snapshot,
             "settings": crate::context::get().settings,

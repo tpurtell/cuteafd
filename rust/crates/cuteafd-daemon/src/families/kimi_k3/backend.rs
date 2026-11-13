@@ -127,7 +127,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
                 .map(crate::shared::probe::ScoreLogits::Device));
         }
         self.engine.usage_phase(cuteafd_ffi::expert_usage::UsagePhase::Prefill);
-        let rows = crate::shared::probe::ScoringRows { probe, position };
+        let rows = crate::shared::probe::ScoringRows { consumer: probe, position };
         self.engine.prefill_scoring(placement, tokens, logit_rows, pool, &mut |offset, logits| {
             rows.record(self.library(), offset, &logits)
         })?;

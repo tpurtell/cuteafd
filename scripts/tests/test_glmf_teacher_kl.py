@@ -43,7 +43,7 @@ def _write_dump(leaf: Path, positions: list[int]) -> None:
                                        "tensor": "log_probs", "dtype": "F32", "byte_order": "little"}) + "\n")
 
 
-def _server(tmp_path, full_prefill_logits=True):
+def _server(tmp_path, prefill_scoring="streamed"):
     root = tmp_path / "dumps"
     root.mkdir()
     seen, headers = [], []
@@ -58,7 +58,7 @@ def _server(tmp_path, full_prefill_logits=True):
 
         def do_GET(self):  # noqa: N802
             headers.append(self.headers.get("authorization"))
-            self._reply({"full_prefill_logits": full_prefill_logits})
+            self._reply({} if prefill_scoring == "absent" else {"prefill_scoring": prefill_scoring})
 
         def do_POST(self):  # noqa: N802
             headers.append(self.headers.get("authorization"))
@@ -138,13 +138,14 @@ def test_rows_become_one_klgate_window_file_each(tmp_path, server, path):
     assert refused.returncode != 0 and "another plan's or path's run" in refused.stderr
 
 
-def test_prefill_path_needs_the_launch_admission_before_any_window(tmp_path):
-    httpd, url, root, seen, _ = _server(tmp_path, full_prefill_logits=False)
+@pytest.mark.parametrize("capability", [None, "absent", "unknown", True])
+def test_prefill_path_needs_explicit_capability_before_any_window(tmp_path, capability):
+    httpd, url, root, seen, _ = _server(tmp_path, prefill_scoring=capability)
     try:
         _plan(tmp_path / "plan.json")
         refused = _run("--url", url, "--plan", tmp_path / "plan.json", "--dump-root", root, "--out", tmp_path / "out",
                        "--path", "prefill")
-        assert refused.returncode != 0 and "FULL_PREFILL_LOGITS=on" in refused.stderr
+        assert refused.returncode != 0 and "prefill_scoring=streamed" in refused.stderr
         assert not seen and not (tmp_path / "out").exists()
         # The decode path needs no admission.
         decode = _run("--url", url, "--plan", tmp_path / "plan.json", "--dump-root", root, "--out", tmp_path / "out",

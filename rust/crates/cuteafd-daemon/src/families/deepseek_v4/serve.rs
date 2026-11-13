@@ -871,7 +871,7 @@ fn schedule(
                                 &mut [(&mut **placement, chunk)], transports, runtime)?)))
                         } else if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring("deepseek_v4") {
                             Ok(Some(engine.prefill_streamed_scoring(placement, chunk, transports,
-                                probe::ScoringRows { probe: &job.probe, position })?))
+                                probe::ScoringRows { consumer: &job.probe, position })?))
                         } else if rows > 1 {
                             Ok(Some(probe::ScoreLogits::Host {
                                 values: engine.prefill(placement, chunk, transports, runtime, rows, None)?,

@@ -755,7 +755,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     |placement, chunk, rows, position| {
                         if rows > 1 && !engine.full_prefill_logits() && probe::streamed_prefill_scoring("mimo_v2") {
                             engine.prefill_streamed_scoring(placement, chunk, &request_media,
-                                probe::ScoringRows { probe: &job.probe, position })
+                                probe::ScoringRows { consumer: &job.probe, position })
                         } else {
                             Ok(engine.prefill_media_device(placement, chunk, rows > 1, None, None, Some(&request_media))?
                                 .map(probe::ScoreLogits::Device))

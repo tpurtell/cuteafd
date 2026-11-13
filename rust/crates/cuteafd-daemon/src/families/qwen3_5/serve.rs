@@ -296,7 +296,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         -> Result<Option<crate::shared::probe::ScoreLogits>> {
         let streamed = logit_rows > 1 && !self.engine.borrow().full_prefill_logits();
         self.prefill_with(placement, tokens, logit_rows,
-            streamed.then_some(crate::shared::probe::ScoringRows { probe, position }))
+            streamed.then_some(crate::shared::probe::ScoringRows { consumer: probe, position }))
     }
     fn coordinator_packed_cap(&self) -> Result<Option<usize>> {
         if self.packing == crate::shared::prefill_packing::PackingMode::Exact {
