@@ -225,3 +225,69 @@ impl<'a> OutputProjection<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use crate::shared::{checkpoint_read, experts::rtx::{dense,
+        push::tests::receive_pushed}};
+    use cuteafd_loader::{formats::exl3_storage::Exl3Codebook,
+        plan::testing, serving_capacity::WeightArenaLayout};
+    use std::{fs::File, os::unix::fs::FileExt};
+
+    #[test]
+    fn native_core_push_is_current_mount_exact_without_receiver_reads() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        for bits in [6, 8] {
+            let root = tempfile::tempdir_in(fixture.directory())?;
+            let stem = "model.layers.0.self_attn.q_proj";
+            let tensors = testing::exl3(stem, 256, 256, bits);
+            let (config, _) = testing::step5_fixture("bf16");
+            testing::write_snapshot(root.path(), &config, &tensors, None);
+            let checkpoint = Checkpoint::open(root.path())?;
+            for tensor in &checkpoint.tensors {
+                let bytes = if tensor.meta.name.ends_with(".mcg") {
+                    Exl3Codebook::Mcg.multiplier().to_le_bytes().to_vec()
+                } else {
+                    (0..tensor.meta.byte_length).map(|i| (i.wrapping_mul(37) >> 3) as u8 ^ 0x5a).collect()
+                };
+                File::options().write(true).open(root.path().join(&tensor.shard))?
+                    .write_all_at(&bytes, tensor.meta.byte_offset)?;
+            }
+            for (side, ranks) in [(TrellisSide::Output, 1), (TrellisSide::Output, 2), (TrellisSide::Input, 2)] {
+                for rank in 0..ranks {
+                    let shape = match side { TrellisSide::Output => [256 / ranks, 256],
+                        TrellisSide::Input => [256, 256 / ranks] };
+                    let layout = CoreWeightLayout { stem: stem.into(), side, rank, ranks, shape,
+                        bytes: shape[0] * shape[1] * bits / 8 + 2 * (shape[0] + shape[1]),
+                        bits, codebook: Exl3Codebook::Mcg };
+                    // Independent legacy host packing, not the recorded recipe.
+                    let expected = layout.read(|name| checkpoint_read::read_tensor(&checkpoint, name))?;
+                    let arena = DeviceWeightArena::new(device,
+                        WeightArenaLayout::new("step5/core-test", layout.shared_layout().arena_tensors(stem)?)?,
+                        ArenaTag::weights("step5/target"))?;
+                    let (actual, records) = dense::recording(|| read_core(device, &checkpoint, &layout, Some(&arena)))?;
+                    assert!(!records.steps.is_empty(), "native payload bypassed recording");
+                    assert_eq!(records.operands.len(), 2, "both H128 vectors must be recorded");
+                    let sockets = tempfile::tempdir_in(fixture.directory())?;
+                    let timing = cuteafd_ffi::load_timing::Split::start();
+                    receive_pushed(device, None, root.path(), sockets.path(), &records, None, 0, 0)?;
+                    assert_eq!(timing.read_bytes(), 0, "receiver read the checkpoint mount");
+                    assert!(timing.push_bytes() > 0, "no bytes arrived through push");
+                    drop(timing);
+                    for (name, allocation, expected) in [("trellis", &actual.payload, &expected.shard.payload),
+                        ("suh", &actual.suh, &expected.shard.suh), ("svh", &actual.svh, &expected.shard.svh)] {
+                        let mut got = vec![0; allocation.buffer.bytes];
+                        device.run(|| library.copy_d2h(&mut got, allocation.buffer))?;
+                        assert_eq!(&got, expected, "K{bits} {side:?} rank {rank}/{ranks} {name}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
