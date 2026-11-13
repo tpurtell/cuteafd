@@ -104,14 +104,6 @@ fn invalid(detail: impl std::fmt::Display) -> Refusal {
 
 fn refusal(error: anyhow::Error) -> Refusal { invalid(format!("{error:#}")) }
 
-/// Per-rank resident bytes of one routed layer on the coordinator: whole or a
-/// TP2 half. Header-exact from the checkpoint's own compressed NVFP4 tensors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct LayerExperts {
-    pub whole: u64,
-    pub half: [u64; 2],
-}
-
 /// Source route selected by the shared push policy. A failed push may fall
 /// back to mount only with this same canonical final layout and identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,7 +184,7 @@ impl ExpertBacking {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalPackage {
     /// Executor workspace per GPU at the admitted unit (TP1 or TP2 layout).
-    Installed { workspace: [u64; 2] },
+    Installed { scratch: u64, output: u64 },
     /// No package beside the manifest: onboarding counts above zero are refused.
     Missing(String),
 }
@@ -244,7 +236,8 @@ pub struct MiniMaxInputs {
     pub manifest: std::sync::Arc<serde_json::Value>,
     /// Routed layer order (the onboarding prefix is `routed[..count]`).
     pub routed: Vec<usize>,
-    pub experts: Vec<LayerExperts>,
+    /// One backing per GPU per ordered prefix; count zero owns none.
+    pub expert_backings: Vec<Vec<ExpertBacking>>,
     pub local: LocalPackage,
     /// Remote charges per onboarding count, per rank (`spark[count][rank]`).
     pub spark: Vec<Vec<SparkCharge>>,
@@ -273,6 +266,8 @@ pub struct AdmittedMiniMax {
     pub placement: Placement,
     pub solved: ResolvedPlan,
     pub onboard: usize,
+    /// The exact selected rank backings; runtime never derives IDs or offsets.
+    pub expert_backings: Vec<ExpertBacking>,
     pub draft_home: Option<u8>,
     pub encoder: Option<usize>,
 }
@@ -360,7 +355,7 @@ impl MiniMaxInputs {
         let solved = solve(request, self.budgets.clone(), self)?;
         let placement = self.execution(&solved)?;
         let onboard = placement.onboard_layers;
-        Ok(AdmittedMiniMax { placement, onboard, draft_home: solved.decisions.draft_home,
+        Ok(AdmittedMiniMax { placement, onboard, expert_backings: self.expert_backings[onboard].clone(), draft_home: solved.decisions.draft_home,
             encoder: solved.decisions.encoder, solved })
     }
 
@@ -403,18 +398,17 @@ impl MiniMaxInputs {
         Ok(placement)
     }
 
-    /// Per-GPU expert arena backing at `count` onboarded layers, including
-    /// the executor workspace (charged only when a layer is onboarded).
+    /// Executor peak is derived from the canonical backing plus the same
+    /// separately owned scratch/output the runtime retains.
     fn arena_bytes(&self, count: usize) -> Result<[u64; 2], Refusal> {
         let mut out = [0u64; 2];
         if count == 0 { return Ok(out); }
-        let LocalPackage::Installed { workspace } = &self.local else {
+        let LocalPackage::Installed { scratch, output } = self.local else {
             return Err(invalid("onboarded layers need the installed fp8-minimax-nvfp4a4 package"));
         };
-        for gpu in 0..self.gpus {
-            let weights = self.experts[..count].iter().try_fold(0u64, |sum, layer| sum.checked_add(
-                if self.gpus == 2 { layer.half[gpu] } else { layer.whole })).ok_or(Refusal::Overflow("MiniMax expert arena"))?;
-            out[gpu] = weights.checked_add(workspace[gpu]).ok_or(Refusal::Overflow("MiniMax expert arena"))?;
+        for backing in &self.expert_backings[count] {
+            out[backing.gpu] = (backing.arena.bytes() as u64).checked_add(scratch)
+                .and_then(|bytes| bytes.checked_add(output)).ok_or(Refusal::Overflow("MiniMax expert peak"))?;
         }
         Ok(out)
     }
@@ -513,7 +507,7 @@ impl Recipe for MiniMaxInputs {
         if !(1..=2).contains(&self.gpus) || self.spark_ranks > 8 || maximum == 0 || maximum == u64::MAX
             || request.context.maximum != self.context.maximum || self.targets.len() != self.gpus
             || self.owners.len() != cfg.layers || self.graph_reserve.len() != self.gpus
-            || self.code.len() != self.gpus || self.experts.len() != self.routed.len()
+            || self.code.len() != self.gpus || self.expert_backings.len() != self.routed.len() + 1
             || self.spark.len() != self.routed.len() + 1 || self.prefill.rows == 0 || self.prefill.waves == 0
             || self.sequences == 0 {
             return Err(invalid("invalid extent or empty domain"));
@@ -525,6 +519,17 @@ impl Recipe for MiniMaxInputs {
         let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
         if self.routed != routed || self.spark.iter().any(|ranks| ranks.len() != self.spark_ranks) {
             return Err(invalid("routed layer order or Spark rank inventory differs from the executor"));
+        }
+        for (count, backings) in self.expert_backings.iter().enumerate() {
+            if backings.len() != if count == 0 { 0 } else { self.gpus } {
+                return Err(invalid("expert backing rank inventory differs from onboarding count"));
+            }
+            for (gpu, backing) in backings.iter().enumerate() {
+                if backing.gpu != gpu || backing.count != count
+                    || backing.layers.iter().map(|layer| layer.layer).collect::<Vec<_>>() != self.routed[..count] {
+                    return Err(invalid("expert backing selection differs from routed prefix"));
+                }
+            }
         }
         if let Pin::Exact(count) = request.onboard {
             if count > self.routed.len() as u64 {
@@ -589,23 +594,19 @@ impl Recipe for MiniMaxInputs {
                 requires.push(Requires { when: Choice { variable: onboard, option }, any_of: vec![] });
                 continue;
             }
-            let arenas = self.arena_bytes(count)?;
-            for gpu in 0..self.gpus {
-                if arenas[gpu] == 0 { continue; }
-                let weights = arenas[gpu] - match &self.local {
-                    LocalPackage::Installed { workspace } => workspace[gpu], LocalPackage::Missing(_) => 0 };
-                let group = if pair { format!("TP2 expert layer halves 0..{count}") }
-                    else { format!("resident routed layers 0..{count}") };
-                let id = Owner::Experts { gpu, count }.id();
-                let location = Location::coordinator(gpu as u8);
-                let owner = Allocation::buffer(&id, location, arenas[gpu], Lifetime::RESIDENT, Category::Experts, group);
-                let mut resident = Component::resident_weight(
-                    ResidentWeight::from_allocation(&owner, ResidentWeights(weights)), ByteCurve::fixed(weights, maximum));
-                resident.activation = activation.clone();
-                components.push(resident);
-                let mut arena = Component::allocation(owner, ByteCurve::fixed(arenas[gpu], maximum), false, maximum);
-                arena.activation = activation.clone();
-                components.push(arena);
+            if count > 0 {
+                let LocalPackage::Installed { scratch, output } = self.local else { unreachable!() };
+                for backing in &self.expert_backings[count] {
+                    let gpu = backing.gpu;
+                    let location = Location::coordinator(gpu as u8);
+                    components.extend(with(weight_arena_components(&backing.arena, location, Lifetime::RESIDENT,
+                        maximum, MemoryKind::Experts)?, &activation));
+                    for (name, bytes) in [("scratch", scratch), ("output", output)] {
+                        components.extend(with(buffer(format!("minimax.expert_workspace.{gpu}.{count}.{name}"),
+                            location, bytes, Lifetime::RESIDENT, Category::Workspace,
+                            "native expert workspace", maximum).into_iter().collect(), &activation));
+                    }
+                }
             }
             if count < self.routed.len() {
                 for (rank, charge) in self.spark[count].iter().enumerate() {
