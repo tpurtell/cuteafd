@@ -1330,3 +1330,11 @@ def test_required_native_library_is_supplied_by_slot_environment():
     assert parser.parse_args(['--golden', '/golden']).native_lib is None
     with pytest.raises(ValueError, match='--golden'):
         parser.parse_args([])
+
+
+def test_hidden_diagnostic_flags_are_accepted():
+    text = 'Usage: cuteafd glm-golden --snapshot <SNAPSHOT>\nOptions:\n      --snapshot <SNAPSHOT>\n      --nll\n'
+    parser, _ = golden.cli_from_help(text)
+    assert parser.parse_args(['--snapshot', '/m', '--skip-routed-experts']).skip_routed_experts
+    with pytest.raises(ValueError, match='--not-a-flag'):
+        parser.parse_args(['--snapshot', '/m', '--not-a-flag'])

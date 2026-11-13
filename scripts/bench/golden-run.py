@@ -110,6 +110,9 @@ KEY_LINE = re.compile(r'(?i)(admission|prefill logits|decode logits|logits diges
 TEST_RESULT = re.compile(r'test result: (\w+)\. (\d+) passed; (\d+) failed')
 GPU_CHECK_EXIT = 86
 # Golden flags that write files: only the arm's {out} directory is writable.
+# Diagnostic switches the daemons declare with `#[arg(long, hide = true)]`: Clap's
+# --help omits them, so the help-derived schema adds them as booleans.
+HIDDEN_FLAGS = ('--skip-routed-experts',)
 WRITERS = ('--dump-dir', '--save-logits', '--bench-dump', '--replay-dump', '--geometry-trace')
 CONTAINER_HOME = '/tmp/cuteafd-home'
 OUT = '/out'
@@ -843,6 +846,9 @@ def cli_from_help(text):
             parser.add_argument(flag, action='store_true')
     if not parser._actions:
         raise ValueError('sealed golden CLI: no options found in --help')
+    for flag in HIDDEN_FLAGS:
+        if flag not in defaults:
+            parser.add_argument(flag, action='store_true')
     return parser, defaults
 
 
