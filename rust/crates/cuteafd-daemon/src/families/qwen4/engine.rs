@@ -22,6 +22,7 @@
 //! by default, EXL3 packages with their admitted resident window) or on the Sparks.
 use super::weights::{Qwen4Head, Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
+use crate::shared::experts::rtx::owner_tp2::OwnerTp2;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{HostAllocation, Tag};
 use crate::shared::qwen::{GdnBank, LayerStateMap, REPLAY_ROWS};
@@ -292,7 +293,7 @@ pub(crate) enum MtpExperts<'a> {
 pub(crate) enum Experts<'a> {
     Local(LocalExperts<'a>),
     LocalExl3(LocalExl3<'a>),
-    Tp2 { routed: RefCell<QwenTp2<'a>>, mtp: Option<MtpExperts<'a>> },
+    Tp2 { routed: RefCell<OwnerTp2<'a>>, mtp: Option<MtpExperts<'a>> },
     /// Spark ranks over RoCE (one BF16 partial plane per rank), plus a local draft layer.
     Spark { transport: RefCell<SparkLink<'a>>, mtp: Option<MtpExperts<'a>> },
     /// No routed experts (plumbing tests only: the MoE output is the shared expert alone).
@@ -1001,229 +1002,6 @@ fn validate_layer_owners(owners: &[usize], devices: usize) -> Result<()> {
     cuteafd_loader::placement::families::qwen4::check_dual_layer_owners(owners)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Tp2Rows {
-    input: usize,
-    ids: usize,
-    weights: usize,
-    bytes: usize,
-    partial_bytes: usize,
-    reduction_bytes: usize,
-    exchange_slot_bytes: usize,
-}
-
-impl Tp2Rows {
-    fn transfer_bytes(&self) -> usize { self.bytes.max(self.partial_bytes) }
-
-    fn new(hidden: usize, topk: usize, rows: usize, wire: bool,
-        partial: crate::shared::experts::rtx::PartialDtype) -> Result<Self> {
-        use crate::shared::experts::rtx::PartialDtype;
-        ensure!(matches!((wire, partial), (true, PartialDtype::F32) | (false, PartialDtype::Bf16)),
-            "Qwen TP2 wire and partial ABI disagree");
-        let layout = cuteafd_loader::placement::families::qwen4::QwenTp2Rows::new(
-            hidden as u64, topk as u64, rows as u64, wire)?;
-        Ok(Self { input: usize::try_from(layout.input)?, ids: usize::try_from(layout.ids)?,
-            weights: usize::try_from(layout.weights)?, bytes: usize::try_from(layout.bytes)?,
-            partial_bytes: usize::try_from(layout.partial_bytes)?,
-            reduction_bytes: usize::try_from(layout.reduction_bytes)?,
-            exchange_slot_bytes: usize::try_from(layout.exchange_slot_bytes)? })
-    }
-}
-
-/// TP2 routed halves reduce only onto the whole-attention owner. The next
-/// broadcast cannot overtake that owner's sum, so both rank workspaces are
-/// serialized without a host synchronization on the request path.
-pub(crate) struct QwenTp2<'a> {
-    library: &'a NativeLibrary,
-    ranks: [Device<'a>; 2],
-    experts: std::mem::ManuallyDrop<[Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>; 2]>,
-    exchange: std::mem::ManuallyDrop<crate::shared::peer_split::PeerExchange<'a>>,
-    combine: [cuteafd_ffi::RtxTp2Combine<'a>; 2],
-    send: [Allocation<'a>; 2],
-    reduced: [Allocation<'a>; 2],
-    hidden: usize,
-    topk: usize,
-    max_rows: usize,
-    wire: bool,
-    layout: Tp2Rows,
-}
-
-impl<'a> QwenTp2<'a> {
-    fn new(library: &'a NativeLibrary, ranks: [crate::shared::peer_split::RankDevice; 2],
-        experts: [Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>; 2],
-        hidden: usize, topk: usize, max_rows: usize, wire: bool) -> Result<Self> {
-        use crate::shared::experts::rtx::{PartialDtype, RtxShard};
-        ensure!(experts[0].partial() == experts[1].partial()
-            && experts[0].layers() == experts[1].layers(), "Qwen TP2 halves disagree");
-        for rank in 0..2 {
-            ensure!(experts[rank].shard() == RtxShard::Tp2 { rank: rank as u8 }
-                && experts[rank].device() == ranks[rank].device, "Qwen TP2 rank ownership mismatch");
-        }
-        let layout = Tp2Rows::new(hidden, topk, max_rows, wire, experts[0].partial())?;
-        let devices = ranks.map(|rank| Device { library, id: rank.device });
-        let zero = |rank: usize, bytes, tag| -> Result<Allocation<'a>> {
-            let allocation = Allocation::new(devices[rank], bytes, tag)?;
-            devices[rank].run(|| library.cuda_zero_bytes(allocation.buffer, bytes))?;
-            Ok(allocation)
-        };
-        let _scope = devices[0].enter()?;
-        let exchange = crate::shared::peer_split::PeerExchange::new_abortable(library, ranks, 2,
-            layout.exchange_slot_bytes, {
-                let decode = Tp2Rows::new(hidden, topk, DECODE_ROWS, wire, experts[0].partial())?;
-                decode.transfer_bytes()
-            })?;
-        let combine = [devices[0].run(|| library.rtx_tp2_combine())?, devices[1].run(|| library.rtx_tp2_combine())?];
-        // Local wire-packing scratch for this rank's routed rows, and the reduce output of both
-        // ranks' partials. The exchange's own landing slots are the transport backing.
-        let send = [zero(0, layout.bytes, Tag::workspace("qwen4/tp2-send"))?,
-            zero(1, layout.bytes, Tag::workspace("qwen4/tp2-send"))?];
-        let reduced = [zero(0, layout.reduction_bytes, Tag::workspace("qwen4/tp2-reduce"))?,
-            zero(1, layout.reduction_bytes, Tag::workspace("qwen4/tp2-reduce"))?];
-        let mut tp2 = Self { library, ranks: devices, experts: std::mem::ManuallyDrop::new(experts),
-            exchange: std::mem::ManuallyDrop::new(exchange), combine, send, reduced,
-            hidden, topk, max_rows, wire, layout };
-        // Prime before any peer wait: CUDA LAZY initialization may synchronize
-        // the device, which would deadlock after a not-yet-published peer flag.
-        for rank in 0..2 {
-            let input = tp2.input(tp2.send[rank].buffer.ptr);
-            let routes = tp2.routes(tp2.send[rank].buffer.ptr, layout);
-            let stream = tp2.exchange.stream(rank);
-            let dtype = match tp2.experts[rank].partial() { PartialDtype::F32 => cuteafd_ffi::RtxPartialDtype::F32,
-                PartialDtype::Bf16 => cuteafd_ffi::RtxPartialDtype::Bf16 };
-            devices[rank].run(|| {
-                // SAFETY: zeroed input/routes cover max_rows, and no peer waits exist yet.
-                unsafe { tp2.experts[rank].prime(input, routes, stream)?; }
-                let partial = cuteafd_ffi::CuteafdDeviceBuffer { ptr: tp2.experts[rank].output(),
-                    bytes: layout.partial_bytes, device_id: devices[rank].id, ..Default::default() };
-                library.cuda_zero_bytes(partial, partial.bytes)?;
-                // Before waits exist, an admitted receive slot is idle scratch.
-                let shared = tp2.exchange.recv(rank, 0)?;
-                // SAFETY: initialize geometry-generic sum/add on disjoint retained buffers.
-                unsafe {
-                    tp2.combine[rank].sum(partial.ptr, partial.ptr, tp2.reduced[rank].buffer.ptr.cast(),
-                        max_rows * hidden, dtype, stream)?;
-                    library.peer_add_bf16(tp2.reduced[rank].buffer.ptr, tp2.reduced[rank].buffer.ptr,
-                        shared, max_rows * hidden, stream)?;
-                    library.cuda_stream_synchronize(stream)?;
-                }
-                Ok(())
-            })?;
-        }
-        Ok(tp2)
-    }
-
-    fn input(&self, ptr: *mut c_void) -> crate::shared::experts::rtx::ExpertInput {
-        if self.wire { crate::shared::experts::rtx::ExpertInput::Fp8K32(ptr) }
-        else { crate::shared::experts::rtx::ExpertInput::Bf16(ptr) }
-    }
-
-    fn routes(&self, ptr: *mut c_void, layout: Tp2Rows) -> crate::shared::experts::rtx::Routes {
-        crate::shared::experts::rtx::Routes { ids: ptr.cast::<u8>().wrapping_add(layout.ids).cast(),
-            weights: ptr.cast::<u8>().wrapping_add(layout.weights).cast() }
-    }
-
-    /// # Safety
-    /// Input/routes/shared/output belong to owner, cover rows, are disjoint
-    /// except the read-only operands, and stay live until both streams drain.
-    unsafe fn enqueue(&mut self, owner: usize, layer: usize, rows: usize, input: *const c_void,
-        routes: crate::shared::experts::rtx::Routes, shared: *const c_void, output: *mut c_void) -> Result<()> {
-        self.exchange.require_live()?;
-        // SAFETY: forwards the retained input/output and ordering contract.
-        let result = unsafe { self.enqueue_live(owner, layer, rows, input, routes, shared, output) };
-        if result.is_err() {
-            // Publish independently, but the whole-engine boundary owns drainage.
-            let aborted = match self.exchange.terminal_state() {
-                crate::shared::peer_split::TerminalState::Aborting => Ok(()),
-                _ => self.exchange.publish_abort(),
-            };
-            crate::shared::decode_graph::fatal_drain(aborted, "Qwen RTX enqueue abort");
-        }
-        result
-    }
-
-    unsafe fn enqueue_live(&mut self, owner: usize, layer: usize, rows: usize, input: *const c_void,
-        routes: crate::shared::experts::rtx::Routes, shared: *const c_void, output: *mut c_void) -> Result<()> {
-        use crate::shared::experts::rtx::PartialDtype;
-        ensure!(owner < 2 && (1..=self.max_rows).contains(&rows), "invalid Qwen TP2 owner/rows");
-        let peer = 1 - owner;
-        let extent = Tp2Rows::new(self.hidden, self.topk, rows, self.wire, self.experts[owner].partial())?;
-        let ptr = self.send[owner].buffer.ptr;
-        let stream = self.exchange.stream(owner);
-        self.ranks[owner].run(|| {
-            for (source, offset, bytes) in [(input, 0, extent.input), (routes.ids.cast_const(), extent.ids, rows * self.topk * 4),
-                (routes.weights.cast_const(), extent.weights, rows * self.topk * 4)] {
-                let dst = cuteafd_ffi::CuteafdDeviceBuffer { ptr: ptr.cast::<u8>().wrapping_add(offset).cast(),
-                    bytes, device_id: self.ranks[owner].id, ..Default::default() };
-                let src = cuteafd_ffi::CuteafdDeviceBuffer { ptr: source.cast_mut(), ..dst };
-                // SAFETY: documented owner inputs are live and destination spans are nonoverlapping.
-                unsafe { crate::shared::memory::device::copy_device_ordered(self.library, dst, src, bytes, stream)?; }
-            }
-            Ok(())
-        })?;
-        self.exchange.push(owner, 0, ptr, extent.bytes)?;
-        self.exchange.wait(peer, 0)?;
-        let local_input = self.input(ptr);
-        let local_routes = self.routes(ptr, extent);
-        let peer_ptr = self.exchange.recv(peer, 0)?;
-        let peer_input = self.input(peer_ptr);
-        let peer_routes = self.routes(peer_ptr, extent);
-        // SAFETY: broadcast is ordered before the peer and owner input packing before local work.
-        // A failed rank launch publishes both abort words from the home device
-        // before returning, so no queued peer wait outlives its producer.
-        let exchange = &*self.exchange;
-        let home = &self.ranks[0];
-        let mut abort = || crate::shared::decode_graph::fatal_drain(home.run(|| exchange.publish_abort()),
-            "Qwen TP2 RTX enqueue abort");
-        unsafe {
-            self.experts[owner].enqueue(layer, rows, local_input, local_routes, stream, &mut abort)?;
-            self.experts[peer].enqueue(layer, rows, peer_input, peer_routes, exchange.stream(peer), &mut abort)?;
-        }
-        self.exchange.push(peer, 1, self.experts[peer].output(), extent.partial_bytes)?;
-        self.exchange.wait(owner, 1)?;
-        let mine = self.experts[owner].output();
-        let theirs = self.exchange.recv(owner, 1)?;
-        let [rank0, rank1] = if owner == 0 { [mine, theirs] } else { [theirs, mine] };
-        let dtype = match self.experts[owner].partial() { PartialDtype::F32 => cuteafd_ffi::RtxPartialDtype::F32,
-            PartialDtype::Bf16 => cuteafd_ffi::RtxPartialDtype::Bf16 };
-        self.ranks[owner].run(|| {
-            // SAFETY: rank partials arrived on owner; reduction/output storage is disjoint and retained.
-            unsafe {
-                self.combine[owner].sum(rank0, rank1, self.reduced[owner].buffer.ptr.cast(), rows * self.hidden, dtype, stream)?;
-                self.library.peer_add_bf16(self.reduced[owner].buffer.ptr, shared, output, rows * self.hidden, stream)
-            }
-        })
-    }
-}
-
-impl Drop for QwenTp2<'_> {
-    fn drop(&mut self) {
-        use crate::shared::peer_split::TerminalState;
-        let complete = match self.exchange.terminal_state() {
-            TerminalState::Drained => true,
-            TerminalState::Active => {
-                // Publish abort before draining: a failed enqueue can leave a
-                // peer wait queued whose producer was never reached.
-                let aborted = self.exchange.publish_abort();
-                let drained = self.exchange.drain_compute();
-                let complete = aborted.is_ok() && drained.is_ok();
-                self.exchange.finish_terminal(complete);
-                if !complete { tracing::error!(?aborted, ?drained, "Qwen TP2 streams failed to drain"); }
-                complete
-            }
-            _ => false,
-        };
-        if !complete {
-            self.library.quarantine_module_after_failed_drain();
-            return;
-        }
-        // SAFETY: both compute streams drained; each retained component drops exactly once.
-        unsafe {
-            std::mem::ManuallyDrop::drop(&mut self.experts);
-            std::mem::ManuallyDrop::drop(&mut self.exchange);
-        }
-    }
-}
-
 pub(crate) struct Qwen4Engine<'a> {
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     pub(crate) spark_bf16: bool,
@@ -1617,8 +1395,8 @@ impl<'a> Qwen4Engine<'a> {
         for bank in &self.gdn_banks {
             bank.device.run(|| { bank.programs.load_matching(|name| name.starts_with("qwen4_")).map(|_| ()) })?;
         }
-        let routed = QwenTp2::new(self.library, ranks, experts, self.cfg.hidden, self.cfg.topk,
-            self.prefill_rows.max(DECODE_ROWS), wire)?;
+        let routed = OwnerTp2::new(self.library, ranks, experts, self.cfg.hidden, self.cfg.topk,
+            self.prefill_rows.max(DECODE_ROWS), DECODE_ROWS, wire, "qwen4")?;
         let mut link = crate::shared::peer_split::hop::HopLink::new(self.library, ranks, &hops, spec, DECODE_ROWS * spec.row_bytes as usize)?;
         link.attach_abort([routed.exchange.abort_word(0)?.context("Qwen rank zero abort word")?,
             routed.exchange.abort_word(1)?.context("Qwen rank one abort word")?])?;
@@ -4948,31 +4726,6 @@ mod owner_state_tests {
     use super::*;
 
     #[test]
-    fn tp2_payloads_pad_routes_and_check_extents() -> Result<()> {
-        use crate::shared::experts::rtx::PartialDtype;
-        for wire in [false, true] {
-            for rows in [1, 3, 64, 4096] {
-                let partial = if wire { PartialDtype::F32 } else { PartialDtype::Bf16 };
-                let p = Tp2Rows::new(2560, 10, rows, wire, partial)?;
-                let planned = cuteafd_loader::placement::families::qwen4::QwenTp2Rows::new(
-                    2560, 10, rows as u64, wire)?;
-                assert_eq!(p.exchange_slot_bytes as u64, planned.exchange_slot_bytes);
-                assert_eq!(p.reduction_bytes as u64, planned.reduction_bytes);
-                assert_eq!(p.ids % 16, 0);
-                assert_eq!(p.weights % 16, 0);
-                assert_eq!(p.bytes % 16, 0);
-                assert!(p.ids >= p.input && p.weights >= p.ids + rows * 40);
-                assert_eq!(p.partial_bytes, rows * 2560 * if wire { 4 } else { 2 });
-            }
-        }
-        assert!(Tp2Rows::new(usize::MAX, 10, 64, false, PartialDtype::F32).is_err());
-        assert!(Tp2Rows::new(2561, 10, 64, true, PartialDtype::F32).is_err());
-        assert!(Tp2Rows::new(2560, 10, 64, false, PartialDtype::F32).is_err());
-        assert!(Tp2Rows::new(2560, 10, 64, true, PartialDtype::Bf16).is_err());
-        Ok(())
-    }
-
-    #[test]
     fn owner_tp2_cutover_and_exit_queues_drain() -> Result<()> {
         use crate::shared::peer_split::order::{check, Schedule};
         for layers in 2..49 {
@@ -5040,26 +4793,6 @@ mod owner_state_tests {
         }
         assert!(LayerStateMap::new(&kinds, &[0], 2).is_err());
         assert!(LayerStateMap::new(&[Gdn], &[2], 2).is_err());
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod decode_extent_tests {
-    use super::*;
-
-    #[test]
-    fn declared_decode_extent_matches_real_tp2_layout() -> Result<()> {
-        use crate::shared::experts::rtx::PartialDtype;
-        for (wire, partial) in [(true, PartialDtype::F32), (false, PartialDtype::Bf16)] {
-            for hidden in [4096, 5120] {
-                let layout = Tp2Rows::new(hidden, 8, DECODE_ROWS, wire, partial)?;
-                let actual = cuteafd_loader::placement::families::qwen4::QwenTp2Rows::new(
-                    hidden as u64, 8, DECODE_ROWS as u64, wire)?;
-                assert_eq!(layout.transfer_bytes() as u64, actual.bytes.max(actual.partial_bytes));
-                assert!(layout.transfer_bytes() <= layout.exchange_slot_bytes);
-            }
-        }
         Ok(())
     }
 }

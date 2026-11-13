@@ -838,6 +838,14 @@ pub(crate) struct Fp8Experts<'a, W = Fp8Weights<'a>> {
 }
 
 impl<'a, W: std::borrow::Borrow<Fp8Weights<'a>>> Fp8Experts<'a, W> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for layer in &self.weights.borrow().layers {
+            layer.allocation_receipts(inventory, &format!("{name}.weight.{}", layer.layer))?;
+        }
+        self.scratch.inventory(inventory, &format!("{name}.scratch"))
+    }
+
     pub(crate) fn from_shared(library: &'a NativeLibrary, weights: W, capacity: usize) -> Result<Self> {
         let scratch = Rc::new(Self::allocate_scratch(library, weights.borrow().slot_scratch_bytes(capacity)?)?);
         Self::from_scratch(weights, capacity, scratch)

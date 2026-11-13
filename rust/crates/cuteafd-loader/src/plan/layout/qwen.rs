@@ -662,7 +662,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
             .with_resident_weights(crate::placement::ResidentWeights(options.drafter_bytes)));
     }
     fixed.extend(qwen4::dual_projection_load_staging(selected));
-    fixed.extend(qwen4::QwenTp2Rows::new(cfg.hidden as u64, cfg.topk as u64, rows.max(64),
+    fixed.extend(crate::serving_capacity::OwnerTp2Rows::new(cfg.hidden as u64, cfg.topk as u64, rows.max(64),
         catalog.exl3().is_some())?.demands()?);
     fixed.extend(qwen4::dual_peer_diagnostics(
         std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1")));
