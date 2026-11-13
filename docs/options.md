@@ -107,8 +107,10 @@ the official NVFP4 checkpoint uses mid-tier mean KL <=0.05 and top-1 >=0.93,
 without the reference-root strict-tier override. Context rows, every window
 (including measured sensitivity-floor windows such as d00), confident top-1
 and top-3 are reported as informational, not independent vetoes. Missing or
-nonfinite rows and invalid precision/provenance still fail. All other families
-retain their existing reference-root tier, calibrated tripwires and window floor.
+nonfinite rows and invalid precision/provenance still fail. Report publication
+keeps this aggregate gated even for native W4A4, rather than applying the general
+NVFP4 informational override. All other families retain their existing
+reference-root tier, calibrated tripwires, window floor and W4A4 report policy.
 Golden, CLI and panel receipts expose the policy, generated/context summaries
 and per-window numbers. CPU-only `cuteafd bench fidelity rescore-golden INPUT
 --out NEW_JSON` recomputes the verdict from retained native golden row records

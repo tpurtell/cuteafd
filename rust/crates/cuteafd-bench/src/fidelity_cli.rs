@@ -270,18 +270,17 @@ fn run_series(args: &RunArgs, full_prefill: bool,
 }
 
 fn run_output(args: &RunArgs, runs: &[Run]) -> Value {
-    if runs.iter().any(|r| crate::fidelity::ScoringPolicy::for_family(r.family.as_deref()).aggregate_only()) {
-        if args.verify_rows.len() > 1 {
-            return json!({"schema":"cuteafd.fidelity.width-sweep/1", "verify_rows":args.verify_rows,
-                "runs":runs, "reports":runs.iter().map(|r| crate::panels::fidelity::record(r, None)).collect::<Vec<_>>()});
-        }
-        return crate::panels::fidelity::record(&runs[0], None);
+    let aggregate_only = runs.iter().any(|r|
+        crate::fidelity::ScoringPolicy::for_family(r.family.as_deref()).aggregate_only());
+    if aggregate_only && args.verify_rows.len() > 1 {
+        return json!({"schema":"cuteafd.fidelity.width-sweep/1", "verify_rows":args.verify_rows,
+            "runs":runs, "reports":runs.iter().map(|r| crate::panels::fidelity::record(r, None)).collect::<Vec<_>>()});
     }
     if args.verify_rows.len() > 1 {
         return json!({"schema": "cuteafd.fidelity.width-sweep/1", "verify_rows": args.verify_rows,
             "runs": runs});
     }
-    let mut output = if args.tier == "standard" { crate::panels::fidelity::record(&runs[0], None) }
+    let mut output = if args.tier == "standard" || aggregate_only { crate::panels::fidelity::record(&runs[0], None) }
         else { json!(runs[0]) };
     if let Some(prefill) = runs.get(1) {
         for (key, value) in crate::panels::fidelity::record(prefill, None).as_object().unwrap() {
@@ -785,6 +784,31 @@ mod tests {
             assert!(output["decode"].is_object());
             assert!(output["prefill"].is_object());
             assert!(output["schema"].is_null());
+        }
+    }
+
+    #[test]
+    fn minimax_output_keeps_both_paths_and_explicit_policy() {
+        for extra in [vec![], vec!["--verify-rows", "4,16"]] {
+            let args = parse(&[vec!["--tier", "standard"], extra].concat());
+            let runs = run_series(&args, true, |one| {
+                let mut run = fixture_run(one);
+                run.family = Some("minimax_m3".into());
+                Ok(run)
+            }).unwrap();
+            let output = run_output(&args, &runs);
+            if args.verify_rows.len() > 1 {
+                let reports = output["reports"].as_array().unwrap();
+                assert_eq!(reports.len(), 3);
+                assert_eq!(reports[2]["prefill_verdict"]["scoring_policy"], "minimax-generated-aggregate");
+            } else {
+                assert!(output["decode"].is_object());
+                assert!(output["prefill"].is_object());
+                for key in ["verdict", "prefill_verdict"] {
+                    assert_eq!(output[key]["scoring_policy"], "minimax-generated-aggregate");
+                    assert!(output[key]["context"].is_object());
+                }
+            }
         }
     }
 

@@ -562,7 +562,8 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
         ensure!(a.checkpoint == b.checkpoint && a.set_sha256 == b.set_sha256 && a.reference_sha256 == b.reference_sha256,
             "runs use different checkpoints, sets or references");
     }
-    ensure!(a.family == b.family, "runs use different family scoring policies");
+    ensure!(ScoringPolicy::for_family(a.family.as_deref()) == ScoringPolicy::for_family(b.family.as_deref()),
+        "runs use different family scoring policies");
     ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows && a.dataset == b.dataset,
         "runs use different tiers, scoring shapes, KL estimators or verify widths");
     ensure!(cross || a.precision == b.precision, "same-checkpoint runs use different routed-expert precision/tier");
@@ -776,6 +777,17 @@ mod tests {
             }
             assert!(!verdict(&bad).pass, "{error}");
         }
+    }
+
+    #[test]
+    fn archived_non_minimax_pairs_keep_the_default_policy() {
+        let archived = run(2, 100);
+        let mut current = archived.clone();
+        current.family = Some("qwen4".into());
+        assert!(compare(&current, &archived, 0.005, 0.005, 100, 1).unwrap().pass);
+        current.family = Some("minimax_m3".into());
+        assert!(compare(&current, &archived, 0.005, 0.005, 100, 1).unwrap_err()
+            .to_string().contains("different family scoring policies"));
     }
 
     #[test]

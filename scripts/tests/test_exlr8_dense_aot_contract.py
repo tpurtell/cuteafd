@@ -475,6 +475,7 @@ def minimax_forward_fixture():
         "Scalar": lambda name, kind="int32": dict(name=name, type=kind),
         "compile_program": lambda launch, **kwargs: kwargs,
         "_dtype": lambda dtype: dtype, "AffineNorm": lambda *args: None,
+        "_ResidualNorm": lambda **kwargs: None,
         "_RouterScores": lambda: None, "_KvPack": lambda: None, "_IndexCacheGather": lambda: None,
     }
     modules = {}

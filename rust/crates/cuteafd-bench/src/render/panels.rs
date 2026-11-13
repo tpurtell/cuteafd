@@ -248,13 +248,13 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
     y += 22.0;
     let aggregate_only = verdict["scoring_policy"] == "minimax-generated-aggregate";
     if aggregate_only {
-        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), "MiniMax: generated aggregate only; windows and auxiliary metrics informational");
+        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), "MiniMax: generated aggregate only");
         y += 17.0;
     }
     if let Some(context) = verdict["context"].as_object().filter(|c| c["positions"].as_u64().unwrap_or(0) > 0) {
         let line = format!("Context rows (informational): {} rows, KL {:.4}, top-1 {:.2}%",
             context["positions"], context["kl"].as_f64().unwrap_or(0.0), context["top1"].as_f64().unwrap_or(0.0) * 100.0);
-        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), &line);
+        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), &super::svg::fit(&line, 10.0, w));
         y += 17.0;
     }
     // Headline: one cell per metric, measured over its bound.
@@ -280,7 +280,7 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
         y += 18.0;
     }
     if aggregate_only {
-        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), "Per-window numbers: informational, not independent gates");
+        doc.text(x, y + 10.0, Font::new(10.0, t.ink2), "Per-window numbers: informational only");
         y += 17.0;
     }
     let Some(windows) = windows.as_object().filter(|w| !w.is_empty()) else { return y - y0 + 10.0 };
@@ -320,12 +320,14 @@ fn fidelity_path(doc: &mut Doc, t: &Theme, x: f64, y0: f64, w: f64, path: &str, 
         doc.rect_attrs(cx - step / 2.0, ktop, step, ttop + th - ktop, 0.0, r#"fill="transparent""#);
         doc.end();
     }
-    for (gy, label, anchor_x, anchor) in [(ky(kl_max), format!("floor {kl_max:.3}"), px + pw, Anchor::End),
-        (ty(top1_min), format!("floor {:.0}%", top1_min * 100.0), px + pw, Anchor::End)] {
+    let bound_label = if aggregate_only { "aggregate bar" } else { "floor" };
+    for (gy, label, anchor_x, anchor) in [(ky(kl_max), format!("{bound_label} {kl_max:.3}"), px + pw, Anchor::End),
+        (ty(top1_min), format!("{bound_label} {:.0}%", top1_min * 100.0), px + pw, Anchor::End)] {
         doc.raw(&format!(r#"<line x1="{px}" x2="{}" y1="{gy}" y2="{gy}" stroke="{}" stroke-width="1" stroke-dasharray="4 3"/>"#, px + pw, t.ink2));
         doc.text(anchor_x, gy - 4.0, Font::new(9.5, t.ink2).anchor(anchor), &label);
     }
-    let note = if w < 480.0 { format!("{} windows · red: past its floor", windows.len()) }
+    let note = if aggregate_only { format!("{} informational windows · hover for values", windows.len()) }
+        else if w < 480.0 { format!("{} windows · red: past its floor", windows.len()) }
         else { format!("{} windows · red: past its floor · hover a window for values", windows.len()) };
     doc.text(px, ttop + th + 14.0, Font::new(9.5, t.muted), &super::svg::fit(&note, 9.5, pw));
     ttop + th + 24.0 - y0
@@ -882,6 +884,25 @@ mod context_load_tests {
             assert!(svg.contains(label), "{label}");
         }
         assert!(!svg.contains("Window text from"), "no ambiguous source line");
+    }
+
+    #[test]
+    fn minimax_panel_labels_window_and_auxiliary_metrics_informational() {
+        let verdict = serde_json::json!({"pass":true, "scoring_policy":"minimax-generated-aggregate",
+            "kl_max":0.05, "top1_min":0.93, "context":{"positions":2020,"kl":1.99,"top1":0.58},
+            "generated":{"positions":2076,"kl":0.026,"top1":0.953,"confident_top1":0.96,"top3_contained":0.98}});
+        let value = serde_json::json!({"decode":{}, "verdict":verdict,
+            "per_window":{"d00":{"positions":512,"kl":0.9,"top1":0.6}}});
+        for width in [360.0, 900.0] {
+            let mut doc = super::Doc::new(width, 900.0);
+            super::fidelity(&mut doc, &super::super::theme::NORMAL, &value, width);
+            let svg = doc.finish();
+            for label in ["generated aggregate only", "Context rows (informational)", "confident top-1 (info)",
+                "top-3 (info)", "Per-window numbers: informational only", "aggregate bar 0.050"] {
+                assert!(svg.contains(label), "{label}");
+            }
+            assert!(!svg.contains("red: past its floor"));
+        }
     }
 
     #[test]
