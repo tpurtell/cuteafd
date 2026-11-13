@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 
@@ -40,6 +42,63 @@ def test_seed_capacity_uses_cores_and_memory():
     assert resource.capacity(20, 124608) == 3
     assert resource.capacity(64, 65536) == 2
     assert resource.capacity(2, 4096) == 1
+
+
+def test_grants_are_fsynced_before_atomic_publication(tmp_path, monkeypatch):
+    path = tmp_path / 'granted'
+    grant = {'host': 'kakapo', 'slots': 3, 'slot': 1}
+    fsynced = []
+    original_fsync, original_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        assert not path.exists()
+        original_fsync(fd)
+        fsynced.append(fd)
+
+    def replace(source, destination):
+        assert fsynced
+        assert source.parent == destination.parent == tmp_path
+        assert json.loads(source.read_text()) == grant
+        original_replace(source, destination)
+
+    monkeypatch.setattr(resource.os, 'fsync', fsync)
+    monkeypatch.setattr(resource.os, 'replace', replace)
+    resource.publish_grant(path, grant)
+    assert json.loads(path.read_text()) == grant
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize('name', ['granted', 'export-granted'])
+def test_grant_readers_never_see_partial_json(tmp_path, name):
+    path = tmp_path / name
+    stop, first_read = Event(), Event()
+    payload = 'x' * 65536
+
+    def read_grants():
+        reads = 0
+        while not stop.is_set():
+            try:
+                grant = json.loads(path.read_text())
+            except FileNotFoundError:
+                continue
+            assert grant['payload'] == payload
+            assert 0 <= grant['generation'] < 100
+            reads += 1
+            first_read.set()
+        return reads
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reader = executor.submit(read_grants)
+        try:
+            for generation in range(100):
+                resource.publish_grant(path, {'generation': generation, 'payload': payload})
+                if generation == 0:
+                    assert first_read.wait(timeout=5)
+        finally:
+            stop.set()
+        assert reader.result(timeout=5) > 0
+    assert json.loads(path.read_text())['generation'] == 99
+    assert list(tmp_path.iterdir()) == [path]
 
 
 def test_counting_slots_preserve_legacy_exclusion_and_release(tmp_path):
@@ -169,7 +228,7 @@ def test_owner_death_before_grant_does_not_acquire(tmp_path):
 
 def test_lease_has_no_elapsed_unlock_deadline_and_stops_before_unlock():
     text = (ROOT / 'scripts/build/build-resource.py').read_text()
-    granted = text[text.index("(args.lease_dir / 'granted')"):]
+    granted = text[text.index("publish_grant(args.lease_dir / 'granted'"):]
     assert 'deadline' not in granted and '7260' not in granted
     assert granted.index('docker stop -t 10') < granted.index('handle.close()')
 
