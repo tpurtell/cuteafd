@@ -171,11 +171,16 @@ def test_peer_watchdog_reports_counters_and_opt_in_exchange_identity():
     native = (ROOT / "native/shared/cuda/peer_exchange.cu").read_text()
     wait = native.split("__global__ void wait_flag_abortable", 1)[1].split(
         "__global__ void publish_abort", 1)[0]
-    timeout = wait.split("global_ns() - start > kWaitTimeoutNs", 1)[1]
+    timeout = wait.split("global_ns() - start > limit", 1)[1]
     for field in ["flag=%p", "state=%p", "aborted=%p", "expected=%u", "observed=%u",
                   "receive=%u", "abort=%u"]:
         assert field in timeout
-    assert timeout.index("printf(") < timeout.index("__trap()")
+    # #1878: counters print first; an abortable wait then records the timeout and exits
+    # (no device fault). Only a wait without the record or an abort word still traps.
+    assert timeout.index("printf(") < timeout.index("if (!timeout || !aborted) __trap();")
+    assert timeout.index("__trap()") < timeout.index("store_release_sys(&timeout->count, 1)")
+    assert "store_release_sys(const_cast<uint32_t*>(aborted), 1)" in timeout
+    assert "state[0] = expected" not in timeout, "a skipped wait never advances its receive sequence"
     shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/peer_split.rs").read_text()
     identity = shared.split("pub fn trace_identity", 1)[1].split(
         "pub fn terminal_state", 1)[0]
