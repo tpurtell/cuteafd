@@ -44,6 +44,8 @@ pub(crate) struct GoldenArgs {
 
 fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 
+const EMBEDDING_UPLOAD: &str = "minimax.unit.0.0.route_ids.upload";
+
 fn reference(root: &Path, id: Option<&str>, vocab: usize) -> Result<Vec<Window>> {
     let bytes = std::fs::read(root.join("manifest.json"))?;
     ensure!(digest(&bytes) == fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256,
@@ -148,6 +150,12 @@ fn run(args: GoldenArgs) -> Result<()> {
             contract.components.push(Component::allocation(allocation,
                 ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
         }
+        let bytes = u64::from(args.prefill_rows) * 4;
+        let allocation = cuteafd_loader::placement::planner::Allocation::buffer(EMBEDDING_UPLOAD,
+            cuteafd_loader::placement::planner::Location::PINNED, bytes, Lifetime::TARGET,
+            Category::Staging, "ordered embedding ids");
+        contract.components.push(Component::allocation(allocation,
+            ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
         contract.add_driver_page_tables();
         Some(envelope)
     } else { None };
@@ -184,6 +192,17 @@ fn run(args: GoldenArgs) -> Result<()> {
     let mut metadata = (0..waves).map(|_| cache.metadata(args.prefill_rows)).collect::<Result<Vec<_>>>()?;
     let head = Head::new(Rc::clone(&stream), &programs, &cfg, args.prefill_rows as usize)?;
     let residual = Allocation::new(device, tokens as usize * 6144 * 4, Tag::workspace("minimax/residual"))?;
+    let embedding_ids = crate::shared::prefix::view(owners[0].plane("route_ids")?, 0,
+        args.prefill_rows as usize * 4)?;
+    let embedding_upload = if embedding.is_some() {
+        device.run(|| {
+            // SAFETY: this stable full-capacity U32 view and the issuing stream
+            // live through all golden work; every consumer is stream ordered.
+            unsafe { library.reserve_h2d_ordered(embedding_ids, stream.raw) }
+        })?;
+        Some(library.ordered_h2d_staging_buffer(embedding_ids, stream.raw)?
+            .context("MiniMax ordered embedding staging was not reserved")?)
+    } else { None };
     let devices = [args.device];
     let mut inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax",
         Lifetime::TARGET, Category::Workspace, "cold golden");
@@ -196,6 +215,14 @@ fn run(args: GoldenArgs) -> Result<()> {
     residual.inventory(&mut inventory, "residual")?;
     for (slot, owner) in owners.iter().enumerate() { owner.inventory(&mut inventory, &format!("unit.{slot}"))?; }
     for (slot, owner) in metadata.iter().enumerate() { owner.inventory(&mut inventory, &format!("metadata.{slot}"))?; }
+    if let Some(buffer) = embedding_upload {
+        let planned = facts.allocations.iter().find(|allocation| allocation.id == EMBEDDING_UPLOAD)
+            .context("MiniMax ordered embedding staging was not admitted")?;
+        ensure!(buffer.bytes as u64 == planned.bytes && buffer.bytes == args.prefill_rows as usize * 4,
+            "MiniMax ordered embedding staging differs from exact admitted extent");
+        inventory.receipts.push(cuteafd_loader::placement::planner::Receipt {
+            allocation: planned.clone(), address: buffer.ptr as u64 });
+    }
     admission::reconcile_sync_h2d(&library, &facts, &mut inventory)?;
     let receipts = inventory.receipts.iter().map(|receipt| serde_json::json!({
         "allocation":receipt.allocation, "address":receipt.address })).collect::<Vec<_>>();
@@ -221,6 +248,12 @@ fn run(args: GoldenArgs) -> Result<()> {
     let mut final_inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax",
         Lifetime::RESIDENT, Category::Staging, "cold golden completion");
     admission::reconcile_sync_h2d(&library, &facts, &mut final_inventory)?;
+    if let Some(initial) = embedding_upload {
+        let actual = library.ordered_h2d_staging_buffer(embedding_ids, stream.raw)?
+            .context("MiniMax ordered embedding staging retired before completion")?;
+        ensure!(actual.ptr == initial.ptr && actual.bytes == initial.bytes,
+            "MiniMax ordered embedding staging grew after first reserve");
+    }
     result
 }
 
@@ -254,7 +287,11 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
             let end = (first + args.prefill_rows as usize).min(count);
             let span = crate::shared::prefix::view(residual.buffer, first * 6144 * 4, (end - first) * 6144 * 4)?;
             if let Some(embedding) = embedding {
-                head.embed_tokens(embedding, &window.tokens[first..end], span)?;
+                let owner = &owners[0];
+                let ids = crate::shared::prefix::view(owner.plane("route_ids")?, 0,
+                    args.prefill_rows as usize * 4)?;
+                Head::embed_tokens(cfg, args.prefill_rows as usize, embedding,
+                    &window.tokens[first..end], &owner.stream, ids, owner.dense.producer_destination(), span)?;
             } else { head.embed(weights, &window.tokens[first..end], span)?; }
         }
         let mut taps = if args.tap_layers.is_empty() { None } else {
