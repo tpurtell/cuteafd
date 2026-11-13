@@ -232,6 +232,13 @@ def jobs(scope):
                        f"ffn_gate_up_i{width}_comp" for width in (3072, 6144, 16896, 33792))]))
     result.append(("kimi-routing", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
+    # Isolate callers of the shared contiguous prefill scorer for targeted changes.
+    for geometry in ("flash", "pro", "glm", "glmf", "ml4", "kimik31", "minimax"):
+        names = ["index_prefill"] if geometry == "minimax" else ["index_topk_prefill_m4096"]
+        if geometry == "kimik31":
+            names.append("scored_index_topk_prefill_m4096")
+        result.append((f"dsa-prefill-{geometry}", "export_b12x_dsv4_aot.py",
+                       ["--geometry", geometry, "--prefill-rows", "4096", "--only", ",".join(names)]))
     if scope == "suspects":
         return result
     for geometry in ("mimo", "mimof"):

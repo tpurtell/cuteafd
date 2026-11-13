@@ -61,6 +61,22 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+@pytest.mark.parametrize("scope", ["all", "suspects"])
+@pytest.mark.parametrize("geometry,names", [
+    ("flash", "index_topk_prefill_m4096"),
+    ("pro", "index_topk_prefill_m4096"),
+    ("glm", "index_topk_prefill_m4096"),
+    ("glmf", "index_topk_prefill_m4096"),
+    ("ml4", "index_topk_prefill_m4096"),
+    ("kimik31", "index_topk_prefill_m4096,scored_index_topk_prefill_m4096"),
+    ("minimax", "index_prefill"),
+])
+def test_dsa_prefill_groups_isolate_shared_contiguous_scorer(scope, geometry, names):
+    selected = [job for job in compare_sm.jobs(scope) if job[0] == f"dsa-prefill-{geometry}"]
+    assert selected == [(f"dsa-prefill-{geometry}", "export_b12x_dsv4_aot.py",
+                         ["--geometry", geometry, "--prefill-rows", "4096", "--only", names])]
+
+
 def test_draft_bf16_group_matches_exported_shapes():
     exporter = compare_sm.load_file("test_draft_bf16_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
     assert exporter.flash_native_bf16_shapes() == {(1536,16384),(1536,8192),
