@@ -2,10 +2,10 @@
 use super::{cache::{self, RequestState, RequestStreams}, graphs::{self, Graphs, Op},
     head::Head, layer::{Kernels, UnitOwner}, prefix::MiniMaxPrefix, weights::TargetWeights};
 use crate::shared::{decode_graph::device::Basis,
-    memory::receipts::{Census, Inventory}, token_io::{EmbedPlacement, TokenEmbedding}};
+    memory::receipts::{Census, Inventory}, token_io::{EmbedPlacement, SelectPlacement, TokenEmbedding, TokenSelector}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::Category;
-use cuteafd_ffi::programs::Programs;
+use cuteafd_ffi::{programs::Programs, expert_usage::{ExpertUsage, UsageDevice, UsageStorage}};
 use cuteafd_loader::{families::minimax_m3::weight_layout::CoordinatorWeights,
     placement::{families::minimax_m3::{AdmittedMiniMax, MiniMaxInputs, Owner},
         planner::{Component, ComponentKind, CoordinatorDevices, Facts, Lifetime, Location, Recipe}}};
@@ -32,6 +32,8 @@ pub(crate) struct Storage<'a> {
     pub prefix: MiniMaxPrefix<'a>,
     pub head: Head<'a>,
     pub embedding: TokenEmbedding<'a>,
+    pub selector: RefCell<TokenSelector<'a>>,
+    pub usage: Option<ExpertUsage<'a>>,
     devices: Vec<i32>,
 }
 impl Drop for Storage<'_> {
@@ -68,6 +70,12 @@ impl<'a> Owners<'a> {
             && admitted.solved.request.context.maximum == inputs.context.maximum
             && embedding.placement() == EmbedPlacement::Gpu,
             "MiniMax serving constructor differs from admitted rank/unit/context or embedding placement");
+        if let Some(geometry) = &inputs.expert_usage {
+            ensure!(geometry.validate() && geometry.layers == inputs.cfg.layers
+                && geometry.experts == inputs.cfg.experts && geometry.topk == inputs.cfg.topk
+                && geometry.routed_layers == inputs.routed,
+                "MiniMax expert usage differs from admitted router geometry");
+        }
         let devices = loaded.iter().map(|rank| rank.streams.decode.device.id).collect::<Vec<_>>();
         let mapping = CoordinatorDevices::new(&devices)?;
         let library = programs.library();
@@ -119,8 +127,22 @@ impl<'a> Owners<'a> {
         let requests = RequestState::new(&inputs.cfg, capacity, admitted, streams)?;
         let prefix = MiniMaxPrefix::new(requests.banks(), ranks[0].prefill[0].borrow().prefix_scratch())?;
         let head_stream = Rc::clone(&ranks.last().context("MiniMax head rank")?.decode.borrow().stream);
-        let head = Head::new(head_stream, programs, &inputs.cfg, capacity.decode.rows as usize)?;
-        let storage = Rc::new(Storage { ranks, requests: RefCell::new(requests), prefix, head, embedding, devices });
+        let head = Head::new(Rc::clone(&head_stream), programs, &inputs.cfg, capacity.decode.rows as usize)?;
+        let selector = head_stream.device.run(|| {
+            let mut selector = TokenSelector::new(library,
+                if inputs.device_sampling { SelectPlacement::Device } else { SelectPlacement::Host },
+                inputs.cfg.vocab_size, capacity.decode.rows as usize)?;
+            selector.reserve_sampler()?;
+            Ok(RefCell::new(selector))
+        })?;
+        let usage = inputs.expert_usage.as_ref().map(|geometry| {
+            let producers = devices.iter().enumerate().take(geometry.routed_layers.len())
+                .map(|(gpu, &cuda)| Ok(UsageDevice { logical: u8::try_from(gpu)?, cuda }))
+                .collect::<Result<Vec<_>>>()?;
+            ExpertUsage::new(library, geometry.clone(), &producers, Default::default())
+        }).transpose()?;
+        let storage = Rc::new(Storage { ranks, requests: RefCell::new(requests), prefix, head,
+            embedding, selector, usage, devices });
         let census = storage.inventory()?;
         reconcile(&census, &admitted.solved.facts, &contract.components, pages, retained_owner)?;
         let mut graphs = Vec::with_capacity(inputs.gpus);
@@ -169,17 +191,45 @@ impl Storage<'_> {
         let mut census = Census::default();
         census.owners(weights.receipts);
         census.owners(execution.receipts);
+        let mut selector = Inventory::new(devices, "serving",
+            cuteafd_loader::placement::planner::serving::ServingOwners::LIFETIME,
+            Category::Workspace, "retained token selector");
+        self.selector.borrow().allocation_receipts(&mut selector, "selector")?;
+        // The shared API prefixes local inventories; canonical serving owners
+        // live at the root rather than under the MiniMax execution namespace.
+        for receipt in &mut selector.receipts {
+            receipt.allocation.id = receipt.allocation.id.strip_prefix("serving.")
+                .context("MiniMax selector receipt namespace")?.to_owned();
+        }
+        census.owners(selector.receipts);
+        if let Some(usage) = &self.usage {
+            let mut observed = Inventory::new(devices, "expert-usage", Lifetime::TARGET,
+                Category::Workspace, "retained expert telemetry");
+            for receipt in usage.allocation_receipts() {
+                ensure!(devices.location(receipt.device.cuda)? == Location::coordinator(receipt.device.logical),
+                    "MiniMax expert usage CUDA/logical device mapping differs");
+                let name = receipt.owner.strip_prefix("expert-usage.")
+                    .context("MiniMax expert usage receipt namespace")?;
+                match receipt.storage {
+                    UsageStorage::Device(buffer) => observed.device(name, buffer)?,
+                    UsageStorage::Pinned(buffer) => observed.pinned(name, buffer)?,
+                }
+            }
+            census.owners(observed.receipts);
+        }
         census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
         Ok(census)
     }
 }
 
 /// This is deliberately not a complete serving reconciliation: the scheduler
-/// must also attach selector/usage/transport/draft/media/host-cache owners and
-/// reconcile startup/driver/graph allowances before signalling readiness.
+/// must also attach transport/experts/draft/media/host-cache owners, account for
+/// expert-usage host history/worker metadata, and reconcile startup/driver/graph
+/// allowances before signalling readiness.
 fn retained_owner(id: &str) -> bool {
     ["minimax/target/", "minimax.kv.", "minimax.cache.", "minimax.rope.", "minimax.decode.",
-        "minimax.unit.", "minimax.prefix.h2d.", "minimax.head."].iter().any(|prefix| id.starts_with(prefix))
+        "minimax.unit.", "minimax.prefix.h2d.", "minimax.head.", "selector.", "expert-usage.gpu"]
+        .iter().any(|prefix| id.starts_with(prefix))
 }
 
 fn reconcile(census: &Census, facts: &Facts, components: &[Component], pages: u64,
@@ -326,7 +376,9 @@ mod tests {
         let budgets = (0..gpus).map(|gpu| canonical::planned_budget(gpu as u8, 96 << 30, 96 << 30, 1 << 30))
             .chain((0..2).map(|rank| canonical::spark_budget(rank, 100 << 30)))
             .chain([cuteafd_loader::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
-        Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, spark_ranks: 2, context: ModelContext::pinned(257),
+        Ok(MiniMaxInputs { cfg: cfg.clone(), gpus,
+            attention: cuteafd_loader::placement::AttentionPlacement::Layers,
+            spark_ranks: 2, context: ModelContext::pinned(257),
             maximum_pool_tokens: 256 * 64, prefill, sequences: concurrency, manifest: std::sync::Arc::new(manifest(&targets)?),
             routed: routed.clone(), expert_backings, owners, budgets,
             local: LocalPackage::Installed { scratch: 64 << 20, output: prefill.rows * 6144 * 2 },
@@ -371,7 +423,12 @@ mod tests {
         let (checkpoint, cfg) = snapshot(dir.path())?;
         for ids in [vec![1], vec![1, 0]] {
             for concurrency in [1, 16, 64] {
-                let inputs = inputs(&checkpoint, &cfg, &ids, concurrency)?;
+                for (device_sampling, expert_usage) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut inputs = inputs(&checkpoint, &cfg, &ids, concurrency)?;
+                inputs.device_sampling = device_sampling;
+                inputs.expert_usage = expert_usage.then(|| cuteafd_core::expert_usage::Geometry {
+                    layers: cfg.layers, experts: cfg.experts, topk: cfg.topk, routed_layers: inputs.routed.clone(),
+                });
                 let request = canonical::request(inputs.context, Some(129 * 64), cuteafd_loader::placement::Onboard::Layers(0),
                     inputs.prefill, Operation::Serving, None, Default::default());
                 let admitted = inputs.admit(request)?;
@@ -402,7 +459,17 @@ mod tests {
                 }
                 let owners = Owners::new(&inputs, &admitted, &programs, loaded, embedding.unwrap())?;
                 assert_eq!(owners.graphs.len(), ids.len());
+                assert_eq!(owners.storage.usage.is_some(), expert_usage);
                 let census = owners.storage.inventory()?;
+                assert_eq!(census.receipts.iter().filter(|r|
+                    r.allocation.id.starts_with("expert-usage.gpu")).count(),
+                    if expert_usage { 3 * ids.len().min(inputs.routed.len()) } else { 0 });
+                assert_eq!(census.receipts.iter().any(|r| r.allocation.id.starts_with("selector.sampler.")),
+                    device_sampling);
+                for receipt in census.receipts.iter().filter(|r| r.allocation.id == "selector.output") {
+                    assert_eq!(receipt.allocation.location, Location::coordinator((ids.len() - 1) as u8));
+                    assert_eq!(receipt.allocation.bytes, concurrency * 12);
+                }
                 reconcile(&census, &admitted.solved.facts, &contract.components, 129, retained_owner)?;
                 let index = census.receipts.iter().position(|receipt|
                     receipt.allocation.id == Owner::Kv { layer: 0, plane: "index" }.id()).unwrap();
@@ -441,6 +508,7 @@ mod tests {
                 assert!(weak.upgrade().is_none());
                 assert_eq!(fixture.mapped_bytes(&library)?, 0, "every virtual native owner retired");
                 assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+                }
             }
         }
         Ok(())
