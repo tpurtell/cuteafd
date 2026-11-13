@@ -10,7 +10,8 @@ use std::collections::BTreeSet;
 const TEXT: &str = "language_model.model.";
 
 mod heads;
-pub use heads::{HeadsWeights, TensorSlice};
+pub use heads::{HeadsWeights, SplitFfnWeights, TensorSlice};
+pub use heads::slice_mount_load;
 
 /// Header-only receive owners for one onboarding candidate. Storage routing is
 /// checked by the recipe, not here: an inactive mount-only count must not poison
