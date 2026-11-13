@@ -113,6 +113,10 @@ This all-layer dense/attention/DSA diagnostic is **not** a full-model golden.
 K3.1 DSA is admitted only through the explicit golden role;
 serving remains refused until qualification. The flag is unavailable to serve.
 
+`cuteafd glm-golden --nll --save-logits DIR` writes `tokens.bin` and all
+prefill rows as F32 `logits.bin` for same-engine build or core-view comparisons.
+The option is listed in CLI help so the sealed golden runner can validate it.
+
 `cuteafd step5-golden --golden TOKENS_DIR --nll --last-layer 91` accepts a
 `tokens.bin`-only directory for same-engine core-view comparisons (2..4096 U32
 tokens). No `--window` is needed; `--save-logits` retains the actual selected

@@ -771,10 +771,9 @@ pub(crate) struct GoldenArgs {
     /// KL); the prefill runs without layer downloads (Spark lanes).
     #[arg(long)]
     pub nll: bool,
-    /// With --nll: also write tokens.bin and every row's logits.bin (F32) to
-    /// this directory, a golden for A/B runs between builds or numerics (e.g.
-    /// W8A8 against --prefill-w8a16 with --skip-routed-experts).
-    #[arg(long, hide = true)]
+    /// With --nll: write tokens.bin and every row's logits.bin (F32) to
+    /// this directory for same-engine build or core-view comparisons.
+    #[arg(long)]
     pub save_logits: Option<PathBuf>,
     /// Time this many prefills of --bench-prefill-tokens tokens (the golden
     /// prompt repeated, in chunks of the prefill capacity) on fresh sequences.
