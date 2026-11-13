@@ -309,12 +309,25 @@ mod tests {
             assert_eq!(embedding.host_rows(&[0, 3])?, vec![0; 2 * 128 * 2]);
             let physical = [1];
             let devices = CoordinatorDevices::new(&physical)?;
-            let mut inventory = Inventory::new(devices, "minimax", Lifetime::RESIDENT,
-                Category::Weights, "checkpoint-native target");
+            let mut inventory = Inventory::new(devices, "minimax", Lifetime::TARGET,
+                Category::Workspace, "cold golden");
             target.inventory(&mut inventory, "target")?;
+            // Exercise the golden's actual import path before census normalization.
+            if placement == EmbedPlacement::Gpu {
+                assert!(inventory.extend(embedding.allocation_receipts(devices, "embedding")?).is_err(),
+                    "Resident embedding roots must not replace Target arena owners");
+            }
+            embedding.inventory(&mut inventory, "embedding", Lifetime::TARGET)?;
+            assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.id == layout.arena.id()).count(), 1);
+            let table = inventory.receipts.iter().find(|r| r.allocation.id == "minimax.embedding.table")
+                .context("missing embedding table receipt")?;
+            assert_eq!(table.allocation.lifetime, Lifetime::TARGET);
+            if placement == EmbedPlacement::Gpu {
+                assert_eq!(table.allocation.view.as_ref().context("embedding must be an arena view")?.backing,
+                    layout.arena.id());
+            }
             let mut census = Census::default();
             census.owners(inventory.receipts);
-            census.owners(embedding.allocation_receipts(devices, "minimax.embedding")?);
             embedding.allocation_aliases(&mut census, devices, "minimax.embedding")?;
             census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
             let roots = census.receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();

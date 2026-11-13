@@ -222,7 +222,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         Lifetime::TARGET, Category::Workspace, "cold golden");
     target.inventory(&mut inventory, "target")?;
     if let Some(embedding) = &embedding {
-        inventory.extend(embedding.allocation_receipts(CoordinatorDevices::new(&devices)?, "embedding")?)?;
+        embedding.inventory(&mut inventory, "embedding", Lifetime::TARGET)?;
     }
     cache.inventory(&mut inventory, "cache")?;
     head.inventory(&mut inventory, "head")?;

@@ -145,14 +145,23 @@ impl<'a> TokenEmbedding<'a> {
         use cuteafd_loader::placement::planner::Lifetime;
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, prefix,
             Lifetime::RESIDENT, Category::Weights, "embedding owners");
+        self.inventory(&mut inventory, "", Lifetime::RESIDENT)?;
+        Ok(inventory.receipts)
+    }
+
+    /// Arena-backed tables join the caller's inventory as views of its existing owner.
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str, lifetime: cuteafd_loader::placement::planner::Lifetime) -> Result<()> {
+        ensure!(inventory.lifetime() == lifetime, "embedding lifetime differs from receiving inventory");
+        let field = |suffix: &str| if name.is_empty() { suffix.to_owned() } else { format!("{name}.{suffix}") };
         match &self.table {
-            ResidentWeight::Device(owner) => owner.inventory(&mut inventory, "table")?,
-            ResidentWeight::Host { storage, .. } => inventory.pinned("table", storage.buffer)?,
+            ResidentWeight::Device(owner) => owner.inventory(inventory, &field("table"))?,
+            ResidentWeight::Host { storage, .. } => inventory.pinned(&field("table"), storage.buffer)?,
         }
         if let Some(vocabulary) = &self.row_fp8 {
-            vocabulary.embedding.inventory(&mut inventory, "native")?;
+            vocabulary.embedding.inventory(inventory, &field("native"))?;
         }
-        Ok(inventory.receipts)
+        Ok(())
     }
 
     pub(crate) fn table_receipt(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
