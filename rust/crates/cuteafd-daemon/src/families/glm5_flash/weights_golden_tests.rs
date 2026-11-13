@@ -119,7 +119,7 @@ fn mixed_fp8_push_matches_host_bytes_on_each_rank_and_split() -> Result<()> {
             let make = |dense| -> Result<_> {
                 let layouts = (0..2).map(|rank| cuteafd_loader::serving_capacity::WeightArenaLayout::new(
                     format!("glmf/mixed/{rank}"), [(format!("{}.payload", joined(&names)), rows * 256),
-                        (format!("{}.scales", joined(&names)), rows / 128 * 2 * 4)])).collect::<Result<Vec<_>>>()?;
+                        (format!("{}.scales", joined(&names)), (rows / 128 * 2 * 4).max(256))])).collect::<Result<Vec<_>>>()?;
                 Ok(GlmfLoader { arenas: arenas(&library, layouts)?, library: &library, checkpoint: &checkpoint,
                     stream: std::ptr::null_mut(), kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Off,
                     kda_output_shard: false, fp8_head: false, packed_head: false, kda_nvfp4: None,

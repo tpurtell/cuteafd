@@ -298,7 +298,7 @@ fn target_buffer_curves_cover_floor_breaks_and_reject_invalid_geometry() {
         Err(Refusal::InvalidFact(_))
     ));
     target.prefill.as_mut().unwrap().0.waves = 3;
-    target.context = u64::MAX;
+    target.payload_row_bytes = u64::MAX;
     assert!(matches!(
         target.components(&cfg()),
         Err(Refusal::Overflow(_))
