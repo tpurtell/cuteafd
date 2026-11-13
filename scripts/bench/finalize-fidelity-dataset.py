@@ -101,6 +101,7 @@ def main():
     parser.add_argument('--config', required=True)
     parser.add_argument('--seal', action='store_true')
     parser.add_argument('--identity-proof', type=Path, help='audited token-identity proof to a later manifest')
+    parser.add_argument('--text-source-description', help='public hosted-text provenance, forwarded to the reference packager')
     args = parser.parse_args()
     validator = load_tool('validate-fidelity-dataset')
     result = validator.validate_reference_only(args.source, seal=args.seal)
@@ -110,7 +111,7 @@ def main():
     expected = expected_source_pins(meta)
     packager.validate_source_pins(meta['source_pin'], expected)
     index = packager.package(args.source, args.out, args.config, args.tokenizer, args.license, args.identity_proof,
-                             expected_source_pins=expected)
+                             expected_source_pins=expected, text_source_description=args.text_source_description)
     config = args.out / args.config
     manifest = json.loads((config / 'manifest.json').read_text())
     for path in config.rglob('*'):

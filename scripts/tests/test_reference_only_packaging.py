@@ -148,6 +148,71 @@ def test_own_model_text_has_no_borrowed_panel_caveat():
     assert '#302' in packager.panel_caveat(panel)
 
 
+def test_hosted_text_description_discloses_generation_separately_from_logits():
+    panel = dict(checkpoint='official', generation_arm=dict(checkpoint='official', text_source='api'))
+    description = ('Text generated through `vendor/model` on Cloudflare, fallback disabled, effort high. '
+                   'Hosted precision unknown; reference logits independently computed from official MXFP8 weights.')
+    assert packager.text_source_note(panel, description) == description + '\n'
+    with pytest.raises(ValueError, match='API text requires --text-source-description'):
+        packager.text_source_note(panel)
+    with pytest.raises(ValueError, match='must not be empty'):
+        packager.text_source_note(panel, '  ')
+    with pytest.raises(ValueError, match='credential'):
+        packager.text_source_note(panel, 'ghp_' + 'a' * 30)
+    panel['generation_arm']['text_source'] = 'hf'
+    assert packager.text_source_note(panel) == 'Text source: `hf` from the scored model.\n'
+
+
+def test_reference_card_labels_exclusions_and_independent_implementation():
+    arithmetic = 'IEEE F32; native activation QDQ; vision, MTP, BF16 narrowing'
+    meta = dict(arithmetic=dict(excluded='vision, MTP, BF16 narrowing'))
+    assert packager.arithmetic_note(meta, arithmetic) == (
+        'IEEE F32; native activation QDQ. Not modelled: vision, MTP, BF16 narrowing.')
+    assert packager.arithmetic_note({}, arithmetic) == arithmetic
+    assert packager.arithmetic_note(meta, 'Already complete.') == 'Already complete.'
+    assert packager.implementation_note('Independent F32 port of two pinned integrations') == (
+        'Reference implementation: Independent F32 port of two pinned integrations.\n'
+        'Tokenizer runtime, platform and oracle seal hashes are in qualification.json.\n')
+
+
+@pytest.mark.parametrize('tool_name', ['package-reference-only-fidelity', 'finalize-fidelity-dataset'])
+def test_reference_cli_forwards_hosted_text_description(tmp_path, monkeypatch, tool_name):
+    import sys
+    from types import SimpleNamespace
+    spec = importlib.util.spec_from_file_location('reference_cli', ROOT / f'scripts/bench/{tool_name}.py')
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    source = tmp_path / 'source'
+    (source / 'golden').mkdir(parents=True)
+    (source / 'golden/meta.json').write_text(json.dumps(dict(source_pin={})))
+    description = 'Hosted vendor/model, Cloudflare only, high effort, unknown precision; independent MXFP8 logits.'
+    calls = []
+
+    class Packaged(Exception):
+        pass
+
+    def package(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise Packaged
+
+    if tool_name == 'finalize-fidelity-dataset':
+        validator = SimpleNamespace(validate_reference_only=lambda *a, **k: dict(passed=True))
+        publisher = SimpleNamespace(package=package, validate_source_pins=lambda *a: None)
+        monkeypatch.setattr(tool, 'load_tool', lambda name: validator if name == 'validate-fidelity-dataset' else publisher)
+        monkeypatch.setattr(tool, 'expected_source_pins', lambda meta: dict(expected='pins'))
+    else:
+        monkeypatch.setattr(tool, 'package', package)
+    monkeypatch.setattr(sys, 'argv', ['tool', '--source', str(source), '--out', str(tmp_path / 'out'),
+        '--tokenizer', str(tmp_path / 'tokenizer.json'), '--license', str(ROOT / 'LICENSE'), '--config', 'test',
+        '--text-source-description', description])
+    with pytest.raises(Packaged):
+        tool.main()
+    assert len(calls) == 1
+    assert calls[0][1]['text_source_description'] == description
+    if tool_name == 'finalize-fidelity-dataset':
+        assert calls[0][1]['expected_source_pins'] == dict(expected='pins')
+
+
 def test_text_checkpoint_guard_accepts_only_same_model_or_declared_higher_fidelity():
     from fidelity_windows import validate_text_source
     panel = dict(checkpoint='quant', generation_arm=dict(checkpoint='original'))
