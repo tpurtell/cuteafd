@@ -56,7 +56,7 @@ impl<'a> Whole<'a> {
         let metadata = fp8::package_metadata(&directory, &tensors, layers, 1, 0, slicing)?;
         validate_info(&metadata.info, &tensors, layers, slicing, max_rows)?;
         let arena = crate::shared::experts::weight_layout::layout(device, "fp8",
-            fp8::regions(&tensors, layers, 1, 0, slicing)?)?;
+            cuteafd_loader::serving_capacity::fp8_expert_regions(&tensors, layers, 1, 0, slicing)?)?;
         let (scratch_bytes, output_bytes, workspace_bytes) = fp8moe_tp2_workspace(
             metadata.scratch_for(max_rows)?, tensors.shape().hidden, max_rows)?;
         Ok(WholePlan { directory, arena, scratch_bytes, output_bytes, workspace_bytes })
