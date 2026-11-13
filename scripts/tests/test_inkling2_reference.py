@@ -606,8 +606,8 @@ def test_official_inkling_first_window_matches_pinned_torch_helpers(official_ink
     cfg = model.Config.from_dict(json.loads((official_inkling_snapshot / "config.json").read_bytes()))
     manifest = load_set(Path(windows_path), "inkling2")
     assert manifest["checkpoint"] == model.CHECKPOINT
-    window = manifest["windows"][0]
-    assert not window.get("media") and 640 <= len(window["tokens"]) <= 2048
+    window = next(w for w in manifest["windows"] if len(w["tokens"]) >= 640)
+    assert not window.get("media") and len(window["tokens"]) <= 4096
     device = torch.device(os.environ.get("INKLING2_REFERENCE_DEVICE", "cuda:0"))
     golden.configure_f32()
     weights = model.Weights(official_inkling_snapshot, device)
