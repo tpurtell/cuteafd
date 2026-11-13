@@ -84,7 +84,7 @@ pub(crate) fn contract(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, weights: 
         if bytes > 0 { raw.push(Allocation::buffer(format!("mount.{name}"), location, bytes,
             Lifetime { first: Phase::Load, last: Phase::Load }, Category::Staging, "target mount")); }
     }
-    let buffers = raw.into_iter().map(|owner| {
+    let buffers: Vec<_> = raw.into_iter().map(|owner| {
         let bytes = owner.bytes;
         Component::allocation(owner, ByteCurve::fixed(bytes, pages), false, pages)
     }).collect();
@@ -287,6 +287,27 @@ mod tests {
         }).collect::<Vec<_>>();
         assert_eq!(added, (0..4).map(|rank| (format!("spark.intake.rank.{rank}.storage.tail"),
             (2 << 20) - 4096)).collect::<Vec<_>>());
+        let serving_links = cuteafd_loader::placement::families::minimax_m3::spark_link(0, 4,
+            PrefillShape { rows: 1024, waves: 3 }, Default::default())?;
+        let mut serving = serving_links[0].components(maximum)?;
+        fixed_request_tails(&mut serving, maximum, &[])?;
+        for rank in 0..4 {
+            let suffix = format!(".intake.rank.{rank}.storage");
+            let storage = |components: &[Component]| components.iter().find_map(|component|
+                match &component.kind {
+                    ComponentKind::Allocation { template, .. } if template.id.ends_with(&suffix) =>
+                        Some((template.bytes, template.location, template.lifetime)),
+                    _ => None,
+                }).expect("intake storage");
+            assert_eq!(storage(&after.components), storage(&serving));
+            assert_eq!(storage(&serving).0, 37_752_832);
+            let tail_id = format!("minimax.spark{suffix}.tail");
+            let tail = serving.iter().find_map(|component| match &component.kind {
+                ComponentKind::AllocationGranularity(tail) if tail.id == tail_id => Some(tail.bytes().unwrap()),
+                _ => None,
+            }).expect("serving intake tail");
+            assert_eq!(tail, added[rank].1);
+        }
         // Removing exactly the four newly charged intake tails recovers every
         // legacy structural field, not just the total number of bytes.
         let mut corrected = after.components.iter().filter(|component| !matches!(&component.kind,
