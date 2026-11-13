@@ -70,6 +70,11 @@ pub fn describe(config: &Value) -> Result<LaunchDescription> {
         }
         // `text_config.moe_layer_freq` marks routed layers; the bundled DSpark
         // drafter is dense, so the Sparks serve backbone layers only.
+        "inkling2" => {
+            let cfg = crate::families::inkling2::Inkling2Config::from_hf(config)?;
+            // Every Inkling 2 layer is routed; the bundled dSpark drafter is dense.
+            ("inkling2", 0, Some(cfg.layers - 1))
+        }
         "minimax_m3_vl" => {
             let cfg = crate::families::minimax_m3::MiniMaxM3Config::from_hf(config)?;
             let first = cfg.moe.iter().position(|&moe| moe).unwrap_or(cfg.layers);

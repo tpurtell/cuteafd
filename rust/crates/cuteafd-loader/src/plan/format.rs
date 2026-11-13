@@ -124,6 +124,16 @@ pub struct QuantOperand {
     pub input_scale: Option<TensorScale>,
     /// Member suffixes beyond the codes and scales (`suh`, `svh`, `mcg`, `bias`).
     pub companions: Vec<String>,
+    /// Native NVFP4 experts (Inkling 2): F32 per-expert `weight_amax` and the
+    /// layer's `weight_outer_scale_denominator`; activations quantize per token.
+    pub expert_scale: Option<ExpertScale>,
+}
+
+/// Which native-NVFP4 outer-scale members a fused expert operand carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct ExpertScale {
+    pub amax: bool,
+    pub denominator: bool,
 }
 
 /// A group whose tensors do not form one operand.
@@ -145,6 +155,7 @@ impl QuantOperand {
             global_scale: None,
             input_scale: None,
             companions: Vec::new(),
+            expert_scale: None,
         }
     }
 
@@ -174,6 +185,8 @@ impl QuantOperand {
             Encoding::E5m2 => "fp8e5m2",
             Encoding::E2m1 => {
                 return match (&self.scale, self.global_scale) {
+                    (Some(scale), None) if scale.encoding == ScaleEncoding::E4m3 && self.expert_scale.is_some() =>
+                        format!("nvfp4-g{}-amax", scale.cols),
                     (Some(scale), Some(global)) if scale.encoding == ScaleEncoding::E4m3 => {
                         let direction = if global.direction == ScaleDirection::Divide { "-divisor" } else { "" };
                         format!("nvfp4-g{}{direction}", scale.cols)
@@ -253,6 +266,18 @@ impl QuantOperand {
                 && s.direction == ScaleDirection::Multiply && matches!(s.rows, RowTiling::Uniform { rows: 1 }))
     }
 
+    /// Inkling 2 native NVFP4 experts: fused packed E2M1 `[E, N, K/2]`, E4M3
+    /// per-16 scales, F32 per-expert amax and one F32 outer denominator, with
+    /// no per-tensor global and no static input scale (activations quantize
+    /// per token with the fouroversix rule).
+    pub fn is_inkling_nvfp4(&self) -> bool {
+        self.encoding == Encoding::E2m1 && self.container == "u8" && self.logical.len() == 3
+            && self.global_scale.is_none() && self.input_scale.is_none()
+            && self.expert_scale == Some(ExpertScale { amax: true, denominator: true })
+            && self.scale.as_ref().is_some_and(|s| s.encoding == ScaleEncoding::E4m3 && s.cols == 16
+                && s.direction == ScaleDirection::Multiply && matches!(s.rows, RowTiling::Uniform { rows: 1 }))
+    }
+
     /// MCG trellis bits for the existing routed-expert kernel contracts.
     /// Dense native loaders select their codebook independently from headers.
     pub fn exl3_bits(&self) -> Option<usize> {
@@ -322,12 +347,23 @@ const SUFFIXES: &[&str] = &[
     "sv",
 ];
 
-/// Splits `a.b.weight_scale_inv` into (`a.b`, `weight_scale_inv`). Names with no
-/// known suffix are their own stem.
+/// Members of a fused expert projection joined by `_` instead of `.`:
+/// `experts.w13_weight`, `experts.w13_weight_scale` and the native NVFP4
+/// `w13_weight_amax` / `w13_weight_outer_scale_denominator` (Inkling 2).
+const FUSED_SUFFIXES: &[&str] = &["weight", "weight_scale", "weight_amax", "weight_outer_scale_denominator"];
+
+/// Splits `a.b.weight_scale_inv` into (`a.b`, `weight_scale_inv`), and a fused
+/// expert member `a.experts.w13_weight_scale` into (`a.experts.w13`,
+/// `weight_scale`). Names with no known suffix are their own stem.
 pub fn split_stem(name: &str) -> (&str, &str) {
     if let Some((stem, suffix)) = name.rsplit_once('.') {
         if SUFFIXES.contains(&suffix) || (suffix.strip_prefix("strided_").is_some_and(|part| part.len() == 5 && part.bytes().all(|b| b.is_ascii_digit())) && stem.ends_with(".engram.embed")) {
             return (stem, suffix);
+        }
+        if let Some((projection, member)) = suffix.split_once('_') {
+            if matches!(projection, "w13" | "w2") && FUSED_SUFFIXES.contains(&member) {
+                return (&name[..name.len() - member.len() - 1], member);
+            }
         }
     }
     (name, "")
@@ -430,8 +466,23 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
             return Err(malformed(&weight.name, "empty stacked expert axis".into()));
         }
         let mut views = BTreeMap::new();
+        let mut expert_scale = None;
         for (suffix, tensor) in members {
             let mut view = (*tensor).clone();
+            if suffix == "weight_amax" || suffix == "weight_outer_scale_denominator" {
+                // Native NVFP4 (Inkling 2): F32 `[E]` per-expert amax and one F32
+                // outer denominator shared by the layer; neither is a per-expert grid.
+                let numel: usize = view.meta.shape.iter().product();
+                let expected = if suffix == "weight_amax" { *experts } else { 1 };
+                if view.meta.dtype != DType::F32 || numel != expected {
+                    return Err(malformed(&view.meta.name, format!("expected F32 [{expected}], found {} {:?}",
+                        dtype_label(&view.meta.dtype), view.meta.shape)));
+                }
+                expert_scale.get_or_insert(ExpertScale { amax: false, denominator: false });
+                let scale = expert_scale.as_mut().expect("just inserted");
+                if suffix == "weight_amax" { scale.amax = true } else { scale.denominator = true }
+                continue;
+            }
             if view.meta.shape.first() != Some(experts) {
                 return Err(malformed(&view.meta.name, format!("expected expert axis {experts}, found {:?}", view.meta.shape)));
             }
@@ -443,6 +494,14 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
         operand.logical.insert(0, *experts);
         operand.stored = weight.shape.clone();
         if let Some(scale) = &mut operand.scale { scale.grid.insert(0, *experts); }
+        if let Some(scale) = expert_scale {
+            if !(scale.amax && scale.denominator) || operand.encoding != Encoding::E2m1
+                || operand.scale.as_ref().is_none_or(|s| s.encoding != ScaleEncoding::E4m3) {
+                return Err(malformed(&weight.name, "per-expert amax and outer denominator belong to packed E2M1 \
+                    experts with E4M3 block scales, both members present".into()));
+            }
+            operand.expert_scale = Some(scale);
+        }
         return Ok(operand);
     }
     let companions: Vec<String> = members.keys().filter(|s| *s == "bias").cloned().collect();
@@ -610,5 +669,24 @@ fn detect_exl3(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOpe
         global_scale: None,
         input_scale: None,
         companions: vec![module.codebook.marker().into(), "suh".into(), "svh".into()],
+        expert_scale: None,
     })
+}
+
+#[cfg(test)]
+mod fused_stem_tests {
+    use super::split_stem;
+
+    #[test]
+    fn fused_expert_members_group_under_the_projection_stem() {
+        let stem = "model.llm.layers.3.mlp.experts.w13";
+        for member in ["weight", "weight_scale", "weight_amax", "weight_outer_scale_denominator"] {
+            assert_eq!(split_stem(&format!("{stem}_{member}")), (stem, member));
+        }
+        assert_eq!(split_stem("model.llm.layers.3.mlp.experts.w2_weight"), ("model.llm.layers.3.mlp.experts.w2", "weight"));
+        // Dotted members keep the ordinary rule; unrelated underscores stay whole stems.
+        assert_eq!(split_stem("model.layers.0.mlp.experts.4.w2.weight"), ("model.layers.0.mlp.experts.4.w2", "weight"));
+        assert_eq!(split_stem("model.layers.0.attn.k_sconv.static_w"), ("model.layers.0.attn.k_sconv.static_w", ""));
+        assert_eq!(split_stem("model.layers.0.w13_other"), ("model.layers.0.w13_other", ""));
+    }
 }

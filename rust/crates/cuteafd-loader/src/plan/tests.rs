@@ -209,7 +209,7 @@ fn glm_and_ml4_planner_native_core_widths_equal_loader_contracts() {
         let accepted = (1..=8).filter(|&bits| {
             let mut operand = format::QuantOperand { encoding: format::Encoding::Exl3 { bits },
                 container: "I16".into(), logical: shape.clone(), stored: vec![], scale: None,
-                global_scale: None, input_scale: None, companions: vec![] };
+                global_scale: None, input_scale: None, companions: vec![], expert_scale: None };
             model.accepts(&role, stem, &mut operand).is_ok()
         }).collect::<Vec<_>>();
         assert_eq!(accepted, widths, "{}", family.id());

@@ -38,6 +38,7 @@ FAMILIES = {
     "muse_spark": "muse_spark",
     "mistral_large4": "mistral_large4",
     "minimax_m3_vl": "minimax_m3",
+    "inkling2": "inkling2",
 }
 
 
@@ -96,7 +97,7 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         raise SystemExit(f"unsupported model_type {kind!r}; known: {', '.join(sorted(FAMILIES))}")
     first, last = 0, -1
     if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "muse_spark", "mistral_large4",
-                  "minimax_m3"):
+                  "minimax_m3", "inkling2"):
         layers = text.get("num_hidden_layers")
         if not isinstance(layers, int) or layers <= 0:
             raise SystemExit("config lacks num_hidden_layers")
@@ -141,6 +142,9 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         # Dense prefix (mlp_layer_types / first_k_dense_replace); the bundled
         # mtp_dspark drafter is dense, so the Sparks serve backbone layers only.
         first = _dense_prefix(text, layers)
+        last = layers - 1
+    elif family == "inkling2":
+        # Every Inkling 2 layer is routed; the bundled dSpark drafter is dense.
         last = layers - 1
     elif family == "minimax_m3":
         # text_config.moe_layer_freq: 0 dense, 1 routed, one entry per layer (the
@@ -188,7 +192,7 @@ def routed_layers(config: dict) -> int | None:
     if family == "glm5_flash":
         # Reuse the runtime-equivalent pattern checks, including agreement.
         describe(config)
-    if family in ("kimi_k3", "mistral_large4", "minimax_m3"):
+    if family in ("kimi_k3", "mistral_large4", "minimax_m3", "inkling2"):
         _, _, first, last = describe(config)
         return last - first + 1
     dense = _pattern(text, layers, {"mlp_layer_types": {"dense": True, "sparse": False},
