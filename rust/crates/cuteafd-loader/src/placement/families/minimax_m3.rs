@@ -49,6 +49,7 @@ pub enum Owner {
     Target { gpu: usize },
     Kv { layer: usize, plane: &'static str },
     Cache { gpu: usize },
+    DecodeTable { gpu: usize },
     Rope { gpu: usize },
     Decode { gpu: usize },
     Unit { gpu: usize, slot: u64 },
@@ -67,6 +68,7 @@ impl Owner {
             Self::Target { gpu } => format!("minimax/target/{gpu}"),
             Self::Kv { layer, plane } => format!("minimax.kv.{layer}.{plane}"),
             Self::Cache { gpu } => format!("minimax.cache.{gpu}"),
+            Self::DecodeTable { gpu } => format!("minimax.cache.{gpu}.decode_table"),
             Self::Rope { gpu } => format!("minimax.rope.{gpu}"),
             Self::Decode { gpu } => format!("minimax.decode.{gpu}"),
             Self::Unit { gpu, slot } => format!("minimax.unit.{gpu}.{slot}"),
@@ -134,49 +136,103 @@ pub struct ExpertBacking {
     pub validation_bytes: usize,
 }
 
-impl ExpertBacking {
-    pub fn plan(tensors: &crate::formats::fp8_experts::Fp8ExpertTensors, layers: &[usize],
-        gpus: usize, gpu: usize, physical_device: i32) -> anyhow::Result<Self> {
+/// Header/source inventory is linear in the routed layers, not in all their
+/// onboarding prefixes. Prefix materialization below only packs cached regions.
+#[derive(Debug)]
+pub struct ExpertInventory {
+    ranks: Vec<Vec<ExpertLayerInventory>>,
+}
+
+#[derive(Debug)]
+struct ExpertLayerInventory {
+    layer: usize,
+    regions: Vec<(String, usize)>,
+    has_sources: bool,
+    push_sources: bool,
+}
+
+impl ExpertInventory {
+    pub fn new(tensors: &crate::formats::fp8_experts::Fp8ExpertTensors, layers: &[usize],
+        gpus: usize) -> anyhow::Result<Self> {
         use crate::formats::fp8_experts::{Fp8Projection, Slicing};
-        use crate::serving_capacity::{expert_weight_arena_id, fp8_expert_regions};
-        anyhow::ensure!((1..=2).contains(&gpus) && gpu < gpus && physical_device >= 0
-            && !layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1]),
-            "invalid MiniMax expert selection");
+        anyhow::ensure!((1..=2).contains(&gpus) && !layers.is_empty()
+            && layers.windows(2).all(|pair| pair[0] < pair[1]), "invalid MiniMax expert selection");
         let tensors = tensors.for_coordinator();
-        let slicing = Slicing::Blocks(128);
-        let regions = fp8_expert_regions(&tensors, layers, gpus, gpu, slicing)?;
-        let arena = WeightArenaLayout::new(expert_weight_arena_id("fp8", physical_device, &regions)?, regions)?;
-        let mut shards = std::collections::BTreeSet::new();
-        let mut views = Vec::new();
-        let mut push_compatible = true;
+        let mut ranks = (0..gpus).map(|_| Vec::with_capacity(layers.len())).collect::<Vec<_>>();
+        let mut shards = std::collections::BTreeMap::new();
         for &layer in layers {
-            let tensors = tensors.for_layer_metadata(layer)?;
-            let planes = (0..6).map(|plane| arena.view(&format!("{layer}.{plane}"))
-                .map_or(0..0, |view| view.offset()..view.offset() + view.bytes()))
-                .collect::<Vec<_>>();
-            let first = planes.iter().filter(|plane| !plane.is_empty()).map(|plane| plane.start).min()
-                .ok_or_else(|| anyhow::anyhow!("empty MiniMax expert layer"))?;
-            let end = planes.iter().map(|plane| plane.end).max().unwrap();
-            // RankPlan rejects inter-plane padding rather than silently
-            // widening admission; a nonpushable selection uses mount.
-            push_compatible &= end - first == planes.iter().map(|plane| plane.len()).sum::<usize>();
-            for expert in 0..tensors.shape().experts {
+            let view = tensors.for_layer_metadata(layer)?;
+            let mut has_sources = false;
+            let mut push_sources = true;
+            for expert in 0..view.shape().experts {
                 for projection in Fp8Projection::ALL {
-                    for name in tensors.projection_source_names(layer, expert, projection) {
-                        shards.insert(tensors.push_source(&name)?.0.path);
+                    for name in view.projection_source_names(layer, expert, projection) {
+                        let path = view.push_source(&name)?.0.path;
+                        has_sources = true;
+                        push_sources &= *shards.entry(path.clone())
+                            .or_insert_with(|| crate::push_load::is_push_shard(&path));
                     }
                 }
             }
-            views.push(ExpertLayerBacking { layer, region: first..end, slicing,
-                planes: planes.try_into().unwrap() });
+            for (gpu, rank) in ranks.iter_mut().enumerate() {
+                rank.push(ExpertLayerInventory { layer, has_sources, push_sources,
+                    regions: crate::serving_capacity::fp8_expert_regions(&tensors, &[layer],
+                        gpus, gpu, Slicing::Blocks(128))? });
+            }
         }
-        let storage = if push_compatible && !shards.is_empty()
-            && shards.iter().all(|path| crate::push_load::is_push_shard(path)) {
+        Ok(Self { ranks })
+    }
+
+    /// Count zero has no backing; all other selections retain canonical shared
+    /// arena IDs, plane order and alignment for the supplied physical devices.
+    pub fn prefixes(&self, physical_devices: &[i32]) -> anyhow::Result<Vec<Vec<ExpertBacking>>> {
+        anyhow::ensure!(physical_devices.len() == self.ranks.len()
+            && physical_devices.iter().all(|&device| device >= 0)
+            && physical_devices.iter().collect::<std::collections::BTreeSet<_>>().len() == self.ranks.len(),
+            "invalid MiniMax expert physical devices");
+        (0..=self.ranks[0].len()).map(|count| {
+            if count == 0 { return Ok(Vec::new()); }
+            physical_devices.iter().enumerate().map(|(gpu, &device)| self.backing(count, gpu, device))
+                .collect()
+        }).collect()
+    }
+
+    fn backing(&self, count: usize, gpu: usize, physical_device: i32) -> anyhow::Result<ExpertBacking> {
+        use crate::formats::fp8_experts::Slicing;
+        anyhow::ensure!(gpu < self.ranks.len() && physical_device >= 0
+            && count > 0 && count <= self.ranks[gpu].len(), "invalid MiniMax expert prefix");
+        let selected = &self.ranks[gpu][..count];
+        let regions = selected.iter().flat_map(|layer| layer.regions.iter().cloned()).collect::<Vec<_>>();
+        let arena = WeightArenaLayout::new(crate::serving_capacity::expert_weight_arena_id(
+            "fp8", physical_device, &regions)?, regions)?;
+        let mut views = Vec::with_capacity(count);
+        let mut push_compatible = true;
+        for cached in selected {
+            let layer = cached.layer;
+            let planes = std::array::from_fn(|plane| arena.view(&format!("{layer}.{plane}"))
+                .map_or(0..0, |view| view.offset()..view.offset() + view.bytes()));
+            let first = planes.iter().filter(|plane| !plane.is_empty()).map(|plane| plane.start).min()
+                .ok_or_else(|| anyhow::anyhow!("empty MiniMax expert layer"))?;
+            let end = planes.iter().map(|plane| plane.end).max().unwrap();
+            // RankPlan rejects inter-plane padding; admission must choose mount.
+            push_compatible &= cached.push_sources
+                && end - first == planes.iter().map(|plane| plane.len()).sum::<usize>();
+            views.push(ExpertLayerBacking { layer, region: first..end,
+                slicing: Slicing::Blocks(128), planes });
+        }
+        let storage = if push_compatible && selected.iter().any(|layer| layer.has_sources) {
             ExpertStorage::Push
         } else { ExpertStorage::Mount };
-        Ok(Self { gpu, physical_device, count: layers.len(), storage,
-            inventory_prefix: format!("minimax.experts.{gpu}.{}", layers.len()), arena,
+        Ok(ExpertBacking { gpu, physical_device, count, storage,
+            inventory_prefix: format!("minimax.experts.{gpu}.{count}"), arena,
             layers: views, validation_bytes: 0 })
+    }
+}
+
+impl ExpertBacking {
+    pub fn plan(tensors: &crate::formats::fp8_experts::Fp8ExpertTensors, layers: &[usize],
+        gpus: usize, gpu: usize, physical_device: i32) -> anyhow::Result<Self> {
+        ExpertInventory::new(tensors, layers, gpus)?.backing(layers.len(), gpu, physical_device)
     }
 }
 
