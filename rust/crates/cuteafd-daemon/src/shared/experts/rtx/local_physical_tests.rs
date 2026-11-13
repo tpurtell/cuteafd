@@ -278,7 +278,7 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
 
 #[test]
 fn glm_fp8_package_physical_weights_equal_mount_and_push() -> Result<()> {
-    use crate::shared::{experts::fp8::{Fp8Layer, regions}, memory::push_fp8::RankPlan};
+    use crate::shared::{experts::fp8::Fp8Layer, memory::push_fp8::RankPlan};
     use cuteafd_loader::{formats::fp8_experts::ExpertFormat, plan::testing::glm5_compact_weights};
     let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
     let library = fixture.load()?;
@@ -320,7 +320,7 @@ fn glm_fp8_package_physical_weights_equal_mount_and_push() -> Result<()> {
                 let (_, slicing) = cuteafd_loader::formats::fp8_experts::exact_layout_directory(&package, &tensors, 2, rank);
                 let weights = if storage == LocalStorage::Mount {
                     let arena = crate::shared::experts::weight_layout::arena(device, "fp8",
-                        regions(&tensors, &selected.layers, 2, rank, slicing)?)?;
+                        cuteafd_loader::serving_capacity::fp8_expert_regions(&tensors, &selected.layers, 2, rank, slicing)?)?;
                     device.run(|| selected.layers.iter().map(|&layer| Fp8Layer::load_into(&library,
                         &tensors.for_layer_metadata(layer)?, layer, 2, rank, slicing, &arena)).collect::<Result<Vec<_>>>())?
                 } else {

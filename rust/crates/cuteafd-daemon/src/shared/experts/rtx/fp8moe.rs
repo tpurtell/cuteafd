@@ -119,7 +119,7 @@ impl<'a> Fp8MoeTp2<'a> {
             plan.workspace_bytes);
         if pushed.is_none() {
             let layout = crate::shared::experts::weight_layout::layout(device.id, "fp8",
-                crate::shared::experts::fp8::regions(tensors, &layers, 2, rank, plan.slicing)?)?;
+                cuteafd_loader::serving_capacity::fp8_expert_regions(tensors, &layers, 2, rank, plan.slicing)?)?;
             crate::shared::experts::weight_layout::admit(&layout, 0, plan.workspace_bytes, budget)?;
         }
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
@@ -156,7 +156,7 @@ impl<'a> Fp8MoeTp2<'a> {
         let plans = [Self::plan(tensors, directory, &layers, 0, max_rows)?, Self::plan(tensors, directory, &layers, 1, max_rows)?];
         for rank in 0..2 {
             let layout = crate::shared::experts::weight_layout::layout(devices[rank].id, "fp8",
-                crate::shared::experts::fp8::regions(tensors, &layers, 2, rank, plans[rank].slicing)?)?;
+                cuteafd_loader::serving_capacity::fp8_expert_regions(tensors, &layers, 2, rank, plans[rank].slicing)?)?;
             crate::shared::experts::weight_layout::admit(&layout, 0,
                 plans[rank].workspace_bytes, budgets[rank])?;
         }
