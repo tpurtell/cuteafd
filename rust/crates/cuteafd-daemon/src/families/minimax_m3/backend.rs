@@ -290,7 +290,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         ensure!(logit_rows <= tokens.len(), "MiniMax scored suffix exceeds append");
         let end = placement.len.checked_add(tokens.len()).context("MiniMax scoring overflow")?;
         let first = end - logit_rows;
-        let scoring = probe::ScoringRows { probe, position };
+        let scoring = probe::ScoringRows { consumer: probe, position };
         self.prefill(&mut [(placement, tokens)], &[first..end], pool, |_, span, logits|
             scoring.record(self.library(), span.start - first, &logits))?;
         Ok((logit_rows > 0).then_some(probe::ScoreLogits::Recorded))
