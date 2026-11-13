@@ -3,7 +3,7 @@
 use super::MiniMaxM3Config;
 use crate::placement::{
     inventory::ProgramEntry,
-    planner::{fixed_request_tails, Allocation, ByteCurve, Component, Lifetime, Location, Refusal},
+    planner::{Allocation, ByteCurve, Component, Lifetime, Location, Refusal},
 };
 use cuteafd_core::memory_layout::Category;
 use cuteafd_ffi::{
@@ -450,8 +450,10 @@ mod tests {
                 let bytes = u64::from(requests) * u64::from(cache.table_width) * 4;
                 assert_eq!(buffers["page_table"], bytes);
                 assert_eq!(buffers["decode_table"], bytes);
-                let components = cache.components("minimax.cache.0", 0, 5).unwrap();
-                use crate::placement::planner::ComponentKind;
+                let mut components = cache.components("minimax.cache.0", 0, 5).unwrap();
+                use crate::placement::planner::{ComponentKind, fixed_request_tails};
+                assert!(components.iter().all(|component| matches!(component.kind, ComponentKind::Allocation { .. })));
+                fixed_request_tails(&mut components, 5, &[]).unwrap();
                 for name in ["page_table", "decode_table"] {
                     let id = format!("minimax.cache.0.{name}");
                     assert_eq!(components.iter().filter(|component| matches!(&component.kind,
@@ -542,8 +544,10 @@ mod tests {
             ("minimax_norm_rope_h4", 4096 * 4 * 256),
             ("minimax_index_producer", 4096 * 2304),
         ]);
-        let components = programs.workspace_components("minimax.producer.0", 0, Lifetime::TARGET, 16).unwrap();
-        use crate::placement::planner::ComponentKind;
+        let mut components = programs.workspace_components("minimax.producer.0", 0, Lifetime::TARGET, 16).unwrap();
+        use crate::placement::planner::{ComponentKind, fixed_request_tails};
+        assert!(components.iter().all(|component| matches!(component.kind, ComponentKind::Allocation { .. })));
+        fixed_request_tails(&mut components, 16, &[]).unwrap();
         assert!(components.iter().any(|c| matches!(&c.kind,
             ComponentKind::AllocationGranularity(tail)
                 if tail.id == "minimax.producer.0.minimax_index_producer.tail")));
@@ -606,9 +610,13 @@ mod tests {
         assert_eq!(prefill["index.keys"], 1048576 * 128);
         assert_eq!(prefill["index.key_scales"], 1048576 * 4);
         assert_eq!(prefill["index.scratch"], 539197952);
-        let components = programs
+        let mut components = programs
             .workspace_components("minimax.prefill.0", 0, true, Lifetime::TARGET, 16)
             .unwrap();
+        use crate::placement::planner::{ComponentKind, fixed_request_tails};
+        assert_eq!(components.len(), prefill.len());
+        assert!(components.iter().all(|component| matches!(component.kind, ComponentKind::Allocation { .. })));
+        fixed_request_tails(&mut components, 16, &[]).unwrap();
         assert!(components.len() > prefill.len());
         assert!(components.iter().any(|c| matches!(&c.kind,
             crate::placement::planner::ComponentKind::AllocationGranularity(tail)
@@ -681,6 +689,5 @@ fn components<S: AsRef<str>>(
             maximum_pages,
         ));
     }
-    fixed_request_tails(&mut out, maximum_pages, &[])?;
     Ok(out)
 }

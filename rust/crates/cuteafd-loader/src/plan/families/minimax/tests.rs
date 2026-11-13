@@ -1,6 +1,113 @@
 use super::*;
 use crate::plan::{self, testing, PlanOptions};
 
+#[test]
+fn execution_inventory_is_exact_recipe_partition_before_shared_finalization() {
+    use crate::placement::families::minimax_m3::{self as shared, Owner};
+    use crate::placement::planner::*;
+    use cuteafd_core::memory_layout::Category;
+    fn signatures(components: &[Component]) -> Vec<String> {
+        let mut values = components.iter().map(|component| format!("{component:?}")).collect::<Vec<_>>();
+        values.sort();
+        values
+    }
+    for gpus in [1, 2] {
+        for concurrency in [1, 16, 64] {
+            let mut inputs = recipe_inputs(gpus, 4);
+            inputs.sequences = concurrency;
+            inputs.host_prefix = serving::HostPrefixOwners { quota_bytes: 8192, chunk_bytes: 4096 };
+            let maximum = inputs.maximum_pages();
+            let execution = inputs.execution_components().unwrap();
+            assert!(execution.iter().all(|component| !matches!(component.kind,
+                ComponentKind::AllocationGranularity(_) | ComponentKind::DriverPageTables { .. })));
+            for component in &execution {
+                if let ComponentKind::Allocation { template, .. } = &component.kind {
+                    if template.id.starts_with("minimax.prefix.h2d.") || template.id.starts_with("host.prefix.") {
+                        assert_eq!(template.location, Location::PINNED, "{}", template.id);
+                    }
+                }
+            }
+            let request = shared::request(inputs.context, None, crate::placement::Onboard::Auto,
+                inputs.prefill, Operation::Serving, None, Default::default());
+            let actual = inputs.prepare(&request).unwrap();
+            let head = (gpus - 1) as u8;
+            let mut combined = execution;
+            for gpu in 0..gpus {
+                combined.extend(inputs.targets[gpu].weight_components(maximum).unwrap());
+                for owner in inputs.mount[gpu].allocations(&Owner::Mount { gpu }.id()) {
+                    let bytes = ByteCurve::fixed(owner.bytes, maximum);
+                    combined.push(Component::allocation(owner, bytes, false, maximum));
+                }
+            }
+            combined.extend(crate::families::minimax_m3::execution::HeadLayout::new(&inputs.cfg, shared::DECODE_ROWS)
+                .unwrap().components(&Owner::Head.id(), head, maximum).unwrap());
+            combined.extend(serving::ServingOwners {
+                selector: serving::SelectorOwners { location: Location::coordinator(head),
+                    capacity: (concurrency as usize).max(shared::DECODE_ROWS as usize),
+                    vocab: inputs.cfg.vocab_size, device_sampling: inputs.device_sampling },
+                prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 },
+            }.components(maximum).unwrap());
+            combined.extend(serving::blas_components("sm_120", &[serving::BlasOwners {
+                name: "MiniMax target head".into(), process: "coordinator".into(),
+                thread: "minimax/blas/serve".into(), location: Location::coordinator(head),
+                gemm: inputs.head.gemm(), lt: inputs.head.lt(), lifetime: Lifetime::TARGET,
+                activation: Activation::always(),
+            }], maximum, PhaseOrder::TARGET_THEN_DRAFT).unwrap());
+            // The remaining partition is entirely conditional expert/transport
+            // ownership. Keep every structural field, including location/curve.
+            for component in &actual.components {
+                let included = match &component.kind {
+                    ComponentKind::Allocation { template, .. } => {
+                        let id = &template.id;
+                        id.starts_with("minimax.hops.") || id.starts_with("minimax.tp2.")
+                            || id.starts_with("minimax.expert_workspace.") || id.starts_with("minimax.spark.")
+                            || inputs.expert_backings.iter().flatten().any(|backing| id == backing.arena.id())
+                            || template.category == Category::Transport
+                    }
+                    ComponentKind::ResidentWeight(owner) => inputs.expert_backings.iter().flatten()
+                        .any(|backing| owner.id == backing.arena.id()),
+                    ComponentKind::AllocationGranularity(owner) => inputs.expert_backings.iter().flatten()
+                        .any(|backing| owner.backings.iter().any(|entry| entry.backing == backing.arena.id())),
+                    ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm121Arena, .. } => true,
+                    ComponentKind::Allowance(_) => component.activation != Activation::always(),
+                    ComponentKind::Sequential(_) | ComponentKind::Reservation(_) => true,
+                    _ => false,
+                };
+                if included { combined.push(component.clone()); }
+            }
+            // Legacy helpers finalized their allocations separately before the
+            // recipe's combined pass. Reproduce that ordering independently.
+            let mut legacy = Vec::new();
+            for component in &combined {
+                let mut helper = vec![component.clone()];
+                if matches!(component.kind, ComponentKind::Allocation { .. }) {
+                    fixed_request_tails(&mut helper, maximum, &[]).unwrap();
+                }
+                // Weight arenas already carry their explicit canonical tail.
+                helper.retain(|item| !matches!(&item.kind, ComponentKind::AllocationGranularity(tail)
+                    if combined.iter().any(|existing| matches!(&existing.kind,
+                        ComponentKind::AllocationGranularity(owner) if owner.id == tail.id))));
+                legacy.extend(helper);
+            }
+            // Restore the canonical arena tails omitted by the helper filter.
+            legacy.extend(combined.iter().filter(|component| matches!(component.kind,
+                ComponentKind::AllocationGranularity(_))).cloned());
+            fixed_request_tails(&mut legacy, maximum, &[]).unwrap();
+            let mut before = actual.clone();
+            before.components = legacy;
+            before.add_driver_page_tables();
+            assert_eq!(signatures(&actual.components), signatures(&before.components),
+                "{gpus} RTX C{concurrency}: moving helper finalization changes no recipe charge");
+            fixed_request_tails(&mut combined, maximum, &[]).unwrap();
+            let mut expected = actual.clone();
+            expected.components = combined;
+            expected.add_driver_page_tables();
+            assert_eq!(signatures(&actual.components), signatures(&expected.components),
+                "{gpus} RTX C{concurrency}: execution + target/head/expert/transport partitions");
+        }
+    }
+}
+
 fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     fixture_with_experts(4)
 }
@@ -223,7 +330,7 @@ fn structural_open_reports_exact_header_drift_and_unknown_tensors_by_name() {
 #[test]
 fn coordinator_native_dense_workspace_prices_each_serial_owner_once() {
     use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
-    use crate::placement::planner::{ComponentKind, Lifetime};
+    use crate::placement::planner::{ComponentKind, Lifetime, fixed_request_tails, independent_request};
     let (dir, _, _) = fixture();
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
@@ -239,13 +346,7 @@ fn coordinator_native_dense_workspace_prices_each_serial_owner_once() {
             ComponentKind::Allocation { template, .. } => Some(template), _ => None }).collect::<Vec<_>>();
         assert_eq!(allocations, owners.iter().collect::<Vec<_>>());
         assert!(!components.iter().any(|c| matches!(c.kind, ComponentKind::ResidentWeight(_))));
-        for component in &components {
-            if let ComponentKind::AllocationGranularity(tail) = &component.kind {
-                assert_eq!(tail.backings.len(), 1);
-                let backing = owners.iter().find(|a| a.id == tail.backings[0].backing).unwrap();
-                assert_eq!(tail.requests(), [backing.bytes]);
-            }
-        }
+        assert!(components.iter().all(|c| !matches!(c.kind, ComponentKind::AllocationGranularity(_))));
         let input = weights.dense_input(rows).unwrap();
         assert_eq!((input.width, input.bytes), (12288, u64::from(rows) * 12288 * 2));
         let input_components = input.components("minimax.dense", 0, Lifetime::TARGET, 1024).unwrap();
@@ -254,11 +355,21 @@ fn coordinator_native_dense_workspace_prices_each_serial_owner_once() {
             ComponentKind::Allocation { template, .. } => Some(template), _ => None }).collect::<Vec<_>>();
         assert_eq!(input_allocations, [&owner]);
         assert!(!owners.iter().any(|a| a.id == owner.id));
-        for component in &input_components {
-            if let ComponentKind::AllocationGranularity(tail) = &component.kind {
+        assert!(input_components.iter().all(|c| !matches!(c.kind, ComponentKind::AllocationGranularity(_))));
+        let mut combined = components;
+        combined.extend(input_components);
+        fixed_request_tails(&mut combined, 1024, &[]).unwrap();
+        let tails = combined.iter().filter_map(|component| match &component.kind {
+            ComponentKind::AllocationGranularity(tail) => Some(tail), _ => None }).collect::<Vec<_>>();
+        let all = owners.iter().chain(std::iter::once(&owner)).collect::<Vec<_>>();
+        assert_eq!(tails.len(), all.iter().filter(|allocation| independent_request(allocation.bytes)).count());
+        for allocation in all {
+            let matching = tails.iter().filter(|tail| tail.backings.iter()
+                .any(|backing| backing.backing == allocation.id)).collect::<Vec<_>>();
+            assert_eq!(matching.len(), usize::from(independent_request(allocation.bytes)), "{}", allocation.id);
+            if let Some(tail) = matching.first() {
                 assert_eq!(tail.backings.len(), 1);
-                assert_eq!(tail.backings[0].backing, owner.id);
-                assert_eq!(tail.requests(), [owner.bytes]);
+                assert_eq!(tail.requests(), [allocation.bytes]);
             }
         }
         assert!(input.components("", 0, Lifetime::TARGET, 1024).is_err());
