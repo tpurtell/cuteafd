@@ -23,6 +23,10 @@ before encoding; publish/upload, no-copy SparkNest import, native eight-place
 `--factor 1/8` spread and task-only cleanup are authorized. A durable user
 timer `cuteafd-inkling2-progress.timer` queues this conversation every 30 min;
 receipts live under `~/.cache/cuteafd/quantization/inkling2-k4-mc/`.
+TJ also requests remaining time and an estimated completion date/time in every
+update (Asia/Taipei). Start with a clearly provisional range from measured
+partial expert throughput; replace it with completed-layer timing as available.
+Keep layer ETA separate from head/MTP, upload and placement allowances.
 
 Source header audit: `thinkingmachines/Inkling-2-Small-MXFP8` at
 `3febc62259ee92ea36e2fb6e8303371c4eb3922c`, 48 indexed model shards plus
