@@ -504,7 +504,7 @@ fn shared_recipe_supports_layouts_and_measured_baselines_without_replanning() {
         let inputs = recipe_inputs(gpus, ranks);
         let request = shared::request(inputs.context, Some(32768), Onboard::Layers(0), inputs.prefill,
             Operation::Serving, None, Default::default());
-        let planned = inputs.admit(request).unwrap();
+        let planned = inputs.admit(request.clone()).unwrap();
         assert_eq!(planned.placement.pool_tokens, 32768);
         assert!(planned.placement.layers.iter().filter(|l| l.experts != ExpertHome::Dense)
             .all(|l| l.experts == ExpertHome::Spark));
@@ -549,11 +549,11 @@ fn shared_recipe_refuses_invalid_owners_concurrency_and_missing_exports() {
     assert!(bad.prepare(&request).unwrap_err().to_string().contains("rank inventory"));
     let mut bad = inputs.clone();
     bad.local = LocalPackage::Missing("missing fp8-minimax-nvfp4a4/tp2/libcuteafd_fp8moe.so".into());
-    let mut pinned = request;
+    let mut pinned = request.clone();
     pinned.onboard = crate::placement::planner::Pin::Exact(1);
     assert!(bad.prepare(&pinned).unwrap_err().to_string().contains("fp8-minimax-nvfp4a4/tp2"));
     // Missing local exports never prevent a remote-only layout.
-    bad.admit(request).unwrap();
+    bad.admit(request.clone()).unwrap();
     let mut bad = inputs.clone();
     let manifest = std::sync::Arc::make_mut(&mut bad.manifest);
     manifest["programs"].as_array_mut().unwrap().retain(|p|
