@@ -399,6 +399,22 @@ def inkling2_producer_programs(prefill_rows: int):
     return result
 
 
+def inkling2_input_quant_program():
+    """Reuse the native group32 quantizer with no foreign-family amax floor."""
+    import torch
+    from b12x._lib.quant.mxfp8_rows import compile_mxfp8_rows_quant_aot
+    from b12x.integration.cuteafd._common import AotProgram, Operand, Scalar
+    compiled = compile_mxfp8_rows_quant_aot(size_k=4608, expected_m=80, amax_floor=0., wire_rows=True)
+    return AotProgram(name="inkling2_expert_input_quant", compiled=compiled,
+        operands=(Operand("source_ptr", torch.bfloat16, "[rows,4608]"),
+                  Operand("values_ptr", torch.uint32, "[rows,1188]", "out"),
+                  Operand("scale_rows_ptr", torch.uint8, "values_ptr+4608", "out", align=1),
+                  Operand("scale_mma_ptr", torch.uint8, "unused")),
+        scalars=(Scalar("rows"), Scalar("grid_x")),
+        geometry=dict(hidden=4608, row_bytes=4752, expected_m=80, amax_floor=0.,
+                      exact_row_cap=2**31-1))
+
+
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
     # Fused top-k has fixed CTA-group spin barriers. The native table has no
     # loaded-kernel occupancy gate/fallback; even a new decode bucket must not
@@ -1871,6 +1887,8 @@ def main() -> None:
         manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
+        work.append(("inkling2", "expert_input_quant", "expert_input_quant", {"max_rows": 4096},
+                     inkling2_input_quant_program))
         # Share DraftProjections unchanged. The D16 relative bias projection
         # uses zero-padded K64 inputs/weight columns (the same BF16 values).
         existing = {suffix for family, suffix, *_ in work if family == "draft_bf16"}
