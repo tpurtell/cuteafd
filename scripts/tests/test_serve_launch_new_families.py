@@ -71,7 +71,8 @@ def test_minimax_qualified_card_opens_one_rtx_three_sparks_public_launch(tmp_pat
     assert "--split-device" not in _line(release, "serve-minimax --snapshot").split()
     pair = _family_launch_result(tmp_path / "pair", config, "MiniMaxAI/MiniMax-M3.1-Flash",
         keys.replace("RTX_GPUS=1", "RTX_GPUS=2"), encoder_plan=PLANNED)
-    assert pair.returncode != 0 and "one coordinator GPU" in pair.stderr
+    assert pair.returncode == 0
+    assert _flag(_line(pair, "serve-minimax --snapshot"), "--split-device") == "1"
     matrix = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
     entry = next(entry for entry in matrix["entries"] if entry["name"] == "minimax-flash-min")
     assert entry["family"] == "minimax_m3" and len(entry["gpus"]) == 1 and len(entry["sparks"]) == 3

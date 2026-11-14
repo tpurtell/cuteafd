@@ -120,9 +120,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return empty(notes);
         }
     };
-    // The trace-free basic card qualifies the admitted whole-rank contract
+    // Trace-free serving cards qualify whole-rank and FP32 split contracts
     // (#1856). Other geometries remain planning inventories, not fit refusals.
-    report.native_serving_admitted = gpus == 1 && !inputs.split() && !inputs.heads();
+    report.native_serving_admitted = !inputs.heads() && (gpus == 1
+        || (inputs.split() && inputs.split_wire == Some(crate::families::minimax_m3::execution::WirePrecision::F32)));
     if report.native_serving_admitted {
         report.runtime = Some(crate::plan::RuntimeStatus::Serving);
         for component in &mut report.components {

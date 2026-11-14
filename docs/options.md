@@ -80,14 +80,16 @@ A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
 ### MiniMax Serving
 
 MiniMax M3.1 Flash supports public `cuteafd serve --family minimax_m3` and
-`./run.sh` on one RTX, qualified by the 2026-11-14 trace-free basic card (#1856).
-Use a build containing the MiniMax native exports. The supported edge uses native MXFP8 dense math,
-NVFP4 W4A4 experts, FP8 MSA KV/index, GPU embedding and device token selection.
-`ATTENTION_PLACEMENT=auto|heads` selects whole ownership; explicit context/layers
-and two-RTX serving remain refused until the split executor is qualified.
+`./run.sh` on one RTX or a two-RTX FP32 split, qualified by the 2026-11-14
+trace-free serving cards (#1856).
+Use a build containing MiniMax native exports: MXFP8 dense math, NVFP4 W4A4
+experts, FP8 MSA KV/index, GPU embedding and device token selection.
+On one RTX, `ATTENTION_PLACEMENT=auto|heads` selects whole ownership. On two RTX,
+`auto|layers` selects contiguous attention and eager FP32 split FFNs. Explicit context placement and
+two-RTX narrow-head serving remain refused.
 `SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
 
-Shared launch keys keep their usual meanings. The one-RTX edge accepts
+Shared launch keys keep their usual meanings. MiniMax accepts
 `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS`, `PREFILL_WAVES`,
 `PREFILL_PACKING=unrestricted|exact`, `PREFIX_CACHE_ENTRIES`, `HOST_CACHE_BYTES`
 (default launcher `auto`), `POOL_TOKENS`, `MAX_CONTEXT_TOKENS`, `CONCURRENCY`,
@@ -98,7 +100,8 @@ The traced one-RTX boot-C16 graph base is 41,943,040 bytes plus the standard
 2,097,152-byte tail; shared bounded runtime extra gives 88,080,384 bytes total
 by default. C1/C16 decode on that bank records no steady-state captures or
 evictions. Untraced rank/concurrency shapes keep an unpinned bootstrap with no
-borrowed measured base. Two-RTX split serving and narrow heads remain pending
+borrowed measured base. Split sections remain eager (no graph-prewarm claim).
+Narrow heads remain planning-only pending
 [#1856](https://github.com/tpurtell/cuteafd/issues/1856); planning still reports their owners.
 
 `./run.sh` options:

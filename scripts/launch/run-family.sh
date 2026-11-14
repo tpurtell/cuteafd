@@ -1341,10 +1341,6 @@ if [[ "$family" == mistral_large4 ]]; then
     *) release_die "Mistral Large 4 attention placement is auto, layers, heads or context" ;;
   esac
 fi
-if [[ "$family" == minimax_m3 ]]; then
-  [[ "$(get RTX_GPUS 1)" != 2 && "$(get COORDINATOR_GPUS)" != *,* ]] ||
-    release_die "MiniMax currently qualifies one coordinator GPU only (#1856)"
-fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
   cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
 fi
@@ -2050,7 +2046,7 @@ fi
 split_hint=""
 split_opt_in=""
 case "$family:$model_type" in
-  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*) ;;
+  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*|minimax_m3:*) ;;
   qwen4:*)
     if [[ "$ranks" == 0 || "$explicit_split" == 1 ]]; then
       : # The planner checks expert ownership; inventory may contain only media.

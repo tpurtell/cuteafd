@@ -245,7 +245,7 @@ fn only_optional_bundled_components_keep_missing_execution_hints() {
 }
 
 #[test]
-fn qualified_whole_rank_admission_opens_public_but_not_split_serving() {
+fn qualified_whole_and_fp32_split_keep_narrow_heads_gated() {
     use crate::placement::OnboardSetting;
     let (dir, inputs) = heads_recipe_fixture_with_experts(128);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
@@ -253,6 +253,7 @@ fn qualified_whole_rank_admission_opens_public_but_not_split_serving() {
         &checkpoint, &inputs.cfg, 1, &vec![0; inputs.cfg.layers]).unwrap();
     let mut programs = inputs.manifest["programs"].as_array().unwrap().clone();
     programs.extend(dense_manifest(&whole[0])["programs"].as_array().unwrap().clone());
+    programs.extend(recipe_inputs(2, 4).manifest["programs"].as_array().unwrap().clone());
     let programs = programs.into_iter().map(|program| (program["name"].as_str().unwrap().to_owned(), program))
         .collect::<std::collections::BTreeMap<_, _>>().into_values().collect::<Vec<_>>();
     let manifest = dir.path().join("PROGRAMS.json");
@@ -275,6 +276,11 @@ fn qualified_whole_rank_admission_opens_public_but_not_split_serving() {
         matches!(component.status, crate::plan::Status::Ready | crate::plan::Status::Unused | crate::plan::Status::Disabled)));
     let mut pair = options;
     pair.layout.as_mut().unwrap().rtx_bytes.push(96 << 30);
+    let supported = plan::plan(dir.path(), &pair).unwrap();
+    assert!(supported.native_serving_admitted && supported.wip_launchable(), "{:?}", supported.hints);
+    assert!(supported.executable());
+    assert_eq!(supported.runtime, Some(RuntimeStatus::Serving));
+    pair.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
     let unsupported = plan::plan(dir.path(), &pair).unwrap();
     assert!(!unsupported.native_serving_admitted && !unsupported.wip_launchable()
         && !unsupported.executable());
@@ -1858,9 +1864,13 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
             }), ..Default::default() };
         let report = plan::plan(dir.path(), &options).unwrap();
         assert!(report.config_error.is_none(), "{:?}", report.config_error);
-        assert!(!report.placement_supported, "planning is not serving qualification");
-        assert!(!report.executable());
-        assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+        let qualified = attention.is_none();
+        assert_eq!(report.native_serving_admitted, qualified);
+        assert_eq!(report.wip_launchable(), qualified);
+        assert_eq!(report.placement_supported, qualified,
+            "only qualified FP32 split has a serving attachment");
+        assert_eq!(report.executable(), qualified);
+        assert_eq!(report.runtime, Some(if qualified { RuntimeStatus::Serving } else { RuntimeStatus::Planned }));
         assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
         let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("qualified default wire produces a shared solved plan: {report:#?}"));
         assert_eq!(placed.attention_placement, report.attention_placement);
