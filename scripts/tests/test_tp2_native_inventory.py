@@ -600,13 +600,17 @@ def test_spark_wait_guard_callers_have_an_earlier_preweight_window():
         ("families/deepseek_v41/v41_native_serve/distributed.rs", "transport.get_mut().bootstrap("),
         ("families/glm5/mod.rs", "SparkLink::prepared("),
         ("families/glm5_flash/mod.rs", "crate::shared::spark_intake::SparkLink::new_waves("),
-        ("families/qwen4/mod.rs", "crate::shared::spark_intake::SparkLink::new_waves("),
+        ("families/qwen4/mod.rs", "self.load_hybrid("),
+        ("families/qwen4/dual.rs", "self.load_hybrid("),
         ("families/step5/serve.rs", "SparkLink::new_waves("),
         ("families/muse_spark/serve.rs", "super::engine::MuseEngine::connect("),
         ("families/kimi_k3/startup.rs", "Engine::load_admitted("),
     ]:
         source = (daemon / path).read_text()
         assert source.index("InventoryPhase::PreWeight") < source.index(end), path
+    hybrid = (daemon / "families/qwen4/hybrid.rs").read_text()
+    assert hybrid.index("SparkAdmission::plan_view(") < hybrid.index("self.spark_link(args, &peers)")
+    assert "SparkLink::new_waves(" in hybrid
     mimo = (daemon / "families/mimo_v2/mod.rs").read_text().split(
         "// Load only selected modules, then measure the admission baseline before tensors.", 1)[1]
     assert mimo.index("preload_native_modules(") < mimo.index("crate::shared::spark_intake::SparkLink::new(")

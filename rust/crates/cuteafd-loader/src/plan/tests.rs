@@ -884,7 +884,7 @@ fn boot_concurrency_full_plan_matrix() {
                             let mut options = case.base_options.clone()
                                 .unwrap_or_else(|| wave_plan_options(case.dir.path(), ranks));
                             options.placement = ExpertPlacement::from_spark_ranks(ranks);
-                            if family == "qwen4" && gpus == 2 && ranks == 0 {
+                            if family == "qwen4" && gpus == 2 {
                                 options.attention_placement = Some(AttentionPlacement::Layers);
                             }
                             if family == "step5" {
@@ -5104,10 +5104,12 @@ fn layout_charges_local_routed_experts_to_the_coordinator() {
     assert!(routed > 0);
     let memory = report.memory_layout.unwrap();
     let expert_weights: u64 = memory.devices[0].items.iter()
-        .filter(|item| item.category == Category::Experts && item.group == "routed expert arenas")
+        .filter(|item| item.category == Category::Experts && item.group == "weight arena")
         .map(|item| item.bytes).sum();
     assert!(expert_weights >= routed);
-    assert_eq!(expert_weights % (2 * 1024 * 1024), 0);
+    let tails: u64 = memory.devices[0].items.iter().filter(|item| item.category == Category::Experts
+        && item.group == "allocation granularity").map(|item| item.bytes).sum();
+    assert_eq!((expert_weights + tails) % (2 * 1024 * 1024), 0);
     // Tier-specific rotations, maps and arena padding add a small overhead;
     // charge them without duplicating the trellis payload itself.
     assert!(expert_weights - routed < routed / 50);
@@ -6118,11 +6120,12 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             }), ..sparks(4) };
             let auto = plan(dir.path(), &options).unwrap();
             let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
-            // No context programs here; Qwen with Spark experts also keeps its single-owner default.
-            let peer = gpus == 2 && auto.family.as_deref() != Some("qwen4");
+            // No context programs here; Qwen whole-layer ownership now also
+            // applies when a selected coordinator pair has Spark expert fallback.
+            let peer = gpus == 2;
             // Standard GLM variants can own whole layers without Context programs;
             // V4 has no qualified Layers executor and keeps its fail-closed default.
-            let default = if matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) && peer {
+            let default = if matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash" | "qwen4")) && peer {
                 AttentionPlacement::Layers
             } else if !peer {
                 AttentionPlacement::Heads
@@ -6130,12 +6133,8 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             assert_eq!(auto.attention_placement, default);
             if auto.family.as_deref() == Some("qwen4") {
                 assert_eq!(auto.spark_ranks, 4);
-                assert_eq!(auto.attention_placement, AttentionPlacement::Heads);
-                if gpus == 2 {
-                    let layout = auto.memory_layout.as_ref().unwrap();
-                    assert!(layout.devices[1].items.is_empty(), "{}", layout.render());
-                    assert_eq!(layout.devices[1].kv_tokens, 0);
-                }
+                assert_eq!(auto.attention_placement, if gpus == 2 { AttentionPlacement::Layers }
+                    else { AttentionPlacement::Heads });
             }
             if auto.family.as_deref() == Some("glm5") {
                 assert!(auto.memory_layout.is_some(), "{}", render(&auto));
