@@ -396,8 +396,13 @@ impl<'a> UnitOwner<'a> {
     }
     /// Router and FFN share the exact same normalized BF16 activation.
     pub fn router(&self, kernels: &Kernels<'_>, weights: &TargetWeights<'_>, layer: usize, rows: usize) -> Result<()> {
+        self.router_boundary()?;
+        self.router_enqueue(kernels, weights, layer, rows)
+    }
+    pub fn router_boundary(&self) -> Result<()> { self.routed_boundary.idle() }
+    /// CUDA-only body; graph callers perform router_boundary on every replay.
+    pub fn router_enqueue(&self, kernels: &Kernels<'_>, weights: &TargetWeights<'_>, layer: usize, rows: usize) -> Result<()> {
         ensure!(kernels.router.is_some(), "MiniMax rank has no router role");
-        self.routed_boundary.idle()?;
         self.normalize(kernels, weights, layer, "post_attention_layernorm.weight", rows)?;
         let device = self.stream.device;
         let weight = Self::weight(weights, layer, "block_sparse_moe.gate.weight")?;
@@ -431,8 +436,18 @@ impl<'a> UnitOwner<'a> {
     fn ffn_projection(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
         admitted: &CoordinatorWeights, layer: usize, rows: usize, shared: bool) -> Result<()> {
         self.check(kernels, rows)?;
-        if shared { self.routed_boundary.before_ffn(self.stream.raw)?; }
-        else { self.routed_boundary.idle()?; }
+        self.ffn_boundary(shared)?;
+        self.ffn_enqueue(kernels, weights, admitted, layer, rows, shared)
+    }
+    pub fn ffn_boundary(&self, shared: bool) -> Result<()> {
+        if shared { self.routed_boundary.before_ffn(self.stream.raw) }
+        else { self.routed_boundary.idle() }
+    }
+    /// CUDA-only body shared by eager and captured whole/partial FFN paths.
+    /// The caller executes ffn_boundary before every invocation or replay.
+    pub fn ffn_enqueue(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+        admitted: &CoordinatorWeights, layer: usize, rows: usize, shared: bool) -> Result<()> {
+        self.check(kernels, rows)?;
         if !shared || (self.split.is_some() && admitted.rank != 0) {
             self.normalize(kernels, weights, layer, "post_attention_layernorm.weight", rows)?;
         }
@@ -514,7 +529,16 @@ impl<'a> UnitOwner<'a> {
     /// the shared expert, then rounds that sum before the FP32 residual update.
     pub fn join_routed(&self, kernels: &Kernels<'_>, rows: usize) -> Result<()> {
         self.check(kernels, rows)?;
-        self.routed_boundary.before_join(self.stream.raw)?;
+        self.join_boundary()?;
+        self.join_routed_enqueue(kernels, rows)?;
+        self.joined();
+        Ok(())
+    }
+    pub fn join_boundary(&self) -> Result<()> { self.routed_boundary.before_join(self.stream.raw) }
+    pub fn joined(&self) { self.routed_boundary.joined(); }
+    /// CUDA-only routed addition; the host boundary remains outside captures.
+    pub fn join_routed_enqueue(&self, kernels: &Kernels<'_>, rows: usize) -> Result<()> {
+        self.check(kernels, rows)?;
         self.stream.device.run(|| {
             // SAFETY: all planes are distinct retained owners on this stream.
             // The split meeting is free after fold narrowing; narrowing the
@@ -530,9 +554,7 @@ impl<'a> UnitOwner<'a> {
                     self.plane("combined")?, rows * 6144, self.stream.raw) }
             }
         })?;
-        self.accumulate_from(if self.split.is_some() { "ffn" } else { "combined" }, rows)?;
-        self.routed_boundary.joined();
-        Ok(())
+        self.accumulate_from(if self.split.is_some() { "ffn" } else { "combined" }, rows)
     }
     fn accumulate(&self, rows: usize) -> Result<()> { self.accumulate_from("ffn", rows) }
     fn accumulate_from(&self, source: &str, rows: usize) -> Result<()> {
