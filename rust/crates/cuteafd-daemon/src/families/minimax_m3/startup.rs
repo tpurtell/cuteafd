@@ -256,7 +256,9 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         dispatchers.push(Dispatcher::spark(link)?);
     }
     let execution = ServingPrefill::new(cfg, dispatchers, bindings, 1)?;
+    let prewarm = crate::shared::memory::load_timing::Split::start();
     owners.prewarm(cfg)?;
+    prewarm.log("MiniMax graph prewarm");
     let quota = inputs.host_prefix.quota_bytes;
     let host_prefix = (quota > 0).then(|| options.prefix.host_config_for(owners.storage.prefix.layout(),
         admitted.solved.served_context() as usize, quota)).transpose()?;
