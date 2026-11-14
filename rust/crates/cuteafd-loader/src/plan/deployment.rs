@@ -78,6 +78,8 @@ pub struct DeploymentSpec<'a> {
     pub prefill_unit_rows: u64,
     pub prefill_waves: u64,
     pub decode_lanes: u8,
+    /// Graphs with kernel nodes on more than one coordinator GPU (see `PlanReport`).
+    pub cross_device_graph_kernels: bool,
     pub prefill_span_rows: u64,
     /// The reserve the depth cuts (the standard 8192, or the planner's fit
     /// cap below it); launches pass it back.
@@ -183,6 +185,7 @@ impl<'a> DeploymentSpec<'a> {
             prefill_unit_rows: report.prefill_unit_rows.unwrap_or(0),
             prefill_waves: report.prefill_waves.unwrap_or(0),
             decode_lanes: report.decode_lanes,
+            cross_device_graph_kernels: report.cross_device_graph_kernels,
             prefill_span_rows: report.prefill_span_rows.unwrap_or(0),
             prefill_reserve_rows: report.prefill_reserve_rows
                 .unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS), topology, roles, peers,
@@ -207,7 +210,9 @@ mod tests {
     use super::*;
     use crate::plan::{layout::LayoutOptions, plan_spark_count, testing, ExpertPlacement, PlanOptions};
 
-    fn fixture(gpus: usize, ranks: usize) -> (tempfile::TempDir, PlanReport) {
+    fn fixture(gpus: usize, ranks: usize) -> (tempfile::TempDir, PlanReport) { fixture_with(gpus, ranks, false) }
+
+    fn fixture_with(gpus: usize, ranks: usize, tp2_dspark_experts: bool) -> (tempfile::TempDir, PlanReport) {
         let dir = tempfile::tempdir().unwrap();
         testing::write_v41_snapshot(dir.path());
         let manifest = testing::write_v41_workspaces(dir.path());
@@ -215,11 +220,26 @@ mod tests {
             placement: ExpertPlacement::from_spark_ranks(ranks),
             vision: crate::plan::MediaMode::Off, audio: crate::plan::MediaMode::Off,
             layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
-                workspace_manifest: Some(manifest), pool_tokens: Some(0),
+                workspace_manifest: Some(manifest), pool_tokens: Some(0), tp2_dspark_experts,
                 prefill_rows: 256, context_tokens: 262_144, ..Default::default() }),
             ..Default::default()
         }, ranks, Some(ranks)).unwrap();
         (dir, report)
+    }
+
+    /// #2094: nsys node-level graph tracing faults on a graph whose kernels run
+    /// on a second GPU. The launcher keys on this declared fact, not a family name.
+    #[test]
+    fn deployment_declares_graphs_with_kernels_on_both_coordinator_gpus() {
+        for (gpus, tp2, expected) in [(1, false, false), (2, false, false), (2, true, true)] {
+            let (_dir, report) = fixture_with(gpus, 4, tp2);
+            assert_eq!(report.cross_device_graph_kernels, expected, "gpus={gpus} tp2={tp2}: {}", crate::plan::render(&report));
+            let options = DeploymentOptions { rtx_gpus: gpus, speculator: "dspark".into(),
+                peers: (0..4).map(|rank| format!("worker-{rank}:9200")).collect(),
+                admission: AdmissionArgs { pool_tokens: Some(0), ..Default::default() }, ..Default::default() };
+            let spec = DeploymentSpec::from_report(&report, &options).unwrap();
+            assert_eq!(serde_json::to_value(&spec).unwrap()["cross_device_graph_kernels"], expected);
+        }
     }
 
     #[test]
