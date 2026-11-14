@@ -27,11 +27,11 @@ INTENDED = {
     "coordinator": {
 
         # shared_coordinator_env_args (SPARK_INTAKE, CONSOLE_TEXT, ATTENTION_PLACEMENT,
-        # FP8_EXPERT_PREFILL): the binary's own defaults, now explicit.
+        # FP8_PREFILL): the binary's own defaults, now explicit.
         "CUTEAFD_SPARK_INTAKE": "auto",
         "CUTEAFD_CONSOLE_TEXT": "true",
         "CUTEAFD_ATTENTION_PLACEMENT": "auto",
-        "CUTEAFD_FP8_EXPERT_PREFILL": "auto",
+        "CUTEAFD_FP8_PREFILL": "auto",
         # Admission follows the launcher's bounded readiness deadline.
         "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS": "30",
         # shared_trace_args: the shared draft policy switches, default off.
@@ -44,7 +44,7 @@ INTENDED = {
     "worker": {
 
         # shared_worker_env_args: FP8 prefill form and the worker's sampler.
-        "CUTEAFD_FP8_EXPERT_PREFILL": "auto",
+        "CUTEAFD_FP8_PREFILL": "auto",
         "CUTEAFD_THERMAL": "on",
     },
 }
@@ -159,6 +159,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
     expected_plans = []
     for old in golden["plans"]:
         expected = [value for value in old if value not in ("--json", "--layout")]
+        index = expected.index("--vision")
+        expected[index:index] = ["--fp8-prefill", "auto"]
         # These captures pin no device override: auto stays with the planner.
         budget_index = expected.index("--spark-budget-gib")
         del expected[budget_index:budget_index + 2]

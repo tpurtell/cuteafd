@@ -352,6 +352,9 @@ pub(crate) fn core_view_settings(view: &cuteafd_loader::plan::checkpoint::Checkp
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    /// Activation precision over already-resident FP8 projections: auto, off or group list.
+    #[arg(long, env = "CUTEAFD_FP8_PREFILL", default_value = "auto")]
+    pub fp8_prefill: cuteafd_loader::plan::fp8_prefill::Policy,
     #[command(flatten)]
     pub attention: CoreViewArgs,
     /// Published EXLR8 manifest name (defaults to bit325).

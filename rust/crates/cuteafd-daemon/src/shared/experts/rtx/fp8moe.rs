@@ -85,12 +85,19 @@ impl<'a> Fp8MoeTp2<'a> {
 
     pub(crate) fn load(device: Device<'a>, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize) -> Result<Self> {
-        Self::bind_rank(device, tensors, directory, layers, rank, max_rows, budget, None)
+        Self::bind_rank(device, tensors, directory, layers, rank, max_rows, budget, None, None)
     }
 
     /// Committed rank payloads use the same package, workspace and output admission as mount loading.
     pub(crate) fn pushed_pair(devices: [Device<'a>; 2], tensors: &Fp8ExpertTensors, directory: &Path,
         layers: Vec<usize>, max_rows: usize, budgets: [usize; 2], pushed: [Vec<Fp8Layer<'a>>; 2]) -> Result<[Self; 2]> {
+        Self::pushed_pair_policy(devices,tensors,directory,layers,max_rows,budgets,pushed,None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pushed_pair_policy(devices:[Device<'a>;2],tensors:&Fp8ExpertTensors,directory:&Path,
+        layers:Vec<usize>,max_rows:usize,budgets:[usize;2],pushed:[Vec<Fp8Layer<'a>>;2],
+        policy:Option<&cuteafd_loader::plan::fp8_prefill::Policy>) -> Result<[Self;2]> {
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid pushed FP8 MoE TP2 device pair");
         validate_layers(&layers, tensors.shape(), 0)?;
@@ -101,13 +108,13 @@ impl<'a> Fp8MoeTp2<'a> {
             ensure!(required <= budgets[rank], "pushed FP8 TP2 rank {rank} exceeds admitted budget");
         }
         let [left, right] = pushed;
-        Ok([Self::bind_rank(devices[0], tensors, directory, layers.clone(), 0, max_rows, budgets[0], Some(left))?,
-            Self::bind_rank(devices[1], tensors, directory, layers, 1, max_rows, budgets[1], Some(right))?])
+        Ok([Self::bind_rank(devices[0], tensors, directory, layers.clone(), 0, max_rows, budgets[0], Some(left), policy)?,
+            Self::bind_rank(devices[1], tensors, directory, layers, 1, max_rows, budgets[1], Some(right), policy)?])
     }
 
     #[allow(clippy::too_many_arguments)]
     fn bind_rank(device: Device<'a>, tensors: &Fp8ExpertTensors, directory: &Path,
-        layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize, pushed: Option<Vec<Fp8Layer<'a>>>) -> Result<Self> {
+        layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize, pushed: Option<Vec<Fp8Layer<'a>>>, policy:Option<&cuteafd_loader::plan::fp8_prefill::Policy>) -> Result<Self> {
         validate_layers(&layers, tensors.shape(), rank)?;
         let coordinator = tensors.for_coordinator().for_layer_metadata(layers[0])?;
         let tensors = &coordinator;
@@ -124,11 +131,12 @@ impl<'a> Fp8MoeTp2<'a> {
         }
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
         let completion = RankCompletion::new(Event::new(device)?);
+        let modules = policy.map(|policy| device.run(|| crate::shared::experts::fp8::Fp8Modules::load(&plan.directory,None,policy))).transpose()?;
         let experts = device.own(|| match pushed {
-            Some(pushed) => Fp8Weights::from_pushed(device.library, tensors, &plan.directory, &layers,
-                2, rank, max_rows, budget - plan.output_bytes, pushed),
-            None => Fp8Weights::load(device.library, tensors, &plan.directory, &layers,
-                2, rank, max_rows, budget - plan.output_bytes),
+            Some(pushed) => Fp8Weights::from_pushed_with_modules(device.library, tensors, &plan.directory, &layers,
+                2, rank, max_rows, budget - plan.output_bytes, pushed,modules),
+            None => Fp8Weights::load_with_modules(device.library, tensors, &plan.directory,None, &layers,
+                2, rank, max_rows, budget - plan.output_bytes,modules),
         })?;
         validate_installed(&layers, experts.layers.iter().map(|layer| layer.layer))?;
         ensure!(experts.resident_bytes() == resident && experts.slot_scratch_bytes(max_rows)? == plan.scratch_bytes,
@@ -146,6 +154,12 @@ impl<'a> Fp8MoeTp2<'a> {
     /// banks read each source projection once for both rank windows.
     pub(crate) fn load_pair(devices: [Device<'a>; 2], tensors: &Fp8ExpertTensors, directory: &Path,
         layers: Vec<usize>, max_rows: usize, budgets: [usize; 2]) -> Result<[Self; 2]> {
+        Self::load_pair_policy(devices,tensors,directory,layers,max_rows,budgets,None)
+    }
+
+    pub(crate) fn load_pair_policy(devices:[Device<'a>;2],tensors:&Fp8ExpertTensors,directory:&Path,
+        layers:Vec<usize>,max_rows:usize,budgets:[usize;2],
+        policy:Option<&cuteafd_loader::plan::fp8_prefill::Policy>) -> Result<[Self;2]> {
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid FP8 MoE TP2 device pair");
         validate_layers(&layers, tensors.shape(), 0)?;
@@ -162,16 +176,19 @@ impl<'a> Fp8MoeTp2<'a> {
         }
         if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
             let ranks = [
-                Self::load(devices[0], tensors, directory, layers.clone(), 0, max_rows, budgets[0])?,
-                Self::load(devices[1], tensors, directory, layers, 1, max_rows, budgets[1])?,
+                Self::bind_rank(devices[0], tensors, directory, layers.clone(), 0, max_rows, budgets[0],None,policy)?,
+                Self::bind_rank(devices[1], tensors, directory, layers, 1, max_rows, budgets[1],None,policy)?,
             ];
             Self::log_pair_load(&ranks, started.elapsed().as_secs_f64());
             return Ok(ranks);
         }
         let completions = [RankCompletion::new(Event::new(devices[0])?), RankCompletion::new(Event::new(devices[1])?)];
-        let experts = Fp8Weights::load_pair(devices, tensors, [&plans[0].directory, &plans[1].directory],
+        let modules = (0..2).map(|rank| policy.map(|policy| devices[rank].run(||
+            crate::shared::experts::fp8::Fp8Modules::load(&plans[rank].directory,None,policy))).transpose())
+            .collect::<Result<Vec<_>>>()?.try_into().map_err(|_|anyhow::anyhow!("two code owners"))?;
+        let experts = Fp8Weights::load_pair_with_modules(devices, tensors, [&plans[0].directory, &plans[1].directory],
             plans.each_ref().map(|p| p.slicing), &layers, max_rows,
-            [budgets[0] - plans[0].output_bytes, budgets[1] - plans[1].output_bytes])?;
+            [budgets[0] - plans[0].output_bytes, budgets[1] - plans[1].output_bytes], modules)?;
         let make = |rank: usize, completion, experts: DeviceOwner<'a, Fp8Weights<'a>>| -> Result<Self> {
             validate_installed(&layers, experts.layers.iter().map(|layer| layer.layer))?;
             ensure!(experts.resident_bytes() == plans[rank].resident_layer_bytes * layers.len()

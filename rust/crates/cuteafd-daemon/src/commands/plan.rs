@@ -24,6 +24,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
     }
     let mut options = PlanOptions {
+        fp8_prefill: args.fp8_prefill.clone(),
         decode_lanes: args.decode_lanes,
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
         mapped_scale_host_budget_bytes: None,
@@ -1326,6 +1327,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            fp8_prefill: Default::default(),
             attention: Default::default(),
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             expert_partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,

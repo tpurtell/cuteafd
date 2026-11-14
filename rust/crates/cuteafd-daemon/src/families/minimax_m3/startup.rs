@@ -150,7 +150,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
             capacity.execution_rows(), u32::try_from(context)?)?);
         if gpus == 2 { library.peer_exchange_initialize()?; library.peer_abort_initialize()?; }
         if may_onboard && matches!(local, LocalPackage::Installed { .. }) {
-            expert_modules.push(fp8::Fp8Modules::load(&package, None)?);
+            expert_modules.push(fp8::Fp8Modules::load(&package, None, &cuteafd_loader::plan::fp8_prefill::Policy::from_env().map_err(anyhow::Error::msg)?)?);
         }
         if !options.peers.is_empty() {
             library.v41_compact_reducer()?.require_plane_reduction(options.peers.len() as u32)?;

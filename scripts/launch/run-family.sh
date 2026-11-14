@@ -114,6 +114,21 @@ done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "${SPARK_COUNT:-}" ]] || { cfg[SPARK_COUNT]="$SPARK_COUNT"; cfg_file[SPARK_COUNT]=1; }
 [[ -z "${SPARK_HOSTS:-}" ]] || { cfg[SPARK_HOSTS]="$SPARK_HOSTS"; cfg_file[SPARK_HOSTS]=1; }
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+# Validate precision syntax before planner containers, SSH, or namespace work.
+fp8_prefill="$(get FP8_PREFILL auto)"
+case "$fp8_prefill" in
+  auto|off) ;;
+  *)
+    declare -A fp8_groups_seen=()
+    IFS=',' read -r -a fp8_groups <<<"$fp8_prefill"
+    [[ -n "$fp8_prefill" && "$fp8_prefill" != *, ]] || release_die "FP8_PREFILL must be auto, off or a projection group list"
+    for group in "${fp8_groups[@]}"; do
+      case "$group" in mla|index|attention|ffn|kda-in|kda-o|experts) ;; *) release_die "FP8_PREFILL invalid group: $group" ;; esac
+      [[ -z "${fp8_groups_seen[$group]:-}" ]] || release_die "FP8_PREFILL repeats group: $group"
+      fp8_groups_seen[$group]=1
+    done ;;
+esac
+export CUTEAFD_FP8_PREFILL="$fp8_prefill"
 # Refused before anything starts: a release never serves pages from a checkout.
 case "$(get CONSOLE_ASSETS off)" in
   on) [[ -n "$wip_slot" ]] || release_die "CONSOLE_ASSETS=on serves pages from a checkout and needs --wip SLOT; release images serve their compiled-in pages" ;;
@@ -251,10 +266,8 @@ powerd_dir="${CUTEAFD_GPU_POWERD_DIR:-/run/gpu-powerd}"
 # or host; see rust/crates/cuteafd-daemon/src/shared/spark_intake.rs).
 # CONSOLE_TEXT=on (default) lets the live console at / stream generated token text to
 # viewers holding the console unlock cookie; CONSOLE_TEXT=off disables it for everyone.
-# FP8_EXPERT_PREFILL: how FP8 expert packages run prefill row counts: auto
-# (default: wire rows W8A8 with E4M3 x E4M3 gate/up, BF16 rows W8A16), w8a16
-# (the former programs) or w8a8 (also quantizes the BF16 rows of experts on the
-# coordinator GPU). Spark workers and the coordinator both read it.
+# FP8_PREFILL selects activation precision over resident FP8 weights. auto
+# retains format-aware expert defaults; off and explicit groups affect FP8 only.
 # ATTENTION_PLACEMENT (validated per family before this) reaches the server too.
 # HOST_WAIT (block, default; or spin) is how serving's host threads wait:
 # block spins 10 ms in each critical-path wait, then sleeps (the Spark exchange
@@ -273,15 +286,13 @@ for phase in prefill decode; do
   key="spark_${phase}_reply_format"
   case "${!key}" in ""|bf16|fp8|nvfp4) ;; *) release_die "SPARK_${phase^^}_REPLY_FORMAT must be bf16, fp8 or nvfp4" ;; esac
 done
-fp8_prefill="$(get FP8_EXPERT_PREFILL auto)"
-case "$fp8_prefill" in auto|w8a8|w8a16) ;; *) echo "FP8_EXPERT_PREFILL must be auto, w8a8 or w8a16" >&2; exit 2 ;; esac
 attention_plan_rows="$(get ATTENTION_PLAN_ROWS auto)"
 if [[ $attention_plan_rows != auto && ! $attention_plan_rows =~ ^[1-9][0-9]*$ ]]; then
   release_die "ATTENTION_PLAN_ROWS must be auto or a positive integer"
 fi
 shared_env_args=(-e "HF_HOME=$container_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intake"
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
-  -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
+  -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_PREFILL=$fp8_prefill"
   -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
 if [[ -n $spark_prefill_reply_format ]]; then
   shared_env_args+=(-e "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT=$spark_prefill_reply_format")
@@ -309,7 +320,7 @@ if [[ -n $idle_park ]]; then
   wait_env_args+=(-e "CUTEAFD_IDLE_PARK_SECONDS=$idle_park")
 fi
 shared_env_args+=("${wait_env_args[@]}")
-shared_worker_env_args=(-e "HF_HOME=$container_hf_home" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)"
+shared_worker_env_args=(-e "HF_HOME=$container_hf_home" -e "CUTEAFD_FP8_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)"
   "${wait_env_args[@]}")
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_worker_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
@@ -794,7 +805,7 @@ readiness_args=(--require-ready)
 # Plan and serve admit resident weights against the same resolved budget.
 v41_weight_budget_gib="$(release_gib "$profile_cap")"
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
-  "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --vision "$VISION" --audio off \
+  "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --fp8-prefill "$(get FP8_PREFILL auto)" --vision "$VISION" --audio off \
   --deployment "${readiness_args[@]}" "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
   "${plan_memory_args[@]}" --gpu-memory-cap "$profile_cap" --coordinator-weight-budget-gib "$v41_weight_budget_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --max-context-tokens "$MAX_CONTEXT_TOKENS" \
@@ -2103,10 +2114,7 @@ fi
 # family with a paged KV pool reads). FP8 weights (a vendor FP8 checkpoint or
 # CORE_VIEW=fp8-compact) are an explicit choice of FP8 numerics, so prefill over
 # them runs W8A8 (E4M3 activations per 128-K block) by default:
-# GLM5_FLASH_ATTENTION_FP8_PREFILL lists the attention groups (default mla;
-# kda-in/kda-o opt-in and need FP8 KDA weights: GLM5_FLASH_KDA_FP8 row128/channel
-# or CORE_VIEW=fp8-compact; all; off for W8A16), GLM5_FLASH_FFN_FP8_PREFILL
-# (default on, off for W8A16) the dense and shared-expert MLPs.
+# FP8_PREFILL auto preserves W8A8 MLA+FFN; KDA groups stay explicit-only.
 if [[ $family == glm5_flash ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   [[ -z "$local_layers" ]] || family_args+=(--rtx-expert-layers "$local_layers")
@@ -2193,31 +2201,10 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--target-head tensor) ;;
     *) echo "GLM5_FLASH_TARGET_HEAD must be auto, exact or tensor" >&2; exit 2 ;;
   esac
-  attention_fp8_prefill="$(get GLM5_FLASH_ATTENTION_FP8_PREFILL mla)"
-  if [[ " ${family_args[*]} " == *" --kda-output-shard "* ]]; then
-    case ",$attention_fp8_prefill," in
-      *,all,*|*,kda-o,*)
-        echo "GLM5_FLASH_ATTENTION_FP8_PREFILL=$attention_fp8_prefill (KDA output W8A8) does not combine with the split's token-row KDA output; set GLM5_FLASH_KDA_SPLIT=partials or drop kda-o" >&2
-        exit 2 ;;
-    esac
+  attention_prefill="$(get FP8_PREFILL auto)"
+  if [[ " ${family_args[*]} " == *" --kda-output-shard "* && ",$attention_prefill," == *,kda-o,* ]]; then
+    release_die "FP8_PREFILL=$attention_prefill (KDA output W8A8) does not combine with the split's token-row KDA output; set GLM5_FLASH_KDA_SPLIT=partials or drop kda-o"
   fi
-  case ",$attention_fp8_prefill," in
-    *,all,*|*,kda-in,*|*,kda-o,*)
-      if [[ $kda_fp8 == off && $core_view != fp8-compact ]]; then
-        echo "GLM5_FLASH_ATTENTION_FP8_PREFILL=$attention_fp8_prefill runs KDA W8A8 over FP8 KDA weights; set GLM5_FLASH_KDA_FP8=row128 or channel" >&2
-        exit 2
-      fi ;;
-  esac
-  case "$attention_fp8_prefill" in
-    mla) ;;
-    off) family_args+=(--attention-fp8-prefill none) ;;
-    *) family_args+=(--attention-fp8-prefill "$attention_fp8_prefill") ;;
-  esac
-  case "$(get GLM5_FLASH_FFN_FP8_PREFILL on)" in
-    on) ;;
-    off) family_args+=(--ffn-fp8-prefill false) ;;
-    *) echo "GLM5_FLASH_FFN_FP8_PREFILL must be on or off" >&2; exit 2 ;;
-  esac
   # GLM5_FLASH_EXL3_WORKER_PATH: how a Spark EXL3 worker uploads a call's inputs and waits for its
   # GPU work. async (the default): pinned staging, one batched asynchronous copy, the hidden rows
   # decoded in place and a polled stream; blocking: the earlier copies and a blocking synchronize.
@@ -2587,7 +2574,7 @@ audio_encoder_hash=""
     plan_profile_env+=("$arg")
   done
   plan_json="$(docker run --rm --network none ${plan_profile_env[@]+"${plan_profile_env[@]}"} "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
-    "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
+    "$coordinator_image" cuteafd plan "$snapshot" --fp8-prefill "$(get FP8_PREFILL auto)" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${core_view_args[@]}" "${plan_memory_args[@]}" \
     --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --coordinator-weight-budget-gib "$coordinator_weight_budget_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$checkpoint_family"

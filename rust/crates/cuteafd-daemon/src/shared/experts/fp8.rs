@@ -158,17 +158,12 @@ pub(super) fn validate_bf16_package(main: &Fp8MoeInfo, bf16: &Fp8MoeInfo, capaci
         .with_context(|| format!("BF16-input FP8 package has no capacity for {capacity} rows"))
 }
 
-/// Environment switch for how FP8 expert packages run prefill row counts:
-/// `auto` (default: FP8 wire rows W8A8, block-scaled E4M3 x E4M3 gate/up; BF16
-/// rows W8A16, exact), `w8a16` (the former programs, weights widened to
-/// `bf16(w * s)`) or `w8a8` (BF16 rows quantized to wire rows too).
-pub(crate) const PREFILL_ENV: &str = "CUTEAFD_FP8_EXPERT_PREFILL";
-
-/// The prefill form `PREFILL_ENV` asks for.
-pub(crate) fn prefill_mode() -> Result<Fp8MoePrefill> {
-    match std::env::var(PREFILL_ENV) {
-        Ok(value) if !value.is_empty() => value.parse().with_context(|| format!("{PREFILL_ENV}={value}")),
-        _ => Ok(Fp8MoePrefill::default()),
+/// Keep package defaults format-aware; non-FP8 weights never inherit FP8 activation policy.
+fn prefill_mode(policy: &cuteafd_loader::plan::fp8_prefill::Policy, weights: Fp8MoeWeights) -> Fp8MoePrefill {
+    match policy.experts(weights == Fp8MoeWeights::Fp8) {
+        None => Fp8MoePrefill::Auto,
+        Some(false) => Fp8MoePrefill::W8a16,
+        Some(true) => Fp8MoePrefill::W8a8,
     }
 }
 
@@ -176,10 +171,10 @@ pub(crate) fn prefill_mode() -> Result<Fp8MoePrefill> {
 ///
 /// # Safety
 /// As `Fp8MoeModule::load`.
-unsafe fn load_module(directory: &Path) -> Result<Fp8MoeModule> {
+unsafe fn load_module(directory: &Path, policy: &cuteafd_loader::plan::fp8_prefill::Policy) -> Result<Fp8MoeModule> {
     let mut module = Fp8MoeModule::load(directory)?;
-    let prefill = prefill_mode()?;
-    module.set_prefill(prefill).with_context(|| format!("{} ({PREFILL_ENV})", directory.display()))?;
+    let prefill = prefill_mode(policy, module.info().weights);
+    module.set_prefill(prefill).with_context(|| format!("{} (FP8_PREFILL)", directory.display()))?;
     if prefill != Fp8MoePrefill::default() {
         tracing::info!(package = %directory.display(), ?prefill, "FP8 expert prefill form");
     }
@@ -435,11 +430,11 @@ impl Fp8Modules {
             self.bf16.is_some(), capacity)?))
     }
 
-    pub(crate) fn load(directory: &Path, bf16_directory: Option<&Path>) -> Result<Self> {
+    pub(crate) fn load(directory: &Path, bf16_directory: Option<&Path>, policy: &cuteafd_loader::plan::fp8_prefill::Policy) -> Result<Self> {
         // SAFETY: selected trusted AOT packages for the current owner device.
-        let module = unsafe { load_module(directory) }?;
+        let module = unsafe { load_module(directory, policy) }?;
         // SAFETY: the sibling has the same trusted-package/current-device contract.
-        let bf16 = bf16_directory.map(|path| unsafe { load_module(path) }).transpose()?;
+        let bf16 = bf16_directory.map(|path| unsafe { load_module(path, policy) }).transpose()?;
         Ok(Self { directory: directory.into(), bf16_directory: bf16_directory.map(Path::to_owned),
             module, bf16 })
     }
@@ -504,8 +499,15 @@ impl<'a> Fp8Weights<'a> {
     pub(crate) fn from_pushed(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors,
         directory: &Path, layers: &[usize], tp: usize, rank: usize, capacity: usize,
         budget: usize, pushed: Vec<Fp8Layer<'a>>) -> Result<Self> {
+        Self::from_pushed_with_modules(library, tensors, directory, layers, tp, rank, capacity, budget, pushed, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_pushed_with_modules(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors,
+        directory: &Path, layers: &[usize], tp: usize, rank: usize, capacity: usize,
+        budget: usize, pushed: Vec<Fp8Layer<'a>>, modules: Option<Fp8Modules>) -> Result<Self> {
         let mut weights = Self::prepare_with_modules(library, tensors, directory, None, layers,
-            tp, rank, capacity, budget, None)?;
+            tp, rank, capacity, budget, modules)?;
         let slicing = tensors.slicing_for_directory(directory, tp);
         ensure!(pushed.len() == layers.len(), "pushed FP8-family inventory length differs from admission");
         for (weight, &layer) in pushed.iter().zip(layers) {
@@ -566,7 +568,7 @@ impl<'a> Fp8Weights<'a> {
         }
         let modules = match modules {
             Some(modules) => modules,
-            None => Fp8Modules::load(directory, bf16_directory)?,
+            None => Fp8Modules::load(directory, bf16_directory, &cuteafd_loader::plan::fp8_prefill::Policy::from_env().map_err(anyhow::Error::msg)?)?,
         };
         ensure!(modules.directory == directory && modules.bf16_directory.as_deref() == bf16_directory,
             "FP8 warmed package path mismatch");
@@ -599,6 +601,13 @@ impl<'a> Fp8Weights<'a> {
     pub fn load_pair(devices: [crate::shared::memory::device::Device<'a>; 2], tensors: &Fp8ExpertTensors,
         directories: [&Path; 2], slicing: [Slicing; 2], layers: &[usize], capacity: usize,
         budgets: [usize; 2]) -> Result<[crate::shared::memory::device::DeviceOwner<'a, Self>; 2]> {
+        Self::load_pair_with_modules(devices, tensors, directories, slicing, layers, capacity, budgets, [None,None])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_pair_with_modules(devices: [crate::shared::memory::device::Device<'a>; 2], tensors: &Fp8ExpertTensors,
+        directories: [&Path;2], slicing: [Slicing;2], layers: &[usize], capacity: usize,
+        budgets: [usize;2], modules: [Option<Fp8Modules>;2]) -> Result<[crate::shared::memory::device::DeviceOwner<'a,Self>;2]> {
         use super::paired_load::{self, Fences};
         use crate::shared::memory::device::Device;
         use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer};
@@ -606,11 +615,12 @@ impl<'a> Fp8Weights<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         let started = std::time::Instant::now();
         ensure!(slicing[0] == slicing[1], "FP8 paired ranks disagree on slicing");
+        let [left,right] = modules;
         let mut owners = [
-            devices[0].own(|| Self::prepare(devices[0].library, tensors, directories[0], None,
-                layers, 2, 0, capacity, budgets[0]))?,
-            devices[1].own(|| Self::prepare(devices[1].library, tensors, directories[1], None,
-                layers, 2, 1, capacity, budgets[1]))?,
+            devices[0].own(|| Self::prepare_with_modules(devices[0].library, tensors, directories[0], None,
+                layers, 2, 0, capacity, budgets[0], left))?,
+            devices[1].own(|| Self::prepare_with_modules(devices[1].library, tensors, directories[1], None,
+                layers, 2, 1, capacity, budgets[1], right))?,
         ];
         let layouts = (0..2).map(|rank| {
             let layout = super::weight_layout::layout(devices[rank].id, "fp8",
@@ -880,8 +890,16 @@ impl<'a> Fp8Experts<'a> {
     pub(crate) fn from_pushed(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: &[usize], tp: usize, rank: usize, capacity: usize, budget: usize,
         pushed: Vec<Fp8Layer<'a>>) -> Result<Self> {
-        let weights = Fp8Weights::from_pushed(library, tensors, directory, layers, tp, rank,
-            capacity, budget, pushed)?;
+        Self::from_pushed_policy(library,tensors,directory,layers,tp,rank,capacity,budget,pushed,
+            &cuteafd_loader::plan::fp8_prefill::Policy::from_env().map_err(anyhow::Error::msg)?)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_pushed_policy(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
+        layers: &[usize],tp:usize,rank:usize,capacity:usize,budget:usize,pushed:Vec<Fp8Layer<'a>>,
+        policy:&cuteafd_loader::plan::fp8_prefill::Policy) -> Result<Self> {
+        let modules=Fp8Modules::load(directory,None,policy)?;
+        let weights = Fp8Weights::from_pushed_with_modules(library, tensors, directory, layers, tp, rank,
+            capacity, budget, pushed, Some(modules))?;
         let scratch = weights.slot_scratch_bytes(capacity)?;
         ensure!(weights.resident_bytes().checked_add(scratch).is_some_and(|bytes| bytes <= budget),
             "pushed FP8 resident weights plus execution scratch exceed budget");
@@ -890,9 +908,17 @@ impl<'a> Fp8Experts<'a> {
 
     pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: &[usize], tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
+        Self::load_policy(library,tensors,directory,layers,tp,rank,capacity,budget,
+            &cuteafd_loader::plan::fp8_prefill::Policy::from_env().map_err(anyhow::Error::msg)?)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_policy(library: &'a NativeLibrary,tensors:&Fp8ExpertTensors,directory:&Path,
+        layers:&[usize],tp:usize,rank:usize,capacity:usize,budget:usize,
+        policy:&cuteafd_loader::plan::fp8_prefill::Policy) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
-        let mut weights = Fp8Weights::prepare(library, tensors, directory, None, layers,
-            tp, rank, capacity, budget)?;
+        let modules=Fp8Modules::load(directory,None,policy)?;
+        let mut weights = Fp8Weights::prepare_with_modules(library, tensors, directory, None, layers,
+            tp, rank, capacity, budget,Some(modules))?;
         let bytes = weights.slot_scratch_bytes(capacity)?;
         if layers.is_empty() {
             ensure!(bytes <= budget, "empty expert window scratch exceeds budget");
@@ -1511,5 +1537,22 @@ mod tests {
             }
             assert!(validate_bf16_package(&primary, &incompatible, 64).is_err(), "{incompatible:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_prefill_policy_tests {
+    use super::*;
+    use cuteafd_loader::plan::fp8_prefill::Policy;
+    #[test]
+    fn explicit_policy_overrides_only_fp8_weight_packages() {
+        for weights in [Fp8MoeWeights::Mxfp4,Fp8MoeWeights::Nvfp4,Fp8MoeWeights::Bf16] {
+            assert_eq!(prefill_mode(&Policy::Off,weights),Fp8MoePrefill::Auto);
+            assert_eq!(prefill_mode(&"experts".parse().unwrap(),weights),Fp8MoePrefill::Auto);
+        }
+        assert_eq!(prefill_mode(&Policy::Off,Fp8MoeWeights::Fp8),Fp8MoePrefill::W8a16);
+        assert_eq!(prefill_mode(&"experts".parse().unwrap(),Fp8MoeWeights::Fp8),Fp8MoePrefill::W8a8);
+        assert_eq!(prefill_mode(&"mla,ffn".parse().unwrap(),Fp8MoeWeights::Fp8),Fp8MoePrefill::Auto);
+        assert_eq!(prefill_mode(&Policy::Auto,Fp8MoeWeights::Fp8),Fp8MoePrefill::Auto);
     }
 }

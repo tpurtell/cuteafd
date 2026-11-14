@@ -393,10 +393,8 @@ fn absolute(run: &Run) -> bool {
 /// layout and unknown knobs stay fixed. GLM 5.3 Flash's kda-state (its KDA recurrent
 /// state's storage) and target-head (the target LM head's GEMM) change numerics only.
 /// CUTEAFD_SPARK_PREFILL_REPLY_FORMAT selects the Spark expert reply's wire encoding.
-/// `fp8-prefill` is GLM Flash's pre-v5.1 spelling of the two prefill activation switches, kept so
-/// archived reports still pair.
-const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-fp8", "fp8-prefill",
-    "attention-fp8-prefill", "ffn-fp8-prefill",
+/// `fp8-prefill` changes activation precision over already-resident FP8 weights.
+const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-fp8", "fp8-prefill", "CUTEAFD_FP8_PREFILL",
     "fp8-decode", "mtp-fp8-head", "kv-cache", "kv-format", "expert-input", "kda-state", "target-head",
     "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT", "CUTEAFD_SPARK_DECODE_REPLY_FORMAT",
     "spark-prefill-reply-format", "spark-decode-reply-format",
@@ -1067,6 +1065,19 @@ mod tests {
         assert!(compare(&bad).is_err());
         let mut bad = candidate.clone(); bad.set_sha256 = "other".into(); assert!(compare(&bad).is_err());
         let mut bad = candidate.clone(); bad.score.records[0].window = "other".into(); assert!(compare(&bad).is_err());
+    }
+
+    #[test]
+    fn pairing_accepts_shared_fp8_policy_but_keeps_unknown_controls_fixed() {
+        let mut baseline=run(3,8);
+        baseline.settings=serde_json::json!({"model":"checkpoint","settings":[
+            {"name":"CUTEAFD_FP8_PREFILL","value":"auto","source":"env"}]});
+        let mut candidate=baseline.clone();
+        candidate.settings["settings"][0]["value"]=serde_json::json!("off");
+        assert!(compare(&candidate,&baseline,0.005,0.005,100,1).unwrap().pass);
+        candidate.settings["settings"].as_array_mut().unwrap().push(
+            serde_json::json!({"name":"CUTEAFD_UNRELATED","value":"changed","source":"env"}));
+        assert!(compare(&candidate,&baseline,0.005,0.005,100,1).is_err());
     }
 
     #[test]

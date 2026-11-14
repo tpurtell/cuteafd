@@ -188,7 +188,7 @@ pub(crate) struct EngineArgs {
     /// KDA in/out projections: the checkpoint's BF16 (off), or E4M3 quantized
     /// per row x 128-K block (row128) or per row (channel) at load, then the
     /// only resident copy: decode rows up to 16 on the FP8 GEMV, wider verify
-    /// steps and prefill W8A16 (W8A8 with --attention-fp8-prefill kda-in/kda-o).
+    /// steps and prefill W8A16 (W8A8 with --fp8-prefill kda-in/kda-o).
     /// Default off (the checkpoint's BF16, one copy). row128 is faster (1 RTX + 2
     /// Sparks, with the FP8 head and drafter: C4 code 113.8 -> 131.8 tok/s) but costs
     /// 3.4 points top-1 (89.1% -> 85.7%) and doubles verify-vs-decode rounding
@@ -239,18 +239,9 @@ pub(crate) struct EngineArgs {
     /// memory decides first).
     #[arg(long, default_value_t = 64)]
     pub exl3_window: usize,
-    /// Attention prefill projections over FP8 weights (vendor FP8, CORE_VIEW=fp8-compact or a
-    /// --kda-fp8 copy) that run W8A8 block-FP8 GEMMs (E4M3 activations per row and 128-K block,
-    /// FP32 scales): `mla` (q_a|kv_a, q_b, o_proj; the default: FP8 weights are an explicit
-    /// choice of FP8 numerics), `kda-in` / `kda-o` (the KDA in-projection and o_proj; opt-in,
-    /// need FP8 KDA weights), `all`, or `none` (every one W8A16). BF16, K6/K8 and EXLR8 native
-    /// cores are unaffected.
-    #[arg(long, value_enum, value_delimiter = ',', default_value = "mla")]
-    pub attention_fp8_prefill: Vec<Fp8PrefillGroup>,
-    /// Dense and shared-expert MLP prefill projections over FP8 weights: W8A8 (`true`, the
-    /// default) or W8A16 (`false`). Routed experts have their own formats.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub ffn_fp8_prefill: bool,
+    /// Prefill activation precision over resident FP8 weights: auto, off or projection groups.
+    #[arg(long, env = "CUTEAFD_FP8_PREFILL", default_value = "auto")]
+    pub fp8_prefill: cuteafd_loader::plan::fp8_prefill::Policy,
     /// Profiling only: MoE layers run the router, the expert wire rows and the
     /// shared expert; the routed experts contribute nothing.
     #[arg(long, hide = true)]
@@ -631,8 +622,7 @@ mod draft_cli_tests {
         converted.kda_output_shard = true;
         converted.kda_prefill_expanded = true;
         converted.kda_nvfp4_gate = Some("search".into());
-        converted.attention_fp8_prefill = vec![Fp8PrefillGroup::All];
-        converted.ffn_fp8_prefill = true;
+        converted.fp8_prefill = "mla,ffn,kda-in,kda-o".parse().unwrap();
         native::normalize(&mut ordinary);
         native::normalize(&mut converted);
         assert_eq!(native::resolved_settings(&ordinary), native::resolved_settings(&converted));
@@ -641,7 +631,7 @@ mod draft_cli_tests {
             assert_eq!(settings[key], "false");
         }
         assert_eq!(settings["kda-fp8"], "off");
-        assert_eq!((settings["attention-fp8-prefill"].as_str(), settings["ffn-fp8-prefill"].as_str()), ("none", "false"));
+        assert_eq!(settings["fp8-prefill"], "off");
         let demands = |args: &EngineArgs| -> Result<Vec<_>> {
             check_options(args)?;
             let options = GlmfScratchOptions { split: false, kda_w8: args.kda_fp8 != fp8::KdaFp8::Off,
@@ -658,7 +648,7 @@ mod draft_cli_tests {
         };
         assert_eq!(demands(&ordinary)?, demands(&converted)?);
         assert_eq!(step_settings(&ordinary, ordinary.index_cache).kda_fp32_partials, false);
-        assert_eq!((converted.attention_fp8_prefill.as_slice(), converted.ffn_fp8_prefill), (&[Fp8PrefillGroup::None][..], false));
+        assert_eq!(converted.fp8_prefill, cuteafd_loader::plan::fp8_prefill::Policy::Off);
         Ok(())
     }
 
@@ -891,18 +881,14 @@ mod draft_cli_tests {
         assert_eq!(policy(&[], false), (true, true, 0));
         // KDA FP8 conversion itself is never on by default (`auto` resolves to off in the launcher).
         assert_eq!(parse(&[]).kda_fp8, fp8::KdaFp8::Off);
-        // `none` + FFN false: every prefill projection over FP8 weights W8A16.
-        assert_eq!(policy(&["--attention-fp8-prefill", "none", "--ffn-fp8-prefill", "false"], true), (false, false, 0));
-        assert_eq!(policy(&["--attention-fp8-prefill", "none"], true), (false, true, 0));
-        assert_eq!(policy(&["--ffn-fp8-prefill", "false"], true), (true, false, 0));
-        assert_eq!(policy(&["--attention-fp8-prefill", "kda-in", "--ffn-fp8-prefill", "false"], true), (false, false, 1));
-        assert_eq!(policy(&["--attention-fp8-prefill", "kda-o", "--ffn-fp8-prefill", "false"], true), (false, false, 2));
-        assert_eq!(policy(&["--attention-fp8-prefill", "all"], true), (true, true, 3));
-        // BF16 KDA has no FP8 weights to run W8A8 over.
-        assert_eq!(policy(&["--attention-fp8-prefill", "all"], false), (true, true, 0));
-        assert_eq!(policy(&["--attention-fp8-prefill", "mla,kda-in,kda-o"], true), (true, true, 3));
-        assert!(Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l", "--attention-fp8-prefill", "ffn"]).is_err());
-        assert!(Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l", "--fp8-prefill", "mla"]).is_err());
+        assert_eq!(policy(&["--fp8-prefill", "off"], true), (false, false, 0));
+        assert_eq!(policy(&["--fp8-prefill", "ffn"], true), (false, true, 0));
+        assert_eq!(policy(&["--fp8-prefill", "mla"], true), (true, false, 0));
+        assert_eq!(policy(&["--fp8-prefill", "kda-in"], true), (false, false, 1));
+        assert_eq!(policy(&["--fp8-prefill", "kda-o"], true), (false, false, 2));
+        assert_eq!(policy(&["--fp8-prefill", "mla,ffn,kda-in,kda-o"], true), (true, true, 3));
+        assert_eq!(policy(&["--fp8-prefill", "mla,ffn,kda-in,kda-o"], false), (true, true, 0));
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l", "--fp8-prefill", "all"]).is_err());
         // The fp8-compact (load-converted) core path and the legacy FP8 checkpoint path both read
         // the policy; no prefill launch hardcodes W8A8.
         let core = include_str!("engine/core.rs");
@@ -923,24 +909,23 @@ mod draft_cli_tests {
     #[test]
     fn single_copy_fp8_options_are_accepted() {
         for extra in [&[][..], &["--kda-fp8", "row128"][..], &["--kda-fp8", "channel"][..], &["--fp8-head"][..],
-            &["--kda-fp8", "row128", "--attention-fp8-prefill", "kda-in,kda-o"][..], &["--attention-fp8-prefill", "all"][..],
-            &["--kda-fp8", "channel", "--attention-fp8-prefill", "all", "--fp8-head"][..], &["--attention-fp8-prefill", "none"][..]] {
+            &["--kda-fp8", "row128", "--fp8-prefill", "kda-in,kda-o"][..], &["--fp8-prefill", "mla,ffn,kda-in,kda-o"][..],
+            &["--kda-fp8", "channel", "--fp8-prefill", "mla,ffn,kda-in,kda-o", "--fp8-head"][..], &["--fp8-prefill", "off"][..]] {
             check_options(&parse(extra)).unwrap();
         }
     }
 
     #[test]
-    fn kda_w8a8_prefill_needs_fp8_kda_weights() {
+    fn kda_w8a8_prefill_leaves_bf16_weights_unchanged() {
         let defaults = parse(&[]);
         assert_eq!((defaults.kda_fp8, defaults.head_format, defaults.draft_fp8),
             (fp8::KdaFp8::Off, head::GlmfHeadFormat::Auto, None));
-        check_options(&parse(&["--kda-fp8", "row128", "--attention-fp8-prefill", "kda-in"])).unwrap();
-        for extra in [&["--kda-fp8", "off", "--attention-fp8-prefill", "kda-in"][..],
-            &["--kda-fp8", "off", "--attention-fp8-prefill", "mla,kda-o"][..], &["--kda-fp8", "off", "--attention-fp8-prefill", "kda-o"][..]] {
-            let error = check_options(&parse(extra)).unwrap_err().to_string();
-            assert!(error.contains("--kda-fp8 row128 or channel"), "{error}");
+        for groups in ["kda-in", "mla,kda-o", "kda-o"] {
+            let args = parse(&["--kda-fp8", "off", "--fp8-prefill", groups]);
+            check_options(&args).unwrap();
+            assert_eq!(fp8_prefill_policy(&args, false).kda_bits, 0);
         }
-        assert!(check_options(&parse(&["--attention-fp8-prefill", "none,mla"])).is_err());
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l", "--fp8-prefill", "none,mla"]).is_err());
         assert!(check_options(&parse(&["--kda-fp8", "row128", "--kda-nvfp4-gate", "rtn"])).is_err());
     }
 
@@ -1132,13 +1117,13 @@ mod draft_cli_tests {
             check_options(&parse(&["--split-device", "1", "--kda-fp8", "row128", option])).unwrap();
         }
         for option in ["--kda-fp32-partials", "--kda-output-shard"] {
-            for group in ["kda-o", "all"] {
+            for group in ["kda-o", "mla,ffn,kda-in,kda-o"] {
                 assert!(check_options(&parse(&["--split-device", "1", "--kda-fp8", "row128",
-                    option, "--attention-fp8-prefill", group])).is_err());
+                    option, "--fp8-prefill", group])).is_err());
             }
         }
         check_options(&parse(&["--split-device", "1", "--kda-fp8", "row128", "--kda-fp32-partials",
-            "--kda-prefill-expanded", "--attention-fp8-prefill", "kda-in"])).unwrap();
+            "--kda-prefill-expanded", "--fp8-prefill", "kda-in"])).unwrap();
         assert_eq!(engine::fp32_partial_reserve(2, 4096, 4096), 369_623_040);
         assert_eq!(engine::fp32_partial_reserve(2, 32, 4096), 6_291_456);
         assert_eq!(engine::output_shard_reserve(2, 4096, 4096), 134_217_728);
@@ -1371,17 +1356,6 @@ mod draft_cli_tests {
         let spark = parse(&SPARKS);
         assert_eq!((spark.peers.as_deref(), spark.local_experts, spark.prefill_rows), (Some(SPARKS[1]), false, 2752));
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum Fp8PrefillGroup {
-    Mla,
-    KdaIn,
-    KdaO,
-    /// Every attention group.
-    All,
-    /// No group: every attention prefill projection over FP8 weights runs W8A16.
-    None,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1665,12 +1639,15 @@ mod reconciliation_tests {
     }
 }
 
-/// The engine's W8A8 prefill switches. `all` covers every attention group with FP8 weights (BF16
-/// KDA has none to run W8A8 over); `kda` says whether the KDA projections are FP8.
+/// Resolve through the same policy and family groups used by offline admission.
 fn fp8_prefill_policy(args: &EngineArgs, kda: bool) -> engine::Fp8Prefill {
-    let group = |g: Fp8PrefillGroup| args.attention_fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
-    engine::Fp8Prefill { mla: group(Fp8PrefillGroup::Mla), ffn: args.ffn_fp8_prefill,
-        kda_bits: i32::from(kda && group(Fp8PrefillGroup::KdaIn)) | (i32::from(kda && group(Fp8PrefillGroup::KdaO)) << 1) }
+    use cuteafd_loader::plan::fp8_prefill::{resolve, Mode, GLMF_GROUPS};
+    let enabled = |name, fp8| {
+        let group = *GLMF_GROUPS.iter().find(|group| group.name == name).unwrap();
+        resolve(&args.fp8_prefill, group, fp8, true, Some("GLMF prefill program scratch")).mode == Mode::W8a8
+    };
+    engine::Fp8Prefill { mla: enabled("mla", true), ffn: enabled("ffn", true),
+        kda_bits: i32::from(enabled("kda-in", kda)) | (i32::from(enabled("kda-o", kda)) << 1) }
 }
 
 /// Option combinations rejected before any checkpoint or native work.
@@ -1686,14 +1663,8 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     ensure!(!(precise || args.kda_prefill_expanded) ||
         (args.split_device.is_some() && args.kda_fp8 != fp8::KdaFp8::Off),
         "KDA partial/expanded options require --split-device and --kda-fp8 row128 or channel");
-    ensure!(!precise || !args.attention_fp8_prefill.iter().any(|g|
-        matches!(g, Fp8PrefillGroup::KdaO | Fp8PrefillGroup::All)),
-        "KDA precise partials require W8A16 output (--attention-fp8-prefill kda-o/all is unsupported)");
-    let kda_prefill = args.attention_fp8_prefill.iter().any(|g| matches!(g, Fp8PrefillGroup::KdaIn | Fp8PrefillGroup::KdaO));
-    ensure!(!kda_prefill || args.kda_fp8 != fp8::KdaFp8::Off || args.attention.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact,
-        "--attention-fp8-prefill kda-in/kda-o run over FP8 KDA weights; add --kda-fp8 row128 or channel");
-    ensure!(!args.attention_fp8_prefill.contains(&Fp8PrefillGroup::None) || args.attention_fp8_prefill.len() == 1,
-        "--attention-fp8-prefill none takes no other group");
+    ensure!(!precise || fp8_prefill_policy(args, true).kda_bits & 2 == 0,
+        "KDA precise partials require W8A16 output (drop kda-o from --fp8-prefill)");
     ensure!(args.kda_nvfp4_gate.is_none() || args.kda_fp8 == fp8::KdaFp8::Off,
         "--kda-nvfp4-gate rounds the BF16 KDA projections; it takes --kda-fp8 off");
     ensure!(args.kda_state == engine::KdaState::F32 || args.split_device.is_none(),
@@ -2787,12 +2758,12 @@ impl Opened {
                 let package = args.fp8_package.clone().unwrap_or_else(||
                     crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
                 Tp2Weights::Fp8(match pushed {
-                    Some(pushed) => Fp8MoeTp2::pushed_pair(devices, tensors, &package, tp2_layers.clone(),
+                    Some(pushed) => Fp8MoeTp2::pushed_pair_policy(devices, tensors, &package, tp2_layers.clone(),
                         args.expert_rows(), budgets, pushed.into_iter().map(PushedExperts::fp8)
                             .collect::<Result<Vec<_>>>()?.try_into()
-                            .map_err(|_| anyhow::anyhow!("two committed FP8 coordinator ranks required"))?)?,
-                    None => Fp8MoeTp2::load_pair(devices, tensors, &package, tp2_layers.clone(),
-                        args.expert_rows(), budgets)?,
+                            .map_err(|_| anyhow::anyhow!("two committed FP8 coordinator ranks required"))?,Some(&args.fp8_prefill))?,
+                    None => Fp8MoeTp2::load_pair_policy(devices, tensors, &package, tp2_layers.clone(),
+                        args.expert_rows(), budgets,Some(&args.fp8_prefill))?,
                 })
             })
         };
@@ -2908,7 +2879,7 @@ impl Opened {
         let mib = |bytes: usize| bytes as f64 / (1u64 << 20) as f64;
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
             split_gib = peer_resident as f64 / (1u64 << 30) as f64,
-            kda_fp8 = ?args.kda_fp8, attention_fp8_prefill = ?args.attention_fp8_prefill, ffn_fp8_prefill = args.ffn_fp8_prefill,
+            kda_fp8 = ?args.kda_fp8, fp8_prefill = %args.fp8_prefill,
             kda_bf16_mib = mib(single.kda_bf16), kda_fp8_mib = mib(single.kda_fp8),
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8 + single.head_packed),
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -3201,10 +3172,10 @@ impl Opened {
             ensure!(args.expert_window != Some(0), "--expert-window must be at least 1");
             let started = Instant::now();
             let experts = match pushed {
-                Some(pushed) => crate::shared::experts::fp8::Fp8Experts::from_pushed(&self.library, tensors,
-                    &directory, selected, 1, 0, args.expert_rows(), budget, pushed.fp8()?),
-                None => crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
-                    selected, 1, 0, args.expert_rows(), budget),
+                Some(pushed) => crate::shared::experts::fp8::Fp8Experts::from_pushed_policy(&self.library, tensors,
+                    &directory, selected, 1, 0, args.expert_rows(), budget, pushed.fp8()?, &args.fp8_prefill),
+                None => crate::shared::experts::fp8::Fp8Experts::load_policy(&self.library, tensors, &directory,
+                    selected, 1, 0, args.expert_rows(), budget, &args.fp8_prefill),
             }.context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
                 or --expert-window N for diagnostic paging")?;
             let loads = experts.layers.len();

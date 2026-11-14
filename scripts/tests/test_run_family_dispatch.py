@@ -2554,7 +2554,8 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     assert "--kda-prefill-expanded" not in launch
     # Prefill over FP8 weights defaults to W8A8 MLA + FFN: nothing forwarded (daemon default mla/true),
     # KDA W8A8 stays opt-in, and KDA FP8 conversion stays off.
-    assert "fp8-prefill" not in launch
+    assert "--fp8-prefill" not in shlex.split(launch)
+    assert "CUTEAFD_FP8_PREFILL=auto" in launch
 
 
 @pytest.mark.parametrize("keys,shard", [("", False), ("GLM5_FLASH_KDA_FP8=row128\n", True),
@@ -2600,12 +2601,11 @@ def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, h
 @pytest.mark.parametrize("layout,accepted", [("RTX_GPUS=1\n", True), ("RTX_GPUS=2\n", False)])
 def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, accepted):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_ATTENTION_FP8_PREFILL=all\n" + layout)
+                                  "GLM5_FLASH_KDA_FP8=row128\nFP8_PREFILL=mla,ffn,kda-in,kda-o\n" + layout)
     assert result.returncode == (0 if accepted else 2), result.stderr
     if accepted:
-        assert "--attention-fp8-prefill all" in result.stderr
+        assert "CUTEAFD_FP8_PREFILL=mla,ffn,kda-in,kda-o" in result.stderr
     else:
-        # The split's default token-row KDA output excludes KDA output W8A8.
         assert "GLM5_FLASH_KDA_SPLIT=partials" in result.stderr
         assert "docker run" not in result.stderr
 
@@ -2614,18 +2614,11 @@ def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, a
     ("GLM5_FLASH_KDA_FP8=row128\n", ["--kda-fp8 row128"]),
     ("GLM5_FLASH_KDA_FP8=channel\n", ["--kda-fp8 channel"]),
     ("GLM5_FLASH_FP8_HEAD=on\n", ["--fp8-head true"]),
-    # KDA output W8A8 (kda-o/all) excludes the split's token-row output, so
-    # those cases select the partial-sum split path explicitly.
-    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_ATTENTION_FP8_PREFILL=all\n",
-     ["--attention-fp8-prefill all"]),
-    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_ATTENTION_FP8_PREFILL=mla,kda-in\n", ["--attention-fp8-prefill mla,kda-in"]),
-    ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_ATTENTION_FP8_PREFILL=kda-o\n"
-     "GLM5_FLASH_FFN_FP8_PREFILL=off\n", ["--attention-fp8-prefill kda-o", "--ffn-fp8-prefill false"]),
-    # off selects W8A16 for that group set.
-    ("GLM5_FLASH_ATTENTION_FP8_PREFILL=off\n", ["--attention-fp8-prefill none"]),
-    ("GLM5_FLASH_FFN_FP8_PREFILL=off\n", ["--ffn-fp8-prefill false"]),
-    ("GLM5_FLASH_ATTENTION_FP8_PREFILL=off\nGLM5_FLASH_FFN_FP8_PREFILL=off\n",
-     ["--attention-fp8-prefill none", "--ffn-fp8-prefill false"]),
+    ("FP8_PREFILL=off\n", ["CUTEAFD_FP8_PREFILL=off"]),
+    ("FP8_PREFILL=ffn\n", ["CUTEAFD_FP8_PREFILL=ffn"]),
+    ("FP8_PREFILL=mla,ffn,kda-in\n", ["CUTEAFD_FP8_PREFILL=mla,ffn,kda-in"]),
+    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_KDA_SPLIT=partials\nFP8_PREFILL=kda-o\n",
+     ["CUTEAFD_FP8_PREFILL=kda-o"]),
 ])
 def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
@@ -2639,10 +2632,12 @@ def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
 
 
 @pytest.mark.parametrize("key,value,message", [
-    ("GLM5_FLASH_ATTENTION_FP8_PREFILL", "all", "GLM5_FLASH_KDA_FP8=row128"),
-    ("GLM5_FLASH_ATTENTION_FP8_PREFILL", "mla,kda-in", "GLM5_FLASH_KDA_FP8=row128"),
-    ("GLM5_FLASH_ATTENTION_FP8_PREFILL", "kda-o", "GLM5_FLASH_KDA_FP8=row128"),
-    ("GLM5_FLASH_FFN_FP8_PREFILL", "mla", "GLM5_FLASH_FFN_FP8_PREFILL must be on or off"),
+    ("FP8_PREFILL", "all", "FP8_PREFILL invalid group"),
+    ("FP8_PREFILL", "mla,mla", "FP8_PREFILL repeats group"),
+    ("FP8_PREFILL", "mla,", "FP8_PREFILL must be"),
+    ("GLM5_FLASH_ATTENTION_FP8_PREFILL", "mla", "unknown configuration key"),
+    ("GLM5_FLASH_FFN_FP8_PREFILL", "on", "unknown configuration key"),
+    ("FP8_EXPERT_PREFILL", "auto", "unknown configuration key"),
     # The pre-v5.1 spellings are gone: a generic unknown/unused-key refusal, no alias.
     ("GLM5_FLASH_FP8_PREFILL", "mla", "GLM5_FLASH_FP8_PREFILL"),
     ("GLMF_FP8_PREFILL", "mla", "GLMF_FP8_PREFILL"),
