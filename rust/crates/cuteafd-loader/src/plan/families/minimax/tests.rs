@@ -245,7 +245,7 @@ fn only_optional_bundled_components_keep_missing_execution_hints() {
 }
 
 #[test]
-fn whole_rank_wip_admission_does_not_open_public_or_split_serving() {
+fn qualified_whole_rank_admission_opens_public_but_not_split_serving() {
     use crate::placement::OnboardSetting;
     let (dir, inputs) = heads_recipe_fixture_with_experts(128);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
@@ -269,11 +269,10 @@ fn whole_rank_wip_admission_does_not_open_public_or_split_serving() {
         }), ..Default::default() };
     let report = plan::plan(dir.path(), &options).unwrap();
     assert!(report.native_serving_admitted && report.wip_launchable(), "{:?}", report.hints);
-    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
-    assert!(!report.executable());
-    let mut no_admission = report.clone();
-    no_admission.native_serving_admitted = false;
-    assert!(!no_admission.wip_launchable());
+    assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
+    assert!(report.executable());
+    assert!(report.components.iter().all(|component|
+        matches!(component.status, crate::plan::Status::Ready | crate::plan::Status::Unused | crate::plan::Status::Disabled)));
     let mut pair = options;
     pair.layout.as_mut().unwrap().rtx_bytes.push(96 << 30);
     let unsupported = plan::plan(dir.path(), &pair).unwrap();

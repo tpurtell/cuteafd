@@ -77,17 +77,17 @@ A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
 - `CONCURRENCY` unset is a boot-time memory derivation; all C-dependent sizes
   follow it. Set it only to pin a value.
 
-### MiniMax WIP Serving
+### MiniMax Serving
 
-MiniMax M3.1 Flash is WIP-only pending #1856 qualification. `./run.sh --wip SLOT`
-uses the hidden `serve-minimax` entry; release launch and public `cuteafd serve`
-remain refused. The supported edge is one RTX with native MXFP8 dense math,
+MiniMax M3.1 Flash supports public `cuteafd serve --family minimax_m3` and
+`./run.sh` on one RTX, qualified by the 2026-11-14 trace-free basic card (#1856).
+Use a build containing the MiniMax native exports. The supported edge uses native MXFP8 dense math,
 NVFP4 W4A4 experts, FP8 MSA KV/index, GPU embedding and device token selection.
 `ATTENTION_PLACEMENT=auto|heads` selects whole ownership; explicit context/layers
 and two-RTX serving remain refused until the split executor is qualified.
 `SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
 
-Shared launch keys keep their usual meanings. The WIP edge accepts
+Shared launch keys keep their usual meanings. The one-RTX edge accepts
 `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS`, `PREFILL_WAVES`,
 `PREFILL_PACKING=unrestricted|exact`, `PREFIX_CACHE_ENTRIES`, `HOST_CACHE_BYTES`
 (default launcher `auto`), `POOL_TOKENS`, `MAX_CONTEXT_TOKENS`, `CONCURRENCY`,
@@ -98,7 +98,8 @@ The traced one-RTX boot-C16 graph base is 41,943,040 bytes plus the standard
 2,097,152-byte tail; shared bounded runtime extra gives 88,080,384 bytes total
 by default. C1/C16 decode on that bank records no steady-state captures or
 evictions. Untraced rank/concurrency shapes keep an unpinned bootstrap with no
-borrowed measured base. The public family tables exclude this still-unqualified edge.
+borrowed measured base. Two-RTX split serving and narrow heads remain pending
+[#1856](https://github.com/tpurtell/cuteafd/issues/1856); planning still reports their owners.
 
 `./run.sh` options:
 
@@ -129,9 +130,8 @@ flags. Users set keys, not these flags or the `CUTEAFD_*` environment variables
 the launcher derives from them.
 
 `cuteafd golden --family minimax_m3` (hidden alias `minimax-golden`) is a
-qualification-only native full-model prefill path. Public MiniMax serving stays
-refused until its qualification card passes; WIP builds can serve it through the
-hidden `serve-minimax` command for qualification.
+native full-model qualification path. Public one-RTX serving dispatches to the
+same `serve-minimax` command used by the qualified card.
 Explicit two-RTX heads planning is available with half KV and replicated index
 storage; `auto` stays contiguous whole attention with neuron-split FFNs on two RTX.
 The two-RTX layers recipe defaults to qualified FP32 split partials. The launcher
@@ -876,4 +876,6 @@ original core is already FP8, not an MC publication.
 | `PROFILE_SPARK_NCU_SKIP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `PROFILE_SPARK_NSYS_GPU_METRICS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 
-MiniMax is not a launch family yet; it gets a column here when it lands.
+MiniMax one-RTX accepted keys and retained qualification gates are listed in
+[MiniMax Serving](#minimax-serving); its family column is listed separately until
+two-RTX serving qualification completes (#1856).
