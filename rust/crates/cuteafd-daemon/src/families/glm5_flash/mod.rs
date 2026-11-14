@@ -188,7 +188,7 @@ pub(crate) struct EngineArgs {
     /// KDA in/out projections: the checkpoint's BF16 (off), or E4M3 quantized
     /// per row x 128-K block (row128) or per row (channel) at load, then the
     /// only resident copy: decode rows up to 16 on the FP8 GEMV, wider verify
-    /// steps and prefill W8A16 (W8A8 with --attention-fp8-prefill kda-in/kda-o).
+    /// steps and prefill W8A16 (W8A8 with --fp8-prefill kda-in/kda-o).
     /// Default off (the checkpoint's BF16, one copy). row128 is faster (1 RTX + 2
     /// Sparks, with the FP8 head and drafter: C4 code 113.8 -> 131.8 tok/s) but costs
     /// 3.4 points top-1 (89.1% -> 85.7%) and doubles verify-vs-decode rounding
@@ -909,24 +909,23 @@ mod draft_cli_tests {
     #[test]
     fn single_copy_fp8_options_are_accepted() {
         for extra in [&[][..], &["--kda-fp8", "row128"][..], &["--kda-fp8", "channel"][..], &["--fp8-head"][..],
-            &["--kda-fp8", "row128", "--attention-fp8-prefill", "kda-in,kda-o"][..], &["--attention-fp8-prefill", "all"][..],
-            &["--kda-fp8", "channel", "--attention-fp8-prefill", "all", "--fp8-head"][..], &["--attention-fp8-prefill", "none"][..]] {
+            &["--kda-fp8", "row128", "--fp8-prefill", "kda-in,kda-o"][..], &["--fp8-prefill", "mla,ffn,kda-in,kda-o"][..],
+            &["--kda-fp8", "channel", "--fp8-prefill", "mla,ffn,kda-in,kda-o", "--fp8-head"][..], &["--fp8-prefill", "off"][..]] {
             check_options(&parse(extra)).unwrap();
         }
     }
 
     #[test]
-    fn kda_w8a8_prefill_needs_fp8_kda_weights() {
+    fn kda_w8a8_prefill_leaves_bf16_weights_unchanged() {
         let defaults = parse(&[]);
         assert_eq!((defaults.kda_fp8, defaults.head_format, defaults.draft_fp8),
             (fp8::KdaFp8::Off, head::GlmfHeadFormat::Auto, None));
-        check_options(&parse(&["--kda-fp8", "row128", "--attention-fp8-prefill", "kda-in"])).unwrap();
-        for extra in [&["--kda-fp8", "off", "--attention-fp8-prefill", "kda-in"][..],
-            &["--kda-fp8", "off", "--attention-fp8-prefill", "mla,kda-o"][..], &["--kda-fp8", "off", "--attention-fp8-prefill", "kda-o"][..]] {
-            let error = check_options(&parse(extra)).unwrap_err().to_string();
-            assert!(error.contains("--kda-fp8 row128 or channel"), "{error}");
+        for groups in ["kda-in", "mla,kda-o", "kda-o"] {
+            let args = parse(&["--kda-fp8", "off", "--fp8-prefill", groups]);
+            check_options(&args).unwrap();
+            assert_eq!(fp8_prefill_policy(&args, false).kda_bits, 0);
         }
-        assert!(check_options(&parse(&["--attention-fp8-prefill", "none,mla"])).is_err());
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l", "--fp8-prefill", "none,mla"]).is_err());
         assert!(check_options(&parse(&["--kda-fp8", "row128", "--kda-nvfp4-gate", "rtn"])).is_err());
     }
 
@@ -1118,13 +1117,13 @@ mod draft_cli_tests {
             check_options(&parse(&["--split-device", "1", "--kda-fp8", "row128", option])).unwrap();
         }
         for option in ["--kda-fp32-partials", "--kda-output-shard"] {
-            for group in ["kda-o", "all"] {
+            for group in ["kda-o", "mla,ffn,kda-in,kda-o"] {
                 assert!(check_options(&parse(&["--split-device", "1", "--kda-fp8", "row128",
-                    option, "--attention-fp8-prefill", group])).is_err());
+                    option, "--fp8-prefill", group])).is_err());
             }
         }
         check_options(&parse(&["--split-device", "1", "--kda-fp8", "row128", "--kda-fp32-partials",
-            "--kda-prefill-expanded", "--attention-fp8-prefill", "kda-in"])).unwrap();
+            "--kda-prefill-expanded", "--fp8-prefill", "kda-in"])).unwrap();
         assert_eq!(engine::fp32_partial_reserve(2, 4096, 4096), 369_623_040);
         assert_eq!(engine::fp32_partial_reserve(2, 32, 4096), 6_291_456);
         assert_eq!(engine::output_shard_reserve(2, 4096, 4096), 134_217_728);

@@ -27,7 +27,7 @@ INTENDED = {
     "coordinator": {
 
         # shared_coordinator_env_args (SPARK_INTAKE, CONSOLE_TEXT, ATTENTION_PLACEMENT,
-        # FP8_EXPERT_PREFILL): the binary's own defaults, now explicit.
+        # FP8_PREFILL): the binary's own defaults, now explicit.
         "CUTEAFD_SPARK_INTAKE": "auto",
         "CUTEAFD_CONSOLE_TEXT": "true",
         "CUTEAFD_ATTENTION_PLACEMENT": "auto",
