@@ -917,7 +917,9 @@ fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<
         coordinator_ranks: 2, attention_placement: Some(crate::placement::AttentionPlacement::Context),
         mla_kv: cuteafd_core::MlaCacheFormat::Bf16, ..Default::default() };
     let cache = model.cache_geometry(options)?.unwrap();
-    for rank in cache.ranks { assert_eq!(rank.persistent_unit_bytes, (24*64*(576*2/2+128+4)) as u64); }
+    for rank in &cache.ranks { assert_eq!(rank.persistent_unit_bytes, (24*64*(576*2+128+4)/2) as u64); }
+    assert_eq!(cache.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>(),
+        (24 * 64 * (576 * 2 + 128 + 4)) as u64, "host snapshot stores each parity half once");
     headers.pop();
     testing::write_safetensors(&dir.path().join("indexers.safetensors"), &headers);
     assert!(Checkpoint::open(dir.path()).is_err());

@@ -97,10 +97,7 @@ impl<'a> KimiPrefix<'a> {
         ensure!(mla.iter().all(|bank| bank.parity() == parity), "Kimi prefix page ownership differs between ranks");
         let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry_for_ranks(cfg, &resident, mla[0].format())?;
         let resident_page_bytes: usize = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes as usize).sum();
-        let page_bytes = if parity {
-            let index_bytes = resident.iter().sum::<usize>() * mla[0].index_page_bytes();
-            (resident_page_bytes - index_bytes) / 2 + index_bytes
-        } else { resident_page_bytes };
+        let page_bytes = if parity { resident_page_bytes / 2 } else { resident_page_bytes };
         let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes as usize).sum();
         ensure!(mark_bytes == kda.iter().map(|bank| bank.mark_bytes()).sum::<usize>(), "Kimi prefix KDA shard geometry differs");
         ensure!(page_bytes > 0, "Kimi prefix has no resident MLA pages");
@@ -819,17 +816,34 @@ mod tests {
             let actual = (0..2).flat_map(|rank| family.state_buffers(rank, 1).unwrap()).map(read).collect::<Result<Vec<_>>>()?;
             assert_eq!(actual, expected, "both KDA state and convolution shards must restore byte-exactly");
             assert_eq!(family.commit_point(&restored), 65);
+            for rank in 0..2 {
+                for (from, to, rows) in [(0, 2, 64), (1, 3, 1)] {
+                    let original = family.page_buffers(rank, from, rows)?;
+                    let restored = family.page_buffers(rank, to, rows)?;
+                    assert_eq!(original.len(), restored.len());
+                    for (expected, actual) in original.into_iter().zip(restored) {
+                        assert_eq!(read(expected)?, read(actual)?, "rank {rank}: restored MLA/index keys/scales");
+                    }
+                    if attention == AttentionPlacement::Context && from as usize % 2 != rank {
+                        assert!(family.page_buffers(rank, from, rows)?.is_empty(), "peer index half must not be restored here");
+                    }
+                }
+            }
             assert_eq!(family.page_segments(0).iter().map(|range| range.bytes).sum::<usize>(), family.layout().page_bytes);
             assert_eq!(family.mark_segments(MarkSlot(0)).iter().map(|range| range.bytes).sum::<usize>(), family.layout().mark_bytes);
             let copies = if attention == AttentionPlacement::Heads { 4 } else { 2 };
-            let index_copies = if attention == AttentionPlacement::Layers { 2 } else { 4 };
+            let index_copies = copies;
             assert_eq!(family.layout().page_bytes, copies * 64 * cache_format.record_bytes()
                 + if indexer { index_copies * 8448 } else { 0 });
             if indexer {
                 assert!(family.record_format().starts_with("kimi_k31_"));
                 for rank in 0..2 {
                     let segments = family.page_buffers(rank, 0, 1)?;
-                    let index_layers = if attention == AttentionPlacement::Layers { 1 } else { 2 };
+                    let index_layers = match attention {
+                        AttentionPlacement::Layers => 1,
+                        AttentionPlacement::Context if rank == 1 => 0,
+                        _ => 2,
+                    };
                     assert_eq!(segments.iter().filter(|segment| segment.bytes == 128).count(), index_layers);
                     assert_eq!(segments.iter().filter(|segment| segment.bytes == 4).count(), index_layers);
                 }

@@ -266,11 +266,12 @@ impl<'a> CacheBank<'a> {
         ensure!(page < self.layout.pages && (1..=MLA_PAGE_ROWS).contains(&rows), "Kimi index prefix page/rows outside admission");
         let mut segments = Vec::new();
         if self.owns_page(page as u32) { segments.push(self.page(layer, page, rows)?); }
-        if self.layout.index_layer_bytes != 0 {
+        if self.layout.index_layer_bytes != 0 && self.owns_page(page as u32) {
             let cache = self.index(layer)?;
-            // Keys and FP32 scale slots are separate streams within each 8448-byte page.
-            segments.push(view(cache, page * 8448, rows * 128)?);
-            segments.push(view(cache, page * 8448 + 8192, rows * 4)?);
+            let local_page = if self.layout.parity { page >> 1 } else { page };
+            // Keys and scales follow the same parity owner as the MLA record.
+            segments.push(view(cache, local_page * 8448, rows * 128)?);
+            segments.push(view(cache, local_page * 8448 + 8192, rows * 4)?);
         }
         Ok(segments)
     }

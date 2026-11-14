@@ -364,9 +364,9 @@ impl FamilyModel for Model {
             geometry.placement = crate::serving_capacity::KvPlacement::PartitionedContext;
             for rank in &mut geometry.ranks {
                 rank.persistent_unit_bytes = (layers * 64 * options.mla_kv.record_bytes() / 2) as u64;
-                // Each context rank selects over the full token history.
+                // Index keys/scales follow the MLA page's parity owner.
                 if let Some(index) = self.cfg.dsa {
-                    rank.persistent_unit_bytes += (layers * 64 * (index.head_dim + 4)) as u64;
+                    rank.persistent_unit_bytes += (layers * 64 * (index.head_dim + 4) / 2) as u64;
                 }
             }
         }

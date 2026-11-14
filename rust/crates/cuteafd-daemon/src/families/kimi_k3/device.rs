@@ -954,15 +954,18 @@ impl<'a> LocalLane<'a> {
     /// leaves that geometry lazy.
     pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize,
         reserve: u64) -> Result<usize> {
-        ensure!(!self.diagnostics_active(),
+        ensure!(!self.diagnostics_active() || self.eager_context_dsa_diagnostic(),
             "CUTEAFD_KIMI_DSA_DUMP/CUTEAFD_KIMI_DSA_SCORES refuse startup CUDA graph capture");
         self.check_startup_keys(keys, rank)?;
         let stream = self.stream().clone();
         let staged = self.attention.take();
         let mut graphs = super::graphs::Graphs::new();
         let result = graphs.attach(stream.device.library, stream.device.id, self.programs.ranks, rank, reserve)
-            .and_then(|()| graphs.prewarm(&stream, self.programs.graph_core(), self.programs.ranks, keys,
-                |key| self.submit_startup_graph(key)));
+            .and_then(|()| {
+                if self.eager_context_dsa_diagnostic() { return Ok(0); }
+                graphs.prewarm(&stream, self.programs.graph_core(), self.programs.ranks, keys,
+                    |key| self.submit_startup_graph(key))
+            });
         self.attention = staged;
         let captured = result?;
         self.graphs = Some(graphs);
@@ -1042,6 +1045,15 @@ impl<'a> LocalLane<'a> {
         Ok(())
     }
 
+    pub(crate) fn context_dsa_diagnostic(&self) -> bool {
+        self.context.is_some() && self.programs.dsa.is_some()
+    }
+
+    fn eager_context_dsa_diagnostic(&self) -> bool {
+        self.context_dsa_diagnostic() && self.dsa_dump.is_some()
+            && self.dsa_scores.is_none() && self.dsa_keys.is_none()
+    }
+
     /// A diagnostic readback adds host-visible host copies inside the step,
     /// so it excludes every recorded stream.
     fn diagnostics_active(&self) -> bool {
@@ -1053,6 +1065,10 @@ impl<'a> LocalLane<'a> {
     /// body owns the whole recorded segment, so nested sites run eagerly.
     fn graph_step(&mut self, rows: usize, op: super::graphs::Op,
         mut body: impl FnMut(&mut Self) -> Result<()>) -> Result<()> {
+        if self.eager_context_dsa_diagnostic() {
+            ensure!(self.graph_untouched(), "Kimi context DSA diagnostic requires an empty eager graph bank");
+            return body(self);
+        }
         if !super::graphs::replay_allowed(op, self.replay_enabled, self.lane.window.is_some())? {
             return body(self);
         }

@@ -465,6 +465,16 @@ mod tests {
         let paired = layers.split("context_pair_with(&mut Pair { binding: self, layer })?;").nth(1).unwrap();
         assert!(paired.trim_start().starts_with("// Diagnostic only:"));
         assert!(paired.find("context_dsa_dump").unwrap() < paired.find("self.publish").unwrap());
+        let graph = device.split("fn graph_step(").nth(1).unwrap().split("pub(crate) fn attention(").next().unwrap();
+        assert!(graph.find("if self.eager_context_dsa_diagnostic()").unwrap() < graph.find("self.graphs.take()").unwrap());
+        assert!(graph.contains("ensure!(self.graph_untouched()"));
+        assert!(graph.split("if self.eager_context_dsa_diagnostic()").nth(1).unwrap()
+            .split("if !super::graphs::replay_allowed").next().unwrap().contains("return body(self)"));
+        let warm = device.split("pub(crate) fn warm_graphs(").nth(1).unwrap().split("pub(crate) fn graph_cycle").next().unwrap();
+        assert!(warm.find("if self.eager_context_dsa_diagnostic() { return Ok(0); }").unwrap()
+            < warm.find("graphs.prewarm").unwrap());
+        assert!(graph.contains("graphs.graph(&stream, key, allow_capture, pinned, || body(self))"),
+            "diagnostic-off dispatch remains the ordinary graph path");
     }
 
     #[test]
@@ -544,6 +554,14 @@ mod tests {
         // SAFETY: all programs and GPU owners are destroyed before this WIP library.
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let programs = library.programs()?.with_manifest(std::path::Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        for id in 0..2 {
+            Device { library: &library, id }.run(|| {
+                KimiIndexTopK::load(&programs, 64, 16384, KimiIndexMode::Decode, true)?;
+                KimiIndexTopK::load(&programs, 4096, 16384, KimiIndexMode::Prefill, true)?;
+                KimiCandidateMerge::load(&programs)?;
+                Ok(())
+            })?;
+        }
         let decode = KimiIndexTopK::load(&programs, 64, 16384, KimiIndexMode::Decode, true)?;
         let prefill = KimiIndexTopK::load(&programs, 4096, 16384, KimiIndexMode::Prefill, true)?;
         let merge = KimiCandidateMerge::load(&programs)?;
