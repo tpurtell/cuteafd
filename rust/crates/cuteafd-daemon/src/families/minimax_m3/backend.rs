@@ -35,8 +35,6 @@ pub(crate) enum BackendError {
     DraftsNotQualified,
     #[error("MiniMax bundled media serving is not qualified")]
     MediaNotQualified,
-    #[error("MiniMax shared-scheduler backend is qualified for one RTX only")]
-    TwoRtxNotQualified,
     #[error("MiniMax backend is terminal after a failed native submission")]
     Terminal,
 }
@@ -106,19 +104,24 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         served_context: usize, host: Option<cuteafd_hostcache::config::Config>,
         packing: crate::shared::prefill_packing::PackingMode) -> Result<Self> {
         let storage = &owners.storage;
-        ensure!(storage.ranks.len() == 1, BackendError::TwoRtxNotQualified);
+        ensure!(matches!(storage.ranks.len(), 1 | 2)
+            && (storage.ranks.len() == 2) == storage.split.is_some(),
+            "MiniMax backend rank count differs from admitted split execution");
         let state = storage.requests.borrow();
         let bank = &state.ranks[0].bank;
         ensure!(served_context > 0 && served_context <= bank.rope.positions as usize
             && served_context <= bank.layout.pool_pages as usize * PAGE_ROWS,
             "MiniMax served context exceeds admitted cache");
         let rank = &storage.ranks[0];
-        let stream = rank.decode.borrow().stream.raw;
-        ensure!(rank.layout.layers.iter().copied().eq(0..cfg.layers)
-            && state.ranks[0].prefill.len() == rank.prefill.len()
-            && rank.prefill.iter().all(|owner| owner.borrow().stream.raw == stream)
-            && bank.readers().iter().all(|reader| reader.raw == stream),
-            super::engine::ServingError::DifferentStreams);
+        let layers = storage.ranks.iter().flat_map(|rank| rank.layout.layers.iter().copied()).collect::<BTreeSet<_>>();
+        ensure!(layers.iter().copied().eq(0..cfg.layers), "MiniMax backend attention owners do not cover every layer");
+        for (gpu, rank) in storage.ranks.iter().enumerate() {
+            let stream = rank.decode.borrow().stream.raw;
+            ensure!(state.ranks[gpu].prefill.len() == rank.prefill.len()
+                && rank.prefill.iter().all(|owner| owner.borrow().stream.raw == stream)
+                && state.ranks[gpu].bank.readers().iter().all(|reader| reader.raw == stream),
+                super::engine::ServingError::DifferentStreams);
+        }
         let schedule = Requests::new(state.capacity, served_context, cfg.layers, rank.prefill.len())?;
         drop(state);
         Ok(Self { owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,

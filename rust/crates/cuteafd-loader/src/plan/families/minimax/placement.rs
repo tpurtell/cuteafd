@@ -122,8 +122,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     // The trace-free basic card qualifies the admitted whole-rank contract
     // (#1856). Other geometries remain planning inventories, not fit refusals.
-    report.native_serving_admitted = gpus == 1 && !inputs.split() && !inputs.heads();
-    if report.native_serving_admitted {
+    report.native_serving_admitted = !inputs.heads() && (gpus == 1
+        || (inputs.split() && inputs.split_wire == Some(crate::families::minimax_m3::execution::WirePrecision::F32)));
+    if gpus == 1 && report.native_serving_admitted {
         report.runtime = Some(crate::plan::RuntimeStatus::Serving);
         for component in &mut report.components {
             if component.status == crate::plan::Status::Planned && component.rejected == 0

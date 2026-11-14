@@ -1,9 +1,9 @@
-//! Whole-rank startup on the shared admission, push, cache and expert owners.
+//! Whole-rank and FP32 split startup on shared admission, cache and expert owners.
 //! The API/readiness edge is attached only after serving qualification.
 use super::{admission::serve_admission::{self, Sample}, cache::RequestStreams,
     engine::{RoutedBinding, ServingPrefill}, experts::Dispatcher, layer::Kernels,
     owners::{LoadedRank, Owners}, weights::push};
-use crate::shared::{experts::{fp8, rtx::{push::PushedExperts, whole::Whole}},
+use crate::shared::{experts::{fp8, rtx::{push::PushedExperts, whole::Whole, fp8moe::Fp8MoeTp2, owner_tp2::OwnerTp2}},
     inventory::{InventoryPhase, RuntimeInventory}, memory::device::{Device, Stream},
     placement::{spark_rings, SparkAdmission}, prefill_pipeline::FfnRoute,
     prefix::{budget::HostBudget, PrefixArgs}, spark_intake::SparkLink};
@@ -22,6 +22,7 @@ use std::{collections::BTreeSet, net::SocketAddr, path::Path, rc::Rc, sync::Arc}
 
 pub(crate) struct Options<'a> {
     pub device: i32,
+    pub split_device: Option<i32>,
     pub peers: &'a [SocketAddr],
     pub native_lib: &'a Path,
     pub manifest_path: &'a Path,
@@ -55,7 +56,8 @@ fn fix_geometry() -> Result<()> {
 }
 
 fn validate(options: &Options<'_>, cfg: &MiniMaxM3Config) -> Result<()> {
-    ensure!(options.device >= 0, "MiniMax serving requires a nonnegative CUDA device");
+    validate_devices(options.device, options.split_device)?;
+    validate_wire(options.split_device, options.split_wire)?;
     cuteafd_core::concurrency::validate("minimax_m3", options.sequences)?;
     serve_admission::validate_prefill(options.prefill)?;
     ensure!(options.context_tokens == 0 || options.context_tokens <= cfg.max_position as u64,
@@ -65,6 +67,18 @@ fn validate(options: &Options<'_>, cfg: &MiniMaxM3Config) -> Result<()> {
     validate_spark_world(options.peers.len(), cfg.moe_intermediate)?;
     ensure!(options.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
         "MiniMax serving requires exact prefix restores");
+    Ok(())
+}
+
+fn validate_devices(device: i32, peer: Option<i32>) -> Result<()> {
+    ensure!(device >= 0 && peer.is_none_or(|peer| peer >= 0 && peer != device),
+        "MiniMax serving requires one device or two distinct nonnegative devices");
+    Ok(())
+}
+
+fn validate_wire(peer: Option<i32>, wire: super::dense::PartialPrecision) -> Result<()> {
+    ensure!(peer.is_none() || wire == super::dense::PartialPrecision::F32,
+        "MiniMax split serving requires qualified FP32 partials; BF16 is golden-only");
     Ok(())
 }
 
@@ -82,7 +96,9 @@ fn validate_spark_world(world: usize, intermediate: usize) -> Result<()> {
 fn program_names(cfg: &MiniMaxM3Config, target: &CoordinatorWeights,
     manifest: &serde_json::Value, capacity: RequestCapacity, context: u32) -> Result<BTreeSet<String>> {
     let (_, msa) = MsaPrograms::resolve(cfg, manifest, capacity.decode.rows, capacity.prefill.rows, context)?;
-    let (_, producers) = ProducerPrograms::resolve(manifest, capacity.execution_rows())?;
+    let (_, producers) = if target.layers.len() < cfg.layers {
+        ProducerPrograms::resolve_split(manifest, capacity.execution_rows())?
+    } else { ProducerPrograms::resolve(manifest, capacity.execution_rows())? };
     let (_, forward) = ForwardPrograms::resolve(manifest, capacity.execution_rows())?;
     let dense = target.resolve_dense_programs(manifest, capacity.execution_rows())?;
     Ok(msa.iter().chain(&producers).chain(&forward).chain(&dense)
@@ -98,25 +114,43 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     ensure!(checkpoint.snapshot == view.snapshot(), "MiniMax startup checkpoint view differs");
     let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest_path)?)?);
     let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
-    let targets = CoordinatorWeights::plan(checkpoint, cfg, 1, &vec![0; cfg.layers])?;
+    let physical = std::iter::once(options.device).chain(options.split_device).collect::<Vec<_>>();
+    let gpus = physical.len();
+    if let Some(peer) = options.split_device {
+        ensure!(crate::shared::peer_split::probed_device(library, options.device, Some(peer))? == Some(peer),
+            "MiniMax split serving requires bidirectional peer access");
+    }
+    let owners = cuteafd_loader::placement::families::minimax_m3::layer_owners(cfg.layers, gpus);
+    let targets = if gpus == 2 {
+        cuteafd_loader::families::minimax_m3::weight_layout::SplitFfnWeights::plan(checkpoint, cfg,
+            &owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>(),
+            cuteafd_loader::placement::planner::EmbeddingHome::Device(0))?
+            .into_iter().map(|rank| rank.target).collect::<Vec<_>>()
+    } else { CoordinatorWeights::plan(checkpoint, cfg, 1, &vec![0; cfg.layers])? };
     let capacity = RequestCapacity::new(options.sequences, options.prefill.rows)?;
     let context = if options.context_tokens == 0 { cfg.max_position as u64 } else { options.context_tokens };
-    let names = program_names(cfg, &targets[0], &manifest, capacity, u32::try_from(context)?)?;
-    let device = Device { library, id: options.device };
-    let package = fp8::package_directory(options.native_lib, 1,
+    let names = targets.iter().map(|target| program_names(cfg, target, &manifest, capacity, u32::try_from(context)?))
+        .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<BTreeSet<_>>();
+    let devices = physical.iter().map(|&id| Device { library, id }).collect::<Vec<_>>();
+    let device = devices[0];
+    let package = fp8::package_directory(options.native_lib, gpus,
         catalog.fp8().context("MiniMax requires native NVFP4 experts")?.format());
     let routed = cfg.moe.iter().enumerate().filter_map(|(layer, moe)| moe.then_some(layer)).collect::<Vec<_>>();
     let may_onboard = options.onboard.layers(routed.len()) != Some(0);
     let local = cuteafd_loader::families::minimax_m3::admission::local_package(
-        &catalog, options.manifest_path, capacity, 1);
-    let mut native = None;
-    let mut expert_modules = None;
-    let runtime = RuntimeInventory::measure(library, &[options.device], InventoryPhase::PreWeight, |_| {
+        &catalog, options.manifest_path, capacity, gpus);
+    let mut native = Vec::new();
+    let mut expert_modules = Vec::new();
+    let runtime = RuntimeInventory::measure(library, &physical, InventoryPhase::PreWeight, |id| {
+        let gpu = physical.iter().position(|&device| device == id).context("MiniMax sampled rank missing")?;
+        let device = devices[gpu];
         programs.load_matching(|name| names.contains(name))?;
-        native = Some(Kernels::bind(device, programs, &manifest, cfg, &targets[0],
+        let bind = if gpus == 2 { Kernels::bind_split } else { Kernels::bind };
+        native.push(bind(device, programs, &manifest, cfg, &targets[gpu],
             capacity.execution_rows(), u32::try_from(context)?)?);
+        if gpus == 2 { library.peer_exchange_initialize()?; library.peer_abort_initialize()?; }
         if may_onboard && matches!(local, LocalPackage::Installed { .. }) {
-            expert_modules = Some(fp8::Fp8Modules::load(&package, None)?);
+            expert_modules.push(fp8::Fp8Modules::load(&package, None)?);
         }
         if !options.peers.is_empty() {
             library.v41_compact_reducer()?.require_plane_reduction(options.peers.len() as u32)?;
@@ -127,7 +161,6 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     let samples = runtime.gpus.iter().map(|sample| Sample { total: sample.total_bytes,
         cap: policy.gpu_cap_bytes(sample.total_bytes), free: sample.free_bytes, pending_code: 0 }).collect::<Vec<_>>();
     let usage_enabled = options.usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?;
-    let physical = [options.device];
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
     let host_cache_bytes = match options.prefix.host_cache_bytes {
         HostBudget::Auto => None, HostBudget::Bytes(bytes) => Some(bytes),
@@ -146,7 +179,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         expert_usage: usage_enabled, resident_weight_limit: options.resident_weights }, &samples, options.onboard)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &admitted.solved.served_context().to_string());
-    publish_deployment(options.device, options.peers);
+    publish_deployment(options.device, options.split_device, options.peers);
     let config = TcpTransportConfig::default();
     let endpoint = SparkEndpoint { ring_depth: None, capacity: capacity.prefill.rows,
         ingress: SparkIngress::Bf16, partial_reply_bytes: None };
@@ -160,38 +193,54 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         Some(SparkAdmission::plan_view(view, ExpertGeometry::MINIMAX_M3, Some(&catalog),
             &working, options.peers.len(), model, None)?)
     };
-    let (pending, membership) = push::prepare_serving(view, &catalog, checkpoint, &[device], &inputs, &admitted)?;
+    let (pending, membership) = push::prepare_serving(view, &catalog, checkpoint, &devices, &inputs, &admitted)?;
     let spark = spark.map(|spark| spark.start_with(options.peers, membership)).transpose()?;
     let push::ServingWeights { targets, embedding, mut expert_sets } = pending.finish(&catalog, spark)?;
-    let stream = Rc::new(Stream::new(device)?);
-    let loaded = targets.into_iter().map(|weights| LoadedRank { weights,
-        streams: RequestStreams { decode: Rc::clone(&stream),
-            prefill: (0..options.prefill.waves).map(|_| Rc::clone(&stream)).collect() } }).collect();
+    let loaded = targets.into_iter().zip(&devices).map(|(weights, &device)| {
+        let stream = Rc::new(Stream::new(device)?);
+        Ok(LoadedRank { weights, streams: RequestStreams { decode: Rc::clone(&stream),
+            prefill: (0..options.prefill.waves).map(|_| Rc::clone(&stream)).collect() } })
+    }).collect::<Result<Vec<_>>>()?;
     let owners = Owners::with_usage_reader(&inputs, &admitted, programs, loaded, embedding,
         options.usage_reader.clone())?;
     let mut dispatchers = Vec::new();
     let mut bindings = vec![None; cfg.layers];
     if admitted.onboard > 0 {
         ensure!(expert_sets.len() == 1, "MiniMax selected expert set missing");
-        let mut set = expert_sets.pop().context("MiniMax expert set missing")?;
-        ensure!(set.ranks.len() == 1 && set.backings == admitted.expert_backings,
-            "MiniMax whole expert set differs from admission");
-        let PushedExperts::Fp8(pushed) = set.ranks.pop().context("MiniMax pushed expert rank missing")? else {
-            anyhow::bail!("MiniMax expert set is not native NVFP4");
-        };
+        let set = expert_sets.pop().context("MiniMax expert set missing")?;
+        ensure!(set.ranks.len() == gpus && set.backings == admitted.expert_backings,
+            "MiniMax local expert set differs from admitted rank backings");
+        let pushed = set.ranks.into_iter().map(|rank| match rank {
+            PushedExperts::Fp8(layers) => Ok(layers),
+            _ => anyhow::bail!("MiniMax expert set is not native NVFP4"),
+        }).collect::<Result<Vec<_>>>()?;
         let LocalPackage::Installed { scratch, output } = inputs.local else {
             anyhow::bail!("MiniMax admitted local experts without installed workspace");
         };
-        let backing = &admitted.expert_backings[0];
-        let budget = backing.arena.bytes().checked_add(usize::try_from(scratch)?)
-            .and_then(|bytes| bytes.checked_add(usize::try_from(output).ok()?))
-            .context("MiniMax expert owner budget overflow")?;
-        let experts = Whole::from_pushed(device, catalog.fp8().context("MiniMax native experts")?,
-            &package, working.rtx_layers.clone(), capacity.execution_rows() as usize, budget, pushed)?;
+        let budgets = admitted.expert_backings.iter().map(|backing| backing.arena.bytes()
+            .checked_add(usize::try_from(scratch)?).and_then(|bytes| bytes.checked_add(usize::try_from(output).ok()?))
+            .context("MiniMax expert owner budget overflow")).collect::<Result<Vec<_>>>()?;
         for &layer in &working.rtx_layers {
             bindings[layer] = Some(RoutedBinding { dispatcher: dispatchers.len(), route: FfnRoute::Local });
         }
-        dispatchers.push(Dispatcher::whole(Box::new(experts))?);
+        if gpus == 1 {
+            let layers = pushed.into_iter().next().context("MiniMax whole pushed rank missing")?;
+            let experts = Whole::from_pushed(device, catalog.fp8().context("MiniMax native experts")?,
+                &package, working.rtx_layers.clone(), capacity.execution_rows() as usize, budgets[0], layers)?;
+            dispatchers.push(Dispatcher::whole(Box::new(experts))?);
+        } else {
+            let pair = [devices[0], devices[1]];
+            let pushed = pushed.try_into().map_err(|_| anyhow::anyhow!("MiniMax pushed TP2 rank count"))?;
+            let experts = Fp8MoeTp2::pushed_pair(pair, catalog.fp8().context("MiniMax native experts")?,
+                &package, working.rtx_layers.clone(), capacity.execution_rows() as usize,
+                [budgets[0], budgets[1]], pushed)?;
+            let endpoints = [0, 1].map(|gpu| crate::shared::peer_split::RankDevice {
+                device: devices[gpu].id, stream: owners.storage.ranks[gpu].decode.borrow().stream.raw });
+            let [left, right] = experts;
+            let executor = OwnerTp2::new(library, endpoints, [Box::new(left), Box::new(right)], cfg.hidden,
+                cfg.topk, capacity.execution_rows() as usize, capacity.decode.rows as usize, false, "minimax")?;
+            dispatchers.push(Dispatcher::tp2(0, executor)?);
+        }
     } else { ensure!(expert_sets.is_empty(), "MiniMax received unselected expert sets"); }
     if !working.spark_layers.is_empty() {
         let layout = inputs.links.first().context("MiniMax admitted Spark link missing")?.clone();
@@ -207,7 +256,8 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         dispatchers.push(Dispatcher::spark(link)?);
     }
     let execution = ServingPrefill::new(cfg, dispatchers, bindings, 1)?;
-    owners.prewarm(cfg)?;
+    if gpus == 1 { owners.prewarm(cfg)?; }
+    else { tracing::info!("MiniMax split serving uses qualified eager sections; split graph prewarm awaits trace"); }
     let quota = inputs.host_prefix.quota_bytes;
     let host_prefix = (quota > 0).then(|| options.prefix.host_config_for(owners.storage.prefix.layout(),
         admitted.solved.served_context() as usize, quota)).transpose()?;
@@ -221,12 +271,12 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         admission_free: samples.iter().map(|sample| sample.free).collect(), host_prefix })
 }
 
-fn publish_deployment(device: i32, peers: &[SocketAddr]) {
+fn publish_deployment(device: i32, peer: Option<i32>, peers: &[SocketAddr]) {
     // Hardware reporting reads the admitted endpoint order, not launch inventory
     // or a hidden command's absent public-family argument capture.
     cuteafd_bench::context::ResolvedSettings::default()
         .value("peers", peers.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
-        .value("device", device).publish();
+        .value("device", device).value("split-device", peer.map_or_else(|| "none".to_owned(), |id| id.to_string())).publish();
 }
 
 fn publish_provenance(native_lib: &Path, manifest: &Path, runtime: &RuntimeInventory,
@@ -244,7 +294,8 @@ fn publish_provenance(native_lib: &Path, manifest: &Path, runtime: &RuntimeInven
             "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
             "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
             "native_sha256": hash(native_lib)?, "programs_sha256": hash(manifest)?,
-            "layout": format!("1 RTX/{spark_world} Sparks; whole; context/{}; slots/{}",
+            "layout": format!("{} RTX/{spark_world} Sparks; {}; context/{}; slots/{}",
+                runtime.gpus.len(), if runtime.gpus.len() == 2 { "split-fp32" } else { "whole" },
                 admitted.solved.served_context(), sequences),
             "devices": runtime.gpus, "spark_world": spark_world,
             "onboard_layers": admitted.onboard, "graph_basis": "uncalibrated MiniMax byte fallback"
@@ -260,7 +311,7 @@ mod tests {
     #[test]
     fn admitted_peer_order_reaches_benchmark_hardware_metadata() -> Result<()> {
         let peers = ["192.0.2.3:19441".parse()?, "192.0.2.1:19441".parse()?, "192.0.2.2:19441".parse()?];
-        let (_, settings) = cuteafd_bench::context::capture_resolved(|| publish_deployment(1, &peers));
+        let (_, settings) = cuteafd_bench::context::capture_resolved(|| publish_deployment(1, None, &peers));
         let mut context = cuteafd_bench::context::ServerContext::default();
         settings.apply(&mut context);
         let hardware = cuteafd_bench::server::hardware(&context.settings);
@@ -271,6 +322,25 @@ mod tests {
         }
         assert!(context.settings.iter().any(|setting| setting.name == "device"
             && setting.value.as_deref() == Some("1") && setting.source == "resolved"));
+        Ok(())
+    }
+
+    #[test]
+    fn split_device_inventory_is_distinct_and_never_synthesizes_a_peer() -> Result<()> {
+        validate_devices(1, None)?;
+        validate_devices(1, Some(0))?;
+        validate_wire(None, super::super::dense::PartialPrecision::Bf16)?;
+        validate_wire(Some(0), super::super::dense::PartialPrecision::F32)?;
+        assert!(validate_wire(Some(0), super::super::dense::PartialPrecision::Bf16).is_err());
+        for (device, peer) in [(-1, None), (0, Some(0)), (0, Some(-1))] {
+            assert!(validate_devices(device, peer).is_err());
+        }
+        let source = include_str!("startup.rs").split_once("pub(crate) fn load<'a>").unwrap().1
+            .split_once("#[cfg(test)]").unwrap().0;
+        assert!(source.contains("SplitFfnWeights::plan("));
+        assert!(source.contains("Fp8MoeTp2::pushed_pair("));
+        assert!(source.contains("OwnerTp2::new("));
+        assert!(source.contains("physical_devices: &physical"));
         Ok(())
     }
 

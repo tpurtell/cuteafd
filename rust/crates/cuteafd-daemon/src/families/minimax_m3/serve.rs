@@ -13,6 +13,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: std::path::PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: std::path::PathBuf,
     #[arg(long, default_value_t = 0)] pub device: i32,
+    /// Distinct peer for contiguous attention with qualified FP32 split FFNs.
+    #[arg(long)] pub split_device: Option<i32>,
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     #[arg(long)] pub pool_tokens: Option<u64>,
     #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<usize>)]
@@ -102,7 +104,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;
             let concurrency = usize::from(worker_args.max_sequences);
             let loaded = super::startup::load(&library, &programs, &view, &checkpoint, &cfg, super::startup::Options {
-                device: worker_args.device, peers: &worker_args.peers, native_lib: &worker_args.native_lib,
+                device: worker_args.device, split_device: worker_args.split_device,
+                peers: &worker_args.peers, native_lib: &worker_args.native_lib,
                 manifest_path: &worker_args.manifest,
                 split_wire: match worker_args.split_wire.as_str() {
                     "bf16" => super::dense::PartialPrecision::Bf16,
@@ -118,13 +121,14 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let served_context = usize::try_from(loaded.admitted.solved.served_context())?;
             let backend = super::backend::MiniMaxBackend::new(&loaded.owners, &cfg,
                 loaded.execution, served_context, loaded.host_prefix, worker_args.prefill_packing)?;
-            library.cuda_set_device(worker_args.device)?;
+            library.cuda_set_device(worker_args.split_device.unwrap_or(worker_args.device))?;
+            let physical = std::iter::once(worker_args.device).chain(worker_args.split_device).collect::<Vec<_>>();
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats,
                 concurrency, scheduler::Drafts::None, Default::default(), eos, worker_args.decode_share,
                 &worker_args.prefix, worker_args.loop_abort.config(), worker_args.token_io.token_select,
                 &mut super::super::qwen3_5::serve::text_media(), None, || {
                     backend.require_live()?;
-                    RuntimeInventory::measure(&library, &[worker_args.device], InventoryPhase::PostLoad,
+                    RuntimeInventory::measure(&library, &physical, InventoryPhase::PostLoad,
                         |_| Ok(()))?.record("minimax_m3-serving-loaded", &loaded.admission_free);
                     if let Some(ready) = ready.take() { let _ = ready.send(Ok(served_context)); }
                     Ok(())

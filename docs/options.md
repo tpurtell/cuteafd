@@ -81,10 +81,12 @@ A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
 
 MiniMax M3.1 Flash supports public `cuteafd serve --family minimax_m3` and
 `./run.sh` on one RTX, qualified by the 2026-11-14 trace-free basic card (#1856).
-Use a build containing the MiniMax native exports. The supported edge uses native MXFP8 dense math,
-NVFP4 W4A4 experts, FP8 MSA KV/index, GPU embedding and device token selection.
-`ATTENTION_PLACEMENT=auto|heads` selects whole ownership; explicit context/layers
-and two-RTX serving remain refused until the split executor is qualified.
+Use a build containing MiniMax native exports: MXFP8 dense math, NVFP4 W4A4
+experts, FP8 MSA KV/index, GPU embedding and device token selection.
+On one RTX, `ATTENTION_PLACEMENT=auto|heads` selects whole ownership. WIP two-RTX
+`auto|layers` selects contiguous attention and eager FP32 split FFNs; public
+two-RTX serving awaits its card (#1856/#2101). Explicit context placement and
+two-RTX narrow-head serving remain refused.
 `SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
 
 Shared launch keys keep their usual meanings. The one-RTX edge accepts
