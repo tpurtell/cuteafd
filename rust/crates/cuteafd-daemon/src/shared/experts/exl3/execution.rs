@@ -309,11 +309,21 @@ impl Manifest {
     }
 }
 
-/// Mutually exclusive capacity specializations in one lane may reuse data
-/// scratch. Persistent synchronization state remains private to each kernel.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SharedWorkspaceError {
+    #[error("shared EXL3 workspace device or serialized stream differs")]
+    ExecutionOwner,
+    #[error("shared EXL3 workspace has no compatible {name} allocation ({bytes} bytes, {dtype})")]
+    Buffer { name: String, bytes: usize, dtype: String },
+}
+
+/// Mutually exclusive capacity specializations and opt-in weight sets reuse
+/// mutable scratch. Kernel counters and LUT bindings remain independently owned.
 pub(crate) struct Exl3Workspace<'a> {
     allocations: BTreeMap<String, DeviceAllocation<'a>>,
     dtypes: BTreeMap<String, String>,
+    serial: Option<(i32, *mut c_void)>,
+    output: Option<Rc<crate::shared::memory::device::Allocation<'a>>>,
 }
 impl<'a> Exl3Workspace<'a> {
     pub(crate) fn bytes(&self) -> usize {
@@ -350,7 +360,41 @@ impl<'a> Exl3Workspace<'a> {
             allocations.insert(name.clone(), DeviceAllocation::new(library, bytes, Tag::workspace("experts/exl3-shared-scratch"))?);
             dtypes.insert(name, dtype);
         }
-        Ok(Rc::new(Self { allocations, dtypes }))
+        Ok(Rc::new(Self { allocations, dtypes, serial: None, output: None }))
+    }
+
+    /// One opt-in target/draft execution owner. Weight sets stay independent;
+    /// scratch and output are shared only on this device's serialized stream.
+    pub(crate) fn serial(library: &'a NativeLibrary, directories: &[PathBuf],
+        epilogue: Exl3Epilogue, stream: *mut c_void, output_bytes: usize) -> Result<Rc<Self>> {
+        let mut arena = Self::new(library, directories, epilogue)?;
+        let unique = Rc::get_mut(&mut arena).context("unpublished EXL3 workspace")?;
+        let device = library.cuda_get_device()?;
+        ensure!(!stream.is_null() && output_bytes > 0, "shared EXL3 serial owner needs a stream and output");
+        unique.serial = Some((device, stream));
+        unique.output = Some(Rc::new(crate::shared::memory::device::Allocation::new(
+            crate::shared::memory::device::Device { library, id: device }, output_bytes,
+            Tag::workspace("experts/exl3-serial-output"))?));
+        Ok(arena)
+    }
+
+    pub(crate) fn serial_output(&self, library: &NativeLibrary, stream: *mut c_void, bytes: usize)
+        -> Result<crate::shared::memory::device::Allocation<'a>> {
+        if self.serial != Some((library.cuda_get_device()?, stream)) {
+            return Err(SharedWorkspaceError::ExecutionOwner.into());
+        }
+        let output = self.output.as_ref().context("EXL3 serial output is absent")?;
+        if output.buffer.bytes < bytes {
+            return Err(SharedWorkspaceError::Buffer { name: "serial output".into(), bytes, dtype: "bytes".into() }.into());
+        }
+        crate::shared::memory::device::Allocation::view(output, 0, bytes)
+    }
+
+    fn validate_stream(&self, device: i32, stream: *mut c_void) -> Result<()> {
+        if self.serial.is_some_and(|owner| owner != (device, stream)) {
+            return Err(SharedWorkspaceError::ExecutionOwner.into());
+        }
+        Ok(())
     }
 }
 
@@ -721,9 +765,10 @@ impl<'a> Exl3Execution<'a> {
                 continue;
             }
             if let Some(arena) = shared.as_ref().filter(|_| !spec.zero_on_create) {
-                let buffer = arena.allocations.get(name).context("missing shared EXL3 scratch")?.buffer;
-                ensure!(buffer.device_id == device && buffer.bytes >= spec.bytes
-                    && arena.dtypes.get(name) == Some(&spec.dtype), "invalid shared EXL3 scratch");
+                let invalid = || SharedWorkspaceError::Buffer { name: name.clone(), bytes: spec.bytes, dtype: spec.dtype.clone() };
+                let buffer = arena.allocations.get(name).ok_or_else(invalid)?.buffer;
+                if buffer.device_id != device || buffer.bytes < spec.bytes
+                    || arena.dtypes.get(name) != Some(&spec.dtype) { return Err(invalid().into()); }
                 pointers.insert(name.clone(), buffer);
                 continue;
             }
@@ -956,6 +1001,7 @@ impl<'a> Exl3Execution<'a> {
     ) -> Result<CuteafdDeviceBuffer> {
         let mut inputs = inputs;
         let mut output = output;
+        if let Some(shared) = &self._shared_workspace { shared.validate_stream(self.device, stream)?; }
         ensure!(
             rows > 0 && rows <= self.capacity,
             "EXL3 live rows exceed capacity"
@@ -1026,6 +1072,7 @@ impl<'a> Exl3Execution<'a> {
     pub(crate) unsafe fn launch_layer_core(&mut self, layer: usize, inputs: [CuteafdDeviceBuffer; 3], rows: usize,
         stream: *mut c_void) -> Result<PartialSources> {
         let mut inputs = inputs;
+        if let Some(shared) = &self._shared_workspace { shared.validate_stream(self.device, stream)?; }
         ensure!(rows > 0 && rows <= self.capacity, "EXL3 live rows exceed capacity");
         ensure!(self.library.cuda_get_device()? == self.device, "EXL3 execution on wrong device");
         for (buffer, bytes) in inputs.iter().zip([
@@ -1063,6 +1110,18 @@ mod shared_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_workspace_refuses_different_stream_or_device_with_typed_error() {
+        let stream = 16usize as *mut c_void;
+        let arena = Exl3Workspace { allocations: BTreeMap::new(), dtypes: BTreeMap::new(),
+            serial: Some((1, stream)), output: None };
+        assert!(arena.validate_stream(1, stream).is_ok());
+        for (device, stream) in [(0, stream), (1, 32usize as *mut c_void)] {
+            let error = arena.validate_stream(device, stream).unwrap_err();
+            assert!(matches!(error.downcast_ref::<SharedWorkspaceError>(), Some(SharedWorkspaceError::ExecutionOwner)));
+        }
+    }
 
     #[test]
     fn planned_residency_refuses_mismatched_code_before_allocation() -> Result<()> {

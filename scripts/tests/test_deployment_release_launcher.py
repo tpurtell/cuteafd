@@ -135,6 +135,13 @@ def test_deployment_preserves_release_container_commands(
             waves = 3 if ranks else 1
             unit = 2752 if waves == 3 else 4096
             if entry["family"] == "qwen4":
+                if "--rtx-expert-layers" in before["command"]:
+                    position = before["command"].index("--rtx-expert-layers")
+                    assert before["command"][position + 1] == "all"
+                    assert "--rtx-expert-layers" not in after["command"]
+                    # Auto now solves the same all-local endpoint when no
+                    # Spark fallback exists; it is not an implicit `all` pin.
+                    del before["command"][position:position + 2]
                 position = before["command"].index("--console-secret-file")
                 before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves)]
             if entry["family"] == "glm5":

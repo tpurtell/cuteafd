@@ -884,7 +884,7 @@ fn boot_concurrency_full_plan_matrix() {
                             let mut options = case.base_options.clone()
                                 .unwrap_or_else(|| wave_plan_options(case.dir.path(), ranks));
                             options.placement = ExpertPlacement::from_spark_ranks(ranks);
-                            if family == "qwen4" && gpus == 2 && ranks == 0 {
+                            if family == "qwen4" && gpus == 2 {
                                 options.attention_placement = Some(AttentionPlacement::Layers);
                             }
                             if family == "step5" {
@@ -1265,7 +1265,9 @@ fn family_executor_prefill_markers_do_not_claim_shared_wave_ports() {
 #[test]
 fn qwen_incomplete_coordinator_headers_refuse_instead_of_charging_a_partial_payload() {
     let config = qwen4_config(4);
-    let complete = qwen4_coordinator(&config, false);
+    let mut complete = qwen4_coordinator(&config, false);
+    let (experts, _) = qwen4_exl3(4, 4);
+    complete.extend(experts);
     let incomplete = complete.iter().filter(|(name, ..)| !name.contains("hyper_connection")).cloned()
         .collect::<Vec<_>>();
     assert!(incomplete.len() < complete.len());
@@ -1274,7 +1276,7 @@ fn qwen_incomplete_coordinator_headers_refuse_instead_of_charging_a_partial_payl
         host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..sparks(4) };
     let hint = "Qwen resident weights: checkpoint headers do not describe the serve-qwen4 resident layout";
     let resident_item = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
-        .flat_map(|d| &d.items).any(|item| item.group == "target incl PLE projections");
+        .flat_map(|d| &d.items).any(|item| item.group == "weight arena" && item.category == cuteafd_core::memory_layout::Category::Weights);
     // The complete headers describe the layout: no such refusal, weights charged.
     let complete = plan(snapshot(config.clone(), &complete).path(), &options).unwrap();
     assert!(complete.fits && !complete.hints.iter().any(|h| h.what == hint), "{}", render(&complete));
@@ -1289,12 +1291,15 @@ fn qwen_incomplete_coordinator_headers_refuse_instead_of_charging_a_partial_payl
 #[test]
 fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
     let config = qwen4_config(4);
-    let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));
+    let mut tensors = qwen4_coordinator(&config, false);
+    tensors.extend(qwen4_exl3(4, 4).0);
+    let dir = snapshot(config.clone(), &tensors);
     // Qwen's mapped-PLE ring is a hard two-wave executor limit (#717).
     for (unit, waves) in [(512, 1), (1024, 2), (2048, 2), (4096, 2)] {
         let report = plan(dir.path(), &PlanOptions {
             layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
                 prefill_rows: unit, prefill_lanes: waves, context_tokens: 32768,
+                onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                 prefix_slots: Some(0), host_cache_bytes: Some(0),
                 host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
             ..sparks(4)
@@ -4878,8 +4883,8 @@ fn qwen_default_attention_follows_spark_free_coordinator_layout() {
         (2, true, 0, AttentionPlacement::Layers),
         (1, true, 0, AttentionPlacement::Heads),
         (2, false, 0, AttentionPlacement::Heads),
-        (2, true, 1, AttentionPlacement::Heads),
-        (2, true, 4, AttentionPlacement::Heads),
+        (2, true, 1, AttentionPlacement::Layers),
+        (2, true, 4, AttentionPlacement::Layers),
     ] {
         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![96 << 30; gpus], head_split: peer, ..Default::default()
@@ -5099,10 +5104,12 @@ fn layout_charges_local_routed_experts_to_the_coordinator() {
     assert!(routed > 0);
     let memory = report.memory_layout.unwrap();
     let expert_weights: u64 = memory.devices[0].items.iter()
-        .filter(|item| item.category == Category::Experts && item.group == "routed expert arenas")
+        .filter(|item| item.category == Category::Experts && item.group == "weight arena")
         .map(|item| item.bytes).sum();
     assert!(expert_weights >= routed);
-    assert_eq!(expert_weights % (2 * 1024 * 1024), 0);
+    let tails: u64 = memory.devices[0].items.iter().filter(|item| item.category == Category::Experts
+        && item.group == "allocation granularity").map(|item| item.bytes).sum();
+    assert_eq!((expert_weights + tails) % (2 * 1024 * 1024), 0);
     // Tier-specific rotations, maps and arena padding add a small overhead;
     // charge them without duplicating the trellis payload itself.
     assert!(expert_weights - routed < routed / 50);
@@ -5365,6 +5372,7 @@ fn qwen_small_card_one_spark_buffers_three_waves_with_one_compute_slot() {
     use cuteafd_core::memory_layout::DeviceKind;
     let dir = qwen_snapshot(4);
     let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+        onboard: Some(crate::placement::OnboardSetting::Layers(0)),
         rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), context_tokens: 262_144,
         host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
         ..Default::default()
@@ -5445,18 +5453,17 @@ fn qwen_spark_layout_keeps_only_native_mtp_experts_on_coordinator() {
     let dir = snapshot(config, &tensors);
     let manifest = write_qwen4_exl3_capacities(dir.path(), "45");
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        onboard: Some(crate::placement::OnboardSetting::Layers(0)),
         rtx_bytes: vec![32 << 30], pool_tokens: Some(32768), native_mtp_layers: 1,
         workspace_manifest: Some(manifest), ..Default::default()
     }), ..sparks(1) };
     let with_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     let lead = &with_mtp.devices[0];
-    assert!(lead.items.iter().any(|i| i.group == "native MTP expert arena" && i.bytes > 0), "{}", with_mtp.render());
-    assert!(!lead.items.iter().any(|i| i.group == "routed expert arenas"));
-    assert!(lead.items.iter().any(|i| i.group == "local EXL3 workspace" && i.bytes > 0));
-    assert!(with_mtp.notes.iter().any(|n| n.contains("MTP experts stay on rtx0")));
+    assert!(lead.items.iter().any(|i| i.group == "weight arena" && i.category == Category::Experts && i.bytes > 0), "{}", with_mtp.render());
+    assert!(lead.items.iter().any(|i| i.group.starts_with("MTP EXL3")));
     options.layout.as_mut().unwrap().native_mtp_layers = 0;
     let without_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert!(!without_mtp.devices[0].items.iter().any(|i| i.group == "native MTP expert arena"));
+    assert!(!without_mtp.devices[0].items.iter().any(|i| i.group == "weight arena" && i.category == Category::Experts));
     assert!(lead.by_category()[&Category::Kv] > without_mtp.devices[0].by_category()[&Category::Kv]);
     assert_eq!(with_mtp.devices[1].by_category()[&Category::Experts],
         without_mtp.devices[1].by_category()[&Category::Experts]);
@@ -6111,11 +6118,12 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             }), ..sparks(4) };
             let auto = plan(dir.path(), &options).unwrap();
             let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
-            // No context programs here; Qwen with Spark experts also keeps its single-owner default.
-            let peer = gpus == 2 && auto.family.as_deref() != Some("qwen4");
+            // No context programs here; Qwen whole-layer ownership now also
+            // applies when a selected coordinator pair has Spark expert fallback.
+            let peer = gpus == 2;
             // Standard GLM variants can own whole layers without Context programs;
             // V4 has no qualified Layers executor and keeps its fail-closed default.
-            let default = if matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash")) && peer {
+            let default = if matches!(auto.family.as_deref(), Some("glm5" | "glm5_flash" | "qwen4")) && peer {
                 AttentionPlacement::Layers
             } else if !peer {
                 AttentionPlacement::Heads
@@ -6123,12 +6131,8 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
             assert_eq!(auto.attention_placement, default);
             if auto.family.as_deref() == Some("qwen4") {
                 assert_eq!(auto.spark_ranks, 4);
-                assert_eq!(auto.attention_placement, AttentionPlacement::Heads);
-                if gpus == 2 {
-                    let layout = auto.memory_layout.as_ref().unwrap();
-                    assert!(layout.devices[1].items.is_empty(), "{}", layout.render());
-                    assert_eq!(layout.devices[1].kv_tokens, 0);
-                }
+                assert_eq!(auto.attention_placement, if gpus == 2 { AttentionPlacement::Layers }
+                    else { AttentionPlacement::Heads });
             }
             if auto.family.as_deref() == Some("glm5") {
                 assert!(auto.memory_layout.is_some(), "{}", render(&auto));
@@ -6634,8 +6638,11 @@ fn qwen_auto_mtp_real_inventory_selects_local_without_losing_mtp() {
             host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
             prefix_slots: Some(0), ..Default::default() }), ..sparks(2) };
     let input = PlanInput::open(dir.path()).unwrap();
-    // A real Spark solve must not masquerade as a local expert deployment.
-    let spark = input.plan(&options).unwrap();
+    // Keep this arm genuinely remote: Auto may onboard the complete small
+    // fixture now, in which case zero expert world correctly enables MTP.
+    let mut remote = options.clone();
+    remote.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
+    let spark = input.plan(&remote).unwrap();
     assert!(spark.solver_placement.is_some(), "{}", render(&spark));
     assert_eq!(spark.spark_expert_world(), 2);
     assert_eq!(spark.speculator, Some("off"));

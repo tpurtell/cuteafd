@@ -25,7 +25,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     };
     let shape = Shape::resolve(input, report, model, options, ShapePolicy::manifest_bounded());
     report.prefill_span_rows = Some(prefill.span_rows);
-    if options.rtx_bytes.len() == 2 && options.head_split && local {
+    if options.rtx_bytes.len() == 2 && options.head_split {
         return dual_layout(report, model, input, options, shape.prefill_rows, shape.concurrency,
             shape.context_tokens, shape.native_layers > 0, shape.manifest.as_deref());
     }
@@ -93,14 +93,6 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
                 // The native MTP layer loads with the target (ledger scope `weights`).
                 _ => Category::Weights,
             });
-            // FP8/NVFP4 local experts load at their checkpoint bytes; EXL3 below as arenas.
-            if local && !exl3 {
-                for component in report.components.iter().filter(|c| c.component == Component::RoutedExpert
-                    && c.status != Status::Unused && c.status != Status::Disabled) {
-                    devices[0].items.push(Item::new(Category::Experts, component.component.label(),
-                        component.formats.keys().cloned().collect::<Vec<_>>().join("+"), component.bytes, Basis::Exact));
-                }
-            }
         }
         None => {
             let what = "Qwen resident weights: checkpoint headers do not describe the serve-qwen4 resident layout".to_string();
@@ -111,48 +103,11 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     if options.host_embedding {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
-    if let Some((backbone, draft)) = exl3_arenas(input, mtp) {
-        if local {
-            devices[0].items.push(Item::new(Category::Experts, "routed expert arenas", "exl3", backbone, Basis::Formula));
-        }
-        if draft > 0 {
-            devices[0].items.push(Item::new(Category::Experts, "native MTP expert arena", "exl3", draft, Basis::Formula));
-        }
-    } else if mtp {
-        let native: u64 = report.components.iter().filter(|c| c.component == Component::SpeculatorExpert && c.status == Status::Unused)
-            .map(|c| c.bytes).sum();
-        if native > 0 {
-            devices[0].items.push(Item::new(Category::Experts, "native MTP experts", "native", native, Basis::Exact));
-        }
-    }
-    if exl3 && (local || mtp) {
-        // The EXL3 window retains its shared capacity arenas beside the trellis
-        // bytes, from the same capacity manifests the loader reads.
-        match expert_workspace(report, model, input, options.workspace_manifest.as_deref(), shape.prefill_rows) {
-            Some(bytes) => devices[0].items.push(Item::new(Category::Experts, "local EXL3 workspace", "", bytes, Basis::Formula)),
-            // A header-only inventory names no image: its workspace is the layout's question.
-            None if shape.manifest.is_none() => notes.push("local EXL3 workspace not charged: no program manifest \
-                (--workspace-manifest or an image's PROGRAMS.json) to read its capacity manifests from".into()),
-            None => {
-                let what = "Qwen local EXL3 workspace: no matching rtx-tp1/m*/v41_exl3.json capacity manifests".to_string();
-                report.refuse_placement(what.clone(), "Images bundle them; or export the exl3 tree \
-                    alongside PROGRAMS.json (--workspace-manifest).");
-                notes.push(what);
-            }
-        }
-    }
-    if !local && mtp {
-        notes.push("Native Qwen MTP experts stay on rtx0; Spark ranks serve backbone experts only".into());
-    }
-    if options.drafter_bytes > 0 {
-        devices[0].items.push(Item::new(Category::Drafter, "drafter", "", options.drafter_bytes, basis));
-    }
-    let pkg = if report.placement == ExpertPlacement::Local { local_package(report) }
-        else if !local { "none" } else if exl3 { "exl3" } else { "fp8" };
+    let pkg = if exl3 { "exl3" } else { "fp8" };
     devices[0].items.push(runtime_item(shape.manifest.as_deref(), &program_families("qwen4", false),
         pkg, false, 0, options.rtx_bytes[0]));
     let spark_ranks = if local { 0 } else { report.placement.spark_ranks() };
-    let working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
+    let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: 1 };
     let charges = SparkCharges { host_bytes: Some(SPARK_HOST_BYTES),
@@ -205,6 +160,13 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         notes.push(format!("full-context admission shortfall: context {} tokens, pool {pool_tokens} tokens, shortfall {} tokens",
             shape.context_tokens, shape.context_tokens - pool_tokens));
     }
+    if let Some(placement) = &report.solver_placement {
+        working.rtx_layers = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
+            (assignment.experts != crate::placement::ExpertHome::Spark).then_some(layer)).collect();
+        working.spark_layers = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
+            (assignment.experts == crate::placement::ExpertHome::Spark).then_some(layer)).collect();
+        report.onboard_layers = Some(placement.onboard_layers);
+    }
     charge_spark_devices(report, model, input, options, charges, &working, endpoints, &mut sparks,
         &mut notes, |device| format!("{} I/O admission", device.name()));
     if local {
@@ -252,44 +214,50 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| ((cfg.ple_dim / cfg.ple_rows().max(1)) as u64
             * if t.meta.dtype == cuteafd_core::DType::F8E4M3 { 1 } else { 2 }, t.meta.dtype == cuteafd_core::DType::F8E4M3));
-    for (package, bytes) in package_scratch(input, report, options.workspace_manifest.as_deref(),
-        shape.prefill_rows, mtp)? {
-        device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
-    }
-    let loaded_bytes = device.used_bytes();
     let host_embedding = options.host_embedding && checkpoint.tensors.iter()
         .filter(|tensor| tensor.meta.name.ends_with("embed_tokens.weight")).count() == 1
         && checkpoint.require_untied_embedding("model.language_model.embed_tokens.weight").is_ok();
-    let mut loaded_weights = qwen4::single_owner_weights(checkpoint, &cfg, cfg.layers, mtp,
-        options.qwen_representation, host_embedding)?
-        .checked_add(crate::placement::ResidentWeights(options.drafter_bytes))?;
-    let all_onboarded = cfg.layers > 0
-        && options.resolve_onboard(cfg.layers) == Some(Onboard::Layers(cfg.layers));
-    let local = report.placement == ExpertPlacement::Local || all_onboarded;
-    if local || mtp {
-        loaded_weights = loaded_weights.checked_add(qwen4::single_expert_weights(
-            input.expert_catalog()?, cfg.layers, local, mtp)?)?;
+    let all_onboarded = cfg.layers > 0 && options.resolve_onboard(cfg.layers) == Some(Onboard::Layers(cfg.layers));
+    let spark_ranks = if report.placement == ExpertPlacement::Local || all_onboarded { 0 }
+        else { report.placement.spark_ranks() };
+    let catalog = input.expert_catalog()?;
+    let lib = qwen4::metadata_library(catalog, options.workspace_manifest.as_deref());
+    let mut experts = if manifest.is_some() {
+        qwen4::QwenExperts::read(catalog, &lib, cfg.layers, 1, shape.prefill_rows.max(64))?
+    } else { qwen4::QwenExperts::headers(catalog, cfg.layers, 1)? };
+    let embedding = if host_embedding { 0 } else { crate::families::qwen4::weight_layout::embedding_table_bytes(checkpoint)? };
+    let arenas = crate::families::qwen4::weight_layout::coordinator_arenas(checkpoint, &cfg,
+        &vec![0; cfg.layers], 1, mtp, options.qwen_representation, embedding)?
+        .into_iter().map(|(_, arena)| arena).collect();
+    let mut future = qwen4::dual_projection_load_staging(options.qwen_representation);
+    future.retain(|demand| demand.gpu == 0);
+    let mut expert_arenas = Vec::new();
+    if mtp && catalog.exl3().is_some() {
+        let (arena, shared) = experts.serial_draft(catalog, 0)?;
+        expert_arenas.push(arena);
+        future.extend(shared);
+    } else if mtp && manifest.is_some() {
+        future.extend(qwen4::dual_draft_demands(catalog, &lib, shape.prefill_rows.max(64))?);
     }
-    let inputs = crate::placement::families::qwen4::QwenInputs {
-        arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
+    let loaded_bytes = device.items.iter().filter(|item| item.category == Category::Runtime)
+        .map(|item| item.bytes).sum::<u64>();
+    let inputs = qwen4::QwenInputs {
+        experts: Some(experts), onboard: options.resolve_onboard(cfg.layers).unwrap_or_default(),
+        arenas, expert_arenas, preallocation: true, future,
         blas_head: if options.qwen_representation.fp8_head { crate::placement::planner::serving::BlasHead::Native } else { options.bf16_target_head },
-        loaded_weights,
-        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), context: crate::placement::planner::Context::resolve(shape.context_tokens, (options.context_tokens > 0).then_some(options.context_tokens)),
+        loaded_weights: crate::placement::ResidentWeights(options.drafter_bytes),
+        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)),
+        spark_reply_format: options.resolved_spark_reply_format(false),
+        context: crate::placement::planner::Context::resolve(shape.context_tokens, (options.context_tokens > 0).then_some(options.context_tokens)),
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: span, slots: options.resolved_state_slots("qwen4"), mark_bytes: marks,
             ple, future_expert_bytes: 0, headroom: crate::placement::reserve::gpu("qwen4") },
-        capacity_bytes: options.rtx_bytes[0],
-        baseline: crate::placement::Baseline::Planned { context_bytes: 0, loaded_bytes },
+        capacity_bytes: options.rtx_bytes[0], baseline: Baseline::Planned { context_bytes: 0, loaded_bytes },
         pending_code_bytes: 0, max_context: shape.context_tokens,
-        requested_pool: options.pool_tokens.filter(|&n| n > 0),
-        spark_ranks: if local { 0 } else { report.placement.spark_ranks() },
-        host,
-        encoders,
+        requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks, host, encoders,
     };
-    let (mut placement, solved) = crate::placement::families::qwen4::admitted(&inputs)?;
-    if all_onboarded {
-        placement.onboard_layers = cfg.layers;
-    }
+    let (placement, solved) = qwen4::admitted(&inputs)?;
+    device.items.retain(|item| item.category == Category::Runtime);
     publish_host(report, options, &inputs.host, &solved)?;
     adopt_encoder(report, &inputs.encoders, &solved, sparks, notes)?;
     report.prefill_span_rows = Some(span);
@@ -319,7 +287,7 @@ fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::
     let (total, available) = host_sample(options)?;
     let all_onboarded = cfg.layers > 0
         && options.resolve_onboard(cfg.layers) == Some(Onboard::Layers(cfg.layers));
-    let ranks = if owners == 2 || all_onboarded { 0 } else { report.spark_ranks };
+    let ranks = if all_onboarded || report.placement == ExpertPlacement::Local { 0 } else { report.spark_ranks };
     let unit_rows = options.prefill_unit_rows.unwrap_or(span_rows);
     let waves = options.prefill_waves.max(1);
     let mapped = cfg.ple_layers.first().is_some_and(|&layer| layer < cfg.layers);
@@ -514,45 +482,6 @@ fn publish_host(report: &mut PlanReport, options: &LayoutOptions, host: &qwen4::
     Ok(())
 }
 
-/// Package scratch of Qwen's resident FP8/NVFP4 experts (`Fp8Experts::load`): one scratch per package
-/// the backbone and the mixed-format MTP layer load, at the prefill rows' capacity.
-fn package_scratch(input: &super::super::PlanInput, report: &PlanReport, workspace_manifest: Option<&std::path::Path>,
-    prefill_rows: u64, mtp: bool) -> Result<Vec<(String, u64)>> {
-    let Ok(catalog) = input.expert_catalog() else { return Ok(Vec::new()) };
-    let Some(tensors) = catalog.fp8() else { return Ok(Vec::new()) };
-    let lib = crate::placement::inventory::image_lib(workspace_manifest);
-    let layers = catalog.routed_experts().layers;
-    let all_onboarded = layers > 0 && report.onboard_layers == Some(layers);
-    let local = report.placement == ExpertPlacement::Local || all_onboarded;
-    let mut out = Vec::new();
-    if local {
-        out.extend(crate::placement::inventory::fp8moe_package_scratch(&lib, "qwen4", tensors.format(), prefill_rows)?);
-    }
-    if mtp {
-        if let Ok(format) = tensors.layer_format(layers) {
-            if !local || format != tensors.format() {
-                out.extend(crate::placement::inventory::fp8moe_package_scratch(&lib, "qwen4", format, prefill_rows)?);
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn exl3_arenas(input: &super::super::PlanInput, mtp: bool) -> Option<(u64, u64)> {
-    use crate::V41Exl3Layer;
-    let catalog = input.expert_catalog().ok()?;
-    let shape = catalog.routed_experts();
-    let manifest = catalog.exl3()?;
-    let bytes = |layer| -> Option<u64> {
-        u64::try_from(manifest.residency(layer, 1, 0).ok()?.device_arena_layout().ok()?.1).ok()
-    };
-    let backbone = (shape.first_layer..shape.layers).try_fold(0u64,
-        |total, layer| total.checked_add(bytes(V41Exl3Layer::Backbone(layer))?))?;
-    let draft = (0..if mtp { shape.draft_stages.min(1) } else { 0 }).try_fold(0u64,
-        |total, stage| total.checked_add(bytes(V41Exl3Layer::Dspark(stage))?))?;
-    Some((backbone, draft))
-}
-
 fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &LayoutOptions, rows: u64, concurrency: u64,
     context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> MemoryLayout {
@@ -601,7 +530,7 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
             return MemoryLayout { devices, pool_tokens: 0, waste: Vec::new(), notes } }
     };
     let (refused, encoders_refused) = (host.clone(), encoders.clone());
-    let pool_tokens = match apply(input, options, &mut devices, rows, concurrency, context, mtp, manifest, host, encoders) {
+    let pool_tokens = match apply(input, options, &mut devices, rows, concurrency, context, mtp, manifest, host, report.placement.spark_ranks(), encoders) {
         Ok((placement, solved, host, encoders)) => {
             if let Err(error) = publish_host(report, options, &host, &solved) {
                 report.refuse_placement(format!("Qwen host ledger: {error:#}"), "Report the host owner geometry.");
@@ -621,14 +550,30 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     refused_encoder(report, &encoders_refused);
     let media_ranks: std::collections::BTreeSet<usize> = report.encoder.as_ref()
         .map_or_else(Vec::new, super::super::encoder::EncoderPlacement::spark_ranks).into_iter().collect();
-    sparks.retain(|device| media_ranks.contains(&(device.index as usize)));
+    if let Some(placement) = &report.solver_placement {
+        let rtx_layers = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
+            (assignment.experts != crate::placement::ExpertHome::Spark).then_some(layer)).collect::<Vec<_>>();
+        let spark_layers = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
+            (assignment.experts == crate::placement::ExpertHome::Spark).then_some(layer)).collect::<Vec<_>>();
+        report.onboard_layers = Some(placement.onboard_layers);
+        if !spark_layers.is_empty() {
+            let working = crate::placement::SparkWorkingSet { rtx_layers, spark_layers,
+                spark_ranks: report.placement.spark_ranks(), prefill_lanes: 1 };
+            let charges = SparkCharges { host_bytes: Some(SPARK_HOST_BYTES),
+                wave_bytes: qwen4::SPARK_WORKSPACE_BYTES, basis: Basis::Formula };
+            sparks = spark_devices(report, _model, input, options, charges, &working,
+                spark_endpoints("qwen4", 1), &mut Vec::new(), &mut notes);
+            charge_spark_devices(report, _model, input, options, charges, &working,
+                spark_endpoints("qwen4", 1), &mut sparks, &mut notes, |device| format!("{} I/O admission", device.name()));
+        } else { sparks.retain(|device| media_ranks.contains(&(device.index as usize))); }
+    }
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste: Vec::new(), notes }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut [DeviceLayout],
-    rows: u64, concurrency: u64, context: u64, mtp: bool, manifest: Option<&serde_json::Value>, host_owners: qwen4::QwenHost,
+    rows: u64, concurrency: u64, context: u64, mtp: bool, manifest: Option<&serde_json::Value>, host_owners: qwen4::QwenHost, spark_ranks: usize,
     encoders: qwen4::QwenEncoders)
     -> Result<(Placement, crate::placement::planner::ResolvedPlan, qwen4::QwenHost, qwen4::QwenEncoders)> {
     let checkpoint = input.checkpoint();
@@ -645,9 +590,13 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let resident = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp, selected)?;
     let catalog = input.expert_catalog()?;
     let costs = qwen4::dual_expert_costs(&catalog, cfg.layers)?;
-    let lib = crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()).join("libcuteafd_native.so");
-    let packages = qwen4::dual_packages(&catalog, &lib)?;
-    let workspace = qwen4::dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), rows.max(64))?;
+    let lib = qwen4::metadata_library(&catalog, options.workspace_manifest.as_deref());
+    let unit_rows = options.prefill_unit_rows.unwrap_or(rows);
+    let prefill_shape = (options.prefill_waves > 1).then_some(crate::serving_capacity::PrefillShape {
+        unit_rows, waves: options.prefill_waves }).map(|shape| shape.validate()).transpose()?;
+    let experts = if manifest.is_some() {
+        qwen4::QwenExperts::read(&catalog, &lib, cfg.layers, 2, unit_rows.max(64))?
+    } else { qwen4::QwenExperts::headers(&catalog, cfg.layers, 2)? };
     let host = options.host_embedding;
     // The loader's own arenas at the fixed cut; the head, entry mixer, MTP and
     // a device embedding are views in them, not separate owner0 demands.
@@ -660,11 +609,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
             .with_resident_weights(crate::placement::ResidentWeights(options.drafter_bytes)));
     }
     fixed.extend(qwen4::dual_projection_load_staging(selected));
-    fixed.extend(crate::serving_capacity::OwnerTp2Rows::new(cfg.hidden as u64, cfg.topk as u64, rows.max(64),
-        catalog.exl3().is_some())?.demands()?);
-    fixed.extend(qwen4::dual_peer_diagnostics(
-        crate::serving_capacity::peer_wait_diagnostics()));
-    if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, rows)?); }
+    if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, unit_rows.max(64))?); }
     let extra = qwen4::dual_ple_demands(&cfg, cfg.layers, &resident)?;
     let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(concurrency,
@@ -673,18 +618,18 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let headroom = crate::placement::reserve::gpu("qwen4");
     let inputs = qwen4::QwenDualInputs {
-        blas_head: if options.qwen_representation.fp8_head { crate::placement::planner::serving::BlasHead::Native } else { options.bf16_target_head },
+        experts: Some(experts), blas_head: if options.qwen_representation.fp8_head { crate::placement::planner::serving::BlasHead::Native } else { options.bf16_target_head },
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), context: crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)),
         owner_manifests,
-        admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
+        admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.resolved_state_slots("qwen4"),
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,
             ple, future_expert_bytes: 0, headroom },
         gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: options.rtx_bytes[rank], reserve_bytes: headroom,
             baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: devices[rank].used_bytes() } }),
         arenas: &arenas, layer_experts: &costs, layer_extra: &extra, fixed,
-        tp2_workspace: workspace, pending_code_bytes: [0; 2], mark_slots: marks, max_context: context,
-        requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks: 0,
+        tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: marks, max_context: context,
+        requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks,
         onboard: options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto),
         host: host_owners, encoders,
     };

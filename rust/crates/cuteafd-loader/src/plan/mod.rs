@@ -1186,12 +1186,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {
         let gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());
-        let all_onboarded = options.layout.as_ref().is_some_and(|layout|
-            input.family_model().ok().is_some_and(|model| model.spec().moe_layers() > 0
-                && layout.resolve_onboard(model.spec().moe_layers())
-                    == Some(crate::placement::Onboard::Layers(model.spec().moe_layers()))));
-        let peer = options.layout.as_ref().is_some_and(|layout| layout.head_split)
-            && (family.id() != "qwen4" || options.placement == ExpertPlacement::Local || all_onboarded);
+        let peer = options.layout.as_ref().is_some_and(|layout| layout.head_split);
         match executor.check_attention(options.attention_placement, gpus, peer) {
             Ok(mode) => report.attention_placement = mode,
             Err(error) => {

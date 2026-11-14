@@ -322,14 +322,24 @@ pub(crate) struct Whole<'a, C = WholeCombine<'a>> {
 pub(crate) enum WholeCombine<'a> {
     Bf16(cuteafd_ffi::Bf16Add<'a>),
     F32(cuteafd_ffi::RtxTp2Combine<'a>),
+    Compact(cuteafd_ffi::V41LocalExpertReducer<'a>),
 }
 
 impl<'a> Whole<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, device: i32,
         backend: Box<dyn RtxExpertLayer + 'a>, hidden: usize, max_rows: usize) -> Result<Self> {
-        Self::bind(device, backend, hidden, max_rows, |dtype| Ok(match dtype {
-            PartialDtype::Bf16 => WholeCombine::Bf16(library.bf16_add()?),
-            PartialDtype::F32 => WholeCombine::F32(library.rtx_tp2_combine()?),
+        Self::with_combine(library, device, backend, hidden, max_rows,
+            cuteafd_loader::plan::family::WholeExpertCombine::SumThenRound)
+    }
+
+    pub(crate) fn with_combine(library: &'a NativeLibrary, device: i32,
+        backend: Box<dyn RtxExpertLayer + 'a>, hidden: usize, max_rows: usize,
+        boundary: cuteafd_loader::plan::family::WholeExpertCombine) -> Result<Self> {
+        use cuteafd_loader::plan::family::WholeExpertCombine;
+        Self::bind(device, backend, hidden, max_rows, |dtype| Ok(match (dtype, boundary) {
+            (PartialDtype::Bf16, _) => WholeCombine::Bf16(library.bf16_add()?),
+            (PartialDtype::F32, WholeExpertCombine::SumThenRound) => WholeCombine::F32(library.rtx_tp2_combine()?),
+            (PartialDtype::F32, WholeExpertCombine::RoundRoutedThenAdd) => WholeCombine::Compact(library.v41_local_expert_reducer()?),
         }))
     }
 
@@ -362,6 +372,8 @@ impl<'a> Whole<'a> {
                 // shared+routed boundary; no conversion arena or extra rounding.
                 WholeCombine::F32(add) => add.partial(backend.output().cast(), shared.ptr.cast(),
                     output.ptr, count, ExchangeDtype::Bf16, stream),
+                WholeCombine::Compact(add) => add.finish(backend.output().cast(), shared.ptr.cast(),
+                    output.ptr.cast(), u32::try_from(rows)?, true, stream),
             }
         }
     }

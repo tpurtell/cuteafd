@@ -13,6 +13,71 @@ impl Drop for Graph<'_> {
 }
 
 #[test]
+#[ignore = "requires EXL3 target+MTP checkpoint, coordinator packages and one CUDA device"]
+fn independently_backed_target_and_draft_share_serial_scratch_exactly() -> Result<()> {
+    let catalog = cuteafd_loader::read_expert_catalog(Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+    let geometry = catalog.routed_experts().geometry()?;
+    cuteafd_core::set_expert_geometry(geometry).map_err(|_| anyhow::anyhow!("expert geometry already selected"))?;
+    let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    library.cuda_set_device(0)?;
+    let root = PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
+    let rows = 64usize;
+    let paths = cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(rows)?
+        .into_iter().map(|capacity| root.join(format!("m{capacity}"))).collect::<Vec<_>>();
+    let device = crate::shared::memory::device::Device { library: &library, id: 0 };
+    let stream = crate::shared::memory::device::Stream::new(device)?;
+    let target = Rc::new(vec![Exl3Weights::load(&library, &catalog, ExpertLayer::BackboneFull { layer: 0 }, usize::MAX)?]);
+    let draft = Rc::new(vec![Exl3Weights::load(&library, &catalog, ExpertLayer::Dspark { stage: 0 }, usize::MAX)?]);
+    let output_bytes = rows * geometry.hidden as usize * 4;
+    let arena = Exl3Workspace::serial(&library, &paths, Exl3Epilogue::Sum, stream.raw, output_bytes)?;
+    let output = arena.serial_output(&library, stream.raw, output_bytes)?;
+    let mut private = Vec::new();
+    let mut shared = Vec::new();
+    for weights in [target, draft] {
+        // SAFETY: these trusted package bindings run exclusively on stream below.
+        private.push(unsafe { Exl3Execution::with_input_format(&library, weights.clone(), paths.last().unwrap(),
+            Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum)? });
+        // SAFETY: both independently backed sets share the arena on one serialized stream.
+        shared.push(unsafe { Exl3Execution::with_shared_workspace(&library, weights, paths.last().unwrap(),
+            Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum, Some(arena.clone()))? });
+    }
+    let (hidden, topk) = (geometry.hidden as usize, geometry.topk as usize);
+    let pitch = hidden + hidden / 32;
+    let input = [DeviceAllocation::new(&library, rows * pitch, crate::shared::memory::TEST)?,
+        DeviceAllocation::new(&library, rows * topk * 4, crate::shared::memory::TEST)?,
+        DeviceAllocation::new(&library, rows * topk * 4, crate::shared::memory::TEST)?];
+    let mut wire = vec![0u8; rows * pitch];
+    for (row, values) in wire.chunks_exact_mut(pitch).enumerate() {
+        for (column, value) in values[..hidden].iter_mut().enumerate() { *value = 0x30 + ((row + column) % 16) as u8; }
+        values[hidden..].fill(127);
+    }
+    library.copy_h2d(input[0].buffer, &wire)?;
+    library.copy_h2d(input[1].buffer, &(0..rows * topk).flat_map(|i| ((i % topk) as i32).to_ne_bytes()).collect::<Vec<_>>())?;
+    library.copy_h2d(input[2].buffer, &(0..rows * topk).flat_map(|_| (1.0f32 / topk as f32).to_ne_bytes()).collect::<Vec<_>>())?;
+    let buffers = || input.each_ref().map(|input| input.buffer);
+    let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
+        let mut bytes = vec![0; rows * hidden * 4];
+        let extent = bytes.len();
+        library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: extent, ..buffer })?;
+        Ok(bytes)
+    };
+    let mut expected = Vec::new();
+    for binding in &mut private {
+        // SAFETY: live distinct input/output, one stream and retained weight owners.
+        let output = unsafe { binding.launch(buffers(), rows, stream.raw)? };
+        stream.drain()?;
+        expected.push(read(output)?);
+    }
+    for index in [0usize, 1, 0, 1] {
+        // SAFETY: target/draft never overlap; output is one retained serial backing.
+        unsafe { shared[index].launch_layer_into(0, buffers(), rows, stream.raw, output.buffer)?; }
+        stream.drain()?;
+        ensure!(read(output.buffer)? == expected[index], "shared target/draft output differs for binding {index}");
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires EXL3 snapshot, TP2 package, native library and two CUDA devices"]
 fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
     let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };

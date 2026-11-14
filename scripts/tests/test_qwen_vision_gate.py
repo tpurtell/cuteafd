@@ -21,13 +21,19 @@ def module(path, name):
 
 def test_lazy_exl3_draft_grouping_uses_the_shared_installed_window_order():
     daemon = ROOT / "rust/crates/cuteafd-daemon/src/families"
-    for family, stream in (("qwen4", "self.execution_stream()"), ("glm5_flash", "self.stream")):
+    for family, stream in (("glm5_flash", "self.stream"),):
         source = (daemon / family / "engine.rs").read_text()
         geometry = source.split("pub(crate) fn draft_geometry(", 1)[1].split("\n    }", 1)[0]
         assert "crate::families::deepseek_v4::local::installed_window_group_rows(" in geometry
         assert f"&local.resident, || local.ensure(layer, {stream}), rows," in geometry
         assert "|experts, rows| experts.group_rows(rows)" in geometry
         assert "local.resident.borrow()" not in geometry
+    qwen = (daemon / "qwen4/engine.rs").read_text()
+    geometry = qwen.split("pub(crate) fn draft_geometry(", 1)[1].split("\n    }", 1)[0]
+    assert "experts.local_layer(layer)" in geometry
+    assert 'context("Qwen local owner")?.group_rows(rows)' in geometry
+    assert "worker_group_rows_for_input" in geometry
+    assert "local.ensure(" not in qwen
     # GLM Flash already installs TP1 windows during admitted onboarding; the
     # shared helper reuses these without changing their stream or load timing.
     glm = (daemon / "glm5_flash/mod.rs").read_text()
@@ -212,7 +218,7 @@ def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body
     root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
     engine = (root / "engine.rs").read_text()
     family = (root / "mod.rs").read_text()
-    startup = family[family.index("pub fn with_engine<T>"):family.index("    fn experts<'s>")]
+    startup = family[family.index("pub fn with_engine<T>"):family.index("    fn local_mtp_experts<'s>")]
     assert startup.index("engine.admit_host_memory(args)?;") < startup.index("engine.prepare_prefill_units()?")
     assert startup.index("engine.prepare_prefill_units()?") < startup.index("let result = body(&engine);")
 

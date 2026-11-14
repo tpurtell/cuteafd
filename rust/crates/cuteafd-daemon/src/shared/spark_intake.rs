@@ -250,6 +250,11 @@ pub(crate) fn choose_mode(library: &NativeLibrary, route: LandingRoute<'_>) -> R
         "host" => (IntakeMode::Host, "CUTEAFD_SPARK_INTAKE=host".to_string(), None, None),
         "pinned" => (IntakeMode::Pinned, "CUTEAFD_SPARK_INTAKE=pinned".to_string(), None, None),
         "gpu" | "auto" => {
+            // Startup may leave the device/link idle during remote weight admission.
+            // Time landing only after exercising the same H2D path as `fabric --warmup`.
+            if let Err(error) = warm_landing_link(library) {
+                tracing::warn!("GPU landing warmup failed: {error:#}");
+            }
             let probe = probe_gpu_landing(library, route);
             let h2d = match (&probe, setting.as_str()) {
                 (Ok(p), "auto") if p.usable() => probe_h2d(library)
@@ -2042,6 +2047,19 @@ mod tests {
             .unwrap_err().to_string();
         assert!(error.contains("--landing-peer") && error.contains("192.168.1.50"), "{error}");
         assert!(sole_rdma_address(&[port(vec![])]).is_err());
+    }
+
+    #[test]
+    fn shared_intake_warms_the_link_before_timing_gpu_landing() {
+        let source = include_str!("spark_intake.rs");
+        let choose = source.split("pub(crate) fn choose_mode(").nth(1).unwrap()
+            .split("#[derive(Debug, Clone, serde::Serialize)]").next().unwrap();
+        let warmup = choose.find("warm_landing_link(library)").unwrap();
+        let timed = choose.find("probe_gpu_landing(library, route)").unwrap();
+        assert!(choose.find("CHOICE.get()").unwrap() < warmup, "cached choices must not warm again");
+        assert!(choose.find("\"gpu\" | \"auto\" =>").unwrap() < warmup,
+            "explicit host/pinned must not probe or warm");
+        assert!(warmup < timed, "cold PCIe/device rates must not choose the serving path");
     }
 
     #[test]

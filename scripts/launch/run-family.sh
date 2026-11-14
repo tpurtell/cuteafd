@@ -1911,6 +1911,10 @@ if [[ "$family" == step5 ]]; then
     release_die "Step-5 RTX_EXPERT_LAYERS is auto, all or a fixed routed-layer count, not $local_layers"
   [[ "$local_layers" == auto ]] || family_args+=(--rtx-expert-layers "$local_layers")
 fi
+if [[ "$family" == qwen4 ]]; then
+  local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  [[ "$local_layers" == auto ]] || family_args+=(--rtx-expert-layers "$local_layers")
+fi
 if ((standalone_family)); then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
@@ -2047,12 +2051,7 @@ split_hint=""
 split_opt_in=""
 case "$family:$model_type" in
   deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*|minimax_m3:*) ;;
-  qwen4:*)
-    if [[ "$ranks" == 0 || "$explicit_split" == 1 ]]; then
-      : # The planner checks expert ownership; inventory may contain only media.
-    else
-      split_hint="Qwen dual requires a Spark-free local TP2 layout"
-    fi ;;
+  qwen4:*) ;; # Shared admission selects whole/TP2 experts and Spark fallback.
   mimo_v2:*) split_hint="add MiMo head-split attention/projection kernels for $model_type" ;;
   *) split_hint="add coordinator head-split kernels for $model_type" ;;
 esac
@@ -2071,7 +2070,6 @@ head_split=0
 if [[ -n "$second" && "$split" != off ]]; then
   if [[ -z "$split_hint" ]]; then
     if [[ "$family" == qwen4 ]]; then
-      family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS all)")
       [[ "$attention_placement" != heads ]] || release_die "Qwen dual owns whole layers; head-split attention is not implemented"
       attention_placement=layers
     fi
@@ -2085,7 +2083,7 @@ fi
 [[ "$tp2_dflash" != on || "$head_split" == 1 ]] ||
   release_die "TP2_DFLASH requires an active two-GPU target split"
 if [[ "$family" == qwen4 && "$attention_placement" == layers && "$head_split" != 1 ]]; then
-  release_die "Qwen whole-layer attention requires a Spark-free coordinator pair"
+  release_die "Qwen whole-layer attention requires a coordinator pair"
 fi
 if [[ "$family" == deepseek_v4 ]]; then
   TP2_DSPARK_EXPERTS="$(get TP2_DSPARK_EXPERTS)"
@@ -2504,7 +2502,7 @@ audio_encoder_hash=""
         off) plan_draft_args+=("${key#*:}" false) ;;
       esac
     done
-    [[ "$head_split" != 1 ]] || plan_draft_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS all)")
+    [[ "$(get RTX_EXPERT_LAYERS auto)" == auto ]] || plan_draft_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS auto)")
   fi
   count_args=(--available-sparks "$available_sparks")
   if ((count_explicit)) || [[ "$backend" == local ]]; then count_args+=(--spark-ranks "$ranks"); fi
@@ -2630,9 +2628,6 @@ audio_encoder_hash=""
     if [[ "${requested_replay_records:-auto}" != shared && "$replay_records" == shared ]]; then
       family_args=("${family_args[@]:0:glmf_replay_pos}" --replay-records shared "${family_args[@]:glmf_replay_pos}")
     fi
-  fi
-  if [[ "$family" == qwen4 && "$head_split" == 1 && "$spark_expert_world" != 0 ]]; then
-    release_die "Qwen dual requires a Spark-free local TP2 layout"
   fi
   if ((spark_expert_world == 0)); then
     case "$family" in

@@ -1611,7 +1611,8 @@ def capture_qwen4_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     assert devices[0]["kv_tokens"] == layout["pool_tokens"], devices
     groups = {item["group"] for item in devices[0]["items"]}
     # The shared Recipe filled the layout: pool, step workspaces and graphs.
-    assert {"records", "state", "decode step", "prefill step", "startup graphs"} <= groups, groups
+    assert {"records", "state", "decode step", "prefill step", "weight arena"} <= groups, groups
+    assert "graph reserve: qwen4.graphs.0" in groups, groups
     report = deployment["report"]
     # The tower is the solve's choice: at the automatic 2M target one RTX keeps
     # the pool and Auto turns vision off (pool first), no pre-solve guess.
@@ -1642,7 +1643,7 @@ def capture_qwen4_real_spark_launch(snapshot: Path, example: Path, binary: Path,
     """Installed EXL3 + four Sparks must keep expert roles through launcher dispatch."""
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
-        "test/qwen-real-sparks", "RTX_GPUS=1\nSPARK_COUNT=4\nEXPERT_BACKEND=spark\nVISION=off\nAUDIO=off\n",
+        "test/qwen-real-sparks", "RTX_GPUS=1\nGPU_MEMORY_CAP=31.8GiB\nSPARK_COUNT=4\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
         physical_gpus=(0,), root_launcher=True, execute_workers=True,
         extra_args=("--wip", "qwen-real-sparks"), extra_env={
             "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
@@ -3642,11 +3643,12 @@ def test_prefill_scoring_uses_ordinary_launch(tmp_path, family_config):
 def test_qwen_explicit_pair_checks_admitted_expert_world(
         tmp_path: Path, checkpoint: str, keys: str) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], "test/model", keys)
-    assert result.returncode != 0, result.stderr
+    assert result.returncode == 0, result.stderr
     planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     assert "--rtx 2" in planner and "--attention-placement layers" in planner
-    assert "Qwen dual requires a Spark-free local TP2 layout" in result.stderr
-    assert "docker run -d" not in result.stderr
+    server = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--split-device 1" in server and "--peers" in server
+    assert "Spark-free local TP2" not in result.stderr
 
 
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n", "COORDINATOR_SPLIT=heads\n"])
@@ -3670,13 +3672,14 @@ def test_qwen_tower_only_pair_reaches_typed_planner_refusal(tmp_path: Path, keys
 
 
 @pytest.mark.parametrize("checkpoint", ["qwen4"])
-def test_auto_keeps_unsupported_checkpoint_on_one_gpu(tmp_path: Path, checkpoint: str) -> None:
+def test_auto_qwen_pair_supports_spark_fallback(tmp_path: Path, checkpoint: str) -> None:
     model = "zai-org/GLM-5.3-Flash" if checkpoint == "glm5_flash" else "test/model"
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], model, "")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert _coordinator_gpus(launch) == [0] and "--split-device" not in launch
-    assert "auto selected GPU 0 alone" in result.stderr
+    assert _coordinator_gpus(launch) == [0, 1] and "--split-device 1" in launch
+    assert "--peers" in launch
+    assert "auto selected GPU 0 alone" not in result.stderr
 
 
 @pytest.mark.parametrize("keys,physical_gpus,ranks,dual", [
@@ -3685,7 +3688,7 @@ def test_auto_keeps_unsupported_checkpoint_on_one_gpu(tmp_path: Path, checkpoint
     ("RTX_GPUS=1\n", (0, 1), 0, False),
     ("COORDINATOR_SPLIT=off\n", (0, 1), 0, False),
     ("", (0,), 0, False),
-    ("", (0, 1), 1, False),
+    ("", (0, 1), 1, True),
 ])
 def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys: str,
                                                            physical_gpus: tuple[int, ...],
@@ -3702,10 +3705,10 @@ def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys
     assert f"--prefill-rows {4096 if ranks == 0 else 2752}" in launch
     assert f"--prefill-waves {1 if ranks == 0 else 3}" in launch
     if dual:
-        assert "--rtx-expert-layers all" in launch
+        assert "--rtx-expert-layers all" not in launch
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert "--attention-placement layers" in preflight
-        assert "--rtx-expert-layers all" in preflight
+        assert "--rtx-expert-layers all" not in preflight
 
 
 @pytest.mark.parametrize("rows,waves", [(512, 1), (1024, 2), (2048, 2), (4096, 2)])
@@ -3740,7 +3743,10 @@ def test_qwen_dual_forwards_shared_onboard_policy(tmp_path: Path, onboard: str) 
                                   f"RTX_GPUS=2\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nSPECULATOR=off\nRTX_EXPERT_LAYERS={onboard}\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert f"--rtx-expert-layers {onboard}" in launch
+    if onboard != "auto":
+        assert f"--rtx-expert-layers {onboard}" in launch
+    else:
+        assert "--rtx-expert-layers all" not in launch
     assert "CUTEAFD_ATTENTION_PLACEMENT=layers" in launch
 
 

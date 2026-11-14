@@ -21,7 +21,7 @@
 //! gate, and routed experts on this GPU (FP8/NVFP4 packages fully resident
 //! by default, EXL3 packages with their admitted resident window) or on the Sparks.
 use super::weights::{Qwen4Head, Qwen4Layer, Qwen4Weights};
-use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
+use crate::shared::experts::fp8::Fp8Experts;
 use crate::shared::experts::rtx::owner_tp2::OwnerTp2;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{HostAllocation, Tag};
@@ -140,163 +140,72 @@ pub(crate) fn spark_session_shape(cfg: &Qwen4Config, rows: usize, bf16: bool)
 /// next draft step (the MTP stash, per state slot).
 pub(crate) const MTP_PENDING_ROWS: usize = 64;
 
-/// Routed experts on this GPU from the TP1 package. All layers stay resident
-/// unless an explicit diagnostic paging window was requested.
-pub(crate) struct LocalExperts<'a> {
-    pub library: &'a NativeLibrary,
-    pub tensors: &'a Fp8ExpertTensors,
-    pub experts: RefCell<Fp8Experts<'a>>,
-    /// Mixed-format MTP owns its FP8 package separately from NVFP4 target layers.
-    pub mtp_experts: Option<Fp8Experts<'a>>,
-    pub base_weights: cuteafd_loader::placement::ResidentWeights,
-    pub window: Option<usize>,
-    pub loads: RefCell<usize>,
-}
-
-impl LocalExperts<'_> {
-    fn index_of(&self, layer: usize) -> Result<usize> {
-        let mut experts = self.experts.borrow_mut();
-        if let Ok(index) = experts.index_of(layer) {
-            return Ok(index);
-        }
-        let window = self.window.context("local expert layer missing from the admitted resident set")?;
-        if experts.layers.len() >= window {
-            experts.layers.remove(0);
-        }
-        let next = Fp8Layer::bytes(&self.tensors.for_layer(layer)?, 1)? as u64;
-        let retained = cuteafd_loader::placement::ResidentWeights(experts.resident_bytes() as u64)
-            .checked_add(cuteafd_loader::placement::ResidentWeights(
-                self.mtp_experts.as_ref().map_or(0, |e| e.resident_bytes() as u64)))?;
-        self.base_weights.checked_add(retained)?
-            .checked_add(cuteafd_loader::placement::ResidentWeights(next))?
-            .check(0, crate::shared::memory::budget::resident_weight_limit())?;
-        let started = std::time::Instant::now();
-        experts.layers.push(Fp8Layer::load(self.library, self.tensors, layer, 1, 0)?);
-        *self.loads.borrow_mut() += 1;
-        tracing::debug!(layer, elapsed_ms = started.elapsed().as_millis() as u64, "FP8 expert layer loaded");
-        Ok(experts.layers.len() - 1)
-    }
-}
-
-/// Routed experts on this GPU from the EXL3 checkpoint (the coordinator's
-/// `exl3-qwen4-k45/rtx-tp1` package): a window of resident layers. The
-/// package reads FP8 K32 wire rows and its reducer adds the shared expert.
-pub(crate) struct LocalExl3<'a> {
-    pub library: &'a NativeLibrary,
-    pub native_lib: std::path::PathBuf,
-    pub catalog: &'a cuteafd_loader::OfficialV41Catalog,
-    pub resident: RefCell<Option<(Vec<usize>, crate::families::deepseek_v4::local::LocalExperts<'a>)>>,
-    pub layers: usize,
-    pub admitted: super::admission::Exl3Admission,
-    pub base_weights: cuteafd_loader::placement::ResidentWeights,
-    pub loads: RefCell<usize>,
-}
-
-impl LocalExl3<'_> {
-    fn admit_weights(&self, layers: &[usize]) -> Result<()> {
-        use crate::shared::experts::{exl3::Exl3Weights, layer::ExpertLayer};
-        use cuteafd_loader::placement::ResidentWeights;
-        let mut selections = (0..usize::from(self.admitted.mtp)).map(|stage| ExpertLayer::Dspark { stage })
-            .chain(layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }));
-        let weights = selections.try_fold(self.base_weights, |sum, selection|
-            sum.checked_add(ResidentWeights(Exl3Weights::plan(self.catalog, selection)?.resident_bytes as u64))
-                .map_err(anyhow::Error::from))?;
-        weights.check(0, crate::shared::memory::budget::resident_weight_limit())?;
-        Ok(())
-    }
-    /// Reuse the exact selections and byte budget admitted before KV allocation.
-    pub(super) fn push_envelope(&self) -> Result<(Vec<crate::shared::experts::layer::ExpertLayer>, usize,
-        cuteafd_loader::push_load::PushHostEnvelope)> {
-        use crate::shared::experts::rtx::push::{CoordinatorExperts, WholeOwner};
-        let selections = self.admitted.selections.clone();
-        let weights_budget = self.admitted.weights_budget;
-        anyhow::ensure!(!selections.is_empty(), "Qwen EXL3 expert window has no selected layers");
-        let experts = CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
-            selections: selections.clone(), budget: weights_budget }] };
-        let envelope = experts.host_envelope(self.catalog, 1, &[])?;
-        Ok((selections, weights_budget, envelope))
-    }
-
-    pub(super) fn push_window(&self, snapshot: &std::path::Path, device: i32,
-        admitted: Option<&cuteafd_loader::push_load::PushHostEnvelope>) -> Result<bool> {
-        if self.resident.borrow().is_some() { return Ok(true); }
-        use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy, WholeOwner};
-        let policy = PushPolicy::for_snapshot(snapshot)?;
-        let started = std::time::Instant::now();
-        let planned = policy.plan(|| {
-            let (selections, weights_budget, envelope) = self.push_envelope()?;
-            let selected_layers = selections.iter().filter_map(|s| match s {
-                crate::shared::experts::layer::ExpertLayer::BackboneFull { layer } => Some(*layer), _ => None,
-            }).collect::<Vec<_>>();
-            self.admitted.validate_layers(&selected_layers)?;
-            self.admit_weights(&selected_layers)?;
-            let experts = CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
-                selections: selections.clone(), budget: weights_budget }] };
-            // The recipe admitted this envelope before allocation; without a
-            // recipe solve (a fixed diagnostic pool) the legacy check remains.
-            let push = match admitted {
-                Some(admitted) => {
-                    admitted.validate_usage(&envelope)?;
-                    CoordinatorPush::prepare_alone_admitted(snapshot, Some(self.catalog), 1, Some(experts), admitted.clone())?
-                }
-                None => CoordinatorPush::prepare_alone(snapshot, Some(self.catalog), 1, Some(experts))?,
-            };
-            Ok((push, selections))
-        }).context("Qwen EXL3 expert window push planning")?;
-        let Some((push, selections)) = planned else { return Ok(false) };
-        let devices = vec![crate::shared::memory::device::Device { library: self.library, id: device }];
-        let (pushed, ()) = push.receive_with::<crate::shared::experts::rtx::push::NoDense, _>(devices, Some(self.catalog),
-            0, None, || ());
-        let mut ranks = policy.committed(pushed).context("Qwen EXL3 expert window push delivery")?
-            .context("Qwen required EXL3 expert window payload")?;
-        let weights = ranks.pop().context("one coordinator rank")?.exl3()?;
-        let local = crate::families::deepseek_v4::local::LocalExperts::from_exl3_weights(self.library, &self.native_lib,
-            self.catalog, &selections, weights, self.admitted.rows)?.context("pushed EXL3 expert window")?;
-        let layers = local.layers().to_vec();
-        self.admitted.validate_layers(&layers)?;
-        *self.loads.borrow_mut() += layers.len();
-        tracing::info!(layers = layers.len(), stages = usize::from(self.admitted.mtp), elapsed_ms = started.elapsed().as_millis() as u64,
-            "Qwen EXL3 expert window pushed");
-        *self.resident.borrow_mut() = Some((layers, local));
-        Ok(true)
-    }
-
-    pub(super) fn ensure(&self, layer: usize, stream: *mut c_void) -> Result<()> {
-        if self.resident.borrow().as_ref().is_some_and(|(layers, _)| layers.binary_search(&layer).is_ok() || layer == self.layers) {
-            ensure!(layer < self.layers || self.admitted.mtp, "MTP experts are not loaded");
-            return Ok(());
-        }
-        ensure!(layer < self.layers || (layer == self.layers && self.admitted.mtp),
-            "EXL3 expert layer {layer} is not admitted");
-        ensure!(self.resident.borrow().is_none(), "admitted EXL3 resident set lost layer {layer}");
-        self.admit_weights(&self.admitted.layers)?;
-        let started = std::time::Instant::now();
-        let local = crate::families::deepseek_v4::local::LocalExperts::load(self.library, &self.native_lib, self.catalog,
-            usize::from(self.admitted.mtp), &self.admitted.layers, self.admitted.rows, self.admitted.peak_bytes, stream)?
-            .context("no coordinator EXL3 package for this checkpoint (build qwen4:exl3-k45)")?;
-        let layers = local.layers().to_vec();
-        self.admitted.validate_layers(&layers)?;
-        *self.loads.borrow_mut() += layers.len();
-        tracing::debug!(?layers, elapsed_ms = started.elapsed().as_millis() as u64, "EXL3 expert window resident");
-        *self.resident.borrow_mut() = Some((layers, local));
-        Ok(())
-    }
+fn remote_front_plane_bytes(rows: usize, hidden: usize, topk: usize, bf16: bool) -> [usize; 4] {
+    let input = if bf16 { hidden * 2 } else { hidden + hidden / 32 };
+    [rows * input, rows * topk * 4, rows * topk * 4, rows * hidden * 2]
+        .map(|bytes| bytes.next_multiple_of(16))
 }
 
 /// The MTP layer stays resident locally even when backbone experts run on Sparks.
 pub(crate) enum MtpExperts<'a> {
+    Whole(crate::shared::experts::rtx::pair::Whole<'a>),
     Fp8(Fp8Experts<'a>),
     Exl3(RefCell<crate::families::deepseek_v4::local::LocalExperts<'a>>),
 }
 
-/// Where the routed experts run.
+/// Resident routed layers, independent of any Spark fallback.
+pub(crate) enum LocalRouted<'a> {
+    Whole(crate::shared::experts::rtx::pair::Whole<'a>),
+    Tp2(RefCell<OwnerTp2<'a>>),
+}
+impl LocalRouted<'_> {
+    pub(crate) fn layers(&self) -> Vec<usize> {
+        match self { Self::Whole(whole) => whole.layers.clone(),
+            Self::Tp2(pair) => pair.borrow().experts[0].layers().to_vec() }
+    }
+    fn wire(&self) -> bool {
+        match self { Self::Whole(whole) => whole.uses_fp8_input(), Self::Tp2(pair) => pair.borrow().wire }
+    }
+    fn group_rows(&self, rows: usize) -> Result<usize> {
+        match self {
+            Self::Whole(whole) => whole.group_rows(rows),
+            Self::Tp2(pair) => {
+                let pair = pair.borrow();
+                let group = pair.experts[0].group_rows(rows)?;
+                ensure!(pair.experts[1].group_rows(rows)? == group, "Qwen TP2 grouping differs");
+                Ok(group)
+            }
+        }
+    }
+    fn weight_read_bytes(&self) -> Result<usize> {
+        match self { Self::Whole(whole) => whole.weight_read_bytes(),
+            Self::Tp2(pair) => pair.borrow().experts.iter().map(|rank| rank.weight_read_bytes())
+                .collect::<Result<Vec<_>>>()?.into_iter().max().context("Qwen TP2 ranks missing") }
+    }
+}
+
+/// All-local and all-Spark are endpoints of the same admitted hybrid.
+pub(crate) struct HybridExperts<'a> {
+    pub local: Option<LocalRouted<'a>>,
+    pub local_layers: Vec<usize>,
+    pub transport: Vec<RefCell<SparkLink<'a>>>,
+    pub mtp: Option<MtpExperts<'a>>,
+    /// A zero-local dual still needs abort words for its attention hops.
+    pub terminal: Option<crate::shared::peer_split::PeerExchange<'a>>,
+}
+impl HybridExperts<'_> {
+    pub(crate) fn local_layer(&self, layer: usize) -> bool { self.local_layers.binary_search(&layer).is_ok() }
+    fn with_peer<T>(&self, body: impl FnOnce(&crate::shared::peer_split::PeerExchange<'_>) -> Result<T>) -> Result<Option<T>> {
+        match &self.local {
+            Some(LocalRouted::Tp2(pair)) => body(&pair.borrow().exchange).map(Some),
+            _ => self.terminal.as_ref().map(body).transpose(),
+        }
+    }
+}
+
 pub(crate) enum Experts<'a> {
-    Local(LocalExperts<'a>),
-    LocalExl3(LocalExl3<'a>),
-    Tp2 { routed: RefCell<OwnerTp2<'a>>, mtp: Option<MtpExperts<'a>> },
-    /// Spark ranks over RoCE (one BF16 partial plane per rank), plus a local draft layer.
-    Spark { transport: RefCell<SparkLink<'a>>, mtp: Option<MtpExperts<'a>> },
-    /// No routed experts (plumbing tests only: the MoE output is the shared expert alone).
+    Hybrid(HybridExperts<'a>),
+    /// Plumbing diagnostics, never a production expert source.
     SharedOnly,
 }
 
@@ -1290,7 +1199,7 @@ impl<'a> Qwen4Engine<'a> {
     /// captures no TP2 peer segments).
     fn graph_shape(&self) -> QwenGraphShapeKey {
         QwenGraphShapeKey::resolve(self.gdn_banks.len(),
-            matches!(self.experts(), Some(Experts::Spark { .. })))
+            self.has_sparks())
     }
 
     /// Attach the per-owner graph banks: one bounded cache per physical device,
@@ -1373,35 +1282,46 @@ impl<'a> Qwen4Engine<'a> {
         self.experts = Some(experts);
     }
 
-    pub fn set_tp2(&mut self,
-        experts: [Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>; 2],
-        wire: bool, mtp: Option<MtpExperts<'a>>, placement: &cuteafd_loader::placement::Placement,
-        spec: cuteafd_loader::placement::HopSpec) -> Result<()> {
-        ensure!(self.gdn_banks.len() == 2 && spec.head_gpu == 0 && spec.entry_gpu == 0,
-            "Qwen TP2 needs two attention owners and the head on owner zero");
-        let ranks = [0, 1].map(|rank| crate::shared::peer_split::RankDevice {
-            device: self.gdn_banks[rank].device.id, stream: self.gdn_banks[rank].stream });
-        let modes: Vec<_> = self.state_map.layers.iter().map(|home| cuteafd_loader::placement::LayerMode::Whole {
-            gpu: home.owner as u8, ffn: cuteafd_loader::placement::FfnMode::Owner }).collect();
-        ensure!(placement.layers.iter().all(|layer| layer.experts == cuteafd_loader::placement::ExpertHome::RtxTp2)
-            && placement.tp2.as_ref().is_some_and(|range| range.first == 0 && range.layers == modes.len()),
-            "Qwen Spark-free dual execution requires TP2 halves at every routed layer");
-        ensure!(placement.layers.iter().map(|layer| layer.mode).eq(modes.iter().copied()),
-            "Qwen executor attention owners disagree with placement");
-        let hops = cuteafd_loader::placement::plan_hops(&modes, &spec)?;
-        ensure!(placement.hops == hops && hops.len() == 2, "Qwen placement must charge cutover and exit");
-        let _scope = self.gdn_banks[0].device.enter()?;
-        for bank in &self.gdn_banks {
-            bank.device.run(|| { bank.programs.load_matching(|name| name.starts_with("qwen4_")).map(|_| ()) })?;
+    pub fn install_hybrid(&mut self, mut experts: HybridExperts<'a>,
+        placement: &cuteafd_loader::placement::Placement, spec: cuteafd_loader::placement::HopSpec) -> Result<()> {
+        let planned = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
+            (assignment.experts != cuteafd_loader::placement::ExpertHome::Spark).then_some(layer)).collect::<Vec<_>>();
+        ensure!(experts.local_layers == planned
+            && experts.local.as_ref().map_or_else(Vec::new, LocalRouted::layers) == planned,
+            "Qwen resident expert IDs differ from admitted homes");
+        if self.gdn_banks.len() == 2 {
+            let ranks = [0, 1].map(|rank| crate::shared::peer_split::RankDevice {
+                device: self.gdn_banks[rank].device.id, stream: self.gdn_banks[rank].stream });
+            let modes: Vec<_> = self.state_map.layers.iter().map(|home| cuteafd_loader::placement::LayerMode::Whole {
+                gpu: home.owner as u8, ffn: cuteafd_loader::placement::FfnMode::Owner }).collect();
+            ensure!(placement.layers.iter().map(|layer| layer.mode).eq(modes.iter().copied()),
+                "Qwen attention owners differ from admission");
+            let hops = cuteafd_loader::placement::plan_hops(&modes, &spec)?;
+            ensure!(placement.hops == hops && hops.len() == 2, "Qwen cutover and exit must be admitted");
+            if experts.local.is_none() {
+                experts.terminal = Some(crate::shared::peer_split::PeerExchange::new_abortable(
+                    self.library, ranks, 1, 256, 256)?);
+            }
+            let mut link = crate::shared::peer_split::hop::HopLink::new(self.library, ranks, &hops,
+                spec, DECODE_ROWS * spec.row_bytes as usize)?;
+            experts.with_peer(|peer| link.attach_abort([
+                peer.abort_word(0)?.context("Qwen rank zero abort")?,
+                peer.abort_word(1)?.context("Qwen rank one abort")?]))?.context("Qwen dual terminal owner")?;
+            self.hops = Some(link);
         }
-        let routed = OwnerTp2::new(self.library, ranks, experts, self.cfg.hidden, self.cfg.topk,
-            self.prefill_rows.max(DECODE_ROWS), DECODE_ROWS, wire, "qwen4")?;
-        let mut link = crate::shared::peer_split::hop::HopLink::new(self.library, ranks, &hops, spec, DECODE_ROWS * spec.row_bytes as usize)?;
-        link.attach_abort([routed.exchange.abort_word(0)?.context("Qwen rank zero abort word")?,
-            routed.exchange.abort_word(1)?.context("Qwen rank one abort word")?])?;
-        self.hops = Some(link);
-        self.experts = Some(Experts::Tp2 { routed: RefCell::new(routed), mtp });
+        self.experts = Some(Experts::Hybrid(experts));
         Ok(())
+    }
+
+    pub(crate) fn has_sparks(&self) -> bool {
+        matches!(&self.experts, Some(Experts::Hybrid(experts)) if !experts.transport.is_empty())
+    }
+    pub(crate) fn spark_layer(&self, layer: usize) -> bool {
+        layer < self.weights.layers.len()
+            && matches!(&self.experts, Some(Experts::Hybrid(experts)) if !experts.local_layer(layer))
+    }
+    fn spark_link(&self, owner: usize) -> Option<&RefCell<SparkLink<'a>>> {
+        match &self.experts { Some(Experts::Hybrid(experts)) => experts.transport.get(owner), _ => None }
     }
 
     /// Admit all still-lazy host consumers, including a frozen serving cache quota.
@@ -1461,7 +1381,7 @@ impl<'a> Qwen4Engine<'a> {
                 let logits = if decode { DECODE_ROWS } else { 1 };
                 let host = HostWorkspaceBytes::new(&self.cfg, rows, decode, self.pages, self.pool_pages,
                     if decode { 0 } else { self.prefill_shape.map_or(0, |shape| shape.waves as usize) },
-                    matches!(self.experts, Some(Experts::Spark { .. })), self.weights.mtp.is_some(), ple_ids, logits)?;
+                    self.has_sparks(), self.weights.mtp.is_some(), ple_ids, logits)?;
                 let label = format!("qwen4/owner-{owner}/{}", if decode { "decode" } else { "prefill" });
                 for (kind, bytes) in [("staging", host.staging), ("pinned-logits", host.logits)] {
                     if bytes > 0 { demands.push((format!("{label}/{kind}"), bytes)); }
@@ -1482,10 +1402,16 @@ impl<'a> Qwen4Engine<'a> {
     pub(crate) fn prepare_prefill_units(&self) -> Result<()> {
         let Some(shape) = self.prefill_shape else { return Ok(()) };
         let shape = shape.validate()?;
-        if self.workspace.borrow().is_none() {
-            *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
-                1, shape.slot_rows() as usize,
-                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
+        for owner in 0..self.gdn_banks.len() {
+            self.on_owner(owner, || {
+                let slot = self.workspace_slot(owner, false)?;
+                if slot.borrow().is_none() {
+                    *slot.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
+                        1, shape.slot_rows() as usize,
+                        if owner == 0 && self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
+                }
+                Ok(())
+            })?;
         }
         if self.weights.mtp.is_some() && self.mtp_prefill_workspace.borrow().is_none() {
             *self.mtp_prefill_workspace.borrow_mut() = Some(self.on_owner(0, ||
@@ -1790,47 +1716,30 @@ impl<'a> Qwen4Engine<'a> {
     pub(crate) fn draft_homes(&self, snapshot: &std::path::Path) -> Result<Vec<crate::shared::draft::resource::LayerHome>> {
         use crate::shared::draft::resource;
         let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
-        let (tp, remote) = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => (transport.borrow().world_size(), true),
-            Some(Experts::Tp2 { .. }) => (2, false),
-            _ => (1, false),
-        };
-        resource::layer_homes((0..self.cfg.layers).map(|_| (false, !remote, tp)), catalog.exl3(), |index| {
-            ensure!(catalog.fp8().is_some(), "Qwen routed expert format cannot be priced");
-            match &self.experts {
-                Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_bytes()),
-                Some(Experts::Tp2 { routed, .. }) => routed.borrow().experts.iter()
-                    .map(|rank| rank.weight_read_bytes()).collect::<Result<Vec<_>>>()?
-                    .into_iter().max().context("Qwen installed TP2 ranks missing"),
-                Some(Experts::Spark { transport, .. }) => resource::worker_weight_read_bytes(
-                    &transport.borrow().installed_grouping()?, index),
-                _ => anyhow::bail!("Qwen layer {index} has no installed FP8-family byte descriptor"),
-            }
+        let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen expert homes missing") };
+        let remote = self.spark_link(0).map(|link| link.borrow().installed_grouping()).transpose()?.unwrap_or_default();
+        let world = self.spark_link(0).map_or(0, |link| link.borrow().world_size());
+        let local_tp = if matches!(experts.local, Some(LocalRouted::Tp2(_))) { 2 } else { 1 };
+        resource::layer_homes((0..self.cfg.layers).map(|layer| {
+            let local = experts.local_layer(layer);
+            (false, local, if local { local_tp } else { world })
+        }), catalog.exl3(), |layer| {
+            if experts.local_layer(layer) { experts.local.as_ref().context("Qwen local owner")?.weight_read_bytes() }
+            else { resource::worker_weight_read_bytes(&remote, layer) }
         })
     }
 
     pub(crate) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize)
         -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource;
-        let remote = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?,
-            _ => Vec::new(),
-        };
+        let remote = self.spark_link(0).map(|link| link.borrow().installed_grouping()).transpose()?.unwrap_or_default();
         resource::geometry_with_grouping(&self.draft_homes(snapshot)?, self.cfg.experts, self.cfg.topk,
-            DECODE_ROWS, width, resource::COPY_EXTENSION, |layer, rows| match &self.experts {
-                Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
-                Some(Experts::LocalExl3(local)) => crate::families::deepseek_v4::local::installed_window_group_rows(
-                    &local.resident, || local.ensure(layer, self.execution_stream()), rows,
-                    |experts, rows| experts.group_rows(rows)),
-                Some(Experts::Tp2 { routed, .. }) => {
-                    let routed = routed.borrow();
-                    let group = routed.experts[0].group_rows(rows)?;
-                    ensure!(routed.experts[1].group_rows(rows)? == group,
-                        "Qwen installed TP2 ranks disagree on grouping");
-                    Ok(group)
+            DECODE_ROWS, width, resource::COPY_EXTENSION, |layer, rows| {
+                match &self.experts {
+                    Some(Experts::Hybrid(experts)) if experts.local_layer(layer) =>
+                        experts.local.as_ref().context("Qwen local owner")?.group_rows(rows),
+                    _ => resource::worker_group_rows_for_input(&remote, layer, rows, self.spark_bf16),
                 }
-                Some(Experts::Spark { .. }) => resource::worker_group_rows_for_input(&remote, layer, rows, self.spark_bf16),
-                _ => anyhow::bail!("Qwen layer {layer} has no installed expert grouping"),
             })
     }
 
@@ -1938,7 +1847,9 @@ impl<'a> Qwen4Engine<'a> {
         if self.terminal.get() != TerminalState::Active {
             return Err(TerminalPeerError::Closed(self.terminal.get()).into());
         }
-        if let Some(Experts::Tp2 { routed, .. }) = &self.experts { routed.borrow().exchange.require_live()?; }
+        if let Some(Experts::Hybrid(experts)) = &self.experts {
+            experts.with_peer(|peer| peer.require_live())?;
+        }
         Ok(())
     }
 
@@ -1948,33 +1859,35 @@ impl<'a> Qwen4Engine<'a> {
         self.terminal.set(TerminalState::Aborting);
         let result = teardown(&mut Teardown {
             abort: || {
-                if let Some(Experts::Tp2 { routed, .. }) = &self.experts {
-                    let routed = routed.try_borrow()?;
-                    if routed.exchange.terminal_state() != TerminalState::Aborting {
-                        let _scope = self.gdn_banks[0].device.enter()?;
-                        routed.exchange.publish_abort()?;
-                    }
+                if let Some(Experts::Hybrid(experts)) = &self.experts {
+                    experts.with_peer(|peer| {
+                        if peer.terminal_state() != TerminalState::Aborting {
+                            let _scope = self.gdn_banks[0].device.enter()?;
+                            peer.publish_abort()?;
+                        }
+                        Ok(())
+                    })?;
                 }
                 Ok(())
             },
             ranks: || self.drain_state(),
             links: || {
-                if let Some(Experts::Spark { transport, .. }) = &self.experts { transport.try_borrow_mut()?.terminal_quiesce()?; }
+                if let Some(Experts::Hybrid(experts)) = &self.experts { for link in &experts.transport { link.try_borrow_mut()?.terminal_quiesce()?; } }
                 Ok(())
             },
             copies: || {
-                if let Some(Experts::Spark { transport, .. }) = &self.experts { transport.try_borrow()?.terminal_drain_copies()?; }
+                if let Some(Experts::Hybrid(experts)) = &self.experts { for link in &experts.transport { link.try_borrow()?.terminal_drain_copies()?; } }
                 Ok(())
             },
             graphs: || {
-                if let Some(Experts::Spark { transport, .. }) = &self.experts { transport.try_borrow_mut()?.terminal_release()?; }
+                if let Some(Experts::Hybrid(experts)) = &self.experts { for link in &experts.transport { link.try_borrow_mut()?.terminal_release()?; } }
                 // The ranks above drained every consumer; captured storage is persistent engine storage.
                 for bank in self.graphs.borrow_mut().iter_mut() { bank.cache_clear_drained(); }
                 Ok(())
             },
             finish: |drained| {
                 self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
-                if let Some(Experts::Tp2 { routed, .. }) = &self.experts { routed.borrow().exchange.finish_terminal(drained); }
+                if let Some(Experts::Hybrid(experts)) = &self.experts { let _ = experts.with_peer(|peer| { peer.finish_terminal(drained); Ok(()) }); }
             },
         });
         crate::shared::decode_graph::fatal_drain(result, "Qwen submission shutdown"); Ok(())
@@ -1993,7 +1906,7 @@ impl<'a> Qwen4Engine<'a> {
         use crate::shared::experts::rtx::pair::Recovery;
         if kind == Recovery::HostGather {
             ensure!(self.gdn_banks.len() == 1 && self.hops.is_none()
-                && matches!(self.experts, None | Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::SharedOnly)),
+                && !self.has_sparks(),
                 "Qwen host-gather recovery needs one owner without peer or Spark work in flight");
         }
         drop(self.ple_pending.borrow_mut().take());
@@ -2117,6 +2030,9 @@ impl<'a> Qwen4Engine<'a> {
 
     fn on_owner<T>(&self, owner: usize, work: impl FnOnce() -> Result<T>) -> Result<T> {
         let bank = self.gdn_banks.get(owner).context("Qwen execution owner out of range")?;
+        // Single-device engines retain their startup CUDA device, as before hybrid
+        // dispatch. Only multi-owner execution needs per-hook device switching.
+        if self.gdn_banks.len() == 1 { return work(); }
         struct Restore<'c>(&'c Cell<usize>, usize);
         impl Drop for Restore<'_> {
             fn drop(&mut self) { self.0.set(self.1); }
@@ -2184,7 +2100,7 @@ impl<'a> Qwen4Engine<'a> {
             super::admission::HostWorkspaceBytes::mtp(&self.cfg, t, self.pages, self.pool_pages, self.prefill_rows.div_ceil(t))?
         } else {
             super::admission::HostWorkspaceBytes::new(&self.cfg, t, decode, self.pages, self.pool_pages,
-                units, matches!(self.experts, Some(Experts::Spark { .. })), self.weights.mtp.is_some(),
+                units, self.has_sparks(), self.weights.mtp.is_some(),
                 self.ple.as_ref().map(|ple| ple.mapped()).is_none(), logit_rows)?
         };
         let (topk, heads, hd) = (self.cfg.topk, self.cfg.heads, self.cfg.head_dim);
@@ -2464,10 +2380,7 @@ impl<'a> Qwen4Engine<'a> {
         scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<DeviceLogits>> {
         use crate::shared::prefill_pipeline::{sequence_units, run_prefill_units};
         let shape = self.prefill_shape.context("Qwen prefill unit shape")?.validate()?;
-        ensure!(self.gdn_banks.len() == 1 && self.hops.is_none(),
-            "Qwen prefill units require a single attention owner; dual-owner hop slots are not admitted");
-        ensure!(matches!(self.experts, Some(Experts::Spark { .. } | Experts::SharedOnly)),
-            "Qwen prefill units require Spark experts (or shared-only diagnostics)");
+        ensure!(self.experts.is_some(), "Qwen prefill units need admitted experts");
         let (t, start) = (tokens.len(), placement.len);
         validate_prefill_span(t, start, self.prefill_rows, self.max_context)?;
         let logit_rows = logit_rows.clamp(1, t);
@@ -2480,43 +2393,49 @@ impl<'a> Qwen4Engine<'a> {
         let mut units = sequence_units(t, shape.unit_rows as usize, 1, self.weights.layers.len())?;
         for unit in &mut units { unit.slot = unit.index % waves; }
         let retained_rows = if scoring.is_some() { 1 } else { logit_rows };
-        let replace = self.workspace.borrow().as_ref().is_none_or(|w| w.rows != shape.unit_rows as usize
-            || w.slot_rows != shape.slot_rows() as usize || w.logit_rows < retained_rows);
-        if replace {
-            self.allow_workspace_creation()?;
-            self.drain_state()?;
-            *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
-                retained_rows, shape.slot_rows() as usize,
-                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
-            self.prepare_prefill_units()?;
+        for owner in 0..self.gdn_banks.len() {
+            self.on_owner(owner, || {
+                let slot = self.workspace_slot(owner, false)?;
+                let replace = slot.borrow().as_ref().is_none_or(|w| w.rows != shape.unit_rows as usize
+                    || w.slot_rows != shape.slot_rows() as usize || w.logit_rows < retained_rows);
+                if replace {
+                    self.allow_workspace_creation()?;
+                    self.drain_state()?;
+                    *slot.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
+                        retained_rows, shape.slot_rows() as usize,
+                        if owner == 0 && self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
+                }
+                Ok(())
+            })?;
         }
-        let workspace = self.workspace.borrow();
-        let w = workspace.as_ref().context("Qwen prefill workspace")?;
-        w.terminal_valid.set(false);
-        w.units.set(true);
+        self.prepare_prefill_units()?;
+        let root = self.workspace.borrow();
+        let peer = self.peer_workspace.borrow();
+        let w = root.as_ref().context("Qwen prefill workspace")?;
+        let work = [Some(w), peer.as_ref()];
+        for w in work.iter().flatten() { w.terminal_valid.set(false); w.units.set(true); }
         let unit_tables: Arc<Vec<_>> = Arc::new(units.iter().map(|unit| tables.unit(unit.rows.clone(),
             if self.ple.is_some() { self.cfg.ple_rows() } else { 0 }, self.cfg.dense_context())).collect());
         let ple_batch = self.ple.as_ref().map(|ple| ple.mapped().batch(Arc::clone(&unit_tables)
             as Arc<dyn crate::shared::mapped_table::RowSource>));
-        let run = |transport: Option<&mut crate::shared::spark_waves::Waves<'_>>| {
-            let mut hooks = UnitHooks { engine: self, transport, w, placement, tokens, tables: unit_tables, ple_batch,
-                current: vec![0; units.len()], entered: vec![false; units.len()],
-                pending: (0..units.len()).map(|_| None).collect(), logit_rows, scoring };
-            run_prefill_units(&mut hooks, &units, waves)
+        let mut links = match &self.experts {
+            Some(Experts::Hybrid(experts)) => experts.transport.iter().map(RefCell::borrow_mut).collect::<Vec<_>>(),
+            _ => Vec::new(),
         };
-        // Spark waves build, post and land on the link's exchange worker
-        // while this thread queues GPU work.
-        let result = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => {
-                let staging = self.wave_staging_bytes(shape.unit_rows as usize)?;
-                let mut link = transport.borrow_mut();
-                let exchange = link.exchange()?;
-                ensure!(exchange.fits(staging), "Spark exchange staging is narrower than a prefill unit");
-                run(Some(exchange))
-            }
-            _ => run(None),
-        };
-        w.row_offset.set(0); w.logit_offset.set(0); w.position.set(0); w.units.set(false);
+        let mut transports = Vec::new();
+        for link in &mut links {
+            let exchange = link.exchange()?;
+            ensure!(exchange.fits(self.wave_staging_bytes(shape.unit_rows as usize)?),
+                "Spark exchange staging is narrower than a prefill unit");
+            transports.push(exchange);
+        }
+        let mut hooks = UnitHooks { engine: self, transports, work, placement, tokens,
+            tables: unit_tables, ple_batch, current: vec![[0; 2]; units.len()],
+            entered: vec![false; units.len()], pending: (0..units.len()).map(|_| None).collect(), logit_rows, scoring };
+        let result = run_prefill_units(&mut hooks, &units, waves);
+        for w in work.iter().flatten() {
+            w.row_offset.set(0); w.logit_offset.set(0); w.position.set(0); w.units.set(false);
+        }
         self.last_stream_offset.set(0);
         result?;
         w.terminal_valid.set(w.terminal_streams.is_some());
@@ -2535,11 +2454,11 @@ impl<'a> Qwen4Engine<'a> {
         if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
         let rows = self.prefill_shape.map_or(self.prefill_rows, |s| s.unit_rows as usize);
         let cap = match &self.experts {
-            Some(Experts::Local(local)) => local.experts.borrow().packed_row_cap(true, rows)?,
-            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?.iter()
+            Some(Experts::Hybrid(experts)) if experts.local.is_none() => self.spark_link(0)
+                .context("Qwen remote grouping")?.borrow().installed_grouping()?.iter()
                 .map(|report| report.packed_row_cap(self.spark_bf16)).min().unwrap_or(0).min(rows),
             Some(Experts::SharedOnly) => rows,
-            // Local EXL3 and the generic RTX trait do not publish arithmetic route metadata.
+            // The shared RTX trait has no arithmetic-route boundary metadata.
             _ => 0,
         };
         let cap = cap.min(self.coordinator_packed_cap(rows)?);
@@ -2636,8 +2555,8 @@ impl<'a> Qwen4Engine<'a> {
                 run_prefill_units(&mut hooks, &[unit], 1)?;
                 Ok(hooks.cur)
             };
-            let cur = match &self.experts {
-                Some(Experts::Spark { transport, .. }) => {
+            let cur = match self.spark_link(0) {
+                Some(transport) => {
                     let mut link = transport.borrow_mut();
                     run(Some(link.exchange()?))?
                 }
@@ -3904,19 +3823,18 @@ impl<'a> Qwen4Engine<'a> {
             self.library.router_select_softmax(w.router_logits.buffer.ptr, w.route_ids.buffer.ptr,
                 w.route_weights.buffer.ptr, t, self.cfg.experts, self.cfg.topk, 1.0, true, self.execution_stream())?;
         }
-        // Spark layers run the shared expert during the exchange (wave_send).
-        if !matches!(experts, Experts::Spark { .. }) || index == self.cfg.layers {
-            self.shared(w, layer, rows)?;
-        }
-        let tp2_wire = match experts {
-            Experts::Tp2 { routed, mtp } => if index < self.cfg.layers { routed.borrow().wire }
-                else { matches!(mtp, Some(MtpExperts::Exl3(_))) },
-            _ => false,
+        if !self.spark_layer(index) { self.shared(w, layer, rows)?; }
+        let wire = match experts {
+            Experts::Hybrid(experts) if index < self.cfg.layers && experts.local_layer(index) =>
+                experts.local.as_ref().context("Qwen resident expert owner")?.wire(),
+            Experts::Hybrid(experts) if index == self.cfg.layers => match &experts.mtp {
+                Some(MtpExperts::Whole(whole)) => whole.uses_fp8_input(),
+                other => matches!(other, Some(MtpExperts::Exl3(_))),
+            },
+            Experts::Hybrid(_) => !self.spark_bf16,
+            Experts::SharedOnly => false,
         };
-        // NVFP4 Spark layers send original BF16 rows; each expert applies its own input_scale.
-        let spark_wire = matches!(experts, Experts::LocalExl3(_) | Experts::Spark { .. })
-            && !(self.spark_bf16 && index < self.cfg.layers);
-        if tp2_wire || spark_wire {
+        if wire {
             let grid = self.quantize_grids[self.active_owner.get()].blocks(t, h);
             self.run("qwen4_expert_input_quant", &[("source_ptr", w.live(&w.x, self.cfg.hidden * 2)), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
@@ -3937,116 +3855,123 @@ impl<'a> Qwen4Engine<'a> {
     fn moe_experts(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool) -> Result<()> {
         let h = self.cfg.hidden;
         match self.experts.as_ref().context("MoE layer without experts")? {
-            Experts::Tp2 { routed, mtp } => {
-                if index < self.cfg.layers {
-                    let mut routed = routed.borrow_mut();
-                    let input = if routed.wire { w.wire.buffer.ptr } else { w.live(&w.x, self.cfg.hidden * 2) };
-                    // SAFETY: all owner buffers persist and were produced on this layer's stream.
-                    return unsafe { routed.enqueue(self.active_owner.get(), index, t, input,
-                        crate::shared::experts::rtx::Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr },
-                        w.live(&w.shared, self.cfg.hidden * 2), w.live(&w.delta, self.cfg.hidden * 2)) };
+            Experts::Hybrid(experts) if index < self.cfg.layers => {
+                if !experts.local_layer(index) {
+                    let mut link = self.spark_link(0).context("Qwen remote layer has no landing link")?.borrow_mut();
+                    let exchange = link.exchange()?;
+                    if self.active_owner.get() == 0 {
+                        let wave = self.wave_send(w, index, t, rows, decode, exchange, None)?;
+                        return self.wave_land(w, t, wave, exchange);
+                    }
+                    let landing = self.workspace_slot(0, decode)?.borrow();
+                    let landing = landing.as_ref().context("Qwen Spark landing workspace")?;
+                    self.remote_front(1, w, landing, index, t, rows)?;
+                    let wave = self.on_owner(0, || self.wave_send(landing, index, t, rows, decode, exchange, None))?;
+                    self.on_owner(0, || self.wave_land(landing, t, wave, exchange))?;
+                    return self.remote_return(1, landing, w, t);
                 }
-                match mtp.as_ref().context("Qwen TP2 MTP experts missing")? {
+                self.exchange_window(index, decode, true)?;
+                let local = experts.local.as_ref().context("Qwen resident layer has no owner")?;
+                let input = if local.wire() { crate::shared::experts::rtx::ExpertInput::Fp8K32(w.wire.buffer.ptr) }
+                    else { crate::shared::experts::rtx::ExpertInput::Bf16(w.live(&w.x, h * 2)) };
+                let routes = crate::shared::experts::rtx::Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr };
+                // SAFETY: owner-local operands persist and the serialized backend combines
+                // before another layer/unit can reuse its workspace.
+                return unsafe { match local {
+                    LocalRouted::Whole(whole) => whole.enqueue(index, t, input, routes,
+                        w.live_buffer(&w.shared, h * 2), w.live_buffer(&w.delta, h * 2), self.execution_stream(),
+                        &mut || crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "Qwen whole abort")),
+                    LocalRouted::Tp2(pair) => pair.borrow_mut().enqueue(self.active_owner.get(), index, t,
+                        match input { crate::shared::experts::rtx::ExpertInput::Fp8K32(ptr)
+                            | crate::shared::experts::rtx::ExpertInput::Bf16(ptr) => ptr }, routes,
+                        w.live(&w.shared, h * 2), w.live(&w.delta, h * 2)),
+                } };
+            }
+            Experts::Hybrid(experts) => {
+                ensure!(index == self.cfg.layers, "unknown Qwen expert layer {index}");
+                match experts.mtp.as_ref().context("Qwen independent MTP expert owner missing")? {
+                    MtpExperts::Whole(whole) => {
+                        // SAFETY: target and MTP share one serialized owner-zero stream,
+                        // and the shared scratch/output outlive both consumers.
+                        return unsafe { whole.enqueue(index, t, crate::shared::experts::rtx::ExpertInput::Fp8K32(w.wire.buffer.ptr),
+                            crate::shared::experts::rtx::Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr },
+                            w.live_buffer(&w.shared, h * 2), w.live_buffer(&w.delta, h * 2), self.execution_stream(),
+                            &mut || crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "Qwen MTP abort")) };
+                    }
                     MtpExperts::Fp8(experts) => {
                         let resident = experts.index_of(index)?;
-                        // SAFETY: MTP owner-zero buffers and resident package persist on this stream.
-                        unsafe { experts.run(resident, t, w.live(&w.x, self.cfg.hidden * 2), w.route_ids.buffer.ptr,
+                        // SAFETY: independent MTP input/routes/output live on the head-owner stream.
+                        unsafe { experts.run(resident, t, w.live(&w.x, h * 2), w.route_ids.buffer.ptr,
                             w.route_weights.buffer.ptr, w.routed.buffer.ptr, self.execution_stream())?; }
                     }
                     MtpExperts::Exl3(experts) => {
                         let mut experts = experts.borrow_mut();
-                        // SAFETY: MTP owner-zero wire/routes/shared and output are stream ordered.
+                        // SAFETY: the full-width MTP scratch and operands persist until stream drainage.
                         unsafe {
                             experts.run(crate::families::deepseek_v4::local::LocalLayer::Stage(0), t,
                                 w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                                w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
-                            crate::shared::memory::device::copy_device_ordered(self.library, w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-            Experts::Local(local) => {
-                self.exchange_window(index, decode, true)?;
-                let target;
-                let fp8 = if let Some(draft) = local.mtp_experts.as_ref()
-                    .filter(|draft| draft.layers.iter().any(|layer| layer.layer == index)) {
-                    draft
-                } else {
-                    local.index_of(index)?;
-                    target = local.experts.borrow();
-                    &*target
-                };
-                let resident = fp8.index_of(index)?;
-                ensure!(!fp8.wire_input(), "the coordinator FP8 package takes BF16 rows");
-                // SAFETY: input rows, route ids, weights and the output are live
-                // buffers of `t` rows on this engine's stream.
-                unsafe {
-                    fp8.run(resident, t, w.live(&w.x, self.cfg.hidden * 2), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                        w.routed.buffer.ptr, self.execution_stream())?;
-                }
-                if local.window.is_some() {
-                    // Diagnostic paging may drop this layer before the stream drains.
-                    // SAFETY: the engine owns this stream.
-                    unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
-                }
-            }
-            Experts::LocalExl3(local) => {
-                self.exchange_window(index, decode, true)?;
-                local.ensure(index, self.execution_stream())?;
-                let mut resident = local.resident.borrow_mut();
-                let (_, experts) = resident.as_mut().context("EXL3 window")?;
-                let layer = if index == self.cfg.layers {
-                    crate::families::deepseek_v4::local::LocalLayer::Stage(0)
-                } else {
-                    crate::families::deepseek_v4::local::LocalLayer::Backbone(index)
-                };
-                // SAFETY: wire rows, routes and the shared-expert rows are complete in
-                // stream order; the output is copied before the window can change.
-                unsafe {
-                    experts.run(layer, t, w.wire.buffer.ptr,
-                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
-                    crate::shared::memory::device::copy_device_ordered(self.library, w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
-                }
-                return Ok(());
-            }
-            Experts::Spark { transport, mtp } => {
-                if index < self.cfg.layers {
-                    let mut link = transport.borrow_mut();
-                    let exchange = link.exchange()?;
-                    let wave = self.wave_send(w, index, t, rows, decode, exchange, None)?;
-                    return self.wave_land(w, t, wave, exchange);
-                }
-                ensure!(index == self.cfg.layers, "unknown Qwen expert layer {index}");
-                match mtp.as_ref().context("Spark backbone needs coordinator-local MTP experts (--mtp)")? {
-                    MtpExperts::Fp8(experts) => {
-                        let resident = experts.index_of(index)?;
-                        // SAFETY: MTP input/routes and its output are live on this stream.
-                        unsafe { experts.run(resident, t, w.live(&w.x, self.cfg.hidden * 2), w.route_ids.buffer.ptr,
-                            w.route_weights.buffer.ptr, w.routed.buffer.ptr, self.execution_stream())? };
-                    }
-                    MtpExperts::Exl3(experts) => {
-                        let mut experts = experts.borrow_mut();
-                        // SAFETY: the resident draft owns its workspace; wire/routes/shared
-                        // and the copied output are ordered on the engine's stream.
-                        unsafe {
-                            experts.run(crate::families::deepseek_v4::local::LocalLayer::Stage(0), t,
-                                w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                                w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
-                            crate::shared::memory::device::copy_device_ordered(self.library, w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
+                                w.live(&w.shared, h * 2), self.execution_stream())?;
+                            crate::shared::memory::device::copy_device_ordered(self.library,
+                                w.live_buffer(&w.delta, h * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
                         }
                         return Ok(());
                     }
                 }
             }
             Experts::SharedOnly => {
-                // SAFETY: both are live [t, H] BF16 buffers ordered on the stream.
-                unsafe { crate::shared::memory::device::copy_device_ordered(self.library, w.live_buffer(&w.delta, self.cfg.hidden * 2), w.live_buffer(&w.shared, self.cfg.hidden * 2), t * h * 2, self.execution_stream())? };
+                // SAFETY: both BF16 planes persist on the same ordered owner stream.
+                unsafe { crate::shared::memory::device::copy_device_ordered(self.library,
+                    w.live_buffer(&w.delta, h * 2), w.live_buffer(&w.shared, h * 2), t * h * 2, self.execution_stream())?; }
                 return Ok(());
             }
         }
         self.run("qwen4_add", &[("a", w.routed.buffer.ptr), ("b", w.live(&w.shared, self.cfg.hidden * 2)), ("out", w.live(&w.delta, self.cfg.hidden * 2))],
             &[rows])
+    }
+
+    fn remote_front(&self, owner: usize, source: &Workspace<'_>, landing: &Workspace<'_>,
+        layer: usize, rows: usize, scalar: Scalar) -> Result<()> {
+        ensure!(owner == 1 && self.active_owner.get() == owner, "Qwen remote front owner");
+        self.shared(source, &self.weights.layers[layer], scalar)?;
+        let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen hybrid missing") };
+        experts.with_peer(|peer| {
+            // Protect the landing scratch from a previous unit's reader before
+            // peer writes it; every edge is on the existing owner streams.
+            peer.signal(0, 0)?;
+            peer.wait(1, 0)?;
+            let input = if self.spark_bf16 { (source.live_buffer(&source.x, self.cfg.hidden * 2),
+                landing.live_buffer(&landing.x, self.cfg.hidden * 2)) }
+                else { (source.wire.buffer, landing.wire.buffer) };
+            let buffers = [input, (source.route_ids.buffer, landing.route_ids.buffer),
+                (source.route_weights.buffer, landing.route_weights.buffer),
+                (source.live_buffer(&source.shared, self.cfg.hidden * 2), landing.live_buffer(&landing.shared, self.cfg.hidden * 2))];
+            let bytes = remote_front_plane_bytes(rows, self.cfg.hidden, self.cfg.topk, self.spark_bf16);
+            for ((source, destination), bytes) in buffers.iter().zip(bytes) {
+                ensure!(bytes <= source.bytes && bytes <= destination.bytes, "Qwen remote plane exceeds workspace");
+            }
+            let mut index = 0;
+            let planes = buffers.map(|(source, destination)| {
+                let bytes = bytes[index] as u64;
+                index += 1;
+                cuteafd_ffi::peer_exchange::PeerPlane {
+                    source: source.ptr, destination: destination.ptr, rows: 1, row_bytes: bytes,
+                    source_pitch: bytes, destination_pitch: bytes }
+            });
+            peer.push_planes(1, 0, &planes)?;
+            peer.wait(0, 0)
+        })?.context("Qwen remote front needs peer owner")?;
+        Ok(())
+    }
+
+    fn remote_return(&self, owner: usize, landing: &Workspace<'_>, destination: &Workspace<'_>, rows: usize) -> Result<()> {
+        ensure!(owner == 1, "Qwen remote return owner");
+        let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen hybrid missing") };
+        experts.with_peer(|peer| {
+            peer.push_to(0, crate::shared::peer_split::DIRECT, landing.live(&landing.delta, self.cfg.hidden * 2),
+                destination.live(&destination.delta, self.cfg.hidden * 2), rows * self.cfg.hidden * 2)?;
+            peer.wait(1, crate::shared::peer_split::DIRECT)
+        })?.context("Qwen remote return needs peer owner")?;
+        Ok(())
     }
 
     /// A wave on the link's exchange: router outputs and wire rows copy into
@@ -4087,7 +4012,9 @@ impl<'a> Qwen4Engine<'a> {
                 }))?
         };
         // The shared expert runs during the exchange (the L2 prefetch behind it).
-        self.shared(w, &self.weights.layers[index], rows)?;
+        if self.state_map.layers[index].owner == self.active_owner.get() {
+            self.shared(w, &self.weights.layers[index], rows)?;
+        }
         self.exchange_window(index, decode, false)?;
         Ok(ticket)
     }
@@ -4147,8 +4074,8 @@ impl PackedHooks<'_, '_, '_, '_, '_, '_> {
 
 impl crate::shared::prefill_pipeline::PrefillHooks for PackedHooks<'_, '_, '_, '_, '_, '_> {
     type Ticket = crate::shared::spark_waves::WaveTicket;
-    fn route(&self, _: usize) -> crate::shared::prefill_pipeline::FfnRoute {
-        if self.transport.is_some() { crate::shared::prefill_pipeline::FfnRoute::Spark }
+    fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+        if self.engine.spark_layer(layer) { crate::shared::prefill_pipeline::FfnRoute::Spark }
         else { crate::shared::prefill_pipeline::FfnRoute::Local }
     }
     fn begin_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
@@ -4196,151 +4123,191 @@ impl crate::shared::prefill_pipeline::PrefillHooks for PackedHooks<'_, '_, '_, '
 /// and rewritten on the execution stream before the hook that consumes them.
 struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
     engine: &'e Qwen4Engine<'a>,
-    /// The Spark link's exchange.
-    transport: Option<&'r mut crate::shared::spark_waves::Waves<'n>>,
-    w: &'w Workspace<'a>,
+    transports: Vec<&'r mut crate::shared::spark_waves::Waves<'n>>,
+    work: [Option<&'w Workspace<'a>>; 2],
     placement: &'p Qwen4Placement,
     tokens: &'t [u32],
     tables: Arc<Vec<StepTables>>,
     ple_batch: Option<Arc<crate::shared::mapped_table::RowBatch>>,
-    current: Vec<usize>,
+    current: Vec<[usize; 2]>,
     entered: Vec<bool>,
     pending: Vec<Option<crate::shared::mapped_table::PendingRows>>,
     logit_rows: usize,
     scoring: Option<crate::shared::probe::ScoringRows<'t>>,
 }
 
-impl UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
-    fn select(&self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+impl<'a, 'w> UnitHooks<'_, 'w, '_, '_, 'a, '_, '_> {
+    fn owner(&self, layer: usize) -> usize { self.engine.state_map.layers[layer].owner }
+    fn workspace(&self, owner: usize) -> Result<&'w Workspace<'a>> { self.work[owner].context("Qwen unit owner workspace") }
+    fn select(&self, owner: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let shape = self.engine.prefill_shape.context("Qwen prefill shape")?;
-        self.w.row_offset.set(Workspace::unit_offset(unit.slot, shape.unit_rows as usize));
-        self.w.position.set(self.tables[unit.index].positions[0] as usize);
-        self.engine.stage_step_tables(self.w, &self.tables[unit.index])
+        let w = self.workspace(owner)?;
+        w.row_offset.set(Workspace::unit_offset(unit.slot, shape.unit_rows as usize));
+        w.position.set(self.tables[unit.index].positions[0] as usize);
+        self.engine.stage_step_tables(w, &self.tables[unit.index])
     }
-
     fn enter(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit, posted: bool) -> Result<()> {
+        let owner = self.owner(index);
         let engine = self.engine;
-        if engine.cfg.ple_layers.contains(&index) {
-            *engine.ple_pending.borrow_mut() = self.pending[unit.index].take();
-            engine.finish_ple(self.w)?;
-        }
-        engine.enter(self.w, &mut self.current[unit.index], posted.then_some(()),
-            &engine.weights.layers[index], index, Scalar::I32(unit.rows.len() as i32), false)?;
+        engine.on_owner(owner, || {
+            // The current hook (or cutover hop) already selected this unit.
+            // Entering the next same-owner layer must not upload its tables again.
+            if engine.cfg.ple_layers.contains(&index) {
+                *engine.ple_pending.borrow_mut() = self.pending[unit.index].take();
+                engine.finish_ple(self.workspace(owner)?)?;
+            }
+            let w = self.work[owner].context("Qwen unit entry workspace")?;
+            engine.enter(w, &mut self.current[unit.index][owner], posted.then_some(()),
+                &engine.weights.layers[index], index, Scalar::I32(unit.rows.len() as i32), false)
+        })?;
         self.entered[unit.index] = true;
         Ok(())
     }
-
+    fn hop(&self, ordinal: usize, from: usize, to: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let engine = self.engine;
+        let src = self.workspace(from)?;
+        let dst = self.workspace(to)?;
+        let stride = HC * engine.cfg.hidden * 2;
+        let hops = engine.hops.as_ref().context("Qwen unit residual hops")?;
+        let ticket = hops.send(ordinal, 0, src.live(&src.streams[self.current[unit.index][from]], stride), unit.rows.len())?;
+        let landed = hops.land(ticket)?;
+        engine.on_owner(to, || {
+            self.select(to, unit)?;
+            let output = dst.live_buffer(&dst.streams[self.current[unit.index][to]], stride);
+            let input = cuteafd_ffi::CuteafdDeviceBuffer { ptr: landed, ..output };
+            // SAFETY: the admitted hop wait precedes the owner-local slot copy.
+            unsafe { crate::shared::memory::device::copy_device_ordered(engine.library, output, input,
+                unit.rows.len() * stride, engine.execution_stream()) }
+        })
+    }
     fn finish_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        let rows = Scalar::I32(unit.rows.len() as i32);
-        if layer + 1 < self.engine.weights.layers.len() {
-            if self.engine.cfg.ple_layers.contains(&(layer + 1)) {
-                self.engine.post(self.w, &mut self.current[unit.index], rows)?;
-                self.enter(layer + 1, unit, false)
-            } else { self.enter(layer + 1, unit, true) }
+        let owner = self.owner(layer);
+        let next = (layer + 1 < self.engine.weights.layers.len()).then_some(layer + 1);
+        let materialize = next.is_none_or(|next| self.owner(next) != owner || self.engine.cfg.ple_layers.contains(&next));
+        if materialize {
+            self.engine.on_owner(owner, || self.engine.post(self.work[owner].context("Qwen unit post workspace")?,
+                &mut self.current[unit.index][owner], Scalar::I32(unit.rows.len() as i32)))?;
+        }
+        if let Some(next) = next {
+            if self.owner(next) != owner { self.hop(0, owner, self.owner(next), unit)?; }
+            self.enter(next, unit, !materialize)
         } else {
-            self.engine.post(self.w, &mut self.current[unit.index], rows)
+            if owner != 0 { self.hop(1, owner, 0, unit)?; }
+            Ok(())
         }
     }
 }
 
 impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
     type Ticket = crate::shared::spark_waves::WaveTicket;
-
-    fn route(&self, _: usize) -> crate::shared::prefill_pipeline::FfnRoute {
-        if matches!(self.engine.experts, Some(Experts::Spark { .. })) {
-            crate::shared::prefill_pipeline::FfnRoute::Spark
-        } else { crate::shared::prefill_pipeline::FfnRoute::Local }
+    fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+        if self.engine.spark_layer(layer) { crate::shared::prefill_pipeline::FfnRoute::Spark }
+        else { crate::shared::prefill_pipeline::FfnRoute::Local }
     }
-
     fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        self.select(unit)?;
         let engine = self.engine;
-        if let Some(mapped) = engine.ple.as_ref().map(|p| p.mapped()) {
-            let batch = self.ple_batch.as_ref().context("PLE prefill batch ownership")?;
-            // Stage the units in flight before enqueueing this one (their rows
-            // are already in the row cache when the look-ahead reached them).
+        if let Some(mapped) = engine.ple.as_ref().map(|ple| ple.mapped()) {
+            let batch = self.ple_batch.as_ref().context("Qwen PLE prefill batch")?;
             for index in unit.index..(unit.index + mapped.depth()).min(self.pending.len()) {
-                if self.pending[index].is_none() {
-                    self.pending[index] = Some(mapped.begin_unit(batch, index, false)?);
+                if self.pending[index].is_none() { self.pending[index] = Some(mapped.begin_unit(batch, index, false)?); }
+            }
+        }
+        engine.on_owner(0, || {
+            self.select(0, unit)?;
+            let w = self.workspace(0)?;
+            engine.stage_embedding(w, &self.tokens[unit.rows.clone()], HC, &w.streams[0], false)?;
+            let start = self.tables[unit.index].positions[0] as usize;
+            let media = embedding_media(&[(self.placement, start, unit.rows.len())])?;
+            engine.inject_media(w, &media, &self.tables[unit.index].seq_first, &w.streams[0], unit.rows.len(), HC)
+        })
+    }
+    fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let owner = self.owner(layer);
+        self.engine.on_owner(owner, || {
+            self.select(owner, unit)?;
+            if !self.entered[unit.index] { self.enter(layer, unit, false)?; }
+            let w = self.work[owner].context("Qwen unit attention workspace")?;
+            let rows = Scalar::I32(unit.rows.len() as i32);
+            let weights = &self.engine.weights.layers[layer];
+            match weights.attention {
+                Qwen4Attention::Gdn => self.engine.gdn(w, layer, weights, rows, "m4096", false)?,
+                Qwen4Attention::Full => self.engine.full(w, layer, weights, rows, "m4096", &self.tables[unit.index])?,
+            }
+            self.engine.post_pre(w, self.current[unit.index][owner], weights, "mlp", rows)?;
+            self.current[unit.index][owner] ^= 1;
+            Ok(())
+        })
+    }
+    fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let owner = self.owner(layer);
+        self.engine.on_owner(owner, || {
+            self.select(owner, unit)?;
+            self.engine.moe(self.workspace(owner)?, layer, &self.engine.weights.layers[layer],
+                unit.rows.len(), Scalar::I32(unit.rows.len() as i32), false)
+        })?;
+        self.finish_ffn(layer, unit)
+    }
+    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<Self::Ticket> {
+        let owner = self.owner(layer);
+        self.engine.on_owner(owner, || {
+            self.select(owner, unit)?;
+            let w = self.work[owner].context("Qwen unit send workspace")?;
+            let rows = Scalar::I32(unit.rows.len() as i32);
+            self.engine.moe_front(w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
+            if owner == 1 {
+                self.engine.on_owner(0, || self.select(0, unit))?;
+                self.engine.remote_front(owner, w, self.work[0].context("Qwen unit landing workspace")?,
+                    layer, unit.rows.len(), rows)?;
+            }
+            self.engine.on_owner(0, || self.engine.wave_send(self.work[0].context("Qwen unit landing workspace")?,
+                layer, unit.rows.len(), rows, false, self.transports.get_mut(0)
+                    .context("Qwen unit Spark landing link")?, unit.reply_origins()?))
+        })
+    }
+    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket) -> Result<()> {
+        let owner = self.owner(layer);
+        self.engine.on_owner(owner, || {
+            self.select(owner, unit)?;
+            let w = self.work[owner].context("Qwen unit land workspace")?;
+            if owner == 1 { self.engine.on_owner(0, || self.select(0, unit))?; }
+            self.engine.on_owner(0, || self.engine.wave_land(self.work[0].context("Qwen unit landing workspace")?,
+                unit.rows.len(), ticket, self.transports.get_mut(0).context("Qwen unit Spark landing link")?))?;
+            if owner == 1 { self.engine.remote_return(owner, self.work[0].context("Qwen unit landing workspace")?, w, unit.rows.len())?; }
+            Ok(())
+        })?;
+        self.finish_ffn(layer, unit)
+    }
+    fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let engine = self.engine;
+        engine.on_owner(0, || {
+            self.select(0, unit)?;
+            let w = self.workspace(0)?;
+            let cur = self.current[unit.index][0];
+            if let Some(terminal) = &w.terminal_streams {
+                let stride = HC * engine.cfg.hidden * 2;
+                let bytes = unit.rows.len() * stride;
+                let src = w.live_buffer(&w.streams[cur], stride);
+                let dst = Qwen4Engine::region(terminal, unit.rows.start * stride, bytes);
+                // SAFETY: unit owns its slot and distinct admitted terminal span.
+                unsafe { crate::shared::memory::device::copy_device_ordered(engine.library, dst, src, bytes, engine.execution_stream())?; }
+            }
+            let first = self.tokens.len() - self.logit_rows;
+            let count = unit.rows.end.saturating_sub(unit.rows.start.max(first));
+            if count > 0 && engine.weights.layers.len() == engine.cfg.layers {
+                let offset = unit.rows.start.max(first) - first;
+                if let Some(scoring) = self.scoring {
+                    engine.record_head(w, &w.streams[cur], unit.rows.len(), count,
+                        crate::shared::probe::ScoringRows { position: scoring.position + offset, ..scoring })?;
+                } else {
+                    w.logit_offset.set(offset);
+                    engine.head(w, &w.streams[cur], unit.rows.len(), Scalar::I32(unit.rows.len() as i32), count)?;
                 }
             }
-        }
-        engine.stage_embedding(self.w, &self.tokens[unit.rows.clone()], HC, &self.w.streams[0], false)?;
-        let start = self.tables[unit.index].positions[0] as usize;
-        let media = embedding_media(&[(self.placement, start, unit.rows.len())])?;
-        engine.inject_media(self.w, &media, &self.tables[unit.index].seq_first, &self.w.streams[0], unit.rows.len(), HC)
+            engine.last_streams.set((false, cur));
+            Ok(())
+        })
     }
-
-    fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        self.select(unit)?;
-        if !self.entered[unit.index] { self.enter(layer, unit, false)?; }
-        let engine = self.engine;
-        let rows = Scalar::I32(unit.rows.len() as i32);
-        let weights = &engine.weights.layers[layer];
-        match weights.attention {
-            Qwen4Attention::Gdn => engine.gdn(self.w, layer, weights, rows, "m4096", false)?,
-            Qwen4Attention::Full => engine.full(self.w, layer, weights, rows, "m4096", &self.tables[unit.index])?,
-        }
-        engine.post_pre(self.w, self.current[unit.index], weights, "mlp", rows)?;
-        self.current[unit.index] ^= 1;
-        Ok(())
-    }
-
-    fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        self.select(unit)?;
-        self.engine.moe(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(),
-            Scalar::I32(unit.rows.len() as i32), false)?;
-        self.finish_ffn(layer, unit)
-    }
-
-    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<Self::Ticket> {
-        self.select(unit)?;
-        let rows = Scalar::I32(unit.rows.len() as i32);
-        self.engine.moe_front(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
-        let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
-        self.engine.wave_send(self.w, layer, unit.rows.len(), rows, false, transport, unit.reply_origins()?)
-    }
-
-    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket)
-        -> Result<()> {
-        self.select(unit)?;
-        let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
-        self.engine.wave_land(self.w, unit.rows.len(), ticket, transport)?;
-        self.finish_ffn(layer, unit)
-    }
-
-    fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        self.select(unit)?;
-        let engine = self.engine;
-        let cur = self.current[unit.index];
-        if let Some(terminal) = &self.w.terminal_streams {
-            let stride = HC * engine.cfg.hidden * 2;
-            let bytes = unit.rows.len() * stride;
-            let src = self.w.live_buffer(&self.w.streams[cur], stride);
-            let dst = Qwen4Engine::region(terminal, unit.rows.start * stride, bytes);
-            // SAFETY: disjoint, admitted terminal and slot rows; the stream orders reuse.
-            unsafe { crate::shared::memory::device::copy_device_ordered(engine.library, dst, src, bytes, engine.execution_stream())?; }
-        }
-        let first = self.tokens.len() - self.logit_rows;
-        let count = unit.rows.end.saturating_sub(unit.rows.start.max(first));
-        if count > 0 && engine.weights.layers.len() == engine.cfg.layers {
-            let offset = unit.rows.start.max(first) - first;
-            if let Some(scoring) = self.scoring {
-                engine.record_head(self.w, &self.w.streams[cur], unit.rows.len(), count,
-                    crate::shared::probe::ScoringRows { position: scoring.position + offset, ..scoring })?;
-            } else {
-                self.w.logit_offset.set(offset);
-                engine.head(self.w, &self.w.streams[cur], unit.rows.len(), Scalar::I32(unit.rows.len() as i32), count)?;
-            }
-        }
-        engine.last_streams.set((false, cur));
-        Ok(())
-    }
-
-    fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        // State is causal per layer; terminal rows retain the exact span for MTP.
-        Ok(())
-    }
+    fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
 }
 
 fn validate_prefill_span(rows: usize, start: usize, admitted_span: usize, max_context: usize) -> Result<()> {
@@ -4363,8 +4330,7 @@ mod gather_recovery_tests {
         assert_eq!(body.matches("pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),").count(), 4);
         let cancel = body.split("    fn cancel_submission(").nth(1).unwrap().split("    pub(crate) fn drain_state(").next().unwrap();
         assert!(cancel.contains("self.gdn_banks.len() == 1 && self.hops.is_none()"));
-        assert!(cancel.contains("None | Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::SharedOnly)"));
-        assert!(!cancel.contains("Experts::Tp2") && !cancel.contains("Experts::Spark"));
+        assert!(cancel.contains("!self.has_sparks()"));
         // Drop tickets, drain the consumers, then the table's own copies, then the graph boundary.
         let order = ["self.ple_pending.borrow_mut().take()", "self.drain_state()?", "ple.mapped().drain()?",
             "w.terminal_valid.set(false)", "self.graph_completed()"];
@@ -4403,6 +4369,102 @@ mod prefill_unit_tests {
     }
 
     #[test]
+    fn remote_front_planes_align_odd_decode_and_prefill_rows() {
+        for rows in [1usize, 41, 2752] {
+            for bf16 in [false, true] {
+                let bytes = remote_front_plane_bytes(rows, 2560, 10, bf16);
+                assert!(bytes.iter().all(|bytes| bytes % 16 == 0));
+                assert_eq!(bytes[1], (rows * 40).next_multiple_of(16));
+                assert_eq!(bytes[2], bytes[1]);
+                assert!(bytes[1] >= rows * 40 && bytes[1] < rows * 40 + 16);
+            }
+        }
+    }
+
+    #[test]
+    fn dual_hybrid_uses_one_spark_link_on_the_landing_owner() {
+        let source = include_str!("hybrid.rs");
+        let links = source.split_once("        let mut transport = Vec::new();").unwrap().1
+            .split_once("        Ok(engine::HybridExperts").unwrap().0;
+        assert_eq!(links.matches("self.spark_link(args, &peers)").count(), 1);
+        assert!(links.contains("devices[0].run("));
+        assert!(!links.contains("for device in devices"));
+        assert_eq!(cuteafd_loader::plan::layout::spark_endpoints("qwen4", 1), 1);
+        let source = include_str!("engine.rs");
+        let begin = source.split_once("    fn remote_front(").unwrap().1.split_once("    fn remote_return(").unwrap().0;
+        assert!(begin.contains("peer.push_planes(1, 0"));
+        assert!(begin.contains("peer.wait(0, 0)"));
+        assert!(!begin.contains("synchronize"));
+    }
+
+    #[test]
+    fn single_owner_hooks_do_not_switch_the_cuda_device() {
+        let source = include_str!("engine.rs");
+        let owner = source.split_once("    fn on_owner<T>").unwrap().1
+            .split_once("    fn workspace_slot(").unwrap().0;
+        let single = owner.find("if self.gdn_banks.len() == 1 { return work(); }").unwrap();
+        assert!(owner.find("self.gdn_banks.get(owner)").unwrap() < single,
+            "invalid owner IDs must still refuse");
+        assert!(single < owner.find("self.active_owner.replace(owner)").unwrap());
+        assert!(single < owner.find("bank.device.run(work)").unwrap(),
+            "single-device nested hooks must bypass CUDA get/set calls");
+    }
+
+    #[test]
+    fn all_spark_units_upload_tables_only_at_the_original_five_hook_sites() {
+        let source = include_str!("engine.rs");
+        let hooks = source.split_once("impl<'a, 'w> UnitHooks<").unwrap().1
+            .split_once("fn validate_prefill_span(").unwrap().0;
+        let enter = hooks.split_once("    fn enter(").unwrap().1.split_once("    fn hop(").unwrap().0;
+        assert!(!enter.contains("self.select("), "same-owner enter must not upload tables");
+        for name in ["begin_unit", "attention", "send_experts", "land_experts", "end_unit"] {
+            let body = hooks.split_once(&format!("    fn {name}(")).unwrap().1
+                .split_once("\n    fn ").map_or_else(|| hooks.split_once(&format!("    fn {name}(")).unwrap().1,
+                    |(body, _)| body);
+            let remote_only = body.matches("|| self.select(0, unit)").count();
+            assert_eq!(body.matches("self.select(").count() - remote_only, 1, "{name}");
+        }
+        let attention = hooks.split_once("    fn attention(").unwrap().1.split_once("    fn local_ffn(").unwrap().0;
+        assert!(attention.find("self.select(").unwrap() < attention.find("self.enter(").unwrap());
+        // Dev all-Spark: one begin/end per unit, attention/send/land per layer.
+        // Pin each unit's ordered upload sites, including a fourth, 41-row tail.
+        for (span, lengths) in [(8192, vec![2752, 2752, 2688]),
+            (8297, vec![2752, 2752, 2752, 41])] {
+            for waves in [1, 2, 3] {
+                let mut units = sequence_units(span, 2752, 1, 48).unwrap();
+                for unit in &mut units { unit.slot = unit.index % waves; }
+                assert_eq!(units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(), lengths);
+                let schedule = prefill_schedule(&vec![FfnRoute::Spark; 48], &units, waves).unwrap();
+                let mut actual = vec![Vec::new(); units.len()];
+                for step in schedule {
+                    let (unit, site, layer) = match step {
+                        Step::Begin { unit } => (unit, "begin", None),
+                        Step::Attention { unit, layer } => (unit, "attention", Some(layer)),
+                        Step::Send { unit, layer } => (unit, "send", Some(layer)),
+                        Step::Land { unit, layer } => (unit, "land", Some(layer)),
+                        Step::End { unit } => (unit, "end", None),
+                        Step::Commit { .. } => continue,
+                        Step::Local { .. } => panic!("all-Spark unit dispatched a local FFN"),
+                    };
+                    actual[unit].push((site, layer, units[unit].rows.len()));
+                }
+                for (unit, sites) in actual.iter().enumerate() {
+                    let rows = lengths[unit];
+                    let mut expected = vec![("begin", None, rows)];
+                    for layer in 0..48 {
+                        expected.extend([("attention", Some(layer), rows),
+                            ("send", Some(layer), rows), ("land", Some(layer), rows)]);
+                    }
+                    expected.push(("end", None, rows));
+                    assert_eq!(*sites, expected, "span={span} waves={waves} unit={unit}");
+                }
+                assert_eq!(actual.iter().map(Vec::len).sum::<usize>(),
+                    if span == 8297 { 584 } else { 438 });
+            }
+        }
+    }
+
+    #[test]
     fn streamed_scoring_preserves_units_and_consumes_head_before_reuse() {
         let source = include_str!("engine.rs");
         let units = source.split_once("    fn prefill_units_with(").unwrap().1
@@ -4416,7 +4478,7 @@ mod prefill_unit_tests {
         assert!(!head.contains("workspace("));
         let hooks = source.split_once("struct UnitHooks<").unwrap().1
             .split_once("fn validate_prefill_span(").unwrap().0;
-        assert!(hooks.contains("engine.record_head(self.w, &self.w.streams[cur]"));
+        assert!(hooks.contains("engine.record_head(w, &w.streams[cur]"));
     }
 
     #[test]
