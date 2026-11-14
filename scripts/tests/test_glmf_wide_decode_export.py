@@ -1269,6 +1269,14 @@ def test_expanded_channel_siblings_keep_explicit_contract_and_row128_fallback(ex
         assert thunk()[3] == {**params, 'fp8_only': 'prefill'}
         fallback = stem.replace('_expanded_channel_', '_expanded_')
         assert 'scale_granularity' not in programs[fallback][1]
+        assert programs[fallback][1].get('scale_granularity', 'row128') == 'row128'
+    # Program geometry's absent field is the original Row128 schema, not Channel.
+    fork = ROOT / 'third_party/sparkinfer/b12x/integration/cuteafd'
+    for name in ('glmf.py', '_glmf_output_rows.py', '_glmf_output_shard.py'):
+        source = (fork / name).read_text()
+        # The new descriptor API arrives with the batched fork pin.
+        if 'scale_granularity' in source:
+            assert 'if scale_granularity == "channel" else {}' in source
     weights = (ROOT / 'rust/crates/cuteafd-daemon/src/families/glm5_flash/weights.rs').read_text()
     assert 'kda_channel: self.kda_fp8 == super::fp8::KdaFp8::Channel' in weights
     assert 'kda_channel: false' in weights
