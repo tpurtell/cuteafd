@@ -784,19 +784,8 @@ fn automatic_context_uses_model_maximum_for_every_core() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn k6_max_context_plan_charges_parity_pool_and_each_shared_allocation() -> Result<()> {
-    use crate::{families::kimi_k3::{context::{self, ContextLayout}, core::CoreSplit},
-        placement::{AttentionPlacement, LayerMode}};
-    use cuteafd_core::{MlaCacheFormat, memory_layout::{Category, DeviceKind}};
-    let dir = tempfile::tempdir()?;
-    testing::write_kimi_core_snapshot(dir.path(), true);
-    let checkpoint = Checkpoint::open(dir.path())?;
-    let model = Model::open(&checkpoint)?;
-    let package = tempfile::tempdir()?;
-    let path = installed_inventory(package.path(), false);
-    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-    context::add_manifest_programs(&mut manifest);
+fn add_k6_program_inventory(model: &Model, manifest: &mut Value) {
+    use crate::families::kimi_k3::core::CoreSplit;
     let mut policies = std::collections::BTreeMap::new();
     for p in model.core.projections.values() {
         for world in [1, 2] {
@@ -823,6 +812,22 @@ fn k6_max_context_plan_charges_parity_pool_and_each_shared_allocation() -> Resul
         manifest["programs"].as_array_mut().unwrap().extend(names.into_iter().map(|name|
             serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":256}})));
     }
+}
+
+#[test]
+fn k6_max_context_plan_charges_parity_pool_and_each_shared_allocation() -> Result<()> {
+    use crate::{families::kimi_k3::{context::{self, ContextLayout}, core::CoreSplit},
+        placement::{AttentionPlacement, LayerMode}};
+    use cuteafd_core::{MlaCacheFormat, memory_layout::{Category, DeviceKind}};
+    let dir = tempfile::tempdir()?;
+    testing::write_kimi_core_snapshot(dir.path(), true);
+    let checkpoint = Checkpoint::open(dir.path())?;
+    let model = Model::open(&checkpoint)?;
+    let package = tempfile::tempdir()?;
+    let path = installed_inventory(package.path(), false);
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    context::add_manifest_programs(&mut manifest);
+    add_k6_program_inventory(&model, &mut manifest);
     std::fs::write(&path, manifest.to_string())?;
     let input = testing::BudgetedPlanInput::open(dir.path())?;
     let mut options = with_layout(6, Some(110 << 30));
@@ -996,6 +1001,43 @@ fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<
     }
     testing::write_safetensors(&k6_dir.path().join("indexers.safetensors"), &headers);
     std::fs::write(&k6_index_path, k6_index.to_string())?;
+    let package = tempfile::tempdir()?;
+    let programs_path = installed_inventory(package.path(), false);
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&programs_path)?)?;
+    let compact = Model::open(&Checkpoint::open(k6_dir.path())?)?;
+    add_k6_program_inventory(&compact, &mut manifest);
+    for rows in [64usize, 4096] {
+        let mode = if rows == 64 { "decode" } else { "prefill" };
+        for (name, bytes) in [
+            (format!("kimik31_kda_m{rows}"), rows * 4096),
+            (format!("kimik31_index_producer_m{rows}"), rows * 8512),
+            (format!("kimik31_index_topk_{mode}_m{rows}"), rows * 256),
+            (format!("kimik31_scored_index_topk_{mode}_m{rows}"), rows * 256),
+        ] {
+            manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({"name":name,
+                "capacity_rows":rows,"scratch_bytes_at_capacity":{"scratch":bytes}}));
+        }
+        for (suffix, heads) in [("", 48), ("_h96", 96)] {
+            for cache in ["", "_fp8"] {
+                for (stem, bytes) in [("mla_producer", rows * 4096), ("sparse_mla",
+                    cuteafd_ffi::KimiSparseMla::scratch_bytes_for(rows, heads, false)?)] {
+                    manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({
+                        "name":format!("kimik31_{stem}{suffix}{cache}_m{rows}"),"capacity_rows":rows,
+                        "scratch_bytes_at_capacity":{"scratch":bytes}}));
+                }
+            }
+            manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({
+                "name":format!("kimik31_mla_output{suffix}_m{rows}"),"capacity_rows":rows,
+                "scratch_bytes_at_capacity":{"scratch":rows * 4096}}));
+        }
+        for cache in ["", "_fp8"] { for begin in [0, 48] {
+            manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({
+                "name":format!("kimik31_sparse_mla_partial{cache}_h{begin}_m{rows}"),"capacity_rows":rows,
+                "scratch_bytes_at_capacity":{"scratch":cuteafd_ffi::KimiSparseMla::scratch_bytes_for(rows, 96, true)?}}));
+        }}
+    }
+    std::fs::write(&programs_path, manifest.to_string())?;
+    options.layout.as_mut().unwrap().workspace_manifest = Some(programs_path);
     options.attention_placement = Some(crate::placement::AttentionPlacement::Layers);
     let k6_report = testing::BudgetedPlanInput::open(k6_dir.path())?.plan(&options)?;
     assert!(k6_report.placement_supported, "{:?}", k6_report.hints);
