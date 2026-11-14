@@ -177,7 +177,7 @@
     },
     {
       "family": "muse_spark",
-      "config": "examples/configs/muse-spark-exl3-max.config",
+      "config": "examples/configs/muse-spark-exl3-k4-mc-max.config",
       "set": {
         "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
         "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
@@ -218,7 +218,7 @@
     },
     {
       "family": "muse_spark",
-      "config": "examples/configs/muse-spark-exl3-max.config",
+      "config": "examples/configs/muse-spark-exl3-k4-mc-max.config",
       "set": {
         "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
         "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",

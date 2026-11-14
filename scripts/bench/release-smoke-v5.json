@@ -1033,7 +1033,7 @@
     },
     {
       "family": "muse_spark",
-      "config": "examples/configs/muse-spark-exl3-min.config",
+      "config": "examples/configs/muse-spark-exl3-k4-mc-min.config",
       "set": {
         "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
         "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
@@ -1054,7 +1054,7 @@
         "EXPERT_BACKEND": "spark",
         "CORE_VIEW": "original"
       },
-      "name": "muse-spark-exl3-min",
+      "name": "muse-spark-exl3-k4-mc-min",
       "gpus": [
         1
       ],
@@ -1067,7 +1067,7 @@
     },
     {
       "family": "muse_spark",
-      "config": "examples/configs/muse-spark-exl3-max.config",
+      "config": "examples/configs/muse-spark-exl3-k4-mc-max.config",
       "set": {
         "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
         "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
@@ -1092,7 +1092,7 @@
         "EXPERT_BACKEND": "spark",
         "CORE_VIEW": "original"
       },
-      "name": "muse-spark-exl3-max",
+      "name": "muse-spark-exl3-k4-mc-max",
       "gpus": [
         0,
         1

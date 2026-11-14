@@ -147,8 +147,9 @@ release-table rows. Card measurements wait for kernel pin #1903.
 
 `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC` is published at
 `cc5dc2537083177e3f02ea0b2d9dfc179d40425c`, with original BF16 (default),
-`k8-compact` and `k6-compact`. Its min/max configs and release row replace the
-standalone Core-K6 checkpoint; historical reports remain. See
+`k8-compact` and `k6-compact`. Its new MC min/max configs and release row replace the
+regular standalone Core-K6 cards; standalone configs, serving support and
+historical reports remain. See
 [Muse core views](models/muse_spark.md#core-views). Main Release smoke entries
 select `original`, with separate max K8/K6 comparisons in the same comparison
 matrix. Whole-core `fp8-compact` remains unsupported until its selected head

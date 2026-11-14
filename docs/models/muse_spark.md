@@ -22,13 +22,16 @@ and on #923.
 and complete `k8-compact` / `k6-compact` cores at revision
 `cc5dc2537083177e3f02ea0b2d9dfc179d40425c`. Select with `CORE_VIEW` (default
 `original`) or `--core-view`; see the [MC contract](../mc-checkpoints.md).
-The [min](../../examples/configs/muse-spark-exl3-min.config) and
-[max](../../examples/configs/muse-spark-exl3-max.config) configs select
+The [min](../../examples/configs/muse-spark-exl3-k4-mc-min.config) and
+[max](../../examples/configs/muse-spark-exl3-k4-mc-max.config) configs select
 `CORE_VIEW=original`. The original path retains native attention, MoE
 frontend/backend and vocabulary head weights. Compact widths have distinct
 dispatch and exact memory charges. Their max-card comparison entries live in
 `scripts/bench/release-smoke-v51-mc-core-comparison.json`; they do not add
-release-table rows. Fresh MC Release smoke measurements are pending.
+release-table rows. Fresh MC Release smoke measurements are pending. The standalone Core-K6
+[min](../../examples/configs/muse-spark-exl3-min.config) and
+[max](../../examples/configs/muse-spark-exl3-max.config) configs remain supported;
+only their regular benchmark cards retire.
 `fp8-compact` is not executable for this complete MC core yet: its selected
 vocabulary head and pre/post-expert projections refuse by role before payload
 reads (#1796). The existing attention-only executor cannot silently skip them.

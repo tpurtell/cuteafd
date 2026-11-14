@@ -807,8 +807,8 @@ def test_muse_refuses_a_slot_without_serve_muse(tmp_path: Path) -> None:
 def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size, gpus, ranks) -> None:
     path = ROOT / f"examples/configs/muse-spark-exl3-{size}.config"
     values = _keys(path)
-    assert values["MODEL_ID"] == "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC"
-    assert values["MODEL_REVISION"] == "cc5dc2537083177e3f02ea0b2d9dfc179d40425c"
+    assert values["MODEL_ID"] == "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6"
+    assert values["MODEL_REVISION"] == "89998fb177acd9a862ac8bd4fb79bfd50e940c97"
     assert values["SPECULATOR"] == "dflash2"
     assert values["SPECULATOR_MODEL_ID"] == "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
     assert values["SPECULATOR_MODEL_REVISION"] == "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
@@ -816,7 +816,8 @@ def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size,
     assert values["VISION"] == ("spark" if size == "min" else "auto")
     assert values["AUDIO"] == "auto"
     if size == "min":
-        assert values["MAX_CONTEXT_TOKENS"] == "auto"
+        assert int(values["MAX_CONTEXT_TOKENS"]) > 262144
+        assert int(values["MAX_CONTEXT_TOKENS"]) % 64 == 0
     else:
         assert "MAX_CONTEXT_TOKENS" not in values
     assert not any(key in values for key in ("RTX_EXPERT_LAYERS", "CONCURRENCY", "SPARK_MEMORY_CAP"))
@@ -838,6 +839,32 @@ def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size,
     assert entry["config"] == str(path.relative_to(ROOT)) and entry["run_args"] == ["--wip", "muse"]
     for key in ("MODEL_ID", "MODEL_REVISION", "SPECULATOR", "SPECULATOR_MODEL_ID", "SPECULATOR_MODEL_REVISION"):
         assert entry["set"][key] == values[key]
+
+
+@pytest.mark.parametrize('size,ranks', [('min', 4), ('max', 6)])
+def test_muse_mc_configs_do_not_replace_standalone_support(size, ranks) -> None:
+    path = ROOT / f'examples/configs/muse-spark-exl3-k4-mc-{size}.config'
+    values = _keys(path)
+    standalone = _keys(ROOT / f'examples/configs/muse-spark-exl3-{size}.config')
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC'
+    assert values['MODEL_REVISION'] == 'cc5dc2537083177e3f02ea0b2d9dfc179d40425c'
+    assert values['CORE_VIEW'] == 'original'
+    assert values['SPARK_COUNT'] == str(ranks)
+    for key in ('SPECULATOR', 'SPECULATOR_MODEL_ID', 'SPECULATOR_MODEL_REVISION', 'VISION', 'AUDIO'):
+        assert values[key] == standalone[key]
+    if size == 'min':
+        assert values['MAX_CONTEXT_TOKENS'] == 'auto'
+        assert standalone['MAX_CONTEXT_TOKENS'] == '634304'
+    matrix = json.loads((ROOT / 'scripts/bench/release-smoke-v5.json').read_text())
+    entry = next(row for row in matrix['entries'] if row['name'] == f'muse-spark-exl3-k4-mc-{size}')
+    assert entry['config'] == str(path.relative_to(ROOT))
+    assert entry['set']['MODEL_ID'] == values['MODEL_ID']
+    assert entry['set']['CORE_VIEW'] == 'original'
+    current = json.loads((ROOT / 'benchmarks/current-matrix.json').read_text())
+    assert any(row['checkpoint'] == values['MODEL_ID'] for row in current['cells'])
+    assert not any(row['checkpoint'] == standalone['MODEL_ID'] for row in current['cells'])
+    retired = next(row for row in current['retired'] if row['name'] == f'muse-spark-exl3-{size}')
+    assert retired['config'] == f'examples/configs/muse-spark-exl3-{size}.config'
 
 
 def test_family_table_and_planner_fixtures_name_muse() -> None:
