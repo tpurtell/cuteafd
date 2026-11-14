@@ -90,6 +90,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let view = worker_args.attention.selected_view.clone().map(Ok)
                 .unwrap_or_else(|| worker_args.attention.select(&worker_args.snapshot))?;
             worker_args.attention.validate_view(&view)?;
+            crate::cli::publish_core_view(&view);
             let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
             let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
             cuteafd_bench::context::set_family("minimax_m3");

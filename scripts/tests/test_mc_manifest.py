@@ -73,7 +73,8 @@ def test_selected_metadata_tamper_and_shared_drift(tmp_path):
 
 
 @pytest.mark.parametrize("family", ["glm5/mod.rs", "glm5_flash/mod.rs", "kimi_k3/serve.rs",
-                                    "muse_spark/serve.rs", "step5/serve.rs"])
+                                    "muse_spark/serve.rs", "step5/serve.rs",
+                                    "minimax_m3/serve.rs", "minimax_m3/golden.rs"])
 def test_resolved_core_identity_is_precision_only(family):
     """Every family publishes its core identity through the one shared publisher, which reports it
     only for checkpoints that declare views (#1755); those names stay precision-only for pairing."""
