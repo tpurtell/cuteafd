@@ -242,6 +242,25 @@ mod tests {
     }
 
     #[test]
+    fn muse_bridge_capacity_raise_preserves_all_existing_row_admissions() {
+        let mut previous = spec();
+        previous.name = ProjectionOutput::Bf16.program_name(8192, 2048);
+        previous.geometry["width"] = serde_json::json!(8192);
+        previous.geometry["outputs"] = serde_json::json!(2048);
+        let mut raised = previous.clone();
+        raised.capacity_rows = 4096;
+        for rows in [1, 4, 8, 16, 64, 128, 512, 1024, 2048] {
+            assert!(admit(&previous, 8192, 2048, rows).is_ok());
+            assert!(admit(&raised, 8192, 2048, rows).is_ok());
+        }
+        assert!(admit(&previous, 8192, 2048, 2752).is_err());
+        assert!(admit(&raised, 8192, 2048, 2752).is_ok());
+        assert!(admit(&raised, 8192, 2048, 4096).is_ok());
+        assert!(admit(&raised, 8192, 2048, 4097).is_err());
+        assert_eq!(previous.geometry, raised.geometry);
+    }
+
+    #[test]
     fn offline_target_admission_matches_runtime_abi() {
         let entry = serde_json::json!({"name":"draft_bf16_k5120_n7168", "capacity_rows":4096,
             "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}], "scalars":[{"type":"int32"}],

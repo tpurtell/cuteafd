@@ -421,6 +421,15 @@ mod family_tests {
                 assert!(!core.native.is_empty());
                 assert!(core.native.values().all(|weight| !weight.fp8));
             }
+            for ranks in [1, 2] {
+                for layer in LayerLayout::ranks(&cfg, 0, ranks, &core)? {
+                    for bridge in ["moe.pre_expert", "moe.post_expert"] {
+                        assert!(layer.core.contains_key(bridge) || layer.native.contains_key(bridge),
+                            "{view}: every bridge must have a bound trellis or native executor");
+                        assert!(!layer.operands.contains_key(bridge), "no unbound plain bridge fallback");
+                    }
+                }
+            }
             let pair = LayerLayout::ranks(&cfg, 0, 2, &core)?;
             bytes.push(pair.iter().map(|l| l.operands.values().sum::<usize>()
                 + l.core.values().map(|c| c.bytes).sum::<usize>()

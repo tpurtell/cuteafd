@@ -91,13 +91,13 @@ impl CoreInventory {
         let mut inventory = Self { projections, native: BTreeMap::new() };
         for (name, shape) in expected(cfg) {
             let stem = name.strip_suffix(".weight").unwrap();
-            if !stem.contains(".self_attn.") || stem.ends_with(".gate_proj")
+            if stem == HEAD || stem.ends_with(".gate_proj")
                 || !checkpoint.contains_tensor(&name) { continue; }
             let selected = checkpoint.projection(stem)?;
             let crate::plan::checkpoint::ProjectionStorage::Native { ref dtype, shape: ref actual } = selected.storage else { continue; };
-            ensure!(*actual == shape, "{stem}: native Muse attention shape {actual:?}, expected {shape:?}");
+            ensure!(*actual == shape, "{stem}: native Muse projection shape {actual:?}, expected {shape:?}");
             ensure!(matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
-                "{stem}: native Muse attention requires BF16 or block E4M3");
+                "{stem}: native Muse projection requires BF16 or block E4M3");
             if *dtype == cuteafd_core::DType::F8E4M3 {
                 if checkpoint.converts_to_fp8(&format!("{stem}.weight")) {
                     return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
@@ -117,7 +117,7 @@ impl CoreInventory {
             for (module, leaves) in [("self_attn", &ATTENTION[..]), ("mlp", &["pre_expert_proj", "post_expert_proj"][..])] {
                 let present = leaves.iter().filter(|leaf|
                     inventory.projections.contains_key(&format!("{root}.{module}.{leaf}"))).count();
-                let mixed_complete = module == "self_attn" && leaves.iter().all(|leaf| {
+                let mixed_complete = leaves.iter().all(|leaf| {
                     let stem = format!("{root}.{module}.{leaf}");
                     inventory.projections.contains_key(&stem) || inventory.native.contains_key(&stem)
                 });
