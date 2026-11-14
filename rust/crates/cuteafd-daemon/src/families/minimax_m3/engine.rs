@@ -136,6 +136,15 @@ impl ServingRequest<'_> {
     }
 }
 
+// Each channel owns one peer sequence: flag, two send words, receive word.
+// All offsets address the unit's already-admitted 256-byte split control.
+const SPLIT_CONTROL_CHANNELS: [(&str, usize, usize); 4] = [
+    ("partial", 0, 16),
+    ("routes", 16, 16),
+    ("routed-sum", 32, 16),
+    ("release", 48, 16),
+];
+
 fn ordered_rank(streams: &[Vec<usize>]) -> Result<()> {
     ensure!(streams.len() == 1, ServingError::TwoRtxNotQualified);
     let first = streams[0].first().context("MiniMax packed serving has no stream")?;
@@ -569,7 +578,7 @@ mod tests {
     use cuteafd_core::memory_layout::Tag;
     use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, native_library_lifetime_fixture::Fixture};
     use cuteafd_loader::families::minimax_m3::execution::{MsaCache, MsaRope};
-    use std::{cell::Cell, ffi::c_void, rc::Rc};
+    use std::{cell::{Cell, RefCell}, ffi::c_void, rc::Rc};
 
     struct ModelSlot<'a> {
         activation: Rc<Allocation<'a>>,
@@ -797,6 +806,77 @@ mod tests {
         assert!(descriptors.rows.iter().enumerate().all(|(row, descriptor)| descriptor.route_offset == (row * 4) as u32));
         drop(dispatchers);
         Ok(())
+    }
+
+    #[test]
+    fn split_routed_broadcast_uses_existing_payload_and_disjoint_charged_controls() -> Result<()> {
+        use cuteafd_loader::families::minimax_m3::execution::{SplitLayout, WirePrecision};
+        for rows in [1, 16, 64, 128] {
+            for wire in [WirePrecision::Bf16, WirePrecision::F32] {
+                let layout = SplitLayout::new(rows, wire)?;
+                let buffers = layout.buffers().into_iter().collect::<BTreeMap<_, _>>();
+                let control = buffers["control"] as usize;
+                let mut ranges = Vec::new();
+                let mut names = BTreeSet::new();
+                for &(name, offset, bytes) in &SPLIT_CONTROL_CHANNELS {
+                    assert!(names.insert(name));
+                    let end = offset.checked_add(bytes).expect("control extent overflow");
+                    assert_eq!(offset % 16, 0);
+                    assert_eq!(bytes, 16);
+                    assert!(end <= control);
+                    assert!(ranges.iter().all(|&(a, b)| end <= a || b <= offset));
+                    ranges.push((offset, end));
+                }
+                assert_eq!(names, BTreeSet::from(["partial", "routes", "routed-sum", "release"]));
+                assert_eq!(buffers["abort"], 256);
+                assert_eq!(layout.events(), 2, "no extra transport event allocation");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn split_pair_sends_both_partials_before_either_destination_waits() -> Result<()> {
+        let trace = RefCell::new(Vec::new());
+        send_split_pair(|rank| {
+            trace.borrow_mut().push(("send", rank));
+            Ok(rank)
+        }, |ticket| {
+            assert_eq!(trace.borrow().iter().filter(|(op, _)| *op == "send").count(), 2);
+            trace.borrow_mut().push(("land", ticket));
+            Ok(())
+        })?;
+        assert_eq!(*trace.borrow(), [("send", 0), ("send", 1), ("land", 0), ("land", 1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn split_pair_failed_send_never_queues_an_unmatched_peer_wait() {
+        for failure in 0..2 {
+            let trace = RefCell::new(Vec::new());
+            let result = send_split_pair(|rank| {
+                trace.borrow_mut().push(("send", rank));
+                ensure!(rank != failure, "injected send failure");
+                Ok(rank)
+            }, |ticket| {
+                trace.borrow_mut().push(("land", ticket));
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(!trace.borrow().iter().any(|(op, _)| *op == "land"));
+        }
+    }
+
+    #[test]
+    fn split_pair_drains_both_ranks_even_if_the_first_drain_fails() {
+        let drained = RefCell::new(Vec::new());
+        let result = drain_split_pair(|rank| {
+            drained.borrow_mut().push(rank);
+            ensure!(rank != 0, "injected first-rank drain failure");
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(*drained.borrow(), [0, 1]);
     }
 
     #[test]

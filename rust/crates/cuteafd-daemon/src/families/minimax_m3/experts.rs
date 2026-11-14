@@ -516,6 +516,33 @@ mod tests {
     }
 
     #[test]
+    fn split_routed_ticket_records_staging_before_partial_activation_reuse() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let rows = rows(device)?;
+        device.run(|| library.copy_h2d(rows.activation.buffer, &vec![37; 6144 * 2]))?;
+        let (dispatcher, _) = dispatcher(device)?;
+        let first = fixture.events()?.len();
+        let ticket = dispatcher.begin(2, &rows, identities(1))?;
+        let staged = fixture.events()?.len();
+        assert!(fences(&fixture.events()?[first..staged]).contains('R'),
+            "begin must record the staged event, not rely on host submission timing");
+        rows.boundary.before_ffn(rows.stream.raw)?;
+        assert_eq!(fences(&fixture.events()?[staged..]), "W",
+            "partial FFN must explicitly wait for routed staging");
+        device.run(|| library.copy_h2d(rows.activation.buffer, &vec![91; 6144 * 2]))?;
+        ticket.land()?;
+        rows.boundary.before_join(rows.stream.raw)?;
+        let mut output = vec![0; 6144 * 2];
+        device.run(|| library.copy_d2h(&mut output, rows.output.buffer))?;
+        assert!(output.iter().all(|&value| value == 37));
+        rows.boundary.joined();
+        Ok(())
+    }
+
+    #[test]
     fn whole_backend_stages_before_overwrite_and_only_writes_routed_sum() -> Result<()> {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
