@@ -145,6 +145,236 @@ const SPLIT_CONTROL_CHANNELS: [(&str, usize, usize); 4] = [
     ("release", 48, 16),
 ];
 
+pub(crate) struct SplitExecution<'a> {
+    hops: crate::shared::peer_split::hop::HopLink<'a>,
+    owners: Vec<usize>,
+    hop_indices: Vec<usize>,
+    onboarded: Vec<bool>,
+    abort_streams: [crate::shared::memory::device::Stream<'a>; 2],
+    compute_streams: [std::rc::Rc<crate::shared::memory::device::Stream<'a>>; 2],
+    abort_words: [Vec<cuteafd_ffi::CuteafdDeviceBuffer>; 2],
+    terminal: std::cell::Cell<bool>,
+}
+
+impl<'a> SplitExecution<'a> {
+    pub fn new(inputs: &cuteafd_loader::placement::families::minimax_m3::MiniMaxInputs,
+        admitted: &cuteafd_loader::placement::families::minimax_m3::AdmittedMiniMax,
+        ranks: &[super::owners::Rank<'a>]) -> Result<Self> {
+        use crate::shared::peer_split::{hop::HopLink, RankDevice};
+        use cuteafd_loader::placement::{ExpertHome, HopSpec, HopStorage, TerminalHome};
+        ensure!(inputs.split() && ranks.len() == 2 && inputs.split_wire.is_some(),
+            "MiniMax split execution needs two admitted ranks and a selected wire");
+        let endpoints = [0, 1].map(|gpu| {
+            let owner = ranks[gpu].decode.borrow();
+            RankDevice { device: owner.stream.device.id, stream: owner.stream.raw }
+        });
+        let library = ranks[0].decode.borrow().stream.device.library;
+        for gpu in 0..2 {
+            let rank = &ranks[gpu];
+            ensure!(rank.prefill.iter().all(|unit| unit.borrow().stream.raw == endpoints[gpu].stream),
+                "MiniMax split prefill differs from its HopLink stream");
+            rank.decode.borrow().stream.device.run(|| {
+                library.peer_exchange_initialize()?;
+                library.peer_abort_initialize()
+            })?;
+        }
+        let peak = 1 + cuteafd_loader::push_load::COPY_STREAMS as u64 + 1 + 1;
+        for gpu in 0..2 {
+            let expected = format!("minimax/driver-stream-slabs/gpu{gpu} ({peak} peak live streams: model + push copies + rotary; split abort 1)");
+            ensure!(admitted.solved.facts.allowances.iter().any(|allowance| allowance.source == expected),
+                "MiniMax split abort stream is not charged at its exact peak count");
+        }
+        let abort_streams = [crate::shared::memory::device::Stream::new(ranks[0].decode.borrow().stream.device)?,
+            crate::shared::memory::device::Stream::new(ranks[1].decode.borrow().stream.device)?];
+        let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: inputs.cfg.hidden as u64 * 4,
+            rows: inputs.prefill.rows.max(inputs.sequences), lanes: 1, entry_gpu: 0, head_gpu: 1,
+            terminal: TerminalHome::Replicated };
+        let mut hops = HopLink::new(library, endpoints, &admitted.placement.hops, spec,
+            inputs.cfg.hidden * 4 * 64)?;
+        let abort = [0, 1].map(|gpu| ranks[gpu].decode.borrow().split_plane("abort")
+            .map(|buffer| buffer.ptr.cast::<u32>() as *const u32));
+        let [abort0, abort1] = abort;
+        hops.attach_abort([abort0?, abort1?])?;
+        let hop_indices = (0..inputs.cfg.layers).map(|layer| admitted.placement.hops.iter()
+            .position(|hop| hop.at == cuteafd_loader::placement::HopPoint::AfterAttention(layer))
+            .context("MiniMax split residual broadcast missing from admission")).collect::<Result<_>>()?;
+        let compute_streams = [0, 1].map(|gpu| std::rc::Rc::clone(&ranks[gpu].decode.borrow().stream));
+        let abort_words = [0, 1].map(|gpu| std::iter::once(&ranks[gpu].decode).chain(&ranks[gpu].prefill)
+            .map(|unit| unit.borrow().split_plane("abort")).collect::<Result<Vec<_>>>());
+        let [words0, words1] = abort_words;
+        Ok(Self { hops, owners: inputs.owners.iter().map(|&gpu| usize::from(gpu)).collect(), hop_indices,
+            onboarded: admitted.placement.layers.iter().map(|layer| layer.experts == ExpertHome::RtxTp2).collect(),
+            abort_streams, compute_streams, abort_words: [words0?, words1?], terminal: std::cell::Cell::new(false) })
+    }
+
+    pub fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for (name, buffer) in self.hops.backing_inventory("hops") {
+            inventory.device(&name, buffer)?;
+        }
+        Ok(())
+    }
+
+    fn cancel(&self) -> Result<()> {
+        self.terminal.set(true);
+        // Never publish behind a possibly blocked compute wait. The independent
+        // retained streams have no dependency on either rank's compute stream.
+        let mut first_error = None;
+        for gpu in 0..2 {
+            let stream = &self.abort_streams[gpu];
+            let result = stream.device.run(|| {
+                for word in &self.abort_words[gpu] {
+                    // SAFETY: charged persistent abort words and independent
+                    // startup stream; words are terminal and never reset.
+                    unsafe { stream.device.library.peer_abort_publish(word.ptr.cast(), stream.raw)?; }
+                }
+                Ok(())
+            }).and_then(|()| stream.drain());
+            if first_error.is_none() { first_error = result.err(); }
+        }
+        let drained = drain_split_pair(|gpu| self.compute_streams[gpu].drain());
+        match first_error { Some(error) => Err(error), None => drained }
+    }
+
+    fn owner(&self, layer: usize) -> Result<usize> {
+        ensure!(!self.terminal.get(), "MiniMax split transport is terminal");
+        self.owners.get(layer).copied().context("MiniMax split attention layer missing")
+    }
+
+    fn residual(&self, units: [&super::layer::UnitOwner<'a>; 2], layer: usize, rows: usize) -> Result<()> {
+        let from = self.owner(layer)?;
+        let index = self.hop_indices[layer];
+        let source = units[from].plane("residual")?;
+        let destination = units[1 - from].plane("residual")?;
+        let ticket = self.hops.send_into(index, 0, source.ptr, rows, Some(destination))?;
+        self.hops.land(ticket)?;
+        Ok(())
+    }
+
+    fn word(buffer: cuteafd_ffi::CuteafdDeviceBuffer, channel: usize, word: usize) -> Result<*mut u32> {
+        let (_, offset, bytes) = *SPLIT_CONTROL_CHANNELS.get(channel).context("MiniMax split channel missing")?;
+        ensure!(bytes == 16 && word < 4 && offset + bytes <= buffer.bytes
+            && buffer.ptr as usize % 16 == 0, "MiniMax split control extent/alignment differs");
+        Ok(buffer.ptr.wrapping_byte_add(offset + word * 4).cast())
+    }
+
+    fn send(units: [&super::layer::UnitOwner<'a>; 2], from: usize, channel: usize,
+        regions: &[(cuteafd_ffi::CuteafdDeviceBuffer, cuteafd_ffi::CuteafdDeviceBuffer, usize)]) -> Result<usize> {
+        let to = 1 - from;
+        let source = units[from];
+        let target = units[to];
+        let local = source.split_plane("control")?;
+        let peer = target.split_plane("control")?;
+        let flag = Self::word(peer, channel, 0)?;
+        let sequence = Self::word(local, channel, 1)?;
+        source.stream.device.run(|| {
+            for &(src, dst, bytes) in regions {
+                ensure!(src.device_id == source.stream.device.id && dst.device_id == target.stream.device.id
+                    && bytes > 0 && bytes <= src.bytes && bytes <= dst.bytes,
+                    "MiniMax split transfer differs from charged destination");
+                // SAFETY: admitted unit planes stay leased through the matching
+                // wait and release handshake; source FIFO orders all producers.
+                unsafe { source.stream.device.library.copy_peer_async(dst, src, bytes, source.stream.raw)?; }
+            }
+            // SAFETY: disjoint persistent 16-byte channel, with payload copies
+            // preceding its system-scope signal on this source stream.
+            unsafe { source.stream.device.library.peer_push_signal(peer.ptr, local.ptr,
+                0, flag, sequence, 0, source.stream.raw)?; }
+            Ok(to)
+        })
+    }
+
+    fn land(units: [&super::layer::UnitOwner<'a>; 2], to: usize, channel: usize) -> Result<()> {
+        let unit = units[to];
+        let control = unit.split_plane("control")?;
+        let flag = Self::word(control, channel, 0)?;
+        let sequence = Self::word(control, channel, 3)?;
+        let abort = unit.split_plane("abort")?;
+        unit.stream.device.run(|| {
+            // SAFETY: the matching send has already been queued, never merely
+            // promised. All words remain live until both ranks drain.
+            unsafe { unit.stream.device.library.peer_wait_abortable(flag, sequence,
+                abort.ptr.cast(), unit.stream.raw) }
+        })
+    }
+
+    fn routes(&self, units: [&super::layer::UnitOwner<'a>; 2], layer: usize, rows: usize) -> Result<()> {
+        if !self.onboarded[layer] { return Ok(()); }
+        let regions = ["route_ids", "route_weights"].map(|name| Ok((units[0].plane(name)?,
+            units[1].plane(name)?, rows * 16))).into_iter().collect::<Result<Vec<_>>>()?;
+        let ticket = Self::send(units, 0, 1, &regions)?;
+        Self::land(units, ticket, 1)
+    }
+
+    fn partials(&self, units: [&super::layer::UnitOwner<'a>; 2], rows: usize) -> Result<()> {
+        send_split_pair(|from| {
+            let local = units[from].split_plane("local")?;
+            let receive = units[1 - from].split_plane("receive")?;
+            let bytes = local.bytes / units[from].rows() as usize * rows;
+            Self::send(units, from, 0, &[(local, receive, bytes)])
+        }, |to| Self::land(units, to, 0))
+    }
+
+    fn routed(&self, units: [&super::layer::UnitOwner<'a>; 2], rows: usize) -> Result<()> {
+        let ticket = Self::send(units, 0, 2, &[(units[0].plane("routed")?, units[1].plane("routed")?, rows * 6144 * 2)])?;
+        Self::land(units, ticket, 2)
+    }
+
+    fn stage(&self, storage: &Storage<'a>, units: [&mut super::layer::UnitOwner<'a>; 2],
+        layer: usize, rows: usize, shared: bool) -> Result<()> {
+        if shared { self.routes([&*units[0], &*units[1]], layer, rows)?; }
+        for (gpu, unit) in units.into_iter().enumerate() {
+            let rank = &storage.ranks[gpu];
+            unit.partial_ffn(&rank.kernels, &rank.weights, &rank.layout, layer, rows, shared)?;
+        }
+        Ok(())
+    }
+
+    fn meet(&self, storage: &Storage<'a>, units: [&super::layer::UnitOwner<'a>; 2],
+        rows: usize, shared: bool) -> Result<()> {
+        self.partials(units, rows)?;
+        // SAFETY: both partial sends precede their waits. Rank0's routed
+        // boundary explicitly waits for ticket.land's ready event here.
+        unsafe { units[0].meet_ffn(&storage.ranks[0].kernels, rows, shared)?; }
+        // The rank0 FIFO now orders ready before this broadcast, including
+        // TP2 experts whose producer/ready event is on an exchange stream.
+        if shared { self.routed(units, rows)?; }
+        // SAFETY: rank1's partial and final BF16 routed sum have landed; its
+        // idle routed boundary is not an invented second routed ticket.
+        unsafe { units[1].meet_ffn(&storage.ranks[1].kernels, rows, shared)?; }
+        self.release(units)
+    }
+
+    fn release(&self, units: [&super::layer::UnitOwner<'a>; 2]) -> Result<()> {
+        // Both consumers finish their meeting before either side can overwrite
+        // the peer's retained receive/routed/route planes on the next layer.
+        send_split_pair(|from| Self::send(units, from, 3, &[]), |to| Self::land(units, to, 3))
+    }
+}
+
+fn send_split_pair<T>(mut send: impl FnMut(usize) -> Result<T>,
+    mut land: impl FnMut(T) -> Result<()>) -> Result<()> {
+    let rank0 = send(0)?;
+    let rank1 = send(1)?;
+    land(rank0)?;
+    land(rank1)
+}
+
+fn drain_split_pair(mut drain: impl FnMut(usize) -> Result<()>) -> Result<()> {
+    let rank0 = drain(0);
+    let rank1 = drain(1);
+    rank0.and(rank1)
+}
+
+fn validate_execution_streams(storage: &Storage<'_>) -> Result<()> {
+    let streams = storage.ranks.iter().map(|rank| std::iter::once(rank.decode.borrow().stream.raw as usize)
+        .chain(rank.prefill.iter().map(|owner| owner.borrow().stream.raw as usize)).collect()).collect::<Vec<_>>();
+    if storage.split.is_some() {
+        ensure!(streams.len() == 2, "MiniMax split execution needs two ranks");
+        for rank in streams { ordered_rank(&[rank])?; }
+        Ok(())
+    } else { ordered_rank(&streams) }
+}
+
 fn ordered_rank(streams: &[Vec<usize>]) -> Result<()> {
     ensure!(streams.len() == 1, ServingError::TwoRtxNotQualified);
     let first = streams[0].first().context("MiniMax packed serving has no stream")?;
@@ -204,8 +434,14 @@ struct NativeSlots<'s, 'a, F> {
 impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic for NativeSlots<'_, '_, F> {
     fn begin(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()> {
         let mut state = self.storage.requests.borrow_mut();
-        let rank = &mut state.ranks[0];
-        prepare_unit(&rank.bank, &mut rank.prefill[unit.slot], unit, requests)?;
+        if self.storage.split.is_some() {
+            for rank in &mut state.ranks {
+                prepare_unit(&rank.bank, &mut rank.prefill[unit.slot], unit, requests)?;
+            }
+        } else {
+            let rank = &mut state.ranks[0];
+            prepare_unit(&rank.bank, &mut rank.prefill[unit.slot], unit, requests)?;
+        }
         let owner = self.storage.ranks[0].prefill[unit.slot].borrow();
         let tokens = unit.segments.iter().map(|segment|
             requests[segment.sequence].tokens_at(segment.tokens.clone())).collect::<Result<Vec<_>>>()?
@@ -217,13 +453,20 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
     }
     fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let state = self.storage.requests.borrow();
-        let request = &state.ranks[0];
+        let gpu = self.storage.split.as_ref().map(|split| split.owner(layer)).transpose()?.unwrap_or(0);
+        let request = &state.ranks[gpu];
         let segments = request.bank.segments(&request.prefill[unit.slot], layer)?;
-        let rank = &self.storage.ranks[0];
+        let rank = &self.storage.ranks[gpu];
         // SAFETY: the retained bank and metadata cover disjoint physical append
         // slots; the shared executor orders causal units on one issuing stream.
         unsafe { rank.prefill[unit.slot].borrow_mut().attention_segments(&rank.kernels,
-            &rank.weights, &rank.layout, layer, &segments) }
+            &rank.weights, &rank.layout, layer, &segments)?; }
+        if let Some(split) = &self.storage.split {
+            let a = self.storage.ranks[0].prefill[unit.slot].borrow();
+            let b = self.storage.ranks[1].prefill[unit.slot].borrow();
+            split.residual([&a, &b], layer, unit.rows.len())?;
+        }
+        Ok(())
     }
     fn router(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let rank = &self.storage.ranks[0];
@@ -240,16 +483,30 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         Ok(())
     }
     fn ffn(&mut self, layer: usize, unit: &Unit, shared: bool) -> Result<()> {
-        let rank = &self.storage.ranks[0];
-        rank.prefill[unit.slot].borrow_mut().ffn(&rank.kernels, &rank.weights, &rank.layout,
-            layer, unit.rows.len(), shared)
+        if let Some(split) = &self.storage.split {
+            let mut a = self.storage.ranks[0].prefill[unit.slot].borrow_mut();
+            let mut b = self.storage.ranks[1].prefill[unit.slot].borrow_mut();
+            split.stage(self.storage, [&mut a, &mut b], layer, unit.rows.len(), shared)?;
+            if !shared { split.meet(self.storage, [&a, &b], unit.rows.len(), false)?; }
+            Ok(())
+        } else {
+            let rank = &self.storage.ranks[0];
+            rank.prefill[unit.slot].borrow_mut().ffn(&rank.kernels, &rank.weights, &rank.layout,
+                layer, unit.rows.len(), shared)
+        }
     }
     fn join(&mut self, unit: &Unit) -> Result<()> {
-        let rank = &self.storage.ranks[0];
-        rank.prefill[unit.slot].borrow().join_routed(&rank.kernels, unit.rows.len())
+        if let Some(split) = &self.storage.split {
+            let a = self.storage.ranks[0].prefill[unit.slot].borrow();
+            let b = self.storage.ranks[1].prefill[unit.slot].borrow();
+            split.meet(self.storage, [&a, &b], unit.rows.len(), true)
+        } else {
+            let rank = &self.storage.ranks[0];
+            rank.prefill[unit.slot].borrow().join_routed(&rank.kernels, unit.rows.len())
+        }
     }
     fn head(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()> {
-        let rank = &self.storage.ranks[0];
+        let rank = &self.storage.ranks[if self.storage.split.is_some() { 1 } else { 0 }];
         let residual = rank.prefill[unit.slot].borrow().plane("residual")?;
         for segment in &unit.segments {
             if !segment.head { continue; }
@@ -355,8 +612,7 @@ impl<'a> ServingPrefill<'a> {
         schedule: &Requests, requests: &mut [ServingRequest<'_>], publish: bool,
         consume: impl FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>) -> Result<()> {
         ensure!(!self.terminal, "MiniMax packed serving is terminal");
-        ordered_rank(&storage.ranks.iter().map(|rank| std::iter::once(rank.decode.borrow().stream.raw as usize)
-            .chain(rank.prefill.iter().map(|owner| owner.borrow().stream.raw as usize)).collect()).collect::<Vec<_>>())?;
+        validate_execution_streams(storage)?;
         ensure!(schedule.capacity == storage.requests.borrow().capacity && schedule.layers == cfg.layers
             && schedule.waves == storage.ranks[0].prefill.len() && self.bindings.len() == cfg.layers,
             "MiniMax packed schedule differs from retained owners");
@@ -385,11 +641,19 @@ impl<'a> ServingPrefill<'a> {
             next_identity: &mut self.next_identity, version: self.version }, &units, schedule.waves);
         if result.is_err() {
             self.terminal = true;
+            if let Some(split) = &storage.split {
+                crate::shared::decode_graph::fatal_drain(split.cancel(), "MiniMax split prefill cancellation");
+            }
             self.dispatchers.clear();
         }
         // Pending ticket drops terminally quiesce exchange before these drains.
-        for unit in &storage.ranks[0].prefill {
-            unit.borrow().stream.drain_or_abort("MiniMax packed serving submission");
+        if storage.split.is_some() {
+            crate::shared::decode_graph::fatal_drain(drain_split_pair(|gpu|
+                storage.ranks[gpu].decode.borrow().stream.drain()), "MiniMax split prefill submission");
+        } else {
+            for unit in &storage.ranks[0].prefill {
+                unit.borrow().stream.drain_or_abort("MiniMax packed serving submission");
+            }
         }
         result
     }
@@ -401,11 +665,11 @@ impl<'a> ServingPrefill<'a> {
         captured: bool)
         -> Result<DeviceLogits> {
         ensure!(!self.terminal, "MiniMax decode serving is terminal");
-        ordered_rank(&storage.ranks.iter().map(|rank| std::iter::once(rank.decode.borrow().stream.raw as usize)
-            .chain(rank.prefill.iter().map(|owner| owner.borrow().stream.raw as usize)).collect()).collect::<Vec<_>>())?;
+        validate_execution_streams(storage)?;
         let rows = schedule.decode_rows(&requests.iter().map(|request| RequestRows {
             slot: request.placement.slot, start: request.start, rows: request.tokens.len(),
         }).collect::<Vec<_>>())?;
+        if storage.split.is_some() { return self.decode_split(storage, cfg, schedule, requests, rows); }
         let rank = &storage.ranks[0];
         let graph_rows = if captured { graphs.row_key(rows)? } else { rows };
         graphs.cycle(crate::shared::decode_graph::device::Cycle::Decode);
@@ -523,6 +787,89 @@ impl<'a> ServingPrefill<'a> {
             self.dispatchers.clear();
         }
         rank.decode.borrow().stream.drain_or_abort("MiniMax eager decode submission");
+        result
+    }
+
+    fn decode_split(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
+        schedule: &Requests, requests: &[ServingRequest<'_>], rows: usize) -> Result<DeviceLogits> {
+        let split = storage.split.as_ref().context("MiniMax split owners missing")?;
+        let result = (|| {
+            let mut state = storage.requests.borrow_mut();
+            ensure!(state.capacity == schedule.capacity, "MiniMax split decode capacity differs");
+            let mut identities = BTreeSet::new();
+            for request in requests {
+                ensure!(request.start == request.placement.len && request.identity != 0
+                    && identities.insert(request.identity), "MiniMax split decode identity/frontier differs");
+            }
+            let placements = requests.iter().map(|request| &*request.placement).collect::<Vec<_>>();
+            for cache in &mut state.ranks { cache.bank.prepare_decode(&mut cache.decode, &placements)?; }
+            let ids = state.tokens.upload(&requests.iter().map(|request| request.tokens[0]).collect::<Vec<_>>())?;
+            {
+                let owner = storage.ranks[0].decode.borrow();
+                // SAFETY: dedicated entry-rank ids and retained decode stream.
+                unsafe { Head::embed_device_ids(cfg, state.capacity.decode.rows as usize,
+                    &storage.embedding, rows, &owner.stream, ids, owner.dense.producer_destination(),
+                    owner.plane("residual")?)?; }
+            }
+            let source = storage.ranks[0].decode.borrow().routed_rows(rows)?;
+            for layer in 0..cfg.layers {
+                let gpu = split.owner(layer)?;
+                let rank = &storage.ranks[gpu];
+                let cache = &state.ranks[gpu];
+                let request = cache.bank.decode_request(&cache.decode, layer)?;
+                // SAFETY: owner-only KV and dedicated metadata cover private
+                // append rows, ordered on this rank's one compute stream.
+                unsafe { rank.decode.borrow_mut().decode(&rank.kernels, &rank.weights,
+                    &rank.layout, layer, request)?; }
+                {
+                    let a = storage.ranks[0].decode.borrow();
+                    let b = storage.ranks[1].decode.borrow();
+                    split.residual([&a, &b], layer, rows)?;
+                }
+                let ticket = if let Some(binding) = self.bindings[layer] {
+                    let rank0 = &storage.ranks[0];
+                    let owner = rank0.decode.borrow();
+                    owner.router(&rank0.kernels, &rank0.weights, layer, rows)?;
+                    if let Some(usage) = &storage.usage {
+                        let tally = usage.routes(owner.stream.device.id, layer,
+                            cuteafd_ffi::expert_usage::UsagePhase::Decode)?;
+                        // SAFETY: the only router/tally producer is logical GPU0.
+                        owner.stream.device.run(|| unsafe { tally.record(owner.plane("route_ids")?.ptr,
+                            rows, None, u32::MAX, true, owner.stream.raw) })?;
+                    }
+                    let identity = self.next_identity;
+                    self.next_identity = identity.checked_add(1).context("MiniMax split dispatch identity exhausted")?;
+                    let dispatch = DispatchRows { request_id: identity, placement_version: self.version,
+                        rows: requests.iter().enumerate().map(|(row, request)| ExpertProtocolV2RowDescriptor {
+                            row_id: row as u64, source_kind: request.kind, source_request_id: request.identity,
+                            token_position: request.start as u64, route_offset: (row * 4) as u32, route_count: 4,
+                        }).collect() };
+                    Some(self.dispatchers[binding.dispatcher].begin(layer, &source, dispatch)?)
+                } else { None };
+                let shared = ticket.is_some();
+                {
+                    let mut a = storage.ranks[0].decode.borrow_mut();
+                    let mut b = storage.ranks[1].decode.borrow_mut();
+                    split.stage(storage, [&mut a, &mut b], layer, rows, shared)?;
+                }
+                if let Some(ticket) = ticket { ticket.land()?; }
+                {
+                    let a = storage.ranks[0].decode.borrow();
+                    let b = storage.ranks[1].decode.borrow();
+                    split.meet(storage, [&a, &b], rows, shared)?;
+                }
+            }
+            let rank = &storage.ranks[1];
+            let residual = rank.decode.borrow().plane("residual")?;
+            storage.head.project_device(&rank.weights, residual, rows)
+        })();
+        if result.is_err() {
+            self.terminal = true;
+            crate::shared::decode_graph::fatal_drain(split.cancel(), "MiniMax split decode cancellation");
+            self.dispatchers.clear();
+        }
+        crate::shared::decode_graph::fatal_drain(drain_split_pair(|gpu|
+            storage.ranks[gpu].decode.borrow().stream.drain()), "MiniMax split decode submission");
         result
     }
 
@@ -805,6 +1152,88 @@ mod tests {
         assert_eq!(descriptors.rows.iter().map(|row| row.source_request_id).collect::<BTreeSet<_>>(), BTreeSet::from([19, 20, 21]));
         assert!(descriptors.rows.iter().enumerate().all(|(row, descriptor)| descriptor.route_offset == (row * 4) as u32));
         drop(dispatchers);
+        Ok(())
+    }
+
+    #[test]
+    fn actual_split_transport_cpu_model_orders_partials_routed_sum_and_fault_abort() -> Result<()> {
+        use super::super::{owners::{self, LoadedRank, Owners}, weights::TargetWeights, cache::RequestStreams};
+        use cuteafd_loader::{families::minimax_m3::execution::WirePrecision,
+            placement::{families::minimax_m3 as canonical, planner::{Context as ModelContext, Operation}},
+            families::minimax_m3::weight_layout::SplitFfnWeights};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.extent_only(&library)?;
+        fixture.peer_ordering_model(&library)?;
+        fixture.configure_device_flags(&library, 0)?;
+        for id in 0..2 { fixture.configure_memory(&library, id, 96 << 30)?; }
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let (checkpoint, cfg) = owners::tests::snapshot(dir.path())?;
+        for wire in [WirePrecision::Bf16, WirePrecision::F32] {
+            let mut inputs = owners::tests::inputs(&checkpoint, &cfg, &[0, 1], 1)?;
+            inputs.split_wire = Some(wire);
+            let request = canonical::request(ModelContext::automatic(inputs.context.maximum), Some(129 * 64),
+                cuteafd_loader::placement::Onboard::Layers(0), inputs.prefill,
+                Operation::Serving, None, Default::default());
+            let admitted = inputs.admit(request)?;
+            fixture.register_programs(&library, inputs.manifest["programs"].as_array().unwrap())?;
+            let manifest = dir.path().join("PROGRAMS.json");
+            std::fs::write(&manifest, serde_json::to_vec(&*inputs.manifest)?)?;
+            let programs = library.programs()?.with_manifest(&manifest)?;
+            let layouts = SplitFfnWeights::plan(&checkpoint, &cfg,
+                &inputs.owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>(),
+                cuteafd_loader::placement::planner::EmbeddingHome::Device(0))?;
+            let mut loaded = Vec::new();
+            let mut embedding = None;
+            for gpu in 0..2 {
+                let device = Device { library: &library, id: gpu as i32 };
+                let (weights, records) = crate::shared::experts::rtx::dense::recording(|| {
+                    if gpu == 0 {
+                        let (weights, table) = TargetWeights::load_split_ffn_with_embedding(device, &checkpoint,
+                            &layouts[gpu], crate::shared::token_io::EmbedPlacement::Gpu)?;
+                        embedding = Some(table);
+                        Ok(weights)
+                    } else { TargetWeights::load_split_ffn(device, &checkpoint, &layouts[gpu]) }
+                })?;
+                drop(records);
+                let decode = Rc::new(Stream::new(device)?);
+                loaded.push(LoadedRank { weights, streams: RequestStreams {
+                    decode: Rc::clone(&decode), prefill: vec![decode; inputs.prefill.waves as usize] } });
+            }
+            let owners = Owners::new(&inputs, &admitted, &programs, loaded, embedding.unwrap())?;
+            let storage = &owners.storage;
+            let split = storage.split.as_ref().unwrap();
+            {
+                let a = storage.ranks[0].decode.borrow();
+                let b = storage.ranks[1].decode.borrow();
+                let units = [&*a, &*b];
+                let first = fixture.events()?.len();
+                split.partials(units, 1)?;
+                let trace = fixture.events()?[first..].chars().filter(|ch| "pw".contains(*ch)).collect::<String>();
+                assert_eq!(trace, "ppww", "both actual sends must precede either wait");
+                a.stream.drain()?;
+                b.stream.drain()?;
+                // Route flags are absent at count0, but final routed output is
+                // always retained on both ranks, including Spark-backed layers.
+                assert!(b.plane("route_ids").is_err());
+                let first = fixture.events()?.len();
+                split.routed(units, 1)?;
+                assert_eq!(fixture.events()?[first..].chars().filter(|ch| "pw".contains(*ch)).collect::<String>(), "pw");
+                a.stream.drain()?;
+                b.stream.drain()?;
+                fixture.peer_stream_fault(&library, a.stream.raw)?;
+                split.partials(units, 1)?;
+                assert!(a.stream.drain().is_err(), "asynchronous producer fault must surface");
+            }
+            let first = fixture.events()?.len();
+            split.cancel()?;
+            let trace = &fixture.events()?[first..];
+            assert!(trace.contains('a'), "independent abort publication missing");
+            assert!(trace.matches('s').count() >= 4, "both abort and compute ranks must drain");
+            assert!(split.owner(0).is_err(), "terminal split transport must reject reuse");
+            fixture.peer_stream_fault(&library, std::ptr::null_mut())?;
+            drop(owners);
+        }
         Ok(())
     }
 

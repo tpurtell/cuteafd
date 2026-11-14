@@ -33,6 +33,7 @@ pub(crate) struct Storage<'a> {
     pub head: Head<'a>,
     pub embedding: TokenEmbedding<'a>,
     pub usage: Option<ExpertUsage<'a>>,
+    pub split: Option<super::engine::SplitExecution<'a>>,
     devices: Vec<i32>,
 }
 impl Drop for Storage<'_> {
@@ -131,6 +132,7 @@ impl<'a> Owners<'a> {
             Category::Weights, "checkpoint-native target");
         for (gpu, rank) in loaded.iter().enumerate() {
             let target = &inputs.targets[gpu];
+            if inputs.split() { validate_split_streams(&rank.streams)?; }
             let device = rank.streams.decode.device;
             ensure!(target.rank == gpu && rank.weights.rank == gpu && rank.weights.layers == target.layers
                 && std::ptr::eq(device.library, library) && rank.streams.prefill.len() == waves
@@ -197,8 +199,10 @@ impl<'a> Owners<'a> {
                 .collect::<Result<Vec<_>>>()?;
             ExpertUsage::new(library, geometry.clone(), &producers, usage_reader.clone())
         }).transpose()?;
+        let split = if inputs.split() { Some(super::engine::SplitExecution::new(inputs, admitted, &ranks)?) }
+            else { None };
         let storage = Rc::new(Storage { ranks, requests: RefCell::new(requests), prefix, head,
-            embedding, usage, devices });
+            embedding, usage, split, devices });
         let census = storage.inventory()?;
         reconcile(&census, &admitted.solved.facts, &contract.components, pages, retained_owner)?;
         let mut graphs = Vec::with_capacity(inputs.gpus);
@@ -306,6 +310,12 @@ impl Storage<'_> {
         let mut census = Census::default();
         census.owners(weights.receipts);
         census.owners(execution.receipts);
+        if let Some(split) = &self.split {
+            let mut transport = Inventory::new(devices, "minimax", Lifetime::TARGET,
+                Category::Transport, "retained residual hop backings");
+            split.inventory(&mut transport)?;
+            census.owners(transport.receipts);
+        }
         if let Some(usage) = &self.usage {
             let mut observed = Inventory::new(devices, "expert-usage", Lifetime::TARGET,
                 Category::Workspace, "retained expert telemetry");
@@ -326,6 +336,14 @@ impl Storage<'_> {
     }
 }
 
+fn validate_split_streams(streams: &RequestStreams<'_>) -> Result<()> {
+    ensure!(!streams.decode.raw.is_null() && streams.prefill.iter().all(|stream|
+        stream.raw == streams.decode.raw && stream.device.id == streams.decode.device.id
+            && std::ptr::eq(stream.device.library, streams.decode.device.library)),
+        "MiniMax split prefill must share its rank's HopLink/decode stream");
+    Ok(())
+}
+
 /// This is deliberately not a complete serving reconciliation: the scheduler
 /// must also reconcile its own canonically charged selector (without allocating
 /// another here), attach transport/experts/draft/media/host-cache owners, account
@@ -333,7 +351,7 @@ impl Storage<'_> {
 /// allowances before signalling readiness.
 fn retained_owner(id: &str) -> bool {
     ["minimax/target/", "minimax.kv.", "minimax.cache.", "minimax.rope.", "minimax.decode.",
-        "minimax.unit.", "minimax.prefix.h2d.", "minimax.head.", "expert-usage.gpu"]
+        "minimax.unit.", "minimax.prefix.h2d.", "minimax.head.", "minimax.hops.", "expert-usage.gpu"]
         .iter().any(|prefix| id.starts_with(prefix))
 }
 
@@ -383,7 +401,7 @@ fn reconcile(census: &Census, facts: &Facts, components: &[Component], pages: u6
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::shared::{experts::rtx::dense::recording, memory::device::{Device, Stream}};
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
@@ -423,7 +441,7 @@ mod tests {
 
     // Sparse native checkpoint headers skip payload IO under dense recording.
     // Production loading, allocation and receipt observation still run unchanged.
-    fn snapshot(dir: &std::path::Path) -> Result<(Checkpoint, MiniMaxM3Config)> {
+    pub(super) fn snapshot(dir: &std::path::Path) -> Result<(Checkpoint, MiniMaxM3Config)> {
         let mut config: Value = serde_json::from_str(include_str!(
             "../../../../cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?;
         config.as_object_mut().unwrap().remove("vision_config");
@@ -514,7 +532,7 @@ mod tests {
         Ok(json!({"programs":entries.into_values().collect::<Vec<_>>()}))
     }
 
-    fn inputs(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, ids: &[i32], concurrency: u64) -> Result<MiniMaxInputs> {
+    pub(super) fn inputs(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, ids: &[i32], concurrency: u64) -> Result<MiniMaxInputs> {
         let gpus = ids.len();
         let namespace_error = cuteafd_loader::push_load::namespace(&checkpoint.snapshot)
             .expect_err("constructor fixture must use mount loading without a push namespace");
@@ -582,6 +600,19 @@ mod tests {
         b.bytes = ByteCurve::fixed(64, 15);
         assert!(unique_curve(&[&a, &b]).is_err(), "equal selected-point bytes do not imply equal curves");
         assert!(unique_curve(&[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn split_constructor_rejects_a_prefill_stream_other_than_its_hop_stream() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let decode = Rc::new(Stream::new(device)?);
+        let good = RequestStreams { decode: Rc::clone(&decode), prefill: vec![Rc::clone(&decode); 3] };
+        validate_split_streams(&good)?;
+        let wrong = RequestStreams { decode, prefill: vec![Rc::new(Stream::new(device)?)] };
+        assert!(validate_split_streams(&wrong).is_err());
         Ok(())
     }
 
@@ -662,8 +693,10 @@ mod tests {
                         assert!(!records.operands.is_empty());
                         weights
                     };
-                    loaded.push(LoadedRank { weights, streams: RequestStreams { decode: Rc::new(Stream::new(device)?),
-                        prefill: (0..3).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<_>>()? } });
+                    let decode = Rc::new(Stream::new(device)?);
+                    let prefill = if inputs.split() { vec![Rc::clone(&decode); 3] }
+                        else { (0..3).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<_>>()? };
+                    loaded.push(LoadedRank { weights, streams: RequestStreams { decode, prefill } });
                 }
                 let constructed = Owners::new(&inputs, &admitted, &programs, loaded, embedding.unwrap());
                 let owners = constructed?;

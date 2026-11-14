@@ -41,6 +41,30 @@ static int immediate_copies;
 static int extent_only;
 static int peer_abort_initialization;
 void fixture_peer_abort_initialization(void) { peer_abort_initialization = 1; }
+/* Opt-in CPU ordering/fault model, not a CUDA numerical implementation. */
+static int peer_model, peer_model_cancelled;
+static void *peer_model_fault_stream;
+struct peer_model_op {
+    void *stream, *dst;
+    const void *src;
+    size_t bytes;
+    uint32_t *flag, *state;
+    const uint32_t *aborted;
+    int kind, done;
+};
+static struct peer_model_op peer_model_ops[4096];
+static size_t peer_model_count;
+void fixture_peer_model(void) { peer_model = 1; immediate_copies = 1; }
+void fixture_peer_model_fault(void *stream) {
+    peer_model_fault_stream = stream;
+    peer_model_cancelled = 0;
+}
+static int peer_model_enqueue(struct peer_model_op op) {
+    if (!peer_model || peer_model_count == 4096) return 1;
+    peer_model_ops[peer_model_count++] = op;
+    return 0;
+}
+static int peer_model_drain(void *stream);
 static size_t mapped_bytes;
 size_t fixture_mapped_bytes(void) { return mapped_bytes; }
 void fixture_extent_only(void) { extent_only = 1; immediate_copies = 1; }
@@ -110,13 +134,31 @@ int cuteafd_peer_copy_rows_async(void *dst, const void *src, uint64_t bytes,
     (void)dst; (void)src; (void)bytes; (void)rows;
     (void)dst_pitch; (void)src_pitch; (void)stream; return 1;
 }
-int cuteafd_peer_abort_initialize(void) { return extent_only || peer_abort_initialization ? 0 : 1; }
+int cuteafd_peer_abort_initialize(void) { return extent_only || peer_abort_initialization || peer_model ? 0 : 1; }
+int cuteafd_peer_push_signal(void *dst, const void *src, uint64_t bytes,
+    uint32_t *flag, uint32_t *state, uint32_t blocks, void *stream) {
+    (void)blocks;
+    if (!peer_model) return 1;
+    event('p');
+    return peer_model_enqueue((struct peer_model_op){ .stream = stream, .dst = dst,
+        .src = src, .bytes = bytes, .flag = flag, .state = state, .kind = 1 });
+}
 int cuteafd_peer_wait_abortable(const uint32_t *flag, uint32_t *state,
     const uint32_t *aborted, void *stream) {
-    (void)flag; (void)state; (void)aborted; (void)stream; return 1;
+    if (!peer_model) return 1;
+    event('w');
+    return peer_model_enqueue((struct peer_model_op){ .stream = stream,
+        .flag = (uint32_t *)flag, .state = state, .aborted = aborted, .kind = 2 });
+}
+int cuteafd_peer_wait(const uint32_t *flag, uint32_t *state, void *stream) {
+    return cuteafd_peer_wait_abortable(flag, state, NULL, stream);
 }
 int cuteafd_peer_abort_publish(uint32_t *aborted, void *stream) {
-    (void)aborted; (void)stream; return 1;
+    if (!peer_model || stream == peer_model_fault_stream || !aborted) return 1;
+    event('a');
+    *aborted = 1;
+    peer_model_cancelled = 1;
+    return 0;
 }
 static int trace_stream_queries;
 void fixture_trace_stream_queries(void) { trace_stream_queries = 1; }
@@ -715,6 +757,51 @@ int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src,
     return pack_status;
 }
 
+int cuteafd_copy_peer_async(struct device_buffer dst, struct device_buffer src,
+    size_t bytes, void *stream) {
+    if (!peer_model || bytes > dst.bytes || bytes > src.bytes) return 1;
+    event('c');
+    return peer_model_enqueue((struct peer_model_op){ .stream = stream, .dst = dst.ptr,
+        .src = src.ptr, .bytes = bytes, .kind = 0 });
+}
+
+static int peer_model_drain(void *stream) {
+    if (peer_model_fault_stream == stream && !peer_model_cancelled) { event('f'); return 1; }
+    for (size_t pass = 0; pass <= peer_model_count; ++pass) {
+        int progress = 0;
+        for (size_t i = 0; i < peer_model_count; ++i) {
+            struct peer_model_op *op = &peer_model_ops[i];
+            if (op->done) continue;
+            int earlier = 0;
+            for (size_t j = 0; j < i; ++j) {
+                if (!peer_model_ops[j].done && peer_model_ops[j].stream == op->stream) { earlier = 1; break; }
+            }
+            if (earlier) continue;
+            if (op->stream == peer_model_fault_stream) {
+                if (!peer_model_cancelled) continue;
+                op->done = 1; progress = 1; continue;
+            }
+            if (op->kind == 2) {
+                if (op->aborted && *op->aborted) { op->done = 1; progress = 1; continue; }
+                if (!op->flag || !op->state || *op->flag <= *op->state) continue;
+                ++*op->state;
+            } else {
+                if (op->bytes) memcpy(op->dst, op->src, op->bytes);
+                if (op->kind == 1) {
+                    if (!op->flag || !op->state) return 1;
+                    *op->flag = ++*op->state;
+                }
+            }
+            op->done = 1; progress = 1;
+        }
+        if (!progress) break;
+    }
+    for (size_t i = 0; i < peer_model_count; ++i)
+        if (!peer_model_ops[i].done && peer_model_ops[i].stream == stream) return 1;
+    event('s');
+    return 0;
+}
+
 int cuteafd_copy_d2h(void *dst, struct device_buffer src, size_t bytes) {
     if (bytes > src.bytes) return 1;
     memcpy(dst, src.ptr, bytes);
@@ -849,6 +936,7 @@ int cuteafd_cuda_stream_query(void *stream, int *ready) {
 }
 
 int cuteafd_cuda_stream_synchronize(void *stream) {
+    if (peer_model) return peer_model_drain(stream);
     (void)stream;
     if (queued_experts) { advance_queue(queued_count); return 0; }
     event('S');

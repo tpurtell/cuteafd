@@ -756,9 +756,10 @@ impl MiniMaxInputs {
             crate::placement::graph_reserve::source(&format!("minimax_m3.graphs.{gpu}")), true, maximum));
         out.extend(allowance(location, self.code[gpu], Lifetime::RESIDENT,
             "MiniMax selected-program loaded code (estimated module residency)".into(), true, maximum));
-        let peak = 1 + crate::push_load::COPY_STREAMS as u64 + 1;
+        let split_abort = u64::from(self.split());
+        let peak = 1 + crate::push_load::COPY_STREAMS as u64 + 1 + split_abort;
         out.extend(allowance(location, cuda_stream_slab_bytes(peak)?, Lifetime::RESIDENT,
-            format!("minimax/driver-stream-slabs/gpu{gpu} ({peak} peak live streams: model + push copies + rotary)"),
+            format!("minimax/driver-stream-slabs/gpu{gpu} ({peak} peak live streams: model + push copies + rotary; split abort {split_abort})"),
             false, maximum));
         Ok(out)
     }
@@ -851,14 +852,16 @@ impl Recipe for MiniMaxInputs {
         let hops = plan_hops(&modes, &spec).map_err(|error| invalid(error))?;
         let hop_bytes = crate::placement::hop_buffer_bytes(&hops, &spec, self.gpus)
             .ok_or(Refusal::Overflow("MiniMax residual hop buffers"))?;
-        for (gpu, &bytes) in hop_bytes.iter().enumerate() {
-            components.extend(buffer(Owner::Hops { gpu }.id(), Location::coordinator(gpu as u8), bytes,
-                Lifetime::TARGET, Category::Transport, "residual hops", maximum));
-        }
         if pair && !self.heads() {
             let layout = crate::placement::HopLinkLayout::new(&hops, &spec)
                 .ok_or(Refusal::Overflow("MiniMax hop control"))?;
+            components.extend(layout.receive_components("minimax.hops", Lifetime::TARGET, maximum));
             components.extend(layout.control_components("minimax.hops", Lifetime::TARGET, maximum));
+        } else {
+            for (gpu, &bytes) in hop_bytes.iter().enumerate() {
+                components.extend(buffer(Owner::Hops { gpu }.id(), Location::coordinator(gpu as u8), bytes,
+                    Lifetime::TARGET, Category::Transport, "residual hops", maximum));
+            }
         }
         // Onboarding: one ordered count profile; destination both GPUs (TP2) or GPU0.
         let counts = self.counts();

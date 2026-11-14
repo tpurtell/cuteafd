@@ -250,6 +250,16 @@ impl<'a> HopLink<'a> {
         peer.require_live()
     }
 
+    /// Physical retained backings, with stable suffixes shared by HopLinkLayout.
+    /// This observes existing storage and never allocates device memory.
+    pub fn backing_inventory(&self, prefix: &str) -> Vec<(String, CuteafdDeviceBuffer)> {
+        self.ends.iter().enumerate().flat_map(|(rank, end)| {
+            end.recv.iter().enumerate().map(move |(slot, owner)|
+                (format!("{prefix}.{rank}.recv.{slot}"), owner.buffer))
+                .chain(std::iter::once((format!("{prefix}.{rank}.control"), end.control.buffer)))
+        }).collect()
+    }
+
     /// Receive bytes held on `rank` (the solver charged exactly this).
     pub fn receive_bytes(&self, rank: usize) -> u64 {
         self.ends[rank].recv.iter().map(|r| r.buffer.bytes as u64).sum()
@@ -351,6 +361,41 @@ fn physical_lane(spec: HopSpec, private: Option<usize>, lane: usize) -> Result<u
 mod cuda_tests {
     use super::*;
     use cuteafd_loader::placement::{plan_hops, FfnMode, LayerMode};
+
+    #[test]
+    fn backing_inventory_matches_individual_admitted_receive_and_control_owners() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::placement::planner::{ComponentKind, Lifetime};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.extent_only(&library)?;
+        let devices = [0, 1].map(|id| Device { library: &library, id });
+        let streams = devices.map(Stream::new);
+        let [a, b] = streams;
+        let (a, b) = (a?, b?);
+        let ranks = [RankDevice { device: 0, stream: a.raw }, RankDevice { device: 1, stream: b.raw }];
+        let modes = [0, 0, 1, 1].map(|gpu| LayerMode::Whole { gpu, ffn: FfnMode::Split });
+        let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: 16, rows: 32,
+            lanes: 1, entry_gpu: 0, head_gpu: 1, terminal: cuteafd_loader::placement::TerminalHome::Replicated };
+        let hops = plan_hops(&modes, &spec)?;
+        let layout = HopLinkLayout::new(&hops, &spec).unwrap();
+        let link = HopLink::new(&library, ranks, &hops, spec, 16)?;
+        let actual = link.backing_inventory("test.hops");
+        let expected = layout.receive_components("test.hops", Lifetime::TARGET, 1).into_iter()
+            .chain(layout.control_components("test.hops", Lifetime::TARGET, 1))
+            .map(|component| match component.kind {
+                ComponentKind::Allocation { template, .. } => (template.id, template.bytes),
+                _ => unreachable!(),
+            }).collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(actual.len(), expected.len());
+        for (name, backing) in actual {
+            assert!(!backing.ptr.is_null());
+            assert_eq!(backing.bytes as u64, expected[&name]);
+        }
+        let bytes = hop_buffer_bytes(&hops, &spec, 2).unwrap();
+        assert_eq!([link.receive_bytes(0), link.receive_bytes(1)], [bytes[0], bytes[1]]);
+        Ok(())
+    }
 
     #[test]
     fn private_hop_instances_charge_one_lane_and_sum_to_the_admitted_forecast() -> Result<()> {
