@@ -40,7 +40,8 @@ impl MiniMaxOutputParser {
     fn step(&mut self, finishing: bool, out: &mut Vec<OutputChunk>) -> bool {
         if self.done { return false; }
         if self.in_call {
-            if let Some(at) = self.pending.find(CALL_CLOSE) {
+            let stop = STOP_MARKERS.iter().filter_map(|marker| self.pending.find(marker)).min();
+            if let Some(at) = self.pending.find(CALL_CLOSE).filter(|at| stop.is_none_or(|stop| *at < stop)) {
                 let end = at + CALL_CLOSE.len();
                 let wire: String = self.pending.drain(..end).collect();
                 match parse_calls(&wire[CALL_OPEN.len()..at], self.options.tools.as_deref().unwrap_or_default()) {

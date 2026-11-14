@@ -155,4 +155,9 @@ fn malformed_partial_and_unknown_calls_return_as_text_not_tools() {
     }
     let wire = format!("Visible{CALL_OPEN}hidden{CALL_CLOSE}");
     assert_eq!(run(&wire, false, wire.len()), ("".into(), "Visible".into(), vec![], 0));
+    let prefix = format!("{CALL_OPEN}{n}<invoke name=\"lookup\">{n}<key>cut");
+    let stopped = format!("{prefix}[e~[{n}</key>{n}</invoke>{CALL_CLOSE}");
+    for split in stopped.char_indices().map(|(i, _)| i).chain([stopped.len()]) {
+        assert_eq!(run(&stopped, true, split), ("".into(), prefix.clone(), vec![], 0));
+    }
 }
