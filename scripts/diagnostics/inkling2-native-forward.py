@@ -218,6 +218,28 @@ class Native:
         return attention+mlp if first else (partial+attention)+mlp
 
 
+def expert_boundary_oracle(x, layer, cfg):
+    """Separate counterfactual: native kernel BF16 FC1/SiTU and route-sum boundary.
+
+    #1915 already includes both MXFP8 A8 QDQs. This diagnostic adds the BF16
+    projection/SiTU materialization documented by #294, without replacing it.
+    """
+    logits = linear(x, layer["mlp.gate.weight"].float())
+    ids, gamma = oracle.route(logits, layer["mlp.gate.bias"], cfg.num_experts_per_tok, cfg.route_scale)
+    inputs = oracle.quantize_mxfp8(x)
+    slots = torch.zeros(len(x), cfg.num_experts_per_tok, cfg.hidden_size, device=x.device)
+    for expert in ids.unique().tolist():
+        rows, choices = torch.where(ids == expert)
+        w13 = oracle.dequant_mxfp8(layer["mlp.experts.w13_weight"][expert], layer["mlp.experts.w13_weight_scale"][expert])
+        gate_up = linear(inputs[rows], w13).bfloat16().float()
+        del w13
+        activation = oracle.capped_swiglu(gate_up, gamma[rows, choices], cfg.mlp_gate_softcap, cfg.mlp_up_softcap).bfloat16().float()
+        down = oracle.dequant_mxfp8(layer["mlp.experts.w2_weight"][expert], layer["mlp.experts.w2_weight_scale"][expert])
+        slots[rows, choices] = linear(oracle.quantize_mxfp8(activation), down)
+        del down
+    return slots.sum(1).bfloat16().float()
+
+
 def stage_probe(native, hidden, layer, cfg, index, weights, report):
     """Diagnostic table only; do not substitute rounded numerics for the oracle."""
     inputs = (hidden,) if index in cfg.local_layer_ids else (hidden,)*3
@@ -258,11 +280,24 @@ def stage_probe(native, hidden, layer, cfg, index, weights, report):
     native_mlp = native.moe(native_input, layer, weights)
     check(f"layer{index}/mlp_out", native_mlp, reference_mlp, report, enforce=False)
     check(f"layer{index}/native_expert_same_native_input", native_mlp, reference_on_native_input, report, enforce=False)
+    boundaries = expert_boundary_oracle(native_input, layer, cfg)
+    check(f"layer{index}/native_vs_bf16_boundary_counterfactual", native_mlp, boundaries, report, enforce=False)
+    check(f"layer{index}/bf16_boundary_vs_f32_reference", boundaries, reference_on_native_input, report, enforce=False)
+    matched = ~set_changed
+    route_report["flip_rate"] = float(set_changed.float().mean())
+    route_report["matched_rows"] = int(matched.sum())
+    check(f"layer{index}/mlp_out_matched_set", native_mlp[matched], reference_mlp[matched], report)
     reference_tail = oracle.short_conv(reference_mlp, layer["mlp_sconv.weight"])
     native_tail = native.short_conv(native_mlp, layer["mlp_sconv.weight"])
     check(f"layer{index}/mlp_conv", native_tail, reference_tail, report, enforce=False)
-    return native_attention+native_tail if first else (hidden+native_attention)+native_tail, (
-        reference_attention+reference_tail if first else (hidden+reference_attention)+reference_tail)
+    actual = native_attention+native_tail if first else (hidden+native_attention)+native_tail
+    expected = reference_attention+reference_tail if first else (hidden+reference_attention)+reference_tail
+    clean = matched.clone()
+    for lag in range(1, cfg.sconv_kernel_size):
+        clean[lag:] &= matched[:-lag]
+    route_report["lag_clean_final_rows"] = int(clean.sum())
+    check(f"layer{index}/final_lag_clean", actual[clean], expected[clean], report)
+    return actual, expected
 
 
 def main():
@@ -314,7 +349,11 @@ def main():
                 actual = native.layer(hidden, [], layer, cfg, index, weights)
             check(f"layer{index}", actual, expected, report, enforce=not args.stage_taps)
             metric = report[f"layer{index}"]
-            if not metric["finite"] or metric["normalized_rms"] > .02 or metric["cosine"] < .999:
+            if args.stage_taps:
+                metrics = [report[f"layer{index}/mlp_out_matched_set"], report[f"layer{index}/final_lag_clean"]]
+            else:
+                metrics = [metric]
+            if any(not m["finite"] or m["normalized_rms"] > .02 or m["cosine"] < .999 for m in metrics):
                 failed.append(index)
             (args.out/"diagnostic.json").write_text(json.dumps(report, indent=2)+"\n")
             del layer, expected, actual, weights.arena, weights.expert_arena, weights.expert
