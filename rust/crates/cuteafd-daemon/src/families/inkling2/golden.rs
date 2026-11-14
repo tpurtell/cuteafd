@@ -38,7 +38,7 @@ fn raw(buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<cuteafd
 fn run(args: GoldenArgs) -> Result<()> {
     let view = args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
-    ensure!(view.name() == "original", "Inkling stage2 golden currently qualifies original BF16 core only");
+    ensure!(view.mode() == cuteafd_loader::plan::CoreView::Original, "Inkling stage2 golden currently qualifies original BF16 core only");
     let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
     ensure!(args.last_layer < cfg.layers, "Inkling --last-layer outside checkpoint");
@@ -120,7 +120,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         }
         let rms = (square/norm.max(1e-30)).sqrt();
         let cosine = dot/(norm*actual_norm).sqrt().max(1e-30);
-        ensure!(rms<=.02 && cosine>=.999, "Inkling partial logits fail RMS/cosine bar: {rms}/{cosine}");
+        ensure!(rms<=0.02 && cosine>=0.999, "Inkling partial logits fail RMS/cosine bar: {rms}/{cosine}");
         serde_json::json!({"normalized_rms":rms,"cosine":cosine})
     } else { serde_json::Value::Null };
     std::fs::create_dir(&args.save_logits)?;

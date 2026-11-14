@@ -22,15 +22,15 @@ def test_predeclared_inkling_producer_stems(monkeypatch):
         'inkling2_router': ['compile_inkling2_router_aot', 'compile_inkling2_gate_aot'],
         'inkling2_glue': ['compile_inkling2_norm_aot', 'compile_inkling2_kv_pack_aot'],
     }
-    def compile(**kwargs): return kwargs
+    def compiler_stub(**kwargs): return kwargs
     for name, functions in modules.items():
         module = types.ModuleType('b12x.integration.cuteafd.'+name)
-        for function in functions: setattr(module, function, compile)
+        for function in functions: setattr(module, function, compiler_stub)
         monkeypatch.setitem(sys.modules, module.__name__, module)
     tree = ast.parse((ROOT/'python/tools/aot/export_b12x_dsv4_aot.py').read_text())
     function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name=='inkling2_producer_programs')
     scope = {}
-    exec(__builtins__['compile'](ast.Module(body=[function], type_ignores=[]), '<producer>', 'exec'), scope)
+    exec(compile(ast.Module(body=[function], type_ignores=[]), '<producer>', 'exec'), scope)
     programs = scope['inkling2_producer_programs'](4096)
     stems = [p[0] for p in programs]
     expected = []
@@ -51,3 +51,21 @@ def test_predeclared_inkling_producer_stems(monkeypatch):
             assert runtime['log_floor'] == 128000 and runtime['log_alpha'] == .1
         if stem == 'router_e384_k8':
             assert runtime['route_scale'] == 8.
+
+
+def test_inkling_projection_and_wire_quantization_inventory():
+    tree = ast.parse((ROOT/'python/tools/aot/export_b12x_dsv4_aot.py').read_text())
+    shape = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name=='inkling2_projection_shapes')
+    scope = {}
+    exec(compile(ast.Module(body=[shape], type_ignores=[]), '<projection>', 'exec'), scope)
+    assert scope['inkling2_projection_shapes']() == {
+        (4608, 6144), (4608, 768), (4608, 1024), (4608, 48), (4608, 32), (4608, 384),
+        (6144, 4608), (64, 1024)}
+    quant = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name=='inkling2_input_quant_program')
+    calls = [n for n in ast.walk(quant) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id=='compile_mxfp8_rows_quant_aot']
+    assert len(calls)==1
+    params = {key.arg: ast.literal_eval(key.value) for key in calls[0].keywords}
+    assert params == dict(size_k=4608, expected_m=80, amax_floor=0., wire_rows=True)
+    source = ast.unparse(tree)
+    assert "('inkling2', 'expert_input_quant', 'expert_input_quant'" in source
