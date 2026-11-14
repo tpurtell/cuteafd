@@ -42,18 +42,24 @@ pub(crate) struct Source {
     path: PathBuf,
     tensors: HashMap<String, SafetensorsTensorMetadata>,
     file_bytes: u64,
+    indexed: Option<cuteafd_loader::plan::Checkpoint>,
 }
 
 impl Source {
     pub fn open(snapshot: &Path) -> Result<Self> {
-        Self::open_file(&snapshot.join("model.safetensors"))
+        if snapshot.join("model.safetensors").is_file() {
+            return Self::open_file(&snapshot.join("model.safetensors"));
+        }
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)?;
+        let tensors = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.meta.clone())).collect();
+        Ok(Self { path: snapshot.to_owned(), tensors, file_bytes: 0, indexed: Some(checkpoint) })
     }
 
     pub fn open_file(path: &Path) -> Result<Self> {
         let path = path.canonicalize()?;
         let tensors = read_safetensors_metadata(&path)?.into_iter().map(|t| (t.name.clone(), t)).collect();
         let file_bytes = std::fs::metadata(&path)?.len();
-        Ok(Self { path, tensors, file_bytes })
+        Ok(Self { path, tensors, file_bytes, indexed: None })
     }
 
     fn parts(&self, parts: &[(&str, usize)], cols: usize) -> Result<Vec<Rect>> {
@@ -61,12 +67,21 @@ impl Source {
     }
 
     pub fn rect(&self, name: &str, shape: &[usize]) -> Result<Rect> {
+        self.native_rect(name, shape, DType::Bf16)
+    }
+
+    pub fn native_rect(&self, name: &str, shape: &[usize], dtype: DType) -> Result<Rect> {
         let tensor = self.tensors.get(name).with_context(|| format!("drafter checkpoint has no {name}"))?;
-        ensure!(tensor.dtype == DType::Bf16, "{name}: drafter weights must be BF16, found {:?}", tensor.dtype);
-        let bytes = shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d))
-            .with_context(|| format!("{name}: BF16 tensor byte count overflow"))?;
+        ensure!(tensor.dtype == dtype, "{name}: expected {dtype:?}, found {:?}", tensor.dtype);
+        let width = match dtype { DType::Bf16 => 2, DType::F8E4M3 | DType::U8 => 1,
+            _ => anyhow::bail!("unsupported native drafter encoding {dtype:?}") };
+        let bytes = shape.iter().try_fold(width, |n: usize, &d| n.checked_mul(d))
+            .with_context(|| format!("{name}: native tensor byte count overflow"))?;
         ensure!(tensor.shape == shape && tensor.byte_length == bytes as u64,
-            "{name}: shape {:?}/{} bytes, expected BF16 {shape:?}/{bytes} bytes", tensor.shape, tensor.byte_length);
+            "{name}: shape {:?}/{} bytes, expected {dtype:?} {shape:?}/{bytes} bytes", tensor.shape, tensor.byte_length);
+        if let Some(checkpoint) = &self.indexed {
+            return Rect::tensor(checkpoint, name, None, None);
+        }
         ensure!(tensor.byte_offset.checked_add(tensor.byte_length).is_some_and(|end| end <= self.file_bytes),
             "{name} lies past the drafter checkpoint file");
         let rows = if shape.len() >= 2 { shape[0] } else { 1 };
@@ -174,7 +189,8 @@ impl<'a, 'b> Load<'a, 'b> {
         }
     }
     pub fn open(library: &'a NativeLibrary, snapshot: &Path) -> Result<Self> {
-        Self::open_file(library, &snapshot.join("model.safetensors"))
+        Ok(Self { library, source: Source::open(snapshot)?, dense: DenseLoad::mount(library),
+            prefetched: None, allocate: None })
     }
 
     pub fn open_file(library: &'a NativeLibrary, path: &Path) -> Result<Self> {
@@ -214,6 +230,10 @@ impl<'a, 'b> Load<'a, 'b> {
 
     pub fn tensor(&self, name: &str, shape: &[usize]) -> Result<DeviceAllocation<'a>> {
         self.operand(vec![self.source.rect(name, shape)?])
+    }
+
+    pub fn native_tensor(&self, name: &str, shape: &[usize], dtype: DType) -> Result<DeviceAllocation<'a>> {
+        self.operand(vec![self.source.native_rect(name, shape, dtype)?])
     }
 
     pub(crate) fn tensor_parts(&self, parts: &[(&str, Vec<usize>)]) -> Result<DeviceAllocation<'a>> {
@@ -416,6 +436,37 @@ mod tests {
     use crate::shared::experts::rtx::dense::{self, RankLayout};
     use cuteafd_loader::plan::testing::{t, write_safetensors};
     use std::os::unix::fs::FileExt;
+
+    #[test]
+    fn indexed_native_drafter_source_preserves_header_payload_and_scale_bytes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("config.json"), "{}")?;
+        let name = "language_model.model.dspark.layers.0.decoder_layer.self_attn.q_proj.weight";
+        let scales = format!("{name}_scale_inv");
+        let file = root.path().join("model-dspark-00001.safetensors");
+        write_safetensors(&file, &[t(name, "F8_E4M3", &[32, 128]), t(&scales, "U8", &[32, 4]),
+            t("language_model.model.dspark.fc.weight", "BF16", &[32, 128])]);
+        std::fs::write(root.path().join("model.safetensors.index.json"), serde_json::to_vec(
+            &serde_json::json!({"weight_map": {name: "model-dspark-00001.safetensors",
+                scales.clone(): "model-dspark-00001.safetensors",
+                "language_model.model.dspark.fc.weight":"model-dspark-00001.safetensors"}}))?)?;
+        let source = Source::open(root.path())?;
+        for (name, shape, dtype, fill) in [(name, vec![32, 128], DType::F8E4M3, 31u8),
+            (scales.as_str(), vec![32, 4], DType::U8, 127),
+            ("language_model.model.dspark.fc.weight", vec![32, 128], DType::Bf16, 93)] {
+            let rect = source.native_rect(name, &shape, dtype.clone())?;
+            let bytes = shape.iter().product::<usize>() * if dtype == DType::Bf16 { 2 } else { 1 };
+            assert_eq!(rect.bytes(), bytes);
+            let file = std::fs::OpenOptions::new().write(true).open(&rect.path)?;
+            file.write_all_at(&vec![fill; bytes], rect.base)?;
+            let mut actual = vec![0; bytes];
+            rect.read(&mut actual)?;
+            assert_eq!(actual, vec![fill; bytes]);
+        }
+        assert!(source.rect(name, &[32, 128]).is_err());
+        assert!(source.native_rect(&scales, &[32, 128], DType::U8).is_err());
+        Ok(())
+    }
 
     #[test]
     fn draft_shards_select_exact_rows_and_strided_bf16_columns() -> Result<()> {
