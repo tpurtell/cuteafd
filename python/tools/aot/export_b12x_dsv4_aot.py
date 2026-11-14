@@ -900,6 +900,15 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
         (f"kda_output_rows_expanded_m{prefill_rows}", "kda_output_rows", {"max_rows": prefill_rows, "prefill_expanded": True},
          lambda: glmf.compile_glmf_kda_output_rows_aot(g, max_rows=prefill_rows, fp8_only="prefill", prefill_expanded=True)),
     ])
+    # Channel is an explicit conversion contract, not inferred from K-major layout.
+    for stem, op, params, _ in tuple(programs):
+        if not params.get("prefill_expanded") or params.get("output_dtype") == "float32":
+            continue
+        channel = dict(params, scale_granularity="channel")
+        compiler = glmf.compile_glmf_kda_output_rows_aot if op == "kda_output_rows" else glmf.compile_glmf_kda_aot
+        programs.append((stem.replace("_expanded_", "_expanded_channel_"), op, channel,
+                         lambda c=compiler, kw=channel: c(g, fp8_only="prefill", **kw)
+                         if "fp8_only" not in kw else c(g, **kw)))
     return programs
 
 

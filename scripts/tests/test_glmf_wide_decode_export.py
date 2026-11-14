@@ -1253,3 +1253,32 @@ def test_muse_tp2_drafter_exports_every_rank_local_projection(exporter, family, 
                 (heads // 2 * (128 if heads == 64 else 64), 8192),
                 (8192, intermediate), (intermediate // 2, 8192)}
     assert {shape for shape, families in shapes.items() if family + "-tp2" in families} == expected
+
+
+def test_expanded_channel_siblings_keep_explicit_contract_and_row128_fallback(exporter):
+    programs = {stem: (op, params, thunk) for stem, op, params, thunk in
+                exporter.glmf_head_split_programs(GEOMETRY, 64, 4096, 131072)}
+    channel = {stem for stem in programs if '_expanded_channel_' in stem}
+    assert channel == {'kda_w8_expanded_channel_m4096',
+                       'kda_w8_norm_expanded_channel_m4096',
+                       'kda_output_rows_expanded_channel_m4096'}
+    for stem in channel:
+        _, params, thunk = programs[stem]
+        assert params['scale_granularity'] == 'channel'
+        assert params['prefill_expanded']
+        assert thunk()[3] == {**params, 'fp8_only': 'prefill'}
+        fallback = stem.replace('_expanded_channel_', '_expanded_')
+        assert 'scale_granularity' not in programs[fallback][1]
+        assert programs[fallback][1].get('scale_granularity', 'row128') == 'row128'
+    # Program geometry's absent field is the original Row128 schema, not Channel.
+    fork = ROOT / 'third_party/sparkinfer/b12x/integration/cuteafd'
+    for name in ('glmf.py', '_glmf_output_rows.py', '_glmf_output_shard.py'):
+        source = (fork / name).read_text()
+        # The new descriptor API arrives with the batched fork pin.
+        if 'scale_granularity' in source:
+            assert 'if scale_granularity == "channel" else {}' in source
+    weights = (ROOT / 'rust/crates/cuteafd-daemon/src/families/glm5_flash/weights.rs').read_text()
+    assert 'kda_channel: self.kda_fp8 == super::fp8::KdaFp8::Channel' in weights
+    assert 'kda_channel: false' in weights
+    engine = (ROOT / 'rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs').read_text()
+    assert 'layer.kda_channel && !self.precise_attention(layer)' in engine
