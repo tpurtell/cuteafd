@@ -1537,6 +1537,20 @@
       "report": "benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max",
       "release": "v5.0.0",
       "release_note": "Retired 2026-11-13; replaced by wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC original view (#1906)."
+    },
+    {
+      "name": "muse-spark-exl3-min",
+      "config": "examples/configs/muse-spark-exl3-min.config",
+      "report": "benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-1rtx-4spark-muse-spark-exl3-min",
+      "release": "v5.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. Last standalone Core-K6 Release smoke; only regular cards retire, not serving support."
+    },
+    {
+      "name": "muse-spark-exl3-max",
+      "config": "examples/configs/muse-spark-exl3-max.config",
+      "report": "benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max",
+      "release": "v5.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. Last standalone Core-K6 Release smoke; only regular cards retire, not serving support."
     }
   ]
 }
