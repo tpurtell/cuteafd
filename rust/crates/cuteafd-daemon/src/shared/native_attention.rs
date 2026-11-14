@@ -170,7 +170,7 @@ mod padding_tests {
 
     #[test]
     fn padded_source_tails_never_overlap_real_transform_destinations() -> Result<()> {
-        for (n,k,alignment) in [(576,7168,128),(202048,8192,128),(129,128,512)] {
+        for (n,k,alignment) in [(576usize,7168usize,128usize),(202048,8192,128),(129,128,512)] {
             let stored = n.div_ceil(alignment)*alignment;
             let stem = "projection";
             let selected = SelectedProjection { storage: ProjectionStorage::Native { dtype:DType::Bf16,shape:vec![n,k] },
