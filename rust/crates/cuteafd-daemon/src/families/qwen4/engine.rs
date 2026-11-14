@@ -4383,12 +4383,41 @@ mod prefill_unit_tests {
         let attention = hooks.split_once("    fn attention(").unwrap().1.split_once("    fn local_ffn(").unwrap().0;
         assert!(attention.find("self.select(").unwrap() < attention.find("self.enter(").unwrap());
         // Dev all-Spark: one begin/end per unit, attention/send/land per layer.
-        let mut units = sequence_units(8192, 2752, 1, 48).unwrap();
-        for unit in &mut units { unit.slot = unit.index % 3; }
-        let schedule = prefill_schedule(&vec![FfnRoute::Spark; 48], &units, 3).unwrap();
-        let uploads = schedule.iter().filter(|step| matches!(step,
-            Step::Begin { .. } | Step::Attention { .. } | Step::Send { .. } | Step::Land { .. } | Step::End { .. })).count();
-        assert_eq!(uploads, units.len() * (2 + 3 * 48));
+        // Pin each unit's ordered upload sites, including a fourth, 41-row tail.
+        for (span, lengths) in [(8192, vec![2752, 2752, 2688]),
+            (8297, vec![2752, 2752, 2752, 41])] {
+            for waves in [1, 2, 3] {
+                let mut units = sequence_units(span, 2752, 1, 48).unwrap();
+                for unit in &mut units { unit.slot = unit.index % waves; }
+                assert_eq!(units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(), lengths);
+                let schedule = prefill_schedule(&vec![FfnRoute::Spark; 48], &units, waves).unwrap();
+                let mut actual = vec![Vec::new(); units.len()];
+                for step in schedule {
+                    let (unit, site, layer) = match step {
+                        Step::Begin { unit } => (unit, "begin", None),
+                        Step::Attention { unit, layer } => (unit, "attention", Some(layer)),
+                        Step::Send { unit, layer } => (unit, "send", Some(layer)),
+                        Step::Land { unit, layer } => (unit, "land", Some(layer)),
+                        Step::End { unit } => (unit, "end", None),
+                        Step::Commit { .. } => continue,
+                        Step::Local { .. } => panic!("all-Spark unit dispatched a local FFN"),
+                    };
+                    actual[unit].push((site, layer, units[unit].rows.len()));
+                }
+                for (unit, sites) in actual.iter().enumerate() {
+                    let rows = lengths[unit];
+                    let mut expected = vec![("begin", None, rows)];
+                    for layer in 0..48 {
+                        expected.extend([("attention", Some(layer), rows),
+                            ("send", Some(layer), rows), ("land", Some(layer), rows)]);
+                    }
+                    expected.push(("end", None, rows));
+                    assert_eq!(*sites, expected, "span={span} waves={waves} unit={unit}");
+                }
+                assert_eq!(actual.iter().map(Vec::len).sum::<usize>(),
+                    if span == 8297 { 584 } else { 438 });
+            }
+        }
     }
 
     #[test]
