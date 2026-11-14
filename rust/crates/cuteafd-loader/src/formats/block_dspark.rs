@@ -949,7 +949,7 @@ fn native_arena_requests(cfg: &BlockDsparkConfig,
     }, |parts, columns| {
         for &(name, rows) in parts {
             let header = headers.get(name).with_context(|| format!("drafter checkpoint has no {name}"))?;
-            match header.dtype {
+            match &header.dtype {
                 DType::Bf16 => {
                     let bytes = tensor(name, &[rows, columns], DType::Bf16, 2)?;
                     requests.borrow_mut().push((name.to_owned(), bytes.max(256)));
