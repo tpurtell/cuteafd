@@ -243,6 +243,10 @@ impl NativeLaneLayout {
     /// AOT-baked selector and recurrence workspaces at their declared capacity.
     pub fn with_live_projection_rows(mut self, heads: usize, ranks: usize) -> Result<Self> {
         let rows = self.unit.max(64);
+        for (name, stride) in [("MLA query", heads * 576 * 2), ("MLA attention", heads * 512 * 2),
+            ("MLA LSE", heads * 4)] {
+            self.operands.insert(name, self.unit * stride);
+        }
         let [producer, output] = cuteafd_ffi::KimiMlaProjection::scratch_bytes_for(rows, heads)?;
         for (name, bytes) in [("MLA producer scratch", producer), ("MLA output scratch", output),
             ("DSA producer scratch", cuteafd_ffi::KimiIndexProducer::scratch_bytes_for(rows)?)] {
@@ -712,6 +716,33 @@ mod tests {
 
     fn cfg() -> KimiK3Config {
         KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap()
+    }
+
+    #[test]
+    fn k31_live_lane_inventory_uses_placed_heads_and_unit_rows() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.dsa = Some(super::super::config::KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+        let scratch = NativeScratch { kda: 629_464_064,
+            mla: [168_296_448, 6_467_616_768, 201_326_592] };
+        for heads in [48, 96] {
+            let old = NativeLaneLayout::new(&cfg, 8256, 2752, 1_048_576, scratch)?
+                .with_sparse_mla_rows(heads)?.with_dsa(&cfg,
+                    DsaScratch { producer: 34_865_152, selector: 742_556_672 })?;
+            let live = old.clone().with_live_projection_rows(heads, 2)?;
+            for name in ["MLA query", "MLA attention", "MLA LSE"] {
+                assert_eq!(live.operands[name] * 96, old.operands[name] * heads);
+            }
+            assert_eq!(live.operands["MLA attention scratch"], 2752 * heads * 16 * 1028);
+            assert_eq!(live.operands["DSA selector scratch"], 742_556_672);
+            assert_eq!(live.operands["DSA producer scratch"],
+                cuteafd_ffi::KimiIndexProducer::scratch_bytes_for(2752)?);
+            assert!(live.bytes()? < old.bytes()?);
+            println!("h{heads}: before={} after={} arena={}", old.bytes()?, live.bytes()?, live.arena_bytes);
+            for (name, bytes) in &live.operands {
+                println!("h{heads} {name}: {bytes} arena_offset={:?}", live.arena_offsets.get(name));
+            }
+        }
+        Ok(())
     }
 
     #[test]
