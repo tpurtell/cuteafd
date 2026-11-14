@@ -650,6 +650,8 @@ fn resume_case(engine: &Qwen4Engine<'_>, family: &Qwen4Prefix<'_, '_>, allocator
             && slot_state(engine, a.slot)? == slot_state(engine, b.slot)?;
         let straight = prefill_digest(engine, &mut a, &embed[at..], chunk, true)?;
         let restored = prefill_digest(engine, &mut b, &embed[at..], chunk, true)?;
+        println!("resume suffix digest at {at} of {n} (chunks of {chunk}): logits straight {:016x}, restored {:016x}; layers straight {:016x?}, restored {:016x?}",
+            straight.logits, restored.logits, straight.layers, restored.layers);
         let first_layer = straight.layers.iter().zip(&restored.layers).position(|(x, y)| x != y);
         let logits_equal = straight.logits == restored.logits;
         let max_diff = straight.last.iter().zip(&restored.last).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
