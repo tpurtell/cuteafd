@@ -48,6 +48,11 @@ pub(crate) struct Loaded<'a> {
     pub host_prefix: Option<cuteafd_hostcache::config::Config>,
 }
 
+fn fix_geometry() -> Result<()> {
+    cuteafd_core::set_expert_geometry(ExpertGeometry::MINIMAX_M3)
+        .map_err(|previous| anyhow::anyhow!("MiniMax serving needs an isolated process: expert geometry already fixed to {previous:?}"))
+}
+
 fn validate(options: &Options<'_>, cfg: &MiniMaxM3Config) -> Result<()> {
     ensure!(options.device >= 0, "MiniMax serving requires a nonnegative CUDA device");
     cuteafd_core::concurrency::validate("minimax_m3", options.sequences)?;
@@ -88,8 +93,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     options: Options<'_>) -> Result<Loaded<'a>> {
     validate(&options, cfg)?;
     cfg.release_geometry()?;
-    cuteafd_core::set_expert_geometry(ExpertGeometry::MINIMAX_M3)
-        .map_err(|_| anyhow::anyhow!("MiniMax serving needs an isolated process"))?;
+    fix_geometry()?;
     ensure!(checkpoint.snapshot == view.snapshot(), "MiniMax startup checkpoint view differs");
     let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest_path)?)?);
     let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
@@ -239,6 +243,35 @@ fn publish_provenance(native_lib: &Path, manifest: &Path, runtime: &RuntimeInven
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_geometry_refuses_a_conflicting_family_without_replacement() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_MINIMAX_GEOMETRY_CHILD";
+        if let Ok(order) = std::env::var(CHILD) {
+            if order == "prior" {
+                cuteafd_core::set_expert_geometry(ExpertGeometry::KIMI_K3).unwrap();
+                let error = fix_geometry().unwrap_err();
+                assert!(error.to_string().contains("isolated process: expert geometry already fixed"));
+                assert_eq!(cuteafd_core::expert_geometry(), ExpertGeometry::KIMI_K3);
+            } else {
+                fix_geometry()?;
+                assert_eq!(cuteafd_core::set_expert_geometry(ExpertGeometry::KIMI_K3), Err(ExpertGeometry::MINIMAX_M3));
+                assert_eq!(cuteafd_core::expert_geometry(), ExpertGeometry::MINIMAX_M3);
+            }
+            return Ok(());
+        }
+        for order in ["prior", "after"] {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "families::minimax_m3::serve::tests::process_geometry_refuses_a_conflicting_family_without_replacement", "--nocapture"])
+                .env(CHILD, order).status()?;
+            ensure!(status.success(), "MiniMax isolated geometry child failed: {order}");
+        }
+        let source = include_str!("serve.rs");
+        let constructor = source.split("pub(crate) fn load<'a>").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
+        assert_eq!(constructor.matches("fix_geometry()?").count(), 1);
+        assert!(constructor.find("fix_geometry()?").unwrap() < constructor.find("fp8::package_directory(").unwrap());
+        Ok(())
+    }
 
     #[test]
     fn native_spark_range_is_not_the_golden_four_rank_pin() -> Result<()> {
