@@ -288,9 +288,9 @@ impl HeadSequence {
 
     /// Part of a captured graph's binding key. Both parity variants retain
     /// their normal graph/workspace owners and are charged by admission.
-    pub fn parity(&self) -> usize { (self.ordinal & 1) as usize }
+    pub fn parity(&self) -> usize { (self.ordinal % cuteafd_core::HEAD_REDUCTION_PARITY_SLOTS as u64) as usize }
 
-    fn slot(&self) -> usize { 2 * self.lane + self.parity() }
+    fn slot(&self) -> usize { cuteafd_core::HEAD_REDUCTION_PARITY_SLOTS * self.lane + self.parity() }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -963,6 +963,20 @@ mod tests {
             if !advanced && at != streams.each_ref().map(Vec::len) { return false; }
         }
         true
+    }
+
+    #[test]
+    fn shared_head_slot_declaration_preserves_existing_lane_addressing() -> Result<()> {
+        assert_eq!(cuteafd_core::HEAD_REDUCTION_PARITY_SLOTS, 2);
+        for lane in 0..2 {
+            let mut sequence = HeadSequence::new(lane)?;
+            for ordinal in [0, 1, 2, 3, 68, 69, u64::MAX - 1, u64::MAX] {
+                sequence.ordinal = ordinal;
+                assert_eq!(sequence.parity(), (ordinal & 1) as usize);
+                assert_eq!(sequence.slot(), lane * 2 + (ordinal & 1) as usize);
+            }
+        }
+        Ok(())
     }
 
     #[test]
