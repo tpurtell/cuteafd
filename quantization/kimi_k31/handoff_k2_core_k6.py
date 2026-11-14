@@ -239,7 +239,7 @@ def unused(paths):
                 argv = (proc / "cmdline").read_bytes().split(b"\0")
                 known = (argv[:2] == [b"/usr/lib/systemd/systemd", b"--user"]
                     or argv[0] == b"(sd-pam)"
-                    or argv[0].strip() == b"sshd-session: tj@notty"
+                    or re.fullmatch(rb"sshd-session: [^@\s]+@(notty|pts/\d+)", argv[0].strip())
                     or argv[:3] == [b"/home/linuxbrew/.linuxbrew/opt/sparknest/bin/sparknestd",
                                     b"--config", b"/srv/sparknest/node.toml"])
                 if not known:
