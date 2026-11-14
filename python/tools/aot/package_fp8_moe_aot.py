@@ -684,7 +684,7 @@ def build(args: argparse.Namespace) -> None:
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
                 "weights": g.weights, "activation": g.activation, "projection": g.projection, "abi_version": ABI_VERSION,
-                **({"scale_convention": g.scale_convention} if g.weights == "nvfp4" else {}),
+                **({"scale_convention": getattr(g, "scale_convention", "multiplier")} if g.weights == "nvfp4" else {}),
                 **dict(zip(("swiglu_alpha", "swiglu_beta"), activation_params(g.activation, g.weights,
                     getattr(g, "swiglu_alpha", None), getattr(g, "swiglu_beta", None), g.swiglu_limit))),
                 "arithmetic_routes": [{"capacity": p["capacity"], "form": p["form"],
