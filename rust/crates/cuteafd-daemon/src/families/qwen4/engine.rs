@@ -4086,7 +4086,8 @@ impl<'a, 'w> UnitHooks<'_, 'w, '_, '_, 'a, '_, '_> {
         let owner = self.owner(index);
         let engine = self.engine;
         engine.on_owner(owner, || {
-            self.select(owner, unit)?;
+            // The current hook (or cutover hop) already selected this unit.
+            // Entering the next same-owner layer must not upload its tables again.
             if engine.cfg.ple_layers.contains(&index) {
                 *engine.ple_pending.borrow_mut() = self.pending[unit.index].take();
                 engine.finish_ple(self.workspace(owner)?)?;
@@ -4157,10 +4158,10 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         })
     }
     fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        if !self.entered[unit.index] { self.enter(layer, unit, false)?; }
         let owner = self.owner(layer);
         self.engine.on_owner(owner, || {
             self.select(owner, unit)?;
+            if !self.entered[unit.index] { self.enter(layer, unit, false)?; }
             let w = self.work[owner].context("Qwen unit attention workspace")?;
             let rows = Scalar::I32(unit.rows.len() as i32);
             let weights = &self.engine.weights.layers[layer];
@@ -4292,6 +4293,29 @@ mod prefill_unit_tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn all_spark_units_upload_tables_only_at_the_original_five_hook_sites() {
+        let source = include_str!("engine.rs");
+        let hooks = source.split_once("impl<'a, 'w> UnitHooks<").unwrap().1
+            .split_once("fn validate_prefill_span(").unwrap().0;
+        let enter = hooks.split_once("    fn enter(").unwrap().1.split_once("    fn hop(").unwrap().0;
+        assert!(!enter.contains("self.select("), "same-owner enter must not upload tables");
+        for name in ["begin_unit", "attention", "send_experts", "land_experts", "end_unit"] {
+            let body = hooks.split_once(&format!("    fn {name}(")).unwrap().1
+                .split_once("\n    fn ").map_or_else(|| hooks.split_once(&format!("    fn {name}(")).unwrap().1,
+                    |(body, _)| body);
+            assert_eq!(body.matches("self.select(").count(), 1, "{name}");
+        }
+        let attention = hooks.split_once("    fn attention(").unwrap().1.split_once("    fn local_ffn(").unwrap().0;
+        assert!(attention.find("self.select(").unwrap() < attention.find("self.enter(").unwrap());
+        // Dev all-Spark: one begin/end per unit, attention/send/land per layer.
+        let units = sequence_units(8192, 2752, 1, 48).unwrap();
+        let schedule = prefill_schedule(&vec![FfnRoute::Spark; 48], &units, 3).unwrap();
+        let uploads = schedule.iter().filter(|step| matches!(step,
+            Step::Begin { .. } | Step::Attention { .. } | Step::Send { .. } | Step::Land { .. } | Step::End { .. })).count();
+        assert_eq!(uploads, units.len() * (2 + 3 * 48));
     }
 
     #[test]
