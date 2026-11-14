@@ -217,6 +217,22 @@ fn validate_partial(source: CuteafdDeviceBuffer, destination: CuteafdDeviceBuffe
 }
 
 impl ProjectionOutput<'_, '_, '_, '_> {
+    /// Copy an unchanged FP32 partial into caller-admitted storage on the same
+    /// stream before the serial workspace can be reused.
+    pub fn copy_partial(self, destination: &Allocation<'_>) -> Result<()> {
+        let prepared = self.prepared;
+        let device = prepared.programs.device;
+        ensure!(std::ptr::eq(device.library, destination.device.library), "MiniMax partial library differs");
+        let count = usize::try_from(self.linear.geometry().output_features)?
+            .checked_mul(prepared.rows as usize).context("MiniMax partial count overflow")?;
+        let source = prepared.owner.workspace.output.buffer;
+        let bytes = validate_partial(source, destination.buffer, count, PartialPrecision::F32)?;
+        device.run(|| {
+            // SAFETY: checked distinct retained FP32 destination, same ordered
+            // producer stream; the consuming peer protocol retains its lease.
+            unsafe { device.library.copy_d2d_async(destination.buffer, source, bytes, prepared.stream) }
+        })
+    }
     /// Keep the exclusive workspace borrow until the consumer records completion
     /// and the producer waits on it. Only the retained destination escapes.
     pub fn stage_partial(self, destination: &mut PartialDestination<'_>) -> Result<()> {

@@ -212,12 +212,18 @@ impl<'a> RequestState<'a> {
         ensure!(modes.len() == cfg.layers && admitted.placement.layers.len() == cfg.layers
             && admitted.placement.layers.iter().map(|layer| layer.mode).eq(modes.iter().copied()),
             "MiniMax request storage differs from admitted attention modes");
+        let heads = streams.len() == 2 && modes.iter().all(|mode| *mode == LayerMode::HeadSplit);
         let mut layers = vec![Vec::new(); streams.len()];
         for (layer, mode) in modes.iter().enumerate() {
-            let LayerMode::Whole { gpu, ffn: FfnMode::Owner | FfnMode::Split } = mode else {
-                anyhow::bail!("MiniMax request storage requires whole-layer owners");
-            };
-            layers.get_mut(usize::from(*gpu)).context("MiniMax attention rank is not admitted")?.push(layer);
+            match mode {
+                LayerMode::HeadSplit if heads => {
+                    for owned in &mut layers { owned.push(layer); }
+                }
+                LayerMode::Whole { gpu, ffn: FfnMode::Owner | FfnMode::Split } if !heads => {
+                    layers.get_mut(usize::from(*gpu)).context("MiniMax attention rank is not admitted")?.push(layer);
+                }
+                _ => anyhow::bail!("MiniMax request storage requires uniform Heads or whole-layer owners"),
+            }
         }
         let globals = capacity.cache(context)?;
         let library = streams[0].decode.device.library;
@@ -255,9 +261,12 @@ impl<'a> RequestState<'a> {
         let tokens = DecodeTokens::new(Rc::clone(&streams[0].decode), capacity.decode.rows)?;
         let rope = MsaRope::new(cfg, context)?;
         let mut ranks = Vec::with_capacity(streams.len());
-        for (readers, owned) in streams.into_iter().zip(layers) {
+        for (rank, (readers, owned)) in streams.into_iter().zip(layers).enumerate() {
             let range = owned[0]..owned[owned.len() - 1] + 1;
-            let layout = MsaCache::new(u32::try_from(range.len())?, pages, capacity.decode.requests, context)?;
+            let layout = if heads {
+                MsaCache::for_heads(&cuteafd_loader::families::minimax_m3::execution::HeadsLayout::new(
+                    cfg, rank as u8, capacity.execution_rows())?, pages, capacity.decode.requests, context)?
+            } else { MsaCache::new(u32::try_from(range.len())?, pages, capacity.decode.requests, context)? };
             let all = std::iter::once(Rc::clone(&readers.decode))
                 .chain(readers.prefill.iter().cloned()).collect();
             let bank = Rc::new(PageBank::new(all, cfg, capacity, layout, rope, range)?);
@@ -330,8 +339,13 @@ impl<'a> PageBank<'a> {
             && readers.iter().all(|reader| reader.device.id == device.id
                 && std::ptr::eq(reader.device.library, device.library)),
             "MiniMax page bank layers/readers differ from admission");
-        ensure!(MsaCache::new(layout.layers, layout.pool_pages, layout.requests, rope.positions)? == layout
-            && MsaRope::new(cfg, rope.positions)? == rope,
+        let expected = if layout.kv_heads() == 2 {
+            let mut expected = MsaCache::for_heads(&cuteafd_loader::families::minimax_m3::execution::HeadsLayout::new(
+                cfg, 0, capacity.execution_rows())?, layout.pool_pages, layout.requests, rope.positions)?;
+            expected.layers = layout.layers;
+            expected
+        } else { MsaCache::new(layout.layers, layout.pool_pages, layout.requests, rope.positions)? };
+        ensure!(expected == layout && MsaRope::new(cfg, rope.positions)? == rope,
             "MiniMax page bank geometry differs from admission");
         let mut planes = BTreeMap::new();
         for (local, bytes) in layout.buffers()? {
@@ -376,8 +390,8 @@ impl<'a> PageBank<'a> {
     pub fn page(&self, layer: usize, plane: &str, page: u32) -> Result<Buffer> {
         ensure!(self.layers.contains(&layer) && page < self.layout.pool_pages,
             "MiniMax page outside resident layer/pool");
-        let stride = PAGE_PLANES.iter().find(|&&(name, _)| name == plane)
-            .context("MiniMax unknown page plane")?.1;
+        let stride = usize::try_from(self.layout.page_planes().into_iter().find(|&(name, _)| name == plane)
+            .context("MiniMax unknown page plane")?.1)?;
         view(self.plane(&format!("layer.{layer}.{plane}"))?, page as usize * stride, stride)
     }
     pub fn validate(&self, placement: &Placement, len: usize) -> Result<()> {
@@ -574,7 +588,8 @@ impl<'a> PageBank<'a> {
                 let (layer, plane) = suffix.split_once('.').context("MiniMax KV inventory name")?;
                 let plane = PAGE_PLANES.iter().find(|&&(name, _)| name == plane)
                     .context("MiniMax KV inventory plane")?.0;
-                Owner::Kv { layer: layer.parse()?, plane }.inventory_name().unwrap()
+                (if self.layout.kv_heads() == 2 { Owner::HeadsKv { gpu: gpu.into(), layer: layer.parse()?, plane } }
+                    else { Owner::Kv { layer: layer.parse()?, plane } }).inventory_name().unwrap()
             } else { format!("{}.{name}", Owner::Cache { gpu: gpu.into() }.inventory_name().unwrap()) };
             allocation.inventory(inventory, &id)?;
         }
@@ -958,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn split_ffn_preserves_whole_attention_cache_owners_and_heads_still_refuses() -> Result<()> {
+    fn split_ffn_preserves_whole_attention_cache_owners_and_mixed_heads_refuses() -> Result<()> {
         use cuteafd_loader::placement::{FfnMode, LayerMode};
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
@@ -996,7 +1011,7 @@ mod tests {
         heads.placement.layers[0].mode = LayerMode::HeadSplit;
         let error = RequestState::new(&cfg, capacity, &heads, request_streams(&library, &ids)?)
             .err().context("heads cache must refuse")?;
-        assert!(error.to_string().contains("requires whole-layer owners"));
+        assert!(error.to_string().contains("uniform Heads or whole-layer owners"));
         assert_eq!(fixture.mapped_bytes(&library)?, 0);
         assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
         Ok(())

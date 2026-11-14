@@ -479,9 +479,15 @@ impl HeadsLayout {
         components(self.buffers(), prefix, self.rank, lifetime, maximum_pages, Category::Workspace)
     }
 
-    /// One exchange per rank, not per layer or reduction. Independent lanes and
-    /// units supply separate receive slots, each reused for O and FFN. Includes
-    /// the abort word allocated by PeerExchange::new_abortable_sized.
+    /// One serialized sequence per physical rank, shared by decode/prefill.
+    /// Both parity slots cover the largest unit; no per-unit receive backing.
+    pub fn serialized_peer_rows(decode_rows: u32, prefill_rows: u32) -> Result<[u32; cuteafd_core::HEAD_REDUCTION_PARITY_SLOTS], Refusal> {
+        UnitMetadata::new(decode_rows)?;
+        UnitMetadata::new(prefill_rows)?;
+        Ok([decode_rows.max(prefill_rows); cuteafd_core::HEAD_REDUCTION_PARITY_SLOTS])
+    }
+
+    /// Exact shared receive slots and the abort word allocated by PeerExchange.
     pub fn peer_buffers(slot_rows: &[u32], diagnostics: bool) -> Result<Vec<(String, u64)>, Refusal> {
         let mut out = Vec::new();
         for (slot, &rows) in slot_rows.iter().enumerate() {
@@ -637,11 +643,14 @@ impl MsaCache {
         Ok(cache)
     }
     pub fn kv_heads(self) -> u32 { self.kv_heads }
+    pub fn page_planes(self) -> [(&'static str, u64); 3] {
+        let kv_stride = u64::from(self.kv_heads) * 64 * 128;
+        [("keys", kv_stride), ("values", kv_stride), ("index", 8448)]
+    }
     pub fn buffers(self) -> Result<Vec<(String, u64)>, Refusal> {
         let mut out = Vec::new();
         for layer in 0..self.layers {
-            let kv_stride = u64::from(self.kv_heads) * 64 * 128;
-            for (name, stride) in [("keys", kv_stride), ("values", kv_stride), ("index", 8448)] {
+            for (name, stride) in self.page_planes() {
                 let bytes = u64::from(self.pool_pages)
                     .checked_mul(stride)
                     .filter(|&n| n <= isize::MAX as u64)
@@ -770,6 +779,21 @@ mod tests {
                     .count(), usize::from(*bytes > 1 << 20));
             }
         }
+    }
+
+    #[test]
+    fn serialized_heads_slots_follow_shared_sequence_count_and_maximum_extent() {
+        for (decode, prefill) in [(1, 2752), (64, 16), (16, 4096)] {
+            let rows = HeadsLayout::serialized_peer_rows(decode, prefill).unwrap();
+            assert_eq!(rows.len(), cuteafd_core::HEAD_REDUCTION_PARITY_SLOTS);
+            assert_eq!(rows, [decode.max(prefill); 2]);
+            let buffers = HeadsLayout::peer_buffers(&rows, false).unwrap();
+            let received = buffers.iter().filter(|(name, _)| name.starts_with("recv.")).collect::<Vec<_>>();
+            assert_eq!(received.len(), cuteafd_core::HEAD_REDUCTION_PARITY_SLOTS);
+            assert!(received.iter().all(|(_, bytes)| *bytes == u64::from(decode.max(prefill)) * 6144 * 4));
+        }
+        assert!(HeadsLayout::serialized_peer_rows(0, 16).is_err());
+        assert!(HeadsLayout::serialized_peer_rows(16, 4097).is_err());
     }
 
     #[test]

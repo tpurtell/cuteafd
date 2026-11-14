@@ -440,8 +440,8 @@ fn drain_split_pair(mut drain: impl FnMut(usize) -> Result<()>) -> Result<()> {
 fn validate_execution_streams(storage: &Storage<'_>) -> Result<()> {
     let streams = storage.ranks.iter().map(|rank| std::iter::once(rank.decode.borrow().stream.raw as usize)
         .chain(rank.prefill.iter().map(|owner| owner.borrow().stream.raw as usize)).collect()).collect::<Vec<_>>();
-    if storage.split.is_some() {
-        ensure!(streams.len() == 2, "MiniMax split execution needs two ranks");
+    if storage.split.is_some() || storage.heads.is_some() {
+        ensure!(streams.len() == 2, "MiniMax paired execution needs two ranks");
         for rank in streams { ordered_rank(&[rank])?; }
         Ok(())
     } else { ordered_rank(&streams) }
@@ -492,7 +492,7 @@ trait SlotArithmetic {
     fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()>;
     fn router(&mut self, layer: usize, unit: &Unit) -> Result<()>;
     fn ffn(&mut self, layer: usize, unit: &Unit, shared: bool) -> Result<()>;
-    fn join(&mut self, unit: &Unit) -> Result<()>;
+    fn join(&mut self, layer: usize, unit: &Unit) -> Result<()>;
     fn head(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()>;
     fn commit(&mut self, unit: &Unit, requests: &mut [ServingRequest<'_>]) -> Result<()>;
     fn abort_split(&self) {}
@@ -510,10 +510,13 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         if let Some(split) = &self.storage.split {
             crate::shared::decode_graph::fatal_drain(split.publish_abort(), "MiniMax split hook before ticket retirement");
         }
+        if let Some(heads) = &self.storage.heads {
+            crate::shared::decode_graph::fatal_drain(heads.publish_abort(), "MiniMax Heads hook before ticket retirement");
+        }
     }
     fn begin(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()> {
         let mut state = self.storage.requests.borrow_mut();
-        if self.storage.split.is_some() {
+        if self.storage.split.is_some() || self.storage.heads.is_some() {
             for rank in &mut state.ranks {
                 prepare_unit(&rank.bank, &mut rank.prefill[unit.slot], unit, requests)?;
             }
@@ -528,10 +531,30 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         let capacity = state.capacity.prefill.rows as usize;
         Head::embed_tokens(self.cfg, capacity, &self.storage.embedding, &tokens, &owner.stream,
             super::cache::view(owner.plane("route_ids")?, 0, capacity * 4)?,
-            owner.dense.producer_destination(), owner.plane("residual")?)
+            owner.dense.producer_destination(), owner.plane("residual")?)?;
+        if let Some(heads) = &self.storage.heads {
+            let peer = self.storage.ranks[1].prefill[unit.slot].borrow();
+            heads.replicate([&owner, &peer], "residual", unit.rows.len() * self.cfg.hidden * 4)?;
+        }
+        Ok(())
     }
     fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let state = self.storage.requests.borrow();
+        if let Some(heads) = &self.storage.heads {
+            for gpu in 0..2 {
+                let cache = &state.ranks[gpu];
+                let segments = cache.bank.segments(&cache.prefill[unit.slot], layer)?;
+                let rank = &self.storage.ranks[gpu];
+                // SAFETY: each narrow owner has distinct local KV heads and
+                // retained metadata; the shared executor orders causal units.
+                unsafe { rank.prefill[unit.slot].borrow_mut().attention_segments(&rank.kernels,
+                    &rank.weights, &rank.layout, layer, &segments)?; }
+            }
+            let a = self.storage.ranks[0].prefill[unit.slot].borrow();
+            let b = self.storage.ranks[1].prefill[unit.slot].borrow();
+            let tag = super::heads::Tag { unit: unit.slot, layer, rows: unit.rows.len(), kind: super::heads::Reduction::Attention };
+            return heads.reduce(&self.storage.ranks, [&a, &b], [tag; 2]);
+        }
         let gpu = self.storage.split.as_ref().map(|split| split.owner(layer)).transpose()?.unwrap_or(0);
         let request = &state.ranks[gpu];
         let segments = request.bank.segments(&request.prefill[unit.slot], layer)?;
@@ -576,6 +599,22 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         Ok(())
     }
     fn ffn(&mut self, layer: usize, unit: &Unit, shared: bool) -> Result<()> {
+        if let Some(heads) = &self.storage.heads {
+            for gpu in 0..2 {
+                let rank = &self.storage.ranks[gpu];
+                rank.prefill[unit.slot].borrow_mut().partial_ffn(&rank.kernels, &rank.weights,
+                    &rank.layout, layer, unit.rows.len(), shared)?;
+            }
+            if !shared {
+                let a = self.storage.ranks[0].prefill[unit.slot].borrow();
+                let b = self.storage.ranks[1].prefill[unit.slot].borrow();
+                let tag = super::heads::Tag { unit: unit.slot, layer, rows: unit.rows.len(),
+                    kind: super::heads::Reduction::Ffn { shared: false } };
+                heads.reduce(&self.storage.ranks, [&a, &b], [tag; 2])?;
+                for owner in [&*a, &*b] { owner.post_fold_tap_enqueue(layer, unit.rows.len())?; }
+            }
+            return Ok(());
+        }
         if let Some(split) = &self.storage.split {
             let mut a = self.storage.ranks[0].prefill[unit.slot].borrow_mut();
             let mut b = self.storage.ranks[1].prefill[unit.slot].borrow_mut();
@@ -606,7 +645,20 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
                 layer, unit.rows.len(), shared)
         }
     }
-    fn join(&mut self, unit: &Unit) -> Result<()> {
+    fn join(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+        if let Some(heads) = &self.storage.heads {
+            let a = self.storage.ranks[0].prefill[unit.slot].borrow();
+            let b = self.storage.ranks[1].prefill[unit.slot].borrow();
+            heads.publish_routed([&a, &b], unit.rows.len() * self.cfg.hidden * 2)?;
+            let tag = super::heads::Tag { unit: unit.slot, layer, rows: unit.rows.len(),
+                kind: super::heads::Reduction::Ffn { shared: true } };
+            heads.reduce(&self.storage.ranks, [&a, &b], [tag; 2])?;
+            for owner in [&*a, &*b] {
+                owner.joined();
+                owner.post_fold_tap_enqueue(layer, unit.rows.len())?;
+            }
+            return Ok(());
+        }
         if let Some(split) = &self.storage.split {
             let a = self.storage.ranks[0].prefill[unit.slot].borrow();
             let b = self.storage.ranks[1].prefill[unit.slot].borrow();
@@ -617,7 +669,7 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         }
     }
     fn head(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()> {
-        let rank = &self.storage.ranks[if self.storage.split.is_some() { 1 } else { 0 }];
+        let rank = &self.storage.ranks[if self.storage.ranks.len() == 2 { 1 } else { 0 }];
         let residual = rank.prefill[unit.slot].borrow().plane("residual")?;
         for segment in &unit.segments {
             if !segment.head { continue; }
@@ -706,9 +758,9 @@ impl<'t, 'a, A: SlotArithmetic> PrefillHooks for ServingHooks<'_, '_, 't, 'a, A>
         abort_hook_error(self.arithmetic, result)?;
         Ok(ticket)
     }
-    fn land_experts(&mut self, _: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
+    fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
         ticket.land_guarded(|| self.arithmetic.abort_split())?;
-        let result = self.arithmetic.join(unit);
+        let result = self.arithmetic.join(layer, unit);
         abort_hook_error(self.arithmetic, result)
     }
     fn end_unit(&mut self, unit: &Unit) -> Result<()> {
@@ -788,6 +840,9 @@ impl<'a> ServingPrefill<'a> {
             if let Some(split) = &storage.split {
                 crate::shared::decode_graph::fatal_drain(split.cancel(), "MiniMax split prefill cancellation");
             }
+            if let Some(heads) = &storage.heads {
+                crate::shared::decode_graph::fatal_drain(heads.cancel(), "MiniMax Heads prefill cancellation");
+            }
             self.dispatchers.clear();
         }
         // Pending ticket drops terminally quiesce exchange before these drains.
@@ -820,6 +875,7 @@ impl<'a> ServingPrefill<'a> {
             slot: request.placement.slot, start: request.start, rows: request.tokens.len(),
         }).collect::<Vec<_>>())?;
         ensure!(graphs.len() == storage.ranks.len(), "MiniMax decode graph rank count differs");
+        if storage.heads.is_some() { return self.decode_heads(storage, cfg, schedule, requests, rows); }
         if storage.split.is_some() { return self.decode_split(storage, cfg, schedule, requests, rows, graphs, captured); }
         let graphs = &mut graphs[0];
         let rank = &storage.ranks[0];
@@ -953,6 +1009,110 @@ impl<'a> ServingPrefill<'a> {
             self.dispatchers.clear();
         }
         rank.decode.borrow().stream.drain_or_abort("MiniMax eager decode submission");
+        result
+    }
+
+    fn decode_heads(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
+        schedule: &Requests, requests: &[ServingRequest<'_>], rows: usize) -> Result<DeviceLogits> {
+        let heads = storage.heads.as_ref().context("MiniMax Heads owner missing")?;
+        let result = (|| {
+            heads.require_live()?;
+            let mut state = storage.requests.borrow_mut();
+            ensure!(state.capacity == schedule.capacity, "MiniMax Heads request capacity differs");
+            let mut identities = BTreeSet::new();
+            for request in requests {
+                ensure!(request.start == request.placement.len && request.identity != 0
+                    && identities.insert(request.identity), "MiniMax Heads identity/frontier differs");
+            }
+            let placements = requests.iter().map(|request| &*request.placement).collect::<Vec<_>>();
+            for cache in &mut state.ranks { cache.bank.prepare_decode(&mut cache.decode, &placements)?; }
+            let ids = state.tokens.upload(&requests.iter().map(|request| request.tokens[0]).collect::<Vec<_>>())?;
+            {
+                let a = storage.ranks[0].decode.borrow();
+                let b = storage.ranks[1].decode.borrow();
+                // SAFETY: retained entry tokens and private decode scratch are
+                // ordered on the one per-rank stream before Heads publications.
+                unsafe { Head::embed_device_ids(cfg, state.capacity.decode.rows as usize, &storage.embedding,
+                    rows, &a.stream, ids, a.dense.producer_destination(), a.plane("residual")?)?; }
+                heads.replicate([&a, &b], "residual", rows * cfg.hidden * 4)?;
+            }
+            let source = storage.ranks[0].decode.borrow().routed_rows(rows)?;
+            for layer in 0..cfg.layers {
+                for gpu in 0..2 {
+                    let rank = &storage.ranks[gpu];
+                    let cache = &state.ranks[gpu];
+                    let request = cache.bank.decode_request(&cache.decode, layer)?;
+                    // SAFETY: local half-KV pages and retained per-rank metadata
+                    // satisfy the same native causal append contract as Whole.
+                    unsafe { rank.decode.borrow_mut().decode(&rank.kernels, &rank.weights,
+                        &rank.layout, layer, request)?; }
+                }
+                {
+                    let a = storage.ranks[0].decode.borrow();
+                    let b = storage.ranks[1].decode.borrow();
+                    let tag = super::heads::Tag { unit: usize::MAX, layer, rows, kind: super::heads::Reduction::Attention };
+                    heads.reduce(&storage.ranks, [&a, &b], [tag; 2])?;
+                }
+                let ticket = if let Some(binding) = self.bindings[layer] {
+                    let rank = &storage.ranks[0];
+                    let owner = rank.decode.borrow();
+                    owner.router(&rank.kernels, &rank.weights, layer, rows)?;
+                    if let Some(usage) = &storage.usage {
+                        let tally = usage.routes(owner.stream.device.id, layer,
+                            cuteafd_ffi::expert_usage::UsagePhase::Decode)?;
+                        // SAFETY: sole router producer and tally share one FIFO.
+                        owner.stream.device.run(|| unsafe { tally.record(owner.plane("route_ids")?.ptr,
+                            rows, None, u32::MAX, true, owner.stream.raw) })?;
+                    }
+                    let identity = self.next_identity;
+                    self.next_identity = identity.checked_add(1).context("MiniMax Heads dispatch identity exhausted")?;
+                    let dispatch = DispatchRows { request_id: identity, placement_version: self.version,
+                        rows: requests.iter().enumerate().map(|(row, request)| ExpertProtocolV2RowDescriptor {
+                            row_id: row as u64, source_kind: request.kind, source_request_id: request.identity,
+                            token_position: request.start as u64, route_offset: (row * 4) as u32, route_count: 4,
+                        }).collect() };
+                    Some(self.dispatchers[binding.dispatcher].begin_guarded(layer, &source, dispatch,
+                        || crate::shared::decode_graph::fatal_drain(heads.publish_abort(), "MiniMax Heads begin before ticket drop"))?)
+                } else { None };
+                let shared = ticket.is_some();
+                for rank in &storage.ranks {
+                    if let Err(error) = rank.decode.borrow_mut().partial_ffn(&rank.kernels, &rank.weights, &rank.layout, layer, rows, shared) {
+                        crate::shared::decode_graph::fatal_drain(heads.publish_abort(), "MiniMax Heads partial before ticket drop");
+                        return Err(error);
+                    }
+                }
+                if let Some(ticket) = ticket {
+                    ticket.land_guarded(|| crate::shared::decode_graph::fatal_drain(heads.publish_abort(),
+                        "MiniMax Heads land before ticket drop"))?;
+                }
+                let a = storage.ranks[0].decode.borrow();
+                let b = storage.ranks[1].decode.borrow();
+                if shared {
+                    heads.publish_routed([&a, &b], rows * cfg.hidden * 2)?;
+                }
+                let tag = super::heads::Tag { unit: usize::MAX, layer, rows, kind: super::heads::Reduction::Ffn { shared } };
+                heads.reduce(&storage.ranks, [&a, &b], [tag; 2])?;
+                for owner in [&*a, &*b] {
+                    if shared { owner.joined(); }
+                    owner.post_fold_tap_enqueue(layer, rows)?;
+                }
+            }
+            let rank = &storage.ranks[1];
+            storage.head.project_device(&rank.weights, rank.decode.borrow().plane("residual")?, rows)
+        })();
+        if result.is_err() {
+            self.terminal = true;
+            crate::shared::decode_graph::fatal_drain(heads.cancel(), "MiniMax Heads decode cancellation");
+            self.dispatchers.clear();
+        }
+        for rank in &storage.ranks {
+            if let Err(error) = rank.decode.borrow().stream.drain() {
+                self.terminal = true;
+                crate::shared::decode_graph::fatal_drain(heads.cancel(), "MiniMax Heads asynchronous decode fault");
+                self.dispatchers.clear();
+                return result.and(Err(error));
+            }
+        }
         result
     }
 
@@ -1253,7 +1413,7 @@ mod tests {
             }
             Ok(())
         }
-        fn join(&mut self, unit: &Unit) -> Result<()> {
+        fn join(&mut self, _layer: usize, unit: &Unit) -> Result<()> {
             let slot = &self.slots[unit.slot];
             slot.boundary.before_join(self.bank.stream.raw)?;
             let output = self.read(super::super::cache::view(slot.output.buffer, 0, unit.rows.len() * 6144 * 2)?)?;
@@ -1507,7 +1667,7 @@ mod tests {
             fn attention(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
             fn router(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
             fn ffn(&mut self, _: usize, _: &Unit, _: bool) -> Result<()> { anyhow::bail!("injected mid-unit hook error") }
-            fn join(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+            fn join(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
             fn head(&mut self, _: &Unit, _: &[ServingRequest<'_>]) -> Result<()> { Ok(()) }
             fn commit(&mut self, _: &Unit, _: &mut [ServingRequest<'_>]) -> Result<()> { Ok(()) }
             fn abort_split(&self) {

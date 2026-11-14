@@ -5,7 +5,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::Tag;
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, minimax_m3::{forward, producers}, programs::Programs};
 use cuteafd_loader::families::minimax_m3::{MiniMaxM3Config,
-    execution::{AttentionLayout, ForwardPrograms, PartialFfnLayout, ProducerPrograms, RouterLayout, RouteReceiveLayout, SplitLayout, UnitLayout, WirePrecision},
+    execution::{AttentionLayout, ForwardPrograms, HeadsLayout, PartialFfnLayout, ProducerPrograms, RouterLayout, RouteReceiveLayout, SplitLayout, UnitLayout, WirePrecision},
     weight_layout::{CoordinatorWeights, Mxfp8Projection}};
 use std::{collections::BTreeMap, rc::Rc};
 
@@ -20,22 +20,30 @@ pub(crate) struct Kernels<'a> {
     add: cuteafd_ffi::Bf16Add<'a>,
     split_add: Option<cuteafd_ffi::Bf16F32Add<'a>>,
     narrow: Option<cuteafd_ffi::F32Bf16Narrow<'a>>,
+    heads: bool,
+    f32_add: Option<cuteafd_ffi::F32Add<'a>>,
 }
 impl<'a> Kernels<'a> {
     pub fn bind(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
         cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32) -> Result<Self> {
-        Self::bind_role(device, programs, manifest, cfg, weights, rows, context, false)
+        Self::bind_role(device, programs, manifest, cfg, weights, rows, context, false, false)
     }
     pub fn bind_split(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
         cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32) -> Result<Self> {
-        Self::bind_role(device, programs, manifest, cfg, weights, rows, context, true)
+        Self::bind_role(device, programs, manifest, cfg, weights, rows, context, true, false)
+    }
+    pub fn bind_heads(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
+        cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32) -> Result<Self> {
+        Self::bind_role(device, programs, manifest, cfg, weights, rows, context, true, true)
     }
     pub fn has_router(&self) -> bool { self.router.is_some() }
     fn bind_role(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
-        cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32, split: bool) -> Result<Self> {
+        cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32, split: bool, heads: bool) -> Result<Self> {
         UnitLayout::new(cfg, rows)?;
-        let (_, forward) = ForwardPrograms::resolve(manifest, rows)?;
-        let (_, producers) = if split { ProducerPrograms::resolve_split(manifest, rows)? }
+        let (_, forward) = if heads { ForwardPrograms::resolve_heads(manifest, rows)? }
+            else { ForwardPrograms::resolve(manifest, rows)? };
+        let (_, producers) = if heads { ProducerPrograms::resolve_heads(manifest, rows)? }
+            else if split { ProducerPrograms::resolve_split(manifest, rows)? }
             else { ProducerPrograms::resolve(manifest, rows)? };
         for expected in forward.iter().chain(&producers) {
             let actual = programs.spec(&expected.name)?;
@@ -46,7 +54,8 @@ impl<'a> Kernels<'a> {
         }
         let dense = dense::NativePrograms::bind(device, programs, weights, manifest, rows)?;
         let attention = (!weights.layers.is_empty()).then(||
-            attention::Kernels::bind(device, programs, manifest, cfg, rows, context)).transpose()?;
+            if heads { attention::Kernels::bind_heads(device, programs, manifest, cfg, rows, context, attention::HeadLayout::Narrow) }
+            else { attention::Kernels::bind(device, programs, manifest, cfg, rows, context) }).transpose()?;
         device.run(|| Ok(Self { device, dense, attention,
             norm: forward::ForwardProducer::bind(programs, forward::Kind::ResidualNorm)?,
             router: (!split || weights.rank == 0).then(||
@@ -56,6 +65,7 @@ impl<'a> Kernels<'a> {
             add: device.library.bf16_add()?,
             split_add: split.then(|| device.library.bf16_f32_add()).transpose()?,
             narrow: split.then(|| device.library.f32_bf16_narrow()).transpose()?,
+            heads, f32_add: heads.then(|| device.library.f32_add()).transpose()?,
         }))
     }
 }
@@ -240,6 +250,22 @@ impl<'a> UnitOwner<'a> {
                 else { attention::Workspace::new_decode(attention) }).transpose()?,
             split: Some(split), stream, rows, planes })
     }
+    pub fn new_heads(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
+        weights: &CoordinatorWeights, rows: u32, prefill: bool) -> Result<Self> {
+        ensure!(kernels.heads && stream.device.id == kernels.device.id
+            && std::ptr::eq(stream.device.library, kernels.device.library), "MiniMax Heads stream/role differs");
+        ensure!(prefill || rows <= 64, "MiniMax Heads decode exceeds capacity");
+        let layout = HeadsLayout::new(cfg, weights.rank as u8, rows)?;
+        let planes = layout.buffers().into_iter().map(|(name, bytes)| Ok((name.into(),
+            Rc::new(Allocation::new(kernels.device, usize::try_from(bytes)?, Tag::workspace("minimax/unit"))?))))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(Self { dense: dense::ExecutionOwner::new(kernels.device, weights, rows)?,
+            routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
+            attention: kernels.attention.as_ref().map(|attention| if prefill { attention::Workspace::new(attention) }
+                else { attention::Workspace::new_decode(attention) }).transpose()?,
+            split: None, stream, rows, planes })
+    }
+    fn heads(&self) -> bool { self.planes.contains_key("reduction") }
     pub fn is_split(&self) -> bool { self.split.is_some() }
     fn owner(&self, name: &str) -> Result<&Allocation<'a>> {
         self.planes.get(name).map(Rc::as_ref).with_context(|| format!("MiniMax unit lacks admitted {name}"))
@@ -373,8 +399,9 @@ impl<'a> UnitOwner<'a> {
     fn projections(&self, weights: &TargetWeights<'_>, layer: usize, first: usize,
         rows: usize) -> Result<attention::Projections> {
         let view = |name, stride| attention::row_view(self.plane(name)?, first, rows, stride);
-        Ok(attention::Projections { query: view("query", 8192 * 2)?, key: view("key", 512 * 2)?,
-            value: view("value", 512 * 2)?, index_query: view("index_query", 512 * 2)?,
+        let divisor = if self.heads() { 2 } else { 1 };
+        Ok(attention::Projections { query: view("query", 8192 * 2 / divisor)?, key: view("key", 512 * 2 / divisor)?,
+            value: view("value", 512 * 2 / divisor)?, index_query: view("index_query", 512 * 2 / divisor)?,
             index_key: view("index_key", 128 * 2)?,
             query_norm: Self::weight(weights, layer, "self_attn.q_norm.weight")?,
             key_norm: Self::weight(weights, layer, "self_attn.k_norm.weight")?,
@@ -382,7 +409,8 @@ impl<'a> UnitOwner<'a> {
             index_key_norm: Self::weight(weights, layer, "self_attn.index_k_norm.weight")? })
     }
     fn copy_attention(&self, output: Buffer, first: usize, rows: usize) -> Result<()> {
-        let destination = attention::row_view(self.dense.producer_destination(), first, rows, 8192 * 2)?;
+        let destination = attention::row_view(self.dense.producer_destination(), first, rows,
+            if self.heads() { 4096 * 2 } else { 8192 * 2 })?;
         let device = self.stream.device;
         device.run(|| {
             // SAFETY: disjoint retained buffers, ordered before scratch reuse and
@@ -393,9 +421,13 @@ impl<'a> UnitOwner<'a> {
     fn finish_attention(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
         admitted: &CoordinatorWeights, layer: usize, rows: usize) -> Result<()> {
         let projection = Self::projection(admitted, layer, "self_attn.o_proj")?;
-        self.dense.prepare(&kernels.dense, projection, rows as u32, self.stream.raw)?
-            .project(weights, projection)?.narrow(self.planes.get("ffn").context("MiniMax ffn plane")?)?;
-        self.accumulate(rows)
+        let destination = self.planes.get(if self.heads() { "reduction" } else { "ffn" })
+            .context("MiniMax attention projection destination")?;
+        let mut prepared = self.dense.prepare(&kernels.dense, projection, rows as u32, self.stream.raw)?;
+        let projected = prepared.project(weights, projection)?;
+        if kernels.heads { projected.copy_partial(destination)?; } else { projected.narrow(destination)?; }
+        drop(prepared);
+        if kernels.heads { Ok(()) } else { self.accumulate(rows) }
     }
     /// Router and FFN share the exact same normalized BF16 activation.
     pub fn router(&self, kernels: &Kernels<'_>, weights: &TargetWeights<'_>, layer: usize, rows: usize) -> Result<()> {
@@ -433,7 +465,7 @@ impl<'a> UnitOwner<'a> {
     /// before touching .ffn or advancing either rank's FP32 residual.
     pub fn partial_ffn(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
         admitted: &CoordinatorWeights, layer: usize, rows: usize, shared: bool) -> Result<()> {
-        ensure!(self.split.is_some(), "MiniMax partial FFN requires split owners");
+        ensure!(self.split.is_some() || self.heads(), "MiniMax partial FFN requires split owners");
         self.ffn_projection(kernels, weights, admitted, layer, rows, shared)
     }
     fn ffn_projection(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
@@ -451,7 +483,7 @@ impl<'a> UnitOwner<'a> {
     pub fn ffn_enqueue(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
         admitted: &CoordinatorWeights, layer: usize, rows: usize, shared: bool) -> Result<()> {
         self.check(kernels, rows)?;
-        if !shared || (self.split.is_some() && admitted.rank != 0) {
+        if !shared || ((self.split.is_some() || self.heads()) && admitted.rank != 0) {
             self.normalize(kernels, weights, layer, "post_attention_layernorm.weight", rows)?;
         }
         let stem = if shared { "block_sparse_moe.shared_experts" } else { "mlp" };
@@ -474,11 +506,13 @@ impl<'a> UnitOwner<'a> {
         let output = prepared.project(weights, down)?;
         if let Some(split) = &mut self.split {
             output.stage_partial(&mut split.partial)?;
+        } else if kernels.heads {
+            output.copy_partial(self.planes.get("reduction").context("MiniMax Heads partial plane")?)?;
         } else {
             output.narrow(self.planes.get("ffn").context("MiniMax ffn plane")?)?;
         }
         drop(prepared);
-        if !shared && self.split.is_none() { self.accumulate(rows)?; }
+        if !shared && self.split.is_none() && !kernels.heads { self.accumulate(rows)?; }
         Ok(())
     }
     /// # Safety
@@ -573,11 +607,40 @@ impl<'a> UnitOwner<'a> {
                         meeting, rows * 6144, self.stream.raw)?;
                     kernels.narrow.as_ref().context("MiniMax split narrow kernel missing")?.launch(
                         meeting.ptr, self.plane("ffn")?.ptr, rows * 6144, self.stream.raw)
+                } else if kernels.heads {
+                    let meeting = self.plane("reduction")?;
+                    kernels.split_add.as_ref().context("MiniMax Heads join kernel missing")?.launch(
+                        self.plane("routed")?, self.plane("ffn")?, meeting, rows * 6144, self.stream.raw)?;
+                    kernels.narrow.as_ref().context("MiniMax Heads narrow kernel missing")?.launch(
+                        meeting.ptr, self.plane("ffn")?.ptr, rows * 6144, self.stream.raw)
                 } else { kernels.add.launch(self.plane("routed")?, self.plane("ffn")?,
                     self.plane("combined")?, rows * 6144, self.stream.raw) }
             }
         })?;
-        self.accumulate_from(if self.split.is_some() { "ffn" } else { "combined" }, rows)
+        self.accumulate_from(if self.split.is_some() || kernels.heads { "ffn" } else { "combined" }, rows)
+    }
+    /// # Safety
+    /// Both ordered FP32 partials are local peer-exchange views, completed before
+    /// this stream consumes them; their lease survives narrowing/residual update.
+    pub(crate) unsafe fn merge_heads(&self, kernels: &Kernels<'_>, values: [*const std::ffi::c_void; 2],
+        rows: usize, attention: bool, shared: bool) -> Result<()> {
+        self.check(kernels, rows)?;
+        ensure!(kernels.heads && self.heads(), "MiniMax head merge requires narrow owners");
+        let count = rows.checked_mul(6144).context("MiniMax head merge extent overflow")?;
+        let buffer = |ptr: *const std::ffi::c_void| Buffer { ptr: ptr.cast_mut(), bytes: count * 4,
+            device_id: self.stream.device.id, flags: 0 };
+        let meeting = self.dense.workspace.output.buffer;
+        self.stream.device.run(|| {
+            // SAFETY: ordered live partial views and disjoint serial temporary;
+            // no subsequent projection reuses it before this narrowing completes.
+            unsafe {
+                kernels.f32_add.as_ref().context("MiniMax Heads add missing")?.launch(
+                    buffer(values[0]), buffer(values[1]), meeting, count, self.stream.raw)?;
+                kernels.narrow.as_ref().context("MiniMax Heads narrow missing")?.launch(
+                    meeting.ptr, self.plane("ffn")?.ptr, count, self.stream.raw)
+            }
+        })?;
+        if attention || !shared { self.accumulate(rows) } else { self.join_routed_enqueue(kernels, rows) }
     }
     fn accumulate(&self, rows: usize) -> Result<()> { self.accumulate_from("ffn", rows) }
     fn accumulate_from(&self, source: &str, rows: usize) -> Result<()> {

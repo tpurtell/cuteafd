@@ -1,5 +1,7 @@
 /// Physical Spark world ceiling shared by planning, protocols and rank storage.
 pub const MAX_SPARK_WORLD: usize = 8;
+/// Alternating receive slots used by one serialized head-reduction sequence.
+pub const HEAD_REDUCTION_PARITY_SLOTS: usize = 2;
 // WaveReceipt uses one bit per physical rank.
 const _: () = assert!(MAX_SPARK_WORLD <= u8::BITS as usize);
 

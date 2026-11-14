@@ -10,6 +10,7 @@ pub(crate) mod prefill;
 pub(crate) mod head;
 mod graphs;
 mod engine;
+mod heads;
 mod owners;
 mod backend;
 pub(crate) mod startup;
