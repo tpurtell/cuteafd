@@ -3157,9 +3157,12 @@ pub(super) mod tests {
                 .collect()
         };
 
-        eprintln!("chunked owner totals eager={} prefill={} decode={} verify={}",
-            total_bytes(&admitted_decode_eager), total_bytes(&admitted_prefill),
-            total_bytes(&admitted_decode), total_bytes(&admitted_verify));
+        // Retain exact physical-owner checks for the qualified 59-layer prefix;
+        // the independent prefix search above follows the current scratch plan.
+        assert_eq!(total_bytes(&admitted_decode_eager), 93_338_386_988);
+        assert_eq!(total_bytes(&admitted_prefill), 93_338_452_524);
+        assert_eq!(total_bytes(&admitted_decode), 94_371_063_596);
+        assert_eq!(total_bytes(&admitted_verify), 94_371_063_596);
 
         // The 65,536 B (64 KiB) difference between prefill and decode_eager
         // is owned 100% by CONTEXT_MEASURED ("CUDA context and loaded modules"),
