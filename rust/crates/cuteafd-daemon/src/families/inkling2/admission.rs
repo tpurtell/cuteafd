@@ -43,9 +43,11 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
         contract.components.push(Component::allocation(Allocation::buffer(name, location, bytes, lifetime,
             category, "Inkling cold native forward owner"), ByteCurve::fixed(bytes, 1), false, 1));
     }
-    contract.components.push(Component::allocation(Allocation::buffer("driver.stream-slabs", Location::coordinator(0),
-        cuda_stream_slab_bytes(1)?, Lifetime::RESIDENT, Category::Runtime, "one ordered cold golden stream"),
-        ByteCurve::fixed(cuda_stream_slab_bytes(1)?, 1), false, 1));
+    contract.components.push(Component { activation: Activation::always(),
+        bytes: ByteCurve::fixed(cuda_stream_slab_bytes(1)?, 1),
+        kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
+            bytes: cuda_stream_slab_bytes(1)?, lifetime: Lifetime::RESIDENT,
+            source: "driver.stream-slabs: one ordered cold golden stream".into(), assumed: false }) });
     let head = crate::shared::target_head::TargetHead::configured().blas_head(true);
     contract.components.extend(serving::blas_components("sm_120", &[serving::BlasOwners {
         name: "inkling2/head".into(), process: "coordinator".into(), thread: "golden".into(),
