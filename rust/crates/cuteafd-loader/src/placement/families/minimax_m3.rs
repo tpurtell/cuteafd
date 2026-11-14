@@ -999,13 +999,21 @@ impl Recipe for MiniMaxInputs {
                 Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Embedding, "media/embedding-cache",
                 maximum).map(|mut c| { c.activation = on.clone(); c }));
         }
-        // BLAS: the BF16 vocabulary head borrows one serving-thread pool.
+        // Target and drafter borrow the same native thread-local BLAS pool.
+        // The shared borrower union charges its GEMM handle exactly once.
+        let mut blas = Vec::new();
         if self.head.bf16() {
-            components.extend(serving::blas_components("sm_120", &[serving::BlasOwners { name: "MiniMax target head".into(),
+            blas.push(serving::BlasOwners { name: "MiniMax target head".into(),
                 process: "coordinator".into(), thread: "minimax/blas/serve".into(), location: Location::coordinator(head),
-                gemm: self.head.gemm(), lt: self.head.lt(), lifetime: Lifetime::TARGET, activation: Activation::always() }],
-                maximum, PhaseOrder::TARGET_THEN_DRAFT)?);
+                gemm: self.head.gemm(), lt: self.head.lt(), lifetime: Lifetime::TARGET, activation: Activation::always() });
         }
+        if self.drafter.is_some() {
+            blas.push(serving::BlasOwners { name: "MiniMax bundled draft head".into(),
+                process: "coordinator".into(), thread: "minimax/blas/serve".into(), location: Location::coordinator(head),
+                gemm: true, lt: false, lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth },
+                activation: Activation::always() });
+        }
+        components.extend(serving::blas_components("sm_120", &blas, maximum, PhaseOrder::TARGET_THEN_DRAFT)?);
         fixed_request_tails(&mut components, maximum, &[])?;
         let mut contract = Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (self.spark_ranks > 0).then(|| SparkReplyFormats {
