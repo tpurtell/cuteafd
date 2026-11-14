@@ -13,6 +13,7 @@ mod engine;
 mod owners;
 mod backend;
 pub(crate) mod startup;
+pub(crate) mod serve;
 pub(crate) mod admission;
 pub(crate) mod golden;
 
