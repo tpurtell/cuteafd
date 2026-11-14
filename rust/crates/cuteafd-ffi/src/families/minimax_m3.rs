@@ -605,7 +605,7 @@ mod tests {
                 .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         let entries = manifest["programs"].as_array().expect("installed programs array");
-        assert_eq!(entries.len(), 1724);
+        assert_eq!(entries.len(), 1734);
         let mut partition = Vec::new();
         for entry in entries {
             let name = entry["name"].as_str().expect("installed program name");
@@ -625,16 +625,26 @@ mod tests {
         partition.sort_unstable();
         assert_eq!(partition, vec![
             ("minimax_attention_decode", "msa"),
+            ("minimax_attention_decode_h32", "msa"),
             ("minimax_attention_extend", "msa"),
+            ("minimax_attention_extend_h32", "msa"),
             ("minimax_index_cache_gather", "gather"),
             ("minimax_index_decode", "msa"),
+            ("minimax_index_decode_h2", "msa"),
             ("minimax_index_prefill", "msa"),
+            ("minimax_index_prefill_h2", "msa"),
             ("minimax_index_producer", "producer"),
+            ("minimax_index_producer_h2", "producer"),
             ("minimax_kv_pack", "forward"),
+            ("minimax_kv_pack_h2", "forward"),
+            ("minimax_norm_rope_h2", "producer"),
+            ("minimax_norm_rope_h32", "producer"),
             ("minimax_norm_rope_h4", "producer"),
             ("minimax_norm_rope_h64", "producer"),
             ("minimax_oai_split_i12288", "producer"),
+            ("minimax_oai_split_i1536", "producer"),
             ("minimax_oai_split_i3072", "producer"),
+            ("minimax_oai_split_i6144", "producer"),
             ("minimax_residual_norm", "forward"),
             ("minimax_router_scores", "forward"),
         ]);
@@ -642,11 +652,11 @@ mod tests {
         let library = fixture.load()?;
         fixture.register_programs(&library, entries)?;
         let programs = library.programs()?.with_manifest(&path)?;
-        assert_eq!(programs.names().count(), 1724);
+        assert_eq!(programs.names().count(), 1734);
         for entry in entries {
             assert!(programs.contains(entry["name"].as_str().unwrap()));
         }
-        println!("validated 1724 installed stems; MiniMax: 4 MSA, 5 Producer, 3 Forward, 1 gather");
+        println!("validated 1734 installed stems; MiniMax: 8 MSA, 10 Producer, 4 Forward, 1 gather");
         Ok(())
     }
 
