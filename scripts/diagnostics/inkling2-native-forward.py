@@ -77,6 +77,15 @@ class ArenaWeights(oracle.Weights):
         expert[0].copy_(w13[:, 0::2]); expert[1].copy_(s13[:, 0::2])
         expert[2].copy_(w13[:, 1::2]); expert[3].copy_(s13[:, 1::2])
         expert[4].copy_(w2); expert[5].zero_(); expert[5][:, :, :i//32].copy_(s2)
+        # Compare one expert at a time: bounded temporary comparisons, no
+        # extra full weight representation and no numerical conversion.
+        for eindex in range(e):
+            for dest, source in [(expert[0][eindex], w13[eindex, 0::2]),
+                                 (expert[2][eindex], w13[eindex, 1::2])]:
+                assert torch.equal(dest.view(torch.uint8), source.view(torch.uint8))
+            assert torch.equal(expert[1][eindex], s13[eindex, 0::2])
+            assert torch.equal(expert[3][eindex], s13[eindex, 1::2])
+        print("diagnostic w13 rawFP8 byte permutation: exact", flush=True)
         self.expert = expert
         self.owner_bytes = {"inkling2.diagnostic.source_arena": self.arena.numel(),
                             "inkling2.diagnostic.expert_arena": self.expert_arena.numel()}
