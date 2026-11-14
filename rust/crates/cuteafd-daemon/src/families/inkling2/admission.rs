@@ -101,3 +101,43 @@ pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<
     cuteafd_loader::placement::planner::reconcile(&projected, Phase::PostTargetKv, &actual)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() -> ResolvedPlan {
+        let owner = Allocation::buffer("unit.partial", Location::coordinator(0), 4096,
+            Lifetime::TARGET, Category::Workspace, "Inkling cold native forward owner");
+        let facts = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations: vec![owner],
+            deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![Allowance {
+                location: Location::coordinator(0), bytes: 1024, lifetime: Lifetime::RESIDENT,
+                source: "driver.stream-slabs".into(), assumed: false }], driver_page_tables: vec![], allocation_granularity: vec![] };
+        let budgets = vec![Budget { id: "rtx0".into(), locations: vec![Location::coordinator(0)],
+            physical_bytes: 1<<30, logical_bytes: 1<<30, headroom: 0,
+            baseline: Baseline::Sampled { free: 1<<30, phase: Phase::Load, source: "CPU fixture".into() } }];
+        let shape = PrefillShape { rows: 64, waves: 1 };
+        ResolvedPlan { encoder_diagnostics: vec![], request: Request { context: Context::pinned(64), pool: Pin::Exact(64),
+            onboard: Pin::Exact(0), prefill: Pin::Exact(shape), operation: Operation::Scoring, resident_weight_limit: None,
+            spark_reply_formats: Default::default() }, decisions: Decisions { attention: vec![], onboard_layers: vec![],
+            expert_homes: Default::default(), embedding: None, draft_home: None, head_home: Some(0), intake_home: None,
+            encoder: None, prefill: shape, lanes: 1, spark_reply_formats: None }, pool_tokens: 64, pool_page_rows: 64,
+            phases: evaluate(&facts, &budgets).unwrap(), facts, budgets }
+    }
+    #[test]
+    fn shared_reconcile_rejects_missing_extra_duplicate_and_wrong_extent() {
+        let plan = fixture();
+        let physical = [1];
+        let devices = CoordinatorDevices::new(&physical).unwrap();
+        let receipt = Receipt { allocation: Allocation::buffer("inkling2.unit.partial", Location::coordinator(0),
+            4096, Lifetime::TARGET, Category::Workspace, "retained"), address: 0x1000 };
+        reconcile_native(&plan, devices, &[receipt.clone()]).unwrap();
+        assert!(reconcile_native(&plan, devices, &[]).is_err());
+        assert!(reconcile_native(&plan, devices, &[receipt.clone(), receipt.clone()]).is_err());
+        let mut wrong = receipt.clone(); wrong.allocation.bytes = 4095;
+        assert!(reconcile_native(&plan, devices, &[wrong]).is_err());
+        let mut wrong = receipt.clone(); wrong.allocation.id = "inkling2.unit.unadmitted".into();
+        assert!(reconcile_native(&plan, devices, &[wrong]).is_err());
+        let mut wrong = receipt.clone(); wrong.allocation.location = Location::coordinator(1);
+        assert!(reconcile_native(&plan, devices, &[wrong]).is_err());
+    }
+}
