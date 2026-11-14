@@ -254,6 +254,14 @@ def jobs(scope):
         result.append((f"minimax-{label}", "export_b12x_dsv4_aot.py",
                        ["--geometry", "minimax", "--decode-rows", "64",
                         "--prefill-rows", "4096", "--only", names]))
+    minimax_dense_shapes = ((6144, 8192), (6144, 512), (6144, 128), (8192, 6144),
+                            (6144, 12288), (12288, 6144), (6144, 3072), (3072, 6144),
+                            (6144, 4096), (6144, 256), (6144, 6144), (6144, 1536),
+                            (4096, 6144), (1536, 6144))
+    minimax_dense = [f"mxfp8_k{k}_n{n}_s1_a8" for k, n in minimax_dense_shapes]
+    minimax_dense += [f"quant_k{k}_bf16_a8" for k in (1536, 3072, 4096, 6144, 8192, 12288)]
+    result.append(("minimax-dense", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "minimax", "--only", ",".join(minimax_dense)]))
     if scope == "suspects":
         return result
     # Inkling 2 Small: biased-sink GQA attention and the coordinator MXFP8 W8A8 expert package.
