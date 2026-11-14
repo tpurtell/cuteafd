@@ -15,6 +15,8 @@ use cuteafd_ffi::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WirePrecision { Bf16, F32 }
 impl WirePrecision {
+    /// Qualified by #2074: BF16 exceeded 0.002 NLL delta and missed 99.5% top-1 agreement.
+    pub const DEFAULT: Self = Self::F32;
     pub fn bytes(self) -> usize { match self { Self::Bf16 => 2, Self::F32 => 4 } }
 }
 

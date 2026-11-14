@@ -208,6 +208,20 @@ impl Fixture {
         Ok(())
     }
 
+    /// Opt-in CPU peer ordering/fault model; default binding-only stubs stay closed.
+    pub fn peer_ordering_model(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: private fixture hook enables only its host-memory queue model.
+        unsafe { library.lib.get::<unsafe extern "C" fn()>(b"fixture_peer_model")?(); }
+        Ok(())
+    }
+
+    pub fn peer_stream_fault(&self, library: &NativeLibrary, stream: *mut std::ffi::c_void) -> Result<()> {
+        // SAFETY: this private fixture hook records an opaque stream identity;
+        // passing null clears the fault after the cancellation assertion.
+        unsafe { library.lib.get::<unsafe extern "C" fn(*mut std::ffi::c_void)>(b"fixture_peer_model_fault")?(stream); }
+        Ok(())
+    }
+
     pub fn mapped_bytes(&self, library: &NativeLibrary) -> Result<usize> {
         // SAFETY: this private fixture export reads its allocation counter.
         Ok(unsafe { library.lib.get::<unsafe extern "C" fn() -> usize>(b"fixture_mapped_bytes")?() })

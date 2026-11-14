@@ -130,10 +130,14 @@ refused until its qualification card passes; WIP builds can serve it through the
 hidden `serve-minimax` command for qualification.
 Explicit two-RTX heads planning is available with half KV and replicated index
 storage; `auto` stays contiguous whole attention with neuron-split FFNs on two RTX.
-The two-RTX layers recipe requires an explicit qualified BF16/F32 split-wire
-precision as an internal admission input. No precision is silently selected:
-default planning and serve admission cleanly refuse with "MiniMax split FFN wire
-precision not qualified/selected" until qualification selects it. Each rank
+The two-RTX layers recipe defaults to qualified FP32 split partials. The launcher
+fixes `--split-wire fp32` and the serve flag defaults to `fp32`; there is no
+user-facing wire configuration key. BF16 remains an explicit golden diagnostic
+(`--wire bf16`), not a serving performance lever. One-RTX arithmetic is unchanged. The fixed qualification rule prefers BF16 only when its NLL differs from
+FP32 by at most 0.002 nats and their top-1 agreement is at least 99.5%. Measured
+BF16/FP32 generated-row NLL delta was 0.00294317 and agreement 95.0867%, so FP32
+is selected. An explicitly unselected internal wire still refuses with
+"MiniMax split FFN wire precision not qualified/selected". Each rank
 normalizes the broadcast FP32 residual locally; the FP32 meeting preserves the
 BF16 whole-FFN boundary before the replicated residual add. GPU0 owns the sole
 Spark endpoint and router; onboarded TP2 routes reach GPU1 as exact IDs/weights
@@ -146,6 +150,18 @@ native library and program manifest, and four real Spark `--peers` endpoints.
 to 1024 (page-aligned 256..4096); `--prefill-waves` defaults to 3 (1..4).
 `--check-headers` validates the immutable reference and checkpoint/export geometry
 without CUDA or workers. Scores use the shared top1024-plus-tail estimator.
+`--split-device ID` selects a distinct physical peer for the diagnostic serving
+split path, with `--attention-placement auto|layers`; `heads` remains refused.
+The peer diagnostic requires explicit `--wire bf16|fp32`; omitting it refuses,
+and it does not select a serving default or qualify that precision. `--decode`
+uses real one-row serving decode after the prompt instead of scoring all rows
+through serving prefill. Without `--split-device`, the existing one-GPU Whole
+cold golden is unchanged. Existing `--save-logits` probes contain normalized
+log-probabilities; optional MiniMax-only `--raw-logits` additionally writes each
+window's scored raw FP32 rows to `WINDOW.raw-logits.bin` for absolute-logit
+comparison (positions follow the immutable reference's scored-row order).
+Split prefill/decode currently serialize on each
+rank's one compute/HopLink stream; slot buffers remain independent.
 MiniMax's explicit `minimax-generated-aggregate` family scoring policy (#1779,
 TJ 2026-11-13) qualifies the aggregate generated rows at the expert-bpw tier:
 the official NVFP4 checkpoint uses mid-tier mean KL <=0.05 and top-1 >=0.93,

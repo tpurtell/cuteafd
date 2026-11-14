@@ -902,11 +902,12 @@ fn boot_concurrency_full_plan_matrix() {
                             if family == "minimax_m3" && gpus == 2
                                 && cuteafd_core::concurrency::validate(family, c).is_ok() {
                                 use crate::families::minimax_m3::execution::WirePrecision;
-                                use crate::placement::families::minimax_m3::ServingRefusal;
-                                let default = input.plan(&options).unwrap();
-                                assert!(default.solver_placement.is_none() && default.phase_ledger.is_none());
-                                assert!(default.hints.iter().any(|hint|
-                                    hint.what == ServingRefusal::SplitWireNotQualified.to_string()), "{}", render(&default));
+                                assert_eq!(options.layout.as_ref().unwrap().minimax_split_wire,
+                                    Some(WirePrecision::F32));
+                                let default = check_concurrency_plan_cell(&input, family, case.label,
+                                    gpus, ranks, c, &options);
+                                assert!(default.solver_placement.is_some() && default.phase_ledger.is_some(),
+                                    "{}", render(&default));
                                 let mut charged = Vec::new();
                                 for wire in [WirePrecision::Bf16, WirePrecision::F32] {
                                     options.layout.as_mut().unwrap().minimax_split_wire = Some(wire);

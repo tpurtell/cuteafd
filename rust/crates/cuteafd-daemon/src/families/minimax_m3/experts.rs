@@ -199,6 +199,10 @@ impl<'a> Dispatcher<'a> {
     }
     pub(crate) fn begin<'t>(&self, layer: usize, rows: &'t RoutedRows<'a>,
         identities: DispatchRows) -> Result<Ticket<'t, 'a>> {
+        self.begin_guarded(layer, rows, identities, || {})
+    }
+    pub(crate) fn begin_guarded<'t>(&self, layer: usize, rows: &'t RoutedRows<'a>,
+        identities: DispatchRows, abort: impl FnOnce()) -> Result<Ticket<'t, 'a>> {
         identities.validate(rows.rows)?;
         let id = {
             let mut inner = self.inner.borrow_mut();
@@ -222,7 +226,10 @@ impl<'a> Dispatcher<'a> {
             id
         };
         let mut ticket = Ticket { inner: self.inner.clone(), rows, id, complete: false };
-        ticket.enqueue(layer, identities)?;
+        if let Err(error) = ticket.enqueue(layer, identities) {
+            abort();
+            return Err(error);
+        }
         Ok(ticket)
     }
 }
@@ -335,14 +342,19 @@ impl Ticket<'_, '_> {
     }
     /// An out-of-order request is retained until earlier tickets land. Its
     /// join returns NotLanded in the meantime; no CUDA wait is queued early.
-    pub(crate) fn land(mut self) -> Result<()> {
-        {
+    pub(crate) fn land(self) -> Result<()> { self.land_guarded(|| {}) }
+    pub(crate) fn land_guarded(mut self, abort: impl FnOnce()) -> Result<()> {
+        let result = (|| {
             let mut inner = self.inner.borrow_mut();
             ensure!(!inner.terminal, DispatchError::Terminal);
             inner.pending.iter_mut().find(|pending| pending.id == self.id)
                 .context("MiniMax routed ticket no longer pending")?.land = true;
             let device = self.rows.stream.device;
-            device.run(|| inner.flush())?;
+            device.run(|| inner.flush())
+        })();
+        if let Err(error) = result {
+            abort();
+            return Err(error);
         }
         self.complete = true;
         Ok(())
@@ -512,6 +524,33 @@ mod tests {
         other.boundary.before_join(other.stream.raw)?;
         other.boundary.joined();
         assert_eq!(count.get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn split_routed_ticket_records_staging_before_partial_activation_reuse() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let rows = rows(device)?;
+        device.run(|| library.copy_h2d(rows.activation.buffer, &vec![37; 6144 * 2]))?;
+        let (dispatcher, _) = dispatcher(device)?;
+        let first = fixture.events()?.len();
+        let ticket = dispatcher.begin(2, &rows, identities(1))?;
+        let staged = fixture.events()?.len();
+        assert!(fences(&fixture.events()?[first..staged]).contains('R'),
+            "begin must record the staged event, not rely on host submission timing");
+        rows.boundary.before_ffn(rows.stream.raw)?;
+        assert_eq!(fences(&fixture.events()?[staged..]), "W",
+            "partial FFN must explicitly wait for routed staging");
+        device.run(|| library.copy_h2d(rows.activation.buffer, &vec![91; 6144 * 2]))?;
+        ticket.land()?;
+        rows.boundary.before_join(rows.stream.raw)?;
+        let mut output = vec![0; 6144 * 2];
+        device.run(|| library.copy_d2h(&mut output, rows.output.buffer))?;
+        assert!(output.iter().all(|&value| value == 37));
+        rows.boundary.joined();
         Ok(())
     }
 

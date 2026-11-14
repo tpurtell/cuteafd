@@ -103,8 +103,11 @@ pub(crate) fn prepare_serving<'a>(view: &CheckpointView, catalog: &OfficialV41Ca
     admitted: &cuteafd_loader::placement::families::minimax_m3::AdmittedMiniMax)
     -> Result<(PendingServing<'a>, Option<Membership>)> {
     use crate::shared::token_io::EmbedPlacement;
-    use cuteafd_loader::{families::minimax_m3::weight_layout::{CoordinatorWeights, HeadsWeights},
+    use cuteafd_loader::{families::minimax_m3::weight_layout::{CoordinatorWeights, HeadsWeights, SplitFfnWeights},
         placement::{families::minimax_m3::ExpertStorage, planner::EmbeddingHome}};
+    if inputs.split() && inputs.split_wire.is_none() {
+        return Err(cuteafd_loader::placement::families::minimax_m3::ServingRefusal::SplitWireNotQualified.into());
+    }
     if PushPolicy::for_snapshot(view.snapshot())? != PushPolicy::Required {
         return Err(ServingRefusal::PushRequired.into());
     }
@@ -117,25 +120,32 @@ pub(crate) fn prepare_serving<'a>(view: &CheckpointView, catalog: &OfficialV41Ca
         ServingRefusal::Contract("selected expert backing is mount-only".into()));
     let heads = if inputs.heads() { Some(HeadsWeights::plan(checkpoint, &inputs.cfg, EmbeddingHome::Device(0))?) }
         else { None };
-    let planned: Vec<CoordinatorWeights> = match &heads {
-        Some(heads) => heads.iter().map(|rank| rank.target.clone()).collect(),
-        None => CoordinatorWeights::plan(checkpoint, &inputs.cfg, inputs.gpus,
+    let split = if inputs.split() { Some(SplitFfnWeights::plan(checkpoint, &inputs.cfg,
+        &inputs.owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>(), EmbeddingHome::Device(0))?) }
+        else { None };
+    let planned: Vec<CoordinatorWeights> = match (&heads, &split) {
+        (Some(heads), _) => heads.iter().map(|rank| rank.target.clone()).collect(),
+        (_, Some(split)) => split.iter().map(|rank| rank.target.clone()).collect(),
+        _ => CoordinatorWeights::plan(checkpoint, &inputs.cfg, inputs.gpus,
             &inputs.owners.iter().map(|&rank| rank as usize).collect::<Vec<_>>())?,
     };
     ensure!(planned == inputs.targets, ServingRefusal::Contract("checkpoint target layout changed".into()));
     let expert_sets = serving_expert_plan(&expected.backings, devices.len())?.into_iter().collect();
     let (prepared, membership) = prepare(view, catalog, devices, inputs.spark_ranks, expert_sets, envelope, || {
-        let (target, embedding) = match &heads {
-            Some(heads) => super::TargetWeights::load_heads_with_embedding(devices[0], checkpoint,
+        let (target, embedding) = match (&heads, &split) {
+            (Some(heads), _) => super::TargetWeights::load_heads_with_embedding(devices[0], checkpoint,
                 &heads[0], EmbedPlacement::Gpu)?,
-            None => super::TargetWeights::load_with_embedding(devices[0], checkpoint,
+            (_, Some(split)) => super::TargetWeights::load_split_ffn_with_embedding(devices[0], checkpoint,
+                &split[0], EmbedPlacement::Gpu)?,
+            _ => super::TargetWeights::load_with_embedding(devices[0], checkpoint,
                 &inputs.targets[0], EmbedPlacement::Gpu)?,
         };
         let mut targets = vec![target];
         for rank in 1..devices.len() {
-            targets.push(match &heads {
-                Some(heads) => super::TargetWeights::load_heads(devices[rank], checkpoint, &heads[rank])?,
-                None => super::TargetWeights::load(devices[rank], checkpoint, &inputs.targets[rank])?,
+            targets.push(match (&heads, &split) {
+                (Some(heads), _) => super::TargetWeights::load_heads(devices[rank], checkpoint, &heads[rank])?,
+                (_, Some(split)) => super::TargetWeights::load_split_ffn(devices[rank], checkpoint, &split[rank])?,
+                _ => super::TargetWeights::load(devices[rank], checkpoint, &inputs.targets[rank])?,
             });
         }
         Ok((targets, embedding))

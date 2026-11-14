@@ -1922,7 +1922,7 @@ if [[ $family == muse_spark ]]; then
 fi
 if [[ $family == minimax_m3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
-  family_args+=(--rtx-expert-layers "$local_layers")
+  family_args+=(--rtx-expert-layers "$local_layers" --split-wire fp32)
 fi
 if [[ $family == kimi_k3 ]]; then
   kv_cache="$(get KV_CACHE fp8)"

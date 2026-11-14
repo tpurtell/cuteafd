@@ -1779,7 +1779,14 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
     use crate::placement::{AttentionPlacement, OnboardSetting};
     let (dir, inputs) = heads_recipe_fixture_with_experts(128);
     let manifest = dir.path().join("PROGRAMS.json");
-    std::fs::write(&manifest, inputs.manifest.to_string()).unwrap();
+    // Auto now selects the qualified split path; this dual-placement fixture
+    // needs both the Heads and canonical split producer/dense inventories.
+    let split = recipe_inputs(2, 4);
+    let programs = inputs.manifest["programs"].as_array().unwrap().iter()
+        .chain(split.manifest["programs"].as_array().unwrap())
+        .map(|entry| (entry["name"].as_str().unwrap().to_owned(), entry.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    std::fs::write(&manifest, serde_json::json!({"programs": programs.into_values().collect::<Vec<_>> ()}).to_string()).unwrap();
     for attention in [Some(AttentionPlacement::Heads), None] {
         let options = PlanOptions { attention_placement: attention,
             placement: plan::ExpertPlacement::Sparks { ranks: 4 },
@@ -1796,13 +1803,10 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
         assert!(!report.executable());
         assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
         assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
-        if attention.is_none() {
-            assert!(report.solver_placement.is_none(), "unselected split precision must not produce a plan");
-            assert!(format!("{report:?}").contains("wire precision not qualified/selected"));
-        } else {
-            let placed = report.solver_placement.as_ref().expect("shared solved placement");
-            assert_eq!(placed.attention_placement, report.attention_placement);
-        }
+        let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("qualified default wire produces a shared solved plan: {report:#?}"));
+        assert_eq!(placed.attention_placement, report.attention_placement);
+        assert_eq!(plan::layout::LayoutOptions::default().minimax_split_wire,
+            Some(crate::families::minimax_m3::execution::WirePrecision::F32));
     }
 }
 
@@ -1958,6 +1962,33 @@ fn split_recipe_precision_roles_and_onboard_route_receives_are_exact() {
                 assert!(!admitted.placement.hops.iter().any(|h| matches!(h.at, HopPoint::Exit | HopPoint::BeforeLayer(_))));
                 assert_eq!(admitted.placement.tp2.is_some(), count > 0);
                 let allocations = &admitted.solved.facts.allocations;
+                let spec = crate::placement::HopSpec { storage: crate::placement::HopStorage::ReceiveSlots,
+                    row_bytes: 6144 * 4, rows: inputs.prefill.rows.max(inputs.sequences), lanes: 1,
+                    entry_gpu: 0, head_gpu: 1, terminal: crate::placement::TerminalHome::Replicated };
+                let hop_layout = crate::placement::HopLinkLayout::new(&admitted.placement.hops, &spec).unwrap();
+                let hop_bytes = crate::placement::hop_buffer_bytes(&admitted.placement.hops, &spec, 2).unwrap();
+                for gpu in 0..2 {
+                    let prefix = format!("minimax.hops.{gpu}");
+                    assert!(!allocations.iter().any(|a| a.id == prefix));
+                    let receives = allocations.iter().filter(|a| a.id.starts_with(&format!("{prefix}.recv."))).collect::<Vec<_>>();
+                    let inbound = admitted.placement.hops.iter().filter(|hop| hop.charged() && hop.to as usize == gpu).count();
+                    assert_eq!(receives.len(), inbound.min(2) * spec.lanes as usize);
+                    assert_eq!(receives.iter().map(|a| a.bytes).sum::<u64>(), hop_bytes[gpu]);
+                    for (slot, &bytes) in hop_layout.receive[gpu].iter().enumerate() {
+                        let id = format!("{prefix}.recv.{slot}");
+                        let owner = receives.iter().find(|a| a.id == id).unwrap();
+                        assert!(owner.view.is_none());
+                        assert_eq!(owner.bytes, bytes);
+                        assert_eq!(owner.location, Location::coordinator(gpu as u8));
+                    }
+                    assert_eq!(allocations.iter().find(|a| a.id == format!("{prefix}.control")).unwrap().bytes,
+                        hop_layout.control_bytes);
+                    let expected_peak = 1 + crate::push_load::COPY_STREAMS as u64 + 1 + 1;
+                    assert!(admitted.solved.facts.allowances.iter().any(|allowance|
+                        allowance.location == Location::coordinator(gpu as u8)
+                            && allowance.source.contains(&format!("{expected_peak} peak live streams"))
+                            && allowance.source.contains("split abort 1")));
+                }
                 assert!(!allocations.iter().any(|a| a.id.starts_with("expert-usage.gpu1.")));
                 let geometry = inputs.expert_usage.as_ref().unwrap();
                 for name in ["counters", "snapshot", "pinned"] {

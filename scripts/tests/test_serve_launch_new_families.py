@@ -62,6 +62,7 @@ def test_minimax_qualification_card_is_one_rtx_three_sparks_and_wip_only(tmp_pat
     serve = _line(result, "serve-minimax --snapshot")
     assert _flag(serve, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(3))
     assert _flag(serve, "--rtx-expert-layers") == "auto"
+    assert _flag(serve, "--split-wire") == "fp32"
     assert _flag(serve, "--host-cache-bytes") == "auto"
     assert "--split-device" not in serve.split()
     refused = _family_launch_result(tmp_path / "release", config, "MiniMaxAI/MiniMax-M3.1-Flash", keys,
