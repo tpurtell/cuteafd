@@ -1,6 +1,8 @@
 //! Inkling biased-sink GQA over shared local rings and global paged records.
 //! Producers supply clipped queries/relative bias and normalized KV; the
 //! caller owns all storage and orders writes before these attention launches.
+#[path = "inkling2_producers.rs"]
+pub mod producers;
 use crate::{programs::{Program, ProgramSpec, Programs, Scalar}, CuteafdDeviceBuffer as Buffer};
 use anyhow::{ensure, Context, Result};
 use std::ffi::c_void;
