@@ -65,7 +65,8 @@ pub fn layout(variant: &str) -> Option<&'static Layout> {
 pub fn reserve(variant: &str) -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
     let (base, tail) = layout(variant).map_or((64 << 20, TAIL_BYTES),
         |layout| (layout.reserve_base_bytes, layout.reserve_extra_bytes));
-    crate::placement::graph_reserve::current(0, false, base, tail)
+    let rank = if variant.ends_with("-layers-rtx2-rank1") { 1 } else { 0 };
+    crate::placement::graph_reserve::current(rank, false, base, tail)
 }
 
 #[cfg(test)]

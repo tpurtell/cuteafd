@@ -30,6 +30,9 @@ pub(crate) struct GoldenArgs {
     pub window: String,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
+    /// Second RTX for contiguous native whole-layer owners.
+    #[arg(long)]
+    pub split_device: Option<i32>,
     #[arg(long)]
     pub save_logits: Option<PathBuf>,
     /// Validate checkpoint headers only (CPU); does not run a golden comparison.
@@ -135,6 +138,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(native)? };
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
+    let peer_device = args.split_device.map(|id| crate::shared::memory::device::Device { library: &library, id });
+    let peer_programs = peer_device.map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest))).transpose()?;
     if let Some(reference) = &args.mtp_golden {
         return engine::mtp::oracle(&args, &library, &programs, &checkpoint, cfg, &directory, reference, &tokens);
     }
@@ -147,8 +152,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         lanes: slots, entries: 1, budget_bytes: 1 << 30, host: false });
     let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
     let mtp_admission = args.packed_mtp.then(|| engine::mtp::Admission::new(&reader, cfg, &programs)).transpose()?;
-    let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
-        args.pool_tokens, mtp_admission.as_ref().map(|a| a.bytes.clone()), slots, marks, args.kv_cache, None, args.verify_check)?;
+    let mut engine = engine::DenseEngine::with_owners(&library, &programs, &checkpoint, cfg.clone(),
+        args.pool_tokens, mtp_admission.as_ref().map(|a| a.bytes.clone()), slots, marks, args.kv_cache, None, args.verify_check,
+        peer_device.zip(peer_programs.as_ref()))?;
     engine.warm_decode_graphs()?;
     if args.verify_check {
         engine.verify_check(&tokens)?;

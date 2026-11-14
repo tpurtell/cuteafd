@@ -587,3 +587,38 @@ fn host_prefix_recipe_uses_the_live_geometry_and_explicit_quota() {
         assert!(ready.owned >= expected);
     }
 }
+
+
+#[test]
+fn native_two_rtx_uses_exact_contiguous_owners_and_one_backing_per_rank() {
+    let (dir, mut options, _, _) = native_planner_fixture();
+    options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30; 2];
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.fits && report.placement_supported, "{:?}", report.hints);
+    assert_eq!(report.attention_placement, crate::placement::AttentionPlacement::Layers);
+    let ledger = report.phase_ledger.as_ref().unwrap();
+    let memory = report.memory_layout.as_ref().unwrap();
+    assert_eq!(memory.devices.len(), 2);
+    let checkpoint = crate::plan::checkpoint::Checkpoint::open(dir.path()).unwrap();
+    let cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+    let target = weight_layout::target_arena(&checkpoint, &cfg, cuteafd_core::DType::F32, weight_layout::DenseFormat::Bf16).unwrap();
+    let backings = memory.devices.iter().flat_map(|device| &device.items)
+        .filter(|item| item.group == "weight arena").collect::<Vec<_>>();
+    assert_eq!(backings.len(), 2);
+    assert!(backings.iter().all(|item| item.bytes > 0));
+    assert!(backings.iter().map(|item| item.bytes).sum::<u64>() >= target.payload_bytes() as u64);
+    let cache = report.cache_requirements.as_ref().unwrap().target_only_layouts.iter()
+        .find(|layout| layout.ranks.len() == 2).unwrap();
+    assert_eq!(cache.placement, crate::serving_capacity::KvPlacement::PartitionedLayers);
+    assert_eq!(cache.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>(),
+        64 * cfg.full_kv_bytes_per_token(crate::families::qwen4::Qwen4KvCache::Bf16) as u64);
+    assert_eq!(cache.ranks.iter().map(|rank| rank.retained_mark_bytes).sum::<u64>(), cfg.recurrent_state_bytes() as u64);
+    assert!(!serde_json::to_string(ledger).unwrap().is_empty());
+    for placement in [crate::placement::AttentionPlacement::Heads, crate::placement::AttentionPlacement::Context] {
+        options.attention_placement = Some(placement);
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(!report.fits);
+        assert!(report.hints.iter().any(|hint| hint.what.contains("unbuilt feature") && hint.how.contains("exports")), "{:?}", report.hints);
+        assert!(report.memory_layout.as_ref().unwrap().devices.is_empty());
+    }
+}

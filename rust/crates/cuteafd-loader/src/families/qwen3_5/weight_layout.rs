@@ -143,8 +143,7 @@ pub fn layer_requests(checkpoint: &Checkpoint, prefix: &str, attention: HybridAt
     }).collect()
 }
 
-/// The dense executor admits one GPU only. Plan its final operands, including
-/// the separate embedding/head owners even when their checkpoint source is tied.
+/// Plan final operands, including separate embedding/head owners even when tied.
 pub fn target_arena(checkpoint: &Checkpoint, cfg: &Qwen35Config, norm_dtype: DType,
     format: DenseFormat) -> Result<WeightArenaLayout> {
     let admitted = crate::placement::families::qwen3_5::NativeWeights::native(checkpoint, cfg, norm_dtype)?;
@@ -162,6 +161,24 @@ pub fn target_arena(checkpoint: &Checkpoint, cfg: &Qwen35Config, norm_dtype: DTy
         ("embedding.table".into(), usize::try_from(admitted.embedding)?),
     ]);
     WeightArenaLayout::new("qwen3_5/target/gpu0", requests)
+}
+
+/// Whole layers retain their native operands; globals live only on rank zero.
+pub fn placed_arenas(target: &WeightArenaLayout, owners: &[u8]) -> Result<[WeightArenaLayout; 2]> {
+    ensure!(!owners.is_empty() && owners.iter().all(|&rank| rank < 2), "invalid dense layer owners");
+    let mut requests = [Vec::new(), Vec::new()];
+    let mut views = target.views().iter().collect::<Vec<_>>();
+    views.sort_by_key(|(_, view)| view.offset());
+    for (name, view) in views {
+        let rank = if let Some(rest) = name.strip_prefix(&format!("{PREFIX}layers.")) {
+            let (index, _) = rest.split_once('/').context("dense layer arena view")?;
+            usize::from(*owners.get(index.parse::<usize>()?).context("dense arena layer owner")?)
+        } else { 0 };
+        requests[rank].push((name.clone(), view.bytes()));
+    }
+    let [first, second] = requests;
+    Ok([WeightArenaLayout::new("qwen3_5/target/gpu0", first)?,
+        WeightArenaLayout::new("qwen3_5/target/gpu1", second)?])
 }
 
 /// Native MTP shares the target's embedding and head, not its weight ownership.
