@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from families.inkling2 import model as f32
 from families.inkling2 import serving_boundary as vendor
+from families.inkling2 import native_boundary as native
 
 
 def main():
@@ -25,7 +26,7 @@ def main():
     parser.add_argument('--tokens', type=Path, required=True)
     parser.add_argument('--last-layer', type=int, default=47)
     parser.add_argument('--prefixes', default='')
-    parser.add_argument('--modes', default='f32,vendor')
+    parser.add_argument('--modes', default='f32,vendor,native')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     if args.snapshot.name != f32.REVISION:
@@ -34,7 +35,7 @@ def main():
     tokens = json.loads(args.tokens.read_bytes())
     modes = args.modes.split(',')
     prefixes = sorted(set([args.last_layer] + [int(x)-1 for x in args.prefixes.split(',') if x]))
-    if (not modes or len(modes)!=len(set(modes)) or any(m not in ('f32','vendor') for m in modes)
+    if (not modes or len(modes)!=len(set(modes)) or any(m not in ('f32','vendor','native') for m in modes)
             or any(not 0<=p<=args.last_layer<cfg.num_hidden_layers for p in prefixes)
             or not 2<=len(tokens)<=4096 or any(type(t) is not int or not 0<=t<cfg.unpadded_vocab_size for t in tokens)):
         parser.error('invalid modes/prefix/tokens')
@@ -64,13 +65,14 @@ def main():
             layer = weights.load_layer(index,cfg)
             for mode in modes:
                 hidden,blocks = states[mode]
-                result = (f32.layer_forward if mode=='f32' else vendor.layer_forward)(hidden,blocks,layer,cfg,index)
+                result = {'f32':f32.layer_forward, 'vendor':vendor.layer_forward,
+                          'native':native.layer_forward}[mode](hidden,blocks,layer,cfg,index)
                 if index%cfg.n_layers_per_attn_res_block==0:
                     blocks.append(hidden)
                 states[mode]=(result,blocks)
                 if index in prefixes:
                     normalized=f32.output_norm(result,blocks,query,norm,cfg)
-                    logits=f32.head_forward(normalized,head,cfg)
+                    logits=f32.head_forward(native.narrow(normalized) if mode=='native' else normalized,head,cfg)
                     nll=F.cross_entropy(logits,torch.tensor(tokens[1:],device='cuda')).item()
                     out=args.out/mode/f'prefix-{index+1}'
                     out.mkdir(parents=True)
@@ -78,7 +80,8 @@ def main():
                     (out/'tokens.bin').write_bytes(b''.join(int(t).to_bytes(4,'little') for t in tokens))
                     (out/'result.json').write_text(json.dumps(dict(partial=vendor.is_partial(index,cfg.num_hidden_layers),
                         last_layer=index,mean_nll=nll,vocab=cfg.unpadded_vocab_size,rows=len(tokens)-1,
-                        mode=mode,oracle='independent #1915' if mode=='f32' else 'pinned vLLM BF16 expert boundaries'),indent=2)+'\n')
+                        mode=mode,oracle={'f32':'independent #1915','vendor':'pinned vLLM BF16 expert boundaries',
+                                          'native':'independent audited native BF16/F32 boundaries'}[mode]),indent=2)+'\n')
                     print(f'Inkling {mode} prefix{index+1} mean NLL={nll:.8f}',flush=True)
                     del normalized,logits
             del layer
