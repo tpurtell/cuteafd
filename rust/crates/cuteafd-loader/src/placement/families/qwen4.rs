@@ -1072,7 +1072,7 @@ impl Recipe for QwenDual<'_> {
             let admitted = qwen_admission(&QwenAdmissionInputs { prefill_shape: None, cfg,
                 layers: a.layers, mtp: a.mtp, kv_format: a.kv_format,
                 manifest: inputs.owner_manifests[gpu].or(a.manifest), prefill_rows: a.prefill_rows,
-                slots: a.slots, mark_bytes: a.mark_bytes, 
+                slots: a.slots, mark_bytes: a.mark_bytes,
                 ple: a.ple, future_expert_bytes: 0, headroom: a.headroom })
                 .map_err(|error| Refusal::InvalidFact(format!("Qwen owner admission: {error}")))?;
             for (index, &(category, group, bytes)) in admitted.items.iter().enumerate() {

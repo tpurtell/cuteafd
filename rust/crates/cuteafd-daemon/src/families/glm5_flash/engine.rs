@@ -1466,8 +1466,6 @@ pub(crate) struct GlmfEngine<'a> {
     /// for the routes and wire rows), the Spark exchanges, and the head (final
     /// norm, vocabulary projection, logits download).
     pub profile: RefCell<[f64; 3]>,
-    /// Permit scoring every prefill row. Native K6 consumes bounded tiles on
-    /// the host; other heads retain full-row device logits.
     /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly), within the graph
     /// budget when one is set.
     graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,

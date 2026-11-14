@@ -75,7 +75,6 @@ pub struct V4Inputs {
     pub requested_pool: Option<u64>,
     /// `RTX_EXPERT_LAYERS` / `--rtx-expert-layers`.
     pub onboard: Onboard,
-    /// Probe-only all-row logits on the lead GPU.
     /// Per GPU, selected-program code still to load by ready
     /// (`CodeAllowance::pending`): the planner's allowance offline, the measured
     /// remainder serve-dsv4 can still attribute. Charged as the named Runtime

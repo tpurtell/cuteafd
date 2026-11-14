@@ -62,7 +62,7 @@ impl Census<'_> {
         Ok(())
     }
     /// Decode owners exist from the startup warm pass; prefill lane owners
-    /// exist from the first prefill, which only scoring runs before Ready.
+    /// exist from the first request prefill in the growth phase.
     fn workspace_lifetime(kind: &str) -> Lifetime {
         Lifetime {
             first: if kind == "prefill" {

@@ -87,7 +87,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         audio: cuteafd_loader::plan::MediaMode::Off, replicas: 1, vision_bytes: (0, 0), audio_bytes: (0, 0) });
     let prepared = shared::ProductionInput { cfg: options.cfg, core: options.core, projections: options.projections,
         catalog: options.catalog,
-        budgets, host: options.host, prefill: options.prefill, 
+        budgets, host: options.host, prefill: options.prefill,
         bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true), slots: options.slots,
         mark_slots: options.mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
@@ -229,7 +229,7 @@ mod tests {
                     gpus, prefill.unit_rows as usize)?,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
-                
+
                 headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
@@ -308,7 +308,7 @@ mod tests {
                     gpus, prefill.unit_rows as usize)?,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
-                
+
                 headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
@@ -354,7 +354,7 @@ mod tests {
                     gpus, prefill.unit_rows as usize)?,
                     measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                         untracked_bytes: arch.context_bytes }; gpus],
-                    
+
                     headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
                     mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                         shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
@@ -431,7 +431,7 @@ mod tests {
                     gpus, prefill.unit_rows as usize)?,
             measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                 untracked_bytes: arch.context_bytes }; gpus],
-            
+
             headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
             mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                 shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),

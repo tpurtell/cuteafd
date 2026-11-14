@@ -593,8 +593,6 @@ pub(crate) struct GlmEngine<'a> {
     /// Its tokio runtime (receives poll on the engine thread).
     pub prefill_runtime: Option<tokio::runtime::Runtime>,
     terminal: Cell<crate::shared::peer_split::TerminalState>,
-    /// Prefill steps keep every row's logits (golden scoring); otherwise the
-    /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
     /// Rows one pipelined prefill call streams through its units (`--prefill-span-rows`).
     pub prefill_span_rows: usize,
     /// Benchmarks: MoE layers skip the Spark exchange (see
@@ -3798,9 +3796,9 @@ mod prefill_unit_tests {
         assert!(head.find("self.launch_head(").unwrap() < head.find("scoring.record(").unwrap());
         assert!(!head.contains("Vec::"));
         let serve = include_str!("serve.rs");
-        assert!(serve.contains("true"));
-        assert!(serve.contains("else { engine.prefill_capacity() }"));
-        assert!(serve.contains("rows > 1"));
+        assert!(serve.contains("probe::validate_scoring(&job.probe, true)"));
+        assert!(serve.contains("let prefill_rows = engine.prefill_capacity();"));
+        assert!(serve.contains("engine.prefill_streamed_scoring("));
     }
 
     #[test]

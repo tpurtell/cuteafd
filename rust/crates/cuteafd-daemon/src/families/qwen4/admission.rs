@@ -762,7 +762,7 @@ mod tests {
                     cfg: &cfg, layers: 4, mtp: false,
                     kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::default(),
                     manifest: None, prefill_rows: rows * waves, prefill_shape: shape,
-                    slots: 8, mark_bytes: 0, 
+                    slots: 8, mark_bytes: 0,
                     ple: mapped_ple.then_some((160, true)), future_expert_bytes: 0, headroom: 0,
                 })?;
                 for (_, name, bytes) in runtime.items.iter().filter(|item| item.1.ends_with("step")) {
@@ -930,7 +930,7 @@ mod tests {
                     owner_manifests: [None; 2],
                     admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false,
                         kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096,
-                        slots: 16, mark_bytes: 0, 
+                        slots: 16, mark_bytes: 0,
                         ple: Some((resident.ple_row_bytes, false)), future_expert_bytes: 0, headroom: 3 << 30 },
                     gpus: [GpuBudget { capacity_bytes: capacity, reserve_bytes: 3 << 30,
                         baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }; 2],
