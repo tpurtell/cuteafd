@@ -214,13 +214,13 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     drop(native);
     crate::shared::memory_report::release_load_staging(library)?;
     publish_provenance(options.native_lib, options.manifest_path, &runtime, &admitted,
-        options.peers.len())?;
+        options.peers.len(), options.sequences)?;
     Ok(Loaded { execution, owners, inputs, admitted,
         admission_free: samples.iter().map(|sample| sample.free).collect(), host_prefix })
 }
 
 fn publish_provenance(native_lib: &Path, manifest: &Path, runtime: &RuntimeInventory,
-    admitted: &AdmittedMiniMax, spark_world: usize) -> Result<()> {
+    admitted: &AdmittedMiniMax, spark_world: usize, sequences: u64) -> Result<()> {
     use sha2::{Digest, Sha256};
     let hash = |path: &Path| -> Result<String> {
         let mut file = std::fs::File::open(path)?;
@@ -235,7 +235,7 @@ fn publish_provenance(native_lib: &Path, manifest: &Path, runtime: &RuntimeInven
             "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
             "native_sha256": hash(native_lib)?, "programs_sha256": hash(manifest)?,
             "layout": format!("1 RTX/{spark_world} Sparks; whole; context/{}; slots/{}",
-                admitted.solved.served_context(), admitted.solved.decisions.prefill.rows),
+                admitted.solved.served_context(), sequences),
             "devices": runtime.gpus, "spark_world": spark_world,
             "onboard_layers": admitted.onboard, "graph_basis": "uncalibrated MiniMax byte fallback"
         }

@@ -199,7 +199,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     }
 
     fn decode(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
-        retain_receipt: bool) -> Result<Option<DeviceLogits>> {
+        retain_receipt: bool, captured: bool) -> Result<Option<DeviceLogits>> {
         let submitted = self.validate(sequences, pool)?;
         let mut placements = submitted.iter().map(|request| request.placement.clone()).collect::<Vec<_>>();
         let requests = placements.iter_mut().zip(&submitted).map(|(placement, request)| ServingRequest {
@@ -208,7 +208,8 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             tokens: &request.tokens, placement }).collect::<Vec<_>>();
         let mut graphs = self.owners.graphs.borrow_mut();
         let graph = graphs.first_mut().context("MiniMax decode graph bank missing")?;
-        let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule, &requests, graph);
+        let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule,
+            &requests, graph, captured);
         let logits = self.completed(result)?;
         graph.tick();
         if graph.needs_boundary() {
@@ -356,16 +357,16 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(!speculative, BackendError::DraftsNotQualified);
-        self.decode(sequences, pool, true)
+        self.decode(sequences, pool, true, true)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(!speculative, BackendError::DraftsNotQualified);
-        if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, pool, true); }
+        if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, pool, true, false); }
         let total: usize = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         ensure!(sequences.len() == 1 && total <= self.geometry().decode_rows,
             "MiniMax diagnostic scoring requires one bounded sequence");
-        if total == 1 { return self.decode(sequences, pool, false); }
+        if total == 1 { return self.decode(sequences, pool, false, false); }
         let start = sequences[0].0.len;
         let mut result = None;
         self.prefill(sequences, &[start..start + total], pool, |_, _, logits| {
