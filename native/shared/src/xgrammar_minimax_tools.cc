@@ -2,6 +2,7 @@
 #include "regex_converter.h"
 #include "xgrammar_regular.h"
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 namespace xgrammar {
@@ -54,6 +55,37 @@ void Validate(const picojson::value& value, const picojson::value& root, size_t 
   if (depth > 64) throw std::invalid_argument("MiniMax schema nesting or reference recursion exceeds 64");
   if (!value.is<picojson::object>()) return;
   const auto& object = value.get<picojson::object>();
+  // The pinned schema IR prioritizes these forms over sibling assertions.
+  // Refuse combinations it would otherwise silently drop; type+enum/const
+  // remains useful for coding tools when every value agrees with that type.
+  for (const auto& primary : {"$ref", "anyOf", "enum", "const"}) {
+    if (!object.count(primary)) continue;
+    for (const auto& entry : object) {
+      const auto& key = entry.first;
+      const bool annotation = key == "title" || key == "description" || key == "default" || key == "examples" ||
+          key == "$defs" || key == "definitions" || key == "$schema" || key == "$id" || key == "$comment" || key == "deprecated";
+      const bool scalar_type = key == "type" && (std::string(primary) == "enum" || std::string(primary) == "const");
+      if (key != primary && !annotation && !scalar_type)
+        throw std::invalid_argument(std::string("MiniMax constrained XML does not support assertion siblings of ") + primary);
+    }
+    auto type = object.find("type");
+    if (type != object.end()) {
+      auto matches = [&](const picojson::value& v) {
+        if (!type->second.is<std::string>()) return false;
+        const auto& kind = type->second.get<std::string>();
+        return (kind == "string" && v.is<std::string>()) || (kind == "boolean" && v.is<bool>()) ||
+            (kind == "number" && v.is<double>()) || (kind == "integer" && v.is<double>() && std::floor(v.get<double>()) == v.get<double>()) ||
+            (kind == "null" && v.is<picojson::null>());
+      };
+      auto values = object.find("enum");
+      if (values != object.end() && values->second.is<picojson::array>()) {
+        for (const auto& v : values->second.get<picojson::array>())
+          if (!matches(v)) throw std::invalid_argument("MiniMax enum value disagrees with sibling type");
+      } else if (auto constant = object.find("const"); constant != object.end() && !matches(constant->second)) {
+        throw std::invalid_argument("MiniMax const value disagrees with sibling type");
+      }
+    }
+  }
   if (auto ref = object.find("$ref"); ref != object.end()) {
     if (!ref->second.is<std::string>() || ref->second.get<std::string>().empty() || ref->second.get<std::string>()[0] != '#')
       throw std::invalid_argument("MiniMax tool schema supports local references only");

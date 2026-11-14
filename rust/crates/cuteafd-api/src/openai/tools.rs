@@ -83,6 +83,20 @@ fn minimax_schema_supported(schema: &Value) -> bool {
     if ["oneOf", "allOf", "patternProperties", "propertyNames", "dependentRequired", "dependentSchemas",
         "if", "then", "else", "not", "contains", "minContains", "maxContains", "uniqueItems", "multipleOf", "unevaluatedProperties"]
         .iter().any(|key| object.contains_key(*key)) { return false; }
+    for primary in ["$ref", "anyOf", "enum", "const"] {
+        if !object.contains_key(primary) { continue; }
+        if object.keys().any(|key| key != primary && !["title", "description", "default", "examples", "$defs", "definitions",
+            "$schema", "$id", "$comment", "deprecated"].contains(&key.as_str())
+            && !(key == "type" && matches!(primary, "enum" | "const"))) { return false; }
+        if let Some(kind) = object.get("type").and_then(Value::as_str) {
+            let matches = |value: &Value| match kind {
+                "string" => value.is_string(), "boolean" => value.is_boolean(), "number" => value.is_number(),
+                "integer" => value.as_f64().is_some_and(|n| n.fract() == 0.0), "null" => value.is_null(), _ => false,
+            };
+            if object.get("enum").and_then(Value::as_array).is_some_and(|values| values.iter().any(|v| !matches(v)))
+                || object.get("const").is_some_and(|v| !matches(v)) { return false; }
+        }
+    }
     if object.get("type").and_then(Value::as_array).is_some_and(|types| types.iter().any(|t| t == "object" || t == "array")) {
         return false;
     }

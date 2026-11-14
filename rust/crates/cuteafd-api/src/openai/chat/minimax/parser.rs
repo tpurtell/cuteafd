@@ -222,13 +222,22 @@ fn accepts_string(schema: &Value, root: &Value, depth: usize) -> bool {
 fn value(node: Node<'_>, schema: &Value, root: &Value, depth: usize) -> Result<Value, &'static str> {
     if depth > 64 { return Err("argument nesting exceeds 64"); }
     let schema = resolve(schema, root, 0);
-    let kind = schema["type"].as_str();
+    let kind = schema["type"].as_str().or_else(|| {
+        if ["properties", "additionalProperties", "unevaluatedProperties"].iter().any(|key| schema.get(*key).is_some()) {
+            Some("object")
+        } else if ["items", "prefixItems", "unevaluatedItems"].iter().any(|key| schema.get(*key).is_some()) {
+            Some("array")
+        } else { None }
+    });
     if kind == Some("array") || (!node.children.is_empty() && node.children.iter().all(|n| n.name == "item") && kind != Some("object")) {
         if node.children.iter().any(|node| node.name != "item") || (node.children.is_empty() && !node.raw.is_empty()) {
             return Err("array must contain item elements");
         }
-        return node.children.into_iter().map(|node| value(node, &schema["items"], root, depth + 1))
-            .collect::<Result<Vec<_>, _>>().map(Value::Array);
+        return node.children.into_iter().enumerate().map(|(index, node)| {
+            let item = schema.get("prefixItems").and_then(Value::as_array).and_then(|items| items.get(index))
+                .unwrap_or(&schema["items"]);
+            value(node, item, root, depth + 1)
+        }).collect::<Result<Vec<_>, _>>().map(Value::Array);
     }
     if kind == Some("object") || !node.children.is_empty() {
         if node.children.is_empty() && !node.raw.is_empty() { return Err("object must contain elements"); }

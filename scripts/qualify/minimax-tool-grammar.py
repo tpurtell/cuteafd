@@ -82,6 +82,8 @@ def main():
     case("array-of-arrays", obj({"rows": {"type": "array", "items": {"type": "array", "items": {"type": "boolean"}}}}),
          {"rows": [[True], [False, True]]})
     case("empty-containers", obj({"a": {"type": "array", "items": {"type": "integer"}}, "o": obj({})}), {"a": [], "o": {}})
+    case("tuple-prefix-items", obj({"v": {"type": "array", "prefixItems": [{"type": "integer"}, {"type": "boolean"}], "items": {"type": "string"}}}), {"v": [1, True, "002"]})
+    case("inferred-empty-containers", obj({"o": {"properties": {}}, "a": {"items": {"type": "integer"}}}), {"o": {}, "a": []})
     case("same-name-recursion", obj({"x": obj({"x": {"type": "string"}})}), {"x": {"x": "yes"}})
     case("enum-string", obj({"mode": {"enum": ["yes", "no"]}}), {"mode": "yes"}, [f"{NS}<mode>other{NS}</mode>"])
     case("enum-number", obj({"mode": {"enum": [1, 2]}}), {"mode": 2}, [f"{NS}<mode>3{NS}</mode>"])
@@ -147,6 +149,9 @@ def main():
                 invoke("grammar_destroy", grammar, error=False)
             print("PASS", name, flush=True)
         for name, schema in [
+            ("enum-pattern-sibling", obj({"mode": {"type": "string", "enum": ["yes", "no"], "pattern": "^yes$"}})),
+            ("enum-type-mismatch", obj({"mode": {"type": "integer", "enum": ["001"]}})),
+            ("anyof-type-sibling", obj({"mode": {"type": "string", "anyOf": [{"type": "integer"}, {"type": "boolean"}]}})),
             ("required-null", obj({"nil": {"type": "null"}})),
             ("required-undeclared", {"type": "object", "required": ["missing"], "additionalProperties": True}),
             ("additional-minimum", {"type": "object", "minProperties": 1, "additionalProperties": True}),

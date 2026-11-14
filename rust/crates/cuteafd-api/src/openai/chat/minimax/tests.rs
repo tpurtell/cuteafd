@@ -170,6 +170,37 @@ fn coding_agent_optional_nullable_schema_is_constrained_and_oneof_falls_back() {
 }
 
 #[test]
+fn tuple_and_inferred_container_types_round_trip_without_stringification() {
+    let n = NAMESPACE;
+    let tool = ToolDefinition { name:"lookup".into(), description:None, strict:None,
+        parameters:json!({"type":"object", "properties":{
+            "v":{"type":"array", "prefixItems":[{"type":"integer"},{"type":"boolean"}],"items":{"type":"string"}},
+            "o":{"properties":{}}, "a":{"items":{"type":"integer"}}}}) };
+    let wire = format!("{CALL_OPEN}{n}<invoke name=\"lookup\">{n}<v>{n}<item>1{n}</item>{n}<item>true{n}</item>{n}<item>002{n}</item>{n}</v>{n}<o>{n}</o>{n}<a>{n}</a>{n}</invoke>{CALL_CLOSE}");
+    for split in wire.char_indices().map(|(i, _)| i).chain([wire.len()]) {
+        let mut parser = MiniMaxOutputParser::new(MiniMaxParserOptions { tools:Some(vec![tool.clone()]),stop_sequences:vec![] });
+        let mut chunks = parser.push(&wire[..split]);
+        chunks.extend(parser.push(&wire[split..]));
+        chunks.extend(parser.finish());
+        assert_eq!(parser.tool_calls(), 1);
+        let call = chunks.into_iter().find_map(|chunk| match chunk {
+            OutputChunk::ToolCall {arguments,..} => Some(serde_json::from_str::<Value>(&arguments).unwrap()), _ => None,
+        }).unwrap();
+        assert_eq!(call, json!({"v":[1,true,"002"],"o":{},"a":[]}));
+    }
+}
+
+#[test]
+fn optional_assistance_falls_back_for_unsupported_assertion_siblings() {
+    use crate::openai::tools::{ToolConstraints,ToolSyntax};
+    use deepseek_recipe_core::tools::ToolChoice;
+    let mut tool = lookup();
+    tool.parameters = json!({"type":"object","properties":{"mode":{"type":"string","enum":["yes","no"],"pattern":"^yes$"}}});
+    assert!(ToolConstraints::new(&[tool], ToolChoice::Auto,false,true,true,ToolSyntax::MiniMaxXml)
+        .unwrap().unwrap().format.is_none());
+}
+
+#[test]
 fn malformed_partial_and_unknown_calls_return_as_text_not_tools() {
     let n = NAMESPACE;
     for wire in [format!("{CALL_OPEN}{n}<invoke name=\"lookup\">{n}<key>cut"),
