@@ -4311,7 +4311,8 @@ mod prefill_unit_tests {
         let attention = hooks.split_once("    fn attention(").unwrap().1.split_once("    fn local_ffn(").unwrap().0;
         assert!(attention.find("self.select(").unwrap() < attention.find("self.enter(").unwrap());
         // Dev all-Spark: one begin/end per unit, attention/send/land per layer.
-        let units = sequence_units(8192, 2752, 1, 48).unwrap();
+        let mut units = sequence_units(8192, 2752, 1, 48).unwrap();
+        for unit in &mut units { unit.slot = unit.index % 3; }
         let schedule = prefill_schedule(&vec![FfnRoute::Spark; 48], &units, 3).unwrap();
         let uploads = schedule.iter().filter(|step| matches!(step,
             Step::Begin { .. } | Step::Attention { .. } | Step::Send { .. } | Step::Land { .. } | Step::End { .. })).count();
