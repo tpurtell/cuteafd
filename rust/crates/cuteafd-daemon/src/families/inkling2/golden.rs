@@ -112,7 +112,11 @@ fn run(args: GoldenArgs) -> Result<()> {
             cuteafd_loader::placement::planner::Lifetime::RESIDENT,
             cuteafd_core::memory_layout::Category::Weights, "cold native weights");
         weights.inventory(&mut inventory, "target")?;
-        experts.inventory(&mut inventory, "experts")?;
+        let mut expert_inventory = crate::shared::memory::receipts::Inventory::new(devices, "inkling2",
+            cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Experts, "cold native experts");
+        experts.inventory(&mut expert_inventory, "experts")?;
+        inventory.receipts.extend(expert_inventory.receipts);
         let mut working = crate::shared::memory::receipts::Inventory::new(devices, "inkling2",
             cuteafd_loader::placement::planner::Lifetime::TARGET,
             cuteafd_core::memory_layout::Category::Workspace, "cold native workspaces");

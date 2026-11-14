@@ -76,7 +76,7 @@ impl<'a> Mxfp8<'a> {
             linear_beta: Some(cfg.up_softcap as f32) }, cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16)?;
         let scratch_bytes = metadata.scratch_for(rows)?;
         let device: Device<'a> = stream.device;
-        let arena = DeviceWeightArena::new(device, layout.arena.clone(), ArenaTag::weights("inkling2/experts"))?;
+        let arena = DeviceWeightArena::new(device, layout.arena.clone(), ArenaTag::experts("inkling2/experts"))?;
         let dense = DenseLoad::mount(device.library);
         dense.admit_mount(layout.mount)?;
         let mut planes = Vec::new();

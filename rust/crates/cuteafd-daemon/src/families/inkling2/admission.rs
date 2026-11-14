@@ -15,7 +15,7 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
     contract.components.extend(weight_arena_components(&execution_arena(target)?, Location::coordinator(0),
         Lifetime::RESIDENT, 1, MemoryKind::Weights)?);
     contract.components.extend(weight_arena_components(&expert.arena, Location::coordinator(0),
-        Lifetime::RESIDENT, 1, MemoryKind::Weights)?);
+        Lifetime::RESIDENT, 1, MemoryKind::Experts)?);
     let mut buffers = unit.buffers.iter().map(|(name, bytes)| (format!("unit.{name}"), Location::coordinator(0),
         *bytes as u64, Lifetime::TARGET, Category::Workspace)).collect::<Vec<_>>();
     for (name, bytes) in [("head.tokens", head_rows*4), ("head.normalized", head_rows*cfg.hidden*2),
