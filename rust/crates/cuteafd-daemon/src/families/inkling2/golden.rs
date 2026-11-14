@@ -165,6 +165,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     } else { serde_json::Value::Null };
     std::fs::create_dir(&args.save_logits)?;
     std::fs::write(args.save_logits.join("logits.bin"), bytes)?;
+    std::fs::write(args.save_logits.join("tokens.bin"), tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
     let report = serde_json::json!({"family":"inkling2","native":true,"partial":args.last_layer+1 != cfg.layers,
         "last_layer":args.last_layer,"rows":rows,"vocab":cfg.unpadded_vocab_size,"mean_nll":nll,
         "reference_comparison":comparison});
