@@ -394,7 +394,7 @@ fn absolute(run: &Run) -> bool {
 /// state's storage) and target-head (the target LM head's GEMM) change numerics only.
 /// CUTEAFD_SPARK_PREFILL_REPLY_FORMAT selects the Spark expert reply's wire encoding.
 /// `fp8-prefill` changes activation precision over already-resident FP8 weights.
-const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-fp8", "fp8-prefill",
+const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-fp8", "fp8-prefill", "CUTEAFD_FP8_PREFILL",
     "fp8-decode", "mtp-fp8-head", "kv-cache", "kv-format", "expert-input", "kda-state", "target-head",
     "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT", "CUTEAFD_SPARK_DECODE_REPLY_FORMAT",
     "spark-prefill-reply-format", "spark-decode-reply-format",
