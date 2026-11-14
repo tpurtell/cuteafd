@@ -37,13 +37,19 @@ impl<'a> Kernels<'a> {
         ops.push(Op::Router);
         let mut producers = BTreeMap::new();
         for op in ops { producers.insert(op.name()?, Producer::load(programs, op)?); }
+        let quant = programs.program("inkling2_expert_input_quant", &["source_ptr", "values_ptr", "scale_rows_ptr", "scale_mma_ptr"])?;
+        let spec = quant.spec();
+        ensure!(spec.capacity_rows == 4096 && spec.scalar_kinds == b"ii" && spec.scratch.is_empty()
+            && spec.geometry["hidden"] == 4608 && spec.geometry["row_bytes"] == 4752
+            && spec.geometry["amax_floor"] == 0.0 && spec.geometry["expected_m"] == 80,
+            "Inkling wire quantizer ABI/geometry/floor differs");
         Ok(Self { projections: DraftProjections::load_with_output(programs, &[
             (4608, 6144), (4608, 768), (4608, 1024), (4608, 48), (4608, 32),
             (4608, 384), (6144, 4608), (64, 1024)], 4096, ProjectionOutput::F32)?,
             local: Attention::load(programs, Kind::Local, Route::Prefill)?,
             global: Attention::load(programs, Kind::Global, Route::Prefill)?,
             add: programs.library().f32_add()?, narrow: programs.library().f32_bf16_narrow()?,
-            quant: programs.program("inkling2_expert_input_quant", &["source_ptr", "values_ptr", "scale_rows_ptr", "scale_mma_ptr"])?,
+            quant,
             sms: programs.library().sm_count()? as usize, producers })
     }
     fn producer(&self, op: Op) -> Result<&Producer<'a>> {
