@@ -11,6 +11,14 @@ use cuteafd_loader::{families::minimax_m3::weight_layout::CoordinatorWeights,
         planner::{Component, ComponentKind, CoordinatorDevices, Facts, Lifetime, Location, Recipe}}};
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
+fn paired_prewarm(work: impl FnOnce() -> Result<()>, cancel: impl FnOnce() -> Result<()>) -> Result<()> {
+    let result = work();
+    if result.is_err() {
+        crate::shared::decode_graph::fatal_drain(cancel(), "MiniMax split prewarm cancellation");
+    }
+    result
+}
+
 pub(crate) struct LoadedRank<'a> {
     pub weights: TargetWeights<'a>,
     pub streams: RequestStreams<'a>,
@@ -297,23 +305,27 @@ impl Owners<'_> {
                 // Both eager initialization and capture/replay must complete a
                 // whole paired exchange; never drain a rank before its peer sends.
                 for _ in 0..2 {
-                    let rank = &self.storage.ranks[0];
-                    if cfg.moe[layer] {
-                        // SAFETY: fixed-row private scratch and retained weights.
-                        unsafe { banks[0].run(graphs::Key { rank: 0, layer, rows, op: Op::Router }, None,
-                            || rank.decode.borrow().router_enqueue(&rank.kernels, &rank.weights, layer, rows))?; }
-                    }
-                    split.decode_stage(&self.storage, &mut banks, layer, rows, cfg.moe[layer], true)?;
-                    split.decode_meet(&self.storage, &mut banks, layer, rows, cfg.moe[layer], true)?;
-                    for rank in &self.storage.ranks { rank.decode.borrow().stream.drain()?; }
-                    // SAFETY: both retained compute streams drained; graph pins
-                    // remain live during this joined two-device observation.
-                    unsafe { crate::shared::decode_graph::device::observe_completed(
-                        self.storage.ranks[0].decode.borrow().stream.device.library, |visit| {
-                            for bank in banks.iter_mut() { bank.visit(visit)?; }
-                            Ok(())
-                        })?; }
-                    for bank in banks.iter_mut() { bank.observed(); }
+                    let submitted = paired_prewarm(|| {
+                        let rank = &self.storage.ranks[0];
+                        if cfg.moe[layer] {
+                            // SAFETY: fixed-row private scratch and retained weights.
+                            unsafe { banks[0].run(graphs::Key { rank: 0, layer, rows, op: Op::Router }, None,
+                                || rank.decode.borrow().router_enqueue(&rank.kernels, &rank.weights, layer, rows))?; }
+                        }
+                        split.decode_stage(&self.storage, &mut banks, layer, rows, cfg.moe[layer], true)?;
+                        split.decode_meet(&self.storage, &mut banks, layer, rows, cfg.moe[layer], true)?;
+                        for rank in &self.storage.ranks { rank.decode.borrow().stream.drain()?; }
+                        // SAFETY: both retained compute streams drained; graph pins
+                        // remain live during this joined two-device observation.
+                        unsafe { crate::shared::decode_graph::device::observe_completed(
+                            self.storage.ranks[0].decode.borrow().stream.device.library, |visit| {
+                                for bank in banks.iter_mut() { bank.visit(visit)?; }
+                                Ok(())
+                            })?; }
+                        for bank in banks.iter_mut() { bank.observed(); }
+                        Ok(())
+                    }, || split.cancel());
+                    submitted?;
                 }
             }
         }
@@ -467,6 +479,35 @@ pub(super) mod tests {
         placement::{families::minimax_m3::{self as canonical, ExpertBacking, LocalPackage, SparkCharge},
             planner::{serving, Context as ModelContext, Operation, PrefillShape}}, plan::{Checkpoint, testing}};
     use serde_json::{json, Value};
+
+    #[test]
+    fn split_prewarm_error_cancels_before_retirement_and_preserves_first_error() -> Result<()> {
+        use std::cell::RefCell;
+        for failed_at in ["router", "partial0", "partial1", "fold0", "fold1", "observe"] {
+            let events = RefCell::new(Vec::new());
+            let result = paired_prewarm(|| {
+                for stage in ["router", "partial0", "partial1", "fold0", "fold1", "observe"] {
+                    events.borrow_mut().push(stage);
+                    ensure!(stage != failed_at, "first submission error");
+                }
+                Ok(())
+            }, || {
+                events.borrow_mut().extend(["abort0", "abort1", "drain0", "drain1"]);
+                Ok(())
+            });
+            assert_eq!(result.unwrap_err().to_string(), "first submission error");
+            events.borrow_mut().push("retire");
+            let events = events.borrow();
+            assert_eq!(&events[events.len() - 5..], ["abort0", "abort1", "drain0", "drain1", "retire"]);
+        }
+        paired_prewarm(|| Ok(()), || panic!("successful prewarm cancelled"))?;
+        let source = include_str!("owners.rs");
+        let prewarm = source.split_once("    fn prewarm_split(").unwrap().1
+            .split_once("    pub fn reconcile_selector(").unwrap().0;
+        assert!(prewarm.contains("paired_prewarm(||"));
+        assert!(prewarm.contains("}, || split.cancel())"));
+        Ok(())
+    }
 
     #[test]
     fn selector_receipts_are_exact_and_missing_sampler_is_not_accepted() -> Result<()> {

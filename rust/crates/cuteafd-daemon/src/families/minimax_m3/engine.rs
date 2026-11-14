@@ -234,7 +234,7 @@ impl<'a> SplitExecution<'a> {
         match first_error { Some(error) => Err(error), None => Ok(()) }
     }
 
-    fn cancel(&self) -> Result<()> {
+    pub(crate) fn cancel(&self) -> Result<()> {
         let aborted = self.publish_abort();
         let drained = drain_split_pair(|gpu| self.compute_streams[gpu].drain());
         aborted.and(drained)
