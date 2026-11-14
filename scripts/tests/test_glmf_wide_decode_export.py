@@ -51,7 +51,8 @@ def exporter(monkeypatch):
         def record_bytes(self):
             return 656 if self.kv_cache == "fp8" else 1152
     package.kimi_dsa.KimiDsaGeometry = lambda: types.SimpleNamespace(index_heads=32, index_head_dim=128,
-        index_topk=2048, index_norm_eps=1e-5, hidden=7168, q_lora_rank=1536, page_rows=64)
+        index_topk=2048, index_norm_eps=1e-5, hidden=7168, q_lora_rank=1536, page_rows=64,
+        sparse_mla_row_chunk_size=64)
     package.kimi_mla.KimiMlaGeometry = lambda **kw: KimiGeometry(**kw)
     package.kimi_mla.kimi_context_heads_per_tile = lambda *, rows: 8 if rows < 4 else 16
     @dataclasses.dataclass(frozen=True)
@@ -701,12 +702,14 @@ def test_kimi_k31_exports_native_dsa_without_changing_k3_or_enabling_a_drafter(e
                     module, function, args, kwargs = catalog[stem][2]()
                     assert args[0].norm_eps == 1e-5
                     assert (args[0].heads, args[0].kv_cache, kwargs["max_rows"]) == (heads, cache, rows)
+                    if stem.startswith("sparse_mla"):
+                        assert kwargs["row_chunk_size"] == 64
                 if heads == 96:
                     for begin in (0, 48):
                         module, function, args, kwargs = catalog[f"sparse_mla_partial{cache_suffix}_h{begin}_m{rows}"][2]()
                         assert (module, function) == ("kimi_dsa", "compile_kimi_sparse_mla_partial_aot")
                         assert args[0].norm_eps == 1e-5
-                        assert kwargs == {"max_rows": rows, "head_begin": begin}
+                        assert kwargs == {"max_rows": rows, "head_begin": begin, "row_chunk_size": 64}
     for stem, op, params, build in exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576):
         if op == "mla_producer":
             assert "norm_eps" not in vars(build()[2][0])
