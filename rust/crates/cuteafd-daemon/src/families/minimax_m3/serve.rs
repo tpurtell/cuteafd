@@ -70,7 +70,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     });
     cuteafd_bench::context::ResolvedSettings::default().value("max-sequences", args.max_sequences)
         .value("prefill-packing", format!("{:?}", args.prefill_packing).to_lowercase())
-        .value("draft-mode", "no speculation").value("expert-usage", args.expert_usage).publish();
+        .value("draft-mode", if args.dspark { "adaptive" } else { "no speculation" })
+        .value("dspark",args.dspark).value("expert-usage", args.expert_usage).publish();
     args.prefix.resolve_entries(usize::from(args.max_sequences));
     let prefill = args.prefill()?;
     let api = args.api.load()?;
