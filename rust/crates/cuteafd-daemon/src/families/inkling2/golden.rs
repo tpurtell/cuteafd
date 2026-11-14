@@ -40,7 +40,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let view = args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
     ensure!(view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Original, "Inkling stage2 golden currently qualifies original BF16 core only");
-    let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
+    let checkpoint = Checkpoint::coordinator_view(&view, true, false)?;
     let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
     ensure!(args.last_layer < cfg.layers, "Inkling --last-layer outside checkpoint");
     let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(&args.tokens)?)?;
