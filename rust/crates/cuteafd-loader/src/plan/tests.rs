@@ -734,7 +734,10 @@ fn check_concurrency_plan_cell(
             "{label} C{c} GPUs={gpus} Sparks={ranks}: missing cache requirements: {}", render(&report)));
         assert_eq!(u64::from(cache.concurrency), c);
         assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
-        let status = family::registry().iter().find(|entry| entry.id() == family).unwrap().runtime();
+        let descriptor = family::registry().iter().find(|entry| entry.id() == family).unwrap().runtime();
+        let status = if family == "minimax_m3" && gpus == 1 && report.native_serving_admitted {
+            family::RuntimeStatus::Serving
+        } else { descriptor };
         assert_eq!(report.runtime, Some(status));
         if status == family::RuntimeStatus::Planned && !report.native_serving_admitted {
             assert!(!report.fits && !report.placement_supported && !report.wip_launchable(),
@@ -760,8 +763,15 @@ fn check_concurrency_plan_cell(
 fn release_matrix_excludes_planned_families() {
     let matrix: Value = serde_json::from_str(include_str!("../../../../../benchmarks/current-matrix.json")).unwrap();
     for entry in family::registry().iter().filter(|entry| entry.runtime() == family::RuntimeStatus::Planned) {
-        assert!(matrix["cells"].as_array().unwrap().iter().all(|cell| cell["family"] != entry.id()),
-            "Planned family {} must not have a release card", entry.id());
+        for cell in matrix["cells"].as_array().unwrap().iter().filter(|cell| cell["family"] == entry.id()) {
+            // MiniMax qualifies its admitted one-RTX report, not every layout
+            // described by the still-Planned family descriptor (#1856).
+            assert_eq!(entry.id(), "minimax_m3", "unqualified family has a release card");
+            for column in ["5090", "2rtx"] {
+                assert_ne!(cell[column]["status"], "current",
+                    "unqualified MiniMax {column} must not have a current card");
+            }
+        }
     }
 }
 
