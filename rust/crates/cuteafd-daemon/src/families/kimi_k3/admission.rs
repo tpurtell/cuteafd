@@ -668,13 +668,14 @@ impl<'a> Admission<'a> {
         ensure!(rank < self.devices.len() && device == self.devices[rank], "Kimi MLA allocation differs from admitted device");
         ensure!(!self.mla_allocated[rank], "Kimi MLA bank already allocated");
         let layout = &self.mla_layouts[rank];
-        let charges = self.placement.items[rank].iter().filter(|item|
-            matches!(item.group.as_str(), "records" | "index records")).collect::<Vec<_>>();
-        ensure!(if layout.bytes() == 0 { charges.is_empty() } else {
-            charges.len() == if self.cfg.dsa.is_some() { 2 } else { 1 }
-                && charges.iter().all(|charge| charge.category == Category::Kv && charge.basis == Basis::Exact)
-                && charges.iter().map(|charge| charge.bytes).sum::<u64>() == layout.reserved_bytes()
-        }, "Kimi MLA allocation differs from accepted record charge");
+        for (group, expected) in [("records", layout.mla_reserved_bytes()),
+            ("index records", layout.index_reserved_bytes())] {
+            let charges = self.placement.items[rank].iter().filter(|item| item.group == group).collect::<Vec<_>>();
+            ensure!(if expected == 0 { charges.is_empty() } else {
+                charges.len() == 1 && charges[0].category == Category::Kv
+                    && charges[0].basis == Basis::Exact && charges[0].bytes == expected
+            }, "Kimi MLA allocation differs from accepted {group} charge");
+        }
         Ok(layout)
     }
 
@@ -2969,5 +2970,203 @@ pub(super) mod tests {
         i.requested_pool = Some(2 << 20);
         i.gpus[1].baseline = Baseline::Measured { free_bytes: 2 << 30 };
         assert!(admit(i).is_err());
+    }
+
+    #[test]
+    fn k31_mla_and_index_cache_owners_reconcile_without_cross_cancellation() -> Result<()> {
+        use cuteafd_loader::{
+            families::kimi_k3::allocation::{CONTEXT_MEASURED, DsaScratch, NativeScratch},
+            placement::{inventory::{loaded_code_allowance, PRO_TOTAL_BYTES}, ArchContext, ProgramSet},
+            serving_capacity::kimi_prewarm::KimiCoreFormat,
+        };
+
+        let mut raw = cuteafd_loader::plan::testing::kimi_k3_config();
+        raw["model_type"] = serde_json::json!("kimi_k31");
+        raw["architectures"] = serde_json::json!(["KimiK31ForConditionalGeneration"]);
+        raw["text_config"]["dsa_config"] = serde_json::json!({
+            "dsa_layers": raw["text_config"]["linear_attn_config"]["full_attn_layers"],
+            "index_num_heads": 32, "index_head_dim": 128, "index_topk": 2048,
+            "index_rope_dim": 0, "index_k_norm_type": "layernorm",
+            "index_topk_freq": 1, "index_skip_topk_offset": 1,
+        });
+        let full = KimiK3Config::from_hf(&raw)?;
+        assert_eq!(full.mla_layers(), 24);
+
+        // No literal scratch fallback: missing installed PROGRAMS.json fails the test,
+        // matching scripts/dev/cpu-gate's live-planner rule.
+        let manifest_path = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
+        ensure!(manifest_path.is_file(), "required installed PROGRAMS.json missing: {}", manifest_path.display());
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let scratch = NativeScratch::from_manifest_for_config(&manifest, &full, 1)?;
+        let dsa_scratch = DsaScratch::from_manifest(&manifest)?;
+        let mut lane = LaneLayout::for_ranks(&full, 4096, 4096, 1_048_576, scratch, 1)?;
+        *lane = (*lane).clone().with_dsa(&full, dsa_scratch)?;
+
+        let arch = ArchContext::for_device("sm_120", PRO_TOTAL_BYTES);
+        let selected = ProgramSet::from_manifest(&manifest, &["kimik3", "kimik31"]);
+        let code_allowance = loaded_code_allowance("kimik3", "exl3", false, 0, arch, Some(&selected));
+
+        let try_prefix = |last_layer: usize, free_bytes: u64, graphs: bool, verify_rows: usize| -> Result<Admission> {
+            let truncated = prefix(&full, last_layer + 1)?;
+            let untracked = PRO_TOTAL_BYTES.saturating_sub(free_bytes);
+            let pending = code_allowance.pending(untracked, arch.context_bytes);
+            let reserve_demands = if graphs {
+                cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(KimiCoreFormat::Bf16, 1)?
+            } else {
+                vec![]
+            };
+            admit(Inputs::<1> {
+                skip_routed_experts: true,
+                expert_usage: false,
+                cfg: &truncated,
+                core: Default::default(),
+                resident_weight_limit: ResidentWeights::DEFAULT_LIMIT,
+                cache_format: cuteafd_core::MlaCacheFormat::Fp8,
+                gpus: [GpuBudget {
+                    capacity_bytes: PRO_TOTAL_BYTES,
+                    reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
+                    baseline: Baseline::Measured { free_bytes },
+                }],
+                devices: [0],
+                peer_access: false,
+                spark_ranks: 0,
+                attention: None,
+                context: None,
+                serving_context: cuteafd_loader::placement::planner::Context::pinned(1_048_576),
+                requested_pool: Some(1_048_576),
+                state_slots: 1,
+                prefix_marks: 1,
+                rows: 4096,
+                lanes: 1,
+                waves: 1,
+                unit_rows: Some(4096),
+                lane_layouts: vec![[lane.clone()]],
+                fixed: vec![cuteafd_loader::families::kimi_k3::allocation::code_demand(0, pending, 1)?],
+                startup: reserve_demands,
+                pool_bounded: vec![],
+                rtx: None,
+                spark_budget: None,
+                draft: None,
+                verify_rows,
+                prefix: None,
+            })
+        };
+
+        let dsa_layers: Vec<usize> = full.attention.iter().enumerate()
+            .filter_map(|(layer, kind)| (*kind == KimiAttention::Mla).then_some(layer))
+            .collect();
+        // 1. Host-independent bound from ARCH_CONTEXTS[1] (PRO_TOTAL_BYTES, cold context + manifest code allowance).
+        let cold_free = PRO_TOTAL_BYTES - arch.context_bytes;
+        assert_eq!(code_allowance.pending(arch.context_bytes, arch.context_bytes), code_allowance.bytes);
+        for (graphs, verify_rows) in [(false, 0), (true, 0), (true, 5)] {
+            let best = dsa_layers.iter().copied()
+                .filter(|&layer| try_prefix(layer, cold_free, graphs, verify_rows).is_ok())
+                .max()
+                .context("at least one DSA prefix must admit on 1x RTX PRO 6000")?;
+            assert_eq!(best, 59,
+                "installed K3.1 sparse-MLA + DSA scratch bounds 1x RTX PRO 6000 DSA prefix at last_layer=59 (graphs={graphs}, verify_rows={verify_rows})");
+        }
+
+        // 2. Recorded PreWeight CUDA driver samples on rtx0 (516ae8fa8 hardware runs 1 & 2):
+        //    - decode_eager / decode / verify (and run 1): free_bytes = 101,294,800,896 (untracked = 678,690,816 = 10,356 * 64 KiB)
+        //    - prefill (run 2): free_bytes = 101,294,735,360 (untracked = 678,756,352 = 10,357 * 64 KiB, +1 * 65,536 B CUDA driver slab)
+        //    Both samples follow NativePrograms PreWeight module loading (85,983,232 B > 56,623,104 B allowance),
+        //    so pending_code evaluates to 0 without any hardcoded zero override.
+        const FREE_DECODE_EAGER: u64 = 101_294_800_896;
+        const FREE_PREFILL: u64 = 101_294_735_360;
+        assert_eq!(code_allowance.pending(PRO_TOTAL_BYTES - FREE_DECODE_EAGER, arch.context_bytes), 0);
+        assert_eq!(code_allowance.pending(PRO_TOTAL_BYTES - FREE_PREFILL, arch.context_bytes), 0);
+
+        for (free, graphs, verify_rows) in [
+            (FREE_PREFILL, false, 0),
+            (FREE_DECODE_EAGER, false, 0),
+            (FREE_DECODE_EAGER, true, 0),
+            (FREE_DECODE_EAGER, true, 5),
+        ] {
+            let best = dsa_layers.iter().copied()
+                .filter(|&layer| try_prefix(layer, free, graphs, verify_rows).is_ok())
+                .max()
+                .context("at least one DSA prefix must admit on recorded rtx0 sample")?;
+            assert_eq!(best, 59);
+        }
+        assert!(try_prefix(60, FREE_DECODE_EAGER, true, 0).is_err());
+
+        let refusal_63_eager = format!("{:#}",
+            try_prefix(63, FREE_DECODE_EAGER, false, 0).err().context("last_layer=63 eager must refuse")?);
+        let refusal_63_decode = format!("{:#}",
+            try_prefix(63, FREE_DECODE_EAGER, true, 0).err().context("last_layer=63 decode graphs must refuse")?);
+        let refusal_63_verify = format!("{:#}",
+            try_prefix(63, FREE_DECODE_EAGER, true, 5).err().context("last_layer=63 verify graphs must refuse")?);
+        assert!(refusal_63_eager.contains("105269952524"), "unexpected 63 eager refusal: {refusal_63_eager}");
+        assert!(refusal_63_decode.contains("106302629132"), "unexpected 63 decode refusal: {refusal_63_decode}");
+        assert!(refusal_63_verify.contains("106302629132"), "unexpected 63 verify refusal: {refusal_63_verify}");
+
+        let admitted_prefill = try_prefix(59, FREE_PREFILL, false, 0)?;
+        let admitted_decode_eager = try_prefix(59, FREE_DECODE_EAGER, false, 0)?;
+        let admitted_decode = try_prefix(59, FREE_DECODE_EAGER, true, 0)?;
+        let mut admitted_verify = try_prefix(59, FREE_DECODE_EAGER, true, 5)?;
+
+        let context_group = cuteafd_loader::placement::sampled_baseline::source(CONTEXT_MEASURED);
+        let total_bytes = |adm: &Admission| -> u64 { adm.placement.items[0].iter().map(|item| item.bytes).sum() };
+        let context_item = |adm: &Admission| -> Result<u64> {
+            Ok(adm.placement.items[0].iter()
+                .find(|item| item.category == Category::Runtime && item.group == context_group)
+                .context("missing sampled_baseline(CONTEXT_MEASURED) runtime owner")?.bytes)
+        };
+        let owned_non_context = |adm: &Admission| -> Vec<(Category, String, u64)> {
+            adm.placement.items[0].iter()
+                .filter(|item| !(item.category == Category::Runtime && item.group == context_group))
+                .map(|item| (item.category, item.group.clone(), item.bytes))
+                .collect()
+        };
+
+        assert_eq!(total_bytes(&admitted_decode_eager), 99_699_916_812);
+        assert_eq!(total_bytes(&admitted_prefill), 99_699_982_348);
+        assert_eq!(total_bytes(&admitted_decode), 100_732_593_420);
+        assert_eq!(total_bytes(&admitted_verify), 100_732_593_420);
+
+        // The 65,536 B (64 KiB) difference between prefill (99,699,982,348) and decode_eager
+        // (99,699,916,812) is owned 100% by CONTEXT_MEASURED ("CUDA context and loaded modules"),
+        // reflecting one 64 KiB CUDA driver page-table/context slab in PreWeight cuMemGetInfo_v2;
+        // every weight, KV, workspace and 2 MiB CUmem granularity item is byte-identical.
+        assert_eq!(context_item(&admitted_prefill)?, 678_756_352);
+        assert_eq!(context_item(&admitted_decode_eager)?, 678_690_816);
+        assert_eq!(context_item(&admitted_prefill)? - context_item(&admitted_decode_eager)?, 65_536);
+        assert_eq!(total_bytes(&admitted_prefill) - total_bytes(&admitted_decode_eager), 65_536);
+        assert_eq!(owned_non_context(&admitted_prefill), owned_non_context(&admitted_decode_eager));
+
+        let weights_bytes: u64 = admitted_verify.placement.items[0].iter()
+            .filter(|item| item.category == Category::Weights)
+            .map(|item| item.bytes)
+            .sum();
+        let mla_bytes = admitted_verify.mla_layouts[0].mla_reserved_bytes();
+        let index_bytes = admitted_verify.mla_layouts[0].index_reserved_bytes();
+        assert_eq!(weights_bytes, 75_709_284_352);
+        assert_eq!(mla_bytes, 10_317_987_840);
+        assert_eq!(index_bytes, 2_076_180_480);
+        assert_eq!(admitted_verify.mla_layouts[0].reserved_bytes(), mla_bytes + index_bytes);
+        admitted_verify.check_mla(0, 0)?;
+
+        // Equal-and-opposite perturbation across "records" and "index records"
+        // preserves total KV bytes yet must fail per-owner reconciliation.
+        let delta = 2 << 20;
+        let records_idx = admitted_verify.placement.items[0].iter()
+            .position(|item| item.category == Category::Kv && item.group == "records")
+            .context("missing MLA records item")?;
+        let index_idx = admitted_verify.placement.items[0].iter()
+            .position(|item| item.category == Category::Kv && item.group == "index records")
+            .context("missing DSA index records item")?;
+        admitted_verify.placement.items[0][records_idx].bytes += delta;
+        admitted_verify.placement.items[0][index_idx].bytes -= delta;
+        assert_eq!(
+            admitted_verify.placement.items[0][records_idx].bytes + admitted_verify.placement.items[0][index_idx].bytes,
+            mla_bytes + index_bytes,
+        );
+        assert!(admitted_verify.check_mla(0, 0).is_err(),
+            "cross-owner cancellation between MLA records and DSA index records must fail");
+        Ok(())
     }
 }

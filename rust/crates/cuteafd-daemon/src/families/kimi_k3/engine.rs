@@ -547,6 +547,45 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    pub(crate) fn attach_dsa_dump(&self, dump: Rc<super::dsa_dump::DsaDump>) -> Result<()> {
+        self.require_live()?;
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        ensure!(self.provisional.borrow().is_none(), "Kimi DSA dump requires idle lanes at startup");
+        for lane in &mut lanes.local {
+            for local in lane {
+                ensure!(local.graph_device().is_none(), "CUTEAFD_KIMI_DSA_DUMP refuses attached CUDA graphs");
+                local.dsa_dump = Some(dump.clone());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn attach_dsa_scores(&self, dump: Rc<super::score_dump::ScoreDump>) -> Result<()> {
+        self.require_live()?;
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        ensure!(self.provisional.borrow().is_none(), "Kimi DSA scores require idle lanes at startup");
+        for lane in &mut lanes.local {
+            for local in lane {
+                ensure!(local.graph_device().is_none(), "CUTEAFD_KIMI_DSA_SCORES refuses attached CUDA graphs");
+                local.dsa_scores = Some(dump.clone());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn attach_dsa_keys(&self, dump: Rc<super::key_dump::KeyDump>) -> Result<()> {
+        self.require_live()?;
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        ensure!(self.provisional.borrow().is_none(), "Kimi DSA key dump requires idle lanes at startup");
+        for lane in &mut lanes.local {
+            for local in lane {
+                ensure!(local.graph_device().is_none(), "CUTEAFD_KIMI_DSA_KEYS refuses attached CUDA graphs");
+                local.dsa_keys = Some(dump.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn graph_replays(&self) -> Result<u64> {
         Ok(self.lanes.try_borrow()?.local.iter().flatten().map(LocalLane::graph_replays).sum())
     }
@@ -691,7 +730,8 @@ impl<'a> Engine<'a> {
         if let Some(draft) = &self.draft { draft.prepare_target()?; }
         let output = submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
-            lanes.local[0][self.head()].config().release_geometry()?;
+            let cfg = lanes.local[0][self.head()].config();
+            if self.execution.skip_routed_experts { cfg.prefix_geometry()?; } else { cfg.release_geometry()?; }
             let cycle = if rows > 64 { crate::shared::decode_graph::device::Cycle::Prefill }
                 else if speculative { crate::shared::decode_graph::device::Cycle::Verify }
                 else { crate::shared::decode_graph::device::Cycle::Decode };
@@ -909,8 +949,12 @@ impl<'a> Engine<'a> {
     pub(crate) fn forward(&self, tokens: &[Vec<u32>], sequences: &[Vec<SequenceRows<'_>>],
         pool: &cuteafd_engine::prefix::RefPagePool,
         mut consume: impl FnMut(usize, usize, usize, &[f32]) -> Result<()>) -> Result<()> {
-        // A truncated inventory has no meaningful model output mix or logits.
-        self.lanes.try_borrow()?.local[0][self.head()].config().release_geometry()?;
+        // A truncated inventory is permitted only under the explicit skipped-routed diagnostic.
+        {
+            let lanes = self.lanes.try_borrow()?;
+            let cfg = lanes.local[0][self.head()].config();
+            if self.execution.skip_routed_experts { cfg.prefix_geometry()?; } else { cfg.release_geometry()?; }
+        }
         ensure!(self.provisional.borrow().is_none(), "Kimi diagnostic cannot overwrite pending verify");
         submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;

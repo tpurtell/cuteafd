@@ -69,6 +69,16 @@ pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize, unit: usi
 
 pub fn package_lane_extents_for_ranks(manifest: &serde_json::Value, rows: usize, unit: usize,
     ranks: usize) -> Result<BTreeMap<&'static str,usize>> {
+    package_lane_extents_with_dsa(manifest, rows, unit, ranks, false)
+}
+
+pub fn package_lane_extents_for_config(manifest: &serde_json::Value, cfg: &KimiK3Config, rows: usize,
+    unit: usize, ranks: usize) -> Result<BTreeMap<&'static str,usize>> {
+    package_lane_extents_with_dsa(manifest, rows, unit, ranks, cfg.dsa.is_some())
+}
+
+fn package_lane_extents_with_dsa(manifest: &serde_json::Value, rows: usize, unit: usize,
+    ranks: usize, dsa: bool) -> Result<BTreeMap<&'static str,usize>> {
     ensure!(matches!(ranks, 1 | 2), "Kimi K6 package physical rank count");
     let programs=manifest["programs"].as_array().context("Kimi K6 package program list")?;
     let scratch=|name: &str| -> Result<usize> {
@@ -78,16 +88,18 @@ pub fn package_lane_extents_for_ranks(manifest: &serde_json::Value, rows: usize,
         scratch.values().try_fold(0usize,|sum,value|sum.checked_add(usize::try_from(value.as_u64()?).ok()?))
             .context("Kimi package scratch extent")
     };
+    let family = if dsa { "kimik31" } else { "kimik3" };
+    let split_prefix = if dsa { "kimik31_" } else { "" };
     let mut base_kda=0;let mut split_kda=0;let mut base_mla=0;let mut split_mla=0;
     for capacity in [64,4096] {
-        let prefix = if ranks == 1 { "kda_fused_h96" } else { "kimik3_kda" };
-        base_kda=base_kda.max(scratch(&format!("{prefix}_m{capacity}"))?);
+        let kda_prefix = if ranks == 1 { "kda_fused_h96".into() } else { format!("{family}_kda") };
+        base_kda=base_kda.max(scratch(&format!("{kda_prefix}_m{capacity}"))?);
         split_kda=split_kda.max(scratch(&format!("kda_core_h{}_m{capacity}", 96 / ranks))?);
         for heads in [48,96] {
             let suffix=if heads==48 {""}else{"_h96"};
-            base_mla=base_mla.max(scratch(&format!("kimik3_mla_producer{suffix}_m{capacity}"))?);
+            base_mla=base_mla.max(scratch(&format!("{family}_mla_producer{suffix}_m{capacity}"))?);
             for stride in [576,640] {for cache in ["","_fp8"] {
-                split_mla=split_mla.max(scratch(&format!("mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"))?);
+                split_mla=split_mla.max(scratch(&format!("{split_prefix}mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"))?);
             }}
         }
     }
@@ -246,7 +258,7 @@ impl CoreCharges {
         ranks: usize) -> Result<Self> {
         ensure!(matches!(ranks, 1 | 2), "Kimi K6 charge physical rank count");
         let mut stages = if core.projections.is_empty() { BTreeMap::new() }
-            else { package_lane_extents_for_ranks(manifest,rows,unit,ranks)? };
+            else { package_lane_extents_for_config(manifest,cfg,rows,unit,ranks)? };
         let native_stages = core.native_stages_from_manifest(native, rows, unit, ranks)?;
         let native_stage_bytes = native_stages.values().sum::<usize>();
         stages.extend(native_stages);

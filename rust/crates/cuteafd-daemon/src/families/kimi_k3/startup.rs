@@ -269,8 +269,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             }
         }
     }
-    let mut selected = cuteafd_loader::placement::ProgramSet::from_names(
-        if core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] }, programs.names());
+    let program_families = match (full.dsa.is_some(), !core.projections.is_empty()) {
+        (false, false) => &["kimik3"][..],
+        (false, true) => &["kimik3", "kimi"][..],
+        (true, false) => &["kimik3", "kimik31"][..],
+        (true, true) => &["kimik3", "kimik31", "kimi"][..],
+    };
+    let mut selected = cuteafd_loader::placement::ProgramSet::from_names(program_families, programs.names());
     selected.names.extend(native_exports.programs.iter().cloned());
     selected.names.sort();
     selected.names.dedup();
@@ -383,6 +388,15 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, options.expert_usage_reader.clone(), checkpoint, native, context_programs, peer, hops,
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules, &mut memory)?
         .with_served_context(options.max_context)?;
+    if let Some(dump) = super::dsa_dump::DsaDump::from_env()? {
+        engine.attach_dsa_dump(dump)?;
+    }
+    if let Some(dump) = super::score_dump::ScoreDump::from_env()? {
+        engine.attach_dsa_scores(dump)?;
+    }
+    if let Some(dump) = super::key_dump::KeyDump::from_env()? {
+        engine.attach_dsa_keys(dump)?;
+    }
     memory.sample("pre-capture")?;
     stop_before_capture(memory.enabled())?;
     if let Some(set) = graph_set {
@@ -586,6 +600,233 @@ mod tests {
     fn missing_inventory_is_refused_without_native_or_device_access() {
         let dir = tempfile::tempdir().unwrap();
         assert!(super::preflight(&dir.path().join("share/absent.json"), &dir.path().join("lib/native.so")).is_err());
+    }
+
+    #[test]
+    fn single_gpu_k31_startup_resolves_whole_kda_and_binds_state_owners() -> Result<()> {
+        use crate::shared::{memory::device::{Device, Stream}, placement::layers::AttentionShare};
+        use super::super::{device::LaneLayout, weights::LayerLayout};
+        use cuteafd_core::DType;
+        use cuteafd_loader::{
+            families::kimi_k3::{
+                allocation::{DsaScratch, NativeScratch},
+                config::{KimiAttention, KimiDsaConfig},
+                dsa::IndexerOperand,
+            },
+            placement::{inventory::PRO_TOTAL_BYTES, Baseline, FfnMode, GpuBudget, LayerMode, LayerPlanError, ResidentWeights},
+            serving_capacity::kimi_prewarm::{kimi_bootstrap, kimi_layout, KimiCoreFormat},
+            LoadedTensor,
+        };
+        use std::rc::Rc;
+
+        let manifest_path = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
+        ensure!(manifest_path.is_file(), "required installed PROGRAMS.json missing: {}", manifest_path.display());
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+
+        let mut raw = cuteafd_loader::plan::testing::kimi_k3_config();
+        raw["model_type"] = serde_json::json!("kimi_k31");
+        raw["architectures"] = serde_json::json!(["KimiK31ForConditionalGeneration"]);
+        raw["text_config"]["dsa_config"] = serde_json::json!({
+            "dsa_layers": raw["text_config"]["linear_attn_config"]["full_attn_layers"],
+            "index_num_heads": 32, "index_head_dim": 128, "index_topk": 2048,
+            "index_rope_dim": 0, "index_k_norm_type": "layernorm",
+            "index_topk_freq": 1, "index_skip_topk_offset": 1,
+        });
+        let full = KimiK3Config::from_hf(&raw)?;
+        let scratch_1gpu = NativeScratch::from_manifest_for_config(&manifest, &full, 1)?;
+        let scratch_2gpu = NativeScratch::from_manifest_for_config(&manifest, &full, 2)?;
+        let dsa_scratch = DsaScratch::from_manifest(&manifest)?;
+        assert!(scratch_1gpu.kda > scratch_2gpu.kda,
+            "1-GPU K3.1 startup must resolve 96-head kda_fused_h96 scratch rather than TP2 48-head scratch");
+
+        let four_layer = super::super::admission::prefix(&full, 4)?;
+        let whole = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
+        let kda_layout_0 = &LayerLayout::ranks_with_core(&four_layer, 0, whole, &CoreInventory::default(), 1)?[0];
+        assert_eq!(kda_layout_0.attention, AttentionShare::Whole);
+        let shared_0 = kda_layout_0.shared_layout();
+        assert_eq!(shared_0.operands["kda.input"], (4 * 96 * 128 + 128 + 96) * 7168 * 2);
+        assert_eq!(shared_0.operands["kda.a_log"], 96 * 4);
+        assert_eq!(shared_0.operands["kda.output"], 7168 * (96 * 128) * 2);
+
+        let graph_set = super::super::graphs::inventory_for_ranks(&four_layer, 1, 4096, 1, 5, 1, |_, _| true)?;
+        let prewarm = super::super::graphs::prewarm_keys(&four_layer, &graph_set.keys,
+            kimi_layout(KimiCoreFormat::Bf16, 1), 1, 4096);
+        let (base, _) = cuteafd_loader::placement::graph_reserve::kimi_default(KimiCoreFormat::Bf16, 1, 0);
+        let fitted = super::super::graphs::fit_prewarm(prewarm, kimi_layout(KimiCoreFormat::Bf16, 1),
+            &[base], &[kimi_bootstrap(1, 0)]);
+        assert!(fitted.iter().any(|key| key.rank == 0
+            && matches!(key.op, super::super::graphs::Op::Attention { layer: 0, .. })),
+            "1-GPU K3.1 bootstrap prewarm must include rank-0 layer-0 KDA attention");
+
+        let mut lane = LaneLayout::for_ranks(&full, 4096, 4096, 1_048_576, scratch_1gpu, 1)?;
+        *lane = (*lane).clone().with_dsa(&full, dsa_scratch)?;
+        let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", PRO_TOTAL_BYTES);
+        let selected = cuteafd_loader::placement::ProgramSet::from_manifest(&manifest, &["kimik3", "kimik31"]);
+        let pending = cuteafd_loader::placement::inventory::loaded_code_allowance(
+            "kimik3", "exl3", false, 0, arch, Some(&selected),
+        ).pending(arch.context_bytes, arch.context_bytes);
+        let admitted = super::super::admission::admit(super::super::admission::Inputs::<1> {
+            skip_routed_experts: true,
+            expert_usage: false,
+            cfg: &four_layer,
+            core: Default::default(),
+            resident_weight_limit: ResidentWeights::DEFAULT_LIMIT,
+            cache_format: cuteafd_core::MlaCacheFormat::Fp8,
+            gpus: [GpuBudget {
+                capacity_bytes: PRO_TOTAL_BYTES,
+                reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
+                baseline: Baseline::Measured { free_bytes: PRO_TOTAL_BYTES - arch.context_bytes },
+            }],
+            devices: [0],
+            peer_access: false,
+            spark_ranks: 0,
+            attention: None,
+            context: None,
+            serving_context: cuteafd_loader::placement::planner::Context::pinned(262_144),
+            requested_pool: Some(262_144),
+            state_slots: 1,
+            prefix_marks: 0,
+            rows: 4096,
+            lanes: 1,
+            waves: 1,
+            unit_rows: Some(4096),
+            lane_layouts: vec![[lane]],
+            fixed: vec![cuteafd_loader::families::kimi_k3::allocation::code_demand(0, pending, 1)?],
+            startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(KimiCoreFormat::Bf16, 1)?,
+            pool_bounded: vec![],
+            rtx: None,
+            spark_budget: None,
+            draft: None,
+            verify_rows: 5,
+            prefix: None,
+        })?;
+        let plan = admitted.execution_plan()?;
+
+        // Scaled 1-GPU K3.1 checkpoint tensors verify real host packing + Whole KDA/DSA/MLA
+        // LayerWeights resolution alongside full 96-head KdaBank + 1-page CacheBank state owners.
+        let mut scaled = four_layer.clone();
+        scaled.hidden = 128; scaled.heads = 4; scaled.kda_heads = 16; scaled.kda_head_dim = 128;
+        scaled.q_lora_rank = 32; scaled.kv_lora_rank = 16; scaled.qk_nope_dim = 16; scaled.qk_rope_dim = 8;
+        scaled.v_head_dim = 16; scaled.dense_intermediate = 256; scaled.latent = 32; scaled.experts = 4;
+        scaled.moe_intermediate = 64; scaled.shared_experts = 2;
+        scaled.dsa = Some(KimiDsaConfig { heads: 2, head_dim: 4, topk: 2 });
+        let width = scaled.kda_heads * scaled.kda_head_dim;
+        let read_scaled = |name: &str| -> Result<LoadedTensor> {
+            let (dtype, shape) = if name.contains(".indexer.") {
+                let (_, shape) = IndexerOperand::ALL.into_iter().map(|op| op.specification(&scaled, 3).unwrap())
+                    .find(|(key, _)| key == name).unwrap();
+                (DType::Bf16, shape)
+            } else if name.ends_with("e_score_correction_bias") { (DType::F32, vec![scaled.experts]) }
+            else if let Some(leaf) = name.split("self_attn.").nth(1) {
+                match leaf {
+                    "q_proj.weight" | "k_proj.weight" | "v_proj.weight" | "g_proj.weight" =>
+                        if name.contains(".layers.3.") { (DType::Bf16, vec![scaled.heads * scaled.v_head_dim, scaled.hidden]) }
+                        else { (DType::Bf16, vec![width, scaled.hidden]) },
+                    "f_a_proj.weight" => (DType::Bf16, vec![128, scaled.hidden]),
+                    "f_b_proj.weight" => (DType::Bf16, vec![width, 128]),
+                    "b_proj.weight" => (DType::Bf16, vec![scaled.kda_heads, scaled.hidden]),
+                    "q_conv1d.weight" | "k_conv1d.weight" | "v_conv1d.weight" => (DType::F32, vec![width, 1, 4]),
+                    "A_log" => (DType::F32, vec![scaled.kda_heads]),
+                    "dt_bias" => (DType::F32, vec![width]),
+                    "o_norm.weight" => (DType::F32, vec![128]),
+                    "o_proj.weight" =>
+                        if name.contains(".layers.3.") { (DType::Bf16, vec![scaled.hidden, scaled.heads * scaled.v_head_dim]) }
+                        else { (DType::Bf16, vec![scaled.hidden, width]) },
+                    "q_a_proj.weight" => (DType::Bf16, vec![scaled.q_lora_rank, scaled.hidden]),
+                    "q_a_layernorm.weight" => (DType::Bf16, vec![scaled.q_lora_rank]),
+                    "kv_a_layernorm.weight" => (DType::Bf16, vec![scaled.kv_lora_rank]),
+                    "kv_a_proj_with_mqa.weight" => (DType::Bf16, vec![scaled.kv_lora_rank + scaled.qk_rope_dim, scaled.hidden]),
+                    "q_b_proj.weight" => (DType::Bf16, vec![scaled.heads * (scaled.qk_nope_dim + scaled.qk_rope_dim), scaled.q_lora_rank]),
+                    "kv_b_proj.weight" => (DType::Bf16, vec![scaled.heads * (scaled.qk_nope_dim + scaled.v_head_dim), scaled.kv_lora_rank]),
+                    _ => anyhow::bail!("unexpected attention tensor {name}"),
+                }
+            } else if name.ends_with("routed_expert_down_proj.weight") { (DType::Bf16, vec![scaled.latent, scaled.hidden]) }
+            else if name.ends_with("routed_expert_up_proj.weight") { (DType::Bf16, vec![scaled.hidden, scaled.latent]) }
+            else if name.ends_with("routed_expert_norm.weight") { (DType::Bf16, vec![scaled.latent]) }
+            else if name.ends_with("gate.weight") { (DType::Bf16, vec![scaled.experts, scaled.hidden]) }
+            else if name.contains(".mlp.down_proj.weight") { (DType::Bf16, vec![scaled.hidden, scaled.dense_intermediate]) }
+            else if name.contains(".mlp.") { (DType::Bf16, vec![scaled.dense_intermediate, scaled.hidden]) }
+            else if name.ends_with("down_proj.weight") { (DType::Bf16, vec![scaled.hidden, scaled.moe_intermediate * scaled.shared_experts]) }
+            else if name.ends_with("gate_proj.weight") || name.ends_with("up_proj.weight") {
+                (DType::Bf16, vec![scaled.moe_intermediate * scaled.shared_experts, scaled.hidden])
+            } else if name.ends_with("_res_proj.weight") { (DType::Bf16, vec![1, scaled.hidden]) }
+            else { (DType::Bf16, vec![scaled.hidden]) };
+            let bytes = vec![0u8; shape.iter().product::<usize>() * if dtype == DType::F32 { 4 } else { 2 }];
+            Ok(LoadedTensor {
+                info: cuteafd_core::TensorInfo { name: name.into(), file: "test".into(), dtype, shape,
+                    byte_offset: 0, byte_length: bytes.len() as u64, role: cuteafd_core::TensorRole::Other,
+                    layer_id: None, expert_id: None, is_quantization_metadata: false },
+                source_path: "test".into(), bytes, elapsed_micros: 0, sha256: String::new(),
+            })
+        };
+
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.configure_memory(&library, 0, 2 << 30)?;
+        let device = Device { library: &library, id: 0 };
+        let stream = Rc::new(Stream::new(device)?);
+
+        let mut layer_weights = Vec::with_capacity(4);
+        for layer in 0..4 {
+            let layouts = LayerLayout::ranks_with_core(&scaled, layer, whole, &CoreInventory::default(), 1)?;
+            let mut packed = super::super::weights::PackedLayer::ranks_with_core(
+                &scaled, layer, whole, &CoreInventory::default(), 1, read_scaled,
+            )?;
+            let weights = super::super::weights::coordinator_golden_tests::baseline_layer(
+                device, &layouts[0], packed.pop().unwrap(),
+            )?;
+            assert_eq!(weights.attention, AttentionShare::Whole);
+            if four_layer.attention[layer] == KimiAttention::Kda {
+                let kda = weights.kda()?;
+                assert_eq!(kda.a_log.bytes, scaled.kda_heads * 4);
+            } else {
+                weights.mla()?;
+                weights.indexer()?;
+            }
+            layer_weights.push(weights);
+        }
+
+        let kda_bank = super::super::state::KdaLayout::for_ranks(&four_layer, 1, 0, 1, 1)?
+            .allocate(device, vec![stream.clone()])?;
+        assert_eq!(kda_bank.heads(), 96);
+        let mut small_placement = admitted.placement.clone();
+        small_placement.pool_tokens = 64;
+        let cache_bank = super::super::mla::CacheLayout::for_ranks(
+            &four_layer, &small_placement, 0, cuteafd_core::MlaCacheFormat::Fp8, 1,
+        )?.allocate(device, vec![stream.clone()])?;
+
+        for layer in 0..4 {
+            let (has_weights, has_state, has_indexer) = super::super::device::layer_attention_resident(
+                &four_layer, layer, 0, &layer_weights[layer], &kda_bank, &cache_bank,
+            )?;
+            let weights_owners = if has_weights { vec![0u8] } else { vec![] };
+            let state_owners = if has_state { vec![0u8] } else { vec![] };
+            plan.validate_state_owners(layer, &weights_owners)?;
+            plan.validate_state_owners(layer, &state_owners)?;
+            if four_layer.attention[layer] == KimiAttention::Mla {
+                assert_eq!(has_indexer, Some(true));
+                plan.validate_state_owners(layer, &[0u8])?;
+            } else {
+                assert_eq!(has_indexer, None);
+            }
+        }
+
+        // Non-owner / absent attention must still fail closed both in kda() and in StateOwners.
+        layer_weights[0].attention = AttentionShare::Absent;
+        assert!(layer_weights[0].kda().is_err());
+        let (has_weights, _, _) = super::super::device::layer_attention_resident(
+            &four_layer, 0, 0, &layer_weights[0], &kda_bank, &cache_bank,
+        )?;
+        assert!(!has_weights);
+        assert_eq!(
+            plan.validate_state_owners(0, &[]),
+            Err(LayerPlanError::StateOwners { layer: 0, actual: vec![], expected: vec![0] }),
+        );
+        Ok(())
     }
 }
 

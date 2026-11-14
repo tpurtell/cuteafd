@@ -497,6 +497,28 @@ at most 64 synchronized phase boundaries, logs signed used/tracked/unclassified
 deltas, then intentionally exits before target graph capture or Ready. It adds
 no external observer, request probes, admission adjustment or automatic allowance.
 
+`CUTEAFD_KIMI_DSA_DUMP`, `CUTEAFD_KIMI_DSA_SCORES` and `CUTEAFD_KIMI_DSA_KEYS`
+are private coordinator-only Kimi K3.1 diagnostics for the DSA index route, not launch
+configuration keys; pass them through `golden-run --arm-env`.
+`CUTEAFD_KIMI_DSA_DUMP=DIR` writes every launched layer's post-selector token
+indices to `DIR/layer-NN.bin` (`KDSA0001`, one record per batch row),
+and `CUTEAFD_KIMI_DSA_DUMP_FROM=N` restricts records to engine positions at or
+after `N`. `CUTEAFD_KIMI_DSA_SCORES=DIR` additionally launches the scored
+selector after the plain one on the same stream and writes the per-slot scores
+aligned with those ids (`KDSAS001`, descending, `-1` tails preserved);
+`CUTEAFD_KIMI_DSA_SCORE_LAYERS=3,59` restricts which layers pay the extra
+launch and `CUTEAFD_KIMI_DSA_SCORE_FROM=N` the positions. The scored launch
+must select exactly the plain route's set; otherwise it fails with the layer
+and position and writes no score file. `CUTEAFD_KIMI_DSA_KEYS=DIR` reads the
+stored index key the selector actually scores: for each token in the required
+`CUTEAFD_KIMI_DSA_KEY_TOKENS=...` list it resolves the physical page through the
+same live page table row and writes that page's E4M3 codes and FP32 UE8M0
+scales (`KDSK0001` records, `KDSKP001` content-interned pages), with
+`CUTEAFD_KIMI_DSA_KEY_LAYERS=3,59` and `CUTEAFD_KIMI_DSA_KEY_FROM=N` restricting
+the readback. All three diagnostics refuse attached CUDA graphs and startup
+capture, so run them on eager arms only. Unset: no readback, no extra launch,
+no stream drain.
+
 `CUTEAFD_DIAG_PEER_WAIT=1` is a private coordinator-only diagnostic for every
 family with a two-GPU head split, not a launch configuration key. Pass it through
 `wip-cards --arm-env ARM:CUTEAFD_DIAG_PEER_WAIT=1`; the launcher forwards every

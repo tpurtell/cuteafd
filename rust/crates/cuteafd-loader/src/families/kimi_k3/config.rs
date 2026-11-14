@@ -209,8 +209,17 @@ impl KimiK3Config {
 
     /// The release's executable geometry. Others parse but are not served.
     pub fn release_geometry(&self) -> Result<()> {
+        ensure!(self.layers == 93, "unsupported Kimi K3 num_hidden_layers: {}, the release geometry is 93", self.layers);
+        self.prefix_geometry()
+    }
+
+    /// Release layer dimensions on a non-empty prefix (1..=93 decoder layers).
+    pub fn prefix_geometry(&self) -> Result<()> {
+        ensure!((1..=93).contains(&self.layers) && self.attention.len() == self.layers
+            && self.dense.len() == self.layers,
+            "unsupported Kimi K3 prefix num_hidden_layers: {}, expected 1..=93", self.layers);
         let expected = [
-            ("hidden_size", self.hidden, 7168), ("num_hidden_layers", self.layers, 93),
+            ("hidden_size", self.hidden, 7168),
             ("vocab_size", self.vocab_size, 163840), ("intermediate_size", self.dense_intermediate, 33792),
             ("num_experts", self.experts, 896), ("num_experts_per_token", self.topk, 16),
             ("moe_intermediate_size", self.moe_intermediate, 3072), ("routed_expert_hidden_size", self.latent, 3584),

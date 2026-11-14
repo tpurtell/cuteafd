@@ -165,18 +165,28 @@ impl CacheLayout {
 
     pub(crate) fn bytes(&self) -> usize { self.bytes }
 
-    /// Physical residency of the cache: every present layer is one cudaMalloc
-    /// of `layer_bytes`, rounded up to the SM120 allocation granularity (a
-    /// request at or below the shared-block threshold costs its own bytes).
-    pub(crate) fn reserved_bytes(&self) -> u64 {
+    fn backing_bytes(bytes: usize) -> u64 {
         use cuteafd_loader::placement::planner::{SM120_ALLOCATION_GRANULARITY_BYTES as G,
             SM120_SHARED_REQUEST_BYTES as SMALL};
-        let backing = |bytes| {
-            let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-            if bytes <= SMALL { bytes } else { bytes.div_ceil(G).saturating_mul(G) }
-        };
-        backing(self.layer_bytes).saturating_add(backing(self.index_layer_bytes))
-            .saturating_mul(self.layers.iter().flatten().count() as u64)
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        if bytes <= SMALL { bytes } else { bytes.div_ceil(G).saturating_mul(G) }
+    }
+
+    pub(crate) fn mla_reserved_bytes(&self) -> u64 {
+        Self::backing_bytes(self.layer_bytes).saturating_mul(self.layers.iter().flatten().count() as u64)
+    }
+
+    pub(crate) fn index_reserved_bytes(&self) -> u64 {
+        if self.index_layer_bytes == 0 { return 0; }
+        Self::backing_bytes(self.index_layer_bytes).saturating_mul(self.layers.iter().flatten().count() as u64)
+    }
+
+    /// Physical residency of the cache: every present layer is one cudaMalloc
+    /// of `layer_bytes` (plus one `index_layer_bytes` backing on DSA layers),
+    /// rounded up to the SM120 allocation granularity (a request at or below
+    /// the shared-block threshold costs its own bytes).
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        self.mla_reserved_bytes().saturating_add(self.index_reserved_bytes())
     }
 
     pub(super) fn page_range(&self, layer: usize, page: usize, rows: usize) -> Result<(usize, usize)> {

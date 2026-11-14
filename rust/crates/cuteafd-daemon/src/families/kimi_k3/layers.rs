@@ -572,7 +572,7 @@ pub(crate) struct Bindings<'e, 'a, 's> {
     lane: usize,
     rows: usize,
     speculative: bool,
-    owners: Vec<(Vec<u8>, Vec<u8>)>,
+    owners: Vec<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)>,
     completed: usize,
     pending: Option<FfnTicket>,
     draft: Option<&'e super::draft::NativeDraft<'a>>,
@@ -616,14 +616,21 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         }
         let mut owners = Vec::new();
         for layer in 0..execution.plan.modes().len() {
-            let mut resident = (Vec::new(), Vec::new());
+            let mut resident = (Vec::new(), Vec::new(), None::<Vec<u8>>);
             for rank in 0..local.len() {
-                let (weights, state) = local[rank].attention_resident(layer)?;
+                let (weights, state, indexer) = local[rank].attention_resident(layer)?;
                 if weights { resident.0.push(rank as u8); }
                 if state { resident.1.push(rank as u8); }
+                if let Some(present) = indexer {
+                    let list = resident.2.get_or_insert_with(Vec::new);
+                    if present { list.push(rank as u8); }
+                }
             }
             execution.plan.validate_state_owners(layer, &resident.0)?;
             execution.plan.validate_state_owners(layer, &resident.1)?;
+            if let Some(indexer) = &resident.2 {
+                execution.plan.validate_state_owners(layer, indexer)?;
+            }
             owners.push(resident);
         }
         if let Some(peer) = peer {
@@ -943,7 +950,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
     type FfnTicket = FfnTicket;
     fn state_owners(&self, layer: usize) -> Result<AttentionStateOwners<'_>> {
         let owners = self.owners.get(layer).context("Kimi layer census outside inventory")?;
-        Ok(AttentionStateOwners { weights: &owners.0, kv: &owners.1, indexer: None, compressor: None })
+        Ok(AttentionStateOwners { weights: &owners.0, kv: &owners.1, indexer: owners.2.as_deref(), compressor: None })
     }
     fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {
         if self.local.len() == 1 { return self.begin_local_ffn(layer, owner); }
