@@ -509,7 +509,9 @@ mod tests {
             cfg.attention = vec![KimiAttention::Kda, KimiAttention::Mla, KimiAttention::Mla];
             cfg.dense.truncate(3);
             let mut inputs = super::super::admission::tests::inputs(&cfg);
-            inputs.attention = (attention == AttentionPlacement::Heads).then_some(AttentionPlacement::Heads);
+            inputs.attention = Some(if attention == AttentionPlacement::Heads {
+                AttentionPlacement::Heads
+            } else { AttentionPlacement::Layers });
             inputs.cache_format = cache_format;
             let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(
                 inputs.rows, inputs.waves, inputs.unit_rows)?.unit_rows as usize;

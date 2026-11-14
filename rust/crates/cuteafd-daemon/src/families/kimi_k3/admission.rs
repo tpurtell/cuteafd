@@ -878,10 +878,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     });
     let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry_for_ranks(cfg, &resident, cache_format)?;
     let mut page_bytes = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>();
-    if placement_mode == AttentionPlacement::Context {
-        let index_bytes = resident.iter().sum::<usize>() as u64 * recipe.index_bytes_per_page;
-        page_bytes = (page_bytes - index_bytes) / 2 + index_bytes;
-    }
+    if placement_mode == AttentionPlacement::Context { page_bytes /= 2; }
     let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes).sum::<u64>()
         + draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose()?.unwrap_or(0) as u64;
     let host_prefix = prefix_args.map(|args| args.resolve_host_config(cuteafd_engine::prefix::FamilyLayout {
