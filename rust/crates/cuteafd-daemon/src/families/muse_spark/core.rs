@@ -366,7 +366,7 @@ mod tests {
                 "scratch_bytes_at_capacity":{"scratch":256},"geometry":{"input_features":128,
                     "output_features":128,"output_dtype":output.torch_dtype(),"max_rows":stage,
                     "scale_block":128,"decode_rows":64,"storage":"row_major_e4m3",
-                    "reduction":"canonical_fp8_gemv64_w8a16"}}));
+                    "reduction":"canonical_fp8_gemv64_w8a16","exact_row_cap":stage}}));
         }
         fixture.register_programs(&library, &entries)?;
         let manifest = serde_json::json!({"programs":entries});
