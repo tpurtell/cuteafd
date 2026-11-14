@@ -408,6 +408,7 @@ historical recipe; new release launches use the v5 matrix.
 
 ## minimax_m3
 
+- 2026-11-14 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× RTX PRO 6000 @ gpu-powerd 435 W (425–450) + 3× DGX Spark · build 3a70a37689dd · [report](minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1/report.svg)
 - 2026-11-14 · Custom · MiniMaxAI/MiniMax-M3.1-Flash · 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 3× DGX Spark · build 3a70a37689dd · [report](minimax_m3/2026-11-14-custom-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1/report.svg)
 
 ## Mistral Large 4

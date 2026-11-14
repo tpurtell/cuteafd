@@ -45,6 +45,15 @@ and reported cap 425-450 W. C1/C16 sweeps have zero power-cap/thermal slowdown,
 busy SM means 2827/2815.4 MHz, max 62/60 C and headroom 31/35 C. Trace and
 speculation instrumentation are disabled; these are not comparisons to another engine.
 
+The canonical [Release smoke](../../benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1/report.svg)
+on the same immutable seal supplies the matrix row: C1/C8/C16
+18.23/70.25/101.08 tok/s and 8K prefill 2314 tok/s. It repeats the fidelity,
+exact restore and tool checks successfully. Its basic thermal window records
+2.003 s power-cap slowdown, zero thermal slowdown, busy SM mean 2829.6 MHz,
+max 62 C and minimum T.Limit headroom 32 C (425-450 W reported cap).
+The custom qualification sweep and canonical basic concurrency are different
+workloads, not a speed comparison.
+
 ## Changelog
 
 | Date | Change | Evidence |

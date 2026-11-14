@@ -734,11 +734,7 @@ fn check_concurrency_plan_cell(
             "{label} C{c} GPUs={gpus} Sparks={ranks}: missing cache requirements: {}", render(&report)));
         assert_eq!(u64::from(cache.concurrency), c);
         assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
-        let descriptor = family::registry().iter().find(|entry| entry.id() == family).unwrap().runtime();
-        let status = if family == "minimax_m3" && gpus == 1 && report.native_serving_admitted {
-            family::RuntimeStatus::Serving
-        } else { descriptor };
-        assert_eq!(report.runtime, Some(status));
+        let status = report.runtime.expect("planned shape must report its runtime qualification");
         if status == family::RuntimeStatus::Planned && !report.native_serving_admitted {
             assert!(!report.fits && !report.placement_supported && !report.wip_launchable(),
                 "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
@@ -760,17 +756,22 @@ fn check_concurrency_plan_cell(
 }
 
 #[test]
-fn release_matrix_excludes_planned_families() {
+fn release_matrix_current_cells_have_measured_shape_reports() {
     let matrix: Value = serde_json::from_str(include_str!("../../../../../benchmarks/current-matrix.json")).unwrap();
-    for entry in family::registry().iter().filter(|entry| entry.runtime() == family::RuntimeStatus::Planned) {
-        for cell in matrix["cells"].as_array().unwrap().iter().filter(|cell| cell["family"] == entry.id()) {
-            // MiniMax qualifies its admitted one-RTX report, not every layout
-            // described by the still-Planned family descriptor (#1856).
-            assert_eq!(entry.id(), "minimax_m3", "unqualified family has a release card");
-            for column in ["5090", "2rtx"] {
-                assert_ne!(cell[column]["status"], "current",
-                    "unqualified MiniMax {column} must not have a current card");
-            }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    for cell in matrix["cells"].as_array().unwrap() {
+        for column in ["5090", "1rtx", "2rtx"] {
+            if cell[column]["status"] != "current" { continue; }
+            let path = cell[column]["report"].as_str().expect("current cell must pin its shape report");
+            let report: Value = serde_json::from_slice(&std::fs::read(root.join(path).join("report.json"))
+                .unwrap_or_else(|error| panic!("{path}: {error}"))).unwrap();
+            assert_eq!(report["server"]["family"], cell["family"], "{path}");
+            assert_eq!(report["server"]["model"], cell["checkpoint"], "{path}");
+            let gpus = report["server"]["hardware"]["gpus"].as_array().expect("measured GPU inventory");
+            let used = gpus.iter().filter(|gpu| gpu["used"] == true).count();
+            assert_eq!(used, if column == "2rtx" { 2 } else { 1 }, "{path}: card shape");
+            assert!(report["baseline"].is_object(), "{path}: current shape needs a measured basic card");
+            assert!(matches!(report["profile"].as_str(), Some("smoke" | "share")), "{path}");
         }
     }
 }
