@@ -139,8 +139,17 @@ impl<'a> Rank<'a> {
             }
         }
         if layout.dsa() {
-            // Rank one publishes this empty run; rank zero overwrites its run
-            // with global selection. Never merge two duplicate global runs.
+            for bank in 0..banks {
+                let buffer = owner.metadata("DSA merged lengths", bank)?;
+                for stream in &owner.streams {
+                    stream.device.run(|| {
+                        // SAFETY: reserve each fixed per-unit destination before
+                        // request-time enqueue-only metadata uploads use it.
+                        unsafe { stream.device.library.reserve_h2d_ordered(buffer, stream.raw) }
+                    })?;
+                }
+            }
+            // Mask candidate tails before the first live selection.
             for (name, bits) in [("DSA global scores", f32::NEG_INFINITY.to_bits()),
                 ("DSA global indices", u32::MAX)] {
                 let buffer = owner.buffer(name)?;
@@ -309,9 +318,19 @@ pub(crate) struct DecodeRows {
 impl DecodeRows {
     pub(crate) fn new(rank: usize, sequences: &[super::device::SequenceRows<'_>], extent: usize,
         slots: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
+        Self::with_capacity(rank, sequences, extent, slots, pool, 64)
+    }
+
+    pub(crate) fn gathered(rank: usize, sequences: &[super::device::SequenceRows<'_>], extent: usize,
+        slots: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
+        Self::with_capacity(rank, sequences, extent, slots, pool, 4096)
+    }
+
+    fn with_capacity(rank: usize, sequences: &[super::device::SequenceRows<'_>], extent: usize,
+        slots: usize, pool: &cuteafd_engine::prefix::RefPagePool, capacity: usize) -> Result<Self> {
         use crate::shared::peer_split::context::{local_pages, shard_rows};
         ensure!(rank < 2 && pool.is_parity(), "Kimi compact metadata needs two-rank parity pages");
-        let rows = super::device::validate_sequence_pages(sequences, 64, slots, extent, pool)?;
+        let rows = super::device::validate_sequence_pages(sequences, capacity, slots, extent, pool)?;
         let width = extent.div_ceil(64).div_ceil(2);
         let mut result = Self { rows, width, owned_pages: 0, slots: Vec::with_capacity(rows * 8),
             tables: vec![0; rows * width * 4], lengths: Vec::with_capacity(rows * 4),
