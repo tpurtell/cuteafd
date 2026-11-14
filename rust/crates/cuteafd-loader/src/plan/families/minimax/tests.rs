@@ -253,6 +253,7 @@ fn qualified_whole_and_fp32_split_keep_narrow_heads_gated() {
         &checkpoint, &inputs.cfg, 1, &vec![0; inputs.cfg.layers]).unwrap();
     let mut programs = inputs.manifest["programs"].as_array().unwrap().clone();
     programs.extend(dense_manifest(&whole[0])["programs"].as_array().unwrap().clone());
+    programs.extend(fixture("minimax_producer_programs")["programs"].as_array().unwrap().clone());
     programs.extend(recipe_inputs(2, 4).manifest["programs"].as_array().unwrap().clone());
     let programs = programs.into_iter().map(|program| (program["name"].as_str().unwrap().to_owned(), program))
         .collect::<std::collections::BTreeMap<_, _>>().into_values().collect::<Vec<_>>();
