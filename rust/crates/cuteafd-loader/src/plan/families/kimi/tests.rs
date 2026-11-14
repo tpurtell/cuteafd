@@ -1006,6 +1006,15 @@ fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<
     let mut manifest: Value = serde_json::from_slice(&std::fs::read(&programs_path)?)?;
     let compact = Model::open(&Checkpoint::open(k6_dir.path())?)?;
     add_k6_program_inventory(&compact, &mut manifest);
+    let split_programs = manifest["programs"].as_array().unwrap().iter().filter_map(|program| {
+        let name = program["name"].as_str()?;
+        name.starts_with("mla_rank_norm_").then(|| {
+            let mut program = program.clone();
+            program["name"] = serde_json::json!(format!("kimik31_{name}"));
+            program
+        })
+    }).collect::<Vec<_>>();
+    manifest["programs"].as_array_mut().unwrap().extend(split_programs);
     for rows in [64usize, 4096] {
         let mode = if rows == 64 { "decode" } else { "prefill" };
         for (name, bytes) in [
