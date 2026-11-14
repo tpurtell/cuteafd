@@ -87,6 +87,7 @@ outside a matching WIP slot.
 
 | Model · quant | Config | Layout |
 | --- | --- | --- |
+| MiniMax M3.1 Flash · native NVFP4 (#1856) | [min](minimax-m31-flash-nvfp4-min.config) | WIP-only 1 RTX + 3 Sparks; native MXFP8 core, default prefix cache, speculation/media off |
 | GLM 5.3 · EXL3 K4 + native K6 core | [min](glm53-exl3-k6core-min.config) · [max](glm53-exl3-k6core-max.config) | 1 RTX + 4 Spark / 2 RTX + 6 Spark, DFlash2, pool-first |
 | GLM 5.3 Flash · EXL3 K4 + native K6 core | [min](glm53f-exl3-k4-core-k6-min.config) · [max](glm53f-exl3-k4-core-k6-max.config) | 1 RTX + 2 Spark / 2 RTX, no Sparks; DFlash2, admitted KV pool |
 | Kimi K3 · EXL3 K2 (#273) | [max](kimi-k3-exl3-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 5 routed layers on the RTX |
