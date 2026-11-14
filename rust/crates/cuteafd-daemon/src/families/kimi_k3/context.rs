@@ -83,6 +83,9 @@ impl<'a> Programs<'a> {
         format: cuteafd_core::MlaCacheFormat, extent: usize, rows: usize, banks: usize,
         cfg: &cuteafd_loader::families::kimi_k3::config::KimiK3Config) -> Result<ContextLayout> {
         let mut names = cuteafd_loader::families::kimi_k3::context::program_names_for_config(format, cfg);
+        if cfg.dsa.is_some() {
+            names.extend(["kimik31_index_producer_m64".into(), "kimik31_index_producer_m4096".into()]);
+        }
         names.extend(programs.names().filter(|name| name.starts_with("dense_trellis_k6_trellis_"))
             .map(str::to_owned));
         let entries = names.iter().map(|name| -> Result<_> {

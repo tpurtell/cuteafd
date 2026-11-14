@@ -295,6 +295,7 @@ struct DsaPrograms<'a> {
     partial: [[cuteafd_ffi::KimiSparseMla<'a>; 2]; 2],
     merge: cuteafd_ffi::KimiCandidateMerge<'a>,
     scratch: cuteafd_loader::families::kimi_k3::allocation::DsaScratch,
+    row_chunk_size: usize,
 }
 
 impl<'a> DsaPrograms<'a> {
@@ -316,7 +317,7 @@ impl<'a> DsaPrograms<'a> {
             producer: producer.iter().map(|p| p.scratch_bytes()).max().unwrap(),
             selector: selector.iter().chain(scored.iter()).map(|p| p.scratch_bytes()).max().unwrap(),
         };
-        Ok(Self { producer, selector, scored, partial,
+        Ok(Self { producer, selector, scored, partial, row_chunk_size: KimiSparseMla::policy_chunk_size(programs)?,
             merge: cuteafd_ffi::KimiCandidateMerge::load(programs)?, scratch })
     }
 }
@@ -413,7 +414,7 @@ impl<'a> NativePrograms<'a> {
         let mut layout=LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks(
             cfg, rows, unit, max_context, self.scratch, self.ranks)?, core: None };
         if let Some(dsa) = &self.dsa {
-            layout.base = layout.base.with_sparse_mla_rows(attention_heads)?.with_dsa(cfg, dsa.scratch)?
+            layout.base = layout.base.with_sparse_mla_rows(attention_heads, dsa.row_chunk_size)?.with_dsa(cfg, dsa.scratch)?
                 .with_live_projection_rows(attention_heads, self.ranks)?;
         }
         if let Some(core)=&self.core {

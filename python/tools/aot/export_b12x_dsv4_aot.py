@@ -1139,7 +1139,8 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                 out.append((f"mla_producer{suffix}{cache_suffix}_m{rows}", "mla_producer", params,
                             lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_producer_aot(g, max_rows=r)))
                 out.append((f"sparse_mla{suffix}{cache_suffix}_m{rows}", "sparse_mla", params,
-                            lambda r=rows, g=mla: kimi_dsa.compile_kimi_sparse_mla_aot(g, max_rows=r)))
+                            lambda r=rows, g=mla: kimi_dsa.compile_kimi_sparse_mla_aot(
+                                g, max_rows=r, row_chunk_size=index.sparse_mla_row_chunk_size)))
                 if cache == "bf16":
                     out.append((f"mla_output{suffix}_m{rows}", "mla_output", params,
                                 lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_output_aot(g, max_rows=r)))
@@ -1148,7 +1149,7 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                         out.append((f"sparse_mla_partial{cache_suffix}_h{begin}_m{rows}", "sparse_mla_partial",
                                     {**params, "head_begin": begin, "head_count": 48},
                                     lambda r=rows, g=mla, b=begin: kimi_dsa.compile_kimi_sparse_mla_partial_aot(
-                                        g, max_rows=r, head_begin=b)))
+                                        g, max_rows=r, head_begin=b, row_chunk_size=index.sparse_mla_row_chunk_size)))
     for cache in ("bf16", "fp8"):
         record_bytes = 1152 if cache == "bf16" else 656
         suffix = "" if cache == "bf16" else "_fp8"
