@@ -373,7 +373,7 @@ def test_nsys_cross_device_rule_applies_only_before_the_fixed_version(monkeypatc
     """Measured on the oracle: 2026.2.1 and 2026.3.2 fault, 2026.5.2 passes. An
     unreadable version is treated as old, and every launch names what it found."""
     monkeypatch.setenv('RELEASE_PROFILE_CROSS_DEVICE_GRAPHS', 'true')
-    for version in ('', '2026.2.1', '2026.3.2', 'junk'):
+    for version in ('', '2026.2.1', '2026.3.2', '2026.5.1', 'junk'):
         monkeypatch.setenv('RELEASE_PROFILE_NSYS_VERSION', version)
         monkeypatch.delenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', raising=False)
         out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
@@ -383,7 +383,7 @@ def test_nsys_cross_device_rule_applies_only_before_the_fixed_version(monkeypatc
         monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', 'node')
         out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
         assert out.returncode != 0 and named in out.stderr, (version, out.stderr)
-    for version in ('2026.5.2', '2026.5.10', '2026.10.1', '2027.1.0'):
+    for version in ('2026.5.2', '2026.5.10', '2026.6.1', '2026.10.1', '2027.1.0'):
         monkeypatch.setenv('RELEASE_PROFILE_NSYS_VERSION', version)
         for requested, traced in (('', 'node'), ('node', 'node'), ('graph', 'graph')):
             monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', requested)
@@ -394,11 +394,12 @@ def test_nsys_cross_device_rule_applies_only_before_the_fixed_version(monkeypatc
             assert 'resolved to graph' not in out.stderr
 
 
-def test_nsys_root_runs_a_mounted_nsys_instead_of_the_image_install(tmp_path, monkeypatch):
+@pytest.mark.parametrize('build', ['2026.5.2.323-1v0', '2026.6.1.251-266139333969v0'])
+def test_nsys_root_runs_a_mounted_nsys_instead_of_the_image_install(tmp_path, monkeypatch, build):
     root = tmp_path / 'nsys-root'
     root.mkdir()
     binary = root / 'nsys'
-    binary.write_text('#!/bin/sh\necho "NVIDIA Nsight Systems version 2026.5.2.323-1v0"\n')
+    binary.write_text(f'#!/bin/sh\necho "NVIDIA Nsight Systems version {build}"\n')
     binary.chmod(0o755)
     monkeypatch.setenv('RELEASE_PROFILE_NSYS_ROOT', str(root))
     out, wrapper, docker = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
@@ -408,7 +409,7 @@ def test_nsys_root_runs_a_mounted_nsys_instead_of_the_image_install(tmp_path, mo
     assert docker[-2:] == ['-v', f'{root}:{root}:ro'] and '--stop-signal' in docker
     version = subprocess.run(['bash', '-c', 'source scripts/lib/release-common.sh; release_profile_nsys_version unused "$1"',
                               'test', str(root)], cwd=ROOT, capture_output=True, text=True)
-    assert version.stdout.strip() == '2026.5.2'
+    assert version.stdout.strip() == '.'.join(build.split('.')[:3])
     for bad in (str(tmp_path / 'absent'), 'relative/dir', str(tmp_path)):
         monkeypatch.setenv('RELEASE_PROFILE_NSYS_ROOT', bad)
         out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')

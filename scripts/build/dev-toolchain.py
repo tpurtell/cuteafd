@@ -17,7 +17,8 @@ BASE_DIGESTS = {
 def identity(source):
     digest = hashlib.sha256()
     for name in ('docker/Dockerfile.dev', 'docker/entrypoint.sh',
-                 'scripts/build/install-dev-cache-tools.sh', 'scripts/build/dev-toolchain.py'):
+                 'scripts/build/install-dev-cache-tools.sh', 'scripts/build/install-nsys.sh',
+                 'scripts/build/dev-toolchain.py'):
         digest.update(name.encode() + b'\0' + (source / name).read_bytes() + b'\0')
     return digest.hexdigest()[:16]
 

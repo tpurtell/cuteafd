@@ -21,6 +21,11 @@ RUN apt-get update && \
       iproute2 pciutils netcat-openbsd && \
     rm -rf /var/lib/apt/lists/*
 
+ARG NSYS_VERSION=2026.6.1.251-266139333969v0
+COPY scripts/build/install-nsys.sh /opt/cuteafd/install-nsys.sh
+RUN NSYS_VERSION=${NSYS_VERSION} bash /opt/cuteafd/install-nsys.sh
+LABEL io.cuteafd.nsys.version=${NSYS_VERSION}
+
 RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
     python3 -m pip install uv && \
