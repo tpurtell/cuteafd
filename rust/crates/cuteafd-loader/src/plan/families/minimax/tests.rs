@@ -1779,7 +1779,14 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
     use crate::placement::{AttentionPlacement, OnboardSetting};
     let (dir, inputs) = heads_recipe_fixture_with_experts(128);
     let manifest = dir.path().join("PROGRAMS.json");
-    std::fs::write(&manifest, inputs.manifest.to_string()).unwrap();
+    // Auto now selects the qualified split path; this dual-placement fixture
+    // needs both the Heads and canonical split producer/dense inventories.
+    let split = recipe_inputs(2, 4);
+    let programs = inputs.manifest["programs"].as_array().unwrap().iter()
+        .chain(split.manifest["programs"].as_array().unwrap())
+        .map(|entry| (entry["name"].as_str().unwrap().to_owned(), entry.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    std::fs::write(&manifest, serde_json::json!({"programs": programs.into_values().collect::<Vec<_>> ()}).to_string()).unwrap();
     for attention in [Some(AttentionPlacement::Heads), None] {
         let options = PlanOptions { attention_placement: attention,
             placement: plan::ExpertPlacement::Sparks { ranks: 4 },
