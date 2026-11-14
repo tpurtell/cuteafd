@@ -118,7 +118,7 @@ impl<'a> WarmModules<'a> {
         if catalog.fp8().is_some() {
             let mut groups = Fp8Group::plan(catalog, config)?;
             for group in &mut groups {
-                group.modules = Some(Fp8Modules::load(&group.directory, group.bf16_directory.as_deref())?);
+                group.modules = Some(Fp8Modules::load(&group.directory, group.bf16_directory.as_deref(), &cuteafd_loader::plan::fp8_prefill::Policy::from_env().map_err(anyhow::Error::msg)?)?);
             }
             return Ok(Self::Fp8(Some(groups)));
         }

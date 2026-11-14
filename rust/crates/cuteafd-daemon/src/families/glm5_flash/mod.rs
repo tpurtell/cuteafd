@@ -2758,12 +2758,12 @@ impl Opened {
                 let package = args.fp8_package.clone().unwrap_or_else(||
                     crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
                 Tp2Weights::Fp8(match pushed {
-                    Some(pushed) => Fp8MoeTp2::pushed_pair(devices, tensors, &package, tp2_layers.clone(),
+                    Some(pushed) => Fp8MoeTp2::pushed_pair_policy(devices, tensors, &package, tp2_layers.clone(),
                         args.expert_rows(), budgets, pushed.into_iter().map(PushedExperts::fp8)
                             .collect::<Result<Vec<_>>>()?.try_into()
-                            .map_err(|_| anyhow::anyhow!("two committed FP8 coordinator ranks required"))?)?,
-                    None => Fp8MoeTp2::load_pair(devices, tensors, &package, tp2_layers.clone(),
-                        args.expert_rows(), budgets)?,
+                            .map_err(|_| anyhow::anyhow!("two committed FP8 coordinator ranks required"))?,Some(&args.fp8_prefill))?,
+                    None => Fp8MoeTp2::load_pair_policy(devices, tensors, &package, tp2_layers.clone(),
+                        args.expert_rows(), budgets,Some(&args.fp8_prefill))?,
                 })
             })
         };
@@ -3172,10 +3172,10 @@ impl Opened {
             ensure!(args.expert_window != Some(0), "--expert-window must be at least 1");
             let started = Instant::now();
             let experts = match pushed {
-                Some(pushed) => crate::shared::experts::fp8::Fp8Experts::from_pushed(&self.library, tensors,
-                    &directory, selected, 1, 0, args.expert_rows(), budget, pushed.fp8()?),
-                None => crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
-                    selected, 1, 0, args.expert_rows(), budget),
+                Some(pushed) => crate::shared::experts::fp8::Fp8Experts::from_pushed_policy(&self.library, tensors,
+                    &directory, selected, 1, 0, args.expert_rows(), budget, pushed.fp8()?, &args.fp8_prefill),
+                None => crate::shared::experts::fp8::Fp8Experts::load_policy(&self.library, tensors, &directory,
+                    selected, 1, 0, args.expert_rows(), budget, &args.fp8_prefill),
             }.context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
                 or --expert-window N for diagnostic paging")?;
             let loads = experts.layers.len();
