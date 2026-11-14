@@ -75,7 +75,7 @@ fn validate_spark_world(world: usize, intermediate: usize) -> Result<()> {
 
 fn program_names(cfg: &MiniMaxM3Config, target: &CoordinatorWeights,
     manifest: &serde_json::Value, capacity: RequestCapacity, context: u32) -> Result<BTreeSet<String>> {
-    let (_, msa) = MsaPrograms::resolve(cfg, manifest, 1, capacity.execution_rows(), context)?;
+    let (_, msa) = MsaPrograms::resolve(cfg, manifest, capacity.decode.rows, capacity.prefill.rows, context)?;
     let (_, producers) = ProducerPrograms::resolve(manifest, capacity.execution_rows())?;
     let (_, forward) = ForwardPrograms::resolve(manifest, capacity.execution_rows())?;
     let dense = target.resolve_dense_programs(manifest, capacity.execution_rows())?;
@@ -88,6 +88,8 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     options: Options<'_>) -> Result<Loaded<'a>> {
     validate(&options, cfg)?;
     cfg.release_geometry()?;
+    cuteafd_core::set_expert_geometry(ExpertGeometry::MINIMAX_M3)
+        .map_err(|_| anyhow::anyhow!("MiniMax serving needs an isolated process"))?;
     ensure!(checkpoint.snapshot == view.snapshot(), "MiniMax startup checkpoint view differs");
     let manifest = Arc::new(serde_json::from_slice(&std::fs::read(options.manifest_path)?)?);
     let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
