@@ -536,6 +536,41 @@ def test_kimi_builds_always_package_k6_programs(tmp_path):
         assert exporter in table
 
 
+def test_kimi_shipping_k8_inventory_preserves_every_existing_geometry():
+    import ast
+
+    source = (ROOT / 'python/tools/aot/export_b12x_dense_trellis_k6_aot.py').read_text()
+    tree = ast.parse(source)
+    scope = {}
+    definitions = {'_bits', '_suffix', '_key', 'shapes_for', 'row_policies', 'grouped_policy', 'output_dtype'}
+    for node in tree.body:
+        if ((isinstance(node, ast.Assign) and all(isinstance(target, ast.Name) for target in node.targets))
+                or isinstance(node, ast.FunctionDef) and node.name in definitions):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), '<trellis inventory>', 'exec'), scope)
+    old_scope = dict(scope)
+    old_tree = ast.parse(source.replace('("kimik3", "glm", "glmf", "muse", "step5")',
+                                       '("glm", "glmf", "muse", "step5")'))
+    for node in old_tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in ('shapes_for', 'row_policies'):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), '<old trellis inventory>', 'exec'), old_scope)
+    for family in ('glm', 'glmf', 'muse', 'step5', 'ml4'):
+        assert scope['shapes_for']((family,)) == old_scope['shapes_for']((family,))
+    shapes = scope['shapes_for'](('kimik3',))
+    existing = scope['KIMI_SHAPES']
+    assert tuple(shape for shape in shapes if scope['_bits'](shape) == 6) == existing
+    assert tuple(shape for shape in shapes if scope['_bits'](shape) == 8) == tuple(
+        (*shape, 8) for shape in existing)
+    policies = scope['row_policies'](('kimik3',))
+    old_policies = old_scope['row_policies'](('kimik3',))
+    assert [row for row in policies if row.get('bits', 6) == 6] == old_policies
+    k8 = [row for row in policies if row.get('bits') == 8]
+    assert len(k8) == 2 * len(existing)
+    assert len({row['native_program'] for row in k8}) == len(k8)
+    assert any(row['input_features'] == 7168 and row['output_features'] == 163840
+               and row['native_program'] == 'trellis_lm_head_mcg_k8' for row in k8)
+    assert {row['codebook'] for row in k8} == {'mcg', 'mul1'}
+
+
 @pytest.mark.parametrize('glm,kimi', [(False, False), (True, False), (False, True)])
 def test_ml4_exports_its_programs_and_k6_shapes_beside_other_families(tmp_path, glm, kimi):
     cmake = ROOT / 'native/cmake/shared/dsv4_programs.cmake'
