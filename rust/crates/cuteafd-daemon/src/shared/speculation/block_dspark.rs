@@ -865,6 +865,21 @@ impl<'a> DsparkDrafter<'a> {
                 addr: at(plane, page.index as usize * bytes) as u64, bytes }).collect())
     }
 
+    /// Slot-local physical planes, including inactive bytes, for exact window
+    /// snapshots. No tap replay or weight-dependent reconstruction is involved.
+    pub(crate) fn window_planes(&self, slot: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
+        ensure!(self.cfg.window == Some(self.context_capacity) && self.paged.is_none()
+            && slot < self.slots, "block dSpark has no admitted window slot");
+        let bytes = self.context_capacity.checked_mul(self.kv_cache.plane_record_bytes(
+            self.cfg.kv_heads, self.cfg.head_dim)).context("block dSpark window extent overflow")?;
+        let offset = slot.checked_mul(bytes).context("block dSpark window offset overflow")?;
+        self.layers.iter().flat_map(|layer| [&layer.k_ring, &layer.v_ring]).map(|plane| {
+            ensure!(offset.checked_add(bytes).is_some_and(|end| end <= plane.buffer.bytes),
+                "block dSpark window plane outside retained backing");
+            Ok(CuteafdDeviceBuffer { ptr: at(plane, offset), bytes, ..plane.buffer })
+        }).collect()
+    }
+
     fn copy_pages(&self, copies: &[cuteafd_engine::prefix::TailCopy]) -> Result<()> {
         let context = self.paged.as_ref().context("block dSpark has no page pool")?;
         let row_bytes = context.layout.record_bytes / 2;
