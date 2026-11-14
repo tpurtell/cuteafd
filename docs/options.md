@@ -146,6 +146,14 @@ native library and program manifest, and four real Spark `--peers` endpoints.
 to 1024 (page-aligned 256..4096); `--prefill-waves` defaults to 3 (1..4).
 `--check-headers` validates the immutable reference and checkpoint/export geometry
 without CUDA or workers. Scores use the shared top1024-plus-tail estimator.
+`--split-device ID` selects a distinct physical peer for the diagnostic serving
+split path, with `--attention-placement auto|layers`; `heads` remains refused.
+The peer diagnostic requires explicit `--wire bf16|fp32`; omitting it refuses,
+and it does not select a serving default or qualify that precision. `--decode`
+uses real one-row serving decode after the prompt instead of scoring all rows
+through serving prefill. Without `--split-device`, the existing one-GPU Whole
+cold golden is unchanged. Split prefill/decode currently serialize on each
+rank's one compute/HopLink stream; slot buffers remain independent.
 MiniMax's explicit `minimax-generated-aggregate` family scoring policy (#1779,
 TJ 2026-11-13) qualifies the aggregate generated rows at the expert-bpw tier:
 the official NVFP4 checkpoint uses mid-tier mean KL <=0.05 and top-1 >=0.93,

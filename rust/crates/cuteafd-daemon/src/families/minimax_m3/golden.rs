@@ -34,6 +34,14 @@ pub(crate) struct GoldenArgs {
     #[arg(long, requires = "tap_layers")] tap_residual_only: bool,
     #[arg(long, value_delimiter = ',', num_args = 1..)] peers: Vec<SocketAddr>,
     #[arg(long, default_value_t = 0)] device: i32,
+    /// Optional distinct physical peer; absent preserves the one-GPU cold golden.
+    #[arg(long, requires = "wire")] split_device: Option<i32>,
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto",
+        value_parser = ["auto", "layers", "heads"])] attention_placement: String,
+    /// Diagnostic choice only; does not qualify or select a shipping default.
+    #[arg(long, requires = "split_device", value_parser = ["bf16", "fp32"])] wire: Option<String>,
+    /// Teacher-forced one-row serving decode after the unscored prompt.
+    #[arg(long, requires = "split_device")] decode: bool,
     #[arg(long, default_value_t = 1024)] prefill_rows: u32,
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=4))] prefill_waves: u8,
     /// Validate checkpoint/reference/export headers without starting CUDA or peers.
@@ -77,6 +85,20 @@ fn selected_programs(cfg: &MiniMaxM3Config, weights: &CoordinatorWeights,
         .map(|spec| spec.name.clone()).collect())
 }
 
+fn split_selection(args: &GoldenArgs) -> Result<Option<([i32; 2], WirePrecision)>> {
+    let Some(peer) = args.split_device else { return Ok(None); };
+    ensure!(args.device >= 0 && peer >= 0 && peer != args.device,
+        "MiniMax golden peer must be a distinct nonnegative physical device");
+    ensure!(matches!(args.attention_placement.as_str(), "auto" | "layers"),
+        "MiniMax serving split golden requires layers attention placement");
+    let wire = match args.wire.as_deref() {
+        Some("bf16") => WirePrecision::Bf16,
+        Some("fp32") => WirePrecision::F32,
+        _ => return Err(cuteafd_loader::placement::families::minimax_m3::ServingRefusal::SplitWireNotQualified.into()),
+    };
+    Ok(Some(([args.device, peer], wire)))
+}
+
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     tokio::task::spawn_blocking(move || run(args)).await?
 }
@@ -96,6 +118,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     cfg.release_geometry()?;
     let windows = reference(&args.golden, args.window.as_deref(), cfg.vocab_size)?;
     let tokens = u32::try_from(windows.iter().map(|window| window.tokens.len() - 1).max().unwrap())?;
+    if args.split_device.is_some() { return run_split(args, view, checkpoint, cfg, windows, tokens); }
     let weights = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &vec![0; cfg.layers])?
         .into_iter().next().context("MiniMax target layout missing")?;
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
@@ -271,6 +294,153 @@ fn run(args: GoldenArgs) -> Result<()> {
     result
 }
 
+fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
+    cfg: MiniMaxM3Config, windows: Vec<Window>, tokens: u32) -> Result<()> {
+    use super::{cache::{Placement, RequestStreams}, engine::{Requests, RoutedBinding, ServingPrefill, ServingRequest},
+        experts::Dispatcher, owners::{LoadedRank, Owners}};
+    use cuteafd_loader::{families::minimax_m3::admission::{gather, Coordinator, FactsRequest},
+        placement::{AttentionPlacement, Onboard, ResidentWeights, planner::{Context as ModelContext, Operation, PrefillShape}}};
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+    let (devices, wire) = split_selection(&args)?.context("MiniMax split golden peer missing")?;
+    ensure!(args.tap_layers.is_empty(), "MiniMax serving split golden does not attach cold layer taps");
+    let manifest: Arc<serde_json::Value> = Arc::new(serde_json::from_slice(&std::fs::read(&args.manifest)?)?);
+    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
+    let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+    let fact_request = |coordinator| FactsRequest { checkpoint: &checkpoint, cfg: &cfg, catalog: &catalog,
+        manifest_path: &args.manifest, manifest: Arc::clone(&manifest), coordinator,
+        attention: Some(AttentionPlacement::Layers), split_wire: Some(wire), physical_devices: &devices,
+        spark_ranks: args.peers.len(), spark_bytes: 100 << 30,
+        prefill: PrefillShape { rows: u64::from(args.prefill_rows), waves: u64::from(args.prefill_waves) },
+        context_tokens: u64::from(tokens), pool_tokens: Some(u64::from(tokens).div_ceil(64) * 64), sequences: 1,
+        host, host_cache_bytes: Some(0), prefix_entries: 1, replies: Default::default(),
+        head: crate::shared::target_head::TargetHead::configured().blas_head(true), expert_usage: false,
+        resident_weight_limit: ResidentWeights::default() };
+    let planned = gather(&fact_request(Coordinator::Planned { cards: devices.iter().map(|_| {
+        cuteafd_loader::placement::CoordinatorCard { physical_bytes: 96 << 30, logical_bytes: 96 << 30 }
+    }).collect() })).map_err(|error| anyhow::anyhow!("{}; {}", error.what, error.how))?;
+    if args.check_headers {
+        planned.admit(cuteafd_loader::placement::families::minimax_m3::request(planned.context,
+            Some(u64::from(tokens).div_ceil(64) * 64), Onboard::Layers(0), planned.prefill,
+            Operation::Serving, None, Default::default()))?;
+        return Ok(());
+    }
+    ensure!(args.peers.len() == 4, "MiniMax split golden qualifies four real Spark ranks");
+    ensure!(!args.save_logits.try_exists()? && args.save_logits.parent().is_some_and(Path::is_dir),
+        "MiniMax split logits output needs an existing parent and new directory");
+    cuteafd_core::set_expert_geometry(ExpertGeometry::MINIMAX_M3)
+        .map_err(|_| anyhow::anyhow!("MiniMax golden needs an isolated process"))?;
+    // SAFETY: all owners and terminal dispatchers retire inside this Arc lifetime.
+    let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
+    let programs = library.programs()?.with_manifest(&args.manifest)?;
+    let runtime = RuntimeInventory::measure(&library, &devices, InventoryPhase::PreWeight, |_| {
+        programs.load_matching(|name| name.starts_with("minimax_") || name.starts_with("exlr8_dense_"))?;
+        Ok(())
+    })?;
+    let policy = cuteafd_core::memory_policy::MemoryPolicy::current();
+    let inputs = gather(&fact_request(Coordinator::Measured { samples: runtime.gpus.iter().map(|sample|
+        (sample.total_bytes, policy.gpu_cap_bytes(sample.total_bytes), sample.free_bytes)).collect(),
+        loaded_code: vec![0; 2] })).map_err(|error| anyhow::anyhow!("{}; {}", error.what, error.how))?;
+    let admitted = inputs.admit(cuteafd_loader::placement::families::minimax_m3::request(inputs.context,
+        Some(u64::from(tokens).div_ceil(64) * 64), Onboard::Layers(0), inputs.prefill,
+        Operation::Serving, None, Default::default()))?;
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: args.prefill_rows,
+        ingress: SparkIngress::Bf16, partial_reply_bytes: None };
+    let config = TcpTransportConfig::default();
+    let rings = spark_rings(config.max_frame_bytes)?;
+    let waves = usize::from(args.prefill_waves);
+    let exports = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports();
+    let executions = cuteafd_loader::plan::spark_executions::admit_family("minimax_m3", &exports,
+        None, u64::from(args.prefill_rows), waves as u64)?;
+    let model = ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint, rings, 1, executions)?;
+    let spark_admission = SparkAdmission::plan_view(&view, ExpertGeometry::MINIMAX_M3, Some(&catalog),
+        &SparkWorkingSet { rtx_layers: vec![], spark_layers: inputs.routed.clone(), spark_ranks: args.peers.len(),
+            prefill_lanes: 1 }, args.peers.len(), model, None)?;
+    let native_devices = devices.map(|id| Device { library: &library, id });
+    let (pending, membership) = super::weights::push::prepare_serving(&view, &catalog, &checkpoint,
+        &native_devices, &inputs, &admitted)?;
+    let spark_pending = spark_admission.start_with(&args.peers, membership)?;
+    let bundle = pending.finish(&catalog, Some(spark_pending))?;
+    ensure!(bundle.expert_sets.is_empty(), "MiniMax diagnostic count0 must not retain local expert sets");
+    let loaded = bundle.targets.into_iter().zip(native_devices).map(|(weights, device)| {
+        let decode = Rc::new(Stream::new(device)?);
+        Ok(LoadedRank { weights, streams: RequestStreams { decode: Rc::clone(&decode),
+            prefill: vec![decode; waves] } })
+    }).collect::<Result<Vec<_>>>()?;
+    let owners = Owners::new(&inputs, &admitted, &programs, loaded, bundle.embedding)?;
+    let link_layout = PreparedSparkLink::endpoint("spark", 0,
+        SparkEndpointOwners { ranks: args.peers.len(), geometry: ExpertGeometry::MINIMAX_M3, endpoint, rings },
+        waves, true, true, SparkIntakeCandidates::Probed, SparkReplyFormat::Bf16, Lifetime::TARGET)?;
+    let mut link = native_devices[0].run(|| SparkLink::prepared(&library,
+        SparkWorld::canonical(args.peers.len())?, &args.peers, config, link_layout))?;
+    link.enable_terminal_ownership(Arc::clone(&library))?;
+    let mut shape = SparkSessionShape::new(args.prefill_rows, 6144, 4, ExpertV2Dtype::Bf16)?;
+    shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    native_devices[0].run(|| link.bootstrap(&shape))?;
+    let bindings = cfg.moe.iter().map(|&moe| moe.then_some(RoutedBinding {
+        dispatcher: 0, route: crate::shared::prefill_pipeline::FfnRoute::Spark })).collect();
+    let mut execution = ServingPrefill::new(&cfg, vec![Dispatcher::spark(link)?], bindings, 17)?;
+    let schedule = Requests::new(inputs.request_capacity()?, tokens as usize, cfg.layers, waves)?;
+    let provenance = serde_json::json!({"family":"minimax_m3", "snapshot":view.snapshot(),
+        "reference_manifest_sha256":fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256,
+        "native_lib":args.native_lib,"manifest_sha256":digest(&std::fs::read(&args.manifest)?),
+        "split_devices":devices,"attention_placement":"layers","wire":args.wire,
+        "serving_execution":true,"decode":args.decode,"prefill_rows":args.prefill_rows,
+        "prefill_waves":args.prefill_waves,"diagnostic_wire_not_qualified":true});
+    std::fs::create_dir(&args.save_logits)?;
+    let mut records = Vec::new();
+    for (identity, window) in windows.into_iter().enumerate() {
+        let count = window.tokens.len() - 1;
+        let dump = args.save_logits.join(&window.id);
+        let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
+            prompt_ids: Some(window.tokens.clone()), score_from: Some(window.score_from),
+            score_positions: Some(window.positions.iter().map(|position| position.pos).collect()),
+            top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
+        probe.admitted("minimax_m3", &window.tokens, 0);
+        probe.selected_score_path(if args.decode { "decode" } else { "prefill" });
+        probe.provenance(provenance.clone());
+        let mut placement = Placement { units: (0..count.div_ceil(64)).map(|page| page as u32).collect(), slot: 0, len: 0 };
+        for rank in &owners.storage.requests.borrow().ranks {
+            let stream = &rank.bank.readers()[0];
+            rank.bank.install(&placement, stream.raw)?;
+        }
+        let first_decode = if args.decode { window.score_from.saturating_sub(1).max(1).min(count) } else { count };
+        let mut request = [ServingRequest { identity: identity as u64 + 1, kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
+            placement: &mut placement, start: 0, tokens: &window.tokens[..first_decode], heads: 0..first_decode }];
+        execution.execute(&owners.storage, &cfg, &schedule, &mut request, false, |_, positions, logits| {
+            let values = logits.to_host(&library)?;
+            for (row, logits) in values.chunks_exact(cfg.vocab_size).enumerate() {
+                let position = positions.start + row + 1;
+                if position >= window.score_from { probe.row(position, logits); }
+            }
+            Ok(())
+        })?;
+        for position in first_decode..count {
+            let request = [ServingRequest { identity: identity as u64 + 1, kind: cuteafd_transport::ExpertV2SourceKind::Decode,
+                placement: &mut placement, start: position, tokens: &window.tokens[position..position + 1], heads: position..position + 1 }];
+            let logits = execution.decode(&owners.storage, &cfg, &schedule, &request)?;
+            probe.row(position + 1, &logits.to_host(&library)?);
+            placement.len = position + 1;
+        }
+        let record = probe.record();
+        ensure!(record.error.is_none(), "MiniMax split row dump failed: {:?}", record.error);
+        let mut scored = window.score(&record.rows);
+        fidelity_rows::score_compact(cfg.vocab_size, &window, &dump, &mut scored)?;
+        ensure!(scored.missing == 0 && scored.non_finite == 0, "MiniMax split scored rows missing/nonfinite");
+        println!("MiniMax split {} wire={:?}: rows={} top1={:.6} NLL={:.8} KL={:.8}",
+            window.id, args.wire, scored.positions, scored.top1, scored.nll, scored.kl);
+        serde_json::to_writer(std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(args.save_logits.join(format!("{}.json", window.id)))?,
+            &serde_json::json!({"probe":record,"score":scored}))?;
+        records.extend(scored.records);
+    }
+    execution.drain(&owners.storage)?;
+    let report = cuteafd_bench::fidelity::minimax_golden_report(Fidelity::from_records(records), provenance)?;
+    serde_json::to_writer(std::fs::OpenOptions::new().write(true).create_new(true)
+        .open(args.save_logits.join("fidelity.json"))?, &report)?;
+    ensure!(report["qualified"] == true, "MiniMax split qualification failed: {}", report["verdict"]);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
     admitted: &CoordinatorWeights, weights: &TargetWeights<'a>,
@@ -363,6 +533,34 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(clap::Parser)]
+    struct ParseGolden { #[command(flatten)] args: GoldenArgs }
+
+    fn parse_args(extra: &[&str]) -> std::result::Result<GoldenArgs, clap::Error> {
+        use clap::Parser;
+        let mut args = vec!["golden", "--snapshot", "/snapshot", "--native-lib", "/native.so",
+            "--golden", "/reference", "--save-logits", "/output", "--nll"];
+        args.extend_from_slice(extra);
+        ParseGolden::try_parse_from(args).map(|parsed| parsed.args)
+    }
+
+    #[test]
+    fn peer_args_require_explicit_wire_and_keep_no_peer_whole_selection() -> Result<()> {
+        let single = parse_args(&[])?;
+        assert!(split_selection(&single)?.is_none());
+        assert!(parse_args(&["--split-device", "1"]).is_err());
+        assert!(parse_args(&["--wire", "bf16"]).is_err());
+        for (name, expected) in [("bf16", WirePrecision::Bf16), ("fp32", WirePrecision::F32)] {
+            let args = parse_args(&["--device", "3", "--split-device", "1", "--wire", name,
+                "--attention-placement", "layers"])?;
+            assert_eq!(split_selection(&args)?, Some(([3, 1], expected)));
+        }
+        assert!(split_selection(&parse_args(&["--split-device", "0", "--wire", "bf16"])?).is_err());
+        assert!(split_selection(&parse_args(&["--split-device", "1", "--wire", "fp32",
+            "--attention-placement", "heads"])?).is_err());
+        Ok(())
+    }
+
     #[test]
     fn reference_rejects_an_unpinned_manifest_before_loading_any_rows() -> Result<()> {
         let root = tempfile::tempdir()?;
