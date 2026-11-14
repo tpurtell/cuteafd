@@ -250,6 +250,11 @@ def jobs(scope):
                         "--prefill-rows", "4096", "--only", names]))
     if scope == "suspects":
         return result
+    # Inkling 2 Small: biased-sink GQA attention and the coordinator MXFP8 W8A8 expert package.
+    result.append(("inkling2-attention", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "inkling2", "--decode-rows", "64", "--prefill-rows", "4096"]))
+    result.append(("routed-inkling2_mxfp8", "package_fp8_moe_aot.py",
+                   ["--geometry", "inkling2_mxfp8", "--capacities", CAPACITIES, "--layouts", "tp1,tp2"]))
     for geometry in ("mimo", "mimof"):
         result.append((f"routed-{geometry}-row-addresses", "package_fp8_moe_aot.py",
                        ["--geometry", geometry, "--capacities", "2752", "--layouts", "tp2", "--row-addresses"]))

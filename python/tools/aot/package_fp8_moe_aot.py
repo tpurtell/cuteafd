@@ -74,8 +74,8 @@ os.environ.setdefault("B12X_COMPILE_MEMORY_CACHE", "0")
 SCHEMA = "cuteafd.fp8moe-package.v1"
 ROLE_LAYOUTS = {"coordinator": ("tp1", "tp2")}
 ABI_VERSION = 6
-STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5}
-ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2, "swigluoai": 3}
+STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5, "mxfp8": 6}
+ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2, "swigluoai": 3, "situ": 4}
 PROJECTION = {"bf16": 1}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
 # Spark ranks take the FP8 K32 wire rows of the expert protocol; coordinator
@@ -84,7 +84,12 @@ ROLE_INPUT = {"spark": "wire", "coordinator": "bf16"}
 
 
 def input_kind(role: str, weights: str, requested: str | None = None) -> str:
-    """NVFP4 quantizes the original BF16 row once with each expert's scale."""
+    """NVFP4 quantizes the original BF16 row once with each expert's scale.
+    MXFP8 experts are W8A8: every role takes the FP8 K32 wire rows."""
+    if weights == "mxfp8":
+        if requested not in (None, "wire"):
+            raise ValueError("MXFP8 W8A8 requires FP8 K32 wire input")
+        return "wire"
     if weights in ("nvfp4", "bf16"):
         if requested not in (None, "bf16"):
             raise ValueError(f"{weights.upper()} requires BF16 input; FP8 K32 wire loses checkpoint numerics")
@@ -502,13 +507,15 @@ def activation_params(activation, weights, alpha, beta, limit) -> tuple[float, f
 
     if not math.isfinite(limit) or limit < 0:
         raise ValueError("SwiGLU limit must be finite and nonnegative")
+    if (activation == "situ") != (weights == "mxfp8"):
+        raise ValueError("SiTU is the MXFP8 expert activation, and its only one")
     if activation == "swigluoai":
         if (weights != "nvfp4" or alpha is None or beta is None
                 or not math.isfinite(alpha) or alpha <= 0 or not math.isfinite(beta) or limit <= 0):
             raise ValueError("SwiGLU-OAI requires native NVFP4, positive finite alpha/limit and finite beta")
         return float(alpha), float(beta)
     if alpha not in (None, 1.0) or beta not in (None, 0.0):
-        raise ValueError("SiLU requires neutral alpha=1 and beta=0")
+        raise ValueError("SiLU and SiTU require neutral alpha=1 and beta=0")
     return 1.0, 0.0
 
 
@@ -637,7 +644,8 @@ def build(args: argparse.Namespace) -> None:
                                  "segmented": segmented, "core_only": core_only,
                                  "minimum_rows": auto_large_rows(wire, g.kind, form) + 1 if segmented else 0,
                                  "act_row_bytes": ((g.slice + g.slice // 32 + 15) // 16 * 16
-                                                   if program.geometry["mxfp4_down_a8"] else 2 * g.slice),
+                                                   if program.geometry["mxfp4_down_a8"] or g.weights == "mxfp8"
+                                                   else 2 * g.slice),
                                  "weight_read_grouping": program.geometry["weight_read_grouping"],
                                  "arithmetic_routes": program.geometry["arithmetic_routes"]})
                 if core_only:
@@ -721,6 +729,8 @@ def verify(package: Path, *, revision: str | None = None, role: str | None = Non
                           info["swiglu_beta"], info["swiglu_limit"])
         if info.get("weights") == "mxfp4" and info["activation"] != "silu_bf16_product":
             raise ValueError(f"{package}/{name}: MXFP4 supports only the pre-SiLU activation contract")
+        if info.get("weights") == "mxfp8" and info.get("input") != "wire":
+            raise ValueError(f"{package}/{name}: MXFP8 W8A8 requires FP8 K32 wire input")
         if info.get("weights") in ("nvfp4", "bf16") and info.get("input") != "bf16":
             raise ValueError(f"{package}/{name}: {info['weights'].upper()} requires BF16 input")
         if input_kind is not None and info.get("input") != input_kind:
@@ -747,7 +757,8 @@ def main() -> None:
     create.add_argument("--role", choices=sorted(ROLE_COMPUTE), required=True)
     create.add_argument("--geometry", choices=("mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
                                                "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4",
-                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4", "minimax_nvfp4a4"),
+                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4", "minimax_nvfp4a4",
+                                               "inkling2_mxfp8"),
                         required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")

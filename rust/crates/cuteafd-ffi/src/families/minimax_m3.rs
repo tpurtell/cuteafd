@@ -605,7 +605,7 @@ mod tests {
                 .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         let entries = manifest["programs"].as_array().expect("installed programs array");
-        assert_eq!(entries.len(), 1734);
+        assert_eq!(entries.len(), 1738);
         let mut partition = Vec::new();
         for entry in entries {
             let name = entry["name"].as_str().expect("installed program name");
@@ -652,11 +652,11 @@ mod tests {
         let library = fixture.load()?;
         fixture.register_programs(&library, entries)?;
         let programs = library.programs()?.with_manifest(&path)?;
-        assert_eq!(programs.names().count(), 1734);
+        assert_eq!(programs.names().count(), 1738);
         for entry in entries {
             assert!(programs.contains(entry["name"].as_str().unwrap()));
         }
-        println!("validated 1734 installed stems; MiniMax: 8 MSA, 10 Producer, 4 Forward, 1 gather");
+        println!("validated 1738 installed stems; MiniMax: 8 MSA, 10 Producer, 4 Forward, 1 gather");
         Ok(())
     }
 

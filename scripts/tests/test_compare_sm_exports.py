@@ -1814,3 +1814,13 @@ def test_placement_publication_rsync_host_syncs_directory_and_current_symlink(tm
     with pytest.raises(SystemExit) as refused:
         publisher.main()
     assert refused.value.code == 2
+
+
+def test_inkling2_groups_select_its_attention_programs_and_coordinator_mxfp8_package():
+    jobs = {name: (script, args) for name, script, args in compare_sm.jobs("all")}
+    assert jobs["inkling2-attention"] == ("export_b12x_dsv4_aot.py", [
+        "--geometry", "inkling2", "--decode-rows", "64", "--prefill-rows", "4096"])
+    assert jobs["routed-inkling2_mxfp8"] == ("package_fp8_moe_aot.py", [
+        "--geometry", "inkling2_mxfp8", "--capacities", compare_sm.CAPACITIES, "--layouts", "tp1,tp2"])
+    # No Spark-role MXFP8 package is registered until the engine's MXFP8 expert format lands.
+    assert not any(name.startswith("routed-inkling2") and "spark" in name for name in jobs)

@@ -13,10 +13,12 @@ extern "C" {
 
 // words (18): [0] packed contract (all bytes required):
 //   bits 0..7: ABI version 6 (old unversioned contracts are rejected)
-//   bits 8..15: storage 1=FP8 block128, 2=MXFP4, 4=NVFP4 W4A4, 5=BF16
+//   bits 8..15: storage 1=FP8 block128, 2=MXFP4, 4=NVFP4 W4A4, 5=BF16,
+//                       6=MXFP8 W8A8 (exported; no native loader yet)
 //   bits 16..23: activation 1=pre-SiLU clamp + BF16 SiLU/product rounding,
 //                          2=post-SiLU clamp + FP32 product/final BF16 rounding,
-//                          3=SwiGLU-OAI FP32 gate*sigmoid(alpha*gate)*(up+beta)
+//                          3=SwiGLU-OAI FP32 gate*sigmoid(alpha*gate)*(up+beta),
+//                          4=SiTU (MXFP8 only; route weight before FC2)
 //   bits 24..31: projection 1=BF16 gate/up and down outputs
 // Both activations clamp up to [-limit, limit]; limit zero disables clamping.
 // [1] hidden, [2] slice, [3] experts, [4] top-k,

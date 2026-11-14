@@ -861,10 +861,11 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
       printf 'host-isa coordinator %s spark grace\n' "$wip_coordinator_host_isa"
       printf 'spark-tp-roles %s\nbf16 %s\naudio %s\n' "$wip_spark_tp_roles" "$bf16_families" "$audio_aot"
       for key in EXL3_AOT NVFP4_AOT DSV4_MAX_CONTEXT DSV4_AOT GLM_AOT CONTEXT_SPLIT_AOT MIMO_AOT MIMO_GEOMETRIES \
-        GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT QWEN_DENSE_AOT STEP5_AOT KIMIK3_AOT ML4_AOT MINIMAX_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
+        GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT QWEN_DENSE_AOT STEP5_AOT KIMIK3_AOT ML4_AOT MINIMAX_AOT INKLING2_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
         VISION_ATTENTION_AOT V41_AOT CARGO_FEATURES; do
         [[ "$key" != KIMIK3_AOT || "${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" != OFF ]] || continue
         [[ "$key" != ML4_AOT || "${CUTEAFD_WIP_ML4_AOT:-OFF}" != OFF ]] || continue
+        [[ "$key" != INKLING2_AOT || "${CUTEAFD_WIP_INKLING2_AOT:-OFF}" != OFF ]] || continue
         local_name="CUTEAFD_WIP_$key"
         printf '%s=%s\n' "$local_name" "${!local_name:-<default>}"
       done
@@ -1374,6 +1375,7 @@ build_coordinator() {
     -e "CUTEAFD_WIP_MUSE_AOT=${CUTEAFD_WIP_MUSE_AOT:-OFF}" \
     -e "CUTEAFD_WIP_ML4_AOT=${CUTEAFD_WIP_ML4_AOT:-OFF}" \
     -e "CUTEAFD_WIP_MINIMAX_AOT=${CUTEAFD_WIP_MINIMAX_AOT:-OFF}" \
+    -e "CUTEAFD_WIP_INKLING2_AOT=${CUTEAFD_WIP_INKLING2_AOT:-OFF}" \
     ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} \
     -e "CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES:-${CUTEAFD_WIP_EXPERT_FAMILIES:-}}" \
     -e "CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}" \

@@ -588,3 +588,134 @@ def test_minimax_producer_fixture_matches_pinned_fork_without_cuda():
                 scratch_bytes_at_capacity={key: fn(4096) for key, fn in program.get("scratch", {}).items()}))
     fixture = ROOT / "rust/crates/cuteafd-ffi/tests/fixtures/minimax_producer_programs.json"
     assert json.loads(fixture.read_text()) == {"programs": expected}
+
+
+def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkeypatch, tmp_path):
+    import dataclasses
+    import json
+    import subprocess
+    import pytest
+
+    tree = ast.parse((ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text())
+    branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                  and ast.unparse(node.test) == "'inkling2' in geometries")
+    helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "inkling2_attention_programs")
+
+    @dataclasses.dataclass(frozen=True)
+    class Geometry:
+        heads: int = 48
+        kv_heads: int = 8
+
+    package = types.ModuleType("b12x.integration.cuteafd")
+    package.INKLING2_SMALL = Geometry()
+    attention = types.ModuleType("b12x.integration.cuteafd.inkling2_attention")
+    attention.compile_inkling2_attention_aot = lambda **kwargs: kwargs
+    for name in ("b12x", "b12x.integration"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    monkeypatch.setitem(sys.modules, attention.__name__, attention)
+    namespace = {"geometries": ["inkling2"], "manifest": {"families": {}}, "work": [], "dataclasses": dataclasses,
+                 "args": types.SimpleNamespace(decode_rows=64, prefill_rows=4096)}
+    exec(compile(ast.Module(body=[helper, branch], type_ignores=[]), "dispatch", "exec"), namespace)
+    assert namespace["manifest"]["families"] == {"inkling2": {"heads": 48, "kv_heads": 8}}
+    stem = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "stem" for target in node.targets)
+                and "kimi_split" in ast.unparse(node.value))
+    names = []
+    for family, suffix, op, params, thunk in namespace["work"]:
+        assert op == "attention" and thunk() == params
+        namespace.update(family=family, suffix=suffix, op=op)
+        exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
+        names.append((namespace["stem"], params))
+    assert names == [
+        ("inkling2_local_attention_decode_m64", dict(kind="local", route="decode", max_rows=64)),
+        ("inkling2_local_attention_prefill_m4096", dict(kind="local", route="prefill", max_rows=4096)),
+        ("inkling2_global_attention_decode_m64", dict(kind="global", route="decode", max_rows=64)),
+        ("inkling2_global_attention_prefill_m4096", dict(kind="global", route="prefill", max_rows=4096)),
+    ]
+    # Non-default capacities reach the pinned compiler and the stem.
+    custom = namespace["inkling2_attention_programs"](16, 2048)
+    assert [(suffix, thunk()["max_rows"]) for suffix, _, _, thunk in custom] == [
+        ("local_attention_decode_m16", 16), ("local_attention_prefill_m2048", 2048),
+        ("global_attention_decode_m16", 16), ("global_attention_prefill_m2048", 2048)]
+    # Appended after every existing program, like MiniMax: the per-geometry loop skips it.
+    source = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
+    assert 'if name in ("minimax", "inkling2"):\n            continue' in source
+    assert source.index('if "minimax" in geometries:') < source.index('if "inkling2" in geometries:')
+
+    spec = importlib.util.spec_from_file_location("inkling2_fp8_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
+    packager = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(packager)
+    assert packager.STORAGE == {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5, "mxfp8": 6}
+    assert packager.ACTIVATION == {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2, "swigluoai": 3, "situ": 4}
+    # W8A8: FP8 K32 wire rows on every role, including the coordinator.
+    assert packager.input_kind("coordinator", "mxfp8") == packager.input_kind("spark", "mxfp8") == "wire"
+    with pytest.raises(ValueError, match="wire"):
+        packager.input_kind("coordinator", "mxfp8", "bf16")
+    assert packager.activation_params("situ", "mxfp8", None, None, 0.0) == (1.0, 0.0)
+    for activation, weights in (("situ", "fp8"), ("silu_bf16_product", "mxfp8")):
+        with pytest.raises(ValueError, match="SiTU"):
+            packager.activation_params(activation, weights, None, None, 0.0)
+    g = types.SimpleNamespace(kind="mxfp8", weights="mxfp8", activation="situ", projection="bf16", swiglu_limit=0.0,
+                              hidden=4608, slice=1152, experts=384, top_k=8, intermediate=2304, tp=2)
+    words = packager.info_words(g, [1, 16, 80, 256, 1024, 4096], True)
+    assert words[0] == packager.ABI_VERSION | 6 << 8 | 4 << 16 | 1 << 24
+    assert words[1:8] == [4608, 1152, 384, 8, 2304, 2, 7] and len(words) == packager.INFO_WORDS
+
+    from test_wip_scope_exports import aot, cmake_flags
+    _, scopes = aot.config_scopes(dict(FAMILY="inkling2", MODEL_ID="fixture/Inkling-2-Small-MXFP8", SPARK_COUNT="4"))
+    assert scopes["CUTEAFD_WIP_INKLING2_AOT"] == "ON"
+    assert scopes["CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES"] == "inkling2:mxfp8"
+    assert scopes["CUTEAFD_WIP_EXPERT_FAMILIES"] == ""
+    assert cmake_flags("coordinator", scopes)["CUTEAFD_ENABLE_INKLING2_AOT"] == "ON"
+
+    def load(name, relative):
+        spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    release = load("inkling2_release_scope", "scripts/build/release-scope.py")
+    monkeypatch.setattr(release, "scopes_module", lambda _: aot)
+    (tmp_path / "inkling2.config").write_text("FAMILY=inkling2\nMODEL_ID=fixture/Inkling-2-Small-MXFP8\nSPARK_COUNT=4\n")
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps({"entries": [{"name": "inkling2", "family": "inkling2", "config": "inkling2.config"}]}))
+    derived, _ = release.derive(tmp_path, matrix, "inkling2", {})
+    assert derived["CUTEAFD_RELEASE_INKLING2_AOT"] == "ON"
+    assert derived["CUTEAFD_RELEASE_MINIMAX_AOT"] == "OFF"
+    assert derived["CUTEAFD_RELEASE_EXPERT_FAMILIES"] == "inkling2:mxfp8"
+    required = release.requirements(tmp_path, matrix, "inkling2")[0]
+    assert required["programs"] == ["inkling2"] and required["experts"] == ["inkling2:mxfp8"]
+    assert required["spark_experts"] == []
+
+    placement = load("inkling2_placement_inputs", "scripts/build/export-placement-inputs.py")
+    jobs = {name: (exporter, args) for name, exporter, args in placement.export_jobs()}
+    args = jobs["programs"][1]
+    geometries = args[args.index("--geometry") + 1].split(",")
+    assert geometries[-2:] == ["minimax", "inkling2"]
+    assert jobs["fp8/fp8-inkling2-mxfp8"] == ("package_fp8_moe_aot.py", [
+        "--geometry", "inkling2_mxfp8", "--capacities", placement.fp8_capacities(),
+        "--layouts", "tp1,tp2", "--role", "coordinator"])
+
+    for flags, expected in (({"CUTEAFD_ENABLE_INKLING2_AOT": "ON"}, "inkling2,expert_reply"),
+                            ({"CUTEAFD_ENABLE_MINIMAX_AOT": "ON", "CUTEAFD_ENABLE_INKLING2_AOT": "ON"},
+                             "minimax,inkling2,expert_reply")):
+        root = tmp_path / "-".join(sorted(flags))
+        root.mkdir()
+        (root / "CMakeLists.txt").write_text("\n".join([
+            "cmake_minimum_required(VERSION 3.18)", "project(inkling2_scope NONE)",
+            "set(CUTEAFD_CUDA_ARCHITECTURES 120)", "set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)",
+            *(f"set({key} {value})" for key, value in flags.items()),
+            "add_custom_target(cuteafd_verify_sparkinfer_source)",
+            f'include("{ROOT / "native/cmake/shared/dsv4_programs.cmake"}")',
+            'file(WRITE "${CMAKE_BINARY_DIR}/scope.json" "${CUTEAFD_PROGRAM_GEOMETRY}|${CUTEAFD_DENSE_TRELLIS_FAMILIES}|${CUTEAFD_EXLR8_FAMILIES}")',
+        ]))
+        result = subprocess.run(["cmake", "-S", str(root), "-B", str(root / "build")],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (root / "build/scope.json").read_text() == expected + "||"
+    fp8 = (ROOT / "native/cmake/shared/fp8_moe.cmake").read_text()
+    assert 'set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-inkling2-mxfp8")' in fp8
+    for script in ("build-wip-artifacts.sh", "build-release-artifacts.sh"):
+        assert "*:nvfp4|*:nvfp4a4|*:mxfp8)" in (ROOT / "scripts/build" / script).read_text()

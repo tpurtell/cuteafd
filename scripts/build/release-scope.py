@@ -17,7 +17,7 @@ import re
 import tarfile
 
 PREFIX = 'CUTEAFD_RELEASE_'
-SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8', 'MINIMAX')
+SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8', 'MINIMAX', 'INKLING2')
 LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES',
          'FP8_MOE_BF16_FAMILIES', 'EXLR8_FAMILIES')
 # v2.0.0 shipped set: complete releases retain this previous-release floor.
@@ -244,6 +244,8 @@ def requirements(repo, matrix, scope):
             programs = {'ml4', 'dense_trellis_k6'} | ({'ml42'} if dual else set())
         elif family == 'minimax_m3':
             programs = {'minimax'}
+        elif family == 'inkling2':
+            programs = {'inkling2'}
         elif family == 'muse_spark':
             programs = {'muse', 'dense_trellis_k6', 'expert_partial'} | ({'muse2'} if dual else set())
         spark_experts = sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES']))
@@ -407,7 +409,7 @@ def check_inventory(root, role, wanted, symbols=None):
                     if role == 'coordinator' and entry['dual']:
                         layouts.extend(['rtx-tp2-rank0', 'rtx-tp2-rank1'] if family == 'qwen4' else ['rtx-tp2'])
                     check_package(root, f'exl3/exl3-{family}-{kind[5:]}', layouts, role, verified)
-                elif kind in ('fp8', 'nvfp4', 'nvfp4a4') or item == 'step5:bf16':
+                elif kind in ('fp8', 'nvfp4', 'nvfp4a4', 'mxfp8') or item == 'step5:bf16':
                     suffix = '-bf16-weights' if item == 'step5:bf16' else '' if kind == 'fp8' else '-' + kind
                     if item == 'step5:nvfp4':
                         suffix = '-nvfp4a4'

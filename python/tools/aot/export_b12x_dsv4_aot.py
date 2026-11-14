@@ -336,6 +336,20 @@ def minimax_forward_programs(prefill_rows: int):
     return result
 
 
+def inkling2_attention_programs(decode_rows: int, prefill_rows: int):
+    """Inkling 2 Small biased-sink GQA attention: local (window 1024 ring) and global (paged) layers."""
+    from functools import partial
+    from b12x.integration.cuteafd.inkling2_attention import compile_inkling2_attention_aot
+
+    result = []
+    for kind in ("local", "global"):
+        for route, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+            params = dict(kind=kind, route=route, max_rows=rows)
+            result.append((f"{kind}_attention_{route}_m{rows}", "attention", params,
+                           partial(compile_inkling2_attention_aot, **params)))
+    return result
+
+
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
     # Fused top-k has fixed CTA-group spin barriers. The native table has no
     # loaded-kernel occupancy gate/fallback; even a new decode bucket must not
@@ -1490,6 +1504,7 @@ def main() -> None:
                              "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
                              "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
                              "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), minimax (vendor MXFP8 A8), "
+                             "inkling2 (Inkling 2 Small biased-sink GQA attention), "
                              "glm_stage/glm2_stage (full/TP2 GLM primitive boundaries), "
                              "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
                              "dense_trellis_k6 (native K6 core projections), "
@@ -1537,9 +1552,9 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "minimax", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "minimax", "inkling2", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, inkling2, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
     kimi_kda = None
@@ -1654,7 +1669,7 @@ def main() -> None:
             }
             work += [(name, *item) for item in dense_programs(families=dense_families, input_dtype="bf16")]
             continue
-        if name == "minimax":
+        if name in ("minimax", "inkling2"):
             continue  # appended after existing programs to preserve their indices
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs
@@ -1802,6 +1817,10 @@ def main() -> None:
             args.decode_rows, args.prefill_rows, args.max_context)]
         work += [("minimax", *item) for item in minimax_producer_programs(args.prefill_rows)]
         work += [("minimax", *item) for item in minimax_forward_programs(args.prefill_rows)]
+    if "inkling2" in geometries:
+        from b12x.integration.cuteafd import INKLING2_SMALL
+        manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)
+        work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.
