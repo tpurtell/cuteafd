@@ -62,6 +62,7 @@ def test_minimax_qualification_card_is_one_rtx_three_sparks_and_wip_only(tmp_pat
     serve = _line(result, "serve-minimax --snapshot")
     assert _flag(serve, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(3))
     assert _flag(serve, "--rtx-expert-layers") == "auto"
+    assert _flag(serve, "--split-wire") == "fp32"
     assert _flag(serve, "--host-cache-bytes") == "auto"
     assert "--split-device" not in serve.split()
     refused = _family_launch_result(tmp_path / "release", config, "MiniMaxAI/MiniMax-M3.1-Flash", keys,
@@ -71,6 +72,21 @@ def test_minimax_qualification_card_is_one_rtx_three_sparks_and_wip_only(tmp_pat
     entry = next(entry for entry in matrix["entries"] if entry["name"] == "minimax-flash-min")
     assert entry["family"] == "minimax_m3" and len(entry["gpus"]) == 1 and len(entry["sparks"]) == 3
     assert entry["config"] == "examples/configs/minimax-m31-flash-nvfp4-min.config"
+
+
+@pytest.mark.parametrize("wire", ["bf16", "fp32", "invalid"])
+def test_minimax_split_wire_is_explicitly_forwarded_and_validated(tmp_path: Path, wire: str) -> None:
+    config = {"model_type": "minimax_m3_vl", "text_config": {
+        "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
+    keys = ("SPARK_COUNT=3\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+            f"SPLIT_WIRE={wire}\n" + "".join(
+                f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(3)))
+    result = _family_launch_result(tmp_path, config, "MiniMaxAI/MiniMax-M3.1-Flash", keys,
+        extra_args=("--wip", "minimax"), encoder_plan=PLANNED)
+    if wire == "invalid":
+        assert result.returncode != 0 and "SPLIT_WIRE must be bf16 or fp32" in result.stderr
+    else:
+        assert _flag(_line(result, "serve-minimax --snapshot"), "--split-wire") == wire
 
 
 @pytest.mark.parametrize("filter", ["", "info,cuteafd::shared::mapped_table=debug"])

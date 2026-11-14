@@ -1796,13 +1796,10 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
         assert!(!report.executable());
         assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
         assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
-        if attention.is_none() {
-            assert!(report.solver_placement.is_none(), "unselected split precision must not produce a plan");
-            assert!(format!("{report:?}").contains("wire precision not qualified/selected"));
-        } else {
-            let placed = report.solver_placement.as_ref().expect("shared solved placement");
-            assert_eq!(placed.attention_placement, report.attention_placement);
-        }
+        let placed = report.solver_placement.as_ref().expect("qualified default wire produces a shared solved plan");
+        assert_eq!(placed.attention_placement, report.attention_placement);
+        assert_eq!(plan::layout::LayoutOptions::default().minimax_split_wire,
+            Some(crate::families::minimax_m3::execution::WirePrecision::F32));
     }
 }
 

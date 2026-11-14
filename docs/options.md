@@ -20,6 +20,7 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 
 | Lever | Families | Enable | Effect | Cost |
 | --- | --- | --- | --- | --- |
+| `SPLIT_WIRE` | MiniMax | `SPLIT_WIRE=bf16` (default = `fp32`) | Halves split FFN partial wire bytes; throughput unmeasured (serving-edge measurement deferred). | Generated-row NLL +0.00294317 vs FP32; paired top-1 agreement 95.0867%. Both pass aggregate reference fidelity, but BF16 misses the fixed default-selection bar. |
 | `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
 | `QWEN_FP8_DECODE` | Qwen4 | `QWEN_FP8_DECODE=on` (unset = checkpoint BF16) | Holds the GDN/attention projections as one resident E4M3 copy; with `QWEN_FP8_HEAD=on`, 1× RTX code C1 222→247 tok/s, C4 441→489, 8K prefill 6100→6177 (2026-10-03). | Converts target projections to FP8 at load: golden KL 0.036→0.046, top-1 88.5%→86.7%; fails the KL gate, so opt-in only. |
 | `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). `GLM5_FLASH_FP8_PREFILL=off` also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614); its speed is unmeasured. FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
@@ -130,10 +131,13 @@ refused until its qualification card passes; WIP builds can serve it through the
 hidden `serve-minimax` command for qualification.
 Explicit two-RTX heads planning is available with half KV and replicated index
 storage; `auto` stays contiguous whole attention with neuron-split FFNs on two RTX.
-The two-RTX layers recipe requires an explicit qualified BF16/F32 split-wire
-precision as an internal admission input. No precision is silently selected:
-default planning and serve admission cleanly refuse with "MiniMax split FFN wire
-precision not qualified/selected" until qualification selects it. Each rank
+The two-RTX layers recipe defaults to qualified FP32 split partials. MiniMax-only
+`SPLIT_WIRE=fp32|bf16` maps to `--split-wire` (default `fp32`); it is inert on one
+RTX. The fixed qualification rule prefers BF16 only when its NLL differs from
+FP32 by at most 0.002 nats and their top-1 agreement is at least 99.5%. Measured
+BF16/FP32 generated-row NLL delta was 0.00294317 and agreement 95.0867%, so FP32
+is selected. An explicitly unselected internal wire still refuses with
+"MiniMax split FFN wire precision not qualified/selected". Each rank
 normalizes the broadcast FP32 residual locally; the FP32 meeting preserves the
 BF16 whole-FFN boundary before the replicated residual add. GPU0 owns the sole
 Spark endpoint and router; onboarded TP2 routes reach GPU1 as exact IDs/weights
@@ -249,6 +253,7 @@ support draft/MTP comparisons or `--save-logits`.
 | `SPARK_<rank>_LANE_B` | unset | IPv4 | Rail B; all active ranks or none. |
 | `EXPERT_BACKEND` | `auto` | `auto`, `local`, `spark` | `local` requires `SPARK_COUNT=0`. Dense Qwen is local-only; the planner admits other families by fit. |
 | `RTX_EXPERT_LAYERS` | `auto` | `auto`, `all`, `N` | Pool-first onboarding of routed-expert layers on the RTX pair. |
+| `SPLIT_WIRE` | `fp32` | `fp32`, `bf16` | MiniMax-only split FFN partial precision; one-RTX arithmetic is unchanged. FP32 is the measured qualified default (#2074). |
 | `RTX_EXPERT_PEER` | `off` | `off` | `on` is refused; TP2 halves replaced it. |
 | `EMBEDDING` | `gpu` | `host`, `gpu` | Untied token-embedding placement. Kimi, Step-5 and Muse accept `gpu` only; plan and serve refuse `host`. |
 | `EXPERT_PORT` | `19441` | 1–65535 | Expert-worker port. |

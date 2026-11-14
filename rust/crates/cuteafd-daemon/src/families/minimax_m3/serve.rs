@@ -18,6 +18,8 @@ pub(crate) struct ServeArgs {
     #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<usize>)]
     pub max_context: Option<usize>,
     #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
+    /// Qualified split FFN wire. One-RTX execution does not transfer partials.
+    #[arg(long, default_value = "fp32", value_parser = ["bf16", "fp32"])] pub split_wire: String,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
@@ -101,6 +103,10 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let loaded = super::startup::load(&library, &programs, &view, &checkpoint, &cfg, super::startup::Options {
                 device: worker_args.device, peers: &worker_args.peers, native_lib: &worker_args.native_lib,
                 manifest_path: &worker_args.manifest,
+                split_wire: match worker_args.split_wire.as_str() {
+                    "bf16" => super::dense::PartialPrecision::Bf16,
+                    _ => super::dense::PartialPrecision::DEFAULT,
+                },
                 prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
                 sequences: concurrency as u64, context_tokens: worker_args.max_context.unwrap_or(0) as u64,
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0),
@@ -170,6 +176,7 @@ mod tests {
         let crate::cli::Commands::ServeMinimax(mut args) = crate::cli::Cli::try_parse_from(argv)?.command else {
             panic!("MiniMax serve command");
         };
+        assert_eq!(args.split_wire, "fp32");
         crate::commands::bench::assert_resolved_family_seam("serve-minimax", &[], || {
             args.prefix.resolve_entries(16);
             args.prefill()?;

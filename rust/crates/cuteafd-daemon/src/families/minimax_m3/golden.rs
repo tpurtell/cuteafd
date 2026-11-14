@@ -103,12 +103,6 @@ fn selected_programs(cfg: &MiniMaxM3Config, weights: &CoordinatorWeights,
         .map(|spec| spec.name.clone()).collect())
 }
 
-fn split_checkpoint(view: &CheckpointView) -> Result<Checkpoint> {
-    // Spark admission derives native scale operands from the complete headers;
-    // coordinator-only filtering is valid only for the legacy cold target load.
-    Checkpoint::open_view(view)
-}
-
 fn split_selection(args: &GoldenArgs) -> Result<Option<([i32; 2], WirePrecision)>> {
     let Some(peer) = args.split_device else { return Ok(None); };
     ensure!(args.device >= 0 && peer >= 0 && peer != args.device,
@@ -137,8 +131,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let view = args.attention.selected_view.clone().map(Ok)
         .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
-    let checkpoint = if args.split_device.is_some() { split_checkpoint(&view)? }
-        else { Checkpoint::coordinator_view(&view, false, false)? };
+    let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
     let windows = reference(&args.golden, args.window.as_deref(), cfg.vocab_size)?;
@@ -616,15 +609,15 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let (whole, cfg) = super::super::owners::tests::snapshot(directory.path())?;
         let view = CheckpointView::select(directory.path(), cuteafd_loader::plan::checkpoint::CoreView::Original)?;
-        let peer = split_checkpoint(&view)?;
+        let peer = Checkpoint::coordinator_view(&view, false, false)?;
         let layers = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
-        let recipe = |checkpoint: &Checkpoint| cuteafd_loader::plan::experts::checkpoint_spark_recipe(checkpoint, 4, &layers);
-        assert_eq!(recipe(&peer)?, recipe(&whole)?);
+        let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
+        let charges = |checkpoint: &Checkpoint| cuteafd_loader::families::minimax_m3::admission::spark_charges(
+            checkpoint, &catalog, &layers, 4, cuteafd_loader::placement::planner::PrefillShape { rows: 1024, waves: 3 });
+        assert_eq!(charges(&peer)?, charges(&whole)?);
         let scalar = "language_model.model.layers.2.block_sparse_moe.experts.0.w1.input_global_scale";
-        assert!(peer.header(scalar).is_some());
-        let filtered = Checkpoint::coordinator_view(&view, false, false)?;
-        assert!(filtered.header(scalar).is_none());
-        assert!(recipe(&filtered).unwrap_err().to_string().contains("missing routed expert tensor header"));
+        assert!(peer.header(scalar).is_none(), "target load remains coordinator-scoped");
+        assert!(whole.header(scalar).is_some(), "shared Spark charge reader supplies full native headers");
         Ok(())
     }
 
@@ -635,7 +628,7 @@ mod tests {
             PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
         let snapshot = home.join("hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e");
         let view = CheckpointView::select(&snapshot, cuteafd_loader::plan::checkpoint::CoreView::Original)?;
-        let peer = split_checkpoint(&view)?;
+        let peer = Checkpoint::coordinator_view(&view, false, false)?;
         let whole = Checkpoint::open_view(&view)?;
         let cfg = MiniMaxM3Config::from_hf(&whole.config)?;
         let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
