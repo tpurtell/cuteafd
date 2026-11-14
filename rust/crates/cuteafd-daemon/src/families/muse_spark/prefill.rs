@@ -250,7 +250,7 @@ mod tests {
         let end = source.split_once("    fn end_unit(").unwrap().1
             .split_once("    fn commit_unit(").unwrap().0;
         let streamed = end.split_once("if let Some(scoring) = self.call.scoring {").unwrap().1
-            .split_once("} else if").unwrap().0;
+            .split_once("} else {").unwrap().0;
         assert!(streamed.contains("scoring.record(rank.device.library, offset, &device_logits)"));
         assert!(!streamed.contains("prefill_logits"));
         assert!(end.find("super::forward::head").unwrap() < end.find("scoring.record").unwrap());

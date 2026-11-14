@@ -541,7 +541,7 @@ mod draft_cli_tests {
     }
 
     /// `cuteafd plan --layout` and `serve-glm` admission charge the same native dense bytes for the same
-    /// geometry: the planner's per-GPU item equals the admitted native scratch layouts.
+    /// geometry: Ready holds decode scratch; prefill scratch joins it at Growth.
     #[test]
     fn planner_charge_equals_admission_charge_for_the_same_geometry() {
         use cuteafd_loader::plan::exlr8::PrefillActivations;
@@ -569,10 +569,8 @@ mod draft_cli_tests {
                         cuteafd_loader::families::glm5::native::scratch_bytes(
                             &native_dense_layouts(&cfg, &records, &plan, &engine).unwrap()).unwrap()
                     }).collect::<Vec<_>>();
-                    // A serving layout allocates its prefill lanes on the first live
-                    // prefill and charges them at Growth; scoring runs that prefill
-                    // before Ready, so its items hold every lane the admission
-                    // charge names. Compare the scoring view.
+                    // The Ready item contains decode scratch only. Admission also
+                    // reserves the prefill scratch allocated at the first request.
                     let layout = cuteafd_loader::plan::layout::LayoutOptions {
                         rtx_bytes: vec![96 << 30; gpus], prefill_rows: engine.prefill_rows as u64,
                         prefill_lanes: u64::from(engine.prefill_waves), prefill_waves: u64::from(engine.prefill_waves),
@@ -584,7 +582,12 @@ mod draft_cli_tests {
                     assert_eq!(memory.devices.len(), gpus);
                     for (rank, device) in memory.devices.iter().enumerate() {
                         let planned: u64 = device.items.iter().filter(|item| item.group == GROUP).map(|item| item.bytes).sum();
-                        assert_eq!(planned, charge[rank], "{gpus} RTX/{rows} rows/{waves} waves/{activations}");
+                        let dense = cuteafd_loader::plan::exlr8::dense::DensePlan::for_rank(&records, gpus, rank).unwrap();
+                        let scratch = native_dense_layouts(&cfg, &records, &dense, &engine).unwrap();
+                        assert_eq!(planned, scratch[0].bytes().unwrap() as u64,
+                            "Ready: {gpus} RTX/{rows} rows/{waves} waves/{activations}");
+                        assert_eq!(charge[rank], planned + scratch[1].bytes().unwrap() as u64,
+                            "Growth: {gpus} RTX/{rows} rows/{waves} waves/{activations}");
                     }
                     admitted.push(charge);
                 }

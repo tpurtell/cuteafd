@@ -2430,7 +2430,8 @@ mod admission_tests {
         let offline = cuteafd_loader::plan::families::step5::native::with_arena_phase(
             base.workspace, projection, head.workspace_bytes())?;
         assert_eq!(runtime.workspace, offline);
-        assert_eq!(runtime.workspace - projection, head.workspace_bytes());
+        assert_eq!(runtime.workspace - projection, layer.max(head.workspace_bytes()));
+        assert!(layer > head.workspace_bytes(), "bounded head no longer dominates the layer arena");
         Ok(())
     }
 
