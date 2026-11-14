@@ -5461,8 +5461,6 @@ fn qwen_spark_layout_keeps_only_native_mtp_experts_on_coordinator() {
     let lead = &with_mtp.devices[0];
     assert!(lead.items.iter().any(|i| i.group == "weight arena" && i.category == Category::Experts && i.bytes > 0), "{}", with_mtp.render());
     assert!(lead.items.iter().any(|i| i.group.starts_with("MTP EXL3")));
-    
-    
     options.layout.as_mut().unwrap().native_mtp_layers = 0;
     let without_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert!(!without_mtp.devices[0].items.iter().any(|i| i.group == "weight arena" && i.category == Category::Experts));
