@@ -96,6 +96,23 @@ fn publish<F: PrefixFamily<Placement = Placement>>(family: &F,
     Ok(())
 }
 
+#[derive(Default)]
+struct PolicyProbe { routes:Option<RoundRoutes> }
+impl PolicyProbe {
+    fn arm(&mut self,layers:usize) { self.routes=Some(RoundRoutes::new(layers,0)); }
+    fn begin(&mut self,rows:usize) {
+        if let Some(routes)=&mut self.routes {
+            routes.begin(rows);
+            // The shared policy learns whole-round cost, without claiming
+            // per-expert or per-layer timings that this adapter does not collect.
+            for layer in 0..routes.layers() { routes.dense(layer).expect("admitted policy layer"); }
+        }
+    }
+    fn finish<T>(&self,observe:impl FnOnce(&RoundRoutes,&[Option<f64>])->T) -> Option<T> {
+        self.routes.as_ref().map(|routes| observe(routes,&[]))
+    }
+}
+
 /// No allocations or placement choices here: startup passes its admitted context
 /// and host-prefix config, and the Owners borrow pins every native backing.
 pub(crate) struct MiniMaxBackend<'e, 'a> {
@@ -106,6 +123,7 @@ pub(crate) struct MiniMaxBackend<'e, 'a> {
     context: usize,
     host: Option<cuteafd_hostcache::config::Config>,
     profile: RefCell<[f64; 2]>,
+    policy_probe: RefCell<PolicyProbe>,
     identities: RefCell<BTreeMap<usize, u64>>,
     next_identity: Cell<u64>,
     pending: RefCell<Option<Vec<Submitted>>>,
@@ -140,7 +158,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let schedule = Requests::new(state.capacity, served_context, cfg.layers, rank.prefill.len())?;
         drop(state);
         Ok(Self { owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
-            host, profile: RefCell::new([0.0; 2]), identities: RefCell::new(BTreeMap::new()),
+            host, profile: RefCell::new([0.0; 2]), policy_probe:RefCell::new(PolicyProbe::default()), identities: RefCell::new(BTreeMap::new()),
             next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false),
             selector_receipts: RefCell::new(None), packing })
     }
@@ -455,7 +473,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             group_rows_by_rows:vec![],experts:0,topk:0,max_requests:self.geometry().slots,
             max_positions:self.geometry().decode_rows,widths:vec![width],classes:vec![cuteafd_core::ResourceClass::rtx()],regimes:1 })
     }
-    fn arm_draft_probe(&self) -> Result<()> { Ok(()) }
+    fn arm_draft_probe(&self) -> Result<()> { self.policy_probe.borrow_mut().arm(self.cfg.layers);Ok(()) }
     fn prefill_draft(&self, placement:&Placement, _:usize, _: &[u32], next:Option<u32>, state:&mut DraftState) -> Result<()> {
         let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter not admitted")?;
         ensure!(draft.frontier(placement.slot)? == placement.len,"MiniMax draft prefill frontier differs");
@@ -546,9 +564,11 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         self.identities.borrow_mut().remove(&placement.slot);
         Ok(())
     }
-    fn probe_begin(&self, _: usize) {}
+    fn probe_begin(&self, rows: usize) { self.policy_probe.borrow_mut().begin(rows); }
     fn probe_end(&self) {}
-    fn probe_finish<T>(&self, _: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
+    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
+        self.policy_probe.borrow().finish(observe)
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +581,41 @@ mod tests {
     use cuteafd_loader::{families::minimax_m3::execution::{MsaCache, MsaRope},
         placement::families::minimax_m3::RequestCapacity};
     use std::rc::Rc;
+
+    #[test]
+    fn policy_probe_observes_each_round_and_updates_only_live_concurrency_bucket() {
+        use crate::shared::draft::{resource,clock::RoundTimes,evidence::DraftSource};
+        let geometry=cuteafd_core::PolicyGeometry { layers:vec![cuteafd_core::LayerResource {
+            class:None,slice_bytes:0.,group_rows:1,timed:false };60],group_rows_by_rows:vec![],
+            experts:0,topk:0,max_requests:16,max_positions:128,widths:vec![7],
+            classes:vec![cuteafd_core::ResourceClass::rtx()],regimes:1 };
+        let mut policy=cuteafd_core::DraftPolicy::seeded(geometry,cuteafd_core::PolicySeed::weak(7)).unwrap();
+        let mut probe=PolicyProbe::default();
+        assert!(probe.finish(|_,_| ()).is_none());
+        probe.arm(60);
+        let mut observed=0;
+        for concurrency in [1,4,16] {
+            let other=[1,4,16].into_iter().filter(|&n| n!=concurrency)
+                .map(|n| (n,policy.cost_snapshot(false,n))).collect::<Vec<_>>();
+            for _ in 0..3 {
+                let before=policy.cost_snapshot(false,concurrency);
+                probe.begin(concurrency * 3);
+                let requests=(0..concurrency).map(|id| resource::Verified { id:id as u64,rows:3,accepted:2,
+                    source:DraftSource::Neural,prior:Some(&[0.8,0.8]),features:None,censor:None }).collect::<Vec<_>>();
+                probe.finish(|routes,times| {
+                    routes.complete().unwrap();
+                    resource::observe_drafted(&mut policy,&requests,routes,times,
+                        RoundTimes { total_us:2000 * concurrency as u64,draft_us:Some(300) },7,None,Some(concurrency)).unwrap();
+                    observed+=1;
+                }).unwrap();
+                let after=policy.cost_snapshot(false,concurrency);
+                assert_ne!(after.round,before.round);
+                assert_ne!(after.draft,before.draft);
+            }
+            for (n,before) in other { assert_eq!(policy.cost_snapshot(false,n),before); }
+        }
+        assert_eq!(observed,9);
+    }
 
     #[test]
     fn diagnostic_logit_tiles_survive_bounded_head_reuse() -> Result<()> {
