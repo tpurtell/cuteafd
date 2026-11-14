@@ -166,6 +166,9 @@ pub trait Family: Sync {
     /// Core inventory resolves native projections before role ownership is known.
     /// Keep their headers for classification without charging their payload to the role.
     fn eager_native_core_headers(&self) -> bool { false }
+    /// Header-only routed storage evidence needed before opening a role. Names
+    /// and formats remain family facts; the shared view owns the header pass.
+    fn eager_expert_header(&self, _name: &str) -> bool { false }
     /// Shipping native trellis widths for the resident head borrowed by drafters.
     fn native_head_widths(&self) -> &'static [usize] { &[] }
     fn exlr8_execution(&self) -> Exlr8Execution { Exlr8Execution::default() }

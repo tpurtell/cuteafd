@@ -156,10 +156,11 @@ impl CheckpointView {
         let metadata = super::Checkpoint { view: None, snapshot: self.snapshot.clone(),
             config: self.config.as_ref().clone(), quantize_config: None,
             weight_map: BTreeMap::new(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
-        let eager_core = crate::plan::family::detect(&metadata)
-            .is_some_and(|family| family.eager_native_core_headers());
+        let family = crate::plan::family::detect(&metadata);
+        let eager_core = family.is_some_and(|family| family.eager_native_core_headers());
         self.weight_map.iter().flat_map(|weights| weights.keys()).map(String::as_str)
-            .filter(move |name| eager_core && !name.contains(".experts.") && !name.contains(".mtp.")
+            .filter(move |name| family.is_some_and(|family| family.eager_expert_header(name))
+                || eager_core && !name.contains(".experts.") && !name.contains(".mtp.")
                 && (name.ends_with(".weight") || name.ends_with(".weight_scale_inv") || name.ends_with(".qscale_weight")
                     || name.ends_with(".weight_scale") || name.ends_with(".input_scale"))
                 && (name.contains(".self_attn.") || name.contains(".attention.") || name.contains(".mlp.") || name.starts_with("lm_head.")
