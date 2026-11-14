@@ -2,5 +2,6 @@
 pub mod admission;
 pub mod config;
 pub mod experts;
+pub mod execution;
 pub mod weight_layout;
 pub use config::{Inkling2Config, Inkling2MtpConfig, Inkling2VisionConfig};

@@ -281,3 +281,35 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         }
     }
 }
+
+#[test]
+fn eager_expert_headers_classify_inventory_and_roles_without_payload_ownership() {
+    use crate::plan::checkpoint::{CheckpointView, CoreView};
+    for kind in [Fixture::Mxfp8, Fixture::Mixed, Fixture::Exl3] {
+        let (dir, _, _) = fixture(kind);
+        let view = CheckpointView::select(dir.path(), CoreView::Original).unwrap();
+        let inventory = Checkpoint::inventory_view(&view).unwrap();
+        assert!(inventory.tensors.is_empty(), "classification evidence must not own payload");
+        assert_eq!(inventory.shard_bytes, 0);
+        for layer in 0..4 {
+            let expected = match kind { Fixture::Mxfp8 => ExpertStorage::Mxfp8,
+                Fixture::Mixed if layer < 3 => ExpertStorage::Nvfp4,
+                Fixture::Mixed => ExpertStorage::Mxfp8, Fixture::Exl3 => ExpertStorage::Exl3 { bits: 4 } };
+            assert_eq!(expert_storage(&inventory, layer).unwrap(), expected);
+        }
+        for local in [false, true] {
+            let role = Checkpoint::coordinator_view(&view, local, false).unwrap();
+            assert!(role.tensors.iter().all(|tensor| local || !tensor.meta.name.contains(".mlp.experts.")));
+            assert_eq!(expert_storage(&role, 0).unwrap(), expert_storage(&inventory, 0).unwrap());
+        }
+    }
+    for name in ["model.llm.layers.0.mlp.experts.w13_weight", "model.llm.layers.1.mlp.experts.w2_weight",
+        "model.llm.layers.2.mlp.experts.0.gate_proj.trellis", "model.llm.layers.2.mlp.experts.0.up_proj.trellis",
+        "model.llm.layers.2.mlp.experts.0.down_proj.trellis"] {
+        assert!(INKLING2.eager_expert_header(name));
+    }
+    for name in ["mtp.model.llm.layers.0.mlp.experts.w13_weight", "model.llm.layers.bad.mlp.experts.w13_weight",
+        "model.llm.layers.0.mlp.experts.1.gate_proj.trellis", "model.llm.layers.0.mlp.experts.w13_weight_scale"] {
+        assert!(!INKLING2.eager_expert_header(name));
+    }
+}

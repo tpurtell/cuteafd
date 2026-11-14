@@ -167,6 +167,7 @@ fn spec(cfg: &MuseSparkConfig, checkpoint: &Checkpoint) -> ModelSpec {
 }
 
 impl Family for MuseSpark {
+    fn eager_native_core_headers(&self) -> bool { true }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "new family on the shared lane structure; a second lane waits for a measured two-lane A/B (#744)" }

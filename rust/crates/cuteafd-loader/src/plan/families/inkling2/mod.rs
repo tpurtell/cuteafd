@@ -311,6 +311,12 @@ fn spec(cfg: &Inkling2Config, vision: bool, mtp: Option<&Inkling2MtpConfig>, sto
 }
 
 impl Family for Inkling2 {
+    fn eager_expert_header(&self, name: &str) -> bool {
+        let Some(tail) = name.strip_prefix("model.llm.layers.") else { return false; };
+        let Some((layer, tail)) = tail.split_once(".mlp.experts.") else { return false; };
+        layer.parse::<usize>().is_ok() && matches!(tail, "w13_weight" | "w2_weight"
+            | "0.gate_proj.trellis" | "0.up_proj.trellis" | "0.down_proj.trellis")
+    }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "decode shares the one Spark link with every prefill wave; a second lane needs its own decode \
