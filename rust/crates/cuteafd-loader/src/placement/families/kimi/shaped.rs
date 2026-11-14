@@ -131,7 +131,10 @@ impl KimiRecipe {
         for owner in &self.shaped {
             let mut samples: Vec<Vec<Vec<u64>>> = Vec::new();
             let mut roots = Vec::new();
-            for pages in 1..=self.maximum_pages {
+            let extent_pages = if matches!(request.context.pin, Pin::Auto) {
+                request.context.maximum.div_ceil(self.page_rows()).min(self.maximum_pages)
+            } else { 1 };
+            for pages in 1..=extent_pages {
                 let context = request.context.served(pages * self.page_rows());
                 let requests = owner.requests(context)?;
                 if pages == 1 {
@@ -148,6 +151,11 @@ impl KimiRecipe {
                     let owner = Allocation::buffer(format!("{group}.{rank}.request.{index}"), Location::coordinator(rank),
                         values[0], Lifetime::RESIDENT, category, group.clone());
                     let mut physical = curve(&values);
+                    if extent_pages < self.maximum_pages {
+                        physical.0.push(BytePiece { first: extent_pages + 1, last: self.maximum_pages,
+                            bytes_at_first: *values.last().expect("nonempty page domain"), bytes_per_page: 0,
+                            granularity: 1, backings: 1 });
+                    }
                     for piece in &mut physical.0 { piece.granularity = SM120_ALLOCATION_GRANULARITY_BYTES; }
                     let mut component = Component::allocation(owner, ByteCurve::fixed(values[0], self.maximum_pages),
                         false, self.maximum_pages);
