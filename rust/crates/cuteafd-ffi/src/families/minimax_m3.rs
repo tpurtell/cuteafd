@@ -605,7 +605,23 @@ mod tests {
                 .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         let entries = manifest["programs"].as_array().expect("installed programs array");
-        assert_eq!(entries.len(), 1734);
+        assert_eq!(entries.len(), 1742);
+        let dense_slices = [
+            "exlr8_dense_mxfp8_k6144_n4096_s1_a8",
+            "exlr8_dense_mxfp8_k6144_n256_s1_a8",
+            "exlr8_dense_mxfp8_k6144_n6144_s1_a8",
+            "exlr8_dense_mxfp8_k6144_n1536_s1_a8",
+            "exlr8_dense_mxfp8_k4096_n6144_s1_a8",
+            "exlr8_dense_mxfp8_k1536_n6144_s1_a8",
+            "exlr8_dense_quant_k4096_bf16_a8",
+            "exlr8_dense_quant_k1536_bf16_a8",
+        ];
+        for name in dense_slices {
+            let selected = entries.iter().filter(|entry| entry["name"] == name).collect::<Vec<_>>();
+            assert_eq!(selected.len(), 1, "missing or duplicate rank-local dense stem {name}");
+            assert_eq!(selected[0]["family"], "minimax");
+            assert_eq!(selected[0]["op"], if name.contains("_quant_") { "dense_mxfp8_quant" } else { "dense_mxfp8" });
+        }
         let mut partition = Vec::new();
         for entry in entries {
             let name = entry["name"].as_str().expect("installed program name");
@@ -652,11 +668,11 @@ mod tests {
         let library = fixture.load()?;
         fixture.register_programs(&library, entries)?;
         let programs = library.programs()?.with_manifest(&path)?;
-        assert_eq!(programs.names().count(), 1734);
+        assert_eq!(programs.names().count(), 1742);
         for entry in entries {
             assert!(programs.contains(entry["name"].as_str().unwrap()));
         }
-        println!("validated 1734 installed stems; MiniMax: 8 MSA, 10 Producer, 4 Forward, 1 gather");
+        println!("validated 1742 installed stems; MiniMax: 8 MSA, 10 Producer, 4 Forward, 1 gather");
         Ok(())
     }
 
