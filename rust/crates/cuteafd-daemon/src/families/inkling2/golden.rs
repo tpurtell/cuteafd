@@ -66,6 +66,11 @@ fn run(args: GoldenArgs) -> Result<()> {
     let device = Device { library: &library, id: args.device };
     let programs = device.run(|| Ok(library.programs()?.with_manifest(&args.manifest)?))?;
     let kernels = device.run(|| Kernels::bind(&programs))?;
+    // Load the expert code before the pre-weight CUDA sample, rather than
+    // attributing its module residency to an unmeasured post-admission owner.
+    // SAFETY: trusted generated package loaded on the retained device; this
+    // code-only owner launches no work and outlives every per-layer instance.
+    let _expert_code = device.run(|| unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(&package) })?;
     let (free, total) = device.run(|| library.cuda_memory_info())?;
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
     let plan = admission::admit(&checkpoint, &cfg, &target_layout, &expert_layouts[0], metadata.scratch_for(rows)?,
