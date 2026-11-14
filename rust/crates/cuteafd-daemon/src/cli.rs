@@ -220,6 +220,9 @@ pub(crate) enum Commands {
     /// Qualify native MiniMax full-model prefill with real Spark experts.
     #[command(hide = true)]
     MinimaxGolden(crate::families::minimax_m3::golden::GoldenArgs),
+    /// Qualify MiniMax whole-rank serving on the shared scheduler.
+    #[command(hide = true)]
+    ServeMinimax(crate::families::minimax_m3::serve::ServeArgs),
     /// Serve Kimi K3 with TP2 attention and six real Spark expert ranks.
     #[command(hide = true)]
     ServeKimi(crate::families::kimi_k3::serve::ServeArgs),

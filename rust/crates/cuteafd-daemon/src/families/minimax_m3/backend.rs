@@ -195,8 +195,18 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             identity: request.identity, kind: ExpertV2SourceKind::Decode, start: request.placement.len,
             heads: request.placement.len..request.placement.len + request.tokens.len(),
             tokens: &request.tokens, placement }).collect::<Vec<_>>();
-        let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule, &requests);
+        let mut graphs = self.owners.graphs.borrow_mut();
+        let graph = graphs.first_mut().context("MiniMax decode graph bank missing")?;
+        let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule, &requests, graph);
         let logits = self.completed(result)?;
+        graph.tick();
+        if graph.needs_boundary() {
+            // SAFETY: completed() drained every arithmetic/cache consumer; the
+            // adapter's storage pins survive controller observation/eviction.
+            unsafe { crate::shared::decode_graph::device::observe_completed(self.library(), |visit| graph.visit(visit))?; }
+            graph.observed();
+        }
+        drop(graphs);
         // Non-speculative input is committed even if selection later cancels.
         // A retained receipt validates the scheduler's optional accept callback;
         // publication itself never depends on that callback or UngraphedKind.

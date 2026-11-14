@@ -1,6 +1,7 @@
 //! Request shapes on shared packing and causal unit execution; no serve loop.
 use super::{cache::{Append, Metadata, PageBank, Placement},
-    experts::{DispatchRows, Dispatcher, RoutedRows, Ticket}, head::Head, owners::Storage};
+    experts::{DispatchRows, Dispatcher, RoutedRows, Ticket}, head::Head, owners::Storage,
+    graphs::{Graphs, Key, Op}};
 use crate::shared::{prefill_packing::{self, Limits},
     prefill_pipeline::{prefill_units, run_prefill_units, FfnRoute, PrefillHooks, Unit, UnitSegment},
     token_io::DeviceLogits};
@@ -379,11 +380,11 @@ impl<'a> ServingPrefill<'a> {
         result
     }
 
-    /// Native one-token decode on admitted boot-C storage. Attention and the
-    /// routed sections remain eager: Boundary performs host-side lease state
-    /// transitions that must execute on every replay, not only during capture.
+    /// Attention consumes only live cache metadata. Independent FFN/router/join
+    /// sections use bounded row keys with synthetic tails outside logical state.
     pub fn decode(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
-        schedule: &Requests, requests: &[ServingRequest<'_>]) -> Result<DeviceLogits> {
+        schedule: &Requests, requests: &[ServingRequest<'_>], graphs: &mut Graphs<'a, Storage<'a>>)
+        -> Result<DeviceLogits> {
         ensure!(!self.terminal, "MiniMax decode serving is terminal");
         ordered_rank(&storage.ranks.iter().map(|rank| std::iter::once(rank.decode.borrow().stream.raw as usize)
             .chain(rank.prefill.iter().map(|owner| owner.borrow().stream.raw as usize)).collect()).collect::<Vec<_>>())?;
@@ -391,6 +392,8 @@ impl<'a> ServingPrefill<'a> {
             slot: request.placement.slot, start: request.start, rows: request.tokens.len(),
         }).collect::<Vec<_>>())?;
         let rank = &storage.ranks[0];
+        let graph_rows = graphs.row_key(rows)?;
+        graphs.cycle(crate::shared::decode_graph::device::Cycle::Decode);
         let result = (|| {
             let mut state = storage.requests.borrow_mut();
             ensure!(state.capacity == schedule.capacity, "MiniMax decode capacity differs from storage");
@@ -419,8 +422,22 @@ impl<'a> ServingPrefill<'a> {
                 // retained stream; the backend validates actual shared-pool refs.
                 unsafe { rank.decode.borrow_mut().decode(&rank.kernels, &rank.weights,
                     &rank.layout, layer, request)?; }
+                if graph_rows > rows {
+                    let owner = rank.decode.borrow();
+                    let tail = super::cache::view(owner.plane("residual")?, rows * cfg.hidden * 4,
+                        (graph_rows - rows) * cfg.hidden * 4)?;
+                    owner.stream.device.run(|| {
+                        // SAFETY: padded rows are private admitted scratch, never
+                        // cache slots; row-independent sections cannot affect live rows.
+                        unsafe { owner.stream.device.library.cuda_zero_bytes_async(tail, tail.bytes, owner.stream.raw) }
+                    })?;
+                }
                 if let Some(binding) = self.bindings[layer] {
-                    rank.decode.borrow().router(&rank.kernels, &rank.weights, layer, rows)?;
+                    rank.decode.borrow().router_boundary()?;
+                    // SAFETY: the exact row key retains all weights/scratch; host
+                    // boundary transitions run outside recording and every replay.
+                    unsafe { graphs.run(Key { rank: 0, layer, rows: graph_rows, op: Op::Router }, None,
+                        || rank.decode.borrow().router_enqueue(&rank.kernels, &rank.weights, layer, graph_rows))?; }
                     if let Some(usage) = &storage.usage {
                         let owner = rank.decode.borrow();
                         let tally = usage.routes(owner.stream.device.id, layer,
@@ -438,11 +455,35 @@ impl<'a> ServingPrefill<'a> {
                             token_position: request.start as u64, route_offset: (row * 4) as u32, route_count: 4,
                         }).collect() };
                     let ticket = self.dispatchers[binding.dispatcher].begin(layer, &source, dispatch)?;
-                    rank.decode.borrow_mut().ffn(&rank.kernels, &rank.weights, &rank.layout, layer, rows, true)?;
+                    rank.decode.borrow().ffn_boundary(true)?;
+                    // SAFETY: immutable geometry and retained unit owner; routed
+                    // staging event wait was enqueued before entering this section.
+                    unsafe { graphs.run(Key { rank: 0, layer, rows: graph_rows, op: Op::Ffn }, None,
+                        || rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights,
+                            &rank.layout, layer, graph_rows, true))?; }
                     ticket.land()?;
-                    rank.decode.borrow().join_routed(&rank.kernels, rows)?;
+                    if graph_rows > rows {
+                        let owner = rank.decode.borrow();
+                        let tail = super::cache::view(owner.plane("routed")?, rows * cfg.hidden * 2,
+                            (graph_rows - rows) * cfg.hidden * 2)?;
+                        owner.stream.device.run(|| {
+                            // SAFETY: dispatch writes only live rows; initialize
+                            // graph padding without reading an uninitialized routed tail.
+                            unsafe { owner.stream.device.library.cuda_zero_bytes_async(tail, tail.bytes, owner.stream.raw) }
+                        })?;
+                    }
+                    rank.decode.borrow().join_boundary()?;
+                    // SAFETY: landed routed output and fixed row key remain live;
+                    // joined() is a host transition performed on every replay.
+                    unsafe { graphs.run(Key { rank: 0, layer, rows: graph_rows, op: Op::JoinRouted }, None,
+                        || rank.decode.borrow().join_routed_enqueue(&rank.kernels, graph_rows))?; }
+                    rank.decode.borrow().joined();
                 } else {
-                    rank.decode.borrow_mut().ffn(&rank.kernels, &rank.weights, &rank.layout, layer, rows, false)?;
+                    rank.decode.borrow().ffn_boundary(false)?;
+                    // SAFETY: row-independent dense FFN with retained fixed pointers.
+                    unsafe { graphs.run(Key { rank: 0, layer, rows: graph_rows, op: Op::Ffn }, None,
+                        || rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights,
+                            &rank.layout, layer, graph_rows, false))?; }
                 }
             }
             let residual = rank.decode.borrow().plane("residual")?;

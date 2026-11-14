@@ -49,7 +49,7 @@ impl Drop for Storage<'_> {
 /// Graph fields retire before the final storage pin. Attention stays eager:
 /// its context-dependent launch scalars are not part of a decode graph key.
 pub(crate) struct Owners<'a> {
-    pub graphs: Vec<Graphs<'a, Storage<'a>>>,
+    pub graphs: RefCell<Vec<Graphs<'a, Storage<'a>>>>,
     pub storage: Rc<Storage<'a>>,
     selector_contract: SelectorContract,
 }
@@ -208,11 +208,47 @@ impl<'a> Owners<'a> {
                 gpu, inputs.cfg.layers, capacity.decode.rows as usize, &sites, graphs::Config {
                     reserve: inputs.graph_reserve[gpu], bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false })?);
         }
-        Ok(Self { graphs, storage, selector_contract: SelectorContract::from_plan(&admitted.solved)? })
+        Ok(Self { graphs: RefCell::new(graphs), storage, selector_contract: SelectorContract::from_plan(&admitted.solved)? })
     }
 }
 
 impl Owners<'_> {
+    /// Initialize only persistent section scratch. No synthetic KV page or
+    /// request enters the logical prefix cache, transport or usage counters.
+    pub fn prewarm(&self, cfg: &cuteafd_loader::families::minimax_m3::MiniMaxM3Config) -> Result<()> {
+        ensure!(self.storage.ranks.len() == 1, "MiniMax whole graph prewarm requires one rank");
+        let rank = &self.storage.ranks[0];
+        let mut banks = self.graphs.borrow_mut();
+        let bank = banks.first_mut().context("MiniMax graph bank missing")?;
+        let keys = bank.bootstrap()?;
+        let stream = Rc::clone(&rank.decode.borrow().stream);
+        {
+            let owner = rank.decode.borrow();
+            let buffers = [owner.plane("residual")?, owner.plane("routed")?, owner.plane("ffn")?,
+                owner.dense.producer_destination()];
+            for buffer in buffers {
+                owner.stream.device.run(|| {
+                    // SAFETY: private startup scratch, outside every recording.
+                    unsafe { owner.stream.device.library.cuda_zero_bytes_async(buffer, buffer.bytes, owner.stream.raw) }
+                })?;
+            }
+        }
+        stream.drain()?;
+        // SAFETY: all graph bodies use this retained decode stream and immutable
+        // weights with fixed key-specific rows; host lease transitions stay outside.
+        unsafe { bank.prewarm(&keys, |_| None, |key| {
+            match key.op {
+                Op::Router => rank.decode.borrow().router_enqueue(&rank.kernels, &rank.weights, key.layer, key.rows),
+                Op::Ffn => rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights, &rank.layout,
+                    key.layer, key.rows, cfg.moe[key.layer]),
+                Op::JoinRouted => rank.decode.borrow().join_routed_enqueue(&rank.kernels, key.rows),
+                Op::Attention => anyhow::bail!("MiniMax attention is not a context-invariant graph section"),
+            }
+        })?; }
+        stream.drain()?;
+        Ok(())
+    }
+
     pub fn reconcile_selector(&self, selector: &crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
         let device_ids = self.storage.ranks.iter().map(|rank| rank.decode.borrow().stream.device.id).collect::<Vec<_>>();
@@ -620,7 +656,7 @@ mod tests {
                 }
                 let constructed = Owners::new(&inputs, &admitted, &programs, loaded, embedding.unwrap());
                 let owners = constructed?;
-                assert_eq!(owners.graphs.len(), ids.len());
+                assert_eq!(owners.graphs.borrow().len(), ids.len());
                 assert_eq!(owners.storage.usage.is_some(), expert_usage);
                 let census = owners.storage.inventory()?;
                 if inputs.split() {
