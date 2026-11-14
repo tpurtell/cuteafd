@@ -1537,14 +1537,13 @@ def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
     hosts = ['ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa'][:count]
     assert card['family'] == 'muse_spark' and card['gpus'] == gpus
     assert card['sparks'] == hosts and values['SPARK_COUNT'] == str(count)
-    assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6'
-    assert values['MODEL_REVISION'] == '89998fb177acd9a862ac8bd4fb79bfd50e940c97'
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC'
+    assert values['MODEL_REVISION'] == 'cc5dc2537083177e3f02ea0b2d9dfc179d40425c'
     assert values['SPECULATOR'] == 'dflash2' and values['POOL_TOKENS'] == 'auto'
     assert values['VISION'] == ('spark' if size == 'min' else 'auto')
     assert values['AUDIO'] == 'auto'
     if size == 'min':
-        context = int(values['MAX_CONTEXT_TOKENS'])
-        assert context > 262144 and context % 64 == 0
+        assert values['MAX_CONTEXT_TOKENS'] == 'auto'
     for rank, host in enumerate(hosts):
         assert values[f'SPARK_{rank}_HOST'] == host
         assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'
