@@ -483,6 +483,15 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
     fn host_spill_restores_exact_prompt_turn_and_resident_page_frontiers() -> Result<()> {
+        host_spill_roundtrip(false)
+    }
+
+    #[test]
+    fn k31_host_spill_restores_both_parity_index_halves_and_mla_bytes() -> Result<()> {
+        host_spill_roundtrip(true)
+    }
+
+    fn host_spill_roundtrip(indexer: bool) -> Result<()> {
         use crate::shared::prefix::CudaCopyEngine;
         use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
         use cuteafd_hostcache::{config::Config, copy::Stream as CopyStream};
@@ -492,7 +501,7 @@ mod tests {
             (2, AttentionPlacement::Heads, 524_288), (2, AttentionPlacement::Context, 1_048_576)].into_iter()
             .flat_map(|(ranks, attention, context)| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
                 .map(|format| (ranks, attention, context, format))) {
-            let fixture = Fixture::build()?;
+            let fixture = if indexer { Fixture::build_for_tests()? } else { Fixture::build()? };
             let library = fixture.load()?;
             fixture.immediate_copies(&library)?;
             let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
@@ -525,6 +534,10 @@ mod tests {
                     layer.mode = cuteafd_loader::placement::LayerMode::Whole {
                         gpu: 0, ffn: cuteafd_loader::placement::FfnMode::Owner };
                 }
+            }
+            if indexer {
+                cfg.dsa = Some(cuteafd_loader::families::kimi_k3::config::KimiDsaConfig {
+                    heads: 32, head_dim: 128, topk: 2048 });
             }
             let bank = |rank| -> Result<_> {
                 let device = Device { library: &library, id: rank as i32 };
@@ -591,8 +604,9 @@ mod tests {
                             let first = start.saturating_sub(index * 64).min(64);
                             let last = end.saturating_sub(index * 64).min(64);
                             if first < last {
-                                let offset = first * cache_format.record_bytes();
-                                let bytes = (last - first) * cache_format.record_bytes();
+                                let row_bytes = buffer.bytes / 64;
+                                let offset = first * row_bytes;
+                                let bytes = (last - first) * row_bytes;
                                 let view = crate::shared::prefix::view(buffer, offset, bytes)?;
                                 fill(view, end + rank * 71 + index * 17)?;
                             }
@@ -627,8 +641,8 @@ mod tests {
                 for rank in 0..ranks {
                     for buffer in family.state_buffers(rank, 1)? { fill(buffer, 243)?; }
                     for buffer in family.page_buffers(rank, restored.units[end / 64], 64)? {
-                        fill(crate::shared::prefix::view(buffer, (end % 64) * cache_format.record_bytes(),
-                            cache_format.record_bytes())?, 241)?;
+                        let row_bytes = buffer.bytes / 64;
+                        fill(crate::shared::prefix::view(buffer, (end % 64) * row_bytes, row_bytes)?, 241)?;
                     }
                 }
                 family.commit(&mut restored, end, 1)?;
