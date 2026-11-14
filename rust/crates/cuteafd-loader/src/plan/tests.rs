@@ -6641,8 +6641,11 @@ fn qwen_auto_mtp_real_inventory_selects_local_without_losing_mtp() {
             host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
             prefix_slots: Some(0), ..Default::default() }), ..sparks(2) };
     let input = PlanInput::open(dir.path()).unwrap();
-    // A real Spark solve must not masquerade as a local expert deployment.
-    let spark = input.plan(&options).unwrap();
+    // Keep this arm genuinely remote: Auto may onboard the complete small
+    // fixture now, in which case zero expert world correctly enables MTP.
+    let mut remote = options.clone();
+    remote.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
+    let spark = input.plan(&remote).unwrap();
     assert!(spark.solver_placement.is_some(), "{}", render(&spark));
     assert_eq!(spark.spark_expert_world(), 2);
     assert_eq!(spark.speculator, Some("off"));
