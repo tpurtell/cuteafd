@@ -12,3 +12,4 @@ pub(crate) mod qwen3_5;
 pub(crate) mod step5;
 pub(crate) mod muse_spark;
 pub(crate) mod minimax_m3;
+pub(crate) mod inkling2;
