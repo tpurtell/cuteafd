@@ -142,7 +142,7 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     let draft_budget = usize::try_from(draft.iter().map(|demand| demand.bytes).sum::<u64>())?;
     let mut draft_arenas = Vec::new();
     if mtp && catalog.is_some_and(|catalog| catalog.exl3().is_some()) && experts.is_some() {
-        let (arena, shared) = experts.as_mut().unwrap().serial_draft(catalog.unwrap())?;
+        let (arena, shared) = experts.as_mut().unwrap().serial_draft(catalog.unwrap(), args.device)?;
         draft_arenas.push(arena);
         future.extend(shared);
     } else { future.extend(draft); }

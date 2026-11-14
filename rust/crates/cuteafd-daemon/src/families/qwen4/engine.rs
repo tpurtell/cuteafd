@@ -140,6 +140,12 @@ pub(crate) fn spark_session_shape(cfg: &Qwen4Config, rows: usize, bf16: bool)
 /// next draft step (the MTP stash, per state slot).
 pub(crate) const MTP_PENDING_ROWS: usize = 64;
 
+fn remote_front_plane_bytes(rows: usize, hidden: usize, topk: usize, bf16: bool) -> [usize; 4] {
+    let input = if bf16 { hidden * 2 } else { hidden + hidden / 32 };
+    [rows * input, rows * topk * 4, rows * topk * 4, rows * hidden * 2]
+        .map(|bytes| bytes.next_multiple_of(16))
+}
+
 /// The MTP layer stays resident locally even when backbone experts run on Sparks.
 pub(crate) enum MtpExperts<'a> {
     Whole(crate::shared::experts::rtx::pair::Whole<'a>),
@@ -3933,15 +3939,24 @@ impl<'a> Qwen4Engine<'a> {
             // peer writes it; every edge is on the existing owner streams.
             peer.signal(0, 0)?;
             peer.wait(1, 0)?;
-            let input = if self.spark_bf16 { (source.live(&source.x, self.cfg.hidden * 2),
-                landing.live(&landing.x, self.cfg.hidden * 2), rows * self.cfg.hidden * 2) }
-                else { (source.wire.buffer.ptr, landing.wire.buffer.ptr, rows * (self.cfg.hidden + self.cfg.hidden / 32)) };
-            let planes = [input, (source.route_ids.buffer.ptr, landing.route_ids.buffer.ptr, rows * self.cfg.topk * 4),
-                (source.route_weights.buffer.ptr, landing.route_weights.buffer.ptr, rows * self.cfg.topk * 4),
-                (source.live(&source.shared, self.cfg.hidden * 2), landing.live(&landing.shared, self.cfg.hidden * 2), rows * self.cfg.hidden * 2)]
-                .map(|(source, destination, bytes)| cuteafd_ffi::peer_exchange::PeerPlane {
-                    source, destination, rows: 1, row_bytes: bytes as u64,
-                    source_pitch: bytes as u64, destination_pitch: bytes as u64 });
+            let input = if self.spark_bf16 { (source.live_buffer(&source.x, self.cfg.hidden * 2),
+                landing.live_buffer(&landing.x, self.cfg.hidden * 2)) }
+                else { (source.wire.buffer, landing.wire.buffer) };
+            let buffers = [input, (source.route_ids.buffer, landing.route_ids.buffer),
+                (source.route_weights.buffer, landing.route_weights.buffer),
+                (source.live_buffer(&source.shared, self.cfg.hidden * 2), landing.live_buffer(&landing.shared, self.cfg.hidden * 2))];
+            let bytes = remote_front_plane_bytes(rows, self.cfg.hidden, self.cfg.topk, self.spark_bf16);
+            for ((source, destination), bytes) in buffers.iter().zip(bytes) {
+                ensure!(bytes <= source.bytes && bytes <= destination.bytes, "Qwen remote plane exceeds workspace");
+            }
+            let mut index = 0;
+            let planes = buffers.map(|(source, destination)| {
+                let bytes = bytes[index] as u64;
+                index += 1;
+                cuteafd_ffi::peer_exchange::PeerPlane {
+                    source: source.ptr, destination: destination.ptr, rows: 1, row_bytes: bytes,
+                    source_pitch: bytes, destination_pitch: bytes }
+            });
             peer.push_planes(1, 0, &planes)?;
             peer.wait(0, 0)
         })?.context("Qwen remote front needs peer owner")?;
@@ -4351,6 +4366,19 @@ mod prefill_unit_tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn remote_front_planes_align_odd_decode_and_prefill_rows() {
+        for rows in [1usize, 41, 2752] {
+            for bf16 in [false, true] {
+                let bytes = remote_front_plane_bytes(rows, 2560, 10, bf16);
+                assert!(bytes.iter().all(|bytes| bytes % 16 == 0));
+                assert_eq!(bytes[1], (rows * 40).next_multiple_of(16));
+                assert_eq!(bytes[2], bytes[1]);
+                assert!(bytes[1] >= rows * 40 && bytes[1] < rows * 40 + 16);
+            }
+        }
     }
 
     #[test]

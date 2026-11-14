@@ -110,6 +110,8 @@ impl QwenExperts {
         if gpus == 2 {
             let demands = crate::serving_capacity::OwnerTp2Rows::new(shape.hidden as u64,
                 shape.topk as u64, rows, catalog.exl3().is_some())?.demands()?;
+            let demands = demands.into_iter().chain(super::dual_peer_diagnostics(
+                crate::serving_capacity::peer_wait_diagnostics()));
             // The receive demand represents two independent driver requests.
             for demand in demands {
                 let copies = if demand.group == "expert receive" { 2 } else { 1 };
@@ -148,7 +150,7 @@ impl QwenExperts {
 
     /// Share the mutable TP1 scratch/output with the independently backed MTP
     /// weight set. Each binding keeps only its private counters/LUT/wire owners.
-    pub fn serial_draft(&mut self, catalog: &crate::OfficialV41Catalog)
+    pub fn serial_draft(&mut self, catalog: &crate::OfficialV41Catalog, device: i32)
         -> anyhow::Result<(WeightArenaLayout, Vec<Demand>)> {
         use anyhow::{ensure, Context};
         ensure!(self.destinations == [0], "Qwen serial draft requires one whole owner");
@@ -168,7 +170,7 @@ impl QwenExperts {
         }
         let bytes = exl3.residency(crate::V41Exl3Layer::Dspark(0), 1, 0)?.device_arena_layout()?.1;
         let regions = vec![("Dspark { stage: 0 }.0".to_string(), bytes)];
-        let arena = WeightArenaLayout::new(crate::serving_capacity::expert_weight_arena_id("exl3", 0, &regions)?, regions)?;
+        let arena = WeightArenaLayout::new(crate::serving_capacity::expert_weight_arena_id("exl3", device, &regions)?, regions)?;
         Ok((arena, fixed))
     }
 

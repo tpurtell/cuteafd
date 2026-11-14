@@ -1261,7 +1261,9 @@ mod tests {
         let mut experts = QwenExperts::read(&catalog, &dir.path().join("lib/libcuteafd_native.so"), 1, 1, 4096).unwrap();
         let original = experts.candidates[1].workspace.iter().filter(|owner| owner.view.is_none())
             .map(|owner| owner.bytes).sum::<u64>();
-        let (draft, fixed) = experts.serial_draft(&catalog).unwrap();
+        let (draft, fixed) = experts.serial_draft(&catalog, 3).unwrap();
+        let regions = vec![("Dspark { stage: 0 }.0".to_string(), draft.view("Dspark { stage: 0 }.0").unwrap().bytes())];
+        assert_eq!(draft.id(), crate::serving_capacity::expert_weight_arena_id("exl3", 3, &regions).unwrap());
         assert_eq!(draft.views().len(), 1);
         assert!(draft.view("Dspark { stage: 0 }.0").is_some());
         for candidate in &experts.candidates {
@@ -1305,6 +1307,30 @@ mod tests {
                 workspace: if count == 0 && gpus == 2 { QwenExperts::terminal_owners() } else { vec![] },
                 backend_bytes: vec![count as u64 * (1 << 30); gpus],
             }).collect() }
+    }
+
+    #[test]
+    fn qwen_hybrid_tp2_candidates_charge_peer_diagnostics_once() {
+        use crate::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot, write_quantize_config};
+        let dir = tempfile::tempdir().unwrap();
+        let (tensors, metadata) = qwen4_exl3(1, 4);
+        write_snapshot(dir.path(), &qwen4_config(1), &tensors, None);
+        write_quantize_config(dir.path(), &metadata);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let experts = QwenExperts::headers(&catalog, 1, 2).unwrap();
+        let enabled = crate::serving_capacity::peer_wait_diagnostics();
+        for (count, candidate) in experts.candidates.iter().enumerate() {
+            let diagnostics = candidate.workspace.iter().filter(|owner|
+                owner.group == "expert peer diagnostics").collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), if enabled && count > 0 { 2 } else { 0 });
+            for (rank, owner) in diagnostics.iter().enumerate() {
+                assert_eq!(owner.location, Location::coordinator(rank as u8));
+                assert_eq!(owner.bytes, 256);
+            }
+            if count == 0 {
+                assert_eq!(candidate.workspace.len(), if enabled { 8 } else { 6 });
+            }
+        }
     }
 
     #[test]
