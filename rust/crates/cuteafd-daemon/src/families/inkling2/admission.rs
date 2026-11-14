@@ -156,5 +156,20 @@ mod tests {
         assert!(reconcile_native(&plan, devices, &[wrong]).is_err());
         let mut wrong = receipt.clone(); wrong.allocation.location = Location::coordinator(1);
         assert!(reconcile_native(&plan, devices, &[wrong]).is_err());
+        let mut wrong = receipt.clone(); wrong.allocation.category = Category::Weights;
+        assert!(reconcile_native(&plan, devices, &[wrong]).is_err());
+        let mut wrong = receipt.clone(); wrong.allocation.lifetime = Lifetime::RESIDENT;
+        assert!(reconcile_native(&plan, devices, &[wrong]).is_err());
+        let mut alias = receipt.clone();
+        alias.allocation.id = "inkling2.unit.partial.alias".into();
+        alias.allocation.bytes = 64; alias.allocation.shape = vec![64];
+        alias.allocation.view = Some(View { backing: "unit.partial".into(), offset: 128 });
+        alias.address = 0x1080;
+        reconcile_native(&plan, devices, &[receipt.clone(), alias.clone()]).unwrap();
+        alias.address = 0x1090;
+        assert!(reconcile_native(&plan, devices, &[receipt.clone(), alias.clone()]).is_err());
+        alias.address = 0x1080;
+        alias.allocation.view.as_mut().unwrap().offset = 4090;
+        assert!(reconcile_native(&plan, devices, &[receipt, alias]).is_err());
     }
 }
