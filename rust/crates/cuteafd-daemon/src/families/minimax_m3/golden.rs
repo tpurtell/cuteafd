@@ -478,6 +478,19 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         records.extend(scored.records);
     }
     execution.drain(&owners.storage)?;
+    if args.decode_graphs {
+        let snapshots = crate::shared::decode_graph::device::snapshots();
+        for &device in &devices {
+            let snapshot = snapshots.iter().find(|snapshot| snapshot.device == device)
+                .context("MiniMax graph oracle has no device controller")?;
+            let captures = snapshot.cycles.values().map(|cycle| cycle.captures).sum::<u64>();
+            let hits = snapshot.cycles.values().map(|cycle| cycle.hits).sum::<u64>();
+            ensure!(captures > 0 && hits > 0,
+                "MiniMax graph oracle must capture and replay on device {device}, captures={captures}, hits={hits}");
+        }
+        serde_json::to_writer(std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(args.save_logits.join("graphs.json"))?, &snapshots)?;
+    }
     let report = cuteafd_bench::fidelity::minimax_golden_report(Fidelity::from_records(records), provenance)?;
     serde_json::to_writer(std::fs::OpenOptions::new().write(true).create_new(true)
         .open(args.save_logits.join("fidelity.json"))?, &report)?;
