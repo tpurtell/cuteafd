@@ -92,7 +92,7 @@ class ArenaWeights(oracle.Weights):
         return values
 
 
-def check(label, actual, expected, report, *, rms_bar=.02, cos_bar=.999):
+def check(label, actual, expected, report, *, rms_bar=.02, cos_bar=.999, enforce=True):
     a, b = actual.float().flatten(), expected.float().flatten()
     finite = bool(torch.isfinite(a).all())
     rms = float((a-b).square().mean().sqrt() / b.square().mean().sqrt().clamp_min(1e-20))
@@ -101,7 +101,7 @@ def check(label, actual, expected, report, *, rms_bar=.02, cos_bar=.999):
                   max_abs=float((a-b).abs().max()))
     print(label, json.dumps(result), flush=True)
     report[label] = result
-    if not finite or rms > rms_bar or cosine < cos_bar:
+    if enforce and (not finite or rms > rms_bar or cosine < cos_bar):
         raise AssertionError(f"{label}: diagnostic bar failed")
 
 
@@ -218,6 +218,35 @@ class Native:
         return attention+mlp if first else (partial+attention)+mlp
 
 
+def stage_probe(native, hidden, layer, cfg, index, weights, report):
+    """Diagnostic table only; do not substitute rounded numerics for the oracle."""
+    inputs = (hidden,) if index in cfg.local_layer_ids else (hidden,)*3
+    reference_attention = oracle.short_conv(oracle.attention_forward(inputs, layer, cfg, index),
+                                            layer["attn_sconv.weight"])
+    native_attention = native.short_conv(native.attention(inputs, layer, cfg, index), layer["attn_sconv.weight"])
+    check(f"layer{index}/attention_out", native_attention, reference_attention, report, enforce=False)
+    first = index % cfg.n_layers_per_attn_res_block == 0
+    def mlp_inputs(attention):
+        mixed = oracle.attn_res([hidden] if first else [], attention if first else hidden,
+            layer[f"attn_res.mlp_queries.{index}"], cfg.rms_norm_eps,
+            addend=None if first else attention)[0]
+        return mixed, oracle.rms_norm(mixed, layer["mlp_norm.weight"], cfg.rms_norm_eps)
+    reference_mix, reference_input = mlp_inputs(reference_attention)
+    native_mix, native_input = mlp_inputs(native_attention)
+    check(f"layer{index}/residual_mix", native_mix, reference_mix, report, enforce=False)
+    check(f"layer{index}/mlp_in", native_input, reference_input, report, enforce=False)
+    reference_mlp = oracle.moe_forward(reference_input, layer, cfg)
+    native_same_input = native.moe(reference_input, layer, weights)
+    check(f"layer{index}/mlp_out_same_reference_input", native_same_input, reference_mlp, report, enforce=False)
+    native_mlp = native.moe(native_input, layer, weights)
+    check(f"layer{index}/mlp_out", native_mlp, reference_mlp, report, enforce=False)
+    reference_tail = oracle.short_conv(reference_mlp, layer["mlp_sconv.weight"])
+    native_tail = native.short_conv(native_mlp, layer["mlp_sconv.weight"])
+    check(f"layer{index}/mlp_conv", native_tail, reference_tail, report, enforce=False)
+    return native_attention+native_tail if first else (hidden+native_attention)+native_tail, (
+        reference_attention+reference_tail if first else (hidden+reference_attention)+reference_tail)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--diagnostic", action="store_true", required=True)
@@ -225,6 +254,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--layers", default="0,5")
     parser.add_argument("--rows", type=int, default=32)
+    parser.add_argument("--stage-taps", action="store_true", help="emit all stage metrics before enforcing unchanged layer bar")
     args = parser.parse_args()
     if not 8 <= args.rows <= 4096:
         parser.error("rows must be8..4096")
@@ -254,17 +284,27 @@ def main():
         norm = weights.tensor(oracle.TEXT+"embed_norm.weight")
         hidden = oracle.rms_norm(hidden, norm, cfg.rms_norm_eps)
         weights.close()
+        failed = []
+        args.out.mkdir(parents=True, exist_ok=True)
         for index in layers:
             layer = weights.load_layer(index, cfg)
             print("diagnostic owners", json.dumps(weights.owner_bytes), flush=True)
-            expected = oracle.layer_forward(hidden, [], layer, cfg, index)
-            actual = native.layer(hidden, [], layer, cfg, index, weights)
-            check(f"layer{index}", actual, expected, report)
+            if args.stage_taps:
+                actual, expected = stage_probe(native, hidden, layer, cfg, index, weights, report)
+            else:
+                expected = oracle.layer_forward(hidden, [], layer, cfg, index)
+                actual = native.layer(hidden, [], layer, cfg, index, weights)
+            check(f"layer{index}", actual, expected, report, enforce=not args.stage_taps)
+            metric = report[f"layer{index}"]
+            if not metric["finite"] or metric["normalized_rms"] > .02 or metric["cosine"] < .999:
+                failed.append(index)
+            (args.out/"diagnostic.json").write_text(json.dumps(report, indent=2)+"\n")
             del layer, expected, actual, weights.arena, weights.expert_arena, weights.expert
             gc.collect()
             torch.cuda.empty_cache()
-    args.out.mkdir(parents=True, exist_ok=True)
     (args.out/"diagnostic.json").write_text(json.dumps(report, indent=2)+"\n")
+    if failed:
+        raise AssertionError(f"unchanged diagnostic bar failed for layers {failed}; stage table retained")
 
 
 if __name__ == "__main__":
