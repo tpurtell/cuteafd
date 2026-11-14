@@ -214,6 +214,12 @@ def draft_bf16_shapes():
     return result
 
 
+def inkling2_projection_shapes():
+    """(K,N) of released native core operands, including small sink/tap projections."""
+    return {(4608, 6144), (4608, 768), (4608, 1024), (4608, 48),
+            (4608, 32), (4608, 384), (6144, 4608), (64, 1024)}
+
+
 def compile_draft_bf16_projection(k, n, output="bf16"):
 
     import torch
@@ -1865,6 +1871,14 @@ def main() -> None:
         manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
         work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
+        # Share DraftProjections unchanged. The D16 relative bias projection
+        # uses zero-padded K64 inputs/weight columns (the same BF16 values).
+        existing = {suffix for family, suffix, *_ in work if family == "draft_bf16"}
+        for k, n in sorted(inkling2_projection_shapes()):
+            suffix = f"k{k}_n{n}_f32"
+            if suffix not in existing:
+                work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},
+                             lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32")))
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.
