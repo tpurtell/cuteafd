@@ -2024,6 +2024,9 @@ impl<'a> Qwen4Engine<'a> {
 
     fn on_owner<T>(&self, owner: usize, work: impl FnOnce() -> Result<T>) -> Result<T> {
         let bank = self.gdn_banks.get(owner).context("Qwen execution owner out of range")?;
+        // Single-device engines retain their startup CUDA device, as before hybrid
+        // dispatch. Only multi-owner execution needs per-hook device switching.
+        if self.gdn_banks.len() == 1 { return work(); }
         struct Restore<'c>(&'c Cell<usize>, usize);
         impl Drop for Restore<'_> {
             fn drop(&mut self) { self.0.set(self.1); }
@@ -4364,6 +4367,19 @@ mod prefill_unit_tests {
         assert!(begin.contains("peer.push_planes(1, 0"));
         assert!(begin.contains("peer.wait(0, 0)"));
         assert!(!begin.contains("synchronize"));
+    }
+
+    #[test]
+    fn single_owner_hooks_do_not_switch_the_cuda_device() {
+        let source = include_str!("engine.rs");
+        let owner = source.split_once("    fn on_owner<T>").unwrap().1
+            .split_once("    fn workspace_slot(").unwrap().0;
+        let single = owner.find("if self.gdn_banks.len() == 1 { return work(); }").unwrap();
+        assert!(owner.find("self.gdn_banks.get(owner)").unwrap() < single,
+            "invalid owner IDs must still refuse");
+        assert!(single < owner.find("self.active_owner.replace(owner)").unwrap());
+        assert!(single < owner.find("bank.device.run(work)").unwrap(),
+            "single-device nested hooks must bypass CUDA get/set calls");
     }
 
     #[test]
