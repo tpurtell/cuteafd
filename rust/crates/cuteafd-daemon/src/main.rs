@@ -76,6 +76,7 @@ fn command_attention(command: &mut Commands) -> Option<(&std::path::Path, &mut c
         Commands::ServeKimi(args) => Some((&args.snapshot, &mut args.attention)),
         Commands::KimiGolden(args) => Some((&args.snapshot, &mut args.attention)),
         Commands::MinimaxGolden(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::Inkling2Golden(args) => Some((&args.snapshot, &mut args.attention)),
         Commands::ServeMinimax(args) => Some((&args.snapshot, &mut args.attention)),
         Commands::ServeStep5(args) => Some((&args.snapshot, &mut args.attention)),
         Commands::Step5Golden(args) => Some((&args.snapshot, &mut args.attention)),
@@ -426,7 +427,7 @@ async fn run() -> Result<()> {
         anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)
             | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeMinimax(_) | Commands::ServeStep5(_) | Commands::ServeMuse(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
             | Commands::ServeDsv4(_) | Commands::V41Golden(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
-            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_) | Commands::KimiGolden(_) | Commands::MinimaxGolden(_) | Commands::MuseGolden(_)),
+            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_) | Commands::KimiGolden(_) | Commands::MinimaxGolden(_) | Commands::Inkling2Golden(_) | Commands::MuseGolden(_)),
             "--gpu-memory-cap applies only to coordinator serve/golden and plan commands");
         cuteafd_ffi::set_coordinator_gpu_budget(cap)?;
         tracing::info!(bytes = cap, "installed per-GPU memory cap; SM count and L2 unchanged");
@@ -476,6 +477,7 @@ async fn run() -> Result<()> {
         Commands::Step5Golden(args) => families::step5::golden::run_golden(args).await,
         Commands::KimiGolden(args) => families::kimi_k3::golden::run_golden(args).await,
         Commands::MinimaxGolden(args) => families::minimax_m3::golden::run_golden(args).await,
+        Commands::Inkling2Golden(args) => families::inkling2::golden::run_golden(args).await,
         Commands::ServeMinimax(args) => families::minimax_m3::serve::run(args).await,
         Commands::ServeKimi(args) => families::kimi_k3::serve::run(args).await,
         Commands::ServeStep5(args) => families::step5::serve::run_serve(args).await,

@@ -220,6 +220,9 @@ pub(crate) enum Commands {
     /// Qualify native MiniMax full-model prefill with real Spark experts.
     #[command(hide = true)]
     MinimaxGolden(crate::families::minimax_m3::golden::GoldenArgs),
+    /// Qualify a native coordinator-only Inkling target prefix.
+    #[command(hide = true)]
+    Inkling2Golden(crate::families::inkling2::golden::GoldenArgs),
     /// Qualify MiniMax whole-rank serving on the shared scheduler.
     #[command(hide = true)]
     ServeMinimax(crate::families::minimax_m3::serve::ServeArgs),
