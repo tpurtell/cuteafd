@@ -105,7 +105,8 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         packing: crate::shared::prefill_packing::PackingMode) -> Result<Self> {
         let storage = &owners.storage;
         ensure!(matches!(storage.ranks.len(), 1 | 2)
-            && (storage.ranks.len() == 2) == storage.split.is_some(),
+            && (storage.ranks.len() == 2) == (storage.split.is_some() || storage.heads.is_some())
+            && !(storage.split.is_some() && storage.heads.is_some()),
             "MiniMax backend rank count differs from admitted split execution");
         let state = storage.requests.borrow();
         let bank = &state.ranks[0].bank;

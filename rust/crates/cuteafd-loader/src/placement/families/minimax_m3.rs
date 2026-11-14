@@ -703,11 +703,14 @@ impl MiniMaxInputs {
             }
         }
         out.extend(MsaRope::new(cfg, context)?.components(&Owner::Rope { gpu }.id(), gpu as u8, maximum)?);
-        let (msa, _) = MsaPrograms::resolve(cfg, &self.manifest, decode_rows, rows, context)?;
-        let (producers, _) = if self.split() {
-            ProducerPrograms::resolve_split(&self.manifest, capacity.execution_rows())?
-        } else { ProducerPrograms::resolve(&self.manifest, capacity.execution_rows())? };
-        ForwardPrograms::resolve(&self.manifest, capacity.execution_rows())?;
+        let (msa, _) = if self.heads() { MsaPrograms::resolve_heads(cfg, &self.manifest, decode_rows, rows, context)? }
+            else { MsaPrograms::resolve(cfg, &self.manifest, decode_rows, rows, context)? };
+        let (producers, _) = if self.heads() {
+            ProducerPrograms::resolve_heads(&self.manifest, capacity.execution_rows())?
+        } else if self.split() { ProducerPrograms::resolve_split(&self.manifest, capacity.execution_rows())? }
+        else { ProducerPrograms::resolve(&self.manifest, capacity.execution_rows())? };
+        if self.heads() { ForwardPrograms::resolve_heads(&self.manifest, capacity.execution_rows())?; }
+        else { ForwardPrograms::resolve(&self.manifest, capacity.execution_rows())?; }
         target.resolve_dense_programs(&self.manifest, capacity.execution_rows())?;
         // One decode lane on every rank (its layers' work), then one owner
         // set per in-flight prefill slot (PrefillHooks unit slots).
@@ -761,7 +764,7 @@ impl MiniMaxInputs {
         // Already-held driver/module bytes are opaque occupancy, not a new allocation.
         out.extend(allowance(location, self.measured_context[gpu], Lifetime::RESIDENT,
             crate::placement::sampled_baseline::source("CUDA context and loaded modules"), false, maximum));
-        let split_abort = u64::from(self.split());
+        let split_abort = u64::from(self.split() || self.heads());
         let peak = 1 + crate::push_load::COPY_STREAMS as u64 + 1 + split_abort;
         out.extend(allowance(location, cuda_stream_slab_bytes(peak)?, Lifetime::RESIDENT,
             format!("minimax/driver-stream-slabs/gpu{gpu} ({peak} peak live streams: model + push copies + rotary; split abort {split_abort})"),
