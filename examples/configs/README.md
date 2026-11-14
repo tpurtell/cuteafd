@@ -95,6 +95,7 @@ outside a matching WIP slot.
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
 | Muse Spark · EXL3 K4 + Core K6 (#923) | [min](muse-spark-exl3-min.config) · [max](muse-spark-exl3-max.config) | 1 RTX + 4 Spark text qualified / 2 RTX + 6 Spark planned; pinned NVIDIA DFlash2, pool-first; media off |
+| Muse Spark · EXL3 K4 MC, original BF16 core | [min](muse-spark-exl3-k4-mc-min.config) · [max](muse-spark-exl3-k4-mc-max.config) | Separate MC reference cards: 1 RTX + 4 Spark / 2 RTX + 6 Spark; original default, K8/K6 overrides; standalone Core-K6 remains supported |
 | Step-5-Preview · EXL3 K4 + Core K6 (#911) | [min](step5-exl3-k6core-min.config) · [max](step5-exl3-k6core-max.config) | 1 RTX + 3 Spark · 2 RTX + 6 Spark |
 
 ## Spark tensor parallelism

@@ -777,6 +777,10 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-"))
     elif name.startswith("step5-exl3-k4-mc-"):
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6core-"))
+    elif name.startswith("muse-spark-exl3-k4-mc-"):
+        expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-"))
+        if name.endswith('-min.config'):
+            expected['MAX_CONTEXT_TOKENS'] = 'auto'
     else:
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6-"))
     publication = next((model, revision, doc) for stem, model, revision, doc in [
@@ -784,6 +788,7 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         ("glm53-flash-", "GLM-5.3-Flash-EXL3-K4-MC", "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d", "glm5_flash"),
         ("glm53-exl3-k4-mc-", "GLM-5.3-EXL3-K4-MC", "c39486376dee84e5faa4904e014e07d7b6e76405", "glm5"),
         ("step5-exl3-k4-mc-", "Step-5-Preview-EXL3-K4-MC", "4483a4bd874e8c360aec486ea72bd31d1ad7a247", "step5"),
+        ("muse-spark-exl3-k4-mc-", "Muse-Spark-Open-EXL3-K4-MC", "cc5dc2537083177e3f02ea0b2d9dfc179d40425c", "muse_spark"),
     ] if name.startswith(stem))
     model, revision, family_doc = publication
     expected.update(MODEL_ID="wrldsuksgo2mars/" + model, MODEL_REVISION=revision,
