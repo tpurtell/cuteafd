@@ -349,6 +349,72 @@ impl<'a> SplitExecution<'a> {
         self.release(units)
     }
 
+    pub(crate) fn decode_stage(&self, storage: &Storage<'a>, graphs: &mut [Graphs<'a, Storage<'a>>],
+        layer: usize, rows: usize, shared: bool, captured: bool) -> Result<()> {
+        let a = storage.ranks[0].decode.borrow();
+        let b = storage.ranks[1].decode.borrow();
+        if shared { self.routes([&a, &b], layer, rows)?; }
+        drop((a, b));
+        for gpu in 0..2 {
+            let rank = &storage.ranks[gpu];
+            rank.decode.borrow().ffn_boundary(shared)?;
+            let work = || {
+                rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights,
+                    &rank.layout, layer, rows, shared)?;
+                let a = storage.ranks[0].decode.borrow();
+                let b = storage.ranks[1].decode.borrow();
+                let units = [&*a, &*b];
+                let local = units[gpu].split_plane("local")?;
+                let receive = units[1 - gpu].split_plane("receive")?;
+                let bytes = local.bytes / units[gpu].rows() as usize * rows;
+                Self::send(units, gpu, 0, &[(local, receive, bytes)])?;
+                Ok(())
+            };
+            if captured {
+                // SAFETY: compute and outbound peer write use only this rank's
+                // retained stream. No receiving wait or host ticket is recorded.
+                unsafe { graphs[gpu].run(Key { rank: gpu, layer, rows, op: Op::Ffn }, None, work)?; }
+            } else { work()?; }
+        }
+        // Both producers are queued before any peer receive wait.
+        let a = storage.ranks[0].decode.borrow();
+        let b = storage.ranks[1].decode.borrow();
+        Self::land([&a, &b], 0, 0)?;
+        Self::land([&a, &b], 1, 0)
+    }
+
+    pub(crate) fn decode_meet(&self, storage: &Storage<'a>, graphs: &mut [Graphs<'a, Storage<'a>>],
+        layer: usize, rows: usize, shared: bool, captured: bool) -> Result<()> {
+        for gpu in 0..2 {
+            let a = storage.ranks[0].decode.borrow();
+            let b = storage.ranks[1].decode.borrow();
+            let units = [&*a, &*b];
+            if gpu == 1 && shared { Self::land(units, 1, 2)?; }
+            units[gpu].fold_boundary(shared)?;
+            let work = || {
+                // SAFETY: stage queued both partial sends before receive waits;
+                // the routed ticket landed before this host boundary.
+                unsafe { units[gpu].meet_ffn_enqueue(&storage.ranks[gpu].kernels, rows, shared)?; }
+                if gpu == 0 && shared {
+                    Self::send(units, 0, 2, &[(units[0].plane("routed")?,
+                        units[1].plane("routed")?, rows * 6144 * 2)])?;
+                }
+                Self::send(units, gpu, 3, &[])?;
+                Ok(())
+            };
+            if captured {
+                // SAFETY: fold/join and outbound publication use this rank's
+                // retained stream; host transitions and blocking waits are outside.
+                unsafe { graphs[gpu].run(Key { rank: gpu, layer, rows, op: Op::JoinRouted }, None, work)?; }
+            } else { work()?; }
+            if shared { units[gpu].joined(); }
+        }
+        let a = storage.ranks[0].decode.borrow();
+        let b = storage.ranks[1].decode.borrow();
+        Self::land([&a, &b], 0, 3)?;
+        Self::land([&a, &b], 1, 3)
+    }
+
     fn release(&self, units: [&super::layer::UnitOwner<'a>; 2]) -> Result<()> {
         // Both consumers finish their meeting before either side can overwrite
         // the peer's retained receive/routed/route planes on the next layer.
@@ -744,7 +810,7 @@ impl<'a> ServingPrefill<'a> {
     /// Attention consumes only live cache metadata. Independent FFN/router/join
     /// sections use bounded row keys with synthetic tails outside logical state.
     pub fn decode(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
-        schedule: &Requests, requests: &[ServingRequest<'_>], graphs: &mut Graphs<'a, Storage<'a>>,
+        schedule: &Requests, requests: &[ServingRequest<'_>], graphs: &mut [Graphs<'a, Storage<'a>>],
         captured: bool)
         -> Result<DeviceLogits> {
         ensure!(!self.terminal, "MiniMax decode serving is terminal");
@@ -752,7 +818,9 @@ impl<'a> ServingPrefill<'a> {
         let rows = schedule.decode_rows(&requests.iter().map(|request| RequestRows {
             slot: request.placement.slot, start: request.start, rows: request.tokens.len(),
         }).collect::<Vec<_>>())?;
-        if storage.split.is_some() { return self.decode_split(storage, cfg, schedule, requests, rows); }
+        ensure!(graphs.len() == storage.ranks.len(), "MiniMax decode graph rank count differs");
+        if storage.split.is_some() { return self.decode_split(storage, cfg, schedule, requests, rows, graphs, captured); }
+        let graphs = &mut graphs[0];
         let rank = &storage.ranks[0];
         let graph_rows = if captured { graphs.row_key(rows)? } else { rows };
         graphs.cycle(crate::shared::decode_graph::device::Cycle::Decode);
@@ -874,8 +942,10 @@ impl<'a> ServingPrefill<'a> {
     }
 
     fn decode_split(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
-        schedule: &Requests, requests: &[ServingRequest<'_>], rows: usize) -> Result<DeviceLogits> {
+        schedule: &Requests, requests: &[ServingRequest<'_>], rows: usize,
+        graphs: &mut [Graphs<'a, Storage<'a>>], captured: bool) -> Result<DeviceLogits> {
         let split = storage.split.as_ref().context("MiniMax split owners missing")?;
+        for graph in graphs.iter_mut() { graph.cycle(crate::shared::decode_graph::device::Cycle::Decode); }
         let result = (|| {
             let mut state = storage.requests.borrow_mut();
             ensure!(state.capacity == schedule.capacity, "MiniMax split decode capacity differs");
@@ -912,7 +982,13 @@ impl<'a> ServingPrefill<'a> {
                 let ticket = if let Some(binding) = self.bindings[layer] {
                     let rank0 = &storage.ranks[0];
                     let owner = rank0.decode.borrow();
-                    owner.router(&rank0.kernels, &rank0.weights, layer, rows)?;
+                    owner.router_boundary()?;
+                    if captured {
+                        // SAFETY: exact live rows, retained rank0 stream/weights
+                        // and private scratch; host boundary is outside recording.
+                        unsafe { graphs[0].run(Key { rank: 0, layer, rows, op: Op::Router }, None,
+                            || owner.router_enqueue(&rank0.kernels, &rank0.weights, layer, rows))?; }
+                    } else { owner.router_enqueue(&rank0.kernels, &rank0.weights, layer, rows)?; }
                     if let Some(usage) = &storage.usage {
                         let tally = usage.routes(owner.stream.device.id, layer,
                             cuteafd_ffi::expert_usage::UsagePhase::Decode)?;
@@ -932,9 +1008,7 @@ impl<'a> ServingPrefill<'a> {
                 } else { None };
                 let shared = ticket.is_some();
                 {
-                    let mut a = storage.ranks[0].decode.borrow_mut();
-                    let mut b = storage.ranks[1].decode.borrow_mut();
-                    if let Err(error) = split.stage(storage, [&mut a, &mut b], layer, rows, shared) {
+                    if let Err(error) = split.decode_stage(storage, graphs, layer, rows, shared, captured) {
                         crate::shared::decode_graph::fatal_drain(split.publish_abort(), "MiniMax split decode stage before ticket drop");
                         return Err(error);
                     }
@@ -944,9 +1018,7 @@ impl<'a> ServingPrefill<'a> {
                         "MiniMax split decode land before ticket drop"))?;
                 }
                 {
-                    let a = storage.ranks[0].decode.borrow();
-                    let b = storage.ranks[1].decode.borrow();
-                    split.meet(storage, [&a, &b], rows, shared)?;
+                    split.decode_meet(storage, graphs, layer, rows, shared, captured)?;
                 }
             }
             let rank = &storage.ranks[1];

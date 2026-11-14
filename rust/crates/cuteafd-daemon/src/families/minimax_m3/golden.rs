@@ -456,7 +456,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
             let request = [ServingRequest { identity: identity as u64 + 1, kind: cuteafd_transport::ExpertV2SourceKind::Decode,
                 placement: &mut placement, start: position, tokens: &window.tokens[position..position + 1], heads: position..position + 1 }];
             let logits = execution.decode(&owners.storage, &cfg, &schedule, &request,
-                &mut owners.graphs.borrow_mut()[0], false)?;
+                &mut owners.graphs.borrow_mut(), false)?;
             let values = logits.to_host(&library)?;
             if let Some(raw) = &mut raw { raw.row(position + 1, &values)?; }
             probe.row(position + 1, &values);

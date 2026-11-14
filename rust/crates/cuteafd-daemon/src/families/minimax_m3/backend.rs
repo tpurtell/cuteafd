@@ -210,16 +210,18 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             heads: request.placement.len..request.placement.len + request.tokens.len(),
             tokens: &request.tokens, placement }).collect::<Vec<_>>();
         let mut graphs = self.owners.graphs.borrow_mut();
-        let graph = graphs.first_mut().context("MiniMax decode graph bank missing")?;
         let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule,
-            &requests, graph, captured);
+            &requests, &mut graphs, captured);
         let logits = self.completed(result)?;
-        graph.tick();
-        if graph.needs_boundary() {
-            // SAFETY: completed() drained every arithmetic/cache consumer; the
-            // adapter's storage pins survive controller observation/eviction.
-            unsafe { crate::shared::decode_graph::device::observe_completed(self.library(), |visit| graph.visit(visit))?; }
-            graph.observed();
+        for graph in graphs.iter_mut() { graph.tick(); }
+        if graphs.iter().any(|graph| graph.needs_boundary()) {
+            // SAFETY: completed() drained every rank; captured storage pins
+            // survive the single joined device-controller observation.
+            unsafe { crate::shared::decode_graph::device::observe_completed(self.library(), |visit| {
+                for graph in graphs.iter_mut() { graph.visit(visit)?; }
+                Ok(())
+            })?; }
+            for graph in graphs.iter_mut() { graph.observed(); }
         }
         drop(graphs);
         // Non-speculative input is committed even if selection later cancels.

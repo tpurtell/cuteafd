@@ -211,15 +211,13 @@ impl<'a> Owners<'a> {
                 else { rank.layout.layers.clone() };
             let sites = layers.iter().flat_map(|&layer| {
                 let mut sites = vec![(layer, Op::Ffn)];
-                if inputs.cfg.moe[layer] {
-                    sites.push((layer, Op::JoinRouted));
-                    if !inputs.split() || gpu == 0 { sites.push((layer, Op::Router)); }
-                }
+                if inputs.split() || inputs.cfg.moe[layer] { sites.push((layer, Op::JoinRouted)); }
+                if inputs.cfg.moe[layer] && (!inputs.split() || gpu == 0) { sites.push((layer, Op::Router)); }
                 sites
             }).collect::<Vec<_>>();
             graphs.push(Graphs::new(Rc::clone(&rank.decode.borrow().stream), Rc::clone(&storage),
                 gpu, inputs.cfg.layers, capacity.decode.rows as usize, &sites, graphs::Config {
-                    reserve: inputs.graph_reserve[gpu], bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false })?);
+                    reserve: inputs.graph_reserve[gpu], bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: inputs.split() })?);
         }
         Ok(Self { graphs: RefCell::new(graphs), storage, selector_contract: SelectorContract::from_plan(&admitted.solved)? })
     }
@@ -229,6 +227,7 @@ impl Owners<'_> {
     /// Initialize only persistent section scratch. No synthetic KV page or
     /// request enters the logical prefix cache, transport or usage counters.
     pub fn prewarm(&self, cfg: &cuteafd_loader::families::minimax_m3::MiniMaxM3Config) -> Result<()> {
+        if self.storage.split.is_some() { return self.prewarm_split(cfg); }
         ensure!(self.storage.ranks.len() == 1, "MiniMax whole graph prewarm requires one rank");
         let rank = &self.storage.ranks[0];
         let mut banks = self.graphs.borrow_mut();
@@ -259,6 +258,58 @@ impl Owners<'_> {
             }
         })?; }
         stream.drain()?;
+        Ok(())
+    }
+
+    fn prewarm_split(&self, cfg: &cuteafd_loader::families::minimax_m3::MiniMaxM3Config) -> Result<()> {
+        let split = self.storage.split.as_ref().context("MiniMax split prewarm owner missing")?;
+        let mut banks = self.graphs.borrow_mut();
+        ensure!(banks.len() == 2, "MiniMax split prewarm graph rank count");
+        let mut rows = banks[0].bootstrap()?.into_iter().map(|key| key.rows).collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows.dedup();
+        for rank in &self.storage.ranks {
+            let unit = rank.decode.borrow();
+            for name in ["residual", "routed", "ffn"] {
+                let buffer = unit.plane(name)?;
+                unit.stream.device.run(|| {
+                    // SAFETY: fresh private scratch, before any captured use.
+                    unsafe { unit.stream.device.library.cuda_zero_bytes_async(buffer, buffer.bytes, unit.stream.raw) }
+                })?;
+            }
+            for name in ["local", "receive", "meeting"] {
+                let buffer = unit.split_plane(name)?;
+                unit.stream.device.run(|| {
+                    // SAFETY: private retained split plane, no logical KV state.
+                    unsafe { unit.stream.device.library.cuda_zero_bytes_async(buffer, buffer.bytes, unit.stream.raw) }
+                })?;
+            }
+        }
+        for &rows in &rows {
+            for layer in 0..cfg.layers {
+                // Both eager initialization and capture/replay must complete a
+                // whole paired exchange; never drain a rank before its peer sends.
+                for _ in 0..2 {
+                    let rank = &self.storage.ranks[0];
+                    if cfg.moe[layer] {
+                        // SAFETY: fixed-row private scratch and retained weights.
+                        unsafe { banks[0].run(graphs::Key { rank: 0, layer, rows, op: Op::Router }, None,
+                            || rank.decode.borrow().router_enqueue(&rank.kernels, &rank.weights, layer, rows))?; }
+                    }
+                    split.decode_stage(&self.storage, &mut banks, layer, rows, cfg.moe[layer], true)?;
+                    split.decode_meet(&self.storage, &mut banks, layer, rows, cfg.moe[layer], true)?;
+                    for rank in &self.storage.ranks { rank.decode.borrow().stream.drain()?; }
+                    // SAFETY: both retained compute streams drained; graph pins
+                    // remain live during this joined two-device observation.
+                    unsafe { crate::shared::decode_graph::device::observe_completed(
+                        self.storage.ranks[0].decode.borrow().stream.device.library, |visit| {
+                            for bank in banks.iter_mut() { bank.visit(visit)?; }
+                            Ok(())
+                        })?; }
+                    for bank in banks.iter_mut() { bank.observed(); }
+                }
+            }
+        }
         Ok(())
     }
 

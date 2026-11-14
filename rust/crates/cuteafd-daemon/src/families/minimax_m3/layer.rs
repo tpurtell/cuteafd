@@ -495,6 +495,21 @@ impl<'a> UnitOwner<'a> {
     /// No transport or producer may replace either slot until the fold completes.
     pub unsafe fn fold_partials(&self, kernels: &Kernels<'_>, fold: &PartialFold<'_>,
         rows: usize, shared: bool) -> Result<()> {
+        self.fold_boundary(shared)?;
+        // SAFETY: the caller retains both landed partials through this stream.
+        unsafe { self.fold_partials_enqueue(kernels, fold, rows, shared)?; }
+        if shared { self.joined(); }
+        Ok(())
+    }
+    pub(crate) fn fold_boundary(&self, shared: bool) -> Result<()> {
+        if shared { self.join_boundary() } else { self.routed_boundary.idle() }
+    }
+    /// CUDA-only fold, narrowing and routed/residual addition. Host ticket
+    /// transitions run before/after this body on every captured replay.
+    /// # Safety
+    /// Both retained partials are landed and stay leased through the stream.
+    unsafe fn fold_partials_enqueue(&self, kernels: &Kernels<'_>, fold: &PartialFold<'_>,
+        rows: usize, shared: bool) -> Result<()> {
         self.check(kernels, rows)?;
         ensure!(rows <= fold.capacity && std::ptr::eq(self.stream.as_ref(), fold.stream.as_ref()),
             "MiniMax partial fold stream/capacity differs from unit");
@@ -505,8 +520,6 @@ impl<'a> UnitOwner<'a> {
         validate_fold_exclusions(buffers, self.planes.values().map(|owner| owner.buffer).chain([
             self.dense.activation.buffer, self.dense.workspace.inputs.buffer,
             self.dense.workspace.records.buffer, self.dense.workspace.output.buffer]))?;
-        if shared { self.routed_boundary.before_join(self.stream.raw)?; }
-        else { self.routed_boundary.idle()?; }
         self.stream.device.run(|| {
             // SAFETY: caller orders landed rank slots; checked typed disjoint
             // retained planes survive this stream and every captured replay.
@@ -523,7 +536,14 @@ impl<'a> UnitOwner<'a> {
         })?;
         // Preserve the whole-down narrowing before routed addition. The existing
         // routed boundary owns exactly-once combination, not this transport fold.
-        if shared { self.join_routed(kernels, rows) } else { self.accumulate(rows) }
+        if shared { self.join_routed_enqueue(kernels, rows) } else { self.accumulate(rows) }
+    }
+    /// # Safety
+    /// Both retained peer partial planes are landed and remain leased.
+    pub(crate) unsafe fn meet_ffn_enqueue(&self, kernels: &Kernels<'_>, rows: usize, shared: bool) -> Result<()> {
+        let split = self.split.as_ref().context("MiniMax meet requires split owners")?;
+        // SAFETY: forward the caller's landed partial and lease contract.
+        unsafe { self.fold_partials_enqueue(kernels, &split.fold, rows, shared) }
     }
     /// Official served-cache math rounds routed reduction to BF16 before adding
     /// the shared expert, then rounds that sum before the FP32 residual update.

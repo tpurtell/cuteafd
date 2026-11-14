@@ -256,8 +256,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         dispatchers.push(Dispatcher::spark(link)?);
     }
     let execution = ServingPrefill::new(cfg, dispatchers, bindings, 1)?;
-    if gpus == 1 { owners.prewarm(cfg)?; }
-    else { tracing::info!("MiniMax split serving uses qualified eager sections; split graph prewarm awaits trace"); }
+    owners.prewarm(cfg)?;
     let quota = inputs.host_prefix.quota_bytes;
     let host_prefix = (quota > 0).then(|| options.prefix.host_config_for(owners.storage.prefix.layout(),
         admitted.solved.served_context() as usize, quota)).transpose()?;
