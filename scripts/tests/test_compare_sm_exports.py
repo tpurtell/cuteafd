@@ -1844,3 +1844,11 @@ def test_inkling2_groups_select_its_attention_programs_and_coordinator_mxfp8_pac
             "--geometry", geometry, "--capacities", compare_sm.CAPACITIES, "--layouts", "tp1,tp2"])
     # No Spark-role MXFP8 package is registered until the engine's MXFP8 expert format lands.
     assert not any(name.startswith("routed-inkling2") and "spark" in name for name in jobs)
+
+
+def test_minimax_native_divisor_export_groups_include_rtx_tp2_and_bf16_sparks():
+    groups = {name: args for name, _, args in compare_sm.jobs("all")}
+    for name in ("routed-minimax_nvfp4a4", "routed-minimax_nvfp4a4-tp2",
+                 "routed-minimax_nvfp4a4-spark-bf16"):
+        assert groups[name][groups[name].index("--geometry") + 1] == "minimax_nvfp4a4"
+    assert "routed-minimax_nvfp4a4-spark-wire" not in groups

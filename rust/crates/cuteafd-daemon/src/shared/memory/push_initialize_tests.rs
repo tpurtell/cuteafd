@@ -645,6 +645,16 @@ fn fp8_header_plans_widen_pad_and_validate_like_mount() -> Result<()> {
             assert_eq!(actual, expected, "nv={nv} rank={rank}");
         }
     }
+    for convention in [cuteafd_loader::formats::fp8_experts::Nvfp4ScaleConvention::Multiplier,
+        cuteafd_loader::formats::fp8_experts::Nvfp4ScaleConvention::Divisor] {
+        let raw = [f32::from_bits(0x466c4ec5).to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+        let arena = delivered(device, &raw, raw.len())?;
+        let ready = initialize(arena, &[Layer::Fp8 { widen: vec![], scalars: vec![0..raw.len()],
+            scalar_convention: convention, inputs: None, expand: vec![] }], None, 0)?;
+        let mut actual = vec![0; raw.len()];
+        library.copy_d2h(&mut actual, ready.region(0)?.buffer())?;
+        assert_eq!(actual, raw, "push initialization changes checkpoint globals: {convention:?}");
+    }
     for value in [0., -1., f32::NAN, f32::INFINITY] {
         let arena = delivered(device, &value.to_le_bytes(), 4)?;
         assert!(initialize(

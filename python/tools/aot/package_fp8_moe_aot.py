@@ -520,6 +520,12 @@ def activation_params(activation, weights, alpha, beta, limit) -> tuple[float, f
     return 1.0, 0.0
 
 
+def static_scale_metadata(g) -> dict:
+    """Only calibrated static NVFP4 carries multiplier/divisor globals."""
+    return ({"scale_convention": getattr(g, "scale_convention", "multiplier")}
+            if g.weights == "nvfp4" and not getattr(g, "dynamic_nvfp4", False) else {})
+
+
 def info_words(g, capacities: list[int], wire: bool) -> list[int]:
     limit = struct.unpack("<I", struct.pack("<f", float(g.swiglu_limit)))[0]
     import math
@@ -536,7 +542,11 @@ def info_words(g, capacities: list[int], wire: bool) -> list[int]:
         raise ValueError("capacities must be positive, strictly increasing int32 values")
     alpha, beta = activation_params(g.activation, g.weights, getattr(g, "swiglu_alpha", None),
                                     getattr(g, "swiglu_beta", None), g.swiglu_limit)
-    contract = ABI_VERSION | STORAGE[g.kind] << 8 | ACTIVATION[g.activation] << 16 | PROJECTION[g.projection] << 24
+    convention = getattr(g, "scale_convention", "multiplier")
+    if convention not in ("multiplier", "divisor") or (convention == "divisor" and g.kind != "nvfp4a4"):
+        raise ValueError("invalid NVFP4 checkpoint scale convention")
+    storage = 8 if convention == "divisor" else STORAGE[g.kind]
+    contract = ABI_VERSION | storage << 8 | ACTIVATION[g.activation] << 16 | PROJECTION[g.projection] << 24
     words = [contract, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7 if wire else 1, limit,
              len(capacities), *capacities]
     if len(words) > 16:
@@ -608,7 +618,7 @@ def build(args: argparse.Namespace) -> None:
             # TP is inspection metadata; kernels, routes and scratch use slice.
             # Preserve a distinct bridge (and its TP info word) per destination.
             compile_key = (g.slice, g.kind, wire, tuple(capacities), g.hidden, g.experts, g.top_k,
-                           g.activation, g.projection, g.swiglu_limit,
+                           g.activation, g.projection, g.swiglu_limit, getattr(g, "scale_convention", "multiplier"),
                            *activation_params(g.activation, g.weights, getattr(g, "swiglu_alpha", None),
                                               getattr(g, "swiglu_beta", None), g.swiglu_limit), ABI_VERSION,
                            _pinned_sparkinfer.REVISION, props.major, props.minor, props.multi_processor_count,
@@ -680,6 +690,7 @@ def build(args: argparse.Namespace) -> None:
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
                 "weights": g.weights, "activation": g.activation, "projection": g.projection, "abi_version": ABI_VERSION,
+                **static_scale_metadata(g),
                 **dict(zip(("swiglu_alpha", "swiglu_beta"), activation_params(g.activation, g.weights,
                     getattr(g, "swiglu_alpha", None), getattr(g, "swiglu_beta", None), g.swiglu_limit))),
                 "arithmetic_routes": [{"capacity": p["capacity"], "form": p["form"],

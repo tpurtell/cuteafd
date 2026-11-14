@@ -83,19 +83,16 @@ pub enum Nvfp4ScaleConvention {
 }
 
 impl Nvfp4ScaleConvention {
-    pub fn normalize(self, value: f32) -> Result<f32> {
+    /// Validate a checkpoint operand without changing its FP32 bits.
+    pub fn validate(self, value: f32) -> Result<f32> {
         ensure!(value.is_finite() && value > 0.0, "{value} is not a positive finite NVFP4 scale");
-        let multiplier = match self { Self::Multiplier => value, Self::Divisor => value.recip() };
-        ensure!(multiplier.is_finite() && multiplier > 0.0,
-            "normalized NVFP4 scale {multiplier} is not positive and finite");
-        Ok(multiplier)
+        Ok(value)
     }
 
-    pub fn normalize_bytes(self, image: &mut [u8]) -> Result<()> {
+    pub fn validate_bytes(self, image: &[u8]) -> Result<()> {
         ensure!(image.len() % 4 == 0, "partial NVFP4 scalar");
-        for bytes in image.chunks_exact_mut(4) {
-            let value = self.normalize(f32::from_le_bytes((&*bytes).try_into().unwrap()))?;
-            bytes.copy_from_slice(&value.to_le_bytes());
+        for bytes in image.chunks_exact(4) {
+            self.validate(f32::from_le_bytes(bytes.try_into().unwrap()))?;
         }
         Ok(())
     }
@@ -871,7 +868,7 @@ impl Fp8ExpertTensors {
         if self.format != ExpertFormat::Nvfp4 {
             return Ok(1.0);
         }
-        self.nvfp4_scale_convention().normalize(f32::from_le_bytes(self.read_scalar_bytes(name)?))
+        self.nvfp4_scale_convention().validate(f32::from_le_bytes(self.read_scalar_bytes(name)?))
             .with_context(|| format!("reading {name}"))
     }
 
@@ -1533,15 +1530,15 @@ mod tests {
                 std::fs::File::options().write(true).open(dir.path().join(&loc.shard)).unwrap()
                     .write_all_at(&value.to_le_bytes(), loc.offset).unwrap();
             };
-            write_scalar(&tensors.alpha_name(&name), 4.0);
+            write_scalar(&tensors.alpha_name(&name), f32::from_bits(0x466c4ec5));
             write_scalar(&tensors.activation_scale_name(&name), 8.0);
-            assert_eq!(tensors.read_alpha(0, 0, projection).unwrap(), 0.25);
-            assert_eq!(tensors.read_input_scale(0, 0, projection).unwrap(), 0.125);
+            assert_eq!(tensors.read_alpha(0, 0, projection).unwrap().to_bits(), 0x466c4ec5);
+            assert_eq!(tensors.read_input_scale(0, 0, projection).unwrap(), 8.0);
             let sizes = tensors.projection_bytes(projection);
             let (mut weights, mut scales) = (vec![0; sizes.0], vec![0; sizes.1]);
             tensors.read_projection_once(0, 0, projection, &mut weights, &mut scales).unwrap();
-            assert_eq!(&scales[sizes.1 - 8..], [0.25f32.to_le_bytes(), 0.125f32.to_le_bytes()].concat());
-            for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::from_bits(1)] {
+            assert_eq!(&scales[sizes.1 - 8..], [f32::from_bits(0x466c4ec5).to_le_bytes(), 8.0f32.to_le_bytes()].concat());
+            for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
                 write_scalar(&tensors.alpha_name(&name), bad);
                 assert!(tensors.read_alpha(0, 0, projection).is_err());
             }
@@ -1553,19 +1550,22 @@ mod tests {
     }
 
     #[test]
-    fn nvfp4_scalar_normalization_rejects_invalid_values_and_reciprocal_overflow() {
+    fn nvfp4_scalars_validate_without_reciprocal_round_trips() {
         for convention in [Nvfp4ScaleConvention::Multiplier, Nvfp4ScaleConvention::Divisor] {
             for value in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-                assert!(convention.normalize(value).is_err());
-                assert!(convention.normalize_bytes(&mut value.to_le_bytes()).is_err());
+                assert!(convention.validate(value).is_err());
+                assert!(convention.validate_bytes(&value.to_le_bytes()).is_err());
             }
-            assert!(convention.normalize_bytes(&mut [0; 3]).is_err());
+            assert!(convention.validate_bytes(&[0; 3]).is_err());
         }
-        assert!(Nvfp4ScaleConvention::Divisor.normalize(f32::from_bits(1)).is_err());
-        assert_eq!(Nvfp4ScaleConvention::Multiplier.normalize(f32::from_bits(1)).unwrap().to_bits(), 1);
-        let mut bytes = [4.0f32.to_le_bytes(), 8.0f32.to_le_bytes()].concat();
-        Nvfp4ScaleConvention::Divisor.normalize_bytes(&mut bytes).unwrap();
-        assert_eq!(bytes, [0.25f32.to_le_bytes(), 0.125f32.to_le_bytes()].concat());
+        assert_eq!(Nvfp4ScaleConvention::Divisor.validate(f32::from_bits(1)).unwrap().to_bits(), 1);
+        assert_eq!(Nvfp4ScaleConvention::Multiplier.validate(f32::from_bits(1)).unwrap().to_bits(), 1);
+        let bytes = [4.0f32.to_le_bytes(), 8.0f32.to_le_bytes()].concat();
+        Nvfp4ScaleConvention::Divisor.validate_bytes(&bytes).unwrap();
+        assert_eq!(bytes, [4.0f32.to_le_bytes(), 8.0f32.to_le_bytes()].concat());
+        let raw = f32::from_bits(0x466c4ec5);
+        assert_ne!(raw.recip().recip().to_bits(), raw.to_bits());
+        assert_eq!(Nvfp4ScaleConvention::Divisor.validate(raw).unwrap().to_bits(), raw.to_bits());
     }
 
     #[test]
@@ -1583,8 +1583,8 @@ mod tests {
             format!("{name}_scale"), format!("{name}_scale_2"),
             "model.layers.0.mlp.experts.0.gate_proj.input_scale".into()]);
         assert_eq!(tensors.nvfp4_scale_convention(), Nvfp4ScaleConvention::Multiplier);
-        let mut image = 0.3f32.to_le_bytes();
-        tensors.nvfp4_scale_convention().normalize_bytes(&mut image).unwrap();
+        let image = 0.3f32.to_le_bytes();
+        tensors.nvfp4_scale_convention().validate_bytes(&image).unwrap();
         assert_eq!(image, 0.3f32.to_le_bytes());
         assert_eq!(tensors.read_input_scale(0, 0, Fp8Projection::Gate).unwrap().to_bits(), 0.3f32.to_bits());
     }
