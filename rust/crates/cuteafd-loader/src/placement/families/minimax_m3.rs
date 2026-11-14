@@ -967,7 +967,10 @@ impl Recipe for MiniMaxInputs {
                     format!("minimax.decode.{head}.{name}")
                 } else { format!("minimax.draft.{name}") };
                 let category = if name.starts_with("prefix.") { Category::Prefix } else { Category::Drafter };
-                components.extend(buffer(id,location,*bytes as u64,lifetime,category,
+                let owner_lifetime = if name.starts_with("unit.") || name.starts_with("decode.") {
+                    Lifetime::TARGET
+                } else { lifetime };
+                components.extend(buffer(id,location,*bytes as u64,owner_lifetime,category,
                     "checkpoint-native bundled dSpark owner",maximum));
             }
             components.extend(buffer("minimax.draft.workspace.landing",Location::PINNED,
