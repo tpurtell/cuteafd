@@ -227,7 +227,7 @@ def minimax_programs():
     for k, n in shapes + partial_shapes:
         params = dict(input_features=k, output_features=n, encoding="mxfp8",
                       sharded_side=1, input_dtype="bf16", rotation_count=1,
-                      max_rows=4096)
+                      max_rows=4096, decode="auto")
         result.append((f"mxfp8_k{k}_n{n}_s1_a8", "dense_mxfp8", params,
                        partial(compile_dense_mxfp8_aot, **params)))
     for k in sorted({k for k, _ in shapes}) + sorted({k for k, _ in partial_shapes} - {k for k, _ in shapes}):
