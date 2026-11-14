@@ -97,6 +97,7 @@ pub(crate) fn system_placement(profile: &ModelProfile) -> SystemPlacement {
             tool_names: Vec::new(), tool_choice: super::chat::muse::MuseToolChoice::Auto, response_format: None }).is_err(),
         ModelEncoding::Mistral(encoding) => encoding.render(&body, &super::mistral::MistralPromptOptions {
             tool_names: Vec::new(), response_format: None }).is_err(),
+        ModelEncoding::MiniMax(encoding) => encoding.render(&body, &super::minimax::MiniMaxPromptOptions::default()).is_err(),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => false,
     };
     if rejects { SystemPlacement::FirstOnly } else { SystemPlacement::Anywhere }

@@ -62,6 +62,19 @@ pub(super) fn mistral_response_constraint(format: Option<Value>, tools: Option<&
     Ok(Some(NativeConstraint(serde_json::to_string(&json!({"type":"structural_tag", "format":format}))?)))
 }
 
+/// MiniMax adaptively emits reasoning, a bare close prefix or neither.
+pub(super) fn minimax_response_constraint(format: Option<Value>, tools: Option<&super::tools::ToolConstraints>,
+    think: [u32; 2]) -> Result<Option<NativeConstraint>> {
+    let Some(constraint) = response_constraint(format, false, tools, 0)? else { return Ok(None) };
+    let content = serde_json::from_str::<Value>(&constraint.0)?["format"].take();
+    let reasoning = json!({"type":"optional", "content":{"type":"or", "elements":[
+        {"type":"token", "token":think[1]},
+        {"type":"sequence", "elements":[{"type":"token", "token":think[0]},
+            {"type":"any_tokens", "exclude_tokens":[think[1]]}, {"type":"token", "token":think[1]}]}]}});
+    Ok(Some(NativeConstraint(json!({"type":"structural_tag", "format":{
+        "type":"sequence", "elements":[reasoning, content]}}).to_string())))
+}
+
 /// XTML starts inside think/response. Match the entire multi-token channel
 /// boundary as a string; `<|close|>` alone also closes arguments and calls.
 pub(super) fn kimi_response_constraint(format: Option<Value>, thinking: bool,
