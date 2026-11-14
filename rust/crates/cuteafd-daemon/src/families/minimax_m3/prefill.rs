@@ -44,14 +44,18 @@ impl LayerTaps {
         Ok(Self { root, layers: layers.iter().copied().collect(),
             bytes: vec![0; usize::try_from(Self::host_bytes(rows))?], residual_only: false })
     }
-    fn write(&mut self, layer: usize, stage: &str, plane: &str, width: usize,
+    pub fn write(&mut self, layer: usize, stage: &str, plane: &str, width: usize,
+        unit: &Unit, owner: &UnitOwner<'_>) -> Result<()> {
+        self.buffer(layer, stage, owner.plane(plane)?, width, unit, owner)
+    }
+    pub fn buffer(&mut self, layer: usize, stage: &str, buffer: Buffer, width: usize,
         unit: &Unit, owner: &UnitOwner<'_>) -> Result<()> {
         if !self.layers.contains(&layer) || (self.residual_only && stage != "residual") { return Ok(()); }
         let count = unit.rows.len().checked_mul(6144 * width).context("MiniMax tap extent")?;
-        ensure!(count <= self.bytes.len(), "MiniMax tap exceeds admitted host buffer");
+        ensure!(count <= self.bytes.len() && count <= buffer.bytes, "MiniMax tap exceeds admitted host buffer");
         owner.stream.drain()?;
         owner.stream.device.run(|| owner.stream.device.library.copy_d2h(
-            &mut self.bytes[..count], owner.plane(plane)?))?;
+            &mut self.bytes[..count], buffer))?;
         self.write_bytes(layer, stage, unit.rows.start, &self.bytes[..count])
     }
     pub fn final_norm(&mut self, head: &super::head::Head<'_>, first: usize, rows: usize) -> Result<()> {

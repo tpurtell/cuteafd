@@ -436,6 +436,7 @@ struct NativeSlots<'s, 'a, F> {
     cfg: &'s MiniMaxM3Config,
     consume: F,
     publish: bool,
+    taps: Option<&'s mut super::prefill::LayerTaps>,
 }
 impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic for NativeSlots<'_, '_, F> {
     fn abort_split(&self) {
@@ -468,6 +469,9 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         let request = &state.ranks[gpu];
         let segments = request.bank.segments(&request.prefill[unit.slot], layer)?;
         let rank = &self.storage.ranks[gpu];
+        if let Some(taps) = &mut self.taps {
+            taps.write(layer, "input", "residual", 4, unit, &rank.prefill[unit.slot].borrow())?;
+        }
         // SAFETY: the retained bank and metadata cover disjoint physical append
         // slots; the shared executor orders causal units on one issuing stream.
         unsafe { rank.prefill[unit.slot].borrow_mut().attention_segments(&rank.kernels,
@@ -476,6 +480,16 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
             let a = self.storage.ranks[0].prefill[unit.slot].borrow();
             let b = self.storage.ranks[1].prefill[unit.slot].borrow();
             split.residual([&a, &b], layer, unit.rows.len())?;
+            if let Some(taps) = &mut self.taps {
+                for (gpu, owner) in [a, b].iter().enumerate() {
+                    taps.write(layer, &format!("rank{gpu}.post_attention"), "residual", 4, unit, owner)?;
+                }
+            }
+        }
+        if let Some(taps) = &mut self.taps {
+            let owner = rank.prefill[unit.slot].borrow();
+            taps.write(layer, "attention_projected.bf16", "ffn", 2, unit, &owner)?;
+            taps.write(layer, "post_attention", "residual", 4, unit, &owner)?;
         }
         Ok(())
     }
@@ -498,7 +512,23 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
             let mut a = self.storage.ranks[0].prefill[unit.slot].borrow_mut();
             let mut b = self.storage.ranks[1].prefill[unit.slot].borrow_mut();
             split.stage(self.storage, [&mut a, &mut b], layer, unit.rows.len(), shared)?;
-            if !shared { split.meet(self.storage, [&a, &b], unit.rows.len(), false)?; }
+            if let Some(taps) = &mut self.taps {
+                for (gpu, owner) in [&*a, &*b].into_iter().enumerate() {
+                    let buffer = owner.split_plane("local")?;
+                    let width = buffer.bytes / owner.rows() as usize / 6144;
+                    taps.buffer(layer, &format!("rank{gpu}.partial"), buffer, width, unit, owner)?;
+                }
+            }
+            if !shared {
+                split.meet(self.storage, [&a, &b], unit.rows.len(), false)?;
+                if let Some(taps) = &mut self.taps {
+                    for (gpu, owner) in [&*a, &*b].into_iter().enumerate() {
+                        taps.buffer(layer, &format!("rank{gpu}.meeting"), owner.split_plane("meeting")?, 4, unit, owner)?;
+                        taps.write(layer, &format!("rank{gpu}.mlp.bf16"), "ffn", 2, unit, owner)?;
+                        taps.write(layer, &format!("rank{gpu}.residual"), "residual", 4, unit, owner)?;
+                    }
+                }
+            }
             Ok(())
         } else {
             let rank = &self.storage.ranks[0];
@@ -648,6 +678,13 @@ impl<'a> ServingPrefill<'a> {
     pub fn execute(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
         schedule: &Requests, requests: &mut [ServingRequest<'_>], publish: bool,
         consume: impl FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>) -> Result<()> {
+        self.execute_with_taps(storage, cfg, schedule, requests, publish, consume, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_taps(&mut self, storage: &Storage<'a>, cfg: &MiniMaxM3Config,
+        schedule: &Requests, requests: &mut [ServingRequest<'_>], publish: bool,
+        consume: impl FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>,
+        taps: Option<&mut super::prefill::LayerTaps>) -> Result<()> {
         ensure!(!self.terminal, "MiniMax packed serving is terminal");
         validate_execution_streams(storage)?;
         ensure!(schedule.capacity == storage.requests.borrow().capacity && schedule.layers == cfg.layers
@@ -672,7 +709,7 @@ impl<'a> ServingPrefill<'a> {
         }
         let sources = units.iter().map(|unit|
             storage.ranks[0].prefill[unit.slot].borrow().routed_rows(unit.rows.len())).collect::<Result<Vec<_>>>()?;
-        let mut arithmetic = NativeSlots { storage, cfg, consume, publish };
+        let mut arithmetic = NativeSlots { storage, cfg, consume, publish, taps };
         let result = run_prefill_units(&mut ServingHooks { arithmetic: &mut arithmetic, sources: &sources,
             dispatchers: &self.dispatchers, bindings: &self.bindings, requests,
             next_identity: &mut self.next_identity, version: self.version }, &units, schedule.waves);

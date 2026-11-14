@@ -327,7 +327,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         placement::{AttentionPlacement, Onboard, ResidentWeights, planner::{Context as ModelContext, Operation, PrefillShape}}};
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     let (devices, wire) = split_selection(&args)?.context("MiniMax split golden peer missing")?;
-    ensure!(args.tap_layers.is_empty(), "MiniMax serving split golden does not attach cold layer taps");
+    ensure!(!args.decode || args.tap_layers.is_empty(), "MiniMax split layer taps require prefill scoring");
     let manifest: Arc<serde_json::Value> = Arc::new(serde_json::from_slice(&std::fs::read(&args.manifest)?)?);
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
@@ -432,7 +432,14 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         let first_decode = if args.decode { window.score_from.saturating_sub(1).max(1).min(count) } else { count };
         let mut request = [ServingRequest { identity: identity as u64 + 1, kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
             placement: &mut placement, start: 0, tokens: &window.tokens[..first_decode], heads: 0..first_decode }];
-        execution.execute(&owners.storage, &cfg, &schedule, &mut request, false, |_, positions, logits| {
+        let mut taps = if args.tap_layers.is_empty() { None } else {
+            let parent = args.save_logits.join("layer-taps");
+            std::fs::create_dir_all(&parent)?;
+            let mut taps = LayerTaps::new(parent.join(&window.id), &args.tap_layers, args.prefill_rows)?;
+            taps.residual_only = args.tap_residual_only;
+            Some(taps)
+        };
+        execution.execute_with_taps(&owners.storage, &cfg, &schedule, &mut request, false, |_, positions, logits| {
             let values = logits.to_host(&library)?;
             for (row, logits) in values.chunks_exact(cfg.vocab_size).enumerate() {
                 let position = positions.start + row + 1;
@@ -442,7 +449,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
                 }
             }
             Ok(())
-        })?;
+        }, taps.as_mut())?;
         for position in first_decode..count {
             let request = [ServingRequest { identity: identity as u64 + 1, kind: cuteafd_transport::ExpertV2SourceKind::Decode,
                 placement: &mut placement, start: position, tokens: &window.tokens[position..position + 1], heads: position..position + 1 }];
