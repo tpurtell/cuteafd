@@ -300,10 +300,9 @@ fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, 
         let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(cfg.hidden)?,
             experts: u32::try_from(cfg.experts)?, topk: u32::try_from(cfg.topk)?,
             intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)? };
-        let bytes = cuteafd_loader::serving_capacity::spark_host_transport(geometry,
+        cuteafd_loader::serving_capacity::spark_host_transport(geometry,
             cuteafd_loader::plan::layout::spark_endpoints("qwen4", 1), spark_ranks, false, true,
-            spark_bf16, unit_rows, intake_rows, waves, None)?;
-        bytes.map(|bytes| bytes * owners as u64)
+            spark_bf16, unit_rows, intake_rows, waves, None)?
     } else { [0; 3] };
     Ok(QwenHost {
         memory: HostMemory { total, available },

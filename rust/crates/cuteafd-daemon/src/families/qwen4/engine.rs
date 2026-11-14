@@ -3848,10 +3848,18 @@ impl<'a> Qwen4Engine<'a> {
         match self.experts.as_ref().context("MoE layer without experts")? {
             Experts::Hybrid(experts) if index < self.cfg.layers => {
                 if !experts.local_layer(index) {
-                    let mut link = self.spark_link(self.active_owner.get()).context("Qwen remote layer has no owner link")?.borrow_mut();
+                    let mut link = self.spark_link(0).context("Qwen remote layer has no landing link")?.borrow_mut();
                     let exchange = link.exchange()?;
-                    let wave = self.wave_send(w, index, t, rows, decode, exchange, None)?;
-                    return self.wave_land(w, t, wave, exchange);
+                    if self.active_owner.get() == 0 {
+                        let wave = self.wave_send(w, index, t, rows, decode, exchange, None)?;
+                        return self.wave_land(w, t, wave, exchange);
+                    }
+                    let landing = self.workspace_slot(0, decode)?.borrow();
+                    let landing = landing.as_ref().context("Qwen Spark landing workspace")?;
+                    self.remote_front(1, w, landing, index, t, rows)?;
+                    let wave = self.on_owner(0, || self.wave_send(landing, index, t, rows, decode, exchange, None))?;
+                    self.on_owner(0, || self.wave_land(landing, t, wave, exchange))?;
+                    return self.remote_return(1, landing, w, t);
                 }
                 self.exchange_window(index, decode, true)?;
                 let local = experts.local.as_ref().context("Qwen resident layer has no owner")?;
@@ -3912,6 +3920,42 @@ impl<'a> Qwen4Engine<'a> {
             &[rows])
     }
 
+    fn remote_front(&self, owner: usize, source: &Workspace<'_>, landing: &Workspace<'_>,
+        layer: usize, rows: usize, scalar: Scalar) -> Result<()> {
+        ensure!(owner == 1 && self.active_owner.get() == owner, "Qwen remote front owner");
+        self.shared(source, &self.weights.layers[layer], scalar)?;
+        let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen hybrid missing") };
+        experts.with_peer(|peer| {
+            // Protect the landing scratch from a previous unit's reader before
+            // peer writes it; every edge is on the existing owner streams.
+            peer.signal(0, 0)?;
+            peer.wait(1, 0)?;
+            let input = if self.spark_bf16 { (source.live(&source.x, self.cfg.hidden * 2),
+                landing.live(&landing.x, self.cfg.hidden * 2), rows * self.cfg.hidden * 2) }
+                else { (source.wire.buffer.ptr, landing.wire.buffer.ptr, rows * (self.cfg.hidden + self.cfg.hidden / 32)) };
+            let planes = [input, (source.route_ids.buffer.ptr, landing.route_ids.buffer.ptr, rows * self.cfg.topk * 4),
+                (source.route_weights.buffer.ptr, landing.route_weights.buffer.ptr, rows * self.cfg.topk * 4),
+                (source.live(&source.shared, self.cfg.hidden * 2), landing.live(&landing.shared, self.cfg.hidden * 2), rows * self.cfg.hidden * 2)]
+                .map(|(source, destination, bytes)| cuteafd_ffi::peer_exchange::PeerPlane {
+                    source, destination, rows: 1, row_bytes: bytes as u64,
+                    source_pitch: bytes as u64, destination_pitch: bytes as u64 });
+            peer.push_planes(1, 0, &planes)?;
+            peer.wait(0, 0)
+        })?.context("Qwen remote front needs peer owner")?;
+        Ok(())
+    }
+
+    fn remote_return(&self, owner: usize, landing: &Workspace<'_>, destination: &Workspace<'_>, rows: usize) -> Result<()> {
+        ensure!(owner == 1, "Qwen remote return owner");
+        let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen hybrid missing") };
+        experts.with_peer(|peer| {
+            peer.push_to(0, crate::shared::peer_split::DIRECT, landing.live(&landing.delta, self.cfg.hidden * 2),
+                destination.live(&destination.delta, self.cfg.hidden * 2), rows * self.cfg.hidden * 2)?;
+            peer.wait(1, crate::shared::peer_split::DIRECT)
+        })?.context("Qwen remote return needs peer owner")?;
+        Ok(())
+    }
+
     /// A wave on the link's exchange: router outputs and wire rows copy into
     /// the wave slot's pinned staging, the shared expert (and in a decode
     /// step the L2 prefetch) queues behind them, and the worker builds and
@@ -3950,7 +3994,9 @@ impl<'a> Qwen4Engine<'a> {
                 }))?
         };
         // The shared expert runs during the exchange (the L2 prefetch behind it).
-        self.shared(w, &self.weights.layers[index], rows)?;
+        if self.state_map.layers[index].owner == self.active_owner.get() {
+            self.shared(w, &self.weights.layers[index], rows)?;
+        }
         self.exchange_window(index, decode, false)?;
         Ok(ticket)
     }
@@ -4190,8 +4236,14 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
             let w = self.work[owner].context("Qwen unit send workspace")?;
             let rows = Scalar::I32(unit.rows.len() as i32);
             self.engine.moe_front(w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
-            self.engine.wave_send(w, layer, unit.rows.len(), rows, false,
-                self.transports.get_mut(owner).context("Qwen unit Spark owner link")?, unit.reply_origins()?)
+            if owner == 1 {
+                self.engine.on_owner(0, || self.select(0, unit))?;
+                self.engine.remote_front(owner, w, self.work[0].context("Qwen unit landing workspace")?,
+                    layer, unit.rows.len(), rows)?;
+            }
+            self.engine.on_owner(0, || self.engine.wave_send(self.work[0].context("Qwen unit landing workspace")?,
+                layer, unit.rows.len(), rows, false, self.transports.get_mut(0)
+                    .context("Qwen unit Spark landing link")?, unit.reply_origins()?))
         })
     }
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket) -> Result<()> {
@@ -4199,8 +4251,11 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         self.engine.on_owner(owner, || {
             self.select(owner, unit)?;
             let w = self.work[owner].context("Qwen unit land workspace")?;
-            self.engine.wave_land(w, unit.rows.len(), ticket, self.transports.get_mut(owner)
-                .context("Qwen unit Spark owner link")?)
+            if owner == 1 { self.engine.on_owner(0, || self.select(0, unit))?; }
+            self.engine.on_owner(0, || self.engine.wave_land(self.work[0].context("Qwen unit landing workspace")?,
+                unit.rows.len(), ticket, self.transports.get_mut(0).context("Qwen unit Spark landing link")?))?;
+            if owner == 1 { self.engine.remote_return(owner, self.work[0].context("Qwen unit landing workspace")?, w, unit.rows.len())?; }
+            Ok(())
         })?;
         self.finish_ffn(layer, unit)
     }
@@ -4296,6 +4351,22 @@ mod prefill_unit_tests {
     }
 
     #[test]
+    fn dual_hybrid_uses_one_spark_link_on_the_landing_owner() {
+        let source = include_str!("hybrid.rs");
+        let links = source.split_once("        let mut transport = Vec::new();").unwrap().1
+            .split_once("        Ok(engine::HybridExperts").unwrap().0;
+        assert_eq!(links.matches("self.spark_link(args, &peers)").count(), 1);
+        assert!(links.contains("devices[0].run("));
+        assert!(!links.contains("for device in devices"));
+        assert_eq!(cuteafd_loader::plan::layout::spark_endpoints("qwen4", 1), 1);
+        let source = include_str!("engine.rs");
+        let begin = source.split_once("    fn remote_front(").unwrap().1.split_once("    fn remote_return(").unwrap().0;
+        assert!(begin.contains("peer.push_planes(1, 0"));
+        assert!(begin.contains("peer.wait(0, 0)"));
+        assert!(!begin.contains("synchronize"));
+    }
+
+    #[test]
     fn all_spark_units_upload_tables_only_at_the_original_five_hook_sites() {
         let source = include_str!("engine.rs");
         let hooks = source.split_once("impl<'a, 'w> UnitHooks<").unwrap().1
@@ -4306,7 +4377,8 @@ mod prefill_unit_tests {
             let body = hooks.split_once(&format!("    fn {name}(")).unwrap().1
                 .split_once("\n    fn ").map_or_else(|| hooks.split_once(&format!("    fn {name}(")).unwrap().1,
                     |(body, _)| body);
-            assert_eq!(body.matches("self.select(").count(), 1, "{name}");
+            let remote_only = body.matches("|| self.select(0, unit)").count();
+            assert_eq!(body.matches("self.select(").count() - remote_only, 1, "{name}");
         }
         let attention = hooks.split_once("    fn attention(").unwrap().1.split_once("    fn local_ffn(").unwrap().0;
         assert!(attention.find("self.select(").unwrap() < attention.find("self.enter(").unwrap());

@@ -304,7 +304,6 @@ fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::
         let intake_rows = if waves == 1 { unit_rows } else {
             crate::serving_capacity::PrefillShape { unit_rows, waves }.validate()?.slot_rows() };
         super::spark_host_transport(report, options, input, false, unit_rows, intake_rows, 1)?
-            .map(|bytes| bytes * owners as u64)
     } else { [0; 3] };
     let host_embedding = if options.host_embedding || report.memory_layout.as_ref().is_some_and(|m|
         m.notes.iter().any(|n| n.starts_with("embedding placement: host"))) {

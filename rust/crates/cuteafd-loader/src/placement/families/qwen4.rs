@@ -1137,7 +1137,7 @@ impl Recipe for QwenDual<'_> {
                 components.push(weights(format!("qwen.tp2.{gpu}"), location,
                     ResidentWeights(self.resident[gpu]), self.maximum_pages));
             }
-            if inputs.spark_ranks > 0 {
+            if inputs.spark_ranks > 0 && gpu == 0 {
                 let bytes = crate::serving_capacity::prefill_return_bytes_with_format(
                     prefill_of(a).waves, prefill_of(a).rows, inputs.spark_ranks as u64,
                     cfg.hidden as u64, SparkReplyFormat::Bf16)
@@ -1334,6 +1334,9 @@ mod tests {
             assert_eq!(solved.decisions.onboard_layers, vec![(0..count).collect::<Vec<_>>(); 2]);
             assert_eq!(placement.layers.iter().map(|layer| layer.experts).collect::<Vec<_>>(),
                 (0..4).map(|layer| if layer < count { ExpertHome::RtxTp2 } else { ExpertHome::Spark }).collect::<Vec<_>>());
+            let intakes = solved.facts.allocations.iter().filter(|allocation| allocation.group == "Spark intake planes").collect::<Vec<_>>();
+            assert_eq!(intakes.len(), 1, "one link/endpoint, regardless of attention owner count");
+            assert_eq!(intakes[0].location, Location::coordinator(0));
             let terminal = solved.facts.allocations.iter().filter(|allocation|
                 allocation.group == "Qwen terminal exchange").collect::<Vec<_>>();
             if count == 0 {

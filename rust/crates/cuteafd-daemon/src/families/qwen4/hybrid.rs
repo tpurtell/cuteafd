@@ -168,10 +168,8 @@ impl Opened {
                     cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(catalog)?,
                     args.prefill_wave_rows(), args.resolved_prefill()?.waves,
                     self.checkpoint.spark_input_is_bf16())?, None)?.select(&peers)?;
-            for device in devices {
-                let link = device.run(|| self.spark_link(args, &peers))?;
-                transport.push(RefCell::new(link));
-            }
+            let link = devices[0].run(|| self.spark_link(args, &peers))?;
+            transport.push(RefCell::new(link));
         }
         Ok(engine::HybridExperts { local, local_layers: layers, transport, mtp, terminal: None })
     }
