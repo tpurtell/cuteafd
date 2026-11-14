@@ -625,19 +625,33 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     monkeypatch.setitem(sys.modules, package.__name__, package)
     monkeypatch.setitem(sys.modules, attention.__name__, attention)
+    shapes = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "inkling2_projection_shapes")
     namespace = {"geometries": ["inkling2"], "manifest": {"families": {}}, "work": [], "dataclasses": dataclasses,
-                 "args": types.SimpleNamespace(decode_rows=64, prefill_rows=4096)}
-    exec(compile(ast.Module(body=[helper, branch], type_ignores=[]), "dispatch", "exec"), namespace)
+                 "args": types.SimpleNamespace(decode_rows=64, prefill_rows=4096),
+                 # Full producer inventory is checked by test_inkling2_producer_exports;
+                 # this isolated dispatcher test needs no CUDA/compiler imports.
+                 "inkling2_producer_programs": lambda rows: [],
+                 "inkling2_input_quant_program": lambda: "native-wire",
+                 "compile_draft_bf16_projection": lambda k, n, output: (k, n, output)}
+    exec(compile(ast.Module(body=[helper, shapes, branch], type_ignores=[]), "dispatch", "exec"), namespace)
     assert namespace["manifest"]["families"] == {"inkling2": {"heads": 48, "kv_heads": 8}}
     stem = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
                 and any(isinstance(target, ast.Name) and target.id == "stem" for target in node.targets)
                 and "kimi_split" in ast.unparse(node.value))
     names = []
     for family, suffix, op, params, thunk in namespace["work"]:
-        assert op == "attention" and thunk() == params
         namespace.update(family=family, suffix=suffix, op=op)
         exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
-        names.append((namespace["stem"], params))
+        if op == "attention":
+            assert thunk() == params
+            names.append((namespace["stem"], params))
+        elif op == "expert_input_quant":
+            assert namespace["stem"] == "inkling2_expert_input_quant" and thunk() == "native-wire"
+        else:
+            assert op == "bf16_projection" and family == "draft_bf16"
+            assert thunk()[2] == "f32"
+    assert len(namespace["work"]) == 4 + 1 + 8
     assert names == [
         ("inkling2_local_attention_decode_m64", dict(kind="local", route="decode", max_rows=64)),
         ("inkling2_local_attention_prefill_m4096", dict(kind="local", route="prefill", max_rows=4096)),
