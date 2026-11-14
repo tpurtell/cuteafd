@@ -5,13 +5,20 @@ use cuteafd_core::memory_layout::{Category, MemoryKind};
 use cuteafd_loader::{families::inkling2::{execution::UnitLayout, weight_layout::CoordinatorWeights, Inkling2Config},
     placement::planner::*, plan::Checkpoint};
 
+fn cold_contract(facts: Facts, rows: usize) -> Contract {
+    let mut contract = Contract::fixed(64, 1, 1, facts);
+    contract.variables = vec![Variable::Prefill(vec![PrefillShape {
+        rows: rows.next_multiple_of(64) as u64, waves: 1 }]), Variable::Lanes(vec![1])];
+    contract
+}
+
 pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &CoordinatorWeights,
     expert: &Mxfp8Layout, scratch: usize, unit: &UnitLayout, head_rows: usize,
     free: u64, total: u64, host: (u64, u64)) -> Result<ResolvedPlan> {
     let empty = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations: vec![],
         deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
         driver_page_tables: vec![], allocation_granularity: vec![] };
-    let mut contract = Contract::fixed(64, 1, 1, empty);
+    let mut contract = cold_contract(empty, unit.rows);
     contract.components.extend(weight_arena_components(&execution_arena(target)?, Location::coordinator(0),
         Lifetime::RESIDENT, 1, MemoryKind::Weights)?);
     contract.components.extend(weight_arena_components(&expert.arena, Location::coordinator(0),
@@ -55,7 +62,7 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
         activation: Activation::always() }], 1, PhaseOrder::TARGET_THEN_DRAFT)?);
     fixed_request_tails(&mut contract.components, 1, &[])?;
     contract.add_driver_page_tables();
-    let facts = contract.facts(&[], 1)?;
+    let facts = contract.facts(&[0, 0], 1)?;
     let host = cuteafd_loader::placement::families::qwen4::host::HostMemory { total: host.0, available: host.1 };
     let policy = cuteafd_core::memory_policy::MemoryPolicy::current();
     let budgets = vec![Budget { id: "rtx0".into(), locations: vec![Location::coordinator(0)], physical_bytes: total,
@@ -171,5 +178,24 @@ mod tests {
         alias.address = 0x1080;
         alias.allocation.view.as_mut().unwrap().offset = 4090;
         assert!(reconcile_native(&plan, devices, &[receipt, alias]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cold_domain_tests {
+    use super::*;
+    #[test]
+    fn cold_contract_materializes_fixed_prefill_and_lane_domains() {
+        for rows in [1, 32, 64, 2752, 4096] {
+            let empty = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations: vec![],
+                deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
+                driver_page_tables: vec![], allocation_granularity: vec![] };
+            let contract = cold_contract(empty, rows);
+            let facts = contract.facts(&[0, 0], 1).unwrap();
+            assert!(facts.allocations.is_empty());
+            let selected = contract.decisions(&[0, 0]).unwrap();
+            assert_eq!(selected.prefill, PrefillShape { rows: rows.next_multiple_of(64) as u64, waves: 1 });
+            assert_eq!(selected.lanes, 1);
+        }
     }
 }
