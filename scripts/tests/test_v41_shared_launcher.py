@@ -159,6 +159,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
     expected_plans = []
     for old in golden["plans"]:
         expected = [value for value in old if value not in ("--json", "--layout")]
+        index = expected.index("--vision")
+        expected[index:index] = ["--fp8-prefill", "auto"]
         # These captures pin no device override: auto stays with the planner.
         budget_index = expected.index("--spark-budget-gib")
         del expected[budget_index:budget_index + 2]

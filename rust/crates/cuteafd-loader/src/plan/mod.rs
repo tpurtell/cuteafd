@@ -1434,8 +1434,12 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let representation = options.layout.as_ref().map(|layout| layout.glmf_representation).unwrap_or_default();
         let ranks = options.layout.as_ref().map_or(1, |layout| if layout.head_split { layout.rtx_bytes.len().min(2) } else { 1 });
         let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config)?;
-        report.fp8_prefill = fp8_prefill::flash_report(checkpoint, &cfg, &options.fp8_prefill,
-            family.fp8_prefill_groups(), manifest.as_deref(), ranks, representation)?;
+        match fp8_prefill::flash_report(checkpoint, &cfg, &options.fp8_prefill,
+            family.fp8_prefill_groups(), manifest.as_deref(), ranks, representation) {
+            Ok(resolved) => report.fp8_prefill = resolved,
+            Err(error) => report.hints.push(Hint { what: format!("FP8 prefill resolution unavailable: {error:#}"),
+                how: "Resolve the checkpoint tensor diagnostics before selecting an FP8 prefill route.".into() }),
+        }
         for resolution in &report.fp8_prefill {
             if let Some(hint) = &resolution.hint {
                 report.hints.push(Hint { what: hint.clone(), how: "Keep W8A16 or install a W8A8 prefill program for this geometry.".into() });
