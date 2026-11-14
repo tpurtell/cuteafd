@@ -350,6 +350,49 @@ def inkling2_attention_programs(decode_rows: int, prefill_rows: int):
     return result
 
 
+def inkling2_producer_programs(prefill_rows: int):
+    """Predeclared producer stems; never widen another family's program group."""
+    from functools import partial
+    import torch
+    from b12x.integration.cuteafd.inkling2_convolution import compile_inkling2_convolution_aot
+    from b12x.integration.cuteafd.inkling2_clip import compile_inkling2_clip_aot
+    from b12x.integration.cuteafd.inkling2_residual import compile_inkling2_residual_aot
+    from b12x.integration.cuteafd.inkling2_router import compile_inkling2_router_aot, compile_inkling2_gate_aot
+    from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_norm_aot, compile_inkling2_kv_pack_aot
+    result = []
+    def add(stem, op, compiler, **params):
+        params = {**params, "max_rows": prefill_rows}
+        serial = {key: str(value).removeprefix("torch.") if isinstance(value, torch.dtype) else value
+                  for key, value in params.items()}
+        result.append((stem, op, serial, partial(compiler, **params)))
+    for dtype, suffix in [(torch.bfloat16, "bf16"), (torch.float32, "f32")]:
+        for width, dynamic in [(4608, False), (1024, False), (1024, True)]:
+            kind = "dynamic" if dynamic else "static"
+            add(f"conv_{kind}_h{width}_{suffix}", "convolution", compile_inkling2_convolution_aot,
+                width=width, heads=8 if dynamic else 1, dynamic=dynamic, dtype=dtype)
+        for local in [True, False]:
+            for name, heads, dim, threshold, scaled in [("q", 48, 128, 128**.5*2, True),
+                    ("k", 8, 128, 128**.5*2, False), ("r", 48, 16, 8., True)]:
+                if name == "k" and not local:
+                    continue
+                kind = "local" if local else "global"
+                add(f"clip_{kind}_{name}_{suffix}", "l2_clip", compile_inkling2_clip_aot,
+                    heads=heads, dim=dim, threshold=threshold, scaled=scaled, dtype=dtype,
+                    log_floor=0 if local else 128000, log_alpha=0. if local else 0.1)
+        add(f"gate_h6144_{suffix}", "gate", compile_inkling2_gate_aot, width=6144, dtype=dtype)
+        add(f"situ_h2304_{suffix}", "situ", compile_inkling2_gate_aot, width=2304, situ=True, dtype=dtype)
+        add(f"norm_h4608_{suffix}", "rms_norm", compile_inkling2_norm_aot, output_dtype=dtype)
+        add(f"norm_v_h8_d128_{suffix}", "rms_norm", compile_inkling2_norm_aot,
+            width=128, heads=8, weighted=False, output_dtype=dtype)
+        add(f"kv_pack_{suffix}", "kv_pack", compile_inkling2_kv_pack_aot, input_dtype=dtype)
+    for queries in [1, 3]:
+        for addend in [False, True]:
+            add(f"residual_q{queries}_{'add' if addend else 'keep'}", "attn_res",
+                compile_inkling2_residual_aot, queries=queries, addend=addend)
+    add("router_e384_k8", "router", compile_inkling2_router_aot, route_scale=8.)
+    return result
+
+
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
     # Fused top-k has fixed CTA-group spin barriers. The native table has no
     # loaded-kernel occupancy gate/fallback; even a new decode bucket must not
@@ -1821,6 +1864,7 @@ def main() -> None:
         from b12x.integration.cuteafd import INKLING2_SMALL
         manifest["families"]["inkling2"] = dataclasses.asdict(INKLING2_SMALL)
         work += [("inkling2", *item) for item in inkling2_attention_programs(args.decode_rows, args.prefill_rows)]
+        work += [("inkling2", *item) for item in inkling2_producer_programs(args.prefill_rows)]
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.
