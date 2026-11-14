@@ -547,6 +547,76 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires K3.1 checkpoint, two RTX GPUs, and matching WIP native programs"]
+    fn k31_context_prefill_host_restore_matches_scratch_index_and_mla_on_both_ranks() -> Result<()> {
+        use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
+        use cuteafd_hostcache::{config::Config, copy::Stream as CopyStream};
+        use std::{path::PathBuf, sync::Arc};
+        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+            .map_err(|_| anyhow::anyhow!("Kimi cache oracle requires an isolated process"))?;
+        let snapshot = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)?;
+        let full = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
+        ensure!(full.dsa.is_some(), "K3.1 checkpoint required");
+        let cfg = super::super::admission::prefix(&full, 4)?;
+        let manifest = PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?);
+        let native = PathBuf::from(std::env::var("CUTEAFD_NATIVE_LIB")?);
+        // SAFETY: all native owners retain this sealed library through teardown.
+        let library = Arc::new(unsafe { NativeLibrary::load(&native)? });
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async {
+            let loaded = super::super::startup::load(&library, &programs, &checkpoint, &full, &cfg,
+                super::super::startup::Options {
+                    role: super::super::startup::Role::Golden { skip_routed_experts: true },
+                    expert_usage: false, expert_usage_reader: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Fp8,
+                    devices: [0, 1], attention: Some(cuteafd_loader::placement::AttentionPlacement::Context),
+                    native_lib: &native, manifest: &manifest, peers: vec![], rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Auto,
+                    rows: 256, waves: 1, prefill_rows: Some(256), slots: 2, marks: 2, max_context: 8192,
+                    context: cuteafd_loader::placement::planner::Context::pinned(8192), pool_tokens: Some(8192),
+                    graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 0, prefix: None,
+                })?;
+            let engine = loaded.engine;
+            let family = engine.prefix_family()?;
+            let layout = family.layout();
+            let chunk = layout.mark_bytes.max(layout.page_bytes) as u64;
+            let copy = crate::shared::prefix::CudaCopyEngine::registered_owned(&library, family.snapshot_owners())?;
+            let mut cache = PrefixCache::new(layout, PrefixConfig { entries: 8, mark_slots: 2,
+                keep_logits: true, min_tokens: 1 }, Some((Config { bytes: chunk * 6, chunk_bytes: chunk,
+                    min_tokens: 1, ..Default::default() }, copy)))?;
+            let build = |units| super::super::prefix::Placement { units, slot: 0, len: 0, state_len: 0 };
+            let tokens = (0..131).map(|token| 1000 + token).collect::<Vec<u32>>();
+            let mut placement = cache.admit(&family, &tokens, 132, false, build)?.placement;
+            engine.prefill_packed(&mut [(&mut placement, &tokens)], cache.pool(), &mut |_, _| Ok(Ok(())))?;
+            let scratch = family.page_images(&placement)?;
+            let digest = family.live_digest(&placement)?;
+            assert!(scratch.iter().all(|rank| !rank.is_empty()));
+            assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &placement, After::from_logits(&[1., 2.], true))?);
+            cache.host_engine_mut().context("host prefix copy engine")?.synchronize(CopyStream::Store)?;
+            cache.tick();
+            cache.release(&family, &placement.units)?;
+            cache.clear(&family)?;
+            engine.reset_cold_state()?;
+            let hit = cache.admit(&family, &tokens, 132, false, build)?;
+            assert_eq!(hit.resume, tokens.len());
+            assert!(hit.source.as_ref().is_some_and(|source| source.host));
+            assert_eq!(family.page_images(&hit.placement)?, scratch, "both ranks: actual prefill index keys/scales and MLA restore exactly");
+            assert_eq!(family.live_digest(&hit.placement)?, digest, "actual prefill recurrent state and index/MLA cache bytes");
+            cache.release(&family, &hit.placement.units)?;
+            cache.clear(&family)?;
+            // Recompute that prefix from scratch with the same shape and compare
+            // bytes, not just logits or future greedy text.
+            engine.reset_cold_state()?;
+            let mut fresh = cache.admit(&family, &tokens, 132, false, build)?.placement;
+            engine.prefill_packed(&mut [(&mut fresh, &tokens)], cache.pool(), &mut |_, _| Ok(Ok(())))?;
+            assert_eq!(family.page_images(&fresh)?, scratch, "scratch prefill index/MLA determinism on each owner");
+            cache.release(&family, &fresh.units)?;
+            cache.clear(&family)?;
+            Ok(())
+        })
+    }
+
+    #[test]
     #[ignore = "requires two peer-capable CUDA GPUs and the K3.1 WIP native library"]
     fn k31_native_chunked_parity_select_matches_single_shot_and_decode() -> Result<()> {
         use crate::shared::memory::device::Device;

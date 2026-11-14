@@ -195,6 +195,24 @@ impl<'a> KimiPrefix<'a> {
         Ok(format!("{:x}", digest.finalize()))
     }
 
+    #[cfg(test)]
+    pub(super) fn page_images(&self, placement: &Placement) -> Result<Vec<Vec<Vec<u8>>>> {
+        self.drain().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        (0..self.0.kda.len()).map(|rank| {
+            let mut images = Vec::new();
+            for (index, &page) in placement.units.iter().enumerate() {
+                let rows = placement.len.saturating_sub(index * MLA_PAGE_ROWS).min(MLA_PAGE_ROWS);
+                if rows == 0 { continue; }
+                for buffer in self.page_buffers(rank, page, rows)? {
+                    let mut bytes = vec![0; buffer.bytes];
+                    self.0.kda[rank].stream.device.run(|| self.0.kda[rank].stream.device.library.copy_d2h(&mut bytes, buffer))?;
+                    images.push(bytes);
+                }
+            }
+            Ok(images)
+        }).collect()
+    }
+
     fn state_buffers(&self, rank: usize, slot: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
         self.0.cfg.attention.iter().enumerate().filter(|(_, kind)| **kind == KimiAttention::Kda)
             .map(|(layer, _)| self.0.kda[rank].slot(layer, slot)).collect::<Result<Vec<_>>>()
