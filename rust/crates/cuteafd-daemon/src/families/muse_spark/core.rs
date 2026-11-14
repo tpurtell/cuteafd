@@ -16,6 +16,7 @@ pub(crate) struct CorePrograms<'a> {
     projections: BTreeMap<(ProjectionKey, ProjectionOutput), Projection<'a>>,
     pub(crate) scratch: Option<ProjectionScratch<'a>>,
     native: NativePrograms<'a>,
+    native_head: Option<cuteafd_ffi::native_attention::Fp8Projections<'a>>,
 }
 
 struct NativePrograms<'a> {
@@ -56,6 +57,11 @@ impl<'a> NativePrograms<'a> {
         };
         let fp8 = load_fp8(ProjectionOutput::Bf16, Output::Bf16)?;
         let fp8_f32 = load_fp8(ProjectionOutput::F32, Output::F32)?;
+        if let Some(head) = &admitted.native_head {
+            let [n, k] = head.shape;
+            let registry = device.run(|| Ok(Fp8Projections::load(programs, &[(k, n)], 64, Output::F32)?))?;
+            required = required.max(registry.scratch_bytes(k, n)?);
+        }
         ensure!(u64::try_from(required)? == admitted.native_programs.fp8_scratch_bytes,
             "Muse native scratch differs from exact admission");
         Ok((Self { bf16, bf16_f32, fp8, fp8_f32, scratch: None, rows }, required))
@@ -157,8 +163,12 @@ impl<'a> CorePrograms<'a> {
                 let policy = projection.program.policy();
                 [&policy.native_input, &policy.native, &policy.output_program].into_iter()
                     .map(|name| (name.as_str(), crate::shared::prefill_packing::ProgramRows::PackedRows))
-            }).chain(admitted.native_programs.programs.iter().map(|name|
-                (name.as_str(), crate::shared::prefill_packing::ProgramRows::PackedRows))),
+            }).chain(admitted.native_programs.programs.iter().filter(|name| {
+                admitted.native_head.as_ref().is_none_or(|head| {
+                    let [n, k] = head.shape;
+                    **name != format!("native_attention_n{n}_k{k}_m64_f32")
+                })
+            }).map(|name| (name.as_str(), crate::shared::prefill_packing::ProgramRows::PackedRows))),
             admitted.native_rows)?;
         let (native, native_scratch) = NativePrograms::bind(programs, device, admitted)?;
         Ok((projections, required, exact_cap, native, native_scratch))
@@ -174,7 +184,12 @@ impl<'a> CorePrograms<'a> {
         };
         native.scratch = if native_scratch == 0 { None }
             else { Some(Allocation::new(device, native_scratch, Tag::workspace("muse/core-scratch"))?) };
-        Ok(Self { projections, scratch, exact_cap, native })
+        let native_head = admitted.native_head.as_ref().map(|head| device.run(|| {
+            let [n, k] = head.shape;
+            Ok(cuteafd_ffi::native_attention::Fp8Projections::load(programs, &[(k, n)], 64,
+                cuteafd_ffi::draft_projection::ProjectionOutput::F32)?)
+        })).transpose()?;
+        Ok(Self { projections, scratch, exact_cap, native, native_head })
     }
 
     pub(crate) fn packed_cap(&self) -> usize { self.exact_cap }
@@ -182,6 +197,19 @@ impl<'a> CorePrograms<'a> {
     pub(crate) fn native(&self, rows: usize, input: Buffer, weight: &super::weights::NativeWeights<'_>,
         output: Buffer, stream: *mut c_void) -> Result<()> {
         self.native.launch(rows, input, weight, output, stream)
+    }
+
+    pub(crate) fn native_head_f32(&self, rows: usize, input: Buffer,
+        weight: &super::weights::NativeWeights<'_>, output: Buffer, stream: *mut c_void) -> Result<()> {
+        let registry = self.native_head.as_ref().context("Muse FP8 head program absent")?;
+        let scratch = self.native.scratch.as_ref().context("Muse FP8 head scratch absent")?.buffer;
+        let scales = weight.scales.as_ref().context("Muse FP8 head scales absent")?.buffer;
+        let [n, k] = weight.layout.shape;
+        head_chunks(rows, input, output, k, n, |count, x, y| {
+            // SAFETY: head chunks validate disjoint typed extents; rank retains all owners through the stream.
+            unsafe { registry.launch(x.ptr, weight.values.buffer.ptr, scales.ptr, y, scratch, count, k, n, stream)?; }
+            Ok(())
+        })
     }
 
     fn projection(&self, weights: &CoreWeights<'_>, output: ProjectionOutput) -> Result<&Projection<'a>> {
@@ -282,7 +310,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut admitted = RankProjections { programs: Default::default(), scratch: None,
                 native_rows: ceiling, native_programs: Resolved::resolve(&requests, ceiling, Some(&typed))?,
-                native: owners.clone() };
+                native: owners.clone(), native_head: None };
             let (mut registry, scratch_bytes) = NativePrograms::bind(&programs, device, &admitted)?;
             registry.scratch = Some(Allocation::new(device, scratch_bytes, crate::shared::memory::TEST)?);
             assert_eq!(registry.scratch.as_ref().unwrap().buffer.bytes, 2048);
@@ -317,6 +345,46 @@ mod tests {
             assert!(NativePrograms::bind(&programs, device, &admitted).is_err());
         }
         assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    #[test]
+    fn native_head_uses_m64_registry_without_limiting_body_rows() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
+            placement::{inventory::ProgramsManifest, planner::native_attention::{NativeProgram, NativePrograms}}};
+        use cuteafd_ffi::draft_projection::ProjectionOutput as Output;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let mut entries = Vec::new();
+        for (stage, output) in [(4096, Output::Bf16), (64, Output::F32)] {
+            let suffix = if output == Output::F32 { "_f32" } else { "" };
+            entries.push(serde_json::json!({"name":format!("native_attention_n128_k128_m{stage}{suffix}"),
+                "capacity_rows":stage,"pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},
+                    {"name":"out"},{"name":"scratch"}],"scalars":[{"type":"int32"}],
+                "scratch_bytes_at_capacity":{"scratch":256},"geometry":{"input_features":128,
+                    "output_features":128,"output_dtype":output.torch_dtype(),"max_rows":stage,
+                    "scale_block":128,"decode_rows":64,"storage":"row_major_e4m3",
+                    "reduction":"canonical_fp8_gemv64_w8a16"}}));
+        }
+        fixture.register_programs(&library, &entries)?;
+        let manifest = serde_json::json!({"programs":entries});
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("PROGRAMS.json");
+        std::fs::write(&path, manifest.to_string())?;
+        let programs = library.programs()?.with_manifest(&path)?;
+        let typed = ProgramsManifest::from_manifest(&manifest)?;
+        let body = NativeLayout { stem:"body".into(),shape:[128,128],fp8:true,rank:0,ranks:1,split:CoreSplit::Whole };
+        let head = NativeLayout { stem:"lm_head".into(),..body.clone() };
+        let mut selected = NativePrograms::resolve(&[NativeProgram { layout:&body,output:Output::Bf16 }],2752,Some(&typed))?;
+        selected.programs.extend(NativePrograms::resolve(&[NativeProgram { layout:&head,output:Output::F32 }],64,Some(&typed))?.programs);
+        let admitted = RankProjections { programs:Default::default(),scratch:None,native_rows:2752,
+            native:vec![cuteafd_loader::families::muse_spark::weight_layout::NativeRequest::new(body)],
+            native_head:Some(head),native_programs:selected };
+        let device = Device { library:&library,id:0 };
+        let (_, _, cap, _, _) = CorePrograms::bind(&programs,device,&admitted)?;
+        assert_eq!(cap,2752,"microbatched head must not lower body row capacity");
         Ok(())
     }
 

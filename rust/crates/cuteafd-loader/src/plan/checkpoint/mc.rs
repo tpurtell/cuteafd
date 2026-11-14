@@ -450,8 +450,32 @@ mod family_tests {
         assert!(!worker.tensors.iter().any(|t| t.meta.name == name));
         assert!(bytes[0] > bytes[2] && bytes[2] > bytes[1]);
         let fp8 = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
-        let error = CoreInventory::from_checkpoint(&cfg, &fp8).unwrap_err().to_string();
-        assert!(error.contains("lm_head.weight") && error.contains("vocabulary head") && error.contains("Muse"), "{error}");
+        let converted = CoreInventory::from_checkpoint(&cfg, &fp8)?;
+        assert_eq!(converted.native.len(), shapes.len());
+        assert!(converted.native.values().all(|p| p.fp8));
+        assert_eq!(converted.head_outputs(&cfg), cfg.vocab_size.next_multiple_of(128));
+        let global = crate::families::muse_spark::weight_layout::GlobalLayout::new(&cfg, &converted)?;
+        assert_eq!(global.head_bf16, 0);
+        assert!(global.head.is_none());
+        assert_eq!(global.head_native.as_ref().unwrap().shape, [202112, 8192]);
+        let admitted = crate::families::muse_spark::weight_layout::projections(&cfg, &converted, 2, 2752)?;
+        assert!(admitted[0].native_head.is_none());
+        assert!(admitted[1].native_head.is_some());
+        assert!(admitted[1].native_programs.programs.iter().any(|n| n == "native_attention_n202112_k8192_m64_f32"));
+        assert!(admitted.iter().all(|rank| rank.native_programs.programs.iter()
+            .all(|name| !name.contains("n202112_k8192_m4096"))));
+        for rank in 0..2 {
+            let layers = (0..cfg.layers).map(|layer| LayerLayout::ranks(&cfg, layer, 2, &converted)
+                .map(|v| v[rank].clone())).collect::<Result<Vec<_>>>()?;
+            let arena = crate::families::muse_spark::weight_layout::coordinator_arena(rank, 2, &global,
+                &layers.iter().collect::<Vec<_>>())?;
+            assert!(arena.view("global.head").is_none());
+            if rank == 1 {
+                assert_eq!(arena.view("lm_head.values").unwrap().bytes(), 202112 * 8192);
+                assert_eq!(arena.view("lm_head.scales").unwrap().bytes(), 1579 * 64 * 4);
+            } else { assert!(arena.view("lm_head.values").is_none()); }
+            assert_eq!(arena.bytes(), arena.payload_bytes() + arena.padding_bytes());
+        }
         Ok(())
     }
 

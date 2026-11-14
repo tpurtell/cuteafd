@@ -374,7 +374,7 @@ impl<'a> ProductionInput<'a> {
         let combine = combine_tables_bytes(unit_rows) as u64 * prefill.waves;
         let rope = rope_tables(cfg, context).map_err(anyhow_refusal)?.allocation_bytes;
         let (stored, trimmed) = crate::families::muse_spark::lane::head_planes(
-            global.head.as_ref().map_or(cfg.vocab_size, |head| head.shape[0]), cfg.vocab_size)
+            global.stored_head_outputs(cfg.vocab_size), cfg.vocab_size)
             .map_err(anyhow_refusal)?;
 
         // Validate the same widest verify step the runtime seals.
@@ -426,7 +426,9 @@ impl<'a> ProductionInput<'a> {
                 gpu, gpus, &global, &rank_layers).map_err(anyhow_refusal)?;
             components.extend(weight_arena_components(&arena, location, Lifetime::RESIDENT, maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)?);
             let mount = crate::families::muse_spark::weight_layout::native_mount_load(
-                layouts.iter().flat_map(|ranks| ranks[gpu].native.values())).map_err(anyhow_refusal)?;
+                layouts.iter().flat_map(|ranks| ranks[gpu].native.values())
+                    .chain((gpu + 1 == gpus).then_some(global.head_native.as_ref()).flatten()))
+                .map_err(anyhow_refusal)?;
             for owner in mount.allocations(&format!("muse.native.load.{gpu}")) {
                 let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
                 components.push(Component::allocation(owner, bytes, false, maximum_pages));
@@ -663,7 +665,7 @@ impl<'a> ProductionInput<'a> {
         let recipe = MuseRecipe { cfg, context, gpus, maximum_pages,
             prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }, attention,
             spark_ranks, encoders, modes: (media.vision, media.audio), cases, peaks, local: local.clone(),
-            drafter: drafter.clone(), head_backend: if global.head.is_none() { bf16_target_head } else { serving::BlasHead::Native } };
+            drafter: drafter.clone(), head_backend: if global.head.is_none() && global.head_native.is_none() { bf16_target_head } else { serving::BlasHead::Native } };
         Ok(PreparedMuse { recipe, budgets, local, drafter, layouts, global, projections,
             spark_budget, host: host_quotas, push })
     }
