@@ -211,8 +211,8 @@ pub(crate) fn attention(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetW
 
 /// Complete layer over a cold, contiguous one-sequence unit. Embedding and
 /// completed six-layer block values remain F32 throughout residual mixing.
-pub(crate) fn layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
-    experts: &dyn Dispatcher, cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
+pub(crate) fn begin_layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
+    cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
     let partial = b("partial")?;
@@ -248,7 +248,17 @@ pub(crate) fn layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeigh
     k.residual(owner, target.operand(&format!("model.llm.attn_res.mlp_queries.{index}"))?.buffer,
         partial, b("mixed")?, rows, 1, site.mlp_candidates, false)?;
     k.norm(owner, b("mixed")?, target.operand(&format!("model.llm.layers.{index}.mlp_norm.weight"))?.buffer,
-        b("projection_input")?, false, Precision::Bf16, rows)?;
+        b("projection_input")?, false, Precision::Bf16, rows)
+}
+
+pub(crate) fn finish_layer(k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
+    experts: &dyn Dispatcher, cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
+    let site = residual_site(cfg, index)?;
+    let b = |name: &str| owner.buffer(name);
+    let library = owner.stream.device.library;
+    let arena = b("residual_arena")?;
+    let stride = owner.layout.rows*cfg.hidden*4;
+    let partial = b("partial")?;
     routed_ffn(k, owner, target, experts, cfg, index, rows)?;
     // SAFETY: expert BF16 output widens into an independently zeroed F32
     // plane; no extra weight representation or host synchronization is used.

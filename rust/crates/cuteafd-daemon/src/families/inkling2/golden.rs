@@ -98,7 +98,7 @@ fn run(args: GoldenArgs) -> Result<()> {
             Ok(())
         })?;
         let experts = device.run(|| Mxfp8::load(Rc::clone(&stream), layout, &metadata, &package, &cfg, rows))?;
-        device.run(|| layers::layer(&kernels, &owner, &weights, &experts, &cfg, index, rows))?;
+        device.run(|| super::prefill::layer(&kernels, &owner, &weights, &experts, &cfg, index, rows))?;
         stream.drain()?;
         println!("Inkling native layer{index} complete rows={rows}");
     }
