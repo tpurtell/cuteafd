@@ -121,7 +121,15 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
     fn record_format(&self) -> &'static str { "minimax_msa_fp8_kv_index_v1" }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
     fn commit_point(&self, placement: &Placement) -> usize { placement.len }
-    fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> { Ok(self.install(placement)?) }
+    fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        if placement.len == 0 {
+            if let Some(draft)=&self.0.draft {
+                draft.drafter.reset_context(placement.slot,0)?;
+                draft.frontiers.borrow_mut()[placement.slot]=0;
+            }
+        }
+        Ok(self.install(placement)?)
+    }
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
         self.restore(None, placement, 0)
     }

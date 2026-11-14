@@ -1102,6 +1102,12 @@ impl<'a> DsparkDrafter<'a> {
             let mut state = context.state.borrow_mut();
             state.discard(slot)?;
             state.bindings[slot] = Some(state.pool.bind(slot, origin)?);
+        } else if origin == 0 {
+            for plane in self.window_planes(slot)? {
+                // SAFETY: fresh slot admission precedes every new consumer;
+                // zero preserves deterministic inactive bytes for exact marks.
+                unsafe { self.library.cuda_zero_bytes_async(plane,plane.bytes,self.stream)?; }
+            }
         }
         Ok(())
     }
