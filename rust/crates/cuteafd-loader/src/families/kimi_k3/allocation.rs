@@ -689,6 +689,44 @@ mod tests {
                 assert_eq!(exact, baseline.with_sparse_mla_rows(heads)?, "runtime and planner use the same owner layout");
             }
         }
+        // Isolate this owner's effect in the real pool solver: fixed BF16
+        // weights/other owners cancel, so reclaimed scratch must become KV.
+        use crate::placement::planner as p;
+        struct Recipe { bytes: u64 }
+        impl p::Recipe for Recipe {
+            fn prepare(&self, _: &p::Request) -> std::result::Result<p::Contract, p::Refusal> {
+                let maximum = 32768;
+                let owner = |id, bytes, category| p::Allocation::buffer(id, p::Location::coordinator(0), bytes,
+                    p::Lifetime::RESIDENT, category, id);
+                let facts = p::Facts { phase_order: p::PhaseOrder::TARGET_THEN_DRAFT,
+                    allocations: vec![owner("Kimi lane 0 native operands", self.bytes, Category::Workspace),
+                        owner("records", 64 * 12 * (656 + 132), Category::Kv)], resident_weights: vec![],
+                    deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
+                    driver_page_tables: vec![], allocation_granularity: vec![] };
+                let mut contract = p::Contract::fixed(64, maximum, 1, facts);
+                contract.set_byte_extent("records", p::ByteCurve::linear(64 * 12 * (656 + 132),
+                    64 * 12 * (656 + 132), maximum))?;
+                contract.variables = vec![p::Variable::Attention { layer: 0,
+                    values: vec![crate::placement::LayerMode::Whole { gpu: 0, ffn: crate::placement::FfnMode::Owner }] },
+                    p::Variable::Prefill(vec![p::PrefillShape { rows: 2752, waves: 1 }]), p::Variable::Lanes(vec![1])];
+                Ok(contract)
+            }
+        }
+        let old = NativeLaneLayout::new(&cfg, 2752, 2752, 1_048_576,
+            NativeScratch { kda: 4096, mla: [4096, maximum, 4096] })?;
+        let exact = old.clone().with_sparse_mla_rows(96)?;
+        let request = p::Request { context: p::Context::resolve(1_048_576, None), pool: p::Pin::Auto,
+            onboard: p::Pin::Auto, prefill: p::Pin::Auto, operation: p::Operation::Serving,
+            resident_weight_limit: None, spark_reply_formats: Default::default() };
+        let capacity = old.bytes()? as u64 + (4 << 30);
+        let budget = p::Budget { id: "rtx0".into(), locations: vec![p::Location::coordinator(0)],
+            physical_bytes: capacity, logical_bytes: capacity, headroom: 0,
+            baseline: p::Baseline::Forecast { occupied: 0, source: "K3.1 exact scratch regression".into(), assumed: false } };
+        let before = p::solve(request.clone(), vec![budget.clone()], &Recipe { bytes: old.bytes()? as u64 })?;
+        let after = p::solve(request, vec![budget], &Recipe { bytes: exact.bytes()? as u64 })?;
+        assert!(after.pool_tokens > before.pool_tokens);
+        assert_eq!(after.facts.allocations.iter().find(|owner| owner.id == "Kimi lane 0 native operands").unwrap().bytes,
+            exact.bytes()? as u64, "solver charges the exact runtime lane allocation");
         Ok(())
     }
 
