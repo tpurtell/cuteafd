@@ -56,6 +56,8 @@ impl HeadsWeights {
                 let Some(rest) = name.strip_prefix(&format!("{TEXT}layers.")) else { return true; };
                 let Some((layer, _)) = rest.split_once('.') else { return true; };
                 let layer: usize = layer.parse().expect("builder emits numeric layer IDs");
+                // The sole GPU0 router supplies exact routes to local TP2 peers.
+                if rank == 1 && router_operand(name) { return false; }
                 ffn_operand(name) || owners[layer] == rank
             });
             builder.tensors.retain(|(name, _)| retain(name));
@@ -140,6 +142,10 @@ pub fn slice_mount_load(checkpoint: &Checkpoint, target: &CoordinatorWeights,
     Ok(load)
 }
 
+fn router_operand(name: &str) -> bool {
+    name.ends_with(".block_sparse_moe.gate.weight") || name.ends_with(".block_sparse_moe.e_score_correction_bias")
+}
+
 fn ffn_operand(name: &str) -> bool {
     name.contains(".post_attention_layernorm.") || name.contains(".block_sparse_moe.")
         || name.contains(".mlp.")
@@ -158,6 +164,12 @@ mod tests {
         let heads = HeadsWeights::plan(checkpoint, cfg, EmbeddingHome::Device(0))?;
         for rank in 0..2 {
             assert_eq!(split[rank].target.layers, whole[rank].layers);
+            for layer in 0..cfg.layers {
+                for suffix in ["gate.weight", "e_score_correction_bias"] {
+                    let name = format!("{TEXT}layers.{layer}.block_sparse_moe.{suffix}");
+                    assert_eq!(split[rank].slices.contains_key(&name), rank == 0 && cfg.moe[layer]);
+                }
+            }
             assert_eq!(split[rank].target.arena.bytes(), split[rank].slices.values().map(TensorSlice::bytes).sum::<usize>());
             assert_eq!(split[rank].target.arena.padding_bytes(), 0);
             let components = split[rank].target.weight_components(1024)?;

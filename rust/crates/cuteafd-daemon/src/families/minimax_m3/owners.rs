@@ -53,9 +53,16 @@ pub(crate) struct Owners<'a> {
     pub storage: Rc<Storage<'a>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConstructorRefusal {
+    #[error("MiniMax 2-RTX split owners not built yet")]
+    SplitOwnersNotBuilt,
+}
+
 impl<'a> Owners<'a> {
     pub fn new(inputs: &MiniMaxInputs, admitted: &AdmittedMiniMax,
         programs: &'a Programs<'a>, loaded: Vec<LoadedRank<'a>>, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        if inputs.split() { return Err(ConstructorRefusal::SplitOwnersNotBuilt.into()); }
         let capacity = inputs.request_capacity()?;
         let contract = inputs.prepare(&admitted.solved.request)?;
         ensure!(admitted.solved.pool_page_rows == contract.page_rows
@@ -321,6 +328,11 @@ mod tests {
                 entries.insert(entry["name"].as_str().unwrap().to_owned(), entry.clone());
             }
         }
+        for (whole, half) in [(3072, 1536), (12288, 6144)] {
+            let source = &entries[&format!("minimax_oai_split_i{whole}")];
+            let entry: Value = serde_json::from_str(&source.to_string().replace(&whole.to_string(), &half.to_string()))?;
+            entries.insert(format!("minimax_oai_split_i{half}"), entry);
+        }
         let scalars = json!([{"name":"rows","type":"int32"},
             {"name":"rotation_id","type":"int32"}, {"name":"cta_limit","type":"int32"}]);
         for projection in targets.iter().flat_map(|target| &target.projections) {
@@ -353,8 +365,14 @@ mod tests {
             && namespace_error.raw_os_error().is_none() && checkpoint.snapshot.exists(),
             "constructor fixture did not resolve the canonical mount route: {namespace_error}");
         let owners = canonical::layer_owners(cfg.layers, gpus);
-        let targets = CoordinatorWeights::plan(checkpoint, cfg, gpus,
-            &owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>())?;
+        let split = if gpus == 2 { Some(cuteafd_loader::families::minimax_m3::weight_layout::SplitFfnWeights::plan(
+            checkpoint, cfg, &owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>(),
+            cuteafd_loader::placement::planner::EmbeddingHome::Device(0))?) } else { None };
+        let targets = match &split {
+            Some(split) => split.iter().map(|w| w.target.clone()).collect(),
+            None => CoordinatorWeights::plan(checkpoint, cfg, gpus,
+                &owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>())?,
+        };
         let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
         let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
         let tensors = catalog.fp8().context("MiniMax fixture native expert catalog")?;
@@ -365,7 +383,7 @@ mod tests {
         let budgets = (0..gpus).map(|gpu| canonical::planned_budget(gpu as u8, 96 << 30, 96 << 30, 1 << 30))
             .chain((0..2).map(|rank| canonical::spark_budget(rank, 100 << 30)))
             .chain([cuteafd_loader::placement::families::kimi::host_budget(512 << 30, 480 << 30)]).collect();
-        Ok(MiniMaxInputs { cfg: cfg.clone(), gpus,
+        Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, split_wire: Some(cuteafd_loader::families::minimax_m3::execution::WirePrecision::Bf16),
             attention: canonical::MINIMAX_M3.check_attention(None, gpus, gpus == 2)?,
             spark_ranks: 2, context: ModelContext::pinned(257),
             maximum_pool_tokens: 256 * 64, prefill, sequences: concurrency, manifest: std::sync::Arc::new(manifest(&targets)?),
@@ -374,13 +392,14 @@ mod tests {
             spark: (0..=routed.len()).map(|count| vec![if count == routed.len() {
                 SparkCharge { experts: 0, owners: 0, runtime: 0 }
             } else { SparkCharge { experts: 1 << 30, owners: 1 << 30, runtime: 1 << 30 } }; 2]).collect(),
-            links: canonical::spark_link((gpus - 1) as u8, 2, prefill, Default::default())?,
+            links: canonical::spark_link(0, 2, prefill, Default::default())?,
             spark_reply_formats: Default::default(), drafter: None, vision: None, code: vec![64 << 20; gpus],
             graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
             host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
             expert_usage: None, resident_weight_limit: None,
             push_host_envelopes: vec![None; routed.len() + 1],
-            mount: targets.iter().map(|target| target.mount_load(checkpoint)).collect::<Result<_>>()?, targets })
+            mount: match split { Some(split) => split.iter().map(|w| w.mount_load(checkpoint)).collect::<Result<_>>()?,
+                None => targets.iter().map(|target| target.mount_load(checkpoint)).collect::<Result<_>>()? }, targets })
     }
 
     #[test]
@@ -428,6 +447,9 @@ mod tests {
                 let path = dir.path().join("PROGRAMS.json");
                 std::fs::write(&path, serde_json::to_vec(&*inputs.manifest)?)?;
                 let programs = library.programs()?.with_manifest(&path)?;
+                let split = if ids.len() == 2 { Some(cuteafd_loader::families::minimax_m3::weight_layout::SplitFfnWeights::plan(
+                    &checkpoint, &cfg, &inputs.owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>(),
+                    cuteafd_loader::placement::planner::EmbeddingHome::Device(0))?) } else { None };
                 let mut loaded = Vec::new();
                 let mut embedding = None;
                 for (gpu, &id) in ids.iter().enumerate() {
@@ -435,19 +457,31 @@ mod tests {
                     let target = &inputs.targets[gpu];
                     let weights = if gpu == 0 {
                         let ((weights, table), records) = recording(||
-                            TargetWeights::load_with_embedding(device, &checkpoint, target, EmbedPlacement::Gpu))?;
+                            match &split {
+                                Some(split) => TargetWeights::load_split_ffn_with_embedding(device, &checkpoint, &split[gpu], EmbedPlacement::Gpu),
+                                None => TargetWeights::load_with_embedding(device, &checkpoint, target, EmbedPlacement::Gpu),
+                            })?;
                         assert!(!records.operands.is_empty());
                         embedding = Some(table);
                         weights
                     } else {
-                        let (weights, records) = recording(|| TargetWeights::load(device, &checkpoint, target))?;
+                        let (weights, records) = recording(|| match &split {
+                            Some(split) => TargetWeights::load_split_ffn(device, &checkpoint, &split[gpu]),
+                            None => TargetWeights::load(device, &checkpoint, target),
+                        })?;
                         assert!(!records.operands.is_empty());
                         weights
                     };
                     loaded.push(LoadedRank { weights, streams: RequestStreams { decode: Rc::new(Stream::new(device)?),
                         prefill: (0..3).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<_>>()? } });
                 }
-                let owners = Owners::new(&inputs, &admitted, &programs, loaded, embedding.unwrap())?;
+                let constructed = Owners::new(&inputs, &admitted, &programs, loaded, embedding.unwrap());
+                if ids.len() == 2 {
+                    let error = constructed.err().context("2-RTX split constructor must refuse until C supplies real owners")?;
+                    assert!(matches!(error.downcast_ref::<ConstructorRefusal>(), Some(ConstructorRefusal::SplitOwnersNotBuilt)));
+                    continue;
+                }
+                let owners = constructed?;
                 assert_eq!(owners.graphs.len(), ids.len());
                 assert_eq!(owners.storage.usage.is_some(), expert_usage);
                 let census = owners.storage.inventory()?;

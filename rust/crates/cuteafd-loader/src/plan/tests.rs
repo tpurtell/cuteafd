@@ -719,7 +719,7 @@ fn check_concurrency_plan_cell(
     ranks: usize,
     c: u64,
     options: &PlanOptions,
-) {
+) -> PlanReport {
     let (report, phases) = input.plan_with_timings(options);
     assert!(phases.total() < std::time::Duration::from_secs(10),
         "{label} C{c} GPUs={gpus} Sparks={ranks}: {phases:?}");
@@ -754,6 +754,7 @@ fn check_concurrency_plan_cell(
         assert_eq!(report.executable(), status == family::RuntimeStatus::Serving,
             "{label} C{c} GPUs={gpus} Sparks={ranks}: {}", render(&report));
     }
+    report
 }
 
 #[test]
@@ -896,7 +897,34 @@ fn boot_concurrency_full_plan_matrix() {
                                 layout.pool_tokens = Some(262_144);
                                 layout.prefix_slots = None;
                             }
-                            check_concurrency_plan_cell(&input, family, case.label, gpus, ranks, c, &options);
+                            if family == "minimax_m3" && gpus == 2
+                                && cuteafd_core::concurrency::validate(family, c).is_ok() {
+                                use crate::families::minimax_m3::execution::WirePrecision;
+                                use crate::placement::families::minimax_m3::ServingRefusal;
+                                let default = input.plan(&options).unwrap();
+                                assert!(default.solver_placement.is_none() && default.phase_ledger.is_none());
+                                assert!(default.hints.iter().any(|hint|
+                                    hint.what == ServingRefusal::SplitWireNotQualified.to_string()), "{}", render(&default));
+                                let mut charged = Vec::new();
+                                for wire in [WirePrecision::Bf16, WirePrecision::F32] {
+                                    options.layout.as_mut().unwrap().minimax_split_wire = Some(wire);
+                                    let report = check_concurrency_plan_cell(&input, family, case.label, gpus, ranks, c, &options);
+                                    let rows = c + report.prefill_unit_rows.unwrap() * report.prefill_waves.unwrap();
+                                    let bytes = report.memory_layout.as_ref().unwrap().devices.iter()
+                                        .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+                                        .map(|device| device.items.iter().filter(|item| item.group == "MiniMax native MSA")
+                                            .map(|item| item.bytes).sum::<u64>()).collect::<Vec<_>>();
+                                    assert_eq!(bytes.len(), 2);
+                                    charged.push((rows, bytes));
+                                }
+                                assert_eq!(charged[0].0, charged[1].0);
+                                // Only two hidden-width wire planes change by two bytes per element.
+                                for (f32, bf16) in charged[1].1.iter().zip(&charged[0].1) {
+                                    assert_eq!(f32 - bf16, charged[0].0 * 6144 * 2 * 2);
+                                }
+                            } else {
+                                check_concurrency_plan_cell(&input, family, case.label, gpus, ranks, c, &options);
+                            }
                         }
                     }
                 }

@@ -163,12 +163,7 @@ pub(crate) struct ProjectionOutput<'r, 'o, 'p, 'a> {
     linear: &'p Mxfp8A8<'a>,
 }
 
-/// Wire precision is selected by numerical qualification, not by topology.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PartialPrecision { Bf16, F32 }
-impl PartialPrecision {
-    pub fn bytes(self) -> usize { match self { Self::Bf16 => 2, Self::F32 => 4 } }
-}
+pub(crate) use cuteafd_loader::families::minimax_m3::execution::WirePrecision as PartialPrecision;
 
 /// Retains an admitted partial destination and its two ordering streams. This
 /// owns no device storage: the unit inventories the destination exactly once.

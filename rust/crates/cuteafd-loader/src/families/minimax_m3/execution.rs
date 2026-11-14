@@ -11,6 +11,124 @@ use cuteafd_ffi::{
     programs::ProgramSpec,
 };
 
+/// Selected by numerical qualification, never inferred from topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WirePrecision { Bf16, F32 }
+impl WirePrecision {
+    pub fn bytes(self) -> usize { match self { Self::Bf16 => 2, Self::F32 => 4 } }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Normalization { Local }
+
+/// Roles exclusively borrow one serial dense owner. The broadcast carries the
+/// FP32 residual; normalization always runs locally into dense.activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionRole { WholeAttention, PartialFfn }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleDescriptor {
+    pub role: ExecutionRole,
+    pub residual_bytes: u64,
+    pub normalization: Normalization,
+}
+
+/// Retained attention planes, without another residual or dense allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionLayout { pub rows: u32 }
+impl AttentionLayout {
+    pub fn new(cfg: &MiniMaxM3Config, rows: u32) -> Result<Self, Refusal> {
+        UnitLayout::new(cfg, rows)?;
+        Ok(Self { rows })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        UnitLayout { rows: self.rows }.buffers().into_iter().filter(|(name, _)|
+            matches!(*name, "query" | "key" | "value" | "index_query" | "index_key")).collect()
+    }
+    pub fn components(self, prefix: &str, rank: u8, maximum: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.buffers(), prefix, rank, Lifetime::TARGET, maximum, Category::Workspace)
+    }
+}
+
+/// Reused across all layers on both ranks. .ffn preserves the BF16 whole-output
+/// boundary before each rank adds it to its identical FP32 residual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialFfnLayout { pub rank: u8, pub rows: u32 }
+impl PartialFfnLayout {
+    pub fn new(cfg: &MiniMaxM3Config, rank: u8, rows: u32) -> Result<Self, Refusal> {
+        UnitLayout::new(cfg, rows)?;
+        if rank > 1 { return Err(Refusal::InvalidFact("MiniMax partial FFN requires TP2 rank".into())); }
+        Ok(Self { rank, rows })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        [("residual", 6144 * 4), ("gate", 6144 * 2), ("up", 6144 * 2),
+            ("ffn", 6144 * 2), ("routed", 6144 * 2)].into_iter()
+            .map(|(name, stride)| (name, u64::from(self.rows) * stride)).collect()
+    }
+    pub fn descriptor(self) -> RoleDescriptor {
+        RoleDescriptor { role: ExecutionRole::PartialFfn,
+            residual_bytes: u64::from(self.rows) * 6144 * 4, normalization: Normalization::Local }
+    }
+    pub fn components(self, prefix: &str, maximum: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.buffers(), prefix, self.rank, Lifetime::TARGET, maximum, Category::Workspace)
+    }
+}
+
+/// Routing planes on GPU0. GPU1 receives exact selected IDs/weights instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterLayout { pub rows: u32 }
+impl RouterLayout {
+    pub fn new(rows: u32) -> Result<Self, Refusal> {
+        UnitMetadata::new(rows)?;
+        Ok(Self { rows })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        [("logits", 128 * 4), ("route_ids", 4 * 4), ("route_weights", 4 * 4)]
+            .into_iter().map(|(name, stride)| (name, u64::from(self.rows) * stride)).collect()
+    }
+    pub fn components(self, prefix: &str, rank: u8, maximum: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.buffers(), prefix, rank, Lifetime::TARGET, maximum, Category::Workspace)
+    }
+}
+
+/// GPU1 receives selected routes only for onboarded layers, ordered on the
+/// existing split control sequence. No router weights, logits or extra flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteReceiveLayout { pub rows: u32 }
+impl RouteReceiveLayout {
+    pub fn new(rows: u32) -> Result<Self, Refusal> {
+        UnitMetadata::new(rows)?;
+        Ok(Self { rows })
+    }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        [("route_ids", 4 * 4), ("route_weights", 4 * 4)].into_iter()
+            .map(|(name, stride)| (name, u64::from(self.rows) * stride)).collect()
+    }
+    pub fn components(self, prefix: &str, maximum: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.buffers(), prefix, 1, Lifetime::TARGET, maximum, Category::Transport)
+    }
+}
+
+/// Independent wire and FP32 meeting storage per decode/prefill slot. Existing
+/// GEMM scratch stages into local; neither wire plane aliases the meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitLayout { pub rows: u32, pub wire: WirePrecision }
+impl SplitLayout {
+    pub fn new(rows: u32, wire: WirePrecision) -> Result<Self, Refusal> {
+        UnitMetadata::new(rows)?;
+        Ok(Self { rows, wire })
+    }
+    /// Ready/consumed events are created before the first launch.
+    pub fn events(self) -> usize { 2 }
+    pub fn buffers(self) -> Vec<(&'static str, u64)> {
+        let count = u64::from(self.rows) * 6144;
+        vec![("local", count * self.wire.bytes() as u64), ("receive", count * self.wire.bytes() as u64),
+            ("meeting", count * 4), ("control", 256), ("abort", 256)]
+    }
+    pub fn components(self, prefix: &str, rank: u8, maximum: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.buffers(), prefix, rank, Lifetime::TARGET, maximum, Category::Workspace)
+    }
+}
+
 /// Producer scratch is separate from dense activations and MSA scoring scratch.
 /// Every concurrently queued execution owner gets its own instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,12 +143,22 @@ impl ProducerPrograms {
         Self::resolve_kinds(manifest, rows, true)
     }
     fn resolve_kinds(manifest: &serde_json::Value, rows: u32, heads: bool) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
-        use cuteafd_ffi::minimax_m3::producers::{Kind, validate_producer_entry};
+        use cuteafd_ffi::minimax_m3::producers::Kind;
+        Self::resolve_selected(manifest, rows, if heads { Kind::HEADS } else { Kind::ALL })
+    }
+    pub fn resolve_split(manifest: &serde_json::Value, rows: u32) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        use cuteafd_ffi::minimax_m3::producers::Kind;
+        Self::resolve_selected(manifest, rows, [Kind::NormRope { heads: 64 }, Kind::NormRope { heads: 4 },
+            Kind::Index, Kind::Oai { width: 1536 }, Kind::Oai { width: 6144 }])
+    }
+    fn resolve_selected(manifest: &serde_json::Value, rows: u32,
+        kinds: [cuteafd_ffi::minimax_m3::producers::Kind; 5]) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        use cuteafd_ffi::minimax_m3::producers::validate_producer_entry;
         let entries = manifest["programs"].as_array()
             .ok_or_else(|| Refusal::InvalidFact("MiniMax PROGRAMS.json has no program list".into()))?;
         let mut specs = Vec::new();
         let mut layouts = Vec::new();
-        for kind in if heads { Kind::HEADS } else { Kind::ALL } {
+        for kind in kinds {
             let missing = |detail| Refusal::MissingExport { export: kind.name().into(),
                 geometry: "MiniMax native norm/partial-NeoX/index/OAI producers".into(), context: 0, detail };
             let mut found = entries.iter().filter(|entry| entry["name"] == kind.name());

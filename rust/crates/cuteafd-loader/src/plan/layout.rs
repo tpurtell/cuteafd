@@ -29,6 +29,8 @@ const GLM_FLASH_ENCODER_SCRATCH_BYTES: u64 = 791_907_584;
 pub struct LayoutOptions {
     /// Charge shared route telemetry on the canonical coordinator rank.
     pub expert_usage: bool,
+    /// Internal qualification input; no MiniMax split-wire default is assumed.
+    pub minimax_split_wire: Option<crate::families::minimax_m3::execution::WirePrecision>,
     /// None sizes full-context KV for concurrency + 4, capped at min(32 GiB, 25% host RAM).
     /// Explicit bytes bypass both; Some(0) disables the host tier.
     pub host_cache_bytes: Option<u64>,
@@ -250,6 +252,7 @@ impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
             expert_usage: false,
+            minimax_split_wire: None,
             host_cache_bytes: None,
             spark_reply_formats: cuteafd_core::spark_reply::requested(),
             media_cache_bytes: None,

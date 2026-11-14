@@ -57,8 +57,10 @@ pub struct FactsRequest<'a> {
     pub manifest_path: &'a Path,
     pub manifest: Arc<serde_json::Value>,
     pub coordinator: Coordinator,
-    /// Explicit planning mode; None keeps the qualified whole-layer default.
+    /// Explicit planning mode; None keeps the family attention default.
     pub attention: Option<crate::placement::AttentionPlacement>,
+    /// Required for two-RTX Layers; qualification chooses the precise layout.
+    pub split_wire: Option<super::execution::WirePrecision>,
     /// Logical rank to physical CUDA device, shared with runtime arena IDs.
     pub physical_devices: &'a [i32],
     pub spark_ranks: usize,
@@ -168,10 +170,21 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         || (gpus == 1 && attention != crate::placement::AttentionPlacement::Heads) {
         return Err(refused("MiniMax attention placement is not implemented", "Use heads on one RTX; layers or heads on two RTX."));
     }
+    if gpus == 2 && !heads && request.split_wire.is_none() {
+        return Err(refused(shared::ServingRefusal::SplitWireNotQualified.to_string(),
+            "Pass an explicitly qualified Bf16 or F32 wire precision to MiniMax admission; no default is selected."));
+    }
     let owners = if heads { Vec::new() } else { shared::layer_owners(cfg.layers, gpus) };
     let target_inventory = || -> anyhow::Result<_> {
         if heads {
             let weights = super::weight_layout::HeadsWeights::plan(request.checkpoint, cfg,
+                crate::placement::planner::EmbeddingHome::Device(0))?;
+            let mount = weights.iter().map(|weight| weight.mount_load(request.checkpoint))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok((weights.into_iter().map(|weight| weight.target).collect::<Vec<_>>(), mount))
+        } else if gpus == 2 {
+            let weights = super::weight_layout::SplitFfnWeights::plan(request.checkpoint, cfg,
+                &owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>(),
                 crate::placement::planner::EmbeddingHome::Device(0))?;
             let mount = weights.iter().map(|weight| weight.mount_load(request.checkpoint))
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -208,7 +221,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         .map_err(|error| refused(format!("MiniMax Spark inventory refused: {error:#}"),
             format!("Use a Spark world with a minimax:nvfp4 package ({:?}).",
                 crate::plan::experts::spark_worlds("minimax:nvfp4a4", cfg.moe_intermediate))))?;
-    let links = shared::spark_link((gpus - 1) as u8, ranks, shape, request.replies)
+    let links = shared::spark_link(0, ranks, shape, request.replies)
         .map_err(|error| refused(format!("MiniMax Spark transport owners refused: {error}"), "Use a supported unit."))?;
     let programs = crate::placement::ProgramSet::from_manifest(&request.manifest, &["minimax", "exlr8"]);
     let mut code = Vec::new();
@@ -245,7 +258,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     let physical = (0..gpus).map(|gpu| request.coordinator.physical(gpu)).collect::<Vec<_>>();
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(&physical, context, request.pool_tokens,
         shared::PAGE_ROWS).maximum_tokens();
-    Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, attention, spark_ranks: ranks,
+    Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, attention, split_wire: request.split_wire, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, owners,
         manifest: request.manifest.clone(), routed: routed.clone(), expert_backings, local, spark, links,
