@@ -314,11 +314,11 @@
       },
       "1rtx": {
         "status": "current",
-        "report": "benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1"
+        "report": "benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-selector-1rtx"
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-flash-tp2-graphs"
+        "report": "benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-selector-2rtx"
       }
     }
   ],
