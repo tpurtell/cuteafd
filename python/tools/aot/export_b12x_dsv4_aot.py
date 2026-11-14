@@ -177,9 +177,20 @@ def native_attention_prefill_shapes():
     }
 
 
+def native_attention_prefill_preference(n, k, output):
+    """Full-band A8/A16 curves: fork#312, SM120/SM121, 2048..4096 plus tails."""
+    shapes = set().union(*native_attention_prefill_shapes().values())
+    expected = "f32" if (n, k) in native_attention_f32_shapes() else "bf16"
+    if (n, k) not in shapes or output != expected:
+        return {"12.0": False, "12.1": False}
+    return {"12.0": True, "12.1": (n, k, output) != (512, 8192, "bf16")}
+
+
 def compile_native_attention_prefill(n, k, output):
     from b12x.integration.cuteafd._fp8_weights import compile_native_fp8_prefill_aot
-    return compile_native_fp8_prefill_aot(input_features=k, output_features=n, max_rows=4096, output=output)
+    program = compile_native_fp8_prefill_aot(input_features=k, output_features=n, max_rows=4096, output=output)
+    return dataclasses.replace(program, geometry=dict(program.geometry,
+        auto_prefill=native_attention_prefill_preference(n, k, output)))
 
 
 def native_attention_prefill_programs():

@@ -1889,3 +1889,14 @@ def test_native_fp8_prefill_stems_are_additive_and_exclude_decode_and_heads():
     jobs = {job[0]:job[1:] for job in compare_sm.jobs("all")}
     assert jobs["native-attention-prefill-fp8"] == ("export_b12x_dsv4_aot.py",
         ["--geometry","native_attention","--only",",".join(entry[0] for entry in entries)])
+
+
+def test_native_fp8_auto_preference_uses_capability_shape_and_output_only():
+    exporter = compare_sm.load_file("test_native_prefill_preference", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    for n,k in set().union(*exporter.native_attention_prefill_shapes().values()):
+        output = "f32" if (n,k) in exporter.native_attention_f32_shapes() else "bf16"
+        expected = {"12.0":True,"12.1":(n,k,output)!=(512,8192,"bf16")}
+        assert exporter.native_attention_prefill_preference(n,k,output)==expected
+        other = "bf16" if output=="f32" else "f32"
+        assert exporter.native_attention_prefill_preference(n,k,other)=={"12.0":False,"12.1":False}
+    assert exporter.native_attention_prefill_preference(128,128,"bf16")=={"12.0":False,"12.1":False}
