@@ -555,6 +555,20 @@ pub fn dual_expert_costs(catalog: &crate::OfficialV41Catalog, layers: usize)
     }).collect()
 }
 
+/// The planner reads the published metadata tree beside PROGRAMS.json; live
+/// loaders read the corresponding native package tree beside their library.
+pub fn metadata_library(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>)
+    -> std::path::PathBuf {
+    let manifest = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+    let share = manifest.parent().unwrap_or(std::path::Path::new("/opt/cuteafd/share"));
+    let metadata = catalog.exl3().is_some_and(|exl3| {
+        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
+        share.join(format!("exl3/exl3-qwen4-k{tiers}/rtx-tp1/m1/v41_exl3.json")).is_file()
+    });
+    (if metadata { share.to_owned() } else { crate::placement::inventory::image_lib(Some(manifest)) })
+        .join("libcuteafd_native.so")
+}
+
 /// Package selection is checkpoint-native and shared by plan and runtime.
 pub fn dual_packages(catalog: &crate::OfficialV41Catalog, native_lib: &std::path::Path)
     -> anyhow::Result<[std::path::PathBuf; 2]> {

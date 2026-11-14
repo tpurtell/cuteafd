@@ -220,8 +220,8 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let all_onboarded = cfg.layers > 0 && options.resolve_onboard(cfg.layers) == Some(Onboard::Layers(cfg.layers));
     let spark_ranks = if report.placement == ExpertPlacement::Local || all_onboarded { 0 }
         else { report.placement.spark_ranks() };
-    let lib = crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()).join("libcuteafd_native.so");
     let catalog = input.expert_catalog()?;
+    let lib = qwen4::metadata_library(catalog, options.workspace_manifest.as_deref());
     let mut experts = if manifest.is_some() {
         qwen4::QwenExperts::read(catalog, &lib, cfg.layers, 1, shape.prefill_rows.max(64))?
     } else { qwen4::QwenExperts::headers(catalog, cfg.layers, 1)? };
@@ -591,7 +591,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let resident = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp, selected)?;
     let catalog = input.expert_catalog()?;
     let costs = qwen4::dual_expert_costs(&catalog, cfg.layers)?;
-    let lib = crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()).join("libcuteafd_native.so");
+    let lib = qwen4::metadata_library(&catalog, options.workspace_manifest.as_deref());
     let unit_rows = options.prefill_unit_rows.unwrap_or(rows);
     let prefill_shape = (options.prefill_waves > 1).then_some(crate::serving_capacity::PrefillShape {
         unit_rows, waves: options.prefill_waves }).map(|shape| shape.validate()).transpose()?;
