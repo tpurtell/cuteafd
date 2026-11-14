@@ -389,7 +389,7 @@ mod tests {
                     for ranks in [1, 2] {
                         for rank in 0..ranks {
                             let layout = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
-                                rows, waves, lead: rank == 0, with_head: rank == 0,
+                                rows, waves, lead: rank == 0, with_head: rank == 0, spark: rank == 0,
                                 prefill_output: MimoPrefillOutput::LastRow,
                                 attention: if ranks == 2 { MimoAttentionWorkspace::PartitionedHeads { ranks } }
                                     else { MimoAttentionWorkspace::Global }, ..options()

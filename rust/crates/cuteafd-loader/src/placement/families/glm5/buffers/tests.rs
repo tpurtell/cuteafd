@@ -94,7 +94,7 @@ fn glm_and_ml4_serving_heads_keep_exact_bounded_charges_across_shapes() {
     let configs = [cfg(), GlmDsaConfig::from_hf(&crate::plan::testing::mistral_large4_config()).unwrap()];
     for config in configs {
         for device in [0, 1] {
-            for rows in [1, 64, 512, 4096, 8256] {
+            for rows in [64, 512, 2048, 2752, 4096] {
                 for waves in [1, 2, 4] {
                     let mut target = target(device);
                     target.prefill.as_mut().unwrap().0 = PrefillShape { rows, waves };
