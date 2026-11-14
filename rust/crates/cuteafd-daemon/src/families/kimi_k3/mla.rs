@@ -155,8 +155,9 @@ impl CacheLayout {
             let share = AttentionShare::bind(assignment.mode, ranks)?[rank];
             Ok(share.present().then_some(share))
         }).collect::<Result<Vec<_>>>()?;
-        // Context MLA is sharded, but index scoring needs the full global history on both ranks.
-        let index_layer_bytes = tokens.checked_mul(cfg.dsa.map_or(0, |index| index.head_dim + 4))
+        // Index records follow the same logical-page parity as the latent cache:
+        // each rank scores its own half and the shared merge joins the runs.
+        let index_layer_bytes = local_tokens.checked_mul(cfg.dsa.map_or(0, |index| index.head_dim + 4))
             .context("Kimi index cache extent overflow")?;
         let bytes = layer_bytes.checked_add(index_layer_bytes).and_then(|per_layer|
             per_layer.checked_mul(layers.iter().flatten().count())).context("Kimi MLA cache total overflow")?;
@@ -379,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn k31_context_index_cache_is_replicated_and_named_separately() -> Result<()> {
+    fn k31_context_index_cache_follows_page_parity() -> Result<()> {
         use cuteafd_loader::families::kimi_k3::config::KimiDsaConfig;
         let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let mut placement = super::super::admission::admit(super::super::admission::tests::inputs(&cfg))?.placement;
@@ -390,9 +391,13 @@ mod tests {
         for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
             for rank in 0..2 {
                 let layout = CacheLayout::new(&cfg, &placement, rank, format)?;
-                assert_eq!(layout.index_layer_bytes, placement.pool_tokens as usize / 64 * 8448);
+                // Index records follow the same logical-page parity as the
+                // latent cache: each rank owns and is charged for half.
+                assert_eq!(layout.index_layer_bytes, placement.pool_tokens as usize / 2 / 64 * 8448);
                 assert_eq!(layout.layer_bytes, placement.pool_tokens as usize / 2 * format.record_bytes());
                 assert_eq!(layout.bytes(), (layout.layer_bytes + layout.index_layer_bytes) * cfg.mla_layers());
+                assert_eq!(layout.index_reserved_bytes(),
+                    CacheLayout::backing_bytes(layout.index_layer_bytes) * cfg.mla_layers() as u64);
                 assert!(layout.reserved_bytes() >= layout.bytes() as u64);
             }
         }

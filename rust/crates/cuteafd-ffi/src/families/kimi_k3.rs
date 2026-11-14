@@ -316,14 +316,17 @@ impl KimiIndexMode {
 #[derive(Clone, Copy, Debug)]
 pub struct KimiIndexSelection {
     pub rows: usize, pub cache_pages: usize, pub table_width: usize, pub table_stride: usize,
+    /// Interleaved half tables use (2, rank); (1, 0) scores the whole cache.
+    pub page_stride: usize, pub page_offset: usize,
     pub query_fp8: Buffer, pub head_weights: Buffer, pub cache: Buffer, pub table: Buffer,
     /// Per-query causal frontier, including the query's current token.
     pub lengths: Buffer,
     pub indices: Buffer, pub scores: Buffer, pub scratch: Buffer,
 }
 
-/// Shared DSA selector. Context always scores the replicated full history and
-/// returns global logical candidates; parity filtering is a later stage.
+/// Shared DSA selector. Context scores each rank's parity-owned half through
+/// its compact table and the shared candidate merge, returning global logical
+/// candidates; (1, 0) keeps the ordinary whole-cache behavior byte for byte.
 pub struct KimiIndexTopK<'a> {
     program: Program<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
     scored: bool, runtime_sms: Option<i32>, scratch: usize,
@@ -346,12 +349,13 @@ impl<'a> KimiIndexTopK<'a> {
     pub fn launch(&self, b: KimiIndexSelection, stream: *mut c_void) -> Result<()> {
         validate_topk_batch(b, self.rows, self.pages, self.mode, self.scored, self.scratch)?;
         if self.scored {
-            // SAFETY: writer aliases and extents checked; full-index (1,0)
-            // selection precedes parity filtering, with retained causal metadata.
+            // SAFETY: writer aliases and extents checked; (2, rank) selects one
+            // parity half through the compact table, (1, 0) the whole cache.
             unsafe { self.program.launch(&[b.query_fp8.ptr, b.head_weights.ptr, b.cache.ptr, b.table.ptr,
                 b.lengths.ptr, b.indices.ptr, b.scores.ptr, b.scratch.ptr],
                 &[Scalar::I32(b.rows as i32), Scalar::I32(b.table_width as i32),
-                  Scalar::I32(b.table_stride as i32), Scalar::I32(1), Scalar::I32(0)], stream)?; }
+                  Scalar::I32(b.table_stride as i32), Scalar::I32(b.page_stride as i32),
+                  Scalar::I32(b.page_offset as i32)], stream)?; }
         } else {
             let scalars = [Scalar::I32(b.rows as i32), Scalar::I32(b.table_width as i32),
                 Scalar::I32(b.table_stride as i32), Scalar::I32(self.runtime_sms.unwrap_or(0))];
@@ -389,7 +393,9 @@ fn validate_topk_batch(b: KimiIndexSelection, rows: usize, pages: usize, mode: K
     scored: bool, scratch: usize) -> Result<()> {
     if b.rows == 0 || b.rows > rows || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize / 64
         || b.table_width == 0 || b.table_width > pages || b.table_stride < b.table_width
-        || b.table_stride > i32::MAX as usize {
+        || b.table_stride > i32::MAX as usize
+        || !matches!(b.page_stride, 1 | 2) || b.page_offset >= b.page_stride
+        || (b.page_stride == 1 && b.page_offset != 0) {
         return Err(KimiMlaError::Invalid("K3.1 selector batch/table geometry"));
     }
     let table = if mode == KimiIndexMode::Prefill { b.table_width } else {
@@ -1565,6 +1571,7 @@ mod tests {
         let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
             bytes: 0x10000000, device_id: 0, flags: 0 };
         let b = KimiIndexSelection { rows: 17, cache_pages: 128, table_width: 64, table_stride: 80,
+            page_stride: 1, page_offset: 0,
             query_fp8: buffer(1), head_weights: buffer(2), cache: buffer(3), table: buffer(4),
             lengths: buffer(5), indices: buffer(6), scores: buffer(7), scratch: buffer(8) };
         for mode in [KimiIndexMode::Decode, KimiIndexMode::Prefill] {
@@ -1576,6 +1583,8 @@ mod tests {
                 for bad in [KimiIndexSelection { rows: 0, ..b }, KimiIndexSelection { rows: 65, ..b },
                     KimiIndexSelection { table_width: 16385, ..b }, KimiIndexSelection { table_stride: 63, ..b },
                     KimiIndexSelection { cache_pages: usize::MAX, ..b },
+                    KimiIndexSelection { page_stride: 3, ..b }, KimiIndexSelection { page_stride: 2,
+                        page_offset: 2, ..b }, KimiIndexSelection { page_stride: 1, page_offset: 1, ..b },
                     KimiIndexSelection { table: Buffer { bytes: table * 4 - 1, ..b.table }, ..b },
                     KimiIndexSelection { cache: Buffer { bytes: b.cache_pages * 8448 - 1, ..b.cache }, ..b },
                     KimiIndexSelection { lengths: Buffer { bytes: b.rows * 4 - 1, ..b.lengths }, ..b }] {

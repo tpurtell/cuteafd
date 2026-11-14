@@ -711,8 +711,9 @@ impl Recipe for KimiRecipe {
                             crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES),
                         false, self.maximum_pages));
                     if self.index_bytes_per_page > 0 {
-                        let bytes = self.index_bytes_per_page.checked_mul(self.page_rows() / PAGE_ROWS)
-                            .ok_or(Refusal::Overflow("Kimi index pages"))?;
+                        // One index backing per owned logical page: context
+                        // halves the page count instead of doubling the page.
+                        let bytes = self.index_bytes_per_page;
                         let owner = Allocation::buffer(format!("index.records.{layer}.{rank}"),
                             Location::coordinator(rank as u8), bytes, Lifetime::RESIDENT,
                             Category::Kv, "index records");
@@ -1161,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn k31_index_backings_keep_independent_tails_and_context_replication() {
+    fn k31_index_backings_keep_independent_tails_and_context_page_parity() {
         use crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES as G;
         for placement in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
             let mut recipe = recipe();
@@ -1190,9 +1191,7 @@ mod tests {
             let expected_layers = if placement == AttentionPlacement::Layers { 2 } else { 4 };
             assert_eq!(owners.len(), expected_layers * 2);
             for owner in &owners {
-                let per_page = if owner.group == "records" { record } else {
-                    8448 * if placement == AttentionPlacement::Context { 2 } else { 1 }
-                };
+                let per_page = if owner.group == "records" { record } else { 8448 };
                 assert_eq!(owner.bytes, (per_page * pages).div_ceil(G) * G);
             }
             if placement != AttentionPlacement::Layers {

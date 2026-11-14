@@ -1169,23 +1169,27 @@ impl<'a> LocalLane<'a> {
         let indices = owner.buffer("DSA global indices")?;
         let stream = self.stream();
         stream.device.run(|| {
-            // Both ranks retain the full index history, independent of MLA parity.
+            // Each rank owns its logical-page-parity half of the index cache:
+            // peer slots are -1, which the producer skips.
             dsa.producer[0].launch(weights, cuteafd_ffi::KimiIndexBatch {
-                rows, cache_pages: self.mla.pages(), x: batch.x, q_resid: batch.q_resid,
-                positions: self.lane.buffer("DSA positions")?, slots: self.lane.buffer("DSA slots")?,
+                rows, cache_pages: self.mla.local_pages(), x: batch.x, q_resid: batch.q_resid,
+                positions: self.lane.buffer("DSA positions")?,
+                slots: owner.metadata("context slots", self.lane.metadata_bank)?,
                 cos_sin: weights.norm, cache, query_fp8: query, head_weights,
                 scratch: self.lane.buffer("DSA producer scratch")?,
             }, stream.raw)?;
-            if self.rank == 0 {
-                dsa.scored[0].launch(cuteafd_ffi::KimiIndexSelection {
-                    rows, cache_pages: self.mla.pages(),
-                    table_width: self.lane.layout.max_context.div_ceil(64),
-                    table_stride: self.lane.layout.max_context.div_ceil(64),
-                    query_fp8: query, head_weights, cache, table: self.lane.buffer("DSA page table")?,
-                    lengths: self.lane.buffer("DSA lengths")?, indices, scores,
-                    scratch: self.lane.buffer("DSA selector scratch")?,
-                }, stream.raw)?;
-            }
+            // Both ranks score their own half; the shared merge joins the two
+            // disjoint runs into the global top-k.
+            let width = owner.compact_width();
+            dsa.scored[0].launch(cuteafd_ffi::KimiIndexSelection {
+                rows, cache_pages: self.mla.local_pages(),
+                table_width: width, table_stride: width,
+                page_stride: 2, page_offset: self.rank,
+                query_fp8: query, head_weights, cache,
+                table: owner.metadata("compact page tables", self.lane.metadata_bank)?,
+                lengths: owner.metadata("shard lengths", self.lane.metadata_bank)?, indices, scores,
+                scratch: self.lane.buffer("DSA selector scratch")?,
+            }, stream.raw)?;
             Ok(())
         })?;
         Ok(crate::shared::peer_split::attention::Candidates { scores: scores.ptr, indices: indices.ptr })
@@ -1455,6 +1459,10 @@ impl<'a> LocalLane<'a> {
     fn dsa_selected(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch, staging: bool,
         speculative: bool) -> Result<()> {
         ensure!(staging == self.mla.parity(), "Kimi Context DSA requires logical slots in gathered staging");
+        // Context prefill still needs its per-rank candidate exchange and merge
+        // (the decode path below has it); fail closed instead of scoring a half
+        // cache as if it were the whole history.
+        ensure!(!staging, "Kimi context prefill selection requires the per-rank candidate merge (#1777)");
         let programs = self.programs.dsa.as_ref().context("Kimi DSA programs not resolved")?;
         let unit = usize::from(batch.rows > 64);
         let cache = self.mla.index(layer)?;
@@ -1487,6 +1495,7 @@ impl<'a> LocalLane<'a> {
                 rows: batch.rows, cache_pages: self.mla.pages(),
                 table_width: self.lane.layout.max_context.div_ceil(64),
                 table_stride: self.lane.layout.max_context.div_ceil(64),
+                page_stride: 1, page_offset: 0,
                 query_fp8: query, head_weights, cache, table: self.lane.buffer("DSA page table")?,
                 lengths: self.lane.buffer("DSA lengths")?, indices,
                 scores: if staging { self.lane.buffer("DSA scores")? } else { indices },
@@ -1500,6 +1509,7 @@ impl<'a> LocalLane<'a> {
                 programs.scored[unit].launch(cuteafd_ffi::KimiIndexSelection {
                     rows: batch.rows, cache_pages: self.mla.pages(),
                     table_width, table_stride: table_width,
+                    page_stride: 1, page_offset: 0,
                     query_fp8: query, head_weights, cache, table: self.lane.buffer("DSA page table")?,
                     lengths: self.lane.buffer("DSA lengths")?,
                     indices: view(self.lane.buffer("DSA producer scratch")?,
