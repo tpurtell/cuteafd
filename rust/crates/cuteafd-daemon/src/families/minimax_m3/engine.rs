@@ -395,6 +395,7 @@ impl<'a> SplitExecution<'a> {
                 // SAFETY: stage queued both partial sends before receive waits;
                 // the routed ticket landed before this host boundary.
                 unsafe { units[gpu].meet_ffn_enqueue(&storage.ranks[gpu].kernels, rows, shared)?; }
+                units[gpu].post_fold_tap_enqueue(layer, rows)?;
                 if gpu == 0 && shared {
                     Self::send(units, 0, 2, &[(units[0].plane("routed")?,
                         units[1].plane("routed")?, rows * 6144 * 2)])?;
@@ -915,8 +916,16 @@ impl<'a> ServingPrefill<'a> {
                     decode_section(captured, graph_rows, rows, |section_rows| {
                         // SAFETY: retained landed routed output and exact row key.
                         unsafe { graphs.run(Key { rank: 0, layer, rows: section_rows, op: Op::JoinRouted }, None,
-                            || rank.decode.borrow().join_routed_enqueue(&rank.kernels, section_rows)) }
-                    }, |live_rows| rank.decode.borrow().join_routed_enqueue(&rank.kernels, live_rows))?;
+                            || {
+                                let owner = rank.decode.borrow();
+                                owner.join_routed_enqueue(&rank.kernels, section_rows)?;
+                                owner.post_fold_tap_enqueue(layer, section_rows)
+                            }) }
+                    }, |live_rows| {
+                        let owner = rank.decode.borrow();
+                        owner.join_routed_enqueue(&rank.kernels, live_rows)?;
+                        owner.post_fold_tap_enqueue(layer, live_rows)
+                    })?;
                     rank.decode.borrow().joined();
                 } else {
                     rank.decode.borrow().ffn_boundary(false)?;
@@ -924,10 +933,16 @@ impl<'a> ServingPrefill<'a> {
                     decode_section(captured, graph_rows, rows, |section_rows| {
                         // SAFETY: retained row-independent dense section operands.
                         unsafe { graphs.run(Key { rank: 0, layer, rows: section_rows, op: Op::Ffn }, None,
-                            || rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights,
-                                &rank.layout, layer, section_rows, false)) }
-                    }, |live_rows| rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights,
-                        &rank.layout, layer, live_rows, false))?;
+                            || {
+                                let mut owner = rank.decode.borrow_mut();
+                                owner.ffn_enqueue(&rank.kernels, &rank.weights, &rank.layout, layer, section_rows, false)?;
+                                owner.post_fold_tap_enqueue(layer, section_rows)
+                            }) }
+                    }, |live_rows| {
+                        let mut owner = rank.decode.borrow_mut();
+                        owner.ffn_enqueue(&rank.kernels, &rank.weights, &rank.layout, layer, live_rows, false)?;
+                        owner.post_fold_tap_enqueue(layer, live_rows)
+                    })?;
                 }
             }
             let residual = rank.decode.borrow().plane("residual")?;

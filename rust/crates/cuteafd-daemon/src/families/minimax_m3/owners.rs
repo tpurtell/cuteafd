@@ -251,9 +251,16 @@ impl Owners<'_> {
         unsafe { bank.prewarm(&keys, |_| None, |key| {
             match key.op {
                 Op::Router => rank.decode.borrow().router_enqueue(&rank.kernels, &rank.weights, key.layer, key.rows),
-                Op::Ffn => rank.decode.borrow_mut().ffn_enqueue(&rank.kernels, &rank.weights, &rank.layout,
-                    key.layer, key.rows, cfg.moe[key.layer]),
-                Op::JoinRouted => rank.decode.borrow().join_routed_enqueue(&rank.kernels, key.rows),
+                Op::Ffn => {
+                    let mut owner = rank.decode.borrow_mut();
+                    owner.ffn_enqueue(&rank.kernels, &rank.weights, &rank.layout, key.layer, key.rows, cfg.moe[key.layer])?;
+                    if cfg.moe[key.layer] { Ok(()) } else { owner.post_fold_tap_enqueue(key.layer, key.rows) }
+                }
+                Op::JoinRouted => {
+                    let owner = rank.decode.borrow();
+                    owner.join_routed_enqueue(&rank.kernels, key.rows)?;
+                    owner.post_fold_tap_enqueue(key.layer, key.rows)
+                },
                 Op::Attention => anyhow::bail!("MiniMax attention is not a context-invariant graph section"),
             }
         })?; }

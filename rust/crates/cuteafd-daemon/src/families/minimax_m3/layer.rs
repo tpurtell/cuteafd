@@ -269,6 +269,9 @@ impl<'a> UnitOwner<'a> {
         Ok(())
     }
     pub fn rows(&self) -> u32 { self.rows }
+    /// CUDA-only target-residual tap seam. The optional drafter owns and admits
+    /// its retained writer; ordinary serving allocates no tap buffers here.
+    pub(crate) fn post_fold_tap_enqueue(&self, _layer: usize, _rows: usize) -> Result<()> { Ok(()) }
     #[cfg(test)]
     pub fn validate_split(&self, inputs: &cuteafd_loader::placement::families::minimax_m3::MiniMaxInputs,
         gpu: usize) -> Result<()> {
