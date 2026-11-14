@@ -231,6 +231,10 @@ def main():
     layers = [int(n) for n in args.layers.split(",")]
     if not layers or any(n not in (0, 5) for n in layers):
         parser.error("diagnostic layers are0,5 only")
+    # Packed immutable core views stay BF16. The independent F32 oracle widens
+    # each projection only during its call, rather than retaining another core.
+    oracle.linear = lambda x, weight, bias=None: linear(x.float(), weight.float(),
+        None if bias is None else bias.float())
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     torch.cuda.set_device(0)
