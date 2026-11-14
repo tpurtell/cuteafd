@@ -47,6 +47,8 @@ pub(super) enum ToolSyntax {
     MuseAtem,
     /// Mistral `[TOOL_CALLS]NAME[ARGS]{json}`, calls back to back.
     MistralCalls,
+    /// MiniMax namespaced recursive XML; never another family's grammar.
+    MiniMaxXml,
 }
 
 pub(super) struct ToolConstraints {
@@ -87,7 +89,12 @@ impl ToolConstraints {
             let validator = if strict { Some(super::constraints::compile_schema(&schema)
                 .with_context(|| format!("invalid parameters for tool {}", tool.name))?) } else { None };
             validators.insert(tool.name.clone(), validator);
+            if syntax == ToolSyntax::MiniMaxXml {
+                ensure!(!(assistance || strict || required), "MiniMax constrained tool decoding not yet available");
+                continue;
+            }
             tags.push(match syntax {
+                ToolSyntax::MiniMaxXml => unreachable!("MiniMax constraints refused before grammar construction"),
                 ToolSyntax::KimiXtml => json!({"type":"tag",
                     "begin":format!("<|open|>call tool=\"{}\" index=\"", tool.name.replace('&', "&amp;").replace('"', "&quot;")),
                     "content":{"type":"sequence", "elements":[
@@ -127,6 +134,7 @@ impl ToolConstraints {
             return Ok(Some(Self { required, format: None, triggered: None, parallel, validators }));
         }
         let (format, triggered) = match syntax {
+            ToolSyntax::MiniMaxXml => anyhow::bail!("MiniMax constrained tool decoding not yet available"),
             // Parallel calls are consecutive tool messages; the response
             // composition (`muse_response_constraint`) owns the optional branch.
             ToolSyntax::MuseAtem => {
