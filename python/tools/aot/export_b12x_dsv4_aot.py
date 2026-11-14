@@ -410,7 +410,7 @@ def inkling2_input_quant_program():
                   Operand("values_ptr", torch.uint32, "[rows,1188]", "out"),
                   Operand("scale_rows_ptr", torch.uint8, "values_ptr+4608", "out", align=1),
                   Operand("scale_mma_ptr", torch.uint8, "unused")),
-        scalars=(Scalar("rows"), Scalar("grid_x")),
+        scalars=(Scalar("m"), Scalar("grid_x")),
         geometry=dict(hidden=4608, row_bytes=4752, expected_m=80, amax_floor=0.,
                       exact_row_cap=2**31-1))
 
