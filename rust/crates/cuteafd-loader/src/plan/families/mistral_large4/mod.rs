@@ -179,6 +179,7 @@ fn routed_shape(cfg: &Ml4Config, stem: &str) -> Option<[usize; 2]> {
 }
 
 impl Family for MistralLarge4 {
+    fn eager_native_core_headers(&self) -> bool { true }
     fn native_head_widths(&self) -> &'static [usize] {
         crate::families::glm5::core::ML4_CORE_WIDTHS
     }
