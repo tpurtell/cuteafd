@@ -36,6 +36,7 @@ fn raw(buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<cuteafd
 }
 
 fn run(args: GoldenArgs) -> Result<()> {
+    ensure!(args.nll, "Inkling cold golden requires --nll");
     let view = args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
     ensure!(view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Original, "Inkling stage2 golden currently qualifies original BF16 core only");
