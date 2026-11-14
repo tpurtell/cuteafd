@@ -27,6 +27,7 @@ pub(crate) struct Options<'a> {
     pub native_lib: &'a Path,
     pub manifest_path: &'a Path,
     pub split_wire: super::dense::PartialPrecision,
+    pub attention_placement: cuteafd_loader::placement::AttentionPlacement,
     pub prefill: PrefillShape,
     pub sequences: u64,
     pub context_tokens: u64,
@@ -94,12 +95,14 @@ fn validate_spark_world(world: usize, intermediate: usize) -> Result<()> {
 }
 
 fn program_names(cfg: &MiniMaxM3Config, target: &CoordinatorWeights,
-    manifest: &serde_json::Value, capacity: RequestCapacity, context: u32) -> Result<BTreeSet<String>> {
-    let (_, msa) = MsaPrograms::resolve(cfg, manifest, capacity.decode.rows, capacity.prefill.rows, context)?;
-    let (_, producers) = if target.layers.len() < cfg.layers {
-        ProducerPrograms::resolve_split(manifest, capacity.execution_rows())?
-    } else { ProducerPrograms::resolve(manifest, capacity.execution_rows())? };
-    let (_, forward) = ForwardPrograms::resolve(manifest, capacity.execution_rows())?;
+    manifest: &serde_json::Value, capacity: RequestCapacity, context: u32, heads: bool) -> Result<BTreeSet<String>> {
+    let (_, msa) = if heads { MsaPrograms::resolve_heads(cfg, manifest, capacity.decode.rows, capacity.prefill.rows, context)? }
+        else { MsaPrograms::resolve(cfg, manifest, capacity.decode.rows, capacity.prefill.rows, context)? };
+    let (_, producers) = if heads { ProducerPrograms::resolve_heads(manifest, capacity.execution_rows())? }
+        else if target.layers.len() < cfg.layers { ProducerPrograms::resolve_split(manifest, capacity.execution_rows())? }
+        else { ProducerPrograms::resolve(manifest, capacity.execution_rows())? };
+    let (_, forward) = if heads { ForwardPrograms::resolve_heads(manifest, capacity.execution_rows())? }
+        else { ForwardPrograms::resolve(manifest, capacity.execution_rows())? };
     let dense = target.resolve_dense_programs(manifest, capacity.execution_rows())?;
     Ok(msa.iter().chain(&producers).chain(&forward).chain(&dense)
         .map(|program| program.name.clone()).collect())
@@ -120,8 +123,13 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         ensure!(crate::shared::peer_split::probed_device(library, options.device, Some(peer))? == Some(peer),
             "MiniMax split serving requires bidirectional peer access");
     }
+    let heads = gpus == 2 && options.attention_placement == cuteafd_loader::placement::AttentionPlacement::Heads;
     let owners = cuteafd_loader::placement::families::minimax_m3::layer_owners(cfg.layers, gpus);
-    let targets = if gpus == 2 {
+    let targets = if heads {
+        cuteafd_loader::families::minimax_m3::weight_layout::HeadsWeights::plan(checkpoint, cfg,
+            cuteafd_loader::placement::planner::EmbeddingHome::Device(0))?
+            .into_iter().map(|rank| rank.target).collect::<Vec<_>>()
+    } else if gpus == 2 {
         cuteafd_loader::families::minimax_m3::weight_layout::SplitFfnWeights::plan(checkpoint, cfg,
             &owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>(),
             cuteafd_loader::placement::planner::EmbeddingHome::Device(0))?
@@ -129,7 +137,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     } else { CoordinatorWeights::plan(checkpoint, cfg, 1, &vec![0; cfg.layers])? };
     let capacity = RequestCapacity::new(options.sequences, options.prefill.rows)?;
     let context = if options.context_tokens == 0 { cfg.max_position as u64 } else { options.context_tokens };
-    let names = targets.iter().map(|target| program_names(cfg, target, &manifest, capacity, u32::try_from(context)?))
+    let names = targets.iter().map(|target| program_names(cfg, target, &manifest, capacity, u32::try_from(context)?, heads))
         .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<BTreeSet<_>>();
     let devices = physical.iter().map(|&id| Device { library, id }).collect::<Vec<_>>();
     let device = devices[0];
@@ -145,7 +153,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         let gpu = physical.iter().position(|&device| device == id).context("MiniMax sampled rank missing")?;
         let device = devices[gpu];
         programs.load_matching(|name| names.contains(name))?;
-        let bind = if gpus == 2 { Kernels::bind_split } else { Kernels::bind };
+        let bind = if heads { Kernels::bind_heads } else if gpus == 2 { Kernels::bind_split } else { Kernels::bind };
         native.push(bind(device, programs, &manifest, cfg, &targets[gpu],
             capacity.execution_rows(), u32::try_from(context)?)?);
         if gpus == 2 { library.peer_exchange_initialize()?; library.peer_abort_initialize()?; }
@@ -170,7 +178,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     let (inputs, admitted) = serve_admission::prepare(FactsRequest { checkpoint, cfg,
         catalog: &catalog, manifest_path: options.manifest_path, manifest: Arc::clone(&manifest),
         coordinator: Coordinator::Measured { samples: vec![], loaded_code: vec![] },
-        attention: None, split_wire: Some(options.split_wire), physical_devices: &physical,
+        attention: Some(options.attention_placement), split_wire: Some(options.split_wire), physical_devices: &physical,
         spark_ranks: options.peers.len(), spark_bytes: policy.spark_cap_bytes(100 << 30),
         prefill: options.prefill, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
         sequences: options.sequences, host, host_cache_bytes,

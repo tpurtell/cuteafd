@@ -15,6 +15,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0)] pub device: i32,
     /// Distinct peer for contiguous attention with qualified FP32 split FFNs.
     #[arg(long)] pub split_device: Option<i32>,
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto",
+        value_parser = ["auto", "layers", "heads"])] pub attention_placement: String,
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     #[arg(long)] pub pool_tokens: Option<u64>,
     #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<usize>)]
@@ -107,6 +109,11 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 device: worker_args.device, split_device: worker_args.split_device,
                 peers: &worker_args.peers, native_lib: &worker_args.native_lib,
                 manifest_path: &worker_args.manifest,
+                attention_placement: match (worker_args.split_device, worker_args.attention_placement.as_str()) {
+                    (Some(_), "heads") | (None, "auto" | "heads") => cuteafd_loader::placement::AttentionPlacement::Heads,
+                    (Some(_), "auto" | "layers") => cuteafd_loader::placement::AttentionPlacement::Layers,
+                    _ => anyhow::bail!("MiniMax layers attention requires two coordinator GPUs"),
+                },
                 split_wire: match worker_args.split_wire.as_str() {
                     "bf16" => super::dense::PartialPrecision::Bf16,
                     _ => super::dense::PartialPrecision::DEFAULT,
