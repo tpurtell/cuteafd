@@ -89,7 +89,11 @@ pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<
     receipts: &[Receipt]) -> Result<()> {
     let mut projected = devices.remap_plan_weight_arenas(plan)?;
     projected.facts.allocations.retain(|a| a.view.is_none() && a.location == Location::coordinator(0));
-    projected.facts.driver_page_tables.retain(|table| table.location == Location::coordinator(0));
+    // Page-table overhead maps pinned owners; the projected device-only
+    // witness excludes those host backings, so it must exclude their mappings
+    // too. The complete admission above still charges them exactly once.
+    projected.facts.driver_page_tables.retain(|table| projected.facts.allocations.iter()
+        .any(|owner| owner.id == table.backing && owner.view.is_none()));
     projected.facts.allowances.retain(|owner| owner.location == Location::coordinator(0));
     projected.facts.reservations.clear();
     projected.facts.sequential.clear();
@@ -155,6 +159,17 @@ mod tests {
         let receipt = Receipt { allocation: Allocation::buffer("inkling2.unit.partial", Location::coordinator(0),
             4096, Lifetime::TARGET, Category::Workspace, "retained"), address: 0x1000 };
         reconcile_native(&plan, devices, &[receipt.clone()]).unwrap();
+        let mut mapped = plan.clone();
+        mapped.facts.allocations.push(Allocation::buffer("mount.source", Location::PINNED, 1<<20,
+            Lifetime::RESIDENT, Category::Staging, "mount"));
+        mapped.facts.driver_page_tables.push(DriverPageTable { model: DriverPageTableModel::Sm120Portable,
+            location: Location::coordinator(0), lifetime: Lifetime::RESIDENT,
+            backing: "mount.source".into(), mapped_bytes: 1<<20 });
+        mapped.budgets.push(Budget { id: "host".into(), locations: vec![Location::HOST, Location::PINNED],
+            physical_bytes: 1<<30, logical_bytes: 1<<30, headroom: 0,
+            baseline: Baseline::Sampled { free: 1<<30, phase: Phase::Load, source: "host fixture".into() } });
+        mapped.phases = evaluate(&mapped.facts, &mapped.budgets).unwrap();
+        reconcile_native(&mapped, devices, &[receipt.clone()]).unwrap();
         assert!(reconcile_native(&plan, devices, &[]).is_err());
         assert!(reconcile_native(&plan, devices, &[receipt.clone(), receipt.clone()]).is_err());
         let mut wrong = receipt.clone(); wrong.allocation.bytes = 4095;
