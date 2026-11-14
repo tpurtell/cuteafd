@@ -945,6 +945,9 @@ impl<'a> ServingPrefill<'a> {
         schedule: &Requests, requests: &[ServingRequest<'_>], rows: usize,
         graphs: &mut [Graphs<'a, Storage<'a>>], captured: bool) -> Result<DeviceLogits> {
         let split = storage.split.as_ref().context("MiniMax split owners missing")?;
+        let graph_rows = if captured { graphs[0].row_key(rows)? } else { rows };
+        ensure!(graphs.iter().all(|graph| graph.row_key(rows).ok() == Some(graph_rows)) || !captured,
+            "MiniMax split graph row buckets differ between ranks");
         for graph in graphs.iter_mut() { graph.cycle(crate::shared::decode_graph::device::Cycle::Decode); }
         let result = (|| {
             let mut state = storage.requests.borrow_mut();
@@ -978,6 +981,17 @@ impl<'a> ServingPrefill<'a> {
                     let a = storage.ranks[0].decode.borrow();
                     let b = storage.ranks[1].decode.borrow();
                     split.residual([&a, &b], layer, rows)?;
+                    if graph_rows > rows {
+                        for unit in [&*a, &*b] {
+                            let tail = super::cache::view(unit.plane("residual")?, rows * cfg.hidden * 4,
+                                (graph_rows - rows) * cfg.hidden * 4)?;
+                            unit.stream.device.run(|| {
+                                // SAFETY: synthetic rows are private arithmetic
+                                // scratch, never KV/metadata/request rows.
+                                unsafe { unit.stream.device.library.cuda_zero_bytes_async(tail, tail.bytes, unit.stream.raw) }
+                            })?;
+                        }
+                    }
                 }
                 let ticket = if let Some(binding) = self.bindings[layer] {
                     let rank0 = &storage.ranks[0];
@@ -986,8 +1000,8 @@ impl<'a> ServingPrefill<'a> {
                     if captured {
                         // SAFETY: exact live rows, retained rank0 stream/weights
                         // and private scratch; host boundary is outside recording.
-                        unsafe { graphs[0].run(Key { rank: 0, layer, rows, op: Op::Router }, None,
-                            || owner.router_enqueue(&rank0.kernels, &rank0.weights, layer, rows))?; }
+                        unsafe { graphs[0].run(Key { rank: 0, layer, rows: graph_rows, op: Op::Router }, None,
+                            || owner.router_enqueue(&rank0.kernels, &rank0.weights, layer, graph_rows))?; }
                     } else { owner.router_enqueue(&rank0.kernels, &rank0.weights, layer, rows)?; }
                     if let Some(usage) = &storage.usage {
                         let tally = usage.routes(owner.stream.device.id, layer,
@@ -1008,7 +1022,7 @@ impl<'a> ServingPrefill<'a> {
                 } else { None };
                 let shared = ticket.is_some();
                 {
-                    if let Err(error) = split.decode_stage(storage, graphs, layer, rows, shared, captured) {
+                    if let Err(error) = split.decode_stage(storage, graphs, layer, graph_rows, shared, captured) {
                         crate::shared::decode_graph::fatal_drain(split.publish_abort(), "MiniMax split decode stage before ticket drop");
                         return Err(error);
                     }
@@ -1018,7 +1032,17 @@ impl<'a> ServingPrefill<'a> {
                         "MiniMax split decode land before ticket drop"))?;
                 }
                 {
-                    split.decode_meet(storage, graphs, layer, rows, shared, captured)?;
+                    if graph_rows > rows && shared {
+                        let unit = storage.ranks[0].decode.borrow();
+                        let tail = super::cache::view(unit.plane("routed")?, rows * cfg.hidden * 2,
+                            (graph_rows - rows) * cfg.hidden * 2)?;
+                        unit.stream.device.run(|| {
+                            // SAFETY: real dispatch writes live rows only; clear
+                            // the private synthetic tail before captured folding.
+                            unsafe { unit.stream.device.library.cuda_zero_bytes_async(tail, tail.bytes, unit.stream.raw) }
+                        })?;
+                    }
+                    split.decode_meet(storage, graphs, layer, graph_rows, shared, captured)?;
                 }
             }
             let rank = &storage.ranks[1];
@@ -1321,6 +1345,26 @@ mod tests {
         assert!(descriptors.rows.iter().enumerate().all(|(row, descriptor)| descriptor.route_offset == (row * 4) as u32));
         drop(dispatchers);
         Ok(())
+    }
+
+    #[test]
+    fn split_decode_buckets_only_private_arithmetic_and_captures_no_receive_wait() {
+        let source = include_str!("engine.rs");
+        let decode = source.split_once("    fn decode_split(").unwrap().1
+            .split_once("    pub fn drain(").unwrap().0;
+        assert!(decode.contains("graphs[0].row_key(rows)?"));
+        assert!(decode.contains("rows: graph_rows, op: Op::Router"));
+        assert!(decode.contains("routed_rows(rows)?"));
+        assert!(decode.contains("decode_stage(storage, graphs, layer, graph_rows"));
+        assert!(decode.contains("decode_meet(storage, graphs, layer, graph_rows"));
+        assert!(decode.contains("project_device(&rank.weights, residual, rows)"));
+        for function in ["decode_stage", "decode_meet"] {
+            let body = source.split_once(&format!("    pub(crate) fn {function}(")).unwrap().1;
+            let captured = body.split_once("            let work = || {").unwrap().1
+                .split_once("            };\n").unwrap().0;
+            assert!(!captured.contains("Self::land("), "receive waits cannot enter a split graph");
+            assert!(captured.contains("Self::send("));
+        }
     }
 
     #[test]

@@ -44,6 +44,8 @@ pub(crate) struct GoldenArgs {
     #[arg(long, requires = "split_device", value_parser = ["bf16", "fp32"])] wire: Option<String>,
     /// Teacher-forced one-row serving decode after the unscored prompt.
     #[arg(long, requires = "split_device")] decode: bool,
+    /// Exercise the same bounded captured split-decode sections as serving.
+    #[arg(long, requires = "decode")] decode_graphs: bool,
     #[arg(long, default_value_t = 1024)] prefill_rows: u32,
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=4))] prefill_waves: u8,
     /// Validate checkpoint/reference/export headers without starting CUDA or peers.
@@ -394,6 +396,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
             prefill: vec![decode; waves] } })
     }).collect::<Result<Vec<_>>>()?;
     let mut owners = Owners::new(&inputs, &admitted, &programs, loaded, bundle.embedding)?;
+    if args.decode_graphs { owners.prewarm(&cfg)?; }
     let link_layout = PreparedSparkLink::endpoint("spark", 0,
         SparkEndpointOwners { ranks: args.peers.len(), geometry: ExpertGeometry::MINIMAX_M3, endpoint, rings },
         waves, true, true, SparkIntakeCandidates::Probed, SparkReplyFormat::Bf16, Lifetime::TARGET)?;
@@ -456,7 +459,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
             let request = [ServingRequest { identity: identity as u64 + 1, kind: cuteafd_transport::ExpertV2SourceKind::Decode,
                 placement: &mut placement, start: position, tokens: &window.tokens[position..position + 1], heads: position..position + 1 }];
             let logits = execution.decode(&owners.storage, &cfg, &schedule, &request,
-                &mut owners.graphs.borrow_mut(), false)?;
+                &mut owners.graphs.borrow_mut(), args.decode_graphs)?;
             let values = logits.to_host(&library)?;
             if let Some(raw) = &mut raw { raw.row(position + 1, &values)?; }
             probe.row(position + 1, &values);
@@ -595,6 +598,9 @@ mod tests {
         assert!(split_selection(&single)?.is_none());
         assert!(parse_args(&["--split-device", "1"]).is_err());
         assert!(parse_args(&["--wire", "bf16"]).is_err());
+        assert!(parse_args(&["--decode-graphs"]).is_err());
+        let graphed = parse_args(&["--split-device", "1", "--wire", "fp32", "--decode", "--decode-graphs"])?;
+        assert!(graphed.decode && graphed.decode_graphs);
         for (name, expected) in [("bf16", WirePrecision::Bf16), ("fp32", WirePrecision::F32)] {
             let args = parse_args(&["--device", "3", "--split-device", "1", "--wire", name,
                 "--attention-placement", "layers"])?;
