@@ -310,6 +310,7 @@ pub struct SparkCharge {
 #[derive(Debug, Clone)]
 pub struct Drafter {
     pub arena: WeightArenaLayout,
+    pub native: crate::formats::block_dspark::NativeDsparkLayout,
     /// Exact scratch owners (name, bytes); state that follows the pool is
     /// charged per page.
     pub scratch: Vec<(String, u64)>,
@@ -842,7 +843,8 @@ impl Recipe for MiniMaxInputs {
         components.extend(HeadLayout::new(cfg, decode_rows)?.components(&Owner::Head.id(), head, maximum)?);
         components.extend(serving::ServingOwners {
             selector: serving::SelectorOwners { location: Location::coordinator(head),
-                capacity: decode_rows as usize, vocab: cfg.vocab_size, device_sampling: self.device_sampling },
+                capacity: self.drafter.as_ref().map_or(decode_rows as usize,|draft| draft.native.verify_rows),
+                vocab: cfg.vocab_size, device_sampling: self.device_sampling },
             prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 } }.components(maximum)?);
         // Transport: coordinator intake planes are fixed owners on the link's
         // GPU; host/pinned candidates join the host budget as one envelope.
@@ -958,6 +960,18 @@ impl Recipe for MiniMaxInputs {
             let location = Location::coordinator(head);
             let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
             components.extend(weight_arena_components(&draft.arena, location, lifetime, maximum, MemoryKind::DrafterWeights)?);
+            for (name,bytes) in &draft.native.buffers {
+                let id = if let Some(name) = name.strip_prefix("unit.") {
+                    format!("minimax.unit.{head}.{name}")
+                } else if let Some(name) = name.strip_prefix("decode.") {
+                    format!("minimax.decode.{head}.{name}")
+                } else { format!("minimax.draft.{name}") };
+                let category = if name.starts_with("prefix.") { Category::Prefix } else { Category::Drafter };
+                components.extend(buffer(id,location,*bytes as u64,lifetime,category,
+                    "checkpoint-native bundled dSpark owner",maximum));
+            }
+            components.extend(buffer("minimax.draft.workspace.landing",Location::PINNED,
+                draft.native.host_landing as u64,lifetime,Category::Staging,"draft token/confidence landing",maximum));
             for (name, bytes) in &draft.scratch {
                 components.extend(buffer(format!("minimax.draft.{name}"), location, *bytes, lifetime,
                     Category::Drafter, "bundled dSpark scratch", maximum));

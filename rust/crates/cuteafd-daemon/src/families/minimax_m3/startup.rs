@@ -174,7 +174,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         spark_ranks: options.peers.len(), spark_bytes: policy.spark_cap_bytes(100 << 30),
         prefill: options.prefill, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
         sequences: options.sequences, host, host_cache_bytes,
-        prefix_entries: options.prefix.prefix_cache_entries as u64, replies,
+        prefix_entries: options.prefix.prefix_cache_entries as u64, drafter:None, replies,
         head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         expert_usage: usage_enabled, resident_weight_limit: options.resident_weights }, &samples, options.onboard)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();

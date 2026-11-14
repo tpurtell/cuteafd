@@ -74,6 +74,7 @@ pub struct FactsRequest<'a> {
     pub host: (u64, u64),
     pub host_cache_bytes: Option<u64>,
     pub prefix_entries: u64,
+    pub drafter: Option<crate::formats::block_dspark::NativeDsparkLayout>,
     pub replies: cuteafd_core::spark_reply::SparkReplyFormats,
     pub head: serving::BlasHead,
     pub expert_usage: bool,
@@ -351,7 +352,9 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, owners,
         manifest: request.manifest.clone(), routed: routed.clone(), expert_backings, local, spark, links,
-        spark_reply_formats: request.replies, drafter: None, vision: None, budgets, code, measured_context, graph_reserve,
+        spark_reply_formats: request.replies, drafter: request.drafter.as_ref().map(|native| shared::Drafter {
+            arena:native.weights.clone(),native:native.clone(),scratch:Vec::new(),state_per_page:0 }),
+        vision: None, budgets, code, measured_context, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
             experts: cfg.experts, topk: cfg.topk, routed_layers: routed }),

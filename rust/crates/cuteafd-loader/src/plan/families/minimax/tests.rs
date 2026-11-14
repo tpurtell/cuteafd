@@ -1786,7 +1786,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
         attention: Some(AttentionPlacement::Heads), split_wire: None, physical_devices: &[0, 1],
         spark_ranks: 4, spark_bytes: 100 << 30, prefill: expected.prefill,
         context_tokens: 1 << 20, pool_tokens: Some(1 << 20), sequences: 16,
-        host: (512 << 30, 480 << 30), host_cache_bytes: Some(1 << 30), prefix_entries: 64,
+        host: (512 << 30, 480 << 30), host_cache_bytes: Some(1 << 30), prefix_entries: 64, drafter:None,
         replies: Default::default(), head: crate::placement::planner::serving::BlasHead::Gemm,
         expert_usage: false, resident_weight_limit: ResidentWeights(80 << 30) };
     let heads = gather(&request).unwrap();

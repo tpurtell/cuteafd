@@ -10,6 +10,77 @@ pub const fn supports_sequences(sequences: usize) -> bool {
     sequences > 0 && sequences <= MAX_SEQUENCES
 }
 
+/// Physical native runtime owners, shared by admission and construction.
+#[derive(Debug, Clone)]
+pub struct NativeDsparkLayout {
+    pub weights: crate::serving_capacity::WeightArenaLayout,
+    pub buffers: Vec<(String, usize)>,
+    pub host_landing: usize,
+    pub verify_rows: usize,
+    pub mark_bytes: usize,
+    pub marks: usize,
+}
+
+impl NativeDsparkLayout {
+    pub fn new(snapshot:&Path, slots:usize, prefill_rows:usize, waves:usize, sms:usize,
+        prefix_entries:usize, mark_budget:u64, host_prefix:bool) -> anyhow::Result<Self> {
+        use anyhow::{ensure,Context};
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        let cfg = BlockDsparkConfig::read(snapshot)?;
+        ensure!(cfg.dialect == DsparkDialect::MiniMax && slots > 0 && supports_sequences(slots)
+            && prefill_rows > 0 && prefill_rows <= 4096 && waves > 0 && waves <= 4,
+            "native block drafter capacity differs from checkpoint");
+        ensure!((cfg.hidden,cfg.heads,cfg.kv_heads,cfg.head_dim,cfg.intermediate,cfg.layers,cfg.block,cfg.vocab)
+            == (6144,64,4,128,12288,5,7,200064) && cfg.taps == [3,17,31,45,59]
+            && cfg.window == Some(4096), "native drafter layout requires installed MiniMax release geometry");
+        let weights = crate::serving_capacity::WeightArenaLayout::new("minimax/draft",
+            block_dspark_arena_requests(snapshot,GlmDraftRepresentation::Bf16Only)?)?;
+        let (h,q,kv,inter,taps) = (cfg.hidden,cfg.heads * cfg.head_dim,cfg.kv_heads * cfg.head_dim,
+            cfg.intermediate,cfg.taps.len());
+        let rows = slots.checked_mul(cfg.block).context("native draft rows overflow")?;
+        let context_rows = 2048usize;
+        let mut buffers = Vec::new();
+        let mut add = |name:String,bytes:usize| { buffers.push((name,bytes.max(256))); };
+        let window = cfg.window.context("native block drafter has no window")?;
+        for layer in 0..cfg.layers {
+            for plane in ["k_ring","v_ring"] { add(format!("layer.{layer}.{plane}"),slots * window * kv * 2); }
+        }
+        for (name,bytes) in [("taps",context_rows * taps * h * 2),("fused",context_rows * h * 2),
+            ("fused_norm",context_rows * h * 2),("context_kv",context_rows * kv * 4),
+            ("context_positions",context_rows * 8),("context_slots",context_rows * 4),
+            ("native.norm-input",context_rows * h * 4),("native.norm-rope",context_rows * q * 2),
+            ("native.gate",context_rows * inter * 2),("native.up",context_rows * inter * 2),
+            ("native.projections.activation",context_rows * inter.max(q).max(h) * 2),
+            ("native.projections.inputs",8),("native.projections.records",context_rows.div_ceil(16) * (inter.max(q).max(h) / 32) * 528),
+            ("native.projections.output",context_rows * inter.max(q).max(h) * 4)] { add(name.into(),bytes); }
+        for (name,width,bytes) in [("h",h,2),("n",h,2),("qkv",q + 2 * kv,2),("q",q,2),
+            ("k",kv,2),("v",kv,2),("attn",q,2),("delta",h,2),("gate_up",2 * inter,2),
+            ("act",inter,2),("logits",cfg.vocab,4),("ids",1,4),("tokens",1,4),("confidence",1,4),
+            ("positions",1,8)] { add(format!("workspace.{name}"),rows * width * bytes); }
+        add("workspace.anchors".into(),slots * 4);
+        add("workspace.tables".into(),slots * 12);
+        add("workspace.head".into(),cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE);
+        add("workspace.markov".into(),slots * 296 * 8 + rows * 4);
+        add("workspace.attention".into(),usize::try_from(crate::serving_capacity::draft_attention_workspace_bytes(
+            slots as u64,cfg.kv_heads as u64,(cfg.heads / cfg.kv_heads * cfg.block).div_ceil(32) as u64,
+            (window + cfg.block) as u64,cfg.head_dim as u64,sms as u64)?)?);
+        let verify_rows = slots.checked_mul(cfg.block + 1).context("native verify rows overflow")?;
+        add("verify.logits".into(),verify_rows * cfg.vocab * 4);
+        add("verify.taps".into(),verify_rows * taps * h * 2);
+        for slot in 0..waves {
+            add(format!("unit.{slot}.target_taps.narrow"),prefill_rows * h * 2);
+            add(format!("unit.{slot}.target_taps.output"),prefill_rows * taps * h * 2);
+        }
+        add("decode.target_taps.narrow".into(),slots * h * 2);
+        add("decode.target_taps.output".into(),slots * taps * h * 2);
+        let mark_bytes = (16 + cfg.layers * 2 * window * kv * 2).div_ceil(256) * 256;
+        let marks = cuteafd_core::prefix::mark_slots_with_host(slots as u64,prefix_entries as u64,
+            mark_bytes as u64,mark_budget,host_prefix) as usize;
+        if marks > 0 { add("prefix.marks".into(),mark_bytes.checked_mul(marks).context("native draft marks overflow")?); }
+        Ok(Self { weights,buffers,host_landing:rows * 8,verify_rows,mark_bytes,marks })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DsparkConfigError {
     #[error(transparent)]
