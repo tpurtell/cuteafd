@@ -15,6 +15,7 @@ struct Inner<'a> {
     /// at begin_unit before arithmetic reads it. Not a table, length or KV byte.
     scratch: Rc<Allocation<'a>>,
     layout: FamilyLayout,
+    record_format: &'static str,
 }
 
 #[derive(Clone)]
@@ -63,7 +64,9 @@ impl<'a> MiniMaxPrefix<'a> {
         for (rank, bank) in banks.iter().enumerate() {
             copies.ordered(rank, |stream| bank.reserve_tables(stream))?;
         }
-        Ok(Self(Rc::new(Inner { copies, banks, scratch: residual_scratch, layout })))
+        let record_format = if heads { "minimax_msa_fp8_kv_index_heads_tp2_v1" }
+            else { "minimax_msa_fp8_kv_index_v1" };
+        Ok(Self(Rc::new(Inner { copies, banks, scratch: residual_scratch, layout, record_format })))
     }
 
     pub fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
@@ -99,7 +102,7 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
     type Placement = Placement;
 
     fn layout(&self) -> FamilyLayout { self.0.layout }
-    fn record_format(&self) -> &'static str { "minimax_msa_fp8_kv_index_v1" }
+    fn record_format(&self) -> &'static str { self.0.record_format }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
     fn commit_point(&self, placement: &Placement) -> usize { placement.len }
     fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> { Ok(self.install(placement)?) }
@@ -259,6 +262,10 @@ mod tests {
         let scratch = Rc::new(Allocation::new(banks[0].stream.device, 256, Tag::workspace("minimax/unit"))?);
         let family = MiniMaxPrefix::new(banks, scratch)?;
         assert_eq!(family.layout().page_bytes, cfg.layers * 2 * (16384 + 16384 + 8448));
+        assert_eq!(family.record_format(), "minimax_msa_fp8_kv_index_heads_tp2_v1");
+        let layers = self::family(&library, 4)?;
+        assert_eq!(layers.record_format(), "minimax_msa_fp8_kv_index_v1");
+        assert_ne!(family.record_format(), layers.record_format(), "host snapshots cannot cross layout namespaces");
         for (rank, bank) in family.0.banks.iter().enumerate() {
             for (plane, bytes) in bank.layout.page_planes() {
                 assert_eq!(bank.page(0, plane, 0)?.bytes, bytes as usize);

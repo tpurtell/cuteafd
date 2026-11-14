@@ -440,8 +440,8 @@ fn drain_split_pair(mut drain: impl FnMut(usize) -> Result<()>) -> Result<()> {
 fn validate_execution_streams(storage: &Storage<'_>) -> Result<()> {
     let streams = storage.ranks.iter().map(|rank| std::iter::once(rank.decode.borrow().stream.raw as usize)
         .chain(rank.prefill.iter().map(|owner| owner.borrow().stream.raw as usize)).collect()).collect::<Vec<_>>();
-    if storage.split.is_some() {
-        ensure!(streams.len() == 2, "MiniMax split execution needs two ranks");
+    if storage.split.is_some() || storage.heads.is_some() {
+        ensure!(streams.len() == 2, "MiniMax paired execution needs two ranks");
         for rank in streams { ordered_rank(&[rank])?; }
         Ok(())
     } else { ordered_rank(&streams) }

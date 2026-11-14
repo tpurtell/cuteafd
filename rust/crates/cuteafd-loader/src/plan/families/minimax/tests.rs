@@ -1539,10 +1539,50 @@ fn heads_recipe_fixture_with_experts(experts: usize) -> (tempfile::TempDir, crat
     inputs.owners.clear();
     let mut manifest = (*inputs.manifest).clone();
     let programs = manifest["programs"].as_array_mut().unwrap();
-    // Heads planning still selects the whole-width OAI producer inventory.
-    for (half, whole) in [(1536, 3072), (6144, 12288)] {
-        let entry = programs.iter_mut().find(|e| e["name"] == format!("minimax_oai_split_i{half}")).unwrap();
-        *entry = serde_json::from_str(&entry.to_string().replace(&half.to_string(), &whole.to_string())).unwrap();
+    // Mirror the installed native narrow programs, not whole-width scratch.
+    for entry in programs.iter_mut() {
+        let name = entry["name"].as_str().unwrap().to_owned();
+        if let Some(mode) = [cuteafd_ffi::minimax_m3::Mode::IndexDecode, cuteafd_ffi::minimax_m3::Mode::IndexPrefill,
+            cuteafd_ffi::minimax_m3::Mode::AttentionDecode, cuteafd_ffi::minimax_m3::Mode::AttentionExtend]
+            .into_iter().find(|mode| mode.name() == name) {
+            let index = matches!(mode, cuteafd_ffi::minimax_m3::Mode::IndexDecode | cuteafd_ffi::minimax_m3::Mode::IndexPrefill);
+            let extent = entry["geometry"][if index { "max_pages" } else { "max_batch" }].as_u64().unwrap() as u32;
+            let rows = entry["capacity_rows"].as_u64().unwrap() as u32;
+            let layout = cuteafd_ffi::minimax_m3::Layout::for_heads(mode, rows, extent).unwrap();
+            entry["name"] = layout.name().into();
+            if index { entry["geometry"]["heads"] = 2.into(); }
+            else { entry["geometry"]["query_heads"] = 32.into(); entry["geometry"]["kv_heads"] = 2.into(); }
+            entry["scratch_bytes_at_capacity"]["scratch"] = layout.scratch.into();
+            for pointer in entry["pointers"].as_array_mut().unwrap() {
+                let shape = pointer["shape"].as_str().unwrap();
+                pointer["shape"] = if pointer["name"] == "scratch" { format!("[{}]", layout.scratch) }
+                    else if pointer["name"] == "q2k_indices" { shape.replacen("[4,", "[2,", 1) }
+                    else { shape.replace(",4]", ",2]").replace(",4,128]", ",2,128]").replace("[rows,64", "[rows,32") }.into();
+            }
+        } else if name == "minimax_norm_rope_h64" || name == "minimax_norm_rope_h4" {
+            let whole = if name.ends_with("h64") { 64 } else { 4 };
+            let half = whole / 2;
+            entry["name"] = format!("minimax_norm_rope_h{half}").into();
+            entry["geometry"]["heads"] = half.into();
+            entry["scratch_bytes_at_capacity"]["scratch"] = (4096 * half * 256).into();
+            for pointer in entry["pointers"].as_array_mut().unwrap() {
+                pointer["shape"] = pointer["shape"].as_str().unwrap().replace(&format!(",{whole},128]"), &format!(",{half},128]")).into();
+            }
+        } else if name == "minimax_index_producer" {
+            entry["name"] = "minimax_index_producer_h2".into();
+            entry["geometry"]["heads"] = 2.into();
+            entry["scratch_bytes_at_capacity"]["scratch"] = (4096 * 5 * 128 * 2).into();
+            for pointer in entry["pointers"].as_array_mut().unwrap() {
+                pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4,128]", ",2,128]")
+                    .replace(",4]", ",2]").replace(",9,128]", ",5,128]").into();
+            }
+        } else if name == "minimax_kv_pack" {
+            entry["name"] = "minimax_kv_pack_h2".into();
+            entry["geometry"]["heads"] = 2.into();
+            for pointer in entry["pointers"].as_array_mut().unwrap() {
+                pointer["shape"] = pointer["shape"].as_str().unwrap().replace(",4", ",2").into();
+            }
+        }
     }
     let mut exports = std::collections::BTreeMap::new();
     for target in &inputs.targets {
@@ -1597,8 +1637,7 @@ fn heads_recipe_matches_native_cache_units_peer_slots_and_one_tail_per_backing()
             let index = (0..inputs.cfg.layers).map(|layer|
                 allocations[&Owner::HeadsKv { gpu, layer, plane: "index" }.id()].1).sum::<u64>();
             assert_eq!(index, inputs.cfg.layers as u64 * 8448, "one replicated index per layer per rank");
-            let mut slots = vec![capacity.decode.rows];
-            slots.extend((0..inputs.prefill.waves).map(|_| capacity.prefill.rows));
+            let slots = HeadsLayout::serialized_peer_rows(capacity.decode.rows, capacity.prefill.rows).unwrap();
             for (name, bytes) in HeadsLayout::peer_buffers(&slots, false).unwrap() {
                 assert_eq!(allocations[&format!("minimax.heads.peer.{gpu}.{name}")], (location, bytes));
             }
