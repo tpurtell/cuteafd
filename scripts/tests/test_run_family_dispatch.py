@@ -3671,13 +3671,14 @@ def test_qwen_tower_only_pair_reaches_typed_planner_refusal(tmp_path: Path, keys
 
 
 @pytest.mark.parametrize("checkpoint", ["qwen4"])
-def test_auto_keeps_unsupported_checkpoint_on_one_gpu(tmp_path: Path, checkpoint: str) -> None:
+def test_auto_qwen_pair_supports_spark_fallback(tmp_path: Path, checkpoint: str) -> None:
     model = "zai-org/GLM-5.3-Flash" if checkpoint == "glm5_flash" else "test/model"
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], model, "")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert _coordinator_gpus(launch) == [0] and "--split-device" not in launch
-    assert "auto selected GPU 0 alone" in result.stderr
+    assert _coordinator_gpus(launch) == [0, 1] and "--split-device 1" in launch
+    assert "--peers" in launch
+    assert "auto selected GPU 0 alone" not in result.stderr
 
 
 @pytest.mark.parametrize("keys,physical_gpus,ranks,dual", [
@@ -3686,7 +3687,7 @@ def test_auto_keeps_unsupported_checkpoint_on_one_gpu(tmp_path: Path, checkpoint
     ("RTX_GPUS=1\n", (0, 1), 0, False),
     ("COORDINATOR_SPLIT=off\n", (0, 1), 0, False),
     ("", (0,), 0, False),
-    ("", (0, 1), 1, False),
+    ("", (0, 1), 1, True),
 ])
 def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys: str,
                                                            physical_gpus: tuple[int, ...],
@@ -3703,10 +3704,10 @@ def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys
     assert f"--prefill-rows {4096 if ranks == 0 else 2752}" in launch
     assert f"--prefill-waves {1 if ranks == 0 else 3}" in launch
     if dual:
-        assert "--rtx-expert-layers all" in launch
+        assert "--rtx-expert-layers all" not in launch
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert "--attention-placement layers" in preflight
-        assert "--rtx-expert-layers all" in preflight
+        assert "--rtx-expert-layers all" not in preflight
 
 
 @pytest.mark.parametrize("rows,waves", [(512, 1), (1024, 2), (2048, 2), (4096, 2)])

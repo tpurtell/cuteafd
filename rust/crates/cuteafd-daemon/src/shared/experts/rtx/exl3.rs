@@ -92,7 +92,7 @@ impl<'a> Exl3Tp2Weights<'a> {
                     vec![Exl3Weights::load_into(device.library, catalog, layer, budget, &arena)?]
                 }
             };
-            ensure!(weights.len() == 1 && weights[0].layout.layer == cuteafd_loader::V41Exl3Layer::Dspark(stage)
+            ensure!(weights.len() == 1 && matches!(weights[0].layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(actual) if actual == stage)
                 && weights[0].layout.world == 1 && weights[0].layout.rank == 0,
                 "draft EXL3 weight set differs from admitted stage");
             Ok(Rc::new(weights))

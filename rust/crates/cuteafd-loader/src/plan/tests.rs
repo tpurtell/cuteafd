@@ -1265,7 +1265,9 @@ fn family_executor_prefill_markers_do_not_claim_shared_wave_ports() {
 #[test]
 fn qwen_incomplete_coordinator_headers_refuse_instead_of_charging_a_partial_payload() {
     let config = qwen4_config(4);
-    let complete = qwen4_coordinator(&config, false);
+    let mut complete = qwen4_coordinator(&config, false);
+    let (experts, _) = qwen4_exl3(4, 4);
+    complete.extend(experts);
     let incomplete = complete.iter().filter(|(name, ..)| !name.contains("hyper_connection")).cloned()
         .collect::<Vec<_>>();
     assert!(incomplete.len() < complete.len());
@@ -1274,7 +1276,7 @@ fn qwen_incomplete_coordinator_headers_refuse_instead_of_charging_a_partial_payl
         host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..sparks(4) };
     let hint = "Qwen resident weights: checkpoint headers do not describe the serve-qwen4 resident layout";
     let resident_item = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
-        .flat_map(|d| &d.items).any(|item| item.group == "target incl PLE projections");
+        .flat_map(|d| &d.items).any(|item| item.group == "weight arena" && item.category == cuteafd_core::memory_layout::Category::Weights);
     // The complete headers describe the layout: no such refusal, weights charged.
     let complete = plan(snapshot(config.clone(), &complete).path(), &options).unwrap();
     assert!(complete.fits && !complete.hints.iter().any(|h| h.what == hint), "{}", render(&complete));
@@ -1289,12 +1291,15 @@ fn qwen_incomplete_coordinator_headers_refuse_instead_of_charging_a_partial_payl
 #[test]
 fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
     let config = qwen4_config(4);
-    let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));
+    let mut tensors = qwen4_coordinator(&config, false);
+    tensors.extend(qwen4_exl3(4, 4).0);
+    let dir = snapshot(config.clone(), &tensors);
     // Qwen's mapped-PLE ring is a hard two-wave executor limit (#717).
     for (unit, waves) in [(512, 1), (1024, 2), (2048, 2), (4096, 2)] {
         let report = plan(dir.path(), &PlanOptions {
             layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
                 prefill_rows: unit, prefill_lanes: waves, context_tokens: 32768,
+                onboard: Some(crate::placement::OnboardSetting::Layers(0)),
                 prefix_slots: Some(0), host_cache_bytes: Some(0),
                 host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
             ..sparks(4)
@@ -4878,8 +4883,8 @@ fn qwen_default_attention_follows_spark_free_coordinator_layout() {
         (2, true, 0, AttentionPlacement::Layers),
         (1, true, 0, AttentionPlacement::Heads),
         (2, false, 0, AttentionPlacement::Heads),
-        (2, true, 1, AttentionPlacement::Heads),
-        (2, true, 4, AttentionPlacement::Heads),
+        (2, true, 1, AttentionPlacement::Layers),
+        (2, true, 4, AttentionPlacement::Layers),
     ] {
         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![96 << 30; gpus], head_split: peer, ..Default::default()
