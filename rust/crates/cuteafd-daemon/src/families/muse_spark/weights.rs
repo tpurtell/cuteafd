@@ -284,6 +284,11 @@ pub(crate) struct GlobalWeights<'a> {
 }
 
 impl<'a> GlobalWeights<'a> {
+    pub(crate) fn stored_head_outputs(&self, logical: usize) -> usize {
+        self.head.as_ref().map(|head| head.shape[0])
+            .or_else(|| self.head_native.as_ref().map(|head| head.layout.shape[0])).unwrap_or(logical)
+    }
+
     pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
         self.final_norm.inventory(inventory, "global.final_norm")?;
         if let Some(head) = &self.head {
@@ -361,6 +366,39 @@ pub(crate) fn load_rank<'a>(device: Device<'a>, cfg: &MuseSparkConfig, checkpoin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padded_native_head_width_matches_both_drafter_scratch_inventories() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
+            families::muse_spark::MuseSparkConfig};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library:&library,id:0 };
+        let cfg = MuseSparkConfig::from_hf(&cuteafd_loader::plan::testing::muse_spark_config())?;
+        let native = device.own(|| Ok(NativeAttentionWeights {
+            layout:NativeLayout { stem:"lm_head".into(),shape:[202112,8192],fp8:true,
+                rank:0,ranks:1,split:CoreSplit::Whole },
+            values:DeviceAllocation::new(&library,256,crate::shared::memory::TEST)?,
+            scales:Some(DeviceAllocation::new(&library,256,crate::shared::memory::TEST)?) }))?;
+        let weights = GlobalWeights { final_norm:Allocation::new(device,256,crate::shared::memory::TEST)?,
+            head:None,head_bf16:None,head_native:Some(native) };
+        assert_eq!(weights.stored_head_outputs(cfg.vocab_size),202112);
+        for name in ["radixark.json","nvidia.json"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/families/muse_spark/fixtures/drafters").join(name);
+            let config:serde_json::Value=serde_json::from_slice(&std::fs::read(path)?)?;
+            let admitted=cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg,&config,16,16,
+                202112,188,cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8)?;
+            let rows=admitted.sequences*admitted.block;
+            assert_eq!(admitted.head_scratch,(rows*(weights.stored_head_outputs(cfg.vocab_size)+cfg.vocab_size)*4) as u64);
+        }
+        let draft=include_str!("draft.rs");
+        assert_eq!(draft.matches("head.globals.stored_head_outputs(cfg.vocab_size)").count(),2,
+            "both drafter allocation and launch must use the selected head width");
+        Ok(())
+    }
 
     #[test]
     fn plain_push_recipes_match_host_packing_on_one_and_two_ranks() -> Result<()> {

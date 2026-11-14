@@ -102,7 +102,7 @@ impl<'a> MuseDraft<'a> {
                     admitted.sequences, mask, true, representation, Fp8Scales::Amax, Fp8Rows::W8a16, kv_cache, allocate)
             }
         })?;
-        let stored_width = head.globals.head.as_ref().map_or(cfg.vocab_size, |weights| weights.shape[0]);
+        let stored_width = head.globals.stored_head_outputs(cfg.vocab_size);
         let rows = admitted.sequences * admitted.block;
         ensure!(admitted.head_scratch == (rows * (stored_width + cfg.vocab_size) * 4) as u64,
             "Muse drafter head scratch differs from its admission");
@@ -147,7 +147,7 @@ impl<'a> MuseDraft<'a> {
         table: &crate::shared::token_io::TokenEmbedding<'_>, sequences: &[DraftSeq]) -> Result<Vec<Draft>> {
         ensure!(sequences.len() * self.block <= self.rows, "Muse draft batch beyond its admitted rows");
         let (vocab, stored) = (cfg.vocab_size,
-            head.globals.head.as_ref().map_or(cfg.vocab_size, |weights| weights.shape[0]));
+            head.globals.stored_head_outputs(cfg.vocab_size));
         let (stored_plane, trimmed_plane, ids) = (self.stored.buffer, self.trimmed.buffer, self.ids.buffer);
         let input = |tokens: &[u32], output: Buffer, stream: *mut c_void| -> Result<()> {
             ensure!(stream == self.stream, "Muse draft input on another stream");
