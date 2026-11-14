@@ -34,24 +34,6 @@ pub(super) fn loaded_media_weights(devices: &[i32], media: Option<(i32, Resident
         cuteafd_core::memory_layout::Basis::Exact).with_resident_weights(weights)))
 }
 
-pub(super) fn expert_weights(experts: Option<&super::engine::Experts<'_>>) -> Result<ResidentWeights> {
-    use super::engine::{Experts, MtpExperts};
-    let mtp = |owner: &MtpExperts<'_>| match owner {
-        MtpExperts::Fp8(weights) => weights.resident_bytes(),
-        MtpExperts::Exl3(weights) => weights.borrow().resident_weights(),
-    };
-    Ok(ResidentWeights(match experts {
-        Some(Experts::Local(local)) => local.experts.borrow().resident_bytes()
-            .checked_add(local.mtp_experts.as_ref().map_or(0, |w| w.resident_bytes()))
-            .ok_or_else(|| anyhow::anyhow!("Qwen expert weight overflow"))?,
-        Some(Experts::LocalExl3(local)) => local.resident.borrow().as_ref()
-            .map_or(0, |(_, weights)| weights.resident_weights()),
-        Some(Experts::Spark { mtp: draft, .. }) => draft.as_ref().map_or(0, mtp),
-        Some(Experts::SharedOnly) | None => 0,
-        Some(Experts::Tp2 { .. }) => anyhow::bail!("Qwen TP2 needs dual admission"),
-    } as u64))
-}
-
 pub(super) fn spark_model(backend: cuteafd_loader::plan::spark_executions::SparkBackend,
     rows: usize, waves: u64, bf16: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     let capacity = u32::try_from(rows)?;
@@ -105,48 +87,16 @@ impl HostWorkspaceBytes {
 
 }
 
-/// Admission follows the selected executor, not unused configured peers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ExpertSource {
-    LocalFp8,
-    LocalExl3,
-    Spark { ranks: usize },
-    None,
+/// Exact resident prefix, independently retired MTP and physical placement.
+pub(super) struct ExpertAdmission {
+    pub placement: cuteafd_loader::placement::Placement,
+    pub candidate: Option<qwen4::ExpertCandidate>,
+    pub draft_budget: usize,
 }
-
-impl ExpertSource {
-    pub(super) fn selected(experts: Option<&super::engine::Experts<'_>>) -> Result<Self> {
-        Ok(match experts {
-            Some(super::engine::Experts::Local(_)) => Self::LocalFp8,
-            Some(super::engine::Experts::LocalExl3(_)) => Self::LocalExl3,
-            Some(super::engine::Experts::Spark { transport, .. }) => Self::Spark { ranks: transport.borrow().world_size() },
-            Some(super::engine::Experts::SharedOnly) | None => Self::None,
-            Some(super::engine::Experts::Tp2 { .. }) => anyhow::bail!("Qwen TP2 needs dual admission"),
-        })
-    }
-
-    fn code_key(self) -> &'static str {
-        match self { Self::LocalFp8 => "fp8", Self::LocalExl3 => "exl3", Self::Spark { .. } | Self::None => "none" }
-    }
-
-    pub(super) fn spark_ranks(self) -> usize {
-        match self { Self::Spark { ranks } => ranks, _ => 0 }
-    }
-}
-
-pub(super) struct Exl3Admission {
-    pub layers: Vec<usize>,
-    pub peak_bytes: usize,
-    pub rows: usize,
-    pub mtp: bool,
-    pub selections: Vec<crate::shared::experts::layer::ExpertLayer>,
-    pub weights_budget: usize,
-}
-
-impl Exl3Admission {
+impl ExpertAdmission {
     pub fn validate_layers(&self, actual: &[usize]) -> Result<()> {
-        anyhow::ensure!(actual == self.layers,
-            "Qwen EXL3 runtime layers differ from pre-upload admission: {actual:?} != {:?}", self.layers);
+        anyhow::ensure!(self.candidate.as_ref().map_or(&[][..], |candidate| candidate.layers.as_slice()) == actual,
+            "Qwen runtime expert IDs differ from pre-upload admission");
         Ok(())
     }
 }
@@ -158,21 +108,19 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     catalog: Option<&cuteafd_loader::OfficialV41Catalog>, layers: usize, mtp: bool,
     manifest: Option<&serde_json::Value>, context: cuteafd_loader::placement::planner::Context,
     media: &crate::shared::experts::rtx::dense::Records,
-    inventory: &crate::shared::inventory::RuntimeInventory) -> Result<(usize, qwen4::QwenHost, Option<Exl3Admission>)> {
+    inventory: &crate::shared::inventory::RuntimeInventory) -> Result<(usize, qwen4::QwenHost, ExpertAdmission)> {
     use anyhow::{ensure, Context};
     use cuteafd_core::memory_layout::{Basis, Category};
     use cuteafd_loader::families::qwen4::{resident::Qwen4Representation, weight_layout};
     use cuteafd_loader::placement::Demand;
-    use crate::shared::experts::{layer::ExpertLayer, rtx::push::PushPolicy};
+    use crate::shared::experts::rtx::push::PushPolicy;
     let rows = args.prefill_rows.max(super::engine::DECODE_ROWS);
     ensure!(args.shared_only || args.expert_window.is_none(),
         "Qwen placement requires resident experts; diagnostic expert paging is not admitted");
-    let source = if args.shared_only { ExpertSource::None }
-        else if args.local_experts {
-            if catalog.context("Qwen local expert headers")?.exl3().is_some() { ExpertSource::LocalExl3 }
-            else { ExpertSource::LocalFp8 }
-        } else if let Some(peers) = &args.peers { ExpertSource::Spark { ranks: peers.split(',').count() } }
-        else { ExpertSource::None };
+    let sparks = args.peers.as_ref().map_or(0, |peers| peers.split(',').count());
+    let mut experts = if args.shared_only || catalog.is_none() { None }
+        else { Some(qwen4::QwenExperts::read(catalog.unwrap(), &args.native_lib, layers, 1, rows as u64)?) };
+    if let Some(experts) = &mut experts { experts.remap_devices(&[args.device])?; }
     let selected = Qwen4Representation { fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head };
     let embedding = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu {
         weight_layout::embedding_table_bytes(checkpoint)? } else { 0 };
@@ -183,67 +131,25 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let mut future = Vec::new();
-    let mut expert_arenas = Vec::new();
+
     if args.fp8_decode {
         future.push(Demand::new(0, Category::Staging, "FP8 projection load staging",
             cuteafd_loader::shared::dense_read::STEP_BYTES as u64, Basis::Exact));
     }
     let mut window_push = Vec::new();
-    let mut exl3 = None;
-    if !args.shared_only {
-        if let Some(catalog) = catalog {
-            if source == ExpertSource::LocalExl3 {
-                let backbone = (0..layers).collect::<Vec<_>>();
-                let planned = crate::families::deepseek_v4::local::plan(library, &args.native_lib,
-                    catalog, usize::from(mtp), &backbone, rows, usize::MAX)?;
-                ensure!(planned.layers == backbone, "Qwen EXL3 header plan omits admitted layers");
-                let expected = (0..usize::from(mtp)).map(|stage| ExpertLayer::Dspark { stage })
-                    .chain(backbone.iter().map(|&layer| ExpertLayer::BackboneFull { layer }))
-                    .collect::<Vec<_>>();
-                let (selections, weights_budget) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
-                    &args.native_lib, catalog, usize::from(mtp), &backbone, rows, planned.peak_bytes)?
-                    .context("Qwen EXL3 admitted package")?;
-                ensure!(selections == expected, "Qwen EXL3 push plan omits admitted layers");
-                expert_arenas.push(crate::shared::experts::weight_layout::layout(args.device, "exl3",
-                    crate::shared::experts::exl3::regions(catalog, selections.iter().copied())?)?);
-                future.push(Demand::new(0, Category::Workspace, "EXL3 execution and load workspace",
-                    planned.peak_bytes.checked_sub(planned.resident_weights)
-                        .context("Qwen EXL3 peak below resident weights")? as u64, Basis::Exact));
-                if PushPolicy::for_snapshot(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot))?
-                    == PushPolicy::Required {
-                    use crate::shared::experts::rtx::push::{CoordinatorExperts, WholeOwner};
-                    window_push.push(("qwen.host.push.exl3", CoordinatorExperts::Whole {
-                        owners: vec![WholeOwner { rank: 0, selections: selections.clone(), budget: weights_budget }]
-                    }.host_envelope(catalog, 1, &[])?));
-                }
-                exl3 = Some(Exl3Admission { layers: planned.layers, peak_bytes: planned.peak_bytes,
-                    rows, mtp, selections, weights_budget });
-            } else if source == ExpertSource::LocalFp8 {
-                let tensors = catalog.fp8().context("Qwen native expert headers")?;
-                let mut sets = vec![(0..layers).collect::<Vec<_>>()];
-                if mtp {
-                    if tensors.layer_format(layers)? == tensors.format() { sets[0].push(layers); }
-                    else { sets.push(vec![layers]); }
-                }
-                for ids in sets {
-                    let tensors = tensors.for_layer(ids[0])?;
-                    let directory = if ids[0] < layers { args.fp8_package.clone() } else { None }
-                        .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
-                    // SAFETY: trusted generated package static ABI; no CUDA state is created.
-                    let metadata = unsafe { cuteafd_ffi::fp8_moe::Fp8MoeMetadata::read(&directory) }?;
-                    crate::shared::experts::fp8::validate_checkpoint_contract(&metadata.info, &tensors,
-                        &ids, 1, 0, cuteafd_loader::formats::fp8_experts::Slicing::Padded)?;
-                    let layout = crate::shared::experts::weight_layout::layout(args.device, "fp8",
-                        cuteafd_loader::serving_capacity::fp8_expert_regions(&tensors, &ids, 1, 0,
-                            cuteafd_loader::formats::fp8_experts::Slicing::Padded)?)?;
-                    expert_arenas.push(layout);
-                    future.push(Demand::new(0, Category::Workspace, "native expert scratch",
-                        cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes(metadata.scratch_layout(), rows)? as u64, Basis::Exact));
-                }
-            } else if mtp && source.spark_ranks() > 0 {
-                future.extend(qwen4::dual_draft_demands(catalog, &args.native_lib, rows as u64)?);
-            }
-        }
+    let draft = if mtp && !args.shared_only {
+        qwen4::dual_draft_demands(catalog.context("Qwen MTP expert catalog")?, &args.native_lib, rows as u64)?
+    } else { Vec::new() };
+    let draft_budget = usize::try_from(draft.iter().map(|demand| demand.bytes).sum::<u64>())?;
+    future.extend(draft);
+    // Push host state is bounded by the largest candidate; only the admitted
+    // prefix is ever allocated or read by the receiver.
+    if let Some(catalog) = catalog.filter(|_| !args.shared_only) {
+        let policy = PushPolicy::for_snapshot(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot))?;
+        if let Some(envelope) = policy.plan(|| {
+            super::hybrid::push_plan(catalog, &(0..layers).collect::<Vec<_>>(), 1, rows, args, None)?
+                .context("Qwen routed push candidate")?.host_envelope(catalog, 1, &[])
+        })? { window_push.push(("qwen.host.push.routed", envelope)); }
     }
     let policy = PushPolicy::for_snapshot(&args.snapshot)?;
     if let Some(envelope) = policy.plan(|| {
@@ -253,16 +159,20 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
             cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?)
     })? { window_push.push(("qwen.host.push.dense", envelope)); }
     let host_embedding = if embedding == 0 { weight_layout::embedding_table_bytes(checkpoint)? as u64 } else { 0 };
-    let host = host_owners(args, cfg, layers, mtp, 1, source.spark_ranks(),
+    let host = host_owners(args, cfg, layers, mtp, 1, sparks,
         checkpoint.spark_input_is_bf16(), ple.map(|p| p.0), host_embedding, window_push)?;
     let admission = inputs(args, cfg, layers, mtp, manifest, ple, 0)?;
     let sample = inventory.gpus.first().context("Qwen pre-weight sample")?;
-    let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", source.code_key(),
+    let code = if catalog.is_some_and(|catalog| catalog.exl3().is_some()) { "exl3" }
+        else if catalog.is_some() { "fp8" } else { "none" };
+    let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", code,
         &manifest.map(|m| cuteafd_loader::placement::ProgramSet::from_manifest(m, &["qwen4"]))
             .unwrap_or_else(|| cuteafd_loader::placement::ProgramSet::from_names(&["qwen4"], [])))?;
-    let mut inputs = placement_inputs(args, admission, source, (sample.free_bytes, sample.total_bytes), pending, context, host);
+    let mut inputs = placement_inputs(args, admission, sparks, (sample.free_bytes, sample.total_bytes), pending, context, host);
+    inputs.experts = experts;
+    inputs.onboard = args.onboard.map(|setting| setting.resolve(layers)).unwrap_or_default();
     inputs.arenas = arenas;
-    inputs.expert_arenas = expert_arenas;
+
     inputs.preallocation = true;
     inputs.future = future;
     // The optional tower already loaded before this sample, so only declare its
@@ -271,41 +181,14 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
         .map_or(ResidentWeights::default(), |(_, bytes)| bytes);
     let (placement, solved) = qwen4::admitted(&inputs)?;
     cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
-    publish_reconciliation(args, &inventory.gpus, &solved, source.spark_ranks())?;
+    publish_reconciliation(args, &inventory.gpus, &solved, sparks)?;
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     tracing::info!(pool_tokens = placement.pool_tokens,
         ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
         "Qwen shared solver admission before allocation");
-    Ok((usize::try_from(placement.pool_tokens)?, inputs.host, exl3))
-}
-
-/// Qwen's KV pool from one sample of free memory after weights, the PLE table and resident experts:
-/// the shared admission's fixed items, the graph reserve before them, and the largest pool that fits.
-pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &QwenAdmissionInputs<'_>,
-    source: ExpertSource, context: cuteafd_loader::placement::planner::Context, loaded_weights: ResidentWeights,
-    host: qwen4::QwenHost, devices: &[RuntimeSample]) -> Result<(usize, qwen4::QwenHost)> {
-    let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", source.code_key(),
-        &inputs.manifest.map(|m| cuteafd_loader::placement::ProgramSet::from_manifest(m, &["qwen4"]))
-            .unwrap_or_else(|| cuteafd_loader::placement::ProgramSet::from_names(&["qwen4"], [])))?;
-    let current = library.cuda_get_device()?;
-    library.cuda_set_device(args.device)?;
-    let sample = library.cuda_memory_info();
-    library.cuda_set_device(current)?;
-    let (available, total) = sample?;
-    let admission = QwenAdmissionInputs { prefill_shape: inputs.prefill_shape, cfg: inputs.cfg, layers: inputs.layers, mtp: inputs.mtp, kv_format: inputs.kv_format,
-        manifest: inputs.manifest, prefill_rows: inputs.prefill_rows, slots: inputs.slots,
-        mark_bytes: inputs.mark_bytes,         ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
-    let mut inputs = placement_inputs(args, admission, source,
-        (available as u64, total as u64), pending, context, host);
-    inputs.loaded_weights = loaded_weights;
-    let (placement, solved) = qwen4::admitted(&inputs)?;
-    cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
-    publish_reconciliation(args, devices, &solved, source.spark_ranks())?;
-    cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
-    tracing::info!(pool_tokens = placement.pool_tokens,
-        ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
-        "Qwen shared solver admission before allocation");
-    Ok((usize::try_from(placement.pool_tokens)?, inputs.host))
+    let selected = inputs.experts.as_ref().map(|experts| experts.selected(&solved.decisions.onboard_layers[0]).cloned()).transpose()?;
+    Ok((usize::try_from(placement.pool_tokens)?, inputs.host,
+        ExpertAdmission { placement, candidate: selected, draft_budget }))
 }
 
 /// Publish the admission identity the shared Ready and first-request memory
@@ -351,7 +234,7 @@ fn reconciliation_provenance(source_commit: &str, source_dirty: &str, toolchain:
     })
 }
 
-fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, source: ExpertSource,
+fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, sparks: usize,
     (available, total): (u64, u64), pending: u64, context: cuteafd_loader::placement::planner::Context,
     host: qwen4::QwenHost) -> qwen4::QwenInputs<'a> {
     qwen4::QwenInputs {
@@ -361,7 +244,7 @@ fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, s
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), context, admission, capacity_bytes: total,
         baseline: Baseline::Measured { free_bytes: available }, pending_code_bytes: pending,
         max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
-        spark_ranks: source.spark_ranks(),
+        spark_ranks: sparks,
         host,
         // The launcher placed the tower; it loaded before this solve and its
         // device bytes are in the measured baseline.
@@ -604,27 +487,6 @@ pub(super) fn dual_push_envelope(dense: [u64; 2]) -> Result<cuteafd_loader::push
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::serving_capacity::qwen_graphs::*;
-
-    #[test]
-    fn exl3_runtime_requires_the_complete_preupload_admitted_window() -> anyhow::Result<()> {
-        use crate::shared::experts::layer::ExpertLayer;
-        let layers = (0..48).collect::<Vec<_>>();
-        let selections = std::iter::once(ExpertLayer::Dspark { stage: 0 })
-            .chain(layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer })).collect();
-        let admitted = super::Exl3Admission { layers: layers.clone(), peak_bytes: 70 << 30,
-            rows: 4096, mtp: true, selections, weights_budget: 69 << 30 };
-        let runtime_layers = admitted.selections.iter().filter_map(|selection| match selection {
-            ExpertLayer::BackboneFull { layer } => Some(*layer), _ => None,
-        }).collect::<Vec<_>>();
-        admitted.validate_layers(&runtime_layers)?;
-        assert_eq!(runtime_layers, layers);
-        assert!(admitted.validate_layers(&runtime_layers[..39]).is_err(),
-            "a post-KV free-memory sample must not silently shrink the resident window");
-        assert!(admitted.validate_layers(&runtime_layers[1..]).is_err());
-        assert_eq!(admitted.peak_bytes, 70 << 30);
-        assert_eq!(admitted.weights_budget, 69 << 30);
-        Ok(())
-    }
 
     #[test]
     fn local_media_weight_owner_follows_sparse_and_reversed_cuda_ordinals() -> anyhow::Result<()> {
@@ -1285,58 +1147,6 @@ mod tests {
                     "the owner charges the sampled bytes, not a second estimate");
             }
         }
-        Ok(())
-    }
-
-    #[test]
-    fn selected_local_source_ignores_configured_peers_for_admission() -> anyhow::Result<()> {
-        use super::{placement_inputs, ExpertSource};
-        use clap::Parser;
-        use cuteafd_loader::placement::families::qwen4;
-        #[derive(Parser)]
-        struct Cli {
-            #[command(flatten)]
-            engine: super::super::EngineArgs,
-        }
-        let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(
-            &cuteafd_loader::plan::testing::qwen4_config(48))?;
-        let local = Cli::try_parse_from(["serve", "--snapshot", "/absent/checkpoint", "--native-lib", "/absent/native.so",
-            "--local-experts", "--max-context-tokens", "32768"])?.engine;
-        let mut with_peers = local.clone();
-        with_peers.peers = Some("127.0.0.1:1234,127.0.0.1:1235".into());
-        let input = |args, source, pending| -> anyhow::Result<_> {
-            Ok(placement_inputs(args, super::inputs(args, &cfg, 48, false, None, None, 0)?,
-                source, (96 << 30, 96 << 30), pending, cuteafd_loader::placement::planner::Context::pinned(args.max_context as u64), qwen4::QwenHost::ample(&cfg, 1, 4096)?))
-        };
-        for (source, key) in [(ExpertSource::LocalFp8, "fp8"), (ExpertSource::LocalExl3, "exl3")] {
-            assert_eq!(source.code_key(), key);
-            assert_eq!(source.spark_ranks(), 0);
-            let pending = cuteafd_loader::placement::inventory::loaded_code_allowance(
-                "qwen4", source.code_key(), false, 0,
-                cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30), None).pending(0, 0);
-            let plain = input(&local, source, pending)?;
-            let peers = input(&with_peers, source, pending)?;
-            assert_eq!(peers.pending_code_bytes, pending);
-            assert_eq!(peers.spark_ranks, 0);
-            assert_eq!(with_peers.resolved_prefill()?.waves, 1);
-            assert_eq!(with_peers.resolved_prefill()?, local.resolved_prefill()?);
-            // Configured peers never reach admission; the selected source does.
-            assert_eq!(qwen4::placement(&plain)?, qwen4::placement(&peers)?);
-        }
-        let spark = ExpertSource::Spark { ranks: 4 };
-        assert_eq!(spark.code_key(), "none");
-        // The selected transport's actual world, not the configured two peers.
-        assert_eq!(input(&with_peers, spark, 0)?.spark_ranks, 4);
-        // Runtime's measured baseline already includes the selected transport,
-        // so the header-only Spark return planes are not charged a second time.
-        let spark_inputs = input(&with_peers, spark, 0)?;
-        assert!(matches!(spark_inputs.baseline, cuteafd_loader::placement::Baseline::Measured { .. }));
-        assert!(qwen4::placement(&spark_inputs)?.items[0].iter().all(|item| item.group != "Spark intake planes"));
-        assert!(qwen4::placement(&input(&local, ExpertSource::LocalExl3, 0)?)?.items[0].iter()
-            .all(|item| item.group != "Spark intake planes"));
-        assert_eq!(ExpertSource::selected(None)?, ExpertSource::None);
-        let shared = super::super::engine::Experts::SharedOnly;
-        assert_eq!(ExpertSource::selected(Some(&shared))?, ExpertSource::None);
         Ok(())
     }
 

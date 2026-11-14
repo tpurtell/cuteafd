@@ -448,7 +448,6 @@ impl Recipe for QwenSingle<'_> {
         if let Some(experts) = &inputs.experts {
             let variable = variables.len();
             experts.extend(&mut variables, &mut components, self.maximum_pages)?;
-            experts.remote(inputs.spark_ranks, &mut variables)?;
             requires.extend(experts.requirements(inputs.spark_ranks, variable));
         }
         inputs.encoders.extend(&mut variables, &mut components, 1, inputs.blas_head, self.maximum_pages)?;
@@ -1183,7 +1182,6 @@ impl Recipe for QwenDual<'_> {
         if let Some(experts) = &inputs.experts {
             let variable = variables.len();
             experts.extend(&mut variables, &mut components, self.maximum_pages)?;
-            experts.remote(inputs.spark_ranks, &mut variables)?;
             requires.extend(experts.requirements(inputs.spark_ranks, variable));
         } else {
             variables.push(Variable::Onboard { layers: (0..a.layers).collect(),

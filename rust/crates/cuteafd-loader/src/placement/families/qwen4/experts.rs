@@ -167,19 +167,27 @@ impl QwenExperts {
         Ok(())
     }
 
-    pub fn remote(&self, sparks: usize, variables: &mut Vec<Variable>) -> Result<(), Refusal> {
-        if sparks > 8 { return Err(Refusal::InvalidFact("Qwen supports at most eight Spark ranks".into())); }
-        if sparks > 0 {
-            variables.push(Variable::ExpertHome { layers: self.layers.clone(),
-                rank_sets: vec![(0..sparks as u8).collect()] });
-        }
-        Ok(())
-    }
-
     pub fn requirements(&self, sparks: usize, variable: usize) -> Vec<Requires> {
         self.candidates.iter().enumerate().filter(|(_, candidate)|
             sparks == 0 && candidate.layers.len() != self.layers.len()).map(|(option, _)|
                 Requires { when: Choice { variable, option }, any_of: vec![] }).collect()
+    }
+
+    pub fn remap_devices(&mut self, devices: &[i32]) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        ensure!(devices.len() == self.destinations.len(), "Qwen expert device map differs from owners");
+        for candidate in &mut self.candidates {
+            for (rank, arena) in &mut candidate.arenas {
+                let regions = arena.views().iter().map(|(name, view)| (name.clone(), view.bytes())).collect::<Vec<_>>();
+                // Preserve the declared order, not the BTreeMap's lexical order.
+                let mut regions = regions;
+                regions.sort_by_key(|(name, _)| arena.view(name).unwrap().offset());
+                let format = if regions[0].0.starts_with("Backbone") { "exl3" } else { "fp8" };
+                *arena = WeightArenaLayout::new(crate::serving_capacity::expert_weight_arena_id(
+                    format, devices[*rank], &regions)?, regions)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn selected(&self, layers: &[usize]) -> Result<&ExpertCandidate, Refusal> {

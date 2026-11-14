@@ -207,8 +207,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-qwen4 needs every layer");
         anyhow::ensure!(engine.experts().is_some(),
             "serve-qwen4 needs --peers (or --local-experts) for the routed experts");
-        let spark = matches!(engine.experts(), Some(super::engine::Experts::Spark { .. }));
-        console::layer_classes(engine.weights.layers.iter().map(|_| console::layer_class(false, spark)).collect());
+        console::layer_classes(engine.weights.layers.iter().enumerate().map(|(layer, _)|
+            console::layer_class(false, engine.spark_layer(layer))).collect());
         if matches!(engine.experts(), Some(super::engine::Experts::SharedOnly)) {
             tracing::warn!("serve-qwen4 --shared-only: replies do not match the model (plumbing and cache gates only)");
         }

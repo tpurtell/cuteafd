@@ -1,16 +1,14 @@
-//! Spark-free Qwen caller: solve both owners before any model allocation.
+//! Qwen whole-layer attention owners with admitted TP2/Spark expert homes.
 use super::{admission, attention_plan, engine, ple, required_fp8_programs, weights, EngineArgs, Opened};
 use anyhow::{ensure, Context, Result};
 use crate::shared::memory::device::{Device, Stream};
-use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxExpertLayer};
 use cuteafd_loader::placement::{families::qwen4, GpuBudget, LayerMode, Onboard};
 
 impl Opened {
     pub(super) fn with_dual_engine<T>(&self, args: &EngineArgs, peer: i32, context: cuteafd_loader::placement::planner::Context,
         media: crate::shared::experts::rtx::dense::Records,
         body: impl FnOnce(&engine::Qwen4Engine<'_>) -> Result<T>) -> Result<T> {
-        ensure!(args.local_experts && args.peers.is_none() && !args.shared_only && args.expert_window.is_none(),
-            "Qwen dual requires Spark-free resident local experts");
+        ensure!(!args.shared_only && args.expert_window.is_none(), "Qwen dual needs resident admitted experts");
         ensure!(peer != args.device, "Qwen dual devices must differ");
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let mtp = args.mtp > 0 && layers == self.cfg.layers;
@@ -46,14 +44,15 @@ impl Opened {
         let manifests = qwen4::dual_program_manifests(&manifest,
             [u32::try_from(sms[0])?, u32::try_from(sms[1])?], plan)?;
         let catalog = self.experts.as_ref().context("Qwen TP2 needs the selected expert catalog")?;
-        let experts = admission::dual_experts(args, catalog, layers)?;
+        let rows = args.prefill_wave_rows().max(engine::DECODE_ROWS);
+        let sparks = args.peers.as_ref().map_or(0, |peers| peers.split(',').count());
+        let mut experts = qwen4::QwenExperts::read(catalog, &args.native_lib, layers, 2, rows as u64)?;
+        experts.remap_devices(&[args.device, peer])?;
+        let costs = qwen4::dual_expert_costs(catalog, layers)?;
         let weights = admission::dual_weights(args, &self.checkpoint, &self.cfg, layers, mtp)?;
         let mut fixed = weights.fixed;
         fixed.extend(admission::loaded_media_weights(&[args.device, peer], args.planner_media_weights)?);
-        fixed.extend(experts.transport);
-        fixed.extend(qwen4::dual_peer_diagnostics(
-            cuteafd_loader::serving_capacity::peer_wait_diagnostics()));
-        let draft = if mtp { qwen4::dual_draft_demands(catalog, &args.native_lib, args.prefill_rows as u64)? }
+        let draft = if mtp { qwen4::dual_draft_demands(catalog, &args.native_lib, rows as u64)? }
             else { Vec::new() };
         let draft_budget = usize::try_from(draft.iter().map(|d| d.bytes).sum::<u64>())?;
         fixed.extend(draft);
@@ -84,20 +83,25 @@ impl Opened {
         let host_embedding = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host {
             u64::try_from(cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&self.checkpoint)?)?
         } else { 0 };
-        let host = admission::host_owners(args, &self.cfg, layers, mtp, 2, 0, false,
+        let mut push_envelopes = dense_envelope.iter().map(|envelope| ("qwen.host.push.dual", envelope.clone())).collect::<Vec<_>>();
+        let expert_policy = PushPolicy::for_snapshot(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot))?;
+        if let Some(envelope) = expert_policy.plan(|| super::hybrid::push_plan(catalog,
+            &(0..layers).collect::<Vec<_>>(), 2, rows, args, None)?.context("Qwen dual routed push")?
+                .host_envelope(catalog, 2, &[]))? { push_envelopes.push(("qwen.host.push.routed", envelope)); }
+        let host = admission::host_owners(args, &self.cfg, layers, mtp, 2, sparks, self.checkpoint.spark_input_is_bf16(),
             ple_info.map(|(row_bytes, _)| row_bytes), host_embedding,
-            dense_envelope.iter().map(|envelope| ("qwen.host.push.dual", envelope.clone())).collect())?;
+            push_envelopes)?;
         let (placement, solved) = qwen4::dual_admitted(&qwen4::QwenDualInputs {
-        experts: None,        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
+        experts: Some(experts.clone()), blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), context,
             owner_manifests: manifests.each_ref().map(Some),
             mark_slots: inputs.mark_bytes / mark_bytes, admission: inputs,
             gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: baselines[rank].0,
                 baseline: baselines[rank].1, reserve_bytes: cuteafd_loader::placement::reserve::gpu("qwen4") }),
-            arenas: &weights.arenas, layer_experts: &experts.costs,
-            layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace, pending_code_bytes: pending,
+            arenas: &weights.arenas, layer_experts: &costs,
+            layer_extra: &weights.layer_extra, fixed, tp2_workspace: [0; 2], pending_code_bytes: pending,
             max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
-            spark_ranks: 0,
+            spark_ranks: sparks,
             onboard: args.onboard.map(|setting| setting.resolve(catalog.routed_experts().routed_layers()))
                 .unwrap_or(Onboard::Auto),
             host: host.clone(), encoders: Default::default(),
@@ -105,7 +109,7 @@ impl Opened {
         tracing::info!(ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
             "Qwen dual admitted phase ledger");
         cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
-        admission::publish_reconciliation(args, &inventory.gpus, &solved, 0)?;
+        admission::publish_reconciliation(args, &inventory.gpus, &solved, sparks)?;
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
         cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
         tracing::info!(placement = %placement.summary(), pool_tokens = placement.pool_tokens,
@@ -171,36 +175,24 @@ impl Opened {
                 &self.cfg, layer, args.prefill_rows, 1, engine::DECODE_ROWS))?), None => None,
         };
         weights::arena::probe(&self.library, &[devices[0].id, devices[1].id], &model, &embedding)?;
-        // Load the independent full-width draft before the target halves, with
-        // its admitted arena rather than a post-allocation free-memory guess.
-        let draft = if mtp { Some(self.local_mtp_experts(args, layers, streams[0].raw, draft_budget)?) } else { None };
-        let budget = placement.tp2.context("Qwen dual solver did not admit TP2 experts")?.peak_bytes;
-        let budgets = [usize::try_from(budget[0])?, usize::try_from(budget[1])?];
-        let rows = args.prefill_rows.max(engine::DECODE_ROWS);
-        let pair: [Box<dyn RtxExpertLayer + '_>; 2] = if catalog.exl3().is_some() {
-            Exl3Tp2::load_pair_with_packages(devices, catalog, cuteafd_core::ExpertGeometry::QWEN4,
-                experts.packages.each_ref().map(|p| p.as_path()), (0..layers).collect(), rows, budgets)?.map(|e| Box::new(e) as _)
-        } else {
-            let tensors = catalog.fp8().context("Qwen native TP2 tensors")?;
-            let directory = args.fp8_package.clone().unwrap_or_else(||
-                crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
-            Fp8MoeTp2::load_pair(devices, tensors, &directory, (0..layers).collect(), rows, budgets)?.map(|e| Box::new(e) as _)
-        };
-        for rank in 0..2 { ensure!(pair[rank].workspace_bytes() as u64 == experts.workspace[rank],
-            "Qwen allocated TP2 workspace disagrees with admission"); }
+        let admitted = admission::ExpertAdmission { placement: placement.clone(),
+            candidate: Some(experts.selected(&solved.decisions.onboard_layers[0])?.clone()), draft_budget };
+        let hybrid = self.load_hybrid(args, &devices, &streams.each_ref().map(|stream| stream.raw), &admitted, &host)?;
         let pool = usize::try_from(placement.pool_tokens)?;
         let context = crate::shared::context::pool_context("qwen4", context, pool)?;
         let engine_ranks = [(devices[0], &programs[0], streams[0].raw), (devices[1], &programs[1], streams[1].raw)];
         let mut engine = engine::Qwen4Engine::new_placed(&self.library, self.cfg.clone(), model, ple, &owners,
             &engine_ranks, context, args.prefill_rows, pool.div_ceil(engine::PAGE_ROWS), args.slots, args.kv_format, embedding)?;
+        engine.prefill_shape = args.prefill_shape()?;
         engine.attention_plan = plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
-        engine.set_tp2(pair, experts.wire, draft, &placement, cuteafd_loader::placement::HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots,
+        engine.install_hybrid(hybrid, &placement, cuteafd_loader::placement::HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots,
             row_bytes: self.cfg.hc_width() as u64 * 2, rows: rows as u64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: cuteafd_loader::placement::TerminalHome::AttentionOwner })?;
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
+        engine.configure_packing(args.prefill_packing)?;
         engine.admitted_host = Some(host);
         engine.admit_host_memory(args)?;
         // Weights and both expert halves are resident: release the load's
