@@ -51,6 +51,40 @@ impl Drop for Storage<'_> {
 pub(crate) struct Owners<'a> {
     pub graphs: Vec<Graphs<'a, Storage<'a>>>,
     pub storage: Rc<Storage<'a>>,
+    selector_contract: SelectorContract,
+}
+
+pub(crate) struct SelectorContract {
+    owners: Vec<cuteafd_loader::placement::planner::Allocation>,
+}
+impl SelectorContract {
+    fn from_plan(plan: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<Self> {
+        let owners = plan.facts.allocations.iter().filter(|owner| owner.id.starts_with("selector.")).cloned().collect::<Vec<_>>();
+        ensure!(!owners.is_empty(), "MiniMax admitted selector owner inventory missing");
+        Ok(Self { owners })
+    }
+
+    pub fn reconcile(&self, receipts: &[cuteafd_loader::placement::planner::Receipt]) -> Result<()> {
+        let actual = receipts.iter().map(|receipt| (receipt.allocation.id.as_str(), receipt)).collect::<BTreeMap<_, _>>();
+        ensure!(actual.len() == receipts.len() && actual.len() == self.owners.len(),
+            "MiniMax scheduler selector owner inventory differs from admission");
+        let mut spans = Vec::new();
+        for planned in &self.owners {
+            let receipt = actual.get(planned.id.as_str()).with_context(|| format!("MiniMax selector missing {}", planned.id))?;
+            let owner = &receipt.allocation;
+            // The shared Inventory's diagnostic group/category may differ;
+            // physical identity, payload, location and lifetime must not.
+            ensure!(owner.view.is_none() && planned.view.is_none() && owner.bytes == planned.bytes
+                && owner.location == planned.location && owner.lifetime == planned.lifetime && receipt.address != 0,
+                "MiniMax selector {} differs from admitted owner", planned.id);
+            let end = receipt.address.checked_add(owner.bytes).context("MiniMax selector address overflow")?;
+            spans.push((owner.location, receipt.address, end));
+        }
+        spans.sort_unstable();
+        ensure!(spans.windows(2).all(|pair| pair[0].0 != pair[1].0 || pair[0].2 <= pair[1].1),
+            "MiniMax selector physical owners overlap");
+        Ok(())
+    }
 }
 
 impl<'a> Owners<'a> {
@@ -174,7 +208,25 @@ impl<'a> Owners<'a> {
                 gpu, inputs.cfg.layers, capacity.decode.rows as usize, &sites, graphs::Config {
                     reserve: inputs.graph_reserve[gpu], bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false })?);
         }
-        Ok(Self { graphs, storage })
+        Ok(Self { graphs, storage, selector_contract: SelectorContract::from_plan(&admitted.solved)? })
+    }
+}
+
+impl Owners<'_> {
+    pub fn reconcile_selector(&self, selector: &crate::shared::token_io::TokenSelector<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        let device_ids = self.storage.ranks.iter().map(|rank| rank.decode.borrow().stream.device.id).collect::<Vec<_>>();
+        let mut inventory = Inventory::new(CoordinatorDevices::new(&device_ids)?, "selector",
+            cuteafd_loader::placement::planner::serving::ServingOwners::LIFETIME,
+            Category::Workspace, "token selector");
+        // Inventory requires a nonempty suffix; strip only that diagnostic
+        // namespace after observing the selector's actual backings.
+        selector.allocation_receipts(&mut inventory, "next")?;
+        for receipt in &mut inventory.receipts {
+            receipt.allocation.id = receipt.allocation.id.replacen("selector.next.", "selector.", 1);
+        }
+        self.selector_contract.reconcile(&inventory.receipts)?;
+        Ok(inventory.receipts)
     }
 }
 
@@ -294,6 +346,33 @@ mod tests {
         placement::{families::minimax_m3::{self as canonical, ExpertBacking, LocalPackage, SparkCharge},
             planner::{serving, Context as ModelContext, Operation, PrefillShape}}, plan::{Checkpoint, testing}};
     use serde_json::{json, Value};
+
+    #[test]
+    fn selector_receipts_are_exact_and_missing_sampler_is_not_accepted() -> Result<()> {
+        use cuteafd_loader::placement::planner::{Allocation, Receipt};
+        let owner = Allocation::buffer("selector.output", Location::coordinator(0), 192,
+            serving::ServingOwners::LIFETIME, Category::Workspace, "token selector");
+        let sampler = Allocation::buffer("selector.sampler.rows", Location::coordinator(0), 512,
+            serving::ServingOwners::LIFETIME, Category::Workspace, "target sampler");
+        let contract = SelectorContract { owners: vec![owner.clone(), sampler.clone()] };
+        let receipts = vec![Receipt { allocation: owner, address: 4096 },
+            Receipt { allocation: sampler, address: 8192 }];
+        contract.reconcile(&receipts)?;
+        assert!(contract.reconcile(&receipts[..1]).is_err());
+        let mut changed = receipts.clone();
+        changed[1].allocation.bytes += 1;
+        assert!(contract.reconcile(&changed).is_err());
+        changed = receipts.clone();
+        changed[1].address = 4100;
+        assert!(contract.reconcile(&changed).is_err());
+        changed = receipts.clone();
+        changed[1].allocation.location = Location::coordinator(1);
+        assert!(contract.reconcile(&changed).is_err());
+        changed = receipts.clone();
+        changed.push(receipts[0].clone());
+        assert!(contract.reconcile(&changed).is_err());
+        Ok(())
+    }
 
     // Sparse native checkpoint headers skip payload IO under dense recording.
     // Production loading, allocation and receipt observation still run unchanged.
@@ -609,7 +688,7 @@ mod tests {
                     assert_eq!(rank.decode.borrow().plane("residual")?.bytes, concurrency as usize * 6144 * 4);
                 }
                 let weak = Rc::downgrade(&owners.storage);
-                let Owners { graphs, storage } = owners;
+                let Owners { graphs, storage, .. } = owners;
                 drop(storage);
                 assert!(weak.upgrade().is_some(), "graph owner must pin all arithmetic/request/weight storage");
                 drop(graphs);

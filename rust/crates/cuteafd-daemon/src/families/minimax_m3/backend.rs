@@ -14,6 +14,12 @@ use std::{cell::{Cell, RefCell}, collections::{BTreeMap, BTreeSet}, ops::Range, 
 
 const MESSAGE_STARTS: &[&str] = &["]~b]"];
 
+fn validate_prefix_concurrency(requested: usize, admitted: usize) -> Result<()> {
+    ensure!(requested > 0 && requested == admitted,
+        "MiniMax prefix concurrency differs from admitted request slots");
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum BackendError {
     #[error("MiniMax neural/speculative drafts are not qualified")]
@@ -82,6 +88,7 @@ pub(crate) struct MiniMaxBackend<'e, 'a> {
     next_identity: Cell<u64>,
     pending: RefCell<Option<Vec<Submitted>>>,
     terminal: Cell<bool>,
+    selector_receipts: RefCell<Option<Vec<cuteafd_loader::placement::planner::Receipt>>>,
 }
 
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
@@ -105,7 +112,8 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         drop(state);
         Ok(Self { owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
             host, profile: RefCell::new([0.0; 2]), identities: RefCell::new(BTreeMap::new()),
-            next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false) })
+            next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false),
+            selector_receipts: RefCell::new(None) })
     }
 
     fn live(&self) -> Result<()> { ensure!(!self.terminal.get(), BackendError::Terminal); Ok(()) }
@@ -223,11 +231,19 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn message_starts(&self) -> &[&str] { MESSAGE_STARTS }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.owners.storage.ranks[0].decode.borrow().stream.device.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
-    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
+    fn selector_ready(&self, selector: &mut TokenSelector<'a>) -> Result<()> {
+        ensure!(self.selector_receipts.borrow().is_none(), "MiniMax selector initialized more than once");
+        selector.reserve_sampler()?;
+        let receipts = self.owners.reconcile_selector(selector)?;
+        tracing::info!(owners = receipts.len(), "MiniMax scheduler selector reconciled before readiness");
+        *self.selector_receipts.borrow_mut() = Some(receipts);
+        Ok(())
+    }
+    fn prefix_cache(&self, args: &PrefixArgs, concurrency: usize)
         -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
         self.idle()?;
-        ensure!(lanes == 1 && args.prefix_partial == Toggle::Off,
-            "MiniMax uses one shared lane with exact prefix restores");
+        validate_prefix_concurrency(concurrency, self.geometry().slots)?;
+        ensure!(args.prefix_partial == Toggle::Off, "MiniMax requires exact prefix restores");
         let family = self.owners.storage.prefix.clone();
         let host = self.host.clone().map(|config| CudaCopyEngine::registered_owned(self.library(),
             family.snapshot_owners()).map(|copy| (config, copy))).transpose()?;
@@ -392,6 +408,17 @@ mod tests {
     use cuteafd_loader::{families::minimax_m3::execution::{MsaCache, MsaRope},
         placement::families::minimax_m3::RequestCapacity};
     use std::rc::Rc;
+
+    #[test]
+    fn prefix_scheduler_argument_is_boot_concurrency_not_decode_lanes() -> Result<()> {
+        for concurrency in [1, 16, 64] {
+            validate_prefix_concurrency(concurrency, concurrency)?;
+            assert!(validate_prefix_concurrency(concurrency + 1, concurrency).is_err());
+        }
+        assert!(validate_prefix_concurrency(0, 0).is_err());
+        assert!(validate_prefix_concurrency(1, 16).is_err());
+        Ok(())
+    }
 
     #[test]
     fn message_start_is_the_served_checkpoints_single_added_token() -> Result<()> {
