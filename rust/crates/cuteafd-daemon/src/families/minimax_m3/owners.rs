@@ -1,4 +1,4 @@
-//! Retained whole-layer serving owners. The shared scheduler is attached separately.
+//! Retained role-specific serving owners. The shared scheduler is attached separately.
 use super::{cache::{self, RequestState, RequestStreams}, graphs::{self, Graphs, Op},
     head::Head, layer::{Kernels, UnitOwner}, prefix::MiniMaxPrefix, weights::TargetWeights};
 use crate::shared::{decode_graph::device::Basis,
@@ -53,16 +53,9 @@ pub(crate) struct Owners<'a> {
     pub storage: Rc<Storage<'a>>,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ConstructorRefusal {
-    #[error("MiniMax 2-RTX split owners not built yet")]
-    SplitOwnersNotBuilt,
-}
-
 impl<'a> Owners<'a> {
     pub fn new(inputs: &MiniMaxInputs, admitted: &AdmittedMiniMax,
         programs: &'a Programs<'a>, loaded: Vec<LoadedRank<'a>>, embedding: TokenEmbedding<'a>) -> Result<Self> {
-        if inputs.split() { return Err(ConstructorRefusal::SplitOwnersNotBuilt.into()); }
         let capacity = inputs.request_capacity()?;
         let contract = inputs.prepare(&admitted.solved.request)?;
         ensure!(admitted.solved.pool_page_rows == contract.page_rows
@@ -109,12 +102,25 @@ impl<'a> Owners<'a> {
         let mut streams = Vec::with_capacity(loaded.len());
         for (gpu, rank) in loaded.into_iter().enumerate() {
             let layout = inputs.targets[gpu].clone();
-            let kernels = Kernels::bind(rank.streams.decode.device, programs, &inputs.manifest,
+            let bind = if inputs.split() { Kernels::bind_split } else { Kernels::bind };
+            let kernels = bind(rank.streams.decode.device, programs, &inputs.manifest,
                 &inputs.cfg, &layout, capacity.execution_rows(), u32::try_from(inputs.context.maximum)?)?;
-            let decode = RefCell::new(UnitOwner::new_decode(&kernels, Rc::clone(&rank.streams.decode),
-                &inputs.cfg, &layout, capacity.decode.rows)?);
-            let prefill = rank.streams.prefill.iter().map(|stream| UnitOwner::new(&kernels,
-                Rc::clone(stream), &inputs.cfg, &layout, capacity.prefill.rows).map(RefCell::new))
+            let make_unit = |stream: Rc<_>, rows, prefill| -> Result<_> {
+                if inputs.split() {
+                    let roles = (0..inputs.cfg.layers).map(|layer| inputs.roles(layer, gpu, rows))
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    ensure!(roles.iter().all(|roles| roles.iter().any(|role|
+                        role.role == cuteafd_loader::families::minimax_m3::execution::ExecutionRole::PartialFfn)),
+                        "MiniMax split rank lacks admitted partial role");
+                    UnitOwner::new_split(&kernels, stream, &inputs.cfg, &layout, rows,
+                        inputs.split_wire.context("MiniMax split wire not selected")?, prefill,
+                        gpu == 1 && admitted.onboard > 0)
+                } else if prefill { UnitOwner::new(&kernels, stream, &inputs.cfg, &layout, rows) }
+                else { UnitOwner::new_decode(&kernels, stream, &inputs.cfg, &layout, rows) }
+            };
+            let decode = RefCell::new(make_unit(Rc::clone(&rank.streams.decode), capacity.decode.rows, false)?);
+            let prefill = rank.streams.prefill.iter().map(|stream|
+                make_unit(Rc::clone(stream), capacity.prefill.rows, true).map(RefCell::new))
                 .collect::<Result<Vec<_>>>()?;
             if gpu == 0 {
                 for unit in &prefill {
@@ -137,8 +143,8 @@ impl<'a> Owners<'a> {
         // The shared Qwen scheduler constructs and owns the one admitted
         // selector. Retaining a second one here would double-charge storage.
         let usage = inputs.expert_usage.as_ref().map(|geometry| {
-            let producers = devices.iter().enumerate().take(geometry.routed_layers.len())
-                .map(|(gpu, &cuda)| Ok(UsageDevice { logical: u8::try_from(gpu)?, cuda }))
+            let producers = inputs.usage_devices().into_iter()
+                .map(|gpu| Ok(UsageDevice { logical: gpu, cuda: devices[usize::from(gpu)] }))
                 .collect::<Result<Vec<_>>>()?;
             ExpertUsage::new(library, geometry.clone(), &producers, Default::default())
         }).transpose()?;
@@ -148,9 +154,14 @@ impl<'a> Owners<'a> {
         reconcile(&census, &admitted.solved.facts, &contract.components, pages, retained_owner)?;
         let mut graphs = Vec::with_capacity(inputs.gpus);
         for (gpu, rank) in storage.ranks.iter().enumerate() {
-            let sites = rank.layout.layers.iter().flat_map(|&layer| {
+            let layers = if inputs.split() { (0..inputs.cfg.layers).collect::<Vec<_>>() }
+                else { rank.layout.layers.clone() };
+            let sites = layers.iter().flat_map(|&layer| {
                 let mut sites = vec![(layer, Op::Ffn)];
-                if inputs.cfg.moe[layer] { sites.extend([(layer, Op::Router), (layer, Op::JoinRouted)]); }
+                if inputs.cfg.moe[layer] {
+                    sites.push((layer, Op::JoinRouted));
+                    if !inputs.split() || gpu == 0 { sites.push((layer, Op::Router)); }
+                }
                 sites
             }).collect::<Vec<_>>();
             graphs.push(Graphs::new(Rc::clone(&rank.decode.borrow().stream), Rc::clone(&storage),
@@ -223,6 +234,20 @@ fn retained_owner(id: &str) -> bool {
         .iter().any(|prefix| id.starts_with(prefix))
 }
 
+fn unique_curve<'b>(matches: &[&'b Component]) -> Result<&'b cuteafd_loader::placement::planner::ByteCurve> {
+    let first = matches.first().context("MiniMax retained owner needs a canonical allocation curve")?;
+    for (index, component) in matches.iter().enumerate() {
+        ensure!(component.bytes == first.bytes, "MiniMax repeated owner has unequal payload curves");
+        for other in &matches[..index] {
+            let exclusive = component.activation.clauses.iter().all(|left|
+                other.activation.clauses.iter().all(|right|
+                    left.iter().any(|a| right.iter().any(|b| a.variable == b.variable && a.option != b.option))));
+            ensure!(exclusive, "MiniMax repeated owner has overlapping activations");
+        }
+    }
+    Ok(&first.bytes)
+}
+
 fn reconcile(census: &Census, facts: &Facts, components: &[Component], pages: u64,
     selected: impl Fn(&str) -> bool) -> Result<()> {
     let actual = census.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).map(|receipt|
@@ -240,8 +265,7 @@ fn reconcile(census: &Census, facts: &Facts, components: &[Component], pages: u6
         let actual = &receipt.allocation;
         let matching = components.iter().filter(|component| matches!(&component.kind,
             ComponentKind::Allocation { template, .. } if template.id == id)).collect::<Vec<_>>();
-        ensure!(matching.len() == 1, "MiniMax retained owner {id} needs one canonical allocation curve");
-        let curve = &matching[0].bytes;
+        let curve = unique_curve(&matching).with_context(|| format!("MiniMax retained owner {id}"))?;
         let piece = curve.0.iter().find(|piece| (piece.first..=piece.last).contains(&pages))
             .context("MiniMax retained owner is outside its curve domain")?;
         let payload = pages.checked_sub(piece.first).and_then(|pages| piece.bytes_per_page.checked_mul(pages))
@@ -271,16 +295,17 @@ mod tests {
         let mut config: Value = serde_json::from_str(include_str!(
             "../../../../cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?;
         config.as_object_mut().unwrap().remove("vision_config");
-        config["text_config"]["num_hidden_layers"] = json!(4);
-        config["text_config"]["moe_layer_freq"].as_array_mut().unwrap().truncate(4);
+        config["text_config"]["num_hidden_layers"] = json!(5);
+        config["text_config"]["moe_layer_freq"].as_array_mut().unwrap().truncate(5);
+        config["text_config"]["moe_layer_freq"][2] = json!(1);
         for key in ["sparse_attention_freq", "sparse_disable_index_value"] {
-            config["text_config"]["sparse_attention_config"][key].as_array_mut().unwrap().truncate(4);
+            config["text_config"]["sparse_attention_config"][key].as_array_mut().unwrap().truncate(5);
         }
         let cfg = MiniMaxM3Config::from_hf(&config)?;
         let mut tensors = vec![("language_model.model.embed_tokens.weight".into(), "BF16", vec![200064, 6144]),
             ("language_model.lm_head.weight".into(), "BF16", vec![200064, 6144]),
             ("language_model.model.norm.weight".into(), "BF16", vec![6144])];
-        for layer in 0..4 {
+        for layer in 0..5 {
             let p = format!("language_model.model.layers.{layer}.");
             for norm in ["input_layernorm", "post_attention_layernorm"] {
                 tensors.push((format!("{p}{norm}.weight"), "BF16", vec![6144]));
@@ -403,6 +428,32 @@ mod tests {
     }
 
     #[test]
+    fn repeated_owner_curves_require_identical_curves_and_exclusive_activations() -> Result<()> {
+        use cuteafd_loader::placement::planner::{Activation, Allocation, ByteCurve, Choice};
+        let owner = Allocation::buffer("receive", Location::coordinator(1), 64,
+            Lifetime::TARGET, Category::Transport, "route receive");
+        let mut a = Component::allocation(owner, ByteCurve::fixed(64, 16), false, 16);
+        a.activation = Activation::choice(0, 1);
+        let mut b = a.clone();
+        b.activation = Activation::choice(0, 2);
+        unique_curve(&[&a, &b])?;
+        b.activation = a.activation.clone();
+        assert!(unique_curve(&[&a, &b]).is_err());
+        b.activation = Activation::always();
+        assert!(unique_curve(&[&a, &b]).is_err());
+        b.activation = Activation { clauses: vec![vec![Choice { variable: 0, option: 2 }],
+            vec![Choice { variable: 1, option: 0 }]] };
+        assert!(unique_curve(&[&a, &b]).is_err(), "every DNF clause must exclude every peer clause");
+        b.activation = Activation::choice(0, 2);
+        b.bytes = ByteCurve::fixed(65, 16);
+        assert!(unique_curve(&[&a, &b]).is_err());
+        b.bytes = ByteCurve::fixed(64, 15);
+        assert!(unique_curve(&[&a, &b]).is_err(), "equal selected-point bytes do not imply equal curves");
+        assert!(unique_curve(&[]).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn ownership_fixture_bf16_add_binding_fails_closed() -> Result<()> {
         use crate::shared::memory::device::Allocation;
         use cuteafd_core::memory_layout::Tag;
@@ -426,6 +477,7 @@ mod tests {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.extent_only(&library)?;
+        fixture.configure_device_flags(&library, 0)?;
         fixture.strict_device_free(&library, true)?;
         for id in 0..2 { fixture.configure_memory(&library, id, 96 << 30)?; }
         let dir = tempfile::tempdir_in(fixture.directory())?;
@@ -433,14 +485,20 @@ mod tests {
         for ids in [vec![1], vec![1, 0]] {
             for concurrency in [1, 16, 64] {
                 for (device_sampling, expert_usage) in [(false, false), (true, false), (false, true), (true, true)] {
+                for (wire, onboard) in if ids.len() == 2 {
+                    vec![(crate::families::minimax_m3::dense::PartialPrecision::Bf16, 0), (crate::families::minimax_m3::dense::PartialPrecision::F32, 0),
+                        (crate::families::minimax_m3::dense::PartialPrecision::Bf16, 1), (crate::families::minimax_m3::dense::PartialPrecision::F32, 1),
+                        (crate::families::minimax_m3::dense::PartialPrecision::Bf16, 2), (crate::families::minimax_m3::dense::PartialPrecision::F32, 2)]
+                } else { vec![(crate::families::minimax_m3::dense::PartialPrecision::Bf16, 0)] } {
                 let mut inputs = inputs(&checkpoint, &cfg, &ids, concurrency)?;
+                inputs.split_wire = Some(wire);
                 inputs.device_sampling = device_sampling;
                 inputs.expert_usage = expert_usage.then(|| cuteafd_core::expert_usage::Geometry {
                     layers: cfg.layers, experts: cfg.experts, topk: cfg.topk, routed_layers: inputs.routed.clone(),
                 });
-                let request = canonical::request(inputs.context, Some(129 * 64), cuteafd_loader::placement::Onboard::Layers(0),
+                let request = canonical::request(inputs.context, Some(129 * 64), cuteafd_loader::placement::Onboard::Layers(onboard),
                     inputs.prefill, Operation::Serving, None, Default::default());
-                let admitted = inputs.admit(request)?;
+                let admitted = inputs.admit(request).with_context(|| format!("{} RTX C{concurrency} wire{wire:?} onboard{onboard}", ids.len()))?;
                 assert_eq!(admitted.solved.pool_tokens, 129 * 64);
                 let contract = inputs.prepare(&admitted.solved.request)?;
                 fixture.register_programs(&library, inputs.manifest["programs"].as_array().unwrap())?;
@@ -476,18 +534,36 @@ mod tests {
                         prefill: (0..3).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<_>>()? } });
                 }
                 let constructed = Owners::new(&inputs, &admitted, &programs, loaded, embedding.unwrap());
-                if ids.len() == 2 {
-                    let error = constructed.err().context("2-RTX split constructor must refuse until C supplies real owners")?;
-                    assert!(matches!(error.downcast_ref::<ConstructorRefusal>(), Some(ConstructorRefusal::SplitOwnersNotBuilt)));
-                    continue;
-                }
                 let owners = constructed?;
                 assert_eq!(owners.graphs.len(), ids.len());
                 assert_eq!(owners.storage.usage.is_some(), expert_usage);
                 let census = owners.storage.inventory()?;
+                if inputs.split() {
+                    assert!(!census.receipts.iter().any(|r| r.allocation.id.starts_with("expert-usage.gpu1")));
+                    if let Some(usage) = &owners.storage.usage {
+                        let layer = inputs.routed[0];
+                        assert!(usage.routes(ids[0], layer, cuteafd_ffi::expert_usage::UsagePhase::Decode).is_ok());
+                        assert!(usage.routes(ids[1], layer, cuteafd_ffi::expert_usage::UsagePhase::Decode).is_err());
+                    }
+                    for (gpu, rank) in owners.storage.ranks.iter().enumerate() {
+                        assert_eq!(rank.kernels.has_router(), gpu == 0);
+                        for unit in std::iter::once(&rank.decode).chain(&rank.prefill) {
+                            let unit = unit.borrow();
+                            assert!(unit.is_split());
+                            assert!(unit.plane("combined").is_err());
+                            assert_eq!(unit.plane("gate")?.bytes, unit.rows() as usize * 6144 * 2);
+                            assert_eq!(unit.plane("up")?.bytes, unit.rows() as usize * 6144 * 2);
+                            assert_eq!(unit.plane("ffn")?.bytes, unit.rows() as usize * 6144 * 2);
+                            assert_eq!(unit.plane("logits").is_ok(), gpu == 0);
+                            assert_eq!(unit.plane("route_ids").is_ok(), gpu == 0 || onboard > 0);
+                            assert_eq!(unit.plane("route_weights").is_ok(), gpu == 0 || onboard > 0);
+                            unit.validate_split(&inputs, gpu)?;
+                        }
+                    }
+                }
                 assert_eq!(census.receipts.iter().filter(|r|
                     r.allocation.id.starts_with("expert-usage.gpu")).count(),
-                    if expert_usage { 3 * ids.len().min(inputs.routed.len()) } else { 0 });
+                    if expert_usage { 3 * inputs.usage_devices().len() } else { 0 });
                 assert!(!census.receipts.iter().any(|r| r.allocation.id.starts_with("selector.")),
                     "the shared scheduler must own the sole selector");
                 let selector = admitted.solved.facts.allocations.iter().find(|owner|
@@ -534,6 +610,7 @@ mod tests {
                 assert!(weak.upgrade().is_none());
                 assert_eq!(fixture.mapped_bytes(&library)?, 0, "every virtual native owner retired");
                 assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+                }
                 }
             }
         }
