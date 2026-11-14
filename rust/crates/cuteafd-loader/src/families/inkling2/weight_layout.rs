@@ -55,6 +55,28 @@ impl CoordinatorWeights {
         }).collect()
     }
 
+    /// Cold golden retains globals and exactly the selected layers. This is
+    /// a physical subset, not a change to the checkpoint's model geometry.
+    pub fn golden(checkpoint: &Checkpoint, cfg: &Inkling2Config, layers: &[usize]) -> Result<Self> {
+        ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1])
+            && layers.iter().all(|&layer| layer < cfg.layers), "Inkling golden layer inventory invalid");
+        let modes = vec![LayerMode::Whole { gpu: 0, ffn: crate::placement::FfnMode::Owner }; cfg.layers];
+        let whole = Self::plan(checkpoint, cfg, 1, &modes)?.remove(0);
+        let selected = whole.arena.views().iter().filter(|(name, _)| {
+            if let Some(rest) = name.strip_prefix(&format!("{TEXT}layers.")) {
+                return rest.split('.').next().and_then(|n| n.parse::<usize>().ok()).is_some_and(|layer| layers.contains(&layer));
+            }
+            if let Some(rest) = name.strip_prefix(&format!("{TEXT}attn_res.mlp_queries.")) {
+                return rest.parse::<usize>().ok().is_some_and(|layer| layers.contains(&layer));
+            }
+            if let Some(rest) = name.strip_prefix(&format!("{TEXT}attn_res.attn_queries.")) {
+                return rest.parse::<usize>().ok().is_some_and(|query| layers.contains(&(query+1)));
+            }
+            true
+        }).map(|(name, view)| (name.clone(), view.bytes())).collect::<Vec<_>>();
+        Ok(Self { rank: 0, layers: layers.to_vec(), arena: WeightArenaLayout::new("inkling2/golden/target", selected)? })
+    }
+
     /// Raw checkpoint operands need only a bounded reused source buffer: no
     /// dequantization, row repacking, scale conversion or device staging.
     pub fn mount_load(&self, checkpoint: &Checkpoint) -> Result<crate::shared::dense_read::MountLoad> {
