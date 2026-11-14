@@ -420,9 +420,10 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
 
 Kimi K3.1 (`kimi_k31`) is recognized by the shared Kimi family for CPU header
-and core-view inspection. Its Gated DSA device path and index-cache prefix
-restore are not installed yet, so plan/serve refuse execution (#1777); dense
-MLA is not a fallback. K3 DFlash2 hidden-state compatibility is unqualified,
+and core-view inspection. Original and K6/K8 compact cores receive complete
+memory plans, including context-parity index caches and prefill workspaces.
+All remain `Planned`, not launchable, pending full-model and compact-core
+qualification (#1777); dense MLA is not a fallback. K3 DFlash2 hidden-state compatibility is unqualified,
 and requesting a drafter for K3.1 refuses explicitly. MC `original`,
 `k8-compact` and `k6-compact` retain native BF16 indexer weights;
 `fp8-compact` refuses until whole-core conversion is implemented.

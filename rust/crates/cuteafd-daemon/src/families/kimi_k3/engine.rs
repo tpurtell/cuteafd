@@ -553,7 +553,8 @@ impl<'a> Engine<'a> {
         ensure!(self.provisional.borrow().is_none(), "Kimi DSA dump requires idle lanes at startup");
         for lane in &mut lanes.local {
             for local in lane {
-                ensure!(local.graph_device().is_none(), "CUTEAFD_KIMI_DSA_DUMP refuses attached CUDA graphs");
+                ensure!(local.graph_device().is_none() || local.context_dsa_diagnostic(),
+                    "CUTEAFD_KIMI_DSA_DUMP refuses attached CUDA graphs outside context DSA");
                 local.dsa_dump = Some(dump.clone());
             }
         }

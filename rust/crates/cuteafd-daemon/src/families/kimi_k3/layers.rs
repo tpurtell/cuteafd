@@ -316,12 +316,26 @@ trait ContextRankKernels {
     fn wait_prior_commit(&mut self, reader: usize, owner: usize) -> Result<()>;
     fn attention_commit(&mut self, rank: usize) -> Result<()>;
     fn record_commit(&mut self, rank: usize) -> Result<()>;
+    fn gathered_dsa_rows(&self) -> Option<usize> { None }
+    fn prepare_dsa(&mut self, _rank: usize) -> Result<()> { anyhow::bail!("Kimi gathered DSA producer absent") }
+    fn select_dsa(&mut self, _rank: usize, _first: usize, _rows: usize, _merge: bool) -> Result<()> {
+        anyhow::bail!("Kimi gathered DSA selector absent")
+    }
 }
 
 fn context_pair_with(kernels: &mut impl ContextRankKernels) -> Result<()> {
     // Snapshot both ranks' previous event generations before either event is
     // re-recorded. Either next-unit gather reads both persistent owner pools.
     for reader in 0..2 { for owner in 0..2 { kernels.wait_prior_commit(reader, owner)?; }}
+    if let Some(rows) = kernels.gathered_dsa_rows() {
+        for rank in 0..2 { kernels.prepare_dsa(rank)?; }
+        for first in (0..rows).step_by(64) {
+            let count = (rows - first).min(64);
+            for merge in [false, true] {
+                for rank in 0..2 { kernels.select_dsa(rank, first, count, merge)?; }
+            }
+        }
+    }
     for rank in 0..2 {
         kernels.attention_commit(rank)?;
         kernels.record_commit(rank)?;
@@ -386,6 +400,39 @@ fn validate_streams(streams: &[[(i32, *mut c_void); 2]], devices: [i32; 2]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn k31_context_chunks_publish_both_ranks_before_waiting_and_reusing_storage() -> Result<()> {
+        #[derive(Default)]
+        struct Pair { published: [usize; 2], merged: [usize; 2], prepared: [bool; 2], calls: Vec<(usize, usize, bool)> }
+        impl ContextRankKernels for Pair {
+            fn wait_prior_commit(&mut self, _: usize, _: usize) -> Result<()> { Ok(()) }
+            fn gathered_dsa_rows(&self) -> Option<usize> { Some(131) }
+            fn prepare_dsa(&mut self, rank: usize) -> Result<()> { self.prepared[rank] = true; Ok(()) }
+            fn select_dsa(&mut self, rank: usize, first: usize, rows: usize, merge: bool) -> Result<()> {
+                ensure!(self.prepared == [true; 2], "both producers must be submitted first");
+                if merge {
+                    ensure!(self.published == [first + rows; 2], "wait before the peer publish");
+                    self.merged[rank] = first + rows;
+                } else {
+                    ensure!(self.merged == [first; 2], "overwrite before both merges consume");
+                    self.published[rank] = first + rows;
+                }
+                self.calls.push((rank, first, merge));
+                Ok(())
+            }
+            fn attention_commit(&mut self, _: usize) -> Result<()> { ensure!(self.merged == [131; 2], "incomplete selection"); Ok(()) }
+            fn record_commit(&mut self, _: usize) -> Result<()> { Ok(()) }
+        }
+        let mut pair = Pair::default();
+        context_pair_with(&mut pair)?;
+        assert_eq!(&pair.calls[..4], &[(0, 0, false), (1, 0, false), (0, 0, true), (1, 0, true)]);
+        let mut serial = Pair::default();
+        serial.prepare_dsa(0)?; serial.prepare_dsa(1)?;
+        serial.select_dsa(0, 0, 64, false)?;
+        assert!(serial.select_dsa(0, 0, 64, true).is_err(), "old serial-rank order must fail");
+        Ok(())
+    }
 
     #[test]
     fn gathered_unit_history_requires_both_prior_owner_commits() {
@@ -907,7 +954,19 @@ impl LayerKernels for Bindings<'_, '_, '_> {
                 }
                 Ok(())
             }
+            fn gathered_dsa_rows(&self) -> Option<usize> {
+                self.binding.local[0].context_gathered_dsa().then_some(self.binding.rows)
+            }
+            fn prepare_dsa(&mut self, rank: usize) -> Result<()> {
+                self.binding.local[rank].context_gathered_stage(self.layer, self.binding.rows, Some(true))
+            }
+            fn select_dsa(&mut self, rank: usize, first: usize, rows: usize, merge: bool) -> Result<()> {
+                self.binding.local[rank].context_dsa_chunk(self.layer, first, rows, merge)
+            }
             fn attention_commit(&mut self, rank: usize) -> Result<()> {
+                if self.gathered_dsa_rows().is_some() {
+                    return self.binding.local[rank].context_gathered_stage(self.layer, self.binding.rows, Some(false));
+                }
                 if let Some(members) = &self.binding.packed {
                     self.binding.local[rank].attention_packed(self.layer, members)
                 } else {
@@ -922,7 +981,29 @@ impl LayerKernels for Bindings<'_, '_, '_> {
                 Ok(())
             }
         }
-        context_pair_with(&mut Pair { binding: self, layer })?;
+        if self.local[0].context_dsa_diagnostic() && self.packed.is_some() {
+            let members = self.packed.take().context("Kimi packed context members absent")?;
+            let total = self.rows;
+            let result: Result<()> = (|| {
+                let mut first = 0;
+                for member in &members {
+                    for local in self.local.iter_mut() { local.stage_context_member(member, first)?; }
+                    self.rows = LocalLane::context_member_rows(member);
+                    context_pair_with(&mut Pair { binding: self, layer })?;
+                    self.local[0].context_dsa_dump(layer, self.rows)?;
+                    first += self.rows;
+                }
+                Ok(())
+            })();
+            self.rows = total;
+            for local in self.local.iter_mut() { local.restore_context_member(total)?; }
+            self.packed = Some(members);
+            result?;
+        } else {
+            context_pair_with(&mut Pair { binding: self, layer })?;
+            // Diagnostic only: both peers have enqueued before either readback.
+            self.local[0].context_dsa_dump(layer, self.rows)?;
+        }
         // Both whole-step replays must be queued before ordinary producer
         // joins, otherwise rank 0's device wait can block rank 1's publication.
         if self.local[0].native_attention(layer)? {

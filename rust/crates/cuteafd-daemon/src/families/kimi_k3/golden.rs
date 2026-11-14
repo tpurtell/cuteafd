@@ -672,11 +672,13 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
         probe.admitted("kimi_k3", &window.tokens, 0);
         probe.selected_score_path("prefill");
         probe.provenance(provenance.clone());
+        let mut forward_seconds = 0.0;
         for chunk in chunks {
             let (first, end) = (chunk.start, chunk.end);
             if let Some(capture) = &capture { capture.arm(first, end - first); }
             let sequences = vec![vec![super::device::SequenceRows {
                 slot: 0, start: first, rows: end - first, pages: &pages }]];
+            let forward_started = std::time::Instant::now();
             engine.forward(&[window.tokens[first..end].to_vec()], &sequences, pool,
                 |lane, offset, rows, logits| {
                     ensure!(lane == 0 && logits.len() == rows * 163840, "Kimi full-forward logits shape differs");
@@ -686,8 +688,11 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
                     }
                     Ok(())
                 })?;
+            forward_seconds += forward_started.elapsed().as_secs_f64();
             probe.scored_prefill_chunk(first + 1, end - first);
         }
+        println!("Kimi scored prefill window {}: tokens={} forward_seconds={:.6} tokens_per_second={:.3} includes_head_and_readback=true",
+            window.id, count, forward_seconds, count as f64 / forward_seconds);
         let record = probe.record();
         ensure!(record.error.is_none(), "Kimi row dump failed: {:?}", record.error);
         let mut score = window.score(&record.rows);
@@ -697,7 +702,9 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
         println!("Kimi window {}: rows={} top-1={:.4}% mean NLL={:.8} mean KL(top1024+tail)={:.8}",
             window.id, score.positions, score.top1 * 100.0, score.nll, score.kl);
         let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join(format!("{}.json", window.id)))?;
-        serde_json::to_writer(&mut out, &serde_json::json!({"probe":record,"score":score}))?;
+        serde_json::to_writer(&mut out, &serde_json::json!({"probe":record,"score":score,"prefill_timing":{
+            "tokens":count,"forward_seconds":forward_seconds,"tokens_per_second":count as f64 / forward_seconds,
+            "includes_head_and_readback":true}}))?;
         out.write_all(b"\n")?;
         records.extend(score.records);
         // Forward's terminal head readback joins both producer ranks. Reset

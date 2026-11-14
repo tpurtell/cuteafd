@@ -218,6 +218,27 @@ impl NativeLaneLayout {
         Ok(layout)
     }
 
+    /// Sparse MLA uses runtime row offsets. Each placed layer's head width
+    /// shares this one serialized attention scratch owner on its rank.
+    pub fn with_sparse_mla_rows(mut self, heads: usize) -> Result<Self> {
+        let bytes = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(self.unit.max(64), heads, false)?;
+        let old = self.operands.insert("MLA attention scratch", bytes).context("Kimi MLA attention scratch absent")?;
+        ensure!(old >= bytes, "Kimi sparse attention scratch exceeds validated exported capacity");
+        self.arena_offsets.clear();
+        self.arena_bytes = 0;
+        for phase in SCRATCH_PHASES {
+            let mut end = 0usize;
+            for &name in phase {
+                let offset = end.next_multiple_of(ARENA_ALIGNMENT);
+                self.arena_offsets.insert(name, offset);
+                end = offset.checked_add(self.operands[name]).context("Kimi sparse phase extent overflow")?;
+            }
+            self.arena_bytes = self.arena_bytes.max(end);
+        }
+        self.bytes()?;
+        Ok(self)
+    }
+
     /// Add exact index owners without changing any existing BF16 or core phase
     /// offsets. Context candidate exchange/partial owners are admitted separately.
     pub fn with_dsa(mut self, cfg: &KimiK3Config, scratch: DsaScratch) -> Result<Self> {
@@ -595,21 +616,24 @@ pub fn baseline_demands(cfg: &KimiK3Config, manifest: &serde_json::Value,
     rows: usize, shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
     core: &super::core::CoreInventory, heads: bool, ranks: usize,
     format: cuteafd_core::SparkReplyFormat) -> Result<Vec<Demand>> {
-    baseline_demands_for_ranks(cfg, manifest, rows, shape, context, slots, verify, core, heads, ranks, 2, format)
+    baseline_demands_for_ranks(cfg, manifest, rows, shape, context, slots, verify, core, heads, ranks, 2, format, if heads { 48 } else { 96 })
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Value,
     rows: usize, shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
     core: &super::core::CoreInventory, heads: bool, spark_ranks: usize, physical_ranks: usize,
-    format: cuteafd_core::SparkReplyFormat) -> Result<Vec<Demand>> {
+    format: cuteafd_core::SparkReplyFormat, attention_heads: usize) -> Result<Vec<Demand>> {
     ensure!(matches!(physical_ranks, 1 | 2), "Kimi baseline physical owner count");
     let shape = shape.validate()?;
     let unit = usize::try_from(shape.unit_rows)?;
     prefill_shape_with(rows, usize::try_from(shape.waves)?, Some(unit))?;
     let mut layout = NativeLaneLayout::for_ranks(cfg, rows, unit, context,
         NativeScratch::from_manifest_for_config(manifest, cfg, physical_ranks)?, physical_ranks)?;
-    if cfg.dsa.is_some() { layout = layout.with_dsa(cfg, DsaScratch::from_manifest(manifest)?)?; }
+    if cfg.dsa.is_some() {
+        layout = layout.with_sparse_mla_rows(attention_heads)?
+            .with_dsa(cfg, DsaScratch::from_manifest(manifest)?)?;
+    }
     let owners = crate::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
     // Enumerate and validate every capturable key; memory is the configured
@@ -645,6 +669,65 @@ mod tests {
 
     fn cfg() -> KimiK3Config {
         KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap()
+    }
+
+    #[test]
+    fn k31_sparse_mla_owner_matches_live_rows_and_placed_heads() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.dsa = Some(super::super::config::KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+        let maximum = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(4096, 96, false)?;
+        for unit in [64, 1024, 2752, 4096] {
+            for heads in [48, 96] {
+                let baseline = NativeLaneLayout::new(&cfg, unit, unit, 1_048_576,
+                    NativeScratch { kda: 4096, mla: [4096, maximum, 4096] })?;
+                let exact = baseline.clone().with_sparse_mla_rows(heads)?;
+                let bytes = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(unit, heads, false)?;
+                assert_eq!(exact.operands["MLA attention scratch"], bytes);
+                assert_eq!(baseline.bytes()? - exact.bytes()?, maximum - bytes);
+                let offset = exact.arena_offsets["MLA attention scratch"];
+                assert!(offset + bytes <= exact.arena_bytes);
+                assert_eq!(exact, baseline.with_sparse_mla_rows(heads)?, "runtime and planner use the same owner layout");
+            }
+        }
+        // Isolate this owner's effect in the real pool solver: fixed BF16
+        // weights/other owners cancel, so reclaimed scratch must become KV.
+        use crate::placement::planner as p;
+        struct Recipe { bytes: u64 }
+        impl p::Recipe for Recipe {
+            fn prepare(&self, _: &p::Request) -> std::result::Result<p::Contract, p::Refusal> {
+                let maximum = 32768;
+                let owner = |id, bytes, category| p::Allocation::buffer(id, p::Location::coordinator(0), bytes,
+                    p::Lifetime::RESIDENT, category, id);
+                let facts = p::Facts { phase_order: p::PhaseOrder::TARGET_THEN_DRAFT,
+                    allocations: vec![owner("Kimi lane 0 native operands", self.bytes, Category::Workspace),
+                        owner("records", 64 * 12 * (656 + 132), Category::Kv)], resident_weights: vec![],
+                    deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
+                    driver_page_tables: vec![], allocation_granularity: vec![] };
+                let mut contract = p::Contract::fixed(64, maximum, 1, facts);
+                contract.set_byte_extent("records", p::ByteCurve::linear(64 * 12 * (656 + 132),
+                    64 * 12 * (656 + 132), maximum))?;
+                contract.variables = vec![p::Variable::Attention { layer: 0,
+                    values: vec![crate::placement::LayerMode::Whole { gpu: 0, ffn: crate::placement::FfnMode::Owner }] },
+                    p::Variable::Prefill(vec![p::PrefillShape { rows: 2752, waves: 1 }]), p::Variable::Lanes(vec![1])];
+                Ok(contract)
+            }
+        }
+        let old = NativeLaneLayout::new(&cfg, 2752, 2752, 1_048_576,
+            NativeScratch { kda: 4096, mla: [4096, maximum, 4096] })?;
+        let exact = old.clone().with_sparse_mla_rows(96)?;
+        let request = p::Request { context: p::Context::resolve(1_048_576, None), pool: p::Pin::Auto,
+            onboard: p::Pin::Auto, prefill: p::Pin::Auto, operation: p::Operation::Serving,
+            resident_weight_limit: None, spark_reply_formats: Default::default() };
+        let capacity = old.bytes()? as u64 + (4 << 30);
+        let budget = p::Budget { id: "rtx0".into(), locations: vec![p::Location::coordinator(0)],
+            physical_bytes: capacity, logical_bytes: capacity, headroom: 0,
+            baseline: p::Baseline::Forecast { occupied: 0, source: "K3.1 exact scratch regression".into(), assumed: false } };
+        let before = p::solve(request.clone(), vec![budget.clone()], &Recipe { bytes: old.bytes()? as u64 })?;
+        let after = p::solve(request, vec![budget], &Recipe { bytes: exact.bytes()? as u64 })?;
+        assert!(after.pool_tokens > before.pool_tokens);
+        assert_eq!(after.facts.allocations.iter().find(|owner| owner.id == "Kimi lane 0 native operands").unwrap().bytes,
+            exact.bytes()? as u64, "solver charges the exact runtime lane allocation");
+        Ok(())
     }
 
     fn k31_manifest() -> serde_json::Value {
@@ -802,7 +885,7 @@ mod tests {
         let shape = prefill_shape_with(8256, 3, Some(2752))?;
         let core = super::super::core::CoreInventory::default();
         let single = baseline_demands_for_ranks(&cfg, &manifest, 8256, shape, 262144, 16, 8,
-            &core, false, 6, 1, cuteafd_core::SparkReplyFormat::Bf16)?;
+            &core, false, 6, 1, cuteafd_core::SparkReplyFormat::Bf16, 96)?;
         let pair = baseline_demands(&cfg, &manifest, 8256, shape, 262144, 16, 8, &core, false, 6, cuteafd_core::SparkReplyFormat::Bf16)?;
         assert!(single.iter().all(|d| d.gpu == 0));
         assert!(!single.iter().any(|d| d.group == "Kimi peer/abort controls"));
@@ -820,7 +903,7 @@ mod tests {
         assert_eq!(code_demand(1, 100, 2)?.bytes, 100);
         assert!(code_demand(1, 0, 1).is_err());
         assert!(baseline_demands_for_ranks(&cfg, &manifest, 8256, shape, 262144, 16, 8,
-            &core, false, 6, 0, cuteafd_core::SparkReplyFormat::Bf16).is_err());
+            &core, false, 6, 0, cuteafd_core::SparkReplyFormat::Bf16, 96).is_err());
         Ok(())
     }
 

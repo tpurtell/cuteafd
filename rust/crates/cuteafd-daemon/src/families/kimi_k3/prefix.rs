@@ -97,10 +97,7 @@ impl<'a> KimiPrefix<'a> {
         ensure!(mla.iter().all(|bank| bank.parity() == parity), "Kimi prefix page ownership differs between ranks");
         let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry_for_ranks(cfg, &resident, mla[0].format())?;
         let resident_page_bytes: usize = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes as usize).sum();
-        let page_bytes = if parity {
-            let index_bytes = resident.iter().sum::<usize>() * mla[0].index_page_bytes();
-            (resident_page_bytes - index_bytes) / 2 + index_bytes
-        } else { resident_page_bytes };
+        let page_bytes = if parity { resident_page_bytes / 2 } else { resident_page_bytes };
         let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes as usize).sum();
         ensure!(mark_bytes == kda.iter().map(|bank| bank.mark_bytes()).sum::<usize>(), "Kimi prefix KDA shard geometry differs");
         ensure!(page_bytes > 0, "Kimi prefix has no resident MLA pages");
@@ -196,6 +193,24 @@ impl<'a> KimiPrefix<'a> {
             }
         }
         Ok(format!("{:x}", digest.finalize()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn page_images(&self, placement: &Placement) -> Result<Vec<Vec<Vec<u8>>>> {
+        self.drain().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        (0..self.0.kda.len()).map(|rank| {
+            let mut images = Vec::new();
+            for (index, &page) in placement.units.iter().enumerate() {
+                let rows = placement.len.saturating_sub(index * MLA_PAGE_ROWS).min(MLA_PAGE_ROWS);
+                if rows == 0 { continue; }
+                for buffer in self.page_buffers(rank, page, rows)? {
+                    let mut bytes = vec![0; buffer.bytes];
+                    self.0.kda[rank].stream.device.run(|| self.0.kda[rank].stream.device.library.copy_d2h(&mut bytes, buffer))?;
+                    images.push(bytes);
+                }
+            }
+            Ok(images)
+        }).collect()
     }
 
     fn state_buffers(&self, rank: usize, slot: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
@@ -486,6 +501,15 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
     fn host_spill_restores_exact_prompt_turn_and_resident_page_frontiers() -> Result<()> {
+        host_spill_roundtrip(false)
+    }
+
+    #[test]
+    fn k31_host_spill_restores_both_parity_index_halves_and_mla_bytes() -> Result<()> {
+        host_spill_roundtrip(true)
+    }
+
+    fn host_spill_roundtrip(indexer: bool) -> Result<()> {
         use crate::shared::prefix::CudaCopyEngine;
         use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
         use cuteafd_hostcache::{config::Config, copy::Stream as CopyStream};
@@ -495,7 +519,7 @@ mod tests {
             (2, AttentionPlacement::Heads, 524_288), (2, AttentionPlacement::Context, 1_048_576)].into_iter()
             .flat_map(|(ranks, attention, context)| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
                 .map(|format| (ranks, attention, context, format))) {
-            let fixture = Fixture::build()?;
+            let fixture = if indexer { Fixture::build_for_tests()? } else { Fixture::build()? };
             let library = fixture.load()?;
             fixture.immediate_copies(&library)?;
             let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
@@ -503,7 +527,9 @@ mod tests {
             cfg.attention = vec![KimiAttention::Kda, KimiAttention::Mla, KimiAttention::Mla];
             cfg.dense.truncate(3);
             let mut inputs = super::super::admission::tests::inputs(&cfg);
-            inputs.attention = (attention == AttentionPlacement::Heads).then_some(AttentionPlacement::Heads);
+            inputs.attention = Some(if attention == AttentionPlacement::Heads {
+                AttentionPlacement::Heads
+            } else { AttentionPlacement::Layers });
             inputs.cache_format = cache_format;
             let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(
                 inputs.rows, inputs.waves, inputs.unit_rows)?.unit_rows as usize;
@@ -528,6 +554,10 @@ mod tests {
                     layer.mode = cuteafd_loader::placement::LayerMode::Whole {
                         gpu: 0, ffn: cuteafd_loader::placement::FfnMode::Owner };
                 }
+            }
+            if indexer {
+                cfg.dsa = Some(cuteafd_loader::families::kimi_k3::config::KimiDsaConfig {
+                    heads: 32, head_dim: 128, topk: 2048 });
             }
             let bank = |rank| -> Result<_> {
                 let device = Device { library: &library, id: rank as i32 };
@@ -594,8 +624,9 @@ mod tests {
                             let first = start.saturating_sub(index * 64).min(64);
                             let last = end.saturating_sub(index * 64).min(64);
                             if first < last {
-                                let offset = first * cache_format.record_bytes();
-                                let bytes = (last - first) * cache_format.record_bytes();
+                                let row_bytes = buffer.bytes / 64;
+                                let offset = first * row_bytes;
+                                let bytes = (last - first) * row_bytes;
                                 let view = crate::shared::prefix::view(buffer, offset, bytes)?;
                                 fill(view, end + rank * 71 + index * 17)?;
                             }
@@ -630,8 +661,8 @@ mod tests {
                 for rank in 0..ranks {
                     for buffer in family.state_buffers(rank, 1)? { fill(buffer, 243)?; }
                     for buffer in family.page_buffers(rank, restored.units[end / 64], 64)? {
-                        fill(crate::shared::prefix::view(buffer, (end % 64) * cache_format.record_bytes(),
-                            cache_format.record_bytes())?, 241)?;
+                        let row_bytes = buffer.bytes / 64;
+                        fill(crate::shared::prefix::view(buffer, (end % 64) * row_bytes, row_bytes)?, 241)?;
                     }
                 }
                 family.commit(&mut restored, end, 1)?;
@@ -819,17 +850,34 @@ mod tests {
             let actual = (0..2).flat_map(|rank| family.state_buffers(rank, 1).unwrap()).map(read).collect::<Result<Vec<_>>>()?;
             assert_eq!(actual, expected, "both KDA state and convolution shards must restore byte-exactly");
             assert_eq!(family.commit_point(&restored), 65);
+            for rank in 0..2 {
+                for (from, to, rows) in [(0, 2, 64), (1, 3, 1)] {
+                    let original = family.page_buffers(rank, from, rows)?;
+                    let restored = family.page_buffers(rank, to, rows)?;
+                    assert_eq!(original.len(), restored.len());
+                    for (expected, actual) in original.into_iter().zip(restored) {
+                        assert_eq!(read(expected)?, read(actual)?, "rank {rank}: restored MLA/index keys/scales");
+                    }
+                    if attention == AttentionPlacement::Context && from as usize % 2 != rank {
+                        assert!(family.page_buffers(rank, from, rows)?.is_empty(), "peer index half must not be restored here");
+                    }
+                }
+            }
             assert_eq!(family.page_segments(0).iter().map(|range| range.bytes).sum::<usize>(), family.layout().page_bytes);
             assert_eq!(family.mark_segments(MarkSlot(0)).iter().map(|range| range.bytes).sum::<usize>(), family.layout().mark_bytes);
             let copies = if attention == AttentionPlacement::Heads { 4 } else { 2 };
-            let index_copies = if attention == AttentionPlacement::Layers { 2 } else { 4 };
+            let index_copies = copies;
             assert_eq!(family.layout().page_bytes, copies * 64 * cache_format.record_bytes()
                 + if indexer { index_copies * 8448 } else { 0 });
             if indexer {
                 assert!(family.record_format().starts_with("kimi_k31_"));
                 for rank in 0..2 {
                     let segments = family.page_buffers(rank, 0, 1)?;
-                    let index_layers = if attention == AttentionPlacement::Layers { 1 } else { 2 };
+                    let index_layers = match attention {
+                        AttentionPlacement::Layers => 1,
+                        AttentionPlacement::Context if rank == 1 => 0,
+                        _ => 2,
+                    };
                     assert_eq!(segments.iter().filter(|segment| segment.bytes == 128).count(), index_layers);
                     assert_eq!(segments.iter().filter(|segment| segment.bytes == 4).count(), index_layers);
                 }

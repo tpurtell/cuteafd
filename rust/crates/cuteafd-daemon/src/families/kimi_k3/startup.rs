@@ -228,7 +228,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     })?;
     memory.sample("modules-shared-peer-reducer")?;
     let lane_layouts: [_; RANKS] = native.iter().enumerate().map(|(rank, native)|
-        native.lane_layout(full, rank, rows, unit, options.max_context)).collect::<Result<Vec<_>>>()?
+        native.lane_layout(full, rank, rows, unit, options.max_context,
+            if RANKS == 2 && matches!(options.attention, Some(cuteafd_loader::placement::AttentionPlacement::Heads | cuteafd_loader::placement::AttentionPlacement::Context)) { 48 } else { 96 }))
+        .collect::<Result<Vec<_>>>()?
         .try_into().map_err(|_| anyhow::anyhow!("Kimi lane physical rank inventory"))?;
     let context_layout = (options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Context))
         .then(|| super::context::Programs::layout(programs, options.cache_format,
