@@ -1742,6 +1742,19 @@ mod tests {
     }
 
     #[test]
+    fn k31_sparse_descriptor_requires_bounded_integer_policy() {
+        for chunk in [1, 64, 512, 4096] {
+            assert_eq!(KimiSparseMla::descriptor_chunk_size(&serde_json::json!({
+                "sparse_mla_row_chunk_size":chunk})).unwrap(), chunk);
+        }
+        for value in [serde_json::Value::Null, serde_json::json!(0), serde_json::json!(4097),
+            serde_json::json!(1.5), serde_json::json!(true), serde_json::json!("64")] {
+            assert!(KimiSparseMla::descriptor_chunk_size(&serde_json::json!({
+                "sparse_mla_row_chunk_size":value})).is_err());
+        }
+    }
+
+    #[test]
     fn k31_selected_mla_manifest_separates_final_and_peer_lse_units() {
         for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
             for (heads, begin) in [(48, None), (96, None), (96, Some(0)), (96, Some(48))] {
@@ -1784,11 +1797,11 @@ mod tests {
 
     #[test]
     fn k31_selected_mla_accepts_sealed_export_manifest() {
-        // Unmodified entries from the f44d9776 SM120 export, not synthesized
+        // Unmodified entries from the 28b496ed chunked SM120 export, not synthesized
         // from the consumer's pointer-name constants.
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/kimi_k31_sparse_mla_sm120.json")).unwrap();
-        assert_eq!(manifest["sparkinfer_revision"], "f44d97769fd540fafd7ed341ae6966554fa80ea7");
+        assert_eq!(manifest["sparkinfer_revision"], "28b496ed82c075da845eb7352814bde2cc52e478");
         let entries = manifest["programs"].as_array().unwrap();
         assert_eq!(entries.len(), 16);
         for entry in entries {

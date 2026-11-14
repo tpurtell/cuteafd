@@ -877,6 +877,22 @@ mod tests {
     }
 
     #[test]
+    fn k31_chunked_owner_is_bounded_for_every_live_unit_and_head_width() -> Result<()> {
+        let cfg = cfg();
+        let maximum = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(4096, 96, false)?;
+        for unit in [1, 6, 64, 512, 513, 2752, 4096] { for heads in [48, 96] {
+            let base = NativeLaneLayout::new(&cfg, unit.max(64), unit.max(64), 1_048_576,
+                NativeScratch { kda: 4096, mla: [4096, maximum, 4096] })?;
+            let chunked = base.clone().with_sparse_mla_rows(heads, 64)?;
+            let expected = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(64, heads, false)?;
+            assert_eq!(chunked.operands["MLA attention scratch"], expected);
+            assert_eq!(base.bytes()? - chunked.bytes()?, maximum - expected);
+            for invalid in [0, 4097] { assert!(base.clone().with_sparse_mla_rows(heads, invalid).is_err()); }
+        }}
+        Ok(())
+    }
+
+    #[test]
     fn k31_sparse_chunk_descriptor_refuses_missing_mixed_and_wrong_scratch() -> Result<()> {
         let manifest = k31_manifest();
         assert_eq!(sparse_mla_chunk(&manifest)?, 64);

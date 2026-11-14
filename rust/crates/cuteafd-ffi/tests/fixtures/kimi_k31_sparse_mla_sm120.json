@@ -1,6 +1,6 @@
 {
-  "source_manifest_sha256": "96c656825d517d3d976bc46f4613c6abc9d33b5fa554f22ff6ffb0e97cb0b847",
-  "sparkinfer_revision": "f44d97769fd540fafd7ed341ae6966554fa80ea7",
+  "source_manifest_sha256": "dd54c5f2adcbd2a667115ffc12fe00a7232aecbb0977dbe4afa6119cab1edd0e",
+  "sparkinfer_revision": "28b496ed82c075da845eb7352814bde2cc52e478",
   "programs": [
     {
       "name": "kimik31_sparse_mla_m64",
@@ -28,6 +28,7 @@
         "partial_output_bytes": 50331648,
         "partial_lse_bytes": 196608,
         "scratch_bytes": 50528256,
+        "row_chunk_size": 64,
         "max_rows": 64,
         "topk": 2048,
         "page_size": 1,
@@ -105,8 +106,8 @@
         "scratch": 50528256
       },
       "capacity_rows": 64,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
-      "object_sha256": "3b8ec465f96108ff0815c691ec81e73443690db5496fe9c5c6e4c2be4cc6b609"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparseAttentionChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "5eff36a64f915ade772772471dae84a81715237f6c19b39573f8a879c0ba9c22"
     },
     {
       "name": "kimik31_sparse_mla_fp8_m64",
@@ -134,6 +135,7 @@
         "partial_output_bytes": 50331648,
         "partial_lse_bytes": 196608,
         "scratch_bytes": 50528256,
+        "row_chunk_size": 64,
         "max_rows": 64,
         "topk": 2048,
         "page_size": 1,
@@ -211,8 +213,8 @@
         "scratch": 50528256
       },
       "capacity_rows": 64,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_fp8_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
-      "object_sha256": "be75a26d4644db5d16eec6576b6158346b160c30d9b50e11a595203727dc6acc"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_fp8_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparseAttentionChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "eb48869edbc8622abed8dc19e08ffc9ceb37085db663b6732fd6cccfee3c9c5f"
     },
     {
       "name": "kimik31_sparse_mla_h96_m64",
@@ -240,6 +242,7 @@
         "partial_output_bytes": 100663296,
         "partial_lse_bytes": 393216,
         "scratch_bytes": 101056512,
+        "row_chunk_size": 64,
         "max_rows": 64,
         "topk": 2048,
         "page_size": 1,
@@ -317,8 +320,8 @@
         "scratch": 101056512
       },
       "capacity_rows": 64,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
-      "object_sha256": "d2ebfe6d8f5247bd13b1bb5ec086d779eb4d0a0e8e3ced92cc4d28009c8cc919"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparseAttentionChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "05db9d1fd1a7e01c36f7c8c650bdf86e4f8932dc5c1e4224bcdc2641b4bd87a4"
     },
     {
       "name": "kimik31_sparse_mla_partial_h0_m64",
@@ -349,7 +352,8 @@
         "head_count": 48,
         "num_splits": 16,
         "page_size": 1,
-        "lse_base": 2
+        "lse_base": 2,
+        "row_chunk_size": 64
       },
       "pointers": [
         {
@@ -419,8 +423,8 @@
         "scratch": 50528256
       },
       "capacity_rows": 64,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h0_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
-      "object_sha256": "b5895b26b822dcfe0b45b42af414c008be16508074220458c3eab3e7c73f56fd"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h0_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparsePartialChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "f986c6b242f1434bb074f3c6ed3460a861a9422c45df4aa7dda79d87ccfdf10a"
     },
     {
       "name": "kimik31_sparse_mla_partial_h48_m64",
@@ -451,7 +455,8 @@
         "head_count": 48,
         "num_splits": 16,
         "page_size": 1,
-        "lse_base": 2
+        "lse_base": 2,
+        "row_chunk_size": 64
       },
       "pointers": [
         {
@@ -521,8 +526,8 @@
         "scratch": 50528256
       },
       "capacity_rows": 64,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h48_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
-      "object_sha256": "34b058bb60a9d4b14ae5bacd4bc5c77cc5cc3a37d252ce6319c7f34839167ec0"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h48_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparsePartialChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "aa643bd622015b6559328709c772f8723cf1312ba0c785d20f4696cc7f8f1447"
     },
     {
       "name": "kimik31_sparse_mla_h96_fp8_m64",
@@ -550,6 +555,7 @@
         "partial_output_bytes": 100663296,
         "partial_lse_bytes": 393216,
         "scratch_bytes": 101056512,
+        "row_chunk_size": 64,
         "max_rows": 64,
         "topk": 2048,
         "page_size": 1,
@@ -627,8 +633,8 @@
         "scratch": 101056512
       },
       "capacity_rows": 64,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_fp8_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
-      "object_sha256": "541536bb477fd9053e298bc5dbc1a0376c208c24d6c6b5dba117492bd81113d8"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_fp8_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparseAttentionChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "eff02cff499722a521b0da8124849aca99b08d24d298fc9370aa4c22dc773cd6"
     },
     {
       "name": "kimik31_sparse_mla_partial_fp8_h0_m64",
@@ -659,7 +665,8 @@
         "head_count": 48,
         "num_splits": 16,
         "page_size": 1,
-        "lse_base": 2
+        "lse_base": 2,
+        "row_chunk_size": 64
       },
       "pointers": [
         {
@@ -729,8 +736,8 @@
         "scratch": 50528256
       },
       "capacity_rows": 64,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h0_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
-      "object_sha256": "d837d4fe99254b901a538579ef5e06ab9b43080463453bd0e920c9cf8d734ec2"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h0_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparsePartialChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "a3f87aed5568b392e07399494385a7aff920f4c02953bd9f7c0445d91dd9ba29"
     },
     {
       "name": "kimik31_sparse_mla_partial_fp8_h48_m64",
@@ -761,7 +768,8 @@
         "head_count": 48,
         "num_splits": 16,
         "page_size": 1,
-        "lse_base": 2
+        "lse_base": 2,
+        "row_chunk_size": 64
       },
       "pointers": [
         {
@@ -831,8 +839,8 @@
         "scratch": 50528256
       },
       "capacity_rows": 64,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h48_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
-      "object_sha256": "d1f7a82e79e5393e89bad74c0c1dfb6e5f56b49a5852a264a5c11429641103ff"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h48_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparsePartialChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "591c44aea3ac978c777d5af5e3a38e2801f3610ddf0939d6f983b7759a1296ad"
     },
     {
       "name": "kimik31_sparse_mla_m4096",
@@ -857,9 +865,10 @@
         "kv_cache": "bf16",
         "num_splits": 16,
         "chunks_per_split": 2,
-        "partial_output_bytes": 3221225472,
-        "partial_lse_bytes": 12582912,
-        "scratch_bytes": 3233808384,
+        "partial_output_bytes": 50331648,
+        "partial_lse_bytes": 196608,
+        "scratch_bytes": 50528256,
+        "row_chunk_size": 64,
         "max_rows": 4096,
         "topk": 2048,
         "page_size": 1,
@@ -934,11 +943,11 @@
         }
       ],
       "scratch_bytes_at_capacity": {
-        "scratch": 3233808384
+        "scratch": 50528256
       },
       "capacity_rows": 4096,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
-      "object_sha256": "7514940bd9610ca87f60d31d5d2f98ab23cd8b4f0b2685ab133c3a98485a4117"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparseAttentionChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "a9701cea199e5fbfb5221f2312b0a8dd90ab2cf86e93024bd012fb86f7f79e05"
     },
     {
       "name": "kimik31_sparse_mla_fp8_m4096",
@@ -963,9 +972,10 @@
         "kv_cache": "fp8",
         "num_splits": 16,
         "chunks_per_split": 2,
-        "partial_output_bytes": 3221225472,
-        "partial_lse_bytes": 12582912,
-        "scratch_bytes": 3233808384,
+        "partial_output_bytes": 50331648,
+        "partial_lse_bytes": 196608,
+        "scratch_bytes": 50528256,
+        "row_chunk_size": 64,
         "max_rows": 4096,
         "topk": 2048,
         "page_size": 1,
@@ -1040,11 +1050,11 @@
         }
       ],
       "scratch_bytes_at_capacity": {
-        "scratch": 3233808384
+        "scratch": 50528256
       },
       "capacity_rows": 4096,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_fp8_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
-      "object_sha256": "2b54043647975fdc1ebec6bb85367ad5983791f80c3f0fb2a89f586d0c989994"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_fp8_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparseAttentionChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "7a0dcebd78583db2532d44b2e5edf90a0c5ab26a490ae057e6e07f28d60dc906"
     },
     {
       "name": "kimik31_sparse_mla_h96_m4096",
@@ -1069,9 +1079,10 @@
         "kv_cache": "bf16",
         "num_splits": 16,
         "chunks_per_split": 2,
-        "partial_output_bytes": 6442450944,
-        "partial_lse_bytes": 25165824,
-        "scratch_bytes": 6467616768,
+        "partial_output_bytes": 100663296,
+        "partial_lse_bytes": 393216,
+        "scratch_bytes": 101056512,
+        "row_chunk_size": 64,
         "max_rows": 4096,
         "topk": 2048,
         "page_size": 1,
@@ -1146,11 +1157,11 @@
         }
       ],
       "scratch_bytes_at_capacity": {
-        "scratch": 6467616768
+        "scratch": 101056512
       },
       "capacity_rows": 4096,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
-      "object_sha256": "9656b40f2fdef1c0a1aa66186fe8d92669b7b2052a66238b7c8a7e4c7c683809"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparseAttentionChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "2f1b9951c7bacfed82eb0adcb5b7304193f374cea9d8ecf38e63b3a240834d35"
     },
     {
       "name": "kimik31_sparse_mla_partial_h0_m4096",
@@ -1181,7 +1192,8 @@
         "head_count": 48,
         "num_splits": 16,
         "page_size": 1,
-        "lse_base": 2
+        "lse_base": 2,
+        "row_chunk_size": 64
       },
       "pointers": [
         {
@@ -1248,11 +1260,11 @@
         }
       ],
       "scratch_bytes_at_capacity": {
-        "scratch": 3233808384
+        "scratch": 50528256
       },
       "capacity_rows": 4096,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h0_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
-      "object_sha256": "9bb6d4d2128d8b9eafb9ab03f46f29cc83f818baf0c7762d2032a4307ffb01c7"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h0_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparsePartialChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "b7c56d1b301c1e6497f5703a89dc46a40ab4e8b5f09dfc71722505efc6fcf70e"
     },
     {
       "name": "kimik31_sparse_mla_partial_h48_m4096",
@@ -1283,7 +1295,8 @@
         "head_count": 48,
         "num_splits": 16,
         "page_size": 1,
-        "lse_base": 2
+        "lse_base": 2,
+        "row_chunk_size": 64
       },
       "pointers": [
         {
@@ -1350,11 +1363,11 @@
         }
       ],
       "scratch_bytes_at_capacity": {
-        "scratch": 3233808384
+        "scratch": 50528256
       },
       "capacity_rows": 4096,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h48_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
-      "object_sha256": "fc6e829d6d9f26475adc6b78fc740a5edf36eb6f45bc75320ec5e60c77312848"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h48_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparsePartialChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "a50b1da23108c3d0f21f0cf06b01ab3a760d0ca4da2e8ae20a2694484dd25ebe"
     },
     {
       "name": "kimik31_sparse_mla_h96_fp8_m4096",
@@ -1379,9 +1392,10 @@
         "kv_cache": "fp8",
         "num_splits": 16,
         "chunks_per_split": 2,
-        "partial_output_bytes": 6442450944,
-        "partial_lse_bytes": 25165824,
-        "scratch_bytes": 6467616768,
+        "partial_output_bytes": 100663296,
+        "partial_lse_bytes": 393216,
+        "scratch_bytes": 101056512,
+        "row_chunk_size": 64,
         "max_rows": 4096,
         "topk": 2048,
         "page_size": 1,
@@ -1456,11 +1470,11 @@
         }
       ],
       "scratch_bytes_at_capacity": {
-        "scratch": 6467616768
+        "scratch": 101056512
       },
       "capacity_rows": 4096,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_fp8_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
-      "object_sha256": "22ac5c3a65c1f2f5ba1d6deda35d6d92512e966483649523f8f4f7a594a36ca3"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_fp8_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparseAttentionChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "2dd421cfc7775827893c6557c74a50a73c16a27f5f88e3516b7e4ebea58f46d0"
     },
     {
       "name": "kimik31_sparse_mla_partial_fp8_h0_m4096",
@@ -1491,7 +1505,8 @@
         "head_count": 48,
         "num_splits": 16,
         "page_size": 1,
-        "lse_base": 2
+        "lse_base": 2,
+        "row_chunk_size": 64
       },
       "pointers": [
         {
@@ -1558,11 +1573,11 @@
         }
       ],
       "scratch_bytes_at_capacity": {
-        "scratch": 3233808384
+        "scratch": 50528256
       },
       "capacity_rows": 4096,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h0_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
-      "object_sha256": "a2d33b123b63c970567743f342f06ebc70c3674b06581734058759227005d832"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h0_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparsePartialChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "58114fd5cc85c9ce317c5be7752abb98c6f8c0072b65290ab2612447a60e3c61"
     },
     {
       "name": "kimik31_sparse_mla_partial_fp8_h48_m4096",
@@ -1593,7 +1608,8 @@
         "head_count": 48,
         "num_splits": 16,
         "page_size": 1,
-        "lse_base": 2
+        "lse_base": 2,
+        "row_chunk_size": 64
       },
       "pointers": [
         {
@@ -1660,11 +1676,11 @@
         }
       ],
       "scratch_bytes_at_capacity": {
-        "scratch": 3233808384
+        "scratch": 50528256
       },
       "capacity_rows": 4096,
-      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h48_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
-      "object_sha256": "06fd54284c611ed1bb60873b4f9e225fda0f5c0ac367ffa90ae5dd206e44d52e"
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h48_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_SparsePartialChunks_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "6acf3ce568056b760a9fe358d54049c59bb311cbf3326a940f8430fc6a9c8ef0"
     }
   ]
 }
