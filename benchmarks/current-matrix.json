@@ -265,12 +265,12 @@
         "reason": "doesn't fit"
       },
       "1rtx": {
-        "status": "pending",
-        "reason": "needs a Release smoke card for the MC original BF16 core"
+        "status": "current",
+        "report": "benchmarks/muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-1rtx-4spark-muse-spark-exl3-k4-mc-min-cand-r1"
       },
       "2rtx": {
-        "status": "pending",
-        "reason": "needs a Release smoke card for the MC original BF16 core"
+        "status": "current",
+        "report": "benchmarks/muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-spark-exl3-k4-mc-max-cand-r1"
       }
     },
     {
