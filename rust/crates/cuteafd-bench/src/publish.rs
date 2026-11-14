@@ -1480,7 +1480,7 @@ mod tests {
             "v4-flash-reference-tp4", "glm53-exlr8-a8-max", "qwen38-27b-bf16-min-nospec",
             "qwen38-27b-fp8-min-nospec", "glm53-exl3-min", "glm53-exl3-max",
             "glm53-exl3-k6core-min", "glm53-exl3-k6core-max", "step5-exl3-k6core-min",
-            "step5-exl3-k6core-max"]));
+            "step5-exl3-k6core-max", "muse-spark-exl3-min", "muse-spark-exl3-max"]));
     }
 
     /// Writes `benchmarks/current-matrix.json` from rows: the real file, re-parsed by the real loader.
