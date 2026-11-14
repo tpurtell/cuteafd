@@ -167,6 +167,43 @@ def native_attention_programs():
     return out
 
 
+def native_attention_prefill_shapes():
+    """Currently executable FP8 groups only; [N,K], never the vocabulary head."""
+    return {
+        "glm": {(16384,2048),(8192,2048),(6144,16384),(6144,8192)},
+        "kimik3": {(18432,1536),(9216,1536),(7168,12288),(7168,6144)},
+        "step5": {(4096,12288),(4096,6144)},
+        "muse": {(8192,8192),(4096,8192),(1024,8192),(512,8192),(8192,4096)},
+    }
+
+
+def native_attention_prefill_preference(n, k, output):
+    """Full-band A8/A16 curves: fork#312, SM120/SM121, 2048..4096 plus tails."""
+    shapes = set().union(*native_attention_prefill_shapes().values())
+    expected = "f32" if (n, k) in native_attention_f32_shapes() else "bf16"
+    if (n, k) not in shapes or output != expected:
+        return {"12.0": False, "12.1": False}
+    return {"12.0": True, "12.1": (n, k, output) != (512, 8192, "bf16")}
+
+
+def compile_native_attention_prefill(n, k, output):
+    from b12x.integration.cuteafd._fp8_weights import compile_native_fp8_prefill_aot
+    program = compile_native_fp8_prefill_aot(input_features=k, output_features=n, max_rows=4096, output=output)
+    return dataclasses.replace(program, geometry=dict(program.geometry,
+        auto_prefill=native_attention_prefill_preference(n, k, output)))
+
+
+def native_attention_prefill_programs():
+    from functools import partial
+    out = []
+    for n,k in sorted(set().union(*native_attention_prefill_shapes().values())):
+        output = "f32" if (n,k) in native_attention_f32_shapes() else "bf16"
+        suffix = "_f32" if output == "f32" else ""
+        out.append((f"n{n}_k{k}_m4096_a8{suffix}", "attention_projection",
+            dict(max_rows=4096), partial(compile_native_attention_prefill, n, k, output)))
+    return out
+
+
 def native_attention_bf16_shapes():
     # Muse original K/V are separate projections, whole and TP2 output splits.
     shapes = {(k, n) for family, operands in native_attention_shapes().items()
@@ -1583,6 +1620,7 @@ def main() -> None:
         if name == "native_attention":
             manifest["families"][name] = {"scale_block": 128, "decode_rows": 64}
             work += [(name, *item) for item in native_attention_programs()]
+            work += [(name, *item) for item in native_attention_prefill_programs()]
             continue
         if name in ("glmf_stage", "glmf2_stage"):
             g = GLM53_FLASH
@@ -1808,6 +1846,7 @@ def main() -> None:
     if "native_attention" not in geometries and any(name in geometries for name in
             ("glm", "glm2", "kimik3", "kimik31", "step5", "step52", "muse", "muse2", "ml4")):
         work += [("native_attention", *item) for item in native_attention_programs()]
+        work += [("native_attention", *item) for item in native_attention_prefill_programs()]
     if "minimax" in geometries:
         from export_b12x_exlr8_dense_aot import minimax_programs
         manifest["families"]["minimax"] = {"abi_version": 1}

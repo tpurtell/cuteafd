@@ -1869,3 +1869,34 @@ def test_minimax_native_divisor_export_groups_include_rtx_tp2_and_bf16_sparks():
                  "routed-minimax_nvfp4a4-spark-bf16"):
         assert groups[name][groups[name].index("--geometry") + 1] == "minimax_nvfp4a4"
     assert "routed-minimax_nvfp4a4-spark-wire" not in groups
+
+
+def test_native_fp8_prefill_stems_are_additive_and_exclude_decode_and_heads():
+    exporter = compare_sm.load_file("test_native_prefill_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    expected_shapes = {
+        "glm": {(16384,2048),(8192,2048),(6144,16384),(6144,8192)},
+        "kimik3": {(18432,1536),(9216,1536),(7168,12288),(7168,6144)},
+        "step5": {(4096,12288),(4096,6144)},
+        "muse": {(8192,8192),(4096,8192),(1024,8192),(512,8192),(8192,4096)},
+    }
+    assert exporter.native_attention_prefill_shapes() == expected_shapes
+    entries = exporter.native_attention_prefill_programs()
+    expected = {f"n{n}_k{k}_m4096_a8" + ("_f32" if (n,k) in exporter.native_attention_f32_shapes() else "")
+                for n,k in set().union(*expected_shapes.values())}
+    assert len(entries) == len(expected) and {entry[0] for entry in entries} == expected
+    assert not expected & {entry[0] for entry in exporter.native_attention_programs()}
+    assert all(entry[2] == {"max_rows":4096} for entry in entries)
+    jobs = {job[0]:job[1:] for job in compare_sm.jobs("all")}
+    assert jobs["native-attention-prefill-fp8"] == ("export_b12x_dsv4_aot.py",
+        ["--geometry","native_attention","--only",",".join(entry[0] for entry in entries)])
+
+
+def test_native_fp8_auto_preference_uses_capability_shape_and_output_only():
+    exporter = compare_sm.load_file("test_native_prefill_preference", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    for n,k in set().union(*exporter.native_attention_prefill_shapes().values()):
+        output = "f32" if (n,k) in exporter.native_attention_f32_shapes() else "bf16"
+        expected = {"12.0":True,"12.1":(n,k,output)!=(512,8192,"bf16")}
+        assert exporter.native_attention_prefill_preference(n,k,output)==expected
+        other = "bf16" if output=="f32" else "f32"
+        assert exporter.native_attention_prefill_preference(n,k,other)=={"12.0":False,"12.1":False}
+    assert exporter.native_attention_prefill_preference(128,128,"bf16")=={"12.0":False,"12.1":False}
