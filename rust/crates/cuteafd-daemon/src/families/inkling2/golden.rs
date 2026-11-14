@@ -38,7 +38,7 @@ fn raw(buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<cuteafd
 fn run(args: GoldenArgs) -> Result<()> {
     let view = args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
-    ensure!(view.mode() == cuteafd_loader::plan::CoreView::Original, "Inkling stage2 golden currently qualifies original BF16 core only");
+    ensure!(view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Original, "Inkling stage2 golden currently qualifies original BF16 core only");
     let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = Inkling2Config::from_hf(&checkpoint.config)?;
     ensure!(args.last_layer < cfg.layers, "Inkling --last-layer outside checkpoint");
@@ -87,6 +87,16 @@ fn run(args: GoldenArgs) -> Result<()> {
     for (index, layout) in expert_layouts.iter().enumerate() {
         // Reuse one independently retired expert arena: no one-card fullmodel
         // fit requirement, and native expert precision is never changed.
+        // Every layer owns separate causal histories; the cold whole-sequence
+        // unit reuses storage only after the preceding layer has drained.
+        device.run(|| {
+            for name in ["attn_conv_history", "mlp_conv_history", "k_conv_history", "v_conv_history", "ring", "global_cache"] {
+                let buffer = owner.buffer(name)?;
+                // SAFETY: no queued prior-layer reader remains after drain.
+                unsafe { library.cuda_zero_bytes_async(buffer, buffer.bytes, stream.raw)?; }
+            }
+            Ok(())
+        })?;
         let experts = device.run(|| Mxfp8::load(Rc::clone(&stream), layout, &metadata, &package, &cfg, rows))?;
         device.run(|| layers::layer(&kernels, &owner, &weights, &experts, &cfg, index, rows))?;
         stream.drain()?;
