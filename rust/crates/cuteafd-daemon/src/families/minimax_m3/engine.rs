@@ -497,6 +497,7 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         let rank = &self.storage.ranks[0];
         let owner = rank.prefill[unit.slot].borrow();
         owner.router(&rank.kernels, &rank.weights, layer, unit.rows.len())?;
+        if let Some(taps) = &mut self.taps { taps.router(layer, &rank.weights, unit, &owner)?; }
         if let Some(usage) = &self.storage.usage {
             let tally = usage.routes(owner.stream.device.id, layer,
                 cuteafd_ffi::expert_usage::UsagePhase::Prefill)?;

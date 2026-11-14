@@ -62,6 +62,15 @@ impl LayerTaps {
             &mut self.bytes[..count], buffer))?;
         self.write_bytes(layer, stage, unit.rows.start, &self.bytes[..count])
     }
+    pub fn router(&mut self, layer: usize, weights: &TargetWeights<'_>, unit: &Unit,
+        owner: &UnitOwner<'_>) -> Result<()> {
+        for (name, bytes) in [("logits", unit.rows.len() * 128 * 4),
+            ("route_ids", unit.rows.len() * 4 * 4), ("route_weights", unit.rows.len() * 4 * 4)] {
+            self.extent(layer, &format!("router.{name}"), owner.plane(name)?, bytes, unit, owner)?;
+        }
+        let bias = weights.operand(&format!("language_model.model.layers.{layer}.block_sparse_moe.e_score_correction_bias"))?.buffer;
+        self.extent(layer, "router.bias", bias, 128 * 4, unit, owner)
+    }
     pub fn ffn_inputs(&mut self, layer: usize, prefix: &str, shared: bool,
         admitted: &CoordinatorWeights, unit: &Unit, owner: &UnitOwner<'_>) -> Result<()> {
         let stem = if shared { "block_sparse_moe.shared_experts" } else { "mlp" };
@@ -166,6 +175,7 @@ impl PrefillHooks for Prefill<'_, '_> {
         let rows = unit.rows.len();
         let owner = &mut self.owners[unit.slot];
         owner.router(self.kernels, self.weights, layer, rows)?;
+        if let Some(taps) = &mut self.taps { taps.router(layer, self.weights, unit, owner)?; }
         let identity = *self.next_identity;
         ensure!(identity != 0, "MiniMax Spark request identity must be nonzero");
         *self.next_identity = identity.checked_add(1).context("MiniMax Spark request identity exhausted")?;
