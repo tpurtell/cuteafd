@@ -23,6 +23,7 @@ TimeoutStopSec below 90 s (systemd would SIGKILL the teardown), and never
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import concurrent.futures
 import contextlib
@@ -2516,13 +2517,26 @@ def checkpoint_is_nvfp4(values):
 def toolchain_hash(revision):
     """The dev toolchain identity of `revision` (scripts/build/dev-toolchain.py
     over that revision's own files), so a build runs in its pinned dev image."""
-    digest = hashlib.sha256()
-    for name in ('docker/Dockerfile.dev', 'docker/entrypoint.sh', 'scripts/build/install-dev-cache-tools.sh',
-                 'scripts/build/dev-toolchain.py'):
+    def read_blob(name):
         shown = subprocess.run(['git', '-C', str(REPO), 'show', f'{revision}:{name}'], capture_output=True, timeout=120)
         if shown.returncode:
             raise ValueError(f'cannot read {name} at {revision}: ' + shown.stderr.decode(errors='replace').strip())
-        blob = shown.stdout
+        return shown.stdout
+
+    script = 'scripts/build/dev-toolchain.py'
+    source = read_blob(script)
+    # Older revisions predate the shared INPUTS declaration. Never execute a
+    # historical toolchain script just to discover its inputs.
+    inputs = ('docker/Dockerfile.dev', 'docker/entrypoint.sh', 'scripts/build/install-dev-cache-tools.sh', script)
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'INPUTS' for target in node.targets):
+            inputs = ast.literal_eval(node.value)
+            break
+    if not isinstance(inputs, tuple) or not inputs or not all(isinstance(name, str) for name in inputs):
+        raise ValueError(f'invalid toolchain INPUTS at {revision}')
+    digest = hashlib.sha256()
+    for name in inputs:
+        blob = source if name == script else read_blob(name)
         digest.update(name.encode() + b'\0' + blob + b'\0')
     return digest.hexdigest()[:16]
 

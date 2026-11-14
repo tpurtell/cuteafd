@@ -1473,6 +1473,25 @@ def test_binary_without_sweep_fields_is_refused(entry, tmp_path, monkeypatch):
     cards.binary_supports('/new/cuteafd', ROOT, job, ['levels', 'post_load_c1'])
 
 
+def test_toolchain_hash_matches_canonical_head_identity():
+    canonical = subprocess.run([sys.executable, str(ROOT / 'scripts/build/dev-toolchain.py')],
+                               capture_output=True, text=True, check=True).stdout.strip()
+    assert cards.toolchain_hash('HEAD') == canonical
+
+
+def test_toolchain_hash_legacy_revisions_keep_the_original_inputs(monkeypatch):
+    import hashlib
+    inputs = ('docker/Dockerfile.dev', 'docker/entrypoint.sh',
+              'scripts/build/install-dev-cache-tools.sh', 'scripts/build/dev-toolchain.py')
+    blobs = {name: b'# legacy input\n' for name in inputs}
+    expected = hashlib.sha256()
+    for name in inputs:
+        expected.update(name.encode() + b'\0' + blobs[name] + b'\0')
+    monkeypatch.setattr(cards.subprocess, 'run', lambda argv, **kwargs:
+                        SimpleNamespace(returncode=0, stdout=blobs[argv[-1].split(':', 1)[1]]))
+    assert cards.toolchain_hash('legacy') == expected.hexdigest()[:16]
+
+
 def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_path, monkeypatch):
     # #72: a 4-Spark MiMo card was staged on six hosts with SPARK_TP=6 forced into
     # the build config, its --set overrides were ignored and untagged dev images
