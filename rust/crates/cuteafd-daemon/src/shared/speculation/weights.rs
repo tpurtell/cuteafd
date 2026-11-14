@@ -93,6 +93,44 @@ impl Weight<'_> {
     }
 }
 
+/// One projection dispatch shared by block backbones; storage stays with its owner.
+pub(crate) trait Projection {
+    /// # Safety
+    /// The device spans hold BF16 [rows,k] input and [rows,n] output, do not
+    /// overlap, and survive all queued work on `stream`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn project(&self, x: *const c_void, first: usize, out: *mut c_void,
+        rows: usize, k: usize, n: usize, stream: *mut c_void) -> Result<()>;
+}
+
+pub(crate) struct LegacyProjection<'w, 'a> {
+    pub weight: &'w Weight<'a>,
+    pub library: &'a NativeLibrary,
+    pub programs: &'w cuteafd_ffi::draft_projection::DraftProjections<'a>,
+    pub scratch: Option<&'w DeviceAllocation<'a>>,
+    pub mode: crate::shared::fp8_linear::Fp8Rows,
+}
+
+impl Projection for LegacyProjection<'_, '_> {
+    unsafe fn project(&self, x: *const c_void, first: usize, out: *mut c_void,
+        rows: usize, k: usize, n: usize, stream: *mut c_void) -> Result<()> {
+        match self.weight {
+            Weight::Bf16(weight) => {
+                // SAFETY: the caller retains input/output and the selected weight rows.
+                let source = unsafe { weight.buffer.ptr.cast::<u8>().add(first * k * 2) }.cast();
+                // SAFETY: the selected matrix and spans satisfy the caller's contract.
+                unsafe { Ok(self.programs.launch(x, source, out, rows, k, n, stream)?) }
+            }
+            Weight::Fp8(weight) => {
+                let scratch = self.scratch.context("FP8 dSpark scratch was not admitted")?;
+                // SAFETY: mode and scratch capacity were checked during admission.
+                unsafe { weight.apply_rows(self.library, x, out, false, rows, first, n,
+                    scratch, stream, self.mode) }
+            }
+        }
+    }
+}
+
 pub(crate) type WeightAllocator<'a, 'b> = dyn FnMut(i32, &str, usize) -> Result<Allocation<'a>> + 'b;
 
 pub(crate) fn standalone<'a>(library: &'a NativeLibrary, device: i32, _: &str, bytes: usize) -> Result<Allocation<'a>> {

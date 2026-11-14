@@ -1,4 +1,4 @@
-//! Checkpoint-native geometry for Qwen3-backbone block dSpark drafters.
+//! Checkpoint-native geometry for block dSpark drafters.
 //! This is admission metadata, not a claim that a matching GPU export exists.
 use serde::Deserialize;
 use serde_json::Value;
@@ -55,6 +55,60 @@ pub struct DsparkRotaryPlan {
     pub attention_factor: f32,
     /// Additional MLA softmax multiplier, separate from rotary magnitude.
     pub softmax_factor: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsparkNorm { Rms, Gemma }
+
+/// Arithmetic belongs to the checkpoint, independently of the draft lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DsparkBackbone {
+    pub norm: DsparkNorm,
+    pub rotary_dim: usize,
+    pub activation: cuteafd_core::FfnActivation,
+}
+
+impl DsparkBackbone {
+    pub fn from_layers(raw: &Value, head_dim: usize) -> Result<Self, DsparkConfigError> {
+        use DsparkConfigError::Unsupported;
+        let norm = match raw.get("use_gemma_norm") {
+            None | Some(Value::Bool(false)) => DsparkNorm::Rms,
+            Some(Value::Bool(true)) => DsparkNorm::Gemma,
+            _ => return Err(Unsupported("use_gemma_norm must be boolean".into())),
+        };
+        let rotary_dim = match raw.get("rotary_dim") {
+            None => head_dim,
+            Some(value) => value.as_u64().and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| Unsupported("invalid rotary_dim".into()))?,
+        };
+        if rotary_dim == 0 || rotary_dim > head_dim || rotary_dim % 2 != 0 {
+            return Err(Unsupported("rotary_dim must be positive, even and no wider than a head".into()));
+        }
+        if let Some(value) = raw.get("partial_rotary_factor") {
+            let factor = value.as_f64().filter(|n| n.is_finite())
+                .ok_or_else(|| Unsupported("invalid partial_rotary_factor".into()))?;
+            if (factor * head_dim as f64 - rotary_dim as f64).abs() > 1e-9 {
+                return Err(Unsupported("partial_rotary_factor disagrees with rotary_dim".into()));
+            }
+        }
+        let activation = match raw["hidden_act"].as_str() {
+            Some("silu") => cuteafd_core::FfnActivation::SiluBf16Product { limit: None },
+            Some("swigluoai") => {
+                let number = |name: &str| raw[name].as_f64().map(|n| n as f32)
+                    .ok_or_else(|| Unsupported(format!("missing or invalid {name}")));
+                cuteafd_core::FfnActivation::SwigluOai {
+                    alpha: number("swiglu_alpha")?, beta: 1.0, limit: number("swiglu_limit")?,
+                }
+            }
+            _ => return Err(Unsupported("unsupported dSpark FFN activation".into())),
+        }.validate().map_err(|error| Unsupported(error.into()))?;
+        Ok(Self { norm, rotary_dim, activation })
+    }
+
+    pub fn is_qwen3(self, head_dim: usize) -> bool {
+        self.norm == DsparkNorm::Rms && self.rotary_dim == head_dim
+            && self.activation == (cuteafd_core::FfnActivation::SiluBf16Product { limit: None })
+    }
 }
 
 impl DsparkRope {
@@ -159,6 +213,7 @@ impl DsparkRope {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockDsparkConfig {
+    pub backbone: DsparkBackbone,
     pub hidden: usize,
     pub intermediate: usize,
     pub layers: usize,
@@ -239,11 +294,9 @@ impl BlockDsparkConfig {
                 "expected DSparkDraftModel or speculators_model_type=dspark".into(),
             ));
         }
-        let t: Layers = serde_json::from_value(if speculators {
-            raw["transformer_layer_config"].clone()
-        } else {
-            raw.clone()
-        })?;
+        let layer_config = if speculators { &raw["transformer_layer_config"] } else { raw };
+        let t: Layers = serde_json::from_value(layer_config.clone())?;
+        let backbone = DsparkBackbone::from_layers(layer_config, t.head_dim)?;
         let d = if speculators {
             raw
         } else {
@@ -303,6 +356,7 @@ impl BlockDsparkConfig {
             || raw["enable_confidence_head"] != true
             || raw["confidence_head_with_markov"] != true
             || t.hidden_act != "silu"
+            || !backbone.is_qwen3(t.head_dim)
             || (speculators
                 && (raw["sample_from_anchor"] != true
                     || raw["draft_vocab_size"].as_u64() != Some(t.vocab_size as u64)))
@@ -338,6 +392,7 @@ impl BlockDsparkConfig {
             return Err(Unsupported("duplicate target tap".into()));
         }
         Ok(Self {
+            backbone,
             hidden: t.hidden_size,
             intermediate: t.intermediate_size,
             layers: t.num_hidden_layers,
@@ -360,6 +415,47 @@ impl BlockDsparkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backbone_descriptor_preserves_qwen_and_reads_native_minimax() {
+        use cuteafd_core::FfnActivation;
+        for raw in [qwen(), glm_flash_speculators()["transformer_layer_config"].clone()] {
+            let head = raw["head_dim"].as_u64().unwrap() as usize;
+            let descriptor = DsparkBackbone::from_layers(&raw, head).unwrap();
+            assert!(descriptor.is_qwen3(head));
+            assert_eq!(descriptor.norm, DsparkNorm::Rms);
+            let old = FfnActivation::SiluBf16Product { limit: None };
+            for gate in -128..128 {
+                for up in [-19.0, -1.125, 0.0, 0.03125, 7.0, 19.0] {
+                    let gate = gate as f32 / 16.0;
+                    assert_eq!(descriptor.activation.evaluate(gate, up).to_bits(), old.evaluate(gate, up).to_bits());
+                }
+            }
+        }
+        let raw: Value = serde_json::from_str(include_str!("../families/minimax_m3/fixtures/dspark-config.json")).unwrap();
+        let descriptor = DsparkBackbone::from_layers(&raw["text_config"], 128).unwrap();
+        assert_eq!(descriptor, DsparkBackbone { norm: DsparkNorm::Gemma, rotary_dim: 64,
+            activation: FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 } });
+        assert!(!descriptor.is_qwen3(128));
+        // Parsing arithmetic does not claim that runtime bindings exist yet.
+        assert!(BlockDsparkConfig::from_json(&raw).is_err());
+    }
+
+    #[test]
+    fn backbone_descriptor_rejects_ambiguous_arithmetic() {
+        for (key, value) in [("use_gemma_norm", json!(1)), ("rotary_dim", json!(0)),
+            ("rotary_dim", json!(127)), ("rotary_dim", json!(130)), ("rotary_dim", json!(1.5)),
+            ("partial_rotary_factor", json!(0.5)), ("hidden_act", json!("gelu"))] {
+            let mut raw = qwen();
+            raw[key] = value;
+            assert!(DsparkBackbone::from_layers(&raw, 128).is_err(), "{key}");
+        }
+        for key in ["swiglu_alpha", "swiglu_limit"] {
+            let mut raw = json!({"hidden_act":"swigluoai", "swiglu_alpha":1.702, "swiglu_limit":7.0});
+            raw[key] = json!(0.0);
+            assert!(DsparkBackbone::from_layers(&raw, 128).is_err(), "{key}");
+        }
+    }
 
     #[test]
     fn arena_requests_follow_the_shared_recipe_for_both_representations() {

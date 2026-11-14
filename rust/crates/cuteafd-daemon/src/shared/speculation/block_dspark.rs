@@ -91,6 +91,7 @@ pub(crate) fn is_dspark(snapshot: &Path) -> Result<bool> {
 /// The drafter geometry the kernels are written for, read from `config.json`.
 #[derive(Debug, Clone)]
 pub(crate) struct DsparkConfig {
+    pub backbone: cuteafd_loader::formats::block_dspark::DsparkBackbone,
     pub hidden: usize,
     pub intermediate: usize,
     pub layers: usize,
@@ -125,7 +126,7 @@ impl DsparkConfig {
             ensure!(matches!(cfg.rope, DsparkRope::Default { .. }), "64-wide dSpark requires default RoPE");
             None
         } else { Some(cfg.rope.plan(cfg.head_dim)?) };
-        Ok(Self { hidden: cfg.hidden, intermediate: cfg.intermediate, layers: cfg.layers,
+        Ok(Self { backbone: cfg.backbone, hidden: cfg.hidden, intermediate: cfg.intermediate, layers: cfg.layers,
             heads: cfg.heads, kv_heads: cfg.kv_heads, head_dim: cfg.head_dim,
             eps: cfg.eps as f32, theta: rope_theta as f32, block: cfg.block,
             mask_token: cfg.mask_token, rank: cfg.rank, taps: cfg.taps, vocab: cfg.vocab, causal: cfg.causal,
@@ -442,6 +443,7 @@ impl<'a> DsparkDrafter<'a> {
         mut allocate: impl FnMut(i32, &str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DsparkConfig::read(snapshot)?;
+        ensure!(cfg.backbone.is_qwen3(cfg.head_dim), "dSpark backbone needs native arithmetic bindings");
         let h = cfg.hidden;
         let shapes = [(h * cfg.taps.len(), h), (h, cfg.qkv_width()), (h, 2 * cfg.kv_heads * cfg.head_dim),
             (cfg.q_width(), h), (h, 2 * cfg.intermediate), (cfg.intermediate, h)];
@@ -592,17 +594,12 @@ impl<'a> DsparkDrafter<'a> {
     #[allow(clippy::too_many_arguments)]
     unsafe fn linear(&self, x: *const c_void, weight: &Weight<'_>, first: usize, out: *mut c_void, rows: usize,
         k: usize, n: usize) -> Result<()> {
-        match weight {
-            // SAFETY: rows first..first + n lie in the matrix; the caller's contract.
-            Weight::Bf16(w) => unsafe { Ok(self.projections.launch(x, at(w, first * k * 2), out, rows, k, n, self.stream)?) },
-            Weight::Fp8(w) => {
-                let scratch = self.fp8_workspace.as_ref().context("FP8 dSpark scratch was not admitted")?;
-                // SAFETY: the scratch covers every shape for up to max(TAP_ROWS, sequences x block) rows
-                // in this mode (set_draft_linear keeps it within the admitted one).
-                unsafe { w.apply_rows(self.library, x, out, false, rows, first, n, scratch, self.stream,
-                    self.fp8_rows.get()) }
-            }
-        }
+        use super::weights::{LegacyProjection, Projection};
+        let projection = LegacyProjection { weight, library: self.library, programs: &self.projections,
+            scratch: self.fp8_workspace.as_ref(), mode: self.fp8_rows.get() };
+        // SAFETY: the caller retains the selected matrix rows and input/output;
+        // set_draft_linear keeps the scratch within its admitted mode.
+        unsafe { projection.project(x, first, out, rows, k, n, self.stream) }
     }
 
     pub fn tap_index(&self, layer: usize) -> Option<usize> {
@@ -1287,7 +1284,10 @@ mod tests {
     }
 
     fn geometry(window: Option<usize>) -> DsparkConfig {
-        DsparkConfig { hidden: 5120, intermediate: 10240, layers: 5, heads: 40, kv_heads: 8,
+        DsparkConfig { backbone: cuteafd_loader::formats::block_dspark::DsparkBackbone {
+                norm: cuteafd_loader::formats::block_dspark::DsparkNorm::Rms, rotary_dim: 128,
+                activation: cuteafd_core::FfnActivation::SiluBf16Product { limit: None } },
+            hidden: 5120, intermediate: 10240, layers: 5, heads: 40, kv_heads: 8,
             head_dim: 128, eps: 1e-6, theta: 1e7, block: 7, mask_token: 248077, rank: 256,
             taps: vec![4,16,28,40,52], vocab: 248320, causal: false, window, rotary: None }
     }
