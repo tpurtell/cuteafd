@@ -926,23 +926,13 @@ Policy decisions:
     once its gates pass. Video (native in MiMo, GLM Flash and Qwen) only if
     image and audio are done while we still wait on Hugh's v2 pieces; plan
     NVDEC decode on the encoder's device, gated against a CPU reference.
-  - Lower priority (TJ, 2026-10-07): **scoring without a launch flag.**
-    Full-tier prefill scoring needs all-row prefill logits, which today must
-    be admitted at launch (FULL_PREFILL_LOGITS=on reserves the extra
-    logits/workspace before KV sizing), so the bench console can't run Full,
-    or Standard's prefill half, against a default server. Instead, borrow the
-    memory from the KV pool per scoring request: a scoring request reserves
-    whole free KV pages, enough for its all-row logits and enlarged workspace,
-    for its duration, through the same admission path as any KV allocation.
-    It waits or returns a 429 with a reason when the pages aren't free, and
-    it never evicts live sequences or shrinks admitted requests. The pages
-    return when it finishes. The engine must run the all-row prefill in that
-    borrowed storage with the same kernels and geometry as the launch-flag
-    path, so the scores are byte-identical (gate: borrowed vs launch-admitted
-    scoring, identical per-row records on Quick/Standard/Full). Then the
-    console gets proper Full measurements on any server, and
-    FULL_PREFILL_LOGITS remains as an explicit reservation for dedicated
-    fidelity hosts.
+  - **Bounded, flag-free prefill scoring (#1444):** prefill fidelity and golden
+    diagnostics stream full-vocabulary rows through the shared row consumer,
+    draining bounded head tiles before reuse. They preserve transformer units,
+    hooks, forced state, raw dumps and exact resume hashes. No separate all-row
+    device reservation or KV borrowing is required. Backends explicitly advertise
+    streamed scoring; unsupported backends fail closed for prefill scoring while
+    retaining decode scoring.
 - **Gate provenance:** every gate seal JSON records the exact source commit
   and a dirty flag, including untracked files, alongside the binary hash.
   Rebuilt gates use task-private targets; never repin a changed shared binary.

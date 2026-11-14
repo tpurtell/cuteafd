@@ -52,6 +52,27 @@ def _flag(line: str, flag: str) -> str | None:
     return tokens[tokens.index(flag) + 1] if flag in tokens else None
 
 
+def test_minimax_qualification_card_is_one_rtx_three_sparks_and_wip_only(tmp_path: Path) -> None:
+    config = {"model_type": "minimax_m3_vl", "text_config": {
+        "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
+    three = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(3))
+    keys = "SPARK_COUNT=3\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + three
+    result = _family_launch_result(tmp_path / "wip", config, "MiniMaxAI/MiniMax-M3.1-Flash", keys,
+        extra_args=("--wip", "minimax"), encoder_plan=PLANNED)
+    serve = _line(result, "serve-minimax --snapshot")
+    assert _flag(serve, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(3))
+    assert _flag(serve, "--rtx-expert-layers") == "auto"
+    assert _flag(serve, "--host-cache-bytes") == "auto"
+    assert "--split-device" not in serve.split()
+    refused = _family_launch_result(tmp_path / "release", config, "MiniMaxAI/MiniMax-M3.1-Flash", keys,
+        encoder_plan=PLANNED)
+    assert refused.returncode != 0 and "WIP-only" in refused.stderr
+    matrix = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
+    entry = next(entry for entry in matrix["entries"] if entry["name"] == "minimax-flash-min")
+    assert entry["family"] == "minimax_m3" and len(entry["gpus"]) == 1 and len(entry["sparks"]) == 3
+    assert entry["config"] == "examples/configs/minimax-m31-flash-nvfp4-min.config"
+
+
 @pytest.mark.parametrize("filter", ["", "info,cuteafd::shared::mapped_table=debug"])
 def test_generic_log_filter_reaches_coordinator_and_workers(tmp_path: Path, filter: str) -> None:
     result = _kimi(tmp_path, extra_env={"RUST_LOG": filter})
@@ -662,12 +683,11 @@ def test_muse_tp2_dflash_reaches_plan_and_serve(tmp_path: Path, selection, expec
     assert _flag(serve, "--tp2-dflash") == _flag(plan, "--tp2-dflash") == expected
 
 
-@pytest.mark.parametrize("setting", ["", "off", "on"])
-def test_muse_prefill_scoring_is_launch_admitted(tmp_path: Path, setting: str) -> None:
-    result = _muse(tmp_path, f"FULL_PREFILL_LOGITS={setting}\n" if setting else "")
+def test_muse_prefill_scoring_uses_ordinary_launch(tmp_path: Path) -> None:
+    result = _muse(tmp_path, "")
     serve, plan = _line(result, "serve-muse --snapshot"), _line(result, "cuteafd plan")
-    assert serve.split().count("--full-prefill-logits") == int(setting == "on")
-    assert plan.split().count("--full-prefill-logits") == int(setting == "on")
+    assert "--full-prefill-logits" not in serve
+    assert "--full-prefill-logits" not in plan
 
 
 def test_muse_forwards_speculation_trace(tmp_path: Path) -> None:

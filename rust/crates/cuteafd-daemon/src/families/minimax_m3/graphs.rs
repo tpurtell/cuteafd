@@ -95,6 +95,16 @@ impl<'a, P> Graphs<'a, P> {
         Ok(())
     }
 
+    pub(crate) fn row_key(&self, live: usize) -> Result<usize> {
+        ensure!((1..=self.capacity).contains(&live), "MiniMax graph rows exceed admitted decode owner");
+        Ok(decode_graph::row_bucket(live).min(self.capacity))
+    }
+    pub(crate) fn bootstrap(&self) -> Result<Vec<Key>> {
+        let mut sites = self.sites.iter().copied().collect::<Vec<_>>();
+        sites.sort_by_key(|&(layer, op)| (layer, match op {
+            Op::Attention => 0, Op::Router => 1, Op::Ffn => 2, Op::JoinRouted => 3 }));
+        bootstrap_keys(self.rank, self.capacity, &sites)
+    }
     pub(crate) fn cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }
     pub(crate) fn needs_boundary(&self) -> bool {
         self.first_touch_pending || self.bank.cache_needs_boundary()

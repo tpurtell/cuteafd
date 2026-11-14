@@ -902,7 +902,6 @@ pub(crate) struct StepSettings {
     pub kda_fp32_partials: bool,
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
-    pub full_prefill_logits: bool,
     /// Sizes the page tables (`glmf_table_pages`).
     pub max_context: usize,
     /// The DSA index cache: the compact one runs the `index_producer_c` programs, whose scratch
@@ -962,7 +961,6 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 partial_bytes: if settings.kda_fp32_partials { 4 } else { 2 },
                 output_shard: settings.kda_output_shard,
                 // K6 scoring downloads tiles through the ordinary bounded staging.
-                full_prefill_logits: settings.full_prefill_logits && !matches!(head, GlmfHead::K6(_) | GlmfHead::RowFp8(_) | GlmfHead::BlockFp8 { .. }),
                 table_pages,
                 table_pool_pages,
             },
@@ -1468,9 +1466,6 @@ pub(crate) struct GlmfEngine<'a> {
     /// for the routes and wire rows), the Spark exchanges, and the head (final
     /// norm, vocabulary projection, logits download).
     pub profile: RefCell<[f64; 3]>,
-    /// Permit scoring every prefill row. Native K6 consumes bounded tiles on
-    /// the host; other heads retain full-row device logits.
-    pub full_prefill_logits: bool,
     /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly), within the graph
     /// budget when one is set.
     graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
@@ -1791,8 +1786,7 @@ impl<'a> GlmfEngine<'a> {
             warming_graphs: std::cell::Cell::new(false),
             prewarming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
-            spark_bf16: false, full_prefill_logits: false,
-            draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
+            spark_bf16: false, draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false, mark_slots: 0,
@@ -3273,24 +3267,11 @@ impl<'a> GlmfEngine<'a> {
         Ok(self.programs.spec(&format!("glmf_{name}"))?.scratch.get("scratch").copied().unwrap_or(0) as usize)
     }
 
-    /// Every prefill workspace teacher-forced scoring runs in, before readiness (`--full-prefill-logits`
-    /// admits them): both ranks' prefill lanes, as a Spark prefill takes them. A serial prefill, a
-    /// short chunk and the prefix captures run in lane 0, so there is no third workspace, and the
-    /// logits staging lives once in shared temporaries (bounded tiles for K6).
-    pub fn prepare_scoring_prefill(&self) -> Result<()> {
-        let lanes = if self.pipelined() { self.prefill_waves } else { 1 };
-        for rank in 0..self.ranks() {
-            drop(self.prefill_slots_of(rank, lanes)?);
-        }
-        Ok(())
-    }
-
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
         StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, &self.weights.head, self.step_experts,
             StepSettings { target_head: self.target_head, kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
-                kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
-                max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
+                kda_prefill_expanded: self.kda_prefill_expanded, max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
                 replay_records: self.replay_records, decode_rows: self.decode_rows })
     }
 
@@ -5861,11 +5842,18 @@ mod prefill_lane_tests {
             // Fork #252 selects NcMmaFp8Gemv for full HQA q_b (2 warps, 1 group,
             // 4 tiles) and o (4 warps, 2 groups, 2 tiles) at M17..64; TP2 o keeps
             // the base kernel. Shipped K splits, thresholds and row-scale routes stay fixed.
-            ("integration/cuteafd/_fp8_weights.py", 0xcc76ce5ed134d682_u64),
+            // Fork #300 applies checkpoint scales to FP32 K64 accumulator segments instead of
+            // rounding scaled weights to BF16; whole NC shapes retain the old arithmetic. Re-audited
+            // decode routes: caps 16/64, shipped warps, groups and wide selection are unchanged,
+            // and thin/wide tiles must agree on native-scale arithmetic.
+            ("integration/cuteafd/_fp8_weights.py", 0x7cebefad8cc230ce_u64),
             // The #252 NC rewrite preserves scaled BF16 operands, per-warp K/MMA order,
             // FP32 accumulation and ascending-warp fold. It changes load/prefetch scheduling,
             // grid order and vectorized fold/store pairs, not per-output arithmetic.
-            ("integration/cuteafd/_fp8_gemv_nc.py", 0x0fab72d50aa7cf81_u64),
+            // Fork #300 explicitly disables native scaling for NC: whole-shape deferral keeps
+            // scaled-BF16 operands in both thin and wide tiles. Re-audited registry routes,
+            // warps, groups and wide selection remain unchanged; no new row-count crossover.
+            ("integration/cuteafd/_fp8_gemv_nc.py", 0xe94e797f8b1fb0d9_u64),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;
@@ -5968,7 +5956,7 @@ mod prefill_lane_tests {
         let decode = GlmfScratch { programs: 26_214_400, topk: 8_653_824 };
         let prefill = GlmfScratch { programs: 782_236_672, topk: 558_007_296 };
         let shape = GlmfStepShape { lead: true, split: false, tp2_experts: false, local_experts: true, spark: false, partial_bytes: 2,
-            output_shard: false, full_prefill_logits: false, table_pages: 32768, table_pool_pages: 8192 };
+            output_shard: false, table_pages: 32768, table_pool_pages: 8192 };
         // A whole workspace per lane, with the head-split rows every workspace used to hold: the
         // frozen accounting of the layout before the lanes shared their temporaries.
         let whole = |rows: u64, step_decode: bool, scratch: GlmfScratch| {
@@ -5991,23 +5979,25 @@ mod prefill_lane_tests {
             let temps = glmf_temporary_bytes(&cfg, rows, false, &shape, prefill);
             assert_eq!((temps.scratch, temps.topk_scratch), (782_236_672, 558_007_296));
         }
-        let full = GlmfStepShape { full_prefill_logits: true, ..shape };
-        assert_eq!(glmf_temporary_bytes(&cfg, 4096, false, &full, prefill).logits
-            - glmf_temporary_bytes(&cfg, 4096, false, &shape, prefill).logits, (4096 - 64) * 154_880 * 4);
-        // Rank 1 holds no head, logits or router rows (each floored to 256 bytes when allocated),
-        // with all-row logits or without.
+        for lead in [true, false] {
+            for rows in [1, 64, 512, 4096, 8256] {
+                for decode in [false, true] {
+                    let shape = GlmfStepShape { lead, ..shape };
+                    let actual = glmf_temporary_bytes(&cfg, rows, decode, &shape, prefill).logits;
+                    assert_eq!(actual, if lead { (if decode { rows } else { rows.min(64) }) * 154_880 * 4 } else { 0 });
+                }
+            }
+        }
+        // Rank 1 holds no head, logits or router rows (floored when allocated).
         let peer = GlmfStepShape { lead: false, ..shape };
         let temps = glmf_temporary_bytes(&cfg, 4096, false, &peer, prefill);
         assert_eq!((temps.logits, temps.head_workspace), (0, 0));
-        assert_eq!(glmf_temporary_bytes(&cfg, 4096, false, &GlmfStepShape { full_prefill_logits: true, ..peer }, prefill),
+        assert_eq!(glmf_temporary_bytes(&cfg, 4096, false, &GlmfStepShape { ..peer }, prefill),
             temps);
         assert!(glmf_lane_bytes(&cfg, 4096, false, &peer).device_bytes()
             < glmf_lane_bytes(&cfg, 4096, false, &shape).device_bytes());
-        // Scoring's exact union (`--full-prefill-logits`): the same lanes, a serial prefill in lane 0,
-        // the all-row logits once in their shared temporaries. Whole workspaces held them three
-        // times (a serial workspace and two lanes). Runtime now owns decode and one arena.
-        let scoring = glmf_step_workspaces(&cfg, 2, 4096, 64, &full, decode, prefill).device_bytes();
-        assert_eq!(scoring - shared, (4096 - 64) * 154_880 * 4);
+        // Scoring drains the same bounded temporaries used by ordinary prefill.
+        assert_eq!(glmf_step_workspaces(&cfg, 2, 4096, 64, &shape, decode, prefill).device_bytes(), shared);
     }
 
     #[test]

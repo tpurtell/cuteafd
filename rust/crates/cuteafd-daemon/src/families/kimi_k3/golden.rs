@@ -33,20 +33,20 @@ pub(crate) struct GoldenArgs {
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
     /// Read-only cuteafd.kimi.layer-state/1 export, never a qualified reference panel.
-    #[arg(long, required_unless_present = "nll")] reference_state: Option<PathBuf>,
+    #[arg(long, group = "partial_scope", required_unless_present = "nll")] reference_state: Option<PathBuf>,
     /// Original token panel whose set and window hashes bind the residual state.
     #[arg(long, required_unless_present = "nll")] windows: Option<PathBuf>,
     /// Prefix window, or one quick-subset window for a full-model smoke.
     #[arg(long, required_unless_present = "nll")] window: Option<String>,
     /// Inclusive zero-based decoder layer; inventory is truncated before admission.
-    #[arg(long, required_unless_present = "nll")] last_layer: Option<usize>,
+    #[arg(long, required_unless_present = "nll", requires = "partial_scope")] last_layer: Option<usize>,
     /// Immutable published F32 reference directory, consumed by shared fidelity code.
     #[arg(long, requires = "nll")] golden: Option<PathBuf>,
     /// New output directory for the shared probe row dumps and fidelity metrics.
     #[arg(long, requires = "nll")] save_logits: Option<PathBuf>,
     #[arg(long, value_delimiter = ',', conflicts_with = "skip_routed_experts")] peers: Vec<SocketAddr>,
     /// Golden only: run router and shared experts, with zero routed contribution.
-    #[arg(long, requires = "nll")] skip_routed_experts: bool,
+    #[arg(long, group = "partial_scope", requires = "nll")] skip_routed_experts: bool,
     #[arg(long, default_value_t = 0)] device: i32,
     /// Optional distinct physical peer; absent scores on the primary device alone.
     #[arg(long)] split_device: Option<i32>,
@@ -58,22 +58,25 @@ pub(crate) struct GoldenArgs {
     /// Informational F32 comparison only; direct gate/up is the speed-first default.
     #[arg(long, env = "CUTEAFD_KIMI_COMPENSATED_FFN")]
     compensated_ffn: bool,
-    /// All-layer logits scored against the immutable F32 reference quick subset.
-    #[arg(long, requires_all = ["golden", "save_logits"], conflicts_with_all = ["reference_state", "last_layer", "windows"])] nll: bool,
+    /// All-layer (or partial --skip-routed-experts --last-layer) logits scored against the immutable reference quick subset.
+    #[arg(long, requires_all = ["golden", "save_logits"], conflicts_with_all = ["reference_state", "windows"])] nll: bool,
+    /// Score the windows as 1-row serving decode steps from score_from:
+    /// the prompt is prefilled up to score_from, then committed 1 row per step.
+    #[arg(long, group = "step_scored", requires = "nll")] decode: bool,
     /// Score the windows as teacher-forced speculative verify cycles of this
     /// many rows (2..=64; all rows accepted) instead of prefill-shaped chunks:
     /// the C1 serving verify shape, with the prompt prefilled up to score_from.
-    #[arg(long, requires = "nll", value_parser = clap::value_parser!(u16).range(2..=64))] verify_rows: Option<u16>,
-    /// With --verify-rows: replay startup verify graphs (on) or run eagerly (off).
+    #[arg(long, group = "step_scored", requires = "nll", value_parser = clap::value_parser!(u16).range(2..=64))] verify_rows: Option<u16>,
+    /// With --decode or --verify-rows: replay startup graphs (on) or run eagerly (off).
     /// Explicit context placement always needs startup graphs, including prefill scoring.
-    #[arg(long, requires = "verify_rows", default_value = "on", value_parser = ["on", "off"])] graphs: String,
+    #[arg(long, requires = "step_scored", default_value = "on", value_parser = ["on", "off"])] graphs: String,
     /// Grouped K6 KDA q/k/v/g input launch (on) or the four standalone launches
     /// (off; eager scoring only, since startup graphs capture the grouped launch).
     #[arg(long, default_value = "on", value_parser = ["on", "off"])] grouped_kda: String,
     /// With --verify-rows: score only the first N verify rows of each window.
     #[arg(long, requires = "verify_rows")] verify_limit: Option<usize>,
     /// Bounded prefill-only native/residual/router diagnostics, below --save-logits.
-    #[arg(long, value_delimiter = ',', requires_all = ["capture_rows", "nll", "window", "save_logits"], conflicts_with = "verify_rows")]
+    #[arg(long, value_delimiter = ',', requires_all = ["capture_rows", "nll", "window", "save_logits"], conflicts_with = "step_scored")]
     capture_layers: Vec<usize>,
     /// Half-open input-row interval, at most 64 rows in one prefill unit.
     #[arg(long, requires = "capture_layers", value_parser = capture_rows)]
@@ -127,7 +130,7 @@ impl Capture {
     fn new(args: &GoldenArgs, windows: &[cuteafd_bench::reference::Window], capacity: usize,
         unit_rows: usize, provenance: Value) -> Result<Option<std::rc::Rc<Self>>> {
         let Some(rows) = args.capture_rows.clone() else { return Ok(None); };
-        ensure!(args.nll && args.verify_rows.is_none() && windows.len() == 1
+        ensure!(args.nll && args.verify_rows.is_none() && !args.decode && windows.len() == 1
             && !args.capture_layers.is_empty() && args.capture_layers.iter().all(|&layer| layer < 93),
             "Kimi capture requires one prefill window and valid layers");
         let chunks = forward_chunks(windows[0].tokens.len(), capacity)?;
@@ -224,7 +227,7 @@ impl GoldenArgs {
     fn startup_graphs(&self) -> Result<bool> {
         let context = self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context;
         ensure!(!context || self.graphs == "on", "Kimi context cannot score without startup decode graphs");
-        Ok((context || self.verify_rows.is_some()) && self.graphs == "on")
+        Ok((context || self.decode || self.verify_rows.is_some()) && self.graphs == "on")
     }
 
     fn role(&self) -> super::startup::Role {
@@ -247,19 +250,33 @@ impl GoldenArgs {
     fn reference_receipt(&self) -> Result<Value> {
         let bytes = std::fs::read(self.golden.as_ref().context("golden reference missing")?.join("manifest.json"))?;
         let manifest: Value = serde_json::from_slice(&bytes)?;
+        let partial = self.skip_routed_experts && self.last_layer.is_some();
+        let comparable = !self.skip_routed_experts && self.last_layer.is_none();
+        let treatment = match (self.skip_routed_experts, self.last_layer) {
+            (true, Some(last)) => format!(
+                "diagnostic partial prefix (layers 0..={last}, routed experts skipped) scored against full-model F32 reference; NLL/KL are non-comparable and never a pass/fail gate"
+            ),
+            (true, None) => "diagnostic dense/attention/DSA run with routed experts skipped against full-model F32 reference; NLL/KL are non-comparable and never a pass/fail gate".into(),
+            (false, _) => "full-model".into(),
+        };
         Ok(serde_json::json!({"config":manifest["config"], "revision":manifest["revision"], "tier":"quick",
-            "manifest_sha256":digest(&bytes), "treatment":if self.skip_routed_experts {
-                "dense/attention/DSA golden with routed experts skipped; not a full-model golden"
-            } else { "full-model" }}))
+            "manifest_sha256":digest(&bytes), "diagnostic_only": !comparable,
+            "partial_prefix": partial, "nll_kl_comparable": comparable,
+            "treatment":treatment}))
     }
 
     fn provenance(&self) -> Value {
+        let comparable = self.nll && !self.skip_routed_experts && self.last_layer.is_none();
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
-            "rtx_expert_layers":self.rtx_expert_layers.to_string(), "attention_placement": self.attention_placement, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll || self.skip_routed_experts,
+            "rtx_expert_layers":self.rtx_expert_layers.to_string(), "attention_placement": self.attention_placement, "window": self.window, "last_layer": self.last_layer,
+            "diagnostic_only": !comparable,
+            "partial_prefix": self.last_layer.is_some(),
+            "nll_kl_comparable": comparable,
             "skip_routed_experts": self.skip_routed_experts,
             "resolved_attention_placement": self.resolved_attention(),
-            "verify_rows": self.verify_rows, "graphs": (self.verify_rows.is_some() || self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context).then_some(&self.graphs), "grouped_kda": self.grouped_kda,
+            "decode": self.decode,
+            "verify_rows": self.verify_rows, "graphs": (self.decode || self.verify_rows.is_some() || self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context).then_some(&self.graphs), "grouped_kda": self.grouped_kda,
             "verify_limit": self.verify_limit, "prefill_rows": self.prefill_rows, "prefill_waves": self.prefill_waves})
     }
 
@@ -274,9 +291,21 @@ impl GoldenArgs {
     }
 
     fn loaded_provenance(&self, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
-        ownership: &super::startup::Ownership) -> Value {
+        full: &KimiK3Config, cfg: &KimiK3Config, ownership: &super::startup::Ownership) -> Value {
         let mut provenance = self.selected_provenance(view);
         provenance["resolved_ownership"] = serde_json::json!(ownership);
+        if self.last_layer.is_some() {
+            provenance["diagnostic_only"] = serde_json::json!(true);
+            provenance["partial_prefix"] = serde_json::json!(true);
+            provenance["nll_kl_comparable"] = serde_json::json!(false);
+            provenance["nll_kl_note"] = serde_json::json!(
+                "truncated BF16 prefix with routed experts skipped scored against full-model F32 reference; NLL/KL are diagnostic only, non-comparable, and never a pass/fail gate"
+            );
+            provenance["dsa_layers_included"] = serde_json::json!(
+                cfg.dsa.is_some().then(|| cfg.mla_layers()).unwrap_or(0));
+            provenance["dsa_layers_total"] = serde_json::json!(
+                full.dsa.is_some().then(|| full.mla_layers()).unwrap_or(0));
+        }
         provenance
     }
 
@@ -540,7 +569,8 @@ fn full_reference(args: &GoldenArgs, cfg: &KimiK3Config) -> Result<Vec<cuteafd_b
     let manifest: Value = serde_json::from_slice(&bytes)?;
     let reference = if manifest["schema"] == "cuteafd.kimi.arithmetic-diagnostic/1" {
         arithmetic_reference(root, &manifest, cfg, args)?
-    } else if args.skip_routed_experts {
+    } else if args.skip_routed_experts
+        && (args.last_layer.is_none() || manifest["schema"] == "cuteafd.kimi.skipped-routed/1") {
         skipped_reference(root, &manifest, cfg)?
     } else {
         let (hash, config) = if cfg.dsa.is_some() {
@@ -568,24 +598,44 @@ fn full_reference(args: &GoldenArgs, cfg: &KimiK3Config) -> Result<Vec<cuteafd_b
 }
 
 fn full_run(args: GoldenArgs) -> Result<()> {
+    ensure!(args.last_layer.is_none() || args.skip_routed_experts,
+        "Kimi partial --last-layer --nll requires --skip-routed-experts");
     let view = args.attention.selected_view.clone().map(Ok)
         .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
     let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
-    let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
-    cfg.release_geometry()?;
-    cfg.validate_attention_role(true)?;
+    let full = KimiK3Config::from_hf(&checkpoint.config)?;
+    full.release_geometry()?;
+    full.validate_attention_role(true)?;
+    let cfg = match args.last_layer {
+        Some(last) => admission::prefix(&full, last.checked_add(1).context("Kimi last-layer overflow")?)?,
+        None => full.clone(),
+    };
     args.hosted(&cfg)?;
-    let windows = full_reference(&args, &cfg)?;
-    println!("Kimi all-layer run provenance: {}", args.selected_provenance(checkpoint.view.as_ref()
-        .context("Kimi golden requires the immutable selected checkpoint view")?));
+    let windows = full_reference(&args, &full)?;
+    let mut provenance = args.selected_provenance(checkpoint.view.as_ref()
+        .context("Kimi golden requires the immutable selected checkpoint view")?);
+    if args.last_layer.is_some() {
+        provenance["diagnostic_only"] = serde_json::json!(true);
+        provenance["partial_prefix"] = serde_json::json!(true);
+        provenance["nll_kl_comparable"] = serde_json::json!(false);
+        provenance["nll_kl_note"] = serde_json::json!(
+            "truncated BF16 prefix with routed experts skipped scored against full-model F32 reference; NLL/KL are diagnostic only, non-comparable, and never a pass/fail gate"
+        );
+        provenance["dsa_layers_included"] = serde_json::json!(
+            cfg.dsa.is_some().then(|| cfg.mla_layers()).unwrap_or(0));
+        provenance["dsa_layers_total"] = serde_json::json!(
+            full.dsa.is_some().then(|| full.mla_layers()).unwrap_or(0));
+    }
+    println!("Kimi {} run provenance: {provenance}",
+        if args.last_layer.is_some() { "partial-prefix" } else { "all-layer" });
     println!("Kimi F32 reference: {} windows={} scored_rows={}", args.reference_receipt()?,
         windows.len(), windows.iter().map(|w| w.positions.len()).sum::<usize>());
     if args.check_headers { return Ok(()); }
     let output = args.save_logits.as_deref().context("--nll requires --save-logits")?;
     ensure!(!output.try_exists()? && output.parent().is_some_and(Path::is_dir),
         "Kimi logits output needs an existing parent and a new directory");
-    native(&args, &checkpoint, &cfg, &cfg, Reference { tokens: vec![], hidden: vec![] }, Some(&windows))
+    native(&args, &checkpoint, &full, &cfg, Reference { tokens: vec![], hidden: vec![] }, Some(&windows))
 }
 
 fn forward_chunks(tokens: usize, capacity: usize) -> Result<Vec<std::ops::Range<usize>>> {
@@ -597,14 +647,16 @@ fn forward_chunks(tokens: usize, capacity: usize) -> Result<Vec<std::ops::Range<
 }
 
 fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engine::prefix::RefPagePool,
-    windows: &[cuteafd_bench::reference::Window], capacity: usize, ownership: &super::startup::Ownership) -> Result<()> {
+    windows: &[cuteafd_bench::reference::Window], capacity: usize,
+    full: &KimiK3Config, cfg: &KimiK3Config, ownership: &super::startup::Ownership) -> Result<()> {
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     use cuteafd_bench::{fidelity_rows, reference::Fidelity};
     use std::io::Write;
     let root = args.save_logits.as_deref().context("--nll requires --save-logits")?;
     std::fs::create_dir(root).context("Kimi logits output must be a new directory")?;
+    let provenance = args.loaded_provenance(engine.target_view(), full, cfg, ownership);
     let capture = Capture::new(args, windows, capacity, args.prefill()?.unit_rows as usize,
-        args.loaded_provenance(engine.target_view(), ownership))?;
+        provenance.clone())?;
     if let Some(capture) = &capture { engine.attach_capture(capture.clone())?; }
     let mut records = Vec::new();
     engine.reset_cold_state()?;
@@ -619,12 +671,14 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
             top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
         probe.admitted("kimi_k3", &window.tokens, 0);
         probe.selected_score_path("prefill");
-        probe.provenance(args.loaded_provenance(engine.target_view(), ownership));
+        probe.provenance(provenance.clone());
+        let mut forward_seconds = 0.0;
         for chunk in chunks {
             let (first, end) = (chunk.start, chunk.end);
             if let Some(capture) = &capture { capture.arm(first, end - first); }
             let sequences = vec![vec![super::device::SequenceRows {
                 slot: 0, start: first, rows: end - first, pages: &pages }]];
+            let forward_started = std::time::Instant::now();
             engine.forward(&[window.tokens[first..end].to_vec()], &sequences, pool,
                 |lane, offset, rows, logits| {
                     ensure!(lane == 0 && logits.len() == rows * 163840, "Kimi full-forward logits shape differs");
@@ -634,8 +688,11 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
                     }
                     Ok(())
                 })?;
+            forward_seconds += forward_started.elapsed().as_secs_f64();
             probe.scored_prefill_chunk(first + 1, end - first);
         }
+        println!("Kimi scored prefill window {}: tokens={} forward_seconds={:.6} tokens_per_second={:.3} includes_head_and_readback=true",
+            window.id, count, forward_seconds, count as f64 / forward_seconds);
         let record = probe.record();
         ensure!(record.error.is_none(), "Kimi row dump failed: {:?}", record.error);
         let mut score = window.score(&record.rows);
@@ -645,7 +702,9 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
         println!("Kimi window {}: rows={} top-1={:.4}% mean NLL={:.8} mean KL(top1024+tail)={:.8}",
             window.id, score.positions, score.top1 * 100.0, score.nll, score.kl);
         let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join(format!("{}.json", window.id)))?;
-        serde_json::to_writer(&mut out, &serde_json::json!({"probe":record,"score":score}))?;
+        serde_json::to_writer(&mut out, &serde_json::json!({"probe":record,"score":score,"prefill_timing":{
+            "tokens":count,"forward_seconds":forward_seconds,"tokens_per_second":count as f64 / forward_seconds,
+            "includes_head_and_readback":true}}))?;
         out.write_all(b"\n")?;
         records.extend(score.records);
         // Forward's terminal head readback joins both producer ranks. Reset
@@ -659,7 +718,79 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
     let out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("fidelity.json"))?;
     serde_json::to_writer(out, &serde_json::json!({"schema":"cuteafd.kimi.golden/1",
         "reference":args.reference_receipt()?,
-        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":args.loaded_provenance(engine.target_view(), ownership),"score":score}))?;
+        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":provenance,"score":score}))?;
+    Ok(())
+}
+
+/// 1-row serving decode scoring: prefill each window up to `score_from`, then
+/// step 1 row at a time (`speculative = false`, `Cycle::Decode`), replaying
+/// startup `rows=1` decode graphs when enabled.
+fn score_decode(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engine::prefix::RefPagePool,
+    windows: &[cuteafd_bench::reference::Window], capacity: usize, graphs: bool,
+    full: &KimiK3Config, cfg: &KimiK3Config, ownership: &super::startup::Ownership) -> Result<()> {
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+    use cuteafd_bench::{fidelity_rows, reference::Fidelity};
+    use cuteafd_engine::prefix::PrefixFamily;
+    use std::io::Write;
+    let root = args.save_logits.as_deref().context("--nll requires --save-logits")?;
+    std::fs::create_dir(root).context("Kimi logits output must be a new directory")?;
+    let provenance = args.loaded_provenance(engine.target_view(), full, cfg, ownership);
+    let family = engine.prefix_family()?;
+    let library = engine.library();
+    let mut records = Vec::new();
+    let captures = cuteafd_ffi::graph_captures();
+    for window in windows {
+        let count = window.tokens.len() - 1;
+        let units = pool.alloc(window.tokens.len().div_ceil(cuteafd_ffi::MLA_PAGE_ROWS))?;
+        let mut placement = super::prefix::Placement { units: units.clone(), slot: 0, len: 0, state_len: 0 };
+        family.bind(&mut placement).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let dump = root.join(&window.id);
+        let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
+            prompt_ids: Some(window.tokens.clone()), score_from: Some(window.score_from),
+            score_positions: Some(window.positions.iter().map(|p| p.pos).collect()),
+            top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
+        probe.admitted("kimi_k3", &window.tokens, 0);
+        probe.selected_score_path(if graphs { "decode-graphs" } else { "decode-eager" });
+        probe.provenance(provenance.clone());
+        let prefix = window.score_from - 1;
+        for first in (0..prefix).step_by(capacity) {
+            let chunk = &window.tokens[first..(first + capacity).min(prefix)];
+            engine.step_device(&mut [(&mut placement, chunk)], pool, 1, true)?;
+        }
+        for first in prefix..count {
+            let logits = engine.step_device(&mut [(&mut placement, &window.tokens[first..first + 1])], pool, 1, graphs)?;
+            library.cuda_set_device(args.split_device.unwrap_or(args.device))?;
+            let values = logits.to_host(library)?;
+            ensure!(values.len() == 163840, "Kimi decode logits shape differs");
+            let position = first + 1;
+            if position >= window.score_from { probe.row(position, &values); }
+        }
+        let record = probe.record();
+        ensure!(record.error.is_none(), "Kimi row dump failed: {:?}", record.error);
+        let mut score = window.score(&record.rows);
+        ensure!(score.missing == 0 && score.non_finite == 0 && score.records.len() == window.positions.len(),
+            "Kimi decode scoring did not cover every finite scored row");
+        fidelity_rows::score_compact(163840, window, &dump, &mut score)?;
+        println!("Kimi window {} decode graphs={graphs}: rows={} top-1={:.4}% mean NLL={:.8} mean KL(top1024+tail)={:.8}",
+            window.id, score.positions, score.top1 * 100.0, score.nll, score.kl);
+        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join(format!("{}.json", window.id)))?;
+        serde_json::to_writer(&mut out, &serde_json::json!({"probe":record,"score":score}))?;
+        out.write_all(b"\n")?;
+        records.extend(score.records);
+        family.drain().map_err(|error| anyhow::anyhow!("{error}"))?;
+        family.discard(&mut placement).map_err(|error| anyhow::anyhow!("{error}"))?;
+        pool.release(&units);
+    }
+    let steady = cuteafd_ffi::graph_captures() - captures;
+    let replays = engine.graph_replays()?;
+    let score = Fidelity::from_records(records);
+    println!("Kimi decode logits: graphs={graphs} replays={replays} steady_captures={steady} rows={} top-1 agreement {:.4}% | mean NLL engine {:.8} | mean KL(top1024+tail) {:.8}",
+        score.positions, score.top1 * 100.0, score.nll, score.kl);
+    let out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("fidelity.json"))?;
+    serde_json::to_writer(out, &serde_json::json!({"schema":"cuteafd.kimi.golden/1",
+        "reference":args.reference_receipt()?,
+        "path_shape":"decode-shaped","kl_kind":"top1024+tail","provenance":provenance,
+        "graph_replays":replays,"score":score}))?;
     Ok(())
 }
 
@@ -670,13 +801,14 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
 /// shorter cycle uses its own exact width.
 fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engine::prefix::RefPagePool,
     windows: &[cuteafd_bench::reference::Window], capacity: usize, verify: usize, graphs: bool,
-    ownership: &super::startup::Ownership) -> Result<()> {
+    full: &KimiK3Config, cfg: &KimiK3Config, ownership: &super::startup::Ownership) -> Result<()> {
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     use cuteafd_bench::{fidelity_rows, reference::Fidelity};
     use cuteafd_engine::prefix::PrefixFamily;
     use std::io::Write;
     let root = args.save_logits.as_deref().context("--nll requires --save-logits")?;
     std::fs::create_dir(root).context("Kimi logits output must be a new directory")?;
+    let provenance = args.loaded_provenance(engine.target_view(), full, cfg, ownership);
     let family = engine.prefix_family()?;
     let library = engine.library();
     let mut records = Vec::new();
@@ -695,7 +827,7 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
             top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
         probe.admitted("kimi_k3", &window.tokens, 0);
         probe.selected_score_path(if graphs { "verify-graphs" } else { "verify-eager" });
-        probe.provenance(args.loaded_provenance(engine.target_view(), ownership));
+        probe.provenance(provenance.clone());
         // Prompt prefix: rows 0..score_from-1, chunked at the lane capacity.
         let prefix = window.score_from - 1;
         for first in (0..prefix).step_by(capacity) {
@@ -750,7 +882,7 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
     let out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("fidelity.json"))?;
     serde_json::to_writer(out, &serde_json::json!({"schema":"cuteafd.kimi.golden/1",
         "reference":args.reference_receipt()?,
-        "path_shape":"verify-shaped","kl_kind":"top1024+tail","provenance":args.loaded_provenance(engine.target_view(), ownership),
+        "path_shape":"verify-shaped","kl_kind":"top1024+tail","provenance":provenance,
         "graph_replays":replays,"score":score}))?;
     Ok(())
 }
@@ -769,7 +901,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
         context: cuteafd_loader::placement::planner::Context::pinned(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT as u64), slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
-        pool_tokens: Some(1_048_576), graphs, full_prefill_logits: false, draft: None, ffn_mode: args.ffn_mode(),
+        pool_tokens: Some(1_048_576), graphs, draft: None, ffn_mode: args.ffn_mode(),
         hosted_layers: args.hosted(cfg)?, verify_rows: verify, prefix: None,
     })
 }
@@ -813,9 +945,11 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     let mut pool = super::prefix::diagnostic_pool(layout);
     let actual = if let Some(windows) = scoring {
         if let Some(verify) = verify {
-            score_verify(args, &engine, &mut pool, windows, rows, verify, graphs, &ownership)?;
+            score_verify(args, &engine, &mut pool, windows, rows, verify, graphs, full, cfg, &ownership)?;
+        } else if args.decode {
+            score_decode(args, &engine, &mut pool, windows, rows, graphs, full, cfg, &ownership)?;
         } else {
-            score_windows(args, &engine, &mut pool, windows, rows, &ownership)?;
+            score_windows(args, &engine, &mut pool, windows, rows, full, cfg, &ownership)?;
         }
         None
     } else {
@@ -1497,7 +1631,7 @@ mod tests {
             capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None, context: None, serving_context: cuteafd_loader::placement::planner::Context::pinned(1_048_576),
-            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None, full_prefill_logits: false,
+            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows, (rows).min(4096),
                 1048576, native_scratch).unwrap())], fixed,
             startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2)?,
@@ -1576,6 +1710,54 @@ mod tests {
         assert!(compare(&[f32::NAN], &[1.0]).is_err());
         assert!(compare(&[1.0], &[1.0, 2.0]).is_err());
         assert!(compare(&[0.0], &[0.0]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_prefix_nll_and_decode_cli_enforce_skipped_experts_and_provenance() -> Result<()> {
+        use clap::Parser;
+        let base = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output"];
+        // Without --skip-routed-experts, --last-layer is still rejected for --nll.
+        assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(["--last-layer", "59"])).is_err());
+
+        let partial = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output",
+            "--skip-routed-experts", "--last-layer", "59"];
+        let crate::cli::Commands::KimiGolden(prefill) = crate::cli::Cli::try_parse_from(partial)?.command
+            else { panic!("Kimi golden"); };
+        assert_eq!(prefill.last_layer, Some(59));
+        assert!(prefill.skip_routed_experts && !prefill.decode && prefill.verify_rows.is_none());
+        assert!(!prefill.startup_graphs()?);
+        assert_eq!(prefill.provenance()["diagnostic_only"], true);
+        assert_eq!(prefill.provenance()["partial_prefix"], true);
+        assert_eq!(prefill.provenance()["nll_kl_comparable"], false);
+
+        let ref_dir = tempfile::tempdir()?;
+        std::fs::write(
+            ref_dir.path().join("manifest.json"),
+            r#"{"config":"kimi-k31-v1_20261105_own-text-effort-matched-mxfp4-f32","revision":"a09a542737757710542b2460b5e1334ef6f79853"}"#,
+        )?;
+        let mut with_ref = prefill;
+        with_ref.golden = Some(ref_dir.path().to_path_buf());
+        let receipt = with_ref.reference_receipt()?;
+        assert_eq!(receipt["diagnostic_only"], true);
+        assert_eq!(receipt["partial_prefix"], true);
+        assert_eq!(receipt["nll_kl_comparable"], false);
+        assert!(receipt["treatment"].as_str().unwrap_or_default().contains("non-comparable"));
+
+        let crate::cli::Commands::KimiGolden(decode) = crate::cli::Cli::try_parse_from(
+            partial.into_iter().chain(["--decode", "--graphs", "on"]))?.command
+            else { panic!("Kimi golden"); };
+        assert!(decode.decode && decode.startup_graphs()?);
+        assert_eq!(decode.provenance()["decode"], true);
+        assert_eq!(decode.provenance()["graphs"], "on");
+
+        // --decode and --verify-rows are mutually exclusive; --capture-layers conflicts with --decode.
+        assert!(crate::cli::Cli::try_parse_from(
+            partial.into_iter().chain(["--decode", "--verify-rows", "5"])).is_err());
+        assert!(crate::cli::Cli::try_parse_from(
+            partial.into_iter().chain(["--decode", "--window", "a00", "--capture-layers", "3", "--capture-rows", "0:16"])).is_err());
         Ok(())
     }
 }

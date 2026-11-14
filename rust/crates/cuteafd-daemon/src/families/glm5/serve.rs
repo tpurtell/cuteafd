@@ -276,7 +276,7 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
     let result = opened.with_resolved_engine_media(&resolved, media_push.records(), Some((&prefix, max_sequences)), (media_owner, bytes as u64), |engine, transport, runtime| {
-        if probe::streamed_prefill_scoring(engine.cfg.family_id()) {
+        {
             cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
         }
         layout.speculator = engine.drafter.as_ref().map(|draft| console::Speculator {
@@ -753,7 +753,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         let reject = |job: &NativeRequest, message: String| {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
                         };
-                        if let Err(error) = probe::validate_scoring(&job.probe, probe::prefill_scoring_admitted(engine.cfg.family_id(), engine.full_prefill_logits)) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, true) {
                             reject(&job, format!("scoring: {error:#}"));
                             continue;
                         }
@@ -867,19 +867,15 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let mut placement = admitted.placement;
                 let mut state = (&mut placement, transport.as_deref_mut());
                 // Diagnostic tails can be smaller than the pipeline's 512-row minimum.
-                let prefill_rows = if engine.full_prefill_logits {
-                    probe::scoring_prefill_capacity(true, engine.prefill_rows, engine.prefill_capacity())
-                } else { engine.prefill_capacity() };
+                let prefill_rows = engine.prefill_capacity();
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, prefill_rows,
-                    DECODE_ROWS, probe::verify_rows(&job.probe), probe::prefill_scoring_admitted(engine.cfg.family_id(), engine.full_prefill_logits), &mut state,
+                    DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut state,
                     |(placement, transport), chunk, rows, position| {
                         let experts = transport.as_deref_mut().map(|t| (t, runtime));
-                        if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring(engine.cfg.family_id()) {
+                        if rows > 1 {
                             engine.prefill_streamed_scoring(placement, chunk, experts, &request_media,
                                 probe::ScoringRows { consumer: &job.probe, position })
-                        } else if rows > 1 {
-                            Ok(engine.prefill_scoring_media(placement, chunk, experts, rows, &request_media)?
-                                .map(|values| probe::ScoreLogits::Host { values, vocab: engine.cfg.vocab_size }))
+
                         } else {
                             Ok(engine.prefill_media_device(placement, chunk, experts, 1, Some(&request_media))?.map(probe::ScoreLogits::Device))
                         }
@@ -1510,20 +1506,12 @@ mod draft_tests {
     use super::*;
 
     #[test]
-    fn streamed_scoring_activation_is_specific_to_the_checkpoint_family() -> Result<()> {
-        use cuteafd_loader::families::glm5::GlmDsaConfig;
-        let ml4 = GlmDsaConfig::from_hf(&serde_json::from_str(include_str!(
-            "../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?)?;
-        let mut glm = ml4.clone();
-        glm.variant = cuteafd_loader::families::glm5::GlmVariant::Glm;
-        assert_eq!(glm.family_id(), "glm5");
-        assert_eq!(ml4.family_id(), "mistral_large4");
-        assert!(probe::streamed_prefill_scoring(glm.family_id()));
-        assert!(probe::prefill_scoring_admitted(glm.family_id(), false));
-        assert!(probe::streamed_prefill_scoring(ml4.family_id()));
-        assert!(probe::prefill_scoring_admitted(ml4.family_id(), false));
-        assert!(probe::prefill_scoring_admitted(ml4.family_id(), true));
-        Ok(())
+    fn streamed_scoring_dispatch_uses_the_checkpoint_engine_without_an_allowlist() {
+        let source = include_str!("serve.rs");
+        let scoring = source.split_once("if let Some(from) = probe::scoring(&job.probe)").unwrap().1
+            .split_once("release(&family").unwrap().0;
+        assert!(scoring.contains("engine.prefill_streamed_scoring("));
+        assert!(scoring.contains("engine.prefill_capacity()"));
     }
 
     #[test]

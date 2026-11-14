@@ -314,7 +314,7 @@ impl<'a> GlmfEngine<'a> {
         let total: usize = steps.iter().map(|(t, _)| t.positions.len()).sum();
         let capacity = logits_capacity(work[0].logits.buffer.bytes, self.cfg.vocab_size)?;
         ensure!(!device || logit_rows <= capacity, "device prefill logits exceed admitted rows");
-        ensure!(logit_rows <= total && (scoring.is_some() || self.full_prefill_logits || logit_rows <= DECODE_ROWS),
+        ensure!(logit_rows <= total && (scoring.is_some() || logit_rows <= DECODE_ROWS),
             "prefill logits exceed admitted rows");
         let mut ranked = Vec::new();
         let mut units = Vec::new();
@@ -495,14 +495,14 @@ mod tests {
             kda_heads: 64, kda_head_dim: 128, heads: 64, q_lora_rank: 1536, kv_lora_rank: 512,
             qk_nope_dim: 256, v_head_dim: 256, index_topk: 2048, index_kpool: 4, eos: vec![] };
         for rows in [1, 63, 64, 65, 129, 4096] {
-            for full in [false, true] {
+            {
                 let shape = GlmfStepShape { lead: true, split: false, tp2_experts: false,
                     local_experts: true, spark: false, partial_bytes: 2, output_shard: false,
-                    full_prefill_logits: full, table_pages: 32768, table_pool_pages: 8192 };
+                    table_pages: 32768, table_pool_pages: 8192 };
                 let bytes = glmf_temporary_bytes(&cfg, rows as u64, false, &shape,
                     GlmfScratch { programs: 0, topk: 0 }).logits as usize;
                 let capacity = logits_capacity(bytes, cfg.vocab_size)?;
-                assert_eq!(capacity, if full { rows } else { rows.min(DECODE_ROWS) });
+                assert_eq!(capacity, rows.min(DECODE_ROWS));
                 let spans = head_spans(rows, rows, capacity).collect::<Vec<_>>();
                 assert_eq!(spans.len() > 1, bytes < rows * cfg.vocab_size * 4);
                 assert!(spans.iter().all(|span| span.len() * cfg.vocab_size * 4 <= bytes));

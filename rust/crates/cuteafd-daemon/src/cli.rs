@@ -220,6 +220,9 @@ pub(crate) enum Commands {
     /// Qualify native MiniMax full-model prefill with real Spark experts.
     #[command(hide = true)]
     MinimaxGolden(crate::families::minimax_m3::golden::GoldenArgs),
+    /// Qualify MiniMax whole-rank serving on the shared scheduler.
+    #[command(hide = true)]
+    ServeMinimax(crate::families::minimax_m3::serve::ServeArgs),
     /// Serve Kimi K3 with TP2 attention and six real Spark expert ranks.
     #[command(hide = true)]
     ServeKimi(crate::families::kimi_k3::serve::ServeArgs),
@@ -514,9 +517,6 @@ pub(crate) struct PlanArgs {
     /// Prefill workspace capacity for --layout (0: family/image default; GLM 5.3 Flash: per lane).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_rows: u64,
-    /// Include the diagnostic all-row prefill head reservation in --layout.
-    #[arg(long)]
-    pub(crate) full_prefill_logits: bool,
     /// Include executed-route telemetry owners in --layout (disable with =false).
     #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
         default_missing_value = "true", require_equals = true)]

@@ -307,7 +307,6 @@ mod tests {
                     peer_access: ranks == 2,
                 },
                 rows,
-                full_prefill_logits: false,
                 waves,
                 unit,
                 sequences: 16,

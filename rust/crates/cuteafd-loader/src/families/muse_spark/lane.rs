@@ -74,19 +74,11 @@ pub fn head_planes(stored: usize, vocab: usize) -> Result<(usize, usize)> {
     Ok((HEAD_ROWS * stored * 4, HEAD_ROWS * vocab * 4))
 }
 
-/// Optional contiguous scoring output, separate from the reusable 64-row head scratch.
-pub fn prefill_logits_bytes(rows: usize, vocab: usize) -> Result<usize> {
-    ensure!(rows > 0 && vocab > 0, "Muse prefill logits need rows and a vocabulary");
-    rows.checked_mul(vocab).and_then(|n| n.checked_mul(4)).context("Muse prefill logits overflow")
-}
-
 #[cfg(test)]
 #[test]
-fn scoring_output_is_checked_f32_rows() {
-    assert_eq!(prefill_logits_bytes(8256, 202048).unwrap(), 8256 * 202048 * 4);
-    assert!(prefill_logits_bytes(0, 202048).is_err());
-    assert!(prefill_logits_bytes(1, 0).is_err());
-    assert!(prefill_logits_bytes(usize::MAX, 202048).is_err());
+fn scoring_reuses_bounded_head_planes() {
+    assert_eq!(head_planes(202112, 202048).unwrap(), (64 * 202112 * 4, 64 * 202048 * 4));
+    assert!(head_planes(0, 202048).is_err());
 }
 
 /// Plane name -> bytes, in a fixed order (BTreeMap) so the device's offsets

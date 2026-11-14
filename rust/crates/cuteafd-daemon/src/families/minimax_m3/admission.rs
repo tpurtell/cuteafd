@@ -145,8 +145,16 @@ pub(crate) mod serve_admission {
         Ok(())
     }
 
-    pub(crate) fn admit(mut facts: FactsRequest<'_>, samples: &[Sample],
+    pub(crate) fn admit(facts: FactsRequest<'_>, samples: &[Sample],
         onboard: cuteafd_loader::placement::Onboard) -> Result<AdmittedMiniMax> {
+        Ok(prepare(facts, samples, onboard)?.1)
+    }
+
+    /// Retain the exact measured facts used to solve; constructors must not
+    /// gather again against a different sample or reconstruct selected owners.
+    pub(crate) fn prepare(mut facts: FactsRequest<'_>, samples: &[Sample],
+        onboard: cuteafd_loader::placement::Onboard)
+        -> Result<(shared::MiniMaxInputs, AdmittedMiniMax)> {
         validate_prefill(facts.prefill)?;
         facts.coordinator = Coordinator::Measured {
             samples: samples.iter().map(|s| (s.total, s.cap, s.free)).collect(),
@@ -156,7 +164,7 @@ pub(crate) mod serve_admission {
             cuteafd_loader::placement::planner::Operation::Serving, inputs.resident_weight_limit, facts.replies);
         let admitted = inputs.admit_serving(request).context("MiniMax serving admission")?;
         cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "minimax_m3");
-        Ok(admitted)
+        Ok((inputs, admitted))
     }
 
     #[cfg(test)]

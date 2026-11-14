@@ -287,7 +287,7 @@ pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inp
         experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },
-        full_prefill_logits: 0, pending_code: inputs.pending_code.clone(),
+        pending_code: inputs.pending_code.clone(),
         context, attention, extra: Vec::new(), physical_bytes: inputs.physical.clone(),
         host: Some(v4::V4Host { total: inputs.host_memory.0, available: inputs.host_memory.1,
             headroom: inputs.prefix.map_or(8 << 30, |p| p.host_cache_headroom_bytes).max(inputs.host_memory.0 / 10),
@@ -297,7 +297,7 @@ pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inp
                 None => Some(0),
             },
             prefix_entries: inputs.prefix.map_or(0, |p| p.prefix_cache_entries as u64),
-            span_rows: shape.span_rows, full_prefill_logits: args.full_prefill_logits,
+            span_rows: shape.span_rows,
             embedding_bytes: if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host {
                 inputs.catalog.tensor("embed.weight")?.metadata.byte_length } else { 0 },
             c128_width: cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? }) })

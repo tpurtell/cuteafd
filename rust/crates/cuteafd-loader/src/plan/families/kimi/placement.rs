@@ -40,11 +40,16 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
-    if let Err(error) = cfg.validate_attention_runtime() {
-        report.refuse_placement(error.to_string(),
-            "Complete the Gated DSA kernel and prefix-cache qualification tracked in #1777; dense MLA is not an equivalent fallback.");
-        return MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(),
-            notes: vec!["Kimi K3.1 headers and core views are recognized; sparse execution is not qualified".into()] };
+    if cfg.dsa.is_some() {
+        report.runtime = Some(crate::plan::RuntimeStatus::Planned);
+        if !report.hints.iter().any(|h| h.what.contains("Kimi K3.1 serving remains gated")) {
+            report.hints.push(crate::plan::Hint {
+                what: if !model.core.projections.is_empty() || !model.core.native.is_empty() {
+                    "Kimi K3.1 serving remains gated pending full-model qualification; K6/K8 core views unqualified on K3.1 (#1777)".into()
+                } else { "Kimi K3.1 serving remains gated pending full-model qualification (#1777)".into() },
+                how: "Placement and memory accounting are computed above; run kimi-golden in Stage 1 and unlock serve-kimi in Stage 4.".into(),
+            });
+        }
     }
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
@@ -173,7 +178,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 .transpose()?.unwrap_or(0);
             let mut demands = allocation::baseline_demands_for_ranks(cfg, manifest, rows, shape, context as usize,
                 usize::try_from(slots)?, verify, &model.core, matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context),
-                ranks, gpus, opts.resolved_spark_reply_format(false))?;
+                ranks, gpus, opts.resolved_spark_reply_format(false), if matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context) && gpus == 2 { 48 } else { 96 })?;
             if let Some(context) = &context_layout {
                 // Validate the context key inventory; the graph reserve is the
                 // configured arena, charged once by the recipe.
@@ -209,16 +214,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         match extra {
             Ok(demands) => {
                 fixed.extend(demands);
-                if opts.full_prefill_logits {
-                    let ordinary = crate::families::kimi_k3::allocation::io_extents_for_ranks(
-                        cfg.vocab_size, head_rank, rows, false, gpus).expect("validated IO ranks");
-                    let scoring = crate::families::kimi_k3::allocation::io_extents_with_logits(
-                        cfg.vocab_size, head_rank, rows, rows, false, gpus).expect("validated IO rows");
-                    let delta = (scoring[1] - ordinary[1]) as u64;
-                    let io = fixed.iter_mut().find(|d| d.gpu as usize == head_rank && d.group == "Kimi lane 0 token IO")
-                        .expect("baseline includes terminal token IO");
-                    io.bytes += delta;
-                }
             },
             Err(error) => { report.refuse_placement(format!("Kimi package admission refused: {error:#}"),
                 "Supply complete matching native and EXL3 workspace manifests."); return memory; }
@@ -228,10 +223,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.refuse_placement("Kimi native K6 requires installed workspace inventory".into(),
             "Supply the matching K6 PROGRAMS.json through --workspace-manifest.");
         return memory;
-    }
-    if opts.full_prefill_logits && manifest.is_none() {
-        fixed.push(Demand::new(head_rank as u8, Category::Workspace, "Kimi full prefill logits",
-            (rows - rows.min(64)) as u64 * cfg.vocab_size as u64 * 4, Basis::Exact));
     }
     let inventory = (|| -> anyhow::Result<_> {
         let catalog = input.expert_catalog()?;
@@ -518,7 +509,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Err(error) => { report.refuse_placement(format!("Kimi host prefix refused: {error:#}"), "Disable host retention or supply a supported quota."); return memory; }
     };
     recipe.owners.push(kimi::host_prefix_owner(host_quota, maximum_pages));
-    let scoring_bytes = match kimi::host_scoring_bytes(if opts.full_prefill_logits { rows } else { rows.min(64) }, rows, cfg.vocab_size) {
+    let scoring_bytes = match kimi::host_scoring_bytes(rows.min(64), rows, cfg.vocab_size) {
         Ok(bytes) => bytes,
         Err(error) => { report.refuse_placement(error.to_string(), "Use supported scoring dimensions."); return memory; }
     };

@@ -93,13 +93,35 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: &Path,
     workspace().unwrap_or_else(|error| LocalPackage::Missing(format!("{error:#}")))
 }
 
+pub(crate) fn spark_checkpoint(checkpoint: &crate::plan::Checkpoint, catalog: &crate::OfficialV41Catalog,
+    routed: &[usize]) -> anyhow::Result<Option<crate::plan::Checkpoint>> {
+    use crate::formats::fp8_experts::Fp8Projection;
+    ensure!(checkpoint.snapshot == catalog.snapshot(), "MiniMax Spark catalog and checkpoint snapshots differ");
+    let tensors = catalog.fp8().context("MiniMax Spark admission requires native expert headers")?;
+    let complete = routed.iter().all(|&layer| (0..catalog.routed_experts().experts).all(|expert|
+        [Fp8Projection::Gate, Fp8Projection::Up, Fp8Projection::Down].into_iter().all(|projection|
+            tensors.projection_source_names(layer, expert, projection).iter()
+                .all(|name| checkpoint.header(name).is_some()))));
+    if complete { return Ok(None); }
+    // Coordinator role inventories omit routed operands. Recipes validate their
+    // scalar headers too, so reopen the same canonical immutable view, not a
+    // guessed tensor subset or a converted checkpoint.
+    let full = match &checkpoint.view {
+        Some(view) => crate::plan::Checkpoint::open_view(view)?,
+        None => crate::plan::Checkpoint::open(&checkpoint.snapshot)?,
+    };
+    ensure!(full.config == checkpoint.config, "MiniMax Spark canonical checkpoint configuration changed");
+    Ok(Some(full))
+}
+
 /// Spark charges per onboarding count and rank: header-exact native NVFP4
 /// slices, endpoint I/O, typed execution owners (installed TP scratch census)
 /// and the shared worker runtime residual.
 pub fn spark_charges(checkpoint: &crate::plan::Checkpoint, catalog: &crate::OfficialV41Catalog, routed: &[usize],
     ranks: usize, prefill: PrefillShape) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
     if ranks == 0 { return Ok(vec![Vec::new(); routed.len() + 1]); }
-    let recipe = crate::plan::experts::checkpoint_spark_recipe(checkpoint, ranks, routed)?;
+    let canonical = spark_checkpoint(checkpoint, catalog, routed)?;
+    let recipe = crate::plan::experts::checkpoint_spark_recipe(canonical.as_ref().unwrap_or(checkpoint), ranks, routed)?;
     let executions = shared::spark_executions(prefill)?;
     let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(prefill.rows)?,
         ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None };

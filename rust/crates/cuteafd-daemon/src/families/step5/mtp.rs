@@ -1228,7 +1228,7 @@ mod tests {
             assert!(metadata.iter().all(|n| *n >= 256));
             let input = native::plane_bytes(&planes(rows)?)?;
             let layer = native::layer_workspace(rows, rows, false, 64)?;
-            let head = native::plane_bytes(&native::head_planes(native::head_rows(rows, false))?)?;
+            let head = native::plane_bytes(&native::head_planes(native::head_rows(rows))?)?;
             let core = native::mtp_scratch_core(rows, kv_format)?;
             assert_eq!(native::mtp_input_offset(rows)?, layer);
             assert_eq!(native::mtp_metadata_offset(rows)?, layer + input);

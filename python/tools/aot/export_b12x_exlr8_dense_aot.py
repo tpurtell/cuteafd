@@ -221,13 +221,16 @@ def minimax_programs():
     shapes = ((6144, 8192), (6144, 512), (6144, 128), (8192, 6144),
               (6144, 12288), (12288, 6144), (6144, 3072), (3072, 6144))
     result = []
-    for k, n in shapes:
+    # Append rank-local slices without changing any whole-owner entry.
+    partial_shapes = ((6144, 4096), (6144, 256), (6144, 6144),
+                      (6144, 1536), (4096, 6144), (1536, 6144))
+    for k, n in shapes + partial_shapes:
         params = dict(input_features=k, output_features=n, encoding="mxfp8",
                       sharded_side=1, input_dtype="bf16", rotation_count=1,
                       max_rows=4096)
         result.append((f"mxfp8_k{k}_n{n}_s1_a8", "dense_mxfp8", params,
                        partial(compile_dense_mxfp8_aot, **params)))
-    for k in sorted({k for k, _ in shapes}):
+    for k in sorted({k for k, _ in shapes}) + sorted({k for k, _ in partial_shapes} - {k for k, _ in shapes}):
         params = dict(input_features=k, input_dtype="bf16", rotation_count=1,
                       max_rows=4096)
         result.append((f"quant_k{k}_bf16_a8", "dense_mxfp8_quant", params,

@@ -561,7 +561,7 @@ mod tests {
         assert_eq!(Verification::bytes(&cfg, 16).unwrap(), 16 * layout.bytes + 64 * cfg.vocab * 4
             + 32 * 64 * cfg.hidden * 2);
         for slots in [1, 4, 16, 64] {
-            let native = cuteafd_loader::placement::families::qwen3_5::NativeBuffers::new(&cfg, 1024, slots, 10, false).unwrap();
+            let native = cuteafd_loader::placement::families::qwen3_5::NativeBuffers::new(&cfg, 1024, slots, 10).unwrap();
             assert_eq!(native.verify.iter().sum::<usize>(), Verification::bytes(&cfg, slots).unwrap());
             assert_eq!(native.verify[0], Verification::layout(&cfg, slots).unwrap().bytes);
             let gdn = GdnLayout::new(cfg.gdn).unwrap();

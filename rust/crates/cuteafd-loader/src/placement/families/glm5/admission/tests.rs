@@ -47,7 +47,7 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
             weights: vec![(EmbeddingHome::Device(0), WeightInventory { ranks: gpus, owners: vec![],
                 core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default(), attention_mount: Default::default() })],
             hooks: (0..gpus).map(|rank| HookBuffers { device: rank as u8, maximum_pages: 1,
-                native: None, core: None, shared_workspace: None, full_prefill_logits: false }).collect(),
+                native: None, core: None, shared_workspace: None, }).collect(),
             embedding_read: None, native_load: None,
         },
         draft: DraftFacts::default(), scratch: Default::default(),
@@ -694,7 +694,6 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
                                 topk: 8192,
                             },
                         )),
-                        full_prefill_logits: false,
                         payload_row_bytes: if local { cfg.hidden as u64 * 4 } else { 0 },
                         core_rows: false, attention_partial_bytes: 2, down_partial_bytes: 2,
                     },
@@ -2109,9 +2108,6 @@ fn composition_refuses_mismatched_geometry_domains_and_non_target_experts() {
     bad.weights[0].when = vec![When::Embedding(EmbeddingHome::Device(1))];
     refuses(bad);
     let mut bad = base.clone();
-    bad.targets[0].value.full_prefill_logits = true;
-    refuses(bad);
-    let mut bad = base.clone();
     bad.attention = vec![
         LayerMode::Whole {
             gpu: 0,
@@ -2261,7 +2257,7 @@ fn scoring_host_output_is_additional_to_text_only_rss() {
     let admitted = input.prepare().unwrap().admit(scoring).unwrap();
     let owner = admitted.solved.facts.allocations.iter().find(|owner| owner.id == "glm.scoring.host_logits").unwrap();
     assert_eq!(owner.location, Location::HOST);
-    assert_eq!(owner.bytes, cuteafd_core::memory_layout::host_logits_bytes(128, 128, cfg.vocab_size as u64).unwrap());
+    assert_eq!(owner.bytes, cuteafd_core::memory_layout::host_logits_bytes(64, 64, cfg.vocab_size as u64).unwrap());
 }
 
 #[test]

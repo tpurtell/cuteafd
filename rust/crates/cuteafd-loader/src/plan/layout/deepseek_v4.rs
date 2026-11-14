@@ -367,12 +367,12 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
         tp2_workspace: tp2_workspace.map_or([0; 2], |bytes| [bytes; 2]),
         exchange_f32: options.exchange_f32,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-        full_prefill_logits: 0, pending_code,
+        pending_code,
         context,
         attention: report.requested_attention, extra, physical_bytes: Vec::new(),
         host: Some(v4::V4Host { total: host.0, available: host.1, headroom: (8 << 30).max(host.0 / 10),
             cache_bytes: options.host_cache_bytes, prefix_entries: options.prefix_entries("deepseek_v4"),
-            span_rows: report.prefill_span_rows.unwrap_or(shape.prefill_rows * options.prefill_waves), full_prefill_logits: options.full_prefill_logits,
+            span_rows: report.prefill_span_rows.unwrap_or(shape.prefill_rows * options.prefill_waves),
             embedding_bytes: if host_embedding { checkpoint.tensors.iter().find(|t| t.meta.name == "embed.weight")
                 .map_or(0, |t| t.meta.byte_length) } else { 0 },
             // Without a manifest, the compiled stride covers the context in 64-row groups.

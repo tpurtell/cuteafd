@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn full_head_arena_keeps_projection_backing_outside_phase_maximum() -> Result<()> {
+    fn bounded_head_arena_keeps_projection_backing_outside_phase_maximum() -> Result<()> {
         use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
         let (unit, span) = (2752, 3 * 2752);
         let mut projection = ProjectionScratchLayout::new(13824, 4096, unit)?;
@@ -180,13 +180,9 @@ mod tests {
         let layer = native::layer_workspace(unit, span, true, 64)?;
         let head_planes = native::head_planes(span)?;
         let head = native::plane_bytes(&head_planes)?;
-        let old_total = (layer + projection).max(head);
-        let old_arena = old_total - projection;
-        assert_eq!(head - old_arena, projection);
-        assert!(view_layout(old_arena as usize, &head_planes, 0).is_err());
         let total = native::with_arena_phase(layer + projection, projection, head)?;
         let arena = usize::try_from(total - projection)?;
-        assert_eq!(total, head + projection);
+        assert_eq!(total, layer.max(head) + projection);
         view_layout(arena, &head_planes, 0)?;
         for depth in [0, 1, 3] {
             let predictor = native::mtp_forecast_workspace(unit, depth,
@@ -246,7 +242,7 @@ mod tests {
             let inputs = view_layout(predictor, &native::mtp_input_planes(rows)?, input_offset)?;
             let metadata_sizes = native::mtp_metadata_planes(rows)?;
             let metadata = view_layout(predictor, &metadata_sizes[..4], metadata_offset)?;
-            let head = view_layout(predictor, &native::head_planes(native::head_rows(rows, false))?, 0)?;
+            let head = view_layout(predictor, &native::head_planes(native::head_rows(rows))?, 0)?;
             let selected = (0..3).map(|stage| view_layout(predictor, &metadata_sizes[4..],
                 core + stage * 256).map(|views| views[0])).collect::<Result<Vec<_>>>()?;
             assert_eq!(input_offset, attention_bytes + usize::try_from(native::ffn_region_bytes(rows, rows)?)?);
@@ -331,7 +327,7 @@ mod tests {
                 // The next layer copies this residual to offset zero before any reuse.
                 assert!(output.0 >= residual);
                 // The head narrows into planes 0/1 before logits may overwrite the residual.
-                let head = native::head_planes(native::head_rows(rows, false))?;
+                let head = native::head_planes(native::head_rows(rows))?;
                 assert!(head[0] + head[1] <= output.0);
             }
         }

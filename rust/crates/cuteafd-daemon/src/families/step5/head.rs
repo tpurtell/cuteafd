@@ -229,38 +229,57 @@ impl<'a> TargetHeadOwner<'a> {
     /// The transaction retains this owner and input through the lane stream's drain.
     pub(super) fn device_logits_on(&self, input: CuteafdDeviceBuffer, rows: usize,
         stream: &Stream<'a>) -> Result<crate::shared::token_io::DeviceLogits> {
-        super::transaction::validate_active_rows(rows, self.rows)?;
+        self.device_logits_at(input, rows, 0, stream)
+    }
+
+    fn normalize_on(&self, input: CuteafdDeviceBuffer, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        ensure!(rows > 0 && rows <= self.rows, "Step-5 norm exceeds admitted rows");
         ensure!(!input.ptr.is_null() && input.bytes >= rows * H * 4
             && input.device_id == self.stream.device.id && stream.device.id == input.device_id
             && std::ptr::eq(stream.device.library, self.stream.device.library),
             "Step-5 final hidden extent/device/stream");
-        let mut guard = stream.cancellation_guard("Step-5 final head input borrow");
+        let mut guard = stream.cancellation_guard("Step-5 final norm input borrow");
         stream.device.run(|| {
             let library = stream.device.library;
-            let p = self.planes.iter().map(|p| p.buffer.ptr).collect::<Vec<_>>();
-            let weight = self.immutable.weights[0].buffer.ptr;
-            // The shared target arena preserves the F32 residual until narrowing
-            // completes; only the later logits/scratch writes may alias that input.
-            // SAFETY: admitted lane-private planes, head handle and input stay live
-            // through the transaction drain; runtime rows never exceed capacity.
+            // Narrow the entire retained residual before the aliased vocabulary plane is written.
+            // SAFETY: admitted planes, input and stream remain live through the drain guard.
             unsafe {
                 library.cuda_f32_to_bf16_async(input, self.planes[0].buffer, rows * H, stream.raw)?;
-                // The span-sized logit planes retain all scoring rows, but the
-                // masked norm export runs at most its compiled unit capacity.
+                let weight = self.immutable.weights[0].buffer.ptr;
                 for start in (0..rows).step_by(self.immutable.kernel_rows) {
                     let count = (rows - start).min(self.immutable.kernel_rows);
-                    let input = p[0].wrapping_byte_add(start * H * 2);
-                    let output = p[1].wrapping_byte_add(start * H * 2);
+                    let input = self.planes[0].buffer.ptr.wrapping_byte_add(start * H * 2);
+                    let output = self.planes[1].buffer.ptr.wrapping_byte_add(start * H * 2);
                     self.immutable.norm.launch(&[input, weight, weight, weight, weight, weight, output],
                         &[Scalar::I32(count as i32), Scalar::F32(self.immutable.epsilon)], stream.raw)?;
                 }
+            }
+            Ok(())
+        })?;
+        guard.complete = true;
+        Ok(())
+    }
+
+    fn device_logits_at(&self, input: CuteafdDeviceBuffer, rows: usize, first: usize,
+        stream: &Stream<'a>) -> Result<crate::shared::token_io::DeviceLogits> {
+        ensure!(first == 0 && rows <= 64, "Step-5 direct head exceeds bounded rows");
+        self.normalize_on(input, rows, stream)?;
+        self.project_normalized_at(rows, first, stream)
+    }
+
+    fn project_normalized_at(&self, rows: usize, first: usize,
+        stream: &Stream<'a>) -> Result<crate::shared::token_io::DeviceLogits> {
+        ensure!(rows > 0 && rows <= 64 && first.checked_add(rows).is_some_and(|end| end <= self.rows),
+            "Step-5 head tile exceeds admitted rows");
+        let mut guard = stream.cancellation_guard("Step-5 final head norm borrow");
+        stream.device.run(|| {
+            // SAFETY: normalized rows and bounded output/scratch survive the stream's drain.
+            unsafe {
                 for start in (0..rows).step_by(self.immutable.kernel_rows) {
                     let count = (rows - start).min(self.immutable.kernel_rows);
-                    let input = p[1].wrapping_byte_add(start * H * 2);
-                    let output: *mut f32 = p[2].wrapping_byte_add(start * V * 4).cast();
+                    let input = self.planes[1].buffer.ptr.wrapping_byte_add((first + start) * H * 2);
+                    let output: *mut f32 = self.planes[2].buffer.ptr.wrapping_byte_add(start * V * 4).cast();
                     if let Some((linear, scratch)) = &self.immutable.native {
-                        // The head's scratch is shared by lanes on this one stream; lanes run
-                        // their heads in stream order on the head rank.
                         let buffer = |ptr: *mut std::ffi::c_void, bytes| CuteafdDeviceBuffer { ptr, bytes,
                             device_id: stream.device.id, flags: 0 };
                         linear.launch(count, buffer(input, count * H * 2), buffer(output.cast(), count * V * 4),
@@ -275,7 +294,7 @@ impl<'a> TargetHeadOwner<'a> {
                 }
             }
             guard.complete = true;
-            Ok(crate::shared::token_io::DeviceLogits { ptr: p[2].cast_const(), rows, vocab: V,
+            Ok(crate::shared::token_io::DeviceLogits { ptr: self.planes[2].buffer.ptr.cast_const(), rows, vocab: V,
                 stride: V, stream: stream.raw, greedy: None })
         })
     }
@@ -283,18 +302,23 @@ impl<'a> TargetHeadOwner<'a> {
     /// Caller drains the target chain first; consume bounded host tiles before reuse.
     pub fn logits_consumer(&self, input: CuteafdDeviceBuffer, scoring: crate::shared::probe::ScoringRows<'_>) -> Result<()> {
         let mut guard = self.stream.get()?.cancellation_guard("Step-5 diagnostic head input borrow");
-        let logits = self.device_logits_on(input, self.rows, self.stream.get()?)?;
-        self.stream.device.run(|| {
-            for span in crate::shared::probe::head_spans(self.rows, 64)? {
-                let tile = crate::shared::token_io::DeviceLogits {
-                    ptr: logits.ptr.wrapping_byte_add(span.start * V * 4), rows: span.len(), ..logits };
-                scoring.record(self.stream.device.library, span.start, &tile)?;
-            }
-            Ok(())
-        })?;
+        normalized_tiles(self.rows,
+            || self.normalize_on(input, self.rows, self.stream.get()?),
+            |span| {
+                let logits = self.project_normalized_at(span.len(), span.start, self.stream.get()?)?;
+                self.stream.device.run(|| scoring.record(self.stream.device.library, span.start, &logits))
+            })?;
         guard.complete = true;
         Ok(())
     }
+}
+
+// The full residual may alias vocabulary output, so normalization is a phase barrier.
+fn normalized_tiles(rows: usize, normalize: impl FnOnce() -> Result<()>,
+    mut tile: impl FnMut(std::ops::Range<usize>) -> Result<()>) -> Result<()> {
+    normalize()?;
+    for span in crate::shared::probe::head_spans(rows, 64)? { tile(span)?; }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -340,6 +364,61 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn normalized_phase_preserves_logits_when_tiles_overlap_the_residual() -> Result<()> {
+        use std::cell::RefCell;
+        const ROWS: usize = 129;
+        const WIDTH: usize = 8;
+        const VOCAB: usize = 17;
+        let hidden = (0..ROWS * WIDTH).map(|i| ((i * 37 % 251) as f32 - 125.0) / 31.0).collect::<Vec<_>>();
+        let weights = (0..VOCAB * WIDTH).map(|i| ((i * 13 % 43) as f32 - 21.0) / 17.0).collect::<Vec<_>>();
+        let run = |aliased: bool| -> Result<Vec<u32>> {
+            let output = if aliased { 0 } else { hidden.len() };
+            let arena = RefCell::new(vec![0f32; hidden.len() + 64 * VOCAB]);
+            arena.borrow_mut()[..hidden.len()].copy_from_slice(&hidden);
+            let normalized = RefCell::new(vec![0f32; hidden.len()]);
+            let mut result = Vec::new();
+            normalized_tiles(ROWS, || {
+                let arena = arena.borrow();
+                let mut norm = normalized.borrow_mut();
+                for row in 0..ROWS {
+                    // Model the native BF16 boundary before the row-wise RMS norm.
+                    let narrow = (0..WIDTH).map(|col| f32::from_bits(arena[row * WIDTH + col].to_bits() & 0xffff0000))
+                        .collect::<Vec<_>>();
+                    let scale = (narrow.iter().map(|v| v * v).sum::<f32>() / WIDTH as f32 + 1e-5).sqrt().recip();
+                    for col in 0..WIDTH {
+                        norm[row * WIDTH + col] = f32::from_bits((narrow[col] * scale).to_bits() & 0xffff0000);
+                    }
+                }
+                Ok(())
+            }, |span| {
+                let norm = normalized.borrow();
+                let mut arena = arena.borrow_mut();
+                for (local, row) in span.enumerate() {
+                    for vocab in 0..VOCAB {
+                        arena[output + local * VOCAB + vocab] = (0..WIDTH)
+                            .map(|col| norm[row * WIDTH + col] * weights[vocab * WIDTH + col]).sum();
+                    }
+                }
+                let count = result.len() / VOCAB;
+                let rows = (ROWS - count).min(64);
+                result.extend(arena[output..output + rows * VOCAB].iter().map(|v| v.to_bits()));
+                Ok(())
+            })?;
+            if aliased { assert_ne!(&arena.borrow()[..hidden.len()], &hidden); }
+            Ok(result)
+        };
+        let baseline = run(false)?;
+        assert_eq!(baseline.len(), ROWS * VOCAB);
+        assert_eq!(run(true)?, baseline);
+        let source = include_str!("head.rs");
+        let consumer = source.split_once("pub fn logits_consumer(").unwrap().1.split_once("\n    }").unwrap().0;
+        assert!(consumer.contains("normalized_tiles(self.rows,"));
+        assert!(consumer.find("self.normalize_on(").unwrap() < consumer.find("self.project_normalized_at(").unwrap());
+        assert!(consumer.contains("span.len(), span.start"));
+        Ok(())
+    }
+
+    #[test]
     fn native_k6_head_plan_matches_private_owner_and_reusable_planes() -> Result<()> {
         use cuteafd_loader::formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook,
             trellis_core::CoreWeightLayout};
@@ -363,7 +442,7 @@ pub(super) mod tests {
             assert_eq!(owner_layout.rows, unit);
             assert_eq!(owner_layout.packed_bytes()? as u64, private_scratch);
             assert_eq!(plan.immutable_bytes(), (H * 4 + core_bytes) as u64 + private_scratch);
-            assert_eq!(plan.workspace_bytes(), (logits * (H * 4 + V * 4) + (4 << 20)) as u64);
+            assert_eq!(plan.workspace_bytes(), (logits * H * 4 + logits.min(64) * V * 4 + (4 << 20)) as u64);
             assert_eq!(plan.bytes(), plan.immutable_bytes() + plan.workspace_bytes());
             // The private owner survives while only the logit planes alias this larger arena.
             let arena = plan.workspace_bytes() + 1024;
@@ -382,7 +461,7 @@ pub(super) mod tests {
     fn final_planes_charge_both_bf16_boundaries_logits_and_head_workspace() {
         for rows in [1, 64, 640, 4096, 8192, 8256] {
             let planes = HeadPlan::plane_bytes(rows).unwrap();
-            assert_eq!(planes, [rows * H * 2, rows * H * 2, rows * V * 4, 4 << 20]);
+            assert_eq!(planes, [rows * H * 2, rows * H * 2, rows.min(64) * V * 4, 4 << 20]);
         }
         for rows in [0, 8257, usize::MAX] { assert!(HeadPlan::plane_bytes(rows).is_err()); }
     }

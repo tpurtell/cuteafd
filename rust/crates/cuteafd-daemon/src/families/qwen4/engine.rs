@@ -1072,7 +1072,6 @@ pub(crate) struct Qwen4Engine<'a> {
     /// Prefill programs over FP8-only projections quantize their activations
     /// (W8A8, `fp8_rows` 1) instead of W8A16 (`--fp8-prefill-w8a8`).
     pub w8a8_prefill: bool,
-    pub full_prefill_logits: bool,
     packed_row_cap: Cell<Option<usize>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
@@ -1279,7 +1278,7 @@ impl<'a> Qwen4Engine<'a> {
             graph_pins: RefCell::new(Vec::new()),
             graph_warmed: Cell::new(false),
             warming_graphs: Cell::new(false),
-            w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
+            w8a8_prefill: false, spark_bf16: false,
             packed_row_cap: Cell::new(None),
             l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4, Tag::drafter_workspace("qwen4/mtp-drafts"))?,
@@ -1410,17 +1409,17 @@ impl<'a> Qwen4Engine<'a> {
         ensure!(!self.host_memory_admitted, "Qwen host memory was already admitted");
         let (config, scoring, headroom) = match &args.planner_host_prefix {
             Some((prefix, lanes)) => {
-                let prefix = prefix.with_scoring(if args.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS },
+                let prefix = prefix.with_scoring(DECODE_ROWS,
                     self.prefill_rows, self.cfg.vocab_size)?;
                 let layout = super::prefix::Qwen4Prefix::geometry(self)?;
                 (prefix.resolve_host_config(layout, self.max_context, *lanes)?, prefix.scoring_host_bytes,
                     prefix.host_cache_headroom_bytes)
             }
             None => (None, cuteafd_core::memory_layout::host_logits_bytes(
-                if args.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS } as u64,
+                DECODE_ROWS as u64,
                 self.prefill_rows as u64, self.cfg.vocab_size as u64).context("Qwen host scoring overflow")?, 0),
         };
-        let tables = self.future_host_workspaces(args.full_prefill_logits)?;
+        let tables = self.future_host_workspaces()?;
         match &self.admitted_host {
             // The recipe charged every host owner against one host sample before
             // allocation; check the actual owners fit what it admitted.
@@ -1446,7 +1445,7 @@ impl<'a> Qwen4Engine<'a> {
         validate_admitted_host(host, tables, prefix_bytes, self.pool_pages as u64)
     }
 
-    fn future_host_workspaces(&self, full_logits: bool) -> Result<Vec<(String, u64)>> {
+    fn future_host_workspaces(&self) -> Result<Vec<(String, u64)>> {
         use super::admission::HostWorkspaceBytes;
         let mut demands = Vec::new();
         if let Some(ple) = &self.ple {
@@ -1459,7 +1458,7 @@ impl<'a> Qwen4Engine<'a> {
                 if self.workspace_slot(owner, decode)?.borrow().is_some() { continue; }
                 let rows = if decode { DECODE_ROWS } else { self.prefill_shape
                     .map_or(self.prefill_rows, |shape| shape.unit_rows as usize) };
-                let logits = if decode { DECODE_ROWS } else if full_logits { self.prefill_rows } else { 1 };
+                let logits = if decode { DECODE_ROWS } else { 1 };
                 let host = HostWorkspaceBytes::new(&self.cfg, rows, decode, self.pages, self.pool_pages,
                     if decode { 0 } else { self.prefill_shape.map_or(0, |shape| shape.waves as usize) },
                     matches!(self.experts, Some(Experts::Spark { .. })), self.weights.mtp.is_some(), ple_ids, logits)?;
@@ -1485,7 +1484,7 @@ impl<'a> Qwen4Engine<'a> {
         let shape = shape.validate()?;
         if self.workspace.borrow().is_none() {
             *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
-                if self.full_prefill_logits { self.prefill_rows } else { 1 }, shape.slot_rows() as usize,
+                1, shape.slot_rows() as usize,
                 if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
         }
         if self.weights.mtp.is_some() && self.mtp_prefill_workspace.borrow().is_none() {
@@ -1504,7 +1503,7 @@ impl<'a> Qwen4Engine<'a> {
                     let slot = self.workspace_slot(owner, decode)?;
                     if slot.borrow().is_none() {
                         let rows = if decode { DECODE_ROWS } else { self.prefill_rows };
-                        let logits = if decode { DECODE_ROWS } else if self.full_prefill_logits { self.prefill_rows } else { 1 };
+                        let logits = if decode { DECODE_ROWS } else { 1 };
                         *slot.borrow_mut() = Some(self.workspace(rows, decode, logits)?);
                     }
                     Ok(())
@@ -2429,7 +2428,7 @@ impl<'a> Qwen4Engine<'a> {
     pub(crate) fn prefill_scoring(&self, placement: &mut Qwen4Placement, tokens: &[u32], logit_rows: usize,
         position: usize, probe: &crate::shared::probe::ProbeRef)
         -> Result<Option<crate::shared::probe::ScoreLogits>> {
-        if logit_rows <= 1 || self.full_prefill_logits {
+        if logit_rows <= 1 {
             return Ok(self.prefill_device(placement, tokens, None, None, logit_rows)?
                 .map(crate::shared::probe::ScoreLogits::Device));
         }
@@ -2487,7 +2486,7 @@ impl<'a> Qwen4Engine<'a> {
             self.allow_workspace_creation()?;
             self.drain_state()?;
             *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
-                if self.full_prefill_logits { self.prefill_rows } else { retained_rows }, shape.slot_rows() as usize,
+                retained_rows, shape.slot_rows() as usize,
                 if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
             self.prepare_prefill_units()?;
         }
@@ -3049,15 +3048,7 @@ impl<'a> Qwen4Engine<'a> {
         self.put(&w.seq_first, seq_first)
     }
 
-    pub fn prepare_scoring_prefill(&mut self) -> Result<()> {
-        *self.workspace.borrow_mut() = Some(match self.prefill_shape {
-            Some(shape) => self.workspace_rows(shape.unit_rows as usize, false, self.prefill_rows,
-                shape.slot_rows() as usize, if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?,
-            None => self.workspace(self.prefill_rows, false, self.prefill_rows)?,
-        });
-        self.full_prefill_logits = true;
-        Ok(())
-    }
+
 
     fn step(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
@@ -4516,7 +4507,7 @@ mod prefill_unit_tests {
                         cfg: &cfg, layers: 48, mtp,
                         kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, manifest: None,
                         prefill_rows: span, prefill_shape: Some(shape), slots: 8, mark_bytes: 0,
-                        full_prefill_logits: 0, ple: mapped.map(|width| (width, width == 160)),
+                        ple: mapped.map(|width| (width, width == 160)),
                         future_expert_bytes: 0, headroom: 0,
                     })?;
                     let planned = admitted.items.iter().find(|item| item.1 == "prefill step").unwrap().2;

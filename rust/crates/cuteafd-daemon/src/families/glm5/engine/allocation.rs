@@ -62,10 +62,10 @@ impl Census<'_> {
         Ok(())
     }
     /// Decode owners exist from the startup warm pass; prefill lane owners
-    /// exist from the first prefill, which only scoring runs before Ready.
-    fn workspace_lifetime(kind: &str, scoring: bool) -> Lifetime {
+    /// exist from the first request prefill in the growth phase.
+    fn workspace_lifetime(kind: &str) -> Lifetime {
         Lifetime {
-            first: if kind == "prefill" && !scoring {
+            first: if kind == "prefill" {
                 Phase::Growth
             } else {
                 Phase::Warmup
@@ -73,8 +73,8 @@ impl Census<'_> {
             last: Phase::Growth,
         }
     }
-    fn hooks(&mut self, kind: &str, slots: &[Workspace<'_>], scoring: bool) -> Result<()> {
-        let lifetime = Self::workspace_lifetime(kind, scoring);
+    fn hooks(&mut self, kind: &str, slots: &[Workspace<'_>]) -> Result<()> {
+        let lifetime = Self::workspace_lifetime(kind);
         let mut shared: Option<Vec<Receipt>> = None;
         for w in slots {
             let mut actual = Census {
@@ -141,9 +141,8 @@ impl Census<'_> {
         decode: bool,
         library: &NativeLibrary,
         stream: *mut c_void,
-        scoring: bool,
     ) -> Result<()> {
-        let lifetime = Self::workspace_lifetime(kind, scoring);
+        let lifetime = Self::workspace_lifetime(kind);
         let mut owners = BTreeMap::new();
         let mut router = None;
         let mut uploads = BTreeMap::new();
@@ -503,9 +502,9 @@ impl GlmEngine<'_> {
                 devices, rank: logical_rank,
             };
             if let Some(w) = decode.borrow().as_ref() {
-                census.hooks("decode", std::slice::from_ref(w), self.full_prefill_logits)?;
+                census.hooks("decode", std::slice::from_ref(w))?;
             }
-            census.hooks("prefill", &prefill.borrow(), self.full_prefill_logits)?;
+            census.hooks("prefill", &prefill.borrow())?;
             if rank == 0 {
                 for (name, head, category) in [
                     (
@@ -605,7 +604,6 @@ impl GlmEngine<'_> {
                     true,
                     self.library,
                     self.stream_of(rank),
-                    self.full_prefill_logits,
                 )?;
             }
             census.rows(
@@ -614,7 +612,6 @@ impl GlmEngine<'_> {
                 false,
                 self.library,
                 self.stream_of(rank),
-                self.full_prefill_logits,
             )?;
             out.extend(census.receipts);
         }

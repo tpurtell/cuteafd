@@ -89,7 +89,7 @@ mod hook_borrow_tests {
         // Startup compares independently loaded allocation owners to offline
         // native admission, including multislot marks and retained prefixes.
         let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg, None, None, 4,
-            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }), std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse()?, false, None, true)?;
+            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }), std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse()?, None, true)?;
         assert!(engine.pool_tokens >= 262144);
         let tokens = (1..=9).collect::<Vec<_>>();
         engine.verify_check(&tokens)?;
@@ -137,7 +137,7 @@ impl<'a> DenseEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         mut cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
-        prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool,
+        prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool, Option<u64>)>, verify_check: bool) -> Result<Self> {
         ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=64 slots");
         let reader = WeightReader { library, checkpoint };
@@ -155,7 +155,7 @@ impl<'a> DenseEngine<'a> {
             .context("dense prefix mark size overflow")?;
         let prefix_marks = prefix.map_or(0, |rule| rule.slots(mark_bytes));
         let prefix_bytes = prefix_marks.checked_mul(mark_bytes).context("dense prefix arena overflow")?;
-        let buffers = NativeBuffers::new(&cfg, admitted.scratch_bytes, slots, prefix_marks, full_prefill_logits)?;
+        let buffers = NativeBuffers::new(&cfg, admitted.scratch_bytes, slots, prefix_marks)?;
         ensure!(buffers.mark_bytes == mark_bytes && buffers.prefix == prefix_bytes,
             "dense native prefix admission differs from state layout");
         let sizes = buffers.planes;
@@ -171,7 +171,7 @@ impl<'a> DenseEngine<'a> {
             pool: requested_pool.filter(|&n| n > 0).map(Pin::Exact).unwrap_or(Pin::Auto),
             onboard: Pin::Auto,
             prefill: Pin::Exact(PrefillShape { rows: ROWS as u64, waves: 1 }),
-            operation: if full_prefill_logits { Operation::Scoring } else { Operation::Serving },
+            operation: Operation::Serving,
             resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()),
             spark_reply_formats: cuteafd_core::spark_reply::requested(),
         };
@@ -209,7 +209,7 @@ impl<'a> DenseEngine<'a> {
         }));
         let graphs = graphs::Graphs::new(device, graph_variant)?;
         let pool_tokens = usize::try_from(admitted_plan.pool_tokens)?;
-        tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits,
+        tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks,
             head_rows = buffers.head_rows, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format),
             // Basis for the Ready reconciliation: everything already resident
             // after modules, programs, the engine stream and before weights.
@@ -299,7 +299,6 @@ impl<'a> DenseEngine<'a> {
 
     pub(crate) fn slot_count(&self) -> usize { self.slots.len() }
     pub(crate) fn decode_rows(&self) -> usize { HEAD_ROWS }
-    pub(crate) fn full_prefill_logits(&self) -> bool { self.head_rows == ROWS }
     pub(crate) fn slot_position(&self, slot: usize) -> Result<usize> {
         self.slots.get(slot).map(|state| state.position).context("dense slot outside admission")
     }

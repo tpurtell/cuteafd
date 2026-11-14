@@ -480,7 +480,7 @@ impl TargetFacts {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let hooks = (0..gpus).map(|rank| HookBuffers { device: rank as u8,
             maximum_pages: 1, native: None, core: core.map(|core| core.ranks[rank].clone()),
-            shared_workspace: None, full_prefill_logits: false }).collect();
+            shared_workspace: None, }).collect();
         let row = cfg.hidden.checked_mul(2).context("GLM embedding row overflow")?;
         let embedding_read = Some(crate::shared::dense_read::ReadBatch::new(
             cfg.vocab_size, row, row, crate::shared::dense_read::STEP_BYTES)?);
@@ -504,8 +504,7 @@ impl TargetFacts {
         let load = NativeLoad::new(&dense.iter().collect::<Vec<_>>(), &vocabulary[0], shared, storage)?;
         let hooks = scratch.iter().enumerate().map(|(rank, layouts)| HookBuffers {
             device: rank as u8, maximum_pages: 1, native: Some(layouts.clone()), core: None,
-            shared_workspace: Some(workspace.clone()), full_prefill_logits: false,
-        }).collect();
+            shared_workspace: Some(workspace.clone()), }).collect();
         Ok(Self { weights: vec![(EmbeddingHome::Device(0), weights)], hooks,
             embedding_read: None, native_load: Some(load) })
     }
@@ -1019,7 +1018,6 @@ impl<'a> ProductionInput<'a> {
         }
         for mut hook in hooks {
             hook.maximum_pages = maximum_pages;
-            hook.full_prefill_logits = self.operation == Operation::Scoring;
             recipe.hooks.push(Case { when: vec![], value: hook });
         }
         if self.gpus == 2 {
@@ -1086,7 +1084,6 @@ impl<'a> ProductionInput<'a> {
                     native_head: recipe.hooks[device as usize].value.core.as_ref()
                         .is_some_and(|core| core.target_head.is_some()),
                     decode: Some(self.scratch[0]), prefill: Some((self.prefill, self.scratch[1])),
-                    full_prefill_logits: self.operation == Operation::Scoring,
                     payload_row_bytes: if count > 0 && self.gpus == 2 {
                         self.cfg.hidden as u64 * self.exchange_element_bytes
                     } else { 0 },
@@ -2217,10 +2214,9 @@ impl Recipe for GlmRecipe<'_> {
                 self.maximum_pages, contract.phase_order)?);
         }
         if request.operation == Operation::Scoring {
-            for (option, shape) in self.prefill.iter().enumerate() {
-                // Scoring's serial-lane calls download one unit directly; the
-                // normal multi-wave prefill gather is not used by this path.
-                let bytes = cuteafd_core::memory_layout::host_logits_bytes(shape.rows, shape.rows, self.cfg.vocab_size as u64)
+            for (option, _) in self.prefill.iter().enumerate() {
+                // Scoring drains one bounded head tile before reusing its storage.
+                let bytes = cuteafd_core::memory_layout::host_logits_bytes(64, 64, self.cfg.vocab_size as u64)
                     .ok_or(Refusal::Overflow("scoring host logits"))?;
                 let owner = Allocation::buffer("glm.scoring.host_logits", Location::HOST, bytes,
                     Lifetime::TARGET, cuteafd_core::memory_layout::Category::Workspace, "scoring host logits");
@@ -2288,7 +2284,6 @@ impl Recipe for GlmRecipe<'_> {
                 || target.partitioned != partitioned
                 || target.owned_layers != expected
                 || target.split_heads != (self.gpus == 2 && !whole)
-                || target.full_prefill_logits != (request.operation == Operation::Scoring)
                 || target.prefill.is_some_and(|(shape, _)| {
                     !case
                         .when

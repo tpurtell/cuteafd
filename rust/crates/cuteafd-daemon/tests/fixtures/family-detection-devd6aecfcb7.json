@@ -2,6 +2,11 @@
   "baseline": "d6aecfcb7229f592318bc8bce96929e356ce805e",
   "results": [
     {
+      "model": "MiniMaxAI/MiniMax-M3.1-Flash",
+      "revision": "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
+      "family": "minimax_m3"
+    },
+    {
       "model": "Qwen/Qwen3.5-9B",
       "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
       "family": "qwen3_5"

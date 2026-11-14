@@ -218,7 +218,6 @@ pub struct GlmfInputs<'a> {
     pub drafter_bridge: Option<MovableDemands>,
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
-    pub full_prefill_logits: u64,
 }
 
 /// One drafter's exact device request lists on each candidate GPU: the resident
@@ -484,7 +483,6 @@ pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
                 .with_requests(cache::prefill_return_requests_with_format(prefill_lanes, i.prefill_rows,
                     i.spark_ranks as u64, i.cfg.hidden as u64, i.spark_reply_format)
                     .map_err(|_| PlacementError::Inventory("GLM Flash Spark reply width or allocation overflow"))?));
-            fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Workspace, "probe prefill logits", i.full_prefill_logits, Basis::Formula));
         }
     }
 
@@ -634,7 +632,7 @@ pub(crate) mod tests {
                 whole: Bytes2 { resident: 2 << 30, staging: 0 },
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, whole_supported: true, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30, drafter_weights: ResidentWeights(2 << 30),
-            drafter_scratch: vec![0; ranks], drafter_requests: None, drafter_bridge: None, requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
+            drafter_scratch: vec![0; ranks], drafter_requests: None, drafter_bridge: None, requested_pool: None, onboard: default_onboard(),
         }
     }
 

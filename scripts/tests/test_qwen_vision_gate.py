@@ -213,7 +213,7 @@ def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body
     engine = (root / "engine.rs").read_text()
     family = (root / "mod.rs").read_text()
     startup = family[family.index("pub fn with_engine<T>"):family.index("    fn experts<'s>")]
-    assert startup.index("engine.prepare_scoring_prefill()?") < startup.index("engine.prepare_prefill_units()?")
+    assert startup.index("engine.admit_host_memory(args)?;") < startup.index("engine.prepare_prefill_units()?")
     assert startup.index("engine.prepare_prefill_units()?") < startup.index("let result = body(&engine);")
 
     prepare = engine[engine.index("    pub(crate) fn prepare_prefill_units("):engine.index("    /// Retain every admitted serving workspace")]
@@ -281,7 +281,7 @@ def test_qwen_joint_host_admission_precedes_lazy_allocations_on_every_layout():
     for filename in ["mod.rs", "dual.rs"]:
         startup = (root / filename).read_text()
         assert startup.count("engine.admit_host_memory(args)?;") == 1
-        assert startup.index("engine.admit_host_memory(args)?;") < startup.index("engine.prepare_scoring_prefill()?")
+        assert startup.index("engine.admit_host_memory(args)?;") < startup.index("crate::shared::memory_report::release_load_staging(&self.library)?;")
         assert startup.index("engine.admit_host_memory(args)?;") < startup.index("let result = body(&engine);")
 
     admit = engine[engine.index("    pub(super) fn admit_host_memory("):engine.index("    fn future_host_workspaces(")]

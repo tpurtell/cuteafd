@@ -65,9 +65,6 @@ pub(crate) struct EngineArgs {
     /// Sequences that can be resident at once (compressor state slots).
     #[arg(long, default_value_t = 8)]
     pub max_sequences: usize,
-    /// Admit every prefill row's logits at startup for fidelity probes.
-    #[arg(long)]
-    pub full_prefill_logits: bool,
     /// Total tokens the compressed-cache pools hold across sequences; 0 uses
     /// planner admission from measured free memory before cache allocation.
     #[arg(long, default_value_t = 0)]
@@ -828,7 +825,6 @@ pub(crate) fn with_engine<T>(
         }
         if remote_experts { tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm"); }
         engine.prepare_workspaces()?;
-        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         // One graph arena per rank, charged before KV sizing and captured lazily
         // inside it. A capture the reserve cannot hold runs eagerly.
         // The prewarm shape is the resolved layout (coordinator GPUs x Sparks

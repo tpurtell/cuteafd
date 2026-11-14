@@ -175,22 +175,22 @@ impl UploadInputs {
 }
 
 /// Pinned logits landing on each owner: decode and prefill arenas coexist.
-pub fn pinned_logits_bytes(owners: usize, full_prefill_logits: bool, span_rows: u64, vocab: u64)
+pub fn pinned_logits_bytes(owners: usize, vocab: u64)
     -> Result<u64, Refusal> {
-    let rows = 64u64.checked_add(if full_prefill_logits { span_rows } else { 1 })
+    let rows = 64u64.checked_add(1)
         .and_then(|n| n.checked_mul(owners as u64)).ok_or(Refusal::Overflow("Qwen pinned logits rows"))?;
     host_logits_bytes(rows, rows, vocab).ok_or(Refusal::Overflow("Qwen pinned logits"))
 }
 
-/// The separate MTP prefill workspace lands one row, even in full-logit mode.
+/// The separate MTP prefill workspace lands one row.
 pub fn mtp_pinned_logits_bytes(prefill_shape: bool, mtp: bool, vocab: u64) -> Result<u64, Refusal> {
     if !prefill_shape || !mtp { return Ok(0); }
     host_logits_bytes(1, 1, vocab).ok_or(Refusal::Overflow("Qwen MTP pinned logits"))
 }
 
-/// Host FP32 scoring logits: the full span when scoring, else one decode wave.
-pub fn scoring_logits_bytes(full_prefill_logits: bool, span_rows: u64, vocab: u64) -> Result<u64, Refusal> {
-    let rows = if full_prefill_logits { span_rows } else { 64 };
+/// Host FP32 scoring logits: one bounded decode/head wave.
+pub fn scoring_logits_bytes(span_rows: u64, vocab: u64) -> Result<u64, Refusal> {
+    let rows = 64;
     host_logits_bytes(rows, span_rows, vocab).ok_or(Refusal::Overflow("Qwen scoring logits"))
 }
 
@@ -386,12 +386,12 @@ mod tests {
     fn mtp_prefill_logits_are_one_separate_row_only_when_the_workspace_exists() {
         let vocab = 248_320;
         for owners in [1, 2] {
-            for full in [false, true] {
+            {
                 for shape in [false, true] {
                     for mtp in [false, true] {
-                        let target = pinned_logits_bytes(owners, full, 8192, vocab).unwrap();
+                        let target = pinned_logits_bytes(owners, vocab).unwrap();
                         let extra = mtp_pinned_logits_bytes(shape, mtp, vocab).unwrap();
-                        assert_eq!(target, owners as u64 * (64 + if full { 8192 } else { 1 }) * vocab * 4);
+                        assert_eq!(target, owners as u64 * 65 * vocab * 4);
                         assert_eq!(extra, if shape && mtp { vocab * 4 } else { 0 });
                         let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
                         let mut host = QwenHost::ample(&cfg, owners, 8192).unwrap();
@@ -407,7 +407,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(pinned_logits_bytes(1, false, 8192, vocab).unwrap(), 64_563_200);
+        assert_eq!(pinned_logits_bytes(1, vocab).unwrap(), 64_563_200);
         assert_eq!(mtp_pinned_logits_bytes(true, true, vocab).unwrap(), 993_280);
     }
 

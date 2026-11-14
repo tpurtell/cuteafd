@@ -413,18 +413,17 @@ def test_deployment_goldens_cover_the_complete_release_matrix() -> None:
 
 
 @pytest.mark.parametrize("quota", ["0", "auto", "16GiB"])
-@pytest.mark.parametrize("full", ["off", "on"])
-def test_host_cache_and_full_logits_reach_plan_and_serve(quota: str, full: str) -> None:
+def test_host_cache_reaches_plan_and_serve(quota: str) -> None:
     entry = release_entry(next(e for e in ENTRIES if e["name"] == "glm53-exl3-max"))
-    entry["set"].update(HOST_CACHE_BYTES=quota, FULL_PREFILL_LOGITS=full)
-    result = capture(ROOT, f"host-budget-{quota}-{full}", release_entry=entry)
+    entry["set"].update(HOST_CACHE_BYTES=quota)
+    result = capture(ROOT, f"host-budget-{quota}", release_entry=entry)
     plan = result["plans"][0]
     serve = parse_run(result["containers"][0]["argv"])["command"]
     assert plan[plan.index("--host-cache-bytes") + 1] == quota
     actual = serve[serve.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in serve else "0"
     assert actual == quota
-    assert ("--full-prefill-logits" in plan) == (full == "on")
-    assert ("--full-prefill-logits" in serve) == (full == "on")
+    assert "--full-prefill-logits" not in plan
+    assert "--full-prefill-logits" not in serve
 
 
 @pytest.mark.parametrize("family", ["deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"])

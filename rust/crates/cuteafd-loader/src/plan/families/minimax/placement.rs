@@ -110,7 +110,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
     }
     let solve_request = crate::placement::families::minimax_m3::request(inputs.context, opts.pool_tokens, onboard,
-        shape, if opts.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
+        shape, Operation::Serving,
         inputs.resident_weight_limit, opts.spark_reply_formats);
     let admitted = match inputs.admit(solve_request) {
         Ok(admitted) => admitted,
@@ -120,6 +120,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return empty(notes);
         }
     };
+    // Hidden WIP serving consumes exactly this whole-rank contract. Public
+    // serving remains Planned; split layouts wait for their executor handoff.
+    report.native_serving_admitted = gpus == 1 && !inputs.split() && !inputs.heads();
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
     report.host_budget_bytes = inputs.host_prefix.quota_bytes;
     let placed = admitted.placement;

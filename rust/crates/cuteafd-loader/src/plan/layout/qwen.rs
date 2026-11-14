@@ -247,8 +247,6 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         Some(units)
     } else { None };
     let span = prefill_shape.map_or(shape.prefill_rows, |s| s.slot_rows());
-    let logits = if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", span,
-        cfg.vocab_size as u64) } else { 0 };
     // The PLE n-gram table is mapped (each step's rows uploaded): row width ple_dim / ple_rows, one byte
     // per value in E4M3, two in BF16 (`ple::PleTable::load`).
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
@@ -279,7 +277,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), context: crate::placement::planner::Context::resolve(shape.context_tokens, (options.context_tokens > 0).then_some(options.context_tokens)),
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: span, slots: options.resolved_state_slots("qwen4"), mark_bytes: marks,
-            full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: crate::placement::reserve::gpu("qwen4") },
+            ple, future_expert_bytes: 0, headroom: crate::placement::reserve::gpu("qwen4") },
         capacity_bytes: options.rtx_bytes[0],
         baseline: crate::placement::Baseline::Planned { context_bytes: 0, loaded_bytes },
         pending_code_bytes: 0, max_context: shape.context_tokens,
@@ -362,9 +360,9 @@ fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::
     Ok(QwenHost {
         memory: HostMemory { total, available },
         ple, uploads: vec![bounds; owners], mtp_upload,
-        pinned_logits: pinned_logits_bytes(owners, options.full_prefill_logits, span_rows, cfg.vocab_size as u64)?,
+        pinned_logits: pinned_logits_bytes(owners, cfg.vocab_size as u64)?,
         mtp_pinned_logits: mtp_pinned_logits_bytes(waves > 1, uploads.mtp, cfg.vocab_size as u64)?,
-        scoring_logits: scoring_logits_bytes(options.full_prefill_logits, span_rows, cfg.vocab_size as u64)?,
+        scoring_logits: scoring_logits_bytes(span_rows, cfg.vocab_size as u64)?,
         prefix_quota, prefix_chunk, loaded_media_cache: 0,
         host_embedding,
         table_reactor: crate::formats::mapped_table::table_reactor_workspace_bytes(report.mapped_placement.mapped) as u64,
@@ -681,7 +679,6 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
         admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.resolved_state_slots("qwen4"),
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,
-            full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", rows, cfg.vocab_size as u64) } else { 0 },
             ple, future_expert_bytes: 0, headroom },
         gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: options.rtx_bytes[rank], reserve_bytes: headroom,
             baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: devices[rank].used_bytes() } }),

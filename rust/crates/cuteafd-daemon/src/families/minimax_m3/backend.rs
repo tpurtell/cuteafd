@@ -14,6 +14,21 @@ use std::{cell::{Cell, RefCell}, collections::{BTreeMap, BTreeSet}, ops::Range, 
 
 const MESSAGE_STARTS: &[&str] = &["]~b]"];
 
+fn packing_rows(mode: crate::shared::prefill_packing::PackingMode, admitted: usize) -> usize {
+    match mode {
+        crate::shared::prefill_packing::PackingMode::Unrestricted => admitted,
+        // Native NVFP4 route occupancy has no exact cap attestation yet;
+        // the shared grouping contract runs unknown routes as singletons.
+        crate::shared::prefill_packing::PackingMode::Exact => 0,
+    }
+}
+
+fn validate_prefix_concurrency(requested: usize, admitted: usize) -> Result<()> {
+    ensure!(requested > 0 && requested == admitted,
+        "MiniMax prefix concurrency differs from admitted request slots");
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum BackendError {
     #[error("MiniMax neural/speculative drafts are not qualified")]
@@ -82,11 +97,14 @@ pub(crate) struct MiniMaxBackend<'e, 'a> {
     next_identity: Cell<u64>,
     pending: RefCell<Option<Vec<Submitted>>>,
     terminal: Cell<bool>,
+    selector_receipts: RefCell<Option<Vec<cuteafd_loader::placement::planner::Receipt>>>,
+    packing: crate::shared::prefill_packing::PackingMode,
 }
 
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     pub fn new(owners: &'e Owners<'a>, cfg: &'e MiniMaxM3Config, execution: ServingPrefill<'a>,
-        served_context: usize, host: Option<cuteafd_hostcache::config::Config>) -> Result<Self> {
+        served_context: usize, host: Option<cuteafd_hostcache::config::Config>,
+        packing: crate::shared::prefill_packing::PackingMode) -> Result<Self> {
         let storage = &owners.storage;
         ensure!(storage.ranks.len() == 1, BackendError::TwoRtxNotQualified);
         let state = storage.requests.borrow();
@@ -105,7 +123,8 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         drop(state);
         Ok(Self { owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
             host, profile: RefCell::new([0.0; 2]), identities: RefCell::new(BTreeMap::new()),
-            next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false) })
+            next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false),
+            selector_receipts: RefCell::new(None), packing })
     }
 
     fn live(&self) -> Result<()> { ensure!(!self.terminal.get(), BackendError::Terminal); Ok(()) }
@@ -180,15 +199,26 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     }
 
     fn decode(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
-        retain_receipt: bool) -> Result<Option<DeviceLogits>> {
+        retain_receipt: bool, captured: bool) -> Result<Option<DeviceLogits>> {
         let submitted = self.validate(sequences, pool)?;
         let mut placements = submitted.iter().map(|request| request.placement.clone()).collect::<Vec<_>>();
         let requests = placements.iter_mut().zip(&submitted).map(|(placement, request)| ServingRequest {
             identity: request.identity, kind: ExpertV2SourceKind::Decode, start: request.placement.len,
             heads: request.placement.len..request.placement.len + request.tokens.len(),
             tokens: &request.tokens, placement }).collect::<Vec<_>>();
-        let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule, &requests);
+        let mut graphs = self.owners.graphs.borrow_mut();
+        let graph = graphs.first_mut().context("MiniMax decode graph bank missing")?;
+        let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule,
+            &requests, graph, captured);
         let logits = self.completed(result)?;
+        graph.tick();
+        if graph.needs_boundary() {
+            // SAFETY: completed() drained every arithmetic/cache consumer; the
+            // adapter's storage pins survive controller observation/eviction.
+            unsafe { crate::shared::decode_graph::device::observe_completed(self.library(), |visit| graph.visit(visit))?; }
+            graph.observed();
+        }
+        drop(graphs);
         // Non-speculative input is committed even if selection later cancels.
         // A retained receipt validates the scheduler's optional accept callback;
         // publication itself never depends on that callback or UngraphedKind.
@@ -218,16 +248,24 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let state = self.owners.storage.requests.borrow();
         scheduler::Geometry { family: "minimax_m3", vocab_size: self.cfg.vocab_size, max_context: self.context,
             slots: state.capacity.decode.requests as usize, prefill_rows: state.capacity.prefill.rows as usize,
-            decode_rows: state.capacity.decode.rows as usize, full_prefill_logits: false }
+            decode_rows: state.capacity.decode.rows as usize, }
     }
     fn message_starts(&self) -> &[&str] { MESSAGE_STARTS }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.owners.storage.ranks[0].decode.borrow().stream.device.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
-    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
+    fn selector_ready(&self, selector: &mut TokenSelector<'a>) -> Result<()> {
+        ensure!(self.selector_receipts.borrow().is_none(), "MiniMax selector initialized more than once");
+        selector.reserve_sampler()?;
+        let receipts = self.owners.reconcile_selector(selector)?;
+        tracing::info!(owners = receipts.len(), "MiniMax scheduler selector reconciled before readiness");
+        *self.selector_receipts.borrow_mut() = Some(receipts);
+        Ok(())
+    }
+    fn prefix_cache(&self, args: &PrefixArgs, concurrency: usize)
         -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
         self.idle()?;
-        ensure!(lanes == 1 && args.prefix_partial == Toggle::Off,
-            "MiniMax uses one shared lane with exact prefix restores");
+        validate_prefix_concurrency(concurrency, self.geometry().slots)?;
+        ensure!(args.prefix_partial == Toggle::Off, "MiniMax requires exact prefix restores");
         let family = self.owners.storage.prefix.clone();
         let host = self.host.clone().map(|config| CudaCopyEngine::registered_owned(self.library(),
             family.snapshot_owners()).map(|copy| (config, copy))).transpose()?;
@@ -296,8 +334,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         Ok((logit_rows > 0).then_some(probe::ScoreLogits::Recorded))
     }
     fn packed_limits(&self) -> Option<Limits> {
-        Some(Limits { rows: self.geometry().prefill_rows, chunk_rows: self.geometry().prefill_rows,
-            max_context: self.context, taps: None })
+        Some(Limits { rows: packing_rows(self.packing, self.geometry().prefill_rows),
+            chunk_rows: self.geometry().prefill_rows, max_context: self.context, taps: None })
     }
     fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, NoDraft>], pool: &RefPagePool,
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> MemberOutcome) -> Result<Vec<Result<()>>> {
@@ -319,16 +357,16 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(!speculative, BackendError::DraftsNotQualified);
-        self.decode(sequences, pool, true)
+        self.decode(sequences, pool, true, true)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(!speculative, BackendError::DraftsNotQualified);
-        if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, pool, true); }
+        if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, pool, true, false); }
         let total: usize = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         ensure!(sequences.len() == 1 && total <= self.geometry().decode_rows,
             "MiniMax diagnostic scoring requires one bounded sequence");
-        if total == 1 { return self.decode(sequences, pool, false); }
+        if total == 1 { return self.decode(sequences, pool, false, false); }
         let start = sequences[0].0.len;
         let mut result = None;
         self.prefill(sequences, &[start..start + total], pool, |_, _, logits| {
@@ -392,6 +430,31 @@ mod tests {
     use cuteafd_loader::{families::minimax_m3::execution::{MsaCache, MsaRope},
         placement::families::minimax_m3::RequestCapacity};
     use std::rc::Rc;
+
+    #[test]
+    fn prefix_scheduler_argument_is_boot_concurrency_not_decode_lanes() -> Result<()> {
+        for concurrency in [1, 16, 64] {
+            validate_prefix_concurrency(concurrency, concurrency)?;
+            assert!(validate_prefix_concurrency(concurrency + 1, concurrency).is_err());
+        }
+        assert!(validate_prefix_concurrency(0, 0).is_err());
+        assert!(validate_prefix_concurrency(1, 16).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn packing_modes_use_shared_grouping_without_silently_changing_mode() {
+        use crate::shared::prefill_packing::{self, PackingMode};
+        let chunks = [(0, 128), (256, 128)];
+        for (mode, expected) in [(PackingMode::Exact, vec![0..1, 1..2]),
+            (PackingMode::Unrestricted, vec![0..2])] {
+            let limits = Limits { rows: packing_rows(mode, 2752), chunk_rows: 2752,
+                max_context: 4096, taps: None };
+            let groups = prefill_packing::groups(chunks.len(), |range|
+                prefill_packing::plan(&chunks[range], &limits).is_ok());
+            assert_eq!(groups, expected);
+        }
+    }
 
     #[test]
     fn message_start_is_the_served_checkpoints_single_added_token() -> Result<()> {

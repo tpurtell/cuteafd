@@ -27,7 +27,6 @@ pub(crate) struct Geometry {
     pub slots: usize,
     pub prefill_rows: usize,
     pub decode_rows: usize,
-    pub full_prefill_logits: bool,
 }
 
 pub(crate) struct Prompt {
@@ -115,6 +114,9 @@ pub(crate) trait Backend<'a> {
     fn message_starts(&self) -> &[&str] { &MESSAGE_STARTS }
     fn library(&self) -> &'a NativeLibrary;
     fn profile(&self) -> &RefCell<[f64; 2]>;
+    /// Observe the scheduler's sole selector before readiness. Families whose
+    /// admission charges eager sampler storage reserve and reconcile it here.
+    fn selector_ready(&self, _selector: &mut TokenSelector<'a>) -> Result<()> { Ok(()) }
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
         -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, Self::Meta>)>;
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(Prompt, RequestMedia, Vec<EncodeJob>)>;
@@ -619,6 +621,20 @@ mod readiness_tests {
     }
 
     #[test]
+    fn sole_selector_is_observed_once_before_readiness() {
+        let source = include_str!("scheduler.rs");
+        let schedule = source.split_once("\npub(crate) fn schedule").unwrap().1;
+        let init = schedule.split_once("= initialize(|| {").unwrap().1
+            .split_once("}, initialized)?;").unwrap().0;
+        let create = init.find("TokenSelector::new(").unwrap();
+        let observe = init.find("engine.selector_ready(&mut selector)?;").unwrap();
+        assert!(create < observe);
+        assert_eq!(schedule.matches("engine.selector_ready(").count(), 1);
+        let hook = source.split_once("    fn selector_ready(").unwrap().1.split_once('\n').unwrap().0;
+        assert!(hook.ends_with("{ Ok(()) }"), "existing families retain lazy sampler behavior");
+    }
+
+    #[test]
     fn scheduler_prefix_cache_is_initialized_before_readiness() {
         let source = include_str!("scheduler.rs");
         let schedule = source.split_once("\npub(crate) fn schedule").unwrap().1;
@@ -783,7 +799,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     initialized: impl FnOnce() -> Result<()>)
     -> Result<()> {
     let geometry = engine.geometry();
-    let streamed_scoring = probe::streamed_prefill_scoring(geometry.family) && engine.streamed_prefill_scoring();
+    let streamed_scoring = engine.streamed_prefill_scoring();
     anyhow::ensure!(geometry.decode_rows > 0 && max_sequences <= geometry.decode_rows
         && max_sequences <= geometry.slots, "scheduler lanes exceed target decode/state capacity");
     let width = match drafts { Drafts::Neural { depth, .. } => depth, Drafts::None => 0 };
@@ -802,7 +818,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             engine.library(), snapshot.join("tokenizer.json"), geometry.vocab_size, eos);
         let cache = cache;
         let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
-        let selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, geometry.decode_rows)?;
+        let mut selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, geometry.decode_rows)?;
+        engine.selector_ready(&mut selector)?;
         let shared = if width > 0 {
             let geometry = engine.draft_geometry(snapshot, width)?;
             engine.arm_draft_probe()?;
@@ -857,7 +874,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                             }
                         };
                         if let Err(error) = probe::validate_scoring(&job.probe,
-                            geometry.full_prefill_logits || streamed_scoring) {
+                            streamed_scoring) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -997,7 +1014,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let scored = probe::score(engine.library(), &job.probe, &tokens, from, geometry.prefill_rows,
                     geometry.decode_rows, probe::verify_rows(&job.probe),
-                    geometry.full_prefill_logits || streamed_scoring, &mut placement,
+                    streamed_scoring, &mut placement,
                     |placement, chunk, rows, position| {
                         if streamed_scoring {
                             engine.prefill_scoring(placement, chunk, rows, position, &job.probe, cache.pool())

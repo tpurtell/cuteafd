@@ -17,7 +17,8 @@ Rubric, each 1–5 (5 best), plus wall time:
 | Model | Use for | Strengths | Weaknesses | Evidence |
 |---|---|---|---|---|
 | Sol 6.1 (Codex) | default engineering, numerics, A/B, lossless fixes | thorough, keeps gates honest, strong root-causing (#163, #190, #171) | over-literal on tooling rules; commits mid-gate (head-moved failures ×3 on 2026-10-14); verbose reports | ~15 tasks |
-| Astra 6 (Codex) | hard kernel design | — | expensive; once spent a week on probe plumbing | few |
+| Astra 6 (Codex) | hard kernel design | bounded packed native FP8 consumer; qualified per-contract gains (#2068, fork #303) | broad kernel wins need selective gates; ancillary inspection can burn time waiting for CPU slots | FP8 R2: three landed decode contracts; earlier evidence below |
+| Claude Fable 5.2 | bounded kernel design and SASS interpretation | native numerical correctness; load-overlap diagnosis and occupancy-aware final pipeline (#2068) | no whole deferred shape qualifies after three rounds; extra CPU probe after seal needed disclosure | FP8 duel R1-R3 measured null, strict SM121 gates green |
 | DeepSeek Flash | drivers; direct analysis and measurement | reliable verifier as driver; strong quantitative reasoning (DiD on existing data, #193); cheap and fast | — | drivers ×10, direct ×1 |
 | Claude Opus 5.5 (orchestrator) | design, review, merges, decisions | fast cross-task diagnosis (#191 Spark regression, stale CMake cache) | pushed a red commit once (61256a22); held agents for an answer while GPUs idled; wrong guesses before evidence (masked-V, cold-start) | this session |
 | Grok 4.7 (xAI, CLI `grok`) | bounded fixes, tests, races; design analysis with precise citations | found a real race behind a "flaky test"; challenged a wrong brief premise (#180 named V4.1/MiMo, but only GLM 5.3 uses the lane path); exact file:line citations (14/14 verified); caught a latent copies_pending bug | context fills fast (72% of 256K on a design task; needed a wrap-up nudge) | 6 tasks (1 kernel duel, lost) |
@@ -25,6 +26,92 @@ Rubric, each 1–5 (5 best), plus wall time:
 | Gemini 4 Carbon High (Antigravity, CLI `agy`) | default Gemini since 2026-11-11: reviews, duels, research | — | — | 1 review (3/6/1 verified/corrected/wrong-premise; strong mechanism leads, fabricates values and symbols) and 2 kernel duels (D1 tied the winner bitwise on 134/134 cells; D2 found the only +3.2% beyond the shipped route). Weak: own GPU launchers hang under `docker -it`; long unmeasured analysis |
 
 ## Log
+
+### 2026-11-14 Native FP8 Decode Duel: Fable Final Null
+
+Fable 5.2 (`claude-fable-5-2`) completed three bounded kernel-only rounds:
+`955b0123` native K64 partials, `87daffc0` load-ahead/NC thin, and final
+`d3f08383` packed load-ahead with restored base thin and MLA late-fold source
+scheduling. Scores: Correct 5, Judgement 4, Quality 4, Creative 4. Roughly
+R1 23 minutes to seal/35 to CPU handoff, R2 35 minutes, R3 27 minutes;
+organizer hardware waits are separate. No entrant GPU, benchmark/oracle
+edits or push.
+
+No deferred shape qualifies. Final SM121 395-cell screen latency geometric
+mean is 1.00420; Qwen width64 is 1.73670 and MLA width64 is 1.1574.
+q_b 16384x1536 initially looked promising (all five screen widths at or
+below production), but the full-grid same-session spread check rejects it:
+width32 production repeats 133.120/133.040 us versus candidate 140.304 us,
+5.40% above production high against 0.06% spread. Width24 also loses;
+width64 wins but cannot qualify the shape. Screen near-wins always need
+the complete live-row grid and spread checks, including the mid-band.
+
+R1/R2 correctness gates pass both architectures. Final R3 SM121 has 105
+passes plus four intentional expanded-layout skips, strict native F32 and
+real/synthetic expert oracles, tail memcheck zero errors, and queried
+resident CTA counts equal to master (Qwen10, MLA5, q_b12). Fifteen CPU AOT
+compile/exports per architecture pass. Final RTX gate was cancelled while
+still queued after decisive SM121 failure; no RTX R3 result is claimed.
+All completed final SM121 screen slowdown counters have zero increments;
+sampled max temperature55C/minimum headroom41C, not continuous peaks.
+
+Useful diagnosis: removing conversion work exposes load-to-use latency.
+The single isolated ncu pair has fewer native instructions/registers and
+better occupancy but higher long-scoreboard stalls. Fable's load-ahead
+wins isolated widths; deeper pipelines trade register residency and high
+widths for low-width overlap. Its final packed pipeline preserves residency
+but still misses the whole-shape bar. It accurately distinguished source
+late-fold order from the compiled per-chunk FMA sequence and disclosed a
+moot post-seal CPU-only q_b landing probe; no source changed. That probe
+also confirms an unrelated direct-widen M16 codegen change would need its
+own qualification if reused. No fourth Fable round; Astra declines its
+bonus round rather than chase partial cells.
+
+All three original NC shapes remain wholly deferred. Astra's separate
+three-contract native-base win is already scored below and landed in fork
+#303. Closing tables and profile explanation: #2068 comment6874525152.
+Receipts: `~/.cache/cuteafd/builds/fp8wide-duel/receipts/`. Entrant worktrees
+and task targets are cleaned; commits and receipts remain available.
+
+### 2026-11-14 Native FP8 Decode Duel: Astra R2 Partial Win
+
+Astra R2 `6eb080c0` landed selectively as fork #303 (`4b126390`).
+Scores: Correct 5, Judgement 4, Quality 4, Creative 4. R1 sealed in about
+9 minutes; R2 in about 5 minutes plus CPU-slot wait; organizer adoption gates
+and measurements took about two hours. No entrant GPU, benchmark, oracle
+or push edits.
+
+The packed K64 consumer widens exact E4M3 values immediately before four
+ordered BF16 MMAs, then applies the native FP32 scale FMA. Only three exact
+shape/warp/scale-layout/output contracts qualify, at every decode width:
+
+| Contract (four warps, BF16 output) | SM120 candidate / production | SM121 |
+|---|---:|---:|
+| 6784x4096, row-major scales | 0.96235 | 0.96972 |
+| 7424x4096, row-major scales | 0.96442 | 0.99433 |
+| 8192x2048, block scales | 0.98051 | 0.98312 |
+
+Conditions: warmed L2-cold graph replay, 12 samples, seed 2057, ten live
+widths 1/4/8/16/17/24/32/48/63/64. Same-session production-vs-production
+spread and same-host Fable R2 runner-up checks passed. The coordinator
+accepts 7424 SM121 r1 +0.03% and r8 +0.36% above observed production high
+as resolution-level ties, not a general margin. 13824 row and KDA 24896
+K-major near-misses do not land.
+
+Exact selective integration: 105 passed plus four intentional layout skips
+and tail memcheck zero errors on each architecture; six native-ARM SM121
+thin/wide AOT exports pass. Current-dev targeted export comparison checks
+470 common objects: 455 identical and exactly 15 changed group/program
+records (13 unique stems), with no ABI, header or inventory drift. Adoption
+thermal counters show zero power/thermal slowdown increments; sampled max
+temperature/minimum headroom are 47C/46C SM120 and 52C/44C SM121.
+
+R1 had no qualifying deferred shape. R2's broad candidate loses other
+contracts, so integration preserves their original arithmetic/cache keys
+and all three NC deferrals. Ancillary CPU inspection hit host-object
+cuobjdump errors and slot waits; the entrant did not claim unavailable
+resource results. R3 is still being measured and is not covered by this
+landed-win score. Receipts: `~/.cache/cuteafd/builds/fp8wide-duel/receipts/`.
 
 | Date | Model | Task | Correct | Judgement | Quality | Creative | Wall | Notes |
 |---|---|---|---|---|---|---|---|---|
@@ -174,3 +261,5 @@ coverage and its removed-geometry negative control.
 | 2026-11-11 | Gemini 4 Carbon High (driven by DeepSeek Flash) | Kimi K3 BF16-core duel D1: decode/verify projection tiles, rows 1-64 (fork #272, closed) | 5 | 4 | 5 | 3 | ~1 h 53 min | 134/134 cells bitwise (torch.equal, 0 ULP) with row-invariance receipts against a same-session interleaved baseline; 11.55 → 9.92 ms/token projection time (1.16×). Tied DeepSeek's shipped table on every comparable cell and beat none. On the KDA input it picked the identical tile. It chose tile_k=128 on a known-bistable shape and measured that shape's slow mode. Its own chunk launcher hung twice under `docker -it` with a background nvidia-smi (2 steers, no numerics drift). |
 | 2026-11-11 | DeepSeek Flash (entrant) | Kimi K3 BF16-core duel D2: wide prefill route wiring, 3 rounds (fork #269) | 5 | 5 | 5 | 3 | ~1 h | Won. Wired the existing `WIDE_PREFILL_CONFIG` into eight Kimi BF16 prefill projections, with measured per-shape floors (512 for 24752×7168, 3584×7168 and q_b 9216×1536; 1024 for the rest). Bitwise at every row; 0.81-0.85× of the old route at the 2752-row unit; about −0.3 s at 8K and −2.7 s at 64K estimated (serving A/B: 64K TTFT 54.9 → 50.3 s). Clean nulls: tile_k=128 doesn't fit smem, 128×256/256×128 lose, 64×128 helps only at 512-1023, persistent rasterization is ≤1.3%. Rebased onto D1 with only a docstring conflict; PROGRAMS diff zero ABI/scratch/capacity changes. Low creativity because the route already existed. |
 | 2026-11-11 | Gemini 4 Carbon High (driven by DeepSeek Flash) | Kimi K3 BF16-core duel D2: beat wide at the 2752-row unit, 2 rounds (fork #271) | 4 | 3 | 4 | 4 | ~2.5 h, 2 CLI runs | Round 1 lost to a CLI pane death after it over-spent on unmeasured smem bank-conflict analysis; recovered with a reproducible bitwise baseline that independently confirmed DeepSeek's floors. Round 2: a 3-stage mbar_last + cross-stage tile is +3.2% bitwise on gate/up 6144×7168 at 2752 rows (641.5 → 621.9 µs, 6/6 blocks), the only cell anyone found beyond wide. Four honest nulls. Gaps: wired dispatch never ran, rows 1024-2048 unmeasured, test claim without receipt. Port tracked in #1766. |
+| 2026-11-14 | Gemini 4 Carbon High (driven by DeepSeek Flash) | Kimi K3.1 scored-twin DSA score diagnostic (`CUTEAFD_KIMI_DSA_SCORES`) on #1980 | 1 | 2 | 1 | 1 | ~1 h 40 min, no deliverable | Blocked at the handoff and said so (three queued driver messages were dropped between 06:49 and 06:57), then went silent: one 13m27s thought, a compacted session, 45+ min with zero file writes, clean worktree, no commit, and the driver's three follow-up messages unread. The driver took the code over. Judgement credit for asking which buffer pair to use and for not touching the model path; no hardware time was spent. |
+| 2026-11-14 | DeepSeek Flash | Kimi K3.1 stage-1 DSA index-selection diagnostics and route ruling (#1980, #1777) | 5 | 5 | 4 | 5 | twin commit 08:24, key-dump commit 08:44, reseal 36 min, launch #8 3 min on gpu0, ruling after an account-restart gap | Took over after the Carbon twin attempt was blocked and brought stage-1 diagnostics to a ruled close. Two env-gated, graph-refusing diagnostics: scored-twin score dump gated on twin-set equality with the live plain route, and stored index key/scale readback of the selector's exact page bytes plus a reference pre-quant key and E4M3-QDQ dump. Launch #8 over 186 rows proved the store contract (slot = token%64 of the same physical page in all three routes, zero collisions, no rewritten page images, stored scale = pow2_ceil(ref amax/448) exactly, keys 0.9995-0.9998 cos vs the F32 oracle at L3); L59 4/31 value outliers traced to hidden-state variation, not placement, and accepted as reordering. Ruling holds on independently reproducible numbers: all routes track the oracle equally (Jaccard 0.9560-0.9654), cutoff gaps 30-300x under route score deltas, flips inside the near-cutoff band, and the byte-identical-key token 509 control pinning the residual on the query/reduction kernel. Restrained scope: no model-path change, references verified before analysis, no rerun of completed arms, no hidden-state run past the logits bound. Judgement and creative credit for the controls; quality held back only because the 610-line module's review landed in the same pass as the ruling. 

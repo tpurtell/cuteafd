@@ -126,7 +126,6 @@ pub(crate) struct EngineArgs {
     pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
     /// Keep every prefill row's logits (glm-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
-    pub full_prefill_logits: bool,
     /// Prefix-cache marks of a window-ring drafter (mtp_dspark): each holds one slot's draft
     /// windows; serve sets it from the prefix mark rule (0: no retained draft windows).
     #[arg(long, hide = true, default_value_t = 0)]
@@ -542,7 +541,7 @@ mod draft_cli_tests {
     }
 
     /// `cuteafd plan --layout` and `serve-glm` admission charge the same native dense bytes for the same
-    /// geometry: the planner's per-GPU item equals the admitted native scratch layouts.
+    /// geometry: Ready holds decode scratch; prefill scratch joins it at Growth.
     #[test]
     fn planner_charge_equals_admission_charge_for_the_same_geometry() {
         use cuteafd_loader::plan::exlr8::PrefillActivations;
@@ -570,12 +569,9 @@ mod draft_cli_tests {
                         cuteafd_loader::families::glm5::native::scratch_bytes(
                             &native_dense_layouts(&cfg, &records, &plan, &engine).unwrap()).unwrap()
                     }).collect::<Vec<_>>();
-                    // A serving layout allocates its prefill lanes on the first live
-                    // prefill and charges them at Growth; scoring runs that prefill
-                    // before Ready, so its items hold every lane the admission
-                    // charge names. Compare the scoring view.
+                    // The Ready item contains decode scratch only. Admission also
+                    // reserves the prefill scratch allocated at the first request.
                     let layout = cuteafd_loader::plan::layout::LayoutOptions {
-                        full_prefill_logits: true,
                         rtx_bytes: vec![96 << 30; gpus], prefill_rows: engine.prefill_rows as u64,
                         prefill_lanes: u64::from(engine.prefill_waves), prefill_waves: u64::from(engine.prefill_waves),
                         exlr8_prefill_activations: activations.parse::<PrefillActivations>().unwrap(), context_tokens: 65536,
@@ -586,7 +582,12 @@ mod draft_cli_tests {
                     assert_eq!(memory.devices.len(), gpus);
                     for (rank, device) in memory.devices.iter().enumerate() {
                         let planned: u64 = device.items.iter().filter(|item| item.group == GROUP).map(|item| item.bytes).sum();
-                        assert_eq!(planned, charge[rank], "{gpus} RTX/{rows} rows/{waves} waves/{activations}");
+                        let dense = cuteafd_loader::plan::exlr8::dense::DensePlan::for_rank(&records, gpus, rank).unwrap();
+                        let scratch = native_dense_layouts(&cfg, &records, &dense, &engine).unwrap();
+                        assert_eq!(planned, scratch[0].bytes().unwrap() as u64,
+                            "Ready: {gpus} RTX/{rows} rows/{waves} waves/{activations}");
+                        assert_eq!(charge[rank], planned + scratch[1].bytes().unwrap() as u64,
+                            "Growth: {gpus} RTX/{rows} rows/{waves} waves/{activations}");
                     }
                     admitted.push(charge);
                 }
@@ -1195,7 +1196,7 @@ impl Opened {
             requested_pool, page_tokens).maximum_tokens();
         let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
         let prefill = PrefillShape { rows: args.prefill_rows as u64, waves: prefill_lanes as u64 };
-        let operation = if args.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
+        let operation = Operation::Serving;
         let push_policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&self.snapshot)?;
         let storage = match push_policy { crate::shared::experts::rtx::push::PushPolicy::Mount => LocalStorage::Mount,
             crate::shared::experts::rtx::push::PushPolicy::Required => LocalStorage::Push };
@@ -1690,7 +1691,6 @@ impl Opened {
         engine.native_experts = native_owners;
         engine.native_scratch = native_scratch;
         engine.spark_bf16 = spark_bf16;
-        engine.full_prefill_logits = args.full_prefill_logits;
         engine.prefill_span_rows = args.prefill_span_rows;
         engine.attention_plan = attention_plan;
         if tp2_range.is_some() && exchange_f32 {
@@ -1834,7 +1834,6 @@ impl Opened {
             engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)), &admitted.graphs, &graph_bootstraps)?;
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
-        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
         for rank in 0..admitted.graphs.ranks().len() {
             let (base, tail) = admitted.graphs.default_reserve();
@@ -2170,7 +2169,7 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
     });
     let mut placement = engine::PageAllocator::new(engine).admit(tokens.len())?;
     let started = Instant::now();
-    let rows = crate::shared::probe::scoring_prefill_capacity(true, engine.prefill_rows, engine.prefill_capacity());
+    let rows = engine.prefill_rows;
     let media = cuteafd_engine::media::RequestMedia::new(Vec::new(), opened.cfg.hidden, tokens.len())?;
     for (index, chunk) in tokens.chunks(rows).enumerate() {
         engine.prefill_streamed_scoring(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)),

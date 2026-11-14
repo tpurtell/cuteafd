@@ -155,13 +155,9 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
     fn prefill_with(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize, scoring: Option<crate::shared::probe::ScoringRows<'_>>)
         -> Result<Option<crate::shared::probe::ScoreLogits>> {
         crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
+            ensure!(scoring.is_some() || logit_rows <= 1, "Muse multi-row prefill requires a row consumer");
             ensure!(logit_rows <= tokens.len(), "Muse prefill logit rows exceed tokens");
-            if logit_rows > 1 && scoring.is_none() {
-                let output = self.ranks.last().and_then(|rank| rank.prefill_logits.as_ref())
-                    .context("Muse prefill scoring requires --full-prefill-logits at launch")?;
-                ensure!(cuteafd_loader::families::muse_spark::lane::prefill_logits_bytes(logit_rows,
-                    self.cfg.vocab_size)? <= output.buffer.bytes, "Muse prefill scoring exceeds admitted rows");
-            }
+
             let units = crate::shared::prefill_pipeline::prefill_units(tokens.len(), self.unit_rows, self.waves, 64)?
                 .into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index, sequence: 0,
                     segments: Vec::new(), rows, layers: 0..self.cfg.layers, slot: index % self.waves, barrier: false })
@@ -383,8 +379,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
 
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "muse_spark", vocab_size: self.cfg.vocab_size, max_context: self.context,
-            slots: self.slots, prefill_rows: self.unit_rows * self.waves, decode_rows: HEAD_ROWS,
-            full_prefill_logits: self.ranks.last().is_some_and(|rank| rank.prefill_logits.is_some()) }
+            slots: self.slots, prefill_rows: self.unit_rows * self.waves, decode_rows: HEAD_ROWS }
     }
     /// Every Muse message opens with `<|start|>` (turn boundaries for prefix marks).
     fn message_starts(&self) -> &[&str] { &[cuteafd_api::openai::chat::muse::START] }
@@ -511,9 +506,8 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     fn prefill_scoring(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         position: usize, probe: &crate::shared::probe::ProbeRef, _pool: &RefPagePool)
         -> Result<Option<crate::shared::probe::ScoreLogits>> {
-        let legacy = self.ranks.last().is_some_and(|rank| rank.prefill_logits.is_some());
         self.prefill_with(placement, tokens, logit_rows,
-            (logit_rows > 1 && !legacy).then_some(crate::shared::probe::ScoringRows { consumer: probe, position }))
+            (logit_rows > 1).then_some(crate::shared::probe::ScoringRows { consumer: probe, position }))
     }
 
     /// Scores every row of every sequence (an anchor and its drafts) from its

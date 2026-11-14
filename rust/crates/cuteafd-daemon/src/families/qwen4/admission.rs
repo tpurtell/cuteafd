@@ -71,10 +71,8 @@ pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize,
     let geometry = qwen_cache_geometry(cfg, layers, mtp, args.kv_format)?;
     let shape = args.resolved_prefill()?;
     let marks = args.planner_prefix_bytes.unwrap_or(geometry.ranks[0].retained_mark_bytes * qwen4::DEFAULT_MARK_SLOTS);
-    let logits = if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes(
-        "qwen4", shape.span_rows, cfg.vocab_size as u64) } else { 0 };
     Ok(QwenAdmissionInputs { prefill_shape: args.prefill_shape()?, cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: shape.span_rows,
-        slots: args.slots as u64, mark_bytes: marks, full_prefill_logits: logits, ple, future_expert_bytes,
+        slots: args.slots as u64, mark_bytes: marks, ple, future_expert_bytes,
         headroom: cuteafd_loader::placement::reserve::gpu("qwen4") })
 }
 
@@ -296,8 +294,7 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
     let (available, total) = sample?;
     let admission = QwenAdmissionInputs { prefill_shape: inputs.prefill_shape, cfg: inputs.cfg, layers: inputs.layers, mtp: inputs.mtp, kv_format: inputs.kv_format,
         manifest: inputs.manifest, prefill_rows: inputs.prefill_rows, slots: inputs.slots,
-        mark_bytes: inputs.mark_bytes, full_prefill_logits: inputs.full_prefill_logits,
-        ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
+        mark_bytes: inputs.mark_bytes,         ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
     let mut inputs = placement_inputs(args, admission, source,
         (available as u64, total as u64), pending, context, host);
     inputs.loaded_weights = loaded_weights;
@@ -422,9 +419,9 @@ fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, 
     Ok(QwenHost {
         memory: HostMemory { total, available },
         ple, uploads: vec![bounds; owners], mtp_upload,
-        pinned_logits: pinned_logits_bytes(owners, args.full_prefill_logits, shape.span_rows, cfg.vocab_size as u64)?,
+        pinned_logits: pinned_logits_bytes(owners, cfg.vocab_size as u64)?,
         mtp_pinned_logits: mtp_pinned_logits_bytes(args.prefill_shape()?.is_some(), mtp && cfg.mtp_layers > 0, cfg.vocab_size as u64)?,
-        scoring_logits: scoring_logits_bytes(args.full_prefill_logits, shape.span_rows, cfg.vocab_size as u64)?,
+        scoring_logits: scoring_logits_bytes(shape.span_rows, cfg.vocab_size as u64)?,
         prefix_quota, prefix_chunk,
         loaded_media_cache: args.planner_media_cache_bytes,
         host_embedding,
@@ -765,7 +762,7 @@ mod tests {
                     cfg: &cfg, layers: 4, mtp: false,
                     kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::default(),
                     manifest: None, prefill_rows: rows * waves, prefill_shape: shape,
-                    slots: 8, mark_bytes: 0, full_prefill_logits: 0,
+                    slots: 8, mark_bytes: 0,
                     ple: mapped_ple.then_some((160, true)), future_expert_bytes: 0, headroom: 0,
                 })?;
                 for (_, name, bytes) in runtime.items.iter().filter(|item| item.1.ends_with("step")) {
@@ -933,7 +930,7 @@ mod tests {
                     owner_manifests: [None; 2],
                     admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false,
                         kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096,
-                        slots: 16, mark_bytes: 0, full_prefill_logits: 0,
+                        slots: 16, mark_bytes: 0,
                         ple: Some((resident.ple_row_bytes, false)), future_expert_bytes: 0, headroom: 3 << 30 },
                     gpus: [GpuBudget { capacity_bytes: capacity, reserve_bytes: 3 << 30,
                         baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }; 2],

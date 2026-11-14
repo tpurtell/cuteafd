@@ -190,6 +190,11 @@ int cuteafd_peer_exchange_initialize(void) { return 0; }
 /* Binding-only: CPU ownership fixtures never implement BF16 arithmetic. */
 int32_t cuteafd_add_tp2_shared_async(const uint16_t *a, const uint16_t *b, uint16_t *out, size_t count, void *stream) { (void)a; (void)b; (void)out; (void)count; (void)stream; return 1; }
 
+/* Binding-only fold stubs must fail rather than simulate successful math. */
+int32_t cuteafd_cuda_residual_add_f32_async(const float *a, const float *b, float *out, size_t count, void *stream) {
+    (void)a; (void)b; (void)out; (void)count; (void)stream; return 1;
+}
+
 /* Head fixture records the scratch selected by the real Rust handle binding. */
 struct fixture_head { void *workspace; int width, rows, vocab; };
 int cuteafd_vocabulary_head_create_vocab(void *workspace, uint64_t bytes,
@@ -388,6 +393,14 @@ int cuteafd_cuda_dmabuf_allocation_granularity(size_t *out) {
 static _Alignas(256) unsigned char reused_device_storage[256];
 static int reuse_device_storage, reused_device_live;
 void fixture_reuse_device_storage(void) { reuse_device_storage = 1; }
+static uint64_t device_flags = 1;
+void fixture_configure_device_flags(uint64_t flags) { device_flags = flags; }
+struct device_allocation {
+    void *ptr;
+    int kind; /* 0: heap, 1: mapped extent, 2: reusable static storage */
+    struct device_allocation *next;
+};
+static struct device_allocation *device_allocations;
 
 int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out, uint32_t kind, const char *owner) {
     if (!valid_tag(kind, owner)) return 1;
@@ -408,7 +421,17 @@ int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out, uint32_
     }
     out->bytes = bytes;
     out->device_id = current_device;
-    out->flags = 1;
+    struct device_allocation *record = malloc(sizeof(*record));
+    if (!record) {
+        if (reuse_device_storage) reused_device_live = 0;
+        else if (extent_only) { munmap(out->ptr, bytes); mapped_bytes -= bytes; }
+        else free(out->ptr);
+        return 1;
+    }
+    *record = (struct device_allocation){out->ptr,
+        reuse_device_storage ? 2 : extent_only ? 1 : 0, device_allocations};
+    device_allocations = record;
+    out->flags = device_flags;
     memory_used[current_device] += bytes;
     event('D');
     return 0;
@@ -422,13 +445,19 @@ int cuteafd_free_device_buffer(struct device_buffer *buffer) {
         return 1;
     }
     event('d');
-    if (buffer->flags == 1) memory_used[buffer->device_id] -= buffer->bytes;
-    if (reuse_device_storage && buffer->ptr == reused_device_storage) {
-        reused_device_live = 0;
-    } else if (extent_only && buffer->flags == 1) {
-        if (munmap(buffer->ptr, buffer->bytes)) return 1;
-        mapped_bytes -= buffer->bytes;
-    } else { free(buffer->ptr); }
+    struct device_allocation **slot = &device_allocations;
+    while (*slot && (*slot)->ptr != buffer->ptr) slot = &(*slot)->next;
+    if (*slot) {
+        struct device_allocation *record = *slot;
+        if (record->kind == 2) reused_device_live = 0;
+        else if (record->kind == 1) {
+            if (munmap(buffer->ptr, buffer->bytes)) return 1;
+            mapped_bytes -= buffer->bytes;
+        } else free(buffer->ptr);
+        memory_used[buffer->device_id] -= buffer->bytes;
+        *slot = record->next;
+        free(record);
+    } else { free(buffer->ptr); } /* Managed fixture allocations are not device charged. */
     memset(buffer, 0, sizeof(*buffer));
     return 0;
 }

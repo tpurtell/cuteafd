@@ -218,14 +218,17 @@ impl ContextLayout {
         let mut workspace = vec![("own-head partial", partial), ("peer-head partial", partial), ("partial scratch", scratch),
             ("decode input", ROWS * 7168 * 2), ("decode output", ROWS * 7168 * 2)];
         if dsa {
-            for name in ["DSA global scores", "DSA global indices", "DSA merged scores", "DSA merged indices",
-                "DSA local slots"] {
-                workspace.push((name, ROWS * 2048 * 4));
+            for name in ["DSA global scores", "DSA global indices", "DSA merged scores", "DSA merged indices"] {
+                workspace.push((name, unit_rows.max(ROWS) * 2048 * 4));
             }
+            workspace.push(("DSA local slots", ROWS * 2048 * 4));
             workspace.push(("DSA local lengths", ROWS * 4));
+            let stride = (unit_rows.max(ROWS) * 4).next_multiple_of(256);
+            workspace.push(("DSA merged lengths", stride * metadata_banks));
         }
+        let metadata_rows = if dsa { unit_rows.max(ROWS) } else { ROWS };
         for (name, bytes) in METADATA.into_iter().zip([unit_rows * 8,
-            ROWS * half_pages * 4, ROWS * 4, (ROWS + 1) * 4, 2 * half_pages * 4,
+            metadata_rows * half_pages * 4, metadata_rows * 4, (metadata_rows + 1) * 4, 2 * half_pages * 4,
             3 * (unit_rows.div_ceil(ROWS) + 1) * 8, 4]) {
             let stride = bytes.max(256).next_multiple_of(256);
             workspace.push((name, stride.checked_mul(metadata_banks).context("Kimi context metadata banks overflow")?));
@@ -252,7 +255,8 @@ impl ContextLayout {
 
     /// Each unit keeps its compact/gather/commit metadata until the wave drains.
     pub fn metadata_extent(&self, name: &str, bank: usize) -> Result<(usize, usize)> {
-        ensure!(METADATA.contains(&name) && bank < self.metadata_banks, "Kimi context metadata bank outside admission");
+        ensure!((METADATA.contains(&name) || (self.dsa && name == "DSA merged lengths"))
+            && bank < self.metadata_banks, "Kimi context metadata bank outside admission");
         let bytes = self.workspace.iter().find(|(key, _)| *key == name).context("Kimi context metadata absent")?.1;
         let stride = bytes / self.metadata_banks;
         Ok((bank * stride, stride))
@@ -438,7 +442,17 @@ mod tests {
             assert_eq!(layout.buffers().candidate_row_bytes, 2048 * 8);
             let candidates = layout.workspace().iter().filter(|(name, _)| name.starts_with("DSA "))
                 .map(|(_, bytes)| *bytes).sum::<usize>();
-            assert_eq!(candidates, ROWS * (5 * 2048 * 4 + 4));
+            assert_eq!(candidates, 2752 * 4 * 2048 * 4 + ROWS * (2048 * 4 + 4) + 2752 * 4 * 3);
+            for unit in [64, 2752, 4096] {
+                let layout = ContextLayout::from_variant(&manifest, format, 8192, unit, 3, true)?;
+                let owners = layout.workspace();
+                for name in ["DSA global scores", "DSA global indices", "DSA merged scores", "DSA merged indices"] {
+                    assert_eq!(owners.iter().filter(|(key, _)| *key == name).count(), 1);
+                    assert_eq!(owners.iter().find(|(key, _)| *key == name).unwrap().1, unit * 2048 * 4);
+                }
+                assert_eq!(layout.metadata_extent("DSA merged lengths", 2)?, (2 * unit * 4, unit * 4));
+                assert_eq!(layout.metadata_extent("compact page tables", 0)?.1, unit * 64 * 4);
+            }
             assert_eq!(layout.buffers().workspace_bytes,
                 layout.workspace().iter().map(|(_, bytes)| *bytes as u64).sum::<u64>());
             assert!(ContextLayout::from_manifest(&manifest, format, 8192, 2752, 3).is_err());

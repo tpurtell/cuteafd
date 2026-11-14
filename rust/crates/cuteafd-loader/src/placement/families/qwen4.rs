@@ -1072,7 +1072,7 @@ impl Recipe for QwenDual<'_> {
             let admitted = qwen_admission(&QwenAdmissionInputs { prefill_shape: None, cfg,
                 layers: a.layers, mtp: a.mtp, kv_format: a.kv_format,
                 manifest: inputs.owner_manifests[gpu].or(a.manifest), prefill_rows: a.prefill_rows,
-                slots: a.slots, mark_bytes: a.mark_bytes, full_prefill_logits: a.full_prefill_logits,
+                slots: a.slots, mark_bytes: a.mark_bytes,
                 ple: a.ple, future_expert_bytes: 0, headroom: a.headroom })
                 .map_err(|error| Refusal::InvalidFact(format!("Qwen owner admission: {error}")))?;
             for (index, &(category, group, bytes)) in admitted.items.iter().enumerate() {
@@ -1121,11 +1121,6 @@ impl Recipe for QwenDual<'_> {
         // record stays in that owner's pool unit.
         components.push(owner("qwen.owner0.mtp.pending", Location::coordinator(0), pending,
             Category::Kv, "owner0 MTP pending", PlanLifetime::RESIDENT, self.maximum_pages));
-        if a.full_prefill_logits > 0 {
-            components.push(owner("qwen.owner0.probe.logits", Location::coordinator(0),
-                a.full_prefill_logits, Category::Workspace, "probe prefill logits",
-                PlanLifetime::RESIDENT, self.maximum_pages));
-        }
         if inputs.host.uploads.len() != 2 {
             return Err(Refusal::InvalidFact("Qwen dual host owners must name both upload owners".into()));
         }
@@ -1269,7 +1264,7 @@ mod tests {
             blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
-                mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
+                mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0 },
             owner_manifests: [None; 2],
             gpus: [GpuBudget { capacity_bytes: 96 * gib, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: 96 * gib } }; 2],
@@ -1499,7 +1494,7 @@ mod tests {
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg, layers: cfg.layers, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
-                mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
+                mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0 },
             capacity_bytes: 96 * gib, baseline, pending_code_bytes: 0, max_context: 131072,
             requested_pool, spark_ranks,
             host: QwenHost::ample(cfg, 1, 4096).unwrap(), encoders: Default::default() }
@@ -1573,7 +1568,7 @@ mod tests {
                 resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp: false,
                     kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
-                    mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
+                    mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0 },
                 owner_manifests: [None; 2], gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 0,
                     baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2],
                 arenas: &arenas, layer_experts: &experts, layer_extra: &extra, fixed: vec![],
@@ -1901,7 +1896,7 @@ mod tests {
             blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
-                mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
+                mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0 },
             owner_manifests: [None; 2],
             gpus: [GpuBudget { capacity_bytes: 96 * gib, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: 96 * gib } }; 2],

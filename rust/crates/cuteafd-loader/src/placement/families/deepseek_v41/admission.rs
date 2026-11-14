@@ -736,7 +736,7 @@ impl HostFacts {
     pub fn prepare(config: &serde_json::Value, headers: &[&crate::SafetensorsTensorMetadata],
         prefill: PrefillShape, gpus: usize, sparks: usize, context: u64, concurrency: u64,
         draft: bool, prefix: Option<u64>, prefix_enabled: bool, chunk: u64,
-        host: (u64, u64), preload_cap: u64, preload_budget: Option<u64>, full_logits: bool) -> anyhow::Result<Self> {
+        host: (u64, u64), preload_cap: u64, preload_budget: Option<u64>) -> anyhow::Result<Self> {
         use anyhow::{Context, ensure};
         let shape = crate::EngramStagingShape::new(prefill.rows as usize, prefill.waves as usize)?;
         let mapped = Self::mapped_placement(headers, shape, preload_budget.unwrap_or_else(|| host.1.saturating_sub(host.0 / 10)), preload_cap)?;
@@ -810,7 +810,6 @@ impl HostFacts {
                     .at(allocation.location).with_lifetime(allocation.lifetime));
             }
         }
-        let _ = full_logits; // The executor retains a full-span scoring plane in both modes.
         Ok(Self { owners, estimates, prefix_bytes, mapped, push })
     }
 }

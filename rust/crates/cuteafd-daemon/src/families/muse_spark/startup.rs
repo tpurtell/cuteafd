@@ -42,7 +42,6 @@ pub(crate) struct Options<'a> {
     pub headroom_bytes: u64,
     pub spark_ranks: usize,
     pub prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan,
-    pub full_prefill_logits: bool,
     pub slots: u64,
     /// Device mark slots from the shared prefix rule (`PrefixArgs::mark_rule`).
     pub mark_slots: u64,
@@ -88,15 +87,14 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         audio: cuteafd_loader::plan::MediaMode::Off, replicas: 1, vision_bytes: (0, 0), audio_bytes: (0, 0) });
     let prepared = shared::ProductionInput { cfg: options.cfg, core: options.core, projections: options.projections,
         catalog: options.catalog,
-        budgets, host: options.host, prefill: options.prefill, full_prefill_logits: options.full_prefill_logits,
+        budgets, host: options.host, prefill: options.prefill,
         bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true), slots: options.slots,
         mark_slots: options.mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
         local: options.local, drafter: options.drafter, fixed, media }.prepare()?;
     let request = shared::production_request(cuteafd_loader::placement::planner::Context::resolve(context, options.max_context), options.pool_tokens, options.onboard,
         cuteafd_loader::placement::planner::PrefillShape { rows: options.prefill.unit_rows, waves: options.prefill.waves },
-        if options.full_prefill_logits { cuteafd_loader::placement::planner::Operation::Scoring }
-        else { cuteafd_loader::placement::planner::Operation::Serving },
+        cuteafd_loader::placement::planner::Operation::Serving,
         Some(crate::shared::memory::budget::resident_weight_limit()), options.partial_reply_formats);
     let admitted = prepared.admit(request)?;
     cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "muse_spark");
@@ -231,7 +229,7 @@ mod tests {
                     gpus, prefill.unit_rows as usize)?,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
-                full_prefill_logits: opts.full_prefill_logits,
+
                 headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
@@ -281,8 +279,7 @@ mod tests {
         let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         let mut refused = 0;
         let mut reduced_pools = 0;
-        for (gpus, sparks, full_prefill_logits) in [(2, 6, false), (2, 4, false), (1, 6, false),
-            (1, 4, true), (2, 6, true)] {
+        for (gpus, sparks) in [(2, 6), (2, 4), (1, 6), (1, 4)] {
             // A complete image: the program manifest with the coordinator EXL3 package beside it.
             let image = dir.path().join(format!("image-{gpus}"));
             let path = testing::write_muse_exl3_capacities(&image);
@@ -290,7 +287,6 @@ mod tests {
             let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
             let opts = LayoutOptions { context_tokens: 634304, host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
                 head_split: gpus == 2, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
-                full_prefill_logits,
                 ..Default::default() };
             let vision = cuteafd_loader::plan::MediaMode::Spark(None);
             let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks), vision,
@@ -312,7 +308,7 @@ mod tests {
                     gpus, prefill.unit_rows as usize)?,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
-                full_prefill_logits: opts.full_prefill_logits,
+
                 headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
@@ -325,14 +321,10 @@ mod tests {
                 drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
                     vision, cuteafd_loader::plan::MediaMode::Off, 1)?) })?.placement;
             let live = without_sampled_baseline(live, arch.context_bytes);
-            assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks, scoring {full_prefill_logits}");
+            assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks");
             for gpu in 0..gpus {
                 let output = live.items[gpu].iter().find(|item| item.group == "Muse prefill logits");
-                if full_prefill_logits && gpu == gpus - 1 {
-                    assert_eq!(output.context("scoring output charge")?.bytes,
-                        cuteafd_loader::families::muse_spark::lane::prefill_logits_bytes(
-                            usize::try_from(prefill.span_rows)?, cfg.vocab_size)? as u64);
-                } else { assert!(output.is_none(), "scoring allocation absent on non-head/default serving"); }
+                assert!(output.is_none(), "scoring reuses the bounded head output");
             }
             let encoder = report.encoder.as_ref().context("vision placement")?;
             assert_eq!(encoder.admitted_bytes(), 4_860_356_960, "native vision ledger");
@@ -362,7 +354,7 @@ mod tests {
                     gpus, prefill.unit_rows as usize)?,
                     measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                         untracked_bytes: arch.context_bytes }; gpus],
-                    full_prefill_logits: opts.full_prefill_logits,
+
                     headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
                     mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                         shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
@@ -439,7 +431,7 @@ mod tests {
                     gpus, prefill.unit_rows as usize)?,
             measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                 untracked_bytes: arch.context_bytes }; gpus],
-            full_prefill_logits: opts.full_prefill_logits,
+
             headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
             mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                 shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),

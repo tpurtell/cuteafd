@@ -227,7 +227,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         let engine = self.engine.borrow();
         scheduler::Geometry { family: "qwen3_5", vocab_size: engine.cfg.vocab, max_context: engine.cfg.max_context,
-            slots: engine.slot_count(), prefill_rows: if self.drafter.is_some() { TAP_ROWS } else { 4096 }, decode_rows: engine.decode_rows(), full_prefill_logits: engine.full_prefill_logits() }
+            slots: engine.slot_count(), prefill_rows: if self.drafter.is_some() { TAP_ROWS } else { 4096 }, decode_rows: engine.decode_rows() }
     }
     fn library(&self) -> &'a NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
@@ -237,7 +237,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
             else { DensePrefix::with_draft(self.engine, self.drafter.clone())? };
         let layout = family.layout();
         let shape = self.geometry();
-        let args = &args.with_scoring(if shape.full_prefill_logits { shape.prefill_rows } else { shape.decode_rows },
+        let args = &args.with_scoring(shape.decode_rows,
             shape.prefill_rows, shape.vocab_size)?;
         let host = self.engine.borrow().admitted_host_config.clone().map(|config|
             CudaCopyEngine::registered_retained(self.library, family.snapshot_owners(),
@@ -294,7 +294,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     fn prefill_scoring(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         position: usize, probe: &crate::shared::probe::ProbeRef, _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::probe::ScoreLogits>> {
-        let streamed = logit_rows > 1 && !self.engine.borrow().full_prefill_logits();
+        let streamed = logit_rows > 1;
         self.prefill_with(placement, tokens, logit_rows,
             streamed.then_some(crate::shared::probe::ScoringRows { consumer: probe, position }))
     }
@@ -585,9 +585,6 @@ pub(crate) struct ServeArgs {
     /// Full-attention KV storage only; GDN recurrence remains FP32.
     #[arg(long, default_value = "fp8")]
     pub kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
-    /// Admit a full prefill batch of vocabulary logits for quality scoring.
-    #[arg(long)]
-    pub full_prefill_logits: bool,
     /// Bound packed rows to the singleton arithmetic route for exact validation.
     #[arg(long, value_enum, default_value_t = crate::shared::prefill_packing::PackingMode::default())]
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
@@ -665,7 +662,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0),
                 draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes.clone())), slots,
-                Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
+                Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache,
                 Some((&engine_args.prefix, lanes,
                     engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device, engine_args.max_context)), false)?);
             engine.borrow_mut().warm_decode_graphs()?;
@@ -863,7 +860,7 @@ mod tests {
             gdn: GdnGeometry { key_heads: 16, value_heads: 32, key_dim: 128, value_dim: 128,
                 conv_kernel: 4, output_gate: GdnOutputGate::Silu }, rope_dim: 64, rope_theta: 10000000.,
             rms_norm_eps: 1e-6, max_context: 262144, mtp_layers: 0, tied_embeddings: false };
-        let buffers = NativeBuffers::new(&cfg, 1024, 4, 2, false)?;
+        let buffers = NativeBuffers::new(&cfg, 1024, 4, 2)?;
         let weights = NativeWeights { layers: vec![256; 2], norm: 256, head: 256, embedding: 256 };
         let target_arena = cuteafd_loader::serving_capacity::WeightArenaLayout::new("qwen3_5/target/gpu0",
             [("target".into(), 5 * 256)])?;
@@ -936,7 +933,7 @@ mod tests {
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
             Some(262144), Some(bytes), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, None, false)?);
         let draft = {
             let target = engine.borrow();
             let cfg = block_dspark::DsparkConfig::read(&draft_snapshot)?;
@@ -968,7 +965,7 @@ mod tests {
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
             Some(262144), Some(admission.bytes.clone()), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, None, false)?);
         let mtp = Rc::new(MtpCache::load(&engine.borrow(), &reader, admission)?);
         let family = DensePrefix::with_mtp(&engine, mtp.clone())?;
         let mut backend = DenseBackend::new(&engine, &library);
@@ -1056,20 +1053,11 @@ mod tests {
             Ok(())
         }).unwrap();
         assert_eq!(parsed.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
-        assert!(!parsed.full_prefill_logits);
     }
 
     #[test]
-    fn full_prefill_logits_is_explicit_and_preserves_kv_selection() {
-        for kv in ["bf16", "fp8"] {
-            for full in [false, true] {
-                let mut args = vec!["dense", "--snapshot", "checkpoint", "--native-lib", "native.so", "--kv-cache", kv];
-                if full { args.push("--full-prefill-logits"); }
-                let parsed = Cli::try_parse_from(args).unwrap().serve;
-                assert_eq!(parsed.full_prefill_logits, full);
-                assert_eq!(parsed.kv_cache.to_string(), kv);
-                assert_eq!(parsed.max_sequences, 4);
-            }
-        }
+    fn removed_all_row_launch_option_is_unknown() {
+        assert!(Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so",
+            "--full-prefill-logits"]).is_err());
     }
 }

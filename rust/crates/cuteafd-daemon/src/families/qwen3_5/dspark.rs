@@ -166,7 +166,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
     let demand = DrafterBytes::block_dspark(snapshot, &config, 1, library.sm_count()? as u64, cfg.max_context)?;
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(demand.clone()), 1, None, args.kv_cache, false, None, args.verify_check)?;
+        Some(demand.clone()), 1, None, args.kv_cache, None, args.verify_check)?;
     engine.warm_decode_graphs()?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
     if args.verify_check { engine.verify_check(prompt)?; }
@@ -189,7 +189,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     // than reconstructing the recurrent state or reusing a stale mark.
     drop(engine);
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(demand), 1, None, args.kv_cache, false, None, args.verify_check)?;
+        Some(demand), 1, None, args.kv_cache, None, args.verify_check)?;
     engine.warm_decode_graphs()?;
     let stream = engine.target_stream().raw;
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
@@ -343,7 +343,7 @@ mod tests {
         let pool_tokens = cfg.max_context.max(16384).next_multiple_of(64);
         let demand = DrafterBytes::block_dspark(&draft, &config, 2, library.sm_count()? as u64, cfg.max_context)?;
         let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(), Some(pool_tokens as u64),
-            Some(demand), 2, None, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, false, None, false)?;
+            Some(demand), 2, None, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, None, false)?;
         let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
         let drafter = load_drafter(&engine, &programs, &draft, 2, mask)?;
         drafter.prepare_workspace()?;

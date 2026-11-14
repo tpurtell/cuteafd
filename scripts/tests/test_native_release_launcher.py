@@ -47,9 +47,9 @@ ssh() { cat >/dev/null; echo "missing Spark package exl3/exl3-ml4-k45/tp5-compac
 
     def test_expert_usage_serve_flag_defaults_on_and_preserves_explicit_off(self) -> None:
         text = FAMILY.read_text()
-        start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == kimi_k3 ]]; then')
+        start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == kimi_k3 || $family == minimax_m3 ]]; then')
         block = text[start:text.index('\nfi', start) + 3]
-        for family in ['deepseek_v4', 'mimo_v2', 'glm5', 'kimi_k3']:
+        for family in ['deepseek_v4', 'mimo_v2', 'glm5', 'kimi_k3', 'minimax_m3']:
             for setting, expected in [('', '--expert-usage'), ('off', '--expert-usage=false'), ('on', '--expert-usage'), ('invalid', None)]:
                 with self.subTest(family=family, setting=setting):
                     script = '''set -euo pipefail

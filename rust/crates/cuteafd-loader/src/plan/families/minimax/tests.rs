@@ -108,6 +108,41 @@ fn execution_inventory_is_exact_recipe_partition_before_shared_finalization() {
     }
 }
 
+#[test]
+fn coordinator_and_peer_spark_charges_use_the_canonical_operand_headers() -> Result<()> {
+    use crate::families::minimax_m3::admission::{spark_checkpoint, spark_charges};
+    use crate::plan::checkpoint::{CheckpointView, CoreView};
+    use crate::placement::planner::PrefillShape;
+    let (dir, config, _) = fixture_with_experts(128);
+    let view = CheckpointView::select(dir.path(), CoreView::Original)?;
+    let full = Checkpoint::open_view(&view)?;
+    let coordinator = Checkpoint::coordinator_view(&view, false, false)?;
+    let cfg = MiniMaxM3Config::from_hf(&config)?;
+    let catalog = crate::read_expert_catalog_view(&view)?;
+    let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
+    let scalar = "language_model.model.layers.3.block_sparse_moe.experts.0.w1.input_global_scale";
+    assert!(full.header(scalar).is_some() && coordinator.header(scalar).is_none());
+    assert!(spark_checkpoint(&full, &catalog, &routed)?.is_none(),
+        "complete planner headers must not reopen the checkpoint");
+    let canonical = spark_checkpoint(&coordinator, &catalog, &routed)?.expect("role view needs canonical headers");
+    assert!(canonical.header(scalar).is_some());
+    let shape = PrefillShape { rows: 1024, waves: 3 };
+    for world in 2..=8 {
+        let recipe = |checkpoint: &Checkpoint| plan::experts::checkpoint_spark_recipe(checkpoint, world, &routed);
+        assert_eq!(recipe(&canonical)?, recipe(&full)?);
+        assert_eq!(spark_charges(&coordinator, &catalog, &routed, world, shape)?,
+            spark_charges(&full, &catalog, &routed, world, shape)?);
+    }
+    // Original callers without a selected view use the same canonical HF source.
+    let mut original = Checkpoint::coordinator_view(&view, false, false)?;
+    original.view = None;
+    assert_eq!(spark_charges(&original, &catalog, &routed, 3, shape)?,
+        spark_charges(&full, &catalog, &routed, 3, shape)?);
+    assert_eq!(spark_charges(&coordinator, &catalog, &routed, 0, shape)?,
+        vec![Vec::new(); routed.len() + 1]);
+    Ok(())
+}
+
 fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     fixture_with_experts(4)
 }
@@ -198,6 +233,52 @@ pub(crate) fn concurrency_matrix_snapshot() -> (tempfile::TempDir, std::path::Pa
     let manifest = dir.path().join("PROGRAMS.json");
     std::fs::write(&manifest, serde_json::json!({"programs": programs}).to_string()).unwrap();
     (dir, manifest)
+}
+
+#[test]
+fn only_optional_bundled_components_keep_missing_execution_hints() {
+    let missing = [Component::Embedding, Component::LmHead, Component::Norm, Component::Attention,
+        Component::Indexer, Component::Router, Component::SharedExpert, Component::RoutedExpert,
+        Component::DenseFfn, Component::Vision, Component::Speculator].into_iter()
+        .filter(|&component| MINIMAX_M3.component_hint(component).is_some()).collect::<Vec<_>>();
+    assert_eq!(missing, [Component::Vision, Component::Speculator]);
+}
+
+#[test]
+fn whole_rank_wip_admission_does_not_open_public_or_split_serving() {
+    use crate::placement::OnboardSetting;
+    let (dir, inputs) = heads_recipe_fixture_with_experts(128);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let whole = crate::families::minimax_m3::weight_layout::CoordinatorWeights::plan(
+        &checkpoint, &inputs.cfg, 1, &vec![0; inputs.cfg.layers]).unwrap();
+    let mut programs = inputs.manifest["programs"].as_array().unwrap().clone();
+    programs.extend(dense_manifest(&whole[0])["programs"].as_array().unwrap().clone());
+    let programs = programs.into_iter().map(|program| (program["name"].as_str().unwrap().to_owned(), program))
+        .collect::<std::collections::BTreeMap<_, _>>().into_values().collect::<Vec<_>>();
+    let manifest = dir.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, serde_json::json!({"programs":programs}).to_string()).unwrap();
+    let options = PlanOptions { vision: crate::plan::MediaMode::Off,
+        audio: crate::plan::MediaMode::Off,
+        placement: plan::ExpertPlacement::Sparks { ranks: 4 },
+        layout: Some(plan::layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30], spark_bytes: 100 << 30,
+            workspace_manifest: Some(manifest), host_memory: Some((512 << 30, 480 << 30)),
+            host_cache_bytes: Some(0), context_tokens: 32768, pool_tokens: Some(32768),
+            prefill_unit_rows: Some(1024), prefill_waves: 3, concurrency: 16,
+            onboard: Some(OnboardSetting::Layers(0)), ..Default::default()
+        }), ..Default::default() };
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.native_serving_admitted && report.wip_launchable(), "{:?}", report.hints);
+    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert!(!report.executable());
+    let mut no_admission = report.clone();
+    no_admission.native_serving_admitted = false;
+    assert!(!no_admission.wip_launchable());
+    let mut pair = options;
+    pair.layout.as_mut().unwrap().rtx_bytes.push(96 << 30);
+    let unsupported = plan::plan(dir.path(), &pair).unwrap();
+    assert!(!unsupported.native_serving_admitted && !unsupported.wip_launchable()
+        && !unsupported.executable());
 }
 
 #[test]
@@ -1326,8 +1407,10 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
                 }
             }
             let head = Location::coordinator((gpus - 1) as u8);
-            add(&mut expected, &Owner::Head.id(), head,
-                HeadLayout::new(&inputs.cfg, capacity.decode.rows).unwrap().buffers());
+            let head_buffers = HeadLayout::new(&inputs.cfg, capacity.decode.rows).unwrap().buffers();
+            assert_eq!(head_buffers.iter().find(|(name, _)| *name == "logits").unwrap().1,
+                concurrency * 200064 * 4, "prefill span adds no vocabulary rows");
+            add(&mut expected, &Owner::Head.id(), head, head_buffers);
             for owner in (serving::SelectorOwners { location: head, capacity: capacity.decode.rows as usize,
                 vocab: inputs.cfg.vocab_size, device_sampling: inputs.device_sampling })
                 .allocations("selector", serving::ServingOwners::LIFETIME).unwrap() {

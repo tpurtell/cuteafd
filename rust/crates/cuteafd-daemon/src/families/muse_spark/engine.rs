@@ -52,7 +52,6 @@ pub(crate) struct RankResources<'a> {
     /// Head rank: F32 rows at the selected head's stored width, then the
     /// softcapped logits trimmed to the vocabulary (`lane::head_planes`).
     pub head: Option<(Allocation<'a>, Allocation<'a>)>,
-    pub prefill_logits: Option<Allocation<'a>>,
     // Handle before its retained workspace: destruction must not outlive scratch.
     pub native_head: Option<DeviceOwner<'a, cuteafd_ffi::programs::VocabularyHead<'a>>>,
     _head_workspace: Option<Allocation<'a>>,
@@ -163,12 +162,10 @@ impl<'a> RankResources<'a> {
                 u32::try_from(cuteafd_loader::families::muse_spark::lane::HEAD_ROWS)?,
                 u32::try_from(cfg.vocab_size)?, crate::shared::target_head::TargetHead::configured().native_mode()) }
         })).transpose()?;
-        let prefill_logits = if has_head && built.prefill_logits_bytes > 0 {
-            Some(Allocation::new(device, built.prefill_logits_bytes, Tag::workspace("muse/prefill-logits"))?)
-        } else { None };
+
         let wire_grid = crate::shared::launch_grid::Fp8QuantizeGrid::new(device.run(|| library.sm_count())?, None)?;
         Ok(Self { device, programs: bound, core, layers, kv, lane, rope, _rotary: rotary, tp2, ranks, rank, wire_grid, step,
-            globals, head, prefill_logits, native_head, _head_workspace: head_workspace, head_stream: stream })
+            globals, head, native_head, _head_workspace: head_workspace, head_stream: stream })
     }
 
     pub(crate) fn check_head_stream(&self, stream: *mut c_void) -> Result<()> {

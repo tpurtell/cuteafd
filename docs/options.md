@@ -77,6 +77,25 @@ A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
 - `CONCURRENCY` unset is a boot-time memory derivation; all C-dependent sizes
   follow it. Set it only to pin a value.
 
+### MiniMax WIP Serving
+
+MiniMax M3.1 Flash is WIP-only pending #1856 qualification. `./run.sh --wip SLOT`
+uses the hidden `serve-minimax` entry; release launch and public `cuteafd serve`
+remain refused. The supported edge is one RTX with native MXFP8 dense math,
+NVFP4 W4A4 experts, FP8 MSA KV/index, GPU embedding and device token selection.
+`ATTENTION_PLACEMENT=auto|heads` selects whole ownership; explicit context/layers
+and two-RTX serving remain refused until the split executor is qualified.
+`SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
+
+Shared launch keys keep their usual meanings. The WIP edge accepts
+`RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS`, `PREFILL_WAVES`,
+`PREFILL_PACKING=unrestricted|exact`, `PREFIX_CACHE_ENTRIES`, `HOST_CACHE_BYTES`
+(default launcher `auto`), `POOL_TOKENS`, `MAX_CONTEXT_TOKENS`, `CONCURRENCY`,
+`EXPERT_USAGE=on|off` (default on), `GPU_GRAPH_RESERVE` and its extra/cap keys,
+and `GRAPH_TRACE`. Only BF16 Spark replies are supported; compressed reply
+formats refuse before loading. Native checkpoint API encoding is mandatory.
+The public family tables exclude this still-unqualified edge.
+
 `./run.sh` options:
 
 | Option | Meaning |
@@ -106,7 +125,9 @@ flags. Users set keys, not these flags or the `CUTEAFD_*` environment variables
 the launcher derives from them.
 
 `cuteafd golden --family minimax_m3` (hidden alias `minimax-golden`) is a
-qualification-only native full-model prefill path; MiniMax serving stays refused.
+qualification-only native full-model prefill path. Public MiniMax serving stays
+refused until its qualification card passes; WIP builds can serve it through the
+hidden `serve-minimax` command for qualification.
 Explicit two-RTX heads planning is available with half KV and replicated index
 storage; `auto` stays contiguous whole attention with neuron-split FFNs on two RTX.
 The two-RTX layers recipe requires an explicit qualified BF16/F32 split-wire
@@ -375,7 +396,6 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `PREFILL_ROWS` | planner | multiple of 64, ≤4096 | Per-unit rows override. |
 | `PREFILL_WAVES` | planner | 0–4 | Units in flight. |
 | `PREFILL_SPAN_ROWS` | planner | positive int | GLM/MiMo shared span. |
-| `FULL_PREFILL_LOGITS` | engine/hidden | `on`, `off` | Legacy all-row diagnostic reservation (2.5 GiB at 4096 rows); may reduce KV or onboarding. GLM Flash, dense Qwen, Qwen4, MiMo, V4, Step-5, Muse, GLM 5.3 and Mistral Large 4 prefill fidelity need no flag after paired raw-row and ordinary-layout Standard proofs: they stream selected logits from bounded existing head storage, preserving transformer prefill units. The Kimi adapter remains staged until its proof passes; its launch admission and scoring dispatch are unchanged. The flag remains temporarily for legacy admission and old/new exactness checks. |
 | `TARGET_HEAD` | `tensor` | `tensor`, `exact` | BF16 target head: tensor cores with FP32 accumulation, or the exact FP32 GEMM diagnostic. |
 | `FP8_EXPERT_PREFILL` | `auto` | `auto`, `w8a8`, `w8a16` | FP8 expert prefill arithmetic. |
 | `EXPERT_INPUT` | family default | `fp8`, `bf16`, `bf16-decode` | MiMo Spark expert inputs. |
@@ -400,9 +420,10 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
 
 Kimi K3.1 (`kimi_k31`) is recognized by the shared Kimi family for CPU header
-and core-view inspection. Its Gated DSA device path and index-cache prefix
-restore are not installed yet, so plan/serve refuse execution (#1777); dense
-MLA is not a fallback. K3 DFlash2 hidden-state compatibility is unqualified,
+and core-view inspection. Original and K6/K8 compact cores receive complete
+memory plans, including context-parity index caches and prefill workspaces.
+All remain `Planned`, not launchable, pending full-model and compact-core
+qualification (#1777); dense MLA is not a fallback. K3 DFlash2 hidden-state compatibility is unqualified,
 and requesting a drafter for K3.1 refuses explicitly. MC `original`,
 `k8-compact` and `k6-compact` retain native BF16 indexer weights;
 `fp8-compact` refuses until whole-core conversion is implemented.
@@ -497,6 +518,28 @@ process environment diagnostic, not a launch configuration key. Pass it through
 at most 64 synchronized phase boundaries, logs signed used/tracked/unclassified
 deltas, then intentionally exits before target graph capture or Ready. It adds
 no external observer, request probes, admission adjustment or automatic allowance.
+
+`CUTEAFD_KIMI_DSA_DUMP`, `CUTEAFD_KIMI_DSA_SCORES` and `CUTEAFD_KIMI_DSA_KEYS`
+are private coordinator-only Kimi K3.1 diagnostics for the DSA index route, not launch
+configuration keys; pass them through `golden-run --arm-env`.
+`CUTEAFD_KIMI_DSA_DUMP=DIR` writes every launched layer's post-selector token
+indices to `DIR/layer-NN.bin` (`KDSA0001`, one record per batch row),
+and `CUTEAFD_KIMI_DSA_DUMP_FROM=N` restricts records to engine positions at or
+after `N`. `CUTEAFD_KIMI_DSA_SCORES=DIR` additionally launches the scored
+selector after the plain one on the same stream and writes the per-slot scores
+aligned with those ids (`KDSAS001`, descending, `-1` tails preserved);
+`CUTEAFD_KIMI_DSA_SCORE_LAYERS=3,59` restricts which layers pay the extra
+launch and `CUTEAFD_KIMI_DSA_SCORE_FROM=N` the positions. The scored launch
+must select exactly the plain route's set; otherwise it fails with the layer
+and position and writes no score file. `CUTEAFD_KIMI_DSA_KEYS=DIR` reads the
+stored index key the selector actually scores: for each token in the required
+`CUTEAFD_KIMI_DSA_KEY_TOKENS=...` list it resolves the physical page through the
+same live page table row and writes that page's E4M3 codes and FP32 UE8M0
+scales (`KDSK0001` records, `KDSKP001` content-interned pages), with
+`CUTEAFD_KIMI_DSA_KEY_LAYERS=3,59` and `CUTEAFD_KIMI_DSA_KEY_FROM=N` restricting
+the readback. All three diagnostics refuse attached CUDA graphs and startup
+capture, so run them on eager arms only. Unset: no readback, no extra launch,
+no stream drain.
 
 `CUTEAFD_DIAG_PEER_WAIT=1` is a private coordinator-only diagnostic for every
 family with a two-GPU head split, not a launch configuration key. Pass it through
@@ -724,7 +767,6 @@ original core is already FP8, not an MC publication.
 | `PREFILL_ROWS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✓ |
 | `PREFILL_WAVES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `PREFILL_SPAN_ROWS` | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `FULL_PREFILL_LOGITS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `TARGET_HEAD` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `FP8_EXPERT_PREFILL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `EXPERT_INPUT` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |

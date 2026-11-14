@@ -139,7 +139,7 @@ pub(crate) fn baseline_global<'a>(device: Device<'a>, layout: &GlobalLayout, pac
     Ok(GlobalWeights { operands, core_head })
 }
 
-fn baseline_layer<'a>(device: Device<'a>, layout: &LayerLayout, packed: PackedLayer)
+pub(in crate::families::kimi_k3) fn baseline_layer<'a>(device: Device<'a>, layout: &LayerLayout, packed: PackedLayer)
     -> Result<LayerWeights<'a>> {
     layout.check(&packed)?;
     let operands = baseline_operands(device, packed.operands)?;

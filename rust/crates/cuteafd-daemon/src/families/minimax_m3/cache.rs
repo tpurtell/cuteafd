@@ -214,7 +214,7 @@ impl<'a> RequestState<'a> {
             "MiniMax request storage differs from admitted attention modes");
         let mut layers = vec![Vec::new(); streams.len()];
         for (layer, mode) in modes.iter().enumerate() {
-            let LayerMode::Whole { gpu, ffn: FfnMode::Owner } = mode else {
+            let LayerMode::Whole { gpu, ffn: FfnMode::Owner | FfnMode::Split } = mode else {
                 anyhow::bail!("MiniMax request storage requires whole-layer owners");
             };
             layers.get_mut(usize::from(*gpu)).context("MiniMax attention rank is not admitted")?.push(layer);
@@ -955,6 +955,51 @@ mod tests {
             Ok(RequestStreams { decode: Rc::new(Stream::new(device)?),
                 prefill: (0..3).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<Vec<_>>>()? })
         }).collect()
+    }
+
+    #[test]
+    fn split_ffn_preserves_whole_attention_cache_owners_and_heads_still_refuses() -> Result<()> {
+        use cuteafd_loader::placement::{FfnMode, LayerMode};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.extent_only(&library)?;
+        fixture.configure_device_flags(&library, 0)?;
+        fixture.strict_device_free(&library, true)?;
+        for id in 0..2 { fixture.configure_memory(&library, id, 1 << 30)?; }
+        let mut cfg = config(); cfg.layers = 4;
+        let ids = [1, 0];
+        let capacity = RequestCapacity::new(16, 128)?;
+        let owner = request_admission(&cfg, 2, capacity)?;
+        let mut split = owner.clone();
+        for mode in &mut split.solved.decisions.attention {
+            let LayerMode::Whole { ffn, .. } = mode else { unreachable!() };
+            *ffn = FfnMode::Split;
+        }
+        for (layer, mode) in split.placement.layers.iter_mut().zip(&split.solved.decisions.attention) {
+            layer.mode = *mode;
+        }
+        let observe = |admitted: &cuteafd_loader::placement::families::minimax_m3::AdmittedMiniMax| -> Result<_> {
+            let state = RequestState::new(&cfg, capacity, admitted, request_streams(&library, &ids)?)?;
+            let ranges = state.ranks.iter().map(|rank| rank.bank.layers.clone()).collect::<Vec<_>>();
+            let mut actual = Inventory::new(CoordinatorDevices::new(&ids)?, "minimax", Lifetime::TARGET,
+                Category::Workspace, "retained request bundle");
+            state.inventory(&mut actual)?;
+            let owners = actual.receipts.iter().map(|receipt| {
+                let owner = &receipt.allocation;
+                (owner.id.clone(), owner.bytes, owner.location, owner.lifetime, owner.category)
+            }).collect::<Vec<_>>();
+            Ok((ranges, owners))
+        };
+        assert_eq!(observe(&owner)?, observe(&split)?);
+        let mut heads = split;
+        heads.solved.decisions.attention[0] = LayerMode::HeadSplit;
+        heads.placement.layers[0].mode = LayerMode::HeadSplit;
+        let error = RequestState::new(&cfg, capacity, &heads, request_streams(&library, &ids)?)
+            .err().context("heads cache must refuse")?;
+        assert!(error.to_string().contains("requires whole-layer owners"));
+        assert_eq!(fixture.mapped_bytes(&library)?, 0);
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
     }
 
     #[test]

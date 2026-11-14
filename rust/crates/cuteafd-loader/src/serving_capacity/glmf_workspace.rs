@@ -48,7 +48,6 @@ pub struct GlmfStepShape {
     /// The KDA output shard's joined heads (`rows * hidden * 4`) follow the programs' scratch.
     pub output_shard: bool,
     /// Every prefill row's logits (golden scoring); otherwise at most the decode rows'.
-    pub full_prefill_logits: bool,
     /// Columns of one row's MLA page table and of its pool-page table.
     pub table_pages: u64,
     pub table_pool_pages: u64,
@@ -348,7 +347,7 @@ pub fn glmf_temporary_bytes(cfg: &GlmNextConfig, rows: u64, decode: bool, shape:
     scratch: GlmfScratch) -> GlmfTemporaryBytes {
     let (t, n, latent) = (rows, cfg.heads as u64, cfg.kv_lora_rank as u64);
     let lead = |bytes: u64| if shape.lead { bytes } else { 0 };
-    let logit_rows = if decode || shape.full_prefill_logits { t } else { t.min(GLMF_DECODE_ROWS) };
+    let logit_rows = if decode { t } else { t.min(GLMF_DECODE_ROWS) };
     GlmfTemporaryBytes {
         query: t * n * latent * 2,
         q_resid: t * cfg.q_lora_rank as u64 * 2,
@@ -513,7 +512,7 @@ mod tests {
     /// One RTX + Sparks, BF16 KDA, at the base run's 118,528-token pool (1,852 MLA pages).
     fn spark_shape() -> GlmfStepShape {
         GlmfStepShape { lead: true, split: false, local_experts: false, tp2_experts: false, spark: true, partial_bytes: 2,
-            output_shard: false, full_prefill_logits: false, table_pages: 1852, table_pool_pages: 463 }
+            output_shard: false, table_pages: 1852, table_pool_pages: 463 }
     }
 
     fn scratch(cfg: &GlmNextConfig, rows: u64, decode: bool) -> GlmfScratch {

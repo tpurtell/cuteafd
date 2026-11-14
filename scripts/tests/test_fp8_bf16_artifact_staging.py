@@ -389,7 +389,8 @@ static void mock_launch(void** args, int) {{
                  isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name) and n.targets[0].id in names]
         exec(compile(ast.Module(body=nodes, type_ignores=[]), filename, "exec"), layout_env)
     layout_geometry = SimpleNamespace(hidden=6144, slice=1024, experts=384, top_k=8,
-        activations="a4" if "nvfp4" in geometry else "a16", weights="fp8", kind="fp8")
+        activations="a4" if "nvfp4" in geometry else "a16", weights="fp8", kind="fp8",
+        dynamic_nvfp4=False)
     query = lib.cuteafd_fp8moe_reply_layout
     query.argtypes = [ctypes.c_uint] * 4 + [ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint]
     words = (ctypes.c_uint64 * 4)()

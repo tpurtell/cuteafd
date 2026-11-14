@@ -316,12 +316,26 @@ trait ContextRankKernels {
     fn wait_prior_commit(&mut self, reader: usize, owner: usize) -> Result<()>;
     fn attention_commit(&mut self, rank: usize) -> Result<()>;
     fn record_commit(&mut self, rank: usize) -> Result<()>;
+    fn gathered_dsa_rows(&self) -> Option<usize> { None }
+    fn prepare_dsa(&mut self, _rank: usize) -> Result<()> { anyhow::bail!("Kimi gathered DSA producer absent") }
+    fn select_dsa(&mut self, _rank: usize, _first: usize, _rows: usize, _merge: bool) -> Result<()> {
+        anyhow::bail!("Kimi gathered DSA selector absent")
+    }
 }
 
 fn context_pair_with(kernels: &mut impl ContextRankKernels) -> Result<()> {
     // Snapshot both ranks' previous event generations before either event is
     // re-recorded. Either next-unit gather reads both persistent owner pools.
     for reader in 0..2 { for owner in 0..2 { kernels.wait_prior_commit(reader, owner)?; }}
+    if let Some(rows) = kernels.gathered_dsa_rows() {
+        for rank in 0..2 { kernels.prepare_dsa(rank)?; }
+        for first in (0..rows).step_by(64) {
+            let count = (rows - first).min(64);
+            for merge in [false, true] {
+                for rank in 0..2 { kernels.select_dsa(rank, first, count, merge)?; }
+            }
+        }
+    }
     for rank in 0..2 {
         kernels.attention_commit(rank)?;
         kernels.record_commit(rank)?;
@@ -386,6 +400,39 @@ fn validate_streams(streams: &[[(i32, *mut c_void); 2]], devices: [i32; 2]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn k31_context_chunks_publish_both_ranks_before_waiting_and_reusing_storage() -> Result<()> {
+        #[derive(Default)]
+        struct Pair { published: [usize; 2], merged: [usize; 2], prepared: [bool; 2], calls: Vec<(usize, usize, bool)> }
+        impl ContextRankKernels for Pair {
+            fn wait_prior_commit(&mut self, _: usize, _: usize) -> Result<()> { Ok(()) }
+            fn gathered_dsa_rows(&self) -> Option<usize> { Some(131) }
+            fn prepare_dsa(&mut self, rank: usize) -> Result<()> { self.prepared[rank] = true; Ok(()) }
+            fn select_dsa(&mut self, rank: usize, first: usize, rows: usize, merge: bool) -> Result<()> {
+                ensure!(self.prepared == [true; 2], "both producers must be submitted first");
+                if merge {
+                    ensure!(self.published == [first + rows; 2], "wait before the peer publish");
+                    self.merged[rank] = first + rows;
+                } else {
+                    ensure!(self.merged == [first; 2], "overwrite before both merges consume");
+                    self.published[rank] = first + rows;
+                }
+                self.calls.push((rank, first, merge));
+                Ok(())
+            }
+            fn attention_commit(&mut self, _: usize) -> Result<()> { ensure!(self.merged == [131; 2], "incomplete selection"); Ok(()) }
+            fn record_commit(&mut self, _: usize) -> Result<()> { Ok(()) }
+        }
+        let mut pair = Pair::default();
+        context_pair_with(&mut pair)?;
+        assert_eq!(&pair.calls[..4], &[(0, 0, false), (1, 0, false), (0, 0, true), (1, 0, true)]);
+        let mut serial = Pair::default();
+        serial.prepare_dsa(0)?; serial.prepare_dsa(1)?;
+        serial.select_dsa(0, 0, 64, false)?;
+        assert!(serial.select_dsa(0, 0, 64, true).is_err(), "old serial-rank order must fail");
+        Ok(())
+    }
 
     #[test]
     fn gathered_unit_history_requires_both_prior_owner_commits() {
@@ -572,7 +619,7 @@ pub(crate) struct Bindings<'e, 'a, 's> {
     lane: usize,
     rows: usize,
     speculative: bool,
-    owners: Vec<(Vec<u8>, Vec<u8>)>,
+    owners: Vec<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)>,
     completed: usize,
     pending: Option<FfnTicket>,
     draft: Option<&'e super::draft::NativeDraft<'a>>,
@@ -616,14 +663,21 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         }
         let mut owners = Vec::new();
         for layer in 0..execution.plan.modes().len() {
-            let mut resident = (Vec::new(), Vec::new());
+            let mut resident = (Vec::new(), Vec::new(), None::<Vec<u8>>);
             for rank in 0..local.len() {
-                let (weights, state) = local[rank].attention_resident(layer)?;
+                let (weights, state, indexer) = local[rank].attention_resident(layer)?;
                 if weights { resident.0.push(rank as u8); }
                 if state { resident.1.push(rank as u8); }
+                if let Some(present) = indexer {
+                    let list = resident.2.get_or_insert_with(Vec::new);
+                    if present { list.push(rank as u8); }
+                }
             }
             execution.plan.validate_state_owners(layer, &resident.0)?;
             execution.plan.validate_state_owners(layer, &resident.1)?;
+            if let Some(indexer) = &resident.2 {
+                execution.plan.validate_state_owners(layer, indexer)?;
+            }
             owners.push(resident);
         }
         if let Some(peer) = peer {
@@ -900,7 +954,19 @@ impl LayerKernels for Bindings<'_, '_, '_> {
                 }
                 Ok(())
             }
+            fn gathered_dsa_rows(&self) -> Option<usize> {
+                self.binding.local[0].context_gathered_dsa().then_some(self.binding.rows)
+            }
+            fn prepare_dsa(&mut self, rank: usize) -> Result<()> {
+                self.binding.local[rank].context_gathered_stage(self.layer, self.binding.rows, Some(true))
+            }
+            fn select_dsa(&mut self, rank: usize, first: usize, rows: usize, merge: bool) -> Result<()> {
+                self.binding.local[rank].context_dsa_chunk(self.layer, first, rows, merge)
+            }
             fn attention_commit(&mut self, rank: usize) -> Result<()> {
+                if self.gathered_dsa_rows().is_some() {
+                    return self.binding.local[rank].context_gathered_stage(self.layer, self.binding.rows, Some(false));
+                }
                 if let Some(members) = &self.binding.packed {
                     self.binding.local[rank].attention_packed(self.layer, members)
                 } else {
@@ -915,7 +981,29 @@ impl LayerKernels for Bindings<'_, '_, '_> {
                 Ok(())
             }
         }
-        context_pair_with(&mut Pair { binding: self, layer })?;
+        if self.local[0].context_dsa_diagnostic() && self.packed.is_some() {
+            let members = self.packed.take().context("Kimi packed context members absent")?;
+            let total = self.rows;
+            let result: Result<()> = (|| {
+                let mut first = 0;
+                for member in &members {
+                    for local in self.local.iter_mut() { local.stage_context_member(member, first)?; }
+                    self.rows = LocalLane::context_member_rows(member);
+                    context_pair_with(&mut Pair { binding: self, layer })?;
+                    self.local[0].context_dsa_dump(layer, self.rows)?;
+                    first += self.rows;
+                }
+                Ok(())
+            })();
+            self.rows = total;
+            for local in self.local.iter_mut() { local.restore_context_member(total)?; }
+            self.packed = Some(members);
+            result?;
+        } else {
+            context_pair_with(&mut Pair { binding: self, layer })?;
+            // Diagnostic only: both peers have enqueued before either readback.
+            self.local[0].context_dsa_dump(layer, self.rows)?;
+        }
         // Both whole-step replays must be queued before ordinary producer
         // joins, otherwise rank 0's device wait can block rank 1's publication.
         if self.local[0].native_attention(layer)? {
@@ -943,7 +1031,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
     type FfnTicket = FfnTicket;
     fn state_owners(&self, layer: usize) -> Result<AttentionStateOwners<'_>> {
         let owners = self.owners.get(layer).context("Kimi layer census outside inventory")?;
-        Ok(AttentionStateOwners { weights: &owners.0, kv: &owners.1, indexer: None, compressor: None })
+        Ok(AttentionStateOwners { weights: &owners.0, kv: &owners.1, indexer: owners.2.as_deref(), compressor: None })
     }
     fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {
         if self.local.len() == 1 { return self.begin_local_ffn(layer, owner); }

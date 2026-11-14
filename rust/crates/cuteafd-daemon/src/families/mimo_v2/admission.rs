@@ -314,9 +314,7 @@ fn preflight_shape(
                 mark_store: cuteafd_engine::prefix::MarkStore::Arena,
                 page_owners: Default::default(),
             };
-            let scoring_rows = if args.full_prefill_logits {
-                super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?
-            } else { 64 };
+            let scoring_rows = 64;
             prefix.with_scoring(scoring_rows, scoring_rows.max(64), cfg.vocab_size)?
                 .resolve_host_config(layout, args.max_context, concurrency)?
         }
@@ -528,7 +526,7 @@ fn preflight_shape(
     } else {
         EmbeddingHome::Device(0)
     };
-    let operation = if args.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
+    let operation = Operation::Serving;
     let budgets = contract::production_budgets(
         &memory.iter().map(|sample| (sample.total_bytes, sample.total_bytes)).collect::<Vec<_>>(),
         &(0..memory.len()).map(|_| contract::device_headroom()).collect::<Vec<_>>(),
@@ -554,8 +552,7 @@ fn preflight_shape(
         spark: spark_profiles.clone(), no_spark: no_spark_profiles.clone(),
         post_kv_additional: post_kv_loading_additional, draft_packing,
         host: contract::HostOwners { expert_input: args.expert_input.into(), output: prefill_output,
-            serving: serving.is_some(), scoring_rows: if args.full_prefill_logits {
-                super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)? } else { 64 },
+            serving: serving.is_some(), scoring_rows: 64,
             diagnostic_rows: if std::env::var("CUTEAFD_ROUTE_CHECK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0) > 0 {
                 super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?.max(64) } else { args.prefill_rows.min(256) },
             prefix_bytes: host_bytes, media_bytes: 0,

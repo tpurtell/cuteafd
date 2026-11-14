@@ -205,7 +205,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         &checkpoint.tensors.iter().map(|tensor| &tensor.meta).collect::<Vec<_>>(),
         PrefillShape { rows, waves: slots as u64 }, ranks, spark_ranks, context, shape.concurrency,
         dspark, options.host_cache_bytes, options.host_cache_bytes != Some(0) && turns > 0,
-        256 << 20, host, report.mapped_placement.cap_bytes, Some(report.mapped_placement.host_budget_bytes), options.full_prefill_logits)?;
+        256 << 20, host, report.mapped_placement.cap_bytes, Some(report.mapped_placement.host_budget_bytes))?;
     report.mapped_placement = host_facts.mapped.clone();
     report.bytes_by_owner.remove("host-preloaded");
     if host_facts.mapped.preloaded_bytes > 0 {
@@ -223,7 +223,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         &vec![options.spark_bytes; spark_ranks])?;
     let request = admission::production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard,
         PrefillShape { rows, waves: slots as u64 },
-        if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
+        Operation::Serving,
         options.weight_budget_bytes, options.spark_reply_formats);
     let media_cache_bytes = options.media_cache_bytes.unwrap_or(0);
     let mut prepared = ProductionInput {
@@ -253,7 +253,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         media_cache_bytes: 0,
         resident_weight_limit: options.weight_budget_bytes,
         spark_reply_formats: options.spark_reply_formats,
-        operation: if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
+        operation: Operation::Serving,
         budgets,
     }.prepare()?;
     prepared.recipe.encoders = encoders.clone();
