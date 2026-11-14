@@ -28,12 +28,14 @@ def main():
     parser.add_argument('--prefixes', default='')
     parser.add_argument('--modes', default='f32,vendor,native')
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--tap-layers', default='')
     args = parser.parse_args()
     if args.snapshot.name != f32.REVISION:
         parser.error('reference requires pinned official MXFP8 snapshot')
     cfg = f32.Config.from_dict(json.loads((args.snapshot/'config.json').read_bytes()))
     tokens = json.loads(args.tokens.read_bytes())
     modes = args.modes.split(',')
+    tap_layers = {int(x) for x in args.tap_layers.split(',') if x}
     prefixes = sorted(set([args.last_layer] + [int(x)-1 for x in args.prefixes.split(',') if x]))
     if (not modes or len(modes)!=len(set(modes)) or any(m not in ('f32','vendor','native') for m in modes)
             or any(not 0<=p<=args.last_layer<cfg.num_hidden_layers for p in prefixes)
@@ -65,8 +67,19 @@ def main():
             layer = weights.load_layer(index,cfg)
             for mode in modes:
                 hidden,blocks = states[mode]
-                result = {'f32':f32.layer_forward, 'vendor':vendor.layer_forward,
-                          'native':native.layer_forward}[mode](hidden,blocks,layer,cfg,index)
+                taps = {} if mode=='native' and index in tap_layers else None
+                if mode=='native':
+                    result=native.layer_forward(hidden,blocks,layer,cfg,index,taps=taps)
+                else:
+                    result={'f32':f32.layer_forward,'vendor':vendor.layer_forward}[mode](hidden,blocks,layer,cfg,index)
+                if taps is not None:
+                    folder=args.out/mode/f'layer-{index}'
+                    folder.mkdir(parents=True)
+                    for name,value in taps.items():
+                        value.cpu().view(torch.uint16).numpy().tofile(folder/f'{name}.bin') if value.dtype==torch.bfloat16 else value.cpu().numpy().tofile(folder/f'{name}.bin')
+                    (folder/'meta.json').write_text(json.dumps(dict(rows=len(tokens)-1,hidden=cfg.hidden_size,
+                        experts=cfg.n_routed_experts,topk=cfg.num_experts_per_tok,local=index in cfg.local_layer_ids)))
+                    del taps
                 if index%cfg.n_layers_per_attn_res_block==0:
                     blocks.append(hidden)
                 states[mode]=(result,blocks)

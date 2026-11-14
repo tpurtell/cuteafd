@@ -69,7 +69,7 @@ def attention_forward(inputs, layer, cfg, index):
     return linear(gated.reshape(length, -1), layer['attn.wo_ud.weight'])
 
 
-def layer_forward(partial, blocks, layer, cfg, index):
+def layer_forward(partial, blocks, layer, cfg, index, taps=None):
     inputs = (f32.attn_res(blocks, partial, layer[f'attn_res.attn_queries.{index-1}'], cfg.rms_norm_eps)
               if blocks else (partial,) if index in cfg.local_layer_ids else (partial,)*3)
     attention = f32.short_conv(attention_forward(inputs, layer, cfg, index), layer['attn_sconv.weight'])
@@ -77,5 +77,15 @@ def layer_forward(partial, blocks, layer, cfg, index):
     mixed = f32.attn_res([*blocks, partial] if first else blocks, attention if first else partial,
         layer[f'attn_res.mlp_queries.{index}'], cfg.rms_norm_eps, addend=None if first else attention)[0]
     mlp_input = narrow(f32.rms_norm(mixed, layer['mlp_norm.weight'], cfg.rms_norm_eps))
+    if taps is not None:
+        logits = linear(mlp_input, layer['mlp.gate.weight'])
+        ids, weights = f32.route(logits, layer['mlp.gate.bias'], cfg.num_experts_per_tok, cfg.route_scale)
+        selection = logits.sigmoid()+layer['mlp.gate.bias']
+        ordered = selection.sort(-1, descending=True).values
+        taps.update(projection_input=mlp_input.bfloat16(), route_logits=logits, route_ids=ids.int(),
+            route_weights=weights, route_margin=ordered[:, cfg.num_experts_per_tok-1]-ordered[:, cfg.num_experts_per_tok])
     mlp = f32.short_conv(vendor.moe_forward(mlp_input, layer, cfg), layer['mlp_sconv.weight'])
-    return attention+mlp if first else (partial+attention)+mlp
+    result = attention+mlp if first else (partial+attention)+mlp
+    if taps is not None:
+        taps['partial'] = result
+    return result
