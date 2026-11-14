@@ -565,6 +565,48 @@ fn installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget() {
         &root);
 }
 
+#[test]
+fn installed_qwen_hybrid_min_sim_and_dual_publish_exact_layer_homes() {
+    use cuteafd_loader::{plan::{testing::BudgetedPlanInput, layout::LayoutOptions,
+        ExpertPlacement, MediaMode, PlanOptions}, placement::{ExpertHome, OnboardSetting}};
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    let hf_home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".cache/huggingface"));
+    let programs = installed_example_programs(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into), &home);
+    let snapshot = require_installed_snapshot("installed Qwen hybrid",
+        "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+        Some("888306bd3996d6317758c07df50622829259ad17"), &hf_home);
+    let input = BudgetedPlanInput::open(&snapshot).unwrap();
+    for (gpus, capacity, onboard) in [(1, 95u64 << 30, OnboardSetting::All),
+        (1, 34_145_991_884, OnboardSetting::Auto), (2, 95u64 << 30, OnboardSetting::Layers(5)),
+        (2, 95u64 << 30, OnboardSetting::Layers(0))] {
+        let report = input.plan(&PlanOptions { placement: ExpertPlacement::Sparks { ranks: 4 },
+            vision: MediaMode::Off, audio: MediaMode::Off,
+            layout: Some(LayoutOptions { rtx_bytes: vec![capacity; gpus], head_split: gpus == 2,
+                onboard: Some(onboard), native_mtp_layers: 0, host_cache_bytes: Some(0),
+                host_memory: Some((128 << 30, 128 << 30)), workspace_manifest: Some(programs.clone()),
+                ..Default::default() }), ..Default::default() }).unwrap();
+        assert!(report.executable(), "{}", cuteafd_loader::plan::render(&report));
+        let placement = report.solver_placement.as_ref().expect("admitted layer homes");
+        let expected = match onboard { OnboardSetting::All => 48, OnboardSetting::Layers(count) => count,
+            OnboardSetting::Auto => placement.onboard_layers };
+        assert_eq!(placement.onboard_layers, expected);
+        assert_eq!(placement.layers.len(), 48);
+        assert_eq!(placement.layers.iter().filter(|layer| layer.experts == ExpertHome::Spark).count(), 48 - expected);
+        for (layer, assignment) in placement.layers.iter().enumerate() {
+            assert_eq!(assignment.experts, if layer >= expected { ExpertHome::Spark }
+                else if gpus == 2 { ExpertHome::RtxTp2 } else { ExpertHome::RtxWhole { gpu: 0 } });
+        }
+        if expected == 0 && gpus == 2 {
+            for rank in 0..2 {
+                let owners = placement.items[rank].iter().filter(|item| item.group == "Qwen terminal exchange").collect::<Vec<_>>();
+                assert_eq!(owners.len(), 1);
+                assert_eq!(owners[0].bytes, if cuteafd_loader::serving_capacity::peer_wait_diagnostics() { 1024 } else { 768 });
+            }
+        }
+    }
+}
+
 /// Drive one shipped config through the real launcher and the real planner;
 /// only hardware and payload execution are stubbed.
 fn installed_real_planner_launch(root: &std::path::Path, capture: &str, snapshot: &std::path::Path,
