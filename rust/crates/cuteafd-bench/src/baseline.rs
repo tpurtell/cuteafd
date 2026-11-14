@@ -226,7 +226,10 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
             .with_context(|| format!("{label} route warm-up"))?;
         crate::prefill::validate(text.tokens, probe.timing.prompt_tokens)?;
         let fabric_mark = client.fabric_mark();
-        let chat = client.chat(plain(client, &text.text, 1), None).with_context(|| label.to_string())?;
+        // Template preambles can share cached pages despite distinct user nonces.
+        // Cold timing excludes both lookup and prompt-end snapshot storage.
+        let chat = client.chat(plain(client, &text.text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
+            .with_context(|| label.to_string())?;
         if let Some(phase) = client.fabric_since(fabric_mark, if tail { "prefill/8k-tail" } else { "prefill/8k" }, true) {
             run.baseline.fabric.push(phase);
         }

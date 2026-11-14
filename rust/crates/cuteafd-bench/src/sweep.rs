@@ -306,7 +306,9 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
         let mark = client.thermal_mark();
         let fabric_mark = client.fabric_mark();
         let counters = phase_counters(client);
-        let chat = client.chat(plain(client, &timed_text.text, 1), None).with_context(|| format!("{length}-token prefill"))?;
+        let chat = client.chat(plain(client, &timed_text.text, 1),
+            Some(cuteafd_api::openai::probe::ProbeSpec { cold: true, ..Default::default() }))
+            .with_context(|| format!("{length}-token prefill"))?;
         let after = phase_counters(client);
         let mapped_tables = mapped_interval(&counters.mapped_tables, &after.mapped_tables);
         let expert_usage = expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref());
