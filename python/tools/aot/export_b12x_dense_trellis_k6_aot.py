@@ -169,17 +169,12 @@ def _key(item):
     return item[1:4] + (() if _bits(item) == 6 else (_bits(item),))
 
 
-def kimi_k8_screen_shapes():
-    """Explicit opt-in only; shipping K4/K6 inventories are unchanged."""
-    return tuple((*shape[:4], 8) for shape in KIMI_SHAPES)
-
-
 def shapes_for(families):
     """Canonicalize equal geometries so runtime lookup is never ambiguous."""
     result, seen = [], set()
     for family in families:
         for item in (*FAMILY_SHAPES[family], *(tuple((*shape[:4], 8) for shape in FAMILY_SHAPES[family] if _bits(shape) == 6)
-                                                if family in ("glm", "glmf", "muse", "step5") else ())):
+                                                if family in ("kimik3", "glm", "glmf", "muse", "step5") else ())):
             if _key(item) not in seen:
                 result.append(item)
                 seen.add(_key(item))

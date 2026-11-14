@@ -44,25 +44,26 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
     transforms.compile_trellis_output_aot = lambda **params: params
     monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
     programs = module["programs"]()
-    assert len(programs) == 48
+    assert len(programs) == 78
     assert len({name for name, *_ in programs}) == len(programs)
     grouped = [item for item in programs if item[2].get("groups")]
     assert {name for name, *_ in grouped} == {
         "trellis_kda_qkvg_tp2_mcg_g4", "trellis_kda_qkvg_tp2_mul1_g4",
+        "trellis_kda_qkvg_tp2_mcg_k8_g4", "trellis_kda_qkvg_tp2_mul1_k8_g4",
         "trellis_input_k7168_bf16_g4", "trellis_output_n6144_bf16_g4"}
     for name, op, params, compile_program in grouped:
         assert params["groups"] == 4 and params["max_rows"] == 4096
         assert compile_program() == params
         if op == "trellis_linear":
-            assert params["rotation_count"] == 4 and params["sharded_side"] == 1 and params["bits"] == 6
+            assert params["rotation_count"] == 4 and params["sharded_side"] == 1 and params["bits"] in (6, 8)
         elif op == "trellis_output":
             assert params["output_dtype"] == "bf16"
     programs = [item for item in programs if not item[2].get("groups")]
     core = [item for item in programs if item[1] == "trellis_linear"]
-    assert len(core) == 2 * len(module["KIMI_SHAPES"])
+    assert len(core) == 4 * len(module["KIMI_SHAPES"])
     for _, op, params, compile_program in core:
         assert op == "trellis_linear"
-        assert params["bits"] == 6
+        assert params["bits"] in (6, 8)
         assert params["codebook"] in ("mcg", "mul1")
         assert params["max_rows"] == 4096
         assert params["rotation_count"] == 1
@@ -91,10 +92,10 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
             assert policy[field] in names
         if "grouped" in policy:
             assert policy["shape"] == "kda_qkvg_tp2"
-            assert policy["grouped"]["native_program"] == f"trellis_kda_qkvg_tp2_{policy['codebook']}_g4"
+            assert policy["grouped"]["native_program"] == f"trellis_kda_qkvg_tp2_{policy['codebook']}{'_k8' if policy.get('bits') == 8 else ''}_g4"
             for field in ("native_program", "native_input", "output_program"):
                 assert policy["grouped"][field] in names
-    assert sum("grouped" in policy for policy in module["row_policies"]()) == 2
+    assert sum("grouped" in policy for policy in module["row_policies"]()) == 4
     fixture = module["programs_for_shapes"]((("s1", 128, 256, 1), ("s2", 128, 256, 2)),
         max_rows=64, f32_outputs=(256,))
     assert {name for name, *_ in fixture} == {
@@ -107,7 +108,7 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
     assert "b12x.integration.cuteafd.trellis_linear" in imports
 
 
-def test_k8_screen_is_opt_in_and_names_do_not_collide(monkeypatch):
+def test_k8_is_shipped_and_names_do_not_collide(monkeypatch):
     module = load_exporter(monkeypatch)
     fake = ModuleType("b12x.integration.cuteafd.trellis_linear")
     fake.compile_trellis_linear_aot = lambda **params: params
@@ -120,7 +121,7 @@ def test_k8_screen_is_opt_in_and_names_do_not_collide(monkeypatch):
     assert {params["bits"] for _, op, params, _ in shipping if op == "trellis_linear"} == {4, 6, 8}
     assert all(params["bits"] == 6 for name, op, params, _ in shipping
                if op == "trellis_linear" and name.startswith("trellis_ml4_"))
-    shapes = module["KIMI_SHAPES"] + module["kimi_k8_screen_shapes"]()
+    shapes = module["shapes_for"](("kimik3",))
     screen = module["programs_for_shapes"](shapes)
     assert len({name for name, *_ in screen}) == len(screen)
     for name, op, params, compile_program in screen:
@@ -139,7 +140,7 @@ def test_comparison_group_is_opt_in():
 
 def test_native_only_policy_has_no_dequant_scratch(monkeypatch):
     policies = load_exporter(monkeypatch)["row_policies"]()
-    assert len(policies) == 28
+    assert len(policies) == 56
     for policy in policies:
         assert not any("chunk" in key or "dequant" in key or "scratch" in key for key in policy)
         assert "wide_input" not in policy
