@@ -50,6 +50,12 @@ GLM 5.3 MC (`c39486376dee84e5faa4904e014e07d7b6e76405`) and Step-5 MC
 compact-view performance and Standard fidelity are pending #1906.
 Both refuse whole-core `fp8-compact`: GLM has no selected block-FP8 roles,
 and Step-5 supports only O projections, not its complete MC core.
+Muse MC (`cc5dc2537083177e3f02ea0b2d9dfc179d40425c`) likewise offers
+`original`, `k8-compact` and `k6-compact`; separate
+`muse-spark-exl3-k4-mc-{min,max}.config` examples select `CORE_VIEW=original`.
+The standalone `muse-spark-exl3-{min,max}.config` examples keep serving Core-K6;
+only their regular benchmark cards retire. Muse's full `fp8-compact` view
+remains unsupported until its selected head and pre/post-expert roles execute.
 
 MC `fp8-compact` converts exactly the original variant's `core_tensors`; published
 Flash MCs include KDA and the target head. Explicit KDA/head conversion keys apply
