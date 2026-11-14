@@ -233,7 +233,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     future.retain(|demand| demand.gpu == 0);
     let mut expert_arenas = Vec::new();
     if mtp && catalog.exl3().is_some() {
-        let (arena, shared) = experts.serial_draft(catalog)?;
+        let (arena, shared) = experts.serial_draft(catalog, 0)?;
         expert_arenas.push(arena);
         future.extend(shared);
     } else if mtp && manifest.is_some() {
