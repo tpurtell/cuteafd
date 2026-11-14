@@ -417,7 +417,9 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         sessions = []
         resolved = resolve_container_keys(dict(set=values, sparks=hosts))
         if 'nsys' in values.get('PROFILE', '').split(','):
-            sessions.append(['docker', 'exec', 'cuteafd-coordinator-' + resolved['instance'], '/usr/local/cuda/bin/nsys'])
+            # PROFILE_NSYS_ROOT runs its own nsys; the window must talk to the same one.
+            nsys = values['PROFILE_NSYS_ROOT'] + '/nsys' if values.get('PROFILE_NSYS_ROOT') else '/usr/local/cuda/bin/nsys'
+            sessions.append(['docker', 'exec', 'cuteafd-coordinator-' + resolved['instance'], nsys])
         if values.get('PROFILE_SPARK') == 'nsys':
             for rank in spark_profile_ranks(values, hosts):
                 worker = f"cuteafd-spark-expert-{hosts[rank]}-{resolved['expert_port']}"
@@ -2527,7 +2529,7 @@ def toolchain_hash(revision):
 BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_EXPECT_GLM_RING',
               'API_KEY_FILE', 'INSTANCE',
               'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
-              'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET', 'PROFILE_NSYS_GPU_METRICS',
+              'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET', 'PROFILE_NSYS_GPU_METRICS', 'PROFILE_NSYS_ROOT',
               'PROFILE_NCU_SKIP', 'PROFILE_SPARK', 'PROFILE_SPARK_RANKS', 'PROFILE_SPARK_NCU_KERNEL', 'PROFILE_SPARK_NCU_COUNT',
               'PROFILE_SPARK_NCU_SET', 'PROFILE_SPARK_NCU_SKIP', 'PROFILE_SPARK_NSYS_GPU_METRICS',
               'PROFILE_EXPERT_INPUT_SAMPLE', 'PROFILE_EXPERT_ROUTE_WEIGHTS', 'COORDINATOR_DOCKER_INFERENCE', 'SPARK_EXPERT_DOCKER_INFERENCE'}

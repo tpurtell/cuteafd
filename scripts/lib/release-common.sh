@@ -815,6 +815,31 @@ release_profile_container_wrapper() {
   RELEASE_PROFILE_WRAPPER=(/bin/bash -c "$script" release-profile-resolve "$tool" "$@")
 }
 
+# First Nsight Systems version measured to trace graph nodes when one graph's
+# kernels run on two GPUs (#2094): 2026.2.1 and 2026.3.2 fault, 2026.5.2 passes.
+RELEASE_NSYS_CROSS_DEVICE_NODES=2026.5.2
+# True when nsys VERSION (X.Y.Z; empty means unknown) is at least that version.
+release_nsys_traces_cross_device_nodes() {
+  [[ "$1" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$RELEASE_NSYS_CROSS_DEVICE_NODES" "$1" | LC_ALL=C sort -V | head -n 1)" == "$RELEASE_NSYS_CROSS_DEVICE_NODES" ]]
+}
+
+# Prints the X.Y.Z version of the nsys a profiled coordinator will run: ROOT/nsys
+# when PROFILE_NSYS_ROOT is set, otherwise the one IMAGE resolves at start.
+# Prints nothing when it cannot be read; callers treat that as unknown.
+# Arguments: IMAGE [ROOT].
+release_profile_nsys_version() {
+  local image="$1" root="${2:-}" script text=""
+  if [[ -n "$root" ]]; then
+    text="$("$root/nsys" --version 2>/dev/null)" || text=""
+  else
+    script="$(declare -f release_profile_resolve_tool)"
+    script+=$'\nbin="$(release_profile_resolve_tool nsys)" && "$bin" --version'
+    text="$(docker run --rm --network none --entrypoint /bin/bash "$image" -c "$script" 2>/dev/null)" || text=""
+  fi
+  sed -n 's/.*Nsight Systems version \([0-9][0-9]*[.][0-9][0-9]*[.][0-9][0-9]*\).*/\1/p' <<<"$text" | head -n 1
+}
+
 # Sets RELEASE_PROFILE_WRAPPER: the argv that goes between the image and the
 # served command (`docker run ... IMAGE "${RELEASE_PROFILE_WRAPPER[@]}" cuteafd
 # ...`), and RELEASE_PROFILE_WRAPPER_DOCKER_ARGS (docker arguments before the
@@ -872,21 +897,29 @@ _release_profile_tool_wrapper() {
     # because sampling perturbs host timing.
     # nsys node-level graph tracing faults cudaGraphInstantiate (Xid 31, MMU
     # write fault) on a graph whose kernel nodes run on a second GPU (#2094;
-    # oracle: native/tests/v41_cross_device_graph_selftest.py). A layout that
-    # captures such graphs says so in its deployment plan
-    # (cross_device_graph_kernels); it is traced per graph, and an explicit
-    # node is refused rather than left to crash at startup.
+    # oracle: native/tests/v41_cross_device_graph_selftest.py). Measured: 2026.2.1
+    # and 2026.3.2 fault, 2026.5.2 passes. A layout that captures such graphs
+    # says so in its deployment plan (cross_device_graph_kernels); under an nsys
+    # older than RELEASE_NSYS_CROSS_DEVICE_NODES (or of unknown version) it is
+    # traced per graph, and an explicit node is refused rather than left to
+    # crash at startup.
     local graph_trace="${RELEASE_PROFILE_NSYS_GRAPH_TRACE:-}"
     case "$graph_trace" in
       ''|node|graph) ;;
       *) release_die "${key}_NSYS_GRAPH_TRACE must be node or graph" ;;
     esac
     if [[ "${RELEASE_PROFILE_CROSS_DEVICE_GRAPHS:-}" == true ]]; then
-      [[ "$graph_trace" != node ]] ||
-        release_die "${key}_NSYS_GRAPH_TRACE=node is refused: this layout captures CUDA graphs with kernels on both coordinator GPUs, and nsys node-level graph tracing faults when such a graph is instantiated (#2094); use graph"
-      [[ -n "$graph_trace" ]] ||
-        echo "${key}_NSYS_GRAPH_TRACE resolved to graph: this layout captures CUDA graphs with kernels on both coordinator GPUs, which nsys node-level graph tracing faults on (#2094); graph replays appear as one span each" >&2
-      graph_trace=graph
+      local nsys_version="${RELEASE_PROFILE_NSYS_VERSION:-}"
+      if release_nsys_traces_cross_device_nodes "$nsys_version"; then
+        echo "nsys $nsys_version traces graph nodes across coordinator GPUs (fixed in $RELEASE_NSYS_CROSS_DEVICE_NODES, #2094); ${key}_NSYS_GRAPH_TRACE=${graph_trace:-node}" >&2
+      else
+        local found="nsys ${nsys_version:-of unknown version}"
+        [[ "$graph_trace" != node ]] ||
+          release_die "${key}_NSYS_GRAPH_TRACE=node is refused: this layout captures CUDA graphs with kernels on both coordinator GPUs, and $found faults when node-level graph tracing instantiates such a graph (#2094; fixed in nsys $RELEASE_NSYS_CROSS_DEVICE_NODES); use graph"
+        [[ -n "$graph_trace" ]] ||
+          echo "${key}_NSYS_GRAPH_TRACE resolved to graph: this layout captures CUDA graphs with kernels on both coordinator GPUs, which $found faults on under node-level graph tracing (#2094; fixed in nsys $RELEASE_NSYS_CROSS_DEVICE_NODES); graph replays appear as one span each" >&2
+        graph_trace=graph
+      fi
     fi
     graph_trace="${graph_trace:-node}"
     local cpu=(--sample=none --cpuctxsw=none)
@@ -895,9 +928,21 @@ _release_profile_tool_wrapper() {
       on) cpu=(--sample=process-tree --cpuctxsw=process-tree --backtrace=dwarf) ;;
       *) release_die "${key}_NSYS_CPU must be on or off" ;;
     esac
-    release_profile_container_wrapper nsys profile --trace=cuda,nvtx,osrt "--cuda-graph-trace=$graph_trace" \
-      "${cpu[@]}" --start-later=true "--session-new=$RELEASE_NSYS_SESSION" \
-      "--output=$output" --force-overwrite=true
+    local -a nsys_args=(profile --trace=cuda,nvtx,osrt "--cuda-graph-trace=$graph_trace"
+      "${cpu[@]}" --start-later=true "--session-new=$RELEASE_NSYS_SESSION"
+      "--output=$output" --force-overwrite=true)
+    # PROFILE_NSYS_ROOT (dev and profiling only): a host directory holding an
+    # `nsys` executable, mounted read-only at its own path and run instead of
+    # the image's install (trying a newer Nsight Systems without an image rebuild).
+    local nsys_root="${RELEASE_PROFILE_NSYS_ROOT:-}"
+    if [[ -n "$nsys_root" ]]; then
+      [[ "$nsys_root" =~ ^/[A-Za-z0-9._/-]+$ && -f "$nsys_root/nsys" && -x "$nsys_root/nsys" ]] ||
+        release_die "${key}_NSYS_ROOT must be an absolute directory holding an nsys executable"
+      RELEASE_PROFILE_WRAPPER=("$nsys_root/nsys" "${nsys_args[@]}")
+      RELEASE_PROFILE_WRAPPER_DOCKER_ARGS+=(-v "$nsys_root:$nsys_root:ro")
+    else
+      release_profile_container_wrapper nsys "${nsys_args[@]}"
+    fi
     if [[ -n "$metrics" ]]; then
       [[ "$metrics" == all || "$metrics" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
         release_die "${key}_NSYS_GPU_METRICS must be all or an nsys GPU index list (e.g. 0 or 0,1)"
@@ -908,6 +953,7 @@ _release_profile_tool_wrapper() {
   [[ -z "$metrics" ]] || release_die "${key}_NSYS_GPU_METRICS needs $key=nsys"
   [[ -z "${RELEASE_PROFILE_NSYS_CPU:-}" ]] || release_die "${key}_NSYS_CPU needs $key=nsys"
   [[ -z "${RELEASE_PROFILE_NSYS_GRAPH_TRACE:-}" ]] || release_die "${key}_NSYS_GRAPH_TRACE needs $key=nsys"
+  [[ -z "${RELEASE_PROFILE_NSYS_ROOT:-}" ]] || release_die "${key}_NSYS_ROOT needs $key=nsys"
   [[ -n "$kernel" ]] || release_die "$key=ncu needs ${key}_NCU_KERNEL (a kernel-name regex); it replays every matched launch"
   [[ "$kernel" != *[[:space:]]* ]] || release_die "${key}_NCU_KERNEL must not contain whitespace"
   count="${count:-20}" set="${set:-full}" skip="${skip:-0}"
@@ -1002,7 +1048,7 @@ release_known_key() {
     GLM5_FLASH_ROUTE_RING_CHECK) return 0 ;;
     PROBE_DUMP_ROOT|MEDIA_FEATURES_DIR|AUDIO_FEATURES_DIR|CORE_VIEW|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
     DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
-    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_NSYS_GRAPH_TRACE|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
+    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_NSYS_GRAPH_TRACE|PROFILE_NSYS_ROOT|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|SPARK_HOSTS)
       return 0

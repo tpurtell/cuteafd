@@ -291,6 +291,73 @@ def test_nsys_traces_whole_graphs_when_kernels_span_coordinator_gpus(monkeypatch
     assert out.returncode == 0 and not wrapper
 
 
+def test_nsys_cross_device_rule_applies_only_before_the_fixed_version(monkeypatch):
+    """Measured on the oracle: 2026.2.1 and 2026.3.2 fault, 2026.5.2 passes. An
+    unreadable version is treated as old, and every launch names what it found."""
+    monkeypatch.setenv('RELEASE_PROFILE_CROSS_DEVICE_GRAPHS', 'true')
+    for version in ('', '2026.2.1', '2026.3.2', 'junk'):
+        monkeypatch.setenv('RELEASE_PROFILE_NSYS_VERSION', version)
+        monkeypatch.delenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', raising=False)
+        out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+        assert out.returncode == 0 and '--cuda-graph-trace=graph' in wrapper, (version, out.stderr)
+        named = f'nsys {version}' if version else 'nsys of unknown version'
+        assert named in out.stderr and 'fixed in nsys 2026.5.2' in out.stderr
+        monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', 'node')
+        out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+        assert out.returncode != 0 and named in out.stderr, (version, out.stderr)
+    for version in ('2026.5.2', '2026.5.10', '2026.10.1', '2027.1.0'):
+        monkeypatch.setenv('RELEASE_PROFILE_NSYS_VERSION', version)
+        for requested, traced in (('', 'node'), ('node', 'node'), ('graph', 'graph')):
+            monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', requested)
+            out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+            assert out.returncode == 0, (version, requested, out.stderr)
+            assert [arg for arg in wrapper if arg.startswith('--cuda-graph-trace=')] == [f'--cuda-graph-trace={traced}']
+            assert f'nsys {version} traces graph nodes across coordinator GPUs' in out.stderr
+            assert 'resolved to graph' not in out.stderr
+
+
+def test_nsys_root_runs_a_mounted_nsys_instead_of_the_image_install(tmp_path, monkeypatch):
+    root = tmp_path / 'nsys-root'
+    root.mkdir()
+    binary = root / 'nsys'
+    binary.write_text('#!/bin/sh\necho "NVIDIA Nsight Systems version 2026.5.2.323-1v0"\n')
+    binary.chmod(0o755)
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_ROOT', str(root))
+    out, wrapper, docker = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0, out.stderr
+    assert wrapper[:3] == [str(binary), 'profile', '--trace=cuda,nvtx,osrt']
+    assert 'release_profile_exec' not in ' '.join(wrapper)
+    assert docker[-2:] == ['-v', f'{root}:{root}:ro'] and '--stop-signal' in docker
+    version = subprocess.run(['bash', '-c', 'source scripts/lib/release-common.sh; release_profile_nsys_version unused "$1"',
+                              'test', str(root)], cwd=ROOT, capture_output=True, text=True)
+    assert version.stdout.strip() == '2026.5.2'
+    for bad in (str(tmp_path / 'absent'), 'relative/dir', str(tmp_path)):
+        monkeypatch.setenv('RELEASE_PROFILE_NSYS_ROOT', bad)
+        out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+        assert out.returncode != 0 and 'PROFILE_NSYS_ROOT must be an absolute directory holding an nsys executable' in out.stderr
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_ROOT', str(root))
+    out, _, _ = _wrapper('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm')
+    assert out.returncode != 0 and 'PROFILE_NSYS_ROOT needs PROFILE=nsys' in out.stderr
+
+
+def test_family_launch_takes_the_nsys_version_from_the_mounted_root(tmp_path):
+    """A declared layout under a fixed nsys keeps node tracing; the window talks to that nsys."""
+    prof = tmp_path / 'prof'
+    root = tmp_path / 'nsys-root'
+    root.mkdir()
+    (root / 'nsys').write_text('#!/bin/sh\necho "NVIDIA Nsight Systems version 2026.5.2.323-1v0"\n')
+    (root / 'nsys').chmod(0o755)
+    keys = f'PROFILE=nsys\nPROFILE_DIR={prof}\nPROFILE_NSYS_ROOT={root}\n'
+    out = _family_launch_result(tmp_path / 'fixed', GLMF_TWO_LAYER, 'test/glmf', keys,
+                                deployment_overrides={'cross_device_graph_kernels': True})
+    assert out.returncode == 0, out.stderr
+    assert 'nsys 2026.5.2 traces graph nodes across coordinator GPUs' in out.stderr
+    assert '--cuda-graph-trace=node' in out.stderr and '--cuda-graph-trace=graph' not in out.stderr
+    assert f'-v {root}:{root}:ro' in out.stderr and f'{root}/nsys profile' in out.stderr
+    cards = (ROOT / 'scripts/bench/wip-cards.py').read_text()
+    assert "values['PROFILE_NSYS_ROOT'] + '/nsys'" in cards
+
+
 def test_family_launch_reads_cross_device_graphs_from_the_deployment_plan(tmp_path):
     """The launcher takes the fact from the plan it launches, for any family."""
     prof = tmp_path / 'prof'
@@ -304,6 +371,7 @@ def test_family_launch_reads_cross_device_graphs_from_the_deployment_plan(tmp_pa
     assert forked.returncode == 0, forked.stderr
     assert '--cuda-graph-trace=graph' in forked.stderr and '--cuda-graph-trace=node' not in forked.stderr
     assert 'PROFILE_NSYS_GRAPH_TRACE resolved to graph' in forked.stderr
+    assert 'nsys of unknown version' in forked.stderr  # the stub image reports none
     refused = _family_launch_result(tmp_path / 'refused', GLMF_TWO_LAYER, 'test/glmf',
                                     keys + 'PROFILE_NSYS_GRAPH_TRACE=node\n', deployment_overrides=declared)
     assert refused.returncode != 0 and 'PROFILE_NSYS_GRAPH_TRACE=node is refused' in refused.stderr
