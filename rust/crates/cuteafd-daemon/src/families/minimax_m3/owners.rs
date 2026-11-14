@@ -65,12 +65,21 @@ impl SelectorContract {
     }
 
     pub fn reconcile(&self, receipts: &[cuteafd_loader::placement::planner::Receipt]) -> Result<()> {
-        let actual = receipts.iter().map(|receipt| (receipt.allocation.id.as_str(), receipt)).collect::<BTreeMap<_, _>>();
-        ensure!(actual.len() == receipts.len() && actual.len() == self.owners.len(),
+        let physical = receipts.iter().filter(|receipt| receipt.allocation.location != Location::HOST).collect::<Vec<_>>();
+        ensure!(receipts.iter().filter(|receipt| receipt.allocation.location == Location::HOST)
+            .all(|receipt| receipt.allocation.id.starts_with("selector.sampler.host.")),
+            "MiniMax selector has an unknown host diagnostic");
+        let actual = physical.iter().map(|receipt| (receipt.allocation.id.as_str(), *receipt)).collect::<BTreeMap<_, _>>();
+        ensure!(actual.len() == physical.len() && actual.len() == self.owners.len(),
             "MiniMax scheduler selector owner inventory differs from admission");
         let mut spans = Vec::new();
         for planned in &self.owners {
-            let receipt = actual.get(planned.id.as_str()).with_context(|| format!("MiniMax selector missing {}", planned.id))?;
+            let observed = match planned.id.strip_prefix("selector.sampler.") {
+                Some(id) => format!("selector.sampler.{}", cuteafd_core::target_sampler_receipt_key(id)
+                    .with_context(|| format!("MiniMax sampler owner has no shared receipt mapping: {id}"))?),
+                None => planned.id.clone(),
+            };
+            let receipt = actual.get(observed.as_str()).with_context(|| format!("MiniMax selector missing {} ({observed})", planned.id))?;
             let owner = &receipt.allocation;
             // The shared Inventory's diagnostic group/category may differ;
             // physical identity, payload, location and lifetime must not.
@@ -388,11 +397,13 @@ mod tests {
         use cuteafd_loader::placement::planner::{Allocation, Receipt};
         let owner = Allocation::buffer("selector.output", Location::coordinator(0), 192,
             serving::ServingOwners::LIFETIME, Category::Workspace, "token selector");
-        let sampler = Allocation::buffer("selector.sampler.rows", Location::coordinator(0), 512,
+        let sampler = Allocation::buffer("selector.sampler.param_device", Location::coordinator(0), 512,
             serving::ServingOwners::LIFETIME, Category::Workspace, "target sampler");
         let contract = SelectorContract { owners: vec![owner.clone(), sampler.clone()] };
+        let mut observed = sampler;
+        observed.id = "selector.sampler.device.params".into();
         let receipts = vec![Receipt { allocation: owner, address: 4096 },
-            Receipt { allocation: sampler, address: 8192 }];
+            Receipt { allocation: observed, address: 8192 }];
         contract.reconcile(&receipts)?;
         assert!(contract.reconcile(&receipts[..1]).is_err());
         let mut changed = receipts.clone();

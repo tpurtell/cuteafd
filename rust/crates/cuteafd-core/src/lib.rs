@@ -29,7 +29,8 @@ mod dspark_rng;
 pub use dspark_rng::{DsparkRng, DsparkRngReservation};
 mod target_sampling;
 pub use target_sampling::{
-    allocations as target_sampler_allocations, device_bytes as target_sampler_device_bytes, SamplerAllocation,
+    allocations as target_sampler_allocations, device_bytes as target_sampler_device_bytes,
+    receipt_key as target_sampler_receipt_key, SamplerAllocation,
     TargetSamplingError, TargetSamplingParams, GREEDY_TEMPERATURE_EPS, MAX_TARGET_TEMPERATURE,
 };
 mod dspark_verify;
