@@ -286,11 +286,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
 fn eager_expert_headers_classify_inventory_and_roles_without_payload_ownership() {
     use crate::plan::checkpoint::{CheckpointView, CoreView};
     for kind in [Fixture::Mxfp8, Fixture::Mixed, Fixture::Exl3] {
-        let (dir, _, tensors) = fixture(kind);
-        let weight_map = tensors.iter().map(|(name, _, _)| (name.clone(), "model.safetensors"))
-            .collect::<BTreeMap<_, _>>();
-        std::fs::write(dir.path().join("model.safetensors.index.json"),
-            serde_json::to_vec(&serde_json::json!({"weight_map":weight_map})).unwrap()).unwrap();
+        let (dir, _, _) = fixture(kind);
         let view = CheckpointView::select(dir.path(), CoreView::Original).unwrap();
         let inventory = Checkpoint::inventory_view(&view).unwrap();
         assert!(inventory.tensors.is_empty(), "classification evidence must not own payload");
