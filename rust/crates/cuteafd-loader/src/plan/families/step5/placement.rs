@@ -191,7 +191,6 @@ pub(super) fn layout(
         rows: usize::try_from(shape.span_rows)?,
         waves,
         unit: checked_rows,
-        full_prefill_logits: opts.full_prefill_logits,
         sequences,
         context, serving_context: crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
         requested_pool: opts.pool_tokens,

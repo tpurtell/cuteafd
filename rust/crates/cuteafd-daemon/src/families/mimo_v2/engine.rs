@@ -1606,8 +1606,8 @@ impl<'a> MimoEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>)
         -> Result<Option<DeviceLogits>> {
-        ensure!(!all_logits || self.prefill_output == MimoPrefillOutput::AllRows,
-            "this MiMo engine admits last-row prefill logits; load an AllRows diagnostic engine for all_logits");
+        ensure!(!all_logits || tokens.len() <= 64 && self.prefill_output == MimoPrefillOutput::AllRows,
+            "multi-row MiMo prefill requires a row consumer beyond the bounded head");
         let (t, start) = (tokens.len(), placement.len);
         ensure!(t > 0 && t <= self.prefill_capacity() && start + t <= self.max_context,
             "prefill of {t} rows at {start}");
@@ -1667,10 +1667,6 @@ impl<'a> MimoEngine<'a> {
     pub fn prefill_capacity(&self) -> usize { self.prefill_span_rows }
 
     fn prefill_waves(&self) -> usize { self.prefill_unit_waves }
-
-    pub fn full_prefill_logits(&self) -> bool {
-        self.prefill_output == MimoPrefillOutput::AllRows
-    }
 
     /// Allocate the diagnostic head before requests can be admitted.
     pub fn prepare_scoring_prefill(&self) -> Result<()> {

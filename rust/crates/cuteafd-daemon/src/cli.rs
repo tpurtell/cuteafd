@@ -514,9 +514,6 @@ pub(crate) struct PlanArgs {
     /// Prefill workspace capacity for --layout (0: family/image default; GLM 5.3 Flash: per lane).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_rows: u64,
-    /// Include the diagnostic all-row prefill head reservation in --layout.
-    #[arg(long)]
-    pub(crate) full_prefill_logits: bool,
     /// Include executed-route telemetry owners in --layout (disable with =false).
     #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
         default_missing_value = "true", require_equals = true)]

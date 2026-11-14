@@ -22,7 +22,6 @@ pub struct V4Host {
     pub prefix_entries: u64,
     /// Rows one prefill call spans: the scoring logits gather.
     pub span_rows: u64,
-    pub full_prefill_logits: bool,
     /// A host-placed token embedding's pinned mapped copy; zero on the GPU.
     pub embedding_bytes: u64,
     /// The compiled C128 index width (`compiled_c128_width`).
@@ -220,7 +219,7 @@ pub fn components(inputs: &V4Inputs, host: &V4Host, prefix: HostPrefixOwners, pa
         components.push(host_component(format!("v4.host.{name}"), Location::PINNED, curve,
             Lifetime::TARGET, Category::Staging, name, maximum)?);
     }
-    let rows = if host.full_prefill_logits { host.span_rows } else { 64 };
+    let rows = 64;
     let logits = cuteafd_core::memory_layout::host_logits_bytes(rows, inputs.prefill_rows,
         inputs.cfg.vocab_size as u64).ok_or(Refusal::Overflow("V4 host logits"))?;
     components.push(host_component("v4.host.logits".into(), Location::HOST, ByteCurve::fixed(logits, maximum),

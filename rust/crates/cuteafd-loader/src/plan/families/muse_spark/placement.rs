@@ -179,7 +179,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         if component == Component::Vision { report.encoder = Some(encoder); } else { report.audio_encoder = Some(encoder); }
     }
     let facts = shared::ProductionInput { cfg, core: &model.core, projections, catalog, budgets, host, prefill,
-        full_prefill_logits: opts.full_prefill_logits, bf16_target_head: opts.bf16_target_head, slots, mark_slots, context, maximum_pool_tokens,
+         bf16_target_head: opts.bf16_target_head, slots, mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
         local, drafter, fixed, media };
     let prepared = match facts.prepare() {
@@ -196,7 +196,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     let request = shared::production_request(crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)), opts.pool_tokens, onboard,
         PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
-        if opts.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
+        Operation::Serving,
         Some(ResidentWeights(opts.weight_budget_bytes)), opts.spark_reply_formats);
     let admitted = match prepared.admit(request) {
         Ok(admitted) => admitted,

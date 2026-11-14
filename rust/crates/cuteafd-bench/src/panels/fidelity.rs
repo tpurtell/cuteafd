@@ -104,8 +104,8 @@ impl Panel for FidelityPanel {
     fn id(&self) -> &'static str { if self.full { "fidelity_full" } else { "fidelity" } }
     fn title(&self) -> &'static str { if self.full { "Fidelity · Full" } else { "Fidelity" } }
     fn description(&self) -> &'static str {
-        if self.full { "64 sealed windows, decode + prefill; calibrated top-1, KL and tripwires. Requires launch-admitted prefill logits." }
-        else { "Standard-v2: sealed, balanced 32 decode / 32 prefill windows; separate calibrated verdicts. Without prefill admission: all 64 decode only. Optional paired history comparison." }
+        if self.full { "64 sealed windows, decode + prefill; calibrated top-1, KL and tripwires. Uses bounded streamed prefill scoring." }
+        else { "Standard-v2: sealed, balanced 32 decode / 32 prefill windows; separate calibrated verdicts. Without backend prefill scoring: all 64 decode only. Optional paired history comparison." }
     }
     fn estimate_s(&self, rates: &Rates, info: &ServerInfo) -> f64 {
         let decode = 32768.0 / rates.decode_tok_s + 350000.0 / rates.prefill_tok_s;

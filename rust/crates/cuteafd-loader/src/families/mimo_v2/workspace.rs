@@ -33,7 +33,7 @@ pub enum MimoPrefillOutput {
 
 impl MimoPrefillOutput {
     pub fn logits_rows(self, rows: u64, decode: bool, with_head: bool) -> u64 {
-        if !with_head { 0 } else if decode || self == Self::AllRows { rows } else { 1 }
+        if !with_head { 0 } else if decode { rows } else if self == Self::AllRows { rows.min(64) } else { 1 }
     }
 }
 
@@ -203,7 +203,7 @@ impl MimoWorkspaceLayout {
             as u64;
         let page_table_rows = if options.decode { t } else { options.waves };
         let logits_rows = options.prefill_output.logits_rows(
-            if options.decode { t } else if options.prefill_output == MimoPrefillOutput::AllRows { t.max(16384) } else { t },
+            t,
             options.decode, options.with_head);
         let layout = Self {
             logits_rows,
@@ -381,7 +381,30 @@ mod tests {
     }
 
     #[test]
-    fn serving_prefill_head_and_allocation_admit_exactly_one_row() {
+    fn ordinary_serving_retains_one_vocab_row_per_wave_on_the_head_rank() {
+        for raw in [mimo_flash_config(), mimo_pro_config()] {
+            let cfg = MimoV2Config::from_hf(&raw).unwrap();
+            for rows in [64, 512, 4096, 8256] {
+                for waves in [1, 2, 4] {
+                    for ranks in [1, 2] {
+                        for rank in 0..ranks {
+                            let layout = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
+                                rows, waves, lead: rank == 0, with_head: rank == 0, spark: rank == 0,
+                                prefill_output: MimoPrefillOutput::LastRow,
+                                attention: if ranks == 2 { MimoAttentionWorkspace::PartitionedHeads { ranks } }
+                                    else { MimoAttentionWorkspace::Global }, ..options()
+                            }).unwrap();
+                            assert_eq!(layout.logits_rows, u64::from(rank == 0));
+                            assert_eq!(layout.logits, if rank == 0 { waves * cfg.vocab_size as u64 * 4 } else { 256 });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_head_is_bounded_and_terminal_only_remains_one_row() {
         let mut raw = mimo_pro_config();
         raw["vocab_size"] = serde_json::json!(152576);
         let cfg = MimoV2Config::from_hf(&raw).unwrap();
@@ -389,9 +412,9 @@ mod tests {
         let last = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
             prefill_output: MimoPrefillOutput::LastRow, ..options()
         }).unwrap();
-        assert_eq!((full.logits_rows, last.logits_rows), (16384, 1));
+        assert_eq!((full.logits_rows, last.logits_rows), (64, 1));
         assert_eq!(last.logits, 152576 * 4);
-        let saved = 16383 * 152576 * 4;
+        let saved = 63 * 152576 * 4;
         assert_eq!(full.logits - last.logits, saved);
         assert_eq!(full.device_bytes().unwrap() - last.device_bytes().unwrap(), saved);
         for ((name, before), (after_name, after)) in full.device_buffers().zip(last.device_buffers()) {

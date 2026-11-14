@@ -75,7 +75,6 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 exchange_f32: args.exchange_f32,
                 context_tokens: args.context_tokens.unwrap_or(0),
                 prefill_rows: args.prefill_rows,
-                full_prefill_logits: args.full_prefill_logits,
                 bf16_target_head: args.target_head.unwrap_or_else(crate::shared::target_head::TargetHead::configured).blas_head(true),
                 expert_usage: args.expert_usage.unwrap_or(true),
                 // Lane families still read prefill_lanes until their unit ports land.
@@ -1369,8 +1368,7 @@ mod tests {
             exchange_f32: false,
             attention_placement: "auto".into(),
             context_tokens: Some(262144),
-            prefill_rows: 0,
-            full_prefill_logits: false, expert_usage: Some(false),
+            prefill_rows: 0, expert_usage: Some(false),
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
             decode_rows: 64,
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
@@ -2355,18 +2353,6 @@ mod tests {
         assert_eq!((auto_knobs.glmf_shared_replay, auto_knobs.glmf_auto_replay), (false, true));
         for zero in ["--state-slots", "--mark-lanes"] {
             assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", zero, "0"]).is_err());
-        }
-    }
-
-    #[test]
-    fn diagnostic_prefill_flag_is_forwarded_to_layout() {
-        use clap::Parser;
-        for enabled in [false, true] {
-            let mut argv = vec!["cuteafd", "plan", "/not-read", "--layout"];
-            if enabled { argv.push("--full-prefill-logits"); }
-            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
-            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
-            assert_eq!(options(&args).unwrap().layout.unwrap().full_prefill_logits, enabled);
         }
     }
 

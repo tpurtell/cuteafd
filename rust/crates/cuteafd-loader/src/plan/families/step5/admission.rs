@@ -191,9 +191,6 @@ pub struct RuntimeInputs {
     pub waves: usize,
     /// The admitted unit (#762); 0 takes `rows / waves` (a static span).
     pub unit: usize,
-    /// All-row prefill scoring was admitted at launch; otherwise the head holds
-    /// only the decode/verify width (prefill needs its last row).
-    pub full_prefill_logits: bool,
     pub sequences: usize,
     pub context: u64,
     pub serving_context: crate::placement::planner::Context,
@@ -361,7 +358,7 @@ fn scaled(bytes: u64, count: usize) -> Result<u64> {
 
 impl RuntimeInputs {
     pub fn logit_rows(&self) -> usize {
-        super::native::head_rows(self.rows, self.full_prefill_logits)
+        super::native::head_rows(self.rows)
     }
 
     /// Rows one hook runs: attention, FFN scratch, peer partials and hops.
@@ -596,7 +593,7 @@ mod tests {
         RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
-            full_prefill_logits: false, waves: 1, unit: 0,
+            waves: 1, unit: 0,
             inventory: Inventory {
                 gpus: vec![
                     GpuBudget {
@@ -1036,8 +1033,6 @@ mod tests {
             assert_eq!(input.unit_rows(), unit);
             assert_eq!(input_bytes(input.rows)?, (unit * waves * (4 + 4096 * 6)) as u64);
             assert_eq!(input.logit_rows(), 64);
-            input.full_prefill_logits = true;
-            assert_eq!(input.logit_rows(), input.rows);
             assert!(super::super::native::mtp_forecast_workspace(unit, 3, input.kv_format).is_ok());
             assert!(super::super::native::mtp_forecast_workspace(input.rows, 3, input.kv_format).is_err());
         }
@@ -1222,17 +1217,16 @@ mod tests {
     }
 
     #[test]
-    fn full_prefill_host_logits_include_the_scoring_tensor_and_decode_lane() -> Result<()> {
-        let mut inputs = inputs(1);
-        inputs.rows = 256;
-        inputs.unit = 256;
-        let decode = run(&inputs)?;
-        inputs.full_prefill_logits = true;
-        let scoring = run(&inputs)?;
-        let logits = |admitted: &Admission| admitted.solved.facts.deferred.iter()
-            .find(|owner| owner.id == "step5.host.logits").unwrap().bytes;
-        assert_eq!(logits(&decode), 64 * config().vocab as u64 * 4);
-        assert_eq!(logits(&scoring), (256 + 64) * config().vocab as u64 * 4);
+    fn bounded_host_logits_do_not_grow_with_prefill_span() -> Result<()> {
+        for rows in [64, 256, 4096] {
+            let mut inputs = inputs(1);
+            inputs.rows = rows;
+            inputs.unit = rows;
+            let admitted = run(&inputs)?;
+            let logits = admitted.solved.facts.deferred.iter()
+                .find(|owner| owner.id == "step5.host.logits").unwrap();
+            assert_eq!(logits.bytes, 64 * config().vocab as u64 * 4);
+        }
         Ok(())
     }
 

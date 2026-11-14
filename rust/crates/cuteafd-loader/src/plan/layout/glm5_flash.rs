@@ -364,7 +364,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-            full_prefill_logits: if options.full_prefill_logits && exlr8.is_none() && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
+             };
         let host = options.host_memory.map(Ok)
             .unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
         let mut process = glmf::admission::ProcessOwners::new(host, (8 << 30).max(host.0 / 10));
@@ -638,7 +638,7 @@ mod tests {
                 for rank in 0..2 {
                     let shape = GlmfStepShape { lead: rank == 0, split: true, local_experts: false,
                         tp2_experts: true, spark: false, partial_bytes: 2, output_shard: false,
-                        full_prefill_logits: false, table_pages, table_pool_pages };
+                        table_pages, table_pool_pages };
                     let allocated = glmf_step_workspaces(&cfg, 1, 4096, 64, &shape, decode, prefill).device_bytes();
                     let charged = planned.iter().filter(|d| d.demand.gpu as usize == rank)
                         .map(|d| d.demand.bytes).sum::<u64>();

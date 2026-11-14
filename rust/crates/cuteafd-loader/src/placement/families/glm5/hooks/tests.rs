@@ -45,8 +45,7 @@ fn layouts() -> HookBuffers {
             bytes: 3072, rows: 64, top_k: 1, max_groups: 4, hidden: 128, units: 16,
             unit_limit: 16, intermediate_bytes: 256, compact: false, unit_tables: false,
         }),
-        full_prefill_logits: false,
-    }
+        }
 }
 
 #[test]

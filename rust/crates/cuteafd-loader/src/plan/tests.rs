@@ -471,8 +471,7 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
     let input = PlanInput::open(dir.path()).unwrap();
     for (total, expected) in [(183u64, 32u64), (64, 16)] {
         let mut report = input.plan(&PlanOptions::default()).unwrap();
-        let mut options = layout::LayoutOptions { host_memory: Some((total << 30, total << 30)),
-            full_prefill_logits: true, context_tokens: 1 << 40,
+        let mut options = layout::LayoutOptions { host_memory: Some((total << 30, total << 30)), context_tokens: 1 << 40,
             prefill_unit_rows: Some(4096), ..Default::default() };
         layout::charge_host(&mut report, &options, &input, false).unwrap();
         let host = report.host_ledger.as_ref().unwrap();
@@ -1507,22 +1506,22 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
 }
 
 #[test]
-fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
+fn host_scoring_tile_is_independent_of_prefill_span_and_lanes() {
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
     let mut report = input.plan(&PlanOptions::default()).unwrap();
     report.prefill_span_rows = Some(4096);
     let options = layout::LayoutOptions { host_memory: Some((183 << 30, 183 << 30)),
-        host_cache_bytes: Some(0), prefill_lanes: 3, full_prefill_logits: true,
+        host_cache_bytes: Some(0), prefill_lanes: 3,
         prefill_unit_rows: Some(4096), ..Default::default() };
     let vocab = report.spec.as_ref().unwrap().vocab as u64;
-    for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096), ("glm5", 4096)] {
+    for family in ["mimo_v2", "glm5_flash", "glm5"] {
         report.family = Some(family.into());
         report.prefill_transports = None;
         layout::charge_host(&mut report, &options, &input, false).unwrap();
         let logits = report.host_ledger.as_ref().unwrap().items.iter()
             .find(|item| item.group == "scoring/full-logits").unwrap().bytes;
-        assert_eq!(logits, rows * vocab * 4, "{family}");
+        assert_eq!(logits, 64 * vocab * 4, "{family}");
     }
 }
 
@@ -3686,7 +3685,7 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
             - cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
         // What the engine allocates from the same arithmetic and manifest.
         let shape = GlmfStepShape { lead: true, split: false, local_experts: false, tp2_experts: false, spark: true, partial_bytes: 2,
-            output_shard: false, full_prefill_logits: false, table_pages: 2048, table_pool_pages: 512 };
+            output_shard: false, table_pages: 2048, table_pool_pages: 512 };
         let engine = glmf_step_workspaces(&cfg, lanes as usize, rows, 64, &shape,
             glmf_step_scratch(&lookup, &cfg, Default::default(), 64, true).unwrap(),
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
@@ -3856,7 +3855,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
     let prefill = glmf_step_scratch(&lookup, &cfg, scratch, 4096, false).unwrap();
     let (table_pages, table_pool_pages) = glmf_table_pages(262144);
     let shape = GlmfStepShape { lead: true, split: true, local_experts: false, tp2_experts: true,
-        spark: true, partial_bytes: 2, output_shard: false, full_prefill_logits: false,
+        spark: true, partial_bytes: 2, output_shard: false,
         table_pages, table_pool_pages };
     // Configured peers with all RTX, mixed, all Spark, then the serial zero-peer deployment.
     // Heads is requested: a two-GPU build whose manifest lacks the context programs refuses
@@ -3899,8 +3898,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             // The plan's own startup graph bound (no graph-budget user key).
             experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
-            drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_requests: None, drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
-            full_prefill_logits: 0 };
+            drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_requests: None, drafter_bridge: None, requested_pool: Some(2 << 20), onboard, };
         let mut process = glmf::admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
         process.target(&checkpoint, &input, None).unwrap();
         process.serving(&input, 0, 0, 0, 0).unwrap();
@@ -4056,7 +4054,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         .any(|note| note.contains(why));
     let (wide_build, one_gpu) = ("CUTEAFD_GLMF_WIDE_DECODE_ROWS=128", "a head split takes --decode-rows 64");
     let shape = GlmfStepShape { lead: true, split: false, local_experts: false, tp2_experts: false, spark: true, partial_bytes: 2,
-        output_shard: false, full_prefill_logits: false, table_pages: 2048, table_pool_pages: 512 };
+        output_shard: false, table_pages: 2048, table_pool_pages: 512 };
     let narrow = plan(dir.path(), &options(64, &wide_path, 1)).unwrap();
     let broad = plan(dir.path(), &options(128, &wide_path, 1)).unwrap();
     assert_eq!(broad.placement_supported, narrow.placement_supported);
@@ -5068,27 +5066,12 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
 }
 
 #[test]
-fn layout_charges_admitted_probe_outputs_before_sizing_kv() {
+fn prefill_scoring_has_no_separate_span_output_reservation() {
     let dir = qwen_snapshot(4);
-    let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        rtx_bytes: vec![96 << 30], prefill_rows: 128, pool_tokens: Some(256),
-        ..Default::default()
-    }), ..sparks(0) };
-    let ordinary = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert!(ordinary.devices[0].items.iter().all(|i| i.group != "probe prefill logits"));
-    options.layout.as_mut().unwrap().full_prefill_logits = true;
-    let diagnostic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    let output = diagnostic.devices[0].items.iter().find(|i| i.group == "probe prefill logits").unwrap();
-    assert_eq!(output.category, cuteafd_core::memory_layout::Category::Workspace);
-    assert!(output.bytes > 0);
-    let cfg = crate::families::qwen4::Qwen4Config::read(dir.path()).unwrap();
-    let landing = |full| crate::placement::families::qwen4::host::pinned_logits_bytes(
-        1, full, 128, cfg.vocab_size as u64).unwrap();
-    let mappings = crate::placement::planner::driver_page_table_bytes(landing(true))
-        - crate::placement::planner::driver_page_table_bytes(landing(false));
-    assert_eq!(ordinary.devices[0].free_bytes() - diagnostic.devices[0].free_bytes(),
-        (output.bytes + mappings) as i64);
-    assert!(diagnostic.devices.iter().skip(1).all(|d| d.items.iter().all(|i| i.group != "probe prefill logits")));
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        rtx_bytes: vec![96 << 30], prefill_rows: 128, pool_tokens: Some(256), ..Default::default() }), ..sparks(0) };
+    let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(memory.devices.iter().all(|device| device.items.iter().all(|item| item.group != "probe prefill logits")));
 }
 
 #[test]

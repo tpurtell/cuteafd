@@ -273,7 +273,7 @@ impl ProcessOwners {
         self.allocations.extend(p::serving::HostPrefixOwners { quota_bytes: quota, chunk_bytes: chunk }
             .allocations("glmf.host.prefix", lifetime)?);
         let logits = cuteafd_core::memory_layout::host_logits_bytes(
-            if i.full_prefill_logits > 0 { i.prefill_rows * i.prefill_lanes } else { 64 },
+            64,
             i.prefill_rows, i.cfg.vocab_size as u64).ok_or(p::Refusal::Overflow("Flash host logits"))?;
         for (name, bytes, category, location) in [("embedding", host_embedding, Category::Embedding, p::Location::PINNED),
             ("media", media, Category::Prefix, p::Location::HOST), ("logits", logits, Category::Workspace, p::Location::PINNED)] {

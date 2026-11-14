@@ -75,7 +75,6 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
     pub context: cuteafd_loader::placement::planner::Context,
     pub pool_tokens: Option<u64>,
     pub graphs: bool,
-    pub full_prefill_logits: bool,
     pub ffn_mode: cuteafd_ffi::KimiFfnMode,
     pub hosted_layers: Option<Vec<usize>>,
     pub draft: Option<super::draft::Options>,
@@ -290,7 +289,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, serving_context: options.context, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
-        unit_rows: options.prefill_rows, full_prefill_logits: options.full_prefill_logits, lane_layouts, fixed,
+        unit_rows: options.prefill_rows, lane_layouts, fixed,
         startup: reserve_demands, pool_bounded: vec![], rtx,
         spark_budget, draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
     options.max_context = usize::try_from(options.context.served(admitted.placement.pool_tokens))?;

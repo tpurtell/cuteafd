@@ -342,7 +342,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "qwen4", vocab_size: self.engine.cfg.vocab_size,
             max_context: self.engine.max_context, slots: self.engine.slots, decode_rows: DECODE_ROWS,
-            prefill_rows: self.engine.prefill_rows, full_prefill_logits: self.engine.full_prefill_logits }
+            prefill_rows: self.engine.prefill_rows }
     }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.engine.library }
     fn profile(&self) -> &std::cell::RefCell<[f64; 2]> { &self.engine.profile }

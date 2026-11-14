@@ -203,7 +203,6 @@ impl Opened {
         }
         engine.admitted_host = Some(host);
         engine.admit_host_memory(args)?;
-        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         // Weights and both expert halves are resident: release the load's
         // transient pinned upload high-water before serving.
         crate::shared::memory_report::release_load_staging(&self.library)?;

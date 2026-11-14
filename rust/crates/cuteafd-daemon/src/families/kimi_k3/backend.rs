@@ -46,15 +46,14 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "kimi_k3", vocab_size: self.geometry.vocab_size,
             max_context: self.geometry.max_context, slots: self.geometry.slots,
-            prefill_rows: self.geometry.prefill_rows, decode_rows: self.geometry.decode_rows,
-            full_prefill_logits: self.geometry.full_prefill_logits }
+            prefill_rows: self.geometry.prefill_rows, decode_rows: self.geometry.decode_rows }
     }
     fn message_starts(&self) -> &[&str] { &["<|open|>"] }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.engine.library() }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
     fn prefix_cache(&self, args: &PrefixArgs, _lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, Self::Meta>)> {
         ensure!(args.prefix_partial == Toggle::Off, "Kimi restores exact KDA/MLA snapshots only");
-        let score_rows = if self.geometry.full_prefill_logits { self.geometry.prefill_rows } else { self.geometry.decode_rows };
+        let score_rows = self.geometry.decode_rows;
         let args = args.with_scoring(score_rows, self.geometry.prefill_rows, self.geometry.vocab_size)?;
         let family = self.engine.prefix_family()?;
         let layout = family.layout();
@@ -122,7 +121,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn prefill_scoring(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         position: usize, probe: &crate::shared::probe::ProbeRef, pool: &RefPagePool)
         -> Result<Option<crate::shared::probe::ScoreLogits>> {
-        if self.geometry.full_prefill_logits || logit_rows <= 1 {
+        if logit_rows <= 1 {
             return Ok(self.prefill_device(placement, tokens, logit_rows, pool)?
                 .map(crate::shared::probe::ScoreLogits::Device));
         }
@@ -668,7 +667,7 @@ mod tests {
                 waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
                 context: cuteafd_loader::placement::planner::Context::resolve(args.max_context.unwrap_or(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT) as u64, args.max_context.map(|n| n as u64)), slots: usize::from(args.max_sequences), marks: 1,
                 max_context: args.max_context.unwrap_or(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT),
-                pool_tokens: args.pool_tokens, graphs: true, full_prefill_logits: false, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
+                pool_tokens: args.pool_tokens, graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
                 hosted_layers: None, draft: Some(super::super::draft::Options {
                     snapshot: args.draft.clone().context("native packing gate requires --draft")?,
                     fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache }), verify_rows: 0, prefix: Some(&args.prefix) })?;

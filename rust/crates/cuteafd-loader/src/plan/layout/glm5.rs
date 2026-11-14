@@ -520,7 +520,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         &options.rtx_bytes[..gpus], context, options.pool_tokens, page_tokens).maximum_tokens();
     let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
     let prefill = PrefillShape { rows, waves: lanes };
-    let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
+    let operation = Operation::Serving;
     let onboard = options.resolve_onboard(cfg.layers.saturating_sub(cfg.first_moe_layer)).unwrap_or_else(glm::default_onboard);
     let exchange_f32 = glm::local_exchange_f32()?;
     let manifest_path = options.workspace_manifest.as_deref().unwrap_or_else(||
@@ -726,7 +726,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
     let budgets = production_budgets(&options.rtx_bytes.iter().map(|&n| (n, n)).collect::<Vec<_>>(),
         crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
-    let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
+    let operation = Operation::Serving;
     let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let admitted = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
@@ -802,7 +802,7 @@ mod tests {
                 // resident at Ready. Serving allocates them on the first live
                 // prefill and charges them post-Ready; the two views together
                 // hold every prefill owner exactly once.
-                let scoring_options = LayoutOptions { full_prefill_logits: true, ..options.clone() };
+                let scoring_options = LayoutOptions { ..options.clone() };
                 let (scoring, _) = native_layout_with_metadata(&checkpoint, &scoring_options, 4, &manifest,
                     "k4", Some(&metadata), Some(attention), None).unwrap();
                 assert_eq!(layout.pool_tokens, 131072);
@@ -836,14 +836,11 @@ mod tests {
                     let scoring_hooks = group(&scoring, "GLM target hooks");
                     let decode = u64::try_from(scratch[0].bytes().unwrap()).unwrap();
                     assert_eq!(hooks, decode);
-                    assert_eq!(scoring_hooks, crate::families::glm5::native::scratch_bytes(&scratch).unwrap());
-                    assert_eq!(scoring_hooks - hooks,
-                        u64::try_from(scratch[1].bytes().unwrap()).unwrap());
+                    assert_eq!(scoring_hooks, hooks);
                     let shared_arenas = group(&layout, "EXLR8 expert workspace");
                     let scoring_arenas = group(&scoring, "EXLR8 expert workspace");
                     assert_eq!(shared_arenas, workspace.bytes as u64);
-                    assert_eq!(scoring_arenas, 2 * workspace.bytes as u64);
-                    assert_eq!(scoring_arenas - shared_arenas, workspace.bytes as u64);
+                    assert_eq!(scoring_arenas, shared_arenas);
                     assert_eq!(device.items, placement.items[rank]);
                     assert!(device.used_bytes() <= device.capacity_bytes);
                 }

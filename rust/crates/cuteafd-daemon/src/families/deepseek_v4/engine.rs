@@ -118,7 +118,6 @@ pub(crate) struct Engine<'a> {
     pub prefill_waves: usize,
     /// Frozen outer intake; independent of live slots and compiled kernel rows.
     pub prefill_span_rows: usize,
-    pub full_prefill_logits: bool,
     pub c128_width: usize,
     /// Longest sequence the exported programs' cache extents cover.
     pub max_context: usize,
@@ -638,7 +637,6 @@ impl<'a> Engine<'a> {
             prefill_kernel_rows: parts.prefill_kernel_rows,
             prefill_waves: parts.prefill_waves,
             prefill_span_rows: parts.prefill_span_rows,
-            full_prefill_logits: false,
             c128_width: parts.c128_width,
             max_context: parts.max_context,
             stream: parts.stream,
@@ -657,14 +655,6 @@ impl<'a> Engine<'a> {
             embedding: parts.embedding,
             skip_routed: parts.skip_routed,
         })
-    }
-
-    /// All-row diagnostics reuse the admitted bounded head buffer, downloading
-    /// its rows in LOGIT_ROWS batches; no vocabulary-sized GPU buffer is added.
-    pub fn prepare_scoring_prefill(&mut self) -> Result<()> {
-        self.prepare_workspaces()?;
-        self.full_prefill_logits = true;
-        Ok(())
     }
 
     /// Reserve every upload source before any peer wait can be queued. Growing

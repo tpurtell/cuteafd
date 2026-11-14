@@ -184,7 +184,6 @@ impl<'a> Engine<'a> {
     pub(crate) fn prefill_packed_check(&self, sequences: &mut [(&mut Placement, &[u32])],
         links: &mut [SparkLink<'_>], prompt_ends: &[bool],
         rows: &mut dyn FnMut(usize, usize, DeviceLogits) -> Result<()>) -> Result<Vec<Result<()>>> {
-        ensure!(self.full_prefill_logits, "packed scoring requires --full-prefill-logits");
         self.prefill_packed_inner(sequences, links, prompt_ends, &mut |_, _| Ok(Ok(())), Some(rows))
     }
 

@@ -388,6 +388,26 @@ mod tests {
     }
 
     #[test]
+    fn serving_head_charge_is_the_original_bounded_plane_on_each_rank_and_wave() {
+        for pro in [false, true] {
+            let cfg = config(pro);
+            for ranks in [1, 2] {
+                for rank in 0..ranks {
+                    for rows in [1, 64, 512, 4096, 8256] {
+                        for waves in [1, 2, 4] {
+                            let (requests, _) = step(&cfg, rows, waves, 1024, rank, ranks,
+                                V4WorkspaceScratch::default(), true).unwrap();
+                            // Five shared planes, 28 table/tap planes per wave, then fixed plane 15.
+                            let logits = requests[5 + waves as usize * 28 + 15];
+                            assert_eq!(logits, if rank == 0 { rows.min(64) * 129280 * 4 } else { 256 });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pro_workspace_tracks_wider_heads_and_hidden_without_flash_constants() {
         // Sum of the engine's allocations, at 128K compiled context, 4096
         // prefill rows x2 lanes, 64 decode rows and 1032 physical pool units.

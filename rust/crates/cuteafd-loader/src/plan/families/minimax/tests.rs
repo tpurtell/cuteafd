@@ -1326,8 +1326,10 @@ fn request_descriptor_allocations_equal_recipe_on_one_and_two_rtx() {
                 }
             }
             let head = Location::coordinator((gpus - 1) as u8);
-            add(&mut expected, &Owner::Head.id(), head,
-                HeadLayout::new(&inputs.cfg, capacity.decode.rows).unwrap().buffers());
+            let head_buffers = HeadLayout::new(&inputs.cfg, capacity.decode.rows).unwrap().buffers();
+            assert_eq!(head_buffers.iter().find(|(name, _)| *name == "logits").unwrap().1,
+                concurrency * 200064 * 4, "prefill span adds no vocabulary rows");
+            add(&mut expected, &Owner::Head.id(), head, head_buffers);
             for owner in (serving::SelectorOwners { location: head, capacity: capacity.decode.rows as usize,
                 vocab: inputs.cfg.vocab_size, device_sampling: inputs.device_sampling })
                 .allocations("selector", serving::ServingOwners::LIFETIME).unwrap() {

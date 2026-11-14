@@ -209,16 +209,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         match extra {
             Ok(demands) => {
                 fixed.extend(demands);
-                if opts.full_prefill_logits {
-                    let ordinary = crate::families::kimi_k3::allocation::io_extents_for_ranks(
-                        cfg.vocab_size, head_rank, rows, false, gpus).expect("validated IO ranks");
-                    let scoring = crate::families::kimi_k3::allocation::io_extents_with_logits(
-                        cfg.vocab_size, head_rank, rows, rows, false, gpus).expect("validated IO rows");
-                    let delta = (scoring[1] - ordinary[1]) as u64;
-                    let io = fixed.iter_mut().find(|d| d.gpu as usize == head_rank && d.group == "Kimi lane 0 token IO")
-                        .expect("baseline includes terminal token IO");
-                    io.bytes += delta;
-                }
             },
             Err(error) => { report.refuse_placement(format!("Kimi package admission refused: {error:#}"),
                 "Supply complete matching native and EXL3 workspace manifests."); return memory; }
@@ -228,10 +218,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.refuse_placement("Kimi native K6 requires installed workspace inventory".into(),
             "Supply the matching K6 PROGRAMS.json through --workspace-manifest.");
         return memory;
-    }
-    if opts.full_prefill_logits && manifest.is_none() {
-        fixed.push(Demand::new(head_rank as u8, Category::Workspace, "Kimi full prefill logits",
-            (rows - rows.min(64)) as u64 * cfg.vocab_size as u64 * 4, Basis::Exact));
     }
     let inventory = (|| -> anyhow::Result<_> {
         let catalog = input.expert_catalog()?;
@@ -518,7 +504,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Err(error) => { report.refuse_placement(format!("Kimi host prefix refused: {error:#}"), "Disable host retention or supply a supported quota."); return memory; }
     };
     recipe.owners.push(kimi::host_prefix_owner(host_quota, maximum_pages));
-    let scoring_bytes = match kimi::host_scoring_bytes(if opts.full_prefill_logits { rows } else { rows.min(64) }, rows, cfg.vocab_size) {
+    let scoring_bytes = match kimi::host_scoring_bytes(rows.min(64), rows, cfg.vocab_size) {
         Ok(bytes) => bytes,
         Err(error) => { report.refuse_placement(error.to_string(), "Use supported scoring dimensions."); return memory; }
     };

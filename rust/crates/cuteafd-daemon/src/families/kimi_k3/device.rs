@@ -2102,7 +2102,6 @@ pub(crate) struct IoLayout {
     hidden: usize,
     vocab: usize,
     core_head: bool,
-    full_prefill_logits: bool,
 }
 
 impl IoLayout {
@@ -2117,8 +2116,7 @@ impl IoLayout {
             && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&rows),
             "Kimi IO rank/row geometry");
         Ok(Self { rank, ranks, rows, hidden: cfg.hidden, vocab: cfg.vocab_size,
-            core_head: rank == ranks - 1 && core.get_weight("language_model.lm_head").is_some(),
-            full_prefill_logits: false })
+            core_head: rank == ranks - 1 && core.get_weight("language_model.lm_head").is_some() })
     }
 
     pub(crate) fn with_core(cfg:&KimiK3Config,rank:usize,rows:usize,
@@ -2126,13 +2124,8 @@ impl IoLayout {
         Self::for_ranks(cfg, rank, rows, core, 2)
     }
 
-    pub(crate) fn with_prefill_logits(mut self, enabled: bool) -> Self {
-        self.full_prefill_logits = enabled;
-        self
-    }
-
     fn logit_rows(&self) -> usize {
-        if self.full_prefill_logits { self.rows } else { self.rows.min(64) }
+        self.rows.min(64)
     }
 
     fn extents(&self) -> [usize; 3] {
@@ -2189,7 +2182,6 @@ impl Drop for TokenIo<'_> {
 }
 
 impl TokenIo<'_> {
-    pub(crate) fn full_prefill_logits(&self) -> bool { self.layout.full_prefill_logits }
 
     pub(super) fn check_lane(&self, local: &LocalLane<'_>, rank: usize) -> Result<()> {
         ensure!(self.layout.rank == rank && self.layout.rows == local.rows()
@@ -3009,7 +3001,7 @@ mod tests {
             device, &layout[0], packed)?);
         let weak = Rc::downgrade(&weights);
         let stream = Rc::new(Stream::new(device)?);
-        let io = IoLayout { rank: 0, ranks: 2, rows: 16, hidden: 4, vocab: 8, core_head:false, full_prefill_logits: false }
+        let io = IoLayout { rank: 0, ranks: 2, rows: 16, hidden: 4, vocab: 8, core_head:false }
             .allocate(device, stream.clone(), weights.clone())?;
         drop(weights);
         drop(stream);
@@ -3041,18 +3033,16 @@ mod tests {
     }
 
     #[test]
-    fn full_prefill_output_is_opt_in_and_keeps_head_workspace_bounded() -> Result<()> {
+    fn head_output_extent_is_independent_of_prefill_span() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         for ranks in [1, 2] {
             for rank in 0..ranks {
-                let ordinary = IoLayout::for_ranks(&cfg, rank, 8256, &Default::default(), ranks)?;
-                let scoring = ordinary.clone().with_prefill_logits(true);
-                let a = ordinary.extents();
-                let b = scoring.extents();
-                assert_eq!(a[0], b[0]);
-                assert_eq!(a[2], b[2]);
-                assert_eq!(b[1] - a[1], if rank == ranks - 1 { (8256 - 64) * cfg.vocab_size * 4 } else { 0 });
-                assert_eq!(ordinary, scoring.with_prefill_logits(false));
+                let decode = IoLayout::for_ranks(&cfg, rank, 64, &Default::default(), ranks)?;
+                for rows in [64, 512, 4096, 8256] {
+                    let prefill = IoLayout::for_ranks(&cfg, rank, rows, &Default::default(), ranks)?;
+                    assert_eq!(prefill.logit_rows(), 64);
+                    assert_eq!(prefill.extents()[1], decode.extents()[1]);
+                }
             }
         }
         Ok(())

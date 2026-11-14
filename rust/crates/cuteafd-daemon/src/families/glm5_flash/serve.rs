@@ -314,7 +314,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         let encoder = vision.map_or(super::media::Encoder::Off, |vision| vision.encoder);
         let health = encoder.health_handle();
         let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
-        if probe::streamed_prefill_scoring("glm5_flash") {
+        {
             cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
         }
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
@@ -737,7 +737,7 @@ mod media_tests {
 /// marks: the `engine.mark_slots` the KV admission reserved ([`super::prefix::ArenaMarks::slots_on`]).
 fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, arena): (PrefixMarks,
     super::prefix::ArenaMarks), _concurrency: usize) -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
-    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
+    let args = &args.with_scoring(64,
         engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "GLM 5.3 Flash restores exact snapshots only (KDA state)");
@@ -1017,7 +1017,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             }
                         };
 
-                        if let Err(error) = probe::validate_scoring(&job.probe, probe::prefill_scoring_admitted("glm5_flash", engine.full_prefill_logits)) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, true) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -1142,13 +1142,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), probe::prefill_scoring_admitted("glm5_flash", engine.full_prefill_logits), &mut placement,
+                    DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
                     |placement, chunk, rows, position| {
-                        if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring("glm5_flash") {
+                        if rows > 1 {
                             engine.prefill_streamed_scoring(placement, chunk, &request_media,
                                 probe::ScoringRows { consumer: &job.probe, position })
-                        } else if rows > 1 {
-                            engine.prefill_scoring_media(placement, chunk, &request_media)
+
                         } else {
                             Ok(engine.prefill_media_device(placement, chunk, &request_media)?.map(probe::ScoreLogits::Device))
                         }

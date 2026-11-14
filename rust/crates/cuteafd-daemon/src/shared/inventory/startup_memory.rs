@@ -365,7 +365,7 @@ mod tests {
             inventory: PlacementInventory { gpus: vec![GpuBudget { capacity_bytes: 96 << 30,
                 reserve_bytes: 0, baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2],
                 spark_ranks: 6, peer_access: true },
-            rows: 64, waves: 1, unit: 64, full_prefill_logits: false, sequences: 16,
+            rows: 64, waves: 1, unit: 64, sequences: 16,
             context: 262144, serving_context: ServingContext::pinned(262144), requested_pool: Some(262144),
             marks: MarkRule { lanes: 16, entries: 0, budget_bytes: 0, host: true },
             peer_diagnostics: false, pending_code: vec![0; 2], onboard: None,
