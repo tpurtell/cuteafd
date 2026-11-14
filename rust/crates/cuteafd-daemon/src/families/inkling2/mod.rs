@@ -3,3 +3,4 @@ pub(crate) mod weights;
 pub(crate) mod owners;
 pub(crate) mod experts;
 pub(crate) mod layers;
+pub(crate) mod head;
