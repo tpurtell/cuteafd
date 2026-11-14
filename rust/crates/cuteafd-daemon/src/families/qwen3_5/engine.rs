@@ -19,6 +19,8 @@ const PREFIX: &str = "model.language_model.";
 
 #[path = "verify.rs"]
 mod verify;
+#[path = "dual.rs"]
+mod dual;
 #[path = "rows.rs"]
 mod rows;
 #[path = "graphs.rs"]
@@ -33,6 +35,7 @@ pub(crate) use qwen3_5::DrafterBytes;
 pub(crate) struct DenseEngine<'a> {
     // Drain queued work before fields retaining buffers/weights begin dropping.
     stream: Stream<'a>,
+    peer: Option<dual::Peer<'a>>,
     graphs: graphs::Graphs<'a>,
     pub(crate) cfg: Qwen35Config,
     pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -57,6 +60,7 @@ pub(crate) struct DenseEngine<'a> {
     prefix_arena: Option<std::rc::Rc<Allocation<'a>>>,
     prefix_marks: usize,
     healthy: bool,
+    tap_layers: Option<Vec<usize>>,
     verification: verify::Verification<'a>,
 }
 
@@ -136,9 +140,19 @@ impl<'a> DenseEngine<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        mut cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
+        cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
         prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool, Option<u64>)>, verify_check: bool) -> Result<Self> {
+        Self::with_owners(library, programs, checkpoint, cfg, requested_pool, drafter, slots, prefix,
+            kv_format, serving, verify_check, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_owners(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        mut cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
+        prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool, Option<u64>)>, verify_check: bool,
+        peer_programs: Option<(Device<'a>, &'a Programs<'a>)>) -> Result<Self> {
         ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=64 slots");
         let reader = WeightReader { library, checkpoint };
         let format = super::weights::DenseFormat::detect(checkpoint)?;
@@ -148,6 +162,17 @@ impl<'a> DenseEngine<'a> {
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
         crate::shared::inventory::preload_native_modules(library)?;
         let device = Device { library, id: library.cuda_get_device()? };
+        if let Some((peer, programs)) = peer_programs {
+            ensure!(peer.id != device.id, "dense split device must differ from primary");
+            device.run(|| library.cuda_enable_peer(peer.id))?;
+            peer.run(|| {
+                library.cuda_enable_peer(device.id)?;
+                DensePrograms::new(&cfg, programs, kv_format, format)?;
+                programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
+                library.peer_exchange_initialize()
+            })?;
+            device.run(|| library.peer_exchange_initialize())?;
+        }
         let stream = Stream::new(device)?;
         let layout = GdnLayout::new(cfg.gdn)?;
         let homes = LayerStateMap::new(&cfg.attention, &vec![0; cfg.attention.len()], 1)?;
@@ -158,13 +183,19 @@ impl<'a> DenseEngine<'a> {
         let buffers = NativeBuffers::new(&cfg, admitted.scratch_bytes, slots, prefix_marks)?;
         ensure!(buffers.mark_bytes == mark_bytes && buffers.prefix == prefix_bytes,
             "dense native prefix admission differs from state layout");
-        let sizes = buffers.planes;
         let logit_bytes = buffers.logits;
         // The live sample fixes the physical witness; the typed admission then
         // consumes it without re-solving for a smaller context or pool.
         let (free, total) = library.cuda_memory_info()?;
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
-        let budgets = qwen3_5::sampled_budgets(free as u64, total as u64, None, host)?;
+        let mut budgets = qwen3_5::sampled_budgets(free as u64, total as u64, None, host)?;
+        if let Some((peer, _)) = peer_programs {
+            let (free, total) = peer.run(|| library.cuda_memory_info())?;
+            let mut budget = qwen3_5::sampled_budgets(free as u64, total as u64, None, host)?.remove(0);
+            budget.id = "rtx1".into();
+            budget.locations = vec![cuteafd_loader::placement::planner::Location::coordinator(1)];
+            budgets.insert(1, budget);
+        }
         let request = Request {
             context: cuteafd_loader::placement::planner::Context::resolve(cfg.max_context as u64,
                 serving.map_or(Some(cfg.max_context as u64), |(_, _, _, context)| context)),
@@ -185,14 +216,30 @@ impl<'a> DenseEngine<'a> {
             cfg.max_context, concurrency)).transpose()?.flatten();
         let solve_started = std::time::Instant::now();
         let graph_variant = cuteafd_loader::serving_capacity::qwen35_graphs::variant(&cfg, format.fp8(), kv_format);
-        let admitted_plan = qwen3_5::admit(request, budgets, DenseFacts { cfg: &cfg,
+        let facts = DenseFacts { cfg: &cfg,
             graph_variant: graph_variant.clone(), graphs_enabled: cuteafd_loader::serving_capacity::qwen35_graphs::enabled(), weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
             record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
             serving: serving.map(|(_, _, device_sampling, _)| ServingFacts { capacity: HEAD_ROWS as u32, device_sampling }),
             host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
                 quota_bytes: host_config.as_ref().map_or(0, |config| config.bytes),
-                chunk_bytes: host_config.as_ref().map_or(0, |config| config.chunk_bytes) }, verify_check })?;
+                chunk_bytes: host_config.as_ref().map_or(0, |config| config.chunk_bytes) }, verify_check };
+        let (admitted_plan, owners, arenas) = if peer_programs.is_some() {
+            let admission = qwen3_5::dual::admit_dual(request, budgets, facts)?;
+            (admission.plan, admission.owners, Vec::from(admission.arenas))
+        } else {
+            (qwen3_5::admit(request, budgets, facts)?, vec![0; cfg.attention.len()], vec![target_arena])
+        };
+        let homes = LayerStateMap::new(&cfg.attention, &owners.iter().map(|&rank| rank as usize).collect::<Vec<_>>(),
+            1 + usize::from(peer_programs.is_some()))?;
+        let mut local_cfg = cfg.clone();
+        local_cfg.attention = cfg.attention.iter().zip(&owners).filter_map(|(&kind, &rank)| (rank == 0).then_some(kind)).collect();
+        let buffers = NativeBuffers::new(&local_cfg, admitted.scratch_bytes, slots, prefix_marks)?;
+        let mut buffers = buffers;
+        buffers.verify[2] = cfg.attention.len() * HEAD_ROWS * cfg.hidden * 2;
+        let sizes = buffers.planes;
+        let prefix_bytes = buffers.prefix;
+        let graph_variant = if peer_programs.is_some() { format!("{graph_variant}-layers-rtx2-rank0") } else { graph_variant };
         tracing::info!(solve_us = solve_started.elapsed().as_micros() as u64,
             ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&admitted_plan))?,
             "dense Qwen admitted phase ledger");
@@ -203,8 +250,8 @@ impl<'a> DenseEngine<'a> {
                 "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
                 "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
                 "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
-                "layout": graph_variant, "devices": [{"device": device.id}],
-                "graph_basis": "uncalibrated bytes, single RTX"
+                "layout": graph_variant, "devices": std::iter::once(device.id).chain(peer_programs.map(|(device, _)| device.id)).map(|device| serde_json::json!({"device": device})).collect::<Vec<_>>(),
+                "graph_basis": "uncalibrated bytes, rank-local whole-layer segments"
             }
         }));
         let graphs = graphs::Graphs::new(device, graph_variant)?;
@@ -218,18 +265,16 @@ impl<'a> DenseEngine<'a> {
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
         // One preplanned backing holds every target layer, the final norm, head and embedding.
-        let arena = super::weights::ScopeArena::new(device, target_arena,
-            cuteafd_core::memory_layout::ArenaTag::weights("qwen35/target"))?;
-        tracing::info!(arena = arena.layout().id(), bytes = arena.layout().bytes(),
-            views = arena.layout().views().len(), padding = arena.layout().padding_bytes(),
-            "dense Qwen target weight arena allocated");
+        let devices = std::iter::once(device).chain(peer_programs.map(|(device, _)| device)).collect::<Vec<_>>();
+        let arenas = arenas.into_iter().zip(&devices).map(|(layout, &device)|
+            super::weights::ScopeArena::new(device, layout,
+                cuteafd_core::memory_layout::ArenaTag::weights("qwen35/target"))).collect::<Result<Vec<_>>>()?;
         let (embedding, weights) = crate::shared::experts::rtx::push::load_alone(
-            &checkpoint.snapshot, &[device], || TokenEmbedding::load_with(library, source, EmbedPlacement::Gpu,
-                || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format,
-                    &mut |name: &str, bytes| arena.allocate(name, bytes)),
-                |name, bytes| arena.allocate(name, bytes)))?;
-        arena.complete()?;
-        drop(arena);
+            &checkpoint.snapshot, &devices, || TokenEmbedding::load_with(library, source, EmbedPlacement::Gpu,
+                || reader.dense_native_placed(&cfg, admitted.norm_dtype.clone(), format, &owners, &devices, &arenas),
+                |name, bytes| arenas[0].allocate(name, bytes)))?;
+        for arena in &arenas { arena.complete()?; }
+        drop(arenas);
         let mut allocated = sizes.into_iter().map(|bytes|
             Allocation::new(device, alloc_bytes(bytes), Tag::workspace("qwen35/planes")))
             .collect::<Result<Vec<_>>>()?;
@@ -246,12 +291,18 @@ impl<'a> DenseEngine<'a> {
         let commit = match admitted.prefix { "qwen35" => "qwen35_gdn_commit", "qwen38" => "qwen38_gdn_commit",
             _ => anyhow::bail!("unadmitted dense prefix") };
         let bank = GdnBank::new(library, programs, stream.raw, cfg.gdn, homes.gdn_layers[0], slots, commit)?;
-        let kv: Vec<Option<std::rc::Rc<Allocation<'a>>>> = cfg.attention.iter().map(|&kind| -> Result<_> {
+        let kv: Vec<Option<std::rc::Rc<Allocation<'a>>>> = cfg.attention.iter().zip(&owners).map(|(&kind, &owner)| -> Result<_> {
             if kind == HybridAttention::Gdn { return Ok(None); }
-            Ok(Some(std::rc::Rc::new(Allocation::new(device,
+            Ok(Some(std::rc::Rc::new(Allocation::new(devices[owner as usize],
                 pool_tokens * kv_format.record_bytes(cfg.kv_heads, cfg.head_dim), Tag::kv("qwen35/kv"))?)))
         }).collect::<Result<_>>()?;
-        let verification = verify::Verification::new(device, &cfg, slots)?;
+        let verification = verify::Verification::new_placed(device, &cfg, &local_cfg, slots)?;
+        let peer = peer_programs.map(|(device, programs)| {
+            let mut peer_cfg = cfg.clone();
+            peer_cfg.attention = cfg.attention.iter().zip(&owners).filter_map(|(&kind, &owner)| (owner == 1).then_some(kind)).collect();
+            let peer_buffers = NativeBuffers::new(&peer_cfg, admitted.scratch_bytes, slots, prefix_marks)?;
+            dual::make_peer(device, programs, &cfg, &admitted, &peer_buffers, &homes, &stream, &owners, slots)
+        }).transpose()?;
         let prefix_arena = if prefix_bytes == 0 { None } else {
             Some(std::rc::Rc::new(Allocation::new(device, prefix_bytes, Tag::prefix("qwen35/prefix"))?))
         };
@@ -268,7 +319,7 @@ impl<'a> DenseEngine<'a> {
             && verification.allocated_bytes() == buffers.verify
             && prefix_arena.as_ref().map_or(0, |a| a.buffer.bytes) == buffers.prefix,
             "dense native planner workspace/prefix differs from actual runtime allocations");
-        let gdn_layers = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count();
+        let gdn_layers = homes.gdn_layers[0];
         ensure!(bank.allocated_bytes() == [buffers.state_per_layer.checked_mul(slots)
             .and_then(|n| n.checked_mul(gdn_layers)).context("dense GDN state inventory overflow")?,
             buffers.replay_per_layer.checked_mul(gdn_layers).context("dense GDN replay inventory overflow")?,
@@ -279,10 +330,10 @@ impl<'a> DenseEngine<'a> {
             "dense native planner KV differs from actual runtime allocations");
         tracing::info!("dense native planner equals actual weight, KV, state, replay, workspace and prefix allocations");
         cfg.max_context = usize::try_from(admitted_plan.served_context())?;
-        Ok(Self { stream, graphs, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
+        Ok(Self { stream, peer, graphs, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
             pool_tokens, admitted_host_config: host_config, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],
-            prefix_arena, prefix_marks, healthy: true, verification })
+            prefix_arena, prefix_marks, healthy: true, tap_layers: None, verification })
     }
 
     /// Retained target weight owners: one arena backing plus a view per tensor.
@@ -295,6 +346,12 @@ impl<'a> DenseEngine<'a> {
         let mut receipts = inventory.receipts;
         receipts.extend(self.embedding.allocation_receipts(devices, "qwen3_5.embedding")?);
         Ok(receipts)
+    }
+
+    pub(crate) fn set_tap_layers(&mut self, layers: Vec<usize>) -> Result<()> {
+        ensure!(layers.iter().all(|&layer| layer < self.cfg.attention.len()), "dense tap outside target");
+        self.tap_layers = Some(layers);
+        Ok(())
     }
 
     pub(crate) fn slot_count(&self) -> usize { self.slots.len() }
@@ -337,26 +394,32 @@ impl<'a> DenseEngine<'a> {
 
     fn put(&self, buffer: CuteafdDeviceBuffer, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= buffer.bytes, "dense step table exceeds admitted capacity");
-        // SAFETY: ordered upload owns pinned staging until this stream consumes it.
-        unsafe { self.stream.device.library.copy_h2d_ordered(buffer, bytes, self.stream.raw) }
+        let stream = if buffer.device_id == self.stream.device.id { &self.stream }
+            else { &self.peer.as_ref().context("dense upload owner")?.stream };
+        // SAFETY: ordered upload owns staging until the destination stream consumes it.
+        stream.device.run(|| unsafe { stream.device.library.copy_h2d_ordered(buffer, bytes, stream.raw) })
     }
 
     fn tables(&self, rows: usize) -> Result<()> {
         let first = self.position;
         let end = first.checked_add(rows).context("dense position overflow")?;
         ensure!(end <= self.cfg.max_context && end <= self.pool_tokens, "dense sequence exceeds admitted cache/context");
-        self.put(self.planes.slots, &vec![0; rows * 4])?;
-        self.put(self.planes.seq_first, &vec![0; rows * 4])?;
+        for rank in 0..self.homes.gdn_layers.len() {
+        let planes = self.owner_planes(rank);
+        self.put(planes.slots, &vec![0; rows * 4])?;
+        self.put(planes.seq_first, &vec![0; rows * 4])?;
         let positions = (first..end).map(i64::try_from).collect::<std::result::Result<Vec<_>, _>>()?;
         let position_bytes: Vec<_> = positions.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.put(self.planes.positions, &position_bytes)?;
-        self.put(self.planes.kv_slots, &position_bytes)?;
+        self.put(planes.positions, &position_bytes)?;
+        self.put(planes.kv_slots, &position_bytes)?;
         let rope: Vec<_> = (first..end).map(i32::try_from).collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter().flat_map(|p| [p; 3]).flat_map(i32::to_le_bytes).collect();
-        self.put(self.planes.rope_positions, &rope)?;
+        self.put(planes.rope_positions, &rope)?;
         let pages: Vec<_> = (0..end.div_ceil(64)).map(i32::try_from).collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter().flat_map(i32::to_le_bytes).collect();
-        self.put(self.planes.page_table, &pages)
+        self.put(planes.page_table, &pages)?;
+        }
+        Ok(())
     }
 
     /// Install scheduler-owned pages only at a committed frontier. Empty pages
@@ -382,16 +445,18 @@ impl<'a> DenseEngine<'a> {
     pub(crate) fn reset_slot(&mut self, slot: usize) -> Result<()> {
         ensure!(slot < self.slots.len(), "dense reset outside admitted slots");
         ensure!(self.healthy && self.verification.pending.is_none(), "dense reset requires committed healthy state");
-        self.stream.drain()?;
+        self.drain()?;
         self.verification.invalidate()?;
         self.healthy = false;
-        for ordinal in 0..self.homes.gdn_layers[0] {
-            for region in self.bank.slot_regions(ordinal, slot) {
-                // SAFETY: slot regions are live and no earlier readers remain after the drain.
-                unsafe { self.stream.device.library.cuda_zero_bytes_async(region, region.bytes, self.stream.raw)?; }
-            }
+        for region in self.state_regions(slot) {
+            let stream = if region.device_id == self.stream.device.id { &self.stream }
+                else { &self.peer.as_ref().expect("admitted peer").stream };
+            // SAFETY: the owning stream is drained and retains this state region.
+            stream.device.run(|| unsafe {
+                self.stream.device.library.cuda_zero_bytes_async(region, region.bytes, stream.raw)
+            })?;
         }
-        self.stream.drain()?;
+        self.drain()?;
         self.slots[slot].position = 0;
         self.slots[slot].pages.clear();
         self.position = self.slots[0].position;
@@ -412,6 +477,7 @@ impl<'a> DenseEngine<'a> {
         ensure!(logit_rows <= self.head_rows.min(tokens.len()), "dense prefill head rows outside admission");
         ensure!(self.healthy && self.verification.pending.is_none(), "dense prefill requires committed healthy state");
         self.graphs.prefill();
+        if let Some(peer) = &self.peer { peer.graphs.prefill(); }
         self.embedding.check(tokens)?;
         let state = &self.slots[slot];
         let end = state.position.checked_add(tokens.len()).context("dense prefill position overflow")?;
@@ -433,12 +499,16 @@ impl<'a> DenseEngine<'a> {
         self.embedding.embed(tokens, self.ids.buffer, 1, self.planes.residual, self.stream.raw)?;
         let step = Step { rows: tokens.len(), capacity: if tokens.len() <= HEAD_ROWS { HEAD_ROWS } else { ROWS },
             table_stride: 0, splits: 1, speculative: false };
-        let blocks = Blocks { programs: self.programs, admitted: &self.admitted, cfg: &self.cfg,
-            homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
         for (index, layer) in self.weights.layers.iter().enumerate() {
-            blocks.run(index, layer, self.planes, self.kv[index].as_ref().map(|v| v.buffer), &step)?;
-            hook(index, self.planes.residual)?;
+            self.enter_layer(index, step.rows)?;
+            let rank = self.homes.layers[index].owner;
+            self.owner_stream(rank).device.run(|| self.layer_blocks(index).run(index, layer,
+                self.owner_planes(rank), self.kv[index].as_ref().map(|v| v.buffer), &step))?;
+            if self.tap_layers.as_ref().is_none_or(|layers| layers.contains(&index)) {
+                hook(index, self.primary_tap(index, step.rows)?)?;
+            }
         }
+        self.finish_layers(step.rows)?;
         let output = if logit_rows == 0 {
             // Scoring may warm a prefix without consuming logits; never launch a zero-row head.
             DeviceLogits { ptr: self.logits.buffer.ptr, rows: 0, vocab: self.cfg.vocab,
@@ -491,6 +561,7 @@ impl<'a> DenseEngine<'a> {
         -> Result<Vec<crate::shared::prefill_packing::Segment>> {
         ensure!(self.healthy && self.verification.pending.is_none(), "dense packed prefill requires committed healthy state");
         self.graphs.prefill();
+        if let Some(peer) = &self.peer { peer.graphs.prefill(); }
         let chunks = sequences.iter().map(|&(slot, tokens)| {
             let state = self.slots.get(slot).context("dense packed slot outside admission")?;
             self.embedding.check(tokens)?;
@@ -527,28 +598,35 @@ impl<'a> DenseEngine<'a> {
         self.healthy = false;
         self.row_tables(&all)?;
         self.embedding.embed(&tokens, self.ids.buffer, 1, self.planes.residual, self.stream.raw)?;
-        let blocks = Blocks { programs: self.programs, admitted: &self.admitted, cfg: &self.cfg,
-            homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
         for (index, layer) in self.weights.layers.iter().enumerate() {
+            self.enter_layer(index, tokens.len())?;
+            let rank = self.homes.layers[index].owner;
+            let base = self.owner_planes(rank);
+            let blocks = self.layer_blocks(index);
+            let _owner = self.owner_stream(rank).device.enter()?;
             for ((s, table), &page_offset) in segments.iter().zip(&tables).zip(&page_offsets) {
-                let mut planes = self.planes.segment(s.first, s.rows, self.cfg.hidden, self.cfg.heads * self.cfg.head_dim)?;
+                let mut planes = base.segment(s.first, s.rows, self.cfg.hidden, self.cfg.heads * self.cfg.head_dim)?;
                 let view = crate::shared::prefix::view;
-                planes.slots = view(self.planes.slots, s.first * 4, s.rows * 4)?;
-                planes.seq_first = view(self.planes.seq_first, s.first * 4, s.rows * 4)?;
-                planes.positions = view(self.planes.positions, s.first * 8, s.rows * 8)?;
-                planes.rope_positions = view(self.planes.rope_positions, s.first * 12, s.rows * 12)?;
-                planes.kv_slots = view(self.planes.kv_slots, s.first * 8, s.rows * 8)?;
-                planes.page_table = view(self.planes.page_table, page_offset * 4, table.pages.len() * 4)?;
+                planes.slots = view(base.slots, s.first * 4, s.rows * 4)?;
+                planes.seq_first = view(base.seq_first, s.first * 4, s.rows * 4)?;
+                planes.positions = view(base.positions, s.first * 8, s.rows * 8)?;
+                planes.rope_positions = view(base.rope_positions, s.first * 12, s.rows * 12)?;
+                planes.kv_slots = view(base.kv_slots, s.first * 8, s.rows * 8)?;
+                planes.page_table = view(base.page_table, page_offset * 4, table.pages.len() * 4)?;
                 blocks.attention(index, layer, planes,
                     self.kv[index].as_ref().map(|v| v.buffer), &Step { rows: s.rows,
                         capacity: if s.rows <= HEAD_ROWS { HEAD_ROWS } else { ROWS },
                         table_stride: 0, splits: 1, speculative: false })?;
             }
-            blocks.ffn(layer, self.planes, &Step { rows: tokens.len(),
+            blocks.ffn(layer, base, &Step { rows: tokens.len(),
                 capacity: if tokens.len() <= HEAD_ROWS { HEAD_ROWS } else { ROWS },
                 table_stride: 0, splits: 1, speculative: false })?;
-            hook(index, self.planes.residual, tokens.len())?;
+            drop(_owner);
+            if self.tap_layers.as_ref().is_none_or(|layers| layers.contains(&index)) {
+                hook(index, self.primary_tap(index, tokens.len())?, tokens.len())?;
+            }
         }
+        self.finish_layers(tokens.len())?;
         for (&(slot, _), s) in sequences.iter().zip(&segments) { self.slots[slot].position = s.start + s.rows; }
         self.position = self.slots[0].position;
         self.healthy = true;
@@ -567,14 +645,18 @@ impl<'a> DenseEngine<'a> {
     fn row_tables(&self, rows: &rows::Rows) -> Result<()> {
         let i32_bytes = |values: &[i32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
         let i64_bytes = |values: &[i64]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-        self.put(self.planes.slots, &i32_bytes(&rows.slots))?;
-        self.put(self.planes.seq_first, &i32_bytes(&rows.first))?;
-        self.put(self.planes.positions, &i64_bytes(&rows.positions))?;
-        self.put(self.planes.kv_slots, &i64_bytes(&rows.kv))?;
+        for rank in 0..self.homes.gdn_layers.len() {
+        let planes = self.owner_planes(rank);
+        self.put(planes.slots, &i32_bytes(&rows.slots))?;
+        self.put(planes.seq_first, &i32_bytes(&rows.first))?;
+        self.put(planes.positions, &i64_bytes(&rows.positions))?;
+        self.put(planes.kv_slots, &i64_bytes(&rows.kv))?;
         let rope = rows.positions.iter().map(|&p| i32::try_from(p)).collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter().flat_map(|p| [p; 3]).collect::<Vec<_>>();
-        self.put(self.planes.rope_positions, &i32_bytes(&rope))?;
-        self.put(self.planes.page_table, &i32_bytes(&rows.pages))
+        self.put(planes.rope_positions, &i32_bytes(&rope))?;
+        self.put(planes.page_table, &i32_bytes(&rows.pages))?;
+        }
+        Ok(())
     }
 
     /// Evaluate causal input rows and return FP32 next-token distributions.
@@ -597,20 +679,23 @@ impl<'a> DenseEngine<'a> {
         ensure!(self.healthy, "dense target cannot resume after a failed evaluation");
         ensure!(self.verification.pending.is_none(), "dense evaluation requires committed verify state");
         self.embedding.check(tokens)?;
-        self.stream.drain()?;
+        self.drain()?;
         self.verification.invalidate()?;
         self.healthy = false;
         self.tables(tokens.len())?;
         self.embedding.embed(tokens, self.ids.buffer, 1, self.planes.residual, self.stream.raw)?;
         let step = Step { rows: tokens.len(), capacity: if tokens.len() <= 64 { 64 } else { ROWS },
             table_stride: 0, splits: 1, speculative: false };
-        let blocks = Blocks { programs: self.programs, admitted: &self.admitted, cfg: &self.cfg,
-            homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
         for (index, layer) in self.weights.layers.iter().enumerate() {
-            blocks.run(index, layer, self.planes, self.kv[index].as_ref().map(|v| v.buffer), &step)?;
-            self.stream.drain()?;
-            hook(index, CuteafdDeviceBuffer { bytes: tokens.len() * self.cfg.hidden * 2, ..self.planes.residual })?;
+            self.enter_layer(index, step.rows)?;
+            let rank = self.homes.layers[index].owner;
+            self.owner_stream(rank).device.run(|| self.layer_blocks(index).run(index, layer,
+                self.owner_planes(rank), self.kv[index].as_ref().map(|v| v.buffer), &step))?;
+            let hidden = self.primary_tap(index, step.rows)?;
+            self.drain()?;
+            hook(index, hidden)?;
         }
+        self.finish_layers(step.rows)?;
         let norm = self.programs.program(&format!("{}_norm", self.admitted.prefix), &["x", "weight", "out"])?;
         // SAFETY: live norm, weight and output extents match the admitted native geometry.
         unsafe { norm.launch(&[self.planes.residual.ptr, self.weights.norm.buffer.ptr, self.planes.norm.ptr],
@@ -629,5 +714,11 @@ impl<'a> DenseEngine<'a> {
         self.slots[0].position = self.position;
         self.healthy = true;
         Ok(())
+    }
+}
+
+impl Drop for DenseEngine<'_> {
+    fn drop(&mut self) {
+        crate::shared::decode_graph::fatal_drain(self.drain(), "dense Qwen execution owners");
     }
 }

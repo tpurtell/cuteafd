@@ -117,6 +117,23 @@ impl<'a> WeightReader<'a> {
             head: self.bf16_with("head.weight", &head_name, &mut *allocate)? })
     }
 
+    pub(crate) fn dense_native_placed(&self, cfg: &Qwen35Config, norm_dtype: DType, format: DenseFormat,
+        owners: &[u8], devices: &[Device<'a>], arenas: &[ScopeArena<'a>]) -> Result<DenseWeights<'a>> {
+        cuteafd_loader::placement::families::qwen3_5::NativeWeights::native(self.checkpoint, cfg, norm_dtype)?;
+        ensure!(owners.len() == cfg.attention.len() && devices.len() == arenas.len(), "dense weight owner geometry");
+        let layers = cfg.attention.iter().enumerate().map(|(index, &kind)| {
+            let rank = usize::from(owners[index]);
+            devices[rank].run(|| self.dense_layer(&format!("{PREFIX}layers.{index}"), kind, format,
+                &mut |name, bytes| arenas[rank].allocate(name, bytes)))
+        }).collect::<Result<_>>()?;
+        let norm_name = format!("{PREFIX}norm.weight");
+        let head_name = if cfg.tied_embeddings { format!("{PREFIX}embed_tokens.weight") } else { "lm_head.weight".into() };
+        let (norm, head) = devices[0].run(|| Ok((self.bf16_with(&norm_name, &norm_name,
+            |name, bytes| arenas[0].allocate(name, bytes))?, self.bf16_with("head.weight", &head_name,
+            |name, bytes| arenas[0].allocate(name, bytes))?)))?;
+        Ok(DenseWeights { layers, norm, head })
+    }
+
     pub(crate) fn dense_layer_bytes(&self, prefix: &str, attention: HybridAttention, format: DenseFormat) -> Result<u64> {
         layer_requests(self.checkpoint, prefix, attention, format)?.into_iter().try_fold(0u64, |total, (_, bytes)| {
             total.checked_add(u64::try_from(bytes)?).context("dense Qwen layer size overflow")

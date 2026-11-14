@@ -6,13 +6,15 @@ use anyhow::{ensure, Result};
 use cuteafd_core::DType;
 
 mod admission;
+pub mod dual;
 pub use admission::{DenseFacts, ServingFacts, admit, forecast_budgets, sampled_budgets};
 
 pub const PAGE_ROWS: u64 = 64;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
-/// Only the initial single-device dense executor; not a claim of TP2 support.
-pub const SINGLE: ExecutorModes = ExecutorModes { family: "qwen3_5", modes: &[WHOLE],
-    hops: false, attention: AttentionPlacement::Heads };
+/// Native dense blocks keep whole-layer ownership on one or two RTX ranks.
+pub const EXECUTOR: ExecutorModes = ExecutorModes { family: "qwen3_5",
+    modes: &[WHOLE, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }],
+    hops: true, attention: AttentionPlacement::Layers };
 
 /// Drafter-owned allocations, excluding the target embedding and vocabulary head.
 #[derive(Debug, Clone, Default)]

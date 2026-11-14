@@ -1184,7 +1184,9 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         options.layout.as_ref().map_or(2, |layout| layout.concurrency))?;
     report.precision_optimizations = precision_optimizations(family.id(), options);
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
-    if let Some(executor) = crate::placement::families::executor(family.id()) {
+    // Dense native admission owns geometry-specific missing-export hints and
+    // chooses its contiguous cut with the phase solver, not this legacy gate.
+    if let Some(executor) = crate::placement::families::executor(family.id()).filter(|_| family.id() != "qwen3_5") {
         let gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());
         let peer = options.layout.as_ref().is_some_and(|layout| layout.head_split);
         match executor.check_attention(options.attention_placement, gpus, peer) {

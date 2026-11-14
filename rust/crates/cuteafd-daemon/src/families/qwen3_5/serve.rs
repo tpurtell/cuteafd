@@ -110,8 +110,8 @@ impl<'e, 'a> DenseBackend<'e, 'a> {
 
     /// Retained weight owners for the opt-in startup census: the target arena
     /// (with its embedding and head) and the separately admitted drafter arena.
-    fn weight_census(&self, device: i32) -> Result<crate::shared::memory::receipts::Census> {
-        let physical = [device];
+    fn weight_census(&self, _device: i32) -> Result<crate::shared::memory::receipts::Census> {
+        let physical = self.engine.borrow().devices();
         let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
         let mut census = crate::shared::memory::receipts::Census::default();
         census.owners(self.engine.borrow().weight_receipts(devices)?);
@@ -577,6 +577,9 @@ pub(crate) struct ServeArgs {
     pub manifest: std::path::PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
+    /// Second RTX for contiguous native whole-layer owners.
+    #[arg(long)]
+    pub split_device: Option<i32>,
     #[arg(long)]
     pub pool_tokens: Option<u64>,
     /// Served context: auto fits the admitted pool; a positive count pins it.
@@ -647,6 +650,9 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             let library = unsafe { NativeLibrary::load(&engine_args.native_lib)? };
             library.cuda_set_device(engine_args.device)?;
             let programs = library.programs()?.with_manifest(&engine_args.manifest)?;
+            let peer_device = engine_args.split_device.map(|id| crate::shared::memory::device::Device { library: &library, id });
+            let peer_programs = peer_device.map(|device| device.run(||
+                library.programs()?.with_manifest(&engine_args.manifest))).transpose()?;
             let lanes = usize::from(engine_args.max_sequences);
             let slots = cuteafd_core::concurrency::state_slots(lanes as u64) as usize;
             let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
@@ -659,12 +665,13 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             }).transpose()?;
             let startup_audit = crate::shared::inventory::startup_probe_enabled()
                 .then(cuteafd_ffi::memory_ledger::AllocationAudit::begin);
-            let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
+            let engine = RefCell::new(DenseEngine::with_owners(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0),
                 draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes.clone())), slots,
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache,
                 Some((&engine_args.prefix, lanes,
-                    engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device, engine_args.max_context)), false)?);
+                    engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device, engine_args.max_context)), false,
+                peer_device.zip(peer_programs.as_ref()))?);
             engine.borrow_mut().warm_decode_graphs()?;
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;
@@ -681,6 +688,10 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 backend.mtp = Some(Rc::new(super::engine::mtp::MtpCache::load(&engine.borrow(), &reader, admission)?));
                 scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp) }
             } else { scheduler::Drafts::None };
+            let taps = backend.drafter.as_ref().map_or_else(Vec::new, |draft| draft.cfg.taps.clone());
+            let mut taps = taps;
+            if backend.mtp.is_some() { taps.push(engine.borrow().cfg.attention.len() - 1); }
+            engine.borrow_mut().set_tap_layers(taps)?;
             resolved_prefill_settings(backend.geometry().prefill_rows).publish();
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 drafts, engine_args.draft_length, eos, engine_args.decode_share, &engine_args.prefix,
@@ -688,7 +699,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                     let history = startup_audit.map(|audit| audit.finish());
                     let census = crate::shared::inventory::startup_probe_enabled()
                         .then(|| backend.weight_census(engine_args.device)).transpose()?;
-                    crate::shared::inventory::startup_probe(&library, &[engine_args.device], "qwen3_5/ready",
+                    crate::shared::inventory::startup_probe(&library, &engine.borrow().devices(), "qwen3_5/ready",
                         crate::shared::inventory::StartupEvidence { history: history.as_ref(),
                             census: census.as_ref(), ..Default::default() })?;
                     if let Some(ready) = ready.take() {
@@ -726,7 +737,7 @@ fn resolved_prefill_settings(rows: usize) -> cuteafd_bench::context::ResolvedSet
 fn console_layout(args: &ServeArgs, model: &str) -> Result<crate::shared::console::Layout> {
     use crate::shared::console;
     let mut layout = console::Layout::new("qwen3_5", model.into(), args.snapshot.clone());
-    layout.hardware = console::hardware(1, 0, true);
+    layout.hardware = console::hardware(1 + usize::from(args.split_device.is_some()), 0, true);
     layout.concurrency = usize::from(args.max_sequences);
     layout.speculator = args.draft.as_deref().map(|snapshot| {
         let depth = block_dspark::DsparkConfig::read(snapshot)?.drafts();

@@ -78,7 +78,7 @@ pub const STEP5: ExecutorModes = ExecutorModes { family: "step5", modes: &[WHOLE
 
 /// Every family's executor set, for lookups by family name.
 pub const EXECUTORS: [ExecutorModes; 11] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4,
-    qwen3_5::SINGLE, KIMI_K3, STEP5, muse_spark::MUSE_SPARK, minimax_m3::MINIMAX_M3];
+    qwen3_5::EXECUTOR, KIMI_K3, STEP5, muse_spark::MUSE_SPARK, minimax_m3::MINIMAX_M3];
 
 pub fn executor(family: &str) -> Option<ExecutorModes> {
     EXECUTORS.into_iter().find(|e| e.family == family)

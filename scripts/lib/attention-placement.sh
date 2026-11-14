@@ -23,11 +23,13 @@ release_check_attention_placement() {
   case "$attention_placement:$family" in
     auto:kimi_k3|heads:kimi_k3|context:kimi_k3|layers:kimi_k3) ;;
     # Step-5 and Muse Spark run only their recorded automatic placement.
+    heads:qwen3_5|context:qwen3_5)
+      release_die "dense Qwen $attention_placement attention is unbuilt: native half-head GDN/GQA and dense FFN exports, shared reductions, and context KV/softmax merge are needed (#2133); use layers" ;;
     auto:minimax_m3|heads:minimax_m3) ;;
     *:minimax_m3) release_die "MiniMax WIP currently supports one-RTX whole attention (auto or heads)" ;;
     auto:step5|auto:muse_spark) ;;
     *:step5|*:muse_spark) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
-    auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
+    auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4|layers:qwen3_5) ;;
     # K4/P7 qualified explicit layers; context remains the recorded auto default.
     # The planner still requires the selected image's executor and native programs.
     layers:glm5|layers:glm5_flash)
@@ -35,8 +37,7 @@ release_check_attention_placement() {
     context:*|layers:*) release_die "$family cannot run attention placement $attention_placement: executor not implemented; only heads is qualified" ;;
     *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;
   esac
-  # Dense Qwen is a single-device executor: auto resolves to heads, an explicit
-  # mode is not qualified.
-  [[ "$family" != qwen3_5 || "$attention_placement" == auto ]] ||
-    release_die "dense Qwen currently supports only single-GPU automatic attention placement"
+  if [[ "$family" == qwen3_5 && "$attention_placement" != auto && "$attention_placement" != layers ]]; then
+    release_die "dense Qwen $attention_placement attention is unbuilt: add native half-head GDN/GQA and dense FFN exports with shared reductions; context also needs partitioned KV/softmax merge (#2133); use layers"
+  fi
 }

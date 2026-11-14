@@ -613,18 +613,22 @@ family's planner and runtime policy):
 
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ heads² | ✓ context⁴ | ✓ layers | ✓ heads |
+| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads |
 | `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✗ | ✗ |
 | `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ |
-| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ |
+| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✓ (two RTX) | ✓ | ✗ | ✗ |
 
 `✓` means the launch path accepts the value; `✗` means it stops with the
 family's attention-placement error.
 
 ¹ V4.1 is `layers` on two GPUs and `heads` on one; an explicit `heads` is
-accepted on either. ² Dense Qwen is a single-device executor: `auto` resolves
-to `heads`, and an explicit `heads` is refused until a multi-GPU executor is
-qualified. ³ Native GLM 5.3 EXLR8 runs `context` (the auto default) and
+accepted on either. ² Dense Qwen `auto` retains one whole owner on one RTX;
+on two RTX it selects solver-admitted contiguous whole-layer ranges, as does
+explicit `layers`. Per-rank native arenas, GDN/KV, prefix marks and lazy decode
+graphs remain local; the shared residual-hop mechanism joins the ranges. This
+primarily adds memory capacity, not parallel layer compute. Explicit `heads`
+and `context` name the missing native sharded exports (#2133), without fallback.
+Single-rank graph traces/pins are never borrowed by the two-rank layout. ³ Native GLM 5.3 EXLR8 runs `context` (the auto default) and
 explicit `heads` or two-GPU `layers` (#1305, #1308); the planner refuses a
 mode whose image lacks its programs. ⁴ Kimi K3 accepts explicit `heads`,
 `context` and `layers` for MLA layers on two GPUs; `auto` selects `context`
@@ -772,7 +776,7 @@ original core is already FP8, not an MC publication.
 | `HOST_CACHE_BYTES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **Attention and KV** | | | | | | | | | | |
 | `CORE_VIEW` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
+| `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

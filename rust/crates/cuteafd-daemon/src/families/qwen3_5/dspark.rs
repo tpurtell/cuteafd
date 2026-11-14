@@ -165,8 +165,10 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     ensure!(required <= cfg.max_context, "spec decode exceeds target checkpoint context");
     let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
     let demand = DrafterBytes::block_dspark(snapshot, &config, 1, library.sm_count()? as u64, cfg.max_context)?;
-    let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(demand.clone()), 1, None, args.kv_cache, None, args.verify_check)?;
+    let peer_device = args.split_device.map(|id| crate::shared::memory::device::Device { library, id });
+    let peer_programs = peer_device.map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest))).transpose()?;
+    let mut engine = DenseEngine::with_owners(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
+        Some(demand.clone()), 1, None, args.kv_cache, None, args.verify_check, peer_device.zip(peer_programs.as_ref()))?;
     engine.warm_decode_graphs()?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
     if args.verify_check { engine.verify_check(prompt)?; }
@@ -188,8 +190,8 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     // Normal evaluation invalidates target marks; use a fresh executor rather
     // than reconstructing the recurrent state or reusing a stale mark.
     drop(engine);
-    let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(demand), 1, None, args.kv_cache, None, args.verify_check)?;
+    let mut engine = DenseEngine::with_owners(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
+        Some(demand), 1, None, args.kv_cache, None, args.verify_check, peer_device.zip(peer_programs.as_ref()))?;
     engine.warm_decode_graphs()?;
     let stream = engine.target_stream().raw;
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
