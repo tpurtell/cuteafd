@@ -173,7 +173,7 @@ impl<'a> NativeProjectionWorkspace<'a> {
     }
     pub fn new(library: &'a NativeLibrary, shapes: &[(usize, usize)], rows: usize) -> Result<Self> {
         let [a, i, r, o] = Self::bytes(shapes, rows)?;
-        let alloc = |bytes, name| DeviceAllocation::new(library, bytes, Tag::drafter_workspace(name));
+        let alloc = |bytes:usize, name| DeviceAllocation::new(library, bytes.max(256), Tag::drafter_workspace(name));
         let owner = Self { library, activation: alloc(a, "shared/draft-native/activation")?,
             inputs: alloc(i, "shared/draft-native/inputs")?, records: alloc(r, "shared/draft-native/records")?,
             output: alloc(o, "shared/draft-native/output")?, rows,
