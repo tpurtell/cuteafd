@@ -1218,7 +1218,7 @@ impl<'a> LocalLane<'a> {
             let width = owner.compact_width();
             dsa.scored[0].launch(cuteafd_ffi::KimiIndexSelection {
                 rows, cache_pages: self.mla.local_pages(),
-                table_width: width, table_stride: width,
+                table_width: self.context_pages[self.lane.metadata_bank].max(1), table_stride: width,
                 page_stride: 2, page_offset: self.rank,
                 query_fp8: query, head_weights, cache,
                 table: owner.metadata("compact page tables", self.lane.metadata_bank)?,
@@ -1270,7 +1270,7 @@ impl<'a> LocalLane<'a> {
                 let scores = view(owner.buffer("DSA global scores")?, first * 2048 * 4, rows * 2048 * 4)?;
                 let indices = view(owner.buffer("DSA global indices")?, first * 2048 * 4, rows * 2048 * 4)?;
                 dsa.scored[0].launch(cuteafd_ffi::KimiIndexSelection {
-                    rows, cache_pages: self.mla.local_pages(), table_width: width, table_stride: width,
+                    rows, cache_pages: self.mla.local_pages(), table_width: self.context_pages[bank].max(1), table_stride: width,
                     page_stride: 2, page_offset: self.rank,
                     query_fp8: view(self.lane.buffer("DSA query")?, first * 4096, rows * 4096)?,
                     head_weights: view(self.lane.buffer("DSA head weights")?, first * 32 * 4, rows * 32 * 4)?,

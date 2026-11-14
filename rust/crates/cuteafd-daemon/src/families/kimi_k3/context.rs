@@ -641,9 +641,9 @@ mod tests {
         let prefill = KimiIndexTopK::load(&programs, 4096, 16384, KimiIndexMode::Prefill, true)?;
         let merge = KimiCandidateMerge::load(&programs)?;
         let rows = 131;
-        let pages = 40;
+        let pages = 600;
         let width = pages / 2;
-        let start = 2041;
+        let start = 32041;
         let streams = [0, 1].map(|id| Stream::new(Device { library: &library, id }).map(Rc::new));
         let [s0, s1] = streams;
         let streams = [s0?, s1?];
@@ -715,7 +715,10 @@ mod tests {
                     let scores = crate::shared::prefix::view(output[0].buffer, first * 2048 * 4, count * 2048 * 4)?;
                     let indices = crate::shared::prefix::view(output[1].buffer, first * 2048 * 4, count * 2048 * 4)?;
                     streams[rank].device.run(|| Ok(decode.launch(KimiIndexSelection {
-                        rows: count, cache_pages: width, table_width: width, table_stride: width,
+                        rows: count, cache_pages: width,
+                        table_width: if repeat == 0 { width } else {
+                            crate::shared::peer_split::context::shard_rows(start + first + count, 64, rank).div_ceil(64).max(1)
+                        }, table_stride: width,
                         page_stride: 2, page_offset: rank, query_fp8: part(0, 4096)?, head_weights: part(1, 32 * 4)?,
                         cache: input[2].buffer, table: part(3, width * 4)?, lengths: part(4, 4)?,
                         indices, scores, scratch: input[5].buffer,
