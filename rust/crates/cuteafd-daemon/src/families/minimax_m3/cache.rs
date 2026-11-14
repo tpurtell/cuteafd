@@ -973,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn split_ffn_preserves_whole_attention_cache_owners_and_heads_still_refuses() -> Result<()> {
+    fn split_ffn_preserves_whole_attention_cache_owners_and_mixed_heads_refuses() -> Result<()> {
         use cuteafd_loader::placement::{FfnMode, LayerMode};
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
@@ -1011,7 +1011,7 @@ mod tests {
         heads.placement.layers[0].mode = LayerMode::HeadSplit;
         let error = RequestState::new(&cfg, capacity, &heads, request_streams(&library, &ids)?)
             .err().context("heads cache must refuse")?;
-        assert!(error.to_string().contains("requires whole-layer owners"));
+        assert!(error.to_string().contains("uniform Heads or whole-layer owners"));
         assert_eq!(fixture.mapped_bytes(&library)?, 0);
         assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
         Ok(())

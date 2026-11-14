@@ -193,7 +193,8 @@ mod tests {
             args.prefix.resolve_entries(16);
             args.prefill()?;
             cuteafd_bench::context::ResolvedSettings::default().value("max-context-tokens", 131072)
-                .value("pool-tokens", 2097152).value("rtx-expert-layers", 0).publish();
+                .value("pool-tokens", 2097152).value("rtx-expert-layers", 0)
+                .value("attention-placement", "heads").publish();
             Ok(())
         })
     }
