@@ -171,6 +171,9 @@ def jobs(scope):
     result.append(("native-attention-fp8", "export_b12x_dsv4_aot.py",
                    ["--geometry", "native_attention", "--only", ",".join(
                        item[0] for item in drafter.native_attention_programs())]))
+    result.append(("native-attention-prefill-fp8", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "native_attention", "--only", ",".join(
+                       item[0] for item in drafter.native_attention_prefill_programs())]))
     # Small-row top-k deliberately exercises the fused persistent route, which
     # the production m64 table does not select.
     for geometry in ("flash", "pro", "glm", "glmf"):
