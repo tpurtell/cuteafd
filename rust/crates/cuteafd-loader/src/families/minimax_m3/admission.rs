@@ -340,7 +340,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }
     } else {
         let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: shared::PAGE_ROWS,
-            page_bytes, mark_bytes: 0, draft_bytes: 0 };
+            page_bytes, mark_bytes: request.drafter.as_ref().map_or(0,|draft| draft.mark_bytes as u64), draft_bytes: 0 };
         let quota = geometry.resolve(request.host_cache_bytes, context, request.sequences, host_total,
             geometry.chunk_bytes()).unwrap_or(0);
         serving::HostPrefixOwners { quota_bytes: quota, chunk_bytes: geometry.chunk_bytes().min(quota.max(1)) }

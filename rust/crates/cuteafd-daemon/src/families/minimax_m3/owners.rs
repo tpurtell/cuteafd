@@ -230,7 +230,8 @@ impl<'a> Owners<'a> {
             drafter.prepare_workspace()?;
             let drafter=Rc::new(drafter);
             let planes=drafter.window_planes(0)?.iter().map(|plane| plane.bytes).collect();
-            let marks=WindowSnapshots::new(&head_stream,planes,native.marks.max(1))?;
+            ensure!(native.marks > 0,"MiniMax DSpark requires at least one exact prefix mark");
+            let marks=WindowSnapshots::new(&head_stream,planes,native.marks)?;
             ensure!(marks.mark_bytes() == native.mark_bytes,"MiniMax draft mark extent differs from admission");
             let prefix=Rc::new(super::prefix::DraftPrefix { drafter,marks,
                 frontiers:RefCell::new(vec![0;inputs.sequences as usize]),slots:native.marks });
