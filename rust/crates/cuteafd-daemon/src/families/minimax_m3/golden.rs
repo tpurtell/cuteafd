@@ -27,6 +27,8 @@ pub(crate) struct GoldenArgs {
     #[arg(long)] golden: PathBuf,
     /// New directory for shared scoring probes and fidelity.json.
     #[arg(long)] save_logits: PathBuf,
+    /// Also write scored raw FP32 rows to WINDOW.raw-logits.bin (not log-probs).
+    #[arg(long)] raw_logits: bool,
     #[arg(long)] window: Option<String>,
     /// Diagnostic residual/branch taps beneath save-logits; requires selected windows.
     #[arg(long, value_delimiter = ',', num_args = 1..)] tap_layers: Vec<usize>,
@@ -53,6 +55,22 @@ pub(crate) struct GoldenArgs {
 fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 
 const EMBEDDING_UPLOAD: &str = "minimax.unit.0.0.route_ids.upload";
+
+struct RawLogits(std::io::BufWriter<std::fs::File>, Vec<usize>);
+impl RawLogits {
+    fn create(args: &GoldenArgs, window: &Window) -> Result<Option<Self>> {
+        args.raw_logits.then(|| Ok(Self(std::io::BufWriter::new(std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(args.save_logits.join(format!("{}.raw-logits.bin", window.id)))?),
+            window.positions.iter().map(|row| row.pos).collect()))).transpose()
+    }
+    fn row(&mut self, position: usize, logits: &[f32]) -> Result<()> {
+        use std::io::Write;
+        if self.1.contains(&position) {
+            for value in logits { self.0.write_all(&value.to_le_bytes())?; }
+        }
+        Ok(())
+    }
+}
 
 fn reference(root: &Path, id: Option<&str>, vocab: usize) -> Result<Vec<Window>> {
     let bytes = std::fs::read(root.join("manifest.json"))?;
@@ -314,7 +332,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         context_tokens: u64::from(tokens), pool_tokens: Some(u64::from(tokens).div_ceil(64) * 64), sequences: 1,
         host, host_cache_bytes: Some(0), prefix_entries: 1, replies: Default::default(),
         head: crate::shared::target_head::TargetHead::configured().blas_head(true), expert_usage: false,
-        resident_weight_limit: ResidentWeights::default() };
+        resident_weight_limit: ResidentWeights::DEFAULT_LIMIT };
     let planned = gather(&fact_request(Coordinator::Planned { cards: devices.iter().map(|_| {
         cuteafd_loader::placement::CoordinatorCard { physical_bytes: 96 << 30, logical_bytes: 96 << 30 }
     }).collect() })).map_err(|error| anyhow::anyhow!("{}; {}", error.what, error.how))?;
@@ -391,6 +409,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
     for (identity, window) in windows.into_iter().enumerate() {
         let count = window.tokens.len() - 1;
         let dump = args.save_logits.join(&window.id);
+        let mut raw = RawLogits::create(&args, &window)?;
         let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
             prompt_ids: Some(window.tokens.clone()), score_from: Some(window.score_from),
             score_positions: Some(window.positions.iter().map(|position| position.pos).collect()),
@@ -410,7 +429,10 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
             let values = logits.to_host(&library)?;
             for (row, logits) in values.chunks_exact(cfg.vocab_size).enumerate() {
                 let position = positions.start + row + 1;
-                if position >= window.score_from { probe.row(position, logits); }
+                if position >= window.score_from {
+                    if let Some(raw) = &mut raw { raw.row(position, logits)?; }
+                    probe.row(position, logits);
+                }
             }
             Ok(())
         })?;
@@ -418,7 +440,9 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
             let request = [ServingRequest { identity: identity as u64 + 1, kind: cuteafd_transport::ExpertV2SourceKind::Decode,
                 placement: &mut placement, start: position, tokens: &window.tokens[position..position + 1], heads: position..position + 1 }];
             let logits = execution.decode(&owners.storage, &cfg, &schedule, &request)?;
-            probe.row(position + 1, &logits.to_host(&library)?);
+            let values = logits.to_host(&library)?;
+            if let Some(raw) = &mut raw { raw.row(position + 1, &values)?; }
+            probe.row(position + 1, &values);
             placement.len = position + 1;
         }
         let record = probe.record();
@@ -460,6 +484,7 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
     for window in windows {
         let count = window.tokens.len() - 1;
         let dump = args.save_logits.join(&window.id);
+        let mut raw = RawLogits::create(&args, &window)?;
         let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
             prompt_ids: Some(window.tokens.clone()), score_from: Some(window.score_from),
             score_positions: Some(window.positions.iter().map(|position| position.pos).collect()),
@@ -504,7 +529,10 @@ fn score<'a>(args: &GoldenArgs, view: &CheckpointView, cfg: &MiniMaxM3Config,
             if let Some(taps) = &mut taps { taps.final_norm(head, first, rows)?; }
             for (row, logits) in logits.chunks_exact(cfg.vocab_size).enumerate() {
                 let position = first + row + 1;
-                if position >= window.score_from { probe.row(position, logits); }
+                if position >= window.score_from {
+                    if let Some(raw) = &mut raw { raw.row(position, logits)?; }
+                    probe.row(position, logits);
+                }
             }
             probe.scored_prefill_chunk(first + 1, rows);
         }

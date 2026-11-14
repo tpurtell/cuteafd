@@ -199,6 +199,10 @@ impl<'a> Dispatcher<'a> {
     }
     pub(crate) fn begin<'t>(&self, layer: usize, rows: &'t RoutedRows<'a>,
         identities: DispatchRows) -> Result<Ticket<'t, 'a>> {
+        self.begin_guarded(layer, rows, identities, || {})
+    }
+    pub(crate) fn begin_guarded<'t>(&self, layer: usize, rows: &'t RoutedRows<'a>,
+        identities: DispatchRows, abort: impl FnOnce()) -> Result<Ticket<'t, 'a>> {
         identities.validate(rows.rows)?;
         let id = {
             let mut inner = self.inner.borrow_mut();
@@ -222,7 +226,10 @@ impl<'a> Dispatcher<'a> {
             id
         };
         let mut ticket = Ticket { inner: self.inner.clone(), rows, id, complete: false };
-        ticket.enqueue(layer, identities)?;
+        if let Err(error) = ticket.enqueue(layer, identities) {
+            abort();
+            return Err(error);
+        }
         Ok(ticket)
     }
 }
@@ -335,14 +342,19 @@ impl Ticket<'_, '_> {
     }
     /// An out-of-order request is retained until earlier tickets land. Its
     /// join returns NotLanded in the meantime; no CUDA wait is queued early.
-    pub(crate) fn land(mut self) -> Result<()> {
-        {
+    pub(crate) fn land(self) -> Result<()> { self.land_guarded(|| {}) }
+    pub(crate) fn land_guarded(mut self, abort: impl FnOnce()) -> Result<()> {
+        let result = (|| {
             let mut inner = self.inner.borrow_mut();
             ensure!(!inner.terminal, DispatchError::Terminal);
             inner.pending.iter_mut().find(|pending| pending.id == self.id)
                 .context("MiniMax routed ticket no longer pending")?.land = true;
             let device = self.rows.stream.device;
-            device.run(|| inner.flush())?;
+            device.run(|| inner.flush())
+        })();
+        if let Err(error) = result {
+            abort();
+            return Err(error);
         }
         self.complete = true;
         Ok(())

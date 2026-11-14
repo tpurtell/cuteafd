@@ -152,7 +152,11 @@ The peer diagnostic requires explicit `--wire bf16|fp32`; omitting it refuses,
 and it does not select a serving default or qualify that precision. `--decode`
 uses real one-row serving decode after the prompt instead of scoring all rows
 through serving prefill. Without `--split-device`, the existing one-GPU Whole
-cold golden is unchanged. Split prefill/decode currently serialize on each
+cold golden is unchanged. Existing `--save-logits` probes contain normalized
+log-probabilities; optional MiniMax-only `--raw-logits` additionally writes each
+window's scored raw FP32 rows to `WINDOW.raw-logits.bin` for absolute-logit
+comparison (positions follow the immutable reference's scored-row order).
+Split prefill/decode currently serialize on each
 rank's one compute/HopLink stream; slot buffers remain independent.
 MiniMax's explicit `minimax-generated-aggregate` family scoring policy (#1779,
 TJ 2026-11-13) qualifies the aggregate generated rows at the expert-bpw tier:

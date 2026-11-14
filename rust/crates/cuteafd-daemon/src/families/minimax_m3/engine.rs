@@ -214,7 +214,7 @@ impl<'a> SplitExecution<'a> {
         Ok(())
     }
 
-    fn cancel(&self) -> Result<()> {
+    fn publish_abort(&self) -> Result<()> {
         self.terminal.set(true);
         // Never publish behind a possibly blocked compute wait. The independent
         // retained streams have no dependency on either rank's compute stream.
@@ -231,8 +231,13 @@ impl<'a> SplitExecution<'a> {
             }).and_then(|()| stream.drain());
             if first_error.is_none() { first_error = result.err(); }
         }
+        match first_error { Some(error) => Err(error), None => Ok(()) }
+    }
+
+    fn cancel(&self) -> Result<()> {
+        let aborted = self.publish_abort();
         let drained = drain_split_pair(|gpu| self.compute_streams[gpu].drain());
-        match first_error { Some(error) => Err(error), None => drained }
+        aborted.and(drained)
     }
 
     fn owner(&self, layer: usize) -> Result<usize> {
@@ -423,6 +428,7 @@ trait SlotArithmetic {
     fn join(&mut self, unit: &Unit) -> Result<()>;
     fn head(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()>;
     fn commit(&mut self, unit: &Unit, requests: &mut [ServingRequest<'_>]) -> Result<()>;
+    fn abort_split(&self) {}
 }
 
 struct NativeSlots<'s, 'a, F> {
@@ -432,6 +438,11 @@ struct NativeSlots<'s, 'a, F> {
     publish: bool,
 }
 impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic for NativeSlots<'_, '_, F> {
+    fn abort_split(&self) {
+        if let Some(split) = &self.storage.split {
+            crate::shared::decode_graph::fatal_drain(split.publish_abort(), "MiniMax split hook before ticket retirement");
+        }
+    }
     fn begin(&mut self, unit: &Unit, requests: &[ServingRequest<'_>]) -> Result<()> {
         let mut state = self.storage.requests.borrow_mut();
         if self.storage.split.is_some() {
@@ -542,6 +553,11 @@ pub(crate) struct RoutedBinding {
     pub route: FfnRoute,
 }
 
+fn abort_hook_error<T>(arithmetic: &impl SlotArithmetic, result: Result<T>) -> Result<T> {
+    if result.is_err() { arithmetic.abort_split(); }
+    result
+}
+
 struct ServingHooks<'s, 'p, 't, 'a, A> {
     arithmetic: &'s mut A,
     sources: &'t [RoutedRows<'a>],
@@ -556,32 +572,53 @@ impl<'t, 'a, A: SlotArithmetic> PrefillHooks for ServingHooks<'_, '_, 't, 'a, A>
     fn route(&self, layer: usize) -> FfnRoute {
         self.bindings[layer].map_or(FfnRoute::Local, |binding| binding.route)
     }
-    fn begin_unit(&mut self, unit: &Unit) -> Result<()> { self.arithmetic.begin(unit, self.requests) }
-    fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> { self.arithmetic.attention(layer, unit) }
+    fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
+        let result = self.arithmetic.begin(unit, self.requests);
+        abort_hook_error(self.arithmetic, result)
+    }
+    fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+        let result = self.arithmetic.attention(layer, unit);
+        abort_hook_error(self.arithmetic, result)
+    }
     fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         if self.bindings[layer].is_some() {
             let ticket = self.send_experts(layer, unit)?;
             self.land_experts(layer, unit, ticket)
-        } else { self.arithmetic.ffn(layer, unit, false) }
+        } else {
+            let result = self.arithmetic.ffn(layer, unit, false);
+            abort_hook_error(self.arithmetic, result)
+        }
     }
     fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Self::Ticket> {
-        self.arithmetic.router(layer, unit)?;
-        let identity = *self.next_identity;
-        *self.next_identity = identity.checked_add(1).context("MiniMax packed dispatch identity exhausted")?;
-        let identities = dispatch_rows(unit, self.requests, identity, self.version)?;
-        let source: &'t RoutedRows<'a> = &self.sources[unit.index];
-        let dispatcher = &self.dispatchers[self.bindings[layer].context("MiniMax routed layer has no owner")?.dispatcher];
-        let ticket = dispatcher.begin(layer, source, identities)?;
-        // Dispatcher stages the normalized activation before shared FFN reuses it.
-        self.arithmetic.ffn(layer, unit, true)?;
+        let setup = (|| {
+            self.arithmetic.router(layer, unit)?;
+            let identity = *self.next_identity;
+            *self.next_identity = identity.checked_add(1).context("MiniMax packed dispatch identity exhausted")?;
+            let identities = dispatch_rows(unit, self.requests, identity, self.version)?;
+            let source: &'t RoutedRows<'a> = &self.sources[unit.index];
+            let dispatcher = &self.dispatchers[self.bindings[layer].context("MiniMax routed layer has no owner")?.dispatcher];
+            dispatcher.begin_guarded(layer, source, identities, || self.arithmetic.abort_split())
+        })();
+        let ticket = abort_hook_error(self.arithmetic, setup)?;
+        // Abort before this draining ticket drops, not after the shared driver
+        // unwinds its outstanding-ticket vector.
+        let result = self.arithmetic.ffn(layer, unit, true);
+        abort_hook_error(self.arithmetic, result)?;
         Ok(ticket)
     }
     fn land_experts(&mut self, _: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
-        ticket.land()?;
-        self.arithmetic.join(unit)
+        ticket.land_guarded(|| self.arithmetic.abort_split())?;
+        let result = self.arithmetic.join(unit);
+        abort_hook_error(self.arithmetic, result)
     }
-    fn end_unit(&mut self, unit: &Unit) -> Result<()> { self.arithmetic.head(unit, self.requests) }
-    fn commit_unit(&mut self, unit: &Unit) -> Result<()> { self.arithmetic.commit(unit, self.requests) }
+    fn end_unit(&mut self, unit: &Unit) -> Result<()> {
+        let result = self.arithmetic.head(unit, self.requests);
+        abort_hook_error(self.arithmetic, result)
+    }
+    fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
+        let result = self.arithmetic.commit(unit, self.requests);
+        abort_hook_error(self.arithmetic, result)
+    }
 }
 
 fn decode_section(captured: bool, bucket: usize, live: usize,
@@ -850,15 +887,22 @@ impl<'a> ServingPrefill<'a> {
                             row_id: row as u64, source_kind: request.kind, source_request_id: request.identity,
                             token_position: request.start as u64, route_offset: (row * 4) as u32, route_count: 4,
                         }).collect() };
-                    Some(self.dispatchers[binding.dispatcher].begin(layer, &source, dispatch)?)
+                    Some(self.dispatchers[binding.dispatcher].begin_guarded(layer, &source, dispatch,
+                        || crate::shared::decode_graph::fatal_drain(split.publish_abort(), "MiniMax split decode begin before ticket drop"))?)
                 } else { None };
                 let shared = ticket.is_some();
                 {
                     let mut a = storage.ranks[0].decode.borrow_mut();
                     let mut b = storage.ranks[1].decode.borrow_mut();
-                    split.stage(storage, [&mut a, &mut b], layer, rows, shared)?;
+                    if let Err(error) = split.stage(storage, [&mut a, &mut b], layer, rows, shared) {
+                        crate::shared::decode_graph::fatal_drain(split.publish_abort(), "MiniMax split decode stage before ticket drop");
+                        return Err(error);
+                    }
                 }
-                if let Some(ticket) = ticket { ticket.land()?; }
+                if let Some(ticket) = ticket {
+                    ticket.land_guarded(|| crate::shared::decode_graph::fatal_drain(split.publish_abort(),
+                        "MiniMax split decode land before ticket drop"))?;
+                }
                 {
                     let a = storage.ranks[0].decode.borrow();
                     let b = storage.ranks[1].decode.borrow();
@@ -1273,6 +1317,61 @@ mod tests {
                 assert_eq!(layout.events(), 2, "no extra transport event allocation");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn hook_error_publishes_split_abort_before_draining_ticket_drop() -> Result<()> {
+        struct FaultSlots<'a> { abort: Allocation<'a>, stream: Rc<Stream<'a>> }
+        impl SlotArithmetic for FaultSlots<'_> {
+            fn begin(&mut self, _: &Unit, _: &[ServingRequest<'_>]) -> Result<()> { Ok(()) }
+            fn attention(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn router(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn ffn(&mut self, _: usize, _: &Unit, _: bool) -> Result<()> { anyhow::bail!("injected mid-unit hook error") }
+            fn join(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+            fn head(&mut self, _: &Unit, _: &[ServingRequest<'_>]) -> Result<()> { Ok(()) }
+            fn commit(&mut self, _: &Unit, _: &mut [ServingRequest<'_>]) -> Result<()> { Ok(()) }
+            fn abort_split(&self) {
+                self.stream.device.run(|| {
+                    // SAFETY: test-owned word and independent abort stream.
+                    unsafe { self.stream.device.library.peer_abort_publish(self.abort.buffer.ptr.cast(), self.stream.raw)?; }
+                    Ok(())
+                }).unwrap();
+                self.stream.drain().unwrap();
+            }
+        }
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.peer_ordering_model(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let stream = Rc::new(Stream::new(device)?);
+        let slot = ModelSlot::new(device, 1)?;
+        let source = slot.source(Rc::clone(&stream), 1)?;
+        let calls = Rc::new(Cell::new(0));
+        let dispatcher = Dispatcher::whole(Box::new(ModelExperts { output: Allocation::new(device,
+            6144 * 2, Tag::workspace("minimax/test/fault-output"))?, calls }))?;
+        let mut arithmetic = FaultSlots { abort: Allocation::new(device, 256,
+            Tag::workspace("minimax/test/fault-abort"))?, stream: Rc::new(Stream::new(device)?) };
+        device.run(|| library.cuda_zero_bytes(arithmetic.abort.buffer, 256))?;
+        fixture.peer_stream_fault(&library, stream.raw)?;
+        let mut placement = Placement { units: vec![0], slot: 0, len: 0 };
+        let mut requests = [ServingRequest { identity: 1, kind: ExpertV2SourceKind::Prefill,
+            placement: &mut placement, start: 0, tokens: &[7], heads: 0..1 }];
+        let unit = Unit { index: 0, sequence: 0, segments: vec![UnitSegment { sequence: 0,
+            rows: 0..1, tokens: 0..1, prompt_end: false, snapshot: false, head: true }],
+            rows: 0..1, layers: 1..2, slot: 0, barrier: false };
+        let mut identity = 1;
+        let first = fixture.events()?.len();
+        let result = run_prefill_units(&mut ServingHooks { arithmetic: &mut arithmetic,
+            sources: &[source], dispatchers: &[dispatcher], bindings: &[None,
+                Some(RoutedBinding { dispatcher: 0, route: FfnRoute::Spark })],
+            requests: &mut requests, next_identity: &mut identity, version: 23 }, &[unit], 1);
+        assert!(result.unwrap_err().to_string().contains("injected mid-unit"));
+        let trace = fixture.events()?;
+        let trace = &trace[first..];
+        assert!(trace.find('a').unwrap() < trace.find('s').unwrap(), "abort before ticket drain: {trace}");
+        assert!(!trace.contains('w'), "no unmatched peer wait may be invented: {trace}");
+        fixture.peer_stream_fault(&library, std::ptr::null_mut())?;
         Ok(())
     }
 
