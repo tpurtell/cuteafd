@@ -8,7 +8,7 @@ use super::{
 };
 use crate::shared::{
     memory::{device::{Allocation, Device}, Tag},
-    golden_scores::{select_scored_rows, scored_nll, scored_kl},
+    golden_scores::scored_nll,
     placement::{spark_rings, SparkAdmission},
     spark_intake::SparkLink,
 };
@@ -147,7 +147,7 @@ fn write_f32(path: PathBuf, values: &[f32], rows: usize, width: usize) -> Result
 fn save_diagnostics(
     args: &GoldenArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
     tokens: &[u32], positions: &[usize], vocab: usize,
-    logits: &[f32], normalized: Option<&[f32]>,
+    logits: Option<&[f32]>, normalized: Option<&[f32]>,
     mut residual: impl FnMut(usize) -> Result<Vec<f32>>,
 ) -> Result<()> {
     diagnostic_selection(args)?;
@@ -163,7 +163,12 @@ fn save_diagnostics(
         std::fs::create_dir_all(dir)?;
         let meta = dir.join("logits.meta.json");
         if meta.exists() { std::fs::remove_file(&meta)?; }
-        write_f32(dir.join("logits.bin"), logits, tokens.len(), vocab)?;
+        if let Some(logits) = logits {
+            write_f32(dir.join("logits.bin"), logits, tokens.len(), vocab)?;
+        } else {
+            ensure!(std::fs::metadata(dir.join("logits.bin"))?.len() == (tokens.len() * vocab * 4) as u64,
+                "streamed Step-5 diagnostic logits incomplete");
+        }
         std::fs::write(dir.join("tokens.bin"), &token_bytes)?;
         std::fs::write(meta, serde_json::to_vec_pretty(&serde_json::json!({
             "schema": "cuteafd.step5.logits/1", "checkpoint": identity,
@@ -294,6 +299,7 @@ pub(super) fn reference_identity(meta: &Value, fp8_diagnostic: bool) -> Result<(
 struct Reference {
     tokens: Vec<u32>,
     expected: Vec<f32>,
+    logits: Option<crate::shared::golden_scores::ReferenceRows>,
     positions: Vec<usize>,
     hidden: Vec<(usize, Vec<f32>)>,
     final_norm: Option<Vec<f32>>,
@@ -349,7 +355,7 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
         ensure!((2..=4096).contains(&rows) && rows <= tokens.len(), "token-only NLL requires 2..4096 rows");
         ensure!(tokens.iter().all(|&t| (t as usize) < vocab), "reference token outside vocabulary");
         tokens.truncate(rows);
-        return Ok(Reference { positions: (1..rows).collect(), tokens, expected: vec![], hidden: vec![], final_norm: None });
+        return Ok(Reference { positions: (1..rows).collect(), tokens, expected: vec![], logits: None, hidden: vec![], final_norm: None });
     }
     let window = args.window.as_deref().context("--window required for pinned reference")?;
     ensure!(
@@ -417,6 +423,7 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
                 "tail diagnostic payload digest differs: {file}");
         }
     }
+    let mut logits = None;
     let (expected, positions) = if args.dump_layer0.is_some() {
         (vec![], vec![])
     } else if args.nll {
@@ -426,19 +433,19 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
             .collect::<Result<Vec<_>>>()?;
         ensure!(!positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
             && positions.windows(2).all(|p| p[0] < p[1]), "invalid scored positions");
-        let bytes = std::fs::read(folder.join("logits.bin"))?;
-        ensure!(bytes.len() == positions.len().checked_mul(vocab).and_then(|n| n.checked_mul(4))
-            .context("reference logit extent overflow")?, "reference scored logit extent");
+        let reference = crate::shared::golden_scores::ReferenceRows::open(
+            &folder.join("logits.bin"), positions.len(), vocab, false)?.unwrap();
         let scored = positions.partition_point(|&p| p < rows);
         ensure!(scored > 0, "selected prefix has no scored reference positions");
-        (bytes[..scored * vocab * 4].chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>(), positions[..scored].to_vec())
+        for row in 0..scored { reference.row(row)?; }
+        logits = Some(reference);
+        (vec![], positions[..scored].to_vec())
     } else {
         (hidden_reference(&folder, args.last_layer, tokens.len(), rows)?, vec![])
     };
     ensure!(expected.iter().all(|v| v.is_finite()), "nonfinite reference payload");
     tokens.truncate(rows);
-    Ok(Reference { tokens, expected, positions, hidden, final_norm })
+    Ok(Reference { tokens, expected, logits, positions, hidden, final_norm })
 }
 
 fn embedding_rows(checkpoint: &Checkpoint, tokens: &[u32], vocab: usize) -> Result<Vec<u8>> {
@@ -1035,26 +1042,24 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         }
         let (_, output) = execution.terminal_output()?;
         ensure!(output.device_id == devices[head_rank].id, "Step-5 shared final head owner");
-        let actual = head.logits(output)?;
+        let metrics = score_head(head, output, args, &reference.tokens, &reference.positions,
+            cfg.vocab, reference.logits.as_ref())?;
         let normalized = (args.dump_residuals.is_some() || reference.final_norm.is_some())
             .then(|| head.normalized()).transpose()?;
         save_diagnostics(args, checkpoint.view.as_ref().context("Step-5 golden requires its selected checkpoint view")?,
             &reference.tokens, &reference.positions, cfg.vocab,
-            &actual, normalized.as_deref(), |layer| execution.diagnostic_output(layer))?;
+            None, normalized.as_deref(), |layer| execution.diagnostic_output(layer))?;
         if let Some(expected) = &reference.final_norm {
             let (cosine, relative_l2) = hidden_metrics(normalized.as_deref().context("final norm inspection")?, &expected)?;
             println!("Step-5 shared hidden rows={rows} layer=final_norm cosine={cosine:.9} relative_l2={relative_l2:.9}");
         }
-        let ours = select_scored_rows(&actual, &reference.positions, cfg.vocab)?;
-        let targets = reference.positions.iter().map(|&p| reference.tokens[p]).collect::<Vec<_>>();
-        let nll = scored_nll(&ours, &targets, cfg.vocab)?;
-        ensure!(actual.iter().all(|v| v.is_finite()), "nonfinite Step-5 logits");
-        if reference.expected.is_empty() {
-            println!("Step-5 shared token-only rows={rows} scored={} engine_nll={nll:.12} (self-comparison only; no reference qualification)", targets.len());
+        let nll = metrics.nll / metrics.rows as f64;
+        if reference.logits.is_none() {
+            println!("Step-5 shared token-only rows={rows} scored={} engine_nll={nll:.12} (self-comparison only; no reference qualification)", metrics.rows);
         } else {
-            let reference_nll = scored_nll(&reference.expected, &targets, cfg.vocab)?;
-            let (kl, max_kl) = scored_kl(&reference.expected, &ours, cfg.vocab)?;
-            println!("Step-5 shared complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (no serving/lossless/cache qualification)", targets.len(), nll-reference_nll);
+            let reference_nll = metrics.reference_nll / metrics.rows as f64;
+            let (kl, max_kl) = (metrics.kl / metrics.rows as f64, metrics.max_kl);
+            println!("Step-5 shared complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (no serving/lossless/cache qualification)", metrics.rows, nll-reference_nll);
             // Engine-only stop bars do not measure quantization error against the BF16 root.
             if args.fp8_diagnostic_reference {
                 shared_diagnostic_verdict(nll, reference_nll, kl, max_kl)?;
@@ -1063,6 +1068,45 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     }
     pool.borrow_mut().release(&family, &placement.pages)?;
     Ok(())
+}
+
+fn score_head(head: &TargetHeadOwner<'_>, output: cuteafd_ffi::CuteafdDeviceBuffer,
+    args: &GoldenArgs, tokens: &[u32], positions: &[usize], vocab: usize,
+    reference: Option<&crate::shared::golden_scores::ReferenceRows>)
+    -> Result<crate::shared::golden_scores::DenseRowMetrics> {
+    use std::io::Write;
+    let mut saved = args.save_logits.as_ref().map(|dir| -> Result<_> {
+        std::fs::create_dir_all(dir)?;
+        let meta = dir.join("logits.meta.json");
+        if meta.exists() { std::fs::remove_file(meta)?; }
+        Ok(std::io::BufWriter::new(std::fs::File::create(dir.join("logits.bin"))?))
+    }).transpose()?;
+    let mut raw = std::env::var_os("CUTEAFD_DUMP_PREFILL_LOGITS").map(|path|
+        std::fs::File::create(path).map(std::io::BufWriter::new)).transpose()?;
+    let mut metrics = crate::shared::golden_scores::DenseRowMetrics::default();
+    let mut rows = 0;
+    let consumer = crate::shared::probe::CallbackRows::new(|position, values: &[f32]| {
+        ensure!(position == rows && values.len() == vocab && values.iter().all(|v| v.is_finite()),
+            "Step-5 diagnostic row order/shape/finiteness differs");
+        for writer in [&mut saved, &mut raw].into_iter().flatten() {
+            for value in values { writer.write_all(&value.to_le_bytes())?; }
+        }
+        if let Ok(index) = positions.binary_search(&(position + 1)) {
+            if let Some(reference) = reference {
+                metrics.push(values, &reference.row(index)?, tokens[position + 1])?;
+            } else {
+                metrics.nll += scored_nll(values, &[tokens[position + 1]], vocab)?;
+                metrics.rows += 1;
+            }
+        }
+        rows += 1;
+        Ok(())
+    });
+    head.logits_consumer(output, crate::shared::probe::ScoringRows { consumer: &consumer, position: 0 })?;
+    drop(consumer);
+    ensure!(rows == tokens.len() && metrics.rows == positions.len(), "Step-5 diagnostic row coverage differs");
+    for writer in [&mut saved, &mut raw].into_iter().flatten() { writer.flush()?; }
+    Ok(metrics)
 }
 
 fn same_logit_bits(left: &[f32], right: &[f32]) -> bool {
@@ -1198,11 +1242,11 @@ fn run(args: GoldenArgs) -> Result<()> {
     let reference = if args.graph_oracle {
         ensure!(cfg.vocab > 0, "Step-5 graph oracle empty vocabulary");
         Reference { tokens: (0..128).map(|n| ((n * 7919 + 17) % cfg.vocab) as u32).collect(),
-            expected: vec![], positions: vec![], hidden: vec![], final_norm: None }
+            expected: vec![], logits: None, positions: vec![], hidden: vec![], final_norm: None }
     } else { reference(&args, cfg.vocab)? };
     if args.dump_layer0.is_some() { return layer0_run(&args, &checkpoint, &cfg, reference); }
     if args.split_device.is_some() { return split_run(&args, &checkpoint, &cfg, reference, &layers, &format); }
-    let Reference { tokens, expected, positions, hidden, final_norm } = reference;
+    let Reference { tokens, expected, logits: reference_logits, positions, hidden, final_norm } = reference;
     let reference_kind = if args.fp8_diagnostic_reference { "native-FP8 diagnostic" } else { "BF16-root diagnostic" };
     let rows = tokens.len();
     ensure!(!args.prefix_state || (args.nll && args.last_layer == 91),
@@ -1376,10 +1420,11 @@ fn run(args: GoldenArgs) -> Result<()> {
         println!("Step-5 hidden ladder rows={rows} layer={layer} cosine={cosine:.9} relative_l2={relative_l2:.9} reference={reference_kind}");
     }
     if let Some(head) = head {
-        let actual = head.logits(chain.output(91)?)?;
+        let metrics = score_head(&head, chain.output(91)?, &args, &tokens, &positions,
+            cfg.vocab, reference_logits.as_ref())?;
         let normalized = (args.dump_residuals.is_some() || final_norm.is_some())
             .then(|| head.normalized()).transpose()?;
-        save_diagnostics(&args, &view, &tokens, &positions, cfg.vocab, &actual,
+        save_diagnostics(&args, &view, &tokens, &positions, cfg.vocab, None,
             normalized.as_deref(), |layer| {
                 Ok(read_buffer(device, chain.output(layer)?)?.chunks_exact(4)
                     .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
@@ -1388,16 +1433,13 @@ fn run(args: GoldenArgs) -> Result<()> {
             let (cosine, relative_l2) = hidden_metrics(normalized.as_deref().context("final norm inspection")?, &expected)?;
             println!("Step-5 hidden ladder rows={rows} layer=final_norm cosine={cosine:.9} relative_l2={relative_l2:.9} reference={reference_kind}");
         }
-        let ours = select_scored_rows(&actual, &positions, cfg.vocab)?;
-        let targets = positions.iter().map(|&p| tokens[p]).collect::<Vec<_>>();
-        let nll = scored_nll(&ours, &targets, cfg.vocab)?;
-        ensure!(actual.iter().all(|v| v.is_finite()), "nonfinite Step-5 logits");
-        if expected.is_empty() {
-            println!("Step-5 token-only rows={rows} scored={} engine_nll={nll:.12} (self-comparison only; no reference qualification)", targets.len());
+        let nll = metrics.nll / metrics.rows as f64;
+        if reference_logits.is_none() {
+            println!("Step-5 token-only rows={rows} scored={} engine_nll={nll:.12} (self-comparison only; no reference qualification)", metrics.rows);
         } else {
-            let reference_nll = scored_nll(&expected, &targets, cfg.vocab)?;
-            let (kl, max_kl) = scored_kl(&expected, &ours, cfg.vocab)?;
-            println!("Step-5 complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (pinned {reference_kind}; no serving/lossless/cache qualification)", targets.len(), nll - reference_nll);
+            let reference_nll = metrics.reference_nll / metrics.rows as f64;
+            let (kl, max_kl) = (metrics.kl / metrics.rows as f64, metrics.max_kl);
+            println!("Step-5 complete target rows={rows} scored={} engine_nll={nll:.12} reference_nll={reference_nll:.12} delta_nll={:.12} mean_kl={kl:.12} max_kl={max_kl:.12} (pinned {reference_kind}; no serving/lossless/cache qualification)", metrics.rows, nll - reference_nll);
         }
         return Ok(());
     }
@@ -1419,6 +1461,7 @@ fn run(args: GoldenArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::golden_scores::select_scored_rows;
     fn diagnostic_args(flags: &[&str]) -> Result<GoldenArgs> {
         use clap::Parser;
         let cli = crate::cli::Cli::try_parse_from([
@@ -1620,7 +1663,7 @@ mod tests {
             let logits = [-0.0f32, 1., -2., 3., 4., 5., 6., 7., 8.];
             let norm = vec![0.5f32; tokens.len() * H];
             let mut requested = vec![];
-            save_diagnostics(&args, &view, &tokens, &positions, 3, &logits, Some(&norm), |layer| {
+            save_diagnostics(&args, &view, &tokens, &positions, 3, Some(&logits), Some(&norm), |layer| {
                 requested.push(layer);
                 Ok(vec![layer as f32; tokens.len() * H])
             })?;
@@ -1671,21 +1714,21 @@ mod tests {
         let norm = vec![1f32; 2 * H];
         for bad in [vec![1.; H], vec![f32::NAN; 2 * H], vec![f32::INFINITY; 2 * H]] {
             std::fs::write(root.path().join("meta.json"), b"stale")?;
-            assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, &[0.; 4], Some(&norm),
+            assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, Some(&[0.; 4]), Some(&norm),
                 |_| Ok(bad.clone())).is_err());
             assert!(!root.path().join("meta.json").exists());
         }
-        assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, &[0.; 4], None,
+        assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, Some(&[0.; 4]), None,
             |_| Ok(norm.clone())).is_err());
         for positions in [vec![], vec![0], vec![2], vec![1, 1]] {
-            assert!(save_diagnostics(&args, &view, &[0, 1], &positions, 2, &[0.; 4], Some(&norm),
+            assert!(save_diagnostics(&args, &view, &[0, 1], &positions, 2, Some(&[0.; 4]), Some(&norm),
                 |_| Ok(norm.clone())).is_err());
         }
         args.dump_residuals = None;
         args.dump_layers.clear();
         args.save_logits = Some(root.path().join("logits"));
         for bad in [vec![0.; 3], vec![f32::NAN; 4]] {
-            assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, &bad, None,
+            assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, Some(&bad), None,
                 |_| unreachable!()).is_err());
         }
         Ok(())
@@ -1905,7 +1948,9 @@ mod tests {
         assert_eq!(full.positions, [1, 3]);
         let targets = full.positions.iter().map(|&p| full.tokens[p]).collect::<Vec<_>>();
         assert_eq!(targets, [1, 2]);
-        assert!(scored_nll(&full.expected, &targets, 3)? < 0.02);
+        let expected = (0..full.positions.len()).map(|row| full.logits.as_ref().unwrap().row(row))
+            .collect::<Result<Vec<_>>>()?.concat();
+        assert!(scored_nll(&expected, &targets, 3)? < 0.02);
         std::fs::write(folder.join("layer03.bin"), vec![1f32; 4 * H].into_iter()
             .flat_map(f32::to_le_bytes).collect::<Vec<_>>())?;
         args.compare_layers = vec![3];
@@ -1922,7 +1967,7 @@ mod tests {
         args.prefill = Some(3);
         let partial = reference(&args, 3)?;
         assert_eq!(partial.positions, [1]);
-        assert_eq!(partial.expected, [0., 5., 0.]);
+        assert_eq!(partial.logits.as_ref().unwrap().row(0)?, [0., 5., 0.]);
         args.prefill = Some(1);
         assert!(reference(&args, 3).is_err());
         args.prefill = None;

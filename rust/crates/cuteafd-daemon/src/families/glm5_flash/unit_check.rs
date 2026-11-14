@@ -55,7 +55,6 @@ pub(crate) fn unit_bytes(engine: &GlmfEngine<'_>, placement: &GlmfPlacement) -> 
 /// Compare two shared-executor schedules with identical cuts, weights and fresh pages.
 pub(crate) fn unit_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> {
     ensure!(engine.weights.layers.len() == engine.cfg.layers, "--unit-check needs every layer");
-    ensure!(engine.full_prefill_logits, "--unit-check needs every prefill row's logits");
     ensure!(engine.prefill_waves >= 2, "--unit-check needs at least two admitted slots");
     let depth = engine.prefill_waves;
     let n = unit_check_rows(tokens.len(), engine.prefill_rows, depth, engine.max_context)?;
@@ -63,14 +62,30 @@ pub(crate) fn unit_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> 
     ensure!(cuts.len() > depth, "--unit-check must reuse an admitted slot");
     let mut allocator = Allocator::for_engine(engine);
     let (mut one, mut two) = (allocator.admit(n)?, allocator.admit(n)?);
+    let run = |placement: &mut GlmfPlacement, waves| -> Result<([u8; 32], usize)> {
+        use sha2::{Digest, Sha256};
+        let (mut digest, mut rows) = (Sha256::new(), 0);
+        let consumer = crate::shared::probe::CallbackRows::new(|position, values: &[f32]| {
+            ensure!(position == rows + 1 && values.len() == engine.cfg.vocab_size
+                && values.iter().all(|v| v.is_finite()), "unit golden row order/shape/finite mismatch");
+            for value in values { digest.update(value.to_le_bytes()); }
+            rows += 1;
+            Ok(())
+        });
+        engine.prefill_unit_width(placement, &tokens[..n], waves,
+            crate::shared::probe::ScoringRows { consumer: &consumer, position: 1 })?
+            .context("unit golden needs the head")?;
+        drop(consumer);
+        ensure!(rows == n, "unit golden row coverage differs");
+        Ok((digest.finalize().into(), rows))
+    };
     let started = std::time::Instant::now();
-    let one_logits = engine.prefill_unit_width(&mut one, &tokens[..n], 1)?.context("unit golden needs the head")?;
+    let one_logits = run(&mut one, 1)?;
     let one_seconds = started.elapsed().as_secs_f64();
     let started = std::time::Instant::now();
-    let two_logits = engine.prefill_unit_width(&mut two, &tokens[..n], depth)?.context("unit golden needs the head")?;
+    let two_logits = run(&mut two, depth)?;
     let two_seconds = started.elapsed().as_secs_f64();
-    let logits = one_logits.len() == two_logits.len()
-        && one_logits.iter().zip(&two_logits).all(|(a, b)| a.to_bits() == b.to_bits());
+    let logits = one_logits == two_logits;
     let state = engine.slot_state(one.slot)? == engine.slot_state(two.slot)?;
     let paged = unit_bytes(engine, &one)? == unit_bytes(engine, &two)?;
     let verdict = |same: bool| if same { "identical" } else { "DIFFER" };

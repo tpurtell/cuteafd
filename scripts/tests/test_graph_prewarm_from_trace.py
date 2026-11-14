@@ -2086,7 +2086,9 @@ def test_dense_qwen_engine_graph_lifetime_reconciliation_contract():
     assert "after > before" in graph
     golden = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/mod.rs").read_text()
     assert "published_reference(golden, cfg.hidden, cfg.vocab)?" in golden
-    assert 'if compact { Vec::new() }' in golden
+    assert 'let consumer = crate::shared::probe::CallbackRows::new(' in golden
+    assert 'reference.row(if reference_rows == tokens.len() { position } else { index })?' in golden
+    assert 'saved.write_all(&value.to_le_bytes())?' in golden
     assert "external top-1024 quality is qualified separately" in golden
     verify = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/verify.rs").read_text()
     assert "if self.graphs.enabled && plan.stride > 0" in verify

@@ -580,8 +580,20 @@ impl<'a> DenseEngine<'a> {
 
     /// Evaluate causal input rows and return FP32 next-token distributions.
     /// Layer hook sees ordinary post-block BF16 hidden rows, before final norm.
-    pub(crate) fn evaluate(&mut self, tokens: &[u32], mut hook: impl FnMut(usize, CuteafdDeviceBuffer) -> Result<()>)
+    pub(crate) fn evaluate(&mut self, tokens: &[u32], hook: impl FnMut(usize, CuteafdDeviceBuffer) -> Result<()>)
         -> Result<Vec<f32>> {
+        let mut output = Vec::new();
+        let consumer = crate::shared::probe::CallbackRows::new(|_, values: &[f32]| {
+            output.extend_from_slice(values);
+            Ok(())
+        });
+        self.evaluate_consumer(tokens, hook, crate::shared::probe::ScoringRows { consumer: &consumer, position: 0 })?;
+        Ok(output)
+    }
+
+    pub(crate) fn evaluate_consumer(&mut self, tokens: &[u32],
+        mut hook: impl FnMut(usize, CuteafdDeviceBuffer) -> Result<()>, scoring: crate::shared::probe::ScoringRows<'_>)
+        -> Result<()> {
         ensure!(!tokens.is_empty() && tokens.len() <= ROWS, "dense evaluation needs 1..4096 input rows");
         ensure!(self.healthy, "dense target cannot resume after a failed evaluation");
         ensure!(self.verification.pending.is_none(), "dense evaluation requires committed verify state");
@@ -604,22 +616,19 @@ impl<'a> DenseEngine<'a> {
         // SAFETY: live norm, weight and output extents match the admitted native geometry.
         unsafe { norm.launch(&[self.planes.residual.ptr, self.weights.norm.buffer.ptr, self.planes.norm.ptr],
             &[Scalar::I32(i32::try_from(tokens.len())?)], self.stream.raw)?; }
-        let mut output = Vec::with_capacity(tokens.len() * self.cfg.vocab);
         for first in (0..tokens.len()).step_by(HEAD_ROWS) {
             let rows = HEAD_ROWS.min(tokens.len() - first);
             let x = self.planes.norm.ptr.cast::<u8>().wrapping_add(first * self.cfg.hidden * 2);
             // SAFETY: head slices retain their normalized source and owned workspace until drain.
             unsafe { crate::shared::target_head::launch(TargetHead::configured(), &self.head, x.cast(),
                 self.weights.head.buffer.ptr, self.logits.buffer.ptr.cast(), rows, self.stream.raw)?; }
-            self.stream.drain()?;
-            let mut bytes = vec![0; rows * self.cfg.vocab * 4];
-            let byte_len = bytes.len();
-            self.stream.device.library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: byte_len, ..self.logits.buffer })?;
-            output.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+            let logits = DeviceLogits { ptr: self.logits.buffer.ptr, rows, vocab: self.cfg.vocab,
+                stride: self.cfg.vocab, stream: self.stream.raw, greedy: None };
+            scoring.record(self.stream.device.library, first, &logits)?;
         }
         self.position += tokens.len();
         self.slots[0].position = self.position;
         self.healthy = true;
-        Ok(output)
+        Ok(())
     }
 }

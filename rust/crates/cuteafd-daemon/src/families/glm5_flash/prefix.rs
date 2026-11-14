@@ -672,15 +672,23 @@ pub(crate) fn prefill_digest(engine: &GlmfEngine<'_>, placement: &mut GlmfPlacem
             rows.hash(&mut hashers[layer]);
             Ok(())
         };
-        let out = engine.prefill_forced(placement, part, Some(&mut on_layer), None, logits)?
-            .ok_or_else(|| anyhow::anyhow!("the resume check needs every layer"))?;
         if logits {
-            for values in out.chunks_exact(vocab) {
+            let consumer = crate::shared::probe::CallbackRows::new(|_position, values: &[f32]| {
+                ensure!(values.len() == vocab, "resume logits vocabulary differs");
                 values.iter().for_each(|v| v.to_bits().hash(&mut logit_hash));
                 argmax.push(values.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(i, _)| i));
-            }
-            bad += nonfinite(&out);
-            last = out[out.len() - vocab..].to_vec();
+                bad += nonfinite(values);
+                last.clear();
+                last.extend_from_slice(values);
+                Ok(())
+            });
+            let position = placement.len + 1;
+            engine.prefill_consumer(placement, part, Some(&mut on_layer), None, None,
+                crate::shared::probe::ScoringRows { consumer: &consumer, position })?
+                .ok_or_else(|| anyhow::anyhow!("the resume check needs every layer"))?;
+        } else {
+            engine.prefill_forced(placement, part, Some(&mut on_layer), None, false)?
+                .ok_or_else(|| anyhow::anyhow!("the resume check needs every layer"))?;
         }
     }
     Ok(SuffixRun { layers: hashers.iter().map(Hasher::finish).collect(), logits: logit_hash.finish(), argmax, last,
@@ -783,7 +791,6 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n
     cold: bool, repeat: usize, marks: PrefixMarks, poison: bool) -> Result<()> {
     use super::engine::Allocator;
     ensure!(engine.weights.layers.len() == engine.cfg.layers, "--resume-at needs every layer");
-    ensure!(engine.full_prefill_logits, "--resume-at needs every prefill row's logits");
     ensure!(at > 0 && at < n && n <= tokens.len(), "--resume-at {at} must lie inside the {n} prefilled tokens");
     ensure!(!poison || marks == PrefixMarks::Pool,
         "--resume-poison-unit0 needs --prefix-marks pool (unit 0 reserved, so nothing else reads or writes it)");

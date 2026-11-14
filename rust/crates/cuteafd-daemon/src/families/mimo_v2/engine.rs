@@ -1634,6 +1634,35 @@ impl<'a> MimoEngine<'a> {
         Ok((self.weights.layers.len() == self.cfg.layers).then_some(crate::shared::probe::ScoreLogits::Recorded))
     }
 
+    /// Preserve hook-driven single-unit execution for golden and resume diagnostics.
+    pub(crate) fn prefill_consumer(&self, placement: &mut MimoPlacement, tokens: &[u32],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, scoring: crate::shared::probe::ScoringRows<'_>)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        if on_layer.is_none() && forced.is_none() {
+            let (t, start) = (tokens.len(), placement.len);
+            ensure!(t > 0 && t <= self.prefill_capacity() && start + t <= self.max_context,
+                "prefill of {t} rows at {start}");
+            self.submit(|| self.step_units_with(placement, tokens, false, None, Some(scoring)))?;
+            placement.len += t;
+            return Ok((self.weights.layers.len() == self.cfg.layers)
+                .then_some(crate::shared::probe::ScoreLogits::Recorded));
+        }
+        let (t, start) = (tokens.len(), placement.len);
+        ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context,
+            "teacher-forced prefill is one unit");
+        let tables = placement.prefill_tables(t, self.max_context)?;
+        self.submit(|| {
+            let output = self.step(&tables, tokens, 1, on_layer, forced, None)?;
+            if output.is_some() {
+                let workspace = self.workspace.borrow();
+                self.record_head(workspace.as_ref().context("MiMo scoring workspace")?, t, 0, scoring)?;
+            }
+            placement.len += t;
+            Ok(output.map(|_| crate::shared::probe::ScoreLogits::Recorded))
+        })
+    }
+
     /// A continuous span reuses unit slots without draining at a wave boundary.
     pub fn prefill_capacity(&self) -> usize { self.prefill_span_rows }
 

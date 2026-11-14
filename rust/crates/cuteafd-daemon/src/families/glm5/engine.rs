@@ -1336,15 +1336,23 @@ impl<'a> GlmEngine<'a> {
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         media: &cuteafd_engine::media::RequestMedia, scoring: crate::shared::probe::ScoringRows<'_>)
         -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        self.with_media(placement.len, tokens.len(), Some(media), ||
+            self.prefill_consumer(placement, tokens, experts, None, scoring))
+    }
+
+    pub(crate) fn prefill_consumer(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<Option<crate::shared::probe::ScoreLogits>> {
         crate::shared::experts::rtx::pair::submit(
             || self.require_live(), || {
                 crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM scoring shutdown");
                 Ok(())
-            }, || self.with_media(placement.len, tokens.len(), Some(media), || {
-                self.prefill_step_with(placement, tokens, experts, None, tokens.len(), Some(scoring))?;
+            }, || {
+                self.prefill_step_with(placement, tokens, experts, on_layer, tokens.len(), Some(scoring))?;
                 Ok((self.weights.layers.len() == self.cfg.layers)
                     .then_some(crate::shared::probe::ScoreLogits::Recorded))
-            }))
+            })
     }
 
     fn record_head(&self, w: &Workspace<'_>, rows: usize, offset: usize,

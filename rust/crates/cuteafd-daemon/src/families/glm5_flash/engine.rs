@@ -3528,9 +3528,18 @@ impl<'a> GlmfEngine<'a> {
     pub(crate) fn prefill_streamed_scoring(&self, placement: &mut GlmfPlacement, tokens: &[u32],
         media: &cuteafd_engine::media::RequestMedia, scoring: crate::shared::probe::ScoringRows<'_>)
         -> Result<Option<crate::shared::probe::ScoreLogits>> {
-        let waves = if self.pipelined() { self.prefill_waves } else { 1 };
-        self.prefill_units_with(placement, tokens, true, false, Some(media), waves,
-            None, None, Some(scoring))?;
+        self.prefill_consumer(placement, tokens, None, None, Some(media), scoring)
+    }
+
+    /// Golden hooks keep the diagnostic executor width and transformer row cuts.
+    pub(crate) fn prefill_consumer(&self, placement: &mut GlmfPlacement, tokens: &[u32],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        let waves = if on_layer.is_some() || forced.is_some() || !self.pipelined() { 1 }
+            else { self.prefill_waves };
+        self.prefill_units_with(placement, tokens, true, false, media, waves,
+            on_layer, forced, Some(scoring))?;
         Ok((self.weights.layers.len() == self.cfg.layers).then_some(crate::shared::probe::ScoreLogits::Recorded))
     }
 
@@ -3549,11 +3558,11 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Compare executor widths without changing row cuts or numerical kernels.
-    pub(crate) fn prefill_unit_width(&self, placement: &mut GlmfPlacement, tokens: &[u32], waves: usize)
-        -> Result<Option<Vec<f32>>> {
+    pub(crate) fn prefill_unit_width(&self, placement: &mut GlmfPlacement, tokens: &[u32], waves: usize,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<Option<crate::shared::probe::ScoreLogits>> {
         ensure!(waves > 0 && waves <= self.prefill_waves, "unit width exceeds admitted slots");
-        self.prefill_units_with(placement, tokens, true, false, None, waves, None, None, None)?
-            .map(|logits| logits.into_host(self.library)).transpose()
+        self.prefill_units_with(placement, tokens, true, false, None, waves, None, None, Some(scoring))?;
+        Ok((self.weights.layers.len() == self.cfg.layers).then_some(crate::shared::probe::ScoreLogits::Recorded))
     }
 
     /// The rows of each lane a pipelined prefill of `tokens` rows runs in, in order.

@@ -2433,13 +2433,20 @@ impl<'a> Qwen4Engine<'a> {
             return Ok(self.prefill_device(placement, tokens, None, None, logit_rows)?
                 .map(crate::shared::probe::ScoreLogits::Device));
         }
-        ensure!(logit_rows <= tokens.len(), "Qwen scoring logits extent");
+        self.prefill_consumer(placement, tokens, None, None, logit_rows,
+            crate::shared::probe::ScoringRows { consumer: probe, position })
+    }
+
+    /// Preserve diagnostic layer hooks and transformer cuts while consuming bounded head tiles.
+    pub(crate) fn prefill_consumer(&self, placement: &mut Qwen4Placement, tokens: &[u32],
+        on_layer: LayerHook<'_>, forced: Forced<'_>, logit_rows: usize,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        ensure!(logit_rows > 0 && logit_rows <= tokens.len(), "Qwen scoring logits extent");
         crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
-            let scoring = crate::shared::probe::ScoringRows { consumer: probe, position };
-            if self.prefill_shape.is_some() {
+            if self.prefill_shape.is_some() && on_layer.is_none() && forced.is_none() {
                 if self.prefill_units_with(placement, tokens, logit_rows, Some(scoring))?.is_none() { return Ok(None); }
             } else {
-                if self.prefill_device(placement, tokens, None, None, 1)?.is_none() { return Ok(None); }
+                if self.prefill_device(placement, tokens, on_layer, forced, 1)?.is_none() { return Ok(None); }
                 let workspace = self.workspace.borrow();
                 let w = workspace.as_ref().context("Qwen scoring workspace")?;
                 let (_, cur) = self.last_streams.get();
