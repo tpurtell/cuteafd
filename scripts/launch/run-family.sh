@@ -1341,10 +1341,6 @@ if [[ "$family" == mistral_large4 ]]; then
     *) release_die "Mistral Large 4 attention placement is auto, layers, heads or context" ;;
   esac
 fi
-if [[ "$family" == minimax_m3 ]]; then
-  [[ -n "$wip_slot" || ( "$(get RTX_GPUS 1)" != 2 && "$(get COORDINATOR_GPUS)" != *,* ) ]] ||
-    release_die "MiniMax public two-RTX serving awaits qualification (#1856)"
-fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
   cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
 fi
