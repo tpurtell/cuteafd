@@ -12,6 +12,7 @@ mod graphs;
 mod engine;
 mod owners;
 mod backend;
+pub(crate) mod startup;
 pub(crate) mod admission;
 pub(crate) mod golden;
 

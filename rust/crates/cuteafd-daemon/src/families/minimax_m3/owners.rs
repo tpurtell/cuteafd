@@ -56,6 +56,12 @@ pub(crate) struct Owners<'a> {
 impl<'a> Owners<'a> {
     pub fn new(inputs: &MiniMaxInputs, admitted: &AdmittedMiniMax,
         programs: &'a Programs<'a>, loaded: Vec<LoadedRank<'a>>, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        Self::with_usage_reader(inputs, admitted, programs, loaded, embedding, Default::default())
+    }
+
+    pub fn with_usage_reader(inputs: &MiniMaxInputs, admitted: &AdmittedMiniMax,
+        programs: &'a Programs<'a>, loaded: Vec<LoadedRank<'a>>, embedding: TokenEmbedding<'a>,
+        usage_reader: cuteafd_core::expert_usage::Reader) -> Result<Self> {
         let capacity = inputs.request_capacity()?;
         let contract = inputs.prepare(&admitted.solved.request)?;
         ensure!(admitted.solved.pool_page_rows == contract.page_rows
@@ -146,7 +152,7 @@ impl<'a> Owners<'a> {
             let producers = inputs.usage_devices().into_iter()
                 .map(|gpu| Ok(UsageDevice { logical: gpu, cuda: devices[usize::from(gpu)] }))
                 .collect::<Result<Vec<_>>>()?;
-            ExpertUsage::new(library, geometry.clone(), &producers, Default::default())
+            ExpertUsage::new(library, geometry.clone(), &producers, usage_reader.clone())
         }).transpose()?;
         let storage = Rc::new(Storage { ranks, requests: RefCell::new(requests), prefix, head,
             embedding, usage, devices });
