@@ -684,6 +684,10 @@ impl Restores {
     }
 }
 
+fn quality_diagnostic_probe() -> ProbeSpec {
+    ProbeSpec { pair_exempt:true,..ProbeSpec::default() }
+}
+
 fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let Some(speculator) = run.info.configuration.speculator.clone() else {
         check.status = CheckStatus::Skipped;
@@ -694,7 +698,7 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let tag = nonce();
     let text = format!("[{tag}] {}", CONTENT[0].1);
     let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, record_rows: TOKENS as usize, top_k: 2,
-        ..ProbeSpec::default() };
+        ..quality_diagnostic_probe() };
     let on = run.client.chat(plain(run.client, &text, TOKENS), Some(spec(false)))?;
     let on_record = probe_of(&on)?;
     if !honoured(on_record) {
@@ -935,7 +939,7 @@ fn template(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let mut body = json!({"messages": messages(&question), "tools": tools, "max_tokens": 600, "temperature": 0,
         "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
         "thinking": {"type": "enabled"}, "reasoning_effort": "low"});
-    let first = run.client.chat(body.clone(), Some(ProbeSpec::default()))?;
+    let first = run.client.chat(body.clone(), Some(quality_diagnostic_probe()))?;
     let Some(call) = first.tool_calls.first().cloned() else {
         check.status = CheckStatus::Fail;
         check.summary = format!("no tool call in {} tokens (finish {})", first.timing.completion_tokens,
@@ -992,7 +996,7 @@ fn template(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
 
 fn c1_c4(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let text = format!("[{}] {}", nonce(), CONTENT[1].1);
-    let probe = || Some(ProbeSpec { cold: true, record_rows: 64, top_k: 2, ..ProbeSpec::default() });
+    let probe = || Some(ProbeSpec { cold: true, record_rows: 64, top_k: 2, ..quality_diagnostic_probe() });
     let one = run.client.chat(plain(run.client, &text, 64), probe())?;
     let client = run.client.clone();
     let four: Vec<Result<Chat>> = std::thread::scope(|scope| {
@@ -1054,6 +1058,24 @@ pub fn describe(timing: &StreamTiming) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quality_diagnostic_probes_are_exempt_from_matched_speed_prompts() {
+        let diagnostic=super::quality_diagnostic_probe();
+        assert!(diagnostic.pair_exempt);
+        for spec in [cuteafd_api::openai::probe::ProbeSpec { cold:true,no_speculation:true,
+                record_rows:128,top_k:2,..super::quality_diagnostic_probe() },
+            cuteafd_api::openai::probe::ProbeSpec { cold:true,record_rows:64,top_k:2,
+                ..super::quality_diagnostic_probe() }] {
+            assert!(spec.pair_exempt);
+        }
+        let source=include_str!("baseline.rs").split("#[cfg(test)]").next().unwrap();
+        for (start,end) in [("fn spec_lossless(","/// What replays"),("fn template(","fn c1_c4("),
+            ("fn c1_c4(","#[cfg(test)]")] {
+            let body=source.split(start).nth(1).unwrap().split(end).next().unwrap();
+            assert!(body.contains("quality_diagnostic_probe()"),"{start}");
+        }
+    }
+
     #[test]
     fn prefill_tail_sizing_failure_is_recorded_but_card_8k_stays_strict() {
         let mut card = crate::report::BasicCard::default();
