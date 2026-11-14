@@ -60,10 +60,14 @@ pub struct DsparkRotaryPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DsparkNorm { Rms, Gemma }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsparkResidual { Bf16, F32 }
+
 /// Arithmetic belongs to the checkpoint, independently of the draft lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DsparkBackbone {
     pub norm: DsparkNorm,
+    pub residual: DsparkResidual,
     pub rotary_dim: usize,
     pub activation: cuteafd_core::FfnActivation,
 }
@@ -102,11 +106,17 @@ impl DsparkBackbone {
             }
             _ => return Err(Unsupported("unsupported dSpark FFN activation".into())),
         }.validate().map_err(|error| Unsupported(error.into()))?;
-        Ok(Self { norm, rotary_dim, activation })
+        let residual = match raw["residual_dtype"].as_str() {
+            None if raw.get("residual_dtype").is_none() => DsparkResidual::Bf16,
+            Some("bfloat16") => DsparkResidual::Bf16,
+            Some("float32") => DsparkResidual::F32,
+            _ => return Err(Unsupported("invalid residual_dtype".into())),
+        };
+        Ok(Self { norm, residual, rotary_dim, activation })
     }
 
     pub fn is_qwen3(self, head_dim: usize) -> bool {
-        self.norm == DsparkNorm::Rms && self.rotary_dim == head_dim
+        self.norm == DsparkNorm::Rms && self.residual == DsparkResidual::Bf16 && self.rotary_dim == head_dim
             && self.activation == (cuteafd_core::FfnActivation::SiluBf16Product { limit: None })
     }
 }
@@ -211,9 +221,29 @@ impl DsparkRope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsparkDialect { Qwen3, MiniMax }
+
+impl DsparkDialect {
+    pub fn tensor(self, name: &str) -> String {
+        match self {
+            Self::Qwen3 => name.into(),
+            Self::MiniMax => {
+                let name = if name == "norm.weight" { "final_norm.weight" } else { name };
+                let name = if let Some(tail) = name.strip_prefix("layers.") {
+                    let (layer, suffix) = tail.split_once('.').expect("recipe layer suffix");
+                    format!("layers.{layer}.decoder_layer.{suffix}")
+                } else { name.into() };
+                format!("language_model.model.dspark.{name}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockDsparkConfig {
     pub backbone: DsparkBackbone,
+    pub dialect: DsparkDialect,
     pub hidden: usize,
     pub intermediate: usize,
     pub layers: usize,
@@ -250,6 +280,36 @@ struct Layers {
 }
 
 impl BlockDsparkConfig {
+    fn from_minimax(raw: &Value) -> Result<Self, DsparkConfigError> {
+        use DsparkConfigError::Unsupported;
+        let parsed = crate::families::minimax_m3::MiniMaxM3DsparkConfig::from_hf(raw)
+            .map_err(|error| Unsupported(error.to_string()))?;
+        let value = raw.get("text_config").unwrap_or(raw);
+        let integer = |key: &str| value[key].as_u64().filter(|&n| n > 0 && n <= 1 << 24)
+            .and_then(|n| usize::try_from(n).ok()).ok_or_else(|| Unsupported(format!("invalid {key}")));
+        let hidden = integer("hidden_size")?;
+        let heads = integer("num_attention_heads")?;
+        let kv_heads = integer("num_key_value_heads")?;
+        let head_dim = integer("head_dim")?;
+        let vocab = integer("vocab_size")?;
+        let eps = value["rms_norm_eps"].as_f64().filter(|n| n.is_finite() && *n > 0.)
+            .ok_or_else(|| Unsupported("invalid rms_norm_eps".into()))?;
+        let theta = value["rope_theta"].as_f64().ok_or_else(|| Unsupported("invalid rope_theta".into()))?;
+        let backbone = DsparkBackbone::from_layers(value, head_dim)?;
+        let rope = DsparkRope::Default { rope_theta: theta };
+        rope.plan(backbone.rotary_dim)?;
+        if heads % kv_heads != 0 || parsed.mask_token as usize >= vocab
+            || value["confidence_head_with_markov"] != true || !parsed.confidence_head
+            || value["use_qk_norm"] != true || value["qk_norm_type"] != "per_head"
+            || value["attention_output_gate"] != false || parsed.markov_rank != 256
+            || parsed.target_layers.iter().any(|&layer| layer >= value["dflash_config"]["num_target_layers"].as_u64().unwrap_or(0) as usize)
+        { return Err(Unsupported("invalid MiniMax draft geometry or arithmetic".into())); }
+        Ok(Self { backbone, dialect: DsparkDialect::MiniMax, hidden,
+            intermediate: parsed.ffn_intermediate, layers: parsed.layers, heads, kv_heads, head_dim,
+            eps, rope, block: parsed.block, mask_token: parsed.mask_token, rank: parsed.markov_rank,
+            taps: parsed.target_layers, vocab, window: Some(parsed.sliding_window), causal: false })
+    }
+
     /// Full layers share the target token budget; windowed layers keep their
     /// original slot-local rings. Both use the shared draft cache inventory.
     pub fn paged_cache_layout(&self, slots: usize, context: usize, target_tokens: usize,
@@ -283,6 +343,9 @@ impl BlockDsparkConfig {
 
     pub fn from_json(raw: &Value) -> Result<Self, DsparkConfigError> {
         use DsparkConfigError::Unsupported;
+        let minimax = raw["architectures"].as_array().is_some_and(|list|
+            list.iter().any(|name| name == "DSparkMiniMaxDraftModel"));
+        if minimax { return Self::from_minimax(raw); }
         let speculators = raw["speculators_model_type"] == "dspark";
         // Speculators also advertises DSparkDraftModel; its explicit dialect wins.
         let specforge = !speculators
@@ -393,6 +456,7 @@ impl BlockDsparkConfig {
         }
         Ok(Self {
             backbone,
+            dialect: DsparkDialect::Qwen3,
             hidden: t.hidden_size,
             intermediate: t.intermediate_size,
             layers: t.num_hidden_layers,
@@ -434,11 +498,55 @@ mod tests {
         }
         let raw: Value = serde_json::from_str(include_str!("../families/minimax_m3/fixtures/dspark-config.json")).unwrap();
         let descriptor = DsparkBackbone::from_layers(&raw["text_config"], 128).unwrap();
-        assert_eq!(descriptor, DsparkBackbone { norm: DsparkNorm::Gemma, rotary_dim: 64,
+        assert_eq!(descriptor, DsparkBackbone { norm: DsparkNorm::Gemma, residual: DsparkResidual::Bf16, rotary_dim: 64,
             activation: FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 } });
         assert!(!descriptor.is_qwen3(128));
-        // Parsing arithmetic does not claim that runtime bindings exist yet.
-        assert!(BlockDsparkConfig::from_json(&raw).is_err());
+        let config = BlockDsparkConfig::from_json(&raw).unwrap();
+        assert_eq!(config.dialect, DsparkDialect::MiniMax);
+        assert_eq!((config.hidden, config.intermediate, config.heads, config.kv_heads), (6144, 12288, 64, 4));
+        assert_eq!((config.block, config.window, config.causal), (7, Some(4096), false));
+        assert_eq!(config.taps, [3, 17, 31, 45, 59]);
+        assert_eq!(config.dialect.tensor("layers.2.self_attn.q_proj.weight"),
+            "language_model.model.dspark.layers.2.decoder_layer.self_attn.q_proj.weight");
+        assert_eq!(config.dialect.tensor("norm.weight"), "language_model.model.dspark.final_norm.weight");
+    }
+
+    #[test]
+    fn native_minimax_arena_follows_header_formats_without_requantization() {
+        let t = |name: &str, dtype: &str, shape: &[usize]| crate::SafetensorsTensorMetadata {
+            name: name.into(), dtype: cuteafd_core::DType::from_safetensors(dtype), shape: shape.to_vec(),
+            byte_offset: 0, byte_length: shape.iter().product::<usize>() as u64 * if dtype == "BF16" { 2 } else { 1 },
+        };
+        let raw: Value = serde_json::from_str(include_str!("../families/minimax_m3/fixtures/dspark-config.json")).unwrap();
+        let config = BlockDsparkConfig::from_json(&raw).unwrap();
+        let headers = std::cell::RefCell::new(std::collections::HashMap::new());
+        block_dspark_weight_recipe(&config, |name, shape| {
+            let header = t(name, "BF16", shape);
+            headers.borrow_mut().insert(name.to_owned(), header);
+            Ok::<_, ()>(())
+        }, |parts, columns| {
+            for &(name, rows) in parts {
+                let bf16 = name.ends_with("dspark.fc.weight");
+                let header = t(name, if bf16 { "BF16" } else { "F8_E4M3" }, &[rows, columns]);
+                headers.borrow_mut().insert(name.to_owned(), header);
+                if !bf16 {
+                    let scales = format!("{name}_scale_inv");
+                    headers.borrow_mut().insert(scales.clone(), t(&scales, "U8", &[rows, columns / 32]));
+                }
+            }
+            Ok(())
+        }).unwrap();
+        let mut headers = headers.into_inner();
+        let requests = native_arena_requests(&config, &headers).unwrap();
+        assert_eq!(requests.len(), 98);
+        let fc = "language_model.model.dspark.fc.weight";
+        assert!(requests.contains(&(fc.into(), 6144 * 30720 * 2)));
+        let query = "language_model.model.dspark.layers.0.decoder_layer.self_attn.q_proj.weight";
+        assert!(requests.contains(&(query.into(), 8192 * 6144)));
+        assert!(requests.contains(&(format!("{query}_scale_inv"), 8192 * 192)));
+        assert!(!requests.iter().any(|(name, _)| name.ends_with(".payload") || name.ends_with(".scales")));
+        headers.get_mut(&format!("{query}_scale_inv")).unwrap().dtype = cuteafd_core::DType::F32;
+        assert!(native_arena_requests(&config, &headers).is_err());
     }
 
     #[test]
@@ -783,8 +891,14 @@ pub struct BlockDsparkWeights<T, M> {
 /// The single recipe for runtime loading and admission: names, shapes and the
 /// order in which the loader requests each owner.
 pub fn block_dspark_weight_recipe<T, M, E>(cfg: &BlockDsparkConfig,
-    mut tensor: impl FnMut(&str, &[usize]) -> Result<T, E>,
-    mut matrix: impl FnMut(&[(&str, usize)], usize) -> Result<M, E>) -> Result<BlockDsparkWeights<T, M>, E> {
+    mut tensor_native: impl FnMut(&str, &[usize]) -> Result<T, E>,
+    mut matrix_native: impl FnMut(&[(&str, usize)], usize) -> Result<M, E>) -> Result<BlockDsparkWeights<T, M>, E> {
+    let mut tensor = |name: &str, shape: &[usize]| tensor_native(&cfg.dialect.tensor(name), shape);
+    let mut matrix = |parts: &[(&str, usize)], columns| {
+        let names = parts.iter().map(|(name, _)| cfg.dialect.tensor(name)).collect::<Vec<_>>();
+        let mapped = parts.iter().zip(&names).map(|((_, rows), name)| (name.as_str(), *rows)).collect::<Vec<_>>();
+        matrix_native(&mapped, columns)
+    };
     let (h, inter) = (cfg.hidden, cfg.intermediate);
     let (q, kv) = (cfg.heads * cfg.head_dim, cfg.kv_heads * cfg.head_dim);
     let layers = (0..cfg.layers).map(|l| -> Result<_, E> {
@@ -813,6 +927,52 @@ pub fn block_dspark_weight_recipe<T, M, E>(cfg: &BlockDsparkConfig,
     })
 }
 
+/// Native mixed-format operands remain in their own checkpoint encoding.
+fn native_arena_requests(cfg: &BlockDsparkConfig,
+    headers: &std::collections::HashMap<String, crate::SafetensorsTensorMetadata>)
+    -> anyhow::Result<Vec<(String, usize)>> {
+    use anyhow::{ensure, Context};
+    use cuteafd_core::DType;
+    let requests = std::cell::RefCell::new(Vec::new());
+    let tensor = |name: &str, shape: &[usize], dtype: DType, element_bytes: usize| -> anyhow::Result<usize> {
+        let header = headers.get(name).with_context(|| format!("drafter checkpoint has no {name}"))?;
+        let bytes = shape.iter().try_fold(element_bytes, |sum, &n| sum.checked_mul(n))
+            .context("native draft tensor extent overflow")?;
+        ensure!(header.dtype == dtype && header.shape == shape && header.byte_length == bytes as u64,
+            "native drafter {name}: {:?} {:?}, expected {dtype:?} {shape:?}", header.dtype, header.shape);
+        Ok(bytes)
+    };
+    block_dspark_weight_recipe(cfg, |name, shape| {
+        let bytes = tensor(name, shape, DType::Bf16, 2)?;
+        requests.borrow_mut().push((name.to_owned(), bytes.max(256)));
+        Ok::<_, anyhow::Error>(())
+    }, |parts, columns| {
+        for &(name, rows) in parts {
+            let header = headers.get(name).with_context(|| format!("drafter checkpoint has no {name}"))?;
+            match header.dtype {
+                DType::Bf16 => {
+                    let bytes = tensor(name, &[rows, columns], DType::Bf16, 2)?;
+                    requests.borrow_mut().push((name.to_owned(), bytes.max(256)));
+                }
+                DType::F8E4M3 => {
+                    ensure!(columns % 32 == 0, "native MXFP8 draft input must contain complete group32 scales");
+                    let bytes = tensor(name, &[rows, columns], DType::F8E4M3, 1)?;
+                    let scales = format!("{name}_scale_inv");
+                    let scale_bytes = tensor(&scales, &[rows, columns / 32], DType::U8, 1)?;
+                    requests.borrow_mut().extend([(name.to_owned(), bytes), (scales, scale_bytes)]);
+                }
+                other => anyhow::bail!("native drafter {name}: unsupported projection format {other:?}"),
+            }
+        }
+        Ok(())
+    })?;
+    requests.borrow_mut().push(("markov_norms".into(), cfg.vocab.checked_mul(4).context("Markov norms extent overflow")?));
+    let requests = requests.into_inner();
+    ensure!(requests.iter().map(|(name, _)| name).collect::<std::collections::BTreeSet<_>>().len() == requests.len(),
+        "native draft recipe repeats a physical owner");
+    Ok(requests)
+}
+
 /// Final device owners the loader binds, in order, from checkpoint headers:
 /// one request per tensor, row-concatenated BF16 matrix, or FP8 payload/scales
 /// plane pair, plus the Markov norms and the RoPE table. A runtime arena and
@@ -823,8 +983,12 @@ pub fn block_dspark_arena_requests(snapshot: &Path,
     use crate::families::glm5::draft_representation::GlmDraftRepresentation;
     use anyhow::{ensure, Context};
     let cfg = BlockDsparkConfig::read(snapshot)?;
-    let headers = crate::read_safetensors_metadata(&snapshot.join("model.safetensors"))?
-        .into_iter().map(|t| (t.name.clone(), t)).collect::<std::collections::HashMap<_, _>>();
+    let checkpoint = crate::plan::checkpoint::Checkpoint::open(snapshot)?;
+    let headers = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.meta.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    if cfg.dialect == DsparkDialect::MiniMax {
+        return native_arena_requests(&cfg, &headers);
+    }
     let bf16 = |name: &str, shape: &[usize]| -> anyhow::Result<usize> {
         let tensor = headers.get(name).with_context(|| format!("drafter checkpoint has no {name}"))?;
         ensure!(tensor.dtype == cuteafd_core::DType::Bf16, "{name}: drafter weights must be BF16, found {:?}", tensor.dtype);

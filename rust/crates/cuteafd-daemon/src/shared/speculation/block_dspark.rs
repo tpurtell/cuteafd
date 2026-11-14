@@ -1482,7 +1482,8 @@ mod tests {
 
     fn geometry(window: Option<usize>) -> DsparkConfig {
         DsparkConfig { backbone: cuteafd_loader::formats::block_dspark::DsparkBackbone {
-                norm: cuteafd_loader::formats::block_dspark::DsparkNorm::Rms, rotary_dim: 128,
+                norm: cuteafd_loader::formats::block_dspark::DsparkNorm::Rms,
+                residual: cuteafd_loader::formats::block_dspark::DsparkResidual::Bf16, rotary_dim: 128,
                 activation: cuteafd_core::FfnActivation::SiluBf16Product { limit: None } },
             hidden: 5120, intermediate: 10240, layers: 5, heads: 40, kv_heads: 8,
             head_dim: 128, eps: 1e-6, theta: 1e7, block: 7, mask_token: 248077, rank: 256,
