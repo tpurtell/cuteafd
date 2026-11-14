@@ -38,7 +38,7 @@ impl UnitLayout {
             ("kv_step", 2048, 2), ("k_dynamic", 32, 4), ("v_dynamic", 32, 4),
             ("route_logits", cfg.experts, 4), ("route_ids", cfg.topk, 4), ("route_weights", cfg.topk, 4),
             ("expert_wire", cfg.hidden + cfg.hidden/32, 1), ("expert_output", cfg.hidden, 2),
-            ("positions", 1, 8), ("first", 1, 4), ("ring_slots", 1, 8), ("cache_slots", 1, 8)] {
+            ("positions", 1, 8), ("first", 1, 4), ("conv_slots", 1, 8), ("ring_slots", 1, 8), ("cache_slots", 1, 8)] {
             add(name, width, bytes)?;
         }
         buffers.insert("attention_scratch".into(), 64 * 32 * 48 * (128*4+4));
