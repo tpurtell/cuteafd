@@ -122,10 +122,9 @@ fn coordinator_and_peer_spark_charges_use_the_canonical_operand_headers() -> Res
     let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
     let scalar = "language_model.model.layers.3.block_sparse_moe.experts.0.w1.input_global_scale";
     assert!(full.header(scalar).is_some() && coordinator.header(scalar).is_none());
-    assert!(matches!(spark_checkpoint(&full, &catalog, &routed)?, std::borrow::Cow::Borrowed(_)),
+    assert!(spark_checkpoint(&full, &catalog, &routed)?.is_none(),
         "complete planner headers must not reopen the checkpoint");
-    let canonical = spark_checkpoint(&coordinator, &catalog, &routed)?;
-    assert!(matches!(canonical, std::borrow::Cow::Owned(_)));
+    let canonical = spark_checkpoint(&coordinator, &catalog, &routed)?.expect("role view needs canonical headers");
     assert!(canonical.header(scalar).is_some());
     let shape = PrefillShape { rows: 1024, waves: 3 };
     for world in 2..=8 {
@@ -135,7 +134,7 @@ fn coordinator_and_peer_spark_charges_use_the_canonical_operand_headers() -> Res
             spark_charges(&full, &catalog, &routed, world, shape)?);
     }
     // Original callers without a selected view use the same canonical HF source.
-    let mut original = coordinator.clone();
+    let mut original = Checkpoint::coordinator_view(&view, false, false)?;
     original.view = None;
     assert_eq!(spark_charges(&original, &catalog, &routed, 3, shape)?,
         spark_charges(&full, &catalog, &routed, 3, shape)?);
