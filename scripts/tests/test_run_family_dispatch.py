@@ -2533,8 +2533,7 @@ def test_deepseek_v4_rejects_invalid_local_limit_before_launch(tmp_path, value):
     ("COORDINATOR_GPUS=1,0\n", (0, 1), True),
     ("RTX_GPUS=1\nCOORDINATOR_SPLIT=heads\n", (0, 1), True),
 ])
-@pytest.mark.parametrize("precision", ["", "GLM5_FLASH_KDA_FP8=auto\nGLM5_FLASH_FP8_HEAD=auto\n",
-                                        "GLMF_KDA_FP8=auto\nGLMF_FP8_HEAD=auto\n"])
+@pytest.mark.parametrize("precision", ["", "GLM5_FLASH_KDA_FP8=auto\nGLM5_FLASH_FP8_HEAD=auto\n"])
 def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical_gpus, split, precision):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   layout + precision,
@@ -2552,6 +2551,9 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     assert launch.count("--snapshot ") == 1
     assert "--kda-output-shard" not in launch
     assert "--kda-prefill-expanded" not in launch
+    # Prefill over FP8 weights defaults to W8A8 MLA + FFN: nothing forwarded (daemon default mla/true),
+    # KDA W8A8 stays opt-in, and KDA FP8 conversion stays off.
+    assert "fp8-prefill" not in launch
 
 
 @pytest.mark.parametrize("keys,shard", [("", False), ("GLM5_FLASH_KDA_FP8=row128\n", True),
@@ -2566,12 +2568,9 @@ def test_glmf_split_token_rows_follow_fp8_kda(tmp_path, keys, shard):
 
 
 @pytest.mark.parametrize("layout", ["RTX_GPUS=1\n", "RTX_GPUS=2\n"])
-@pytest.mark.parametrize("prefix", ["GLM5_FLASH", "GLMF"])
 @pytest.mark.parametrize("kda,head", [("off", "off"), ("row128", "on"), ("channel", "off")])
-def test_glmf_explicit_precision_wins_on_either_layout(tmp_path, layout, prefix, kda, head):
-    # Current names also take precedence over conflicting deprecated names.
-    keys = "GLMF_KDA_FP8=channel\nGLMF_FP8_HEAD=on\n" if prefix == "GLM5_FLASH" else ""
-    keys += f"{prefix}_KDA_FP8={kda}\n{prefix}_FP8_HEAD={head}\n"
+def test_glmf_explicit_precision_wins_on_either_layout(tmp_path, layout, kda, head):
+    keys = f"GLM5_FLASH_KDA_FP8={kda}\nGLM5_FLASH_FP8_HEAD={head}\n"
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   layout + keys)
     assert result.returncode == 0, result.stderr
@@ -2600,10 +2599,10 @@ def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, h
 @pytest.mark.parametrize("layout,accepted", [("RTX_GPUS=1\n", True), ("RTX_GPUS=2\n", False)])
 def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, accepted):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_FP8_PREFILL=all\n" + layout)
+                                  "GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_ATTENTION_FP8_PREFILL=all\n" + layout)
     assert result.returncode == (0 if accepted else 2), result.stderr
     if accepted:
-        assert "--fp8-prefill all" in result.stderr
+        assert "--attention-fp8-prefill all" in result.stderr
     else:
         # The split's default token-row KDA output excludes KDA output W8A8.
         assert "GLM5_FLASH_KDA_SPLIT=partials" in result.stderr
@@ -2612,16 +2611,20 @@ def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, a
 
 @pytest.mark.parametrize("keys,expected", [
     ("GLM5_FLASH_KDA_FP8=row128\n", ["--kda-fp8 row128"]),
-    ("GLMF_KDA_FP8=channel\n", ["--kda-fp8 channel"]),
+    ("GLM5_FLASH_KDA_FP8=channel\n", ["--kda-fp8 channel"]),
     ("GLM5_FLASH_FP8_HEAD=on\n", ["--fp8-head true"]),
-    ("GLMF_FP8_HEAD=on\n", ["--fp8-head true"]),
     # KDA output W8A8 (kda-o/all) excludes the split's token-row output, so
     # those cases select the partial-sum split path explicitly.
-    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_FP8_PREFILL=all\n",
-     ["--fp8-prefill all"]),
-    ("GLMF_KDA_FP8=row128\nGLMF_FP8_PREFILL=mla,kda-in\n", ["--fp8-prefill mla,kda-in"]),
-    ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_FP8_PREFILL=kda-o,ffn\n",
-     ["--fp8-prefill kda-o,ffn"]),
+    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_ATTENTION_FP8_PREFILL=all\n",
+     ["--attention-fp8-prefill all"]),
+    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_ATTENTION_FP8_PREFILL=mla,kda-in\n", ["--attention-fp8-prefill mla,kda-in"]),
+    ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_KDA_SPLIT=partials\nGLM5_FLASH_ATTENTION_FP8_PREFILL=kda-o\n"
+     "GLM5_FLASH_FFN_FP8_PREFILL=off\n", ["--attention-fp8-prefill kda-o", "--ffn-fp8-prefill false"]),
+    # off selects W8A16 for that group set.
+    ("GLM5_FLASH_ATTENTION_FP8_PREFILL=off\n", ["--attention-fp8-prefill none"]),
+    ("GLM5_FLASH_FFN_FP8_PREFILL=off\n", ["--ffn-fp8-prefill false"]),
+    ("GLM5_FLASH_ATTENTION_FP8_PREFILL=off\nGLM5_FLASH_FFN_FP8_PREFILL=off\n",
+     ["--attention-fp8-prefill none", "--ffn-fp8-prefill false"]),
 ])
 def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
@@ -2635,9 +2638,15 @@ def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
 
 
 @pytest.mark.parametrize("key,value,message", [
-    ("GLM5_FLASH_FP8_PREFILL", "all", "GLM5_FLASH_KDA_FP8=row128"),
-    ("GLMF_FP8_PREFILL", "mla,kda-in", "GLM5_FLASH_KDA_FP8=row128"),
-    ("GLM5_FLASH_FP8_PREFILL", "kda-o,ffn", "GLM5_FLASH_KDA_FP8=row128"),
+    ("GLM5_FLASH_ATTENTION_FP8_PREFILL", "all", "GLM5_FLASH_KDA_FP8=row128"),
+    ("GLM5_FLASH_ATTENTION_FP8_PREFILL", "mla,kda-in", "GLM5_FLASH_KDA_FP8=row128"),
+    ("GLM5_FLASH_ATTENTION_FP8_PREFILL", "kda-o", "GLM5_FLASH_KDA_FP8=row128"),
+    ("GLM5_FLASH_FFN_FP8_PREFILL", "mla", "GLM5_FLASH_FFN_FP8_PREFILL must be on or off"),
+    # The pre-v5.1 spellings are gone: a generic unknown/unused-key refusal, no alias.
+    ("GLM5_FLASH_FP8_PREFILL", "mla", "GLM5_FLASH_FP8_PREFILL"),
+    ("GLMF_FP8_PREFILL", "mla", "GLMF_FP8_PREFILL"),
+    ("GLMF_KDA_FP8", "row128", "GLMF_KDA_FP8"),
+    ("GLMF_FP8_HEAD", "on", "GLMF_FP8_HEAD"),
     ("GLM5_FLASH_FP8_HEAD", "maybe", "GLM5_FLASH_FP8_HEAD must be auto, on, off or packed"),
     ("GLM5_FLASH_FP8_HEAD", "bf16", "GLM5_FLASH_FP8_HEAD must be auto, on, off or packed"),
     ("GLM5_FLASH_INDEX_CACHE", "tails", "GLM5_FLASH_INDEX_CACHE must be"),

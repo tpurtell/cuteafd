@@ -393,7 +393,10 @@ fn absolute(run: &Run) -> bool {
 /// layout and unknown knobs stay fixed. GLM 5.3 Flash's kda-state (its KDA recurrent
 /// state's storage) and target-head (the target LM head's GEMM) change numerics only.
 /// CUTEAFD_SPARK_PREFILL_REPLY_FORMAT selects the Spark expert reply's wire encoding.
+/// `fp8-prefill` is GLM Flash's pre-v5.1 spelling of the two prefill activation switches, kept so
+/// archived reports still pair.
 const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-fp8", "fp8-prefill",
+    "attention-fp8-prefill", "ffn-fp8-prefill",
     "fp8-decode", "mtp-fp8-head", "kv-cache", "kv-format", "expert-input", "kda-state", "target-head",
     "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT", "CUTEAFD_SPARK_DECODE_REPLY_FORMAT",
     "spark-prefill-reply-format", "spark-decode-reply-format",

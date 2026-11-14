@@ -73,14 +73,22 @@ def test_selected_metadata_tamper_and_shared_drift(tmp_path):
 
 
 @pytest.mark.parametrize("family", ["glm5/mod.rs", "glm5_flash/mod.rs", "kimi_k3/serve.rs",
-                                    "muse_spark/serve.rs", "step5/serve.rs"])
+                                    "muse_spark/serve.rs", "step5/serve.rs",
+                                    "minimax_m3/serve.rs", "minimax_m3/golden.rs"])
 def test_resolved_core_identity_is_precision_only(family):
+    """Every family publishes its core identity through the one shared publisher, which reports it
+    only for checkpoints that declare views (#1755); those names stay precision-only for pairing."""
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families" / family).read_text()
+    cli = (ROOT / "rust/crates/cuteafd-daemon/src/cli.rs").read_text()
     bench = (ROOT / "rust/crates/cuteafd-bench/src/fidelity.rs").read_text()
     precision = re.search(r"const PRECISION_SETTINGS:.*?= &\[(.*?)\];", bench, re.S)
     assert precision is not None
     allowed = set(re.findall(r'"([^"]+)"', precision.group(1)))
     identity = {"core-view", "core-view-fingerprint", "core-fp8-recipe"}
-    published = set(re.findall(r'set_resolved\("(core-[^"]+)"', source))
-    assert published == identity, (family, published)
-    assert published <= allowed, (family, published - allowed)
+    assert "crate::cli::publish_core_view(" in source, family
+    assert not re.findall(r'set_resolved\("(core-[^"]+)"', source), family
+    settings = cli.split("fn core_view_settings(")[1].split("\n}\n")[0]
+    published = set(re.findall(r'\("(core-[^"]+)",', settings))
+    assert published == identity, published
+    assert published <= allowed, published - allowed
+    assert "declared_view()" in settings

@@ -155,17 +155,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             cuteafd_bench::context::set_family(cfg.family_id());
             let view = checkpoint.view.as_ref()
                 .context("Kimi serving requires the immutable selected checkpoint view")?;
-            use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, CoreView};
-            let mode = match view.mode() {
-                CoreView::Original => "original", CoreView::K6Compact => "k6-compact", CoreView::K8Compact => "k8-compact",
-                CoreView::Fp8Compact => "fp8-compact",
-            };
-            let recipe = if view.mode() == CoreView::Fp8Compact { FP8_RECIPE } else { "none" };
-            cuteafd_bench::context::set_resolved("core-view", mode);
-            cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
-            cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
-            tracing::info!(core_view = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
-                "selected immutable attention bundle");
+            crate::cli::publish_core_view(view);
             let concurrency = usize::from(worker_args.max_sequences);
             let slots = cuteafd_core::concurrency::state_slots(concurrency as u64) as usize;
             let prefill = worker_args.prefill()?;

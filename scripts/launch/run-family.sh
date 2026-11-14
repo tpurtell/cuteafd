@@ -130,13 +130,6 @@ release_coordinator_device_args() {
   cuteafd_cdi_gpu_args "$csv" || exit 2
   RELEASE_COORDINATOR_DEVICE_ARGS=("${CUTEAFD_CDI_ARGS[@]}" -e "CUDA_VISIBLE_DEVICES=$csv")
 }
-# key NEW OLD [DEFAULT]: a renamed key; the pre-rename spelling works for one
-# release with a warning.
-key() {
-  if [[ -n "${cfg[$1]:-}" ]]; then printf '%s' "${cfg[$1]}"
-  elif [[ -n "${cfg[$2]:-}" ]]; then echo "warning: config key $2 is deprecated; use $1" >&2; printf '%s' "${cfg[$2]}"
-  else printf '%s' "${3:-}"; fi
-}
 source "$repo_root/scripts/lib/family-keys.sh"
 source "$repo_root/scripts/lib/attention-placement.sh"
 vision="$(get VISION auto)"
@@ -2111,18 +2104,20 @@ fi
 # token-row KDA output ownership (--kda-output-shard --kda-prefill-expanded),
 # which avoids rounding half-K BF16 partials (2026-10-05: C1 +7.6%, paired
 # top-1 453 -> 460/512, KL +0.0008). GLM5_FLASH_KDA_SPLIT=partials keeps the
-# old split path. Explicit current or legacy keys override either default.
+# old split path. Explicit keys override either default.
 # Each weight has one resident copy; the DFlash2 drafter stays FP8 by default.
 # Its MLA pools hold POOL_TOKENS tokens (a key every
-# family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
-# projections that run W8A8 (E4M3 activations per 128-K block): unset = the
-# engine default mla,ffn, a list of mla,ffn,kda-in,kda-o / all (kda-* need
-# GLM5_FLASH_KDA_FP8 row128/channel), or off (every FP8 weight W8A16). The
-# GLMF_* spellings still work for one release.
+# family with a paged KV pool reads). FP8 weights (a vendor FP8 checkpoint or
+# CORE_VIEW=fp8-compact) are an explicit choice of FP8 numerics, so prefill over
+# them runs W8A8 (E4M3 activations per 128-K block) by default:
+# GLM5_FLASH_ATTENTION_FP8_PREFILL lists the attention groups (default mla;
+# kda-in/kda-o opt-in and need FP8 KDA weights: GLM5_FLASH_KDA_FP8 row128/channel
+# or CORE_VIEW=fp8-compact; all; off for W8A16), GLM5_FLASH_FFN_FP8_PREFILL
+# (default on, off for W8A16) the dense and shared-expert MLPs.
 if [[ $family == glm5_flash ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   [[ -z "$local_layers" ]] || family_args+=(--rtx-expert-layers "$local_layers")
-  kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
+  kda_fp8="$(get GLM5_FLASH_KDA_FP8 auto)"
   case "$kda_fp8" in
     ""|auto) kda_fp8=off ;;
     off|row128|channel) ;;
@@ -2167,7 +2162,7 @@ if [[ $family == glm5_flash ]]; then
   # (mirroring V41_FP8_HEAD=packed): target logits exact, drafts through its coarse plane, about
   # three quarters of the BF16 bytes. The daemon checks packed split support after normalizing
   # native K6/EXLR8 heads, which ignore this conversion setting.
-  fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
+  fp8_head="$(get GLM5_FLASH_FP8_HEAD auto)"
   case "$fp8_head" in
     ""|auto) fp8_head=auto ;;
     on|off|packed) ;;
@@ -2205,25 +2200,30 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--target-head tensor) ;;
     *) echo "GLM5_FLASH_TARGET_HEAD must be auto, exact or tensor" >&2; exit 2 ;;
   esac
-  fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
+  attention_fp8_prefill="$(get GLM5_FLASH_ATTENTION_FP8_PREFILL mla)"
   if [[ " ${family_args[*]} " == *" --kda-output-shard "* ]]; then
-    case ",$fp8_prefill," in
+    case ",$attention_fp8_prefill," in
       *,all,*|*,kda-o,*)
-        echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill (KDA output W8A8) does not combine with the split's token-row KDA output; set GLM5_FLASH_KDA_SPLIT=partials or drop kda-o" >&2
+        echo "GLM5_FLASH_ATTENTION_FP8_PREFILL=$attention_fp8_prefill (KDA output W8A8) does not combine with the split's token-row KDA output; set GLM5_FLASH_KDA_SPLIT=partials or drop kda-o" >&2
         exit 2 ;;
     esac
   fi
-  case ",$fp8_prefill," in
+  case ",$attention_fp8_prefill," in
     *,all,*|*,kda-in,*|*,kda-o,*)
       if [[ $kda_fp8 == off && $core_view != fp8-compact ]]; then
-        echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill runs KDA W8A8 over FP8 KDA weights; set GLM5_FLASH_KDA_FP8=row128 or channel" >&2
+        echo "GLM5_FLASH_ATTENTION_FP8_PREFILL=$attention_fp8_prefill runs KDA W8A8 over FP8 KDA weights; set GLM5_FLASH_KDA_FP8=row128 or channel" >&2
         exit 2
       fi ;;
   esac
-  case "$fp8_prefill" in
-    "") ;;
-    off) family_args+=(--fp8-prefill none) ;;
-    *) family_args+=(--fp8-prefill "$fp8_prefill") ;;
+  case "$attention_fp8_prefill" in
+    mla) ;;
+    off) family_args+=(--attention-fp8-prefill none) ;;
+    *) family_args+=(--attention-fp8-prefill "$attention_fp8_prefill") ;;
+  esac
+  case "$(get GLM5_FLASH_FFN_FP8_PREFILL on)" in
+    on) ;;
+    off) family_args+=(--ffn-fp8-prefill false) ;;
+    *) echo "GLM5_FLASH_FFN_FP8_PREFILL must be on or off" >&2; exit 2 ;;
   esac
   # GLM5_FLASH_EXL3_WORKER_PATH: how a Spark EXL3 worker uploads a call's inputs and waits for its
   # GPU work. async (the default): pinned staging, one batched asynchronous copy, the hidden rows

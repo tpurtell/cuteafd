@@ -281,12 +281,10 @@ impl GoldenArgs {
     }
 
     fn selected_provenance(&self, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Value {
-        use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, CoreView};
         let mut provenance = self.provenance();
-        provenance["core_view"] = serde_json::json!(view.mode());
-        provenance["core_view_fingerprint"] = serde_json::json!(view.fingerprint());
-        provenance["core_fp8_recipe"] = serde_json::json!(
-            if view.mode() == CoreView::Fp8Compact { FP8_RECIPE } else { "none" });
+        for (name, value) in crate::cli::core_view_settings(view) {
+            provenance[name.replace('-', "_")] = serde_json::json!(value);
+        }
         provenance
     }
 

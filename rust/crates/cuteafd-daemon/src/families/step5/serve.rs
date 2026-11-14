@@ -275,12 +275,7 @@ fn with_backend<T>(args: &ServeArgs,
     let view = args.attention.selected_view.clone().map(Ok)
         .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
-    cuteafd_bench::context::set_resolved("core-view", view.mode().name());
-    cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
-    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
-        cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
-    } else { "none" };
-    cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
+    crate::cli::publish_core_view(&view);
     let checkpoint = Checkpoint::coordinator_view(&view, false, args.mtp > 0)?;
     let cfg = Config::parse(&checkpoint)?;
     cuteafd_bench::context::set_family(cfg.family_id());

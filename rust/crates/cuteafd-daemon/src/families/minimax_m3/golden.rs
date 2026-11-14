@@ -131,6 +131,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let view = args.attention.selected_view.clone().map(Ok)
         .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     args.attention.validate_view(&view)?;
+    crate::cli::publish_core_view(&view);
     let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
