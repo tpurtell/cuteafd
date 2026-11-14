@@ -191,6 +191,20 @@ mod tests {
         let scratch = Rc::new(Allocation::new(banks[0].stream.device, 256, Tag::workspace("minimax/unit"))?);
         MiniMaxPrefix::new(banks, scratch)
     }
+    fn heads_family(library: &NativeLibrary, pages: u32) -> Result<MiniMaxPrefix<'_>> {
+        use cuteafd_loader::families::minimax_m3::execution::HeadsLayout;
+        let cfg = MiniMaxM3Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?)?;
+        let mut banks = Vec::new();
+        for rank in 0..2 {
+            let stream = Rc::new(Stream::new(Device { library, id: rank })?);
+            let layout = MsaCache::for_heads(&HeadsLayout::new(&cfg, rank as u8, 16)?, pages, 4, 256)?;
+            banks.push(Rc::new(PageBank::new(vec![stream], &cfg, RequestCapacity::new(4, 16)?,
+                layout, MsaRope::new(&cfg, 256)?, 0..cfg.layers)?));
+        }
+        let scratch = Rc::new(Allocation::new(banks[0].stream.device, 256, Tag::workspace("minimax/unit"))?);
+        MiniMaxPrefix::new(banks, scratch)
+    }
     fn build(units: Vec<u32>, slot: usize) -> Placement { Placement { units, slot, len: 0 } }
     fn read_page(family: &MiniMaxPrefix<'_>, page: u32) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
@@ -207,10 +221,10 @@ mod tests {
         Ok(out)
     }
     fn write_page(family: &MiniMaxPrefix<'_>, page: u32, salt: usize) -> Result<()> {
-        for bank in &family.0.banks {
+        for (rank, bank) in family.0.banks.iter().enumerate() {
             for layer in bank.layers.clone() {
                 for (plane, stride) in bank.layout.page_planes() {
-                    let bytes = (0..stride as usize).map(|i| ((i * 31 + salt * 13 + layer * 7) % 251) as u8).collect::<Vec<_>>();
+                    let bytes = (0..stride as usize).map(|i| ((i * 31 + salt * 13 + layer * 7 + rank * 17) % 251) as u8).collect::<Vec<_>>();
                     bank.stream.device.run(|| bank.stream.device.library.copy_h2d(
                         bank.page(layer, plane, page)?, &bytes))?;
                 }
@@ -390,6 +404,30 @@ mod tests {
         fixture.configure_memory(&library, 0, 32 << 20)?;
         fixture.configure_memory(&library, 1, 32 << 20)?;
         let family = family(&library, 20)?;
+        prompt_and_turn_restore(&family)?;
+        drop(family);
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        for id in [0, 1] {
+            assert_eq!(Device { library: &library, id }.run(|| library.cuda_physical_memory_info())?.0, 32 << 20);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires two RTX GPUs and the sealed native library through golden-run"]
+    fn native_heads_prompt_and_turn_snapshot_bytes_are_exact() -> Result<()> {
+        // SAFETY: all CUDA banks, streams and snapshots retire before the library.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let family = heads_family(&library, 20)?;
+        assert_eq!(family.record_format(), "minimax_msa_fp8_kv_index_heads_tp2_v1");
+        assert!(family.0.banks.iter().all(|bank| bank.model_layers == 60 && bank.layers == (0..60)
+            && bank.layout.kv_heads() == 2));
+        prompt_and_turn_restore(&family)?;
+        eprintln!("MiniMax native Heads prompt65/turn129 snapshot bytes exact across all60 layers, both index copies, sibling isolation and partial128");
+        Ok(())
+    }
+
+    fn prompt_and_turn_restore(family: &MiniMaxPrefix<'_>) -> Result<()> {
         let mut cache = cache(&family)?;
         let prompt: Vec<u32> = (0..65).collect();
         let turn: Vec<u32> = (0..129).collect();
@@ -439,11 +477,6 @@ mod tests {
         cache.release(&family, &partial.placement.units)?;
         cache.clear(&family)?;
         assert_eq!(cache.pool().used(), 0);
-        drop(cache); drop(family);
-        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
-        for id in [0, 1] {
-            assert_eq!(Device { library: &library, id }.run(|| library.cuda_physical_memory_info())?.0, 32 << 20);
-        }
         Ok(())
     }
 }
