@@ -39,6 +39,8 @@ impl<'a> TargetWeights<'a> {
     pub fn load(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoordinatorWeights) -> Result<Self> {
         ensure!(layout.rank == 0 && layout.arena.views().keys().all(|name| !name.contains('#')),
             "Inkling stage2 core mount requires whole coordinator operands");
+        ensure!(!crate::shared::experts::rtx::dense::is_recording(),
+            "Inkling relative transpose is a cold mount transform, not yet a push finish");
         let mut rects = BTreeMap::new();
         for (name, view) in layout.arena.views() {
             let rect = Rect::tensor(checkpoint, name, None, None)?;
@@ -56,8 +58,6 @@ impl<'a> TargetWeights<'a> {
             operands.insert(name, allocation);
         }
         dense.release();
-        ensure!(!crate::shared::experts::rtx::dense::is_recording(),
-            "Inkling relative transpose is a cold mount transform, not yet a push finish");
         for &layer in &layout.layers {
             let name = format!("model.llm.layers.{layer}.attn.rel_logits_proj");
             let mut source = vec![0u8; 16*1024*2];
