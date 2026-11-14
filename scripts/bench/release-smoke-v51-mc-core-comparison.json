@@ -174,6 +174,88 @@
         "EXPERT_BACKEND": "spark",
         "CORE_VIEW": "k6-compact"
       }
+    },
+    {
+      "family": "muse_spark",
+      "config": "examples/configs/muse-spark-exl3-k4-mc-max.config",
+      "set": {
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
+        "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8864",
+        "EXPERT_PORT": "28800",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "EXPERT_BACKEND": "spark",
+        "CORE_VIEW": "k8-compact"
+      },
+      "name": "muse-mc-k8-compact-max",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ]
+    },
+    {
+      "family": "muse_spark",
+      "config": "examples/configs/muse-spark-exl3-k4-mc-max.config",
+      "set": {
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
+        "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8865",
+        "EXPERT_PORT": "29000",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "EXPERT_BACKEND": "spark",
+        "CORE_VIEW": "k6-compact"
+      },
+      "name": "muse-mc-k6-compact-max",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ]
     }
   ],
   "unsupported": [
@@ -188,6 +270,12 @@
       "core_view": "fp8-compact",
       "status": "na",
       "reason": "Step-5 executes block FP8 only for O projections; the MC core also selects q/k/v, FFNs and the head."
+    },
+    {
+      "family": "muse_spark",
+      "core_view": "fp8-compact",
+      "status": "na",
+      "reason": "Selected vocabulary head and pre/post-expert roles require whole-core FP8 executors (#1796)."
     }
   ]
 }

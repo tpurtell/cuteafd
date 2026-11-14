@@ -1075,8 +1075,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
     assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
         .collect::<std::collections::BTreeSet<_>>(), expected_installed);
-    assert_eq!(tested, 30, "installed checkpoint revision set changed");
-    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax entry (#2081): {tested} installed checkpoint revisions verified");
+    assert_eq!(tested, 31, "installed checkpoint revision set changed");
+    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081) and Muse MC entries: {tested} installed checkpoint revisions verified");
 }
 
 fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<String> {
@@ -1150,6 +1150,38 @@ fn run_installed_release_matrix_recipes(hf_home: Option<std::ffi::OsString>,
         }
     }
     assert_eq!(tested, entries.len());
+}
+
+#[test]
+fn installed_mc_views_cover_executable_projection_manifests() {
+    let hf_home = require_installed_hf_home("installed_mc_views_cover_executable_projection_manifests",
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"));
+    let programs = installed_example_programs(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").unwrap()));
+    for (model, revision) in [
+        ("Muse-Spark-Open-EXL3-K4-MC", "cc5dc2537083177e3f02ea0b2d9dfc179d40425c"),
+        ("GLM-5.3-EXL3-K4-MC", "c39486376dee84e5faa4904e014e07d7b6e76405"),
+        ("GLM-5.3-Flash-EXL3-K4-MC", "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d"),
+        ("Step-5-Preview-EXL3-K4-MC", "4483a4bd874e8c360aec486ea72bd31d1ad7a247"),
+    ] {
+        let snapshot = require_installed_snapshot("MC projection coverage",
+            &format!("wrldsuksgo2mars/{model}"), Some(revision), &hf_home);
+        for view in ["original", "k6-compact", "k8-compact"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+                .arg("plan").arg(&snapshot).args(["--core-view", view,
+                    "--layout", "--rtx", "2", "--spark-ranks", "6", "--concurrency", "16",
+                    "--max-context-tokens", "auto", "--no-speculator", "--vision", "off", "--audio", "off",
+                    "--json", "--workspace-manifest"]).arg(&programs)
+                .env("HF_HOME", &hf_home).output().unwrap();
+            assert!(output.status.success(), "{model}/{view}: {}", String::from_utf8_lossy(&output.stderr));
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["placement_supported"], true, "{model}/{view}: {}", report["hints"]);
+            assert!(report["memory_layout"]["devices"].as_array().is_some_and(|owners| !owners.is_empty()),
+                "{model}/{view}: no executable projection owners");
+            assert!(!report["hints"].to_string().contains("MissingExport"), "{model}/{view}: {}", report["hints"]);
+        }
+    }
 }
 
 #[test]

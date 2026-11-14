@@ -114,7 +114,7 @@ def native_attention_f32_shapes():
 
 def native_attention_bf16_f32_shapes():
     # ML4 q/o and FFNs ship FP8; these split-output shapes need no BF16 fallback.
-    return native_attention_f32_shapes() - {(6144, 4096), (6144, 12288), (6144, 3072)}
+    return (native_attention_f32_shapes() - {(6144, 4096), (6144, 12288), (6144, 3072)}) | {(8192, 2048)}
 
 
 def compile_native_attention_projection(n, k, max_rows, output="bf16"):
@@ -171,7 +171,7 @@ def native_attention_bf16_shapes():
     # Muse original K/V are separate projections, whole and TP2 output splits.
     shapes = {(k, n) for family, operands in native_attention_shapes().items()
               if family != "ml4" for n, k in operands}
-    return shapes | {(6144, 512), (6144, 576), (8192, 1024), (8192, 512), (8192, 4096)}
+    return shapes | {(6144, 512), (6144, 576), (8192, 1024), (8192, 512), (8192, 4096), (8192, 2048)}
 
 
 def draft_bf16_shapes():
@@ -225,7 +225,7 @@ def compile_draft_bf16_projection(k, n, output="bf16"):
         raise ValueError("projection output is bf16 or f32")
     dtype = torch.bfloat16 if output == "bf16" else torch.float32
     # Preserve fixed-M16 routes already shared by GLM Flash, MiMo and drafters.
-    native_shapes = native_attention_bf16_shapes() - {(6144, 512), (6144, 576), (8192, 4096)}
+    native_shapes = native_attention_bf16_shapes() - {(6144, 512), (6144, 576), (8192, 4096), (8192, 2048)}
     tiles = DECODE_TMA_TILES.get((n, k), ()) if (k, n) in native_shapes else ((16, 1, 4, 16, 64, 6),)
     launch = TmaBf16Projection(n, k, out_dtype=cutlass.BFloat16 if output == "bf16" else cutlass.Float32,
                                tiles_by_rows=tiles)

@@ -841,6 +841,32 @@ def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size,
         assert entry["set"][key] == values[key]
 
 
+@pytest.mark.parametrize('size,ranks', [('min', 4), ('max', 6)])
+def test_muse_mc_configs_do_not_replace_standalone_support(size, ranks) -> None:
+    path = ROOT / f'examples/configs/muse-spark-exl3-k4-mc-{size}.config'
+    values = _keys(path)
+    standalone = _keys(ROOT / f'examples/configs/muse-spark-exl3-{size}.config')
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC'
+    assert values['MODEL_REVISION'] == 'cc5dc2537083177e3f02ea0b2d9dfc179d40425c'
+    assert values['CORE_VIEW'] == 'original'
+    assert values['SPARK_COUNT'] == str(ranks)
+    for key in ('SPECULATOR', 'SPECULATOR_MODEL_ID', 'SPECULATOR_MODEL_REVISION', 'VISION', 'AUDIO'):
+        assert values[key] == standalone[key]
+    if size == 'min':
+        assert values['MAX_CONTEXT_TOKENS'] == 'auto'
+        assert standalone['MAX_CONTEXT_TOKENS'] == '634304'
+    matrix = json.loads((ROOT / 'scripts/bench/release-smoke-v5.json').read_text())
+    entry = next(row for row in matrix['entries'] if row['name'] == f'muse-spark-exl3-k4-mc-{size}')
+    assert entry['config'] == str(path.relative_to(ROOT))
+    assert entry['set']['MODEL_ID'] == values['MODEL_ID']
+    assert entry['set']['CORE_VIEW'] == 'original'
+    current = json.loads((ROOT / 'benchmarks/current-matrix.json').read_text())
+    assert any(row['checkpoint'] == values['MODEL_ID'] for row in current['cells'])
+    assert not any(row['checkpoint'] == standalone['MODEL_ID'] for row in current['cells'])
+    retired = next(row for row in current['retired'] if row['name'] == f'muse-spark-exl3-{size}')
+    assert retired['config'] == f'examples/configs/muse-spark-exl3-{size}.config'
+
+
 def test_family_table_and_planner_fixtures_name_muse() -> None:
     out = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"), "/dev/stdin"],
                          input=json.dumps(MUSE), capture_output=True, text=True, check=True)

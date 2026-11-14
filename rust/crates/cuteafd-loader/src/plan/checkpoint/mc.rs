@@ -284,6 +284,38 @@ mod family_tests {
     use crate::plan::{testing, Checkpoint, checkpoint::CheckpointView};
 
     #[test]
+    fn mc_native_classification_follows_family_capability_without_role_payloads() -> Result<()> {
+        use crate::plan::{family, testing::t};
+        for (architecture, model_type, eager) in [
+            ("GlmMoeDsaForCausalLM", "glm_moe_dsa", true),
+            ("Glm5NextForConditionalGeneration", "glm5_next", true),
+            ("MuseSparkForConditionalGeneration", "muse_spark", true),
+            ("Step5ForConditionalGeneration", "step5", false),
+        ] {
+            let dir = tempfile::tempdir()?;
+            let config = serde_json::json!({"model_type":model_type,"architectures":[architecture]});
+            let core = "model.language_model.layers.0.self_attn.k_proj.weight";
+            let expert = "model.layers.0.mlp.experts.0.gate_proj.weight";
+            let shapes = BTreeMap::from([(core.to_owned(), vec![128, 128])]);
+            testing::write_mc_snapshot(dir.path(), &config,
+                &[t(core, "BF16", &[128,128]), t(expert, "BF16", &[128,128])], &shapes);
+            for mode in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact] {
+                let selected = CheckpointView::select(dir.path(), mode)?;
+                let inventory = Checkpoint::inventory_view(&selected)?;
+                assert_eq!(family::detect(&inventory).unwrap().eager_native_core_headers(), eager);
+                assert!(inventory.tensors.is_empty(), "{model_type}: classification is not payload");
+                let worker = Checkpoint::open_view_for_role(&selected, "experts", |name| name == expert)?;
+                assert_eq!(worker.tensors.len(), 1);
+                assert_eq!(worker.tensors[0].meta.name, expert);
+                assert_eq!(worker.header(core).is_some(), eager && mode == CoreView::Original,
+                    "{model_type}/{mode}: keep only selected native classification headers");
+                assert_eq!(worker.shard_bytes, std::fs::metadata(dir.path().join("shared-and-core.safetensors"))?.len());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn kimi_original_k6_k8_reuse_native_and_width_specific_layouts() -> Result<()> {
         use crate::families::kimi_k3::{config::KimiK3Config, core::CoreInventory};
         let dir = tempfile::tempdir()?;
@@ -389,11 +421,33 @@ mod family_tests {
                 assert!(!core.native.is_empty());
                 assert!(core.native.values().all(|weight| !weight.fp8));
             }
+            for ranks in [1, 2] {
+                for layer in LayerLayout::ranks(&cfg, 0, ranks, &core)? {
+                    for bridge in ["moe.pre_expert", "moe.post_expert"] {
+                        assert!(layer.core.contains_key(bridge) || layer.native.contains_key(bridge),
+                            "{view}: every bridge must have a bound trellis or native executor");
+                        assert!(!layer.operands.contains_key(bridge), "no unbound plain bridge fallback");
+                    }
+                }
+            }
             let pair = LayerLayout::ranks(&cfg, 0, 2, &core)?;
             bytes.push(pair.iter().map(|l| l.operands.values().sum::<usize>()
                 + l.core.values().map(|c| c.bytes).sum::<usize>()
                 + l.native.values().map(|n| n.bytes().unwrap() as usize).sum::<usize>()).sum::<usize>());
         }
+        let selected = CheckpointView::select(dir.path(), CoreView::Original)?;
+        let inventory = Checkpoint::inventory_view(&selected)?;
+        let full = Checkpoint::open_view(&selected)?;
+        let role = crate::plan::files::ReadRole::Spark { rank: 0, world: 4 };
+        assert_eq!(crate::plan::files::required_tensors(&inventory, role)?,
+            crate::plan::files::required_tensors(&full, role)?);
+        let worker = crate::plan::files::open_role_view(&selected, role)?;
+        assert!(worker.tensors.iter().all(|t| t.meta.name.contains(".experts.")));
+        let worker_core = CoreInventory::from_checkpoint(&cfg, &worker)?;
+        assert_eq!(worker_core.native, CoreInventory::from_checkpoint(&cfg, &full)?.native);
+        let name = format!("{}0.self_attn.k_proj.weight", crate::families::muse_spark::core::PREFIX);
+        assert!(worker.header(&name).is_some());
+        assert!(!worker.tensors.iter().any(|t| t.meta.name == name));
         assert!(bytes[0] > bytes[2] && bytes[2] > bytes[1]);
         let fp8 = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
         let error = CoreInventory::from_checkpoint(&cfg, &fp8).unwrap_err().to_string();

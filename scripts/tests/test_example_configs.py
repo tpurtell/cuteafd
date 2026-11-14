@@ -25,7 +25,7 @@ STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|n
 ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-{size}.config" for size in ("min", "max")}
 NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
                     ("mistral-large4-exl3-k4", "glm53-flash-exl3-k4-mc",
-                     "glm53-exl3-k4-mc", "step5-exl3-k4-mc") for size in ("min", "max")}
+                     "glm53-exl3-k4-mc", "step5-exl3-k4-mc", "muse-spark-exl3-k4-mc") for size in ("min", "max")}
 QUALIFICATION = {"minimax-m31-flash-nvfp4-min.config", "kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
                  "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
                  "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION | NEW_PUBLICATIONS
@@ -777,6 +777,10 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-"))
     elif name.startswith("step5-exl3-k4-mc-"):
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6core-"))
+    elif name.startswith("muse-spark-exl3-k4-mc-"):
+        expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-"))
+        if name.endswith('-min.config'):
+            expected['MAX_CONTEXT_TOKENS'] = 'auto'
     else:
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6-"))
     publication = next((model, revision, doc) for stem, model, revision, doc in [
@@ -784,6 +788,7 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         ("glm53-flash-", "GLM-5.3-Flash-EXL3-K4-MC", "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d", "glm5_flash"),
         ("glm53-exl3-k4-mc-", "GLM-5.3-EXL3-K4-MC", "c39486376dee84e5faa4904e014e07d7b6e76405", "glm5"),
         ("step5-exl3-k4-mc-", "Step-5-Preview-EXL3-K4-MC", "4483a4bd874e8c360aec486ea72bd31d1ad7a247", "step5"),
+        ("muse-spark-exl3-k4-mc-", "Muse-Spark-Open-EXL3-K4-MC", "cc5dc2537083177e3f02ea0b2d9dfc179d40425c", "muse_spark"),
     ] if name.startswith(stem))
     model, revision, family_doc = publication
     expected.update(MODEL_ID="wrldsuksgo2mars/" + model, MODEL_REVISION=revision,
@@ -998,6 +1003,7 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         "glm53-exlr8-a8-max", "qwen38-27b-bf16-min-nospec", "qwen38-27b-fp8-min-nospec",
         "glm53-exl3-min", "glm53-exl3-max", "glm53-exl3-k6core-min",
         "glm53-exl3-k6core-max", "step5-exl3-k6core-min", "step5-exl3-k6core-max",
+        "muse-spark-exl3-min", "muse-spark-exl3-max",
     }
     reports = [(path, json.loads(path.read_text())) for path in (ROOT / "benchmarks").glob("*/*/report.json")]
     for entry in retired:

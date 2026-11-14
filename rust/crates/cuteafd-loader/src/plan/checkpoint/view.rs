@@ -152,10 +152,12 @@ impl CheckpointView {
     pub(super) fn quantize_config(&self) -> Option<Value> { self.quantize_config.as_deref().cloned() }
     pub(super) fn weight_map(&self) -> Option<&BTreeMap<String, String>> { self.weight_map.as_deref() }
     pub(super) fn native_core_names(&self) -> impl Iterator<Item = &str> {
-        let model_type = self.config.get("model_type").and_then(Value::as_str).unwrap_or("");
-        let eager_core = matches!(model_type, "glm_moe_dsa" | "glm5_moe" | "glm5" | "glm_next"
-            | "glm5_flash" | "glm5_next" | "glm5_next_text" | "mistral4" | "mistral_large4" | "mistral3"
-            | "kimi_k3" | "kimi_k3_1" | "kimi_k31" | "kimi_linear");
+        // Family detection is config-only; do not open its model before these headers exist.
+        let metadata = super::Checkpoint { view: None, snapshot: self.snapshot.clone(),
+            config: self.config.as_ref().clone(), quantize_config: None,
+            weight_map: BTreeMap::new(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
+        let eager_core = crate::plan::family::detect(&metadata)
+            .is_some_and(|family| family.eager_native_core_headers());
         self.weight_map.iter().flat_map(|weights| weights.keys()).map(String::as_str)
             .filter(move |name| eager_core && !name.contains(".experts.") && !name.contains(".mtp.")
                 && (name.ends_with(".weight") || name.ends_with(".weight_scale_inv") || name.ends_with(".qscale_weight")
