@@ -184,6 +184,17 @@ pub(crate) fn concurrency_matrix_snapshot() -> (tempfile::TempDir, std::path::Pa
             "{}/../cuteafd-ffi/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap();
         programs.extend(fixture["programs"].as_array().unwrap().clone());
     }
+    let split = crate::families::minimax_m3::weight_layout::SplitFfnWeights::plan(&checkpoint, &cfg,
+        &[0, 0, 1, 1], crate::placement::planner::EmbeddingHome::Device(0)).unwrap();
+    for weights in split {
+        programs.extend(dense_manifest(&weights.target)["programs"].as_array().unwrap().clone());
+    }
+    for (whole, half) in [(3072, 1536), (12288, 6144)] {
+        let source = programs.iter().find(|e| e["name"] == format!("minimax_oai_split_i{whole}")).unwrap();
+        programs.push(serde_json::from_str(&source.to_string().replace(&whole.to_string(), &half.to_string())).unwrap());
+    }
+    let programs = programs.into_iter().map(|entry| (entry["name"].as_str().unwrap().to_owned(), entry))
+        .collect::<std::collections::BTreeMap<_, _>>().into_values().collect::<Vec<_>>();
     let manifest = dir.path().join("PROGRAMS.json");
     std::fs::write(&manifest, serde_json::json!({"programs": programs}).to_string()).unwrap();
     (dir, manifest)
@@ -603,10 +614,11 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
     for name in ["minimax_msa_programs", "minimax_producer_programs", "minimax_forward_programs"] {
         programs.extend(fixture(name)["programs"].as_array().unwrap().clone());
     }
-    for (whole, half) in [(3072, 1536), (12288, 6144)] {
-        let entry = programs.iter().find(|e| e["name"] == format!("minimax_oai_split_i{whole}")).unwrap();
-        let half_entry = entry.to_string().replace(&whole.to_string(), &half.to_string());
-        programs.push(serde_json::from_str(&half_entry).unwrap());
+    if gpus == 2 {
+        for (whole, half) in [(3072, 1536), (12288, 6144)] {
+            let entry = programs.iter_mut().find(|e| e["name"] == format!("minimax_oai_split_i{whole}")).unwrap();
+            *entry = serde_json::from_str(&entry.to_string().replace(&whole.to_string(), &half.to_string())).unwrap();
+        }
     }
     let mut dense = std::collections::BTreeMap::new();
     for target in &targets {
@@ -1843,6 +1855,11 @@ fn split_recipe_precision_roles_and_onboard_route_receives_are_exact() {
                 let mut inputs = recipe_inputs(2, if count == 0 { 4 } else { 0 });
                 inputs.split_wire = Some(wire);
                 inputs.sequences = concurrency;
+                inputs.expert_usage = Some(cuteafd_core::expert_usage::Geometry {
+                    layers: inputs.cfg.layers, experts: inputs.cfg.experts, topk: inputs.cfg.topk,
+                    routed_layers: inputs.routed.clone(),
+                });
+                assert_eq!(inputs.usage_devices(), vec![0]);
                 let request = shared::request(inputs.context, Some(32768), Onboard::Layers(count),
                     inputs.prefill, Operation::Serving, None, Default::default());
                 let admitted = inputs.admit(request.clone()).unwrap();
@@ -1853,6 +1870,17 @@ fn split_recipe_precision_roles_and_onboard_route_receives_are_exact() {
                 assert!(!admitted.placement.hops.iter().any(|h| matches!(h.at, HopPoint::Exit | HopPoint::BeforeLayer(_))));
                 assert_eq!(admitted.placement.tp2.is_some(), count > 0);
                 let allocations = &admitted.solved.facts.allocations;
+                assert!(!allocations.iter().any(|a| a.id.starts_with("expert-usage.gpu1.")));
+                let geometry = inputs.expert_usage.as_ref().unwrap();
+                for name in ["counters", "snapshot", "pinned"] {
+                    let id = cuteafd_core::expert_usage::device_owner(0, name);
+                    let owners = allocations.iter().filter(|a| a.id == id).collect::<Vec<_>>();
+                    assert_eq!(owners.len(), 1);
+                    assert_eq!(owners[0].bytes, geometry.table_bytes().unwrap() as u64);
+                    assert_eq!(owners[0].location, if name == "pinned" { Location::PINNED } else { Location::coordinator(0) });
+                }
+                assert_eq!(allocations.iter().find(|a| a.id == "expert-usage.history").unwrap().bytes,
+                    geometry.host_bytes(1).unwrap() as u64);
                 for gpu in 0..2 {
                     assert!(!inputs.targets[1].arena.views().keys().any(|name|
                         name.ends_with(".block_sparse_moe.gate.weight") || name.ends_with(".e_score_correction_bias")));

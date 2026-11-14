@@ -466,6 +466,12 @@ impl MiniMaxInputs {
 
     pub fn split(&self) -> bool { self.gpus == 2 && self.attention == AttentionPlacement::Layers }
 
+    /// Only canonical router producers own telemetry; copied routes are not work.
+    pub fn usage_devices(&self) -> Vec<u8> {
+        let producers = if self.split() { 1 } else { self.gpus };
+        (0..producers.min(self.routed.len())).map(|gpu| gpu as u8).collect()
+    }
+
     pub fn roles(&self, layer: usize, gpu: usize, rows: u32) -> Result<Vec<RoleDescriptor>, Refusal> {
         if !self.split() || layer >= self.cfg.layers || gpu >= self.gpus
             || self.owners.len() != self.cfg.layers {
@@ -624,8 +630,7 @@ impl MiniMaxInputs {
             out.push(Component::allocation(owner, bytes, false, maximum));
         }
         if let Some(geometry) = &self.expert_usage {
-            let devices = (0..self.gpus.min(geometry.routed_layers.len())).map(|gpu| gpu as u8).collect::<Vec<_>>();
-            out.extend(crate::placement::expert_usage::components(geometry, &devices, maximum)?);
+            out.extend(crate::placement::expert_usage::components(geometry, &self.usage_devices(), maximum)?);
         }
         // The library releases this shared startup copy chunk before readiness.
         out.extend(buffer("staging/sync-h2d", Location::PINNED,
