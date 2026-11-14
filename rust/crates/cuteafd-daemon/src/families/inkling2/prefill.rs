@@ -25,7 +25,7 @@ pub(crate) fn layer(kernels: &Kernels<'_>, owner: &UnitOwner<'_>, target: &Targe
         fn end_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
         fn commit_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
     }
-    let mut units = sequence_units(rows, owner.layout.rows, 1, cfg.layers)?;
+    let mut units = sequence_units(rows, owner.layout.rows.next_multiple_of(64), 1, cfg.layers)?;
     for unit in &mut units { unit.layers = index..index+1; }
     run_prefill_units(&mut Hooks { kernels, owner, target, experts, cfg }, &units, 1)
 }
