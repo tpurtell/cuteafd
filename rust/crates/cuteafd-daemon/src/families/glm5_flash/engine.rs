@@ -3613,7 +3613,9 @@ impl<'a> GlmfEngine<'a> {
                 GlmNextAttention::Kda => {
                     let name = if layer.has("w_in_fp8") {
                         if self.kda_state == KdaState::F32 {
-                            format!("kda_w8{}_m4096", if self.kda_prefill_expanded { "_expanded" } else { "" })
+                            format!("kda_w8{}_m4096", if self.kda_prefill_expanded {
+                                if layer.kda_channel && !self.precise_attention(layer) { "_expanded_channel" } else { "_expanded" }
+                            } else { "" })
                         } else { self.kda_state.w8_program(PREFILL_CAP) }
                     } else { self.kda_state.program(PREFILL_CAP) };
                     add(name, SequenceLocal);
@@ -4008,7 +4010,9 @@ impl<'a> GlmfEngine<'a> {
         let norm = w.delta.buffer.ptr.wrapping_byte_add(first * h * 2);
         let (a, b) = if rank == 0 { (norm, peer_norm) } else { (peer_norm, norm) };
         let full = self.full_kda_norm(w);
-        let expanded = if self.kda_prefill_expanded && !is_decode(cap) { "_expanded" } else { "" };
+        let expanded = if self.kda_prefill_expanded && !is_decode(cap) {
+            if layer.kda_channel { "_expanded_channel" } else { "_expanded" }
+        } else { "" };
         if owned != 0 {
             self.run_on(rank, true, "join_heads", &[("a", a), ("b", b), ("out", full)],
                 &[Scalar::I32(owned as i32)])?;
@@ -4847,7 +4851,9 @@ impl<'a> GlmfEngine<'a> {
         pointers.push(("scratch", w.scratch.buffer.ptr));
         let dtype = if self.output_shard_attention(layer) { "_norm" }
             else if self.precise_attention(layer) { "_f32" } else { "" };
-        let expanded = if self.kda_prefill_expanded && !is_decode(cap) { "_expanded" } else { "" };
+        let expanded = if self.kda_prefill_expanded && !is_decode(cap) {
+            if layer.kda_channel && !self.precise_attention(layer) { "_expanded_channel" } else { "_expanded" }
+        } else { "" };
         let name = if self.kda_state == KdaState::F32 { format!("kda_w8{dtype}{expanded}_{cap}") }
             else { self.kda_state.w8_program(cap) };
         self.run_on(rank, layer.attention_share.split(), &name, &pointers, &scalars)

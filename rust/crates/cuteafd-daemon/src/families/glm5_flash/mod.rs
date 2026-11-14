@@ -2334,10 +2334,16 @@ impl Opened {
                 "glmf2_join_heads", "glmf2_join_rows"]);
         }
         if args.kda_prefill_expanded {
-            needed.push(if args.kda_output_shard { "glmf2_kda_w8_norm_expanded_m4096" }
-                else if args.kda_fp32_partials { "glmf2_kda_w8_f32_expanded_m4096" }
-                else { "glmf2_kda_w8_expanded_m4096" });
-            if args.kda_output_shard { needed.push("glmf2_kda_output_rows_expanded_m4096"); }
+            let channel = args.kda_fp8 == fp8::KdaFp8::Channel;
+            needed.push(if args.kda_output_shard {
+                if channel { "glmf2_kda_w8_norm_expanded_channel_m4096" } else { "glmf2_kda_w8_norm_expanded_m4096" }
+            } else if args.kda_fp32_partials { "glmf2_kda_w8_f32_expanded_m4096" }
+            else if channel { "glmf2_kda_w8_expanded_channel_m4096" }
+            else { "glmf2_kda_w8_expanded_m4096" });
+            if args.kda_output_shard {
+                needed.push(if channel { "glmf2_kda_output_rows_expanded_channel_m4096" }
+                    else { "glmf2_kda_output_rows_expanded_m4096" });
+            }
         }
         for name in needed {
             programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head/--index-cache compact need \

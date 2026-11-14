@@ -55,6 +55,8 @@ pub(crate) struct GlmfLayer<'a> {
     /// FFN width; whole attention still retains a split FFN on two GPUs.
     pub split: bool,
     pub attention_share: AttentionShare,
+    /// Explicit load-time conversion metadata; never inferred from scale bytes.
+    pub kda_channel: bool,
     pub(crate) core: std::collections::BTreeMap<String, crate::shared::dense_trellis::CoreWeights<'a>>,
     pub(crate) attention_native: std::collections::BTreeMap<String, NativeAttentionWeights<'a>>,
     pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
@@ -966,7 +968,7 @@ impl<'a> GlmfLoader<'a> {
             let attention_native = self.native_operands(native_layouts, rank)?;
             let core = layouts.into_iter().map(|(name, layout)| Ok((name, self.core_weights(layout, rank)?)))
                 .collect::<Result<_>>()?;
-            Ok(GlmfLayer { attention, dense, split: ranks == 2, attention_share, core, operands, attention_native,
+            Ok(GlmfLayer { kda_channel: false, attention, dense, split: ranks == 2, attention_share, core, operands, attention_native,
                 native: HashMap::new(), native_projections: HashMap::new() })
         }).collect()
     }
@@ -1060,7 +1062,7 @@ impl<'a> GlmfLoader<'a> {
             ops.insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
         }
-        Ok(GlmfLayer { attention, dense, split: false, attention_share: AttentionShare::Whole,
+        Ok(GlmfLayer { kda_channel: self.kda_fp8 == super::fp8::KdaFp8::Channel, attention, dense, split: false, attention_share: AttentionShare::Whole,
             core: Default::default(), attention_native: self.native_operands(inventory.layer_native(cfg, layer, 1, None)?.remove(0), 0)?, operands: ops, native: HashMap::new(), native_projections: HashMap::new() })
     }
 
@@ -1464,7 +1466,7 @@ impl<'a> GlmfLoader<'a> {
         let owner = match mode { LayerMode::Whole { gpu, .. } if ranks == 2 => Some(gpu), _ => None };
         let layouts = inventory.layer_native(cfg, layer, ranks, owner)?;
         ops.into_iter().zip(attention_shares).zip(layouts).enumerate().map(|(rank, ((operands, attention_share), layouts))|
-            Ok(GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(),
+            Ok(GlmfLayer { kda_channel: self.kda_fp8 == super::fp8::KdaFp8::Channel, attention, dense, split: true, attention_share, core: Default::default(),
                 attention_native: self.native_operands(layouts, rank)?, operands,
                 native: HashMap::new(), native_projections: HashMap::new() })).collect()
     }
@@ -1541,7 +1543,7 @@ impl<'a> GlmfLoader<'a> {
                         let owns = !matches!(mode, LayerMode::Whole { gpu, .. } if self.ranks() == 2 && usize::from(gpu) != rank);
                         ensure!(source.kv_b.is_some() == owns, "{p}: loaded MLA owner differs from execution plan");
                     }
-                    Ok(GlmfLayer { attention, dense, split: self.ranks() == 2, attention_share, operands, native,
+                    Ok(GlmfLayer { kda_channel: false, attention, dense, split: self.ranks() == 2, attention_share, operands, native,
                         native_projections: source.projections.iter().map(|(&name, (projection, _))| (name, projection.clone())).collect(),
                         core: Default::default(), attention_native: Default::default() })
                 })?;
