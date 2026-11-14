@@ -705,7 +705,7 @@ impl Recipe for Step5Recipe<'_> {
                 Lifetime { first: Phase::Ready, last: Phase::Growth }),
             ("logits", Location::HOST, Category::Staging,
                 cuteafd_core::memory_layout::host_logits_bytes(
-                    if self.inputs.full_prefill_logits { self.inputs.rows as u64 } else { self.inputs.rows.min(64) as u64 },
+                    self.inputs.rows.min(64) as u64,
                     self.inputs.rows.min(64) as u64,
                     self.cfg.vocab as u64).ok_or(Refusal::Overflow("Step-5 host logits"))?,
                 Lifetime { first: Phase::Ready, last: Phase::Growth }),

@@ -117,7 +117,6 @@ pub(crate) struct ServeArgs {
     model_id: Option<String>,
     /// All prefill rows are always scored by this eager target.
     #[arg(long)]
-    full_prefill_logits: bool,
     #[command(flatten)]
     prefix: PrefixArgs,
     #[command(flatten)]
@@ -336,7 +335,6 @@ fn with_backend<T>(args: &ServeArgs,
         host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, reserve_bytes: reserve }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
-        full_prefill_logits: args.full_prefill_logits,
         waves: usize::from(args.prefill_waves), unit: args.prefill_rows as usize,
         sequences: usize::from(args.max_sequences), context: args.max_context, serving_context,
         requested_pool: args.pool_tokens,
@@ -556,7 +554,6 @@ fn with_backend<T>(args: &ServeArgs,
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_served_context(usize::try_from(admission.solved.served_context())?)?
         .with_admitted_host(admission.host_cache_bytes, admission.host_geometry)
-        .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
             args.prefill_rows as usize)?)?
         .configure_packing(args.prefill_packing, coordinator_cap)?;
@@ -947,7 +944,7 @@ mod tests {
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
                 reserve_bytes: 0 }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: args.max_context, serving_context: cuteafd_loader::placement::planner::Context::pinned(args.max_context), requested_pool: None,
+            rows: 256, waves: 1, unit: 0, sequences: 16, context: args.max_context, serving_context: cuteafd_loader::placement::planner::Context::pinned(args.max_context), requested_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),
@@ -993,7 +990,7 @@ mod tests {
             for stage in 0..usize::from(depth) {
                 super::super::mtp::InputPlan::prepare(&programs, &checkpoint, stage, inputs.unit_rows(), &contract)?;
                 super::super::head::HeadPlan::for_mtp_stage(&programs, &checkpoint, stage,
-                    plan::families::step5::native::head_rows(inputs.rows, false), &contract)?;
+                    plan::families::step5::native::head_rows(inputs.rows), &contract)?;
                 super::super::ffn::DensePlan::for_mtp_stage(&programs, &checkpoint,
                     stage, inputs.rows, u64::MAX, &[], &contract)?;
             }

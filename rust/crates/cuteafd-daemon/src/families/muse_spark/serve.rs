@@ -65,7 +65,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "unrestricted")]
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Admit all-row prefill logits for fidelity scoring before KV sizing.
-    #[arg(long)] pub full_prefill_logits: bool,
     /// Prefill units in flight on the one Spark transport; unset follows the shared policy.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: Option<u8>,
@@ -225,7 +224,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
             free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes }).collect(),
         headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: args.peers.len(), prefill: args.prefill()?,
-        full_prefill_logits: args.full_prefill_logits, slots: u64::from(args.max_sequences),
+         slots: u64::from(args.max_sequences),
         mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
             .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
         max_context: args.max_context.filter(|&tokens| tokens > 0),
@@ -729,7 +728,6 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         ensure!(args.peers.len() == 4, "short Muse trace uses the smallest four-Spark layout");
         args.max_sequences = 1;
-        args.full_prefill_logits = scored_split;
         args.expert_partial_bf16_max_rows = cutoff;
         args.prefix.resolve_entries(1);
         args.validate()?;

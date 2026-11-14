@@ -286,7 +286,7 @@ mod tests {
             let target = target_arena(&checkpoint, &cfg, DType::Bf16, format)?;
             let mtp = mtp_arena(&checkpoint, &cfg, format)?;
             let weights = NativeWeights::native(&checkpoint, &cfg, DType::Bf16)?;
-            let buffers = NativeBuffers::new(&cfg, 256, 1, 0, false)?;
+            let buffers = NativeBuffers::new(&cfg, 256, 1, 0)?;
             let draft = DrafterBytes::native_mtp(&checkpoint, &cfg)?;
             assert_eq!(draft.weight_arena, Some(("qwen3_5/mtp/gpu0", mtp.bytes() as u64)));
             assert_eq!(draft.weights.0, mtp.payload_bytes() as u64);
@@ -366,7 +366,7 @@ mod tests {
             }), ..Default::default()
         };
         let weights = NativeWeights::native(&checkpoint, &cfg, norm)?;
-        let buffers = NativeBuffers::new(&cfg, 256, 1, 0, false)?;
+        let buffers = NativeBuffers::new(&cfg, 256, 1, 0)?;
         let mut layouts = vec![target.clone()];
         let mut drafts = vec![None];
         if cfg.mtp_layers == 1 {

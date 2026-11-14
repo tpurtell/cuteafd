@@ -828,7 +828,6 @@ pub(crate) fn with_engine<T>(
         }
         if remote_experts { tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm"); }
         engine.prepare_workspaces()?;
-        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         // One graph arena per rank, charged before KV sizing and captured lazily
         // inside it. A capture the reserve cannot hold runs eagerly.
         // The prewarm shape is the resolved layout (coordinator GPUs x Sparks

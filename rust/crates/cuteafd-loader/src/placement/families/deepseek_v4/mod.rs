@@ -76,7 +76,6 @@ pub struct V4Inputs {
     /// `RTX_EXPERT_LAYERS` / `--rtx-expert-layers`.
     pub onboard: Onboard,
     /// Probe-only all-row logits on the lead GPU.
-    pub full_prefill_logits: u64,
     /// Per GPU, selected-program code still to load by ready
     /// (`CodeAllowance::pending`): the planner's allowance offline, the measured
     /// remainder serve-dsv4 can still attribute. Charged as the named Runtime
@@ -294,10 +293,6 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), Place
                     .map_err(|_| PlacementError::Overflow("V4 peer exchange"))?, Basis::Formula));
             demands.push(Demand::new(gpu, Category::Transport, "expert peer exchange", exchange, Basis::Formula));
         }
-        if rank == 0 && inputs.full_prefill_logits > 0 {
-            demands.push(Demand::new(gpu, Category::Workspace, "probe prefill logits", inputs.full_prefill_logits,
-                Basis::Formula));
-        }
     }
     Ok((demands, reserves))
 }
@@ -373,7 +368,7 @@ mod default_tests {
                     workspace: None, experts: Vec::new(), draft: Vec::new(), draft_half: Vec::new(), experts_half: Vec::new(),
                     tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0,
                     first_routed: 0, requested_pool: Some(262144), onboard: Onboard::Layers(0),
-                    full_prefill_logits: 0, pending_code: Vec::new(), context: None, attention: None,
+                    pending_code: Vec::new(), context: None, attention: None,
                     extra: Vec::new(), physical_bytes: Vec::new(), host: None,
                 };
                 let baseline = fixed_demands(&input).unwrap().0;

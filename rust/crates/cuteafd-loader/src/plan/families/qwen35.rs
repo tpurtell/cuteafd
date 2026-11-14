@@ -100,7 +100,7 @@ impl FamilyModel for Model {
             return Err(CacheGeometryError::Unsupported { family: "qwen3_5", what: "dense target currently owns one GPU" });
         }
         let cfg = &self.header.config;
-        let buffers = crate::placement::families::qwen3_5::NativeBuffers::new(cfg, 0, 1, 0, false)
+        let buffers = crate::placement::families::qwen3_5::NativeBuffers::new(cfg, 0, 1, 0)
             .map_err(|_| CacheGeometryError::Overflow("dense native cache"))?;
         let state = buffers.mark_bytes as u64;
         let gdn = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count() as u64;
@@ -170,10 +170,10 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     }
     ensure!(scratch > 0, "dense native prefill requires nonzero scratch");
     let slots = usize::try_from(options.resolved_state_slots("qwen3_5"))?;
-    let mark = qwen3_5::NativeBuffers::new(cfg, scratch as usize, slots, 0, options.full_prefill_logits)?.mark_bytes;
+    let mark = qwen3_5::NativeBuffers::new(cfg, scratch as usize, slots, 0)?.mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(options.resolved_concurrency("qwen3_5"),
         options.prefix_entries("qwen3_5"), mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
-    let buffers = qwen3_5::NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?, options.full_prefill_logits)?;
+    let buffers = qwen3_5::NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?)?;
     let norm = norm.context("missing GDN precision")?;
     let weights = qwen3_5::NativeWeights::native(input.checkpoint(), cfg, norm.clone())?;
     let target_arena = crate::families::qwen3_5::weight_layout::target_arena(input.checkpoint(), cfg, norm,
@@ -197,7 +197,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let host = options.host_memory.map(Ok)
         .unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
     let budgets = qwen3_5::forecast_budgets(physical, capacity, set.module_bytes(), host)?;
-    let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
+    let operation = Operation::Serving;
     let onboard = match options.onboard.unwrap_or_default().resolve(0) {
         Onboard::Auto => Pin::Auto,
         Onboard::Layers(layers) => Pin::Exact(layers as u64),

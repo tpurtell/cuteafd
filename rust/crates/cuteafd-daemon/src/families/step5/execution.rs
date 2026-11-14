@@ -2581,7 +2581,7 @@ mod unit_overwrite_tests {
                 out.ffn[rank].push(planes(&ffn, if shared_region { largest } else { own }, &ffn_half));
             }
         }
-        let rows = native::head_rows(CHUNK, false);
+        let rows = native::head_rows(CHUNK);
         out.head = planes(&sequential(&native::head_planes(rows).unwrap()), 0, &sequential(&native::head_planes(rows).unwrap()));
         out
     }

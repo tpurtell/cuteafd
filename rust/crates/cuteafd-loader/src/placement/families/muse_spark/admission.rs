@@ -180,7 +180,6 @@ pub struct ProductionInput<'a> {
     pub budgets: Vec<Budget>,
     pub host: HostInput,
     pub prefill: PrefillPlan,
-    pub full_prefill_logits: bool,
     pub bf16_target_head: serving::BlasHead,
     /// Active sequence slots (each owns its sliding rings).
     pub slots: u64,
@@ -206,7 +205,6 @@ pub struct ProductionInput<'a> {
 pub struct PreparedMuse<'a> {
     pub recipe: MuseRecipe<'a>,
     budgets: Vec<Budget>,
-    prefill_logits_bytes: usize,
     local: LocalPackage,
     drafter: Option<MuseDrafter>,
     layouts: Vec<Vec<LayerLayout>>,
@@ -227,7 +225,6 @@ pub struct AdmittedMuse {
     pub drafter: Option<MuseDrafter>,
     /// The coordinator GPU the solve placed the drafter on (the target head).
     pub draft_home: Option<u8>,
-    pub prefill_logits_bytes: usize,
     /// Per layer, per coordinator rank: the operands the device packs.
     pub layouts: Vec<Vec<LayerLayout>>,
     pub global: GlobalLayout,
@@ -327,7 +324,7 @@ fn tower_options(media: &MediaOptions, gpus: usize, sparks: usize)
 
 impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedMuse<'a>, Refusal> {
-        let ProductionInput { cfg, core, projections, catalog, mut budgets, host, prefill, full_prefill_logits, bf16_target_head, slots, mark_slots,
+        let ProductionInput { cfg, core, projections, catalog, mut budgets, host, prefill, bf16_target_head, slots, mark_slots,
             context, maximum_pool_tokens, partial_bf16_max_rows, partial_reply_formats, local, drafter, fixed,
             media } = self;
         let coordinator = budgets.iter().filter(|budget| budget.locations.iter()
@@ -379,11 +376,7 @@ impl<'a> ProductionInput<'a> {
         let (stored, trimmed) = crate::families::muse_spark::lane::head_planes(
             global.head.as_ref().map_or(cfg.vocab_size, |head| head.shape[0]), cfg.vocab_size)
             .map_err(anyhow_refusal)?;
-        let prefill_logits_bytes = if full_prefill_logits {
-            crate::families::muse_spark::lane::prefill_logits_bytes(
-                usize::try_from(prefill.span_rows).map_err(|_| Refusal::Overflow("Muse span rows"))?,
-                cfg.vocab_size).map_err(anyhow_refusal)?
-        } else { 0 };
+
         // Validate the same widest verify step the runtime seals.
         let cutoff = crate::families::muse_spark::replies::Cutoff::with_formats(partial_bf16_max_rows,
             crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
@@ -409,13 +402,7 @@ impl<'a> ProductionInput<'a> {
             components.extend(buffer(format!("muse.host.{id}"), Location::PINNED, bytes,
                 Lifetime::RESIDENT, Category::Staging, group, maximum_pages));
         }
-        if full_prefill_logits {
-            let bytes = cuteafd_core::memory_layout::host_logits_bytes(prefill.span_rows,
-                prefill.unit_rows, cfg.vocab_size as u64).ok_or(Refusal::Overflow("Muse scoring logits"))?;
-            components.extend(buffer("muse.host.scoring".into(), Location::HOST, bytes,
-                Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Workspace,
-                "host scoring logits", maximum_pages));
-        }
+
         components.push(Component { activation: Activation::always(),
             bytes: ByteCurve::fixed(HOST_RUNTIME.bytes, maximum_pages),
             kind: ComponentKind::Allowance(Allowance { location: Location::HOST, bytes: HOST_RUNTIME.bytes,
@@ -499,9 +486,7 @@ impl<'a> ProductionInput<'a> {
                 crate::serving_capacity::GLMF_HEAD_WORKSPACE, Lifetime::RESIDENT,
                 Category::Workspace, "Muse native target/drafter head workspace", maximum_pages));
         }
-        components.extend(buffer("muse.prefill_logits".into(), Location::coordinator(head_gpu),
-            prefill_logits_bytes as u64, Lifetime::RESIDENT, Category::Workspace, "Muse prefill logits",
-            maximum_pages));
+
         components.extend(buffer("muse.partial_planes".into(), Location::coordinator(0), planes,
             Lifetime::RESIDENT, Category::Transport, "Muse Spark partial reply planes", maximum_pages));
         // The drafter is not a fixed owner: it borrows the target head (its
@@ -679,7 +664,7 @@ impl<'a> ProductionInput<'a> {
             prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }, attention,
             spark_ranks, encoders, modes: (media.vision, media.audio), cases, peaks, local: local.clone(),
             drafter: drafter.clone(), head_backend: if global.head.is_none() { bf16_target_head } else { serving::BlasHead::Native } };
-        Ok(PreparedMuse { recipe, budgets, prefill_logits_bytes, local, drafter, layouts, global, projections,
+        Ok(PreparedMuse { recipe, budgets, local, drafter, layouts, global, projections,
             spark_budget, host: host_quotas, push })
     }
 }
@@ -1029,7 +1014,7 @@ fn solve_sampled(request: Request, mut budgets: Vec<Budget>, recipe: &MuseRecipe
 impl PreparedMuse<'_> {
     /// The single admission solve. Planner and serving call this one verb.
     pub fn admit(self, request: Request) -> Result<AdmittedMuse, Refusal> {
-        let PreparedMuse { recipe, budgets, prefill_logits_bytes, local, drafter, layouts, global, projections,
+        let PreparedMuse { recipe, budgets, local, drafter, layouts, global, projections,
             spark_budget, mut host, push } = self;
         let started = std::time::Instant::now();
         let solved = solve_sampled(request, budgets, &recipe)?;
@@ -1040,7 +1025,7 @@ impl PreparedMuse<'_> {
         let media = recipe.media(&solved)?;
         if media.vision.admitted_bytes() == 0 && media.audio.admitted_bytes() == 0 { host.media_bytes = 0; }
         Ok(AdmittedMuse { placement, spark, draft_home: solved.decisions.draft_home, solved, media, local,
-            drafter, prefill_logits_bytes, layouts, global, projections, spark_budget, solve_us, host, push })
+            drafter, layouts, global, projections, spark_budget, solve_us, host, push })
     }
 }
 

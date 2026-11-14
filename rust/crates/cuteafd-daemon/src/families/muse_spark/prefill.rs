@@ -226,19 +226,9 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
                     rows: logits.bytes / (self.cfg.vocab_size * 4), vocab: self.cfg.vocab_size,
                     stride: self.cfg.vocab_size, stream, greedy: None };
                 rank.device.run(|| scoring.record(rank.device.library, offset, &device_logits))?;
-            } else if self.call.logit_rows == 1 {
-                self.logits = Some(logits);
             } else {
-                let output = rank.prefill_logits.as_ref().context("Muse prefill logits not admitted")?.buffer;
-                let at = offset * self.cfg.vocab_size * 4;
-                ensure!(at <= output.bytes && logits.bytes <= output.bytes - at, "Muse prefill logits output range");
-                let target = Buffer { ptr: output.ptr.cast::<u8>().wrapping_add(at).cast(), bytes: logits.bytes, ..output };
-                rank.device.run(|| {
-                    // SAFETY: both allocations outlive the call; the head, copy and next scratch reuse
-                    // are ordered on the head stream, before this unit's lane slot can be reused.
-                    unsafe { rank.device.library.copy_d2d_async(target, logits, logits.bytes, stream) }
-                })?;
-                self.logits = Some(Buffer { bytes: self.call.logit_rows * self.cfg.vocab_size * 4, ..output });
+                ensure!(self.call.logit_rows == 1, "Muse multi-row prefill requires a row consumer");
+                self.logits = Some(logits);
             }
         }
         Ok(())

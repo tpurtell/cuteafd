@@ -497,7 +497,6 @@ pub struct QwenAdmissionInputs<'a> {
     pub prefill_shape: Option<super::PrefillShape>,
     pub slots: u64,
     pub mark_bytes: u64,
-    pub full_prefill_logits: u64,
     /// Mapped PLE table: row bytes and whether rows are FP8.
     pub ple: Option<(u64, bool)>,
     /// Lazily loaded EXL3 expert window (peak), 0 when experts are resident.
@@ -537,7 +536,6 @@ pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission,
         (Category::Workspace, "decode step", workspace(true)),
         (Category::Workspace, "prefill step", workspace(false)),
         (Category::Workspace, "prefill MTP step", mtp_workspace),
-        (Category::Workspace, "probe prefill logits", inputs.full_prefill_logits),
         (Category::Kv, "state", rank.active_state_per_sequence_bytes * inputs.slots + rank.fixed_state_bytes
             + rank.speculative_replay_bytes),
         (Category::Prefix, "marks", inputs.mark_bytes),
@@ -595,7 +593,7 @@ mod tests {
         let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config).unwrap();
         let mut inputs = QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: true, kv_format: Qwen4KvCache::Fp8,
             manifest: None, prefill_rows: 4096, prefill_shape: None, slots: 8, mark_bytes: 0,
-            full_prefill_logits: 0, ple: Some((160, true)), future_expert_bytes: 0, headroom: 0 };
+             ple: Some((160, true)), future_expert_bytes: 0, headroom: 0 };
         let legacy = qwen_admission(&inputs).unwrap();
         inputs.prefill_shape = Some(PrefillShape { unit_rows: 2048, waves: 2 });
         let units = qwen_admission(&inputs).unwrap();

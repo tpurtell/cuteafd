@@ -246,7 +246,7 @@ mod tests {
             let inputs = view_layout(predictor, &native::mtp_input_planes(rows)?, input_offset)?;
             let metadata_sizes = native::mtp_metadata_planes(rows)?;
             let metadata = view_layout(predictor, &metadata_sizes[..4], metadata_offset)?;
-            let head = view_layout(predictor, &native::head_planes(native::head_rows(rows, false))?, 0)?;
+            let head = view_layout(predictor, &native::head_planes(native::head_rows(rows))?, 0)?;
             let selected = (0..3).map(|stage| view_layout(predictor, &metadata_sizes[4..],
                 core + stage * 256).map(|views| views[0])).collect::<Result<Vec<_>>>()?;
             assert_eq!(input_offset, attention_bytes + usize::try_from(native::ffn_region_bytes(rows, rows)?)?);
@@ -331,7 +331,7 @@ mod tests {
                 // The next layer copies this residual to offset zero before any reuse.
                 assert!(output.0 >= residual);
                 // The head narrows into planes 0/1 before logits may overwrite the residual.
-                let head = native::head_planes(native::head_rows(rows, false))?;
+                let head = native::head_planes(native::head_rows(rows))?;
                 assert!(head[0] + head[1] <= output.0);
             }
         }

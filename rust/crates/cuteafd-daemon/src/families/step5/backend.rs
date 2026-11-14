@@ -144,7 +144,6 @@ pub(super) struct Step5Backend<'e, 'a> {
     sequences: usize,
     library: &'a NativeLibrary,
     mtp: Option<&'e super::mtp::Runtime<'a>>,
-    full_prefill_logits: bool,
     /// Prefill unit rows and units in flight (PLAN "Prefill contract").
     /// Prefill units: the unit and the waves in flight.
     prefill: (usize, usize),
@@ -183,7 +182,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         };
         Ok(Self { state: BackendState::new(fail_verify_once), execution, ranks, embedding, inputs,
             profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None,
-            full_prefill_logits: false, prefill: (rows, 1), depth: None, packed_row_cap: None, admitted_host: None })
+            prefill: (rows, 1), depth: None, packed_row_cap: None, admitted_host: None })
     }
 
     pub(super) fn with_served_context(mut self, context: usize) -> Result<Self> {
@@ -228,12 +227,6 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             // Native MTP target history is request-owned, not a shared tap ring.
             taps: None,
         }
-    }
-
-    /// The head was admitted at chunk width: all-row prefill scoring is served.
-    pub(super) fn with_full_prefill_logits(mut self, enabled: bool) -> Self {
-        self.full_prefill_logits = enabled;
-        self
     }
 
     pub(super) fn with_mtp(mut self, mtp: &'e super::mtp::Runtime<'a>) -> Self {
@@ -470,7 +463,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
             // A call is the slots' units.
             prefill_rows: self.depth.as_ref().map_or(self.rows, |depth| depth.call_rows().min(self.rows)),
             decode_rows: self.rows.min(64),
-            full_prefill_logits: self.full_prefill_logits }
+             }
     }
     fn message_starts(&self) -> &[&str] { &["<|im_start|>"] }
     fn library(&self) -> &'a NativeLibrary { self.library }
@@ -546,8 +539,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.retire();
         ensure!(logit_rows <= tokens.len(), "Step-5 prefill logits extent");
-        ensure!(logit_rows <= 1 || self.full_prefill_logits,
-            "Step-5 all-row prefill logits require --full-prefill-logits");
+        ensure!(logit_rows <= 1, "Step-5 multirow prefill logits require the bounded consumer");
         // The head projects only the rows serving needs, never the whole chunk.
         let logits = self.immediate(&mut [(placement, tokens)], pool,
             cuteafd_transport::ExpertV2SourceKind::Prefill, Some(logit_rows.max(1)))?;
@@ -558,7 +550,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     fn prefill_scoring(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         position: usize, probe: &crate::shared::probe::ProbeRef, pool: &RefPagePool)
         -> Result<Option<crate::shared::probe::ScoreLogits>> {
-        if logit_rows <= 1 || self.full_prefill_logits {
+        if logit_rows <= 1 {
             return Ok(self.prefill_device(placement, tokens, logit_rows, pool)?
                 .map(crate::shared::probe::ScoreLogits::Device));
         }

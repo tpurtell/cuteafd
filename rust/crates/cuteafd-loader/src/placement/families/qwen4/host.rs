@@ -175,22 +175,22 @@ impl UploadInputs {
 }
 
 /// Pinned logits landing on each owner: decode and prefill arenas coexist.
-pub fn pinned_logits_bytes(owners: usize, full_prefill_logits: bool, span_rows: u64, vocab: u64)
+pub fn pinned_logits_bytes(owners: usize, vocab: u64)
     -> Result<u64, Refusal> {
-    let rows = 64u64.checked_add(if full_prefill_logits { span_rows } else { 1 })
+    let rows = 64u64.checked_add(1)
         .and_then(|n| n.checked_mul(owners as u64)).ok_or(Refusal::Overflow("Qwen pinned logits rows"))?;
     host_logits_bytes(rows, rows, vocab).ok_or(Refusal::Overflow("Qwen pinned logits"))
 }
 
-/// The separate MTP prefill workspace lands one row, even in full-logit mode.
+/// The separate MTP prefill workspace lands one row.
 pub fn mtp_pinned_logits_bytes(prefill_shape: bool, mtp: bool, vocab: u64) -> Result<u64, Refusal> {
     if !prefill_shape || !mtp { return Ok(0); }
     host_logits_bytes(1, 1, vocab).ok_or(Refusal::Overflow("Qwen MTP pinned logits"))
 }
 
-/// Host FP32 scoring logits: the full span when scoring, else one decode wave.
-pub fn scoring_logits_bytes(full_prefill_logits: bool, span_rows: u64, vocab: u64) -> Result<u64, Refusal> {
-    let rows = if full_prefill_logits { span_rows } else { 64 };
+/// Host FP32 scoring logits: one bounded decode/head wave.
+pub fn scoring_logits_bytes(span_rows: u64, vocab: u64) -> Result<u64, Refusal> {
+    let rows = 64;
     host_logits_bytes(rows, span_rows, vocab).ok_or(Refusal::Overflow("Qwen scoring logits"))
 }
 

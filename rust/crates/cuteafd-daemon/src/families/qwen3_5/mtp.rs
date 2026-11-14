@@ -622,7 +622,7 @@ pub(crate) fn oracle<'a>(args: &super::super::GoldenArgs, library: &'a NativeLib
         pools: vec![(64 * layout.record_bytes) as u64, layout.hidden_bytes as u64],
         ..DrafterBytes::native_mtp(checkpoint, cfg)? };
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(demand), 1, None, args.kv_cache, false, None, false)?;
+        Some(demand), 1, None, args.kv_cache, None, false)?;
     ensure!(engine.planes.scratch.bytes >= admitted.scratch_bytes, "MTP scratch exceeds shared target admission");
     let input = Allocation::new(engine.stream.device, HEAD_ROWS * width, Tag::workspace("qwen35/mtp-oracle"))?;
     let mut mtp = Mtp::load(&engine, &reader, format, admitted, fixed)?;
@@ -740,7 +740,7 @@ mod tests {
                 pools: vec![(64 * layout.record_bytes) as u64, layout.hidden_bytes as u64],
                 ..DrafterBytes::native_mtp(&checkpoint, &cfg)? }), 2,
             Some(crate::shared::prefix::MarkRule { lanes: 2, entries: 2, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, None, false)?);
         let mut mtp = Mtp::load(&engine.borrow(), &reader, format, admitted, fixed)?;
         let input = Allocation::new(engine.borrow().stream.device, HEAD_ROWS * layout.hidden_bytes, crate::shared::memory::TEST)?;
         let selector = RefCell::new(crate::shared::token_io::TokenSelector::new(&library,

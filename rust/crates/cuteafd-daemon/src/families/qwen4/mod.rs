@@ -83,9 +83,6 @@ pub(crate) struct EngineArgs {
     /// Arithmetic-route policy for already-queued short prompt packing.
     #[arg(long, value_enum, default_value_t = crate::shared::prefill_packing::PackingMode::default())]
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
-    /// Admit every prefill row's logits at startup for fidelity probes.
-    #[arg(long)]
-    pub full_prefill_logits: bool,
     /// Hold the GDN and attention in/out projections (target and MTP layers)
     /// as E4M3 with FP32 128x128 block scales, quantized at load, INSTEAD of
     /// the checkpoint's BF16 (no BF16 copy stays resident): every step shape
@@ -379,17 +376,15 @@ mod weight_representation_tests {
             assert!(args(&extra)?.prefill_shape().is_err(), "{extra:?}");
         }
         let diagnostic = args(&["--shared-only", "--prefill-rows", "16384", "--prefill-units", "2752",
-            "--prefill-waves", "2", "--full-prefill-logits"])?;
+            "--prefill-waves", "2"])?;
         assert!(diagnostic.prefill_shape().is_err());
         let diagnostic = args(&["--shared-only", "--prefill-rows", "5504", "--prefill-units", "2752",
-            "--prefill-waves", "2", "--full-prefill-logits"])?;
+            "--prefill-waves", "2"])?;
         let shape = diagnostic.prefill_shape()?.unwrap();
         assert_eq!((shape.unit_rows, shape.waves, diagnostic.prefill_rows), (2752, 2, 5504));
         let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
         let admitted = admission::inputs(&diagnostic, &cfg, 48, false, None, Some((160, true)), 0)?;
         assert_eq!((admitted.prefill_shape, admitted.prefill_rows), (Some(shape), 5504));
-        assert_eq!(admitted.full_prefill_logits,
-            cuteafd_loader::plan::layout::full_prefill_logits_bytes("qwen4", 5504, cfg.vocab_size as u64));
         let shape = args(&["--peers", "localhost:9870", "--prefill-rows", "2048", "--prefill-waves", "2"])?.prefill_shape()?.unwrap();
         assert_eq!((shape.unit_rows, shape.slot_rows()), (2048, 4096));
         let mut parsed = args(&["--peers", "localhost:9870", "--prefill-waves", "2"])?;
@@ -764,7 +759,6 @@ impl Opened {
         }
         engine.admitted_host = Some(admitted_host);
         engine.admit_host_memory(args)?;
-        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.prepare_prefill_units()?;
         // Weights and experts are resident: the load's pinned upload high-water
         // is transient (serving's small table uploads regrow only what they use).

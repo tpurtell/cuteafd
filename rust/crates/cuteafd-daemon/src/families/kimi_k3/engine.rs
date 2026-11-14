@@ -383,8 +383,7 @@ impl<'a> Engine<'a> {
         Ok(crate::shared::qwen::scheduler::Geometry { family: "kimi_k3",
             vocab_size: local.config().vocab_size, max_context: self.served_context,
             // A call is the slots' units.
-            slots: state.slots(), prefill_rows: local.rows().min(self.depth.call_rows()), decode_rows: local.rows().min(64),
-            full_prefill_logits: lanes.io[0][self.head()].full_prefill_logits() })
+            slots: state.slots(), prefill_rows: local.rows().min(self.depth.call_rows()), decode_rows: local.rows().min(64) })
     }
 
     pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
@@ -680,7 +679,7 @@ impl<'a> Engine<'a> {
         let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
             rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi submission rows overflow")))?;
         let geometry = self.geometry()?;
-        let logit_capacity = if consume.is_some() || geometry.full_prefill_logits { geometry.prefill_rows }
+        let logit_capacity = if consume.is_some() { geometry.prefill_rows }
             else { geometry.decode_rows };
         ensure!(!sequences.is_empty() && logit_rows > 0 && logit_rows <= rows && logit_rows <= logit_capacity,
             "Kimi device submission logit extent");

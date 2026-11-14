@@ -150,7 +150,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
                 reserve_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: 1_048_576, serving_context: crate::placement::planner::Context::pinned(1_048_576),
+            rows: 256, waves: 1, unit: 0, sequences: 16, context: 1_048_576, serving_context: crate::placement::planner::Context::pinned(1_048_576),
             requested_pool: Some(1_048_576),
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
@@ -312,7 +312,7 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
                 }).collect::<Vec<_>>();
                 let layer_bytes = attention.iter().map(|bytes| bytes + native::ffn_region_bytes(rows, rows).unwrap())
                     .collect::<Vec<_>>();
-                let logits = native::head_rows(rows, false);
+                let logits = native::head_rows(rows);
                 let head_bytes = if rank == usize::from(head) { native::plane_bytes(&native::head_planes(logits).unwrap()).unwrap() } else { 0 };
                 let expected = layer_bytes.iter().copied().max().unwrap_or(0).max(head_bytes);
                 assert_eq!(native::rank_admission(&cp, &owners, rank, rows, rows, logits).unwrap().workspace, expected);

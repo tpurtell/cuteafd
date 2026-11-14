@@ -769,7 +769,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
         context: cuteafd_loader::placement::planner::Context::pinned(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT as u64), slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
-        pool_tokens: Some(1_048_576), graphs, full_prefill_logits: false, draft: None, ffn_mode: args.ffn_mode(),
+        pool_tokens: Some(1_048_576), graphs, draft: None, ffn_mode: args.ffn_mode(),
         hosted_layers: args.hosted(cfg)?, verify_rows: verify, prefix: None,
     })
 }
@@ -1497,7 +1497,7 @@ mod tests {
             capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None, context: None, serving_context: cuteafd_loader::placement::planner::Context::pinned(1_048_576),
-            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None, full_prefill_logits: false,
+            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows, (rows).min(4096),
                 1048576, native_scratch).unwrap())], fixed,
             startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2)?,

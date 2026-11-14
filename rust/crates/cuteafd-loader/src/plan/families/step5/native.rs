@@ -354,10 +354,9 @@ pub fn rank_attention_bytes(cfg: &Config, ownership: &ExecutionOwnership, rank: 
     Ok(largest)
 }
 
-/// Head logit rows: the decode/verify width, or every chunk row only when
-/// full-prefill scoring is admitted. Prefill never needs more than its last row.
-pub fn head_rows(rows: usize, full_prefill_logits: bool) -> usize {
-    if full_prefill_logits { rows } else { rows.min(64) }
+/// Bounded decode/verify head scratch, reused by streamed prefill scoring.
+pub fn head_rows(rows: usize) -> usize {
+    rows.min(64)
 }
 
 pub fn head_planes(rows: usize) -> Result<[usize; 4]> {
@@ -412,7 +411,7 @@ pub fn mtp_compact_planes(rows: usize, kv_format: Qwen4KvCache) -> Result<[usize
 pub fn mtp_scratch_core(rows: usize, kv_format: Qwen4KvCache) -> Result<u64> {
     Ok(mtp_compact_offset(rows)?.checked_add(plane_bytes(&mtp_compact_planes(rows, kv_format)?)?)
         .context("Step-5 predictor compact staging overflow")?
-        .max(plane_bytes(&head_planes(head_rows(rows, false))?)?))
+        .max(plane_bytes(&head_planes(head_rows(rows))?)?))
 }
 
 /// `unit` rows run through attention and FFN scratch per hook; `span` rows
@@ -514,7 +513,7 @@ pub struct MtpRows {
 /// vocabulary head retains only its decode/verify width, never the wave span.
 pub fn mtp_rows(unit: usize) -> Result<MtpRows> {
     ensure!((1..=4096).contains(&unit), "Step-5 MTP allocation unit must be 1..=4096 rows");
-    Ok(MtpRows { layer: unit, head: head_rows(unit, false) })
+    Ok(MtpRows { layer: unit, head: head_rows(unit) })
 }
 
 /// Each predictor stage's native owners hold private projection scratch at
@@ -764,11 +763,11 @@ mod tests {
                 assert_eq!(layer_workspace(rows, rows, full, heads)?, attention_bytes(rows, full, heads)? + region);
             }
             assert!(layer_workspace(rows, rows, true, 64)? >= layer_workspace(rows, rows, false, 64)?);
-            assert!(layer_workspace(rows, rows, true, 64)? > plane_bytes(&head_planes(head_rows(rows, false))?)?);
+            assert!(layer_workspace(rows, rows, true, 64)? > plane_bytes(&head_planes(head_rows(rows))?)?);
         }
-        assert_eq!(head_rows(4096, false), 64);
-        assert_eq!(head_rows(16, false), 16);
-        assert_eq!(head_rows(4096, true), 4096);
+        assert_eq!(head_rows(4096), 64);
+        assert_eq!(head_rows(16), 16);
+        assert_eq!(head_rows(8256), 64);
         Ok(())
     }
 }

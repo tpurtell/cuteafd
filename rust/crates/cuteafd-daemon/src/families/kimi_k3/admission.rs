@@ -88,7 +88,6 @@ pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
     pub waves: usize,
     /// Explicit unit rows (else `rows / waves`).
     pub unit_rows: Option<usize>,
-    pub full_prefill_logits: bool,
     pub lane_layouts: Vec<[LaneLayout; RANKS]>,
     pub fixed: Vec<Demand>,
     pub startup: Vec<Demand>,
@@ -723,9 +722,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let state_slots = inputs.state_slots;
     let legacy_marks = inputs.prefix_marks;
     let global_layouts = GlobalLayout::ranks_with_core(cfg, &core, devices.len())?;
-    let full_prefill_logits = inputs.full_prefill_logits;
-    let io_layouts = (0..devices.len()).map(|rank| IoLayout::for_ranks(cfg, rank, inputs.rows, &core, devices.len())
-        .map(|layout| layout.with_prefill_logits(full_prefill_logits)))
+    let io_layouts = (0..devices.len()).map(|rank| IoLayout::for_ranks(cfg, rank, inputs.rows, &core, devices.len()))
         .collect::<Result<Vec<_>>>()?;
     let rtx = inputs.rtx.take();
     let spark_budget = inputs.spark_budget.take();
@@ -895,7 +892,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     }, usize::try_from(request.pool.compiled_context)?, graph_slots)).transpose()?.flatten();
     recipe.owners.push(kimi::host_prefix_owner(host_prefix.as_ref().map_or(0, |config| config.bytes), maximum_pages));
     let rows = lane_layouts[0][0].rows();
-    let scoring_bytes = kimi::host_scoring_bytes(if full_prefill_logits { rows } else { rows.min(64) }, rows, cfg.vocab_size)?;
+    let scoring_bytes = kimi::host_scoring_bytes(rows.min(64), rows, cfg.vocab_size)?;
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
     recipe.owners.extend(kimi::stream_slab_owners(RANKS, maximum_pages)?);
@@ -1072,8 +1069,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
         fixed.push(demand);
     }
     for rank in 0..RANKS {
-        let layout = IoLayout::for_ranks(cfg, rank, i.rows, &i.core, RANKS)?
-            .with_prefill_logits(i.full_prefill_logits);
+        let layout = IoLayout::for_ranks(cfg, rank, i.rows, &i.core, RANKS)?;
         for lane in 0..i.lanes {
             let demand = layout.demand(lane)?;
             ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
@@ -1424,7 +1420,7 @@ pub(super) mod tests {
     fn inputs_for_ranks<const RANKS: usize>(cfg: &KimiK3Config) -> Inputs<'_, RANKS> {
         Inputs { skip_routed_experts: false, expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; RANKS], devices: std::array::from_fn(|rank| rank as i32), peer_access: RANKS == 2, spark_ranks: 6,
-            attention: (RANKS == 2).then_some(AttentionPlacement::Layers), context: None, serving_context: cuteafd_loader::placement::planner::Context::pinned(1 << 20), requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None, full_prefill_logits: false,
+            attention: (RANKS == 2).then_some(AttentionPlacement::Layers), context: None, serving_context: cuteafd_loader::placement::planner::Context::pinned(1 << 20), requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::for_ranks(
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 2048, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }, RANKS).unwrap()); 2],
@@ -2765,26 +2761,19 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn full_prefill_logits_charge_is_opt_in_and_precedes_allocation() -> Result<()> {
+    fn bounded_head_output_is_charged_once_before_allocation() -> Result<()> {
         let cfg = cfg();
-        let ordinary = admit(inputs(&cfg))?;
-        let mut scoring = inputs(&cfg);
-        scoring.full_prefill_logits = true;
-        let scoring = admit(scoring)?;
+        let admitted = admit(inputs(&cfg))?;
         for rank in 0..2 {
             for lane in 0..2 {
-                let a = ordinary.io_layouts[rank].demand(lane)?;
-                let b = scoring.io_layouts[rank].demand(lane)?;
-                assert_eq!(b.bytes - a.bytes, if rank == 1 { (4096 - 64) * cfg.vocab_size as u64 * 4 } else { 0 });
-                let charged = scoring.placement.items[rank].iter().find(|item| item.group == b.group).unwrap();
-                assert_eq!(charged.bytes, b.bytes);
-                scoring.check_io(rank, lane, rank as i32)?;
+                let demand = admitted.io_layouts[rank].demand(lane)?;
+                let charged = admitted.placement.items[rank].iter()
+                    .filter(|item| item.group == demand.group).collect::<Vec<_>>();
+                assert_eq!(charged.len(), 1);
+                assert_eq!(charged[0].bytes, demand.bytes);
+                admitted.check_io(rank, lane, rank as i32)?;
             }
         }
-        let mut explicit_off = inputs(&cfg);
-        explicit_off.full_prefill_logits = false;
-        let explicit_off = admit(explicit_off)?;
-        assert_eq!(serde_json::to_value(&ordinary.placement)?, serde_json::to_value(&explicit_off.placement)?);
         Ok(())
     }
 
