@@ -1619,7 +1619,8 @@ mod tests {
         requested_pool: Option<u64>,
         loaded: ResidentWeights, limit: Option<ResidentWeights>) -> QwenInputs<'a> {
         let gib = 1u64 << 30;
-        QwenInputs { blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: limit, loaded_weights: loaded,
+        QwenInputs { experts: None, onboard: Onboard::Auto,
+            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: limit, loaded_weights: loaded,
             arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg, layers: cfg.layers, mtp: false,
