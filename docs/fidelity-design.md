@@ -53,17 +53,17 @@ changes using the fixed dataset; its old calibration campaigns are historical.
 
 ### Bounded prefill scoring (2026-11-12)
 
-GLM Flash, dense Qwen, Qwen4, MiMo, V4, Step-5, Muse, GLM 5.3 and Mistral Large 4
-accept prefill-shaped fidelity probes on ordinary serving launches after paired
-raw-row and ordinary-layout Standard proofs, without reserving all-call logits
-before KV sizing. The Kimi adapter remains staged behind a central activation
-allowlist until its proof passes; its existing launch admission and scoring
-dispatch are unchanged. Scoring preserves
-the serving transformer's prefill calls and unit cuts, projects through existing
-head storage, and consumes selected rows before that storage is reused. Raw
-logits dumps use those same rows for byte-exactness and full-vocabulary KL.
-Other families retain their existing admission requirement during migration;
-the legacy flag remains only until each family's paired exactness check passes.
+GLM Flash, dense Qwen, Qwen4, MiMo, V4, V4.1, Step-5, Muse, Kimi K3,
+GLM 5.3 and Mistral Large 4 accept prefill-shaped fidelity probes on ordinary
+serving launches without reserving all-call logits before KV sizing. Each
+implemented backend publishes its positive streamed-prefill scoring capability;
+unknown or unsupported backends fail closed for prefill, while decode scoring
+remains available. Scoring preserves the serving transformer's prefill calls
+and unit cuts, projects through bounded head storage, and consumes selected
+rows before that storage is reused. Raw logits dumps, golden NLL and resume
+hashes share those bounded rows for byte-exactness and full-vocabulary KL.
+Families still in bring-up must expose that capability and pass paired/raw-row
+and ordinary-layout checks when their target heads are integrated.
 Scoring continues through normal request admission. GLM 5.3 / Mistral Large 4
 stream the actual serving cuts; legacy all-row retention could collapse those
 cuts into a serial diagnostic call. Their paired comparison therefore reports

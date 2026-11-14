@@ -115,8 +115,6 @@ pub(crate) struct ServeArgs {
     max_sequences: u8,
     #[arg(long)]
     model_id: Option<String>,
-    /// All prefill rows are always scored by this eager target.
-    #[arg(long)]
     #[command(flatten)]
     prefix: PrefixArgs,
     #[command(flatten)]

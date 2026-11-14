@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn full_head_arena_keeps_projection_backing_outside_phase_maximum() -> Result<()> {
+    fn bounded_head_arena_keeps_projection_backing_outside_phase_maximum() -> Result<()> {
         use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
         let (unit, span) = (2752, 3 * 2752);
         let mut projection = ProjectionScratchLayout::new(13824, 4096, unit)?;
@@ -180,13 +180,9 @@ mod tests {
         let layer = native::layer_workspace(unit, span, true, 64)?;
         let head_planes = native::head_planes(span)?;
         let head = native::plane_bytes(&head_planes)?;
-        let old_total = (layer + projection).max(head);
-        let old_arena = old_total - projection;
-        assert_eq!(head - old_arena, projection);
-        assert!(view_layout(old_arena as usize, &head_planes, 0).is_err());
         let total = native::with_arena_phase(layer + projection, projection, head)?;
         let arena = usize::try_from(total - projection)?;
-        assert_eq!(total, head + projection);
+        assert_eq!(total, layer.max(head) + projection);
         view_layout(arena, &head_planes, 0)?;
         for depth in [0, 1, 3] {
             let predictor = native::mtp_forecast_workspace(unit, depth,

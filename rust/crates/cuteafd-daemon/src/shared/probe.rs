@@ -521,12 +521,6 @@ pub(crate) fn verify_rows(probe: &ProbeRef) -> Option<usize> {
     probe.as_ref().and_then(|p| p.spec.verify_rows)
 }
 
-/// Diagnostic tails may be below a family's minimum pipelined chunk size.
-/// Use a serial lane while preserving existing non-diagnostic chunking.
-pub(crate) fn scoring_prefill_capacity(admitted: bool, lane_rows: usize, normal_rows: usize) -> usize {
-    if admitted { lane_rows } else { normal_rows }
-}
-
 /// Keep the family's existing scoring width unless explicitly overridden.
 /// Reject unsupported widths before prefill or any device work is queued.
 fn scoring_width(capacity: usize, requested: Option<usize>) -> Result<usize> {
@@ -754,8 +748,7 @@ mod tests {
 
     #[test]
     fn admitted_scoring_splits_short_pipelined_tails_into_serial_lanes() {
-        assert_eq!(scoring_prefill_capacity(false, 256, 1024), 1024);
-        let rows = scoring_prefill_capacity(true, 256, 1024);
+        let rows = 256;
         let plan = score_plan(513, 1, rows, 8, None, ScorePath::Prefill, true).unwrap();
         let continuation: Vec<_> = plan.iter().filter(|s| s.tokens.start >= 1).collect();
         assert_eq!(continuation.iter().map(|s| s.tokens.len()).collect::<Vec<_>>(), [256, 255]);

@@ -1503,7 +1503,7 @@ impl<'a> Qwen4Engine<'a> {
                     let slot = self.workspace_slot(owner, decode)?;
                     if slot.borrow().is_none() {
                         let rows = if decode { DECODE_ROWS } else { self.prefill_rows };
-                        let logits = if decode { DECODE_ROWS } else 1;
+                        let logits = if decode { DECODE_ROWS } else { 1 };
                         *slot.borrow_mut() = Some(self.workspace(rows, decode, logits)?);
                     }
                     Ok(())

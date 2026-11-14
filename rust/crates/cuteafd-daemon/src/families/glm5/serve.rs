@@ -1506,20 +1506,12 @@ mod draft_tests {
     use super::*;
 
     #[test]
-    fn streamed_scoring_activation_is_specific_to_the_checkpoint_family() -> Result<()> {
-        use cuteafd_loader::families::glm5::GlmDsaConfig;
-        let ml4 = GlmDsaConfig::from_hf(&serde_json::from_str(include_str!(
-            "../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?)?;
-        let mut glm = ml4.clone();
-        glm.variant = cuteafd_loader::families::glm5::GlmVariant::Glm;
-        assert_eq!(glm.family_id(), "glm5");
-        assert_eq!(ml4.family_id(), "mistral_large4");
-        assert!(probe::streamed_prefill_scoring(glm.family_id()));
-        assert!(probe::prefill_scoring_admitted(glm.family_id(), false));
-        assert!(probe::streamed_prefill_scoring(ml4.family_id()));
-        assert!(probe::prefill_scoring_admitted(ml4.family_id(), false));
-        assert!(probe::prefill_scoring_admitted(ml4.family_id(), true));
-        Ok(())
+    fn streamed_scoring_dispatch_uses_the_checkpoint_engine_without_an_allowlist() {
+        let source = include_str!("serve.rs");
+        let scoring = source.split_once("if let Some(from) = probe::scoring(&job.probe)").unwrap().1
+            .split_once("release(&family").unwrap().0;
+        assert!(scoring.contains("engine.prefill_streamed_scoring("));
+        assert!(scoring.contains("engine.prefill_capacity()"));
     }
 
     #[test]

@@ -2166,7 +2166,7 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
     });
     let mut placement = engine::PageAllocator::new(engine).admit(tokens.len())?;
     let started = Instant::now();
-    let rows = crate::shared::probe::scoring_prefill_capacity(true, engine.prefill_rows, engine.prefill_capacity());
+    let rows = engine.prefill_rows;
     let media = cuteafd_engine::media::RequestMedia::new(Vec::new(), opened.cfg.hidden, tokens.len())?;
     for (index, chunk) in tokens.chunks(rows).enumerate() {
         engine.prefill_streamed_scoring(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)),

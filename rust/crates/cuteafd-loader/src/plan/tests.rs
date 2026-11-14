@@ -1506,7 +1506,7 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
 }
 
 #[test]
-fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
+fn host_scoring_tile_is_independent_of_prefill_span_and_lanes() {
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
     let mut report = input.plan(&PlanOptions::default()).unwrap();
@@ -1515,13 +1515,13 @@ fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
         host_cache_bytes: Some(0), prefill_lanes: 3,
         prefill_unit_rows: Some(4096), ..Default::default() };
     let vocab = report.spec.as_ref().unwrap().vocab as u64;
-    for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096), ("glm5", 4096)] {
+    for family in ["mimo_v2", "glm5_flash", "glm5"] {
         report.family = Some(family.into());
         report.prefill_transports = None;
         layout::charge_host(&mut report, &options, &input, false).unwrap();
         let logits = report.host_ledger.as_ref().unwrap().items.iter()
             .find(|item| item.group == "scoring/full-logits").unwrap().bytes;
-        assert_eq!(logits, rows * vocab * 4, "{family}");
+        assert_eq!(logits, 64 * vocab * 4, "{family}");
     }
 }
 

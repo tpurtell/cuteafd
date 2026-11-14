@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn serving_prefill_head_and_allocation_admit_exactly_one_row() {
+    fn prefill_head_is_bounded_and_terminal_only_remains_one_row() {
         let mut raw = mimo_pro_config();
         raw["vocab_size"] = serde_json::json!(152576);
         let cfg = MimoV2Config::from_hf(&raw).unwrap();
@@ -389,9 +389,9 @@ mod tests {
         let last = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
             prefill_output: MimoPrefillOutput::LastRow, ..options()
         }).unwrap();
-        assert_eq!((full.logits_rows, last.logits_rows), (16384, 1));
+        assert_eq!((full.logits_rows, last.logits_rows), (64, 1));
         assert_eq!(last.logits, 152576 * 4);
-        let saved = 16383 * 152576 * 4;
+        let saved = 63 * 152576 * 4;
         assert_eq!(full.logits - last.logits, saved);
         assert_eq!(full.device_bytes().unwrap() - last.device_bytes().unwrap(), saved);
         for ((name, before), (after_name, after)) in full.device_buffers().zip(last.device_buffers()) {
