@@ -781,3 +781,21 @@ def test_nvfp4_divisor_storage_is_distinct_without_changing_abi_or_capacity_slot
     g.scale_convention = "unknown"
     with pytest.raises(ValueError, match="scale convention"):
         package_tool.info_words(g, [16], False)
+
+
+def test_dynamic_nvfp4_manifest_omits_static_scale_convention():
+    g = SimpleNamespace(kind="nvfp4a4", weights="nvfp4", activation="swigluoai", projection="bf16",
+                        swiglu_limit=7.0, swiglu_alpha=1.702, swiglu_beta=1.0,
+                        hidden=6144, slice=3072, experts=128, top_k=4, intermediate=3072, tp=1,
+                        dynamic_nvfp4=False, scale_convention="multiplier")
+    assert package_tool.static_scale_metadata(g) == {"scale_convention": "multiplier"}
+    assert package_tool.info_words(g, [16], False)[0] >> 8 & 255 == 4
+    g.scale_convention = "divisor"
+    assert package_tool.static_scale_metadata(g) == {"scale_convention": "divisor"}
+    assert package_tool.info_words(g, [16], False)[0] >> 8 & 255 == 8
+    g.dynamic_nvfp4 = True
+    g.scale_convention = "multiplier"
+    g.kind = "nvfp4dyn"
+    assert package_tool.static_scale_metadata(g) == {}
+    # Build's manifest serialization must use the same tested helper.
+    assert "**static_scale_metadata(g)," in TOOL.read_text()
