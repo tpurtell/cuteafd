@@ -432,36 +432,11 @@ impl<'w> NativePendingFfn<'w, '_> {
         let rows = self.rows;
         let slot = self.ticket.slot();
         let exchange = self.link.exchange()?;
-        // A host-ordered pass (1 RTX) collects as before the exchange: the
-        // host waits for the reply here, where everything this layer can
-        // issue (router, staging, shared FFN, L2 prefetch) is already queued,
-        // and only then queues the landing and reduce, so no stream sits
-        // blocked on a device wait through the round trip. A device-ordered
-        // pass queues them at once (the device waits).
-        //
-        // Every wait here yields to the executor rather than blocking the
-        // thread (#815): prefill polls its two encoder lanes on this thread,
-        // and a lane that spun or slept through its ~10 ms round trip kept
-        // the other lane from issuing its next layer, so only one wave was
-        // ever in flight and the Sparks idled half the time. A lone future
-        // (decode) re-polls at once, so its wait is still a spin.
+        // Both execution modes queue the shared exchange's device wait. Its
+        // per-rank pulls preserve early PCIe overlap without a host poll loop.
+        // Non-deferred passes still drain the final reduction below before
+        // reusing pinned staging or rebinding per-layer owners.
         let host_ordered = !crate::shared::memory::chain::deferred();
-        if host_ordered {
-            // The shared host-wait pacing still applies (`--host-wait block`
-            // sleeps past its spin window), between yields. Pinned ranks that
-            // arrived are pulled meanwhile (#815) on the reduce stream (after
-            // the slot's previous reduce; no chain work touches the planes),
-            // so their PCIe transfer overlaps the ranks still on the wire.
-            let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
-            while !exchange.landed(&self.ticket) {
-                crate::shared::spark_waves::healthy()?;
-                exchange.pull_arrived(&self.ticket, self.stream.raw)?;
-                backoff.pause();
-                tokio::task::yield_now().await;
-            }
-            // The reply landed: progress for the pacing around the lane loop.
-            cuteafd_transport::wait_policy::note_active();
-        }
         // SAFETY: the reduce stream joins the chain (the shared contribution's
         // producers), then waits on the device for this wave's planes; the
         // intake planes, shared values and output stay live until the stream

@@ -147,9 +147,8 @@ impl<'a> BackboneRouterWeights<'a> {
             window: RowWindow::NONE,
             kernel: self.library.v41_router()?,
             input_quantizer: self.library.v41_expert_input_quantizer()?,
-            // Decode/verification benefits from batching small DMA transfers.
-            // Large prefill retains direct downloads to avoid another host copy.
-            // Route ids (24 B per row); also the non-deferred mask staging.
+            // Explicit route diagnostics and the non-deferred mask upload only;
+            // ordinary router execution never downloads route ids.
             request_staging: HostAllocation::new(self.library, capacity as usize * 24, Tag::staging("v41/backbone-router"))?,
             mask_staging: HostAllocation::new(self.library, capacity as usize, Tag::staging("v41/backbone-router"))?,
             route_ring: Some(HostAllocation::new(self.library, 40 * capacity as usize * 24, Tag::staging("v41/backbone-router"))?),
@@ -189,7 +188,8 @@ pub(crate) struct RouterOutput<'a> {
 }
 impl RouterOutput<'_> {
     /// # Safety
-    /// The completed router output stays live and unchanged through this copy.
+    /// The router output and its producer stream stay live and unchanged through
+    /// this copy; this diagnostic may block until queued router work completes.
     pub unsafe fn capture_route_ids(&self, library: &NativeLibrary, output: &mut Vec<[u32; 6]>) -> Result<()> {
         ensure!(self.rows > 0 && self.rows <= 4096 && self.ids.bytes == self.rows as usize * 24,
             "invalid route capture extent");
@@ -198,9 +198,15 @@ impl RouterOutput<'_> {
         // vector is exclusively borrowed and fully initialized before copying.
         let bytes = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), self.ids.bytes) };
         ensure!(bytes.len() <= self.request_staging.bytes, "route capture staging extent differs");
-        // This execution already drained the graph's route-ID download.
+        // Keep this diagnostic outside the graph, ordered after the producer.
+        // SAFETY: the owner retains ids and pinned staging through the drain,
+        // including a failed enqueue, before either buffer is read or reused.
+        let copied = unsafe { library.copy_d2h_host_buffer_async(
+            self.request_staging, self.ids, bytes.len(), self.stream) };
+        let drained = unsafe { library.cuda_stream_synchronize(self.stream) };
+        copied.and(drained)?;
+        // SAFETY: the producer and diagnostic copy have completed into this staging.
         unsafe { std::ptr::copy_nonoverlapping(self.request_staging.ptr.cast::<u8>(), bytes.as_mut_ptr(), bytes.len()); }
-        let _ = library;
         Ok(())
     }
     pub fn binding(&self) -> Result<QueryBinding> {
@@ -272,15 +278,12 @@ mod reuse_tests {
                     let [fresh_input, fresh_mask] = fresh.inputs();
                     library.copy_h2d(fresh_input, &hidden)?;
                     library.copy_h2d(fresh_mask, &mask)?;
-                    if local {
-                        unsafe { std::ptr::write_bytes(lane.request_staging.buffer.ptr, 0xa5, lane.request_staging.buffer.bytes); }
-                    }
+                    // Neither eager execution nor replay may download routes.
+                    unsafe { std::ptr::write_bytes(lane.request_staging.buffer.ptr, 0xa5, lane.request_staging.buffer.bytes); }
                     let actual = unsafe { lane.execute_captured(rows)? };
                     let reference = unsafe { fresh.execute(rows)? };
-                    if local {
-                        let staging = unsafe { std::slice::from_raw_parts(actual.request_staging.ptr.cast::<u8>(), actual.request_staging.bytes) };
-                        assert!(staging[rows as usize * 24..].iter().all(|&b| b == 0xa5));
-                    }
+                    let staging = unsafe { std::slice::from_raw_parts(actual.request_staging.ptr.cast::<u8>(), actual.request_staging.bytes) };
+                    assert!(staging.iter().all(|&b| b == 0xa5));
                     for (a,b) in [(actual.ids,reference.ids),(actual.routing,reference.routing),
                                   (actual.expert_input,reference.expert_input)] {
                         assert_eq!(bytes(&library,a)?,bytes(&library,b)?);
@@ -291,9 +294,13 @@ mod reuse_tests {
                     let captured: Vec<u8> = ids.iter().flatten().flat_map(|v| v.to_ne_bytes()).collect();
                     assert_eq!(captured,bytes(&library,reference.ids)?);
                     assert_eq!(unsafe { actual.download_request(&library) }.is_err(),local);
-                    let handle = lane.graphs.get(layer,&weights[layer]).unwrap().0;
+                    // Two-node router/quantizer graphs may remain eager under
+                    // the shared tiny-graph policy; retained handles stay stable.
+                    let handle = lane.graphs.get(layer,&weights[layer]).map(|entry| entry.0);
                     if let Some(previous) = handles.insert((local,layer),handle) { assert_eq!(previous,handle); }
-                    if let Some(other) = handles.get(&(!local,layer)) { assert_ne!(*other,handle); }
+                    if let (Some(handle), Some(Some(other))) = (handle, handles.get(&(!local,layer))) {
+                        assert_ne!(*other,handle);
+                    }
                 }
             }
         }
@@ -389,7 +396,7 @@ mod reuse_tests {
                             .chunks_exact(4)
                             .all(|b| f32::from_ne_bytes(b.try_into().unwrap()).is_finite()));
                     }
-                    let handle = lane.graphs.get(layer, &weights[layer]).unwrap().0;
+                    let handle = lane.graphs.get(layer, &weights[layer]).map(|entry| entry.0);
                     if cycle == 0 {
                         handles.insert(layer, handle);
                     } else {
@@ -607,13 +614,8 @@ impl<'a> BackboneRouterWave<'_, 'a> {
                 self.input_quantizer
                     .launch(self.b(0), self.b(5), rows, self.stream().raw)?;
             }
-            // Route ids only (route capture, route-policy tracing). A remote
-            // layer's wave stages its hidden rows, ids and weights from the
-            // device buffers (`wave_sources`), so nothing else comes down (P4).
-            let bytes = rows as usize * 24;
-            ensure!(bytes <= self.request_staging.buffer.bytes, "route staging too small");
-            let ids = std::slice::from_raw_parts_mut(self.request_staging.buffer.ptr.cast::<u8>(), bytes);
-            self.stream().library.copy_d2h_async(ids, self.b(3), self.stream().raw)?;
+            // Experts and the shared exchange consume the device route planes.
+            // Only explicit capture/tracing downloads ids, outside this graph.
             Ok(())
         }
     }
@@ -736,7 +738,8 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         Ok(())
     }
     /// Stage completed input on the router stream. The mask uses the beginning
-    /// of the pinned request arena; H2D consumes it before graph D2H overwrites it.
+    /// of the pinned request arena; explicit route diagnostics reuse it only
+    /// after the producer stream consumes the mask upload.
     /// The caller must drain even if subsequent graph preparation fails.
     unsafe fn stage_inputs(&mut self, input: CuteafdDeviceBuffer, mask: &[u8]) -> Result<()> {
         ensure!(
@@ -1043,8 +1046,95 @@ impl BackboneRouterWeights<'_> {
 
 #[cfg(test)]
 mod host_order_tests {
-    use crate::shared::memory::{chain::{self, StageChain}, DeviceAllocation, LoadStream};
+    use crate::shared::memory::{chain::{self, StageChain}, DeviceAllocation, HostAllocation, LoadStream};
     use anyhow::Result;
+
+    #[test]
+    fn route_readback_is_explicit_and_completion_is_device_ordered() {
+        let router = include_str!("v41_backbone_router.rs");
+        let enqueue = &router[router.find("    unsafe fn enqueue(&mut self, rows:").unwrap()..];
+        let enqueue = &enqueue[..enqueue.find("    pub unsafe fn execute(").unwrap()];
+        assert!(!enqueue.contains("copy_d2h"), "router graphs must retain device route ids");
+        let capture = &router[router.find("    pub unsafe fn capture_route_ids(").unwrap()..];
+        let capture = &capture[..capture.find("    pub fn binding(").unwrap()];
+        assert!(capture.contains("copy_d2h_host_buffer_async"));
+        assert!(capture.find("copy_d2h_host_buffer_async").unwrap() < capture.find("cuda_stream_synchronize").unwrap());
+        let coordinator = include_str!("v41_experts/coordinator.rs");
+        let finish = &coordinator[coordinator.find("    async unsafe fn finish_values(").unwrap()..];
+        let finish = &finish[..finish.find("#[cfg(test)]").unwrap()];
+        for forbidden in [".landed(", ".pull_arrived(", "yield_now", "backoff"] {
+            assert!(!finish.contains(forbidden), "network completion must not poll: {forbidden}");
+        }
+        assert!(finish.contains("exchange.land(self.ticket, self.stream.raw)?"));
+        assert!(finish.contains("finish_or_wait(self.stream, false).await?"),
+            "non-deferred staging and rebinds retain their final lifetime fence");
+    }
+
+    #[test]
+    fn device_landing_retains_independent_slots_and_failure_release() {
+        let coordinator = include_str!("v41_experts/coordinator.rs");
+        let slots = &coordinator[coordinator.find("    pub fn unlinked(").unwrap()..];
+        let slots = &slots[..slots.find("    pub(crate) fn bootstrap(").unwrap()];
+        assert!(slots.contains("raw: library.cuda_stream_create()?"));
+        let collect = &coordinator[coordinator.find("    pub(crate) async unsafe fn collect_unit<'w>(").unwrap()..];
+        let collect = &collect[..collect.find("    pub(crate) async unsafe fn unit_shared(").unwrap()];
+        assert!(collect.contains("stream: &self.stream"));
+        let units = include_str!("v41_target_pass/encoder_units.rs");
+        let land = &units[units.find("    async fn land_experts(&mut self,").unwrap()..];
+        let land = &land[..land.find("    async fn end_unit(").unwrap()];
+        assert!(land.contains("self.slots[unit.slot].pass.unit_chain()?"));
+        assert!(land.contains("chain.scope(self.land_experts_inner"));
+        let pass = include_str!("v41_target_pass.rs");
+        let chain = &pass[pass.find("    pub(super) fn unit_chain(").unwrap()..];
+        assert!(chain[..chain.find("    pub(super) fn library(").unwrap()]
+            .contains("chain.set_device_order(true)"));
+        assert!(pass.contains("chain::watchdog("));
+        assert!(pass.contains("and_then(|()| crate::shared::spark_waves::healthy())"));
+        let wait = include_str!("../../shared/memory.rs");
+        let wait = &wait[wait.find("    pub(crate) async fn wait(&self)").unwrap()..];
+        let wait = &wait[..wait.find("impl Drop for LoadStream").unwrap()];
+        assert!(wait.contains("cuda_stream_query(self.raw)?"));
+        assert!(wait.contains("tokio::task::yield_now().await"));
+        let waves = include_str!("../../shared/spark_waves.rs");
+        assert!(waves.contains("since.elapsed() < timeout"));
+        let failure = &waves[waves.find("fn finish_worker<").unwrap()..];
+        let failure = &failure[..failure.find("/// A reply frame").unwrap()];
+        assert!(failure.contains("health::record_failure"));
+        assert!(failure.contains("release_until_closed(native, inbox, highest)"));
+        let release = &waves[waves.find("    fn fail(&mut self, sequence: u32) {\n        // Descriptors first:").unwrap()..];
+        let release = &release[..release.find("\n    }\n").unwrap()];
+        for required in ["self.pulls.clear", "Counter::Arrived(rank)", "self.publish(sequence)"] {
+            assert!(release.contains(required), "failed link must release queued waits: {required}");
+        }
+    }
+
+    #[test]
+    fn explicit_route_capture_reads_current_device_ids_not_stale_staging() -> Result<()> {
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
+        let ids = DeviceAllocation::new(&library, 24, crate::shared::memory::TEST)?;
+        let mut staging = HostAllocation::new(&library, 24, crate::shared::memory::TEST)?;
+        let mut captured = vec![[u32::MAX; 6]; 5];
+        for seed in [0u32, 101, 0] {
+            let expected = std::array::from_fn::<_, 6, _>(|i| seed + i as u32);
+            let bytes: Vec<_> = expected.iter().flat_map(|id| id.to_ne_bytes()).collect();
+            library.copy_h2d(ids.buffer, &bytes)?;
+            staging.bytes_mut().fill(0xa5);
+            let routed = super::RouterOutput {
+                layer: 0, rows: 1, input: ids.buffer, expert_input: ids.buffer,
+                request_nvfp4: false, mask: ids.buffer, scores: ids.buffer,
+                ids: ids.buffer, routing: ids.buffer, tokens: &[],
+                request_staging: staging.buffer, full_request: true, origin: None,
+                stream: stream.raw, _owner: std::marker::PhantomData,
+            };
+            // SAFETY: both planes and the producer stream live through this explicit capture.
+            unsafe { routed.capture_route_ids(&library, &mut captured)?; }
+            assert_eq!(captured, vec![expected]);
+        }
+        Ok(())
+    }
     #[test]
     fn host_ordered_passes_wait_once_per_layer_after_issuing_it() -> Result<()> {
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
