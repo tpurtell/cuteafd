@@ -441,7 +441,7 @@ pub(super) mod tests {
 
     // Sparse native checkpoint headers skip payload IO under dense recording.
     // Production loading, allocation and receipt observation still run unchanged.
-    pub(super) fn snapshot(dir: &std::path::Path) -> Result<(Checkpoint, MiniMaxM3Config)> {
+    pub(crate) fn snapshot(dir: &std::path::Path) -> Result<(Checkpoint, MiniMaxM3Config)> {
         let mut config: Value = serde_json::from_str(include_str!(
             "../../../../cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?;
         config.as_object_mut().unwrap().remove("vision_config");
@@ -532,7 +532,7 @@ pub(super) mod tests {
         Ok(json!({"programs":entries.into_values().collect::<Vec<_>>()}))
     }
 
-    pub(super) fn inputs(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, ids: &[i32], concurrency: u64) -> Result<MiniMaxInputs> {
+    pub(crate) fn inputs(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, ids: &[i32], concurrency: u64) -> Result<MiniMaxInputs> {
         let gpus = ids.len();
         let namespace_error = cuteafd_loader::push_load::namespace(&checkpoint.snapshot)
             .expect_err("constructor fixture must use mount loading without a push namespace");
