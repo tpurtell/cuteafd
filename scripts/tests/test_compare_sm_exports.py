@@ -121,9 +121,12 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
                                                         (6144,12288),(6144,3072)}
     assert exporter.native_attention_bf16_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192),(8192,2048)}
     programs = exporter.native_attention_programs()
+    muse_core = {(4096,8192),(1024,8192),(512,8192),(2048,8192),(8192,2048)}
     expected = {f"n{n}_k{k}_m{rows}{suffix}"
-                for n,k in set().union(*shapes.values()) for rows in (64,4096)
-                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() else ("",))}
+                for n,k in set().union(*shapes.values()) | muse_core for rows in (64,4096)
+                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() | {(8192,2048)} else ("",))}
+    expected.add("n202112_k8192_m64_f32")
+    assert "n202112_k8192_m4096_f32" not in expected, "head is microbatched at64rows"
     assert len(programs) == len(expected) and {p[0] for p in programs} == expected
     jobs = {job[0]: job[1:] for job in compare_sm.jobs("all")}
     assert jobs["native-attention-fp8"] == ("export_b12x_dsv4_aot.py",

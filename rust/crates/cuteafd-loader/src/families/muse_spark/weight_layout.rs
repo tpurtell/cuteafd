@@ -19,7 +19,11 @@ pub fn coordinator_arena(rank: usize, ranks: usize, global: &GlobalLayout, layer
     if rank == 0 { tensors.push(("embedding.table".into(), global.embedding)); }
     if rank + 1 == ranks {
         if let Some(head) = &global.head { tensors.extend(head.arena_tensors(&head.stem)?); }
-        else { tensors.push(("global.head".into(), global.head_bf16)); }
+        else if let Some(head) = &global.head_native {
+            let extents = head.allocation_extents()?;
+            tensors.push((format!("{}.values", head.stem), usize::try_from(extents[0])?));
+            if head.fp8 { tensors.push((format!("{}.scales", head.stem), usize::try_from(extents[1])?)); }
+        } else { tensors.push(("global.head".into(), global.head_bf16)); }
     }
     for (layer, layout) in layers.iter().enumerate() {
         tensors.extend(layout.operands.iter().map(|(name, bytes)| (format!("layers.{layer}.{name}"), *bytes)));
@@ -144,6 +148,7 @@ pub struct GlobalLayout {
     pub embedding: usize,
     pub final_norm: usize,
     pub head: Option<CoreWeightLayout>,
+    pub head_native: Option<NativeLayout>,
     pub head_bf16: usize,
 }
 
@@ -151,11 +156,24 @@ impl GlobalLayout {
     pub fn new(cfg: &MuseSparkConfig, core: &CoreInventory) -> Result<Self> {
         let head = core.get_weight(super::core::HEAD).map(|p| CoreWeightLayout::new(p, TrellisSide::Output, 0, 1))
             .transpose()?;
+        let head_native = core.native.get(super::core::HEAD).map(|p| NativeLayout {
+            stem: super::core::HEAD.into(), shape: p.shape, fp8: p.fp8,
+            rank: 0, ranks: 1, split: CoreSplit::Whole });
         Ok(Self { embedding: cfg.vocab_size * cfg.hidden * 2, final_norm: cfg.hidden * 2,
-            head_bf16: if head.is_some() { 0 } else { cfg.vocab_size * cfg.hidden * 2 }, head })
+            head_bf16: if head.is_some() || head_native.is_some() { 0 }
+                else { cfg.vocab_size * cfg.hidden * 2 }, head, head_native })
     }
 
-    pub fn head_bytes(&self) -> usize { self.head.as_ref().map_or(self.head_bf16, |h| h.bytes) }
+    pub fn head_bytes(&self) -> usize {
+        self.head.as_ref().map(|h| h.bytes)
+            .or_else(|| self.head_native.as_ref().map(|h| h.bytes().expect("validated head extent") as usize))
+            .unwrap_or(self.head_bf16)
+    }
+
+    pub fn stored_head_outputs(&self, logical: usize) -> usize {
+        self.head.as_ref().map(|h| h.shape[0])
+            .or_else(|| self.head_native.as_ref().map(|h| h.shape[0])).unwrap_or(logical)
+    }
 }
 
 /// A K6 projection program's package geometry: (K, N stored, side 1/2, codebook).
@@ -196,6 +214,7 @@ pub struct RankProjections {
     pub scratch: Option<crate::formats::trellis_core::ProjectionScratchLayout>,
     pub native: Vec<NativeRequest>,
     pub native_rows: usize,
+    pub native_head: Option<NativeLayout>,
     pub native_programs: crate::placement::planner::native_attention::NativePrograms,
 }
 
@@ -242,7 +261,8 @@ pub fn projections_with_manifest(cfg: &MuseSparkConfig, core: &CoreInventory, ra
     use crate::placement::planner::native_attention::{NativeProgram, NativePrograms};
     ensure!(rows > 0 && rows <= i32::MAX as usize, "Muse projection row ceiling outside signed launch domain");
     let mut out = vec![RankProjections { programs: BTreeMap::new(), scratch: None,
-        native: Vec::new(), native_rows: rows, native_programs: NativePrograms::resolve(&[], rows, manifest)? }; ranks];
+        native: Vec::new(), native_rows: rows, native_head: None,
+        native_programs: NativePrograms::resolve(&[], rows, manifest)? }; ranks];
     for layer in 0..cfg.layers {
         for (rank, layout) in LayerLayout::ranks(cfg, layer, ranks, core)?.into_iter().enumerate() {
             for weight in layout.native.values() {
@@ -256,9 +276,11 @@ pub fn projections_with_manifest(cfg: &MuseSparkConfig, core: &CoreInventory, ra
             }
         }
     }
-    if let Some(head) = GlobalLayout::new(cfg, core)?.head {
+    let global = GlobalLayout::new(cfg, core)?;
+    if let Some(head) = global.head {
         out[ranks - 1].programs.insert((projection_key(&head), ProjectionOutput::F32), rows.min(64));
     }
+    out[ranks - 1].native_head = global.head_native;
     for rank in &mut out {
         let requests = rank.native.iter().map(|request| NativeProgram {
             layout: &request.layout, output: match request.output {
@@ -267,6 +289,14 @@ pub fn projections_with_manifest(cfg: &MuseSparkConfig, core: &CoreInventory, ra
             },
         }).collect::<Vec<_>>();
         rank.native_programs = NativePrograms::resolve(&requests, rows, manifest)?;
+        if let Some(head) = &rank.native_head {
+            let selected = NativePrograms::resolve(&[NativeProgram { layout: head,
+                output: cuteafd_ffi::draft_projection::ProjectionOutput::F32 }], 64, manifest)?;
+            rank.native_programs.programs.extend(selected.programs);
+            rank.native_programs.programs.sort();
+            rank.native_programs.programs.dedup();
+            rank.native_programs.fp8_scratch_bytes = rank.native_programs.fp8_scratch_bytes.max(selected.fp8_scratch_bytes);
+        }
         let mut merged: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
         for (&((k, n, _, _, _), _), &program_rows) in &rank.programs {
             let mut layout = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, program_rows)?;
