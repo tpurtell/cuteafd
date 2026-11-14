@@ -875,9 +875,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         if rows > 1 {
                             engine.prefill_streamed_scoring(placement, chunk, experts, &request_media,
                                 probe::ScoringRows { consumer: &job.probe, position })
-                        } else if rows > 1 {
-                            Ok(engine.prefill_scoring_media(placement, chunk, experts, rows, &request_media)?
-                                .map(|values| probe::ScoreLogits::Host { values, vocab: engine.cfg.vocab_size }))
+
                         } else {
                             Ok(engine.prefill_media_device(placement, chunk, experts, 1, Some(&request_media))?.map(probe::ScoreLogits::Device))
                         }

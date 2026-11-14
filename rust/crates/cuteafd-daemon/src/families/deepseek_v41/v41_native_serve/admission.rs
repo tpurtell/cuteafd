@@ -642,7 +642,7 @@ pub(super) fn resolve_with_owners(
             crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes) },
         args.prefix.host_cache_bytes.enabled() && args.resolved_prefix_entries() > 0,
         crate::shared::prefix::PrefixArgs::host_chunk_bytes(super::prefix::layout(1, args.dspark)),
-        host_memory, cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?, None, false)?;
+        host_memory, cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?, None)?;
     if embedding_placement(args.embedding_placement, memory[0].1) == crate::shared::memory::EmbedPlacement::Host {
         let bytes = catalog.tensors().iter().filter(|tensor| tensor.metadata.name == "embed.weight")
             .map(|tensor| tensor.metadata.byte_length).sum();

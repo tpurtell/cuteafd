@@ -205,7 +205,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         &checkpoint.tensors.iter().map(|tensor| &tensor.meta).collect::<Vec<_>>(),
         PrefillShape { rows, waves: slots as u64 }, ranks, spark_ranks, context, shape.concurrency,
         dspark, options.host_cache_bytes, options.host_cache_bytes != Some(0) && turns > 0,
-        256 << 20, host, report.mapped_placement.cap_bytes, Some(report.mapped_placement.host_budget_bytes), false)?;
+        256 << 20, host, report.mapped_placement.cap_bytes, Some(report.mapped_placement.host_budget_bytes))?;
     report.mapped_placement = host_facts.mapped.clone();
     report.bytes_by_owner.remove("host-preloaded");
     if host_facts.mapped.preloaded_bytes > 0 {

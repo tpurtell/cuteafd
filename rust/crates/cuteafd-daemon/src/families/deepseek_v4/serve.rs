@@ -872,10 +872,7 @@ fn schedule(
                         } else if rows > 1 {
                             Ok(Some(engine.prefill_streamed_scoring(placement, chunk, transports,
                                 probe::ScoringRows { consumer: &job.probe, position })?))
-                        } else if rows > 1 {
-                            Ok(Some(probe::ScoreLogits::Host {
-                                values: engine.prefill(placement, chunk, transports, runtime, rows, None)?,
-                                vocab: engine.cfg.vocab_size }))
+
                         } else {
                             Ok(engine.prefill_device(placement, chunk, transports, runtime, rows)?
                                 .map(probe::ScoreLogits::Device))

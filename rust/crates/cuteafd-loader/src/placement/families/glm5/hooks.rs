@@ -15,8 +15,6 @@ pub struct HookBuffers {
     pub core: Option<CoreRankLayout>,
     /// Manifest-derived shared execution owners and bindings, once per hook.
     pub shared_workspace: Option<crate::plan::exlr8::ExecutionWorkspace>,
-    /// Scoring allocates its prefill lanes during startup; serving allocates
-    /// them on the first live prefill, after Ready.
 }
 
 struct Builder {

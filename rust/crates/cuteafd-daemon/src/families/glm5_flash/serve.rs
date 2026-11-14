@@ -1147,8 +1147,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         if rows > 1 {
                             engine.prefill_streamed_scoring(placement, chunk, &request_media,
                                 probe::ScoringRows { consumer: &job.probe, position })
-                        } else if rows > 1 {
-                            engine.prefill_scoring_media(placement, chunk, &request_media)
+
                         } else {
                             Ok(engine.prefill_media_device(placement, chunk, &request_media)?.map(probe::ScoreLogits::Device))
                         }

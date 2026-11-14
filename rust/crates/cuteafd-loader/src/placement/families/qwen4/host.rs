@@ -386,12 +386,12 @@ mod tests {
     fn mtp_prefill_logits_are_one_separate_row_only_when_the_workspace_exists() {
         let vocab = 248_320;
         for owners in [1, 2] {
-            for full in [false, true] {
+            {
                 for shape in [false, true] {
                     for mtp in [false, true] {
-                        let target = pinned_logits_bytes(owners, full, 8192, vocab).unwrap();
+                        let target = pinned_logits_bytes(owners, vocab).unwrap();
                         let extra = mtp_pinned_logits_bytes(shape, mtp, vocab).unwrap();
-                        assert_eq!(target, owners as u64 * (64 + if full { 8192 } else { 1 }) * vocab * 4);
+                        assert_eq!(target, owners as u64 * 65 * vocab * 4);
                         assert_eq!(extra, if shape && mtp { vocab * 4 } else { 0 });
                         let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
                         let mut host = QwenHost::ample(&cfg, owners, 8192).unwrap();
@@ -407,7 +407,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(pinned_logits_bytes(1, false, 8192, vocab).unwrap(), 64_563_200);
+        assert_eq!(pinned_logits_bytes(1, vocab).unwrap(), 64_563_200);
         assert_eq!(mtp_pinned_logits_bytes(true, true, vocab).unwrap(), 993_280);
     }
 
