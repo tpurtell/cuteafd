@@ -275,6 +275,7 @@ fn spec(cfg: &KimiK3Config, checkpoint: &Checkpoint) -> ModelSpec {
 }
 
 impl Family for KimiK3 {
+    fn eager_native_core_headers(&self) -> bool { true }
     fn native_head_widths(&self) -> &'static [usize] {
         crate::families::kimi_k3::core::NATIVE_CORE_WIDTHS
     }
