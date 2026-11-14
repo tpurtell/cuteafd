@@ -15,7 +15,7 @@ use std::ffi::c_void;
 pub(crate) mod receipts;
 #[path = "memory/snapshot.rs"]
 mod snapshot;
-pub(crate) use snapshot::{SnapshotCopies, SnapshotPool, SnapshotStorage, WindowSnapshots};
+pub(crate) use snapshot::{SnapshotCopies, SnapshotPool, SnapshotStorage};
 #[path = "memory/download.rs"]
 mod download;
 pub(crate) use download::RowDownload;
