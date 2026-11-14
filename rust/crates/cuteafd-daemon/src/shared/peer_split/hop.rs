@@ -192,7 +192,9 @@ impl<'a> HopLink<'a> {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
                 library.peer_exchange_initialize()?;
                 let zeroed = |bytes: usize| -> Result<DeviceAllocation<'a>> {
-                    let allocation = DeviceAllocation::new(library, bytes.max(256), Tag::transport("shared/residual-hops"))?;
+                    let allocation = DeviceAllocation::from_allocation(
+                        crate::shared::memory::device::Allocation::new(Device { library, id: ranks[rank].device },
+                            bytes.max(256), Tag::transport("shared/residual-hops"))?);
                     library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                     Ok(allocation)
                 };
@@ -369,6 +371,7 @@ mod cuda_tests {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.extent_only(&library)?;
+        fixture.strict_device_free(&library, true)?;
         let devices = [0, 1].map(|id| Device { library: &library, id });
         let streams = devices.map(Stream::new);
         let [a, b] = streams;
@@ -394,6 +397,10 @@ mod cuda_tests {
         }
         let bytes = hop_buffer_bytes(&hops, &spec, 2).unwrap();
         assert_eq!([link.receive_bytes(0), link.receive_bytes(1)], [bytes[0], bytes[1]]);
+        library.cuda_set_device(0)?;
+        drop(link);
+        assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+        assert_eq!(fixture.mapped_bytes(&library)?, 0);
         Ok(())
     }
 

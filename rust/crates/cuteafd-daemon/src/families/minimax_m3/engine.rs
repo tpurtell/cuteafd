@@ -647,9 +647,15 @@ impl<'a> ServingPrefill<'a> {
             self.dispatchers.clear();
         }
         // Pending ticket drops terminally quiesce exchange before these drains.
-        if storage.split.is_some() {
-            crate::shared::decode_graph::fatal_drain(drain_split_pair(|gpu|
-                storage.ranks[gpu].decode.borrow().stream.drain()), "MiniMax split prefill submission");
+        if let Some(split) = &storage.split {
+            for gpu in 0..2 {
+                if let Err(error) = storage.ranks[gpu].decode.borrow().stream.drain() {
+                    self.terminal = true;
+                    crate::shared::decode_graph::fatal_drain(split.cancel(), "MiniMax split prefill async fault");
+                    self.dispatchers.clear();
+                    return result.and(Err(error));
+                }
+            }
         } else {
             for unit in &storage.ranks[0].prefill {
                 unit.borrow().stream.drain_or_abort("MiniMax packed serving submission");
@@ -868,8 +874,14 @@ impl<'a> ServingPrefill<'a> {
             crate::shared::decode_graph::fatal_drain(split.cancel(), "MiniMax split decode cancellation");
             self.dispatchers.clear();
         }
-        crate::shared::decode_graph::fatal_drain(drain_split_pair(|gpu|
-            storage.ranks[gpu].decode.borrow().stream.drain()), "MiniMax split decode submission");
+        for gpu in 0..2 {
+            if let Err(error) = storage.ranks[gpu].decode.borrow().stream.drain() {
+                self.terminal = true;
+                crate::shared::decode_graph::fatal_drain(split.cancel(), "MiniMax split decode async fault");
+                self.dispatchers.clear();
+                return result.and(Err(error));
+            }
+        }
         result
     }
 
