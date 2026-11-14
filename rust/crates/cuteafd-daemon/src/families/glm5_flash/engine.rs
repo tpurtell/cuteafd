@@ -5974,9 +5974,16 @@ mod prefill_lane_tests {
             let temps = glmf_temporary_bytes(&cfg, rows, false, &shape, prefill);
             assert_eq!((temps.scratch, temps.topk_scratch), (782_236_672, 558_007_296));
         }
-        assert_eq!(glmf_temporary_bytes(&cfg, 4096, false, &shape, prefill).logits, 64 * 154_880 * 4);
-        // Rank 1 holds no head, logits or router rows (each floored to 256 bytes when allocated),
-        // with all-row logits or without.
+        for lead in [true, false] {
+            for rows in [1, 64, 512, 4096, 8256] {
+                for decode in [false, true] {
+                    let shape = GlmfStepShape { lead, ..shape };
+                    let actual = glmf_temporary_bytes(&cfg, rows, decode, &shape, prefill).logits;
+                    assert_eq!(actual, if lead { (if decode { rows } else { rows.min(64) }) * 154_880 * 4 } else { 0 });
+                }
+            }
+        }
+        // Rank 1 holds no head, logits or router rows (floored when allocated).
         let peer = GlmfStepShape { lead: false, ..shape };
         let temps = glmf_temporary_bytes(&cfg, 4096, false, &peer, prefill);
         assert_eq!((temps.logits, temps.head_workspace), (0, 0));

@@ -1606,7 +1606,7 @@ impl<'a> MimoEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>)
         -> Result<Option<DeviceLogits>> {
-        ensure!(!all_logits || tokens.len() <= 64,
+        ensure!(!all_logits || tokens.len() <= 64 && self.prefill_output == MimoPrefillOutput::AllRows,
             "multi-row MiMo prefill requires a row consumer beyond the bounded head");
         let (t, start) = (tokens.len(), placement.len);
         ensure!(t > 0 && t <= self.prefill_capacity() && start + t <= self.max_context,

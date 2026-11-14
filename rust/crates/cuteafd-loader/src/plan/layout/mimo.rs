@@ -350,7 +350,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         }
         let workspaces = workspace_options(&cfg, ranks, rank, rows as usize, context as usize,
             lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp,
-            MimoPrefillOutput::AllRows,
+            MimoPrefillOutput::LastRow,
             fp8_output, |name| {
                 let Some(manifest) = manifest else { return Ok(0); };
                 let program = manifest["programs"].as_array().context("PROGRAMS.json lacks programs")?
@@ -420,7 +420,7 @@ fn offline_host(checkpoint: &super::super::Checkpoint, options: &LayoutOptions, 
             .context("invalid MiMo host prefix geometry or quota")? };
     Ok(crate::placement::families::mimo_v2::admission::HostOwners {
         expert_input: options.mimo_expert_input,
-        output: MimoPrefillOutput::AllRows,
+        output: MimoPrefillOutput::LastRow,
         serving: true, scoring_rows: 64,
         diagnostic_rows: rows.min(256) as usize, prefix_bytes, media_bytes: 0,
         // Serve adds the media quota to the base headroom (`with_media_headroom`).

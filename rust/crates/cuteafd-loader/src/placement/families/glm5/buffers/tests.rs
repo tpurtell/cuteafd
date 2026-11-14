@@ -42,6 +42,10 @@ pub(super) fn target(device: u8) -> TargetBuffers {
 }
 
 fn facts(target: &TargetBuffers, pages: u64) -> Facts {
+    facts_for_config(target, pages, &cfg())
+}
+
+fn facts_for_config(target: &TargetBuffers, pages: u64, config: &GlmDsaConfig) -> Facts {
     let mut contract = Contract::fixed(
         target.page_tokens,
         target.maximum_pages,
@@ -58,7 +62,7 @@ fn facts(target: &TargetBuffers, pages: u64) -> Facts {
         Variable::Prefill(vec![target.prefill.as_ref().unwrap().0]),
         Variable::Lanes(vec![1]),
     ];
-    contract.components = target.components(&cfg()).unwrap();
+    contract.components = target.components(config).unwrap();
     contract.facts(&[0, 0], pages).unwrap()
 }
 
@@ -83,6 +87,30 @@ fn budgets() -> Vec<Budget> {
         headroom: 0,
     })
     .collect()
+}
+
+#[test]
+fn glm_and_ml4_serving_heads_keep_exact_bounded_charges_across_shapes() {
+    let configs = [cfg(), GlmDsaConfig::from_hf(&crate::plan::testing::mistral_large4_config()).unwrap()];
+    for config in configs {
+        for device in [0, 1] {
+            for rows in [1, 64, 512, 4096, 8256] {
+                for waves in [1, 2, 4] {
+                    let mut target = target(device);
+                    target.prefill.as_mut().unwrap().0 = PrefillShape { rows, waves };
+                    let facts = facts_for_config(&target, 32, &config);
+                    for (phase, head_rows) in [("decode", 64), ("prefill", rows.min(64))] {
+                        let id = format!("glm.target.gpu.{device}.{phase}.logits");
+                        let owner = facts.allocations.iter().find(|a| a.id == id).unwrap();
+                        let bytes = if device == 0 { head_rows * config.vocab_size as u64 * 4 } else { 256 };
+                        assert_eq!(owner.bytes, searched(bytes));
+                        assert!(owner.view.is_none());
+                        assert_eq!(facts.allocations.iter().filter(|a| a.id == id).count(), 1);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

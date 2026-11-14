@@ -2214,10 +2214,9 @@ impl Recipe for GlmRecipe<'_> {
                 self.maximum_pages, contract.phase_order)?);
         }
         if request.operation == Operation::Scoring {
-            for (option, shape) in self.prefill.iter().enumerate() {
-                // Scoring's serial-lane calls download one unit directly; the
-                // normal multi-wave prefill gather is not used by this path.
-                let bytes = cuteafd_core::memory_layout::host_logits_bytes(shape.rows, shape.rows, self.cfg.vocab_size as u64)
+            for (option, _) in self.prefill.iter().enumerate() {
+                // Scoring drains one bounded head tile before reusing its storage.
+                let bytes = cuteafd_core::memory_layout::host_logits_bytes(64, 64, self.cfg.vocab_size as u64)
                     .ok_or(Refusal::Overflow("scoring host logits"))?;
                 let owner = Allocation::buffer("glm.scoring.host_logits", Location::HOST, bytes,
                     Lifetime::TARGET, cuteafd_core::memory_layout::Category::Workspace, "scoring host logits");

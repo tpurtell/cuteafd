@@ -102,10 +102,7 @@ pub fn admit(request: Request, mut budgets: Vec<Budget>, facts: DenseFacts<'_>)
         || facts.target_arena.payload_bytes() as u64 != facts.weights.layers.iter().sum::<u64>()
             + facts.weights.norm + facts.weights.head + facts.weights.embedding
         || facts.drafter.as_ref().is_some_and(|draft| draft.weights.0 > 0 && draft.weight_arena.is_none())
-        || facts.buffers.head_rows != match request.operation {
-            Operation::Serving => super::VERIFY_ROWS,
-            Operation::Scoring => PREFILL_ROWS,
-        }
+        || facts.buffers.head_rows != super::VERIFY_ROWS
     {
         return Err(Refusal::InvalidFact(
             "dense geometry or operation differs from allocation recipe".into()));

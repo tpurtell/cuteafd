@@ -612,6 +612,17 @@ mod sampling_budget_tests {
     /// budgeting stays honest (design §5.5, §11.1). The formula is pinned here
     /// so a field added without updating `device_bytes` fails loudly.
     #[test]
+    fn serving_head_charge_keeps_the_original_fixed_capacity_planes() {
+        for capacity in [1, 64, 80] {
+            assert_eq!(STRIDES[4] * capacity, capacity * 129280 * 4);
+            assert_eq!(TargetHeadWave::device_bytes(capacity).unwrap(),
+                V41VocabularyProjection::WORKSPACE_BYTES
+                    + capacity * (40960 + 16 + 10240 + 10240 + 129280 * 4 + 4 + 4)
+                    + TargetSamplingWave::device_bytes(capacity, 129280));
+        }
+    }
+
+    #[test]
     fn sampling_workspace_bytes_follow_the_documented_formula() {
         for capacity in [1usize, 6, 48, 64, 80] {
             let param = capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES;

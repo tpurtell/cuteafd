@@ -2257,7 +2257,7 @@ fn scoring_host_output_is_additional_to_text_only_rss() {
     let admitted = input.prepare().unwrap().admit(scoring).unwrap();
     let owner = admitted.solved.facts.allocations.iter().find(|owner| owner.id == "glm.scoring.host_logits").unwrap();
     assert_eq!(owner.location, Location::HOST);
-    assert_eq!(owner.bytes, cuteafd_core::memory_layout::host_logits_bytes(128, 128, cfg.vocab_size as u64).unwrap());
+    assert_eq!(owner.bytes, cuteafd_core::memory_layout::host_logits_bytes(64, 64, cfg.vocab_size as u64).unwrap());
 }
 
 #[test]

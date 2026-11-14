@@ -271,7 +271,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
     let result = opened.with_engine_reserved_media(&args, Some((&prefix, max_sequences)), media_push.records(),
-        cuteafd_loader::families::mimo_v2::MimoPrefillOutput::AllRows, |engine, host_config| {
+        cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow, |engine, host_config| {
         layout.speculator = engine.drafter.as_ref().map(|draft| ("DFlash", draft.cfg.drafts()))
             .or_else(|| engine.mtp.as_ref().map(|mtp| ("MTP", mtp.stages.len())))
             .map(|(name, native)| console::Speculator { name: name.into(), positions: native,

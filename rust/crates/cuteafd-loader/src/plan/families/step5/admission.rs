@@ -191,8 +191,6 @@ pub struct RuntimeInputs {
     pub waves: usize,
     /// The admitted unit (#762); 0 takes `rows / waves` (a static span).
     pub unit: usize,
-    /// All-row prefill scoring was admitted at launch; otherwise the head holds
-    /// only the decode/verify width (prefill needs its last row).
     pub sequences: usize,
     pub context: u64,
     pub serving_context: crate::placement::planner::Context,
@@ -1034,7 +1032,6 @@ mod tests {
             input.validate(&cfg)?;
             assert_eq!(input.unit_rows(), unit);
             assert_eq!(input_bytes(input.rows)?, (unit * waves * (4 + 4096 * 6)) as u64);
-            assert_eq!(input.logit_rows(), 64);
             assert_eq!(input.logit_rows(), 64);
             assert!(super::super::native::mtp_forecast_workspace(unit, 3, input.kv_format).is_ok());
             assert!(super::super::native::mtp_forecast_workspace(input.rows, 3, input.kv_format).is_err());

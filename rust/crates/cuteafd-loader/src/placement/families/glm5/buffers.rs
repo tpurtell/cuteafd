@@ -233,8 +233,7 @@ impl Builder {
     ) -> Result<(), Refusal> {
         let name = if decode { "decode" } else { "prefill" };
         // The decode workspace is allocated by the startup warm pass. Prefill
-        // lanes are allocated by the first prefill: during startup only for
-        // scoring, otherwise by live traffic after Ready.
+        // lanes are allocated by the first live prefill after Ready.
         let lifetime = Lifetime {
             first: if decode {
                 Phase::Warmup

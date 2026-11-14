@@ -423,12 +423,12 @@ fn onboarding_pins_are_auto_zero_and_refuse_random_layer_counts() {
 }
 
 #[test]
-fn operations_must_match_the_allocated_head_rows() {
+fn serving_and_scoring_share_bounded_head_rows_and_validate_geometry() {
     let (cfg, weights, buffers, arena) = fixture();
     let mut ask = request();
     ask.operation = Operation::Scoring;
-    assert!(matches!(admit(ask, budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap_err(),
-        Refusal::InvalidFact(_)));
+    assert_eq!(buffers.head_rows, 64);
+    assert!(admit(ask, budgets(), facts(&cfg, &weights, &buffers, &arena)).is_ok());
     let mut input = facts(&cfg, &weights, &buffers, &arena);
     input.slots = 0;
     assert!(matches!(admit(request(), budgets(), input).unwrap_err(), Refusal::InvalidFact(_)));

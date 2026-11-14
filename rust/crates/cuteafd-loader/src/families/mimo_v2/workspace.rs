@@ -381,6 +381,29 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_serving_retains_one_vocab_row_per_wave_on_the_head_rank() {
+        for raw in [mimo_flash_config(), mimo_pro_config()] {
+            let cfg = MimoV2Config::from_hf(&raw).unwrap();
+            for rows in [64, 512, 4096, 8256] {
+                for waves in [1, 2, 4] {
+                    for ranks in [1, 2] {
+                        for rank in 0..ranks {
+                            let layout = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
+                                rows, waves, lead: rank == 0, with_head: rank == 0,
+                                prefill_output: MimoPrefillOutput::LastRow,
+                                attention: if ranks == 2 { MimoAttentionWorkspace::PartitionedHeads { ranks } }
+                                    else { MimoAttentionWorkspace::Global }, ..options()
+                            }).unwrap();
+                            assert_eq!(layout.logits_rows, u64::from(rank == 0));
+                            assert_eq!(layout.logits, if rank == 0 { waves * cfg.vocab_size as u64 * 4 } else { 256 });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn prefill_head_is_bounded_and_terminal_only_remains_one_row() {
         let mut raw = mimo_pro_config();
         raw["vocab_size"] = serde_json::json!(152576);
