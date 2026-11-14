@@ -208,3 +208,59 @@ mod padding_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod padding_numeric_tests {
+    use super::*;
+    use cuteafd_loader::{formats::{native_attention::{Fp8Role, NativeLayout}, trellis_core::CoreSplit},
+        plan::checkpoint::{CoreView, CheckpointTensor, ProjectionStorage, SelectedProjection}, SafetensorsTensorMetadata};
+    use crate::shared::{memory::{DeviceAllocation, TEST}, experts::rtx::dense::DenseLoad};
+
+    #[test]
+    fn padded_mapped_quantization_matches_explicit_zero_extension_byte_for_byte() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library,0,1<<30)?;
+        fixture.immediate_copies(&library)?;
+        for (n,k,alignment) in [(129usize,128usize,512usize),(576,256,128)] {
+            let stored = n.div_ceil(alignment)*alignment;
+            let source:Vec<u8> = (0..n*k).flat_map(|i| {
+                let value = (((i*17)%127) as f32 - 63.) / 32.;
+                ((value.to_bits()>>16) as u16).to_le_bytes()
+            }).collect();
+            let dir = tempfile::tempdir_in(fixture.directory())?;
+            std::fs::write(dir.path().join("source"),&source)?;
+            let selected = SelectedProjection { storage:ProjectionStorage::Native {dtype:DType::Bf16,shape:vec![n,k]},
+                tensors:vec![CheckpointTensor {shard:"source".into(),meta:SafetensorsTensorMetadata {
+                    name:"projection.weight".into(),dtype:DType::Bf16,shape:vec![n,k],byte_offset:0,byte_length:source.len() as u64}}],
+                source_bytes:source.len() as u64};
+            let values = DeviceAllocation::new(&library,stored*k,TEST)?;
+            let scales = DeviceAllocation::new(&library,(stored/128*k/128*4).max(256),TEST)?;
+            library.copy_h2d(values.buffer,&vec![0xa5;values.buffer.bytes])?;
+            library.copy_h2d(scales.buffer,&vec![0xa5;scales.buffer.bytes])?;
+            let layout = NativeLayout {stem:"projection".into(),shape:[stored,k],fp8:true,rank:0,ranks:1,split:CoreSplit::Whole};
+            let records = attention_records(dir.path(),&selected,CoreView::Fp8Compact,&layout,
+                Fp8Role::padded("projection",true,alignment),crate::shared::fp8_linear::Fp8Scales::Amax,
+                values.buffer,Some(scales.buffer))?;
+            let load = DenseLoad::mount(&library);
+            for record in records.into_iter().rev() {
+                let AttentionRecord::Step(step)=record else {panic!("quantization step")};
+                load.step(step,std::ptr::null_mut())?;
+            }
+            load.release();
+            let mut extended = source.clone(); extended.resize(stored*k*2,0);
+            let (expected_q,expected_s) = crate::families::glm5_flash::fp8::quantize(&extended,stored,k,
+                crate::families::glm5_flash::fp8::Layout::Block,crate::shared::fp8_linear::Fp8Scales::Amax);
+            let mut q = vec![0;values.buffer.bytes]; library.copy_d2h(&mut q,values.buffer)?;
+            assert_eq!(q,expected_q);
+            let mut grid = vec![0;scales.buffer.bytes];library.copy_d2h(&mut grid,scales.buffer)?;
+            let real_blocks=n.div_ceil(128)*(k/128);
+            let real:Vec<u8>=expected_s[..real_blocks].iter().flat_map(|scale|scale.to_le_bytes()).collect();
+            assert_eq!(grid[..real.len()],real);
+            let padded_end=stored/128*(k/128)*4;
+            assert!(grid[real.len()..padded_end].iter().all(|byte|*byte==0));
+            assert!(grid[padded_end..].iter().all(|byte|*byte==0xa5));
+        }
+        Ok(())
+    }
+}
