@@ -194,6 +194,13 @@ impl Fixture {
         Ok(())
     }
 
+    /// Model device-resident descriptors without changing fixture allocation/free behavior.
+    pub fn configure_device_flags(&self, library: &NativeLibrary, flags: u64) -> Result<()> {
+        // SAFETY: this private CPU fixture export accepts the descriptor flag bits.
+        unsafe { library.lib.get::<unsafe extern "C" fn(u64)>(b"fixture_configure_device_flags")?(flags); }
+        Ok(())
+    }
+
     /// Allow pair construction while preserving real byte copies; peer launches still fail.
     pub fn peer_abort_initialization(&self, library: &NativeLibrary) -> Result<()> {
         // SAFETY: this private fixture export only enables the no-argument initializer.
@@ -439,6 +446,54 @@ mod device_free_tests {
         let event = library.cuda_event_create_ordering()?;
         // SAFETY: the fresh fixture-owned event remains live and unrecorded.
         unsafe { library.cuda_event_destroy(event)?; }
+        Ok(())
+    }
+
+    #[test]
+    fn fold_binding_stubs_always_fail_without_writing_outputs() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let a = [1.0f32];
+        let b = [2.0f32];
+        let mut output = [37.0f32];
+        // SAFETY: private fixture exports use the exact production ABI; all
+        // supplied pointers address live typed arrays for the requested count.
+        unsafe {
+            let add = library.lib.get::<unsafe extern "C" fn(*const f32, *const f32, *mut f32, usize, *mut c_void) -> i32>(b"cuteafd_cuda_residual_add_f32_async")?;
+            assert_ne!(add(a.as_ptr(), b.as_ptr(), output.as_mut_ptr(), 1, std::ptr::null_mut()), 0);
+        }
+        assert_eq!(output, [37.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_flag_device_allocations_free_exact_heap_mapped_and_reused_accounting() -> Result<()> {
+        for mode in 0..3 {
+            let fixture = Fixture::build_for_tests()?;
+            let library = fixture.load()?;
+            fixture.configure_memory(&library, 0, 4096)?;
+            fixture.configure_device_flags(&library, 0)?;
+            if mode == 1 { fixture.extent_only(&library)?; }
+            // SAFETY: private fixture exports, with exact native signatures.
+            let (allocate, free) = unsafe {
+                if mode == 2 { library.lib.get::<unsafe extern "C" fn()>(b"fixture_reuse_device_storage")?(); }
+                (*library.lib.get::<unsafe extern "C" fn(usize, *mut CuteafdDeviceBuffer, u32, *const c_char) -> i32>(b"cuteafd_alloc_device_buffer")?,
+                 *library.lib.get::<unsafe extern "C" fn(*mut CuteafdDeviceBuffer) -> i32>(b"cuteafd_free_device_buffer")?)
+            };
+            let mut buffer = CuteafdDeviceBuffer::default();
+            // SAFETY: writes one fresh fixture-owned allocation descriptor.
+            assert_eq!(unsafe { allocate(256, &mut buffer, crate::memory_ledger::MemoryKind::Workspace.as_raw(), c"test/flags-zero".as_ptr()) }, 0);
+            assert_eq!(buffer.flags, 0);
+            assert_eq!(library.physical_memory_query()?.sample(0)?, (3840, 4096));
+            assert_eq!(fixture.mapped_bytes(&library)?, if mode == 1 { 256 } else { 0 });
+            // Changing flags after allocation cannot change its real backing kind.
+            fixture.configure_device_flags(&library, 1)?;
+            // SAFETY: frees the exact still-live fixture allocation on its device.
+            assert_eq!(unsafe { free(&mut buffer) }, 0);
+            assert_eq!(fixture.mapped_bytes(&library)?, 0);
+            assert_eq!(library.physical_memory_query()?.sample(0)?, (4096, 4096));
+            assert!(buffer.ptr.is_null());
+        }
         Ok(())
     }
 

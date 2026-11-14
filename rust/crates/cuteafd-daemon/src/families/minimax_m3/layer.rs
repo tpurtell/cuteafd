@@ -5,26 +5,38 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::Tag;
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, minimax_m3::{forward, producers}, programs::Programs};
 use cuteafd_loader::families::minimax_m3::{MiniMaxM3Config,
-    execution::{ForwardPrograms, ProducerPrograms, UnitLayout},
+    execution::{AttentionLayout, ForwardPrograms, PartialFfnLayout, ProducerPrograms, RouterLayout, RouteReceiveLayout, SplitLayout, UnitLayout, WirePrecision},
     weight_layout::{CoordinatorWeights, Mxfp8Projection}};
 use std::{collections::BTreeMap, rc::Rc};
 
 pub(crate) struct Kernels<'a> {
     device: Device<'a>,
     pub dense: dense::NativePrograms<'a>,
-    pub attention: attention::Kernels<'a>,
+    pub attention: Option<attention::Kernels<'a>>,
     norm: forward::ForwardProducer<'a>,
-    router: forward::ForwardProducer<'a>,
+    router: Option<forward::ForwardProducer<'a>>,
     oai_dense: producers::Producer<'a>,
     oai_shared: producers::Producer<'a>,
     add: cuteafd_ffi::Bf16Add<'a>,
+    split_add: Option<cuteafd_ffi::Bf16F32Add<'a>>,
+    narrow: Option<cuteafd_ffi::F32Bf16Narrow<'a>>,
 }
 impl<'a> Kernels<'a> {
     pub fn bind(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
         cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32) -> Result<Self> {
+        Self::bind_role(device, programs, manifest, cfg, weights, rows, context, false)
+    }
+    pub fn bind_split(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
+        cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32) -> Result<Self> {
+        Self::bind_role(device, programs, manifest, cfg, weights, rows, context, true)
+    }
+    pub fn has_router(&self) -> bool { self.router.is_some() }
+    fn bind_role(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
+        cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32, split: bool) -> Result<Self> {
         UnitLayout::new(cfg, rows)?;
         let (_, forward) = ForwardPrograms::resolve(manifest, rows)?;
-        let (_, producers) = ProducerPrograms::resolve(manifest, rows)?;
+        let (_, producers) = if split { ProducerPrograms::resolve_split(manifest, rows)? }
+            else { ProducerPrograms::resolve(manifest, rows)? };
         for expected in forward.iter().chain(&producers) {
             let actual = programs.spec(&expected.name)?;
             ensure!(actual.pointers == expected.pointers && actual.scalar_kinds == expected.scalar_kinds
@@ -33,13 +45,17 @@ impl<'a> Kernels<'a> {
                 "MiniMax layer program {} differs from admission", expected.name);
         }
         let dense = dense::NativePrograms::bind(device, programs, weights, manifest, rows)?;
-        let attention = attention::Kernels::bind(device, programs, manifest, cfg, rows, context)?;
+        let attention = (!weights.layers.is_empty()).then(||
+            attention::Kernels::bind(device, programs, manifest, cfg, rows, context)).transpose()?;
         device.run(|| Ok(Self { device, dense, attention,
             norm: forward::ForwardProducer::bind(programs, forward::Kind::ResidualNorm)?,
-            router: forward::ForwardProducer::bind(programs, forward::Kind::RouterScores)?,
-            oai_dense: producers::Producer::bind(programs, producers::Kind::Oai { width: 12288 })?,
-            oai_shared: producers::Producer::bind(programs, producers::Kind::Oai { width: 3072 })?,
+            router: (!split || weights.rank == 0).then(||
+                forward::ForwardProducer::bind(programs, forward::Kind::RouterScores)).transpose()?,
+            oai_dense: producers::Producer::bind(programs, producers::Kind::Oai { width: if split { 6144 } else { 12288 } })?,
+            oai_shared: producers::Producer::bind(programs, producers::Kind::Oai { width: if split { 1536 } else { 3072 } })?,
             add: device.library.bf16_add()?,
+            split_add: split.then(|| device.library.bf16_f32_add()).transpose()?,
+            narrow: split.then(|| device.library.f32_bf16_narrow()).transpose()?,
         }))
     }
 }
@@ -129,13 +145,38 @@ fn packed_rows(spans: impl IntoIterator<Item = (usize, usize)>, capacity: usize)
     Ok(next)
 }
 
+pub(crate) struct SplitOwner<'a> {
+    pub layout: SplitLayout,
+    planes: BTreeMap<String, Rc<Allocation<'a>>>,
+    pub partial: dense::PartialDestination<'a>,
+    fold: PartialFold<'a>,
+}
+impl<'a> SplitOwner<'a> {
+    fn new(stream: Rc<Stream<'a>>, layout: SplitLayout, rank: usize) -> Result<Self> {
+        let planes = layout.buffers().into_iter().map(|(name, bytes)| Ok((name.into(),
+            Rc::new(Allocation::new(stream.device, usize::try_from(bytes)?, Tag::workspace("minimax/split"))?))))
+            .collect::<Result<BTreeMap<String, Rc<Allocation<'a>>>>>()?;
+        let partial = dense::PartialDestination::new(Rc::clone(&planes["local"]),
+            Rc::clone(&stream), Rc::clone(&stream), layout.wire)?;
+        let (rank0, rank1) = if rank == 0 { ("local", "receive") } else { ("receive", "local") };
+        let fold = PartialFold::new(stream, Rc::clone(&planes[rank0]), Rc::clone(&planes[rank1]),
+            Rc::clone(&planes["meeting"]), layout.wire, layout.rows as usize)?;
+        Ok(Self { layout, planes, partial, fold })
+    }
+    fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
+        for (name, owner) in &self.planes { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }
+        Ok(())
+    }
+}
+
 /// Independent residual/branches for one in-flight slot. The retained stream
 /// drains before any storage retires, including a partially submitted chain.
 pub(crate) struct UnitOwner<'a> {
     pub stream: Rc<Stream<'a>>,
     pub dense: dense::ExecutionOwner<'a>,
-    attention: attention::Workspace<'a>,
-    layout: UnitLayout,
+    attention: Option<attention::Workspace<'a>>,
+    split: Option<SplitOwner<'a>>,
+    rows: u32,
     planes: BTreeMap<String, Rc<Allocation<'a>>>,
     routed_boundary: Rc<super::experts::Boundary<'a>>,
 }
@@ -163,9 +204,43 @@ impl<'a> UnitOwner<'a> {
         }).collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self { dense: dense::ExecutionOwner::new(kernels.device, weights, rows)?,
             routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
-            attention: if prefill { attention::Workspace::new(&kernels.attention)? }
-                else { attention::Workspace::new_decode(&kernels.attention)? }, stream, layout, planes })
+            attention: kernels.attention.as_ref().map(|attention| if prefill { attention::Workspace::new(attention) }
+                else { attention::Workspace::new_decode(attention) }).transpose()?,
+            split: None, stream, rows: layout.rows, planes })
     }
+    pub fn new_split(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
+        weights: &CoordinatorWeights, rows: u32, wire: WirePrecision, prefill: bool,
+        receive_routes: bool) -> Result<Self> {
+        ensure!(stream.device.id == kernels.device.id
+            && std::ptr::eq(stream.device.library, kernels.device.library), "MiniMax split stream differs");
+        ensure!(prefill || rows <= 64, "MiniMax split decode rows exceed native capacity");
+        let partial = PartialFfnLayout::new(cfg, weights.rank as u8, rows)?;
+        let mut buffers = partial.buffers();
+        if !weights.layers.is_empty() { buffers.extend(AttentionLayout::new(cfg, rows)?.buffers()); }
+        if weights.rank == 0 { buffers.extend(RouterLayout::new(rows)?.buffers()); }
+        else if receive_routes { buffers.extend(RouteReceiveLayout::new(rows)?.buffers()); }
+        let mut planes = BTreeMap::new();
+        for (name, bytes) in buffers {
+            ensure!(!planes.contains_key(name), "duplicate MiniMax split owner {name}");
+            planes.insert(name.into(), Rc::new(Allocation::new(kernels.device, usize::try_from(bytes)?,
+                Tag::workspace("minimax/unit"))?));
+        }
+        let split = SplitOwner::new(Rc::clone(&stream), SplitLayout::new(rows, wire)?, weights.rank)?;
+        stream.device.run(|| {
+            // SAFETY: fresh admitted flags are initialized on the retained unit
+            // stream before any device-side control consumer can observe them.
+            unsafe {
+                stream.device.library.cuda_zero_bytes_async(split.planes["control"].buffer, 256, stream.raw)?;
+                stream.device.library.cuda_zero_bytes_async(split.planes["abort"].buffer, 256, stream.raw)
+            }
+        })?;
+        Ok(Self { dense: dense::ExecutionOwner::new(kernels.device, weights, rows)?,
+            routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
+            attention: kernels.attention.as_ref().map(|attention| if prefill { attention::Workspace::new(attention) }
+                else { attention::Workspace::new_decode(attention) }).transpose()?,
+            split: Some(split), stream, rows, planes })
+    }
+    pub fn is_split(&self) -> bool { self.split.is_some() }
     fn owner(&self, name: &str) -> Result<&Allocation<'a>> {
         self.planes.get(name).map(Rc::as_ref).with_context(|| format!("MiniMax unit lacks admitted {name}"))
     }
@@ -173,19 +248,45 @@ impl<'a> UnitOwner<'a> {
     pub fn prefix_scratch(&self) -> Rc<Allocation<'a>> { Rc::clone(&self.planes["residual"]) }
     pub fn plane(&self, name: &str) -> Result<Buffer> { Ok(self.owner(name)?.buffer) }
     pub(crate) fn routed_rows(&self, rows: usize) -> Result<super::experts::RoutedRows<'a>> {
-        ensure!(rows <= self.layout.rows as usize, "MiniMax routed rows exceed unit");
-        super::experts::RoutedRows::new(self.dense.activation.clone(), self.planes["route_ids"].clone(),
-            self.planes["route_weights"].clone(), self.planes["routed"].clone(), self.stream.clone(),
+        ensure!(rows <= self.rows as usize, "MiniMax routed rows exceed unit");
+        let retained = |name| self.planes.get(name).cloned().with_context(|| format!("MiniMax rank has no {name} role"));
+        super::experts::RoutedRows::new(self.dense.activation.clone(), retained("route_ids")?,
+            retained("route_weights")?, retained("routed")?, self.stream.clone(),
             self.routed_boundary.clone(), rows)
     }
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         self.dense.inventory(inventory, &format!("{prefix}.dense"))?;
-        self.attention.inventory(inventory, &format!("{prefix}.attention"))?;
-        for (name, owner) in &self.planes { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }
+        if let Some(attention) = &self.attention { attention.inventory(inventory, &format!("{prefix}.attention"))?; }
+        if let Some(split) = &self.split { split.inventory(inventory, &format!("{prefix}.split"))?; }
+        for (name, owner) in &self.planes {
+            owner.inventory(inventory, &format!("{prefix}.{name}"))?;
+            if self.split.is_some() && !self.planes.contains_key("logits")
+                && matches!(name.as_str(), "route_ids" | "route_weights") {
+                inventory.receipts.last_mut().context("MiniMax route receipt")?.allocation.category =
+                    cuteafd_core::memory_layout::Category::Transport;
+            }
+        }
+        Ok(())
+    }
+    pub fn rows(&self) -> u32 { self.rows }
+    #[cfg(test)]
+    pub fn validate_split(&self, inputs: &cuteafd_loader::placement::families::minimax_m3::MiniMaxInputs,
+        gpu: usize) -> Result<()> {
+        let split = self.split.as_ref().context("MiniMax split owner missing")?;
+        ensure!(split.layout.wire == inputs.split_wire.context("MiniMax selected wire")?
+            && split.layout.events() == 2, "MiniMax split descriptor differs");
+        for (name, bytes) in split.layout.buffers() {
+            ensure!(split.planes[name].buffer.bytes == bytes as usize, "MiniMax split plane {name} differs");
+        }
+        for layer in 0..inputs.cfg.layers {
+            let roles = inputs.roles(layer, gpu, self.rows)?;
+            ensure!(roles.iter().any(|r| r.role == cuteafd_loader::families::minimax_m3::execution::ExecutionRole::WholeAttention)
+                == (inputs.owners[layer] as usize == gpu), "MiniMax attention role differs");
+        }
         Ok(())
     }
     fn check(&self, kernels: &Kernels<'_>, rows: usize) -> Result<()> {
-        ensure!(rows > 0 && rows <= self.layout.rows as usize && self.stream.device.id == kernels.device.id
+        ensure!(rows > 0 && rows <= self.rows as usize && self.stream.device.id == kernels.device.id
             && std::ptr::eq(self.stream.device.library, kernels.device.library),
             "MiniMax live rows/device differ from unit owner");
         Ok(())
@@ -224,13 +325,14 @@ impl<'a> UnitOwner<'a> {
     /// cache satisfy Workspace::enqueue. All owners survive stream drainage.
     pub unsafe fn attention_segments(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
         admitted: &CoordinatorWeights, layer: usize, segments: &[attention::Segment]) -> Result<()> {
-        let rows = segment_rows(segments, self.layout.rows as usize)?;
+        let rows = segment_rows(segments, self.rows as usize)?;
         self.project_attention(kernels, weights, admitted, layer, rows)?;
         for segment in segments {
             let p = self.projections(weights, layer, segment.first_row, segment.request.rows)?;
             // SAFETY: each segment owns its metadata/cache, and the stream orders
             // scratch reuse after copying the preceding output into its row span.
-            let output = unsafe { self.attention.enqueue(&kernels.attention, p, segment.request, &self.stream)? };
+            let output = unsafe { self.attention.as_mut().context("MiniMax rank has no attention role")?.enqueue(
+                kernels.attention.as_ref().context("MiniMax missing attention kernels")?, p, segment.request, &self.stream)? };
             self.copy_attention(output, segment.first_row, segment.request.rows)?;
         }
         self.finish_attention(kernels, weights, admitted, layer, rows)
@@ -245,7 +347,8 @@ impl<'a> UnitOwner<'a> {
         self.project_attention(kernels, weights, admitted, layer, rows)?;
         let p = self.projections(weights, layer, 0, rows)?;
         // SAFETY: caller supplies batched metadata; producer planes are retained.
-        let output = unsafe { self.attention.decode(&kernels.attention, p, request, &self.stream)? };
+        let output = unsafe { self.attention.as_mut().context("MiniMax rank has no attention role")?.decode(
+            kernels.attention.as_ref().context("MiniMax missing attention kernels")?, p, request, &self.stream)? };
         self.copy_attention(output, 0, rows)?;
         self.finish_attention(kernels, weights, admitted, layer, rows)
     }
@@ -293,6 +396,7 @@ impl<'a> UnitOwner<'a> {
     }
     /// Router and FFN share the exact same normalized BF16 activation.
     pub fn router(&self, kernels: &Kernels<'_>, weights: &TargetWeights<'_>, layer: usize, rows: usize) -> Result<()> {
+        ensure!(kernels.router.is_some(), "MiniMax rank has no router role");
         self.routed_boundary.idle()?;
         self.normalize(kernels, weights, layer, "post_attention_layernorm.weight", rows)?;
         let device = self.stream.device;
@@ -302,7 +406,7 @@ impl<'a> UnitOwner<'a> {
             // SAFETY: all disjoint input/logit/route planes and arena operands
             // remain live; selector receives E128/K4 and sigmoid/noaux_tc math.
             unsafe {
-                kernels.router.router(forward::RouterBatch { rows, input: self.dense.producer_destination(),
+                kernels.router.as_ref().context("MiniMax rank has no router role")?.router(forward::RouterBatch { rows, input: self.dense.producer_destination(),
                     weight, output: self.plane("logits")? }, self.stream.raw)?;
                 device.library.router_select(self.plane("logits")?.ptr, bias.ptr, std::ptr::null(),
                     std::ptr::null(), self.plane("route_ids")?.ptr, self.plane("route_weights")?.ptr,
@@ -314,10 +418,24 @@ impl<'a> UnitOwner<'a> {
     /// Local dense layers normalize here; shared layers reuse router's norm.
     pub fn ffn(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>, admitted: &CoordinatorWeights,
         layer: usize, rows: usize, shared: bool) -> Result<()> {
+        ensure!(self.split.is_none(), "MiniMax split FFN must stage a partial before meeting");
+        self.ffn_projection(kernels, weights, admitted, layer, rows, shared)
+    }
+    /// Stages a native half-FFN result; the caller must exchange and fold it
+    /// before touching .ffn or advancing either rank's FP32 residual.
+    pub fn partial_ffn(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+        admitted: &CoordinatorWeights, layer: usize, rows: usize, shared: bool) -> Result<()> {
+        ensure!(self.split.is_some(), "MiniMax partial FFN requires split owners");
+        self.ffn_projection(kernels, weights, admitted, layer, rows, shared)
+    }
+    fn ffn_projection(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,
+        admitted: &CoordinatorWeights, layer: usize, rows: usize, shared: bool) -> Result<()> {
         self.check(kernels, rows)?;
         if shared { self.routed_boundary.before_ffn(self.stream.raw)?; }
         else { self.routed_boundary.idle()?; }
-        if !shared { self.normalize(kernels, weights, layer, "post_attention_layernorm.weight", rows)?; }
+        if !shared || (self.split.is_some() && admitted.rank != 0) {
+            self.normalize(kernels, weights, layer, "post_attention_layernorm.weight", rows)?;
+        }
         let stem = if shared { "block_sparse_moe.shared_experts" } else { "mlp" };
         let gate = Self::projection(admitted, layer, &format!("{stem}.gate_proj"))?;
         let up = Self::projection(admitted, layer, &format!("{stem}.up_proj"))?;
@@ -334,10 +452,28 @@ impl<'a> UnitOwner<'a> {
             Ok(())
         })?;
         let down = Self::projection(admitted, layer, &format!("{stem}.down_proj"))?;
-        self.dense.prepare(&kernels.dense, down, rows as u32, self.stream.raw)?
-            .project(weights, down)?.narrow(self.planes.get("ffn").context("MiniMax ffn plane")?)?;
-        if !shared { self.accumulate(rows)?; }
+        let mut prepared = self.dense.prepare(&kernels.dense, down, rows as u32, self.stream.raw)?;
+        let output = prepared.project(weights, down)?;
+        if let Some(split) = &mut self.split {
+            output.stage_partial(&mut split.partial)?;
+        } else {
+            output.narrow(self.planes.get("ffn").context("MiniMax ffn plane")?)?;
+        }
+        drop(prepared);
+        if !shared && self.split.is_none() { self.accumulate(rows)?; }
         Ok(())
+    }
+    /// # Safety
+    /// The peer partial has landed in this unit's receive plane, and both
+    /// slots remain leased until the ordered fold and residual update finish.
+    pub unsafe fn meet_ffn(&self, kernels: &Kernels<'_>, rows: usize, shared: bool) -> Result<()> {
+        let split = self.split.as_ref().context("MiniMax meet requires split owners")?;
+        // SAFETY: the caller supplies the same ordering/lease contract.
+        unsafe { self.fold_partials(kernels, &split.fold, rows, shared) }
+    }
+    pub fn split_plane(&self, name: &str) -> Result<Buffer> {
+        self.split.as_ref().and_then(|split| split.planes.get(name)).map(|owner| owner.buffer)
+            .with_context(|| format!("MiniMax split plane missing: {name}"))
     }
     /// # Safety
     /// Both rank slots have landed and their producers precede this unit stream.
@@ -380,11 +516,21 @@ impl<'a> UnitOwner<'a> {
         self.check(kernels, rows)?;
         self.routed_boundary.before_join(self.stream.raw)?;
         self.stream.device.run(|| {
-            // SAFETY: distinct retained planes, same stream as the landed wave.
-            unsafe { kernels.add.launch(self.plane("routed")?, self.plane("ffn")?,
-                self.plane("combined")?, rows * 6144, self.stream.raw) }
+            // SAFETY: all planes are distinct retained owners on this stream.
+            // The split meeting is free after fold narrowing; narrowing the
+            // exactly representable BF16 sum preserves the whole join boundary.
+            unsafe {
+                if let Some(split) = &self.split {
+                    let meeting = split.planes["meeting"].buffer;
+                    kernels.split_add.as_ref().context("MiniMax split join kernel missing")?.launch(self.plane("routed")?, self.plane("ffn")?,
+                        meeting, rows * 6144, self.stream.raw)?;
+                    kernels.narrow.as_ref().context("MiniMax split narrow kernel missing")?.launch(
+                        meeting.ptr, self.plane("ffn")?.ptr, rows * 6144, self.stream.raw)
+                } else { kernels.add.launch(self.plane("routed")?, self.plane("ffn")?,
+                    self.plane("combined")?, rows * 6144, self.stream.raw) }
+            }
         })?;
-        self.accumulate_from("combined", rows)?;
+        self.accumulate_from(if self.split.is_some() { "ffn" } else { "combined" }, rows)?;
         self.routed_boundary.joined();
         Ok(())
     }
@@ -403,6 +549,50 @@ impl<'a> UnitOwner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_join_rounds_shared_before_routed_and_preserves_fp32_residual_bits() {
+        fn narrow(value: f32) -> f32 {
+            let bits = value.to_bits();
+            f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
+        }
+        // Independent nearest-even conversion by choosing adjacent BF16 values.
+        fn reference(value: f32) -> f32 {
+            let bits = value.to_bits();
+            let lower = bits & 0xffff0000;
+            let tail = bits & 0xffff;
+            let rounded = lower + if tail > 0x8000 || (tail == 0x8000 && lower & 0x10000 != 0) {
+                0x10000
+            } else { 0 };
+            f32::from_bits(rounded)
+        }
+        let cases = [
+            (1.0, 0.00390625, -1.0, 0.25),
+            (1.0, 0.01171875, -1.0, -0.25),
+            (65536.0, 0.5, -65536.0, 0.125),
+            (1.0e20, 1.0e-20, -1.0e20, -1.0e-10),
+            (-65536.0, -0.5, 65536.0, -0.125),
+            (0.0, -0.0, -0.0, 0.0),
+        ];
+        for wire in [dense::PartialPrecision::Bf16, dense::PartialPrecision::F32] {
+            for (p0, p1, routed, residual) in cases {
+                let stage = |value| match wire { dense::PartialPrecision::Bf16 => narrow(value),
+                    dense::PartialPrecision::F32 => value };
+                let stage_ref = |value| match wire { dense::PartialPrecision::Bf16 => reference(value),
+                    dense::PartialPrecision::F32 => value };
+                let shared = narrow(stage(p0) + stage(p1));
+                let meeting = narrow(routed) + shared;
+                let ffn = narrow(meeting);
+                let expected_shared = reference(stage_ref(p0) + stage_ref(p1));
+                let expected_ffn = reference(reference(routed) + expected_shared);
+                assert_eq!(ffn.to_bits(), expected_ffn.to_bits(), "{wire:?}");
+                assert_eq!((residual + ffn).to_bits(), (residual + expected_ffn).to_bits(), "{wire:?}");
+            }
+        }
+        // Moving the shared narrowing after the routed add changes this tie.
+        assert_ne!(narrow(narrow(1.0 + 0.00390625) - 1.0).to_bits(),
+            narrow(1.0 + 0.00390625 - 1.0).to_bits());
+    }
 
     #[test]
     fn both_wire_precisions_require_disjoint_rank_meeting_and_whole_planes() -> Result<()> {
@@ -546,7 +736,7 @@ mod tests {
     }
 
     fn attention_diagnostic(owner: &UnitOwner<'_>) -> Result<AttentionDiagnostic> {
-        let plane = |name| owner.attention.diagnostic_plane(name);
+        let plane = |name| owner.attention.as_ref().context("MiniMax test attention role")?.diagnostic_plane(name);
         let query = bf16_values(&read_buffer(owner, attention::row_view(plane("attention.query")?, 0, 1, 16384)?)?);
         let output = bf16_values(&read_buffer(owner, attention::row_view(plane("attention.output")?, 0, 1, 16384)?)?);
         let bytes = read_buffer(owner, plane("selections")?)?;
