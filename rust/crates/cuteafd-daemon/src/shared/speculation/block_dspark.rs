@@ -1334,7 +1334,11 @@ impl<'a> DsparkDrafter<'a> {
                     "dSpark borrows the target BF16 head [{}, {}]", self.cfg.vocab, self.cfg.hidden);
                 HeadRef::Bf16(owner.buffer.ptr)
             }
-            TargetHead::Bf16Buffer(_) => anyhow::bail!("dSpark requires its retained target head owner"),
+            TargetHead::Bf16Buffer(buffer) => {
+                ensure!(buffer.bytes == self.cfg.vocab * self.cfg.hidden * 2 && !buffer.ptr.is_null(),
+                    "dSpark borrowed target head extent differs");
+                HeadRef::Bf16(buffer.ptr)
+            },
             TargetHead::Launch(launch) => HeadRef::Launch(launch),
         })
     }

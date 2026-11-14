@@ -40,10 +40,10 @@ pub(crate) enum BackendError {
 }
 
 #[derive(Default)]
-pub(crate) struct NoDraft;
-impl scheduler::DraftState for NoDraft {
-    fn pending_rows(&self) -> usize { 0 }
-    fn close(&mut self, _: u32) {}
+pub(crate) struct DraftState { anchor:Option<u32> }
+impl scheduler::DraftState for DraftState {
+    fn pending_rows(&self) -> usize { usize::from(self.anchor.is_some()) }
+    fn close(&mut self, token: u32) { self.anchor=Some(token); }
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +201,36 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         self.completed(published)
     }
 
+    fn verify_staged(&self,sequences:&mut [(&mut Placement,&[u32])],pool:&RefPagePool) -> Result<Option<DeviceLogits>> {
+        ensure!(self.pending.borrow().is_none(),"MiniMax verify overlaps an unaccepted round");
+        let submitted=self.validate(sequences,pool)?;
+        let retained=self.owners.storage.verify_logits.as_ref().context("MiniMax retained verify logits missing")?;
+        let rows=submitted.iter().map(|request| request.tokens.len()).sum::<usize>();
+        ensure!(rows <= self.geometry().decode_rows,"MiniMax verify rows exceed admission");
+        let mut placements=submitted.iter().map(|request| request.placement.clone()).collect::<Vec<_>>();
+        let mut requests=placements.iter_mut().zip(&submitted).map(|(placement,request)| ServingRequest {
+            identity:request.identity,kind:ExpertV2SourceKind::Decode,start:request.placement.len,
+            tokens:&request.tokens,heads:request.placement.len..request.placement.len + request.tokens.len(),placement
+        }).collect::<Vec<_>>();
+        let mut offsets=Vec::new();let mut offset=0;
+        for request in &submitted { offsets.push(offset);offset+=request.tokens.len(); }
+        let library=self.library();
+        let result=self.execution.borrow_mut().execute(&self.owners.storage,self.cfg,&self.schedule,&mut requests,false,
+            |index,span,logits| {
+                let first=offsets[index] + span.start - submitted[index].placement.len;
+                let bytes=logits.rows * self.cfg.vocab_size * 4;
+                let source=cuteafd_ffi::CuteafdDeviceBuffer { ptr:logits.ptr,bytes,device_id:retained.buffer.device_id,..Default::default() };
+                let target=super::cache::view(retained.buffer,first * self.cfg.vocab_size * 4,bytes)?;
+                // SAFETY: bounded head tile is consumed before reuse on the producing stream.
+                unsafe { library.copy_d2d_async(target,source,bytes,logits.stream) }
+            });
+        self.completed(result)?;
+        *self.pending.borrow_mut()=Some(submitted);
+        let stream=self.owners.storage.ranks.last().context("MiniMax head rank missing")?.decode.borrow().stream.raw;
+        Ok(Some(DeviceLogits { ptr:retained.buffer.ptr,rows,vocab:self.cfg.vocab_size,
+            stride:self.cfg.vocab_size,stream,greedy:None }))
+    }
+
     fn decode(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
         retain_receipt: bool, captured: bool) -> Result<Option<DeviceLogits>> {
         let submitted = self.validate(sequences, pool)?;
@@ -242,7 +272,7 @@ impl Drop for MiniMaxBackend<'_, '_> {
 
 impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     type Placement = Placement;
-    type Draft = NoDraft;
+    type Draft = DraftState;
     type History = u64;
     type Coordinates = ();
     type Encoder = crate::shared::qwen::Encoder;
@@ -253,7 +283,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let state = self.owners.storage.requests.borrow();
         scheduler::Geometry { family: "minimax_m3", vocab_size: self.cfg.vocab_size, max_context: self.context,
             slots: state.capacity.decode.requests as usize, prefill_rows: state.capacity.prefill.rows as usize,
-            decode_rows: state.capacity.decode.rows as usize, }
+            decode_rows: self.owners.storage.verify_logits.as_ref().map_or(state.capacity.decode.rows as usize,
+                |owner| owner.buffer.bytes / (self.cfg.vocab_size * 4)), }
     }
     fn message_starts(&self) -> &[&str] { MESSAGE_STARTS }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.owners.storage.ranks[0].decode.borrow().stream.device.library }
@@ -311,8 +342,11 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         Ok(())
     }
     fn history(&self, placement: &Placement) -> u64 { self.identities.borrow().get(&placement.slot).copied().unwrap_or(0) }
-    fn restore_draft(&self, _: &Placement, _: usize, _: &[u32], _: &mut NoDraft) -> Result<()> {
-        Err(BackendError::DraftsNotQualified.into())
+    fn restore_draft(&self, placement:&Placement, frontier:usize, tokens:&[u32], state:&mut DraftState) -> Result<()> {
+        let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter was not admitted")?;
+        ensure!(draft.frontier(placement.slot)? == frontier,"MiniMax restored draft frontier differs");
+        state.anchor=tokens.get(frontier).copied();
+        Ok(())
     }
     fn require_live(&self) -> Result<()> { self.live() }
     fn log_table_stats(&self, _: &str) {}
@@ -342,9 +376,10 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         Some(Limits { rows: packing_rows(self.packing, self.geometry().prefill_rows),
             chunk_rows: self.geometry().prefill_rows, max_context: self.context, taps: None })
     }
-    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, NoDraft>], pool: &RefPagePool,
+    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, DraftState>], pool: &RefPagePool,
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> MemberOutcome) -> Result<Vec<Result<()>>> {
-        ensure!(sequences.iter().all(|sequence| !sequence.neural), BackendError::DraftsNotQualified);
+        ensure!(self.owners.storage.draft_prefix.is_some() || sequences.iter().all(|sequence| !sequence.neural),
+            BackendError::DraftsNotQualified);
         let mut heads = Vec::with_capacity(sequences.len());
         for sequence in sequences.iter() {
             ensure!(sequence.start == sequence.placement.len && !sequence.tokens.is_empty(), "MiniMax packed start differs");
@@ -357,16 +392,22 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             ensure!(outcomes[index].is_none(), "MiniMax packed member head consumed twice");
             outcomes[index] = Some(on_logits(index, logits)?); Ok(())
         })?;
+        drop(target);
+        for sequence in sequences.iter_mut().filter(|sequence| sequence.neural) {
+            sequence.draft.anchor=sequence.next;
+        }
         outcomes.into_iter().map(|outcome| outcome.context("MiniMax packed member head missing")).collect()
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative, BackendError::DraftsNotQualified);
-        self.decode(sequences, pool, true, true)
+        if speculative || self.owners.storage.draft_prefix.is_some() { self.verify_staged(sequences,pool) }
+        else { self.decode(sequences, pool, true, true) }
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative, BackendError::DraftsNotQualified);
+        if speculative || (kind == scheduler::UngraphedKind::Decode && self.owners.storage.draft_prefix.is_some()) {
+            return self.verify_staged(sequences,pool);
+        }
         if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, pool, true, false); }
         let total: usize = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         ensure!(sequences.len() == 1 && total <= self.geometry().decode_rows,
@@ -386,15 +427,79 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({
             "kind":"minimax_msa", "rows":rows, "contexts":contexts, "attention":"eager", "arithmetic":"eager" }))
     }
-    fn draft_geometry(&self, _: &Path, _: usize) -> Result<cuteafd_core::PolicyGeometry> { Err(BackendError::DraftsNotQualified.into()) }
-    fn arm_draft_probe(&self) -> Result<()> { Err(BackendError::DraftsNotQualified.into()) }
-    fn prefill_draft(&self, _: &Placement, _: usize, _: &[u32], _: Option<u32>, _: &mut NoDraft) -> Result<()> {
-        Err(BackendError::DraftsNotQualified.into())
+    fn draft_geometry(&self, _: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
+        ensure!(self.owners.storage.draft_prefix.is_some(),"MiniMax drafter not admitted");
+        Ok(cuteafd_core::PolicyGeometry { layers:vec![cuteafd_core::LayerResource {
+            class:None,slice_bytes:0.,group_rows:1,timed:false };self.cfg.layers],
+            group_rows_by_rows:vec![],experts:0,topk:0,max_requests:self.geometry().slots,
+            max_positions:self.geometry().decode_rows,widths:vec![width],classes:vec![cuteafd_core::ResourceClass::rtx()],regimes:1 })
     }
-    fn draft(&self, _: &mut [scheduler::DraftSeq<'_, Placement, NoDraft>], _: &mut scheduler::DraftTiming,
-        _: &mut TokenSelector<'_>) -> Result<Vec<Vec<u32>>> { Err(BackendError::DraftsNotQualified.into()) }
-    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, NoDraft, u64>], speculative: bool) -> Result<()> {
+    fn arm_draft_probe(&self) -> Result<()> { Ok(()) }
+    fn prefill_draft(&self, placement:&Placement, _:usize, _: &[u32], next:Option<u32>, state:&mut DraftState) -> Result<()> {
+        let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter not admitted")?;
+        ensure!(draft.frontier(placement.slot)? == placement.len,"MiniMax draft prefill frontier differs");
+        state.anchor=next;
+        Ok(())
+    }
+    fn draft(&self,sequences:&mut [scheduler::DraftSeq<'_,Placement,DraftState>],timing:&mut scheduler::DraftTiming,
+        _: &mut TokenSelector<'_>) -> Result<Vec<Vec<u32>>> {
+        use crate::shared::speculation::dflash::{DraftSeq,TargetHead};
+        let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter not admitted")?;
+        let mut output=vec![Vec::new();sequences.len()];
+        let selected=sequences.iter().enumerate().filter(|(_,sequence)| sequence.depth > 0).collect::<Vec<_>>();
+        if selected.is_empty() { return Ok(output); }
+        let rows=selected.iter().map(|(_,sequence)| {
+            ensure!(draft.frontier(sequence.placement.slot)? == sequence.placement.len,"MiniMax draft target frontier differs");
+            Ok(DraftSeq { slot:sequence.placement.slot,anchor:sequence.seq.anchor.context("MiniMax draft anchor missing")?,
+                position:sequence.placement.len,valid_from:0 })
+        }).collect::<Result<Vec<_>>>()?;
+        let head=self.owners.storage.ranks.last().context("MiniMax head rank")?.weights
+            .operand("language_model.lm_head.weight")?.buffer;
+        let started=std::time::Instant::now();
+        let proposed=draft.drafter.draft_device(&rows,&self.owners.storage.embedding,TargetHead::Bf16Buffer(head))?;
+        timing.steps+=1;timing.seconds+=started.elapsed().as_secs_f64();
+        for ((index,sequence),draft) in selected.into_iter().zip(proposed) {
+            output[index]=draft.tokens.into_iter().take(sequence.depth).collect();
+        }
+        Ok(output)
+    }
+    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, u64>], speculative: bool) -> Result<()> {
         self.live()?;
+        if let Some(draft)=&self.owners.storage.draft_prefix {
+            let submitted=self.pending.borrow_mut().take().context("MiniMax staged accept has no receipt")?;
+            let checked=(|| {
+                ensure!(submitted.len() == verified.len(),"MiniMax staged accept request count differs");
+                let mut first=0;
+                for (sent,sequence) in submitted.iter().zip(verified.iter()) {
+                    sent.validate(sequence.history,sequence.placement,sequence.start,sequence.rows)?;
+                    let keep=if speculative { sequence.kept.map_or(0,|(rows,_)| rows) } else { sequence.rows.len() };
+                    ensure!(keep <= sequence.rows.len() && sequence.first_row == first
+                        && self.identity(sequence.placement)? == sent.identity
+                        && draft.frontier(sequence.placement.slot)? == sequence.start,
+                        "MiniMax staged accept identity/frontier/rows differ");
+                    first+=sequence.rows.len();
+                }
+                let taps=self.owners.storage.verify_taps.as_ref().context("MiniMax retained verify taps missing")?;
+                let stream=self.owners.storage.ranks.last().context("MiniMax head rank")?.decode.borrow().stream.raw;
+                for sequence in verified.iter_mut() {
+                    let keep=if speculative { sequence.kept.map_or(0,|(rows,_)| rows) } else { sequence.rows.len() };
+                    if keep > 0 {
+                        // SAFETY: retained verify taps are initialized and owned until this accept drains.
+                        unsafe { draft.drafter.capture_concatenated(taps.buffer,sequence.first_row,keep,0,stream)?; }
+                        let rows=(0..keep).map(|tap_row| crate::shared::speculation::dflash::ContextRow {
+                            tap_row,slot:sequence.placement.slot,position:sequence.start + tap_row }).collect::<Vec<_>>();
+                        draft.drafter.update(&rows)?;
+                        draft.advance(sequence.placement.slot,sequence.start,keep)?;
+                    }
+                    let mut next=Placement { len:sequence.start + keep,..sequence.placement.clone() };
+                    self.owners.storage.prefix.bind(&mut next).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    *sequence.placement=next;
+                    if let Some((_,anchor))=sequence.kept { sequence.seq.anchor=Some(anchor); }
+                }
+                Ok(())
+            })();
+            return self.completed(checked);
+        }
         ensure!(!speculative && verified.iter().all(|sequence| !sequence.neural), BackendError::DraftsNotQualified);
         let submitted = self.pending.borrow_mut().take().context("MiniMax accept has no native receipt")?;
         let checked = (|| {
