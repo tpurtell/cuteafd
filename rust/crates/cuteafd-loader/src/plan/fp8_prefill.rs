@@ -62,7 +62,7 @@ impl Policy {
         match self {
             Self::Auto => None,
             Self::Off => Some(false),
-            Self::Groups(groups) => Some(groups.contains("experts")),
+            Self::Groups(groups) => groups.contains("experts").then_some(true),
         }
     }
 }
@@ -200,6 +200,6 @@ mod tests {
         assert_eq!(Policy::Auto.experts(true), None);
         assert_eq!(Policy::Off.experts(true), Some(false));
         assert_eq!("experts".parse::<Policy>().unwrap().experts(true), Some(true));
-        assert_eq!("mla".parse::<Policy>().unwrap().experts(true), Some(false));
+        assert_eq!("mla".parse::<Policy>().unwrap().experts(true), None);
     }
 }

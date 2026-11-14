@@ -2554,7 +2554,8 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     assert "--kda-prefill-expanded" not in launch
     # Prefill over FP8 weights defaults to W8A8 MLA + FFN: nothing forwarded (daemon default mla/true),
     # KDA W8A8 stays opt-in, and KDA FP8 conversion stays off.
-    assert "fp8-prefill" not in launch
+    assert "--fp8-prefill" not in shlex.split(launch)
+    assert "CUTEAFD_FP8_PREFILL=auto" in launch
 
 
 @pytest.mark.parametrize("keys,shard", [("", False), ("GLM5_FLASH_KDA_FP8=row128\n", True),
