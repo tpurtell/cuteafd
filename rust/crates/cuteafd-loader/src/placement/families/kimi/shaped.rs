@@ -39,6 +39,59 @@ impl ShapedOwner {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_curves_and_receipts_follow_solved_pool_and_pins() -> anyhow::Result<()> {
+        let mut manifest = serde_json::json!({"programs": []});
+        crate::families::kimi_k3::context::add_manifest_programs(&mut manifest);
+        let initial = ContextLayout::from_manifest(&manifest, cuteafd_core::MlaCacheFormat::Fp8,
+            1_048_576, 2752, 3)?;
+        let mut recipe = super::super::tests::recipe();
+        recipe.context = 1_048_576;
+        recipe.maximum_pages = 16_384;
+        recipe.shaped.push(ShapedOwner::Context { layout: initial.clone() });
+        for context in [Context::automatic(1_048_576), Context::pinned(262_145)] {
+            let request = Request { context, ..super::super::tests::single() };
+            let components = recipe.shaped_components(&request)?;
+            for pages in [1, 63, 64, 4096, 4097, 8192, 16384] {
+                let served = context.served(pages * recipe.page_rows());
+                let expected = initial.with_served_context(served as usize)?;
+                let demands = expected.buffers().demands()?;
+                for component in &components {
+                    let ComponentKind::Allocation { template, .. } = &component.kind else { panic!("allocation"); };
+                    let requests = recipe.shaped[0].requests(served)?.into_iter()
+                        .find(|(rank, group, _, _)| Location::coordinator(*rank) == template.location
+                            && *group == template.group).unwrap().3;
+                    let demand = demands.iter().find(|d| Location::coordinator(d.gpu) == template.location
+                        && d.group == template.group).unwrap();
+                    assert_eq!(requests.iter().sum::<u64>(), demand.bytes);
+                    assert_eq!(component.bytes.at(pages)?, backing(&requests)?);
+                }
+                let contract = Contract { components: components.clone(), floor_fallback: None,
+                    resident_weight_limit: None, phase_order: PhaseOrder::DRAFT_THEN_TARGET,
+                    spark_reply_formats: None, page_rows: recipe.page_rows(), pool_page_multiple: 1,
+                    maximum_pages: recipe.maximum_pages, gpus: 2, variables: vec![], requires: vec![] };
+                let facts = contract.facts(&[], pages)?;
+                let mut solved = ResolvedPlan { request: request.clone(), pool_tokens: pages * recipe.page_rows(),
+                    pool_page_rows: recipe.page_rows(), facts, budgets: vec![], phases: vec![],
+                    decisions: contract.decisions(&[])?, encoder_diagnostics: vec![] };
+                recipe.refine_shaped(&mut solved)?;
+                for demand in demands {
+                    let owners = solved.facts.allocations.iter().filter(|root|
+                        root.group == demand.group && root.location == Location::coordinator(demand.gpu)).collect::<Vec<_>>();
+                    assert_eq!(owners.len(), 1);
+                    assert_eq!(owners[0].bytes, demand.bytes);
+                }
+                assert_eq!(solved.facts.allocation_granularity.len(), 6);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn backing(requests: &[u64]) -> Result<u64, Refusal> {
     requests.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(sm120_request_backing(bytes)?)
         .ok_or(Refusal::Overflow("Kimi shaped backing")))

@@ -473,6 +473,18 @@ mod tests {
                 assert_eq!(layout.metadata_extent("DSA merged lengths", 2)?, (2 * unit * 4, unit * 4));
                 assert_eq!(layout.metadata_extent("compact page tables", 0)?.1, unit * 64 * 4);
             }
+            let prepared = ContextLayout::from_variant(&manifest, format, 1_048_576, 2752, 3, true)?;
+            for extent in [1, 65, 8192, 131_201, 997_376, 1_048_576] {
+                let resolved = prepared.with_served_context(extent)?;
+                let fresh = ContextLayout::from_variant(&manifest, format, extent, 2752, 3, true)?;
+                assert_eq!(resolved, fresh, "resolved history must equal fresh layout at {extent}");
+                assert_eq!(resolved.metadata_extent("compact page tables", 0)?.1,
+                    (2752 * extent.div_ceil(64).div_ceil(2) * 4).max(256).next_multiple_of(256));
+                assert_eq!(resolved.buffers().demands()?[0].bytes,
+                    2 * extent.div_ceil(64) as u64 * 64 * format.record_bytes() as u64);
+            }
+            assert!(prepared.with_served_context(0).is_err());
+            assert!(prepared.with_served_context(1_048_577).is_err());
             assert_eq!(layout.buffers().workspace_bytes,
                 layout.workspace().iter().map(|(_, bytes)| *bytes as u64).sum::<u64>());
             assert!(ContextLayout::from_manifest(&manifest, format, 8192, 2752, 3).is_err());

@@ -1099,7 +1099,7 @@ mod tests {
         }
     }
 
-    fn single() -> Request {
+    pub(super) fn single() -> Request {
         request_with(Some(0))
     }
 
@@ -1129,7 +1129,7 @@ mod tests {
         }
     }
 
-    fn recipe() -> KimiRecipe {
+    pub(super) fn recipe() -> KimiRecipe {
         let mut recipe = KimiRecipe {
             expert_usage: None,
             shaped: Vec::new(),

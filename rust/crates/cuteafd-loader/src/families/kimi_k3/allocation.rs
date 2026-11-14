@@ -276,6 +276,7 @@ impl NativeLaneLayout {
             }
         }
         layout.max_context = context;
+        layout.bytes()?;
         Ok(layout)
     }
 
@@ -816,6 +817,16 @@ mod tests {
                 assert_eq!(lane.metadata_extent(name, 1)?, (stride, stride));
             }
             assert_eq!(lane.metadata_extent("DSA lengths", 0)?.1, unit * 4);
+            for context in [1usize, 65, 8192, 997_376, 1_048_576] {
+                let resolved = lane.with_served_context(context)?;
+                assert_eq!(resolved.arena_offsets, lane.arena_offsets);
+                assert_eq!(resolved.arena_bytes, lane.arena_bytes);
+                for name in ["MLA page table", "DSA page table"] {
+                    assert_eq!(resolved.operands[name],
+                        (unit.min(64) * context.div_ceil(64) * 4).max(16).next_multiple_of(16) * lane.metadata_banks());
+                }
+                for name in DSA_SCRATCH { assert_eq!(resolved.operands[name], lane.operands[name]); }
+            }
             let extra = DSA_METADATA.into_iter().chain(DSA_SCRATCH).map(|name| lane.operands[name]).sum::<usize>();
             assert_eq!(lane.bytes()? - base.bytes()?, extra);
             assert!(lane.with_dsa(&cfg, index).is_err());

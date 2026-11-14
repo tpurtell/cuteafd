@@ -1531,6 +1531,38 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn automatic_context_resolves_real_workspace_staging_and_lane_tables() -> Result<()> {
+        let cfg = cfg();
+        let mut i = inputs(&cfg);
+        i.lanes = 1;
+        i.lane_layouts.truncate(1);
+        i.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
+        i.attention = Some(AttentionPlacement::Context);
+        let initial = context_layout(i.cache_format)?;
+        i.context = Some(initial.clone());
+        i.serving_context = cuteafd_loader::placement::planner::Context::automatic(1_048_576);
+        i.requested_pool = Some(262_144);
+        let admitted = admit(i)?;
+        assert_eq!(admitted.placement.pool_tokens, 262_144);
+        let resolved = initial.with_served_context(262_144)?;
+        assert_eq!(admitted.context_layout(), Some(&resolved));
+        assert!(resolved.buffers().workspace_bytes < initial.buffers().workspace_bytes);
+        for demand in resolved.buffers().demands()? {
+            let items = admitted.placement.items[demand.gpu as usize].iter()
+                .filter(|item| item.group == demand.group).collect::<Vec<_>>();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].bytes, demand.bytes);
+        }
+        for (rank, layout) in admitted.lane_layouts[0].iter().enumerate() {
+            assert_eq!(layout.max_context(), 262_144);
+            let demand = layout.demand(rank as u8, 0)?;
+            assert_eq!(admitted.placement.items[rank].iter().filter(|item| item.group == demand.group)
+                .map(|item| item.bytes).sum::<u64>(), demand.bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn auto_pair_charges_exactly_explicit_context_and_single_stays_layers() -> Result<()> {
         let cfg = cfg();
         let pair = |attention| -> Result<_> {
