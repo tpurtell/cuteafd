@@ -1610,7 +1610,10 @@ if [[ -z "$speculator" ]]; then
   fi
 
 fi
+# MiniMax keeps speculation default-off until native DSpark qualification.
+[[ "$family:$speculator" != minimax_m3:auto ]] || speculator=off
 case "$family:$speculator" in
+  minimax_m3:dspark) ;;
   qwen4:mtp|qwen4:auto) ;;
   glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
     { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
@@ -1746,7 +1749,9 @@ case "$speculator" in
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
     [[ "$family:$speculator" != qwen3_5:dspark || -n "$drafter" ]] || drafter=RadixArk/Qwen3.8-27B-DSpark
-    if [[ $speculator == dspark && ( $family == deepseek_v4 || $checkpoint_family == mistral_large4 ) ]]; then
+    if [[ "$family:$speculator" == minimax_m3:dspark ]]; then
+      : # Bundled native drafter; --dspark is supplied with MiniMax family args.
+    elif [[ $speculator == dspark && ( $family == deepseek_v4 || $checkpoint_family == mistral_large4 ) ]]; then
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
       draft_revision="$(get SPECULATOR_MODEL_REVISION)"
@@ -1937,6 +1942,7 @@ fi
 if [[ $family == minimax_m3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
   family_args+=(--rtx-expert-layers "$local_layers" --split-wire fp32)
+  [[ "$speculator" != dspark ]] || family_args+=(--dspark)
 fi
 if [[ $family == kimi_k3 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
@@ -2474,6 +2480,8 @@ audio_encoder_hash=""
   [[ -z "$(get SPARK_PREFILL_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-prefill-reply-format "$(get SPARK_PREFILL_REPLY_FORMAT)")
   [[ -z "$(get SPARK_DECODE_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-decode-reply-format "$(get SPARK_DECODE_REPLY_FORMAT)")
   if [[ "$family" == minimax_m3 ]]; then
+    plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
+    [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi

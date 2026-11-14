@@ -208,6 +208,7 @@ pub(crate) fn is_dspark(snapshot: &Path) -> Result<bool> {
 #[derive(Debug, Clone)]
 pub(crate) struct DsparkConfig {
     pub backbone: cuteafd_loader::formats::block_dspark::DsparkBackbone,
+    pub dialect: cuteafd_loader::formats::block_dspark::DsparkDialect,
     pub hidden: usize,
     pub intermediate: usize,
     pub layers: usize,
@@ -241,8 +242,8 @@ impl DsparkConfig {
         let rotary = if cfg.head_dim == 64 {
             ensure!(matches!(cfg.rope, DsparkRope::Default { .. }), "64-wide dSpark requires default RoPE");
             None
-        } else { Some(cfg.rope.plan(cfg.head_dim)?) };
-        Ok(Self { backbone: cfg.backbone, hidden: cfg.hidden, intermediate: cfg.intermediate, layers: cfg.layers,
+        } else { Some(cfg.rope.plan(cfg.backbone.rotary_dim)?) };
+        Ok(Self { backbone: cfg.backbone, dialect: cfg.dialect, hidden: cfg.hidden, intermediate: cfg.intermediate, layers: cfg.layers,
             heads: cfg.heads, kv_heads: cfg.kv_heads, head_dim: cfg.head_dim,
             eps: cfg.eps as f32, theta: rope_theta as f32, block: cfg.block,
             mask_token: cfg.mask_token, rank: cfg.rank, taps: cfg.taps, vocab: cfg.vocab, causal: cfg.causal,
@@ -301,16 +302,136 @@ fn weight_recipe<T, M>(snapshot: &Path, tensor: impl FnMut(&str, &[usize]) -> Re
     cuteafd_loader::formats::block_dspark::block_dspark_weight_recipe(&cfg, tensor, matrix)
 }
 
+struct NativeBackbone<'a> {
+    norm: cuteafd_ffi::minimax_m3::forward::ForwardProducer<'a>,
+    query: cuteafd_ffi::minimax_m3::producers::Producer<'a>,
+    key: cuteafd_ffi::minimax_m3::producers::Producer<'a>,
+    activation: cuteafd_ffi::minimax_m3::producers::Producer<'a>,
+    add: cuteafd_ffi::Bf16Add<'a>,
+    wide: Dev<'a>,
+    norm_scratch: Dev<'a>,
+    gate: Dev<'a>,
+    up: Dev<'a>,
+    rope: CuteafdDeviceBuffer,
+    positions: usize,
+    projections: Rc<super::weights::NativeProjectionWorkspace<'a>>,
+}
+
+impl<'a> NativeBackbone<'a> {
+    fn bind(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        cfg: &DsparkConfig, rope: CuteafdDeviceBuffer, positions: usize,
+        projections: Rc<super::weights::NativeProjectionWorkspace<'a>>) -> Result<Self> {
+        use cuteafd_loader::formats::block_dspark::{DsparkNorm, DsparkResidual};
+        use cuteafd_ffi::minimax_m3::{forward, producers};
+        ensure!(cfg.hidden == 6144 && cfg.heads == 64 && cfg.kv_heads == 4 && cfg.head_dim == 128
+            && cfg.backbone.norm == DsparkNorm::Gemma && cfg.backbone.residual == DsparkResidual::Bf16
+            && cfg.backbone.rotary_dim == 64 && cfg.eps == 1e-6 && cfg.theta == 1e7
+            && cfg.backbone.activation == (cuteafd_core::FfnActivation::SwigluOai { alpha:1.702, beta:1., limit:7. })
+            && !cfg.causal && cfg.intermediate == 12288 && positions > 0
+            && rope.device_id == library.cuda_get_device()? && !rope.ptr.is_null()
+            && positions.checked_mul(256).is_some_and(|bytes| bytes <= rope.bytes),
+            "native block drafter arithmetic differs from installed MiniMax programs");
+        let alloc = |bytes, name| DeviceAllocation::new(library, bytes, Tag::drafter_workspace(name));
+        Ok(Self { norm: forward::ForwardProducer::bind(programs, forward::Kind::ResidualNorm)?,
+            query: producers::Producer::bind(programs, producers::Kind::NormRope { heads:64 })?,
+            key: producers::Producer::bind(programs, producers::Kind::NormRope { heads:4 })?,
+            activation: producers::Producer::bind(programs, producers::Kind::Oai { width:12288 })?,
+            add: library.bf16_add()?, wide: alloc(TAP_ROWS * cfg.hidden * 4, "shared/draft-native/norm-input")?,
+            norm_scratch: alloc(TAP_ROWS * cfg.q_width() * 2, "shared/draft-native/norm-rope")?,
+            gate: alloc(TAP_ROWS * cfg.intermediate * 2, "shared/draft-native/gate")?,
+            up: alloc(TAP_ROWS * cfg.intermediate * 2, "shared/draft-native/up")?, rope, positions, projections })
+    }
+
+    unsafe fn norm(&self, library: &NativeLibrary, input: *const c_void, weight: CuteafdDeviceBuffer,
+        output: *mut c_void, rows: usize, stream: *mut c_void) -> Result<()> {
+        ensure!(rows > 0 && rows <= TAP_ROWS, "native draft norm row capacity");
+        let buffer = |ptr, bytes| CuteafdDeviceBuffer { ptr, bytes, device_id:self.wide.buffer.device_id, ..Default::default() };
+        // SAFETY: retained scratch and caller spans survive the ordered native producers.
+        unsafe {
+            library.cuda_zero_bytes_async(self.wide.buffer, rows * 6144 * 4, stream)?;
+            library.cuda_accumulate_bf16_to_f32_async(buffer(input.cast_mut(),rows * 6144 * 2),
+                self.wide.buffer, rows * 6144, stream)?;
+            self.norm.norm(cuteafd_ffi::minimax_m3::forward::NormBatch { rows,
+                input:self.wide.buffer,weight,output:buffer(output,rows * 6144 * 2) }, stream)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn rope(&self, cfg: &DsparkConfig, input: CuteafdDeviceBuffer, query_norm: CuteafdDeviceBuffer,
+        key_norm: CuteafdDeviceBuffer, positions: CuteafdDeviceBuffer, query: CuteafdDeviceBuffer,
+        key: CuteafdDeviceBuffer, value: CuteafdDeviceBuffer, rows: usize, context: bool,
+        stream: *mut c_void) -> Result<()> {
+        use cuteafd_ffi::minimax_m3::producers::NormRopeBatch;
+        let library = self.wide.library;
+        let q = if context { 0 } else { cfg.q_width() };
+        let kv = cfg.kv_width();
+        let packed = q + 2 * kv;
+        ensure!(rows > 0 && rows <= TAP_ROWS && rows * packed * 2 <= input.bytes,
+            "native draft QKV extent differs");
+        // SAFETY: distinct retained scratch and packed input; producers and
+        // rotary table are retained on the issuing stream by the backbone owner.
+        unsafe {
+            if !context {
+                library.copy_d2d_2d_async(query, q * 2, input, packed * 2, q * 2, rows, stream)?;
+                self.query.norm_rope(NormRopeBatch { rows, positions_capacity:self.positions,
+                    input:query, weight:query_norm, positions, cos_sin:self.rope,
+                    output:self.norm_scratch.buffer, scratch:self.wide.buffer },stream)?;
+                library.copy_d2d_async(query,self.norm_scratch.buffer,rows * q * 2,stream)?;
+            }
+            let k = CuteafdDeviceBuffer { ptr:input.ptr.wrapping_byte_add(q * 2),
+                bytes:input.bytes - q * 2, ..input };
+            let v = CuteafdDeviceBuffer { ptr:input.ptr.wrapping_byte_add((q + kv) * 2),
+                bytes:input.bytes - (q + kv) * 2, ..input };
+            library.copy_d2d_2d_async(key,kv * 2,k,packed * 2,kv * 2,rows,stream)?;
+            library.copy_d2d_2d_async(value,kv * 2,v,packed * 2,kv * 2,rows,stream)?;
+            self.key.norm_rope(NormRopeBatch { rows, positions_capacity:self.positions,
+                input:key,weight:key_norm,positions,cos_sin:self.rope,
+                output:self.norm_scratch.buffer,scratch:self.wide.buffer },stream)?;
+            library.copy_d2d_async(key,self.norm_scratch.buffer,rows * kv * 2,stream)?;
+        }
+        Ok(())
+    }
+
+    unsafe fn add_norm(&self, library:&NativeLibrary, residual:CuteafdDeviceBuffer,
+        delta:CuteafdDeviceBuffer, weight:CuteafdDeviceBuffer, output:*mut c_void,
+        rows:usize, stream:*mut c_void) -> Result<()> {
+        // SAFETY: all spans survive this stream; BF16 addition matches checkpoint residual rounding.
+        unsafe {
+            self.add.launch(residual,delta,self.norm_scratch.buffer,rows * 6144,stream)?;
+            library.copy_d2d_async(residual,self.norm_scratch.buffer,rows * 6144 * 2,stream)?;
+            self.norm(library,residual.ptr,weight,output,rows,stream)
+        }
+    }
+
+    fn inventory(&self, inventory: &mut receipts::Inventory<'_>, prefix: &str) -> Result<()> {
+        for (name, owner) in [("norm-input", &self.wide), ("norm-rope", &self.norm_scratch),
+            ("gate", &self.gate), ("up", &self.up)] { owner.inventory(inventory,&format!("{prefix}.{name}"))?; }
+        self.projections.inventory(inventory,&format!("{prefix}.projections"))
+    }
+}
+
+enum Matrix<'a> {
+    Legacy(Weight<'a>),
+    Native(super::weights::NativeProjection<'a>),
+}
+impl Matrix<'_> {
+    fn inventory(&self, inventory: &mut receipts::Inventory<'_>, name: &str) -> Result<()> {
+        match self { Self::Legacy(weight) => weight.allocation_receipts(inventory, name),
+            Self::Native(weight) => weight.inventory(inventory, name) }
+    }
+}
+
 struct DraftLayer<'a> {
     input_norm: Dev<'a>,
     post_norm: Dev<'a>,
     /// q | k | v rows; the context update reads the k | v rows.
-    qkv: Weight<'a>,
+    qkv: Matrix<'a>,
     q_norm: Dev<'a>,
     k_norm: Dev<'a>,
-    o: Weight<'a>,
-    gate_up: Weight<'a>,
-    down: Weight<'a>,
+    o: Matrix<'a>,
+    gate_up: Matrix<'a>,
+    down: Matrix<'a>,
     k_ring: Dev<'a>,
     v_ring: Dev<'a>,
 }
@@ -422,7 +543,8 @@ pub(crate) struct DsparkDrafter<'a> {
     paged: Option<PagedContext<'a>>,
     inv_freq: Option<Dev<'a>>,
     projections: cuteafd_ffi::draft_projection::DraftProjections<'a>,
-    fc: Weight<'a>,
+    native: Option<NativeBackbone<'a>>,
+    fc: Matrix<'a>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
     markov_w1: Dev<'a>,
@@ -474,10 +596,11 @@ impl<'a> DsparkDrafter<'a> {
 
     pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
         prefix: &str) -> Result<()> {
-        self.fc.allocation_receipts(inventory, &format!("{prefix}.fc"))?;
+        if let Some(native) = &self.native { native.inventory(inventory, &format!("{prefix}.native"))?; }
+        self.fc.inventory(inventory, &format!("{prefix}.fc"))?;
         for (index, layer) in self.layers.iter().enumerate() {
             for (name, owner) in [("qkv", &layer.qkv), ("o", &layer.o), ("gate_up", &layer.gate_up), ("down", &layer.down)] {
-                owner.allocation_receipts(inventory, &format!("{prefix}.layer.{index}.{name}"))?;
+                owner.inventory(inventory, &format!("{prefix}.layer.{index}.{name}"))?;
             }
             for (name, owner) in [("input_norm", &layer.input_norm), ("post_norm", &layer.post_norm),
                 ("q_norm", &layer.q_norm), ("k_norm", &layer.k_norm)] {
@@ -557,14 +680,40 @@ impl<'a> DsparkDrafter<'a> {
         fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, target_tokens: usize,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         mut allocate: impl FnMut(i32, &str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>) -> Result<Self> {
+        Self::load_backbone_with(library, programs, target_projection, snapshot, tensors, stream,
+            slots, max_sequences, mask_row, representation, scales, fp8_rows, context_capacity,
+            target_tokens, kv_cache, None, &mut allocate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_native_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        target_projection: super::dflash::TargetProjection, snapshot: &Path, stream: *mut c_void,
+        slots: usize, max_sequences: usize, mask_row: Vec<u8>, rope: CuteafdDeviceBuffer, positions: usize,
+        mut allocate: impl FnMut(i32, &str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>) -> Result<Self> {
+        let cfg = DsparkConfig::read(snapshot)?;
+        let capacity = cfg.window.context("native block drafter requires a declared sliding window")?;
+        Self::load_backbone_with(library, programs, target_projection, snapshot, HashMap::new(), stream,
+            slots, max_sequences, mask_row, GlmDraftRepresentation::Bf16Only, fp8_linear::Fp8Scales::Pow2,
+            fp8_linear::Fp8Rows::W8a16, capacity, slots.checked_mul(capacity).context("native draft capacity overflow")?,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, Some((rope,positions)), &mut allocate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_backbone_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: super::dflash::TargetProjection, snapshot: &Path, tensors: HashMap<String, Vec<u8>>, stream: *mut c_void,
+        slots: usize, max_sequences: usize, mask_row: Vec<u8>, representation: GlmDraftRepresentation,
+        scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, target_tokens: usize,
+        kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, native_rope: Option<(CuteafdDeviceBuffer,usize)>,
+        allocate: &mut WeightAllocator<'a, '_>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DsparkConfig::read(snapshot)?;
-        ensure!(cfg.backbone.is_qwen3(cfg.head_dim), "dSpark backbone needs native arithmetic bindings");
+        ensure!(cfg.backbone.is_qwen3(cfg.head_dim) == native_rope.is_none(),
+            "dSpark backbone needs its declared native arithmetic bindings");
         let h = cfg.hidden;
         let shapes = [(h * cfg.taps.len(), h), (h, cfg.qkv_width()), (h, 2 * cfg.kv_heads * cfg.head_dim),
             (cfg.q_width(), h), (h, 2 * cfg.intermediate), (cfg.intermediate, h)];
+        let native_bf16 = [(h * cfg.taps.len(), h)];
         let projections = cuteafd_ffi::draft_projection::DraftProjections::load(programs,
-            if representation == GlmDraftRepresentation::Bf16Only { &shapes } else { &[] },
+            if native_rope.is_some() { &native_bf16 } else if representation == GlmDraftRepresentation::Bf16Only { &shapes } else { &[] },
             cuteafd_ffi::draft_projection::batch_rows(TAP_ROWS, cfg.block, max_sequences,
                 programs.capacities().decode_rows.unwrap_or(0)))?;
         ensure!(context_capacity > 0 && slots > 0 && max_sequences <= slots,
@@ -583,8 +732,12 @@ impl<'a> DsparkDrafter<'a> {
             context_capacity, target_tokens, kv_cache)?;
         tracing::info!(resident_bytes = residency.owned, scratch_bytes = residency.scratch, kv_cache = %kv_cache, "dSpark shared readiness inventory");
         ensure!((1..=MAX_SEQUENCES).contains(&max_sequences), "dSpark drafts take 1..={MAX_SEQUENCES} sequences");
-        let allocate: &mut WeightAllocator<'a, '_> = &mut allocate;
-        let load = Load::with_tensors(library, snapshot, tensors)?.with_allocator(allocate);
+        let load = if native_rope.is_some() { Load::open(library, snapshot)? }
+            else { Load::with_tensors(library, snapshot, tensors)? }.with_allocator(allocate);
+        let native_shapes = [(h, cfg.q_width()), (h,cfg.kv_width()), (cfg.q_width(),h),
+            (h,cfg.intermediate), (cfg.intermediate,h)];
+        let native_workspace = native_rope.map(|_| super::weights::NativeProjectionWorkspace::new(library,
+            &native_shapes, TAP_ROWS.max(max_sequences * cfg.block)).map(Rc::new)).transpose()?;
         let upload = |name: &str, data: &[u8]| -> Result<Dev<'a>> {
             let allocation = load.allocation(name, data.len().max(256))?;
             library.copy_h2d(allocation.buffer, data)?;
@@ -597,7 +750,15 @@ impl<'a> DsparkDrafter<'a> {
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
         let weights = weight_recipe(snapshot, |name, shape| load.tensor(name, shape),
-            |parts, cols| load.matrix(parts, cols, representation == GlmDraftRepresentation::Fp8Only, scales, stream))?;
+            |parts, cols| {
+                if let Some(workspace) = &native_workspace {
+                    if parts.len() == 1 && parts[0].0.ends_with("dspark.fc.weight") {
+                        return load.tensor(parts[0].0, &[parts[0].1,cols]).map(Weight::Bf16).map(Matrix::Legacy);
+                    }
+                    return super::weights::NativeProjection::load(&load,programs,parts,cols,Rc::clone(workspace)).map(Matrix::Native);
+                }
+                load.matrix(parts, cols, representation == GlmDraftRepresentation::Fp8Only, scales, stream).map(Matrix::Legacy)
+            })?;
         let layers = weights.layers.into_iter().map(|layer| -> Result<_> {
             Ok(DraftLayer { input_norm: layer.input_norm, post_norm: layer.post_norm, qkv: layer.qkv,
                 q_norm: layer.q_norm, k_norm: layer.k_norm, o: layer.o, gate_up: layer.gate_up, down: layer.down,
@@ -635,7 +796,8 @@ impl<'a> DsparkDrafter<'a> {
                 Some(PagedContext { tables: zeroed(cache_layout.page_table_bytes as usize, Tag::drafter_workspace("shared/dspark-page-tables"))?,
                     layout: cache_layout, state: RefCell::new(state) })
             } else { None },
-            inv_freq: cfg.rotary.as_ref().map(|plan| upload("inv_freq", bytes_of(&plan.inv_freq))).transpose()?,
+            inv_freq: if native_rope.is_some() { None } else {
+                cfg.rotary.as_ref().map(|plan| upload("inv_freq", bytes_of(&plan.inv_freq))).transpose()? },
             fc: weights.fc, hidden_norm: weights.hidden_norm, norm: weights.norm,
             markov_w1: weights.markov_w1, markov_w2: weights.markov_w2, markov_norms,
             confidence_w: weights.confidence_w, confidence_b: weights.confidence_b,
@@ -648,7 +810,8 @@ impl<'a> DsparkDrafter<'a> {
             context_slots: zeroed(TAP_ROWS * 4, Tag::drafter_workspace("shared/dspark-context-update"))?,
             mask_row,
             target_projection, workspace: RefCell::new(None),
-            projections, representation,
+            projections, representation, native: native_rope.map(|(rope,positions)|
+                NativeBackbone::bind(library,programs,&cfg,rope,positions,native_workspace.expect("native workspace"))).transpose()?,
             fp8_workspace,
             head_mode: Cell::new(DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
@@ -657,7 +820,43 @@ impl<'a> DsparkDrafter<'a> {
         })
     }
 
-    /// How draft steps run the borrowed BF16 head from now on (the FP8 head launcher ignores it).
+    /// Retained owners including canonical K/V and prepared request scratch.
+    pub fn runtime_receipts(&self, devices:cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+        prefix:&str) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_loader::placement::planner::{Lifetime,Phase};
+        use cuteafd_core::memory_layout::Category;
+        let mut inventory = receipts::Inventory::new(devices,prefix,
+            Lifetime { first:Phase::DraftLoad,last:Phase::Growth },Category::Drafter,"native draft owners");
+        self.allocation_receipts(&mut inventory,"")?;
+        for (index,layer) in self.layers.iter().enumerate() {
+            layer.k_ring.inventory(&mut inventory,&format!("layer.{index}.k_ring"))?;
+            layer.v_ring.inventory(&mut inventory,&format!("layer.{index}.v_ring"))?;
+        }
+        for (name,owner) in [("taps",&self.taps),("fused",&self.fused),("fused_norm",&self.fused_norm),
+            ("context_kv",&self.context_kv),("context_positions",&self.context_positions),("context_slots",&self.context_slots)] {
+            owner.inventory(&mut inventory,name)?;
+        }
+        if let Some(workspace) = self.workspace.borrow().as_ref() {
+            for (name,owner) in [("h",&workspace.h),("n",&workspace.n),("qkv",&workspace.qkv),
+                ("q",&workspace.q),("k",&workspace.k),("v",&workspace.v),("attn",&workspace.attn),
+                ("delta",&workspace.delta),("gate_up",&workspace.gate_up),("act",&workspace.act),
+                ("logits",&workspace.logits),("anchors",&workspace.anchors),("ids",&workspace.ids),
+                ("tokens",&workspace.tokens),("confidence",&workspace.confidence),("positions",&workspace.positions),
+                ("tables",&workspace.tables),("head",&workspace._head_workspace),
+                ("attention",&workspace.attention_workspace),("markov",&workspace.markov_workspace)] {
+                owner.inventory(&mut inventory,&format!("workspace.{name}"))?;
+            }
+            inventory.pinned("workspace.landing",workspace.landing.buffer)?;
+        }
+        for receipt in &mut inventory.receipts {
+            if receipt.allocation.id.starts_with(&format!("{prefix}..")) {
+                receipt.allocation.id = receipt.allocation.id.replacen("..",".",1);
+            }
+        }
+        Ok(inventory.receipts)
+    }
+
+    /// How draft steps run the borrowed BF16 head (native head launchers ignore it).
     pub fn set_draft_head(&self, mode: DraftHead) {
         self.head_mode.set(mode);
     }
@@ -667,13 +866,14 @@ impl<'a> DsparkDrafter<'a> {
     #[cfg(test)]
     pub(crate) fn weight_buffers(&self) -> Vec<(String, CuteafdDeviceBuffer)> {
         let mut out = Vec::new();
-        let mut weight = |name: String, weight: &Weight<'_>| match weight {
-            Weight::Bf16(owner) => out.push((name, owner.buffer)),
-            Weight::Fp8(owner) => {
+        let mut weight = |name: String, weight: &Matrix<'_>| match weight {
+            Matrix::Legacy(Weight::Bf16(owner)) => out.push((name, owner.buffer)),
+            Matrix::Legacy(Weight::Fp8(owner)) => {
                 let (values, scales) = owner.buffers();
                 out.push((format!("{name}.values"), values));
                 out.push((format!("{name}.scales"), scales));
             }
+            Matrix::Native(_) => panic!("legacy weight digest requires a legacy projection"),
         };
         weight("fc".into(), &self.fc);
         for (index, layer) in self.layers.iter().enumerate() {
@@ -708,14 +908,19 @@ impl<'a> DsparkDrafter<'a> {
     /// # Safety
     /// Pointers are live device buffers of those shapes.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn linear(&self, x: *const c_void, weight: &Weight<'_>, first: usize, out: *mut c_void, rows: usize,
+    unsafe fn linear(&self, x: *const c_void, weight: &Matrix<'_>, first: usize, out: *mut c_void, rows: usize,
         k: usize, n: usize) -> Result<()> {
         use super::weights::{LegacyProjection, Projection};
-        let projection = LegacyProjection { weight, library: self.library, programs: &self.projections,
-            scratch: self.fp8_workspace.as_ref(), mode: self.fp8_rows.get() };
-        // SAFETY: the caller retains the selected matrix rows and input/output;
-        // set_draft_linear keeps the scratch within its admitted mode.
-        unsafe { projection.project(x, first, out, rows, k, n, self.stream) }
+        match weight {
+            Matrix::Legacy(weight) => {
+                let projection = LegacyProjection { weight, library: self.library, programs: &self.projections,
+                    scratch: self.fp8_workspace.as_ref(), mode: self.fp8_rows.get() };
+                // SAFETY: caller retains matrix/input/output; admitted mode bounds scratch.
+                unsafe { projection.project(x, first, out, rows, k, n, self.stream) }
+            }
+            // SAFETY: same caller contract, native adapter retains records and output scratch.
+            Matrix::Native(projection) => unsafe { projection.project(x, first, out, rows, k, n, self.stream) },
+        }
     }
 
     pub fn tap_index(&self, layer: usize) -> Option<usize> {
@@ -735,6 +940,26 @@ impl<'a> DsparkDrafter<'a> {
             self.library.glm_dflash_tap_mean(streams.cast::<u8>().add(first * hc * h * 2).cast(),
                 self.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(), n, h, hc, width, index * h, self.stream)
         }
+    }
+
+    /// Copy a row span already concatenated in checkpoint tap order. The
+    /// producer's ordered stream must be this drafter's stream.
+    ///
+    /// # Safety
+    /// `source` holds initialized BF16 rows of taps*hidden elements and its
+    /// owner survives the queued copy; source/destination do not overlap.
+    pub unsafe fn capture_concatenated(&self, source:CuteafdDeviceBuffer, first:usize,
+        rows:usize, to:usize, stream:*mut c_void) -> Result<()> {
+        let pitch = self.cfg.taps.len().checked_mul(self.cfg.hidden).and_then(|n| n.checked_mul(2))
+            .context("draft concatenated tap pitch overflow")?;
+        let end = first.checked_add(rows).and_then(|n| n.checked_mul(pitch)).context("source tap extent overflow")?;
+        ensure!(stream == self.stream && source.device_id == self.taps.buffer.device_id
+            && rows > 0 && end <= source.bytes && to.checked_add(rows).is_some_and(|n| n <= TAP_ROWS),
+            "concatenated target taps differ from admitted drafter span/stream");
+        let input = CuteafdDeviceBuffer { ptr:source.ptr.wrapping_byte_add(first * pitch),bytes:rows * pitch,..source };
+        let output = CuteafdDeviceBuffer { ptr:at(&self.taps,to * pitch),bytes:rows * pitch,..self.taps.buffer };
+        // SAFETY: caller retains the checked disjoint source; this owner retains taps.
+        unsafe { self.library.copy_d2d_async(output,input,rows * pitch,self.stream) }
     }
 
     /// Copies ordered, strided target taps without a host transfer. Reads use
@@ -823,15 +1048,48 @@ impl<'a> DsparkDrafter<'a> {
         // SAFETY: every buffer holds TAP_ROWS rows of its width; the stream orders the chain.
         unsafe {
             self.linear(at(&self.taps, first * width * 2), &self.fc, 0, self.fused.buffer.ptr, n, width, h)?;
-            self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
-                self.fused_norm.buffer.ptr, n, h, self.cfg.eps, s)?;
+            if let Some(native) = &self.native {
+                ensure!(positions.iter().all(|&p| p >= 0 && (p as usize) < native.positions),
+                    "native draft context position exceeds admitted rotary table");
+                native.norm(self.library,self.fused.buffer.ptr,self.hidden_norm.buffer,self.fused_norm.buffer.ptr,n,s)?;
+            } else {
+                self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
+                    self.fused_norm.buffer.ptr, n, h, self.cfg.eps, s)?;
+            }
             let q_rows = self.cfg.q_width();
             for layer in &self.layers {
                 self.linear(self.fused_norm.buffer.ptr, &layer.qkv, q_rows, self.context_kv.buffer.ptr, n, h, 2 * kv)?;
-                self.library.block_dspark_qk_rope(self.context_kv.buffer.ptr, layer.q_norm.buffer.ptr,
-                    layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, self.context_slots.buffer.ptr,
-                    self.inv_freq.as_ref().map_or(std::ptr::null(), |v| v.buffer.ptr.cast_const()), std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads, self.cfg.head_dim,
-                    self.cfg.theta, self.cfg.rotary.as_ref().map_or(1.0, |p| p.attention_factor), self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                if let Some(native) = &self.native {
+                    native.rope(&self.cfg,self.context_kv.buffer,layer.q_norm.buffer,layer.k_norm.buffer,
+                        self.context_positions.buffer,CuteafdDeviceBuffer::default(),native.gate.buffer,native.up.buffer,n,true,s)?;
+                    let row_bytes = kv * 2;
+                    for group in groups.values() {
+                        let mut offset = 0;
+                        while offset < group.len() {
+                            let begin = group[offset];
+                            let mut count = 1;
+                            while offset + count < group.len() {
+                                let next = group[offset + count];
+                                if next.tap_row != begin.tap_row + count || next.position != begin.position + count
+                                    || (begin.position % self.context_capacity) + count >= self.context_capacity { break; }
+                                count += 1;
+                            }
+                            let source = (begin.tap_row - first) * row_bytes;
+                            let destination = usize::try_from(self.cfg.context_row(begin.slot,begin.position,self.slots,self.context_capacity)?)? * row_bytes;
+                            for (src,dst) in [(&native.gate,&layer.k_ring),(&native.up,&layer.v_ring)] {
+                                let from = CuteafdDeviceBuffer { ptr:at(src,source),bytes:count * row_bytes,..src.buffer };
+                                let to = CuteafdDeviceBuffer { ptr:at(dst,destination),bytes:count * row_bytes,..dst.buffer };
+                                self.library.copy_d2d_async(to,from,count * row_bytes,s)?;
+                            }
+                            offset += count;
+                        }
+                    }
+                } else {
+                    self.library.block_dspark_qk_rope(self.context_kv.buffer.ptr, layer.q_norm.buffer.ptr,
+                        layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, self.context_slots.buffer.ptr,
+                        self.inv_freq.as_ref().map_or(std::ptr::null(), |v| v.buffer.ptr.cast_const()), std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads, self.cfg.head_dim,
+                        self.cfg.theta, self.cfg.rotary.as_ref().map_or(1.0, |p| p.attention_factor), self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                }
             }
         }
         lease.commit()
@@ -845,6 +1103,12 @@ impl<'a> DsparkDrafter<'a> {
             let mut state = context.state.borrow_mut();
             state.discard(slot)?;
             state.bindings[slot] = Some(state.pool.bind(slot, origin)?);
+        } else if origin == 0 {
+            for plane in self.window_planes(slot)? {
+                // SAFETY: fresh slot admission precedes every new consumer;
+                // zero preserves deterministic inactive bytes for exact marks.
+                unsafe { self.library.cuda_zero_bytes_async(plane,plane.bytes,self.stream)?; }
+            }
         }
         Ok(())
     }
@@ -1077,7 +1341,11 @@ impl<'a> DsparkDrafter<'a> {
                     "dSpark borrows the target BF16 head [{}, {}]", self.cfg.vocab, self.cfg.hidden);
                 HeadRef::Bf16(owner.buffer.ptr)
             }
-            TargetHead::Bf16Buffer(_) => anyhow::bail!("dSpark requires its retained target head owner"),
+            TargetHead::Bf16Buffer(buffer) => {
+                ensure!(buffer.bytes == self.cfg.vocab * self.cfg.hidden * 2 && !buffer.ptr.is_null(),
+                    "dSpark borrowed target head extent differs");
+                HeadRef::Bf16(buffer.ptr)
+            },
             TargetHead::Launch(launch) => HeadRef::Launch(launch),
         })
     }
@@ -1169,14 +1437,25 @@ impl<'a> DsparkDrafter<'a> {
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
-            l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
+            if let Some(native) = &self.native {
+                ensure!(positions.iter().all(|&p| p >= 0 && (p as usize) < native.positions),
+                    "native draft block position exceeds admitted rotary table");
+                native.norm(l,w.h.buffer.ptr,self.layers[0].input_norm.buffer,w.n.buffer.ptr,rows,s)?;
+            } else {
+                l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
+            }
             for (index, layer) in self.layers.iter().enumerate() {
                 self.linear(w.n.buffer.ptr, &layer.qkv, 0, w.qkv.buffer.ptr, rows, h, c.qkv_width())?;
-                l.block_dspark_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
-                    w.positions.buffer.ptr, std::ptr::null(),
-                    self.inv_freq.as_ref().map_or(std::ptr::null(), |v| v.buffer.ptr.cast_const()), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, rows,
-                    c.heads, c.kv_heads, c.head_dim, c.theta,
-                    c.rotary.as_ref().map_or(1.0, |p| p.attention_factor), eps, false, s)?;
+                if let Some(native) = &self.native {
+                    native.rope(c,w.qkv.buffer,layer.q_norm.buffer,layer.k_norm.buffer,w.positions.buffer,
+                        w.q.buffer,w.k.buffer,w.v.buffer,rows,false,s)?;
+                } else {
+                    l.block_dspark_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
+                        w.positions.buffer.ptr, std::ptr::null(),
+                        self.inv_freq.as_ref().map_or(std::ptr::null(), |v| v.buffer.ptr.cast_const()), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, rows,
+                        c.heads, c.kv_heads, c.head_dim, c.theta,
+                        c.rotary.as_ref().map_or(1.0, |p| p.attention_factor), eps, false, s)?;
+                }
                 if let Some(context) = &self.paged {
                     l.block_dspark_attention_paged(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr,
                         layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, w.tables.buffer.ptr,
@@ -1192,14 +1471,29 @@ impl<'a> DsparkDrafter<'a> {
                         max_keys, c.causal, c.head_dim, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
                 }
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows, c.q_width(), h)?;
-                l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr,
-                    w.h.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
+                if let Some(native) = &self.native {
+                    native.add_norm(l,w.h.buffer,w.delta.buffer,layer.post_norm.buffer,w.n.buffer.ptr,rows,s)?;
+                } else {
+                    l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr,
+                        w.h.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
+                }
                 self.linear(w.n.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr, rows, h, 2 * inter)?;
-                l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?;
+                if let Some(native) = &self.native {
+                    l.copy_d2d_2d_async(native.gate.buffer,inter * 2,w.gate_up.buffer,inter * 4,inter * 2,rows,s)?;
+                    let up = CuteafdDeviceBuffer { ptr:at(&w.gate_up,inter * 2),
+                        bytes:w.gate_up.buffer.bytes - inter * 2,..w.gate_up.buffer };
+                    l.copy_d2d_2d_async(native.up.buffer,inter * 2,up,inter * 4,inter * 2,rows,s)?;
+                    native.activation.oai(cuteafd_ffi::minimax_m3::producers::OaiBatch { rows,
+                        gate:native.gate.buffer,up:native.up.buffer,output:w.act.buffer },s)?;
+                } else { l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?; }
                 self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows, inter, h)?;
-                let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
-                l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr,
-                    rows, h, eps, s)?;
+                let next = self.layers.get(index + 1).map_or(self.norm.buffer, |n| n.input_norm.buffer);
+                if let Some(native) = &self.native {
+                    native.add_norm(l,w.h.buffer,w.delta.buffer,next,w.n.buffer.ptr,rows,s)?;
+                } else {
+                    l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, next.ptr, w.h.buffer.ptr, w.n.buffer.ptr,
+                        rows, h, eps, s)?;
+                }
             }
             match head {
                 HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(w.head.as_ref().context("BF16 dSpark head was not prepared before serving")?,
@@ -1482,8 +1776,10 @@ mod tests {
 
     fn geometry(window: Option<usize>) -> DsparkConfig {
         DsparkConfig { backbone: cuteafd_loader::formats::block_dspark::DsparkBackbone {
-                norm: cuteafd_loader::formats::block_dspark::DsparkNorm::Rms, rotary_dim: 128,
+                norm: cuteafd_loader::formats::block_dspark::DsparkNorm::Rms,
+                residual: cuteafd_loader::formats::block_dspark::DsparkResidual::Bf16, rotary_dim: 128,
                 activation: cuteafd_core::FfnActivation::SiluBf16Product { limit: None } },
+            dialect: cuteafd_loader::formats::block_dspark::DsparkDialect::Qwen3,
             hidden: 5120, intermediate: 10240, layers: 5, heads: 40, kv_heads: 8,
             head_dim: 128, eps: 1e-6, theta: 1e7, block: 7, mask_token: 248077, rank: 256,
             taps: vec![4,16,28,40,52], vocab: 248320, causal: false, window, rotary: None }

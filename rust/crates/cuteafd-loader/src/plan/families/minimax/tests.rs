@@ -2,6 +2,31 @@ use super::*;
 use crate::plan::{self, testing, PlanOptions};
 
 #[test]
+fn bundled_draft_head_shares_one_blas_pool_with_target() {
+    use crate::placement::{families::minimax_m3::{self as shared,Drafter},planner::*};
+    use crate::formats::block_dspark::NativeDsparkLayout;
+    for head in [serving::BlasHead::TensorLt,serving::BlasHead::Gemm] {
+        let mut inputs=recipe_inputs(1,3);
+        inputs.head=head;
+        let weights=crate::serving_capacity::WeightArenaLayout::new("minimax/draft",[("fixture".into(),256)]).unwrap();
+        inputs.drafter=Some(Drafter { arena:weights.clone(),scratch:Vec::new(),state_per_page:0,
+            native:NativeDsparkLayout { snapshot:Default::default(),weights,buffers:Vec::new(),host_landing:16,
+                verify_rows:128,mark_bytes:0,marks:0 } });
+        let request=shared::request(inputs.context,None,crate::placement::Onboard::Layers(0),inputs.prefill,
+            Operation::Serving,None,Default::default());
+        let contract=inputs.prepare(&request).unwrap();
+        for phase in [Phase::Warmup,Phase::Ready,Phase::Growth] {
+            let bytes=contract.components.iter().filter_map(|component| match &component.kind {
+                ComponentKind::Allowance(owner) if owner.source.starts_with(serving::CUBLAS_HANDLE_OWNER)
+                    && owner.lifetime.contains(phase,PhaseOrder::TARGET_THEN_DRAFT) => Some(owner.bytes),
+                _ => None,
+            }).sum::<u64>();
+            assert_eq!(bytes,64 << 20,"{head:?} {phase:?}");
+        }
+    }
+}
+
+#[test]
 fn execution_inventory_is_exact_recipe_partition_before_shared_finalization() {
     use crate::placement::families::minimax_m3::{self as shared, Owner};
     use crate::placement::planner::*;
@@ -1786,7 +1811,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
         attention: Some(AttentionPlacement::Heads), split_wire: None, physical_devices: &[0, 1],
         spark_ranks: 4, spark_bytes: 100 << 30, prefill: expected.prefill,
         context_tokens: 1 << 20, pool_tokens: Some(1 << 20), sequences: 16,
-        host: (512 << 30, 480 << 30), host_cache_bytes: Some(1 << 30), prefix_entries: 64,
+        host: (512 << 30, 480 << 30), host_cache_bytes: Some(1 << 30), prefix_entries: 64, drafter:None,
         replies: Default::default(), head: crate::placement::planner::serving::BlasHead::Gemm,
         expert_usage: false, resident_weight_limit: ResidentWeights(80 << 30) };
     let heads = gather(&request).unwrap();

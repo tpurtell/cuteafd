@@ -15,6 +15,26 @@ struct Inner<'a> {
     /// at begin_unit before arithmetic reads it. Not a table, length or KV byte.
     scratch: Rc<Allocation<'a>>,
     layout: FamilyLayout,
+    draft: Option<Rc<DraftPrefix<'a>>>,
+}
+
+pub(crate) struct DraftPrefix<'a> {
+    pub drafter: Rc<crate::shared::speculation::block_dspark::DsparkDrafter<'a>>,
+    pub marks: crate::shared::speculation::block_dspark::WindowSnapshots<'a>,
+    pub frontiers: std::cell::RefCell<Vec<usize>>,
+    pub slots: usize,
+}
+impl DraftPrefix<'_> {
+    pub fn frontier(&self,slot:usize) -> Result<usize> {
+        self.frontiers.borrow().get(slot).copied().ok_or_else(|| anyhow::anyhow!("MiniMax draft slot outside admission"))
+    }
+    pub fn advance(&self,slot:usize,start:usize,rows:usize) -> Result<()> {
+        let mut frontiers=self.frontiers.borrow_mut();
+        let frontier=frontiers.get_mut(slot).ok_or_else(|| anyhow::anyhow!("MiniMax draft slot outside admission"))?;
+        ensure!(*frontier == start,"MiniMax draft frontier differs from target commit");
+        *frontier=start.checked_add(rows).ok_or_else(|| anyhow::anyhow!("MiniMax draft frontier overflow"))?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -22,6 +42,10 @@ pub(crate) struct MiniMaxPrefix<'a>(Rc<Inner<'a>>);
 
 impl<'a> MiniMaxPrefix<'a> {
     pub fn new(banks: Vec<Rc<PageBank<'a>>>, residual_scratch: Rc<Allocation<'a>>) -> Result<Self> {
+        Self::with_draft(banks,residual_scratch,None)
+    }
+    pub fn with_draft(banks: Vec<Rc<PageBank<'a>>>, residual_scratch: Rc<Allocation<'a>>,
+        draft:Option<Rc<DraftPrefix<'a>>>) -> Result<Self> {
         ensure!(matches!(banks.len(), 1 | 2), "MiniMax prefix requires one or two physical ranks");
         let first = &banks[0];
         let library = first.stream.device.library;
@@ -46,19 +70,24 @@ impl<'a> MiniMaxPrefix<'a> {
         let page_bytes = layers.len().checked_mul(PAGE_PLANES.iter().map(|&(_, bytes)| bytes).sum())
             .ok_or_else(|| anyhow::anyhow!("MiniMax prefix page extent overflow"))?;
         let layout = FamilyLayout { page_rows: PAGE_ROWS, pages: first.layout.pool_pages as usize,
-            page_bytes, mark_bytes: 0, draft_bytes: 0, rule: ReuseRule::paged(PAGE_ROWS),
+            page_bytes, mark_bytes: draft.as_ref().map_or(0,|draft| draft.marks.mark_bytes()),
+            draft_bytes: 0, rule: if draft.is_some() { ReuseRule::EXACT } else { ReuseRule::paged(PAGE_ROWS) },
             mark_store: MarkStore::Arena, page_owners: Default::default() };
         let copies = PrefixCopies::new(library, banks.iter().map(|bank| bank.readers().iter()
             .map(|reader| Reader { device: reader.device.id, stream: reader.raw }).collect()).collect())?;
         for (rank, bank) in banks.iter().enumerate() {
             copies.ordered(rank, |stream| bank.reserve_tables(stream))?;
         }
-        Ok(Self(Rc::new(Inner { copies, banks, scratch: residual_scratch, layout })))
+        Ok(Self(Rc::new(Inner { copies, banks, scratch: residual_scratch, layout, draft })))
     }
 
     pub fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
-        self.0.banks.iter().flat_map(|bank| bank.owners()).chain([Rc::clone(&self.0.scratch)]).collect()
+        self.0.banks.iter().flat_map(|bank| bank.owners()).chain([Rc::clone(&self.0.scratch)])
+            .chain(self.0.draft.iter().map(|draft| draft.marks.backing())).collect()
     }
+
+    pub fn mark_slots(&self) -> usize { self.0.draft.as_ref().map_or(0,|draft| draft.slots) }
+    pub fn draft(&self) -> Option<&Rc<DraftPrefix<'a>>> { self.0.draft.as_ref() }
 
     pub fn upload_inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
         for (rank, bank) in self.0.banks.iter().enumerate() {
@@ -92,7 +121,15 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
     fn record_format(&self) -> &'static str { "minimax_msa_fp8_kv_index_v1" }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
     fn commit_point(&self, placement: &Placement) -> usize { placement.len }
-    fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> { Ok(self.install(placement)?) }
+    fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        if placement.len == 0 {
+            if let Some(draft)=&self.0.draft {
+                draft.drafter.reset_context(placement.slot,0)?;
+                draft.frontiers.borrow_mut()[placement.slot]=0;
+            }
+        }
+        Ok(self.install(placement)?)
+    }
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
         self.restore(None, placement, 0)
     }
@@ -103,13 +140,34 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
         *placement = next;
         Ok(())
     }
-    fn capture(&self, _: MarkSlot, placement: &Placement, len: usize) -> Result<(), BoxError> {
+    fn capture(&self, mark: MarkSlot, placement: &Placement, len: usize) -> Result<(), BoxError> {
         self.validate(placement, len)?;
         if len != placement.len { return Err("MiniMax capture is not at the committed frontier".into()); }
+        if let Some(draft) = &self.0.draft {
+            if draft.frontier(placement.slot)? != len { return Err("MiniMax draft snapshot frontier differs".into()); }
+            let planes=draft.drafter.window_planes(placement.slot)?;
+            // SAFETY: retained drafter owns the planes and both producer/copy streams.
+            unsafe { draft.marks.capture(mark.0 as usize,&planes,0,len)?; }
+        }
         Ok(())
     }
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut Placement, len: usize) -> Result<(), BoxError> {
-        if mark.is_some() { return Err("MiniMax paged snapshots have no positional mark".into()); }
+        if let Some(draft) = &self.0.draft {
+            match mark {
+                Some(mark) => {
+                    let planes=draft.drafter.window_planes(placement.slot)?;
+                    // SAFETY: initialized mark and retained canonical planes survive the copies.
+                    let (origin,end)=unsafe { draft.marks.restore(mark.0 as usize,&planes,len)? };
+                    if origin != 0 { return Err("MiniMax draft snapshot has a cold reconstructed origin".into()); }
+                    draft.frontiers.borrow_mut()[placement.slot]=end;
+                }
+                None => {
+                    if len != 0 { return Err("MiniMax speculative prefix restore requires an exact window mark".into()); }
+                    draft.frontiers.borrow_mut()[placement.slot]=0;
+                    draft.drafter.reset_context(placement.slot,0)?;
+                }
+            }
+        } else if mark.is_some() { return Err("MiniMax paged snapshots have no positional mark".into()); }
         self.validate(placement, len)?;
         let next = Placement { len, ..placement.clone() };
         self.install(&next)?;
@@ -136,14 +194,21 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
         unsafe { self.0.copies.copy_d2d(&copies)?; }
         Ok(())
     }
-    fn drain(&self) -> Result<(), BoxError> { Ok(self.0.copies.drain()?) }
+    fn drain(&self) -> Result<(), BoxError> {
+        self.0.copies.drain()?;
+        if let Some(draft)=&self.0.draft { draft.marks.drain()?; }
+        Ok(())
+    }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         if page as usize >= self.0.layout.pages { return Vec::new(); }
         self.0.banks.iter().flat_map(|bank| bank.layers.clone().flat_map(move |layer|
             PAGE_PLANES.into_iter().map(move |(plane, _)|
                 range(bank.page(layer, plane, page).expect("validated MiniMax page"))))).collect()
     }
-    fn mark_segments(&self, _: MarkSlot) -> Vec<DeviceRange> { Vec::new() }
+    fn mark_segments(&self, mark: MarkSlot) -> Vec<DeviceRange> {
+        self.0.draft.as_ref().map(|draft| vec![range(draft.marks.mark(mark.0 as usize)
+            .expect("admitted MiniMax draft mark"))]).unwrap_or_default()
+    }
     fn host_tail(&self) -> Vec<DeviceRange> {
         vec![range(view(self.0.scratch.buffer, 0, 1).expect("validated MiniMax scratch"))]
     }

@@ -333,7 +333,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         spark_ranks: args.peers.len(), spark_bytes: 100 << 30,
         prefill: PrefillShape { rows: u64::from(args.prefill_rows), waves: u64::from(args.prefill_waves) },
         context_tokens: u64::from(tokens), pool_tokens: Some(u64::from(tokens).div_ceil(64) * 64), sequences: 1,
-        host, host_cache_bytes: Some(0), prefix_entries: 1, replies: Default::default(),
+        host, host_cache_bytes: Some(0), prefix_entries: 1, drafter:None, replies: Default::default(),
         head: crate::shared::target_head::TargetHead::configured().blas_head(true), expert_usage: false,
         resident_weight_limit: ResidentWeights::DEFAULT_LIMIT };
     let planned = gather(&fact_request(Coordinator::Planned { cards: devices.iter().map(|_| {

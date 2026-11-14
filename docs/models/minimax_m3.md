@@ -13,8 +13,11 @@ MiniMax exports. The existing [minimum config](../../examples/configs/minimax-m3
 has the qualified geometry; its old WIP-only comments are historical. Set your
 own endpoints and use images built from the qualified source, not the config's
 older image tags. Shared settings are in [MiniMax Serving](../options.md#minimax-serving).
-Keep `SPECULATOR=off`, `VISION=off` and `AUDIO=off`: bundled drafter/media
-integration remains pending [#1856](https://github.com/tpurtell/cuteafd/issues/1856).
+Keep `SPECULATOR=off` for qualified serving; `auto` remains off. A matching WIP
+build accepts explicit `SPECULATOR=dspark` for bundled native drafter qualification
+through shared speculation and exact window snapshots; this is not yet a qualified
+default. Keep `VISION=off` and `AUDIO=off`; remaining gates are tracked in
+[#1856](https://github.com/tpurtell/cuteafd/issues/1856).
 
 `ATTENTION_PLACEMENT=auto|heads` selects whole ownership on one RTX. On two RTX,
 `auto|layers` selects contiguous attention with qualified FP32 split FFNs

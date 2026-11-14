@@ -14,6 +14,21 @@ use std::{cell::{Cell, RefCell}, collections::{BTreeMap, BTreeSet}, ops::Range, 
 
 const MESSAGE_STARTS: &[&str] = &["]~b]"];
 
+fn retain_logit_tile(library:&cuteafd_ffi::NativeLibrary, retained:cuteafd_ffi::CuteafdDeviceBuffer,
+    first:usize, vocab:usize, logits:DeviceLogits) -> Result<()> {
+    ensure!(logits.vocab == vocab && logits.stride == vocab && logits.rows > 0,
+        "MiniMax retained logit tile geometry differs");
+    let row_bytes=vocab.checked_mul(4).context("MiniMax logit row extent overflow")?;
+    let bytes=logits.rows.checked_mul(row_bytes).context("MiniMax logit tile extent overflow")?;
+    let offset=first.checked_mul(row_bytes).context("MiniMax logit tile offset overflow")?;
+    let target=super::cache::view(retained,offset,bytes)?;
+    let source=cuteafd_ffi::CuteafdDeviceBuffer { ptr:logits.ptr.cast_mut(),bytes,
+        device_id:retained.device_id,..Default::default() };
+    // SAFETY: the callback owns this live head tile until its next projection;
+    // the retained plane survives selection and this copy uses its producer stream.
+    unsafe { library.copy_d2d_async(target,source,bytes,logits.stream) }
+}
+
 fn packing_rows(mode: crate::shared::prefill_packing::PackingMode, admitted: usize) -> usize {
     match mode {
         crate::shared::prefill_packing::PackingMode::Unrestricted => admitted,
@@ -40,10 +55,10 @@ pub(crate) enum BackendError {
 }
 
 #[derive(Default)]
-pub(crate) struct NoDraft;
-impl scheduler::DraftState for NoDraft {
-    fn pending_rows(&self) -> usize { 0 }
-    fn close(&mut self, _: u32) {}
+pub(crate) struct DraftState { anchor:Option<u32> }
+impl scheduler::DraftState for DraftState {
+    fn pending_rows(&self) -> usize { usize::from(self.anchor.is_some()) }
+    fn close(&mut self, token: u32) { self.anchor=Some(token); }
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +96,23 @@ fn publish<F: PrefixFamily<Placement = Placement>>(family: &F,
     Ok(())
 }
 
+#[derive(Default)]
+struct PolicyProbe { routes:Option<RoundRoutes> }
+impl PolicyProbe {
+    fn arm(&mut self,layers:usize) { self.routes=Some(RoundRoutes::new(layers,0)); }
+    fn begin(&mut self,rows:usize) {
+        if let Some(routes)=&mut self.routes {
+            routes.begin(rows);
+            // The shared policy learns whole-round cost, without claiming
+            // per-expert or per-layer timings that this adapter does not collect.
+            for layer in 0..routes.layers() { routes.dense(layer).expect("admitted policy layer"); }
+        }
+    }
+    fn finish<T>(&self,observe:impl FnOnce(&RoundRoutes,&[Option<f64>])->T) -> Option<T> {
+        self.routes.as_ref().map(|routes| observe(routes,&[]))
+    }
+}
+
 /// No allocations or placement choices here: startup passes its admitted context
 /// and host-prefix config, and the Owners borrow pins every native backing.
 pub(crate) struct MiniMaxBackend<'e, 'a> {
@@ -91,6 +123,7 @@ pub(crate) struct MiniMaxBackend<'e, 'a> {
     context: usize,
     host: Option<cuteafd_hostcache::config::Config>,
     profile: RefCell<[f64; 2]>,
+    policy_probe: RefCell<PolicyProbe>,
     identities: RefCell<BTreeMap<usize, u64>>,
     next_identity: Cell<u64>,
     pending: RefCell<Option<Vec<Submitted>>>,
@@ -125,7 +158,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let schedule = Requests::new(state.capacity, served_context, cfg.layers, rank.prefill.len())?;
         drop(state);
         Ok(Self { owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
-            host, profile: RefCell::new([0.0; 2]), identities: RefCell::new(BTreeMap::new()),
+            host, profile: RefCell::new([0.0; 2]), policy_probe:RefCell::new(PolicyProbe::default()), identities: RefCell::new(BTreeMap::new()),
             next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false),
             selector_receipts: RefCell::new(None), packing })
     }
@@ -201,6 +234,32 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         self.completed(published)
     }
 
+    fn verify_staged(&self,sequences:&mut [(&mut Placement,&[u32])],pool:&RefPagePool) -> Result<Option<DeviceLogits>> {
+        ensure!(self.pending.borrow().is_none(),"MiniMax verify overlaps an unaccepted round");
+        let submitted=self.validate(sequences,pool)?;
+        let retained=self.owners.storage.verify_logits.as_ref().context("MiniMax retained verify logits missing")?;
+        let rows=submitted.iter().map(|request| request.tokens.len()).sum::<usize>();
+        ensure!(rows <= self.geometry().decode_rows,"MiniMax verify rows exceed admission");
+        let mut placements=submitted.iter().map(|request| request.placement.clone()).collect::<Vec<_>>();
+        let mut requests=placements.iter_mut().zip(&submitted).map(|(placement,request)| ServingRequest {
+            identity:request.identity,kind:ExpertV2SourceKind::Decode,start:request.placement.len,
+            tokens:&request.tokens,heads:request.placement.len..request.placement.len + request.tokens.len(),placement
+        }).collect::<Vec<_>>();
+        let mut offsets=Vec::new();let mut offset=0;
+        for request in &submitted { offsets.push(offset);offset+=request.tokens.len(); }
+        let library=self.library();
+        let result=self.execution.borrow_mut().execute(&self.owners.storage,self.cfg,&self.schedule,&mut requests,false,
+            |index,span,logits| {
+                let first=offsets[index] + span.start - submitted[index].placement.len;
+                retain_logit_tile(library,retained.buffer,first,self.cfg.vocab_size,logits)
+            });
+        self.completed(result)?;
+        *self.pending.borrow_mut()=Some(submitted);
+        let stream=self.owners.storage.ranks.last().context("MiniMax head rank missing")?.decode.borrow().stream.raw;
+        Ok(Some(DeviceLogits { ptr:retained.buffer.ptr,rows,vocab:self.cfg.vocab_size,
+            stride:self.cfg.vocab_size,stream,greedy:None }))
+    }
+
     fn decode(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
         retain_receipt: bool, captured: bool) -> Result<Option<DeviceLogits>> {
         let submitted = self.validate(sequences, pool)?;
@@ -242,7 +301,7 @@ impl Drop for MiniMaxBackend<'_, '_> {
 
 impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     type Placement = Placement;
-    type Draft = NoDraft;
+    type Draft = DraftState;
     type History = u64;
     type Coordinates = ();
     type Encoder = crate::shared::qwen::Encoder;
@@ -253,7 +312,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let state = self.owners.storage.requests.borrow();
         scheduler::Geometry { family: "minimax_m3", vocab_size: self.cfg.vocab_size, max_context: self.context,
             slots: state.capacity.decode.requests as usize, prefill_rows: state.capacity.prefill.rows as usize,
-            decode_rows: state.capacity.decode.rows as usize, }
+            decode_rows: self.owners.storage.verify_logits.as_ref().map_or(state.capacity.decode.rows as usize,
+                |owner| owner.buffer.bytes / (self.cfg.vocab_size * 4)), }
     }
     fn message_starts(&self) -> &[&str] { MESSAGE_STARTS }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.owners.storage.ranks[0].decode.borrow().stream.device.library }
@@ -277,7 +337,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
         let layout = family.layout();
         let cache = PrefixCache::new(layout, PrefixConfig { entries: args.prefix_cache_entries,
-            mark_slots: 0, keep_logits: true, min_tokens: args.prefix_cache_min_tokens }, host)?;
+            mark_slots: family.mark_slots(), keep_logits: true, min_tokens: args.prefix_cache_min_tokens }, host)?;
         cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64,
             Some((layout.pages * layout.page_rows) as u64), layout.pages as u64, family.record_format(), host_bytes);
         Ok((family, cache))
@@ -311,8 +371,11 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         Ok(())
     }
     fn history(&self, placement: &Placement) -> u64 { self.identities.borrow().get(&placement.slot).copied().unwrap_or(0) }
-    fn restore_draft(&self, _: &Placement, _: usize, _: &[u32], _: &mut NoDraft) -> Result<()> {
-        Err(BackendError::DraftsNotQualified.into())
+    fn restore_draft(&self, placement:&Placement, frontier:usize, tokens:&[u32], state:&mut DraftState) -> Result<()> {
+        let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter was not admitted")?;
+        ensure!(draft.frontier(placement.slot)? == frontier,"MiniMax restored draft frontier differs");
+        state.anchor=tokens.get(frontier).copied();
+        Ok(())
     }
     fn require_live(&self) -> Result<()> { self.live() }
     fn log_table_stats(&self, _: &str) {}
@@ -342,9 +405,10 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         Some(Limits { rows: packing_rows(self.packing, self.geometry().prefill_rows),
             chunk_rows: self.geometry().prefill_rows, max_context: self.context, taps: None })
     }
-    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, NoDraft>], pool: &RefPagePool,
+    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, DraftState>], pool: &RefPagePool,
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> MemberOutcome) -> Result<Vec<Result<()>>> {
-        ensure!(sequences.iter().all(|sequence| !sequence.neural), BackendError::DraftsNotQualified);
+        ensure!(self.owners.storage.draft_prefix.is_some() || sequences.iter().all(|sequence| !sequence.neural),
+            BackendError::DraftsNotQualified);
         let mut heads = Vec::with_capacity(sequences.len());
         for sequence in sequences.iter() {
             ensure!(sequence.start == sequence.placement.len && !sequence.tokens.is_empty(), "MiniMax packed start differs");
@@ -357,22 +421,38 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             ensure!(outcomes[index].is_none(), "MiniMax packed member head consumed twice");
             outcomes[index] = Some(on_logits(index, logits)?); Ok(())
         })?;
+        drop(target);
+        for sequence in sequences.iter_mut().filter(|sequence| sequence.neural) {
+            sequence.draft.anchor=sequence.next;
+        }
         outcomes.into_iter().map(|outcome| outcome.context("MiniMax packed member head missing")).collect()
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative, BackendError::DraftsNotQualified);
-        self.decode(sequences, pool, true, true)
+        if speculative || self.owners.storage.draft_prefix.is_some() { self.verify_staged(sequences,pool) }
+        else { self.decode(sequences, pool, true, true) }
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative, BackendError::DraftsNotQualified);
+        if speculative || (kind == scheduler::UngraphedKind::Decode && self.owners.storage.draft_prefix.is_some()) {
+            return self.verify_staged(sequences,pool);
+        }
         if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, pool, true, false); }
         let total: usize = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         ensure!(sequences.len() == 1 && total <= self.geometry().decode_rows,
             "MiniMax diagnostic scoring requires one bounded sequence");
-        if total == 1 { return self.decode(sequences, pool, false, false); }
         let start = sequences[0].0.len;
+        if let Some(retained)=&self.owners.storage.verify_logits {
+            let mut stream=None;
+            self.prefill(sequences,&[start..start + total],pool,|_,span,logits| {
+                retain_logit_tile(self.library(),retained.buffer,span.start - start,self.cfg.vocab_size,logits)?;
+                stream=Some(logits.stream);
+                Ok(())
+            })?;
+            return Ok(Some(DeviceLogits { ptr:retained.buffer.ptr,rows:total,vocab:self.cfg.vocab_size,
+                stride:self.cfg.vocab_size,stream:stream.context("MiniMax diagnostic scoring produced no rows")?,greedy:None }));
+        }
+        if total == 1 { return self.decode(sequences, pool, false, false); }
         let mut result = None;
         self.prefill(sequences, &[start..start + total], pool, |_, _, logits| {
             ensure!(result.is_none(), "MiniMax bounded diagnostic head split unexpectedly");
@@ -386,15 +466,79 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({
             "kind":"minimax_msa", "rows":rows, "contexts":contexts, "attention":"eager", "arithmetic":"eager" }))
     }
-    fn draft_geometry(&self, _: &Path, _: usize) -> Result<cuteafd_core::PolicyGeometry> { Err(BackendError::DraftsNotQualified.into()) }
-    fn arm_draft_probe(&self) -> Result<()> { Err(BackendError::DraftsNotQualified.into()) }
-    fn prefill_draft(&self, _: &Placement, _: usize, _: &[u32], _: Option<u32>, _: &mut NoDraft) -> Result<()> {
-        Err(BackendError::DraftsNotQualified.into())
+    fn draft_geometry(&self, _: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
+        ensure!(self.owners.storage.draft_prefix.is_some(),"MiniMax drafter not admitted");
+        Ok(cuteafd_core::PolicyGeometry { layers:vec![cuteafd_core::LayerResource {
+            class:None,slice_bytes:0.,group_rows:1,timed:false };self.cfg.layers],
+            group_rows_by_rows:vec![],experts:0,topk:0,max_requests:self.geometry().slots,
+            max_positions:self.geometry().decode_rows,widths:vec![width],classes:vec![cuteafd_core::ResourceClass::rtx()],regimes:1 })
     }
-    fn draft(&self, _: &mut [scheduler::DraftSeq<'_, Placement, NoDraft>], _: &mut scheduler::DraftTiming,
-        _: &mut TokenSelector<'_>) -> Result<Vec<Vec<u32>>> { Err(BackendError::DraftsNotQualified.into()) }
-    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, NoDraft, u64>], speculative: bool) -> Result<()> {
+    fn arm_draft_probe(&self) -> Result<()> { self.policy_probe.borrow_mut().arm(self.cfg.layers);Ok(()) }
+    fn prefill_draft(&self, placement:&Placement, _:usize, _: &[u32], next:Option<u32>, state:&mut DraftState) -> Result<()> {
+        let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter not admitted")?;
+        ensure!(draft.frontier(placement.slot)? == placement.len,"MiniMax draft prefill frontier differs");
+        state.anchor=next;
+        Ok(())
+    }
+    fn draft(&self,sequences:&mut [scheduler::DraftSeq<'_,Placement,DraftState>],timing:&mut scheduler::DraftTiming,
+        _: &mut TokenSelector<'_>) -> Result<Vec<Vec<u32>>> {
+        use crate::shared::speculation::dflash::{DraftSeq,TargetHead};
+        let draft=self.owners.storage.draft_prefix.as_ref().context("MiniMax drafter not admitted")?;
+        let mut output=vec![Vec::new();sequences.len()];
+        let selected=sequences.iter().enumerate().filter(|(_,sequence)| sequence.depth > 0).collect::<Vec<_>>();
+        if selected.is_empty() { return Ok(output); }
+        let rows=selected.iter().map(|(_,sequence)| {
+            ensure!(draft.frontier(sequence.placement.slot)? == sequence.placement.len,"MiniMax draft target frontier differs");
+            Ok(DraftSeq { slot:sequence.placement.slot,anchor:sequence.seq.anchor.context("MiniMax draft anchor missing")?,
+                position:sequence.placement.len,valid_from:0 })
+        }).collect::<Result<Vec<_>>>()?;
+        let head=self.owners.storage.ranks.last().context("MiniMax head rank")?.weights
+            .operand("language_model.lm_head.weight")?.buffer;
+        let started=std::time::Instant::now();
+        let proposed=draft.drafter.draft_device(&rows,&self.owners.storage.embedding,TargetHead::Bf16Buffer(&head))?;
+        timing.steps+=1;timing.seconds+=started.elapsed().as_secs_f64();
+        for ((index,sequence),draft) in selected.into_iter().zip(proposed) {
+            output[index]=draft.tokens.into_iter().take(sequence.depth).collect();
+        }
+        Ok(output)
+    }
+    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, u64>], speculative: bool) -> Result<()> {
         self.live()?;
+        if let Some(draft)=&self.owners.storage.draft_prefix {
+            let submitted=self.pending.borrow_mut().take().context("MiniMax staged accept has no receipt")?;
+            let checked=(|| {
+                ensure!(submitted.len() == verified.len(),"MiniMax staged accept request count differs");
+                let mut first=0;
+                for (sent,sequence) in submitted.iter().zip(verified.iter()) {
+                    sent.validate(sequence.history,sequence.placement,sequence.start,sequence.rows)?;
+                    let keep=if speculative { sequence.kept.map_or(0,|(rows,_)| rows) } else { sequence.rows.len() };
+                    ensure!(keep <= sequence.rows.len() && sequence.first_row == first
+                        && self.identity(sequence.placement)? == sent.identity
+                        && draft.frontier(sequence.placement.slot)? == sequence.start,
+                        "MiniMax staged accept identity/frontier/rows differ");
+                    first+=sequence.rows.len();
+                }
+                let taps=self.owners.storage.verify_taps.as_ref().context("MiniMax retained verify taps missing")?;
+                let stream=self.owners.storage.ranks.last().context("MiniMax head rank")?.decode.borrow().stream.raw;
+                for sequence in verified.iter_mut() {
+                    let keep=if speculative { sequence.kept.map_or(0,|(rows,_)| rows) } else { sequence.rows.len() };
+                    if keep > 0 {
+                        // SAFETY: retained verify taps are initialized and owned until this accept drains.
+                        unsafe { draft.drafter.capture_concatenated(taps.buffer,sequence.first_row,keep,0,stream)?; }
+                        let rows=(0..keep).map(|tap_row| crate::shared::speculation::dflash::ContextRow {
+                            tap_row,slot:sequence.placement.slot,position:sequence.start + tap_row }).collect::<Vec<_>>();
+                        draft.drafter.update(&rows)?;
+                        draft.advance(sequence.placement.slot,sequence.start,keep)?;
+                    }
+                    let mut next=Placement { len:sequence.start + keep,..sequence.placement.clone() };
+                    self.owners.storage.prefix.bind(&mut next).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    *sequence.placement=next;
+                    if let Some((_,anchor))=sequence.kept { sequence.seq.anchor=Some(anchor); }
+                }
+                Ok(())
+            })();
+            return self.completed(checked);
+        }
         ensure!(!speculative && verified.iter().all(|sequence| !sequence.neural), BackendError::DraftsNotQualified);
         let submitted = self.pending.borrow_mut().take().context("MiniMax accept has no native receipt")?;
         let checked = (|| {
@@ -420,9 +564,11 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         self.identities.borrow_mut().remove(&placement.slot);
         Ok(())
     }
-    fn probe_begin(&self, _: usize) {}
+    fn probe_begin(&self, rows: usize) { self.policy_probe.borrow_mut().begin(rows); }
     fn probe_end(&self) {}
-    fn probe_finish<T>(&self, _: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
+    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
+        self.policy_probe.borrow().finish(observe)
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +581,66 @@ mod tests {
     use cuteafd_loader::{families::minimax_m3::execution::{MsaCache, MsaRope},
         placement::families::minimax_m3::RequestCapacity};
     use std::rc::Rc;
+
+    #[test]
+    fn policy_probe_observes_each_round_and_updates_only_live_concurrency_bucket() {
+        use crate::shared::draft::{resource,clock::RoundTimes,evidence::DraftSource};
+        let geometry=cuteafd_core::PolicyGeometry { layers:vec![cuteafd_core::LayerResource {
+            class:None,slice_bytes:0.,group_rows:1,timed:false };60],group_rows_by_rows:vec![],
+            experts:0,topk:0,max_requests:16,max_positions:128,widths:vec![7],
+            classes:vec![cuteafd_core::ResourceClass::rtx()],regimes:1 };
+        let mut policy=cuteafd_core::DraftPolicy::seeded(geometry,cuteafd_core::PolicySeed::weak(7)).unwrap();
+        let mut probe=PolicyProbe::default();
+        assert!(probe.finish(|_,_| ()).is_none());
+        probe.arm(60);
+        let mut observed=0;
+        for concurrency in [1,4,16] {
+            let other=[1,4,16].into_iter().filter(|&n| n!=concurrency)
+                .map(|n| (n,policy.cost_snapshot(false,n))).collect::<Vec<_>>();
+            for _ in 0..3 {
+                let before=policy.cost_snapshot(false,concurrency);
+                probe.begin(concurrency * 3);
+                let requests=(0..concurrency).map(|id| resource::Verified { id:id as u64,rows:3,accepted:2,
+                    source:DraftSource::Neural,prior:Some(&[0.8,0.8]),features:None,censor:None }).collect::<Vec<_>>();
+                probe.finish(|routes,times| {
+                    routes.complete().unwrap();
+                    resource::observe_drafted(&mut policy,&requests,routes,times,
+                        RoundTimes { total_us:2000 * concurrency as u64,draft_us:Some(300) },7,None,Some(concurrency)).unwrap();
+                    observed+=1;
+                }).unwrap();
+                let after=policy.cost_snapshot(false,concurrency);
+                assert_ne!(after.round,before.round);
+                assert_ne!(after.draft,before.draft);
+            }
+            for (n,before) in other { assert_eq!(policy.cost_snapshot(false,n),before); }
+        }
+        assert_eq!(observed,9);
+    }
+
+    #[test]
+    fn diagnostic_logit_tiles_survive_bounded_head_reuse() -> Result<()> {
+        let fixture=Fixture::build_for_tests()?;
+        let library=fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device=Device { library:&library,id:0 };
+        let head=Allocation::new(device,4 * 8 * 4,Tag::workspace("test/head"))?;
+        let retained=Allocation::new(device,32 * 8 * 4,Tag::workspace("test/retained-logits"))?;
+        let mut expected=Vec::new();
+        for first in (0..32).step_by(4) {
+            let bytes=(first * 8..(first + 4) * 8).flat_map(|n| (n as f32).to_le_bytes()).collect::<Vec<_>>();
+            library.copy_h2d(head.buffer,&bytes)?;
+            retain_logit_tile(&library,retained.buffer,first,8,DeviceLogits { ptr:head.buffer.ptr,
+                rows:4,vocab:8,stride:8,stream:std::ptr::null_mut(),greedy:None })?;
+            expected.extend(bytes);
+        }
+        library.copy_h2d(head.buffer,&vec![197;head.buffer.bytes])?;
+        let mut actual=vec![0;retained.buffer.bytes];
+        library.copy_d2h(&mut actual,retained.buffer)?;
+        assert_eq!(actual,expected);
+        assert!(retain_logit_tile(&library,retained.buffer,31,8,DeviceLogits { ptr:head.buffer.ptr,
+            rows:4,vocab:8,stride:8,stream:std::ptr::null_mut(),greedy:None }).is_err());
+        Ok(())
+    }
 
     #[test]
     fn prefix_scheduler_argument_is_boot_concurrency_not_decode_lanes() -> Result<()> {

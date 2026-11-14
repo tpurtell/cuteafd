@@ -26,6 +26,9 @@ pub(crate) struct ServeArgs {
     pub max_sequences: u8,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long)] pub model_id: Option<String>,
+    /// Explicit bundled native DSpark; remains off until qualification passes.
+    #[arg(long,default_value_t=false)] pub dspark: bool,
+    #[command(flatten)] pub draft_length: crate::shared::draft::length::DraftLength,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
         num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     pub expert_usage: bool,
@@ -67,7 +70,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     });
     cuteafd_bench::context::ResolvedSettings::default().value("max-sequences", args.max_sequences)
         .value("prefill-packing", format!("{:?}", args.prefill_packing).to_lowercase())
-        .value("draft-mode", "no speculation").value("expert-usage", args.expert_usage).publish();
+        .value("draft-mode", if args.dspark { "adaptive" } else { "no speculation" })
+        .value("dspark",args.dspark).value("expert-usage", args.expert_usage).publish();
     args.prefix.resolve_entries(usize::from(args.max_sequences));
     let prefill = args.prefill()?;
     let api = args.api.load()?;
@@ -117,14 +121,15 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 onboard: worker_args.rtx_expert_layers.resolve(cfg.moe.iter().filter(|&&moe| moe).count()),
                 prefix: &worker_args.prefix, expert_usage: worker_args.expert_usage,
                 usage_reader: worker_args.expert_usage_reader.clone(),
-                resident_weights: crate::shared::memory::budget::resident_weight_limit() })?;
+                resident_weights: crate::shared::memory::budget::resident_weight_limit(),draft:worker_args.dspark })?;
             let served_context = usize::try_from(loaded.admitted.solved.served_context())?;
             let backend = super::backend::MiniMaxBackend::new(&loaded.owners, &cfg,
                 loaded.execution, served_context, loaded.host_prefix, worker_args.prefill_packing)?;
             library.cuda_set_device(worker_args.split_device.unwrap_or(worker_args.device))?;
             let physical = std::iter::once(worker_args.device).chain(worker_args.split_device).collect::<Vec<_>>();
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats,
-                concurrency, scheduler::Drafts::None, Default::default(), eos, worker_args.decode_share,
+                concurrency, if worker_args.dspark { scheduler::Drafts::Neural { depth:7 } } else { scheduler::Drafts::None },
+                worker_args.draft_length, eos, worker_args.decode_share,
                 &worker_args.prefix, worker_args.loop_abort.config(), worker_args.token_io.token_select,
                 &mut super::super::qwen3_5::serve::text_media(), None, || {
                     backend.require_live()?;

@@ -1806,6 +1806,10 @@ def main() -> None:
         work += [("draft_bf16", f"k{k}_n{n}_f32", "bf16_projection", {"max_rows": 4096},
                   lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32"))
                  for n, k in sorted(native_attention_bf16_f32_shapes())]
+    elif "minimax" in geometries:
+        # Native decoder projections use MXFP8; only context fusion is BF16.
+        work.append(("draft_bf16", "k30720_n6144", "bf16_projection", {"max_rows": 2048},
+                     lambda: compile_draft_bf16_projection(30720, 6144)))
     if "native_attention" not in geometries and any(name in geometries for name in
             ("glm", "glm2", "kimik3", "kimik31", "step5", "step52", "muse", "muse2", "ml4")):
         work += [("native_attention", *item) for item in native_attention_programs()]

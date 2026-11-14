@@ -110,6 +110,7 @@ pub struct LayoutOptions {
     pub drafter_bytes: u64,
     pub dense_qwen_drafter_snapshot: Option<std::path::PathBuf>,
     pub dense_qwen_mtp: bool,
+    pub minimax_dspark: bool,
     /// Explicitly disable GLM Flash external speculation and its arenas.
     pub glmf_drafter_disabled: bool,
     /// GLM Flash external draft checkpoint; absent resolves the launcher default from HF_HOME.
@@ -287,6 +288,7 @@ impl Default for LayoutOptions {
             drafter_bytes: 0,
             dense_qwen_drafter_snapshot: None,
             dense_qwen_mtp: false,
+            minimax_dspark: false,
             glmf_drafter_disabled: false,
             glmf_drafter_snapshot: None,
             glmf_dense_manifest: None,

@@ -369,6 +369,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if !options.qwen_auto_mtp && !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
+        layout.minimax_dspark = family == "minimax_m3" && args.speculator == "dspark";
         resolve_mimo_drafter(layout, &args.speculator);
         if family == "qwen3_5" { layout.dense_qwen_mtp = args.speculator == "mtp"; }
         if family == "qwen3_5" && args.speculator == "dspark" {
@@ -582,7 +583,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3" | "muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
-        | ("deepseek_v4" | "deepseek_v41" | "mistral_large4", "dspark") => true,
+        | ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3", "dspark") => true,
         _ => false,
     };
     anyhow::ensure!(enabled, "SPECULATOR={} does not apply to {family}", args.speculator);

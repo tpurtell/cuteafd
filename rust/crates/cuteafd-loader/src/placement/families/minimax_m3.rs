@@ -310,6 +310,7 @@ pub struct SparkCharge {
 #[derive(Debug, Clone)]
 pub struct Drafter {
     pub arena: WeightArenaLayout,
+    pub native: crate::formats::block_dspark::NativeDsparkLayout,
     /// Exact scratch owners (name, bytes); state that follows the pool is
     /// charged per page.
     pub scratch: Vec<(String, u64)>,
@@ -420,8 +421,22 @@ pub fn spark_link(gpu: u8, ranks: usize, prefill: PrefillShape, replies: SparkRe
 
 /// Typed Spark owners at the admitted unit (one prefill + one decode lane).
 pub fn spark_executions(prefill: PrefillShape) -> anyhow::Result<cuteafd_core::SparkExecutions> {
+    spark_executions_for_rows(prefill,64)
+}
+
+/// Boot concurrency and admitted draft width determine the largest wire verify.
+pub fn spark_verify_rows(concurrency:u64, drafts:usize) -> anyhow::Result<u32> {
+    anyhow::ensure!(concurrency > 0 && concurrency <= 64,"MiniMax Spark concurrency {concurrency} outside 1..=64");
+    concurrency.checked_mul(u64::try_from(drafts)?.checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("MiniMax draft width overflow"))?)
+        .and_then(|rows| u32::try_from(rows).ok()).ok_or_else(|| anyhow::anyhow!("MiniMax Spark verify rows overflow"))
+}
+
+pub fn spark_executions_for_rows(prefill:PrefillShape,rows:u32) -> anyhow::Result<cuteafd_core::SparkExecutions> {
+    use anyhow::Context;
     crate::plan::spark_executions::admit_family("minimax_m3",
-        &crate::plan::spark_executions::SparkBackend::Fp8.exports(), None, prefill.rows, prefill.waves)
+        &crate::plan::spark_executions::SparkBackend::Fp8.exports(), Some(rows), prefill.rows, prefill.waves)
+        .with_context(|| format!("MiniMax Spark decode owner cannot cover {rows} verify rows at unit {}",prefill.rows))
 }
 
 /// Balanced whole-layer attention owners for a pair: a contiguous cut that
@@ -842,7 +857,8 @@ impl Recipe for MiniMaxInputs {
         components.extend(HeadLayout::new(cfg, decode_rows)?.components(&Owner::Head.id(), head, maximum)?);
         components.extend(serving::ServingOwners {
             selector: serving::SelectorOwners { location: Location::coordinator(head),
-                capacity: decode_rows as usize, vocab: cfg.vocab_size, device_sampling: self.device_sampling },
+                capacity: self.drafter.as_ref().map_or(decode_rows as usize,|draft| draft.native.verify_rows),
+                vocab: cfg.vocab_size, device_sampling: self.device_sampling },
             prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 } }.components(maximum)?);
         // Transport: coordinator intake planes are fixed owners on the link's
         // GPU; host/pinned candidates join the host budget as one envelope.
@@ -958,6 +974,21 @@ impl Recipe for MiniMaxInputs {
             let location = Location::coordinator(head);
             let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
             components.extend(weight_arena_components(&draft.arena, location, lifetime, maximum, MemoryKind::DrafterWeights)?);
+            for (name,bytes) in &draft.native.buffers {
+                let id = if let Some(name) = name.strip_prefix("unit.") {
+                    format!("minimax.unit.{head}.{name}")
+                } else if let Some(name) = name.strip_prefix("decode.") {
+                    format!("minimax.decode.{head}.{name}")
+                } else { format!("minimax.draft.{name}") };
+                let category = if name.starts_with("prefix.") { Category::Prefix } else { Category::Drafter };
+                let owner_lifetime = if name.starts_with("unit.") || name.starts_with("decode.") {
+                    Lifetime::TARGET
+                } else { lifetime };
+                components.extend(buffer(id,location,*bytes as u64,owner_lifetime,category,
+                    "checkpoint-native bundled dSpark owner",maximum));
+            }
+            components.extend(buffer("minimax.draft.workspace.landing",Location::PINNED,
+                draft.native.host_landing as u64,lifetime,Category::Staging,"draft token/confidence landing",maximum));
             for (name, bytes) in &draft.scratch {
                 components.extend(buffer(format!("minimax.draft.{name}"), location, *bytes, lifetime,
                     Category::Drafter, "bundled dSpark scratch", maximum));
@@ -982,13 +1013,21 @@ impl Recipe for MiniMaxInputs {
                 Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Embedding, "media/embedding-cache",
                 maximum).map(|mut c| { c.activation = on.clone(); c }));
         }
-        // BLAS: the BF16 vocabulary head borrows one serving-thread pool.
+        // Target and drafter borrow the same native thread-local BLAS pool.
+        // The shared borrower union charges its GEMM handle exactly once.
+        let mut blas = Vec::new();
         if self.head.bf16() {
-            components.extend(serving::blas_components("sm_120", &[serving::BlasOwners { name: "MiniMax target head".into(),
+            blas.push(serving::BlasOwners { name: "MiniMax target head".into(),
                 process: "coordinator".into(), thread: "minimax/blas/serve".into(), location: Location::coordinator(head),
-                gemm: self.head.gemm(), lt: self.head.lt(), lifetime: Lifetime::TARGET, activation: Activation::always() }],
-                maximum, PhaseOrder::TARGET_THEN_DRAFT)?);
+                gemm: self.head.gemm(), lt: self.head.lt(), lifetime: Lifetime::TARGET, activation: Activation::always() });
         }
+        if self.drafter.is_some() {
+            blas.push(serving::BlasOwners { name: "MiniMax bundled draft head".into(),
+                process: "coordinator".into(), thread: "minimax/blas/serve".into(), location: Location::coordinator(head),
+                gemm: true, lt: false, lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth },
+                activation: Activation::always() });
+        }
+        components.extend(serving::blas_components("sm_120", &blas, maximum, PhaseOrder::TARGET_THEN_DRAFT)?);
         fixed_request_tails(&mut components, maximum, &[])?;
         let mut contract = Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (self.spark_ranks > 0).then(|| SparkReplyFormats {
@@ -1027,6 +1066,22 @@ pub fn spark_budget(rank: u8, bytes: u64) -> Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spark_decode_owner_covers_boot_concurrency_times_verify_width() {
+        let shape=PrefillShape { rows:2752,waves:3 };
+        let rows=spark_verify_rows(16,7).unwrap();
+        assert_eq!(rows,128);
+        let executions=spark_executions_for_rows(shape,rows).unwrap();
+        assert_eq!(executions.decode.len(),1);
+        assert_eq!(executions.decode[0].capacity,128);
+        assert_eq!(executions.decode[0].compiled_capacity,256);
+        assert_eq!(executions.owner(Some(0),128).unwrap(),cuteafd_core::ExecutionOwner::Decode(0));
+        assert!(executions.owner(Some(0),129).is_err());
+        assert_eq!(spark_verify_rows(16,0).unwrap(),16);
+        let error=spark_executions_for_rows(shape,4097).unwrap_err();
+        assert!(format!("{error:#}").contains("4097 verify rows"));
+    }
 
     #[test]
     fn executor_runs_single_whole_and_pair_split_layers() {
