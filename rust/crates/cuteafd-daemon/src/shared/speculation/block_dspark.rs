@@ -819,7 +819,43 @@ impl<'a> DsparkDrafter<'a> {
         })
     }
 
-    /// How draft steps run the borrowed BF16 head from now on (the FP8 head launcher ignores it).
+    /// Retained owners including canonical K/V and prepared request scratch.
+    pub fn runtime_receipts(&self, devices:cuteafd_loader::placement::planner::CoordinatorDevices<'_>,
+        prefix:&str) -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_loader::placement::planner::{Lifetime,Phase};
+        use cuteafd_core::memory_layout::Category;
+        let mut inventory = receipts::Inventory::new(devices,prefix,
+            Lifetime { first:Phase::DraftLoad,last:Phase::Growth },Category::Drafter,"native draft owners");
+        self.allocation_receipts(&mut inventory,"")?;
+        for (index,layer) in self.layers.iter().enumerate() {
+            layer.k_ring.inventory(&mut inventory,&format!("layer.{index}.k_ring"))?;
+            layer.v_ring.inventory(&mut inventory,&format!("layer.{index}.v_ring"))?;
+        }
+        for (name,owner) in [("taps",&self.taps),("fused",&self.fused),("fused_norm",&self.fused_norm),
+            ("context_kv",&self.context_kv),("context_positions",&self.context_positions),("context_slots",&self.context_slots)] {
+            owner.inventory(&mut inventory,name)?;
+        }
+        if let Some(workspace) = self.workspace.borrow().as_ref() {
+            for (name,owner) in [("h",&workspace.h),("n",&workspace.n),("qkv",&workspace.qkv),
+                ("q",&workspace.q),("k",&workspace.k),("v",&workspace.v),("attn",&workspace.attn),
+                ("delta",&workspace.delta),("gate_up",&workspace.gate_up),("act",&workspace.act),
+                ("logits",&workspace.logits),("anchors",&workspace.anchors),("ids",&workspace.ids),
+                ("tokens",&workspace.tokens),("confidence",&workspace.confidence),("positions",&workspace.positions),
+                ("tables",&workspace.tables),("head",&workspace._head_workspace),
+                ("attention",&workspace.attention_workspace),("markov",&workspace.markov_workspace)] {
+                owner.inventory(&mut inventory,&format!("workspace.{name}"))?;
+            }
+            inventory.pinned("workspace.landing",workspace.landing.buffer)?;
+        }
+        for receipt in &mut inventory.receipts {
+            if receipt.allocation.id.starts_with(&format!("{prefix}..")) {
+                receipt.allocation.id = receipt.allocation.id.replacen("..",".",1);
+            }
+        }
+        Ok(inventory.receipts)
+    }
+
+    /// How draft steps run the borrowed BF16 head (native head launchers ignore it).
     pub fn set_draft_head(&self, mode: DraftHead) {
         self.head_mode.set(mode);
     }
@@ -903,6 +939,26 @@ impl<'a> DsparkDrafter<'a> {
             self.library.glm_dflash_tap_mean(streams.cast::<u8>().add(first * hc * h * 2).cast(),
                 self.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(), n, h, hc, width, index * h, self.stream)
         }
+    }
+
+    /// Copy a row span already concatenated in checkpoint tap order. The
+    /// producer's ordered stream must be this drafter's stream.
+    ///
+    /// # Safety
+    /// `source` holds initialized BF16 rows of taps*hidden elements and its
+    /// owner survives the queued copy; source/destination do not overlap.
+    pub unsafe fn capture_concatenated(&self, source:CuteafdDeviceBuffer, first:usize,
+        rows:usize, to:usize, stream:*mut c_void) -> Result<()> {
+        let pitch = self.cfg.taps.len().checked_mul(self.cfg.hidden).and_then(|n| n.checked_mul(2))
+            .context("draft concatenated tap pitch overflow")?;
+        let end = first.checked_add(rows).and_then(|n| n.checked_mul(pitch)).context("source tap extent overflow")?;
+        ensure!(stream == self.stream && source.device_id == self.taps.buffer.device_id
+            && rows > 0 && end <= source.bytes && to.checked_add(rows).is_some_and(|n| n <= TAP_ROWS),
+            "concatenated target taps differ from admitted drafter span/stream");
+        let input = CuteafdDeviceBuffer { ptr:source.ptr.wrapping_byte_add(first * pitch),bytes:rows * pitch,..source };
+        let output = CuteafdDeviceBuffer { ptr:at(&self.taps,to * pitch),bytes:rows * pitch,..self.taps.buffer };
+        // SAFETY: caller retains the checked disjoint source; this owner retains taps.
+        unsafe { self.library.copy_d2d_async(output,input,rows * pitch,self.stream) }
     }
 
     /// Copies ordered, strided target taps without a host transfer. Reads use
