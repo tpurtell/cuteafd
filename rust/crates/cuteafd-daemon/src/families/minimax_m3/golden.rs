@@ -392,7 +392,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         Ok(LoadedRank { weights, streams: RequestStreams { decode: Rc::clone(&decode),
             prefill: vec![decode; waves] } })
     }).collect::<Result<Vec<_>>>()?;
-    let owners = Owners::new(&inputs, &admitted, &programs, loaded, bundle.embedding)?;
+    let mut owners = Owners::new(&inputs, &admitted, &programs, loaded, bundle.embedding)?;
     let link_layout = PreparedSparkLink::endpoint("spark", 0,
         SparkEndpointOwners { ranks: args.peers.len(), geometry: ExpertGeometry::MINIMAX_M3, endpoint, rings },
         waves, true, true, SparkIntakeCandidates::Probed, SparkReplyFormat::Bf16, Lifetime::TARGET)?;
@@ -454,7 +454,8 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         for position in first_decode..count {
             let request = [ServingRequest { identity: identity as u64 + 1, kind: cuteafd_transport::ExpertV2SourceKind::Decode,
                 placement: &mut placement, start: position, tokens: &window.tokens[position..position + 1], heads: position..position + 1 }];
-            let logits = execution.decode(&owners.storage, &cfg, &schedule, &request)?;
+            let logits = execution.decode(&owners.storage, &cfg, &schedule, &request,
+                &mut owners.graphs[0], false)?;
             let values = logits.to_host(&library)?;
             if let Some(raw) = &mut raw { raw.row(position + 1, &values)?; }
             probe.row(position + 1, &values);

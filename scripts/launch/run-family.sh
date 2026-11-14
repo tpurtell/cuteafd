@@ -1922,9 +1922,7 @@ if [[ $family == muse_spark ]]; then
 fi
 if [[ $family == minimax_m3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
-  split_wire="$(get SPLIT_WIRE fp32)"
-  case "$split_wire" in bf16|fp32) ;; *) release_die "SPLIT_WIRE must be bf16 or fp32" ;; esac
-  family_args+=(--rtx-expert-layers "$local_layers" --split-wire "$split_wire")
+  family_args+=(--rtx-expert-layers "$local_layers" --split-wire fp32)
 fi
 if [[ $family == kimi_k3 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
