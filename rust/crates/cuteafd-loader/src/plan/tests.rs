@@ -785,7 +785,10 @@ fn boot_concurrency_full_plan_matrix() {
             options.attention_placement = None;
             options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
             Case { family: "minimax_m3", label: "minimax_m3", dir,
-                topologies: &[(1, 2), (2, 2), (1, 4), (2, 4), (1, 6), (2, 6), (1, 8), (2, 8)],
+                // This tiny fixture supports 2..4 Sparks; the release model
+                // supports 3..8. Six/eight only passed while Planned hid the
+                // executable range check. Keep admitted boot-C coverage here.
+                topologies: &[(1, 2), (2, 2), (1, 4), (2, 4)],
                 concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: Some(options) }
         }),
         Box::new(|| {

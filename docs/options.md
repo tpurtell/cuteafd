@@ -77,6 +77,25 @@ A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
 - `CONCURRENCY` unset is a boot-time memory derivation; all C-dependent sizes
   follow it. Set it only to pin a value.
 
+### MiniMax WIP Serving
+
+MiniMax M3.1 Flash is WIP-only pending #1856 qualification. `./run.sh --wip SLOT`
+uses the hidden `serve-minimax` entry; release launch and public `cuteafd serve`
+remain refused. The supported edge is one RTX with native MXFP8 dense math,
+NVFP4 W4A4 experts, FP8 MSA KV/index, GPU embedding and device token selection.
+`ATTENTION_PLACEMENT=auto|heads` selects whole ownership; explicit context/layers
+and two-RTX serving remain refused until the split executor is qualified.
+`SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
+
+Shared launch keys keep their usual meanings. The WIP edge accepts
+`RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS`, `PREFILL_WAVES`,
+`PREFILL_PACKING=unrestricted|exact`, `PREFIX_CACHE_ENTRIES`, `HOST_CACHE_BYTES`
+(default launcher `auto`), `POOL_TOKENS`, `MAX_CONTEXT_TOKENS`, `CONCURRENCY`,
+`EXPERT_USAGE=on|off` (default on), `GPU_GRAPH_RESERVE` and its extra/cap keys,
+and `GRAPH_TRACE`. Only BF16 Spark replies are supported; compressed reply
+formats refuse before loading. Native checkpoint API encoding is mandatory.
+The public family tables exclude this still-unqualified edge.
+
 `./run.sh` options:
 
 | Option | Meaning |
@@ -106,7 +125,9 @@ flags. Users set keys, not these flags or the `CUTEAFD_*` environment variables
 the launcher derives from them.
 
 `cuteafd golden --family minimax_m3` (hidden alias `minimax-golden`) is a
-qualification-only native full-model prefill path; MiniMax serving stays refused.
+qualification-only native full-model prefill path. Public MiniMax serving stays
+refused until its qualification card passes; WIP builds can serve it through the
+hidden `serve-minimax` command for qualification.
 Explicit two-RTX heads planning is available with half KV and replicated index
 storage; `auto` stays contiguous whole attention with neuron-split FFNs on two RTX.
 The two-RTX layers recipe requires an explicit qualified BF16/F32 split-wire

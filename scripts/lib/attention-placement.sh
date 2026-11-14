@@ -23,6 +23,8 @@ release_check_attention_placement() {
   case "$attention_placement:$family" in
     auto:kimi_k3|heads:kimi_k3|context:kimi_k3|layers:kimi_k3) ;;
     # Step-5 and Muse Spark run only their recorded automatic placement.
+    auto:minimax_m3|heads:minimax_m3) ;;
+    *:minimax_m3) release_die "MiniMax WIP currently supports one-RTX whole attention (auto or heads)" ;;
     auto:step5|auto:muse_spark) ;;
     *:step5|*:muse_spark) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
     auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;

@@ -143,6 +143,8 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         prefix_entries: options.prefix.prefix_cache_entries as u64, replies,
         head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         expert_usage: usage_enabled, resident_weight_limit: options.resident_weights }, &samples, options.onboard)?;
+    cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
+    cuteafd_bench::context::set_resolved("max-context-tokens", &admitted.solved.served_context().to_string());
     let config = TcpTransportConfig::default();
     let endpoint = SparkEndpoint { ring_depth: None, capacity: capacity.prefill.rows,
         ingress: SparkIngress::Bf16, partial_reply_bytes: None };
@@ -203,6 +205,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         dispatchers.push(Dispatcher::spark(link)?);
     }
     let execution = ServingPrefill::new(cfg, dispatchers, bindings, 1)?;
+    owners.prewarm(cfg)?;
     let quota = inputs.host_prefix.quota_bytes;
     let host_prefix = (quota > 0).then(|| options.prefix.host_config_for(owners.storage.prefix.layout(),
         admitted.solved.served_context() as usize, quota)).transpose()?;

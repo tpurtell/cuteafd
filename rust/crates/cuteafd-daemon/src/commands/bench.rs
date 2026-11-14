@@ -2,7 +2,7 @@
 //! does the work), `bench publish` for the README table and benchmarks index,
 //! `bench smoke --matrix` for release prep. Also the capture of a serve
 //! command's resolved options for the server's own benchmark reports.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory};
 use cuteafd_bench::report::Setting;
 use std::path::PathBuf;
@@ -360,12 +360,27 @@ pub(crate) fn fixture_prefix() -> crate::shared::prefix::PrefixArgs {
 #[cfg(test)]
 pub(crate) fn assert_resolved_family_seam<T>(family: &str, later: &[&str],
     seam: impl FnOnce() -> Result<T>) -> Result<T> {
-    let command = crate::commands::family::FAMILIES.iter()
-        .find(|(id, _, _)| *id == family).unwrap().1;
-    let mut argv = vec!["cuteafd", command, "--snapshot", "/fixture", "--native-lib", "/native"];
-    if family == "step5" { argv.extend(["--peers", "127.0.0.1:19000"]); }
-    let matches = crate::cli::Cli::command().try_get_matches_from(argv)?;
-    let mut context = serve_context(&matches, None)?.unwrap();
+    let mut context = if family.starts_with("serve-") {
+        // Hidden qualification commands need not enter the public family or
+        // executor registries before their hardware gates pass.
+        let mut command = crate::cli::Cli::command();
+        let definition = command.find_subcommand_mut(family).context("hidden serve command missing")?;
+        let _ = definition.try_get_matches_from_mut([family, "--snapshot", "/fixture", "--native-lib", "/native"])?;
+        let mut context = cuteafd_bench::context::ServerContext { command: family.into(), ..Default::default() };
+        for argument in definition.get_arguments() {
+            if let Some(name) = argument.get_long() {
+                if derived_argument("", name) { context.require_resolved(name); }
+            }
+        }
+        context
+    } else {
+        let command = crate::commands::family::FAMILIES.iter()
+            .find(|(id, _, _)| *id == family).context("public family command missing")?.1;
+        let mut argv = vec!["cuteafd", command, "--snapshot", "/fixture", "--native-lib", "/native"];
+        if family == "step5" { argv.extend(["--peers", "127.0.0.1:19000"]); }
+        let matches = crate::cli::Cli::command().try_get_matches_from(argv)?;
+        serve_context(&matches, None)?.context("public serve context missing")?
+    };
     reply_settings(&mut context, Default::default());
     let (result, facts) = cuteafd_bench::context::capture_resolved(seam);
     // A refused admission has no effective serving configuration to report.

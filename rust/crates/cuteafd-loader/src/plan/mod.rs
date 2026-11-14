@@ -896,22 +896,27 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
         cache.concurrency = u32::try_from(concurrency)?;
         cache.state_slots = u32::try_from(options.state_slots.unwrap_or(cuteafd_core::concurrency::state_slots(concurrency)))?;
     }
+    let prior_admission = std::mem::take(&mut report.native_serving_admitted);
     match model.placement(input, report, options, requested) {
         Some(Ok(mut memory)) => {
             for device in &mut memory.devices {
                 cuteafd_core::memory_layout::charge_spark_runtime(device)
                     .ok_or_else(|| anyhow::anyhow!("Spark arena reserve overflow"))?;
             }
-            report.native_serving_admitted = model.native_serving_admission();
+            // Only this placement call may provide shape-specific admission;
+            // prior deployment flags must not qualify an unsupported descriptor.
+            report.native_serving_admitted |= model.native_serving_admission();
             Ok(memory)
         },
         Some(Err(error)) => {
+            report.native_serving_admitted = prior_admission;
             report.refuse_placement(format!("native placement refused: {error:#}"),
                 "Supply the native exports and a shape supported by the family's executor.");
             Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0,
                 waste: vec![], notes: vec![format!("native placement refused: {error:#}")] })
         }
         None => {
+            report.native_serving_admitted = prior_admission;
             let family = report.family.as_deref().unwrap_or("unknown");
             let drafter = matches!(family, "dflash2" | "dspark");
             let what = if drafter { format!("{family}: a drafter checkpoint has no memory layout of its own") }
