@@ -65,9 +65,6 @@ pub(crate) struct EngineArgs {
     /// Sequences that can be resident at once (compressor state slots).
     #[arg(long, default_value_t = 8)]
     pub max_sequences: usize,
-    /// Admit every prefill row's logits at startup for fidelity probes.
-    #[arg(long)]
-    pub full_prefill_logits: bool,
     /// Total tokens the compressed-cache pools hold across sequences; 0 uses
     /// planner admission from measured free memory before cache allocation.
     #[arg(long, default_value_t = 0)]

@@ -229,7 +229,13 @@ impl<'a> TargetHeadOwner<'a> {
     /// The transaction retains this owner and input through the lane stream's drain.
     pub(super) fn device_logits_on(&self, input: CuteafdDeviceBuffer, rows: usize,
         stream: &Stream<'a>) -> Result<crate::shared::token_io::DeviceLogits> {
-        super::transaction::validate_active_rows(rows, self.rows)?;
+        self.device_logits_at(input, rows, 0, stream)
+    }
+
+    fn device_logits_at(&self, input: CuteafdDeviceBuffer, rows: usize, first: usize,
+        stream: &Stream<'a>) -> Result<crate::shared::token_io::DeviceLogits> {
+        ensure!(rows > 0 && rows <= 64 && first.checked_add(rows).is_some_and(|end| end <= self.rows),
+            "Step-5 head tile exceeds admitted rows");
         ensure!(!input.ptr.is_null() && input.bytes >= rows * H * 4
             && input.device_id == self.stream.device.id && stream.device.id == input.device_id
             && std::ptr::eq(stream.device.library, self.stream.device.library),
@@ -237,16 +243,18 @@ impl<'a> TargetHeadOwner<'a> {
         let mut guard = stream.cancellation_guard("Step-5 final head input borrow");
         stream.device.run(|| {
             let library = stream.device.library;
-            let p = self.planes.iter().map(|p| p.buffer.ptr).collect::<Vec<_>>();
+            let mut p = self.planes.iter().map(|p| p.buffer.ptr).collect::<Vec<_>>();
+            p[0] = p[0].wrapping_byte_add(first * H * 2);
+            p[1] = p[1].wrapping_byte_add(first * H * 2);
             let weight = self.immutable.weights[0].buffer.ptr;
             // The shared target arena preserves the F32 residual until narrowing
             // completes; only the later logits/scratch writes may alias that input.
             // SAFETY: admitted lane-private planes, head handle and input stay live
             // through the transaction drain; runtime rows never exceed capacity.
             unsafe {
-                library.cuda_f32_to_bf16_async(input, self.planes[0].buffer, rows * H, stream.raw)?;
-                // The span-sized logit planes retain all scoring rows, but the
-                // masked norm export runs at most its compiled unit capacity.
+                let narrow = CuteafdDeviceBuffer { ptr: p[0], bytes: rows * H * 2, ..self.planes[0].buffer };
+                library.cuda_f32_to_bf16_async(input, narrow, rows * H, stream.raw)?;
+                // Keep norm rows for residual diagnostics; the vocabulary plane is one tile.
                 for start in (0..rows).step_by(self.immutable.kernel_rows) {
                     let count = (rows - start).min(self.immutable.kernel_rows);
                     let input = p[0].wrapping_byte_add(start * H * 2);
@@ -283,15 +291,15 @@ impl<'a> TargetHeadOwner<'a> {
     /// Caller drains the target chain first; consume bounded host tiles before reuse.
     pub fn logits_consumer(&self, input: CuteafdDeviceBuffer, scoring: crate::shared::probe::ScoringRows<'_>) -> Result<()> {
         let mut guard = self.stream.get()?.cancellation_guard("Step-5 diagnostic head input borrow");
-        let logits = self.device_logits_on(input, self.rows, self.stream.get()?)?;
-        self.stream.device.run(|| {
-            for span in crate::shared::probe::head_spans(self.rows, 64)? {
-                let tile = crate::shared::token_io::DeviceLogits {
-                    ptr: logits.ptr.wrapping_byte_add(span.start * V * 4), rows: span.len(), ..logits };
-                scoring.record(self.stream.device.library, span.start, &tile)?;
-            }
-            Ok(())
-        })?;
+        for span in crate::shared::probe::head_spans(self.rows, 64)? {
+            let offset = span.start * H * 4;
+            ensure!(offset <= input.bytes && span.len() * H * 4 <= input.bytes - offset,
+                "Step-5 diagnostic hidden extent");
+            let tile_input = CuteafdDeviceBuffer { ptr: input.ptr.wrapping_byte_add(offset),
+                bytes: span.len() * H * 4, ..input };
+            let logits = self.device_logits_at(tile_input, span.len(), span.start, self.stream.get()?)?;
+            self.stream.device.run(|| scoring.record(self.stream.device.library, span.start, &logits))?;
+        }
         guard.complete = true;
         Ok(())
     }
@@ -382,7 +390,7 @@ pub(super) mod tests {
     fn final_planes_charge_both_bf16_boundaries_logits_and_head_workspace() {
         for rows in [1, 64, 640, 4096, 8192, 8256] {
             let planes = HeadPlan::plane_bytes(rows).unwrap();
-            assert_eq!(planes, [rows * H * 2, rows * H * 2, rows * V * 4, 4 << 20]);
+            assert_eq!(planes, [rows * H * 2, rows * H * 2, rows.min(64) * V * 4, 4 << 20]);
         }
         for rows in [0, 8257, usize::MAX] { assert!(HeadPlan::plane_bytes(rows).is_err()); }
     }

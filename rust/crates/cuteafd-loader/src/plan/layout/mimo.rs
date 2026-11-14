@@ -350,7 +350,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         }
         let workspaces = workspace_options(&cfg, ranks, rank, rows as usize, context as usize,
             lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp,
-            if options.full_prefill_logits { MimoPrefillOutput::AllRows } else { MimoPrefillOutput::LastRow },
+            MimoPrefillOutput::AllRows,
             fp8_output, |name| {
                 let Some(manifest) = manifest else { return Ok(0); };
                 let program = manifest["programs"].as_array().context("PROGRAMS.json lacks programs")?
@@ -420,8 +420,8 @@ fn offline_host(checkpoint: &super::super::Checkpoint, options: &LayoutOptions, 
             .context("invalid MiMo host prefix geometry or quota")? };
     Ok(crate::placement::families::mimo_v2::admission::HostOwners {
         expert_input: options.mimo_expert_input,
-        output: if options.full_prefill_logits { MimoPrefillOutput::AllRows } else { MimoPrefillOutput::LastRow },
-        serving: true, scoring_rows: if options.full_prefill_logits { options.prefill_span_rows.unwrap_or(rows) as usize } else { 64 },
+        output: MimoPrefillOutput::AllRows,
+        serving: true, scoring_rows: 64,
         diagnostic_rows: rows.min(256) as usize, prefix_bytes, media_bytes: 0,
         // Serve adds the media quota to the base headroom (`with_media_headroom`).
         headroom: (8u64 << 30).max(host.0 / 10).checked_add(media_cache).context("MiMo media headroom overflow")?,
@@ -549,7 +549,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let maximum_pool_tokens = admission::maximum_pool_tokens(&options.rtx_bytes[..ranks], context,
         options.pool_tokens, profiles.steady.pool_unit_rows);
     let prefill = PrefillShape { rows, waves: lanes as u64 };
-    let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
+    let operation = Operation::Serving;
     let embedding = if use_host_embedding(checkpoint, options) { EmbeddingHome::HostPinned }
         else { EmbeddingHome::Device(0) };
     let budgets = admission::production_budgets(

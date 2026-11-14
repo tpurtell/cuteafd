@@ -375,7 +375,6 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `PREFILL_ROWS` | planner | multiple of 64, ≤4096 | Per-unit rows override. |
 | `PREFILL_WAVES` | planner | 0–4 | Units in flight. |
 | `PREFILL_SPAN_ROWS` | planner | positive int | GLM/MiMo shared span. |
-| `FULL_PREFILL_LOGITS` | engine/hidden | `on`, `off` | Legacy all-row diagnostic reservation (2.5 GiB at 4096 rows); may reduce KV or onboarding. GLM Flash, dense Qwen, Qwen4, MiMo, V4, Step-5, Muse, GLM 5.3 and Mistral Large 4 prefill fidelity need no flag after paired raw-row and ordinary-layout Standard proofs: they stream selected logits from bounded existing head storage, preserving transformer prefill units. The Kimi adapter remains staged until its proof passes; its launch admission and scoring dispatch are unchanged. The flag remains temporarily for legacy admission and old/new exactness checks. |
 | `TARGET_HEAD` | `tensor` | `tensor`, `exact` | BF16 target head: tensor cores with FP32 accumulation, or the exact FP32 GEMM diagnostic. |
 | `FP8_EXPERT_PREFILL` | `auto` | `auto`, `w8a8`, `w8a16` | FP8 expert prefill arithmetic. |
 | `EXPERT_INPUT` | family default | `fp8`, `bf16`, `bf16-decode` | MiMo Spark expert inputs. |
@@ -724,7 +723,6 @@ original core is already FP8, not an MC publication.
 | `PREFILL_ROWS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✓ |
 | `PREFILL_WAVES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `PREFILL_SPAN_ROWS` | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `FULL_PREFILL_LOGITS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `TARGET_HEAD` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `FP8_EXPERT_PREFILL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `EXPERT_INPUT` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |

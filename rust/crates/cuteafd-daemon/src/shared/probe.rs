@@ -13,16 +13,6 @@ pub(crate) mod features;
 
 pub(crate) type ProbeRef = Option<Arc<Probe>>;
 
-/// Activate each adapter only after its paired raw-row and ordinary-layout proof.
-/// Remove this temporary allowlist with the final FULL_PREFILL_LOGITS deletion.
-pub(crate) fn streamed_prefill_scoring(family: &str) -> bool {
-    matches!(family, "glm5_flash" | "qwen4" | "qwen3_5" | "mimo_v2" | "deepseek_v4" | "step5" | "muse_spark" | "glm5" | "mistral_large4" | "kimi_k3")
-}
-
-pub(crate) fn prefill_scoring_admitted(family: &str, full_prefill_logits: bool) -> bool {
-    full_prefill_logits || streamed_prefill_scoring(family)
-}
-
 pub(crate) fn image_echo(job: &cuteafd_api::openai::NativeRequest, spans: &[cuteafd_core::MediaSpan]) -> Result<()> {
     if let Some(probe) = &job.probe {
         anyhow::ensure!(spans.len() == job.media.len(), "probe image count differs");
@@ -548,10 +538,10 @@ fn scoring_width(capacity: usize, requested: Option<usize>) -> Result<usize> {
 }
 
 /// Validate before grammar setup, cache admission, or any request device work.
-pub(crate) fn validate_scoring(probe: &ProbeRef, full_prefill_logits: bool) -> Result<()> {
+pub(crate) fn validate_scoring(probe: &ProbeRef, prefill_scoring: bool) -> Result<()> {
     let Some(probe) = probe.as_ref().filter(|p| p.scoring().is_some()) else { return Ok(()) };
     let path = ScorePath::parse(probe.spec.score_path.as_deref(), ScorePath::Decode)?;
-    score_plan(2, 1, 1, usize::MAX, probe.spec.verify_rows, path, full_prefill_logits)?;
+    score_plan(2, 1, 1, usize::MAX, probe.spec.verify_rows, path, prefill_scoring)?;
     Ok(())
 }
 
@@ -594,14 +584,14 @@ struct ScoreStep {
 }
 
 fn score_plan(len: usize, from: usize, prefill_rows: usize, verify_capacity: usize,
-    requested_verify_rows: Option<usize>, path: ScorePath, full_prefill_logits: bool) -> Result<Vec<ScoreStep>> {
+    requested_verify_rows: Option<usize>, path: ScorePath, prefill_scoring: bool) -> Result<Vec<ScoreStep>> {
     anyhow::ensure!(len >= 2, "scoring needs at least two tokens");
     let rows = match path {
         ScorePath::Decode => scoring_width(verify_capacity, requested_verify_rows)?,
         ScorePath::Prefill => {
             anyhow::ensure!(requested_verify_rows.is_none(), "probe verify_rows requires score_path=decode");
-            anyhow::ensure!(full_prefill_logits,
-                "prefill-shaped probe scoring requires --full-prefill-logits at server launch (FULL_PREFILL_LOGITS=on)");
+            anyhow::ensure!(prefill_scoring,
+                "this backend does not implement streamed prefill scoring");
             prefill_rows.max(1)
         }
     };
@@ -629,12 +619,12 @@ fn score_plan(len: usize, from: usize, prefill_rows: usize, verify_capacity: usi
 /// the default, with no drafts, retained prefix, or diagnostic workspace growth.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32], from: usize, prefill_rows: usize,
-    verify_capacity: usize, requested_verify_rows: Option<usize>, full_prefill_logits: bool, state: &mut S,
+    verify_capacity: usize, requested_verify_rows: Option<usize>, prefill_scoring: bool, state: &mut S,
     mut prefill: impl FnMut(&mut S, &[u32], usize, usize) -> Result<Option<ScoreLogits>>,
     mut verify: impl FnMut(&mut S, &[u32]) -> Result<DeviceLogits>) -> Result<usize> {
     let path = ScorePath::parse(probe.as_ref().and_then(|p| p.spec.score_path.as_deref()), ScorePath::Decode)?;
     let steps = score_plan(tokens.len(), from, prefill_rows, verify_capacity, requested_verify_rows, path,
-        full_prefill_logits)?;
+        prefill_scoring)?;
     if let Some(probe) = probe { probe.selected_score_path(path.name()); }
     let mut scored = 0;
     for step in steps {
@@ -683,58 +673,15 @@ mod tests {
     }
 
     #[test]
-    fn streamed_scoring_activation_requires_a_proven_family() {
-        for family in ["glm5_flash", "qwen4", "qwen3_5", "mimo_v2", "deepseek_v4", "step5", "muse_spark", "glm5", "mistral_large4", "kimi_k3"] {
-            assert!(streamed_prefill_scoring(family), "{family}");
-            assert!(prefill_scoring_admitted(family, false), "{family}");
+    fn scoring_requires_backend_capability_but_decode_does_not() {
+        for supported in [false, true] {
+            assert!(score_plan(20, 4, 8, 8, None, ScorePath::Decode, supported).is_ok());
+            assert_eq!(score_plan(20, 4, 8, 8, None, ScorePath::Prefill, supported).is_ok(), supported);
         }
-        for family in ["kimi_k31", "minimax_m3", "unknown"] {
-            assert!(!streamed_prefill_scoring(family), "{family}");
-            for legacy in [false, true] {
-                assert_eq!(prefill_scoring_admitted(family, legacy), legacy, "{family}");
-                for path in [ScorePath::Decode, ScorePath::Prefill] {
-                    let actual = score_plan(20, 4, 8, 8, None, path, prefill_scoring_admitted(family, legacy));
-                    let dev = score_plan(20, 4, 8, 8, None, path, legacy);
-                    match (actual, dev) {
-                        (Ok(actual), Ok(dev)) => assert_eq!(actual, dev, "{family}"),
-                        (Err(actual), Err(dev)) => assert_eq!(actual.to_string(), dev.to_string(), "{family}"),
-                        _ => panic!("{family} changed legacy scoring admission"),
-                    }
-                }
-            }
-            let probe = Some(Probe::new(ProbeSpec { score_from: Some(4), score_path: Some("prefill".into()),
-                ..ProbeSpec::default() }));
-            assert!(validate_scoring(&probe, prefill_scoring_admitted(family, false)).is_err());
-            assert!(validate_scoring(&probe, prefill_scoring_admitted(family, true)).is_ok());
-        }
-    }
-
-    #[test]
-    fn streamed_scoring_activation_gates_capability_validation_and_dispatch() {
-        let scheduler = include_str!("qwen/scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
-        assert!(scheduler.contains("probe::streamed_prefill_scoring(geometry.family) && engine.streamed_prefill_scoring()"));
-        assert!(scheduler.contains("if streamed_scoring {\n            cuteafd_bench::context::set_resolved"));
-        assert_eq!(scheduler.matches("geometry.full_prefill_logits || streamed_scoring").count(), 2);
-        let dispatch = scheduler.split_once("|placement, chunk, rows, position| {").unwrap().1
-            .split_once("|placement, chunk| engine.verify_device_ungraphed").unwrap().0;
-        assert!(dispatch.contains("if streamed_scoring {"));
-        assert!(dispatch.contains("engine.prefill_scoring("));
-        assert!(dispatch.contains("engine.prefill_device(placement, chunk, rows, cache.pool())"));
-        for (family, source) in [
-            ("glm5_flash", include_str!("../families/glm5_flash/serve.rs")),
-            ("mimo_v2", include_str!("../families/mimo_v2/serve.rs")),
-            ("deepseek_v4", include_str!("../families/deepseek_v4/serve.rs")),
-        ] {
-            assert!(source.contains(&format!("if probe::streamed_prefill_scoring(\"{family}\") {{")));
-            assert_eq!(source.matches(&format!("probe::prefill_scoring_admitted(\"{family}\", engine.full_prefill_logits")).count(), 2);
-            assert!(source.contains(&format!("&& probe::streamed_prefill_scoring(\"{family}\")")));
-        }
-        let glm = include_str!("../families/glm5/serve.rs");
-        assert!(glm.contains("if probe::streamed_prefill_scoring(engine.cfg.family_id()) {"));
-        assert_eq!(glm.matches("probe::prefill_scoring_admitted(engine.cfg.family_id(), engine.full_prefill_logits)").count(), 2);
-        assert!(glm.contains("&& probe::streamed_prefill_scoring(engine.cfg.family_id())"));
-        let kimi = include_str!("../families/kimi_k3/serve.rs");
-        assert!(kimi.contains("if crate::shared::probe::streamed_prefill_scoring(\"kimi_k3\") {"));
+        let scheduler = include_str!("qwen/scheduler.rs");
+        assert!(scheduler.contains("let streamed_scoring = engine.streamed_prefill_scoring();"));
+        assert!(!scheduler.contains("geometry.full_prefill"));
+        assert!(scheduler.contains("engine.prefill_scoring("));
     }
 
     #[test]
@@ -759,7 +706,7 @@ mod tests {
         assert!(source.contains("consume(first, describe(logits, rows))?"));
         let backend = include_str!("../families/kimi_k3/backend.rs");
         assert!(backend.contains("fn streamed_prefill_scoring(&self) -> bool { true }"));
-        assert!(backend.contains("self.geometry.full_prefill_logits || logit_rows <= 1"));
+        assert!(backend.contains("logit_rows <= 1"));
     }
 
     #[test]
@@ -875,7 +822,7 @@ mod tests {
     #[test]
     fn prefill_requires_launch_admission_and_rejects_verify_override() {
         let error = score_plan(20, 4, 8, 8, None, ScorePath::Prefill, false).unwrap_err();
-        assert!(error.to_string().contains("--full-prefill-logits"));
+        assert!(error.to_string().contains("streamed prefill scoring"));
         assert!(score_plan(20, 4, 8, 8, Some(1), ScorePath::Prefill, true).unwrap_err()
             .to_string().contains("verify_rows requires score_path=decode"));
         assert!(score_plan(1, 0, 8, 8, None, ScorePath::Decode, false).is_err());
@@ -891,7 +838,7 @@ mod tests {
             ..ProbeSpec::default() }));
         assert!(cold(&probe));
         assert!(no_speculation(&probe));
-        assert!(validate_scoring(&probe, false).unwrap_err().to_string().contains("--full-prefill-logits"));
+        assert!(validate_scoring(&probe, false).unwrap_err().to_string().contains("streamed prefill scoring"));
         assert!(validate_scoring(&probe, true).is_ok());
     }
 

@@ -96,9 +96,6 @@ pub(crate) struct EngineArgs {
     /// Shared topology depth (zero selects the shared default).
     #[arg(long, default_value_t = 0)]
     pub prefill_waves: usize,
-    /// Admit every prefill row's logits at startup for fidelity probes.
-    #[arg(long)]
-    pub full_prefill_logits: bool,
     /// Sanity cap for measured selected-module loading before admission.
     /// Modules belong to the measured baseline; this cap is not reserved storage.
     #[arg(long, default_value_t = 1024)]
@@ -1472,8 +1469,7 @@ impl Opened {
                 };
                 engine.set_rtx_local(local);
             }
-            if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
-            if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
+                if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
                 engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
             }
             engine.configure_packing(args.prefill_packing.unwrap_or_default())?;

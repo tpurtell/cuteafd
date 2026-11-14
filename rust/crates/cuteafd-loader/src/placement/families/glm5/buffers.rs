@@ -89,7 +89,6 @@ pub struct TargetBuffers {
     pub native_head: bool,
     pub decode: Option<GlmScratch>,
     pub prefill: Option<(PrefillShape, GlmScratch)>,
-    pub full_prefill_logits: bool,
     /// Optional TP2 payload and K6 row arenas; their hook-local owners are separate.
     pub payload_row_bytes: u64,
     pub core_rows: bool,
@@ -237,7 +236,7 @@ impl Builder {
         // lanes are allocated by the first prefill: during startup only for
         // scoring, otherwise by live traffic after Ready.
         let lifetime = Lifetime {
-            first: if decode || facts.full_prefill_logits {
+            first: if decode {
                 Phase::Warmup
             } else {
                 Phase::Growth
@@ -294,7 +293,7 @@ impl Builder {
                 }
             }
         }
-        let logits_rows = super::logits_rows(shape.rows, decode, facts.full_prefill_logits);
+        let logits_rows = super::logits_rows(shape.rows, decode);
         let logits = if lead {
             mul(mul(logits_rows, cfg.vocab_size as u64)?, 4)?.max(FLOOR)
         } else {

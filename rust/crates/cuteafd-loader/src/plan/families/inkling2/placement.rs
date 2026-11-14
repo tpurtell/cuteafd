@@ -91,7 +91,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let routed = inputs.routed.len();
     let onboard = opts.resolve_onboard(routed).unwrap_or(Onboard::Auto);
     let solve_request = crate::placement::families::inkling2::request(inputs.context, opts.pool_tokens, onboard,
-        shape, if opts.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
+        shape, Operation::Serving,
         inputs.resident_weight_limit, opts.spark_reply_formats);
     let admitted = match inputs.admit(solve_request) {
         Ok(admitted) => admitted,

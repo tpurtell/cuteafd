@@ -1700,11 +1700,7 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
 fi
 # Kimi K3 and Step-5 serve text only; their commands take no media options.
 ((text_family)) || family_args+=(--vision "$vision" --audio "$audio")
-case "$(get FULL_PREFILL_LOGITS off)" in
-  on) family_args+=(--full-prefill-logits) ;;
-  off) ;;
-  *) echo "FULL_PREFILL_LOGITS must be on or off" >&2; exit 2 ;;
-esac
+
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then
   case "$(get MIMO_WEIGHT_POLICY auto)" in
@@ -2381,7 +2377,6 @@ audio_encoder_hash=""
     fi
   done
   plan_draft_args+=(--host-cache-bytes "$plan_host_cache")
-  [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)
   case "$(get EXPERT_USAGE on)" in
     on) plan_draft_args+=(--expert-usage) ;;
     off) plan_draft_args+=(--expert-usage=false) ;;

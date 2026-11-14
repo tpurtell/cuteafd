@@ -573,18 +573,6 @@ mod tests {
     }
 
     #[test]
-    fn full_prefill_logits_charge_matches_workspace_minimum_allocations() {
-        use super::qwen_workspace_bytes;
-        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
-        let baseline = qwen_workspace_bytes(&cfg, 2048, false, 1, 0, Some(160), 0, 0);
-        for logits in [1, 16, 32, 33, 2048, 2752, 8192, 8256, 16384] {
-            let runtime = qwen_workspace_bytes(&cfg, 2048, false, logits, 0, Some(160), 0, 0) - baseline;
-            assert_eq!(crate::plan::layout::full_prefill_logits_bytes("qwen4", logits, cfg.vocab_size as u64),
-                runtime, "{logits} logit rows");
-        }
-    }
-
-    #[test]
     fn unit_mtp_scratch_and_page_tables_are_admitted_separately() {
         use super::{qwen_admission, qwen_workspace_bytes, QwenAdmissionInputs};
         use crate::serving_capacity::PrefillShape;

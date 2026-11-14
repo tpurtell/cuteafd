@@ -218,7 +218,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let state = self.owners.storage.requests.borrow();
         scheduler::Geometry { family: "minimax_m3", vocab_size: self.cfg.vocab_size, max_context: self.context,
             slots: state.capacity.decode.requests as usize, prefill_rows: state.capacity.prefill.rows as usize,
-            decode_rows: state.capacity.decode.rows as usize, full_prefill_logits: false }
+            decode_rows: state.capacity.decode.rows as usize, }
     }
     fn message_starts(&self) -> &[&str] { MESSAGE_STARTS }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.owners.storage.ranks[0].decode.borrow().stream.device.library }

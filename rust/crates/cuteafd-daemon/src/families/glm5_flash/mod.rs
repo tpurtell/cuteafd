@@ -237,7 +237,6 @@ pub(crate) struct EngineArgs {
     pub kda_nvfp4_gate: Option<String>,
     /// Keep every prefill row's logits (glmf-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
-    pub full_prefill_logits: bool,
     /// Most EXL3 expert layers resident at once (about 3 GiB each; the free
     /// memory decides first).
     #[arg(long, default_value_t = 64)]
@@ -651,7 +650,7 @@ mod draft_cli_tests {
             Ok(cuteafd_loader::placement::families::glm5_flash::step_workspace_demands(&cfg, 3, 4096, 64,
                 GlmfStepShape { lead: true, split: false, local_experts: false, tp2_experts: false,
                     spark: true, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
-                    output_shard: args.kda_output_shard, full_prefill_logits: false, table_pages: 512, table_pool_pages: 512 },
+                    output_shard: args.kda_output_shard, table_pages: 512, table_pool_pages: 512 },
                 decode, prefill).into_iter().map(|d| d.demand.bytes).collect())
         };
         assert_eq!(demands(&ordinary)?, demands(&converted)?);
@@ -1684,8 +1683,7 @@ impl EngineArgs {
 /// with the DSA index cache `with_engine` resolved (a head split keeps `keys`).
 fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
     engine::StepSettings { target_head: args.resolved_target_head(), kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
-        kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
-        max_context: args.max_context, index_cache, kda_state: args.kda_state, replay_records: args.replay_records,
+        kda_prefill_expanded: args.kda_prefill_expanded, max_context: args.max_context, index_cache, kda_state: args.kda_state, replay_records: args.replay_records,
         decode_rows: args.decode_rows }
 }
 
@@ -2029,7 +2027,7 @@ impl Opened {
         let (table_pages, table_pool_pages) = glmf_table_pages(args.max_context as u64);
         let shape = GlmfStepShape { lead: true, split, local_experts: !args.skip_experts && !split && self.fp8().is_some(),
             tp2_experts: !args.skip_experts && split, spark: spark_ranks > 0, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
-            output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits && !self.native && (core.get_weight("lm_head").is_none() && !core.native.contains_key("lm_head")), table_pages, table_pool_pages };
+            output_shard: args.kda_output_shard, table_pages, table_pool_pages };
         let workspaces = |spark, lanes| admission::step_workspace_demands(&self.cfg, lanes,
             args.prefill_rows as u64, args.decode_rows as u64, GlmfStepShape { spark, ..shape }, decode, prefill);
         let mut workspace = workspaces(spark_ranks > 0, lanes);
@@ -2123,10 +2121,7 @@ impl Opened {
                 && representation.head == head::GlmfHeadFormat::Bf16),
             representation, resident, workspace, local_workspace, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
-            full_prefill_logits: if shape.full_prefill_logits {
-                cuteafd_loader::plan::layout::full_prefill_logits_bytes("glm5_flash", args.prefill_rows as u64,
-                    self.cfg.vocab_size as u64)
-            } else { 0 } };
+ };
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
         let headroom = args.serving_prefix.as_ref().map_or(8 << 30, |prefix| prefix.host_cache_headroom_bytes).max(host.0 / 10);
         let mut process = admission::admission::ProcessOwners::new(host, headroom);
@@ -2940,7 +2935,6 @@ impl Opened {
         }
         probe("context-attach")?;
         probe("peer-exchanges")?;
-        engine.full_prefill_logits = args.full_prefill_logits;
         let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
         // `all`: every group with FP8 weights (BF16 KDA has none to run W8A8 over).
         let kda = args.kda_fp8 != fp8::KdaFp8::Off || core.native.iter().any(|(stem, weight)|
@@ -3015,7 +3009,6 @@ impl Opened {
             probe("install-workspaces")?;
             if args.serving_graph_policy.is_some() { engine.prepare_serving_workspaces()?; }
             probe("serving-workspaces")?;
-            if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
             probe("scoring-prefill")?;
             probe("workspaces")
         }, |engine| {

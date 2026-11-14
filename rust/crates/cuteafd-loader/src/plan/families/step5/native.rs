@@ -361,7 +361,7 @@ pub fn head_rows(rows: usize) -> usize {
 
 pub fn head_planes(rows: usize) -> Result<[usize; 4]> {
     validate_span_rows(rows)?;
-    Ok([rows * H * 2, rows * H * 2, rows * 128896 * 4, 4 << 20])
+    Ok([rows * H * 2, rows * H * 2, rows.min(64) * 128896 * 4, 4 << 20])
 }
 
 /// Global RoPE positions, rebased KV positions, request ids, a bounded page

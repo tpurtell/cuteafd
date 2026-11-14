@@ -94,8 +94,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         local: options.local, drafter: options.drafter, fixed, media }.prepare()?;
     let request = shared::production_request(cuteafd_loader::placement::planner::Context::resolve(context, options.max_context), options.pool_tokens, options.onboard,
         cuteafd_loader::placement::planner::PrefillShape { rows: options.prefill.unit_rows, waves: options.prefill.waves },
-        if options.full_prefill_logits { cuteafd_loader::placement::planner::Operation::Scoring }
-        else { cuteafd_loader::placement::planner::Operation::Serving },
+        cuteafd_loader::placement::planner::Operation::Serving,
         Some(crate::shared::memory::budget::resident_weight_limit()), options.partial_reply_formats);
     let admitted = prepared.admit(request)?;
     cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "muse_spark");

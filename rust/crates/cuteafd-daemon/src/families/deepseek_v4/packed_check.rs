@@ -250,7 +250,7 @@ mod tests {
         let manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?;
         let mode = std::env::var("CUTEAFD_PACKED_CHECK_MODE")?;
         let args = Cli::try_parse_from(["v4", "--snapshot", &snapshot, "--peers", &peers,
-            "--manifest", &manifest, "--golden", &fixtures, "--full-prefill-logits",
+            "--manifest", &manifest, "--golden", &fixtures,
             "--pool-tokens", "262144", "--rtx-expert-layers", "2", "--dspark",
             "--prefill-rows", "2752", "--prefill-waves", "3", "--max-sequences", "8",
             "--packed-check", "3", "--prefill-packing", &mode])?.args;

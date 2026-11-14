@@ -3622,21 +3622,10 @@ SPLIT_CONFIGS = {
     SPLIT_CONFIGS["glm5_flash"], {"model_type": "glm_moe_dsa", "num_hidden_layers": 4,
                                 "first_k_dense_replace": 3}, {"model_type": "deepseek_v4"},
 ])
-@pytest.mark.parametrize("setting", ["", "FULL_PREFILL_LOGITS=off\n", "FULL_PREFILL_LOGITS=on\n"])
-def test_full_prefill_logits_is_one_shared_opt_in(tmp_path, family_config, setting):
-    keys = "SPECULATOR=off\n" + setting
-    result = _family_launch_result(tmp_path, family_config, "test/model", keys)
+def test_prefill_scoring_uses_ordinary_launch(tmp_path, family_config):
+    result = _family_launch_result(tmp_path, family_config, "test/model", "SPECULATOR=off\n")
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert launch.count("--full-prefill-logits") == int("=on" in setting)
-
-
-def test_full_prefill_logits_rejects_invalid_setting_before_launch(tmp_path):
-    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["mimo_flash"], "test/model",
-                                  "FULL_PREFILL_LOGITS=true\n")
-    assert result.returncode == 2, result.stderr
-    assert "FULL_PREFILL_LOGITS must be on or off" in result.stderr
-    assert "docker run" not in result.stderr
+    assert "--full-prefill-logits" not in result.stderr
 
 
 @pytest.mark.parametrize("checkpoint", ["qwen4"])
@@ -4305,7 +4294,7 @@ def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, i
             "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
     keys = (f"EXPERT_INPUT={ingress}\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
             "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\n"
-            "MAX_CONTEXT_TOKENS=262144\nDECODE_GRAPHS=on\nFULL_PREFILL_LOGITS=on\n")
+            "MAX_CONTEXT_TOKENS=262144\nDECODE_GRAPHS=on\n")
     result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
@@ -5141,18 +5130,17 @@ def test_mimo_swa_record_format_reaches_serve_and_plan(tmp_path, value, model_ty
     assert plans and all(f"--mimo-swa-kv-cache {expected}" in line for line in plans)
 
 
-@pytest.mark.parametrize("full", ["off", "on"])
 @pytest.mark.parametrize("kv", [None, "bf16", "fp8"])
-def test_dense_full_prefill_logits_reaches_serve_and_plan(tmp_path, full, kv):
+def test_dense_prefill_scoring_needs_no_launch_option(tmp_path, kv):
     result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
-        f"SPARK_COUNT=0\nSPECULATOR=off\nFULL_PREFILL_LOGITS={full}\n" + (f"KV_CACHE={kv}\n" if kv else ""),
+        "SPARK_COUNT=0\nSPECULATOR=off\n" + (f"KV_CACHE={kv}\n" if kv else ""),
         extra_args=("--wip", "dense-test"),
         encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan " in line)
-    assert ("--full-prefill-logits" in launch) == (full == "on")
-    assert ("--full-prefill-logits" in plan) == (full == "on")
+    assert "--full-prefill-logits" not in launch
+    assert "--full-prefill-logits" not in plan
     expected_kv = kv or "fp8"
     assert f"--kv-cache {expected_kv}" in launch
     assert f"--kv-cache {expected_kv}" in plan

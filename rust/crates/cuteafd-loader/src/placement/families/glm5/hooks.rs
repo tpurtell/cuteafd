@@ -17,7 +17,6 @@ pub struct HookBuffers {
     pub shared_workspace: Option<crate::plan::exlr8::ExecutionWorkspace>,
     /// Scoring allocates its prefill lanes during startup; serving allocates
     /// them on the first live prefill, after Ready.
-    pub full_prefill_logits: bool,
 }
 
 struct Builder {
@@ -116,7 +115,7 @@ impl HookBuffers {
             // Prefill hooks live in the lanes the first prefill allocates: during
             // startup only when scoring, otherwise from live traffic after Ready.
             let workspace = Lifetime {
-                first: if kind == "prefill" && !self.full_prefill_logits {
+                first: if kind == "prefill" {
                     Phase::Growth
                 } else {
                     Phase::Warmup

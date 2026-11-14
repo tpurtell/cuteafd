@@ -262,8 +262,8 @@ pub fn step_row_widths(cfg: &GlmDsaConfig, lead: bool, split: bool, router: bool
 
 /// Logits rows a step workspace keeps for `rows`-row calls: every row for
 /// decode or full logits, else at most [`DECODE_ROWS`].
-pub fn logits_rows(rows: u64, decode: bool, full_logits: bool) -> u64 {
-    if decode || full_logits { rows } else { rows.min(DECODE_ROWS) }
+pub fn logits_rows(rows: u64, decode: bool) -> u64 {
+    if decode { rows } else { rows.min(DECODE_ROWS) }
 }
 
 /// Device bytes of a GLM step workspace's row buffers for `rows` rows (each
@@ -297,8 +297,8 @@ pub fn step_shared(lead: bool, native_head: bool, scratch: GlmScratch) -> u64 {
 /// has the engine's 256-byte floor; pinned router staging is not GPU storage.
 /// Peer local-router rows are a separate `local_extra_workspace` backend delta.
 pub fn step_bytes(cfg: &GlmDsaConfig, rows: u64, lead: bool, split: bool,
-    decode: bool, full_logits: bool, native_head: bool, scratch: GlmScratch) -> Result<u64, PlacementError> {
-    step_rows(cfg, rows, lead, split, false, logits_rows(rows, decode, full_logits))?
+    decode: bool, native_head: bool, scratch: GlmScratch) -> Result<u64, PlacementError> {
+    step_rows(cfg, rows, lead, split, false, logits_rows(rows, decode))?
         .checked_add(step_shared(lead, native_head, scratch))
         .ok_or(PlacementError::Overflow("GLM step buffers"))
 }
@@ -309,9 +309,9 @@ pub fn step_bytes(cfg: &GlmDsaConfig, rows: u64, lead: bool, split: bool,
 /// logits rows serve one unit at a time (`launch_head` per unit). Its bytes:
 /// one step workspace's rows at the reserve.
 pub fn prefill_bytes(cfg: &GlmDsaConfig, unit_rows: u64, slots: u64, lead: bool, split: bool, router: bool,
-    full_logits: bool, native_head: bool, scratch: GlmScratch) -> Result<u64, PlacementError> {
+    native_head: bool, scratch: GlmScratch) -> Result<u64, PlacementError> {
     let span = prefill_span(unit_rows, slots);
-    step_rows(cfg, span, lead, split, router, logits_rows(unit_rows, false, full_logits))?
+    step_rows(cfg, span, lead, split, router, logits_rows(unit_rows, false))?
         .checked_add(step_shared(lead, native_head, scratch)).ok_or(PlacementError::Overflow("GLM prefill buffers"))
 }
 
@@ -897,10 +897,10 @@ mod tests {
         let cfg = config();
         let scratch = GlmScratch { programs: 1000, topk: 2000 };
         for lead in [false, true] {
-            let ordinary = step_bytes(&cfg, 64, lead, true, true, false, false, scratch).unwrap()
-                + prefill_bytes(&cfg, 2752, 3, lead, true, false, false, false, scratch).unwrap();
-            let native = step_bytes(&cfg, 64, lead, true, true, false, true, scratch).unwrap()
-                + prefill_bytes(&cfg, 2752, 3, lead, true, false, false, true, scratch).unwrap();
+            let ordinary = step_bytes(&cfg, 64, lead, true, true, false, scratch).unwrap()
+                + prefill_bytes(&cfg, 2752, 3, lead, true, false, false, scratch).unwrap();
+            let native = step_bytes(&cfg, 64, lead, true, true, true, scratch).unwrap()
+                + prefill_bytes(&cfg, 2752, 3, lead, true, false, true, scratch).unwrap();
             assert_eq!(ordinary - native, if lead { 2 * (4 << 20) } else { 0 });
             assert_eq!(head_workspace_bytes(lead, true), if lead { None } else { Some(FLOOR) });
             assert_eq!(head_workspace_bytes(lead, false), Some(if lead { 4 << 20 } else { FLOOR }));
@@ -931,10 +931,10 @@ mod tests {
                 .map(|&(_, width)| (span * width).max(FLOOR)).sum();
             let logits = if lead { DECODE_ROWS * cfg.vocab_size as u64 * 4 } else { FLOOR };
             let runtime = arenas + logits + span * 8 + step_shared(lead, native_head, scratch);
-            assert_eq!(prefill_bytes(&cfg, unit, slots, lead, true, router, false, native_head, scratch).unwrap(), runtime);
+            assert_eq!(prefill_bytes(&cfg, unit, slots, lead, true, router, native_head, scratch).unwrap(), runtime);
             // Compare identical router ownership; step_bytes excludes the local-backend delta.
             let per_slot = slots * (step_rows(&cfg, unit, lead, true, router,
-                logits_rows(unit, false, false)).unwrap() + step_shared(lead, native_head, scratch));
+                logits_rows(unit, false)).unwrap() + step_shared(lead, native_head, scratch));
             assert!(runtime + (slots - 1) * (scratch.programs + scratch.topk) <= per_slot,
                 "lead {lead}, router {router}, native head {native_head}");
         }

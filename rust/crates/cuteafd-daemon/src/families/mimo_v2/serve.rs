@@ -134,7 +134,7 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
-    if probe::streamed_prefill_scoring("mimo_v2") {
+    {
         cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
     }
     args.draft_length.report_inactive(args.engine.draft.is_some() || args.engine.mtp > 0);
@@ -271,8 +271,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
     let result = opened.with_engine_reserved_media(&args, Some((&prefix, max_sequences)), media_push.records(),
-        if args.full_prefill_logits { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::AllRows }
-        else { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow }, |engine, host_config| {
+        cuteafd_loader::families::mimo_v2::MimoPrefillOutput::AllRows, |engine, host_config| {
         layout.speculator = engine.drafter.as_ref().map(|draft| ("DFlash", draft.cfg.drafts()))
             .or_else(|| engine.mtp.as_ref().map(|mtp| ("MTP", mtp.stages.len())))
             .map(|(name, native)| console::Speculator { name: name.into(), positions: native,
@@ -461,7 +460,7 @@ impl Reserving for Active<'_> {
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
 pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize)
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
-    let rows = if engine.full_prefill_logits() { engine.prefill_capacity() } else { 64 };
+    let rows = 64;
     let args = args.with_scoring(rows, rows, engine.cfg.vocab_size)?;
     prefix_cache_with(engine, &args, concurrency, |layout| args.host_config(layout, engine.max_context, concurrency))
 }
@@ -476,7 +475,7 @@ fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, conc
     let layout = family.layout();
     // Serving consumes the quota resolved before loading; diagnostics may
     // resolve it here. Register all pools/mark arenas on their actual GPUs.
-    let rows = if engine.full_prefill_logits() { engine.prefill_capacity() } else { 64 };
+    let rows = 64;
     let scoring = args.with_scoring(rows, rows, engine.cfg.vocab_size)?;
     let host = host_config(layout)?.map(|config| {
         // Preflight resolved the quota before loading. Re-admit with all pinned
@@ -615,7 +614,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             }
                         };
                         failures.watch(&job.events);
-                        if let Err(error) = probe::validate_scoring(&job.probe, probe::prefill_scoring_admitted("mimo_v2", engine.full_prefill_logits())) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, true) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -751,9 +750,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let mut placement = admitted.placement;
                 let scored = probe::score(engine.library, &job.probe, &tokens, from,
                     engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), probe::prefill_scoring_admitted("mimo_v2", engine.full_prefill_logits()), &mut placement,
+                    DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
                     |placement, chunk, rows, position| {
-                        if rows > 1 && !engine.full_prefill_logits() && probe::streamed_prefill_scoring("mimo_v2") {
+                        if rows > 1 {
                             engine.prefill_streamed_scoring(placement, chunk, &request_media,
                                 probe::ScoringRows { consumer: &job.probe, position })
                         } else {

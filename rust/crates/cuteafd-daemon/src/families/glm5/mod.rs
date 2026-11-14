@@ -126,7 +126,6 @@ pub(crate) struct EngineArgs {
     pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
     /// Keep every prefill row's logits (glm-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
-    pub full_prefill_logits: bool,
     /// Prefix-cache marks of a window-ring drafter (mtp_dspark): each holds one slot's draft
     /// windows; serve sets it from the prefix mark rule (0: no retained draft windows).
     #[arg(long, hide = true, default_value_t = 0)]
@@ -575,7 +574,6 @@ mod draft_cli_tests {
                     // before Ready, so its items hold every lane the admission
                     // charge names. Compare the scoring view.
                     let layout = cuteafd_loader::plan::layout::LayoutOptions {
-                        full_prefill_logits: true,
                         rtx_bytes: vec![96 << 30; gpus], prefill_rows: engine.prefill_rows as u64,
                         prefill_lanes: u64::from(engine.prefill_waves), prefill_waves: u64::from(engine.prefill_waves),
                         exlr8_prefill_activations: activations.parse::<PrefillActivations>().unwrap(), context_tokens: 65536,
@@ -1195,7 +1193,7 @@ impl Opened {
             requested_pool, page_tokens).maximum_tokens();
         let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
         let prefill = PrefillShape { rows: args.prefill_rows as u64, waves: prefill_lanes as u64 };
-        let operation = if args.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
+        let operation = Operation::Serving;
         let push_policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&self.snapshot)?;
         let storage = match push_policy { crate::shared::experts::rtx::push::PushPolicy::Mount => LocalStorage::Mount,
             crate::shared::experts::rtx::push::PushPolicy::Required => LocalStorage::Push };
@@ -1690,7 +1688,6 @@ impl Opened {
         engine.native_experts = native_owners;
         engine.native_scratch = native_scratch;
         engine.spark_bf16 = spark_bf16;
-        engine.full_prefill_logits = args.full_prefill_logits;
         engine.prefill_span_rows = args.prefill_span_rows;
         engine.attention_plan = attention_plan;
         if tp2_range.is_some() && exchange_f32 {
@@ -1834,7 +1831,6 @@ impl Opened {
             engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)), &admitted.graphs, &graph_bootstraps)?;
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
-        if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
         for rank in 0..admitted.graphs.ranks().len() {
             let (base, tail) = admitted.graphs.default_reserve();

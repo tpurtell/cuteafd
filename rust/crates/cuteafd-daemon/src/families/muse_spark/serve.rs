@@ -64,7 +64,6 @@ pub(crate) struct ServeArgs {
     #[arg(long)] pub prefill_rows: Option<usize>,
     #[arg(long, default_value = "unrestricted")]
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
-    /// Admit all-row prefill logits for fidelity scoring before KV sizing.
     /// Prefill units in flight on the one Spark transport; unset follows the shared policy.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: Option<u8>,

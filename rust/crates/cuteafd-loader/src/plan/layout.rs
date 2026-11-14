@@ -59,8 +59,6 @@ pub struct LayoutOptions {
     pub head_split: bool,
     /// Prefill rows per step (workspace shape; GLM 5.3 Flash: per lane).
     pub prefill_rows: u64,
-    /// Admit the probe-only all-row vocabulary output on the lead GPU.
-    pub full_prefill_logits: bool,
     /// Backend selected for BF16 target logits; native checkpoint heads override it.
     pub bf16_target_head: crate::placement::planner::serving::BlasHead,
     /// Prefill lanes (GLM 5.3 Flash); 0 selects the family default.
@@ -266,7 +264,6 @@ impl Default for LayoutOptions {
             spark_allocation_budget_bytes: None,
             head_split: true,
             prefill_rows: 0,
-            full_prefill_logits: false,
             bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             prefill_lanes: 0,
             prefill_unit_rows: None,
@@ -344,30 +341,6 @@ impl Default for LayoutOptions {
     }
 }
 
-/// Additional lead-GPU output bytes for admitted all-row fidelity probes.
-/// GLM callers with multiple admitted units use the explicit-lane variant;
-/// GLM Flash's units share one set of temporaries and one logits buffer.
-/// V4 reuses its bounded head buffer; V4.1 already supports prefill scoring.
-pub fn full_prefill_logits_bytes(family: &str, rows: u64, vocab: u64) -> u64 {
-    full_prefill_logits_bytes_with_lanes(family, rows, vocab, 1)
-}
-
-pub fn full_prefill_logits_bytes_with_lanes(family: &str, rows: u64, vocab: u64, glm_lanes: usize) -> u64 {
-    let (lanes, ordinary_rows) = match family {
-        "mimo_v2" => (1, 1),
-        "qwen4" => (1, 1),
-        "glm5" | "mistral_large4" => (glm_lanes.clamp(1, 4) as u64, rows.min(64)),
-        "glm5_flash" => (1, rows.min(64)),
-        _ => return 0,
-    };
-    let extra_rows = rows.saturating_sub(ordinary_rows);
-    let logits = extra_rows.saturating_mul(lanes).saturating_mul(vocab).saturating_mul(4);
-    // Both Qwen selection arrays have a 256-byte allocation floor already
-    // charged for the ordinary one-row head.
-    let selection = rows.saturating_mul(8).max(256).saturating_sub(256).saturating_mul(2);
-    logits.saturating_add(if family == "qwen4" { selection } else { 0 })
-}
-
 #[cfg(test)]
 mod scoring_workspace_tests {
     use super::*;
@@ -386,27 +359,7 @@ mod scoring_workspace_tests {
         assert_eq!(unmigrated.bytes, arch.context_bytes + arch.cublas_bytes + 34 * MIB);
     }
 
-    #[test]
-    fn full_rows_are_opt_in_and_reserve_the_family_output_delta() {
-        assert!(!LayoutOptions::default().full_prefill_logits);
-        assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
-        assert_eq!(full_prefill_logits_bytes("qwen4", 128, 1000), 509_536);
-        for (rows, selection) in [(1, 0), (16, 0), (32, 0), (33, 16)] {
-            assert_eq!(full_prefill_logits_bytes("qwen4", rows, 1000), (rows - 1) * 4000 + selection);
-        }
-        for lanes in 1..=4 {
-            assert_eq!(full_prefill_logits_bytes_with_lanes("glm5", 128, 1000, lanes),
-                lanes as u64 * 64 * 1000 * 4);
-        }
-        assert_eq!(full_prefill_logits_bytes("glm5_flash", 128, 1000), 64 * 1000 * 4);
-        for family in ["deepseek_v4", "deepseek_v41"] {
-            assert_eq!(full_prefill_logits_bytes(family, 2048, 1000), 0);
-        }
-        for family in ["mimo_v2", "qwen4", "glm5", "glm5_flash"] {
-            assert_eq!(full_prefill_logits_bytes(family, 1, 1000), 0);
-            assert_eq!(full_prefill_logits_bytes(family, u64::MAX, u64::MAX), u64::MAX);
-        }
-    }
+
 }
 
 /// Ring endpoints a family's coordinator opens to each selected Spark rank,
@@ -1236,7 +1189,7 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let (table_pages, table_pool_pages) = glmf_table_pages(context);
     let spark = matches!(placement, ExpertPlacement::Sparks { .. });
     let shape = GlmfStepShape { lead: true, split, local_experts: !split && rtx_experts, tp2_experts: split && rtx_experts, spark, partial_bytes: if fp32_partials { 4 } else { 2 },
-        output_shard: split && repr.output_shard, full_prefill_logits: false, table_pages, table_pool_pages };
+        output_shard: split && repr.output_shard, table_pages, table_pool_pages };
     let native = match native {
         Some(native) => native,
         None => crate::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, checkpoint).ok()?.scratch_mask(&cfg, cfg.layers),
@@ -1819,15 +1772,13 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
                 Basis::Formula);
         }
     }
-    let score_lanes = if matches!(family, "glm5_flash") { lanes } else { 1 };
-    let score_rows = if options.full_prefill_logits { rows.checked_mul(score_lanes).context("host scoring rows overflow")? }
-        else if family == "deepseek_v41" { rows.max(256) } else { 64 };
+    let score_rows = if family == "deepseek_v41" { rows.max(256) } else { 64 };
     let logits = host_logits_bytes(score_rows, rows, spec.vocab as u64).context("host logits overflow")?;
     push(Category::Workspace, "scoring/full-logits", "FP32", logits, Basis::Formula);
     if family == "qwen4" {
         // Decode and prefill arenas coexist on each owner. A peer may need
         // fewer output rows; charge the all-owner upper bound.
-        let pinned_rows = 64u64.checked_add(if options.full_prefill_logits { rows } else { 1 })
+        let pinned_rows = 64u64.checked_add(1)
             .and_then(|n| n.checked_mul(options.rtx_bytes.len() as u64))
             .context("Qwen pinned logits rows overflow")?;
         let pinned = host_logits_bytes(pinned_rows, pinned_rows, spec.vocab as u64)

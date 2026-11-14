@@ -446,7 +446,7 @@ mod default_tests {
             decode_rows: 64, max_context: 262144, mark_slots: 0,
             workspace: None, experts: Vec::new(), draft: Vec::new(), draft_half: Vec::new(), experts_half: Vec::new(),
             tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0, first_routed: 0,
-            requested_pool: Some(262144), onboard: Onboard::Layers(0), full_prefill_logits: 0,
+            requested_pool: Some(262144), onboard: Onboard::Layers(0),
             pending_code: Vec::new(), context: None, attention: None, extra: Vec::new(),
             physical_bytes: Vec::new(), host: None,
         }

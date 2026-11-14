@@ -187,7 +187,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             crate::shared::memory_report::release_load_staging(&library)?;
             loaded.engine.configure_packing(worker_args.prefill_packing)?;
             let backend = KimiBackend::new(&loaded.engine)?;
-            if crate::shared::probe::streamed_prefill_scoring("kimi_k3") {
+            {
                 cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
             }
             // The shared selector allocates on the calling thread's device and

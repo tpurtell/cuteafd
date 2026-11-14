@@ -36,7 +36,6 @@ pub(super) fn target(device: u8) -> TargetBuffers {
                 topk: 7,
             },
         )),
-        full_prefill_logits: false,
         payload_row_bytes: 0,
         core_rows: false, attention_partial_bytes: 2, down_partial_bytes: 2,
     }

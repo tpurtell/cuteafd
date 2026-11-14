@@ -33,7 +33,7 @@ pub enum MimoPrefillOutput {
 
 impl MimoPrefillOutput {
     pub fn logits_rows(self, rows: u64, decode: bool, with_head: bool) -> u64 {
-        if !with_head { 0 } else if decode || self == Self::AllRows { rows } else { 1 }
+        if !with_head { 0 } else if decode { rows } else if self == Self::AllRows { rows.min(64) } else { 1 }
     }
 }
 
@@ -203,7 +203,7 @@ impl MimoWorkspaceLayout {
             as u64;
         let page_table_rows = if options.decode { t } else { options.waves };
         let logits_rows = options.prefill_output.logits_rows(
-            if options.decode { t } else if options.prefill_output == MimoPrefillOutput::AllRows { t.max(16384) } else { t },
+            t,
             options.decode, options.with_head);
         let layout = Self {
             logits_rows,

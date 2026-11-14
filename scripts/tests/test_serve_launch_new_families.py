@@ -662,12 +662,11 @@ def test_muse_tp2_dflash_reaches_plan_and_serve(tmp_path: Path, selection, expec
     assert _flag(serve, "--tp2-dflash") == _flag(plan, "--tp2-dflash") == expected
 
 
-@pytest.mark.parametrize("setting", ["", "off", "on"])
-def test_muse_prefill_scoring_is_launch_admitted(tmp_path: Path, setting: str) -> None:
-    result = _muse(tmp_path, f"FULL_PREFILL_LOGITS={setting}\n" if setting else "")
+def test_muse_prefill_scoring_uses_ordinary_launch(tmp_path: Path) -> None:
+    result = _muse(tmp_path, "")
     serve, plan = _line(result, "serve-muse --snapshot"), _line(result, "cuteafd plan")
-    assert serve.split().count("--full-prefill-logits") == int(setting == "on")
-    assert plan.split().count("--full-prefill-logits") == int(setting == "on")
+    assert "--full-prefill-logits" not in serve
+    assert "--full-prefill-logits" not in plan
 
 
 def test_muse_forwards_speculation_trace(tmp_path: Path) -> None:

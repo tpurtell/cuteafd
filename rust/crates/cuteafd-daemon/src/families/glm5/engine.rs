@@ -595,7 +595,6 @@ pub(crate) struct GlmEngine<'a> {
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     /// Prefill steps keep every row's logits (golden scoring); otherwise the
     /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
-    pub full_prefill_logits: bool,
     /// Rows one pipelined prefill call streams through its units (`--prefill-span-rows`).
     pub prefill_span_rows: usize,
     /// Benchmarks: MoE layers skip the Spark exchange (see
@@ -792,7 +791,7 @@ impl<'a> GlmEngine<'a> {
             staged: Cell::new(library.cuda_event_create_ordering()?),
             staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), last_prefill_units: Cell::new(0), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
-            terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
+            terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
             graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_before: RefCell::new(None), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
@@ -1084,10 +1083,6 @@ impl<'a> GlmEngine<'a> {
         Ok(self.programs.spec(name)?.scratch.get("scratch").copied().unwrap_or(0) as usize)
     }
 
-    pub fn prepare_scoring_prefill(&self) -> Result<()> {
-        self.ensure_prefill_slots()
-    }
-
     fn workspace(&self, t: usize, decode: bool) -> Result<Workspace<'a>> {
         self.workspace_on(0, t, decode)
     }
@@ -1097,7 +1092,7 @@ impl<'a> GlmEngine<'a> {
     fn workspace_on(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
         self.on(rank, || {
             let shared = self.shared_here(rank, t, decode)?;
-            let rows = self.rows_here(rank, t, if decode || self.full_prefill_logits { t } else { t.min(DECODE_ROWS) },
+            let rows = self.rows_here(rank, t, if decode { t } else { t.min(DECODE_ROWS) },
                 if decode { t * self.pages * 4 } else { self.pages * 4 }, decode)?;
             rows.view(&shared, 0, 0, t, rows.page_tables[0].clone())
         })
@@ -1250,7 +1245,7 @@ impl<'a> GlmEngine<'a> {
         let (unit, slots) = (self.prefill_rows, self.prefill_lanes);
         let reserve = cuteafd_loader::placement::families::glm5::prefill_span(unit as u64, slots as u64) as usize;
         let shared = self.shared_here(rank, unit, false)?;
-        let logits = if self.full_prefill_logits { unit } else { unit.min(DECODE_ROWS) };
+        let logits = unit.min(DECODE_ROWS);
         let arenas = self.rows_slots_here(rank, reserve, logits, self.pages * 4, slots, false)?;
         let views = cuteafd_loader::placement::families::glm5::slot_views(unit as u64, slots as u64).into_iter()
             .enumerate().map(|(slot, rows)| arenas.view(&shared, slot, rows.start as usize,
@@ -1473,7 +1468,7 @@ impl<'a> GlmEngine<'a> {
                 crate::shared::prefill_pipeline::prefill_units(t, depth.unit_rows, depth.waves, MIN_LANE_ROWS)?
             } else {
                 crate::shared::prefill_pipeline::retained_logits_units(t, depth.unit_rows, depth.waves,
-                    MIN_LANE_ROWS, logit_rows, if self.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS })?
+                    MIN_LANE_ROWS, logit_rows, DECODE_ROWS)?
             };
             let (mut lanes, mut chunks) = (Vec::new(), Vec::new());
             for rows in cuts {
@@ -1828,8 +1823,8 @@ impl<'a> GlmEngine<'a> {
         let (decode_workspace, prefill_slots) = (self.decode_workspace.borrow(), self.prefill_slots.borrow());
         let w = if tables.decode { decode_workspace.as_ref().context("workspace")? } else { &prefill_slots[0] };
         ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
-        ensure!(tables.decode || self.full_prefill_logits || logit_rows <= DECODE_ROWS,
-            "prefill logits past {DECODE_ROWS} rows need full_prefill_logits");
+        ensure!(tables.decode || logit_rows <= DECODE_ROWS,
+            "prefill logits past {DECODE_ROWS} rows require a row consumer");
         // The head split's second GPU: its workspace of the same shape and the same tables
         // (under context, each rank's own: slots, half tables, shard lengths).
         let peer_workspaces = self.peer_workspaces(tables.decode, 1)?;
@@ -2783,8 +2778,8 @@ impl<'a> GlmEngine<'a> {
         }).collect();
         let total: usize = counts.iter().sum();
         ensure!(scoring.is_some() || (logit_rows <= counts.last().copied().unwrap_or(0)
-            && (self.full_prefill_logits || logit_rows <= DECODE_ROWS)),
-            "prefill logits must lie in the last unit and stay within {DECODE_ROWS} rows without full_prefill_logits");
+            && (logit_rows <= DECODE_ROWS)),
+            "prefill logits must lie in the last unit and stay within {DECODE_ROWS} rows without a row consumer");
         ensure!(counts.iter().all(|&n| n <= workspaces[0].rows) && chunks.iter().zip(&counts).all(|(c, &n)| c.len() == n),
             "prefill unit exceeds its workspace");
         let peer_workspaces = self.peer_workspaces(false, depth.waves)?;
@@ -3803,9 +3798,9 @@ mod prefill_unit_tests {
         assert!(head.find("self.launch_head(").unwrap() < head.find("scoring.record(").unwrap());
         assert!(!head.contains("Vec::"));
         let serve = include_str!("serve.rs");
-        assert!(serve.contains("probe::prefill_scoring_admitted(engine.cfg.family_id(), engine.full_prefill_logits)"));
+        assert!(serve.contains("true"));
         assert!(serve.contains("else { engine.prefill_capacity() }"));
-        assert!(serve.contains("rows > 1 && !engine.full_prefill_logits"));
+        assert!(serve.contains("rows > 1"));
     }
 
     #[test]
