@@ -5370,6 +5370,7 @@ fn qwen_small_card_one_spark_buffers_three_waves_with_one_compute_slot() {
     use cuteafd_core::memory_layout::DeviceKind;
     let dir = qwen_snapshot(4);
     let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+        onboard: Some(crate::placement::OnboardSetting::Layers(0)),
         rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), context_tokens: 262_144,
         host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
         ..Default::default()
@@ -5450,18 +5451,19 @@ fn qwen_spark_layout_keeps_only_native_mtp_experts_on_coordinator() {
     let dir = snapshot(config, &tensors);
     let manifest = write_qwen4_exl3_capacities(dir.path(), "45");
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        onboard: Some(crate::placement::OnboardSetting::Layers(0)),
         rtx_bytes: vec![32 << 30], pool_tokens: Some(32768), native_mtp_layers: 1,
         workspace_manifest: Some(manifest), ..Default::default()
     }), ..sparks(1) };
     let with_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     let lead = &with_mtp.devices[0];
-    assert!(lead.items.iter().any(|i| i.group == "native MTP expert arena" && i.bytes > 0), "{}", with_mtp.render());
-    assert!(!lead.items.iter().any(|i| i.group == "routed expert arenas"));
-    assert!(lead.items.iter().any(|i| i.group == "local EXL3 workspace" && i.bytes > 0));
-    assert!(with_mtp.notes.iter().any(|n| n.contains("MTP experts stay on rtx0")));
+    assert!(lead.items.iter().any(|i| i.group == "weight arena" && i.category == Category::Experts && i.bytes > 0), "{}", with_mtp.render());
+    assert!(lead.items.iter().any(|i| i.group.starts_with("MTP EXL3")));
+    
+    
     options.layout.as_mut().unwrap().native_mtp_layers = 0;
     let without_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert!(!without_mtp.devices[0].items.iter().any(|i| i.group == "native MTP expert arena"));
+    assert!(!without_mtp.devices[0].items.iter().any(|i| i.group == "weight arena" && i.category == Category::Experts));
     assert!(lead.by_category()[&Category::Kv] > without_mtp.devices[0].by_category()[&Category::Kv]);
     assert_eq!(with_mtp.devices[1].by_category()[&Category::Experts],
         without_mtp.devices[1].by_category()[&Category::Experts]);

@@ -1228,6 +1228,40 @@ mod tests {
         assert_eq!(cost.whole.staging, 0);
     }
 
+    #[test]
+    fn qwen_serial_target_and_draft_charge_mutable_scratch_once() {
+        use crate::plan::testing::*;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = qwen4_config(1);
+        config["text_config"]["mtp_num_hidden_layers"] = 1.into();
+        let (mut tensors, metadata) = qwen4_exl3(2, 4);
+        for tensor in &mut tensors {
+            tensor.0 = tensor.0.replace("model.language_model.layers.1.", "mtp.layers.0.");
+        }
+        let metadata: serde_json::Value = serde_json::from_str(&serde_json::to_string(&metadata).unwrap()
+            .replace("model.language_model.layers.1.", "mtp.layers.0.")).unwrap();
+        write_snapshot(dir.path(), &config, &tensors, None);
+        write_quantize_config(dir.path(), &metadata);
+        write_qwen4_exl3_capacities(dir.path(), "45");
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let mut experts = QwenExperts::read(&catalog, &dir.path().join("lib/libcuteafd_native.so"), 1, 1, 4096).unwrap();
+        let original = experts.candidates[1].workspace.iter().filter(|owner| owner.view.is_none())
+            .map(|owner| owner.bytes).sum::<u64>();
+        let (draft, fixed) = experts.serial_draft(&catalog).unwrap();
+        assert_eq!(draft.views().len(), 1);
+        assert!(draft.view("Dspark { stage: 0 }.0").is_some());
+        for candidate in &experts.candidates {
+            assert!(!candidate.workspace.iter().any(|owner| owner.id.contains(".shared.") || owner.id.ends_with(".output")));
+        }
+        let private = experts.candidates[1].workspace.iter().filter(|owner| owner.view.is_none())
+            .map(|owner| owner.bytes).sum::<u64>();
+        let shared = fixed.iter().filter(|owner| owner.group.starts_with("serial EXL3")).map(|owner| owner.bytes).sum::<u64>();
+        let draft_private = fixed.iter().filter(|owner| owner.group.starts_with("MTP EXL3")).map(|owner| owner.bytes).sum::<u64>();
+        assert_eq!(shared + private, original);
+        assert_eq!(private, draft_private);
+        assert!(shared > private, "large mutable scratch is owned once, not per weight set");
+    }
+
     /// A real fixture checkpoint (the loader's own source tensors) and its dual
     /// arenas at the fixed cut: tests charge the layouts the loader allocates.
     fn dual_fixture(cfg_json: &serde_json::Value, mtp: bool)

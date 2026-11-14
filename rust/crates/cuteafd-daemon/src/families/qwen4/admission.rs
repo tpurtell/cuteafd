@@ -583,6 +583,7 @@ mod tests {
             }
             let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(&config)?;
             let mut tensors = testing::qwen4_coordinator(&config, false);
+            tensors.extend(testing::qwen4_exl3(4, 4).0);
             if mapped_ple {
                 tensors.push(testing::t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
                     "F8_E4M3", &[100, 160]));
@@ -1022,21 +1023,20 @@ mod tests {
             let weights = super::dual_weights(&args, &checkpoint, &cfg, 4, mtp)?;
             let experts = super::dual_experts(&args, &catalog, 4)?;
             let mut fixed = weights.fixed;
-            fixed.extend(experts.transport);
             if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, args.prefill_rows as u64)?); }
             let admission = super::inputs(&args, &cfg, 4, mtp, Some(&manifests[0]), None, 0)?;
             let host_embedding = if host {
                 u64::try_from(cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint)?)?
             } else { 0 };
             let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs {
-        experts: None,        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
+        experts: Some(qwen4::QwenExperts::read(&catalog, &lib, 4, 2, args.prefill_rows.max(64) as u64)?), blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072), owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
                     reserve_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
                         - layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
                             .map(|item| item.bytes).sum::<u64>() } }),
                 arenas: &weights.arenas, layer_experts: &experts.costs,
-                layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace,
+                layer_extra: &weights.layer_extra, fixed, tp2_workspace: [0; 2],
                 pending_code_bytes: [0; 2], mark_slots: 0, max_context: 131072, requested_pool: None,
                 spark_ranks: 0, onboard: Onboard::Auto,
                 host: super::host_owners_with_memory(&args, &cfg, 4, mtp, 2, 0, false, None,

@@ -1111,6 +1111,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn serial_workspace_refuses_different_stream_or_device_with_typed_error() {
+        let stream = 16usize as *mut c_void;
+        let arena = Exl3Workspace { allocations: BTreeMap::new(), dtypes: BTreeMap::new(),
+            serial: Some((1, stream)), output: None };
+        assert!(arena.validate_stream(1, stream).is_ok());
+        for (device, stream) in [(0, stream), (1, 32usize as *mut c_void)] {
+            let error = arena.validate_stream(device, stream).unwrap_err();
+            assert!(matches!(error.downcast_ref::<SharedWorkspaceError>(), Some(SharedWorkspaceError::ExecutionOwner)));
+        }
+    }
+
+    #[test]
     fn planned_residency_refuses_mismatched_code_before_allocation() -> Result<()> {
         use cuteafd_loader::{V41Exl3Layer, V41Exl3Residency, V41Exl3ResidentBuffer};
         use cuteafd_core::tp_units::{RankUnits, UnitRule};

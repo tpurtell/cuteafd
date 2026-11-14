@@ -138,8 +138,12 @@ impl Opened {
         };
         let mtp = if let Some(serial) = serial {
             let package = whole_package(args, catalog)?;
+            let draft_weight = catalog.exl3().context("Qwen EXL3 draft headers")?
+                .residency(cuteafd_loader::V41Exl3Layer::Dspark(0), 1, 0)?.device_arena_layout()?.1;
+            let workspace = Exl3Tp2::whole_workspace_bytes(&package, rows,
+                cuteafd_core::ExpertGeometry::QWEN4, RtxSelectionPolicy::CanonicalDecode)?;
             let weights = rtx::exl3::Exl3Tp2Weights::draft(devices[0], catalog, &package, 0,
-                rows, admitted.draft_budget, None)?;
+                rows, draft_weight + workspace, None)?;
             // SAFETY: the target binding above and this draft use the same owner stream.
             let backend = unsafe { weights.execution_serial(serial, streams[0])? };
             use cuteafd_loader::plan::family::Family;
