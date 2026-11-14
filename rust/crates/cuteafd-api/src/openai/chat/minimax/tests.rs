@@ -129,16 +129,44 @@ fn optional_reasoning_constraint_uses_native_minimax_tokens() {
 }
 
 #[test]
-fn strict_tool_decoding_refuses_until_a_native_xml_grammar_lands() {
+fn strict_tool_decoding_uses_native_recursive_xml_grammar() {
     use crate::openai::tools::{ToolConstraints, ToolSyntax};
     use deepseek_recipe_core::tools::ToolChoice;
     let mut tool = lookup();
     assert!(ToolConstraints::new(&[tool.clone()], ToolChoice::Auto, false, true, false,
         ToolSyntax::MiniMaxXml).unwrap().unwrap().format.is_none());
     tool.strict = Some(true);
-    let error = ToolConstraints::new(&[tool], ToolChoice::Auto, false, true, false,
-        ToolSyntax::MiniMaxXml).err().unwrap();
-    assert!(error.to_string().contains("MiniMax constrained tool decoding not yet available"));
+    let constraints = ToolConstraints::new(&[tool.clone()], ToolChoice::Auto, false, true, false,
+        ToolSyntax::MiniMaxXml).unwrap().unwrap();
+    let grammar = constraints.format.unwrap().to_string();
+    assert!(grammar.contains("minimax_tool_schema"));
+    assert!(!grammar.contains("muse_tool_schema") && !grammar.contains("style"));
+    tool.strict = Some(false);
+    let assisted = ToolConstraints::new(&[tool.clone()], ToolChoice::Auto, false, true, true,
+        ToolSyntax::MiniMaxXml).unwrap().unwrap();
+    let format = assisted.format.unwrap();
+    assert_eq!(format["content"]["tags"][0]["content"]["json_schema"], tool.parameters,
+        "MiniMax keeps declared types even for non-strict assistance");
+    assert_eq!(assisted.triggered.unwrap()["triggers"][0], CALL_OPEN);
+}
+
+#[test]
+fn coding_agent_optional_nullable_schema_is_constrained_and_oneof_falls_back() {
+    use crate::openai::tools::{ToolConstraints, ToolSyntax};
+    use deepseek_recipe_core::tools::ToolChoice;
+    let mut tool = lookup();
+    tool.parameters = json!({"type":"object", "properties":{"command":{"type":"string"},
+        "timeout_ms":{"anyOf":[{"type":"integer"},{"type":"null"}]}},"required":["command","timeout_ms"]});
+    let supported = ToolConstraints::new(&[tool.clone()], ToolChoice::Auto, false, true, true,
+        ToolSyntax::MiniMaxXml).unwrap().unwrap();
+    assert!(supported.format.unwrap().to_string().contains("minimax_tool_schema"));
+    tool.parameters["properties"]["timeout_ms"] = json!({"oneOf":[{"type":"integer"},{"type":"null"}]});
+    let fallback = ToolConstraints::new(&[tool.clone()], ToolChoice::Auto, false, true, true,
+        ToolSyntax::MiniMaxXml).unwrap().unwrap();
+    assert!(fallback.format.is_none() && fallback.triggered.is_none());
+    let required = ToolConstraints::new(&[tool], ToolChoice::Auto, true, true, true,
+        ToolSyntax::MiniMaxXml).unwrap().unwrap();
+    assert!(required.format.unwrap().to_string().contains("oneOf"), "native build clearly refuses required unsupported schemas");
 }
 
 #[test]

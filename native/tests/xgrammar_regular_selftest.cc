@@ -1,4 +1,6 @@
 #include "xgrammar_regular.h"
+#include "xgrammar_minimax_tools.h"
+#include <picojson.h>
 #include <xgrammar/xgrammar.h>
 #include <iostream>
 #include <stdexcept>
@@ -75,5 +77,26 @@ int main() {
     V41RegularFSM(Grammar::FromEBNF("root ::= \"\" | \"a\" root \"b\"\n"));
   } catch (const std::invalid_argument&) { rejected = true; }
   if (!rejected) throw std::runtime_error("non-regular recursion accepted");
+  // MiniMax M3 recursively serializes XML, not upstream kMiniMaxXML.
+  picojson::value schema;
+  auto error = picojson::parse(schema, R"({"type":"object","properties":{"s":{"type":"string"},"n":{"type":"integer","minimum":1,"maximum":7},"nested":{"type":"object","properties":{"flag":{"type":"boolean"}},"required":["flag"],"additionalProperties":false},"rows":{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":2}},"required":["s","n","nested","rows"],"additionalProperties":false})");
+  if (!error.empty()) throw std::runtime_error(error);
+  auto minimax = compiler.CompileGrammar(Grammar::FromEBNF(MiniMaxToolSchemaToEBNF(schema, true)));
+  const std::string ns = "]<]minimax[>[";
+  const std::string valid = ns + "<s>001" + ns + "</s>" + ns + "<n>3" + ns + "</n>" + ns + "<nested>" + ns + "<flag>true" + ns + "</flag>" + ns + "</nested>" + ns + "<rows>" + ns + "<item>1" + ns + "</item>" + ns + "<item>2" + ns + "</item>" + ns + "</rows>";
+  if (!Accept(minimax, valid)) throw std::runtime_error("MiniMax template XML rejected");
+  auto bad = valid;
+  bad.replace(bad.find("<n>3"), 4, "<n>9");
+  if (Accept(minimax, bad) || Accept(minimax, valid + valid)) throw std::runtime_error("invalid MiniMax XML accepted");
+  auto refuse = [&](const std::string& text) {
+    picojson::value input;
+    if (!picojson::parse(input, text).empty()) throw std::runtime_error("invalid test schema");
+    bool refused = false;
+    try { MiniMaxToolSchemaToEBNF(input, true); } catch (const std::invalid_argument&) { refused = true; }
+    if (!refused) throw std::runtime_error("unrepresentable MiniMax schema accepted");
+  };
+  refuse(R"({"type":"object","properties":{"nil":{"type":"null"}},"required":["nil"]})");
+  refuse(R"({"type":"object","required":["unknown"],"additionalProperties":true})");
+  refuse(R"({"type":"object","minProperties":1,"additionalProperties":true})");
   std::cout << "regular grammar checks passed: " << checked << " language comparisons\n";
 }
