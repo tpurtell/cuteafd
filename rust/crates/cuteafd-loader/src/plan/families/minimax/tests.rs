@@ -1450,6 +1450,11 @@ fn heads_recipe_fixture_with_experts(experts: usize) -> (tempfile::TempDir, crat
     inputs.owners.clear();
     let mut manifest = (*inputs.manifest).clone();
     let programs = manifest["programs"].as_array_mut().unwrap();
+    // Heads planning still selects the whole-width OAI producer inventory.
+    for (half, whole) in [(1536, 3072), (6144, 12288)] {
+        let entry = programs.iter_mut().find(|e| e["name"] == format!("minimax_oai_split_i{half}")).unwrap();
+        *entry = serde_json::from_str(&entry.to_string().replace(&half.to_string(), &whole.to_string())).unwrap();
+    }
     let mut exports = std::collections::BTreeMap::new();
     for target in &inputs.targets {
         for entry in dense_manifest(target)["programs"].as_array().unwrap() {
