@@ -193,6 +193,10 @@ impl GatheredPrefill {
 pub(crate) trait GatheredKernels {
     fn gather(&mut self, owner: usize) -> Result<()>;
     fn produce(&mut self) -> Result<()>;
+    /// Selection for layers that index a history split across the pair.
+    /// Called once per unit after both gathers and `produce`, enqueue-only:
+    /// the exchange rides the context candidate buffers and no host wait.
+    fn select(&mut self) -> Result<()> { Ok(()) }
     fn attention(&mut self) -> Result<()>;
     fn commit(&mut self) -> Result<()>;
     fn output(&mut self) -> Result<()>;
@@ -201,6 +205,7 @@ pub(crate) trait GatheredKernels {
 pub(crate) fn gathered_prefill_with(kernels: &mut impl GatheredKernels) -> Result<()> {
     for owner in 0..2 { kernels.gather(owner)?; }
     kernels.produce()?;
+    kernels.select()?;
     kernels.attention()?;
     kernels.commit()?;
     kernels.output()
