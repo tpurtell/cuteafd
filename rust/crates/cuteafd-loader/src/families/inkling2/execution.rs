@@ -32,7 +32,8 @@ impl UnitLayout {
         add("global_mixes", 3 * cfg.hidden, 4)?;
         for (name, width, bytes) in [("q", 6144, 4), ("r", 768, 4), ("k", 1024, 4), ("v", 1024, 4),
             ("q_clipped", 6144, 4), ("r_clipped", 768, 4), ("k_clipped", 1024, 4), ("v_norm", 1024, 4),
-            ("q_bf16", 6144, 2), ("relative_input", 768, 2), ("relative", 48 * 1024, 2),
+            ("q_bf16", 6144, 2), ("relative_source", 768, 2), ("relative_input", 48*64, 2), ("relative", 48 * 1024, 2),
+            ("relative_f32", 48*1024, 4), ("conv_k", 1024, 4), ("conv_v", 1024, 4),
             ("gate", 6144, 4), ("sinks", 48, 4), ("attended", 6144, 2), ("gated", 6144, 2),
             ("kv_step", 2048, 2), ("k_dynamic", 32, 4), ("v_dynamic", 32, 4),
             ("route_logits", cfg.experts, 4), ("route_ids", cfg.topk, 4), ("route_weights", cfg.topk, 4),
