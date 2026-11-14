@@ -750,6 +750,12 @@ int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
 int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src,
                            size_t bytes, void *stream) {
     if (bytes > dst.bytes || bytes > src.bytes) return 1;
+    if (peer_model && dst.device_id != src.device_id) {
+        if (src.device_id != current_device) return 1;
+        event('c');
+        return peer_model_enqueue((struct peer_model_op){ .stream = stream, .dst = dst.ptr,
+            .src = src.ptr, .bytes = bytes, .kind = 0 });
+    }
     if (!immediate_copies) return cuteafd_copy_h2d_async(dst, src.ptr, bytes, stream);
     if (dst.device_id != current_device) return 1;
     memcpy(dst.ptr, src.ptr, bytes);
@@ -759,7 +765,7 @@ int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src,
 
 int cuteafd_copy_peer_async(struct device_buffer dst, struct device_buffer src,
     size_t bytes, void *stream) {
-    if (!peer_model || bytes > dst.bytes || bytes > src.bytes) return 1;
+    if (!peer_model || bytes > dst.bytes || bytes > src.bytes || dst.device_id != current_device) return 1;
     event('c');
     return peer_model_enqueue((struct peer_model_op){ .stream = stream, .dst = dst.ptr,
         .src = src.ptr, .bytes = bytes, .kind = 0 });

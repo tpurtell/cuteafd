@@ -278,7 +278,7 @@ impl<'a> SplitExecution<'a> {
                     "MiniMax split transfer differs from charged destination");
                 // SAFETY: admitted unit planes stay leased through the matching
                 // wait and release handshake; source FIFO orders all producers.
-                unsafe { source.stream.device.library.copy_peer_async(dst, src, bytes, source.stream.raw)?; }
+                unsafe { source.stream.device.library.copy_d2d_async(dst, src, bytes, source.stream.raw)?; }
             }
             // SAFETY: disjoint persistent 16-byte channel, with payload copies
             // preceding its system-scope signal on this source stream.
@@ -1263,6 +1263,14 @@ mod tests {
                 let a = storage.ranks[0].decode.borrow();
                 let b = storage.ranks[1].decode.borrow();
                 let units = [&*a, &*b];
+                let local = a.split_plane("local")?;
+                let receive = b.split_plane("receive")?;
+                let wrong_copy = a.stream.device.run(|| {
+                    // SAFETY: buffers/stream are live; deliberately wrong current
+                    // device for the destination-stream-only peer-copy API.
+                    unsafe { library.copy_peer_async(receive, local, 16, a.stream.raw) }
+                });
+                assert!(wrong_copy.is_err(), "CPU model must reject source-stream copy_peer_async");
                 let first = fixture.events()?.len();
                 split.partials(units, 1)?;
                 let trace = fixture.events()?[first..].chars().filter(|ch| "pw".contains(*ch)).collect::<String>();
