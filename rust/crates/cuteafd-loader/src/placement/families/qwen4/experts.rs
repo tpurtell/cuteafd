@@ -124,8 +124,9 @@ impl QwenExperts {
     /// Minimal existing PeerExchange: one 256-byte receive/control/abort request
     /// per rank, retained as the residual hop terminal owner without RTX experts.
     pub fn terminal_owners() -> Vec<Allocation> {
-        (0..2).flat_map(|rank| ["receive", "control", "abort"].map(|name|
-            Allocation::buffer(format!("qwen.terminal.{rank}.{name}"), Location::coordinator(rank),
+        (0..2).flat_map(|rank| ["receive", "control", "abort"].into_iter()
+            .chain(crate::serving_capacity::peer_wait_diagnostics().then_some("progress"))
+            .map(move |name| Allocation::buffer(format!("qwen.terminal.{rank}.{name}"), Location::coordinator(rank),
                 256, PlanLifetime::RESIDENT, Category::Transport, "Qwen terminal exchange"))).collect()
     }
 
@@ -163,6 +164,15 @@ impl QwenExperts {
         let mut owners = components.split_off(first_component);
         crate::placement::planner::fixed_request_tails(&mut owners, maximum, &[])?;
         components.extend(owners);
+        Ok(())
+    }
+
+    pub fn remote(&self, sparks: usize, variables: &mut Vec<Variable>) -> Result<(), Refusal> {
+        if sparks > 8 { return Err(Refusal::InvalidFact("Qwen supports at most eight Spark ranks".into())); }
+        if sparks > 0 {
+            variables.push(Variable::ExpertHome { layers: self.layers.clone(),
+                rank_sets: vec![(0..sparks as u8).collect()] });
+        }
         Ok(())
     }
 

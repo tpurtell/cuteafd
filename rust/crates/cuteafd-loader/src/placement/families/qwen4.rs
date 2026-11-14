@@ -448,6 +448,7 @@ impl Recipe for QwenSingle<'_> {
         if let Some(experts) = &inputs.experts {
             let variable = variables.len();
             experts.extend(&mut variables, &mut components, self.maximum_pages)?;
+            experts.remote(inputs.spark_ranks, &mut variables)?;
             requires.extend(experts.requirements(inputs.spark_ranks, variable));
         }
         inputs.encoders.extend(&mut variables, &mut components, 1, inputs.blas_head, self.maximum_pages)?;
@@ -1182,6 +1183,7 @@ impl Recipe for QwenDual<'_> {
         if let Some(experts) = &inputs.experts {
             let variable = variables.len();
             experts.extend(&mut variables, &mut components, self.maximum_pages)?;
+            experts.remote(inputs.spark_ranks, &mut variables)?;
             requires.extend(experts.requirements(inputs.spark_ranks, variable));
         } else {
             variables.push(Variable::Onboard { layers: (0..a.layers).collect(),
@@ -1245,6 +1247,80 @@ mod tests {
         let arenas = dual_arenas(&checkpoint, &cfg, &dual_owners(cfg.layers), mtp,
             Qwen4Representation::default(), 0).unwrap();
         (dir, arenas)
+    }
+
+    fn hybrid_fixture(gpus: usize, layers: usize) -> QwenExperts {
+        QwenExperts { layers: (0..layers).collect(), destinations: (0..gpus as u8).collect(),
+            candidates: (0..=layers).map(|count| ExpertCandidate {
+                layers: (0..count).collect(),
+                arenas: if count == 0 { vec![] } else { (0..gpus).map(|rank| (rank,
+                    crate::serving_capacity::WeightArenaLayout::new(format!("qwen.test.experts.{rank}"),
+                        (0..count).map(|layer| (layer.to_string(), 1usize << 30))).unwrap())).collect() },
+                workspace: if count == 0 && gpus == 2 { QwenExperts::terminal_owners() } else { vec![] },
+            }).collect() }
+    }
+
+    #[test]
+    fn qwen_hybrid_dual_pins_route_exact_prefixes_and_zero_keeps_only_terminal() {
+        let config = crate::plan::testing::qwen4_config(4);
+        let cfg = Qwen4Config::from_hf(&config).unwrap();
+        let (_dir, arenas) = dual_fixture(&config, false);
+        let costs = vec![Some(tp2_cost()); 4];
+        let extra = vec![vec![]; 4];
+        for count in 0..=4 {
+            let inputs = QwenDualInputs { experts: Some(hybrid_fixture(2, 4)),
+                blas_head: crate::placement::planner::serving::BlasHead::Native,
+                resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
+                admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
+                    kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 8,
+                    mark_bytes: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
+                owner_manifests: [None; 2],
+                gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 0,
+                    baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2],
+                arenas: &arenas, layer_experts: &costs, layer_extra: &extra, fixed: vec![],
+                tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
+                max_context: 131072, requested_pool: Some(131072), spark_ranks: 4,
+                onboard: Onboard::Layers(count), host: QwenHost::ample(&cfg, 2, 4096).unwrap(),
+                encoders: Default::default() };
+            let (placement, solved) = dual_admitted(&inputs).unwrap();
+            assert_eq!(placement.onboard_layers, count);
+            assert_eq!(solved.decisions.onboard_layers, vec![(0..count).collect::<Vec<_>>(); 2]);
+            assert_eq!(placement.layers.iter().map(|layer| layer.experts).collect::<Vec<_>>(),
+                (0..4).map(|layer| if layer < count { ExpertHome::RtxTp2 } else { ExpertHome::Spark }).collect::<Vec<_>>());
+            let terminal = solved.facts.allocations.iter().filter(|allocation|
+                allocation.group == "Qwen terminal exchange").collect::<Vec<_>>();
+            if count == 0 {
+                assert!(placement.tp2.is_none());
+                assert_eq!(terminal.len(), QwenExperts::terminal_owners().len());
+                assert_eq!(terminal.iter().map(|owner| owner.bytes).sum::<u64>(),
+                    QwenExperts::terminal_owners().len() as u64 * 256);
+                assert!(!solved.facts.allocations.iter().any(|allocation| allocation.id.starts_with("qwen.test.experts")));
+            } else {
+                assert_eq!(placement.tp2.unwrap().layers, count);
+                assert!(terminal.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn qwen_hybrid_single_auto_is_pool_first_and_explicit_pins_refuse() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        let mut inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+            4, Some(131072), ResidentWeights(0), None);
+        inputs.experts = Some(hybrid_fixture(1, 4));
+        let target = placement(&inputs).unwrap();
+        assert_eq!(target.onboard_layers, 4);
+        inputs.capacity_bytes = target.items[0].iter().map(|item| item.bytes).sum::<u64>() - (1 << 29);
+        inputs.baseline = Baseline::Measured { free_bytes: inputs.capacity_bytes };
+        let smaller = placement(&inputs).unwrap();
+        assert_eq!(smaller.pool_tokens, target.pool_tokens);
+        assert!(smaller.onboard_layers < target.onboard_layers);
+        inputs.onboard = Onboard::Layers(4);
+        assert!(placement(&inputs).is_err());
+        inputs.onboard = Onboard::Layers(0);
+        assert_eq!(placement(&inputs).unwrap().onboard_layers, 0);
+        inputs.spark_ranks = 0;
+        assert!(placement(&inputs).is_err());
     }
 
     #[test]
