@@ -972,7 +972,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
     let matrix: serde_json::Value = serde_json::from_slice(
         &std::fs::read(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
     let retired = retired_configs(&matrix);
-    // Original detector baseline, extended with verified published MC configurations.
+    // Original detector baseline, extended with verified published MC configurations
+    // and the deliberately added pinned MiniMax qualification checkpoint (#2081).
     let baseline: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/family-detection-devd6aecfcb7.json")).unwrap();
     let expected = baseline["results"].as_array().unwrap().iter().map(|entry|
@@ -1019,7 +1020,10 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         let pinned = expected.get(&(model.as_str(), revision.as_str()))
             .unwrap_or_else(|| panic!("add verified baseline family for {model}@{revision}"));
         assert_eq!(detected, *pinned, "{model}@{revision}: changed from devd6aecfcb7");
-        assert_ne!(detected, "minimax_m3");
+        let is_minimax = model == "MiniMaxAI/MiniMax-M3.1-Flash"
+            && revision == "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e";
+        assert_eq!(detected == "minimax_m3", is_minimax,
+            "only the deliberately pinned MiniMax entry may detect as minimax_m3");
         eprintln!("{model}@{revision}: {detected}");
         installed.insert((model, revision));
         tested += 1;
@@ -1028,8 +1032,8 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
     assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
         .collect::<std::collections::BTreeSet<_>>(), expected_installed);
-    assert_eq!(tested, 29, "installed checkpoint revision set changed");
-    eprintln!("family detection baselined6aecfcb7: {tested} installed checkpoint revisions unchanged");
+    assert_eq!(tested, 30, "installed checkpoint revision set changed");
+    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax entry (#2081): {tested} installed checkpoint revisions verified");
 }
 
 fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<String> {
