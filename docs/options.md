@@ -246,6 +246,14 @@ support draft/MTP comparisons or `--save-logits`.
 | `WIP_INSTANCE`, `WIP_ROOT` | unset | instance / absolute path | `--wip` slot staging. |
 | `CUTEAFD_EXPORT_HOST`, `WIP_BUILD_SEED` | empty / `kakapo` | host / seed | Site build settings; every launch path accepts them. |
 
+A local `scripts/build/build-dev-images.sh` rebuild immediately moves the shared
+coordinator and Spark default image tags, even before its branch merges. Existing
+containers retain their old images; rebuild them with `./wip.sh --refresh-containers`
+when adopting the new toolchain. Each WIP build pins immutable per-host image IDs
+for its entire invocation, including container creation, native cache keys and
+sealed metadata, so a concurrent default-tag move cannot change its build inputs.
+Versioned `tc-*` image tags remain available for older checkouts.
+
 ## Hardware placement
 
 | Key | Default | Values | Notes |
