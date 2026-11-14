@@ -309,8 +309,6 @@ impl Manifest {
     }
 }
 
-/// Mutually exclusive capacity specializations in one lane may reuse data
-/// scratch. Persistent synchronization state remains private to each kernel.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SharedWorkspaceError {
     #[error("shared EXL3 workspace device or serialized stream differs")]
@@ -319,6 +317,8 @@ pub(crate) enum SharedWorkspaceError {
     Buffer { name: String, bytes: usize, dtype: String },
 }
 
+/// Mutually exclusive capacity specializations and opt-in weight sets reuse
+/// mutable scratch. Kernel counters and LUT bindings remain independently owned.
 pub(crate) struct Exl3Workspace<'a> {
     allocations: BTreeMap<String, DeviceAllocation<'a>>,
     dtypes: BTreeMap<String, String>,
@@ -1072,6 +1072,7 @@ impl<'a> Exl3Execution<'a> {
     pub(crate) unsafe fn launch_layer_core(&mut self, layer: usize, inputs: [CuteafdDeviceBuffer; 3], rows: usize,
         stream: *mut c_void) -> Result<PartialSources> {
         let mut inputs = inputs;
+        if let Some(shared) = &self._shared_workspace { shared.validate_stream(self.device, stream)?; }
         ensure!(rows > 0 && rows <= self.capacity, "EXL3 live rows exceed capacity");
         ensure!(self.library.cuda_get_device()? == self.device, "EXL3 execution on wrong device");
         for (buffer, bytes) in inputs.iter().zip([
