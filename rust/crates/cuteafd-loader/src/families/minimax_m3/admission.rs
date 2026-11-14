@@ -162,10 +162,18 @@ pub fn spark_charges(checkpoint: &crate::plan::Checkpoint, catalog: &crate::Offi
     }).collect()
 }
 
-fn measured_graph_base(gpus: usize, sequences: u64) -> (u64, u64) {
-    if gpus == 1 && sequences == 16 {
-        (41_943_040, 2 << 20)
-    } else { (0, 0) }
+fn measured_graph_base(gpus: usize, sequences: u64, rank: usize,
+    attention: crate::placement::AttentionPlacement, wire: Option<super::execution::WirePrecision>) -> (u64, u64) {
+    use crate::placement::AttentionPlacement;
+    use super::execution::WirePrecision;
+    match (gpus, sequences, rank, attention, wire) {
+        (1, 16, 0, AttentionPlacement::Heads, _) => (41_943_040, 2 << 20),
+        // TP2 C16 startup at 5b7dd075a: 531/360 peer-spanning sections,
+        // measured Ready graph owners 62/42 MiB; one physical tail each.
+        (2, 16, 0, AttentionPlacement::Layers, Some(WirePrecision::F32)) => (65_011_712, 2 << 20),
+        (2, 16, 1, AttentionPlacement::Layers, Some(WirePrecision::F32)) => (44_040_192, 2 << 20),
+        _ => (0, 0),
+    }
 }
 
 #[cfg(test)]
@@ -174,13 +182,40 @@ mod graph_tests {
 
     #[test]
     fn measured_c16_whole_graph_base_has_one_standard_tail_and_no_arena_margin() {
-        let (base, tail) = measured_graph_base(1, 16);
+        let (base, tail) = measured_graph_base(1, 16, 0, crate::placement::AttentionPlacement::Heads, None);
         assert_eq!((base, tail), (41_943_040, 2_097_152));
         let resolved = crate::placement::graph_reserve::resolve(None, 0, false, base, tail).unwrap();
         assert_eq!(resolved.base_bytes, 44_040_192);
         assert_eq!(resolved.bytes, 88_080_384);
-        for shape in [(2, 16), (1, 64), (1, 3)] {
-            assert_eq!(measured_graph_base(shape.0, shape.1), (0, 0));
+        for shape in [(2, 64, 0), (1, 64, 0), (1, 3, 0), (2, 16, 2)] {
+            assert_eq!(measured_graph_base(shape.0, shape.1, shape.2,
+                crate::placement::AttentionPlacement::Heads, None), (0, 0));
+        }
+    }
+
+    #[test]
+    fn measured_c16_split_graphs_charge_each_rank_once_through_shared_extra() {
+        for (rank, measured, expected_base) in [(0, 65_011_712, 64 << 20), (1, 44_040_192, 44 << 20)] {
+            let (base, tail) = measured_graph_base(2, 16, rank,
+                crate::placement::AttentionPlacement::Layers, Some(super::super::execution::WirePrecision::F32));
+            assert_eq!((base, tail), (measured, 2 << 20));
+            let resolved = crate::placement::graph_reserve::resolve(None, rank, false, base, tail).unwrap();
+            assert_eq!(resolved.base_bytes, expected_base);
+            assert_eq!(resolved.bytes, expected_base * 2);
+        }
+    }
+
+    #[test]
+    fn untraced_split_attention_or_wire_never_borrows_layers_base() {
+        use crate::placement::AttentionPlacement;
+        use super::super::execution::WirePrecision;
+        for rank in 0..2 {
+            for attention in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+                assert_eq!(measured_graph_base(2, 16, rank, attention, Some(WirePrecision::F32)), (0, 0));
+            }
+            for wire in [None, Some(WirePrecision::Bf16)] {
+                assert_eq!(measured_graph_base(2, 16, rank, AttentionPlacement::Layers, wire), (0, 0));
+            }
         }
     }
 }
@@ -280,10 +315,10 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
             // The measured sample follows module loading: only what it has not seen.
             Coordinator::Measured { loaded_code, .. } => loaded_code.get(gpu).copied().unwrap_or(0),
         });
-        // SM120 whole-rank C16 + TP3 trace e78eb75b0 (#1856): all reachable
-        // rows 1/4/16 prewarmed; C1/C16 decode had zero captures/evictions.
-        // Untraced rank/concurrency shapes borrow neither this base nor pins.
-        let (base, tail) = measured_graph_base(gpus, request.sequences);
+        // SM120 C16 rows 1/4/16: whole-rank TP3 at e78eb75b0 and split TP4
+        // at 5b7dd075a (#1856). Each rank charges its own measured graph owner.
+        // Untraced rank/concurrency shapes borrow neither these bases nor pins.
+        let (base, tail) = measured_graph_base(gpus, request.sequences, gpu, attention, request.split_wire);
         graph_reserve.push(crate::placement::graph_reserve::current(gpu, false, base, tail)
             .map_err(|error| refused(format!("MiniMax graph reserve refused: {error}"), "Fix GPU_GRAPH_RESERVE."))?.bytes);
     }

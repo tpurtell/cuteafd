@@ -222,7 +222,7 @@ concurrency point is that limit.
 <td width="19%" valign="top"><a href="docs/models/minimax_m3.md"><b>minimax_m3</b></a><br><sub>MiniMaxAI/MiniMax-M3.1-Flash</sub><br><sub>nvfp4-g16-divisor</sub></td>
 <td width="27%" valign="top">pending<br><sub>not measured (#1856)</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1/card.svg"><img src="benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1/card.svg" alt="MiniMaxAI/MiniMax-M3.1-Flash on 1× RTX PRO 6000 @ gpu-powerd 435 W (425–450) + 3× DGX Spark"></a><br><sub>1× RTX + 3× Spark</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-flash-min-cand-r1/card.svg"><img src="benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-flash-min-cand-r1/card.svg" alt="MiniMaxAI/MiniMax-M3.1-Flash on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–425) + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-flash-tp2-graphs/card.svg"><img src="benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-flash-tp2-graphs/card.svg" alt="MiniMaxAI/MiniMax-M3.1-Flash on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (415–430) + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
 </table>
 

@@ -269,6 +269,9 @@ impl<'a> UnitOwner<'a> {
         Ok(())
     }
     pub fn rows(&self) -> u32 { self.rows }
+    /// CUDA-only target-residual tap seam. The optional drafter owns and admits
+    /// its retained writer; ordinary serving allocates no tap buffers here.
+    pub(crate) fn post_fold_tap_enqueue(&self, _layer: usize, _rows: usize) -> Result<()> { Ok(()) }
     #[cfg(test)]
     pub fn validate_split(&self, inputs: &cuteafd_loader::placement::families::minimax_m3::MiniMaxInputs,
         gpu: usize) -> Result<()> {
@@ -495,6 +498,21 @@ impl<'a> UnitOwner<'a> {
     /// No transport or producer may replace either slot until the fold completes.
     pub unsafe fn fold_partials(&self, kernels: &Kernels<'_>, fold: &PartialFold<'_>,
         rows: usize, shared: bool) -> Result<()> {
+        self.fold_boundary(shared)?;
+        // SAFETY: the caller retains both landed partials through this stream.
+        unsafe { self.fold_partials_enqueue(kernels, fold, rows, shared)?; }
+        if shared { self.joined(); }
+        Ok(())
+    }
+    pub(crate) fn fold_boundary(&self, shared: bool) -> Result<()> {
+        if shared { self.join_boundary() } else { self.routed_boundary.idle() }
+    }
+    /// CUDA-only fold, narrowing and routed/residual addition. Host ticket
+    /// transitions run before/after this body on every captured replay.
+    /// # Safety
+    /// Both retained partials are landed and stay leased through the stream.
+    unsafe fn fold_partials_enqueue(&self, kernels: &Kernels<'_>, fold: &PartialFold<'_>,
+        rows: usize, shared: bool) -> Result<()> {
         self.check(kernels, rows)?;
         ensure!(rows <= fold.capacity && std::ptr::eq(self.stream.as_ref(), fold.stream.as_ref()),
             "MiniMax partial fold stream/capacity differs from unit");
@@ -505,8 +523,6 @@ impl<'a> UnitOwner<'a> {
         validate_fold_exclusions(buffers, self.planes.values().map(|owner| owner.buffer).chain([
             self.dense.activation.buffer, self.dense.workspace.inputs.buffer,
             self.dense.workspace.records.buffer, self.dense.workspace.output.buffer]))?;
-        if shared { self.routed_boundary.before_join(self.stream.raw)?; }
-        else { self.routed_boundary.idle()?; }
         self.stream.device.run(|| {
             // SAFETY: caller orders landed rank slots; checked typed disjoint
             // retained planes survive this stream and every captured replay.
@@ -523,7 +539,14 @@ impl<'a> UnitOwner<'a> {
         })?;
         // Preserve the whole-down narrowing before routed addition. The existing
         // routed boundary owns exactly-once combination, not this transport fold.
-        if shared { self.join_routed(kernels, rows) } else { self.accumulate(rows) }
+        if shared { self.join_routed_enqueue(kernels, rows) } else { self.accumulate(rows) }
+    }
+    /// # Safety
+    /// Both retained peer partial planes are landed and remain leased.
+    pub(crate) unsafe fn meet_ffn_enqueue(&self, kernels: &Kernels<'_>, rows: usize, shared: bool) -> Result<()> {
+        let split = self.split.as_ref().context("MiniMax meet requires split owners")?;
+        // SAFETY: forward the caller's landed partial and lease contract.
+        unsafe { self.fold_partials_enqueue(kernels, &split.fold, rows, shared) }
     }
     /// Official served-cache math rounds routed reduction to BF16 before adding
     /// the shared expert, then rounds that sum before the FP32 residual update.
@@ -871,6 +894,95 @@ mod tests {
         let relative = (squared / norm).sqrt();
         eprintln!("MiniMax {label}: rows={} rel_l2={relative} max_abs_over_peak={}", actual.len() / 6144, max / peak);
         ensure!(relative <= limits.0 && max / peak <= limits.1, "{label}: residual exceeds regression tripwire");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires MiniMax checkpoint and two native SM120 devices through golden-run --native-test"]
+    fn native_split_ffn_bucket_padding_preserves_real_rows() -> Result<()> {
+        use cuteafd_loader::{families::minimax_m3::{execution::WirePrecision,
+            weight_layout::SplitFfnWeights}, plan::Checkpoint, serving_capacity::WeightArenaLayout};
+        use std::path::Path;
+        let snapshot = std::env::var("CUTEAFD_MINIMAX_SNAPSHOT")?;
+        let checkpoint = Checkpoint::coordinator(Path::new(&snapshot), false, false)?;
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+        // SAFETY: runner supplies the native library; all owners retire first.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        ensure!(crate::shared::peer_split::probed_device(&library, 0, Some(1))? == Some(1),
+            "MiniMax padding oracle requires a CUDA peer pair");
+        let manifest_path = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let programs = library.programs()?.with_manifest(Path::new(&manifest_path))?;
+        let mut layouts = SplitFfnWeights::plan(&checkpoint, &cfg, &vec![0; cfg.layers],
+            cuteafd_loader::placement::planner::EmbeddingHome::Device(0))?;
+        for layout in &mut layouts {
+            let selected = |name: &str| name.starts_with("language_model.model.layers.0.")
+                || name.starts_with("language_model.model.layers.3.");
+            layout.target.arena = WeightArenaLayout::new(format!("minimax/padding/{}", layout.target.rank),
+                layout.target.arena.views().iter().filter(|(name, _)| selected(name))
+                    .map(|(name, view)| (name.clone(), view.bytes())))?;
+            layout.target.projections.retain(|projection| selected(&projection.stem));
+            layout.target.layers.clear();
+            layout.slices.retain(|name, _| selected(name));
+        }
+        let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+        let weights = layouts.iter().zip(devices).map(|(layout, device)|
+            TargetWeights::load_split_ffn(device, &checkpoint, layout)).collect::<Result<Vec<_>>>()?;
+        let kernels = layouts.iter().zip(devices).map(|(layout, device)|
+            Kernels::bind_split(device, &programs, &manifest, &cfg, &layout.target, 64, 128))
+            .collect::<Result<Vec<_>>>()?;
+        let streams = devices.map(|device| Stream::new(device).map(Rc::new));
+        let [left, right] = streams;
+        let streams = [left?, right?];
+        for wire in [WirePrecision::Bf16, WirePrecision::F32] {
+            let mut units = (0..2).map(|gpu| UnitOwner::new_split(&kernels[gpu], Rc::clone(&streams[gpu]),
+                &cfg, &layouts[gpu].target, 64, wire, false, false)).collect::<Result<Vec<_>>>()?;
+            for (layer, shared) in [(0, false), (3, true)] {
+                for live in [1, 2, 3, 4, 5, 8, 15, 16, 17, 31, 32, 33, 63, 64] {
+                    let bucket = crate::shared::decode_graph::row_bucket(live);
+                    let mut reference = None;
+                    for rows in [live, bucket] {
+                        for gpu in 0..2 {
+                            let unit = &units[gpu];
+                            let residual = residual_bytes(7, 0..64);
+                            devices[gpu].run(|| {
+                                library.copy_h2d(unit.plane("residual")?, &residual)?;
+                                library.cuda_zero_bytes(unit.plane("routed")?, 64 * 6144 * 2)
+                            })?;
+                        }
+                        if shared { units[0].router(&kernels[0], &weights[0], layer, rows)?; }
+                        for gpu in 0..2 {
+                            units[gpu].partial_ffn(&kernels[gpu], &weights[gpu], &layouts[gpu].target,
+                                layer, rows, shared)?;
+                        }
+                        for stream in &streams { stream.drain()?; }
+                        for gpu in 0..2 {
+                            let source = units[1 - gpu].split_plane("local")?;
+                            let receive = units[gpu].split_plane("receive")?;
+                            let bytes = rows * 6144 * wire.bytes();
+                            devices[1 - gpu].run(|| {
+                                // SAFETY: both producers drained; retained P2P
+                                // planes stay live through each fold below.
+                                unsafe { library.copy_d2d_async(receive, source, bytes, streams[1 - gpu].raw) }
+                            })?;
+                        }
+                        for stream in &streams { stream.drain()?; }
+                        for gpu in 0..2 {
+                            // SAFETY: both peer partial copies have drained.
+                            unsafe { units[gpu].meet_ffn(&kernels[gpu], rows, shared)?; }
+                        }
+                        let actual = units.iter().map(|unit| read_residual(unit, live)
+                            .map(|values| values.into_iter().map(f32::to_bits).collect::<Vec<_>>()))
+                            .collect::<Result<Vec<_>>>()?;
+                        ensure!(actual[0] == actual[1], "MiniMax rank fold differs");
+                        if let Some(expected) = &reference {
+                            ensure!(&actual == expected, "MiniMax live={live} bucket={bucket} layer={layer} wire={wire:?}: padding changed real rows");
+                        } else { reference = Some(actual); }
+                    }
+                }
+            }
+        }
+        eprintln!("MiniMax split padding oracle PASS: dense/shared, BF16/FP32 wire, live1..64 boundaries");
         Ok(())
     }
 

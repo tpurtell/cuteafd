@@ -85,7 +85,9 @@ trace-free serving cards (#1856).
 Use a build containing MiniMax native exports: MXFP8 dense math, NVFP4 W4A4
 experts, FP8 MSA KV/index, GPU embedding and device token selection.
 On one RTX, `ATTENTION_PLACEMENT=auto|heads` selects whole ownership. On two RTX,
-`auto|layers` selects contiguous attention and eager FP32 split FFNs. Explicit context placement and
+`auto|layers` selects contiguous attention and FP32 split FFNs. Boot-C16 split
+router, FFN and fold/publication sections replay through the shared graph cache;
+attention and peer receive waits stay eager. Explicit context placement and
 two-RTX narrow-head serving remain refused.
 `SPECULATOR=off`, `VISION=off` and `AUDIO=off` are required for this increment.
 
@@ -99,8 +101,13 @@ formats refuse before loading. Native checkpoint API encoding is mandatory.
 The traced one-RTX boot-C16 graph base is 41,943,040 bytes plus the standard
 2,097,152-byte tail; shared bounded runtime extra gives 88,080,384 bytes total
 by default. C1/C16 decode on that bank records no steady-state captures or
-evictions. Untraced rank/concurrency shapes keep an unpinned bootstrap with no
-borrowed measured base. Split sections remain eager (no graph-prewarm claim).
+evictions. The two-RTX boot-C16 split has per-rank measured bases 65,011,712 /
+44,040,192 bytes (62 / 42 MiB), each plus one 2,097,152-byte tail. The unchanged
+shared extra rule charges 134,217,728 / 92,274,688 bytes by default (128 / 88 MiB).
+The bounded rows 1/4/16 bootstrap records no steady C1/C16 captures or evictions;
+only private arithmetic/peer scratch is padded, never KV or request rows.
+Untraced rank/concurrency shapes keep an unpinned bootstrap with no borrowed
+measured base.
 Narrow heads remain planning-only pending
 [#1856](https://github.com/tpurtell/cuteafd/issues/1856); planning still reports their owners.
 
