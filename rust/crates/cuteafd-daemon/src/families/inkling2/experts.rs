@@ -52,7 +52,7 @@ impl Mxfp8Layout {
             mount.merge(MountLoad::read(ReadBatch::new(n, pitch, width, STEP_BYTES)?));
             lands.push(source);
         }
-        Ok(Self { arena: WeightArenaLayout::new(format!("inkling2/experts/{layer}"), tensors)?, mount, lands })
+        Ok(Self { arena: WeightArenaLayout::new("inkling2/golden/experts", tensors)?, mount, lands })
     }
 }
 
