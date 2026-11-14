@@ -19,11 +19,11 @@ pub struct DualAdmission {
 
 /// Try every legal contiguous cut using exact per-owner allocations, not a
 /// proportional estimate of a single-device ledger. Equal pools retain the
-/// cut with the most remaining capacity on its tighter rank.
+/// cut with the smallest residual-headroom gap, including KV and workspaces.
 pub fn admit_dual(request: Request, budgets: Vec<Budget>, facts: DenseFacts<'_>)
     -> Result<DualAdmission, Refusal> {
     let groups = vec![(true, None); facts.cfg.attention.len()];
-    let mut best: Option<((u64, u64), DualAdmission)> = None;
+    let mut best: Option<((u64, std::cmp::Reverse<u64>), DualAdmission)> = None;
     let mut failure = None;
     for cut in crate::placement::attention::owner_boundaries(&groups, true) {
         let owners = (0..groups.len()).map(|i| u8::from(i >= cut)).collect::<Vec<_>>();
@@ -35,8 +35,9 @@ pub fn admit_dual(request: Request, budgets: Vec<Budget>, facts: DenseFacts<'_>)
         match candidate {
             Ok(plan) => {
                 let free = plan.phases.iter().filter(|row| row.phase == Phase::Growth && row.budget.starts_with("rtx"))
-                    .map(|row| row.available.saturating_sub(row.owned + row.opaque)).min().unwrap_or(0);
-                let score = (plan.pool_tokens, free);
+                    .map(|row| row.available.saturating_sub(row.owned + row.opaque)).collect::<Vec<_>>();
+                let gap = free.iter().max().copied().unwrap_or(0).saturating_sub(free.iter().min().copied().unwrap_or(0));
+                let score = (plan.pool_tokens, std::cmp::Reverse(gap));
                 if best.as_ref().is_none_or(|(old, _)| score > *old) {
                     best = Some((score, DualAdmission { plan, owners, arenas }));
                 }
@@ -98,6 +99,23 @@ fn prepare(facts: &DenseFacts<'_>, owners: &[u8], arenas: &[WeightArenaLayout; 2
         let mut contract = local.prepare(&Request { context: (cfg.max_context as u64).into(),
             pool: Pin::Auto, onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving,
             resident_weight_limit: None, spark_reply_formats: Default::default() })?;
+        // Full-context drafter page indices are signed. Both ranks must expose
+        // the same domain when merging; target-only retains its unsigned extent.
+        let maximum = if facts.drafter.is_some() { i32::MAX as u64 / PAGE_ROWS } else { u32::MAX as u64 / PAGE_ROWS };
+        if contract.maximum_pages != maximum {
+            for component in &mut contract.components {
+                let truncate = |curve: &mut ByteCurve| {
+                    curve.0.retain(|piece| piece.first <= maximum);
+                    for piece in &mut curve.0 { piece.last = piece.last.min(maximum); }
+                };
+                truncate(&mut component.bytes);
+                if let ComponentKind::Allocation { shape, offset, .. } = &mut component.kind {
+                    for curve in shape { truncate(curve); }
+                    if let Some(curve) = offset { truncate(curve); }
+                }
+            }
+            contract.maximum_pages = maximum;
+        }
         contract.components.retain(|component| match &component.kind {
             ComponentKind::DriverPageTables { .. } => false,
             ComponentKind::Allocation { template, .. } if rank == 1 && template.id == "weights.upload" => false,
@@ -128,4 +146,55 @@ fn prepare(facts: &DenseFacts<'_>, owners: &[u8], arenas: &[WeightArenaLayout; 2
     result.components.extend(transport);
     result.add_driver_page_tables();
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speculation_alone_selects_common_signed_domain_and_exact_owner_balance() {
+        let (dir, _, buffers, _) = crate::families::qwen3_5::tests::native_planner_fixture();
+        let checkpoint = crate::plan::checkpoint::Checkpoint::open(dir.path()).unwrap();
+        let cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+        let weights = NativeWeights::native(&checkpoint, &cfg, cuteafd_core::DType::F32).unwrap();
+        let target = crate::families::qwen3_5::weight_layout::target_arena(&checkpoint, &cfg,
+            cuteafd_core::DType::F32, crate::families::qwen3_5::weight_layout::DenseFormat::Bf16).unwrap();
+        let mut budgets = forecast_budgets(&crate::placement::ARCH_CONTEXTS[1], 96 << 30, 0,
+            (128 << 30, 128 << 30)).unwrap();
+        let mut peer = budgets[0].clone();
+        peer.id = "rtx1".into(); peer.locations = vec![Location::coordinator(1)]; budgets.insert(1, peer);
+        let request = Request { context: (262144).into(), pool: Pin::Exact(262144),
+            onboard: Pin::Auto, prefill: Pin::Auto, operation: Operation::Serving,
+            resident_weight_limit: None, spark_reply_formats: Default::default() };
+        for draft in [false, true] {
+            let facts = DenseFacts { cfg: &cfg, weights: &weights, target_arena: &target, buffers: &buffers,
+                slots: 4, record_bytes: 4096, graph_variant: "fixture".into(), graphs_enabled: false,
+                drafter: draft.then(|| DrafterBytes { owned: 4096, weights: ResidentWeights(1024),
+                    weight_arena: Some(("qwen3_5/mtp/gpu0", 1280)), pools: vec![4096],
+                    workspace_requests: vec![2048, 1024], ..Default::default() }),
+                blas_head: serving::BlasHead::Native, serving: None,
+                host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, verify_check: false };
+            let admission = admit_dual(request.clone(), budgets.clone(), facts.clone()).unwrap();
+            let contract = prepare(&facts, &admission.owners, &admission.arenas).unwrap();
+            let maximum = if draft { i32::MAX as u64 } else { u32::MAX as u64 } / PAGE_ROWS;
+            assert_eq!(contract.maximum_pages, maximum);
+            assert_eq!(maximum * PAGE_ROWS, if draft { 2147483584 } else { 4294967232 });
+            assert!(contract.components.iter().all(|component| component.bytes.0.last().unwrap().last == maximum));
+            assert_eq!(admission.plan.served_context(), 262144);
+            let slack = |plan: &ResolvedPlan| plan.phases.iter().filter(|row|
+                row.phase == Phase::Growth && row.budget.starts_with("rtx"))
+                .map(|row| row.available - row.owned - row.opaque).collect::<Vec<_>>();
+            let selected = slack(&admission.plan);
+            let gap = selected[0].abs_diff(selected[1]);
+            for cut in 1..cfg.attention.len() {
+                let owners = (0..cfg.attention.len()).map(|i| u8::from(i >= cut)).collect::<Vec<_>>();
+                let arenas = crate::families::qwen3_5::weight_layout::placed_arenas(&target, &owners).unwrap();
+                let candidate = super::super::admission::admit_contract(request.clone(), budgets.clone(),
+                    prepare(&facts, &owners, &arenas).unwrap()).unwrap();
+                let free = slack(&candidate);
+                assert!(gap <= free[0].abs_diff(free[1]), "cut {cut} has a smaller admitted headroom gap");
+            }
+        }
+    }
 }

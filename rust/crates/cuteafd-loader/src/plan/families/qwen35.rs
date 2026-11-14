@@ -140,7 +140,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         if matches!(report.requested_attention, Some(crate::placement::AttentionPlacement::Heads | crate::placement::AttentionPlacement::Context)) {
             let mode = report.requested_attention.expect("explicit attention");
             report.refuse_placement(format!("dense Qwen {mode} attention is an unbuilt feature"),
-                "Add native half-head GDN, GQA producer/output and row-parallel dense FFN exports, sliced checkpoint operands, and shared peer reductions; context additionally needs owner-partitioned KV and shared softmax merge. Select layers for the native whole-layer executor (#1991).");
+                "Add native half-head GDN, GQA producer/output and row-parallel dense FFN exports, sliced checkpoint operands, and shared peer reductions; context additionally needs owner-partitioned KV and shared softmax merge. Select layers for the native whole-layer executor; native sharding is tracked in #2133.");
             return Ok(MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![] });
         }
         report.attention_placement = crate::placement::AttentionPlacement::Layers;

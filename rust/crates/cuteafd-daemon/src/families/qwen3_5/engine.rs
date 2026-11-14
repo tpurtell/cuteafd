@@ -169,6 +169,7 @@ impl<'a> DenseEngine<'a> {
                 library.cuda_enable_peer(device.id)?;
                 DensePrograms::new(&cfg, programs, kv_format, format)?;
                 programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
+                crate::shared::inventory::preload_native_modules(library)?;
                 library.peer_exchange_initialize()
             })?;
             device.run(|| library.peer_exchange_initialize())?;
@@ -405,19 +406,19 @@ impl<'a> DenseEngine<'a> {
         let end = first.checked_add(rows).context("dense position overflow")?;
         ensure!(end <= self.cfg.max_context && end <= self.pool_tokens, "dense sequence exceeds admitted cache/context");
         for rank in 0..self.homes.gdn_layers.len() {
-        let planes = self.owner_planes(rank);
-        self.put(planes.slots, &vec![0; rows * 4])?;
-        self.put(planes.seq_first, &vec![0; rows * 4])?;
-        let positions = (first..end).map(i64::try_from).collect::<std::result::Result<Vec<_>, _>>()?;
-        let position_bytes: Vec<_> = positions.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.put(planes.positions, &position_bytes)?;
-        self.put(planes.kv_slots, &position_bytes)?;
-        let rope: Vec<_> = (first..end).map(i32::try_from).collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter().flat_map(|p| [p; 3]).flat_map(i32::to_le_bytes).collect();
-        self.put(planes.rope_positions, &rope)?;
-        let pages: Vec<_> = (0..end.div_ceil(64)).map(i32::try_from).collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter().flat_map(i32::to_le_bytes).collect();
-        self.put(planes.page_table, &pages)?;
+            let planes = self.owner_planes(rank);
+            self.put(planes.slots, &vec![0; rows * 4])?;
+            self.put(planes.seq_first, &vec![0; rows * 4])?;
+            let positions = (first..end).map(i64::try_from).collect::<std::result::Result<Vec<_>, _>>()?;
+            let position_bytes: Vec<_> = positions.iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.put(planes.positions, &position_bytes)?;
+            self.put(planes.kv_slots, &position_bytes)?;
+            let rope: Vec<_> = (first..end).map(i32::try_from).collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter().flat_map(|p| [p; 3]).flat_map(i32::to_le_bytes).collect();
+            self.put(planes.rope_positions, &rope)?;
+            let pages: Vec<_> = (0..end.div_ceil(64)).map(i32::try_from).collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter().flat_map(i32::to_le_bytes).collect();
+            self.put(planes.page_table, &pages)?;
         }
         Ok(())
     }
@@ -646,15 +647,15 @@ impl<'a> DenseEngine<'a> {
         let i32_bytes = |values: &[i32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
         let i64_bytes = |values: &[i64]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
         for rank in 0..self.homes.gdn_layers.len() {
-        let planes = self.owner_planes(rank);
-        self.put(planes.slots, &i32_bytes(&rows.slots))?;
-        self.put(planes.seq_first, &i32_bytes(&rows.first))?;
-        self.put(planes.positions, &i64_bytes(&rows.positions))?;
-        self.put(planes.kv_slots, &i64_bytes(&rows.kv))?;
-        let rope = rows.positions.iter().map(|&p| i32::try_from(p)).collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter().flat_map(|p| [p; 3]).collect::<Vec<_>>();
-        self.put(planes.rope_positions, &i32_bytes(&rope))?;
-        self.put(planes.page_table, &i32_bytes(&rows.pages))?;
+            let planes = self.owner_planes(rank);
+            self.put(planes.slots, &i32_bytes(&rows.slots))?;
+            self.put(planes.seq_first, &i32_bytes(&rows.first))?;
+            self.put(planes.positions, &i64_bytes(&rows.positions))?;
+            self.put(planes.kv_slots, &i64_bytes(&rows.kv))?;
+            let rope = rows.positions.iter().map(|&p| i32::try_from(p)).collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter().flat_map(|p| [p; 3]).collect::<Vec<_>>();
+            self.put(planes.rope_positions, &i32_bytes(&rope))?;
+            self.put(planes.page_table, &i32_bytes(&rows.pages))?;
         }
         Ok(())
     }
