@@ -262,11 +262,11 @@ mod tests {
         }
         for order in ["prior", "after"] {
             let status = std::process::Command::new(std::env::current_exe()?)
-                .args(["--exact", "families::minimax_m3::serve::tests::process_geometry_refuses_a_conflicting_family_without_replacement", "--nocapture"])
+                .args(["--exact", "families::minimax_m3::startup::tests::process_geometry_refuses_a_conflicting_family_without_replacement", "--nocapture"])
                 .env(CHILD, order).status()?;
             ensure!(status.success(), "MiniMax isolated geometry child failed: {order}");
         }
-        let source = include_str!("serve.rs");
+        let source = include_str!("startup.rs");
         let constructor = source.split("pub(crate) fn load<'a>").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
         assert_eq!(constructor.matches("fix_geometry()?").count(), 1);
         assert!(constructor.find("fix_geometry()?").unwrap() < constructor.find("fp8::package_directory(").unwrap());
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn constructor_orders_admission_before_push_and_releases_staging() {
-        let source = include_str!("serve.rs");
+        let source = include_str!("startup.rs");
         let constructor = source.split("pub(crate) fn load<'a>").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
         let admission = constructor.find("serve_admission::prepare(").unwrap();
         let push = constructor.find("push::prepare_serving(").unwrap();
