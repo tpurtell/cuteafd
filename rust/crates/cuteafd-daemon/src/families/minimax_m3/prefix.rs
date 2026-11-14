@@ -282,6 +282,21 @@ mod tests {
         family.drain().map_err(|error| anyhow::anyhow!(error.to_string()))?;
         assert_eq!(read_page(&family, 1)?, expected, "partial tail copies every native backing byte");
         assert_ne!(expected[2], expected[cfg.layers * 3 + 2], "both index copies retain independent bytes");
+        let mut cache = cache(&family)?;
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let mut placement = cache.admit(&family, &tokens, 128, false, |pages| build(pages, 0))?.placement;
+        for (index, &page) in placement.units.iter().enumerate() { write_page(&family, page, index + 51)?; }
+        let cold = placement.units.iter().map(|&page| read_page(&family, page)).collect::<Result<Vec<_>>>()?;
+        placement.len = tokens.len();
+        assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &placement,
+            After::from_logits(&[0.0, 1.0], true))?);
+        cache.release(&family, &placement.units)?;
+        let restored = cache.admit(&family, &tokens, 128, false, |pages| build(pages, 1))?;
+        assert_eq!(restored.resume, tokens.len());
+        let observed = restored.placement.units.iter().map(|&page| read_page(&family, page)).collect::<Result<Vec<_>>>()?;
+        assert_eq!(observed, cold, "Heads prompt snapshot must restore every cold Heads state byte");
+        check_binding(&family, &restored.placement)?;
+        cache.release(&family, &restored.placement.units)?;
         Ok(())
     }
 
