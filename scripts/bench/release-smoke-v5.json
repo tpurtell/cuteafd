@@ -1035,8 +1035,8 @@
       "family": "muse_spark",
       "config": "examples/configs/muse-spark-exl3-min.config",
       "set": {
-        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6",
-        "MODEL_REVISION": "89998fb177acd9a862ac8bd4fb79bfd50e940c97",
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
+        "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
         "RTX_GPUS": "1",
         "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
@@ -1051,7 +1051,8 @@
         "SPARK_3_HOST": "REPLACE-ME-spark-3",
         "SPARK_3_LANE_A": "192.0.2.4",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
-        "EXPERT_BACKEND": "spark"
+        "EXPERT_BACKEND": "spark",
+        "CORE_VIEW": "original"
       },
       "name": "muse-spark-exl3-min",
       "gpus": [
@@ -1068,8 +1069,8 @@
       "family": "muse_spark",
       "config": "examples/configs/muse-spark-exl3-max.config",
       "set": {
-        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6",
-        "MODEL_REVISION": "89998fb177acd9a862ac8bd4fb79bfd50e940c97",
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
+        "MODEL_REVISION": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
         "RTX_GPUS": "2",
         "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
@@ -1088,7 +1089,8 @@
         "SPARK_5_HOST": "REPLACE-ME-spark-5",
         "SPARK_5_LANE_A": "192.0.2.6",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
-        "EXPERT_BACKEND": "spark"
+        "EXPERT_BACKEND": "spark",
+        "CORE_VIEW": "original"
       },
       "name": "muse-spark-exl3-max",
       "gpus": [

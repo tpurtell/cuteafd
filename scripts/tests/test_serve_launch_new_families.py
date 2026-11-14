@@ -807,8 +807,8 @@ def test_muse_refuses_a_slot_without_serve_muse(tmp_path: Path) -> None:
 def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size, gpus, ranks) -> None:
     path = ROOT / f"examples/configs/muse-spark-exl3-{size}.config"
     values = _keys(path)
-    assert values["MODEL_ID"] == "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6"
-    assert values["MODEL_REVISION"] == "89998fb177acd9a862ac8bd4fb79bfd50e940c97"
+    assert values["MODEL_ID"] == "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC"
+    assert values["MODEL_REVISION"] == "cc5dc2537083177e3f02ea0b2d9dfc179d40425c"
     assert values["SPECULATOR"] == "dflash2"
     assert values["SPECULATOR_MODEL_ID"] == "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
     assert values["SPECULATOR_MODEL_REVISION"] == "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
@@ -816,8 +816,7 @@ def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size,
     assert values["VISION"] == ("spark" if size == "min" else "auto")
     assert values["AUDIO"] == "auto"
     if size == "min":
-        assert int(values["MAX_CONTEXT_TOKENS"]) > 262144
-        assert int(values["MAX_CONTEXT_TOKENS"]) % 64 == 0
+        assert values["MAX_CONTEXT_TOKENS"] == "auto"
     else:
         assert "MAX_CONTEXT_TOKENS" not in values
     assert not any(key in values for key in ("RTX_EXPERT_LAYERS", "CONCURRENCY", "SPARK_MEMORY_CAP"))

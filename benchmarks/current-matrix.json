@@ -259,18 +259,18 @@
     },
     {
       "family": "muse_spark",
-      "checkpoint": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6",
+      "checkpoint": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
       "5090": {
         "status": "na",
         "reason": "doesn't fit"
       },
       "1rtx": {
-        "status": "current",
-        "report": "benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-1rtx-4spark-muse-spark-exl3-min"
+        "status": "pending",
+        "reason": "needs a Release smoke card for the MC original BF16 core"
       },
       "2rtx": {
-        "status": "current",
-        "report": "benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max"
+        "status": "pending",
+        "reason": "needs a Release smoke card for the MC original BF16 core"
       }
     },
     {

@@ -145,8 +145,17 @@ The main smoke entries use `original`; max K8/K6 comparisons live separately in
 `scripts/bench/release-smoke-v51-mc-core-comparison.json` and do not add
 release-table rows. Card measurements wait for kernel pin #1903.
 
-The other intended MC repositories are Kimi-K3.1-Pro-EXL3-K2-MC and
-Muse-Spark-Open-EXL3-K4-MC under `wrldsuksgo2mars`.
+`wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC` is published at
+`cc5dc2537083177e3f02ea0b2d9dfc179d40425c`, with original BF16 (default),
+`k8-compact` and `k6-compact`. Its min/max configs and release row replace the
+standalone Core-K6 checkpoint; historical reports remain. See
+[Muse core views](models/muse_spark.md#core-views). Main Release smoke entries
+select `original`, with separate max K8/K6 comparisons in the same comparison
+matrix. Whole-core `fp8-compact` remains unsupported until its selected head
+and pre/post-expert roles execute (#1796).
+
+`wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC` is also published; compact-view
+metadata correction and K3.1 serving qualification are tracked in #2098/#1777.
 
 The non-MC Mistral publication is pinned at
 `9c354cee78cd6feddb057549b8edde6e3b319822`; its

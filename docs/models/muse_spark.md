@@ -1,9 +1,10 @@
 # Muse Spark
 
 `meta-models/Muse-Spark-Open-816B-A42B` (`MuseSparkForConditionalGeneration`,
-text `muse_spark_text`) serves text from an EXL3 publication: K4 routed
-experts split per expert, a K6 MCG core (attention q/k/v/o, the MoE's
-`pre_expert_proj`/`post_expert_proj`, the LM head) and the rest at the
+text `muse_spark_text`) serves text from an MC EXL3 publication: K4 routed
+experts split per expert, the original BF16 core by default, and complete
+K8/K6 MCG alternatives (attention q/k/v/o, the MoE's
+`pre_expert_proj`/`post_expert_proj`, the LM head). The rest retains the
 checkpoint's precision. The BF16 release fuses each layer's 256 experts into
 one tensor and has no expert package; `cuteafd plan` names the publication to
 serve instead.
@@ -18,12 +19,19 @@ and on #923.
 ## Core views
 
 `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC` provides the original BF16 core
-and complete `k8-compact` / `k6-compact` cores. Select with `CORE_VIEW` (default
+and complete `k8-compact` / `k6-compact` cores at revision
+`cc5dc2537083177e3f02ea0b2d9dfc179d40425c`. Select with `CORE_VIEW` (default
 `original`) or `--core-view`; see the [MC contract](../mc-checkpoints.md).
-The original path retains native attention, MoE frontend/backend and vocabulary
-head weights. Compact widths have distinct dispatch and exact memory charges.
-`fp8-compact` retains the existing attention conversion scope, using row-major
-E4M3 weights with F32 block-128 scales and BF16 activations (W8A16).
+The [min](../../examples/configs/muse-spark-exl3-min.config) and
+[max](../../examples/configs/muse-spark-exl3-max.config) configs select
+`CORE_VIEW=original`. The original path retains native attention, MoE
+frontend/backend and vocabulary head weights. Compact widths have distinct
+dispatch and exact memory charges. Their max-card comparison entries live in
+`scripts/bench/release-smoke-v51-mc-core-comparison.json`; they do not add
+release-table rows. Fresh MC Release smoke measurements are pending.
+`fp8-compact` is not executable for this complete MC core yet: its selected
+vocabulary head and pre/post-expert projections refuse by role before payload
+reads (#1796). The existing attention-only executor cannot silently skip them.
 Towers and routed experts are shared, not converted with the core.
 
 ## Architecture
