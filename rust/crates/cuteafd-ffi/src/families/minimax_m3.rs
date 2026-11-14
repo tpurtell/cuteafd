@@ -622,13 +622,23 @@ mod tests {
             assert_eq!(selected[0]["family"], "minimax");
             assert_eq!(selected[0]["op"], if name.contains("_quant_") { "dense_mxfp8_quant" } else { "dense_mxfp8" });
         }
-        // Inkling 2 Small attention: exactly these four stems, appended after every other program.
-        let inkling2 = [
-            "inkling2_local_attention_decode_m64",
-            "inkling2_local_attention_prefill_m4096",
-            "inkling2_global_attention_decode_m64",
-            "inkling2_global_attention_prefill_m4096",
+        // Inkling is appended after every existing family. Pin its complete
+        // producer inventory too, so a publication cannot silently add stems.
+        let mut inkling2 = vec![
+            "inkling2_local_attention_decode_m64".to_string(),
+            "inkling2_local_attention_prefill_m4096".to_string(),
+            "inkling2_global_attention_decode_m64".to_string(),
+            "inkling2_global_attention_prefill_m4096".to_string(),
         ];
+        for suffix in ["bf16", "f32"] {
+            for name in ["conv_static_h4608", "conv_static_h1024", "conv_dynamic_h1024",
+                "clip_local_q", "clip_local_k", "clip_local_r", "clip_global_q", "clip_global_r",
+                "gate_h6144", "situ_h2304", "norm_h4608", "norm_v_h8_d128", "kv_pack"] {
+                inkling2.push(format!("inkling2_{name}_{suffix}"));
+            }
+        }
+        inkling2.extend(["residual_q1_keep", "residual_q1_add", "residual_q3_keep", "residual_q3_add", "router_e384_k8"]
+            .map(|name| format!("inkling2_{name}")));
         let installed = entries.iter().filter(|entry| entry["family"] == "inkling2"
             || entry["name"].as_str().is_some_and(|name| name.starts_with("inkling2")))
             .map(|entry| entry["name"].as_str().expect("installed program name")).collect::<Vec<_>>();
@@ -637,7 +647,8 @@ mod tests {
             .map(|entry| entry["name"].as_str().unwrap()).collect::<Vec<_>>(), inkling2);
         for entry in &entries[entries.len() - inkling2.len()..] {
             assert_eq!(entry["family"], "inkling2");
-            assert_eq!(entry["op"], "attention");
+            assert!(matches!(entry["op"].as_str(), Some("attention" | "convolution" | "l2_clip" | "gate"
+                | "situ" | "rms_norm" | "kv_pack" | "attn_res" | "router")));
         }
         let mut partition = Vec::new();
         for entry in entries {
