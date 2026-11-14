@@ -17,7 +17,7 @@ Rubric, each 1–5 (5 best), plus wall time:
 | Model | Use for | Strengths | Weaknesses | Evidence |
 |---|---|---|---|---|
 | Sol 6.1 (Codex) | default engineering, numerics, A/B, lossless fixes | thorough, keeps gates honest, strong root-causing (#163, #190, #171) | over-literal on tooling rules; commits mid-gate (head-moved failures ×3 on 2026-10-14); verbose reports | ~15 tasks |
-| Astra 6 (Codex) | hard kernel design | — | expensive; once spent a week on probe plumbing | few |
+| Astra 6 (Codex) | hard kernel design | bounded packed native FP8 consumer; qualified per-contract gains (#2068, fork #303) | broad kernel wins need selective gates; ancillary inspection can burn time waiting for CPU slots | FP8 R2: three landed decode contracts; earlier evidence below |
 | DeepSeek Flash | drivers; direct analysis and measurement | reliable verifier as driver; strong quantitative reasoning (DiD on existing data, #193); cheap and fast | — | drivers ×10, direct ×1 |
 | Claude Opus 5.5 (orchestrator) | design, review, merges, decisions | fast cross-task diagnosis (#191 Spark regression, stale CMake cache) | pushed a red commit once (61256a22); held agents for an answer while GPUs idled; wrong guesses before evidence (masked-V, cold-start) | this session |
 | Grok 4.7 (xAI, CLI `grok`) | bounded fixes, tests, races; design analysis with precise citations | found a real race behind a "flaky test"; challenged a wrong brief premise (#180 named V4.1/MiMo, but only GLM 5.3 uses the lane path); exact file:line citations (14/14 verified); caught a latent copies_pending bug | context fills fast (72% of 256K on a design task; needed a wrap-up nudge) | 6 tasks (1 kernel duel, lost) |
@@ -25,6 +25,46 @@ Rubric, each 1–5 (5 best), plus wall time:
 | Gemini 4 Carbon High (Antigravity, CLI `agy`) | default Gemini since 2026-11-11: reviews, duels, research | — | — | 1 review (3/6/1 verified/corrected/wrong-premise; strong mechanism leads, fabricates values and symbols) and 2 kernel duels (D1 tied the winner bitwise on 134/134 cells; D2 found the only +3.2% beyond the shipped route). Weak: own GPU launchers hang under `docker -it`; long unmeasured analysis |
 
 ## Log
+
+### 2026-11-14 Native FP8 Decode Duel: Astra R2 Partial Win
+
+Astra R2 `6eb080c0` landed selectively as fork #303 (`4b126390`).
+Scores: Correct 5, Judgement 4, Quality 4, Creative 4. R1 sealed in about
+9 minutes; R2 in about 5 minutes plus CPU-slot wait; organizer adoption gates
+and measurements took about two hours. No entrant GPU, benchmark, oracle
+or push edits.
+
+The packed K64 consumer widens exact E4M3 values immediately before four
+ordered BF16 MMAs, then applies the native FP32 scale FMA. Only three exact
+shape/warp/scale-layout/output contracts qualify, at every decode width:
+
+| Contract (four warps, BF16 output) | SM120 candidate / production | SM121 |
+|---|---:|---:|
+| 6784x4096, row-major scales | 0.96235 | 0.96972 |
+| 7424x4096, row-major scales | 0.96442 | 0.99433 |
+| 8192x2048, block scales | 0.98051 | 0.98312 |
+
+Conditions: warmed L2-cold graph replay, 12 samples, seed 2057, ten live
+widths 1/4/8/16/17/24/32/48/63/64. Same-session production-vs-production
+spread and same-host Fable R2 runner-up checks passed. The coordinator
+accepts 7424 SM121 r1 +0.03% and r8 +0.36% above observed production high
+as resolution-level ties, not a general margin. 13824 row and KDA 24896
+K-major near-misses do not land.
+
+Exact selective integration: 105 passed plus four intentional layout skips
+and tail memcheck zero errors on each architecture; six native-ARM SM121
+thin/wide AOT exports pass. Current-dev targeted export comparison checks
+470 common objects: 455 identical and exactly 15 changed group/program
+records (13 unique stems), with no ABI, header or inventory drift. Adoption
+thermal counters show zero power/thermal slowdown increments; sampled max
+temperature/minimum headroom are 47C/46C SM120 and 52C/44C SM121.
+
+R1 had no qualifying deferred shape. R2's broad candidate loses other
+contracts, so integration preserves their original arithmetic/cache keys
+and all three NC deferrals. Ancillary CPU inspection hit host-object
+cuobjdump errors and slot waits; the entrant did not claim unavailable
+resource results. R3 is still being measured and is not covered by this
+landed-win score. Receipts: `~/.cache/cuteafd/builds/fp8wide-duel/receipts/`.
 
 | Date | Model | Task | Correct | Judgement | Quality | Creative | Wall | Notes |
 |---|---|---|---|---|---|---|---|---|
