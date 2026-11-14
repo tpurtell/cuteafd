@@ -24,6 +24,8 @@ pub(crate) struct GoldenArgs {
     /// Optional raw FP32 matching partial-prefix reference logits.
     #[arg(long)] golden: Option<PathBuf>,
     #[arg(long)] check_headers: bool,
+    /// Diagnostic native hidden/routes/logits at selected zero-based layers.
+    #[arg(long, value_delimiter=',')] tap_layers: Vec<usize>,
 }
 
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
@@ -46,6 +48,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(&args.tokens)?)?;
     ensure!((2..=4096).contains(&tokens.len()) && tokens.iter().all(|&t| (t as usize)<cfg.unpadded_vocab_size),
         "Inkling golden needs2..4096 valid token ids");
+    ensure!(args.tap_layers.iter().all(|&layer| layer<=args.last_layer), "Inkling tap layer exceeds run depth");
     let rows = tokens.len()-1;
     let unit_layout = UnitLayout::new(&cfg, rows, tokens.len().max(64))?;
     let target_layout = CoordinatorWeights::golden(&checkpoint, &cfg, &(0..=args.last_layer).collect::<Vec<_>>())?;
@@ -75,6 +78,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
     let plan = admission::admit(&checkpoint, &cfg, &target_layout, &expert_layouts[0], metadata.scratch_for(rows)?,
         &unit_layout, rows, free as u64, total as u64, host)?;
+    if !args.tap_layers.is_empty() { std::fs::create_dir(&args.save_logits)?; }
     let stream = Rc::new(Stream::new(device)?);
     let owner = UnitOwner::new(Rc::clone(&stream), unit_layout)?;
     let weights = TargetWeights::load(device, &checkpoint, &target_layout)?;
@@ -106,6 +110,18 @@ fn run(args: GoldenArgs) -> Result<()> {
         let experts = device.run(|| Mxfp8::load(Rc::clone(&stream), layout, &metadata, &package, &cfg, rows))?;
         device.run(|| super::prefill::layer(&kernels, &owner, &weights, &experts, &cfg, index, rows))?;
         stream.drain()?;
+        if args.tap_layers.contains(&index) {
+            let out = args.save_logits.join(format!("layer-{index}"));
+            std::fs::create_dir(&out)?;
+            for name in ["partial", "mixed", "projection_input", "route_ids", "route_weights", "route_logits"] {
+                let buffer = owner.buffer(name)?;
+                let mut bytes = vec![0u8; buffer.bytes];
+                device.run(|| library.copy_d2h(&mut bytes, buffer))?;
+                std::fs::write(out.join(format!("{name}.bin")), bytes)?;
+            }
+            std::fs::write(out.join("meta.json"), serde_json::to_vec_pretty(&serde_json::json!({
+                "rows":rows,"hidden":cfg.hidden,"experts":cfg.experts,"topk":cfg.topk,"local":cfg.local[index]}))?)?;
+        }
         let physical = [args.device];
         let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "inkling2",
@@ -176,7 +192,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         serde_json::json!({"normalized_rms":rms,"cosine":cosine,"reference_nll":reference_nll,
             "nll_delta":nll-reference_nll})
     } else { serde_json::Value::Null };
-    std::fs::create_dir(&args.save_logits)?;
+    if args.tap_layers.is_empty() { std::fs::create_dir(&args.save_logits)?; }
     std::fs::write(args.save_logits.join("logits.bin"), bytes)?;
     std::fs::write(args.save_logits.join("tokens.bin"), tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
     let report = serde_json::json!({"family":"inkling2","native":true,"partial":args.last_layer+1 != cfg.layers,
