@@ -4060,9 +4060,9 @@ struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
     scoring: Option<crate::shared::probe::ScoringRows<'t>>,
 }
 
-impl UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
+impl<'a, 'w> UnitHooks<'_, 'w, '_, '_, 'a, '_, '_> {
     fn owner(&self, layer: usize) -> usize { self.engine.state_map.layers[layer].owner }
-    fn workspace(&self, owner: usize) -> Result<&Workspace<'_>> { self.work[owner].context("Qwen unit owner workspace") }
+    fn workspace(&self, owner: usize) -> Result<&'w Workspace<'a>> { self.work[owner].context("Qwen unit owner workspace") }
     fn select(&self, owner: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let shape = self.engine.prefill_shape.context("Qwen prefill shape")?;
         let w = self.workspace(owner)?;

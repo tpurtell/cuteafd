@@ -425,7 +425,8 @@ mod weight_representation_tests {
 
     #[test]
     fn dual_selector_requires_resident_local_experts() {
-        assert!(args(&["--split-device", "1"]).is_err());
+        assert!(args(&["--split-device", "1"]).is_ok());
+        assert!(args(&["--split-device", "1", "--peers", "localhost:1"]).is_ok());
         assert!(args(&["--local-experts", "--split-device", "1"]).is_ok());
         assert!(args(&["--local-experts", "--split-device", "1", "--expert-window", "1"]).is_err());
         assert!(args(&["--local-experts", "--split-device", "1", "--peers", "localhost:1"]).is_err());
@@ -438,7 +439,7 @@ mod weight_representation_tests {
         let command = Command::command();
         let selector = command.get_arguments().find(|arg| arg.get_id() == "split_device").unwrap();
         assert_eq!(selector.get_env(), Some(std::ffi::OsStr::new("CUTEAFD_QWEN_SPLIT_DEVICE")));
-        assert!(args(&["--rtx-expert-layers", "all"]).is_err());
+        assert!(args(&["--rtx-expert-layers", "all"]).is_ok());
         for policy in ["auto", "all", "0", "5"] {
             assert!(args(&["--local-experts", "--split-device", "1", "--rtx-expert-layers", policy]).is_ok());
         }

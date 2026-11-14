@@ -417,3 +417,10 @@ def test_embedding_value_support_and_expert_usage_adapters():
     assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 3
     assert {family for family in COLUMNS if MATRIX["EXPERT_USAGE"][family]} == {
         "V4.1", "V4", "GLM 5.3 / ML4", "MiMo", "Kimi K3"}
+
+
+def test_qwen_pool_first_onboarding_documents_whole_and_hybrid_tp2():
+    text = DOC.read_text()
+    assert "`RTX_EXPERT_LAYERS=auto` is pool-first on one or two RTX devices" in text
+    assert "Spark-backed layouts: whole routed layers on one RTX, TP2 halves on two" in text
+    assert "`--rtx-expert-layers` does not require `--split-device`" in text

@@ -650,7 +650,13 @@ world of zero. Configured Spark inventory and admitted vision-only ranks do
 not disable this default. Media-only Spark layouts still require an available
 worker and complete encoder admission. Other formats and Spark expert layouts
 default off. Explicit values win.
-Qwen4 keeps the exact pre-allocation-admitted EXL3 expert set resident, with no runtime paging.
+Qwen4 keeps the exact pre-allocation-admitted expert set resident, with no runtime paging.
+`RTX_EXPERT_LAYERS=auto` is pool-first on one or two RTX devices, including
+Spark-backed layouts: whole routed layers on one RTX, TP2 halves on two, and
+the remaining layers on the Sparks. `all` and `N` are exact fit-or-refuse pins;
+`--rtx-expert-layers` does not require `--split-device`. Zero onboarded layers
+and all-local layouts use the same per-layer executor. Two-RTX attention owns
+whole layer ranges (`ATTENTION_PLACEMENT=layers`), independent of expert homes.
 
 KV precision (`KV_CACHE`; `SWA_KV_CACHE` is MiMo only):
 

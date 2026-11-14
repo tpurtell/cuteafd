@@ -3642,11 +3642,12 @@ def test_prefill_scoring_uses_ordinary_launch(tmp_path, family_config):
 def test_qwen_explicit_pair_checks_admitted_expert_world(
         tmp_path: Path, checkpoint: str, keys: str) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], "test/model", keys)
-    assert result.returncode != 0, result.stderr
+    assert result.returncode == 0, result.stderr
     planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     assert "--rtx 2" in planner and "--attention-placement layers" in planner
-    assert "Qwen dual requires a Spark-free local TP2 layout" in result.stderr
-    assert "docker run -d" not in result.stderr
+    server = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--split-device 1" in server and "--peers" in server
+    assert "Spark-free local TP2" not in result.stderr
 
 
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n", "COORDINATOR_SPLIT=heads\n"])
@@ -3740,7 +3741,10 @@ def test_qwen_dual_forwards_shared_onboard_policy(tmp_path: Path, onboard: str) 
                                   f"RTX_GPUS=2\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nSPECULATOR=off\nRTX_EXPERT_LAYERS={onboard}\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert f"--rtx-expert-layers {onboard}" in launch
+    if onboard != "auto":
+        assert f"--rtx-expert-layers {onboard}" in launch
+    else:
+        assert "--rtx-expert-layers all" not in launch
     assert "CUTEAFD_ATTENTION_PLACEMENT=layers" in launch
 
 
