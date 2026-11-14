@@ -108,7 +108,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 resident_weights: crate::shared::memory::budget::resident_weight_limit() })?;
             let served_context = usize::try_from(loaded.admitted.solved.served_context())?;
             let backend = super::backend::MiniMaxBackend::new(&loaded.owners, &cfg,
-                loaded.execution, served_context, loaded.host_prefix)?;
+                loaded.execution, served_context, loaded.host_prefix, worker_args.prefill_packing)?;
             library.cuda_set_device(worker_args.device)?;
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats,
                 concurrency, scheduler::Drafts::None, Default::default(), eos, worker_args.decode_share,

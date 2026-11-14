@@ -125,7 +125,9 @@ flags. Users set keys, not these flags or the `CUTEAFD_*` environment variables
 the launcher derives from them.
 
 `cuteafd golden --family minimax_m3` (hidden alias `minimax-golden`) is a
-qualification-only native full-model prefill path; MiniMax serving stays refused.
+qualification-only native full-model prefill path. Public MiniMax serving stays
+refused until its qualification card passes; WIP builds can serve it through the
+hidden `serve-minimax` command for qualification.
 Explicit two-RTX heads planning is available with half KV and replicated index
 storage; `auto` stays contiguous whole attention with neuron-split FFNs on two RTX.
 The two-RTX layers recipe requires an explicit qualified BF16/F32 split-wire

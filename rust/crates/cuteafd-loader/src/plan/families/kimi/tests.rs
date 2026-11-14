@@ -960,7 +960,17 @@ fn k31_original_core_plan_charges_index_records_once_and_refuses_compact_core() 
     let input = testing::BudgetedPlanInput::open(dir.path())?;
     let mut options = with_layout(6, Some(115 << 30));
     let report = input.plan(&options)?;
-    assert!(!report.wip_launchable(), "serve-kimi stays fail-closed for K3.1 in Stage 1");
+    assert!(!report.native_serving_admitted && !report.wip_launchable(),
+        "serve-kimi stays fail-closed for K3.1 in Stage 1");
+    // Earlier deployment guards may have admitted a native storage route.
+    // A descriptor that refuses DSA serving must not inherit that prior true.
+    let mut prior = report.clone();
+    prior.native_serving_admitted = true;
+    let mut layout = options.layout.clone().unwrap();
+    let raw_input = crate::plan::PlanInput::open(dir.path())?;
+    let model = Model::open(raw_input.checkpoint())?;
+    let _ = crate::plan::family_layout(&model, &raw_input, &mut prior, &mut layout, options.placement)?;
+    assert!(!prior.native_serving_admitted && !prior.wip_launchable());
     let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
     let memory = report.memory_layout.as_ref().unwrap();
     for dev in memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx) {

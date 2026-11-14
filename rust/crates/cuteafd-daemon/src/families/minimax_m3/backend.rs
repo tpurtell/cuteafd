@@ -14,6 +14,15 @@ use std::{cell::{Cell, RefCell}, collections::{BTreeMap, BTreeSet}, ops::Range, 
 
 const MESSAGE_STARTS: &[&str] = &["]~b]"];
 
+fn packing_rows(mode: crate::shared::prefill_packing::PackingMode, admitted: usize) -> usize {
+    match mode {
+        crate::shared::prefill_packing::PackingMode::Unrestricted => admitted,
+        // Native NVFP4 route occupancy has no exact cap attestation yet;
+        // the shared grouping contract runs unknown routes as singletons.
+        crate::shared::prefill_packing::PackingMode::Exact => 0,
+    }
+}
+
 fn validate_prefix_concurrency(requested: usize, admitted: usize) -> Result<()> {
     ensure!(requested > 0 && requested == admitted,
         "MiniMax prefix concurrency differs from admitted request slots");
@@ -89,11 +98,13 @@ pub(crate) struct MiniMaxBackend<'e, 'a> {
     pending: RefCell<Option<Vec<Submitted>>>,
     terminal: Cell<bool>,
     selector_receipts: RefCell<Option<Vec<cuteafd_loader::placement::planner::Receipt>>>,
+    packing: crate::shared::prefill_packing::PackingMode,
 }
 
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     pub fn new(owners: &'e Owners<'a>, cfg: &'e MiniMaxM3Config, execution: ServingPrefill<'a>,
-        served_context: usize, host: Option<cuteafd_hostcache::config::Config>) -> Result<Self> {
+        served_context: usize, host: Option<cuteafd_hostcache::config::Config>,
+        packing: crate::shared::prefill_packing::PackingMode) -> Result<Self> {
         let storage = &owners.storage;
         ensure!(storage.ranks.len() == 1, BackendError::TwoRtxNotQualified);
         let state = storage.requests.borrow();
@@ -113,7 +124,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         Ok(Self { owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
             host, profile: RefCell::new([0.0; 2]), identities: RefCell::new(BTreeMap::new()),
             next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false),
-            selector_receipts: RefCell::new(None) })
+            selector_receipts: RefCell::new(None), packing })
     }
 
     fn live(&self) -> Result<()> { ensure!(!self.terminal.get(), BackendError::Terminal); Ok(()) }
@@ -322,8 +333,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         Ok((logit_rows > 0).then_some(probe::ScoreLogits::Recorded))
     }
     fn packed_limits(&self) -> Option<Limits> {
-        Some(Limits { rows: self.geometry().prefill_rows, chunk_rows: self.geometry().prefill_rows,
-            max_context: self.context, taps: None })
+        Some(Limits { rows: packing_rows(self.packing, self.geometry().prefill_rows),
+            chunk_rows: self.geometry().prefill_rows, max_context: self.context, taps: None })
     }
     fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, NoDraft>], pool: &RefPagePool,
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> MemberOutcome) -> Result<Vec<Result<()>>> {
@@ -428,6 +439,20 @@ mod tests {
         assert!(validate_prefix_concurrency(0, 0).is_err());
         assert!(validate_prefix_concurrency(1, 16).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn packing_modes_use_shared_grouping_without_silently_changing_mode() {
+        use crate::shared::prefill_packing::{self, PackingMode};
+        let chunks = [(0, 128), (256, 128)];
+        for (mode, expected) in [(PackingMode::Exact, vec![0..1, 1..2]),
+            (PackingMode::Unrestricted, vec![0..2])] {
+            let limits = Limits { rows: packing_rows(mode, 2752), chunk_rows: 2752,
+                max_context: 4096, taps: None };
+            let groups = prefill_packing::groups(chunks.len(), |range|
+                prefill_packing::plan(&chunks[range], &limits).is_ok());
+            assert_eq!(groups, expected);
+        }
     }
 
     #[test]

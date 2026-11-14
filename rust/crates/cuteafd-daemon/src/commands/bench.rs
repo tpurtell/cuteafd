@@ -2,7 +2,7 @@
 //! does the work), `bench publish` for the README table and benchmarks index,
 //! `bench smoke --matrix` for release prep. Also the capture of a serve
 //! command's resolved options for the server's own benchmark reports.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory};
 use cuteafd_bench::report::Setting;
 use std::path::PathBuf;
