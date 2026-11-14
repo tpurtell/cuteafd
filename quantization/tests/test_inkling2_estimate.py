@@ -86,3 +86,41 @@ def test_io_recovery_uses_new_cycles_and_excludes_partial_restart_layer(tmp_path
     assert value['basis']=='mean of recent completed layers'
     assert value['sample_layers']==1
     assert value['seconds_per_layer']==7200
+
+
+def test_operational_resume_preserves_remaining_work_and_excludes_partial_layer(tmp_path):
+    start=datetime(2026,11,13,tzinfo=timezone.utc)
+    def at(seconds):
+        return datetime.fromtimestamp(start.timestamp()+seconds,timezone.utc)
+    write(tmp_path/'layers/layer-000/complete.json',dict(layer=0,seconds=1000))
+    (tmp_path/'events.jsonl').write_text(json.dumps(dict(event='layer_complete',time=start.isoformat()))+'\n')
+    write(tmp_path/'runtime-recovery.json',dict(blocked=True,episodes=[dict(layer=1,
+        stopped_at=at(100).isoformat(),resumed_at=None)]))
+    write(tmp_path/'status.json',dict(time=at(100).isoformat()))
+    failed=estimate(tmp_path,at(400),supervisor_failed=True)
+    assert failed['blocked']
+    assert failed['current_layer_downtime_seconds']==300
+    assert failed['layer_remaining_seconds_estimate']==47*1000-100
+    assert 'resumes now' in failed['assumption']
+    write(tmp_path/'runtime-recovery.json',dict(blocked=False,episodes=[dict(layer=1,
+        stopped_at=at(100).isoformat(),resumed_at=at(400).isoformat())]))
+    resumed=estimate(tmp_path,at(500))
+    assert not resumed['blocked']
+    assert resumed['layer_remaining_seconds_estimate']==47*1000-200
+    write(tmp_path/'layers/layer-001/complete.json',dict(layer=1,seconds=200))
+    value=estimate(tmp_path,at(500))
+    assert value['seconds_per_layer']==1000
+    assert value['sample_layers']==1
+    assert value['interrupted_layers_excluded']==[1]
+
+
+def test_supervisor_failure_pauses_forecast_without_python_failure_receipt(tmp_path):
+    start=datetime(2026,11,13,tzinfo=timezone.utc)
+    write(tmp_path/'layers/layer-000/complete.json',dict(layer=0,seconds=1000))
+    (tmp_path/'events.jsonl').write_text(json.dumps(dict(event='layer_complete',time=start.isoformat()))+'\n')
+    write(tmp_path/'status.json',dict(time=start.isoformat()))
+    now=datetime.fromtimestamp(start.timestamp()+300,timezone.utc)
+    value=estimate(tmp_path,now,supervisor_failed=True)
+    assert value['blocked']
+    assert value['current_layer_downtime_seconds']==300
+    assert value['layer_remaining_seconds_estimate']==47*1000

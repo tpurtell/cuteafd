@@ -18,7 +18,7 @@ def stamp(value):
     return datetime.fromisoformat(value).timestamp()
 
 
-def estimate(root, now=None):
+def estimate(root, now=None, *, supervisor_failed=False):
     """Return a provisional range and timezone-explicit completion timestamps.
 
     Before one whole layer completes, extrapolate actual successive K4 expert
@@ -47,15 +47,20 @@ def estimate(root, now=None):
     cleaned = load(root/'handoff-cleanup-complete.json').get('status') == 'passed'
     failure = load(root/'failure.json')
     recovery = load(root/'io-recovery.json')
+    runtime = load(root/'runtime-recovery.json')
+    episodes = runtime.get('episodes', [])
     io_epoch = stamp(recovery['resumed_at']) if recovery.get('resumed_at') else None
     mixed_layer = recovery.get('resumed_layer') if io_epoch is not None else None
+    blocked = bool(failure or runtime.get('blocked') or supervisor_failed)
     result = dict(as_of=now.astimezone(TAIPEI).isoformat(), timezone='Asia/Taipei',
-        provisional=True, completed_layers=len(layers), blocked=bool(failure),
-        assumption='continuous progress; failure or hardware downtime moves the calendar estimate')
+        provisional=True, completed_layers=len(layers), blocked=blocked,
+        assumption=('forecast assumes work resumes now; further downtime shifts completion' if blocked else
+                    'continuous progress; failure or hardware downtime moves the calendar estimate'))
     remaining_layers = max(0, 48-len(layers))
     base_seconds = None
     count_based = None
-    clean_layers = [r for r in layers if r.get('layer') != mixed_layer]
+    interrupted = {mixed_layer} | {e['layer'] for e in episodes}
+    clean_layers = [r for r in layers if r.get('layer') not in interrupted]
     if clean_layers:
         samples = [r['seconds'] for r in clean_layers[-6:]]
         base_seconds = statistics.mean(samples)
@@ -98,7 +103,30 @@ def estimate(root, now=None):
     else:
         entries = [e for e in events if e.get('event') == 'attention_input_capture']
         started = stamp(entries[0]['time']) if entries else now.timestamp()
-    elapsed = max(0, now.timestamp()-started)
+    paused = []
+    for episode in episodes:
+        stop = max(started, stamp(episode['stopped_at']))
+        resume = min(now.timestamp(), stamp(episode['resumed_at'])
+                     if episode.get('resumed_at') else now.timestamp())
+        if resume > stop:
+            paused.append((stop, resume))
+    if supervisor_failed:
+        status = load(root/'status.json')
+        if status.get('time'):
+            paused.append((max(started, stamp(status['time'])), now.timestamp()))
+    # Merge overlaps so an open recovery episode and supervisor failure never
+    # charge the same downtime twice.
+    intervals = []
+    for stop, resume in sorted(paused):
+        if intervals and stop <= intervals[-1][1]:
+            intervals[-1][1] = max(intervals[-1][1], resume)
+        elif resume > stop:
+            intervals.append([stop, resume])
+    downtime = sum(resume-stop for stop, resume in intervals)
+    elapsed = max(0, now.timestamp()-started-downtime)
+    if episodes or supervisor_failed:
+        result.update(current_layer_downtime_seconds=downtime,
+                      interrupted_layers_excluded=sorted(n for n in interrupted if n is not None))
     if remaining_layers == 0 or complete or published or handed:
         layer_range = [0., 0.]
     elif base_seconds is not None:
