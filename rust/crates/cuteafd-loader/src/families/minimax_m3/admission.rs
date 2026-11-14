@@ -43,8 +43,9 @@ impl Coordinator {
         match self {
             Self::Planned { cards } => shared::planned_budget(gpu as u8, cards[gpu].physical_bytes,
                 cards[gpu].logical_bytes, ArchContext::for_device("sm_120", cards[gpu].physical_bytes).context_bytes),
+            // The sampled occupancy is a named recipe owner; leave no second subtraction.
             Self::Measured { samples, .. } => shared::measured_budget(gpu as u8, samples[gpu].0, samples[gpu].1,
-                samples[gpu].2),
+                samples[gpu].0),
         }
     }
 }
@@ -286,6 +287,12 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         graph_reserve.push(crate::placement::graph_reserve::current(gpu, false, base, tail)
             .map_err(|error| refused(format!("MiniMax graph reserve refused: {error}"), "Fix GPU_GRAPH_RESERVE."))?.bytes);
     }
+    let measured_context = match &request.coordinator {
+        Coordinator::Planned { .. } => vec![0; gpus],
+        Coordinator::Measured { samples, .. } => samples.iter().map(|&(total, _, free)|
+            total.checked_sub(free).ok_or_else(|| refused("MiniMax sampled free bytes exceed physical capacity",
+                "Provide a valid post-module CUDA memory sample."))).collect::<Result<Vec<_>, _>>()?,
+    };
     let mut budgets = (0..gpus).map(|gpu| request.coordinator.budget(gpu)).collect::<Vec<_>>();
     budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, request.spark_bytes)));
     let (host_total, host_available) = request.host;
@@ -309,7 +316,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, owners,
         manifest: request.manifest.clone(), routed: routed.clone(), expert_backings, local, spark, links,
-        spark_reply_formats: request.replies, drafter: None, vision: None, budgets, code, graph_reserve,
+        spark_reply_formats: request.replies, drafter: None, vision: None, budgets, code, measured_context, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
             experts: cfg.experts, topk: cfg.topk, routed_layers: routed }),

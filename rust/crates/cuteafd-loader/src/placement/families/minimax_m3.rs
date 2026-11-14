@@ -360,6 +360,8 @@ pub struct MiniMaxInputs {
     pub budgets: Vec<Budget>,
     /// Per-rank planned code allowance (zero on the measured edge).
     pub code: Vec<u64>,
+    /// Already-held post-module occupancy, charged once with full-capacity budgets.
+    pub measured_context: Vec<u64>,
     /// Per-rank graph reserve (the canonical `graph reserve` owner).
     pub graph_reserve: Vec<u64>,
     pub head: serving::BlasHead,
@@ -609,7 +611,8 @@ impl MiniMaxInputs {
         let maximum = self.maximum_pages();
         if !(1..=2).contains(&self.gpus) || maximum == 0 || maximum == u64::MAX
             || self.targets.len() != self.gpus
-            || self.graph_reserve.len() != self.gpus || self.code.len() != self.gpus {
+            || self.graph_reserve.len() != self.gpus || self.code.len() != self.gpus
+            || self.measured_context.len() != self.gpus {
             return Err(invalid("invalid execution inventory extent"));
         }
         self.validate_attention()?;
@@ -756,6 +759,9 @@ impl MiniMaxInputs {
             crate::placement::graph_reserve::source(&format!("minimax_m3.graphs.{gpu}")), true, maximum));
         out.extend(allowance(location, self.code[gpu], Lifetime::RESIDENT,
             "MiniMax selected-program loaded code (estimated module residency)".into(), true, maximum));
+        // Already-held driver/module bytes are opaque occupancy, not a new allocation.
+        out.extend(allowance(location, self.measured_context[gpu], Lifetime::RESIDENT,
+            crate::placement::sampled_baseline::source("CUDA context and loaded modules"), false, maximum));
         let split_abort = u64::from(self.split());
         let peak = 1 + crate::push_load::COPY_STREAMS as u64 + 1 + split_abort;
         out.extend(allowance(location, cuda_stream_slab_bytes(peak)?, Lifetime::RESIDENT,
@@ -771,7 +777,7 @@ impl Recipe for MiniMaxInputs {
         let maximum = self.maximum_pages();
         if !(1..=2).contains(&self.gpus) || self.spark_ranks > 8 || maximum == 0 || maximum == u64::MAX
             || request.context.maximum != self.context.maximum || self.targets.len() != self.gpus
-            || self.graph_reserve.len() != self.gpus
+            || self.graph_reserve.len() != self.gpus || self.measured_context.len() != self.gpus
             || self.code.len() != self.gpus || self.expert_backings.len() != self.routed.len() + 1
             || self.spark.len() != self.routed.len() + 1
             || self.push_host_envelopes.len() != self.routed.len() + 1

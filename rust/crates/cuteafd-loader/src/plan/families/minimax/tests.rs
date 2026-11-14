@@ -731,7 +731,8 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         spark: (0..=routed.len()).map(charge).collect(),
         links: shared::spark_link(0, ranks, prefill, Default::default()).unwrap(),
         spark_reply_formats: Default::default(), drafter: None, vision: None, budgets,
-        code: vec![64 << 20; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
+        code: vec![64 << 20; gpus], measured_context: vec![0; gpus],
+        graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
         expert_usage: None, resident_weight_limit: None,
         push_host_envelopes: vec![None; routed.len() + 1],
@@ -1723,6 +1724,47 @@ fn heads_expert_backend_charges_tp2_exchange_separately_without_weight_replicati
 
 
 #[test]
+fn measured_context_changes_only_the_named_owner_with_a_pinned_pool() {
+    use crate::placement::families::minimax_m3 as shared;
+    use crate::placement::planner::{Baseline, Operation};
+    let group = crate::placement::sampled_baseline::source("CUDA context and loaded modules");
+    for gpus in [1, 2] {
+        let mut inputs = recipe_inputs(gpus, 4);
+        for gpu in 0..gpus {
+            let budget = &mut inputs.budgets[gpu];
+            budget.baseline = Baseline::Forecast { occupied: 0, source: "full capacity".into(), assumed: false };
+            inputs.measured_context[gpu] = 688_455_680;
+        }
+        let request = shared::request(inputs.context, Some(32768), crate::placement::Onboard::Layers(0),
+            inputs.prefill, Operation::Serving, None, Default::default());
+        let before = inputs.admit(request.clone()).unwrap();
+        inputs.measured_context[0] += 65_536;
+        let after = inputs.admit(request).unwrap();
+        assert_eq!(before.placement.pool_tokens, 32768);
+        assert_eq!(before.placement.pool_tokens, after.placement.pool_tokens);
+        assert_eq!(before.solved.decisions, after.solved.decisions);
+        for gpu in 0..gpus {
+            let items = |admitted: &shared::AdmittedMiniMax| admitted.placement.items[gpu].iter()
+                .filter(|item| item.group != group).cloned().collect::<Vec<_>>();
+            assert_eq!(items(&before), items(&after));
+            let owner = |admitted: &shared::AdmittedMiniMax| {
+                let owners = admitted.placement.items[gpu].iter().filter(|item| item.group == group)
+                    .collect::<Vec<_>>();
+                assert_eq!(owners.len(), 1);
+                assert_eq!(owners[0].category, cuteafd_core::memory_layout::Category::Runtime);
+                assert_eq!(owners[0].basis, cuteafd_core::memory_layout::Basis::Calibrated);
+                owners[0].bytes
+            };
+            assert_eq!(owner(&before), 688_455_680);
+            assert_eq!(owner(&after) - owner(&before), if gpu == 0 { 65_536 } else { 0 });
+        }
+        let mut expected = before.solved.facts.clone();
+        expected.allowances.iter_mut().find(|owner| owner.source == group).unwrap().bytes += 65_536;
+        assert_eq!(expected, after.solved.facts);
+    }
+}
+
+#[test]
 fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pages() {
     use crate::families::minimax_m3::admission::{gather, Coordinator, FactsRequest};
     use crate::placement::{AttentionPlacement, CoordinatorCard, ResidentWeights};
@@ -1746,6 +1788,24 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
     assert!(heads.heads() && heads.owners.is_empty());
     assert_eq!(heads.targets, expected.targets);
     assert_eq!(heads.mount, expected.mount);
+    assert_eq!(heads.measured_context, vec![0; 2]);
+    let planned = request.coordinator.clone();
+    for occupied in [688_455_680, 688_455_680 + 65_536] {
+        request.coordinator = Coordinator::Measured {
+            samples: vec![(96 << 30, 80 << 30, (96 << 30) - occupied); 2], loaded_code: vec![0; 2] };
+        let measured = gather(&request).unwrap();
+        assert_eq!(measured.measured_context, vec![occupied; 2]);
+        assert_eq!(measured.code, vec![0; 2]);
+        for budget in &measured.budgets[..2] {
+            assert!(matches!(budget.baseline, crate::placement::planner::Baseline::Sampled { free, .. }
+                if free == 96 << 30));
+            assert_eq!(budget.logical_bytes, 80 << 30);
+        }
+    }
+    request.coordinator = Coordinator::Measured { samples: vec![(96 << 30, 80 << 30, (96 << 30) + 1); 2],
+        loaded_code: vec![0; 2] };
+    assert!(gather(&request).unwrap_err().what.contains("sampled free bytes exceed physical capacity"));
+    request.coordinator = planned;
     request.attention = None;
     request.split_wire = Some(crate::families::minimax_m3::execution::WirePrecision::Bf16);
     let layers = gather(&request).unwrap();

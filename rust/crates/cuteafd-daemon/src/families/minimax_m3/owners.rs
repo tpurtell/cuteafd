@@ -569,7 +569,7 @@ pub(super) mod tests {
             } else { SparkCharge { experts: 1 << 30, owners: 1 << 30, runtime: 1 << 30 } }; 2]).collect(),
             links: canonical::spark_link(0, 2, prefill, Default::default())?,
             spark_reply_formats: Default::default(), drafter: None, vision: None, code: vec![64 << 20; gpus],
-            graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
+            measured_context: vec![0; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
             host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
             expert_usage: None, resident_weight_limit: None,
             push_host_envelopes: vec![None; routed.len() + 1],
