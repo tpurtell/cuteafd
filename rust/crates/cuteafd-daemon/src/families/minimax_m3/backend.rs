@@ -14,6 +14,21 @@ use std::{cell::{Cell, RefCell}, collections::{BTreeMap, BTreeSet}, ops::Range, 
 
 const MESSAGE_STARTS: &[&str] = &["]~b]"];
 
+fn retain_logit_tile(library:&cuteafd_ffi::NativeLibrary, retained:cuteafd_ffi::CuteafdDeviceBuffer,
+    first:usize, vocab:usize, logits:DeviceLogits) -> Result<()> {
+    ensure!(logits.vocab == vocab && logits.stride == vocab && logits.rows > 0,
+        "MiniMax retained logit tile geometry differs");
+    let row_bytes=vocab.checked_mul(4).context("MiniMax logit row extent overflow")?;
+    let bytes=logits.rows.checked_mul(row_bytes).context("MiniMax logit tile extent overflow")?;
+    let offset=first.checked_mul(row_bytes).context("MiniMax logit tile offset overflow")?;
+    let target=super::cache::view(retained,offset,bytes)?;
+    let source=cuteafd_ffi::CuteafdDeviceBuffer { ptr:logits.ptr.cast_mut(),bytes,
+        device_id:retained.device_id,..Default::default() };
+    // SAFETY: the callback owns this live head tile until its next projection;
+    // the retained plane survives selection and this copy uses its producer stream.
+    unsafe { library.copy_d2d_async(target,source,bytes,logits.stream) }
+}
+
 fn packing_rows(mode: crate::shared::prefill_packing::PackingMode, admitted: usize) -> usize {
     match mode {
         crate::shared::prefill_packing::PackingMode::Unrestricted => admitted,
@@ -218,11 +233,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let result=self.execution.borrow_mut().execute(&self.owners.storage,self.cfg,&self.schedule,&mut requests,false,
             |index,span,logits| {
                 let first=offsets[index] + span.start - submitted[index].placement.len;
-                let bytes=logits.rows * self.cfg.vocab_size * 4;
-                let source=cuteafd_ffi::CuteafdDeviceBuffer { ptr:logits.ptr.cast_mut(),bytes,device_id:retained.buffer.device_id,..Default::default() };
-                let target=super::cache::view(retained.buffer,first * self.cfg.vocab_size * 4,bytes)?;
-                // SAFETY: bounded head tile is consumed before reuse on the producing stream.
-                unsafe { library.copy_d2d_async(target,source,bytes,logits.stream) }
+                retain_logit_tile(library,retained.buffer,first,self.cfg.vocab_size,logits)
             });
         self.completed(result)?;
         *self.pending.borrow_mut()=Some(submitted);
@@ -412,8 +423,18 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let total: usize = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         ensure!(sequences.len() == 1 && total <= self.geometry().decode_rows,
             "MiniMax diagnostic scoring requires one bounded sequence");
-        if total == 1 { return self.decode(sequences, pool, false, false); }
         let start = sequences[0].0.len;
+        if let Some(retained)=&self.owners.storage.verify_logits {
+            let mut stream=None;
+            self.prefill(sequences,&[start..start + total],pool,|_,span,logits| {
+                retain_logit_tile(self.library(),retained.buffer,span.start - start,self.cfg.vocab_size,logits)?;
+                stream=Some(logits.stream);
+                Ok(())
+            })?;
+            return Ok(Some(DeviceLogits { ptr:retained.buffer.ptr,rows:total,vocab:self.cfg.vocab_size,
+                stride:self.cfg.vocab_size,stream:stream.context("MiniMax diagnostic scoring produced no rows")?,greedy:None }));
+        }
+        if total == 1 { return self.decode(sequences, pool, false, false); }
         let mut result = None;
         self.prefill(sequences, &[start..start + total], pool, |_, _, logits| {
             ensure!(result.is_none(), "MiniMax bounded diagnostic head split unexpectedly");
@@ -540,6 +561,31 @@ mod tests {
     use cuteafd_loader::{families::minimax_m3::execution::{MsaCache, MsaRope},
         placement::families::minimax_m3::RequestCapacity};
     use std::rc::Rc;
+
+    #[test]
+    fn diagnostic_logit_tiles_survive_bounded_head_reuse() -> Result<()> {
+        let fixture=Fixture::build_for_tests()?;
+        let library=fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let device=Device { library:&library,id:0 };
+        let head=Allocation::new(device,4 * 8 * 4,Tag::workspace("test/head"))?;
+        let retained=Allocation::new(device,32 * 8 * 4,Tag::workspace("test/retained-logits"))?;
+        let mut expected=Vec::new();
+        for first in (0..32).step_by(4) {
+            let bytes=(first * 8..(first + 4) * 8).flat_map(|n| (n as f32).to_le_bytes()).collect::<Vec<_>>();
+            library.copy_h2d(head.buffer,&bytes)?;
+            retain_logit_tile(&library,retained.buffer,first,8,DeviceLogits { ptr:head.buffer.ptr,
+                rows:4,vocab:8,stride:8,stream:std::ptr::null_mut(),greedy:None })?;
+            expected.extend(bytes);
+        }
+        library.copy_h2d(head.buffer,&vec![197;head.buffer.bytes])?;
+        let mut actual=vec![0;retained.buffer.bytes];
+        library.copy_d2h(&mut actual,retained.buffer)?;
+        assert_eq!(actual,expected);
+        assert!(retain_logit_tile(&library,retained.buffer,31,8,DeviceLogits { ptr:head.buffer.ptr,
+            rows:4,vocab:8,stride:8,stream:std::ptr::null_mut(),greedy:None }).is_err());
+        Ok(())
+    }
 
     #[test]
     fn prefix_scheduler_argument_is_boot_concurrency_not_decode_lanes() -> Result<()> {
