@@ -1610,6 +1610,30 @@ mod tests {
     }
 
     #[test]
+    fn k31_live_projection_scratch_matches_kernel_offsets_and_keeps_static_kda_workspace() {
+        for rows in [1usize, 64, 1024, 2752, 4096] { for heads in [48, 96] {
+            let align = |n: usize| n.next_multiple_of(1024);
+            let [producer, output] = KimiMlaProjection::scratch_bytes_for(rows, heads).unwrap();
+            assert_eq!(producer, align(rows * 2112 * 2) + align(rows * heads * 192 * 2));
+            assert_eq!(output, 2 * align(rows * heads * 128 * 2));
+            let index = KimiIndexProducer::scratch_bytes_for(rows).unwrap();
+            assert_eq!(index, align(rows * 8192) + align(rows * 320));
+            let g = KimiKdaGeometry::new(heads).unwrap();
+            let planes = |m| align(m * g.input_width() * 2) + align(m * 4 * g.width())
+                + align(m * 6 * g.width()) + 2 * align(m * 2 * g.width());
+            let exported = planes(4096) + 17 * 1024;
+            assert_eq!(KimiKda::scratch_bytes_for(rows, 4096, heads, exported).unwrap(),
+                planes(rows) + 17 * 1024);
+            assert!(KimiKda::scratch_bytes_for(rows, 4096, heads, planes(4096) - 1).is_err());
+        }}
+        for rows in [0, 4097, usize::MAX] {
+            assert!(KimiMlaProjection::scratch_bytes_for(rows, 96).is_err());
+            assert!(KimiIndexProducer::scratch_bytes_for(rows).is_err());
+            assert!(KimiKda::scratch_bytes_for(rows, 4096, 48, 629_464_064).is_err());
+        }
+    }
+
+    #[test]
     fn k31_index_selection_checks_causal_metadata_extents_and_writer_aliases() {
         let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
             bytes: 0x10000000, device_id: 0, flags: 0 };

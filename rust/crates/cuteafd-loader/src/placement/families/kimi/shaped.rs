@@ -41,6 +41,16 @@ impl ShapedOwner {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn affine_curves_preserve_every_sample_without_rounding_sawtooth_expansion() {
+        let values = (1..=32768).map(|pages| (pages.min(16384) * 256) as u64).collect::<Vec<_>>();
+        let curve = super::curve(&values);
+        assert!(curve.0.len() <= 2);
+        for (index, &value) in values.iter().enumerate() {
+            assert_eq!(curve.at(index as u64 + 1).unwrap(), value);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -79,8 +89,12 @@ mod tests {
                 let selected = [0, 0];
                 let facts = contract.facts(&selected, pages)?;
                 let mut solved = ResolvedPlan { request: request.clone(), pool_tokens: pages * recipe.page_rows(),
-                    pool_page_rows: recipe.page_rows(), facts, budgets: vec![], phases: vec![],
-                    decisions: contract.decisions(&selected)?, encoder_diagnostics: vec![] };
+                    pool_page_rows: recipe.page_rows(), facts,
+                    budgets: (0..2).map(|rank| Budget { id: format!("gpu{rank}"),
+                        locations: vec![Location::coordinator(rank)], physical_bytes: 96 << 30,
+                        logical_bytes: 96 << 30, headroom: 0,
+                        baseline: Baseline::Forecast { occupied: 0, source: "fixture".into(), assumed: false } }).collect(),
+                    phases: vec![], decisions: contract.decisions(&selected)?, encoder_diagnostics: vec![] };
                 recipe.refine_shaped(&mut solved)?;
                 for demand in demands {
                     let owners = solved.facts.allocations.iter().filter(|root|
