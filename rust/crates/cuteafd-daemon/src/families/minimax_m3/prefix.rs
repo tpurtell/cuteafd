@@ -26,7 +26,9 @@ impl<'a> MiniMaxPrefix<'a> {
         let first = &banks[0];
         let library = first.stream.device.library;
         let mut devices = std::collections::BTreeSet::new();
+        let heads = banks.len() == 2 && banks.iter().all(|bank| bank.layout.kv_heads() == 2);
         let mut layers = std::collections::BTreeSet::new();
+        let mut page_bytes = 0usize;
         for bank in &banks {
             ensure!(devices.insert(bank.stream.device.id)
                 && std::ptr::eq(library, bank.stream.device.library)
@@ -34,8 +36,18 @@ impl<'a> MiniMaxPrefix<'a> {
                 && bank.layout.requests == first.layout.requests && bank.rope == first.rope
                 && bank.model_layers == first.model_layers,
                 "MiniMax prefix rank geometry or device differs");
-            ensure!(bank.layers.clone().all(|layer| layers.insert(layer)),
-                "MiniMax prefix ranks replicate a layer's KV");
+            if heads {
+                ensure!(bank.layers == (0..first.model_layers), "MiniMax Heads prefix rank omits model layers");
+                layers.extend(bank.layers.clone());
+            } else {
+                ensure!(bank.layout.kv_heads() == 4 && bank.layers.clone().all(|layer| layers.insert(layer)),
+                    "MiniMax prefix ranks replicate whole KV or mix layouts");
+            }
+            let stride = bank.layout.page_planes().into_iter().map(|(_, bytes)| usize::try_from(bytes))
+                .collect::<std::result::Result<Vec<_>, _>>()?.into_iter().sum::<usize>();
+            page_bytes = page_bytes.checked_add(bank.layers.len().checked_mul(stride)
+                .ok_or_else(|| anyhow::anyhow!("MiniMax prefix rank page extent overflow"))?)
+                .ok_or_else(|| anyhow::anyhow!("MiniMax prefix page extent overflow"))?;
         }
         ensure!(layers.iter().copied().eq(0..first.model_layers),
             "MiniMax prefix rank ranges do not cover the complete model");
@@ -43,8 +55,6 @@ impl<'a> MiniMaxPrefix<'a> {
             && residual_scratch.buffer.device_id == first.stream.device.id
             && std::ptr::eq(residual_scratch.device.library, library),
             "MiniMax host-tail scratch differs from rank zero");
-        let page_bytes = layers.len().checked_mul(PAGE_PLANES.iter().map(|&(_, bytes)| bytes).sum())
-            .ok_or_else(|| anyhow::anyhow!("MiniMax prefix page extent overflow"))?;
         let layout = FamilyLayout { page_rows: PAGE_ROWS, pages: first.layout.pool_pages as usize,
             page_bytes, mark_bytes: 0, draft_bytes: 0, rule: ReuseRule::paged(PAGE_ROWS),
             mark_store: MarkStore::Arena, page_owners: Default::default() };
@@ -196,8 +206,8 @@ mod tests {
     fn write_page(family: &MiniMaxPrefix<'_>, page: u32, salt: usize) -> Result<()> {
         for bank in &family.0.banks {
             for layer in bank.layers.clone() {
-                for (plane, stride) in PAGE_PLANES {
-                    let bytes = (0..stride).map(|i| ((i * 31 + salt * 13 + layer * 7) % 251) as u8).collect::<Vec<_>>();
+                for (plane, stride) in bank.layout.page_planes() {
+                    let bytes = (0..stride as usize).map(|i| ((i * 31 + salt * 13 + layer * 7) % 251) as u8).collect::<Vec<_>>();
                     bank.stream.device.run(|| bank.stream.device.library.copy_h2d(
                         bank.page(layer, plane, page)?, &bytes))?;
                 }
@@ -229,6 +239,43 @@ mod tests {
     fn cache(family: &MiniMaxPrefix<'_>) -> Result<PrefixCache<CudaCopyEngine<'static>>> {
         Ok(PrefixCache::new(family.layout(), PrefixConfig {
             entries: 8, mark_slots: 0, keep_logits: true, min_tokens: 1 }, None)?)
+    }
+
+    #[test]
+    fn heads_snapshots_include_native_half_kv_and_both_independent_index_copies() -> Result<()> {
+        use cuteafd_loader::families::minimax_m3::execution::HeadsLayout;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let cfg = MiniMaxM3Config::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?)?;
+        let mut banks = Vec::new();
+        for rank in 0..2 {
+            let stream = Rc::new(Stream::new(Device { library: &library, id: rank })?);
+            let layout = MsaCache::for_heads(&HeadsLayout::new(&cfg, rank as u8, 16)?, 4, 4, 256)?;
+            banks.push(Rc::new(PageBank::new(vec![stream], &cfg, RequestCapacity::new(4, 16)?,
+                layout, MsaRope::new(&cfg, 256)?, 0..cfg.layers)?));
+        }
+        let scratch = Rc::new(Allocation::new(banks[0].stream.device, 256, Tag::workspace("minimax/unit"))?);
+        let family = MiniMaxPrefix::new(banks, scratch)?;
+        assert_eq!(family.layout().page_bytes, cfg.layers * 2 * (16384 + 16384 + 8448));
+        for (rank, bank) in family.0.banks.iter().enumerate() {
+            for (plane, bytes) in bank.layout.page_planes() {
+                assert_eq!(bank.page(0, plane, 0)?.bytes, bytes as usize);
+                let buffer = bank.page(0, plane, 0)?;
+                bank.stream.device.run(|| library.copy_h2d(buffer, &vec![0x31 + rank as u8; buffer.bytes]))?;
+            }
+        }
+        let expected = read_page(&family, 0)?;
+        let segments = family.page_segments(0);
+        assert_eq!(segments.len(), cfg.layers * 2 * 3);
+        assert_eq!(segments.iter().map(|segment| segment.bytes).sum::<usize>(), family.layout().page_bytes);
+        family.copy_rows(TailCopy { from: 0, to: 1, rows: 1, owner: None })
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        family.drain().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        assert_eq!(read_page(&family, 1)?, expected, "partial tail copies every native backing byte");
+        assert_ne!(expected[2], expected[cfg.layers * 3 + 2], "both index copies retain independent bytes");
+        Ok(())
     }
 
     #[test]

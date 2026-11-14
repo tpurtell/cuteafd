@@ -637,11 +637,14 @@ impl MsaCache {
         Ok(cache)
     }
     pub fn kv_heads(self) -> u32 { self.kv_heads }
+    pub fn page_planes(self) -> [(&'static str, u64); 3] {
+        let kv_stride = u64::from(self.kv_heads) * 64 * 128;
+        [("keys", kv_stride), ("values", kv_stride), ("index", 8448)]
+    }
     pub fn buffers(self) -> Result<Vec<(String, u64)>, Refusal> {
         let mut out = Vec::new();
         for layer in 0..self.layers {
-            let kv_stride = u64::from(self.kv_heads) * 64 * 128;
-            for (name, stride) in [("keys", kv_stride), ("values", kv_stride), ("index", 8448)] {
+            for (name, stride) in self.page_planes() {
                 let bytes = u64::from(self.pool_pages)
                     .checked_mul(stride)
                     .filter(|&n| n <= isize::MAX as u64)
