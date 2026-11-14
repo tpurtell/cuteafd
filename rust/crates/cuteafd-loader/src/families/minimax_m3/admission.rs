@@ -121,10 +121,15 @@ pub(crate) fn spark_checkpoint(checkpoint: &crate::plan::Checkpoint, catalog: &c
 /// and the shared worker runtime residual.
 pub fn spark_charges(checkpoint: &crate::plan::Checkpoint, catalog: &crate::OfficialV41Catalog, routed: &[usize],
     ranks: usize, prefill: PrefillShape) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
+    spark_charges_for_rows(checkpoint,catalog,routed,ranks,prefill,64)
+}
+
+pub fn spark_charges_for_rows(checkpoint:&crate::plan::Checkpoint,catalog:&crate::OfficialV41Catalog,routed:&[usize],
+    ranks:usize,prefill:PrefillShape,decode_rows:u32) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
     if ranks == 0 { return Ok(vec![Vec::new(); routed.len() + 1]); }
     let canonical = spark_checkpoint(checkpoint, catalog, routed)?;
     let recipe = crate::plan::experts::checkpoint_spark_recipe(canonical.as_ref().unwrap_or(checkpoint), ranks, routed)?;
-    let executions = shared::spark_executions(prefill)?;
+    let executions = shared::spark_executions_for_rows(prefill,decode_rows)?;
     let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(prefill.rows)?,
         ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None };
     let rings = crate::plan::layout::spark_ring_geometry(shared::LANES as usize);
@@ -299,7 +304,11 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(
         format!("MiniMax push host inventory refused: {error:#}"), "Provide complete native push source headers."))?;
     let local = local_package(request.catalog, request.manifest_path, capacity, gpus);
-    let spark = spark_charges(request.checkpoint, request.catalog, &routed, ranks, shape)
+    let decode_rows=match &request.drafter {
+        Some(draft) => u32::try_from(draft.verify_rows).map_err(|_| refused("MiniMax verify rows overflow","Use supported concurrency/draft width."))?,
+        None => shared::spark_verify_rows(request.sequences,0).map_err(|error| refused(error.to_string(),"Use supported concurrency."))?,
+    };
+    let spark = spark_charges_for_rows(request.checkpoint, request.catalog, &routed, ranks, shape,decode_rows)
         .map_err(|error| refused(format!("MiniMax Spark inventory refused: {error:#}"),
             format!("Use a Spark world with a minimax:nvfp4 package ({:?}).",
                 crate::plan::experts::spark_worlds("minimax:nvfp4a4", cfg.moe_intermediate))))?;

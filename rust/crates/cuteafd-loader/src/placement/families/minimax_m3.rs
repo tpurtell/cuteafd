@@ -421,8 +421,22 @@ pub fn spark_link(gpu: u8, ranks: usize, prefill: PrefillShape, replies: SparkRe
 
 /// Typed Spark owners at the admitted unit (one prefill + one decode lane).
 pub fn spark_executions(prefill: PrefillShape) -> anyhow::Result<cuteafd_core::SparkExecutions> {
+    spark_executions_for_rows(prefill,64)
+}
+
+/// Boot concurrency and admitted draft width determine the largest wire verify.
+pub fn spark_verify_rows(concurrency:u64, drafts:usize) -> anyhow::Result<u32> {
+    anyhow::ensure!(concurrency > 0 && concurrency <= 64,"MiniMax Spark concurrency {concurrency} outside 1..=64");
+    concurrency.checked_mul(u64::try_from(drafts)?.checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("MiniMax draft width overflow"))?)
+        .and_then(|rows| u32::try_from(rows).ok()).ok_or_else(|| anyhow::anyhow!("MiniMax Spark verify rows overflow"))
+}
+
+pub fn spark_executions_for_rows(prefill:PrefillShape,rows:u32) -> anyhow::Result<cuteafd_core::SparkExecutions> {
+    use anyhow::Context;
     crate::plan::spark_executions::admit_family("minimax_m3",
-        &crate::plan::spark_executions::SparkBackend::Fp8.exports(), None, prefill.rows, prefill.waves)
+        &crate::plan::spark_executions::SparkBackend::Fp8.exports(), Some(rows), prefill.rows, prefill.waves)
+        .with_context(|| format!("MiniMax Spark decode owner cannot cover {rows} verify rows at unit {}",prefill.rows))
 }
 
 /// Balanced whole-layer attention owners for a pair: a contiguous cut that
@@ -1052,6 +1066,22 @@ pub fn spark_budget(rank: u8, bytes: u64) -> Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spark_decode_owner_covers_boot_concurrency_times_verify_width() {
+        let shape=PrefillShape { rows:2752,waves:3 };
+        let rows=spark_verify_rows(16,7).unwrap();
+        assert_eq!(rows,128);
+        let executions=spark_executions_for_rows(shape,rows).unwrap();
+        assert_eq!(executions.decode.len(),1);
+        assert_eq!(executions.decode[0].capacity,128);
+        assert_eq!(executions.decode[0].compiled_capacity,256);
+        assert_eq!(executions.owner(Some(0),128).unwrap(),cuteafd_core::ExecutionOwner::Decode(0));
+        assert!(executions.owner(Some(0),129).is_err());
+        assert_eq!(spark_verify_rows(16,0).unwrap(),16);
+        let error=spark_executions_for_rows(shape,4097).unwrap_err();
+        assert!(format!("{error:#}").contains("4097 verify rows"));
+    }
 
     #[test]
     fn executor_runs_single_whole_and_pair_split_layers() {
