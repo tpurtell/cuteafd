@@ -163,6 +163,9 @@ pub enum WholeExpertCombine {
 pub trait Family: Sync {
     fn whole_expert_combine(&self) -> WholeExpertCombine { WholeExpertCombine::SumThenRound }
     fn id(&self) -> &'static str;
+    /// Core inventory resolves native projections before role ownership is known.
+    /// Keep their headers for classification without charging their payload to the role.
+    fn eager_native_core_headers(&self) -> bool { false }
     /// Shipping native trellis widths for the resident head borrowed by drafters.
     fn native_head_widths(&self) -> &'static [usize] { &[] }
     fn exlr8_execution(&self) -> Exlr8Execution { Exlr8Execution::default() }
