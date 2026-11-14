@@ -146,6 +146,124 @@ impl Projection for LegacyProjection<'_, '_> {
     }
 }
 
+/// Serial native MXFP8 projections reuse one admitted record/output owner.
+/// Inputs are copied to its stable producer destination before quantization.
+pub(crate) struct NativeProjectionWorkspace<'a> {
+    library: &'a NativeLibrary,
+    activation: DeviceAllocation<'a>,
+    inputs: DeviceAllocation<'a>,
+    records: DeviceAllocation<'a>,
+    output: DeviceAllocation<'a>,
+    rows: usize,
+    width: usize,
+}
+
+impl<'a> NativeProjectionWorkspace<'a> {
+    pub fn bytes(shapes: &[(usize, usize)], rows: usize) -> Result<[usize; 4]> {
+        ensure!(!shapes.is_empty() && (1..=4096).contains(&rows), "invalid native draft projection admission");
+        let mut sizes = [0usize, 8, 0, 0];
+        for &(k, n) in shapes {
+            ensure!(k > 0 && k % 128 == 0 && n > 0 && n % 32 == 0, "invalid native draft MXFP8 geometry");
+            sizes[0] = sizes[0].max(rows.checked_mul(k.max(n)).and_then(|n| n.checked_mul(2)).context("draft activation overflow")?);
+            sizes[2] = sizes[2].max(rows.div_ceil(16).checked_mul(k / 32)
+                .and_then(|n| n.checked_mul(528)).context("draft MXFP8 records overflow")?);
+            sizes[3] = sizes[3].max(rows.checked_mul(n).and_then(|n| n.checked_mul(4)).context("draft output overflow")?);
+        }
+        Ok(sizes)
+    }
+    pub fn new(library: &'a NativeLibrary, shapes: &[(usize, usize)], rows: usize) -> Result<Self> {
+        let [a, i, r, o] = Self::bytes(shapes, rows)?;
+        let alloc = |bytes, name| DeviceAllocation::new(library, bytes, Tag::drafter_workspace(name));
+        let owner = Self { library, activation: alloc(a, "shared/draft-native/activation")?,
+            inputs: alloc(i, "shared/draft-native/inputs")?, records: alloc(r, "shared/draft-native/records")?,
+            output: alloc(o, "shared/draft-native/output")?, rows,
+            width: shapes.iter().map(|&(k, _)| k).max().unwrap() };
+        library.copy_h2d(owner.inputs.buffer, &(owner.activation.buffer.ptr as u64).to_le_bytes())?;
+        Ok(owner)
+    }
+    pub fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        for (part, owner) in [("activation", &self.activation), ("inputs", &self.inputs),
+            ("records", &self.records), ("output", &self.output)] {
+            owner.inventory(inventory, &format!("{name}.{part}"))?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct NativeProjectionPart<'a> {
+    payload: DeviceAllocation<'a>,
+    scales: DeviceAllocation<'a>,
+    linear: cuteafd_ffi::native_dense::Mxfp8A8<'a>,
+    rows: usize,
+    columns: usize,
+}
+
+/// Separate matrices keep the checkpoint's per-role encoding; concatenation
+/// changes only the destination layout, never scales or numerical format.
+pub(crate) struct NativeProjection<'a> {
+    parts: Vec<NativeProjectionPart<'a>>,
+    workspace: std::rc::Rc<NativeProjectionWorkspace<'a>>,
+}
+impl<'a> NativeProjection<'a> {
+    pub fn load(load: &Load<'a, '_>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        parts: &[(&str, usize)], columns: usize, workspace: std::rc::Rc<NativeProjectionWorkspace<'a>>) -> Result<Self> {
+        let parts = parts.iter().map(|&(name, rows)| {
+            let payload = load.native_tensor(name, &[rows, columns], DType::F8E4M3)?;
+            let scales = load.native_tensor(&format!("{name}_scale_inv"), &[rows, columns / 32], DType::U8)?;
+            let linear = cuteafd_ffi::native_dense::Mxfp8A8::bind(programs,
+                &format!("exlr8_dense_mxfp8_k{columns}_n{rows}_s1_a8"),
+                &format!("exlr8_dense_quant_k{columns}_bf16_a8"))?;
+            Ok(NativeProjectionPart { payload, scales, linear, rows, columns })
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Self { parts, workspace })
+    }
+    pub fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        for (index, part) in self.parts.iter().enumerate() {
+            part.payload.inventory(inventory, &format!("{name}.{index}.payload"))?;
+            part.scales.inventory(inventory, &format!("{name}.{index}.scales"))?;
+        }
+        Ok(())
+    }
+}
+impl Projection for NativeProjection<'_> {
+    unsafe fn project(&self, x: *const c_void, first: usize, out: *mut c_void,
+        rows: usize, k: usize, n: usize, stream: *mut c_void) -> Result<()> {
+        let owner = &self.workspace;
+        let outputs: usize = self.parts.iter().map(|part| part.rows).sum();
+        ensure!(rows > 0 && rows <= owner.rows && k <= owner.width && !self.parts.is_empty()
+            && self.parts.iter().all(|part| part.columns == k)
+            && first.checked_add(n).is_some_and(|end| end <= outputs), "native draft projection outside admission");
+        let device = owner.activation.buffer.device_id;
+        let input = CuteafdDeviceBuffer { ptr: x.cast_mut(), bytes: rows * k * 2, device_id: device, ..Default::default() };
+        let destination = CuteafdDeviceBuffer { ptr: out, bytes: rows * n * 2, device_id: device, ..Default::default() };
+        // SAFETY: caller retains its disjoint input/output, and this serial owner
+        // survives all queued operations on the issuing stream.
+        unsafe { owner.library.copy_d2d_async(owner.activation.buffer, input, input.bytes, stream)?; }
+        self.parts[0].linear.quantize(rows as u32, owner.inputs.buffer, owner.activation.buffer, owner.records.buffer, stream)?;
+        let mut offset = 0;
+        for part in &self.parts {
+            let start = first.max(offset);
+            let end = (first + n).min(offset + part.rows);
+            if start < end {
+                part.linear.project(rows as u32, owner.inputs.buffer, part.payload.buffer, part.scales.buffer,
+                    owner.records.buffer, owner.output.buffer, stream)?;
+                // Narrow the complete part in reusable activation storage, then
+                // pack selected columns into the original concatenated result.
+                part.linear.narrow(rows as u32, owner.output.buffer, owner.activation.buffer, stream)?;
+                let source = CuteafdDeviceBuffer { ptr: owner.activation.buffer.ptr.wrapping_byte_add((start - offset) * 2),
+                    bytes: owner.activation.buffer.bytes - (start - offset) * 2, ..owner.activation.buffer };
+                let target = CuteafdDeviceBuffer { ptr: destination.ptr.wrapping_byte_add((start - first) * 2),
+                    bytes: destination.bytes - (start - first) * 2, ..destination };
+                // SAFETY: selected columns and row pitches lie in retained spans.
+                unsafe { owner.library.copy_d2d_2d_async(target, n * 2, source, part.rows * 2,
+                    (end - start) * 2, rows, stream)?; }
+            }
+            offset += part.rows;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) type WeightAllocator<'a, 'b> = dyn FnMut(i32, &str, usize) -> Result<Allocation<'a>> + 'b;
 
 pub(crate) fn standalone<'a>(library: &'a NativeLibrary, device: i32, _: &str, bytes: usize) -> Result<Allocation<'a>> {
@@ -436,6 +554,21 @@ mod tests {
     use crate::shared::experts::rtx::dense::{self, RankLayout};
     use cuteafd_loader::plan::testing::{t, write_safetensors};
     use std::os::unix::fs::FileExt;
+
+    #[test]
+    fn native_projection_workspace_covers_input_output_and_records() -> Result<()> {
+        let shapes = [(6144, 8192), (6144, 512), (8192, 6144), (6144, 12288), (12288, 6144)];
+        let [activation, inputs, records, output] = NativeProjectionWorkspace::bytes(&shapes, 224)?;
+        assert_eq!(activation, 224 * 12288 * 2);
+        assert_eq!(inputs, 8);
+        assert_eq!(records, 14 * 384 * 528);
+        assert_eq!(output, 224 * 12288 * 4);
+        assert!(NativeProjectionWorkspace::bytes(&shapes, 4097).is_err());
+        assert!(NativeProjectionWorkspace::bytes(&[], 1).is_err());
+        assert!(NativeProjectionWorkspace::bytes(&[(6145, 8192)], 1).is_err());
+        assert!(NativeProjectionWorkspace::bytes(&[(usize::MAX - 127, 8192)], 4096).is_err());
+        Ok(())
+    }
 
     #[test]
     fn indexed_native_drafter_source_preserves_header_payload_and_scale_bytes() -> Result<()> {
