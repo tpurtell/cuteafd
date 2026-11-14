@@ -604,10 +604,15 @@ mod tests {
             assert_eq!(family.live_digest(&hit.placement)?, digest, "actual prefill recurrent state and index/MLA cache bytes");
             cache.release(&family, &hit.placement.units)?;
             cache.clear(&family)?;
-            // Recompute that prefix from scratch with the same shape and compare
-            // bytes, not just logits or future greedy text.
+            // A new cache has no host hit: recompute with the same shape and
+            // compare actual cache bytes, not logits or future greedy text.
+            drop(cache);
+            let mut cache = PrefixCache::<crate::shared::prefix::CudaCopyEngine<'_>, super::super::prefix::SnapshotMeta>::new(
+                layout, PrefixConfig { entries: 8, mark_slots: 2, keep_logits: true, min_tokens: 1 }, None)?;
             engine.reset_cold_state()?;
-            let mut fresh = cache.admit(&family, &tokens, 132, false, build)?.placement;
+            let fresh = cache.admit(&family, &tokens, 132, false, build)?;
+            assert_eq!(fresh.resume, 0);
+            let mut fresh = fresh.placement;
             engine.prefill_packed(&mut [(&mut fresh, &tokens)], cache.pool(), &mut |_, _| Ok(Ok(())))?;
             assert_eq!(family.page_images(&fresh)?, scratch, "scratch prefill index/MLA determinism on each owner");
             cache.release(&family, &fresh.units)?;
