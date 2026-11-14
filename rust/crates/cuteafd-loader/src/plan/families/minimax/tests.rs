@@ -1796,7 +1796,7 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
         assert!(!report.executable());
         assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
         assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
-        let placed = report.solver_placement.as_ref().expect("qualified default wire produces a shared solved plan");
+        let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("qualified default wire produces a shared solved plan: {report:#?}"));
         assert_eq!(placed.attention_placement, report.attention_placement);
         assert_eq!(plan::layout::LayoutOptions::default().minimax_split_wire,
             Some(crate::families::minimax_m3::execution::WirePrecision::F32));
