@@ -295,6 +295,24 @@ def test_kimi_w8_cross_sm_groups(group, names):
                    ["--geometry", "kimik3", "--only", ",".join(names)])
 
 
+@pytest.mark.parametrize("scope", ["suspects", "all"])
+def test_kimi_k31_sparse_mla_has_an_exact_scoped_export_gate(scope):
+    job, = (job for job in compare_sm.jobs(scope) if job[0] == "kimi-k31-sparse-mla")
+    _, exporter, args = job
+    assert exporter == "export_b12x_dsv4_aot.py"
+    assert args[:3] == ["--geometry", "kimik31", "--only"]
+    selected = args[3].split(",")
+    expected = {
+        f"sparse_mla{heads}{cache}_m{rows}"
+        for rows in (64, 4096) for heads in ("", "_h96") for cache in ("", "_fp8")
+    } | {
+        f"sparse_mla_partial{cache}_h{begin}_m{rows}"
+        for rows in (64, 4096) for cache in ("", "_fp8") for begin in (0, 48)
+    }
+    assert len(selected) == len(set(selected)) == 16
+    assert set(selected) == expected
+
+
 def test_ml4_context_fc_has_a_scoped_cross_sm_gate():
     for scope in ("suspects", "all"):
         job = next(job for job in compare_sm.jobs(scope) if job[0] == "ml4-draft-context-fc")

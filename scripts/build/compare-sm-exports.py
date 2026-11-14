@@ -202,6 +202,12 @@ def jobs(scope):
                   for mode, rows in (("decode", 64), ("verify", 64), ("extend", 4096))]
         result.append((f"kimi-mla-h{heads}", "export_b12x_dsv4_aot.py",
                        ["--geometry", "kimik3", "--only", ",".join(names)]))
+    kimi_sparse = [f"sparse_mla{heads}{cache}_m{rows}"
+                   for rows in (64, 4096) for heads in ("", "_h96") for cache in ("", "_fp8")]
+    kimi_sparse += [f"sparse_mla_partial{cache}_h{begin}_m{rows}"
+                    for rows in (64, 4096) for cache in ("", "_fp8") for begin in (0, 48)]
+    result.append(("kimi-k31-sparse-mla", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik31", "--only", ",".join(kimi_sparse)]))
     result.append(("ml4-draft-context-fc", "export_b12x_dsv4_aot.py",
                    ["--geometry", "ml4", "--only", "draft_context_fc"]))
     result.append(("ml4-index", "export_b12x_dsv4_aot.py",
