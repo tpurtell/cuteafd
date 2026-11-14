@@ -116,6 +116,29 @@ and minimum T.Limit headroom 33 C. One distinct-C4 timing point reports host
 page reclaim, so this smoke is correctness/default coverage, not paired speed
 evidence.
 
+## Native MXFP8 Decode
+
+The canonical selector smokes at `4269c4b1f` cover
+[1 RTX + 3 Sparks](../../benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-selector-1rtx/report.svg)
+and [2 RTX + 4 Sparks](../../benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-selector-2rtx/report.svg).
+Native group-32 MXFP8 activation records and weights retain their numerics;
+measured shape-specific decode tiles avoid the prefill tile's small-row waste.
+C1/C8/C16 are 32.724 / 87.550 / 118.531 tok/s on one RTX and
+34.457 / 111.243 / 155.004 tok/s on two RTX. Prefill 8K is 2302 / 2134 tok/s,
+readiness 82.574 / 69.176 s, and pools remain 1,146,880 / 2,097,152 tokens
+with zero / six local expert layers. These are canonical observations, not
+an interleaved speed comparison to earlier reports.
+
+Both cells pass generated aggregate fidelity, exact prompt/turn restores and
+cold recomputation, tool re-render and C1/C4 greedy identity (4/4). One-RTX
+ready/first memory delta is +925,409 bytes; two-RTX deltas are
++8,260,411 / +7,334,523 bytes, within the bar. The one-RTX basic window has
+2.0 s power-cap slowdown, zero thermal slowdown, busy clock 2836.3 MHz,
+maximum 62 C and minimum T.Limit headroom 36 C. Two RTX have no power-cap or
+thermal slowdown, busy clocks 2790.2 / 2850.1 MHz, maximum 61 C and minimum
+headroom 34 C. The two-cell build scope includes both Spark TP3 and TP4;
+shared `wip-cards` derives this union automatically.
+
 ## Changelog
 
 | Date | Change | Evidence |
@@ -123,3 +146,4 @@ evidence.
 | 2026-11-14 | Qualify public one-RTX native serving, exact prefix restores, tool grammar and named baseline/graph memory owners. | Basic card at `3a70a3768`, generated aggregate fidelity pass; two-RTX and narrow heads remain gated by #1856. |
 | 2026-11-14 | Qualify public two-RTX contiguous attention and FP32 split FFNs; eager split sections, native TP2 experts and exact shared prefix state. | Golden and mixed card at `60831478b`; narrow heads/media/drafts remain pending #1856. |
 | 2026-11-15 | Replay bounded TP2 router, split FFN and fold/publication sections with per-rank measured graph owners. | Same-build C1/C16/8K A/B is throughput-neutral; generated graph/eager and real-row padding oracles are byte-exact; #2112. |
+| 2026-11-15 | Select native group-32 MXFP8 small-row projection kernels with measured row cutovers. | Canonical one/two-RTX smokes at `4269c4b1f`: C1 32.724 / 34.457 tok/s; fidelity, cache, tools and memory pass; #2111. |
