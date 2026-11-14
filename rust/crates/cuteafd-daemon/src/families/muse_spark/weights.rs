@@ -251,7 +251,7 @@ impl<'a> LayerWeights<'a> {
         let native = layout.native.iter().map(|(&name, layout)| {
             let weights = allocate_native(device, arena, layout)?;
             let selected = checkpoint.projection(&layout.stem)?;
-            for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.projection_view(&layout.stem), layout,
+            for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.projection_view(&layout.stem), layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true),
                 crate::shared::fp8_linear::Fp8Scales::Amax, weights.values.buffer,
                 weights.scales.as_ref().map(|scales| scales.buffer))? {
                 match record {
@@ -561,7 +561,7 @@ mod tests {
                         let mode = if compact && layout.stem == bf16 { CoreView::Fp8Compact } else { CoreView::Original };
                         for owner in [&actual, &expected] {
                             device.run(|| {
-                                for record in attention_records(dir.path(), &selected, mode, layout,
+                                for record in attention_records(dir.path(), &selected, mode, layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true),
                                     crate::shared::fp8_linear::Fp8Scales::Amax, owner.values.buffer,
                                     owner.scales.as_ref().map(|s| s.buffer))? {
                                     match record {
@@ -651,7 +651,7 @@ mod tests {
                     let scales = fp8.then_some(CuteafdDeviceBuffer { ptr: 0x8000_0000usize as *mut _,
                         bytes: 64 * (k / 128) * 4, ..values });
                     let receipt = cuteafd_loader::families::muse_spark::weight_layout::native_mount_load([&layout])?;
-                    let records = attention_records(dir.path(), &selected, mode, &layout,
+                    let records = attention_records(dir.path(), &selected, mode, &layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true),
                         crate::shared::fp8_linear::Fp8Scales::Amax, values, scales)?;
                     // Conversion windows are whole 128-row scale blocks, bounded above
                     // by STEP_BYTES; smaller shared transform windows are also valid.

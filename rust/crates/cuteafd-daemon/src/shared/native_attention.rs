@@ -21,11 +21,12 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
     selected: &cuteafd_loader::plan::checkpoint::SelectedProjection,
     mode: cuteafd_loader::plan::checkpoint::CoreView,
     layout: &cuteafd_loader::formats::native_attention::NativeLayout,
+    role: cuteafd_loader::formats::native_attention::Fp8Role,
     rule: crate::shared::fp8_linear::Fp8Scales, values: CuteafdDeviceBuffer,
     scales: Option<CuteafdDeviceBuffer>) -> Result<Vec<AttentionRecord>> {
     use cuteafd_loader::{formats::trellis_core::CoreSplit,
         plan::checkpoint::{CoreView, ProjectionStorage}};
-    use crate::shared::experts::rtx::dense::{Operand, Step, windows};
+    use crate::shared::experts::rtx::dense::{Operand, Step, windows, windows_with_tail};
     let ProjectionStorage::Native { dtype, shape } = &selected.storage else {
         anyhow::bail!("{}: native recipe received trellis", layout.stem);
     };
@@ -39,13 +40,21 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
     ensure!(fp8 == layout.fp8 && layout.ranks > 0 && layout.rank < layout.ranks,
         "native attention recipe differs from selected mode");
     let [n, k] = layout.shape;
+    let padded = mode == CoreView::Fp8Compact && role.pad_to.is_some();
+    if padded {
+        ensure!(layout.ranks == 1 || layout.split != CoreSplit::Output,
+            "padded output rows cannot be split between ranks");
+        let stored = role.stored_shape([shape[0], shape[1]])?;
+        ensure!(n == stored[0] && k == stored[1] / if layout.split == CoreSplit::Input { layout.ranks } else { 1 },
+            "native attention explicit padded shape differs from admission");
+    }
     let (rows, cols) = match layout.split {
         CoreSplit::Output => (layout.rank*n..(layout.rank+1)*n, 0..k),
-        CoreSplit::Input => (0..n, layout.rank*k..(layout.rank+1)*k),
-        CoreSplit::Whole => (0..n, 0..k),
+        CoreSplit::Input => (0..if padded { shape[0] } else { n }, layout.rank*k..(layout.rank+1)*k),
+        CoreSplit::Whole => (0..if padded { shape[0] } else { n }, 0..k),
     };
     ensure!(rows.end <= shape[0] && cols.end <= shape[1]
-        && rows.len() == n && cols.len() == k, "native attention source slice");
+        && rows.len() == if padded { shape[0] } else { n } && cols.len() == k, "native attention source slice");
     let source = |name: &str, rows: std::ops::Range<usize>, cols: std::ops::Range<usize>, width: usize| -> Result<Rect> {
         let t = selected.tensors.iter().find(|t| t.meta.name == name).context("native attention selected tensor missing")?;
         ensure!(t.meta.shape.len() == 2 && rows.end <= t.meta.shape[0] && cols.end <= t.meta.shape[1],
@@ -73,15 +82,31 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
     }
     let rule = if mode == CoreView::Fp8Compact { crate::shared::fp8_linear::Fp8Scales::Amax } else { rule };
     let whole = source(&weight, rows, cols, 2)?;
-    windows(&[whole], 128)?.into_iter().map(|(rects, rows)| {
+    let windows = if padded { windows_with_tail(&[whole], 128)? } else { windows(&[whole], 128)? };
+    windows.into_iter().map(|(rects, rows)| {
         let target = Target {
             q: CuteafdDeviceBuffer { ptr: values.ptr.wrapping_byte_add(rows.start*k), bytes: rows.len()*k, ..values },
             q_stride: k,
             scales: CuteafdDeviceBuffer { ptr: grid.ptr.wrapping_byte_add(rows.start/128*(k/128)*4),
-                bytes: rows.len()/128*(k/128)*4, ..grid }, kmajor: None,
+                bytes: rows.len().div_ceil(128)*(k/128)*4, ..grid }, kmajor: None,
         };
-        Ok(AttentionRecord::Step(Step { device, rects, jobs: vec![Job::Quant { rows: 0..rows.len(), pitch: k,
-            col0: 0, cols: k, layout: crate::shared::fp8_load_quant::Layout::Block, rule, target }] }))
+        let mut jobs = Vec::new();
+        if padded && rows.end == shape[0] {
+            let start = shape[0] * k;
+            if start < n * k {
+                jobs.push(Job::Zero { dst: CuteafdDeviceBuffer {
+                    ptr: values.ptr.wrapping_byte_add(start), bytes: n*k-start, ..values } });
+            }
+            let start = shape[0].div_ceil(128) * (k/128) * 4;
+            let end = (n/128) * (k/128) * 4;
+            if start < end {
+                jobs.push(Job::Zero { dst: CuteafdDeviceBuffer {
+                    ptr: grid.ptr.wrapping_byte_add(start), bytes: end-start, ..grid } });
+            }
+        }
+        jobs.push(Job::Quant { rows: 0..rows.len(), pitch: k, col0: 0, cols: k,
+            layout: crate::shared::fp8_load_quant::Layout::Block, rule, target });
+        Ok(AttentionRecord::Step(Step { device, rects, jobs }))
     }).collect()
 }
 
@@ -98,7 +123,7 @@ mod tests {
         let layout = NativeLayout { stem: "layers.0.attention.wq".into(), shape: [256, 256],
             fp8: true, rank: 0, ranks: 1, split: CoreSplit::Whole };
         let error = attention_records(std::path::Path::new("/unreadable"), &selected,
-            CoreView::Fp8Compact, &layout, crate::shared::fp8_linear::Fp8Scales::Amax,
+            CoreView::Fp8Compact, &layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true), crate::shared::fp8_linear::Fp8Scales::Amax,
             CuteafdDeviceBuffer::default(), None).err().expect("already-FP8 must refuse");
         let refusal = error.downcast_ref::<cuteafd_loader::formats::native_attention::UnsupportedFp8Conversion>()
             .expect("conversion refusal must retain its typed error");
@@ -121,17 +146,121 @@ mod tests {
             let values = CuteafdDeviceBuffer { device_id: 0, bytes: 65536, ..Default::default() };
             let scales = CuteafdDeviceBuffer { device_id: 0, bytes: 256, ..Default::default() };
             let records = attention_records(std::path::Path::new("/selected"), &selected, CoreView::Original,
-                &layout, crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales))?;
+                &layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true), crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales))?;
             let AttentionRecord::Operand(scale) = &records[1] else { panic!("native scale must land verbatim"); };
             assert_eq!(scale.lands[0].0.name, format!("{stem}.{suffix}"));
             assert_eq!(scale.lands[0].0.rows, 2..4);
             assert_eq!(scale.lands[0].0.cols, 0..8);
             selected.tensors.pop();
             let error = attention_records(std::path::Path::new("/selected"), &selected, CoreView::Original,
-                &layout, crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales)).err().unwrap();
+                &layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true), crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales)).err().unwrap();
             assert!(error.is::<cuteafd_loader::formats::native_attention::InvalidFp8Scale>());
         }
         Ok(())
     }
 }
 
+
+#[cfg(test)]
+mod padding_tests {
+    use super::*;
+    use cuteafd_loader::{formats::{native_attention::{Fp8Role, NativeLayout}, trellis_core::CoreSplit},
+        plan::checkpoint::{CoreView, CheckpointTensor, ProjectionStorage, SelectedProjection}, SafetensorsTensorMetadata};
+    use crate::shared::experts::rtx::dense::Job;
+
+    #[test]
+    fn padded_source_tails_never_overlap_real_transform_destinations() -> Result<()> {
+        for (n,k,alignment) in [(576usize,7168usize,128usize),(202048,8192,128),(129,128,512)] {
+            let stored = n.div_ceil(alignment)*alignment;
+            let stem = "projection";
+            let selected = SelectedProjection { storage: ProjectionStorage::Native { dtype:DType::Bf16,shape:vec![n,k] },
+                tensors:vec![CheckpointTensor {shard:"source".into(),meta:SafetensorsTensorMetadata {
+                    name:format!("{stem}.weight"),dtype:DType::Bf16,shape:vec![n,k],byte_offset:128,byte_length:(n*k*2) as u64 }}],
+                source_bytes:(n*k*2) as u64 };
+            let layout = NativeLayout {stem:stem.into(),shape:[stored,k],fp8:true,rank:0,ranks:1,split:CoreSplit::Whole};
+            let values = CuteafdDeviceBuffer {ptr:4096usize as *mut _,bytes:stored*k,device_id:0,flags:0};
+            let scales = CuteafdDeviceBuffer {ptr:8192usize as *mut _,bytes:stored/128*(k/128)*4,device_id:0,flags:0};
+            let recipe = |role| attention_records(std::path::Path::new("/not-read"),&selected,
+                CoreView::Fp8Compact,&layout,role,crate::shared::fp8_linear::Fp8Scales::Amax,values,Some(scales));
+            assert!(recipe(Fp8Role::exact("projection",true)).is_err());
+            let records = recipe(Fp8Role::padded("projection",true,alignment))?;
+            let mut source_rows = 0;
+            let mut zeros = Vec::new();
+            for record in records {
+                let AttentionRecord::Step(step) = record else { panic!("conversion must be a staged step"); };
+                for rect in &step.rects {assert!(rect.rows.end<=n);source_rows+=rect.rows.len();}
+                for job in step.jobs {
+                    match job {
+                        Job::Quant {rows,target,..} => {
+                            assert_eq!(target.q.bytes,rows.len()*k);
+                            assert_eq!(target.scales.bytes,rows.len().div_ceil(128)*(k/128)*4);
+                        }
+                        Job::Zero {dst} => zeros.push(dst),
+                        _ => panic!("unexpected conversion job"),
+                    }
+                }
+            }
+            assert_eq!(source_rows,n);
+            assert!(zeros.iter().any(|dst| dst.ptr==values.ptr.wrapping_byte_add(n*k) && dst.bytes==(stored-n)*k));
+            let grid_start = n.div_ceil(128)*(k/128)*4;
+            assert_eq!(zeros.iter().filter(|dst|dst.ptr==scales.ptr.wrapping_byte_add(grid_start)).count(),usize::from(grid_start<scales.bytes));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod padding_numeric_tests {
+    use super::*;
+    use cuteafd_loader::{formats::{native_attention::{Fp8Role, NativeLayout}, trellis_core::CoreSplit},
+        plan::checkpoint::{CoreView, CheckpointTensor, ProjectionStorage, SelectedProjection}, SafetensorsTensorMetadata};
+    use crate::shared::{memory::{DeviceAllocation, TEST}, experts::rtx::dense::DenseLoad};
+
+    #[test]
+    fn padded_mapped_quantization_matches_explicit_zero_extension_byte_for_byte() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library,0,1<<30)?;
+        fixture.immediate_copies(&library)?;
+        for (n,k,alignment) in [(129usize,128usize,512usize),(576,256,128)] {
+            let stored = n.div_ceil(alignment)*alignment;
+            let source:Vec<u8> = (0..n*k).flat_map(|i| {
+                let value = (((i*17)%127) as f32 - 63.) / 32.;
+                ((value.to_bits()>>16) as u16).to_le_bytes()
+            }).collect();
+            let dir = tempfile::tempdir_in(fixture.directory())?;
+            std::fs::write(dir.path().join("source"),&source)?;
+            let selected = SelectedProjection { storage:ProjectionStorage::Native {dtype:DType::Bf16,shape:vec![n,k]},
+                tensors:vec![CheckpointTensor {shard:"source".into(),meta:SafetensorsTensorMetadata {
+                    name:"projection.weight".into(),dtype:DType::Bf16,shape:vec![n,k],byte_offset:0,byte_length:source.len() as u64}}],
+                source_bytes:source.len() as u64};
+            let values = DeviceAllocation::new(&library,stored*k,TEST)?;
+            let scales = DeviceAllocation::new(&library,(stored/128*k/128*4).max(256),TEST)?;
+            library.copy_h2d(values.buffer,&vec![0xa5;values.buffer.bytes])?;
+            library.copy_h2d(scales.buffer,&vec![0xa5;scales.buffer.bytes])?;
+            let layout = NativeLayout {stem:"projection".into(),shape:[stored,k],fp8:true,rank:0,ranks:1,split:CoreSplit::Whole};
+            let records = attention_records(dir.path(),&selected,CoreView::Fp8Compact,&layout,
+                Fp8Role::padded("projection",true,alignment),crate::shared::fp8_linear::Fp8Scales::Amax,
+                values.buffer,Some(scales.buffer))?;
+            let load = DenseLoad::mount(&library);
+            for record in records.into_iter().rev() {
+                let AttentionRecord::Step(step)=record else {panic!("quantization step")};
+                load.step(step,std::ptr::null_mut())?;
+            }
+            load.release();
+            let mut extended = source.clone(); extended.resize(stored*k*2,0);
+            let (expected_q,expected_s) = crate::families::glm5_flash::fp8::quantize(&extended,stored,k,
+                crate::families::glm5_flash::fp8::Layout::Block,crate::shared::fp8_linear::Fp8Scales::Amax);
+            let mut q = vec![0;values.buffer.bytes]; library.copy_d2h(&mut q,values.buffer)?;
+            assert_eq!(q,expected_q);
+            let mut grid = vec![0;scales.buffer.bytes];library.copy_d2h(&mut grid,scales.buffer)?;
+            let real_blocks=n.div_ceil(128)*(k/128);
+            let real:Vec<u8>=expected_s[..real_blocks].iter().flat_map(|scale|scale.to_le_bytes()).collect();
+            assert_eq!(grid[..real.len()],real);
+            let padded_end=stored/128*(k/128)*4;
+            assert!(grid[real.len()..padded_end].iter().all(|byte|*byte==0));
+            assert!(grid[padded_end..].iter().all(|byte|*byte==0xa5));
+        }
+        Ok(())
+    }
+}

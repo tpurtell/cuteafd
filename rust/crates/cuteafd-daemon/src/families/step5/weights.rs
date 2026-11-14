@@ -119,7 +119,7 @@ pub(super) fn load_operand<'a>(
         ensure!(native.bytes()? == operand.allocation_bytes, "Step-5 FP8 owner extent");
         let selected = checkpoint.projection(&native.stem)?;
         let (values, scales) = fp8_buffers(allocation.buffer, &operand.shape)?;
-        let records = attention_records(&checkpoint.snapshot, &selected, checkpoint.projection_view(&native.stem), &native,
+        let records = attention_records(&checkpoint.snapshot, &selected, checkpoint.projection_view(&native.stem), &native, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true),
             crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales))?;
         let dense = DenseLoad::mount(device.library);
         dense.admit_mount(cuteafd_loader::shared::dense_read::MountLoad::from_headers(
@@ -353,7 +353,7 @@ mod tests {
             let owner = CuteafdDeviceBuffer { bytes: layout.bytes()? as usize, ..Default::default() };
             let (q, scales) = fp8_buffers(owner, &operand.shape)?;
             let records = attention_records(std::path::Path::new("/selected"), &selected,
-                CoreView::Fp8Compact, &layout, crate::shared::fp8_linear::Fp8Scales::Amax, q, Some(scales))?;
+                CoreView::Fp8Compact, &layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true), crate::shared::fp8_linear::Fp8Scales::Amax, q, Some(scales))?;
             let mut rows = 0;
             for record in records {
                 let AttentionRecord::Step(step) = record else { panic!("BF16 conversion must be staged, not resident"); };

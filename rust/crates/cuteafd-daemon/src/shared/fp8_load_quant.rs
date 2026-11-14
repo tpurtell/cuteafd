@@ -104,7 +104,7 @@ impl<'a> GpuQuantizer<'a> {
 /// Retained pinned table allocation, shared by load execution and admission.
 pub(crate) fn quant_table_bytes(rows: usize, layout: Layout) -> Result<usize> {
     let unit = if layout == Layout::Block { 128 } else { 1 };
-    Ok(cuteafd_ffi::programs::fp8_load_table_bytes(rows, unit)?)
+    Ok(cuteafd_ffi::programs::fp8_load_table_bytes(rows.checked_add(unit - 1).context("FP8 load rows overflow")? / unit * unit, unit)?)
 }
 
 pub(crate) fn scale_code_table_bytes(targets: usize) -> Result<usize> {
@@ -138,11 +138,11 @@ impl<'a> LoadKernels<'a> {
     pub fn quantize_from(&mut self, source: &[u8], rows: std::ops::Range<usize>, pitch: usize, col0: usize,
         cols: usize, layout: Layout, rule: Fp8Scales, target: Target, stream: *mut c_void) -> Result<()> {
         let unit = if layout == Layout::Block { 128 } else { 1 };
-        ensure!(cols > 0 && cols % 128 == 0 && col0 + cols <= pitch && rows.len() % unit == 0 && rows.start % unit == 0,
-            "FP8 load quantization window is not whole scale units");
+        ensure!(cols > 0 && cols % 128 == 0 && col0 + cols <= pitch && !rows.is_empty() && rows.start % unit == 0,
+            "FP8 load quantization window is empty or starts inside a scale unit");
         ensure!(layout != Layout::Channel || (col0 == 0 && cols == pitch), "channel scales span whole rows");
         ensure!(rows.end * pitch * 2 <= source.len(), "window exceeds the staged source");
-        let (units, kb) = (rows.len() / unit, cols / 128);
+        let (units, kb) = (rows.len().div_ceil(unit), cols / 128);
         ensure!(target.q.bytes >= rows.len() * target.q_stride && target.q_stride >= cols,
             "quantized rows exceed their operand");
         let scale_need = match target.kmajor { Some((scale_rows, row0)) => (kb - 1) * scale_rows + row0 + units, None => units * kb };
@@ -156,17 +156,18 @@ impl<'a> LoadKernels<'a> {
         let jobs_ptr = jobs.as_mut_ptr().cast::<Job>();
         for u in 0..units {
             let first = rows.start + u * unit;
+            let live = unit.min(rows.end - first);
             // SAFETY: both tables were sized for `units` entries above and are
             // pinned, device-visible memory owned by this quantizer.
             unsafe {
                 let segment = segments.add(u);
                 // SAFETY (pointer math): `first * pitch * 2` is inside the staged source (checked above).
-                segment.write(Segment { offset: 0, ptr: base.add(first * pitch * 2), bytes: (unit * pitch * 2) as u64 });
+                segment.write(Segment { offset: 0, ptr: base.add(first * pitch * 2), bytes: (live * pitch * 2) as u64 });
                 let (scales, scale_stride) = match target.kmajor {
                     Some((scale_rows, row0)) => (target.scales.ptr.cast::<f32>().add(row0 + u), scale_rows as i64),
                     None => (target.scales.ptr.cast::<f32>().add(u * kb), 1),
                 };
-                jobs_ptr.add(u).write(Job { segments: segment, count: 1, rows: unit as i32, cols: cols as i32,
+                jobs_ptr.add(u).write(Job { segments: segment, count: 1, rows: live as i32, cols: cols as i32,
                     layout: layout_code(layout), rule: rule.code(), pad: 0, col0: col0 as i64, pitch: pitch as i64,
                     q: target.q.ptr.cast::<u8>().add(u * unit * target.q_stride), q_stride: target.q_stride as i64,
                     scales, scale_stride });

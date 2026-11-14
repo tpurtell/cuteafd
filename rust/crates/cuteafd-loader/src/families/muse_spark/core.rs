@@ -65,7 +65,7 @@ impl CoreInventory {
             let role = if stem.ends_with("lm_head") { "vocabulary head" }
                 else if stem.contains(".self_attn.") { "attention projection" }
                 else if stem.contains(".mlp.") { "FFN projection" } else { "non-core" };
-            (role, stem.contains(".self_attn.") && matches!(stem.rsplit('.').next(), Some("q_proj" | "k_proj" | "v_proj" | "o_proj")))
+            crate::formats::native_attention::Fp8Role::exact(role, stem.contains(".self_attn.") && matches!(stem.rsplit('.').next(), Some("q_proj" | "k_proj" | "v_proj" | "o_proj")))
         })?;
         let projections = read_projections(checkpoint, &expected(cfg), selected,
             |stem| split(cfg, stem).map(|split| CoreContract { family: "Muse", widths: &[4, 6, 8], split, view_varying: true, padded_outputs: stem == HEAD }))?;

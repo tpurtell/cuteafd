@@ -2,6 +2,34 @@
 use super::trellis_core::CoreSplit;
 use anyhow::{Context, Result};
 
+/// A family explicitly permits output padding for this role; no shape infers it.
+#[derive(Debug, Clone, Copy)]
+pub struct Fp8Role {
+    pub name: &'static str,
+    pub supported: bool,
+    pub pad_to: Option<usize>,
+}
+impl Fp8Role {
+    pub const fn exact(name: &'static str, supported: bool) -> Self {
+        Self { name, supported, pad_to: None }
+    }
+    pub const fn padded(name: &'static str, supported: bool, alignment: usize) -> Self {
+        Self { name, supported, pad_to: Some(alignment) }
+    }
+    pub fn stored_shape(self, [n, k]: [usize; 2]) -> Result<[usize; 2]> {
+        anyhow::ensure!(self.supported && n > 0 && k > 0 && k % 128 == 0,
+            "role {} requires supported positive block-128 geometry [{n}, {k}]", self.name);
+        let stored = match self.pad_to {
+            None => { anyhow::ensure!(n % 128 == 0, "role {} requires whole output blocks; declare pad_to explicitly", self.name); n },
+            Some(alignment) => {
+                anyhow::ensure!(alignment > 0 && alignment % 128 == 0, "role {} pad_to must be a multiple of 128", self.name);
+                n.checked_add(alignment - 1).context("FP8 role output padding overflow")? / alignment * alignment
+            }
+        };
+        Ok([stored, k])
+    }
+}
+
 /// Unrotated selected-view attention with the same logical TP axes as K6.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeProjection { pub shape: [usize; 2], pub fp8: bool, pub split: CoreSplit }
@@ -93,6 +121,25 @@ mod tests {
             selected.tensors.push(alias);
             assert!(fp8_scale(&selected, stem).unwrap_err().is::<InvalidFp8Scale>());
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod padding_tests {
+    use super::*;
+    #[test]
+    fn padding_is_declared_and_checked_without_changing_logical_source() -> Result<()> {
+        let exact = Fp8Role::exact("projection", true);
+        assert_eq!(exact.stored_shape([512, 7168])?, [512, 7168]);
+        assert!(exact.stored_shape([576, 7168]).is_err());
+        let padded = Fp8Role::padded("projection", true, 128);
+        assert_eq!(padded.stored_shape([576, 7168])?, [640, 7168]);
+        assert_eq!(padded.stored_shape([202048, 8192])?, [202112, 8192]);
+        assert!(padded.stored_shape([576, 7169]).is_err());
+        assert!(padded.stored_shape([usize::MAX, 8192]).is_err());
+        assert!(Fp8Role::padded("projection", true, 64).stored_shape([576,7168]).is_err());
+        assert!(Fp8Role::padded("projection", false, 128).stored_shape([576,7168]).is_err());
         Ok(())
     }
 }
