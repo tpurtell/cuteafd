@@ -232,7 +232,7 @@ impl RankDevice<'_, '_> {
             (1, Some(core)) => self.core.local(rows, gated, core, attended, self.stream),
             (2, Some(core)) => self.k_split(Channel::Attention, rows, gated, core, attended, peer),
             (1, None) => self.project(layer, "attn.o", rows, gated, attended),
-            (2, None) => self.native_k_split(rows, gated,
+            (2, None) => self.native_k_split(Channel::Attention, rows, gated,
                 weights.native("attn.o").context("Muse TP2 o_proj owner absent")?, attended, peer),
             _ => anyhow::bail!("Muse attention needs one or two coordinator ranks"),
         }
@@ -335,16 +335,16 @@ impl RankDevice<'_, '_> {
         crate::shared::dense_trellis::retain_partial(&ops.narrow, local, output, rows * self.cfg.hidden, self.stream)
     }
 
-    fn native_k_split(&self, rows: usize, input: Buffer, weight: &super::weights::NativeWeights<'_>,
+    fn native_k_split(&self, channel: Channel, rows: usize, input: Buffer, weight: &super::weights::NativeWeights<'_>,
         output: Buffer, peer: &mut dyn PeerExchange) -> Result<()> {
         use cuteafd_loader::formats::trellis_core::CoreSplit;
         ensure!(weight.layout.ranks == 2 && weight.layout.rank == self.rank
             && weight.layout.split == CoreSplit::Input && weight.layout.shape[0] == self.cfg.hidden,
-            "Muse native TP2 o_proj differs from admitted input split");
+            "Muse native TP2 projection differs from admitted input split");
         let ops = self.tp2.context("Muse native TP2 needs F32 add/narrow helpers")?;
         let local = self.lane.rows("o_core", rows)?;
         self.core.native(rows, input, weight, local, self.stream)?;
-        let received = peer.swap(Channel::Attention, local)?;
+        let received = peer.swap(channel, local)?;
         let (rank0, rank1) = if self.rank == 0 { (local, received) } else { (received, local) };
         let reduced = self.lane.rows("o_reduced", rows)?;
         let count = rows.checked_mul(self.cfg.hidden).context("Muse native TP2 reduction extent")?;
@@ -499,8 +499,14 @@ impl RankDevice<'_, '_> {
         } else {
             peer.receive(Channel::Combined, rows * half_bytes)?
         };
-        let core = self.weights(layer)?.core("moe.post_expert").context("Muse TP2 post_expert must be K6 core")?;
-        self.k_split(Channel::Moe, rows, input, core, lane.rows("moe", rows)?, peer)
+        let weights = self.weights(layer)?;
+        let output = lane.rows("moe", rows)?;
+        if let Some(core) = weights.core("moe.post_expert") {
+            self.k_split(Channel::Moe, rows, input, core, output, peer)
+        } else {
+            self.native_k_split(Channel::Moe, rows, input,
+                weights.native("moe.post_expert").context("Muse TP2 post_expert owner absent")?, output, peer)
+        }
     }
 
     /// `muse_tp_combine_*` for one landed wave into `combined`: the layer's
