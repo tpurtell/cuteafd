@@ -239,6 +239,33 @@ impl NativeLaneLayout {
         Ok(self)
     }
 
+    /// Projection offsets use live rows; sparse selection still retains its
+    /// AOT-baked selector and recurrence workspaces at their declared capacity.
+    pub fn with_live_projection_rows(mut self, heads: usize, ranks: usize) -> Result<Self> {
+        let rows = self.unit.max(64);
+        let [producer, output] = cuteafd_ffi::KimiMlaProjection::scratch_bytes_for(rows, heads)?;
+        for (name, bytes) in [("MLA producer scratch", producer), ("MLA output scratch", output),
+            ("DSA producer scratch", cuteafd_ffi::KimiIndexProducer::scratch_bytes_for(rows)?)] {
+            let old = self.operands.insert(name, bytes).context("Kimi projection owner absent")?;
+            ensure!(old >= bytes, "Kimi live projection exceeds exported scratch");
+        }
+        let old = self.operands["KDA scratch"];
+        self.operands.insert("KDA scratch", cuteafd_ffi::KimiKda::scratch_bytes_for(rows, 4096, 96 / ranks, old)?);
+        self.arena_offsets.clear();
+        self.arena_bytes = 0;
+        for phase in SCRATCH_PHASES {
+            let mut end = 0usize;
+            for &name in phase {
+                let offset = end.next_multiple_of(ARENA_ALIGNMENT);
+                self.arena_offsets.insert(name, offset);
+                end = offset.checked_add(self.operands[name]).context("Kimi live phase extent overflow")?;
+            }
+            self.arena_bytes = self.arena_bytes.max(end);
+        }
+        self.bytes()?;
+        Ok(self)
+    }
+
     /// Add exact index owners without changing any existing BF16 or core phase
     /// offsets. Context candidate exchange/partial owners are admitted separately.
     pub fn with_dsa(mut self, cfg: &KimiK3Config, scratch: DsaScratch) -> Result<Self> {
@@ -647,7 +674,8 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
         NativeScratch::from_manifest_for_config(manifest, cfg, physical_ranks)?, physical_ranks)?;
     if cfg.dsa.is_some() {
         layout = layout.with_sparse_mla_rows(attention_heads)?
-            .with_dsa(cfg, DsaScratch::from_manifest(manifest)?)?;
+            .with_dsa(cfg, DsaScratch::from_manifest(manifest)?)?
+            .with_live_projection_rows(attention_heads, physical_ranks)?;
     }
     let owners = crate::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;

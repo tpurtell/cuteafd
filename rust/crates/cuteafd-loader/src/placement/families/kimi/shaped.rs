@@ -68,16 +68,19 @@ mod tests {
                     let demand = demands.iter().find(|d| Location::coordinator(d.gpu) == template.location
                         && d.group == template.group).unwrap();
                     assert_eq!(requests.iter().sum::<u64>(), demand.bytes);
-                    assert_eq!(component.bytes.at(pages)?, backing(&requests)?);
+                    let index: usize = template.id.rsplit('.').next().unwrap().parse()?;
+                    assert_eq!(component.bytes.at(pages)?, sm120_request_backing(requests[index])?);
                 }
                 let contract = Contract { components: components.clone(), floor_fallback: None,
                     resident_weight_limit: None, phase_order: PhaseOrder::DRAFT_THEN_TARGET,
                     spark_reply_formats: None, page_rows: recipe.page_rows(), pool_page_multiple: 1,
-                    maximum_pages: recipe.maximum_pages, gpus: 2, variables: vec![], requires: vec![] };
-                let facts = contract.facts(&[], pages)?;
+                    maximum_pages: recipe.maximum_pages, gpus: 2,
+                    variables: vec![Variable::Prefill(vec![recipe.prefill]), Variable::Lanes(vec![1])], requires: vec![] };
+                let selected = [0, 0];
+                let facts = contract.facts(&selected, pages)?;
                 let mut solved = ResolvedPlan { request: request.clone(), pool_tokens: pages * recipe.page_rows(),
                     pool_page_rows: recipe.page_rows(), facts, budgets: vec![], phases: vec![],
-                    decisions: contract.decisions(&[])?, encoder_diagnostics: vec![] };
+                    decisions: contract.decisions(&selected)?, encoder_diagnostics: vec![] };
                 recipe.refine_shaped(&mut solved)?;
                 for demand in demands {
                     let owners = solved.facts.allocations.iter().filter(|root|
@@ -90,11 +93,6 @@ mod tests {
         }
         Ok(())
     }
-}
-
-fn backing(requests: &[u64]) -> Result<u64, Refusal> {
-    requests.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(sm120_request_backing(bytes)?)
-        .ok_or(Refusal::Overflow("Kimi shaped backing")))
 }
 
 /// Compress exact samples into affine intervals. A capped served context makes
@@ -117,7 +115,7 @@ impl KimiRecipe {
     pub(super) fn shaped_components(&self, request: &Request) -> Result<Vec<Component>, Refusal> {
         let mut components = Vec::new();
         for owner in &self.shaped {
-            let mut samples: Vec<Vec<u64>> = Vec::new();
+            let mut samples: Vec<Vec<Vec<u64>>> = Vec::new();
             let mut roots = Vec::new();
             for pages in 1..=self.maximum_pages {
                 let context = request.context.served(pages * self.page_rows());
@@ -127,16 +125,21 @@ impl KimiRecipe {
                     roots = requests.clone();
                 }
                 for (values, (_, _, _, requests)) in samples.iter_mut().zip(requests) {
-                    values.push(backing(&requests)?);
+                    if pages == 1 { values.resize_with(requests.len(), Vec::new); }
+                    for (values, bytes) in values.iter_mut().zip(requests) { values.push(bytes); }
                 }
             }
-            for ((rank, group, category, _), values) in roots.into_iter().zip(samples) {
-                let owner = Allocation::buffer(format!("{group}.{rank}"), Location::coordinator(rank),
-                    values[0], Lifetime::RESIDENT, category, group);
-                let mut component = Component::allocation(owner, ByteCurve::fixed(values[0], self.maximum_pages),
-                    false, self.maximum_pages);
-                component.byte_extent(curve(&values))?;
-                components.push(component);
+            for ((rank, group, category, _), requests) in roots.into_iter().zip(samples) {
+                for (index, values) in requests.into_iter().enumerate() {
+                    let owner = Allocation::buffer(format!("{group}.{rank}.request.{index}"), Location::coordinator(rank),
+                        values[0], Lifetime::RESIDENT, category, group.clone());
+                    let mut physical = curve(&values);
+                    for piece in &mut physical.0 { piece.granularity = SM120_ALLOCATION_GRANULARITY_BYTES; }
+                    let mut component = Component::allocation(owner, ByteCurve::fixed(values[0], self.maximum_pages),
+                        false, self.maximum_pages);
+                    component.byte_extent(physical)?;
+                    components.push(component);
+                }
             }
         }
         Ok(components)
@@ -147,9 +150,19 @@ impl KimiRecipe {
         for owner in &self.shaped {
             for (rank, group, _, requests) in owner.requests(solved.served_context())? {
                 let id = format!("{group}.{rank}");
-                let root = solved.facts.allocations.iter_mut().find(|root| root.id == id)
-                    .ok_or_else(|| invalid("shaped owner missing from selected receipt"))?;
-                if root.bytes != backing(&requests)? { return Err(invalid("shaped backing differs from search")); }
+                let mut root = None;
+                for (index, &bytes) in requests.iter().enumerate() {
+                    let request_id = format!("{id}.request.{index}");
+                    let position = solved.facts.allocations.iter().position(|root| root.id == request_id)
+                        .ok_or_else(|| invalid("shaped owner missing from selected receipt"))?;
+                    let allocation = solved.facts.allocations.remove(position);
+                    if allocation.bytes != sm120_request_backing(bytes)? {
+                        return Err(invalid("shaped backing differs from search"));
+                    }
+                    root.get_or_insert(allocation);
+                }
+                let mut root = root.ok_or_else(|| invalid("shaped owner has no allocations"))?;
+                root.id = id.clone();
                 root.bytes = requests.iter().sum();
                 root.shape = vec![root.bytes];
                 solved.facts.allocation_granularity.push(AllocationGranularity {
@@ -157,6 +170,7 @@ impl KimiRecipe {
                     backings: vec![GranularityBacking { backing: id, requests }],
                     evidence: GranularityEvidence::IndependentLarge,
                 });
+                solved.facts.allocations.push(root);
             }
         }
         let after = evaluate(&solved.facts, &solved.budgets)?;

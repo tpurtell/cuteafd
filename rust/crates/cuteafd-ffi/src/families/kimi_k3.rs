@@ -181,8 +181,18 @@ impl<'a> KimiMlaProjection<'a> {
 
     pub fn scratch_bytes(&self) -> [usize; 2] { self.scratch }
 
+    pub fn scratch_bytes_for(rows: usize, heads: usize) -> Result<[usize; 2]> {
+        if !(1..=4096).contains(&rows) || !matches!(heads, 48 | 96) {
+            return Err(KimiMlaError::Invalid("K3.1 projection scratch rows/heads"));
+        }
+        let align = |n: usize| n.next_multiple_of(1024);
+        Ok([align(rows * 2112 * 2) + align(rows * heads * 192 * 2),
+            2 * align(rows * heads * 128 * 2)])
+    }
+
     pub fn produce(&self, weights: KimiMlaWeights, b: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
-        validate_producer(weights, b, self.heads, self.rows, self.scratch[0], self.cache_format.record_bytes())?;
+        validate_producer(weights, b, self.heads, self.rows,
+            Self::scratch_bytes_for(b.rows, self.heads)?[0], self.cache_format.record_bytes())?;
         // SAFETY: validated native operands and disjoint writes; caller retains
         // the stream and all backing arenas through completion and graph replay.
         unsafe { self.producer.launch(&[b.x.ptr, b.slots.ptr, weights.qkv_a.ptr, weights.q_a_norm.ptr,
@@ -192,7 +202,7 @@ impl<'a> KimiMlaProjection<'a> {
     }
 
     pub fn output(&self, weights: KimiMlaWeights, b: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
-        validate_output(weights, b, self.heads, self.rows, self.scratch[1])?;
+        validate_output(weights, b, self.heads, self.rows, Self::scratch_bytes_for(b.rows, self.heads)?[1])?;
         // SAFETY: validated output phase; selected attention or peer combination
         // precedes this launch on the retained stream, with stable buffer owners.
         unsafe { self.output.launch(&[b.attention.ptr, b.x.ptr, weights.uv.ptr, weights.gate.ptr,
@@ -206,9 +216,7 @@ fn validate_k31_projection_manifest(specs: [&ProgramSpec; 2], heads: usize, rows
     if !matches!(heads, 48 | 96) || !(1..=4096).contains(&rows) {
         return Err(KimiMlaError::Invalid("K3.1 projection head/row geometry"));
     }
-    let align = |n: usize| n.div_ceil(1024) * 1024;
-    let scratch = [align(rows * 2112 * 2) + align(rows * heads * 192 * 2),
-        2 * align(rows * heads * 128 * 2)];
+    let scratch = KimiMlaProjection::scratch_bytes_for(rows, heads)?;
     for (i, spec) in specs.iter().enumerate() {
         let g = &spec.geometry;
         let pointers = if i == 0 { PRODUCER } else { OUTPUT };
@@ -257,10 +265,15 @@ impl<'a> KimiIndexProducer<'a> {
 
     pub fn scratch_bytes(&self) -> usize { self.scratch }
 
+    pub fn scratch_bytes_for(rows: usize) -> Result<usize> {
+        if !(1..=4096).contains(&rows) { return Err(KimiMlaError::Invalid("K3.1 index scratch rows")); }
+        Ok((rows * 4096 * 2).next_multiple_of(1024) + (rows * 160 * 2).next_multiple_of(1024))
+    }
+
     /// The caller orders normalized q-LoRA and hidden inputs before this stage,
     /// and retains native weights/cache/outputs through stream and graph use.
     pub fn launch(&self, weights: KimiIndexWeights, b: KimiIndexBatch, stream: *mut c_void) -> Result<()> {
-        validate_index_batch(weights, b, self.rows, self.scratch)?;
+        validate_index_batch(weights, b, self.rows, Self::scratch_bytes_for(b.rows)?)?;
         // SAFETY: extents, devices and write aliases checked. The owning lane
         // supplies valid physical slots and retains the stream and storage.
         unsafe { self.program.launch(&[b.x.ptr, b.q_resid.ptr, b.positions.ptr, b.slots.ptr,
@@ -283,8 +296,7 @@ fn validate_index_manifest(spec: &ProgramSpec, rows: usize) -> Result<usize> {
         || g["query_amax_floor"].as_f64() != Some(1e-10) || g["key_amax_floor"].as_f64() != Some(1e-4) {
         return Err(KimiMlaError::Invalid("K3.1 index manifest arithmetic/geometry/ABI"));
     }
-    let align = |n: usize| n.div_ceil(1024) * 1024;
-    let scratch = align(rows * 4096 * 2) + align(rows * 160 * 2);
+    let scratch = KimiIndexProducer::scratch_bytes_for(rows)?;
     if spec.scratch.len() != 1 || spec.scratch.get("scratch").copied() != Some(scratch as u64) {
         return Err(KimiMlaError::Invalid("K3.1 index manifest scratch"));
     }
@@ -1094,6 +1106,24 @@ impl<'a> KimiKda<'a> {
     }
 
     pub fn scratch_bytes(&self) -> usize { self.scratch }
+
+    /// The recurrence workspace has baked offsets; only projection planes use
+    /// live-row offsets. Keep its full extent beside the smaller row planes.
+    pub fn scratch_bytes_for(rows: usize, capacity: usize, heads: usize, exported: usize) -> W8Result<usize> {
+        if rows == 0 || rows > capacity || !matches!(capacity, 64 | 4096) {
+            return Err(KimiW8Error::Invalid("KDA scratch rows/capacity"));
+        }
+        let geometry = KimiKdaGeometry::new(heads)?;
+        let base = |rows: usize| {
+            let align = |n: usize| n.next_multiple_of(1024);
+            let width = geometry.width();
+            align(rows * geometry.input_width() * 2) + align(rows * 2 * width * 2)
+                + align(rows * 3 * width * 2) + 2 * align(rows * width * 2)
+        };
+        let chunked = exported.checked_sub(base(capacity)).ok_or(KimiW8Error::Invalid("KDA exported scratch"))?;
+        base(rows).checked_add(chunked).ok_or(KimiW8Error::Invalid("KDA live scratch overflow"))
+    }
+
     pub fn state_bytes(slots: usize) -> W8Result<usize> { kda_slot_bytes(slots, 48 * 128 * 128 * 4) }
     pub fn conv_state_bytes(slots: usize) -> W8Result<usize> { kda_slot_bytes(slots, 3 * 3 * 6144 * 2) }
     pub const fn replay_bytes() -> usize { 64 * 48 * (3 * 128 * 4 + 4 + 3 * 128 * 2) }
@@ -1101,7 +1131,8 @@ impl<'a> KimiKda<'a> {
     /// No allocation, synchronization or lazy loading on the launch path.
     pub fn launch(&self, weights: KimiKdaWeights, b: KimiKdaBatch,
         stream: *mut c_void) -> W8Result<()> {
-        validate_kda_buffers_heads(weights, b, self.rows, self.decode, self.scratch, self.geometry)?;
+        validate_kda_buffers_heads(weights, b, self.rows, self.decode,
+            Self::scratch_bytes_for(b.rows, self.rows, self.geometry.heads(), self.scratch)?, self.geometry)?;
         let mut pointers = [b.input.ptr, weights.input.ptr, weights.forget.ptr,
             weights.convolution.ptr, weights.a_log.ptr, weights.dt_bias.ptr, weights.norm.ptr,
             weights.output.ptr, b.conv_state.ptr, b.state.ptr, b.slots.ptr, b.first.ptr,

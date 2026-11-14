@@ -413,7 +413,8 @@ impl<'a> NativePrograms<'a> {
         let mut layout=LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks(
             cfg, rows, unit, max_context, self.scratch, self.ranks)?, core: None };
         if let Some(dsa) = &self.dsa {
-            layout.base = layout.base.with_sparse_mla_rows(attention_heads)?.with_dsa(cfg, dsa.scratch)?;
+            layout.base = layout.base.with_sparse_mla_rows(attention_heads)?.with_dsa(cfg, dsa.scratch)?
+                .with_live_projection_rows(attention_heads, self.ranks)?;
         }
         if let Some(core)=&self.core {
             layout.core=core.layouts[rank].clone();
