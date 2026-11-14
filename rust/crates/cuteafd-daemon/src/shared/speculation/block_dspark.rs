@@ -398,7 +398,8 @@ impl<'a> NativeBackbone<'a> {
         rows:usize, stream:*mut c_void) -> Result<()> {
         // SAFETY: all spans survive this stream; BF16 addition matches checkpoint residual rounding.
         unsafe {
-            self.add.launch(residual,delta,residual,rows * 6144,stream)?;
+            self.add.launch(residual,delta,self.norm_scratch.buffer,rows * 6144,stream)?;
+            library.copy_d2d_async(residual,self.norm_scratch.buffer,rows * 6144 * 2,stream)?;
             self.norm(library,residual.ptr,weight,output,rows,stream)
         }
     }
