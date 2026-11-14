@@ -52,6 +52,14 @@ pub struct CoreInventory {
     pub native: BTreeMap<String, NativeProjection>,
 }
 
+pub fn fp8_role(cfg: &MuseSparkConfig, name: &str) -> crate::formats::native_attention::Fp8Role {
+    use crate::formats::native_attention::Fp8Role;
+    let stem = name.strip_suffix(".weight").unwrap_or(name);
+    if stem == HEAD { Fp8Role::padded("vocabulary head", true, 128) }
+    else { Fp8Role::exact(if stem.contains(".self_attn.") { "attention projection" }
+        else { "FFN projection" }, split(cfg, stem).is_some()) }
+}
+
 impl CoreInventory {
     pub fn from_checkpoint(cfg: &MuseSparkConfig, checkpoint: &Checkpoint) -> Result<Self> {
         let selected = |name: &str| name.starts_with("lm_head.") || name.strip_prefix(PREFIX)
@@ -60,13 +68,7 @@ impl CoreInventory {
                 && !leaf.starts_with("mlp.experts."));
         // A trellis head is stored at whole 128-row output blocks (202,112 for the
         // logical 202,048 vocabulary); the engine trims logits before the softcap.
-        checkpoint.validate_fp8_roles("Muse", |name| {
-            let stem = name.strip_suffix(".weight").unwrap_or(name);
-            let role = if stem.ends_with("lm_head") { "vocabulary head" }
-                else if stem.contains(".self_attn.") { "attention projection" }
-                else if stem.contains(".mlp.") { "FFN projection" } else { "non-core" };
-            crate::formats::native_attention::Fp8Role::exact(role, stem.contains(".self_attn.") && matches!(stem.rsplit('.').next(), Some("q_proj" | "k_proj" | "v_proj" | "o_proj")))
-        })?;
+        checkpoint.validate_fp8_roles("Muse", |name| fp8_role(cfg, name))?;
         let projections = read_projections(checkpoint, &expected(cfg), selected,
             |stem| split(cfg, stem).map(|split| CoreContract { family: "Muse", widths: &[4, 6, 8], split, view_varying: true, padded_outputs: stem == HEAD }))?;
         if let Some(head) = projections.get(HEAD) {
@@ -91,7 +93,8 @@ impl CoreInventory {
         let mut inventory = Self { projections, native: BTreeMap::new() };
         for (name, shape) in expected(cfg) {
             let stem = name.strip_suffix(".weight").unwrap();
-            if stem == HEAD || stem.ends_with(".gate_proj")
+            let converted = checkpoint.converts_to_fp8(&name);
+            if ((stem == HEAD || stem.ends_with(".gate_proj")) && !converted)
                 || !checkpoint.contains_tensor(&name) { continue; }
             let selected = checkpoint.projection(stem)?;
             let crate::plan::checkpoint::ProjectionStorage::Native { ref dtype, shape: ref actual } = selected.storage else { continue; };
@@ -106,10 +109,11 @@ impl CoreInventory {
                 }
                 crate::formats::native_attention::fp8_scale(&selected, stem)?;
             }
+            let stored = if converted { fp8_role(cfg, &name).stored_shape([shape[0], shape[1]])? }
+                else { [shape[0], shape[1]] };
             inventory.native.insert(stem.into(), NativeProjection {
-                shape: [shape[0], shape[1]], split: split(cfg, stem).context("Muse attention split")?,
-                fp8: *dtype == cuteafd_core::DType::F8E4M3
-                    || checkpoint.converts_to_fp8(&format!("{stem}.weight")),
+                shape: stored, split: split(cfg, stem).context("Muse projection split")?,
+                fp8: *dtype == cuteafd_core::DType::F8E4M3 || converted,
             });
         }
         for layer in 0..cfg.layers {
@@ -131,7 +135,8 @@ impl CoreInventory {
     /// The selected target head: padded for header-native trellis, logical for BF16.
     /// `from_checkpoint` validates the native operand, never a fallback from another view.
     pub fn head_outputs(&self, cfg: &MuseSparkConfig) -> usize {
-        self.get_weight(HEAD).map_or(cfg.vocab_size, |head| head.stored_outputs)
+        self.get_weight(HEAD).map(|head| head.stored_outputs)
+            .or_else(|| self.native.get(HEAD).map(|head| head.shape[0])).unwrap_or(cfg.vocab_size)
     }
 
     pub fn get_weight(&self, name: &str) -> Option<&CoreProjection> {
@@ -178,6 +183,32 @@ mod head_tests {
                         format!("draft_bf16_k{}_n{}{suffix}", shape[1], shape[0]));
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_compact_converts_only_selected_core_ids_including_optional_gate() -> Result<()> {
+        use crate::plan::checkpoint::{CheckpointView, CoreView};
+        let config = testing::muse_spark_config();
+        let cfg = MuseSparkConfig::from_hf(&config)?;
+        let shapes = expected(&cfg);
+        let tensors = shapes.iter().map(|(name, shape)| testing::t(name, "BF16", shape)).collect::<Vec<_>>();
+        let gate = format!("{PREFIX}0.self_attn.gate_proj.weight");
+        for selected in [BTreeMap::from([(gate.clone(), shapes[&gate].clone())]),
+            BTreeMap::from([("lm_head.weight".into(), shapes["lm_head.weight"].clone())])] {
+            let dir = tempfile::tempdir()?;
+            testing::write_mc_snapshot(dir.path(), &config, &tensors, &selected);
+            let checkpoint = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
+            let inventory = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+            let converted = inventory.native.iter().filter(|(_, p)| p.fp8).map(|(stem, _)|
+                format!("{stem}.weight")).collect::<Vec<_>>();
+            assert_eq!(converted, selected.keys().cloned().collect::<Vec<_>>());
+            assert!(!inventory.native[&format!("{PREFIX}0.mlp.pre_expert_proj")].fp8);
+            assert!(!inventory.native[&format!("{PREFIX}0.self_attn.q_proj")].fp8);
+            if selected.contains_key("lm_head.weight") {
+                assert_eq!(inventory.head_outputs(&cfg), 202112);
+            } else { assert_eq!(inventory.head_outputs(&cfg), 202048); }
         }
         Ok(())
     }

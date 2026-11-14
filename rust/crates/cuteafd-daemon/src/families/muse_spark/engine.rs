@@ -131,6 +131,10 @@ impl<'a> RankResources<'a> {
                 .collect::<Vec<_>>()).collect::<Vec<_>>();
         built.projections.get(rank).context("Muse rank projections")?
             .validate_native_owners(&actual_native, unit_rows)?;
+        let actual_global = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(cfg, &actual_core)?;
+        let expected_head = if rank + 1 == ranks { actual_global.head_native.as_ref() } else { None };
+        ensure!(built.projections[rank].native_head.as_ref() == expected_head,
+            "Muse native head ownership differs from admission");
         // Programs before any allocation: a missing export refuses here.
         let bound = device.run(|| RankPrograms::bind(programs, ranks))?;
         let core = CorePrograms::load(programs, device, built.projections.get(rank).context("Muse rank projections")?)?;
@@ -147,7 +151,7 @@ impl<'a> RankResources<'a> {
         let step = StepStorage::allocate(device, tables)?;
         let global_layout = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(cfg, &actual_core)?;
         let globals = GlobalWeights::load(device, checkpoint, &global_layout, rank, ranks, arena)?;
-        let has_head = globals.head.is_some() || globals.head_bf16.is_some();
+        let has_head = globals.head.is_some() || globals.head_bf16.is_some() || globals.head_native.is_some();
         let head = if has_head {
             let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(
                 actual_core.head_outputs(cfg), cfg.vocab_size)?;

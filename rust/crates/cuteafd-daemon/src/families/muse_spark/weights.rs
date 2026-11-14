@@ -280,6 +280,7 @@ pub(crate) struct GlobalWeights<'a> {
     pub final_norm: Allocation<'a>,
     pub head: Option<CoreWeights<'a>>,
     pub head_bf16: Option<Allocation<'a>>,
+    pub head_native: Option<NativeWeights<'a>>,
 }
 
 impl<'a> GlobalWeights<'a> {
@@ -291,6 +292,10 @@ impl<'a> GlobalWeights<'a> {
             }
         }
         if let Some(head) = &self.head_bf16 { head.inventory(inventory, "global.head")?; }
+        if let Some(head) = &self.head_native {
+            head.values.inventory(inventory, "global.head.values")?;
+            if let Some(scales) = &head.scales { scales.inventory(inventory, "global.head.scales")?; }
+        }
         Ok(())
     }
 
@@ -301,6 +306,9 @@ impl<'a> GlobalWeights<'a> {
         let root = PREFIX.trim_end_matches("layers.");
         let name = format!("{root}norm.weight");
         let dense = DenseLoad::mount(device.library);
+        let native_load = DenseLoad::mount(device.library);
+        native_load.admit_mount(cuteafd_loader::families::muse_spark::weight_layout::native_mount_load(
+            (rank + 1 == ranks).then_some(layout.head_native.as_ref()).flatten())?)?;
         let rect = checked_rect(checkpoint, &name, DType::Bf16, None, None)?;
         ensure!(rect.bytes() == layout.final_norm, "Muse final norm differs from admitted bytes");
         let final_norm = land(device, arena, "global.final_norm", &dense, rect)?;
@@ -309,13 +317,26 @@ impl<'a> GlobalWeights<'a> {
                 let core = CoreWeightLayout::from_shared(core.clone());
                 (Some(core.load_recorded_with(device, checkpoint, &dense, std::ptr::null_mut(),
                     |name, bytes| allocate(device, arena, name, bytes))?), None)
-            } else {
+            } else if layout.head_native.is_some() { (None, None) } else {
                 let rect = checked_rect(checkpoint, "lm_head.weight", DType::Bf16, None, None)?;
                 ensure!(rect.bytes() == layout.head_bf16, "Muse BF16 head differs from admitted bytes");
                 (None, Some(land(device, arena, "global.head", &dense, rect)?))
             }
         } else { (None, None) };
-        Ok(Self { final_norm, head, head_bf16 })
+        let head_native = if rank + 1 == ranks { layout.head_native.as_ref().map(|layout| -> Result<_> {
+            let weights = allocate_native(device, arena, layout)?;
+            let selected = checkpoint.projection(&layout.stem)?;
+            for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.projection_view(&layout.stem),
+                layout, cuteafd_loader::families::muse_spark::core::fp8_role(
+                    &MuseSparkConfig::from_hf(&checkpoint.config)?, "lm_head.weight"),
+                crate::shared::fp8_linear::Fp8Scales::Amax, weights.values.buffer,
+                weights.scales.as_ref().map(|scales| scales.buffer))? {
+                match record { AttentionRecord::Operand(operand) => native_load.operand(operand)?,
+                    AttentionRecord::Step(step) => native_load.step(step, std::ptr::null_mut())? }
+            }
+            Ok(weights)
+        }).transpose()? } else { None };
+        Ok(Self { final_norm, head, head_bf16, head_native })
     }
 }
 
@@ -536,7 +557,7 @@ mod tests {
                     let layer = LayerLayout { operands: BTreeMap::new(), core: cores, native };
                     let global = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout {
                         embedding: 512, final_norm: 512, head: Some(projection(head, CoreSplit::Whole,
-                            TrellisSide::Output, 0, 1)?), head_bf16: 0 };
+                            TrellisSide::Output, 0, 1)?), head_native: None, head_bf16: 0 };
                     let arena = DeviceWeightArena::new(device,
                         cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(rank, ranks, &global, &[&layer])?, crate::shared::memory::TEST_ARENA)?;
                     let dense = DenseLoad::mount(&library);

@@ -76,9 +76,12 @@ pub(crate) fn project_head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, rows
     input: Buffer, staged: Buffer, trimmed: Buffer, logits: Buffer, stream: *mut c_void) -> Result<()> {
     rank.check_head_stream(stream)?;
     let (vocab, stored) = (cfg.vocab_size,
-        rank.globals.head.as_ref().map_or(cfg.vocab_size, |head| head.shape[0]));
+        rank.globals.head.as_ref().map(|head| head.shape[0])
+            .or_else(|| rank.globals.head_native.as_ref().map(|head| head.layout.shape[0])).unwrap_or(cfg.vocab_size));
     if let Some(weights) = &rank.globals.head {
         rank.core.head_f32(rows, input, weights, staged, stream)?;
+    } else if let Some(weights) = &rank.globals.head_native {
+        rank.core.native_head_f32(rows, input, weights, staged, stream)?;
     } else {
         let weights = rank.globals.head_bf16.as_ref().context("Muse BF16 head weights absent")?;
         let head = rank.native_head.as_ref().context("Muse BF16 head handle absent")?;

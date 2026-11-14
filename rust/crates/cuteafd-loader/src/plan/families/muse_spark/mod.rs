@@ -271,7 +271,10 @@ impl FamilyModel for Model {
             return Ok(());
         }
         if let Some(projection) = self.core.native.get(stem) {
-            return super::require(operand.logical == projection.shape
+            let expected = if stem == crate::families::muse_spark::core::HEAD {
+                vec![self.cfg.vocab_size, self.cfg.hidden]
+            } else { projection.shape.to_vec() };
+            return super::require(operand.logical == expected
                 && (operand.is_plain(&[format::Encoding::Bf16])
                     || operand.is_fp8_block(128, &[format::ScaleEncoding::F32]))
                 && operand.input_scale.is_none() && operand.global_scale.is_none()
