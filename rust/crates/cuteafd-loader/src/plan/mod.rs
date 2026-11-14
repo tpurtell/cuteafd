@@ -10,6 +10,7 @@ pub mod families;
 pub mod family;
 pub mod files;
 pub mod format;
+pub mod fp8_prefill;
 pub mod inputs;
 pub mod launch;
 pub mod layout;
@@ -256,6 +257,7 @@ pub struct AdmissionTiming {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
+    pub fp8_prefill: Vec<fp8_prefill::Resolution>,
     pub mapped_placement: crate::formats::mapped_preload::MappedPlacement,
     /// Coordinator-host admission including estimated owner bounds, separate from mapped-scale preload.
     pub host_budget_bytes: u64,
@@ -441,6 +443,7 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    pub fp8_prefill: fp8_prefill::Policy,
     /// None preserves each family's qualified decode-view default.
     pub decode_lanes: Option<u8>,
     /// Host RAM cap for mapped tables: every table (rows and scales) when all fit,
@@ -472,6 +475,7 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            fp8_prefill: Default::default(),
             decode_lanes: None,
             mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
             mapped_scale_host_budget_bytes: None,
@@ -991,6 +995,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
 pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::Result<PlanReport> {
     let checkpoint = input.checkpoint();
     Ok(PlanReport {
+        fp8_prefill: Vec::new(),
         mapped_placement: Default::default(),
         host_budget_bytes: 0,
         host_ledger: None,
@@ -1420,6 +1425,22 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let _ = family_layout(model, input, &mut report, &mut inventory, options.placement)?;
         report.prefill_unit_rows = inventory.prefill_unit_rows;
         report.prefill_waves = Some(inventory.prefill_waves);
+    }
+    if family.id() == "glm5_flash" {
+        let manifest = options.layout.as_ref().and_then(|layout| layout.workspace_manifest.as_deref())
+            .or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json").is_file()
+                .then_some(Path::new("/opt/cuteafd/share/PROGRAMS.json")))
+            .and_then(|path| input.manifest(path).ok());
+        let representation = options.layout.as_ref().map(|layout| layout.glmf_representation).unwrap_or_default();
+        let ranks = options.layout.as_ref().map_or(1, |layout| if layout.head_split { layout.rtx_bytes.len().min(2) } else { 1 });
+        let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config)?;
+        report.fp8_prefill = fp8_prefill::flash_report(checkpoint, &cfg, &options.fp8_prefill,
+            family.fp8_prefill_groups(), manifest.as_deref(), ranks, representation)?;
+        for resolution in &report.fp8_prefill {
+            if let Some(hint) = &resolution.hint {
+                report.hints.push(Hint { what: hint.clone(), how: "Keep W8A16 or install a W8A8 prefill program for this geometry.".into() });
+            }
+        }
     }
     finalize_media_report(&mut report, checkpoint, family, spec)?;
     if family.runtime() == RuntimeStatus::Planned && !report.native_serving_admitted {
@@ -1868,6 +1889,10 @@ pub fn render(report: &PlanReport) -> String {
     }
     for (module, numerics) in &report.module_numerics {
         let _ = writeln!(out, "numerics   {module}: {numerics:?} (checkpoint declaration)");
+    }
+    for resolution in &report.fp8_prefill {
+        let _ = writeln!(out, "fp8-prefill {}: {:?}{}", resolution.group, resolution.mode,
+            resolution.scratch_owner.as_ref().map_or(String::new(), |owner| format!(" (scratch: {owner}, already charged)")));
     }
     for optimization in &report.precision_optimizations {
         let _ = writeln!(out, "precision  {optimization}");

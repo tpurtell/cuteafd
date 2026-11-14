@@ -158,18 +158,15 @@ pub(super) fn validate_bf16_package(main: &Fp8MoeInfo, bf16: &Fp8MoeInfo, capaci
         .with_context(|| format!("BF16-input FP8 package has no capacity for {capacity} rows"))
 }
 
-/// Environment switch for how FP8 expert packages run prefill row counts:
-/// `auto` (default: FP8 wire rows W8A8, block-scaled E4M3 x E4M3 gate/up; BF16
-/// rows W8A16, exact), `w8a16` (the former programs, weights widened to
-/// `bf16(w * s)`) or `w8a8` (BF16 rows quantized to wire rows too).
-pub(crate) const PREFILL_ENV: &str = "CUTEAFD_FP8_EXPERT_PREFILL";
-
-/// The prefill form `PREFILL_ENV` asks for.
-pub(crate) fn prefill_mode() -> Result<Fp8MoePrefill> {
-    match std::env::var(PREFILL_ENV) {
-        Ok(value) if !value.is_empty() => value.parse().with_context(|| format!("{PREFILL_ENV}={value}")),
-        _ => Ok(Fp8MoePrefill::default()),
-    }
+/// Keep package defaults format-aware; non-FP8 weights never inherit FP8 activation policy.
+fn prefill_mode(weights: Fp8MoeWeights) -> Result<Fp8MoePrefill> {
+    use cuteafd_loader::plan::fp8_prefill::Policy;
+    let policy = Policy::from_env().map_err(anyhow::Error::msg)?;
+    Ok(match policy.experts(weights == Fp8MoeWeights::Fp8) {
+        None => Fp8MoePrefill::Auto,
+        Some(false) => Fp8MoePrefill::W8a16,
+        Some(true) => Fp8MoePrefill::W8a8,
+    })
 }
 
 /// Loads an FP8 expert package and selects its prefill form.
@@ -178,8 +175,8 @@ pub(crate) fn prefill_mode() -> Result<Fp8MoePrefill> {
 /// As `Fp8MoeModule::load`.
 unsafe fn load_module(directory: &Path) -> Result<Fp8MoeModule> {
     let mut module = Fp8MoeModule::load(directory)?;
-    let prefill = prefill_mode()?;
-    module.set_prefill(prefill).with_context(|| format!("{} ({PREFILL_ENV})", directory.display()))?;
+    let prefill = prefill_mode(module.info().weights)?;
+    module.set_prefill(prefill).with_context(|| format!("{} (FP8_PREFILL)", directory.display()))?;
     if prefill != Fp8MoePrefill::default() {
         tracing::info!(package = %directory.display(), ?prefill, "FP8 expert prefill form");
     }

@@ -871,7 +871,7 @@ def test_mc_fp8_example_declares_only_activation_extras(name: str, tmp_path: Pat
     values = keys(EXAMPLES / name)
     assert values["CORE_VIEW"] == "fp8-compact"
     # MLA/FFN W8A8 are the default; the example opts KDA in as well.
-    assert values["GLM5_FLASH_ATTENTION_FP8_PREFILL"] == "all"
+    assert values["FP8_PREFILL"] == "mla,ffn,kda-in,kda-o,experts"
     assert "GLM5_FLASH_FFN_FP8_PREFILL" not in values
     assert values["RTX_GPUS"] == "2" and values["SPARK_COUNT"] == "0"
     assert "GLM5_FLASH_FP8_HEAD" not in values and "GLM5_FLASH_KDA_FP8" not in values

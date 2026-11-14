@@ -235,7 +235,7 @@ RUN_STATEMENTS = {
 
 RUN_VARS = """
 source scripts/lib/family-keys.sh
-shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on)
+shared_worker_env_args=(-e CUTEAFD_FP8_PREFILL=auto -e CUTEAFD_THERMAL=on)
 hosts=(seed0 seed1)
 i=0
 host=seed0
@@ -432,7 +432,7 @@ class TestRunShLifecycle:
             "fp", "2", "", "", "info", "__none__",
             "-1", "19541", "", "revision", "1",
             # Docker options follow the positionals behind one sentinel.
-            "--profile-args", "-e", "CUTEAFD_FP8_EXPERT_PREFILL=auto", "-e", "CUTEAFD_THERMAL=on",
+            "--profile-args", "-e", "CUTEAFD_FP8_PREFILL=auto", "-e", "CUTEAFD_THERMAL=on",
         ], payload
 
     def test_empty_optionals_do_not_shift_the_launch_vector(self, tmp_path):

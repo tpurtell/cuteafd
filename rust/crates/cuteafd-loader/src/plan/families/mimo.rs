@@ -208,7 +208,7 @@ impl Family for MiMo {
                 how: format!("Exact family `mimof:fp8` (E2M1 packed U8 [N,K/2], UE8M0 U8 [N,K/32]); \
                     fp8-mimof tp1 coordinator and tp2/tp4 Spark, package_fp8_moe_aot.py --geometry mimof. \
                     TP2 owns {} rows per rank; TP4 owns {}. SM121 uses MXFP8 x MXFP4 large-row \
-                    prefill; FP8_EXPERT_PREFILL=w8a16 keeps BF16 down.", i / 2, i / 4),
+                    prefill; FP8_PREFILL=off keeps BF16 down for FP8 experts.", i / 2, i / 4),
             }),
             Component::RoutedExpert if mxfp4 => {
                 // TP6 owns whole K32 blocks; physical storage follows the measured policy.
@@ -224,7 +224,7 @@ impl Family for MiMo {
                         over six ranks: whole 32-blocks per rank ({widest}/{} rows), widest stored width {stored}, \
                         {:.1} GiB per rank. The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
                         above 640 live rows, and its down projection quantizes the BF16 SwiGLU rows per K32 to \
-                        MXFP8 for block-scaled MXFP8 x MXFP4 MMAs (FP8_EXPERT_PREFILL=w8a16 keeps BF16 down); \
+                        MXFP8 for block-scaled MXFP8 x MXFP4 MMAs (MXFP4 arithmetic is unaffected by FP8_PREFILL); \
                         smaller row counts use the grouped route.",
                         widest - 32, per_rank(stored)),
                 })
