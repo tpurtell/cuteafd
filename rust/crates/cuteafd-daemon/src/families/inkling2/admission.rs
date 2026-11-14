@@ -27,7 +27,7 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
     mount.merge(expert.mount);
     for (name, bytes, location) in [("source", mount.pinned_source, Location::PINNED),
         ("rows", mount.full_row_cache, Location::HOST), ("tables", mount.pinned_tables, Location::PINNED)] {
-        if bytes>0 { buffers.push((format!("mount.{name}"), location, bytes, Lifetime { first: Phase::Load, last: Phase::Load }, Category::Staging)); }
+        if bytes>0 { buffers.push((format!("mount.{name}"), location, bytes, Lifetime::RESIDENT, Category::Staging)); }
     }
     let sync = mount.pinned_source.max(1024*64*2);
     buffers.push(("sync-h2d".into(), Location::PINNED, sync, Lifetime::RESIDENT, Category::Staging));

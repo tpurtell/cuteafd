@@ -67,7 +67,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let kernels = device.run(|| Kernels::bind(&programs))?;
     let (free, total) = device.run(|| library.cuda_memory_info())?;
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
-    let _facts = admission::admit(&checkpoint, &cfg, &target_layout, &expert_layouts[0], metadata.scratch_for(rows)?,
+    let facts = admission::admit(&checkpoint, &cfg, &target_layout, &expert_layouts[0], metadata.scratch_for(rows)?,
         &unit_layout, rows, free as u64, total as u64, host)?;
     let stream = Rc::new(Stream::new(device)?);
     let owner = UnitOwner::new(Rc::clone(&stream), unit_layout)?;
@@ -100,6 +100,26 @@ fn run(args: GoldenArgs) -> Result<()> {
         let experts = device.run(|| Mxfp8::load(Rc::clone(&stream), layout, &metadata, &package, &cfg, rows))?;
         device.run(|| super::prefill::layer(&kernels, &owner, &weights, &experts, &cfg, index, rows))?;
         stream.drain()?;
+        let physical = [args.device];
+        let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "inkling2",
+            cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "cold native weights");
+        weights.inventory(&mut inventory, "target")?;
+        experts.inventory(&mut inventory, "experts")?;
+        let mut working = crate::shared::memory::receipts::Inventory::new(devices, "inkling2",
+            cuteafd_loader::placement::planner::Lifetime::TARGET,
+            cuteafd_core::memory_layout::Category::Workspace, "cold native workspaces");
+        owner.inventory(&mut working, "unit")?;
+        head.inventory(&mut working, "head")?;
+        let measured = inventory.receipts.iter().chain(&working.receipts)
+            .filter(|r| r.allocation.view.is_none() && r.allocation.location == cuteafd_loader::placement::planner::Location::coordinator(0))
+            .map(|r| r.allocation.bytes).sum::<u64>();
+        let admitted = facts.allocations.iter().filter(|a| a.view.is_none()
+            && a.location == cuteafd_loader::placement::planner::Location::coordinator(0)).map(|a| a.bytes).sum::<u64>();
+        ensure!(measured <= admitted, "Inkling measured device owners exceed cold admission: {measured}/{admitted}");
+        tracing::info!(layer=index, measured_device_owner_bytes=measured, admitted_device_owner_bytes=admitted,
+            native_weight_arena_aliases=inventory.receipts.len(), "Inkling native cold owner census");
         println!("Inkling native layer{index} complete rows={rows}");
     }
     let candidates = super::layers::residual_site(&cfg, args.last_layer)?.mlp_candidates;

@@ -35,6 +35,13 @@ impl<'a> Head<'a> {
     pub fn workspace_bytes(_cfg: &Inkling2Config, _rows: usize) -> Result<usize> {
         Ok(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE)
     }
+    pub fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str) -> Result<()> {
+        for (name, owner) in [("tokens", &self.tokens), ("normalized", &self.normalized),
+            ("logits", &self.logits), ("workspace", &self._workspace)] {
+            owner.inventory(inventory, &format!("{prefix}.{name}"))?;
+        }
+        Ok(())
+    }
     pub fn embed(&self, k: &Kernels<'_>, owner: &UnitOwner<'_>, target: &TargetWeights<'_>,
         cfg: &Inkling2Config, tokens: &[u32]) -> Result<()> {
         ensure!(!tokens.is_empty() && tokens.len()<=self.rows && tokens.iter().all(|&t| (t as usize)<cfg.unpadded_vocab_size),
