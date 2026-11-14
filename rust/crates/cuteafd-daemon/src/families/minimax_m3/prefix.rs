@@ -207,6 +207,7 @@ mod tests {
     }
     fn build(units: Vec<u32>, slot: usize) -> Placement { Placement { units, slot, len: 0 } }
     fn read_page(family: &MiniMaxPrefix<'_>, page: u32) -> Result<Vec<Vec<u8>>> {
+        family.0.copies.drain()?;
         let mut out = Vec::new();
         for bank in &family.0.banks {
             for layer in bank.layers.clone() {
@@ -221,6 +222,7 @@ mod tests {
         Ok(out)
     }
     fn write_page(family: &MiniMaxPrefix<'_>, page: u32, salt: usize) -> Result<()> {
+        family.0.copies.drain()?;
         for (rank, bank) in family.0.banks.iter().enumerate() {
             for layer in bank.layers.clone() {
                 for (plane, stride) in bank.layout.page_planes() {
@@ -428,54 +430,54 @@ mod tests {
     }
 
     fn prompt_and_turn_restore(family: &MiniMaxPrefix<'_>) -> Result<()> {
-        let mut cache = cache(&family)?;
+        let mut cache = cache(family)?;
         let prompt: Vec<u32> = (0..65).collect();
         let turn: Vec<u32> = (0..129).collect();
-        let mut original = cache.admit(&family, &prompt, 192, false, |pages| build(pages, 0))?.placement;
-        for (i, &page) in original.units.iter().enumerate() { write_page(&family, page, i)?; }
+        let mut original = cache.admit(family, &prompt, 192, false, |pages| build(pages, 0))?.placement;
+        for (i, &page) in original.units.iter().enumerate() { write_page(family, page, i)?; }
         original.len = 65;
-        let first = read_page(&family, original.units[0])?;
-        let prompt_tail = read_page(&family, original.units[1])?;
-        assert!(cache.capture(&family, SnapshotKind::Prompt, &prompt, &original,
+        let first = read_page(family, original.units[0])?;
+        let prompt_tail = read_page(family, original.units[1])?;
+        assert!(cache.capture(family, SnapshotKind::Prompt, &prompt, &original,
             After::from_logits(&[0.0, 1.0], true))?);
         // A turn changes every byte of the live tail, including head 3 and the
         // separate index scales, after the prompt snapshot privately copied it.
-        write_page(&family, original.units[1], 91)?;
+        write_page(family, original.units[1], 91)?;
         original.len = 129;
-        let turn_middle = read_page(&family, original.units[1])?;
-        let turn_tail = read_page(&family, original.units[2])?;
-        assert!(cache.capture(&family, SnapshotKind::Turn, &turn, &original,
+        let turn_middle = read_page(family, original.units[1])?;
+        let turn_tail = read_page(family, original.units[2])?;
+        assert!(cache.capture(family, SnapshotKind::Turn, &turn, &original,
             After::from_logits(&[2.0, 1.0], true))?);
-        write_page(&family, original.units[2], 93)?;
-        cache.release(&family, &original.units)?;
+        write_page(family, original.units[2], 93)?;
+        cache.release(family, &original.units)?;
 
-        let hit = cache.admit(&family, &prompt, 192, false, |pages| build(pages, 1))?;
+        let hit = cache.admit(family, &prompt, 192, false, |pages| build(pages, 1))?;
         assert_eq!(hit.resume, 65);
         assert_eq!(hit.source.as_ref().unwrap().kind, SnapshotKind::Prompt);
         assert!(hit.source.as_ref().unwrap().plan.exact());
-        check_binding(&family, &hit.placement)?;
-        assert_eq!(read_page(&family, hit.placement.units[0])?, first);
-        assert_eq!(read_page(&family, hit.placement.units[1])?, prompt_tail);
-        let sibling = cache.admit(&family, &prompt, 192, false, |pages| build(pages, 2))?;
+        check_binding(family, &hit.placement)?;
+        assert_eq!(read_page(family, hit.placement.units[0])?, first);
+        assert_eq!(read_page(family, hit.placement.units[1])?, prompt_tail);
+        let sibling = cache.admit(family, &prompt, 192, false, |pages| build(pages, 2))?;
         assert_ne!(hit.placement.units[1], sibling.placement.units[1]);
-        write_page(&family, hit.placement.units[1], 121)?;
-        assert_eq!(read_page(&family, sibling.placement.units[1])?, prompt_tail);
-        cache.release(&family, &hit.placement.units)?;
-        cache.release(&family, &sibling.placement.units)?;
+        write_page(family, hit.placement.units[1], 121)?;
+        assert_eq!(read_page(family, sibling.placement.units[1])?, prompt_tail);
+        cache.release(family, &hit.placement.units)?;
+        cache.release(family, &sibling.placement.units)?;
 
-        let hit = cache.admit(&family, &turn, 192, false, |pages| build(pages, 1))?;
+        let hit = cache.admit(family, &turn, 192, false, |pages| build(pages, 1))?;
         assert_eq!(hit.resume, 129);
         assert_eq!(hit.source.as_ref().unwrap().kind, SnapshotKind::Turn);
-        check_binding(&family, &hit.placement)?;
-        assert_eq!(read_page(&family, hit.placement.units[1])?, turn_middle);
-        assert_eq!(read_page(&family, hit.placement.units[2])?, turn_tail);
-        cache.release(&family, &hit.placement.units)?;
+        check_binding(family, &hit.placement)?;
+        assert_eq!(read_page(family, hit.placement.units[1])?, turn_middle);
+        assert_eq!(read_page(family, hit.placement.units[2])?, turn_tail);
+        cache.release(family, &hit.placement.units)?;
         let mut branch = turn.clone(); branch[128] = 9999;
-        let partial = cache.admit(&family, &branch, 192, false, |pages| build(pages, 3))?;
+        let partial = cache.admit(family, &branch, 192, false, |pages| build(pages, 3))?;
         assert_eq!(partial.resume, 128);
-        assert_eq!(read_page(&family, partial.placement.units[1])?, turn_middle);
-        cache.release(&family, &partial.placement.units)?;
-        cache.clear(&family)?;
+        assert_eq!(read_page(family, partial.placement.units[1])?, turn_middle);
+        cache.release(family, &partial.placement.units)?;
+        cache.clear(family)?;
         assert_eq!(cache.pool().used(), 0);
         Ok(())
     }
