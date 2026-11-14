@@ -637,18 +637,19 @@ mod tests {
                 inkling2.push(format!("inkling2_{name}_{suffix}"));
             }
         }
-        inkling2.extend(["residual_q1_keep", "residual_q1_add", "residual_q3_keep", "residual_q3_add", "router_e384_k8"]
+        inkling2.extend(["residual_q1_keep", "residual_q1_add", "residual_q3_keep", "residual_q3_add", "router_e384_k8", "expert_input_quant"]
             .map(|name| format!("inkling2_{name}")));
         let installed = entries.iter().filter(|entry| entry["family"] == "inkling2"
             || entry["name"].as_str().is_some_and(|name| name.starts_with("inkling2")))
             .map(|entry| entry["name"].as_str().expect("installed program name")).collect::<Vec<_>>();
         assert_eq!(installed, inkling2);
-        assert_eq!(entries[entries.len() - inkling2.len()..].iter()
+        let first = entries.iter().position(|entry| entry["name"].as_str() == Some(inkling2[0].as_str())).unwrap();
+        assert_eq!(entries[first..first + inkling2.len()].iter()
             .map(|entry| entry["name"].as_str().unwrap()).collect::<Vec<_>>(), inkling2);
-        for entry in &entries[entries.len() - inkling2.len()..] {
+        for entry in &entries[first..first + inkling2.len()] {
             assert_eq!(entry["family"], "inkling2");
             assert!(matches!(entry["op"].as_str(), Some("attention" | "convolution" | "l2_clip" | "gate"
-                | "situ" | "rms_norm" | "kv_pack" | "attn_res" | "router")));
+                | "situ" | "rms_norm" | "kv_pack" | "attn_res" | "router" | "expert_input_quant")));
         }
         let mut partition = Vec::new();
         for entry in entries {
