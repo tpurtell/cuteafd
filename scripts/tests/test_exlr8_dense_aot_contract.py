@@ -221,6 +221,7 @@ def test_minimax_native_mxfp8_a8_catalog_preserves_shipping_exlr8(monkeypatch):
         assert thunk() == params
         if op == "dense_mxfp8":
             assert params["encoding"] == "mxfp8" and params["sharded_side"] == 1
+            assert params["decode"] == "auto"
             assert name == f"mxfp8_k{params['input_features']}_n{params['output_features']}_s1_a8"
         else:
             assert op == "dense_mxfp8_quant"
