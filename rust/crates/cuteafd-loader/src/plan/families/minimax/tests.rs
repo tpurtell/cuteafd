@@ -213,8 +213,15 @@ fn only_optional_bundled_components_keep_missing_execution_hints() {
 fn whole_rank_wip_admission_does_not_open_public_or_split_serving() {
     use crate::placement::OnboardSetting;
     let (dir, inputs) = heads_recipe_fixture_with_experts(128);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let whole = crate::families::minimax_m3::weight_layout::CoordinatorWeights::plan(
+        &checkpoint, &inputs.cfg, 1, &vec![0; inputs.cfg.layers]).unwrap();
+    let mut programs = inputs.manifest["programs"].as_array().unwrap().clone();
+    programs.extend(dense_manifest(&whole[0])["programs"].as_array().unwrap().clone());
+    let programs = programs.into_iter().map(|program| (program["name"].as_str().unwrap().to_owned(), program))
+        .collect::<std::collections::BTreeMap<_, _>>().into_values().collect::<Vec<_>>();
     let manifest = dir.path().join("PROGRAMS.json");
-    std::fs::write(&manifest, inputs.manifest.to_string()).unwrap();
+    std::fs::write(&manifest, serde_json::json!({"programs":programs}).to_string()).unwrap();
     let options = PlanOptions { vision: crate::plan::MediaMode::Off,
         audio: crate::plan::MediaMode::Off,
         placement: plan::ExpertPlacement::Sparks { ranks: 4 },
