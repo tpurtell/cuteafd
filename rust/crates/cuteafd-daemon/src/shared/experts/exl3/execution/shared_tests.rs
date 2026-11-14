@@ -57,7 +57,8 @@ fn independently_backed_target_and_draft_share_serial_scratch_exactly() -> Resul
     let buffers = || input.each_ref().map(|input| input.buffer);
     let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
         let mut bytes = vec![0; rows * hidden * 4];
-        library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: bytes.len(), ..buffer })?;
+        let extent = bytes.len();
+        library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: extent, ..buffer })?;
         Ok(bytes)
     };
     let mut expected = Vec::new();

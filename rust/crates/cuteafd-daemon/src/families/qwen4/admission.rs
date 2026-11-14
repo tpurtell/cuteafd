@@ -1106,26 +1106,28 @@ mod tests {
                 assert!(report.placement_supported, "{}", cuteafd_loader::plan::render(&report));
                 let layout = report.memory_layout.unwrap();
                 let device = &layout.devices[0];
-                assert!(device.items.iter().any(|i| i.group == "target incl PLE projections" && i.bytes > 0));
-                let baseline = device.items.iter().filter(|i| !matches!(i.group.as_str(), "records" | "state" |
-                    "marks" | "startup graphs" | "decode step" | "prefill step"))
-                    .map(|i| i.bytes).sum::<u64>();
+                assert!(device.items.iter().any(|i| i.group == "weight arena" && i.bytes > 0));
+                let baseline = device.items.iter().filter(|item| item.group == "context+modules")
+                    .map(|item| item.bytes).sum::<u64>();
                 let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
                     "--native-lib", "/nonexistent/lib.so", "--max-context-tokens", &context.to_string(),
                     "--slots", &concurrency.to_string(),
                     "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
-                let loaded_weights = super::single_weights(&args, &checkpoint, &cfg, cfg.layers, false)?
-                    .checked_add(qwen4::single_expert_weights(&catalog, cfg.layers, true, false)?)?;
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
+                let arenas = cuteafd_loader::families::qwen4::weight_layout::coordinator_arenas(&checkpoint,
+                    &cfg, &vec![0; cfg.layers], 1, false, Default::default(),
+                    cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint)?)?
+                    .into_iter().map(|(_, arena)| arena).collect();
                 let planned = qwen4::QwenInputs {
-        experts: None, onboard: cuteafd_loader::placement::Onboard::Auto,                    arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
-        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
-                    loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
-                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs, capacity_bytes: capacity,
-                    baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
-                    max_context: context, requested_pool: pool, spark_ranks: 0,
-
+                    experts: Some(qwen4::QwenExperts::headers(&catalog, cfg.layers, 1)?),
+                    onboard: Default::default(), arenas, expert_arenas: vec![], preallocation: true, future: vec![],
+                    blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
+                    loaded_weights: ResidentWeights(0), resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
+                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+                    context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs,
+                    capacity_bytes: capacity, baseline: Baseline::Measured { free_bytes: capacity - baseline },
+                    pending_code_bytes: 0, max_context: context, requested_pool: pool, spark_ranks: 0,
                     host: qwen4::QwenHost::ample(&cfg, 1, 4096)?, encoders: Default::default() };
                 // The graph reserve is one owner at the resolved capture shape,
                 // charged once before KV sizing.

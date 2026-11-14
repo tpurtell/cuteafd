@@ -163,7 +163,8 @@ impl QwenExperts {
         }
         for candidate in &mut self.candidates {
             candidate.workspace.retain(|allocation| !allocation.id.contains(".shared.")
-                && !allocation.id.ends_with(".output"));
+                && !allocation.id.ends_with(".output")
+                && allocation.view.as_ref().is_none_or(|view| !view.backing.contains(".shared.")));
         }
         let bytes = exl3.residency(crate::V41Exl3Layer::Dspark(0), 1, 0)?.device_arena_layout()?.1;
         let regions = vec![("Dspark { stage: 0 }.0".to_string(), bytes)];
