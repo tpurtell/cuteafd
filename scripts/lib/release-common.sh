@@ -805,6 +805,24 @@ release_profile_exec() {
   exec "$bin" "$@"
 }
 
+# Container command for PROFILE_NSYS_CPU=on: BIN is the nsys to run, or - to
+# resolve the image's. nsys writes a report without CPU samples and exits 0
+# when it cannot open perf events (#1700), so the container refuses to start
+# unless nsys's own environment check passes for process-tree sampling.
+release_profile_exec_cpu_sampled() {
+  local bin="$1" report
+  shift
+  if [[ "$bin" == - ]]; then bin="$(release_profile_resolve_tool nsys)" || exit 127; fi
+  mkdir -p "${HOME:-/tmp}" 2>/dev/null || true
+  report="$("$bin" status --environment 2>&1)" || true
+  if ! grep -q 'CPU Profiling Environment (process-tree): OK' <<<"$report"; then
+    printf '%s\n' "$report" >&2
+    printf '%s\n' 'PROFILE_NSYS_CPU=on: nsys cannot sample CPU in this container (the environment check above; perf_event_open needs CAP_PERFMON and kernel.perf_event_paranoid <= 2). Refusing to serve under a profile that would silently have no CPU samples.' >&2
+    exit 126
+  fi
+  exec "$bin" "$@"
+}
+
 # Container command: resolve TOOL at start, then exec it with the remaining
 # arguments. The caller appends the served command after this argv.
 release_profile_container_wrapper() {
@@ -922,10 +940,14 @@ _release_profile_tool_wrapper() {
       fi
     fi
     graph_trace="${graph_trace:-node}"
-    local cpu=(--sample=none --cpuctxsw=none)
+    # CPU sampling opens perf events. The serving seccomp profile and Docker's
+    # default both allow perf_event_open only with CAP_PERFMON (or SYS_ADMIN),
+    # so the profiled container gets that one capability, and its start command
+    # checks that nsys can sample before serving (#1700).
+    local cpu=(--sample=none --cpuctxsw=none) cpu_sampled=0
     case "${RELEASE_PROFILE_NSYS_CPU:-}" in
       ''|off) ;;
-      on) cpu=(--sample=process-tree --cpuctxsw=process-tree --backtrace=dwarf) ;;
+      on) cpu=(--sample=process-tree --cpuctxsw=process-tree --backtrace=dwarf) cpu_sampled=1 ;;
       *) release_die "${key}_NSYS_CPU must be on or off" ;;
     esac
     local -a nsys_args=(profile --trace=cuda,nvtx,osrt "--cuda-graph-trace=$graph_trace"
@@ -942,6 +964,15 @@ _release_profile_tool_wrapper() {
       RELEASE_PROFILE_WRAPPER_DOCKER_ARGS+=(-v "$nsys_root:$nsys_root:ro")
     else
       release_profile_container_wrapper nsys "${nsys_args[@]}"
+    fi
+    if ((cpu_sampled)); then
+      local cpu_script
+      cpu_script="$(declare -f release_profile_resolve_tool; declare -f release_profile_exec_cpu_sampled)"
+      cpu_script+=$'\nrelease_profile_exec_cpu_sampled "$@"'
+      local cpu_bin=-
+      [[ -z "$nsys_root" ]] || cpu_bin="$nsys_root/nsys"
+      RELEASE_PROFILE_WRAPPER=(/bin/bash -c "$cpu_script" release-profile-cpu "$cpu_bin" "${nsys_args[@]}")
+      RELEASE_PROFILE_WRAPPER_DOCKER_ARGS+=(--cap-add PERFMON)
     fi
     if [[ -n "$metrics" ]]; then
       [[ "$metrics" == all || "$metrics" =~ ^[0-9]+(,[0-9]+)*$ ]] ||

@@ -1,6 +1,7 @@
 """PROFILE=... forwards one set of profiling switches to the coordinator and every
 Spark worker in every family (run-family.sh) and on the V4.1 path (run.sh)."""
 import shutil
+import os
 import socket
 import subprocess
 from pathlib import Path
@@ -226,6 +227,83 @@ def test_nsys_cpu_sampling_is_opt_in(monkeypatch):
     monkeypatch.setenv('RELEASE_PROFILE_NSYS_CPU', 'maybe')
     out, _, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
     assert out.returncode != 0 and 'PROFILE_NSYS_CPU must be on or off' in out.stderr
+
+
+def _cpu_exec(tmp_path, status_text, *, explicit=True):
+    """Run the container start command against a stub nsys whose `status` prints STATUS_TEXT."""
+    root = tmp_path / ('root-' + str(abs(hash(status_text)) % 10**6))
+    binary = root / 'usr/local/bin/nsys'
+    binary.parent.mkdir(parents=True)
+    binary.write_text('#!/bin/sh\nif [ "$1" = status ]; then cat <<EOF\n' + status_text + '\nEOF\nexit 0; fi\necho "RAN $*"\n')
+    binary.chmod(0o755)
+    script = ('source scripts/lib/release-common.sh; release_profile_resolve_tool() { echo "$NSYS_STUB"; }; '
+              'release_profile_exec_cpu_sampled "$@"')
+    return subprocess.run(['bash', '-c', script, 'test', str(binary) if explicit else '-', 'profile', '--sample=process-tree'],
+                          cwd=ROOT, capture_output=True, text=True,
+                          env={**os.environ, 'NSYS_STUB': str(binary), 'HOME': str(tmp_path / 'home')})
+
+
+def test_nsys_cpu_sampling_gets_perfmon_and_nothing_wider(tmp_path, monkeypatch):
+    """#1700: seccomp allows perf_event_open only with CAP_PERFMON; without it nsys
+    writes a report with no CPU samples and exits 0."""
+    monkeypatch.delenv('RELEASE_PROFILE_NSYS_CPU', raising=False)
+    out, wrapper, docker = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0 and '--cap-add' not in docker
+    assert 'release_profile_exec_cpu_sampled' not in wrapper[2]
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_CPU', 'on')
+    out, wrapper, docker = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0, out.stderr
+    assert docker[docker.index('--cap-add') + 1] == 'PERFMON' and docker.count('--cap-add') == 1
+    joined = ' '.join(docker)
+    for wider in ('SYS_ADMIN', 'SYS_PTRACE', 'privileged', 'unconfined'):
+        assert wider not in joined
+    assert wrapper[:2] == ['/bin/bash', '-c'] and wrapper[2].rstrip().endswith('release_profile_exec_cpu_sampled "$@"')
+    assert wrapper[4] == '-' and wrapper[5] == 'profile'
+    for flag in ('--sample=process-tree', '--cpuctxsw=process-tree', '--backtrace=dwarf'):
+        assert flag in wrapper
+    # With PROFILE_NSYS_ROOT the same check runs against the mounted nsys.
+    root = tmp_path / 'nsys-root'
+    root.mkdir()
+    (root / 'nsys').write_text('#!/bin/sh\n')
+    (root / 'nsys').chmod(0o755)
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_ROOT', str(root))
+    out, wrapper, docker = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0, out.stderr
+    assert wrapper[4] == f'{root}/nsys' and wrapper[5] == 'profile'
+    assert docker.count('--cap-add') == 1 and f'{root}:{root}:ro' in docker
+    monkeypatch.delenv('RELEASE_PROFILE_NSYS_ROOT')
+    # ncu never takes the capability.
+    monkeypatch.delenv('RELEASE_PROFILE_NSYS_CPU')
+    out, _, docker = _wrapper('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm')
+    assert out.returncode == 0 and '--cap-add' not in docker
+
+
+def test_nsys_cpu_sampling_refuses_to_start_when_nsys_cannot_sample(tmp_path):
+    passing = '- Linux perf_event_open syscall available: OK\n- CPU Profiling Environment (process-tree): OK\n- CPU Profiling Environment (system-wide): Fail'
+    failing = '- Linux perf_event_open syscall available: Fail\n- CPU Profiling Environment (process-tree): Fail'
+    for explicit in (True, False):
+        ok = _cpu_exec(tmp_path / f'ok{explicit}', passing, explicit=explicit)
+        assert ok.returncode == 0 and ok.stdout.strip() == 'RAN profile --sample=process-tree', ok.stderr
+        bad = _cpu_exec(tmp_path / f'bad{explicit}', failing, explicit=explicit)
+        assert bad.returncode == 126 and 'RAN' not in bad.stdout
+        assert 'perf_event_open syscall available: Fail' in bad.stderr
+        assert 'PROFILE_NSYS_CPU=on: nsys cannot sample CPU in this container' in bad.stderr
+
+
+def test_family_launch_gives_only_the_cpu_sampled_coordinator_perfmon(tmp_path):
+    prof = tmp_path / 'prof'
+    keys = f'PROFILE=nsys\nPROFILE_DIR={prof}\n'
+    plain = _family_launch_result(tmp_path / 'plain', GLMF_TWO_LAYER, 'test/glmf', keys)
+    assert plain.returncode == 0 and 'PERFMON' not in plain.stderr
+    sampled = _family_launch_result(tmp_path / 'sampled', GLMF_TWO_LAYER, 'test/glmf', keys + 'PROFILE_NSYS_CPU=on\n')
+    assert sampled.returncode == 0, sampled.stderr
+    # The wrapper script spans lines: take the coordinator's whole docker command.
+    text, marker = sampled.stderr, 'cuteafd serve-glmf'
+    assert text.count(marker) == 1 and text.count('--cap-add PERFMON') == 1
+    coordinator = text[text.rfind('docker ', 0, text.index('--cap-add PERFMON')):text.index('\n', text.index(marker))]
+    assert '--cap-add PERFMON' in coordinator and 'release_profile_exec_cpu_sampled' in coordinator
+    workers = [line for line in text.splitlines() if 'cuteafd expertd-native' in line]
+    assert workers and not [line for line in workers if 'PERFMON' in line]
 
 
 def test_nsys_graph_trace_defaults_to_nodes_and_accepts_graphs(monkeypatch):

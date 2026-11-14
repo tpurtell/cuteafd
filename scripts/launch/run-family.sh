@@ -383,7 +383,10 @@ done
 #                     PROFILE_NSYS_ROOT=/abs/dir (dev and profiling only) runs
 #                     DIR/nsys, mounted read-only, instead of the image's install.
 #                     PROFILE_NSYS_CPU=on adds CPU sampling and context switches
-#                     (host-side stalls; perturbs host timing).
+#                     (host-side stalls; perturbs host timing). That container
+#                     alone gets --cap-add PERFMON (perf_event_open is otherwise
+#                     denied by seccomp) and refuses to start if nsys's
+#                     environment check says it cannot sample.
 #                     PROFILE_NSYS_GPU_METRICS=all also samples every GPU's clocks,
 #                     power and DRAM/SM activity into the same report (an index
 #                     list uses nsys's device order, not CUDA's).
