@@ -219,7 +219,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             |index,span,logits| {
                 let first=offsets[index] + span.start - submitted[index].placement.len;
                 let bytes=logits.rows * self.cfg.vocab_size * 4;
-                let source=cuteafd_ffi::CuteafdDeviceBuffer { ptr:logits.ptr,bytes,device_id:retained.buffer.device_id,..Default::default() };
+                let source=cuteafd_ffi::CuteafdDeviceBuffer { ptr:logits.ptr.cast_mut(),bytes,device_id:retained.buffer.device_id,..Default::default() };
                 let target=super::cache::view(retained.buffer,first * self.cfg.vocab_size * 4,bytes)?;
                 // SAFETY: bounded head tile is consumed before reuse on the producing stream.
                 unsafe { library.copy_d2d_async(target,source,bytes,logits.stream) }
@@ -456,7 +456,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let head=self.owners.storage.ranks.last().context("MiniMax head rank")?.weights
             .operand("language_model.lm_head.weight")?.buffer;
         let started=std::time::Instant::now();
-        let proposed=draft.drafter.draft_device(&rows,&self.owners.storage.embedding,TargetHead::Bf16Buffer(head))?;
+        let proposed=draft.drafter.draft_device(&rows,&self.owners.storage.embedding,TargetHead::Bf16Buffer(&head))?;
         timing.steps+=1;timing.seconds+=started.elapsed().as_secs_f64();
         for ((index,sequence),draft) in selected.into_iter().zip(proposed) {
             output[index]=draft.tokens.into_iter().take(sequence.depth).collect();

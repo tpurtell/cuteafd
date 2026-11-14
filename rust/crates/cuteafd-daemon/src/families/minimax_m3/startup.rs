@@ -36,6 +36,7 @@ pub(crate) struct Options<'a> {
     pub expert_usage: bool,
     pub usage_reader: Reader,
     pub resident_weights: ResidentWeights,
+    pub draft: bool,
 }
 
 /// The executor drops first: it terminally drains links before storage retires.
@@ -174,7 +175,11 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         spark_ranks: options.peers.len(), spark_bytes: policy.spark_cap_bytes(100 << 30),
         prefill: options.prefill, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
         sequences: options.sequences, host, host_cache_bytes,
-        prefix_entries: options.prefix.prefix_cache_entries as u64, drafter:None, replies,
+        prefix_entries: options.prefix.prefix_cache_entries as u64,
+        drafter: if options.draft { Some(cuteafd_loader::formats::block_dspark::NativeDsparkLayout::new(
+            &checkpoint.snapshot.join("dspark"),options.sequences as usize,options.prefill.rows as usize,
+            options.prefill.waves as usize,library.sm_count()? as usize,options.prefix.prefix_cache_entries,
+            options.prefix.prefix_cache_mark_mib as u64 * (1 << 20),options.prefix.host_cache_bytes.enabled())?) } else { None }, replies,
         head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         expert_usage: usage_enabled, resident_weight_limit: options.resident_weights }, &samples, options.onboard)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
