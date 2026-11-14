@@ -581,6 +581,7 @@ fn installed_qwen_hybrid_min_sim_and_dual_publish_exact_layer_homes() {
         (1, 34_145_991_884, OnboardSetting::Auto), (2, 95u64 << 30, OnboardSetting::Layers(5)),
         (2, 95u64 << 30, OnboardSetting::Layers(0))] {
         let report = input.plan(&PlanOptions { placement: ExpertPlacement::Sparks { ranks: 4 },
+            attention_placement: (gpus == 2).then_some(cuteafd_loader::placement::AttentionPlacement::Layers),
             vision: MediaMode::Off, audio: MediaMode::Off,
             layout: Some(LayoutOptions { rtx_bytes: vec![capacity; gpus], head_split: gpus == 2,
                 onboard: Some(onboard), native_mtp_layers: 0, host_cache_bytes: Some(0),
