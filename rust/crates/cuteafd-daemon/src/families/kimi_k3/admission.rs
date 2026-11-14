@@ -3163,13 +3163,15 @@ pub(super) mod tests {
                 .collect()
         };
 
-        assert_eq!(total_bytes(&admitted_decode_eager), 99_699_916_812);
-        assert_eq!(total_bytes(&admitted_prefill), 99_699_982_348);
-        assert_eq!(total_bytes(&admitted_decode), 100_732_593_420);
-        assert_eq!(total_bytes(&admitted_verify), 100_732_593_420);
+        // Independently rounding the actual lane requests adds 3,326,496 B
+        // versus the former fictional single-allocation lane tail.
+        assert_eq!(total_bytes(&admitted_decode_eager), 99_703_243_308);
+        assert_eq!(total_bytes(&admitted_prefill), 99_703_308_844);
+        assert_eq!(total_bytes(&admitted_decode), 100_735_919_916);
+        assert_eq!(total_bytes(&admitted_verify), 100_735_919_916);
 
-        // The 65,536 B (64 KiB) difference between prefill (99,699,982,348) and decode_eager
-        // (99,699,916,812) is owned 100% by CONTEXT_MEASURED ("CUDA context and loaded modules"),
+        // The 65,536 B (64 KiB) difference between prefill and decode_eager
+        // is owned 100% by CONTEXT_MEASURED ("CUDA context and loaded modules"),
         // reflecting one 64 KiB CUDA driver page-table/context slab in PreWeight cuMemGetInfo_v2;
         // every weight, KV, workspace and 2 MiB CUmem granularity item is byte-identical.
         assert_eq!(context_item(&admitted_prefill)?, 678_756_352);
