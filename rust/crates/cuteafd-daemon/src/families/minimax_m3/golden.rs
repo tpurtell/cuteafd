@@ -368,6 +368,14 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
     let admitted = inputs.admit(cuteafd_loader::placement::families::minimax_m3::request(inputs.context,
         Some(u64::from(tokens).div_ceil(64) * 64), Onboard::Layers(0), inputs.prefill,
         Operation::Serving, None, Default::default()))?;
+    if !args.tap_layers.is_empty() {
+        use cuteafd_loader::placement::planner::{Allocation as PlannedAllocation, Location};
+        let mut diagnostic = admitted.solved.facts.clone();
+        diagnostic.allocations.push(PlannedAllocation::buffer("golden.layer-taps", Location::HOST,
+            LayerTaps::host_bytes(args.prefill_rows), Lifetime::TARGET, Category::Workspace,
+            "diagnostic layer download"));
+        cuteafd_loader::placement::planner::evaluate(&diagnostic, &inputs.budgets)?;
+    }
     let endpoint = SparkEndpoint { ring_depth: None, capacity: args.prefill_rows,
         ingress: SparkIngress::Bf16, partial_reply_bytes: None };
     let config = TcpTransportConfig::default();

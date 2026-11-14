@@ -50,13 +50,32 @@ impl LayerTaps {
     }
     pub fn buffer(&mut self, layer: usize, stage: &str, buffer: Buffer, width: usize,
         unit: &Unit, owner: &UnitOwner<'_>) -> Result<()> {
-        if !self.layers.contains(&layer) || (self.residual_only && stage != "residual") { return Ok(()); }
         let count = unit.rows.len().checked_mul(6144 * width).context("MiniMax tap extent")?;
+        self.extent(layer, stage, buffer, count, unit, owner)
+    }
+    pub fn extent(&mut self, layer: usize, stage: &str, buffer: Buffer, count: usize,
+        unit: &Unit, owner: &UnitOwner<'_>) -> Result<()> {
+        if !self.layers.contains(&layer) || (self.residual_only && stage != "residual") { return Ok(()); }
         ensure!(count <= self.bytes.len() && count <= buffer.bytes, "MiniMax tap exceeds admitted host buffer");
         owner.stream.drain()?;
         owner.stream.device.run(|| owner.stream.device.library.copy_d2h(
             &mut self.bytes[..count], buffer))?;
         self.write_bytes(layer, stage, unit.rows.start, &self.bytes[..count])
+    }
+    pub fn ffn_inputs(&mut self, layer: usize, prefix: &str, shared: bool,
+        admitted: &CoordinatorWeights, unit: &Unit, owner: &UnitOwner<'_>) -> Result<()> {
+        let stem = if shared { "block_sparse_moe.shared_experts" } else { "mlp" };
+        let name = format!("language_model.model.layers.{layer}.{stem}.down_proj");
+        let input = admitted.projections.iter().find(|p| p.stem == name)
+            .context("MiniMax diagnostic down projection missing")?.input;
+        let bytes = unit.rows.len() * input * 2;
+        for plane in ["gate", "up"] {
+            self.extent(layer, &format!("{prefix}{plane}.bf16"), owner.plane(plane)?, bytes, unit, owner)?;
+        }
+        self.extent(layer, &format!("{prefix}oai.bf16"), owner.dense.producer_destination(), bytes, unit, owner)?;
+        let records = unit.rows.len().div_ceil(16) * (input / 32) * 528;
+        self.extent(layer, &format!("{prefix}down.records"), owner.dense.workspace.records.buffer,
+            records, unit, owner)
     }
     pub fn final_norm(&mut self, head: &super::head::Head<'_>, first: usize, rows: usize) -> Result<()> {
         let count = rows.checked_mul(6144 * 2).context("MiniMax final norm tap extent")?;
@@ -137,6 +156,7 @@ impl PrefillHooks for Prefill<'_, '_> {
     fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         self.owners[unit.slot].ffn(self.kernels, self.weights, self.admitted, layer, unit.rows.len(), false)?;
         if let Some(taps) = &mut self.taps {
+            taps.ffn_inputs(layer, "", false, self.admitted, unit, &self.owners[unit.slot])?;
             taps.write(layer, "mlp.bf16", "ffn", 2, unit, &self.owners[unit.slot])?;
             taps.write(layer, "residual", "residual", 4, unit, &self.owners[unit.slot])?;
         }

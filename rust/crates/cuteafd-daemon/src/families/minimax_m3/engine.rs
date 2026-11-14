@@ -514,6 +514,8 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
             split.stage(self.storage, [&mut a, &mut b], layer, unit.rows.len(), shared)?;
             if let Some(taps) = &mut self.taps {
                 for (gpu, owner) in [&*a, &*b].into_iter().enumerate() {
+                    taps.ffn_inputs(layer, &format!("rank{gpu}."), shared,
+                        &self.storage.ranks[gpu].layout, unit, owner)?;
                     let buffer = owner.split_plane("local")?;
                     let width = buffer.bytes / owner.rows() as usize / 6144;
                     taps.buffer(layer, &format!("rank{gpu}.partial"), buffer, width, unit, owner)?;
