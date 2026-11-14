@@ -1863,7 +1863,11 @@ fn explicit_heads_public_layout_remains_planned_and_auto_selects_layers() {
             }), ..Default::default() };
         let report = plan::plan(dir.path(), &options).unwrap();
         assert!(report.config_error.is_none(), "{:?}", report.config_error);
-        assert!(!report.placement_supported, "planning is not serving qualification");
+        let split_wip = attention.is_none();
+        assert_eq!(report.native_serving_admitted, split_wip);
+        assert_eq!(report.wip_launchable(), split_wip);
+        assert_eq!(report.placement_supported, split_wip,
+            "only qualified FP32 split has a WIP serving attachment");
         assert!(!report.executable());
         assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
         assert_eq!(report.attention_placement, attention.unwrap_or(AttentionPlacement::Layers));
