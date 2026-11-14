@@ -1760,6 +1760,25 @@ pub struct SamplerAllocation {
     pub pinned: bool,
 }
 
+/// Stable passive-receipt key for one admitted physical sampler owner.
+/// Host Vec diagnostics are not physical sampler arenas and have no mapping.
+pub fn receipt_key(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "param_device" => "device.params", "param_pinned" => "pinned.params",
+        "mask_device" => "device.masks", "mask_pinned" => "pinned.masks",
+        "scratch" => "device.scratch", "bitmap" => "device.bitmap", "histogram" => "device.histogram",
+        "ids_device" => "device.ids", "status_device" => "device.status",
+        "detail_device" => "device.detail", "scores_device" => "device.scores",
+        "total_device" => "device.total", "nucleus_device" => "device.nucleus",
+        "rank_order_ids" => "device.rank_ids", "rank_order_scratch" => "device.rank_scratch",
+        "retained_count_device" => "device.retained", "pivot_passes_device" => "device.passes",
+        "ids_pinned" => "pinned.ids", "status_pinned" => "pinned.status",
+        "detail_pinned" => "pinned.detail", "scores_pinned" => "pinned.scores",
+        "retained_count_staging" => "pinned.retained",
+        _ => return None,
+    })
+}
+
 /// Maximum retained sampler storage, shared by admission and allocation.
 pub fn allocations(capacity: usize, vocab: usize) -> Result<Vec<SamplerAllocation>, &'static str> {
     if !(1..=128).contains(&capacity) || vocab == 0 {
@@ -1794,6 +1813,21 @@ pub fn device_bytes(capacity: usize, vocab: usize) -> usize {
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
+
+    #[test]
+    fn all_sampler_owner_ids_have_unique_space_preserving_receipt_keys() {
+        let owners = allocations(16, 200064).unwrap();
+        let keys = owners.iter().map(|owner| {
+            let key = receipt_key(owner.id).expect("canonical receipt key");
+            assert_eq!(key.starts_with("pinned."), owner.pinned);
+            assert_eq!(key.starts_with("device."), !owner.pinned);
+            key
+        }).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys.len(), 22);
+        for unknown in ["", "host.params", "device.params", "other"] {
+            assert!(receipt_key(unknown).is_none());
+        }
+    }
 
     #[test]
     fn sampler_owner_census_matches_device_formula_and_pinned_arenas() {

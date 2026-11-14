@@ -798,6 +798,56 @@ mod allocation_accounting_tests {
     use super::*;
 
     #[test]
+    fn canonical_owner_mapping_matches_all_observed_arenas_and_host_diagnostics() -> Result<()> {
+        use anyhow::Context;
+        use crate::shared::memory::receipts::Inventory;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        library.cuda_set_device(1)?;
+        let physical = [1];
+        for capacity in [1, 16, 64, 128] {
+            for vocab in [33, 200064] {
+                let mut wave = TargetSamplingWave::new(&library, capacity, vocab)?;
+                wave.params.reserve(capacity);
+                wave.last_status.reserve(capacity);
+                wave.last_retained.reserve(capacity);
+                let mut inventory = Inventory::new(CoordinatorDevices::new(&physical)?, "sampler",
+                    Lifetime::TARGET, Category::Workspace, "target sampler");
+                wave.allocation_receipts(&mut inventory, "next")?;
+                let actual = inventory.receipts.iter().map(|receipt|
+                    (receipt.allocation.id.as_str(), receipt)).collect::<std::collections::BTreeMap<_, _>>();
+                let planned = cuteafd_core::target_sampler_allocations(capacity, vocab).map_err(anyhow::Error::msg)?;
+                assert_eq!(planned.len(), 22);
+                assert_eq!(actual.len(), 25, "22 physical owners and three separately measured host diagnostics");
+                let mut mapped = std::collections::BTreeSet::new();
+                for owner in planned {
+                    let key = cuteafd_core::target_sampler_receipt_key(owner.id).context("sampler owner mapping missing")?;
+                    assert!(mapped.insert(key));
+                    let receipt = actual[format!("sampler.next.{key}").as_str()];
+                    assert_eq!(receipt.allocation.bytes, owner.bytes as u64, "{}", owner.id);
+                    assert_eq!(receipt.allocation.location,
+                        if owner.pinned { Location::PINNED } else { Location::coordinator(0) }, "{}", owner.id);
+                    assert_ne!(receipt.address, 0);
+                }
+                for (name, bytes) in [("params", wave.params.capacity() * std::mem::size_of::<CuteafdV41SamplerRow>()),
+                    ("status", wave.last_status.capacity() * 4), ("retained", wave.last_retained.capacity() * 4)] {
+                    let receipt = actual[format!("sampler.next.host.{name}").as_str()];
+                    assert_eq!(receipt.allocation.location, Location::HOST);
+                    assert_eq!(receipt.allocation.bytes, bytes as u64);
+                    assert_ne!(receipt.address, 0);
+                }
+                assert!(cuteafd_core::target_sampler_receipt_key("unknown").is_none());
+                assert!(cuteafd_core::target_sampler_receipt_key("host.params").is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn shared_device_bytes_match_every_sampler_arena() {
         for rows in [1, 7, 64, 128] {
             for vocab in [1usize, 31, 32, 33, 128896] {
