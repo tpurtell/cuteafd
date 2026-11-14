@@ -485,10 +485,22 @@ impl<'a> KimiSparseMla<'a> {
     }
     pub fn scratch_bytes(&self) -> usize { self.scratch }
 
+    /// The native sparse kernel derives partial/LSE offsets from live rows,
+    /// unlike the index selector whose prepared offsets are capacity-baked.
+    pub fn scratch_bytes_for(rows: usize, heads: usize, partial: bool) -> Result<usize> {
+        if !(1..=4096).contains(&rows) || !matches!(heads, 48 | 96) || (partial && heads != 96) {
+            return Err(KimiMlaError::Invalid("selected MLA scratch rows/heads"));
+        }
+        let n = rows * if partial { 48 } else { heads } * 16;
+        Ok((n * 512 * 2).next_multiple_of(1024)
+            + if partial { n * 4 } else { (n * 4).next_multiple_of(1024) })
+    }
+
     /// Indices are preselected, causal, valid local slots; each query is one
     /// request. Empty local lengths are permitted only for a Context partial.
     pub fn launch(&self, b: KimiSparseBatch, stream: *mut c_void) -> Result<()> {
-        validate_sparse_batch(b, self.heads, self.rows, self.partial, self.scratch, self.format)?;
+        let scratch = Self::scratch_bytes_for(b.rows, self.heads, self.partial)?;
+        validate_sparse_batch(b, self.heads, self.rows, self.partial, scratch, self.format)?;
         let partial_scalars = [Scalar::I32(b.rows as i32), Scalar::I64(2048), Scalar::I32(16)];
         let full_scalars = [Scalar::I32(b.rows as i32), Scalar::I32(b.rows as i32), Scalar::I64(2048), Scalar::I32(16)];
         let scalars = if self.partial { &partial_scalars[..] } else { &full_scalars[..] };
@@ -1731,6 +1743,34 @@ mod tests {
                     "{} accepted stale alias {alias}", spec.name);
             }
         }
+    }
+
+    #[test]
+    fn k31_sparse_scratch_uses_live_rows_and_rejects_larger_head_or_row_launches() {
+        let buffer = |index| Buffer { ptr: (index * 0x100000000usize) as *mut c_void,
+            bytes: 0x100000000, device_id: 0, flags: 0 };
+        for rows in [1, 17, 64, 2752, 4096] {
+            for heads in [48, 96] {
+                let scratch = KimiSparseMla::scratch_bytes_for(rows, heads, false).unwrap();
+                let b = KimiSparseBatch { rows, cache_tokens: 128, query: buffer(1), cache: buffer(2),
+                    indices: buffer(3), lengths: buffer(4), query_offsets: buffer(5), output: buffer(6),
+                    lse: buffer(7), scratch: Buffer { bytes: scratch, ..buffer(8) } };
+                validate_sparse_batch(b, heads, 4096, false, scratch, MlaCacheFormat::Fp8).unwrap();
+                let short = KimiSparseBatch { scratch: Buffer { bytes: scratch - 1, ..b.scratch }, ..b };
+                assert!(validate_sparse_batch(short, heads, 4096, false, scratch, MlaCacheFormat::Fp8).is_err());
+                if heads == 48 {
+                    let wider = KimiSparseMla::scratch_bytes_for(rows, 96, false).unwrap();
+                    assert!(validate_sparse_batch(b, 96, 4096, false, wider, MlaCacheFormat::Fp8).is_err());
+                }
+                if rows < 4096 {
+                    let next = KimiSparseBatch { rows: rows + 1, ..b };
+                    let needed = KimiSparseMla::scratch_bytes_for(rows + 1, heads, false).unwrap();
+                    assert!(validate_sparse_batch(next, heads, 4096, false, needed, MlaCacheFormat::Fp8).is_err());
+                }
+            }
+        }
+        assert!(KimiSparseMla::scratch_bytes_for(4097, 96, false).is_err());
+        assert!(KimiSparseMla::scratch_bytes_for(64, 47, false).is_err());
     }
 
     #[test]

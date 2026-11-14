@@ -996,7 +996,7 @@ fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<
     }
     testing::write_safetensors(&k6_dir.path().join("indexers.safetensors"), &headers);
     std::fs::write(&k6_index_path, k6_index.to_string())?;
-    options.attention_placement = None;
+    options.attention_placement = Some(crate::placement::AttentionPlacement::Layers);
     let k6_report = testing::BudgetedPlanInput::open(k6_dir.path())?.plan(&options)?;
     assert!(k6_report.placement_supported, "{:?}", k6_report.hints);
     assert!(k6_report.memory_layout.as_ref().is_some_and(|memory| memory.pool_tokens > 0));

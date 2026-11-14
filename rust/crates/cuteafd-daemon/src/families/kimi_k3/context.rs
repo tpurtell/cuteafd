@@ -455,7 +455,7 @@ mod tests {
         let pair = layers.split("fn context_pair_with").nth(1).unwrap().split("fn producer_streams").next().unwrap();
         assert!(pair.find("kernels.wait_prior_commit(reader, owner)?").unwrap()
             < pair.find("kernels.attention_commit(rank)?").unwrap());
-        let select = device.split("fn context_dsa_select_gathered").nth(1).unwrap().split("fn context_dsa_merge").next().unwrap();
+        let select = device.split("pub(crate) fn context_dsa_chunk").nth(1).unwrap().split("pub(crate) fn context_dsa_dump").next().unwrap();
         assert!(select.find("dsa.merge.launch").unwrap() < select.find("push_query_width").unwrap());
         assert!(select.contains("context.exchange.wait_query(self.rank, slot)?"));
         assert!(!select.contains("drain()") && !select.contains("synchronize"));
@@ -463,7 +463,7 @@ mod tests {
         assert!(diagnostic.find("return Ok(())").unwrap() < diagnostic.find("owner.metadata").unwrap());
         assert!(diagnostic.find("return Ok(())").unwrap() < diagnostic.find("record_selected").unwrap());
         let paired = layers.split("context_pair_with(&mut Pair { binding: self, layer })?;").nth(1).unwrap();
-        assert!(paired.trim_start().starts_with("// Diagnostic only:"));
+        assert!(paired.contains("context_dsa_dump"));
         assert!(paired.find("context_dsa_dump").unwrap() < paired.find("self.publish").unwrap());
         let graph = device.split("fn graph_step(").nth(1).unwrap().split("pub(crate) fn attention(").next().unwrap();
         assert!(graph.find("if self.eager_context_dsa_diagnostic()").unwrap() < graph.find("self.graphs.take()").unwrap());

@@ -405,14 +405,16 @@ impl<'a> NativePrograms<'a> {
     }
 
     /// `rows` lane rows of units of at most `unit` rows (the programs' launch capacity).
-    pub(crate) fn lane_layout(&self, cfg: &KimiK3Config, rank: usize, rows: usize, unit: usize, max_context: usize) -> Result<LaneLayout> {
+    pub(crate) fn lane_layout(&self, cfg: &KimiK3Config, rank: usize, rows: usize, unit: usize, max_context: usize, attention_heads: usize) -> Result<LaneLayout> {
         self.check_config(cfg)?;
         ensure!(rank < self.ranks, "Kimi lane rank outside physical owners");
         ensure!(self.mla.iter().all(|p| [p.decode.max_context(), p.verify.max_context(), p.extend.max_context()]
             .into_iter().all(|capacity| max_context <= capacity)), "Kimi lane context exceeds native programs");
         let mut layout=LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks(
             cfg, rows, unit, max_context, self.scratch, self.ranks)?, core: None };
-        if let Some(dsa) = &self.dsa { layout.base = layout.base.with_dsa(cfg, dsa.scratch)?; }
+        if let Some(dsa) = &self.dsa {
+            layout.base = layout.base.with_sparse_mla_rows(attention_heads)?.with_dsa(cfg, dsa.scratch)?;
+        }
         if let Some(core)=&self.core {
             layout.core=core.layouts[rank].clone();
             // Split producers consume the same named scratch planes as fused
@@ -817,6 +819,16 @@ impl<'a> LocalLane<'a> {
         Ok(())
     }
 
+    pub(crate) fn stage_context_member(&mut self, metadata: &AttentionRows, first: usize) -> Result<()> {
+        self.select_subwave(Some(first..first + metadata.rows))?;
+        self.lane.metadata_bank = 0;
+        self.upload_attention(metadata)?;
+        self.attention = Some(AttentionShape { rows: metadata.rows, sequences: 1 });
+        Ok(())
+    }
+
+    pub(crate) fn context_member_rows(metadata: &AttentionRows) -> usize { metadata.rows }
+
     /// Attention alone selects member row views. Residual mixing and FFNs retain
     /// the packed shape; recurrent slots and MLA page tables never cross members.
     pub(crate) fn packed_attention(&self, sequences: &[SequenceRows<'_>],
@@ -1218,55 +1230,69 @@ impl<'a> LocalLane<'a> {
         Ok(crate::shared::peer_split::attention::Candidates { scores: scores.ptr, indices: indices.ptr })
     }
 
-    fn context_dsa_select_gathered(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
+    fn context_dsa_produce_gathered(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
+        let dsa = self.programs.dsa.as_ref().context("Kimi gathered index programs missing")?;
+        let owner = &self.context.as_ref().context("Kimi context not bound")?.0.ranks[self.rank];
+        let weights = self.layer(layer)?.indexer()?;
+        let stream = self.stream();
+        stream.device.run(|| Ok(dsa.producer[usize::from(batch.rows > 64)].launch(weights, cuteafd_ffi::KimiIndexBatch {
+            rows: batch.rows, cache_pages: self.mla.local_pages(), x: batch.x, q_resid: batch.q_resid,
+            positions: self.lane.buffer("DSA positions")?, slots: owner.metadata("context slots", self.lane.metadata_bank)?,
+            cos_sin: weights.norm, cache: self.mla.index(layer)?, query_fp8: self.lane.buffer("DSA query")?,
+            head_weights: self.lane.buffer("DSA head weights")?, scratch: self.lane.buffer("DSA producer scratch")?,
+        }, stream.raw)?))
+    }
+
+    pub(crate) fn restore_context_member(&mut self, rows: usize) -> Result<()> {
+        self.lane.window = None;
+        self.lane.metadata_bank = 0;
+        self.attention = Some(AttentionShape { rows, sequences: 1 });
+        Ok(())
+    }
+
+    pub(crate) fn context_gathered_dsa(&self) -> bool {
+        self.programs.dsa.is_some() && self.context_units[self.lane.metadata_bank].is_some()
+    }
+
+    /// The pair queues both ranks' publishes before either merge/ack wait.
+    pub(crate) fn context_dsa_chunk(&self, layer: usize, first: usize, rows: usize, merge: bool) -> Result<()> {
         let dsa = self.programs.dsa.as_ref().context("Kimi gathered index programs missing")?;
         let (context, _) = self.context.as_ref().context("Kimi context not bound")?;
         let owner = &context.ranks[self.rank];
         let bank = self.lane.metadata_bank;
         let stream = self.stream();
-        let weights = self.layer(layer)?.indexer()?;
-        let cache = self.mla.index(layer)?;
-        let query = self.lane.buffer("DSA query")?;
-        let head_weights = self.lane.buffer("DSA head weights")?;
         let width = owner.compact_width();
         let ordinal = self.cfg.attention[..layer].iter().filter(|&&kind| kind == KimiAttention::Mla).count();
         let slot = crate::shared::peer_split::context::slot(ordinal, self.lane_index);
+        let table = view(owner.metadata("compact page tables", bank)?, first * width * 4, rows * width * 4)?;
         stream.device.run(|| {
-            dsa.producer[usize::from(batch.rows > 64)].launch(weights, cuteafd_ffi::KimiIndexBatch {
-                rows: batch.rows, cache_pages: self.mla.local_pages(), x: batch.x, q_resid: batch.q_resid,
-                positions: self.lane.buffer("DSA positions")?, slots: owner.metadata("context slots", bank)?,
-                cos_sin: weights.norm, cache, query_fp8: query, head_weights,
-                scratch: self.lane.buffer("DSA producer scratch")?,
-            }, stream.raw)?;
-            for first in (0..batch.rows).step_by(64) {
-                let rows = (batch.rows - first).min(64);
+            if !merge {
                 let scores = view(owner.buffer("DSA global scores")?, first * 2048 * 4, rows * 2048 * 4)?;
                 let indices = view(owner.buffer("DSA global indices")?, first * 2048 * 4, rows * 2048 * 4)?;
-                let table = view(owner.metadata("compact page tables", bank)?, first * width * 4, rows * width * 4)?;
                 dsa.scored[0].launch(cuteafd_ffi::KimiIndexSelection {
                     rows, cache_pages: self.mla.local_pages(), table_width: width, table_stride: width,
                     page_stride: 2, page_offset: self.rank,
-                    query_fp8: view(query, first * 4096, rows * 4096)?,
-                    head_weights: view(head_weights, first * 32 * 4, rows * 32 * 4)?, cache, table,
+                    query_fp8: view(self.lane.buffer("DSA query")?, first * 4096, rows * 4096)?,
+                    head_weights: view(self.lane.buffer("DSA head weights")?, first * 32 * 4, rows * 32 * 4)?,
+                    cache: self.mla.index(layer)?, table,
                     lengths: view(owner.metadata("shard lengths", bank)?, first * 4, rows * 4)?, indices, scores,
                     scratch: self.lane.buffer("DSA selector scratch")?,
                 }, stream.raw)?;
-                context.exchange.push_candidates(self.rank, slot, scores.ptr, indices.ptr, rows)?;
-                let (scores, indices) = context.exchange.wait_candidates(self.rank, slot)?;
-                let receive = |ptr| CuteafdDeviceBuffer { ptr, bytes: rows * 4096 * 4,
-                    device_id: stream.device.id, flags: 0 };
-                dsa.merge.launch(cuteafd_ffi::KimiCandidateBatch {
-                    rows, table_stride: width, rank: self.rank, scores: receive(scores), indices: receive(indices),
-                    output_scores: view(owner.buffer("DSA merged scores")?, first * 2048 * 4, rows * 2048 * 4)?,
-                    output_indices: view(owner.buffer("DSA merged indices")?, first * 2048 * 4, rows * 2048 * 4)?,
-                    table, local_slots: owner.buffer("DSA local slots")?, local_lengths: owner.buffer("DSA local lengths")?,
-                }, stream.raw)?;
-                // Candidate slots have no consumed credit. The otherwise idle
-                // query channel acknowledges both merges before either overwrite.
-                // Both commands use this owner's exact stream and abort words.
-                context.exchange.push_query_width(self.rank, slot, query.ptr, 16, 1, 16)?;
-                context.exchange.wait_query(self.rank, slot)?;
+                return context.exchange.push_candidates(self.rank, slot, scores.ptr, indices.ptr, rows);
             }
+            let (scores, indices) = context.exchange.wait_candidates(self.rank, slot)?;
+            let receive = |ptr| CuteafdDeviceBuffer { ptr, bytes: rows * 4096 * 4,
+                device_id: stream.device.id, flags: 0 };
+            dsa.merge.launch(cuteafd_ffi::KimiCandidateBatch {
+                rows, table_stride: width, rank: self.rank, scores: receive(scores), indices: receive(indices),
+                output_scores: view(owner.buffer("DSA merged scores")?, first * 2048 * 4, rows * 2048 * 4)?,
+                output_indices: view(owner.buffer("DSA merged indices")?, first * 2048 * 4, rows * 2048 * 4)?,
+                table, local_slots: owner.buffer("DSA local slots")?, local_lengths: owner.buffer("DSA local lengths")?,
+            }, stream.raw)?;
+            // Candidate receive storage has no consumed credit. A post-merge
+            // query acknowledgement protects the next chunk from overwrite.
+            context.exchange.push_query_width(self.rank, slot, self.lane.buffer("DSA query")?.ptr, 16, 1, 16)?;
+            context.exchange.wait_query(self.rank, slot)?;
             Ok(())
         })
     }
@@ -1431,6 +1457,11 @@ impl<'a> LocalLane<'a> {
     }
 
     fn context_gathered(&self, layer: usize, rows: usize) -> Result<()> {
+        ensure!(self.programs.dsa.is_none(), "Kimi gathered DSA must submit both ranks per chunk");
+        self.context_gathered_stage(layer, rows, None)
+    }
+
+    pub(crate) fn context_gathered_stage(&self, layer: usize, rows: usize, prepare: Option<bool>) -> Result<()> {
         use crate::shared::peer_split::context::{gathered_prefill_with, GatheredKernels};
         let unit = self.context_units[self.lane.metadata_bank].context("Kimi gathered metadata not staged")?;
         let (context, programs) = self.context.as_ref().context("Kimi context not bound")?;
@@ -1471,10 +1502,10 @@ impl<'a> LocalLane<'a> {
                             cuteafd_ffi::programs::Scalar::I32(2), cuteafd_ffi::programs::Scalar::I32(rank as i32)], stream.raw) }
                 })
             }
-            fn produce(&mut self) -> Result<()> { self.local.mla_produce(self.layer, self.batch) }
-            fn select(&mut self) -> Result<()> {
-                if self.local.programs.dsa.is_none() { return Ok(()); }
-                self.local.context_dsa_select_gathered(self.layer, self.batch)
+            fn produce(&mut self) -> Result<()> {
+                self.local.mla_produce(self.layer, self.batch)?;
+                if self.local.programs.dsa.is_some() { self.local.context_dsa_produce_gathered(self.layer, self.batch)?; }
+                Ok(())
             }
             fn attention(&mut self) -> Result<()> {
                 if self.local.programs.dsa.is_some() {
@@ -1511,7 +1542,12 @@ impl<'a> LocalLane<'a> {
             }
             fn output(&mut self) -> Result<()> { self.local.mla_output(self.layer, self.batch) }
         }
-        gathered_prefill_with(&mut Bindings { local: self, context, programs, unit, layer, batch })
+        let mut binding = Bindings { local: self, context, programs, unit, layer, batch };
+        match prepare {
+            Some(true) => { for rank in 0..2 { binding.gather(rank)?; } binding.produce() }
+            Some(false) => { binding.attention()?; binding.commit()?; binding.output() }
+            None => gathered_prefill_with(&mut binding),
+        }
     }
 
     fn mla_program(&self, layer: usize, rows: usize, speculative: bool) -> Result<&super::mla::Mla<'a>> {
