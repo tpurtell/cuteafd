@@ -93,14 +93,6 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
                 // The native MTP layer loads with the target (ledger scope `weights`).
                 _ => Category::Weights,
             });
-            // FP8/NVFP4 local experts load at their checkpoint bytes; EXL3 below as arenas.
-            if local && !exl3 {
-                for component in report.components.iter().filter(|c| c.component == Component::RoutedExpert
-                    && c.status != Status::Unused && c.status != Status::Disabled) {
-                    devices[0].items.push(Item::new(Category::Experts, component.component.label(),
-                        component.formats.keys().cloned().collect::<Vec<_>>().join("+"), component.bytes, Basis::Exact));
-                }
-            }
         }
         None => {
             let what = "Qwen resident weights: checkpoint headers do not describe the serve-qwen4 resident layout".to_string();
@@ -111,44 +103,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     if options.host_embedding {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
-    if let Some((backbone, draft)) = exl3_arenas(input, mtp) {
-        if local {
-            devices[0].items.push(Item::new(Category::Experts, "routed expert arenas", "exl3", backbone, Basis::Formula));
-        }
-        if draft > 0 {
-            devices[0].items.push(Item::new(Category::Experts, "native MTP expert arena", "exl3", draft, Basis::Formula));
-        }
-    } else if mtp {
-        let native: u64 = report.components.iter().filter(|c| c.component == Component::SpeculatorExpert && c.status == Status::Unused)
-            .map(|c| c.bytes).sum();
-        if native > 0 {
-            devices[0].items.push(Item::new(Category::Experts, "native MTP experts", "native", native, Basis::Exact));
-        }
-    }
-    if exl3 && (local || mtp) {
-        // The EXL3 window retains its shared capacity arenas beside the trellis
-        // bytes, from the same capacity manifests the loader reads.
-        match expert_workspace(report, model, input, options.workspace_manifest.as_deref(), shape.prefill_rows) {
-            Some(bytes) => devices[0].items.push(Item::new(Category::Experts, "local EXL3 workspace", "", bytes, Basis::Formula)),
-            // A header-only inventory names no image: its workspace is the layout's question.
-            None if shape.manifest.is_none() => notes.push("local EXL3 workspace not charged: no program manifest \
-                (--workspace-manifest or an image's PROGRAMS.json) to read its capacity manifests from".into()),
-            None => {
-                let what = "Qwen local EXL3 workspace: no matching rtx-tp1/m*/v41_exl3.json capacity manifests".to_string();
-                report.refuse_placement(what.clone(), "Images bundle them; or export the exl3 tree \
-                    alongside PROGRAMS.json (--workspace-manifest).");
-                notes.push(what);
-            }
-        }
-    }
-    if !local && mtp {
-        notes.push("Native Qwen MTP experts stay on rtx0; Spark ranks serve backbone experts only".into());
-    }
-    if options.drafter_bytes > 0 {
-        devices[0].items.push(Item::new(Category::Drafter, "drafter", "", options.drafter_bytes, basis));
-    }
-    let pkg = if report.placement == ExpertPlacement::Local { local_package(report) }
-        else if !local { "none" } else if exl3 { "exl3" } else { "fp8" };
+    let pkg = if exl3 { "exl3" } else { "fp8" };
     devices[0].items.push(runtime_item(shape.manifest.as_deref(), &program_families("qwen4", false),
         pkg, false, 0, options.rtx_bytes[0]));
     let spark_ranks = if local { 0 } else { report.placement.spark_ranks() };
@@ -267,19 +222,28 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         else { report.placement.spark_ranks() };
     let lib = crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()).join("libcuteafd_native.so");
     let catalog = input.expert_catalog()?;
-    let experts = qwen4::QwenExperts::read(catalog, &lib, cfg.layers, 1, shape.prefill_rows.max(64))?;
+    let mut experts = if manifest.is_some() {
+        qwen4::QwenExperts::read(catalog, &lib, cfg.layers, 1, shape.prefill_rows.max(64))?
+    } else { qwen4::QwenExperts::headers(catalog, cfg.layers, 1)? };
     let embedding = if host_embedding { 0 } else { crate::families::qwen4::weight_layout::embedding_table_bytes(checkpoint)? };
     let arenas = crate::families::qwen4::weight_layout::coordinator_arenas(checkpoint, &cfg,
         &vec![0; cfg.layers], 1, mtp, options.qwen_representation, embedding)?
         .into_iter().map(|(_, arena)| arena).collect();
     let mut future = qwen4::dual_projection_load_staging(options.qwen_representation);
     future.retain(|demand| demand.gpu == 0);
-    if mtp { future.extend(qwen4::dual_draft_demands(catalog, &lib, shape.prefill_rows.max(64))?); }
-    let loaded_bytes = device.items.iter().filter(|item| item.group == "context+modules")
+    let mut expert_arenas = Vec::new();
+    if mtp && catalog.exl3().is_some() {
+        let (arena, shared) = experts.serial_draft(catalog)?;
+        expert_arenas.push(arena);
+        future.extend(shared);
+    } else if mtp && manifest.is_some() {
+        future.extend(qwen4::dual_draft_demands(catalog, &lib, shape.prefill_rows.max(64))?);
+    }
+    let loaded_bytes = device.items.iter().filter(|item| item.category == Category::Runtime)
         .map(|item| item.bytes).sum::<u64>();
     let inputs = qwen4::QwenInputs {
         experts: Some(experts), onboard: options.resolve_onboard(cfg.layers).unwrap_or_default(),
-        arenas, expert_arenas: vec![], preallocation: true, future,
+        arenas, expert_arenas, preallocation: true, future,
         blas_head: if options.qwen_representation.fp8_head { crate::placement::planner::serving::BlasHead::Native } else { options.bf16_target_head },
         loaded_weights: crate::placement::ResidentWeights(options.drafter_bytes),
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)),
@@ -293,7 +257,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks, host, encoders,
     };
     let (placement, solved) = qwen4::admitted(&inputs)?;
-    device.items.retain(|item| item.group == "context+modules");
+    device.items.retain(|item| item.category == Category::Runtime);
     publish_host(report, options, &inputs.host, &solved)?;
     adopt_encoder(report, &inputs.encoders, &solved, sparks, notes)?;
     report.prefill_span_rows = Some(span);
@@ -519,45 +483,6 @@ fn publish_host(report: &mut PlanReport, options: &LayoutOptions, host: &qwen4::
     Ok(())
 }
 
-/// Package scratch of Qwen's resident FP8/NVFP4 experts (`Fp8Experts::load`): one scratch per package
-/// the backbone and the mixed-format MTP layer load, at the prefill rows' capacity.
-fn package_scratch(input: &super::super::PlanInput, report: &PlanReport, workspace_manifest: Option<&std::path::Path>,
-    prefill_rows: u64, mtp: bool) -> Result<Vec<(String, u64)>> {
-    let Ok(catalog) = input.expert_catalog() else { return Ok(Vec::new()) };
-    let Some(tensors) = catalog.fp8() else { return Ok(Vec::new()) };
-    let lib = crate::placement::inventory::image_lib(workspace_manifest);
-    let layers = catalog.routed_experts().layers;
-    let all_onboarded = layers > 0 && report.onboard_layers == Some(layers);
-    let local = report.placement == ExpertPlacement::Local || all_onboarded;
-    let mut out = Vec::new();
-    if local {
-        out.extend(crate::placement::inventory::fp8moe_package_scratch(&lib, "qwen4", tensors.format(), prefill_rows)?);
-    }
-    if mtp {
-        if let Ok(format) = tensors.layer_format(layers) {
-            if !local || format != tensors.format() {
-                out.extend(crate::placement::inventory::fp8moe_package_scratch(&lib, "qwen4", format, prefill_rows)?);
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn exl3_arenas(input: &super::super::PlanInput, mtp: bool) -> Option<(u64, u64)> {
-    use crate::V41Exl3Layer;
-    let catalog = input.expert_catalog().ok()?;
-    let shape = catalog.routed_experts();
-    let manifest = catalog.exl3()?;
-    let bytes = |layer| -> Option<u64> {
-        u64::try_from(manifest.residency(layer, 1, 0).ok()?.device_arena_layout().ok()?.1).ok()
-    };
-    let backbone = (shape.first_layer..shape.layers).try_fold(0u64,
-        |total, layer| total.checked_add(bytes(V41Exl3Layer::Backbone(layer))?))?;
-    let draft = (0..if mtp { shape.draft_stages.min(1) } else { 0 }).try_fold(0u64,
-        |total, stage| total.checked_add(bytes(V41Exl3Layer::Dspark(stage))?))?;
-    Some((backbone, draft))
-}
-
 fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &LayoutOptions, rows: u64, concurrency: u64,
     context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> MemoryLayout {
@@ -670,7 +595,9 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let unit_rows = options.prefill_unit_rows.unwrap_or(rows);
     let prefill_shape = (options.prefill_waves > 1).then_some(crate::serving_capacity::PrefillShape {
         unit_rows, waves: options.prefill_waves }).map(|shape| shape.validate()).transpose()?;
-    let experts = qwen4::QwenExperts::read(&catalog, &lib, cfg.layers, 2, unit_rows.max(64))?;
+    let experts = if manifest.is_some() {
+        qwen4::QwenExperts::read(&catalog, &lib, cfg.layers, 2, unit_rows.max(64))?
+    } else { qwen4::QwenExperts::headers(&catalog, cfg.layers, 2)? };
     let host = options.host_embedding;
     // The loader's own arenas at the fixed cut; the head, entry mixer, MTP and
     // a device embedding are views in them, not separate owner0 demands.

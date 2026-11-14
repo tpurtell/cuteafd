@@ -370,7 +370,6 @@ mod weight_representation_tests {
             vec!["--shared-only", "--prefill-units", "8192"],
             vec!["--shared-only", "--prefill-units", "4096", "--prefill-waves", "3"],
             vec!["--shared-only", "--prefill-units", "2752", "--prefill-waves", "4"],
-            vec!["--local-experts", "--split-device", "1", "--prefill-units", "2048"],
         ] {
             assert!(args(&extra)?.prefill_shape().is_err(), "{extra:?}");
         }

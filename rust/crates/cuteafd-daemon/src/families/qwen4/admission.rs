@@ -120,7 +120,6 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     let sparks = args.peers.as_ref().map_or(0, |peers| peers.split(',').count());
     let mut experts = if args.shared_only || catalog.is_none() { None }
         else { Some(qwen4::QwenExperts::read(catalog.unwrap(), &args.native_lib, layers, 1, rows as u64)?) };
-    if let Some(experts) = &mut experts { experts.remap_devices(&[args.device])?; }
     let selected = Qwen4Representation { fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head };
     let embedding = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu {
         weight_layout::embedding_table_bytes(checkpoint)? } else { 0 };
@@ -141,7 +140,13 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
         qwen4::dual_draft_demands(catalog.context("Qwen MTP expert catalog")?, &args.native_lib, rows as u64)?
     } else { Vec::new() };
     let draft_budget = usize::try_from(draft.iter().map(|demand| demand.bytes).sum::<u64>())?;
-    future.extend(draft);
+    let mut draft_arenas = Vec::new();
+    if mtp && catalog.is_some_and(|catalog| catalog.exl3().is_some()) && experts.is_some() {
+        let (arena, shared) = experts.as_mut().unwrap().serial_draft(catalog.unwrap())?;
+        draft_arenas.push(arena);
+        future.extend(shared);
+    } else { future.extend(draft); }
+    if let Some(experts) = &mut experts { experts.remap_devices(&[args.device])?; }
     // Push host state is bounded by the largest candidate; only the admitted
     // prefix is ever allocated or read by the receiver.
     if let Some(catalog) = catalog.filter(|_| !args.shared_only) {
@@ -172,7 +177,7 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     inputs.experts = experts;
     inputs.onboard = args.onboard.map(|setting| setting.resolve(layers)).unwrap_or_default();
     inputs.arenas = arenas;
-
+    inputs.expert_arenas = draft_arenas;
     inputs.preallocation = true;
     inputs.future = future;
     // The optional tower already loaded before this sample, so only declare its

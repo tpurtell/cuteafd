@@ -802,20 +802,20 @@ pub fn qwen4_coordinator(config: &Value, mtp: bool) -> Vec<Tensor> {
     out
 }
 
-/// TP1 EXL3 capacity manifests for Qwen's routed geometry under `share/exl3`,
-/// as images bundle them beside PROGRAMS.json; returns that PROGRAMS.json.
+/// TP1 EXL3 capacity manifests in the installed lib tree; returns PROGRAMS.json.
 pub fn write_qwen4_exl3_capacities(dir: &Path, tiers: &str) -> std::path::PathBuf {
     let share = dir.join("share");
     for capacity in crate::placement::inventory::exl3_capacities(4096) {
-        let path = share.join("exl3").join(format!("exl3-qwen4-k{tiers}")).join(format!("rtx-tp1/m{capacity}"));
+        let path = dir.join("lib/exl3").join(format!("exl3-qwen4-k{tiers}")).join(format!("rtx-tp1/m{capacity}"));
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
             "capacity": capacity, "hidden": 2560, "experts": 512, "intermediate": 640, "top_k": 10,
-            "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
+            "output_dtype": "fp32", "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
                 "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 8, "zero_on_create": false}}
         })).unwrap()).unwrap();
     }
     let programs = share.join("PROGRAMS.json");
+    fs::create_dir_all(&share).unwrap();
     fs::write(&programs, b"{}").unwrap();
     programs
 }

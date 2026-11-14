@@ -152,7 +152,16 @@ impl Exlr8Execution {
     }
 }
 
+/// Precision boundary between a complete routed expert sum and shared FFN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WholeExpertCombine {
+    #[default]
+    SumThenRound,
+    RoundRoutedThenAdd,
+}
+
 pub trait Family: Sync {
+    fn whole_expert_combine(&self) -> WholeExpertCombine { WholeExpertCombine::SumThenRound }
     fn id(&self) -> &'static str;
     /// Shipping native trellis widths for the resident head borrowed by drafters.
     fn native_head_widths(&self) -> &'static [usize] { &[] }

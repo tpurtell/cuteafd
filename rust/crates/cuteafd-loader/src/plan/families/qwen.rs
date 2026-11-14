@@ -14,6 +14,9 @@ pub struct Qwen;
 pub static QWEN4: Qwen = Qwen;
 
 impl Family for Qwen {
+    fn whole_expert_combine(&self) -> crate::plan::family::WholeExpertCombine {
+        crate::plan::family::WholeExpertCombine::RoundRoutedThenAdd
+    }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "Qwen 3.8 Flash Next cards are 1 RTX + 0 Sparks: no Spark round trip for a second lane to hide, and the 5090 + 1 Spark card is memory-tight for its workspace (#744)" }

@@ -8,14 +8,8 @@ use cuteafd_loader::{placement::families::qwen4::ExpertCandidate, OfficialV41Cat
 use std::{cell::RefCell, path::Path};
 
 pub(super) fn backend_budget(candidate: &ExpertCandidate, rank: usize) -> Result<usize> {
-    let weights = candidate.arenas.iter().filter(|(owner, _)| *owner == rank)
-        .map(|(_, arena)| arena.bytes()).sum::<usize>();
-    let workspace = candidate.workspace.iter().filter(|allocation| allocation.view.is_none()
-        && allocation.location == cuteafd_loader::placement::planner::Location::coordinator(rank as u8)
-        && allocation.id.starts_with("qwen.experts.rank"))
-        .try_fold(0usize, |sum, allocation| sum.checked_add(usize::try_from(allocation.bytes)?)
-            .context("Qwen expert workspace overflow"))?;
-    weights.checked_add(workspace).context("Qwen backend budget overflow")
+    usize::try_from(*candidate.backend_bytes.get(rank).context("Qwen expert backend owner missing")?)
+        .context("Qwen backend budget overflow")
 }
 
 pub(super) fn push_plan(catalog: &OfficialV41Catalog, layers: &[usize], gpus: usize,
@@ -65,6 +59,14 @@ impl Opened {
                 None => None,
             }
         } else { None };
+        let serial = if gpus == 1 && catalog.exl3().is_some() && admitted.draft_budget > 0 {
+            let package = whole_package(args, catalog)?;
+            let directories = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::QWEN4)
+                .capacities(rows)?.into_iter().map(|capacity| package.join(format!("m{capacity}"))).collect::<Vec<_>>();
+            Some(devices[0].run(|| crate::shared::experts::exl3::execution::Exl3Workspace::serial(
+                &self.library, &directories, crate::shared::experts::exl3::execution::Exl3Epilogue::Sum,
+                streams[0], rows * self.cfg.hidden * 4))?)
+        } else { None };
         let local = if layers.is_empty() { None } else if gpus == 1 {
             let package = whole_package(args, catalog)?;
             let budget = backend_budget(candidate, 0)?;
@@ -76,7 +78,12 @@ impl Opened {
                     None => Exl3Tp2::load_whole_weights(devices[0], catalog, &package, layers.clone(),
                         rows, budget, RtxSelectionPolicy::CanonicalDecode)?,
                 };
-                Box::new(weights.execution()?)
+                Box::new(match &serial {
+                    // SAFETY: both family bindings enqueue only on owner zero's stream;
+                    // neither target nor MTP graphs can overlap that stream.
+                    Some(arena) => unsafe { weights.execution_serial(arena.clone(), streams[0])? },
+                    None => weights.execution()?,
+                })
             } else {
                 let tensors = catalog.fp8().context("Qwen native whole headers")?;
                 Box::new(match pushed {
@@ -85,8 +92,9 @@ impl Opened {
                     None => rtx::whole::Whole::load(devices[0], tensors, &package, layers.clone(), rows, budget)?,
                 })
             };
-            Some(engine::LocalRouted::Whole(rtx::pair::Whole::new(&self.library, devices[0].id, backend,
-                self.cfg.hidden, rows)?))
+            use cuteafd_loader::plan::family::Family;
+            Some(engine::LocalRouted::Whole(rtx::pair::Whole::with_combine(&self.library, devices[0].id, backend,
+                self.cfg.hidden, rows, cuteafd_loader::plan::families::qwen::QWEN4.whole_expert_combine())?))
         } else {
             let pair_devices = [devices[0], devices[1]];
             let budgets = [backend_budget(candidate, 0)?, backend_budget(candidate, 1)?];
@@ -128,7 +136,17 @@ impl Opened {
                 ranks, pair, self.cfg.hidden, self.cfg.topk, rows, engine::DECODE_ROWS,
                 catalog.exl3().is_some(), "qwen4")?)))
         };
-        let mtp = if admitted.draft_budget > 0 {
+        let mtp = if let Some(serial) = serial {
+            let package = whole_package(args, catalog)?;
+            let weights = rtx::exl3::Exl3Tp2Weights::draft(devices[0], catalog, &package, 0,
+                rows, admitted.draft_budget, None)?;
+            // SAFETY: the target binding above and this draft use the same owner stream.
+            let backend = unsafe { weights.execution_serial(serial, streams[0])? };
+            use cuteafd_loader::plan::family::Family;
+            Some(engine::MtpExperts::Whole(rtx::pair::Whole::with_combine(&self.library,
+                devices[0].id, Box::new(backend), self.cfg.hidden, rows,
+                cuteafd_loader::plan::families::qwen::QWEN4.whole_expert_combine())?))
+        } else if admitted.draft_budget > 0 {
             Some(devices[0].run(|| self.local_mtp_experts(args, self.cfg.layers, streams[0], admitted.draft_budget))?)
         } else { None };
         let remote = admitted.placement.layers.iter().enumerate().filter_map(|(layer, assignment)|

@@ -212,7 +212,7 @@ def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body
     root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
     engine = (root / "engine.rs").read_text()
     family = (root / "mod.rs").read_text()
-    startup = family[family.index("pub fn with_engine<T>"):family.index("    fn experts<'s>")]
+    startup = family[family.index("pub fn with_engine<T>"):family.index("    fn local_mtp_experts<'s>")]
     assert startup.index("engine.admit_host_memory(args)?;") < startup.index("engine.prepare_prefill_units()?")
     assert startup.index("engine.prepare_prefill_units()?") < startup.index("let result = body(&engine);")
 

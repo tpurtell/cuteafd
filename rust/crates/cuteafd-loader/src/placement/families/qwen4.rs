@@ -1255,6 +1255,7 @@ mod tests {
                     crate::serving_capacity::WeightArenaLayout::new(format!("qwen.test.experts.{rank}"),
                         (0..count).map(|layer| (layer.to_string(), 1usize << 30))).unwrap())).collect() },
                 workspace: if count == 0 && gpus == 2 { QwenExperts::terminal_owners() } else { vec![] },
+                backend_bytes: vec![count as u64 * (1 << 30); gpus],
             }).collect() }
     }
 

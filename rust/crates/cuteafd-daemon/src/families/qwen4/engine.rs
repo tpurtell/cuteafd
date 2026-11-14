@@ -142,6 +142,7 @@ pub(crate) const MTP_PENDING_ROWS: usize = 64;
 
 /// The MTP layer stays resident locally even when backbone experts run on Sparks.
 pub(crate) enum MtpExperts<'a> {
+    Whole(crate::shared::experts::rtx::pair::Whole<'a>),
     Fp8(Fp8Experts<'a>),
     Exl3(RefCell<crate::families::deepseek_v4::local::LocalExperts<'a>>),
 }
@@ -3817,7 +3818,10 @@ impl<'a> Qwen4Engine<'a> {
         let wire = match experts {
             Experts::Hybrid(experts) if index < self.cfg.layers && experts.local_layer(index) =>
                 experts.local.as_ref().context("Qwen resident expert owner")?.wire(),
-            Experts::Hybrid(experts) if index == self.cfg.layers => matches!(experts.mtp, Some(MtpExperts::Exl3(_))),
+            Experts::Hybrid(experts) if index == self.cfg.layers => match &experts.mtp {
+                Some(MtpExperts::Whole(whole)) => whole.uses_fp8_input(),
+                other => matches!(other, Some(MtpExperts::Exl3(_))),
+            },
             Experts::Hybrid(_) => !self.spark_bf16,
             Experts::SharedOnly => false,
         };
@@ -3869,6 +3873,14 @@ impl<'a> Qwen4Engine<'a> {
             Experts::Hybrid(experts) => {
                 ensure!(index == self.cfg.layers, "unknown Qwen expert layer {index}");
                 match experts.mtp.as_ref().context("Qwen independent MTP expert owner missing")? {
+                    MtpExperts::Whole(whole) => {
+                        // SAFETY: target and MTP share one serialized owner-zero stream,
+                        // and the shared scratch/output outlive both consumers.
+                        return unsafe { whole.enqueue(index, t, crate::shared::experts::rtx::ExpertInput::Fp8K32(w.wire.buffer.ptr),
+                            crate::shared::experts::rtx::Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr },
+                            w.live_buffer(&w.shared, h * 2), w.live_buffer(&w.delta, h * 2), self.execution_stream(),
+                            &mut || crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "Qwen MTP abort")) };
+                    }
                     MtpExperts::Fp8(experts) => {
                         let resident = experts.index_of(index)?;
                         // SAFETY: independent MTP input/routes/output live on the head-owner stream.

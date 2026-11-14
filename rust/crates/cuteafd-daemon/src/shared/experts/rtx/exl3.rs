@@ -69,6 +69,38 @@ impl<'a> Exl3Tp2Weights<'a> {
     pub(crate) fn execution(&self) -> Result<Exl3Tp2<'a>> {
         self.execution_with_modules(None)
     }
+
+    /// A separately owned full-width draft weight set, using the same token-sum
+    /// executor as a whole target layer without coupling their retirement.
+    pub(crate) fn draft(device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &Path, stage: usize, max_rows: usize, budget: usize,
+        pushed: Option<Vec<Exl3Weights<'a>>>) -> Result<Self> {
+        let geometry = expert_geometry();
+        let row_policy = Exl3RowPolicy::for_geometry(geometry);
+        let selection = RtxSelectionPolicy::CanonicalDecode;
+        validate_whole_package(package, max_rows, row_policy, selection, geometry)?;
+        let layer = ExpertLayer::Dspark { stage };
+        let layout = crate::shared::experts::weight_layout::layout(device.id, "exl3",
+            crate::shared::experts::exl3::regions(catalog, [layer])?)?;
+        let workspace_bytes = Exl3Tp2::whole_workspace_bytes(package, max_rows, geometry, selection)?;
+        crate::shared::experts::weight_layout::admit(&layout, 0, workspace_bytes, budget)?;
+        let weights = device.own(|| {
+            let weights = match pushed {
+                Some(weights) => weights,
+                None => {
+                    let arena = crate::shared::experts::exl3::arena(device, catalog, [layer])?;
+                    vec![Exl3Weights::load_into(device.library, catalog, layer, budget, &arena)?]
+                }
+            };
+            ensure!(weights.len() == 1 && weights[0].layout.layer == cuteafd_loader::V41Exl3Layer::Dspark(stage)
+                && weights[0].layout.world == 1 && weights[0].layout.rank == 0,
+                "draft EXL3 weight set differs from admitted stage");
+            Ok(Rc::new(weights))
+        })?;
+        Ok(Self { device, rank: 0, shard: RtxShard::Whole,
+            layers: vec![catalog.routed_experts().layers + stage], geometry, row_policy, selection,
+            package: package.to_owned(), max_rows, workspace_bytes, weights: Rc::new(weights) })
+    }
     /// The same resident weights admitted at another row capacity: lanes built
     /// from it select packages, workspace and output at `max_rows`.
     pub(crate) fn with_max_rows(&self, max_rows: usize) -> Result<Self> {
@@ -77,6 +109,19 @@ impl<'a> Exl3Tp2Weights<'a> {
         Ok(Self { max_rows, workspace_bytes, ..self.clone() })
     }
     pub(crate) fn execution_with_modules(&self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<Exl3Tp2<'a>> {
+        self.execution_with_serial(modules, None)
+    }
+
+    /// # Safety
+    /// This binding and every other user of the arena serialize on its stream,
+    /// including graph replay. Independent weight sets retain their own backing.
+    pub(crate) unsafe fn execution_serial(&self, arena: Rc<Exl3Workspace<'a>>, stream: *mut c_void)
+        -> Result<Exl3Tp2<'a>> {
+        self.execution_with_serial(None, Some((arena, stream)))
+    }
+
+    fn execution_with_serial(&self, modules: Option<Vec<Exl3Modules<'a>>>,
+        serial: Option<(Rc<Exl3Workspace<'a>>, *mut c_void)>) -> Result<Exl3Tp2<'a>> {
         let reduction_plan = match self.selection {
             RtxSelectionPolicy::FirstCapacity => None,
             RtxSelectionPolicy::CanonicalDecode => Some(Exl3ReductionPlan::new(&directories(
@@ -102,7 +147,7 @@ impl<'a> Exl3Tp2Weights<'a> {
             weights: self.weights.clone(),
             output: None,
         };
-        lane.initialize_lane(modules)?;
+        lane.initialize_lane_with_serial(modules, serial)?;
         Ok(lane)
     }
 }
@@ -616,6 +661,11 @@ impl<'a> Exl3Tp2<'a> {
     }
 
     fn initialize_lane(&mut self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<()> {
+        self.initialize_lane_with_serial(modules, None)
+    }
+
+    fn initialize_lane_with_serial(&mut self, modules: Option<Vec<Exl3Modules<'a>>>,
+        serial: Option<(Rc<Exl3Workspace<'a>>, *mut c_void)>) -> Result<()> {
         let paths = selected_directories(
             &self.package,
             self.max_rows,
@@ -623,7 +673,10 @@ impl<'a> Exl3Tp2<'a> {
             self.selection,
         )?;
         self.executions = Some(self.device.own(|| {
-            let arena = Exl3Workspace::new(self.device.library, &paths, Exl3Epilogue::Sum)?;
+            let arena = match &serial {
+                Some((arena, _)) => arena.clone(),
+                None => Exl3Workspace::new(self.device.library, &paths, Exl3Epilogue::Sum)?,
+            };
             let modules = match modules {
                 Some(modules) => modules,
                 None => paths.iter().map(|path| {
@@ -664,10 +717,11 @@ impl<'a> Exl3Tp2<'a> {
                 })
                 .collect::<Result<Vec<_>>>()
         })?);
-        self.output = Some(Allocation::new(
-            self.device,
-            output_bytes(self.geometry, self.max_rows)?, Tag::workspace("experts/rtx-exl3-output")
-        )?);
+        let bytes = output_bytes(self.geometry, self.max_rows)?;
+        self.output = Some(match serial {
+            Some((arena, stream)) => self.device.run(|| arena.serial_output(self.device.library, stream, bytes))?,
+            None => Allocation::new(self.device, bytes, Tag::workspace("experts/rtx-exl3-output"))?,
+        });
         Ok(())
     }
 

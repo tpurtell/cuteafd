@@ -8,6 +8,8 @@ pub struct ExpertCandidate {
     pub layers: Vec<usize>,
     pub arenas: Vec<(usize, WeightArenaLayout)>,
     pub workspace: Vec<Allocation>,
+    /// Loader fit witness, including shared mutable owners charged elsewhere.
+    pub backend_bytes: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +22,17 @@ pub struct QwenExperts {
 impl QwenExperts {
     pub fn read(catalog: &crate::OfficialV41Catalog, native_lib: &std::path::Path,
         layers: usize, gpus: usize, rows: u64) -> anyhow::Result<Self> {
+        Self::read_with_packages(catalog, native_lib, layers, gpus, rows, true)
+    }
+
+    /// Header-only inventories remain useful before exports exist. They do not
+    /// claim to have priced an executable backend; runtime always uses `read`.
+    pub fn headers(catalog: &crate::OfficialV41Catalog, layers: usize, gpus: usize) -> anyhow::Result<Self> {
+        Self::read_with_packages(catalog, std::path::Path::new("/uninstalled/lib.so"), layers, gpus, 64, false)
+    }
+
+    fn read_with_packages(catalog: &crate::OfficialV41Catalog, native_lib: &std::path::Path,
+        layers: usize, gpus: usize, rows: u64, installed: bool) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         use crate::formats::fp8_experts::Slicing;
         use crate::serving_capacity::{expert_weight_arena_id, fp8_expert_regions};
@@ -45,8 +58,10 @@ impl QwenExperts {
             let prefix = format!("qwen.experts.rank{rank}");
             let mut allocations = Vec::new();
             let layer_regions = if let Some(exl3) = catalog.exl3() {
-                let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::QWEN4)
-                    .capacities(usize::try_from(rows)?)?;
+                let capacities = if installed {
+                    cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::QWEN4)
+                        .capacities(usize::try_from(rows)?)?
+                } else { Vec::new() };
                 let manifests = capacities.iter().map(|capacity| -> anyhow::Result<serde_json::Value> {
                     let path = packages[rank].join(format!("m{capacity}/v41_exl3.json"));
                     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)
@@ -61,10 +76,12 @@ impl QwenExperts {
                         "Qwen expert package geometry mismatch: {}", path.display());
                     Ok(manifest)
                 }).collect::<anyhow::Result<Vec<_>>>()?;
-                allocations.extend(crate::serving_capacity::Exl3WorkspaceLayout::from_manifests(
-                    &manifests, true, Exl3Epilogue::Sum)?.allocations(&prefix, location, PlanLifetime::RESIDENT));
-                allocations.push(Allocation::buffer(format!("{prefix}.output"), location,
-                    rows * shape.hidden as u64 * 4, PlanLifetime::RESIDENT, Category::Experts, "expert output"));
+                if installed {
+                    allocations.extend(crate::serving_capacity::Exl3WorkspaceLayout::from_manifests(
+                        &manifests, true, Exl3Epilogue::Sum)?.allocations(&prefix, location, PlanLifetime::RESIDENT));
+                    allocations.push(Allocation::buffer(format!("{prefix}.output"), location,
+                        rows * shape.hidden as u64 * 4, PlanLifetime::RESIDENT, Category::Experts, "expert output"));
+                }
                 (0..layers).map(|layer| {
                     let name = if gpus == 1 { format!("BackboneFull {{ layer: {layer} }}.0") }
                         else { format!("BackboneTp2 {{ layer: {layer}, rank: {rank} }}.0") };
@@ -73,6 +90,7 @@ impl QwenExperts {
                 }).collect::<anyhow::Result<Vec<_>>>()?
             } else {
                 let tensors = catalog.fp8().context("Qwen native experts unavailable")?.for_coordinator();
+                if installed {
                 let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
                     packages[rank].parent().context("Qwen package parent")?.join("manifest.json"))?)?;
                 let layout = packages[rank].file_name().and_then(|name| name.to_str()).context("Qwen package layout")?;
@@ -81,6 +99,7 @@ impl QwenExperts {
                 for (name, bytes) in [("scratch", scratch), ("output", rows * shape.hidden as u64 * 2)] {
                     allocations.push(Allocation::buffer(format!("{prefix}.{name}"), location, bytes,
                         PlanLifetime::RESIDENT, Category::Experts, format!("expert {name}")));
+                }
                 }
                 fp8_expert_regions(&tensors, &(0..layers).collect::<Vec<_>>(), gpus, rank,
                     if gpus == 1 { Slicing::Padded } else { Slicing::Blocks(128) })?
@@ -116,9 +135,40 @@ impl QwenExperts {
             let workspace = if count == 0 {
                 if gpus == 2 { Self::terminal_owners() } else { Vec::new() }
             } else { workspace.clone() };
-            candidates.push(ExpertCandidate { layers: selected, arenas, workspace });
+            let backend_bytes = (0..gpus).map(|rank| {
+                arenas.iter().filter(|(owner, _)| *owner == rank).map(|(_, arena)| arena.bytes() as u64).sum::<u64>()
+                    + workspace.iter().filter(|allocation| allocation.view.is_none()
+                        && allocation.location == Location::coordinator(rank as u8)
+                        && allocation.id.starts_with("qwen.experts.rank")).map(|allocation| allocation.bytes).sum::<u64>()
+            }).collect();
+            candidates.push(ExpertCandidate { layers: selected, arenas, workspace, backend_bytes });
         }
         Ok(Self { layers: (0..layers).collect(), destinations: (0..gpus as u8).collect(), candidates })
+    }
+
+    /// Share the mutable TP1 scratch/output with the independently backed MTP
+    /// weight set. Each binding keeps only its private counters/LUT/wire owners.
+    pub fn serial_draft(&mut self, catalog: &crate::OfficialV41Catalog)
+        -> anyhow::Result<(WeightArenaLayout, Vec<Demand>)> {
+        use anyhow::{ensure, Context};
+        ensure!(self.destinations == [0], "Qwen serial draft requires one whole owner");
+        let exl3 = catalog.exl3().context("Qwen serial draft requires EXL3")?;
+        let template = self.candidates.last().context("Qwen expert candidates missing")?.workspace.clone();
+        let mut fixed = Vec::new();
+        for allocation in template.iter().filter(|allocation| allocation.view.is_none()) {
+            let shared = allocation.id.contains(".shared.") || allocation.id.ends_with(".output");
+            fixed.push(Demand::new(0, allocation.category,
+                if shared { format!("serial EXL3 {}", allocation.id) }
+                else { format!("MTP EXL3 {}", allocation.id) }, allocation.bytes, Basis::Exact));
+        }
+        for candidate in &mut self.candidates {
+            candidate.workspace.retain(|allocation| !allocation.id.contains(".shared.")
+                && !allocation.id.ends_with(".output"));
+        }
+        let bytes = exl3.residency(crate::V41Exl3Layer::Dspark(0), 1, 0)?.device_arena_layout()?.1;
+        let regions = vec![("Dspark { stage: 0 }.0".to_string(), bytes)];
+        let arena = WeightArenaLayout::new(crate::serving_capacity::expert_weight_arena_id("exl3", 0, &regions)?, regions)?;
+        Ok((arena, fixed))
     }
 
     /// Minimal existing PeerExchange: one 256-byte receive/control/abort request
