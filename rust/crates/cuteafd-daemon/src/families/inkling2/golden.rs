@@ -68,7 +68,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     let kernels = device.run(|| Kernels::bind(&programs))?;
     let (free, total) = device.run(|| library.cuda_memory_info())?;
     let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
-    let facts = admission::admit(&checkpoint, &cfg, &target_layout, &expert_layouts[0], metadata.scratch_for(rows)?,
+    let plan = admission::admit(&checkpoint, &cfg, &target_layout, &expert_layouts[0], metadata.scratch_for(rows)?,
         &unit_layout, rows, free as u64, total as u64, host)?;
     let stream = Rc::new(Stream::new(device)?);
     let owner = UnitOwner::new(Rc::clone(&stream), unit_layout)?;
@@ -116,9 +116,11 @@ fn run(args: GoldenArgs) -> Result<()> {
         let measured = inventory.receipts.iter().chain(&working.receipts)
             .filter(|r| r.allocation.view.is_none() && r.allocation.location == cuteafd_loader::placement::planner::Location::coordinator(0))
             .map(|r| r.allocation.bytes).sum::<u64>();
-        let admitted = facts.allocations.iter().filter(|a| a.view.is_none()
+        let admitted = plan.facts.allocations.iter().filter(|a| a.view.is_none()
             && a.location == cuteafd_loader::placement::planner::Location::coordinator(0)).map(|a| a.bytes).sum::<u64>();
-        ensure!(measured <= admitted, "Inkling measured device owners exceed cold admission: {measured}/{admitted}");
+        let receipts = inventory.receipts.iter().chain(&working.receipts).cloned().collect::<Vec<_>>();
+        admission::reconcile_native(&plan, devices, &receipts)?;
+        ensure!(measured == admitted, "Inkling measured device owners differ from cold admission: {measured}/{admitted}");
         tracing::info!(layer=index, measured_device_owner_bytes=measured, admitted_device_owner_bytes=admitted,
             native_weight_arena_aliases=inventory.receipts.len(), "Inkling native cold owner census");
         println!("Inkling native layer{index} complete rows={rows}");

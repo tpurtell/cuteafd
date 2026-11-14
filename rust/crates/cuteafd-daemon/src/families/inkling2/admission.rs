@@ -1,13 +1,13 @@
 //! Cold partial-golden contract uses shared phase/arena/tail admission.
 use super::{experts::Mxfp8Layout, head::Head, weights::execution_arena};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use cuteafd_core::memory_layout::{Category, MemoryKind};
 use cuteafd_loader::{families::inkling2::{execution::UnitLayout, weight_layout::CoordinatorWeights, Inkling2Config},
     placement::planner::*, plan::Checkpoint};
 
 pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &CoordinatorWeights,
     expert: &Mxfp8Layout, scratch: usize, unit: &UnitLayout, head_rows: usize,
-    free: u64, total: u64, host: (u64, u64)) -> Result<Facts> {
+    free: u64, total: u64, host: (u64, u64)) -> Result<ResolvedPlan> {
     let empty = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![], allocations: vec![],
         deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
         driver_page_tables: vec![], allocation_granularity: vec![] };
@@ -64,5 +64,40 @@ pub(crate) fn admit(checkpoint: &Checkpoint, cfg: &Inkling2Config, target: &Coor
     let phases = evaluate(&facts, &budgets)?;
     tracing::info!(record = %serde_json::json!({"facts":facts,"budgets":budgets,"phases":phases}),
         "Inkling cold native forward admission");
-    Ok(facts)
+    let shape = PrefillShape { rows: unit.rows.next_multiple_of(64) as u64, waves: 1 };
+    Ok(ResolvedPlan { encoder_diagnostics: vec![],
+        request: Request { context: Context::pinned(64), pool: Pin::Exact(64), onboard: Pin::Exact(0),
+            prefill: Pin::Exact(shape), operation: Operation::Scoring, resident_weight_limit: None,
+            spark_reply_formats: Default::default() },
+        decisions: Decisions { attention: vec![], onboard_layers: vec![], expert_homes: Default::default(),
+            embedding: None, draft_home: None, head_home: Some(0), intake_home: None, encoder: None,
+            prefill: shape, lanes: 1, spark_reply_formats: None },
+        pool_tokens: 64, pool_page_rows: 64, budgets, facts, phases })
+}
+
+/// Project only independently retained native device backings; loading pools
+/// and host scoring temporaries keep their own phase accounting. Tensor aliases
+/// remain Inventory views, and never become a second residency charge.
+pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<'_>,
+    receipts: &[Receipt]) -> Result<()> {
+    let mut projected = devices.remap_plan_weight_arenas(plan)?;
+    projected.facts.allocations.retain(|a| a.view.is_none() && a.location == Location::coordinator(0));
+    projected.facts.driver_page_tables.retain(|table| table.location == Location::coordinator(0));
+    let expected = projected.facts.allocations.iter().map(|a| (a.id.as_str(), a)).collect::<std::collections::BTreeMap<_, _>>();
+    let mut actual = Vec::new();
+    for receipt in receipts.iter().filter(|r| r.allocation.view.is_none()) {
+        let id = if receipt.allocation.group == "weight arena" { receipt.allocation.id.as_str() }
+            else { receipt.allocation.id.strip_prefix("inkling2.").unwrap_or(&receipt.allocation.id) };
+        let id = if id == "experts.scratch" { "expert.scratch" } else { id };
+        let spec = expected.get(id).with_context(|| format!("Inkling unadmitted retained owner {id}"))?;
+        anyhow::ensure!(receipt.allocation.bytes == spec.bytes && receipt.allocation.location == spec.location,
+            "Inkling retained owner {id} bytes/location differ: actual{}/admitted{}", receipt.allocation.bytes, spec.bytes);
+        // Metadata comes from the canonical pre-allocation contract after the
+        // measured payload/location check, never from observed bytes.
+        actual.push(Receipt { allocation: (*spec).clone(), address: receipt.address });
+    }
+    projected.budgets.retain(|budget| budget.locations.contains(&Location::coordinator(0)));
+    projected.phases = evaluate(&projected.facts, &projected.budgets)?;
+    cuteafd_loader::placement::planner::reconcile(&projected, Phase::PostTargetKv, &actual)?;
+    Ok(())
 }
