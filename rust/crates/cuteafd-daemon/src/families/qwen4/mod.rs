@@ -238,7 +238,7 @@ impl EngineArgs {
     fn resolved_prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
         let ranks = self.peers.as_deref().map_or(0, |peers| peers.split(',').filter(|p| !p.is_empty()).count());
-        let local = self.local_experts || self.split_device.is_some() || (ranks == 0 && !self.shared_only);
+        let local = self.local_experts || (ranks == 0 && !self.shared_only);
         let shape = prefill_shape(if local { 0 } else { ranks }, cuteafd_loader::families::qwen4::prefill_limits(local),
             PrefillOverrides {
                 unit_rows: self.prefill_units.or((self.prefill_rows > 0).then_some(self.prefill_rows)).map(|r| r as u64),
@@ -248,8 +248,6 @@ impl EngineArgs {
             })?;
         ensure!(shape.waves == 1 || self.peers.is_some() || self.shared_only,
             "Qwen prefill units need Spark experts or shared-only diagnostics");
-        ensure!(self.split_device.is_none() || self.prefill_units.is_none(),
-            "Qwen dual-owner execution does not admit diagnostic unit cuts");
         cuteafd_bench::context::ResolvedSettings::prefill(shape)
             .value("prefill-rows", shape.span_rows).value("prefill-units", shape.unit_rows).publish();
         Ok(shape)

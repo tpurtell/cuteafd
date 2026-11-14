@@ -1395,10 +1395,16 @@ impl<'a> Qwen4Engine<'a> {
     pub(crate) fn prepare_prefill_units(&self) -> Result<()> {
         let Some(shape) = self.prefill_shape else { return Ok(()) };
         let shape = shape.validate()?;
-        if self.workspace.borrow().is_none() {
-            *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
-                1, shape.slot_rows() as usize,
-                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
+        for owner in 0..self.gdn_banks.len() {
+            self.on_owner(owner, || {
+                let slot = self.workspace_slot(owner, false)?;
+                if slot.borrow().is_none() {
+                    *slot.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
+                        1, shape.slot_rows() as usize,
+                        if owner == 0 && self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
+                }
+                Ok(())
+            })?;
         }
         if self.weights.mtp.is_some() && self.mtp_prefill_workspace.borrow().is_none() {
             *self.mtp_prefill_workspace.borrow_mut() = Some(self.on_owner(0, ||
@@ -2364,8 +2370,6 @@ impl<'a> Qwen4Engine<'a> {
         scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<DeviceLogits>> {
         use crate::shared::prefill_pipeline::{sequence_units, run_prefill_units};
         let shape = self.prefill_shape.context("Qwen prefill unit shape")?.validate()?;
-        ensure!(self.gdn_banks.len() == 1 && self.hops.is_none(),
-            "Qwen prefill units require a single attention owner; dual-owner hop slots are not admitted");
         ensure!(self.experts.is_some(), "Qwen prefill units need admitted experts");
         let (t, start) = (tokens.len(), placement.len);
         validate_prefill_span(t, start, self.prefill_rows, self.max_context)?;
@@ -2379,43 +2383,49 @@ impl<'a> Qwen4Engine<'a> {
         let mut units = sequence_units(t, shape.unit_rows as usize, 1, self.weights.layers.len())?;
         for unit in &mut units { unit.slot = unit.index % waves; }
         let retained_rows = if scoring.is_some() { 1 } else { logit_rows };
-        let replace = self.workspace.borrow().as_ref().is_none_or(|w| w.rows != shape.unit_rows as usize
-            || w.slot_rows != shape.slot_rows() as usize || w.logit_rows < retained_rows);
-        if replace {
-            self.allow_workspace_creation()?;
-            self.drain_state()?;
-            *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
-                retained_rows, shape.slot_rows() as usize,
-                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
-            self.prepare_prefill_units()?;
+        for owner in 0..self.gdn_banks.len() {
+            self.on_owner(owner, || {
+                let slot = self.workspace_slot(owner, false)?;
+                let replace = slot.borrow().as_ref().is_none_or(|w| w.rows != shape.unit_rows as usize
+                    || w.slot_rows != shape.slot_rows() as usize || w.logit_rows < retained_rows);
+                if replace {
+                    self.allow_workspace_creation()?;
+                    self.drain_state()?;
+                    *slot.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
+                        retained_rows, shape.slot_rows() as usize,
+                        if owner == 0 && self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
+                }
+                Ok(())
+            })?;
         }
-        let workspace = self.workspace.borrow();
-        let w = workspace.as_ref().context("Qwen prefill workspace")?;
-        w.terminal_valid.set(false);
-        w.units.set(true);
+        self.prepare_prefill_units()?;
+        let root = self.workspace.borrow();
+        let peer = self.peer_workspace.borrow();
+        let w = root.as_ref().context("Qwen prefill workspace")?;
+        let work = [Some(w), peer.as_ref()];
+        for w in work.iter().flatten() { w.terminal_valid.set(false); w.units.set(true); }
         let unit_tables: Arc<Vec<_>> = Arc::new(units.iter().map(|unit| tables.unit(unit.rows.clone(),
             if self.ple.is_some() { self.cfg.ple_rows() } else { 0 }, self.cfg.dense_context())).collect());
         let ple_batch = self.ple.as_ref().map(|ple| ple.mapped().batch(Arc::clone(&unit_tables)
             as Arc<dyn crate::shared::mapped_table::RowSource>));
-        let run = |transport: Option<&mut crate::shared::spark_waves::Waves<'_>>| {
-            let mut hooks = UnitHooks { engine: self, transport, w, placement, tokens, tables: unit_tables, ple_batch,
-                current: vec![0; units.len()], entered: vec![false; units.len()],
-                pending: (0..units.len()).map(|_| None).collect(), logit_rows, scoring };
-            run_prefill_units(&mut hooks, &units, waves)
+        let mut links = match &self.experts {
+            Some(Experts::Hybrid(experts)) => experts.transport.iter().map(RefCell::borrow_mut).collect::<Vec<_>>(),
+            _ => Vec::new(),
         };
-        // Spark waves build, post and land on the link's exchange worker
-        // while this thread queues GPU work.
-        let result = match self.spark_link(0) {
-            Some(transport) => {
-                let staging = self.wave_staging_bytes(shape.unit_rows as usize)?;
-                let mut link = transport.borrow_mut();
-                let exchange = link.exchange()?;
-                ensure!(exchange.fits(staging), "Spark exchange staging is narrower than a prefill unit");
-                run(Some(exchange))
-            }
-            _ => run(None),
-        };
-        w.row_offset.set(0); w.logit_offset.set(0); w.position.set(0); w.units.set(false);
+        let mut transports = Vec::new();
+        for link in &mut links {
+            let exchange = link.exchange()?;
+            ensure!(exchange.fits(self.wave_staging_bytes(shape.unit_rows as usize)?),
+                "Spark exchange staging is narrower than a prefill unit");
+            transports.push(exchange);
+        }
+        let mut hooks = UnitHooks { engine: self, transports, work, placement, tokens,
+            tables: unit_tables, ple_batch, current: vec![[0; 2]; units.len()],
+            entered: vec![false; units.len()], pending: (0..units.len()).map(|_| None).collect(), logit_rows, scoring };
+        let result = run_prefill_units(&mut hooks, &units, waves);
+        for w in work.iter().flatten() {
+            w.row_offset.set(0); w.logit_offset.set(0); w.position.set(0); w.units.set(false);
+        }
         self.last_stream_offset.set(0);
         result?;
         w.terminal_valid.set(w.terminal_streams.is_some());
@@ -4037,14 +4047,13 @@ impl crate::shared::prefill_pipeline::PrefillHooks for PackedHooks<'_, '_, '_, '
 /// and rewritten on the execution stream before the hook that consumes them.
 struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
     engine: &'e Qwen4Engine<'a>,
-    /// The Spark link's exchange.
-    transport: Option<&'r mut crate::shared::spark_waves::Waves<'n>>,
-    w: &'w Workspace<'a>,
+    transports: Vec<&'r mut crate::shared::spark_waves::Waves<'n>>,
+    work: [Option<&'w Workspace<'a>>; 2],
     placement: &'p Qwen4Placement,
     tokens: &'t [u32],
     tables: Arc<Vec<StepTables>>,
     ple_batch: Option<Arc<crate::shared::mapped_table::RowBatch>>,
-    current: Vec<usize>,
+    current: Vec<[usize; 2]>,
     entered: Vec<bool>,
     pending: Vec<Option<crate::shared::mapped_table::PendingRows>>,
     logit_rows: usize,
@@ -4052,136 +4061,167 @@ struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
 }
 
 impl UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
-    fn select(&self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+    fn owner(&self, layer: usize) -> usize { self.engine.state_map.layers[layer].owner }
+    fn workspace(&self, owner: usize) -> Result<&Workspace<'_>> { self.work[owner].context("Qwen unit owner workspace") }
+    fn select(&self, owner: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let shape = self.engine.prefill_shape.context("Qwen prefill shape")?;
-        self.w.row_offset.set(Workspace::unit_offset(unit.slot, shape.unit_rows as usize));
-        self.w.position.set(self.tables[unit.index].positions[0] as usize);
-        self.engine.stage_step_tables(self.w, &self.tables[unit.index])
+        let w = self.workspace(owner)?;
+        w.row_offset.set(Workspace::unit_offset(unit.slot, shape.unit_rows as usize));
+        w.position.set(self.tables[unit.index].positions[0] as usize);
+        self.engine.stage_step_tables(w, &self.tables[unit.index])
     }
-
     fn enter(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit, posted: bool) -> Result<()> {
+        let owner = self.owner(index);
         let engine = self.engine;
-        if engine.cfg.ple_layers.contains(&index) {
-            *engine.ple_pending.borrow_mut() = self.pending[unit.index].take();
-            engine.finish_ple(self.w)?;
-        }
-        engine.enter(self.w, &mut self.current[unit.index], posted.then_some(()),
-            &engine.weights.layers[index], index, Scalar::I32(unit.rows.len() as i32), false)?;
+        engine.on_owner(owner, || {
+            self.select(owner, unit)?;
+            if engine.cfg.ple_layers.contains(&index) {
+                *engine.ple_pending.borrow_mut() = self.pending[unit.index].take();
+                engine.finish_ple(self.workspace(owner)?)?;
+            }
+            let w = self.work[owner].context("Qwen unit entry workspace")?;
+            engine.enter(w, &mut self.current[unit.index][owner], posted.then_some(()),
+                &engine.weights.layers[index], index, Scalar::I32(unit.rows.len() as i32), false)
+        })?;
         self.entered[unit.index] = true;
         Ok(())
     }
-
+    fn hop(&self, ordinal: usize, from: usize, to: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let engine = self.engine;
+        let src = self.workspace(from)?;
+        let dst = self.workspace(to)?;
+        let stride = HC * engine.cfg.hidden * 2;
+        let hops = engine.hops.as_ref().context("Qwen unit residual hops")?;
+        let ticket = hops.send(ordinal, 0, src.live(&src.streams[self.current[unit.index][from]], stride), unit.rows.len())?;
+        let landed = hops.land(ticket)?;
+        engine.on_owner(to, || {
+            self.select(to, unit)?;
+            let output = dst.live_buffer(&dst.streams[self.current[unit.index][to]], stride);
+            let input = cuteafd_ffi::CuteafdDeviceBuffer { ptr: landed, ..output };
+            // SAFETY: the admitted hop wait precedes the owner-local slot copy.
+            unsafe { crate::shared::memory::device::copy_device_ordered(engine.library, output, input,
+                unit.rows.len() * stride, engine.execution_stream()) }
+        })
+    }
     fn finish_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        let rows = Scalar::I32(unit.rows.len() as i32);
-        if layer + 1 < self.engine.weights.layers.len() {
-            if self.engine.cfg.ple_layers.contains(&(layer + 1)) {
-                self.engine.post(self.w, &mut self.current[unit.index], rows)?;
-                self.enter(layer + 1, unit, false)
-            } else { self.enter(layer + 1, unit, true) }
+        let owner = self.owner(layer);
+        let next = (layer + 1 < self.engine.weights.layers.len()).then_some(layer + 1);
+        let materialize = next.is_none_or(|next| self.owner(next) != owner || self.engine.cfg.ple_layers.contains(&next));
+        if materialize {
+            self.engine.on_owner(owner, || self.engine.post(self.work[owner].context("Qwen unit post workspace")?,
+                &mut self.current[unit.index][owner], Scalar::I32(unit.rows.len() as i32)))?;
+        }
+        if let Some(next) = next {
+            if self.owner(next) != owner { self.hop(0, owner, self.owner(next), unit)?; }
+            self.enter(next, unit, !materialize)
         } else {
-            self.engine.post(self.w, &mut self.current[unit.index], rows)
+            if owner != 0 { self.hop(1, owner, 0, unit)?; }
+            Ok(())
         }
     }
 }
 
 impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
     type Ticket = crate::shared::spark_waves::WaveTicket;
-
     fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
-        if self.engine.spark_layer(layer) {
-            crate::shared::prefill_pipeline::FfnRoute::Spark
-        } else { crate::shared::prefill_pipeline::FfnRoute::Local }
+        if self.engine.spark_layer(layer) { crate::shared::prefill_pipeline::FfnRoute::Spark }
+        else { crate::shared::prefill_pipeline::FfnRoute::Local }
     }
-
     fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        self.select(unit)?;
         let engine = self.engine;
-        if let Some(mapped) = engine.ple.as_ref().map(|p| p.mapped()) {
-            let batch = self.ple_batch.as_ref().context("PLE prefill batch ownership")?;
-            // Stage the units in flight before enqueueing this one (their rows
-            // are already in the row cache when the look-ahead reached them).
+        if let Some(mapped) = engine.ple.as_ref().map(|ple| ple.mapped()) {
+            let batch = self.ple_batch.as_ref().context("Qwen PLE prefill batch")?;
             for index in unit.index..(unit.index + mapped.depth()).min(self.pending.len()) {
-                if self.pending[index].is_none() {
-                    self.pending[index] = Some(mapped.begin_unit(batch, index, false)?);
+                if self.pending[index].is_none() { self.pending[index] = Some(mapped.begin_unit(batch, index, false)?); }
+            }
+        }
+        engine.on_owner(0, || {
+            self.select(0, unit)?;
+            let w = self.workspace(0)?;
+            engine.stage_embedding(w, &self.tokens[unit.rows.clone()], HC, &w.streams[0], false)?;
+            let start = self.tables[unit.index].positions[0] as usize;
+            let media = embedding_media(&[(self.placement, start, unit.rows.len())])?;
+            engine.inject_media(w, &media, &self.tables[unit.index].seq_first, &w.streams[0], unit.rows.len(), HC)
+        })
+    }
+    fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        if !self.entered[unit.index] { self.enter(layer, unit, false)?; }
+        let owner = self.owner(layer);
+        self.engine.on_owner(owner, || {
+            self.select(owner, unit)?;
+            let w = self.work[owner].context("Qwen unit attention workspace")?;
+            let rows = Scalar::I32(unit.rows.len() as i32);
+            let weights = &self.engine.weights.layers[layer];
+            match weights.attention {
+                Qwen4Attention::Gdn => self.engine.gdn(w, layer, weights, rows, "m4096", false)?,
+                Qwen4Attention::Full => self.engine.full(w, layer, weights, rows, "m4096", &self.tables[unit.index])?,
+            }
+            self.engine.post_pre(w, self.current[unit.index][owner], weights, "mlp", rows)?;
+            self.current[unit.index][owner] ^= 1;
+            Ok(())
+        })
+    }
+    fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let owner = self.owner(layer);
+        self.engine.on_owner(owner, || {
+            self.select(owner, unit)?;
+            self.engine.moe(self.workspace(owner)?, layer, &self.engine.weights.layers[layer],
+                unit.rows.len(), Scalar::I32(unit.rows.len() as i32), false)
+        })?;
+        self.finish_ffn(layer, unit)
+    }
+    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<Self::Ticket> {
+        let owner = self.owner(layer);
+        self.engine.on_owner(owner, || {
+            self.select(owner, unit)?;
+            let w = self.work[owner].context("Qwen unit send workspace")?;
+            let rows = Scalar::I32(unit.rows.len() as i32);
+            self.engine.moe_front(w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
+            self.engine.wave_send(w, layer, unit.rows.len(), rows, false,
+                self.transports.get_mut(owner).context("Qwen unit Spark owner link")?, unit.reply_origins()?)
+        })
+    }
+    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket) -> Result<()> {
+        let owner = self.owner(layer);
+        self.engine.on_owner(owner, || {
+            self.select(owner, unit)?;
+            let w = self.work[owner].context("Qwen unit land workspace")?;
+            self.engine.wave_land(w, unit.rows.len(), ticket, self.transports.get_mut(owner)
+                .context("Qwen unit Spark owner link")?)
+        })?;
+        self.finish_ffn(layer, unit)
+    }
+    fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let engine = self.engine;
+        engine.on_owner(0, || {
+            self.select(0, unit)?;
+            let w = self.workspace(0)?;
+            let cur = self.current[unit.index][0];
+            if let Some(terminal) = &w.terminal_streams {
+                let stride = HC * engine.cfg.hidden * 2;
+                let bytes = unit.rows.len() * stride;
+                let src = w.live_buffer(&w.streams[cur], stride);
+                let dst = Qwen4Engine::region(terminal, unit.rows.start * stride, bytes);
+                // SAFETY: unit owns its slot and distinct admitted terminal span.
+                unsafe { crate::shared::memory::device::copy_device_ordered(engine.library, dst, src, bytes, engine.execution_stream())?; }
+            }
+            let first = self.tokens.len() - self.logit_rows;
+            let count = unit.rows.end.saturating_sub(unit.rows.start.max(first));
+            if count > 0 && engine.weights.layers.len() == engine.cfg.layers {
+                let offset = unit.rows.start.max(first) - first;
+                if let Some(scoring) = self.scoring {
+                    engine.record_head(w, &w.streams[cur], unit.rows.len(), count,
+                        crate::shared::probe::ScoringRows { position: scoring.position + offset, ..scoring })?;
+                } else {
+                    w.logit_offset.set(offset);
+                    engine.head(w, &w.streams[cur], unit.rows.len(), Scalar::I32(unit.rows.len() as i32), count)?;
                 }
             }
-        }
-        engine.stage_embedding(self.w, &self.tokens[unit.rows.clone()], HC, &self.w.streams[0], false)?;
-        let start = self.tables[unit.index].positions[0] as usize;
-        let media = embedding_media(&[(self.placement, start, unit.rows.len())])?;
-        engine.inject_media(self.w, &media, &self.tables[unit.index].seq_first, &self.w.streams[0], unit.rows.len(), HC)
+            engine.last_streams.set((false, cur));
+            Ok(())
+        })
     }
-
-    fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        self.select(unit)?;
-        if !self.entered[unit.index] { self.enter(layer, unit, false)?; }
-        let engine = self.engine;
-        let rows = Scalar::I32(unit.rows.len() as i32);
-        let weights = &engine.weights.layers[layer];
-        match weights.attention {
-            Qwen4Attention::Gdn => engine.gdn(self.w, layer, weights, rows, "m4096", false)?,
-            Qwen4Attention::Full => engine.full(self.w, layer, weights, rows, "m4096", &self.tables[unit.index])?,
-        }
-        engine.post_pre(self.w, self.current[unit.index], weights, "mlp", rows)?;
-        self.current[unit.index] ^= 1;
-        Ok(())
-    }
-
-    fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        self.select(unit)?;
-        self.engine.moe(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(),
-            Scalar::I32(unit.rows.len() as i32), false)?;
-        self.finish_ffn(layer, unit)
-    }
-
-    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<Self::Ticket> {
-        self.select(unit)?;
-        let rows = Scalar::I32(unit.rows.len() as i32);
-        self.engine.moe_front(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
-        let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
-        self.engine.wave_send(self.w, layer, unit.rows.len(), rows, false, transport, unit.reply_origins()?)
-    }
-
-    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket)
-        -> Result<()> {
-        self.select(unit)?;
-        let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
-        self.engine.wave_land(self.w, unit.rows.len(), ticket, transport)?;
-        self.finish_ffn(layer, unit)
-    }
-
-    fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        self.select(unit)?;
-        let engine = self.engine;
-        let cur = self.current[unit.index];
-        if let Some(terminal) = &self.w.terminal_streams {
-            let stride = HC * engine.cfg.hidden * 2;
-            let bytes = unit.rows.len() * stride;
-            let src = self.w.live_buffer(&self.w.streams[cur], stride);
-            let dst = Qwen4Engine::region(terminal, unit.rows.start * stride, bytes);
-            // SAFETY: disjoint, admitted terminal and slot rows; the stream orders reuse.
-            unsafe { crate::shared::memory::device::copy_device_ordered(engine.library, dst, src, bytes, engine.execution_stream())?; }
-        }
-        let first = self.tokens.len() - self.logit_rows;
-        let count = unit.rows.end.saturating_sub(unit.rows.start.max(first));
-        if count > 0 && engine.weights.layers.len() == engine.cfg.layers {
-            let offset = unit.rows.start.max(first) - first;
-            if let Some(scoring) = self.scoring {
-                engine.record_head(self.w, &self.w.streams[cur], unit.rows.len(), count,
-                    crate::shared::probe::ScoringRows { position: scoring.position + offset, ..scoring })?;
-            } else {
-                self.w.logit_offset.set(offset);
-                engine.head(self.w, &self.w.streams[cur], unit.rows.len(), Scalar::I32(unit.rows.len() as i32), count)?;
-            }
-        }
-        engine.last_streams.set((false, cur));
-        Ok(())
-    }
-
-    fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
-        // State is causal per layer; terminal rows retain the exact span for MTP.
-        Ok(())
-    }
+    fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
 }
 
 fn validate_prefill_span(rows: usize, start: usize, admitted_span: usize, max_context: usize) -> Result<()> {
@@ -4204,8 +4244,7 @@ mod gather_recovery_tests {
         assert_eq!(body.matches("pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),").count(), 4);
         let cancel = body.split("    fn cancel_submission(").nth(1).unwrap().split("    pub(crate) fn drain_state(").next().unwrap();
         assert!(cancel.contains("self.gdn_banks.len() == 1 && self.hops.is_none()"));
-        assert!(cancel.contains("None | Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::SharedOnly)"));
-        assert!(!cancel.contains("Experts::Tp2") && !cancel.contains("Experts::Spark"));
+        assert!(cancel.contains("!self.has_sparks()"));
         // Drop tickets, drain the consumers, then the table's own copies, then the graph boundary.
         let order = ["self.ple_pending.borrow_mut().take()", "self.drain_state()?", "ple.mapped().drain()?",
             "w.terminal_valid.set(false)", "self.graph_completed()"];
@@ -4257,7 +4296,7 @@ mod prefill_unit_tests {
         assert!(!head.contains("workspace("));
         let hooks = source.split_once("struct UnitHooks<").unwrap().1
             .split_once("fn validate_prefill_span(").unwrap().0;
-        assert!(hooks.contains("engine.record_head(self.w, &self.w.streams[cur]"));
+        assert!(hooks.contains("engine.record_head(w, &w.streams[cur]"));
     }
 
     #[test]
