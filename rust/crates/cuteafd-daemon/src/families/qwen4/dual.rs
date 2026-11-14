@@ -172,7 +172,8 @@ impl Opened {
             "Qwen dual selectable weight residency disagrees with admission");
         let ple = match self.cfg.ple_layers.first().copied().filter(|&layer| layer < layers) {
             Some(layer) => Some(devices[owners[layer]].run(|| ple::PleTable::load(&self.library, &self.checkpoint,
-                &self.cfg, layer, args.prefill_rows, 1, engine::DECODE_ROWS))?), None => None,
+                &self.cfg, layer, args.prefill_wave_rows(), args.resolved_prefill()?.waves as usize,
+                engine::DECODE_ROWS))?), None => None,
         };
         weights::arena::probe(&self.library, &[devices[0].id, devices[1].id], &model, &embedding)?;
         let admitted = admission::ExpertAdmission { placement: placement.clone(),

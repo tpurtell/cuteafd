@@ -340,6 +340,7 @@ fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::
         let intake_rows = if waves == 1 { unit_rows } else {
             crate::serving_capacity::PrefillShape { unit_rows, waves }.validate()?.slot_rows() };
         super::spark_host_transport(report, options, input, false, unit_rows, intake_rows, 1)?
+            .map(|bytes| bytes * owners as u64)
     } else { [0; 3] };
     let host_embedding = if options.host_embedding || report.memory_layout.as_ref().is_some_and(|m|
         m.notes.iter().any(|n| n.starts_with("embedding placement: host"))) {
@@ -666,8 +667,10 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let catalog = input.expert_catalog()?;
     let costs = qwen4::dual_expert_costs(&catalog, cfg.layers)?;
     let lib = crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()).join("libcuteafd_native.so");
-    let packages = qwen4::dual_packages(&catalog, &lib)?;
-    let experts = qwen4::QwenExperts::read(&catalog, &lib, cfg.layers, 2, rows.max(64))?;
+    let unit_rows = options.prefill_unit_rows.unwrap_or(rows);
+    let prefill_shape = (options.prefill_waves > 1).then_some(crate::serving_capacity::PrefillShape {
+        unit_rows, waves: options.prefill_waves }).map(|shape| shape.validate()).transpose()?;
+    let experts = qwen4::QwenExperts::read(&catalog, &lib, cfg.layers, 2, unit_rows.max(64))?;
     let host = options.host_embedding;
     // The loader's own arenas at the fixed cut; the head, entry mixer, MTP and
     // a device embedding are views in them, not separate owner0 demands.
@@ -680,7 +683,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
             .with_resident_weights(crate::placement::ResidentWeights(options.drafter_bytes)));
     }
     fixed.extend(qwen4::dual_projection_load_staging(selected));
-    if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, rows)?); }
+    if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, unit_rows.max(64))?); }
     let extra = qwen4::dual_ple_demands(&cfg, cfg.layers, &resident)?;
     let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(concurrency,
@@ -692,7 +695,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
         experts: Some(experts), blas_head: if options.qwen_representation.fp8_head { crate::placement::planner::serving::BlasHead::Native } else { options.bf16_target_head },
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), context: crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)),
         owner_manifests,
-        admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
+        admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.resolved_state_slots("qwen4"),
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,
             ple, future_expert_bytes: 0, headroom },

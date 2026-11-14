@@ -1105,14 +1105,14 @@ impl Recipe for QwenDual<'_> {
                 PlanLifetime::RESIDENT, self.maximum_pages));
             components.push(owner(format!("qwen.owner{gpu}.hops"), location, self.hop_bytes[gpu],
                 Category::Transport, "residual hops", PlanLifetime::RESIDENT, self.maximum_pages));
-            let admitted = qwen_admission(&QwenAdmissionInputs { prefill_shape: None, cfg,
-                layers: a.layers, mtp: a.mtp, kv_format: a.kv_format,
+            let admitted = qwen_admission(&QwenAdmissionInputs { prefill_shape: a.prefill_shape, cfg,
+                layers: a.layers, mtp: gpu == 0 && a.mtp, kv_format: a.kv_format,
                 manifest: inputs.owner_manifests[gpu].or(a.manifest), prefill_rows: a.prefill_rows,
                 slots: a.slots, mark_bytes: a.mark_bytes,
                 ple: a.ple, future_expert_bytes: 0, headroom: a.headroom })
                 .map_err(|error| Refusal::InvalidFact(format!("Qwen owner admission: {error}")))?;
             for (index, &(category, group, bytes)) in admitted.items.iter().enumerate() {
-                if !matches!(group, "decode step" | "prefill step") { continue; }
+                if !matches!(group, "decode step" | "prefill step" | "prefill MTP step") { continue; }
                 components.push(owner(format!("qwen.owner{gpu}.step.{index}"), location, bytes,
                     category, group, PlanLifetime::RESIDENT, self.maximum_pages));
             }

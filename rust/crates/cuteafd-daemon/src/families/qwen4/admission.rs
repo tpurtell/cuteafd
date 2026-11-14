@@ -114,7 +114,7 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     use cuteafd_loader::families::qwen4::{resident::Qwen4Representation, weight_layout};
     use cuteafd_loader::placement::Demand;
     use crate::shared::experts::rtx::push::PushPolicy;
-    let rows = args.prefill_rows.max(super::engine::DECODE_ROWS);
+    let rows = args.prefill_wave_rows().max(super::engine::DECODE_ROWS);
     ensure!(args.shared_only || args.expert_window.is_none(),
         "Qwen placement requires resident experts; diagnostic expert paging is not admitted");
     let sparks = args.peers.as_ref().map_or(0, |peers| peers.split(',').count());
@@ -295,9 +295,10 @@ fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, 
         let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(cfg.hidden)?,
             experts: u32::try_from(cfg.experts)?, topk: u32::try_from(cfg.topk)?,
             intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)? };
-        cuteafd_loader::serving_capacity::spark_host_transport(geometry,
+        let bytes = cuteafd_loader::serving_capacity::spark_host_transport(geometry,
             cuteafd_loader::plan::layout::spark_endpoints("qwen4", 1), spark_ranks, false, true,
-            spark_bf16, unit_rows, intake_rows, waves, None)?
+            spark_bf16, unit_rows, intake_rows, waves, None)?;
+        bytes.map(|bytes| bytes * owners as u64)
     } else { [0; 3] };
     Ok(QwenHost {
         memory: HostMemory { total, available },
@@ -328,7 +329,7 @@ pub(super) fn dual_experts(args: &EngineArgs, catalog: &cuteafd_loader::Official
     use anyhow::{ensure, Context};
     use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2};
     use cuteafd_loader::formats::fp8_experts::Slicing;
-    let rows = args.prefill_rows.max(super::engine::DECODE_ROWS);
+    let rows = args.prefill_wave_rows().max(super::engine::DECODE_ROWS);
     let costs = qwen4::dual_expert_costs(catalog, layers)?;
     let wire = catalog.exl3().is_some();
     let (packages, backend_workspace) = if let Some(exl3) = catalog.exl3() {
