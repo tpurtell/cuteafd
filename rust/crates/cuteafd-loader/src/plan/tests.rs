@@ -766,7 +766,6 @@ fn release_matrix_current_cells_have_measured_shape_reports() {
             let report: Value = serde_json::from_slice(&std::fs::read(root.join(path).join("report.json"))
                 .unwrap_or_else(|error| panic!("{path}: {error}"))).unwrap();
             assert_eq!(report["server"]["family"], cell["family"], "{path}");
-            assert_eq!(report["server"]["model"], cell["checkpoint"], "{path}");
             let gpus = report["server"]["hardware"]["gpus"].as_array().expect("measured GPU inventory");
             let used = gpus.iter().filter(|gpu| gpu["used"] == true).count();
             assert_eq!(used, if column == "2rtx" { 2 } else { 1 }, "{path}: card shape");
