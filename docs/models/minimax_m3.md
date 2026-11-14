@@ -70,6 +70,13 @@ half of release padding, with graph slack zero. Both GPUs record zero
 power-cap/thermal slowdown at 425 W each; basic busy SM means 2805.5/2851.2 MHz,
 max temperatures 56/62 C and minimum T.Limit headroom 37/34 C.
 
+The canonical [two-RTX Release smoke](../../benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-flash-min-cand-r1/report.svg)
+on the same seal supplies the matrix row: C1/C8/C16 18.54/83.43/125.91 tok/s,
+8K prefill 2227 tok/s (tail 2060), pool 2,097,152 and readiness 69.61 s.
+Fidelity, exact restore, tool and greedy checks pass. Both GPUs record zero
+power-cap/thermal slowdown, busy SM means 2804.1/2850.7 MHz, max56/61 C and
+minimum T.Limit headroom37/33 C at reported420-425/425 W caps.
+
 ## Changelog
 
 | Date | Change | Evidence |
