@@ -100,8 +100,8 @@ bench_dir="$HOME/.cache/cuteafd/bench"
 fidelity_cache="$HOME/.cache/cuteafd/fidelity"
 api_args=() api_mount_args=() probe_args=() trace_args=() bench_nonce_env_args=() graph_census_args=()
 profile_args=() profile_wrapper=() profile_wrapper_args=()
-shared_env_args=(-e CUTEAFD_SPARK_INTAKE=auto -e CUTEAFD_CONSOLE_TEXT=true -e CUTEAFD_ATTENTION_PLACEMENT=auto -e CUTEAFD_FP8_EXPERT_PREFILL=auto)
-shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on)
+shared_env_args=(-e CUTEAFD_SPARK_INTAKE=auto -e CUTEAFD_CONSOLE_TEXT=true -e CUTEAFD_ATTENTION_PLACEMENT=auto -e CUTEAFD_FP8_PREFILL=auto)
+shared_worker_env_args=(-e CUTEAFD_FP8_PREFILL=auto -e CUTEAFD_THERMAL=on)
 thermal_args=(-e CUTEAFD_THERMAL=on)
 v41_fp8_head_args=()
 v41_l2_prefetch=

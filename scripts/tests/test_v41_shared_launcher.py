@@ -31,7 +31,7 @@ INTENDED = {
         "CUTEAFD_SPARK_INTAKE": "auto",
         "CUTEAFD_CONSOLE_TEXT": "true",
         "CUTEAFD_ATTENTION_PLACEMENT": "auto",
-        "CUTEAFD_FP8_EXPERT_PREFILL": "auto",
+        "CUTEAFD_FP8_PREFILL": "auto",
         # Admission follows the launcher's bounded readiness deadline.
         "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS": "30",
         # shared_trace_args: the shared draft policy switches, default off.
@@ -44,7 +44,7 @@ INTENDED = {
     "worker": {
 
         # shared_worker_env_args: FP8 prefill form and the worker's sampler.
-        "CUTEAFD_FP8_EXPERT_PREFILL": "auto",
+        "CUTEAFD_FP8_PREFILL": "auto",
         "CUTEAFD_THERMAL": "on",
     },
 }

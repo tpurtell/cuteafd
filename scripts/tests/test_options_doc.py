@@ -204,12 +204,12 @@ def test_unset_defaults_preserve_resolved_value_annotations(monkeypatch, tmp_pat
     doc.write_text(
         "## Test\n| Key | Default |\n| --- | --- |\n"
         "| `CORE_VIEW` | unset (= `original`) |\n"
-        "| `GLM5_FLASH_ATTENTION_FP8_PREFILL` | unset (= `mla`) |\n"
+        "| `FP8_PREFILL` | unset (= `auto`) |\n"
         "| `GLM5_FLASH_KDA_FP8` | unset (`auto` = `off`) |\n"
         "| `EXPERT_USAGE` | `on` |\n")
     monkeypatch.setitem(globals(), "DOC", doc)
     assert parse_defaults() == {
-        "CORE_VIEW": "unset", "GLM5_FLASH_ATTENTION_FP8_PREFILL": "unset",
+        "CORE_VIEW": "unset", "FP8_PREFILL": "unset",
         "GLM5_FLASH_KDA_FP8": "unset", "EXPERT_USAGE": "on",
     }
 
