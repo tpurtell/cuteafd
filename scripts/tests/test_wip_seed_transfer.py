@@ -372,7 +372,7 @@ printf '%s|%s|%s\\n' "${wip_target_hosts[*]}" "${wip_container_hosts[*]}" "$wip_
     # Distribution and fingerprint checks iterate the targets; containers, process
     # checks and --recreate cover the seed's build container too.
     assert WIP.count('for host in "${wip_target_hosts[@]}"; do') == 4
-    assert WIP.count('"${wip_container_hosts[@]}"') == 6
+    assert WIP.count('"${wip_container_hosts[@]}"') == 7  # includes immutable per-host image pinning
 
 
 def test_legacy_wip_sh_with_a_six_spark_union_and_an_outside_seed_is_refused_early(entry, tmp_path, monkeypatch):
@@ -470,12 +470,14 @@ def test_dev_image_identity_is_its_layers_not_its_store_specific_id(tmp_path):
     script = _function('spark_image_layers') + _function('distribute_spark_dev_image') + '''
 release_die() { echo "die: $*" >&2; exit 2; }
 stream_between_hosts() { printf 'send %s -> %s\\n' "$1" "$3" >> "$TRACE"; }
-seed_host=ostrich wip_target_hosts=(dodo emu kiwi) wip_seed_rdma=1 SPARK_EXPERT_DOCKER_DEV=img
+seed_host=ostrich wip_target_hosts=(dodo emu kiwi) wip_seed_rdma=1 SPARK_EXPERT_DOCKER_DEV=pinned wip_spark_image_ref=img
 distribute_spark_dev_image
 '''
     ssh = '''host=$3
 case "$*" in
   *RootFS.Layers*) case "$host" in kiwi) echo '["sha256:old"]' ;; *) echo '["sha256:new"]' ;; esac ;;
+  *'{{.Id}}'*) echo "id-$host" ;;
+  *'docker tag'*) exit 0 ;;
   *) exit 1 ;;
 esac'''
     result, trace = _bash(script, tmp_path, {'ssh': ssh})

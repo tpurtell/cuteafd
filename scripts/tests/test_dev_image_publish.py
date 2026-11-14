@@ -16,7 +16,8 @@ SPEC.loader.exec_module(TOOLCHAIN)
 def fixture_repo(tmp_path):
     repo = tmp_path / 'repo'
     for name in ('scripts/build/build-dev-images.sh', 'scripts/build/dev-toolchain.py',
-                 'scripts/build/install-dev-cache-tools.sh', 'scripts/build/assert-build-filesystem.py',
+                 'scripts/build/install-dev-cache-tools.sh', 'scripts/build/install-nsys.sh',
+                 'scripts/build/assert-build-filesystem.py',
                  'scripts/lib/release-common.sh', 'scripts/lib/checkpoint-family.py', 'scripts/lib/cdi-gpus.sh', 'scripts/lib/build-supervision.sh', 'docker/Dockerfile.dev', 'docker/entrypoint.sh', '.dockerignore'):
         dest = repo / name
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -266,3 +267,26 @@ def test_identity_excludes_kernel_pin_and_includes_tool_versions(tmp_path):
     dockerfile = repo / 'docker/Dockerfile.dev'
     dockerfile.write_text(dockerfile.read_text().replace('1.98.1', '1.98.2'))
     assert TOOLCHAIN.identity(repo) != before
+
+
+def test_identity_includes_profiler_installer(tmp_path):
+    repo, _, _ = fixture_repo(tmp_path)
+    before = TOOLCHAIN.identity(repo)
+    installer = repo / 'scripts/build/install-nsys.sh'
+    installer.write_text(installer.read_text() + '\n# changed package pin\n')
+    assert TOOLCHAIN.identity(repo) != before
+
+
+def test_dev_and_release_pin_the_same_profiler_and_override_cuda_path():
+    version = '2026.6.1.251-266139333969v0'
+    for name in ('dev', 'release'):
+        dockerfile = (ROOT / f'docker/Dockerfile.{name}').read_text()
+        assert f'ARG NSYS_VERSION={version}' in dockerfile
+        assert 'COPY scripts/build/install-nsys.sh' in dockerfile
+        assert 'RUN NSYS_VERSION=${NSYS_VERSION} bash /opt/cuteafd/install-nsys.sh' in dockerfile
+    installer = (ROOT / 'scripts/build/install-nsys.sh').read_text()
+    assert f'"$NSYS_VERSION" == {version}' in installer
+    assert 'ln -sf "$bin" /usr/local/cuda/bin/nsys' in installer
+    assert 'sha256sum --check --strict' in installer
+    build = (ROOT / 'scripts/build/build-dev-images.sh').read_text()
+    assert 'scripts/build/install-dev-cache-tools.sh scripts/build/install-nsys.sh "$seed_host:$remote_dir/"' in build

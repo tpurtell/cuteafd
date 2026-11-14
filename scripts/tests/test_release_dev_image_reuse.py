@@ -30,7 +30,7 @@ class DevImageReuseTest(unittest.TestCase):
         self.dockerfile = b'ARG RUST_TOOLCHAIN=1.98.1\n'
         (self.source / 'docker/Dockerfile.dev').write_bytes(self.dockerfile)
         (self.source / 'docker/entrypoint.sh').write_bytes(b'entrypoint')
-        for name in ('install-dev-cache-tools.sh', 'dev-toolchain.py'):
+        for name in ('install-dev-cache-tools.sh', 'install-nsys.sh', 'dev-toolchain.py'):
             (self.source / 'scripts/build' / name).write_bytes(b'toolchain input')
         self.lock = {'revision': REVISION, 'source_tree_sha256': 'c' * 64}
         (self.source / 'third_party/transformers.lock.json').write_text(json.dumps(self.lock))

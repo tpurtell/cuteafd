@@ -266,6 +266,13 @@ if release_is_lan_seed "$seed_host" && [[ "$role" != coordinator ]] && ((seed_ex
 fi
 
 wip_build_resource_release() {
+  if [[ -n "${wip_transport_image:-}" ]]; then
+    local host
+    for host in "${wip_transport_hosts[@]}"; do
+      timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" docker image rm "$wip_transport_image" >/dev/null 2>&1 || true
+    done
+    unset wip_transport_image
+  fi
   [[ -n "${wip_build_resource_pid:-}" ]] || return 0
   if [[ "${wip_resource_complete:-0}" == 1 ]]; then
     printf x >"$wip_build_resource_dir/release"
@@ -318,7 +325,11 @@ wip_build_resource_acquire() {
       wip_seed_addr="$(python3 "$repo_root/scripts/build/seed-transfer.py" lan-addr "$seed_host")" ||
         release_die "WIP seed $seed_host has no reachable LAN address"
     fi
-    ensure_seed_image
+    if [[ -z "${wip_spark_image_ids[$seed_host]:-}" ]]; then
+      wip_transport_hosts+=("$seed_host")
+      stream_between_hosts "$original_seed" "docker image save '$SPARK_EXPERT_DOCKER_DEV'" "$seed_host" 'docker image load'
+      wip_pin_spark_host "$seed_host"
+    fi
     ensure_remote_container "$seed_host"
   fi
 }
@@ -406,7 +417,7 @@ ensure_seed_image() (
     release_validate_path_setting remote_source "$remote_source"
     trap 'release_ssh "$seed_host" "rm -rf $remote_source" >/dev/null 2>&1 || true' EXIT
     tar -C "$staging_dir" -cf - docker/Dockerfile.dev docker/entrypoint.sh \
-      scripts/build/install-dev-cache-tools.sh scripts/build/dev-toolchain.py \
+      scripts/build/install-dev-cache-tools.sh scripts/build/install-nsys.sh scripts/build/dev-toolchain.py \
       scripts/build/select-dev-image.py scripts/build/assert-build-filesystem.py .dockerignore |
       release_ssh "$seed_host" "tar -C $remote_source -xf -"
     release_ssh "$seed_host" setsid --wait bash -s -- "$remote_source" "$SPARK_EXPERT_DOCKER_DEV" \
@@ -504,6 +515,36 @@ else
 fi
 trap wip_build_resource_release EXIT
 
+# A local dev-image rebuild moves the shared default tags immediately. Freeze
+# this invocation before container checks or cache keys can observe a retag.
+wip_pin_dev_images() {
+  COORDINATOR_DOCKER_DEV="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
+  [[ "$COORDINATOR_DOCKER_DEV" =~ ^sha256:[0-9a-f]{64}$ ]] || release_die 'invalid coordinator development image ID'
+  ((wip_spark_leg)) || return 0
+  local image_id
+  wip_spark_image_ref="$SPARK_EXPERT_DOCKER_DEV"
+  image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || release_die 'invalid Spark development image ID'
+  wip_spark_image_layers="$(spark_image_layers "$seed_host" "$image_id")"
+  [[ -n "$wip_spark_image_layers" ]] || release_die 'missing Spark development image layers'
+  # docker save by ID loses tags; use a content-addressed transport tag, then
+  # resolve a local immutable ID on each receiver (image stores can differ).
+  SPARK_EXPERT_DOCKER_DEV="cuteafd-spark-expert-dev:pinned-${image_id#sha256:}-$BASHPID"
+  wip_transport_image="$SPARK_EXPERT_DOCKER_DEV"
+  wip_transport_hosts=("$seed_host" "${wip_target_hosts[@]}")
+  ssh -o BatchMode=yes "$seed_host" docker tag "$image_id" "$SPARK_EXPERT_DOCKER_DEV"
+}
+
+declare -A wip_spark_image_ids=()
+wip_pin_spark_host() {
+  local host="$1" image_id layers
+  image_id="$(ssh -o BatchMode=yes "$host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || release_die "invalid development image ID on $host"
+  layers="$(spark_image_layers "$host" "$image_id")"
+  [[ "$layers" == "$wip_spark_image_layers" ]] || release_die "development image changed on $host during this build"
+  wip_spark_image_ids["$host"]="$image_id"
+}
+
 # stream_between_hosts SRC SRC_CMD DST DST_CMD: SRC_CMD's stdout into DST_CMD's stdin, over
 # rdmapipe when both hosts have it, otherwise a plain ssh pipe relayed through this host (the
 # fallback scripts/build/build-dev-images.sh uses for the development images).
@@ -536,8 +577,12 @@ distribute_spark_dev_image() {
   local -a targets=()
   local host remote_id
   for host in "${wip_target_hosts[@]}"; do
-    remote_id="$(spark_image_layers "$host" "$SPARK_EXPERT_DOCKER_DEV")"
-    [[ "$remote_id" == "$seed_id" ]] || targets+=("$host")
+    remote_id="$(ssh -o BatchMode=yes "$host" "docker image inspect -f '{{.Id}}' '$wip_spark_image_ref' 2>/dev/null || true")"
+    if [[ -n "$remote_id" && "$(spark_image_layers "$host" "$remote_id")" == "$seed_id" ]]; then
+      ssh -o BatchMode=yes "$host" docker tag "$remote_id" "$SPARK_EXPERT_DOCKER_DEV"
+    else
+      targets+=("$host")
+    fi
   done
   ((${#targets[@]})) || return 0
   local source="$seed_host"
@@ -659,8 +704,12 @@ preflight_existing_container_images() {
   done
 }
 
+wip_pin_dev_images
 preflight_existing_container_images
-((wip_spark_leg == 0)) || distribute_spark_dev_image
+if ((wip_spark_leg)); then
+  distribute_spark_dev_image
+  for host in "${wip_container_hosts[@]}"; do wip_pin_spark_host "$host"; done
+fi
 
 # wip_container_gpu_ok CONTAINER: its GPU still answers NVML.
 wip_container_gpu_ok() {
@@ -744,7 +793,7 @@ ensure_remote_container() {
     fi
   }
   ssh -o BatchMode=yes "$host" bash -s -- \
-    "$spark_container" "$SPARK_EXPERT_DOCKER_DEV" \
+    "$spark_container" "${wip_spark_image_ids[$host]}" \
     "$(printf '%q' "${CUTEAFD_KACHE_SPARK:-__unset__}")" \
     "$(printf '%q' "${CUTEAFD_KACHE_REMOTE:-__unset__}")" \
     "$(printf '%q' "${CUTEAFD_KACHE_SPARK_CACHE_DIR:-__unset__}")" \
@@ -878,7 +927,7 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
     "$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")" | sha256sum | awk '{print $1}')"
   if ((wip_spark_leg)); then
     wip_expert_key="$(printf '%s spark-expert %s\n' "$wip_build_key" \
-      "$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")" | sha256sum | awk '{print $1}')"
+      "${wip_spark_image_ids[$seed_host]}" | sha256sum | awk '{print $1}')"
   fi
   echo "WIP build key: $wip_build_key (coordinator $wip_coordinator_key${wip_expert_key:+, expert $wip_expert_key})"
 fi
@@ -1467,8 +1516,8 @@ build_expert() (
   echo "== incrementally building Spark expert slot $slot on $seed_host =="
   sync_seed_source
   local image_id image_layers
-  image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
-  image_layers="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{json .RootFS.Layers}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  image_id="${wip_spark_image_ids[$seed_host]}"
+  image_layers="$wip_spark_image_layers"
   local cache_wrapper= cuda_cache=0
   if [[ "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
     if ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" test -d /opt/cuteafd-sccache-cache; then
@@ -1532,7 +1581,7 @@ build_expert() (
   timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" ${exlr8_remote[@]+"${exlr8_remote[@]}"} "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
-    "$SPARK_EXPERT_DOCKER_DEV" "$image_id" "$(printf '%q' "$image_layers")"
+    "$image_id" "$image_id" "$(printf '%q' "$image_layers")"
 )
 
 # Role builders end here.

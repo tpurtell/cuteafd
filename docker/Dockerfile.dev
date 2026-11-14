@@ -61,6 +61,11 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},shar
 
 # Toolchain only: kernels and their lock come from the mounted checkout.
 RUN uv pip check
+
+ARG NSYS_VERSION=2026.6.1.251-266139333969v0
+COPY scripts/build/install-nsys.sh /opt/cuteafd/install-nsys.sh
+RUN NSYS_VERSION=${NSYS_VERSION} bash /opt/cuteafd/install-nsys.sh
+
 ARG BASE_IMAGE
 ARG CUTEAFD_ENGINE_COMMIT=unknown
 ARG CUTEAFD_TOOLCHAIN_HASH=unknown
@@ -72,6 +77,7 @@ LABEL org.opencontainers.image.source="https://github.com/tpurtell/cuteafd" \
       io.cuteafd.cutlass-dsl.version="4.8.1" \
       io.cuteafd.kache.version=${KACHE_VERSION} \
       io.cuteafd.sccache.version=${SCCACHE_VERSION} \
+      io.cuteafd.nsys.version=${NSYS_VERSION} \
       io.cuteafd.toolchain.hash=${CUTEAFD_TOOLCHAIN_HASH}
 
 WORKDIR /workspace/cuteafd

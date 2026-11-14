@@ -856,6 +856,7 @@ repo_root={str(ROOT)!r}
 sync_seed_source() {{ :; }}
 release_die() {{ exit 2; }}
 slot=test seed_host=rhea spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
+wip_spark_image_layers='[]'; declare -A wip_spark_image_ids=([rhea]=image)
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
 wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
@@ -1471,6 +1472,25 @@ def test_binary_without_sweep_fields_is_refused(entry, tmp_path, monkeypatch):
         cards.binary_supports('/old/cuteafd', ROOT, job, ['levels', 'post_load_c1'])
     monkeypatch.setattr(cards.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stderr='levels=Some([1]) post_load_c1=true', stdout=''))
     cards.binary_supports('/new/cuteafd', ROOT, job, ['levels', 'post_load_c1'])
+
+
+def test_toolchain_hash_matches_canonical_head_identity():
+    canonical = subprocess.run([sys.executable, str(ROOT / 'scripts/build/dev-toolchain.py')],
+                               capture_output=True, text=True, check=True).stdout.strip()
+    assert cards.toolchain_hash('HEAD') == canonical
+
+
+def test_toolchain_hash_legacy_revisions_keep_the_original_inputs(monkeypatch):
+    import hashlib
+    inputs = ('docker/Dockerfile.dev', 'docker/entrypoint.sh',
+              'scripts/build/install-dev-cache-tools.sh', 'scripts/build/dev-toolchain.py')
+    blobs = {name: b'# legacy input\n' for name in inputs}
+    expected = hashlib.sha256()
+    for name in inputs:
+        expected.update(name.encode() + b'\0' + blobs[name] + b'\0')
+    monkeypatch.setattr(cards.subprocess, 'run', lambda argv, **kwargs:
+                        SimpleNamespace(returncode=0, stdout=blobs[argv[-1].split(':', 1)[1]]))
+    assert cards.toolchain_hash('legacy') == expected.hexdigest()[:16]
 
 
 def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_path, monkeypatch):
@@ -2531,6 +2551,7 @@ repo_root={str(ROOT)!r}
 sync_seed_source() {{ :; }}
 release_die() {{ exit 2; }}
 slot=test seed_host=kakapo spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
+wip_spark_image_layers='[]'; declare -A wip_spark_image_ids=([kakapo]=image)
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
 wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$

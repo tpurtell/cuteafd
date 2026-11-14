@@ -165,7 +165,7 @@ build_expert_dev() (
   ssh -o BatchMode=yes "$seed_host" python3 - "$remote_dir" <"$repo_root/scripts/build/assert-build-filesystem.py"
   ssh -o BatchMode=yes "$seed_host" "mkdir -p '$remote_dir'"
   (cd "$repo_root" && rsync -aR --delete --exclude .git .dockerignore docker/ \
-    scripts/build/install-dev-cache-tools.sh "$seed_host:$remote_dir/")
+    scripts/build/install-dev-cache-tools.sh scripts/build/install-nsys.sh "$seed_host:$remote_dir/")
   ssh -o BatchMode=yes "$seed_host" setsid --wait bash -s -- \
     "$run_id" "$remote_dir" "$base_arm64" "$revision" "$hash" "$spark_tag" <<'REMOTE'
 set -euo pipefail

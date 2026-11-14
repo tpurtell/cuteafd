@@ -38,7 +38,8 @@ def test_toolchain_hash_intentionally_covers_cache_syntax(tmp_path):
     toolchain = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(toolchain)
     for name in ('docker/Dockerfile.dev', 'docker/entrypoint.sh',
-                 'scripts/build/install-dev-cache-tools.sh', 'scripts/build/dev-toolchain.py'):
+                 'scripts/build/install-dev-cache-tools.sh', 'scripts/build/install-nsys.sh',
+                 'scripts/build/dev-toolchain.py'):
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((ROOT / name).read_bytes())

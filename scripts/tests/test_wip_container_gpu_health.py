@@ -11,6 +11,47 @@ ROOT = Path(__file__).resolve().parents[2]
 WIP = (ROOT / 'wip.sh').read_text()
 
 
+def test_build_pins_images_across_shared_default_retag(tmp_path):
+    start = WIP.index('wip_pin_dev_images() {')
+    end = WIP.index('# stream_between_hosts SRC', start)
+    old, new, remote = ('sha256:' + char * 64 for char in ('a', 'b', 'c'))
+    script = f'''set -euo pipefail
+release_die() {{ echo "$*" >&2; exit 9; }}
+default={old}
+docker() {{ printf '%s\\n' "$default"; }}
+ssh() {{
+  case "$*" in
+    *"docker tag"*) return 0 ;;
+    *"docker image inspect"*)
+      if [[ "$*" == *"pinned-"* || "$*" == *"{old}"* ]]; then echo {remote}; else echo "$default"; fi ;;
+  esac
+}}
+spark_image_layers() {{ echo '["layer-a"]'; }}
+COORDINATOR_DOCKER_DEV=coordinator-default
+SPARK_EXPERT_DOCKER_DEV=spark-default
+seed_host=seed wip_spark_leg=1
+wip_target_hosts=(receiver)
+{WIP[start:end]}
+wip_pin_dev_images
+default={new}
+wip_pin_spark_host seed
+wip_pin_spark_host receiver
+[[ "$COORDINATOR_DOCKER_DEV" == {old} ]]
+[[ "$SPARK_EXPERT_DOCKER_DEV" == cuteafd-spark-expert-dev:pinned-a* ]]
+[[ "${{wip_spark_image_ids[seed]}}" == {remote} ]]
+[[ "${{wip_spark_image_ids[receiver]}}" == {remote} ]]
+spark_image_layers() {{ echo '["wrong-layer"]'; }}
+wip_pin_spark_host replacement
+'''
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+    assert result.returncode == 9, result.stderr
+    assert 'development image changed on replacement during this build' in result.stderr
+    assert WIP.index('wip_pin_dev_images\npreflight_existing_container_images') < WIP.index('# Each role\'s key')
+    assert '"$spark_container" "${wip_spark_image_ids[$host]}"' in WIP
+    assert 'image_id="${wip_spark_image_ids[$seed_host]}"' in WIP
+    assert 'docker image rm "$wip_transport_image"' in WIP
+
+
 def _functions():
     start = WIP.index('# wip_container_gpu_ok CONTAINER')
     end = WIP.index('\n}\n', WIP.index('ensure_local_container() {')) + 3

@@ -52,6 +52,7 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
     command = ('set -euo pipefail\nrelease_die() { printf "%s\\n" "$*" >&2; exit 2; }\n' + validation + '\n'
                'slot=test; coordinator_container=coordinator; spark_container=spark; seed_host=fixture\n'
                'COORDINATOR_DOCKER_DEV=fixture; SPARK_EXPERT_DOCKER_DEV=fixture\n'
+               'wip_spark_image_layers="[]"; declare -A wip_spark_image_ids=([fixture]=fixture)\n'
                'wip_spark_tp_roles=; bf16_families=\n'
                'sync_local_source() { :; }; sync_seed_source() { :; }\n'
                'docker() { printf "docker %s\\n" "$*"; }\n'

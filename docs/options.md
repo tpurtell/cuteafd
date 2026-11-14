@@ -253,6 +253,14 @@ support draft/MTP comparisons or `--save-logits`.
 | `WIP_INSTANCE`, `WIP_ROOT` | unset | instance / absolute path | `--wip` slot staging. |
 | `CUTEAFD_EXPORT_HOST`, `WIP_BUILD_SEED` | empty / `kakapo` | host / seed | Site build settings; every launch path accepts them. |
 
+A local `scripts/build/build-dev-images.sh` rebuild immediately moves the shared
+coordinator and Spark default image tags, even before its branch merges. Existing
+containers retain their old images; rebuild them with `./wip.sh --refresh-containers`
+when adopting the new toolchain. Each WIP build pins immutable per-host image IDs
+for its entire invocation, including container creation, native cache keys and
+sealed metadata, so a concurrent default-tag move cannot change its build inputs.
+Versioned `tc-*` image tags remain available for older checkouts.
+
 ## Hardware placement
 
 | Key | Default | Values | Notes |
@@ -527,7 +535,7 @@ Keys here that are optional and off by default are also listed under
 | `PROFILE_DIR` | unset | absolute dir | Report destination; also runner-owned for `wip-cards --probe memory` without a profiler. |
 | `PROFILE_NCU_KERNEL` | unset | kernel regex | Required by `PROFILE=ncu`; each match is replayed. |
 | `PROFILE_NCU_COUNT`, `PROFILE_NCU_SET`, `PROFILE_NCU_SKIP` | 1, `full`, 0 | 1–9999 / section set / integer | ncu replay count, section set, warm-up matches skipped. |
-| `PROFILE_NSYS_GPU_METRICS`, `PROFILE_NSYS_CPU`, `PROFILE_NSYS_GRAPH_TRACE` | unset | GPU list / `on`/`off` / `node`/`graph` | nsys extras. `PROFILE_NSYS_CPU=on` adds CPU sampling and context switches; the profiled container alone gets `--cap-add PERFMON` (seccomp denies `perf_event_open` without it), and it refuses to start, printing nsys's environment check, if nsys cannot sample (#1700). Graph trace defaults to `node` (each kernel inside a graph replay is timed). A layout that captures graphs with kernels on both coordinator GPUs (V4.1 on two GPUs with TP2 dSpark experts) resolves to `graph` and refuses `node` when the coordinator's nsys is older than 2026.5.2 or its version cannot be read: older nsys node tracing faults when such a graph is instantiated (#2094; 2026.2.1 and 2026.3.2 fault, 2026.5.2 passes). The launch logs the detected version. There, each graph replay is one span; eager kernels keep per-kernel timing. |
+| `PROFILE_NSYS_GPU_METRICS`, `PROFILE_NSYS_CPU`, `PROFILE_NSYS_GRAPH_TRACE` | unset | GPU list / `on`/`off` / `node`/`graph` | nsys extras. `PROFILE_NSYS_CPU=on` adds CPU sampling and context switches; the profiled container alone gets `--cap-add PERFMON` (seccomp denies `perf_event_open` without it), and it refuses to start, printing nsys's environment check, if nsys cannot sample (#1700). Graph trace defaults to `node` (each kernel inside a graph replay is timed). A layout that captures graphs with kernels on both coordinator GPUs (V4.1 on two GPUs with TP2 dSpark experts) resolves to `graph` and refuses `node` when the coordinator's nsys is older than 2026.5.2 or its version cannot be read: older nsys node tracing faults when such a graph is instantiated (#2094; 2026.2.1 and 2026.3.2 fault, 2026.5.2 passes). Dev and release images pin Nsight Systems 2026.6.1, so their default remains `node`; the fallback stays active for older custom images. The launch logs the detected version. Under the fallback, each graph replay is one span; eager kernels keep per-kernel timing. |
 | `PROFILE_NSYS_ROOT` | unset | absolute dir | Dev and profiling only: run `DIR/nsys` (mounted read-only at its own path) instead of the image's Nsight Systems, to try another version without rebuilding the dev image. Requires `PROFILE=nsys`; coordinator only. |
 | `PROFILE_EXPERT_INPUT_SAMPLE`, `PROFILE_EXPERT_ROUTE_WEIGHTS` | unset | row count / `on`/`off` | Require `PROFILE=expert-routes`. |
 | `PROFILE_SPARK`, `PROFILE_SPARK_RANKS` | unset | `nsys`, `ncu` / rank list | Profile Spark workers instead of the coordinator. |
