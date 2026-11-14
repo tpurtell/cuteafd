@@ -62,7 +62,7 @@ impl<'a> Kernels<'a> {
         // metadata addresses the unit's exclusive history and valid packed rows.
         unsafe { self.producer(Op::Convolution { width, dynamic: global, precision: Precision::F32 })?
             .launch(&[input, weight, dynamic, owner.buffer(history)?, owner.buffer("first")?,
-                owner.buffer("ring_slots")?, output], rows, None, owner.stream.raw) }
+                owner.buffer("conv_slots")?, output], rows, None, owner.stream.raw) }
     }
     pub fn residual(&self, owner: &UnitOwner<'_>, query: Buffer, addend: Buffer, output: Buffer,
         rows: usize, queries: usize, candidates: usize, add: bool) -> Result<()> {
