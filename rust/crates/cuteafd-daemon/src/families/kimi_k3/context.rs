@@ -462,7 +462,7 @@ mod tests {
         let diagnostic = device.split("pub(crate) fn context_dsa_dump").nth(1).unwrap().split("fn context_dsa_merge").next().unwrap();
         assert!(diagnostic.find("return Ok(())").unwrap() < diagnostic.find("owner.metadata").unwrap());
         assert!(diagnostic.find("return Ok(())").unwrap() < diagnostic.find("record_selected").unwrap());
-        let paired = layers.split("context_pair_with(&mut Pair { binding: self, layer })?;").nth(1).unwrap();
+        let paired = layers.rsplit("context_pair_with(&mut Pair { binding: self, layer })?;").next().unwrap();
         assert!(paired.contains("context_dsa_dump"));
         assert!(paired.find("context_dsa_dump").unwrap() < paired.find("self.publish").unwrap());
         let graph = device.split("fn graph_step(").nth(1).unwrap().split("pub(crate) fn attention(").next().unwrap();
