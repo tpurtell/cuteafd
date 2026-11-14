@@ -13,6 +13,15 @@ logical token ids (ascending, the runner's order), their F32 scores, the cutoff
 (2048th-ranked) score, and the next 256 just-below-cutoff slots. That is what
 the engine's ``CUTEAFD_KIMI_DSA_SCORES`` dump is compared against.
 
+``CUTEAFD_KIMI_REF_DSA_KEYS`` (with ``CUTEAFD_KIMI_REF_DSA_KEY_TOKENS``) records
+the pre-quantization index key the reference's own DSA forward scores: the 128 F32
+values of each requested logical token's normalized ``wk(x)`` projection, exactly
+the tensor ``indexer_score_reduction`` receives. In the QDQ arm the row is also
+recorded after the served contract is applied (BF16 rounding, then E4M3 payload
+times the UE8M0 scale), so the served key can be compared against the engine's
+stored codes and scale. This is the reference for the engine's
+``CUTEAFD_KIMI_DSA_KEYS`` dump and is likewise diagnostic only.
+
 ``CUTEAFD_KIMI_REF_DSA_QDQ=1`` re-runs the same window with the served indexer
 contract applied to the reference's own F32 indexer projections: per-(row,head)
 E4M3 query QDQ over 128 dims with a UE8M0 power-of-two scale (amax floor
@@ -52,6 +61,8 @@ ENV_DIR = "CUTEAFD_KIMI_REF_DSA_DUMP"
 ENV_LAYERS = "CUTEAFD_KIMI_REF_DSA_LAYERS"
 ENV_FROM = "CUTEAFD_KIMI_REF_DSA_FROM"
 ENV_QDQ = "CUTEAFD_KIMI_REF_DSA_QDQ"
+ENV_KEYS = "CUTEAFD_KIMI_REF_DSA_KEYS"
+ENV_KEY_TOKENS = "CUTEAFD_KIMI_REF_DSA_KEY_TOKENS"
 
 FLOAT8_E4M3_MAX = 448.0
 QUERY_AMAX_FLOOR = 1e-10
@@ -62,9 +73,12 @@ DIR = os.environ.get(ENV_DIR)
 LAYERS = frozenset(int(part) for part in os.environ.get(ENV_LAYERS, "").split(",") if part.strip())
 FROM = int(os.environ.get(ENV_FROM, "0"))
 QDQ = os.environ.get(ENV_QDQ, "0") not in ("", "0", "false", "False")
+KEYS_DIR = os.environ.get(ENV_KEYS)
+KEY_TOKENS = sorted({int(part) for part in os.environ.get(ENV_KEY_TOKENS, "").split(",") if part.strip()})
 STOP_LAYER = max(LAYERS) if LAYERS else None
 
 RECORDS: dict[int, list] = {}
+KEY_RECORDS: dict[int, dict[int, dict]] = {}
 QDQ_CALLS = 0
 
 
@@ -106,18 +120,53 @@ def _quantize_dequantize(value: torch.Tensor, floor: float) -> torch.Tensor:
     return payload * scale
 
 
+def _record_keys(site, raw, served):
+    """Record the reference's own key row for every requested token it covers.
+
+    The DSA forward hands the reduction the full causal prefix key
+    (``ik[:start + ROWS]``), so row ``token`` is the global window token
+    ``token`` regardless of which chunk is being scored.
+    """
+    layer, _, _ = site
+    if LAYERS and layer not in LAYERS:
+        return
+    entries = KEY_RECORDS.setdefault(layer, {})
+    count = int(raw.shape[0])
+    for token in KEY_TOKENS:
+        if token >= count or token in entries:
+            continue
+        row = raw[token].detach().float().cpu()
+        values = [float(value) for value in row]
+        record = {
+            "layer": layer,
+            "token": token,
+            "dim": int(row.numel()),
+            "amax": max(abs(value) for value in values),
+            "norm": sum(value * value for value in values) ** 0.5,
+            "key": values,
+        }
+        if served is not None:
+            record["served"] = [float(value) for value in served[token].detach().float().cpu()]
+        entries[token] = record
+
+
 _original_topk = shape_invariant.fixed_index_topk
 _original_reduction = ops.indexer_score_reduction
 
 
 def _reduction(query, key, head_weights):
     global QDQ_CALLS
-    if QDQ and _dsa_site(sys._getframe(1)) is not None:
+    site = _dsa_site(sys._getframe(1)) if QDQ or KEYS_DIR is not None else None
+    raw = key
+    if QDQ and site is not None:
         # The producer rounds the normalized key to BF16 before its FP8 cast;
         # the query stays F32 until the QDQ scale.
         query = _quantize_dequantize(query, QUERY_AMAX_FLOOR)
-        key = _quantize_dequantize(key.to(torch.bfloat16).to(torch.float32), KEY_AMAX_FLOOR)
+        raw = key.to(torch.bfloat16).to(torch.float32)
+        key = _quantize_dequantize(raw, KEY_AMAX_FLOOR)
         QDQ_CALLS += 1
+    if KEYS_DIR is not None and KEY_TOKENS and site is not None:
+        _record_keys(site, raw, key if QDQ and site is not None else None)
     return _original_reduction(query, key, head_weights)
 
 
@@ -193,6 +242,16 @@ def _write_outputs():
             "last_position": rows[-1]["position"],
             "sha256": _digest(path),
         }
+    if KEYS_DIR is not None:
+        written_keys = {}
+        for layer, entries in sorted(KEY_RECORDS.items()):
+            path = base / f"layer-{layer:02}-keys.jsonl"
+            with path.open("w") as stream:
+                for token in sorted(entries):
+                    stream.write(json.dumps(entries[token], separators=(",", ":")) + "\n")
+            written_keys[path.name] = {"rows": len(entries), "sha256": _digest(path)}
+    else:
+        written_keys = None
     reference = ROOT / "python/reference"
     manifest = {
         "schema": "cuteafd.kimi.ref-dsa-scores/1",
@@ -219,6 +278,12 @@ def _write_outputs():
                          "families/mistral_large4/ops.py", "shape_invariant.py")
         },
         "files": written,
+        "key_files": written_keys,
+        "key_tokens": KEY_TOKENS if KEYS_DIR is not None else None,
+        "key_contract": ("the normalized F32 wk(x) key the reference reduces (BF16-rounded in the QDQ arm), "
+                         "with the served E4M3/UE8M0 QDQ row alongside it"
+                         if QDQ else
+                         "the normalized F32 wk(x) key the reference reduces"),
     }
     (base / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(f"reference DSA selection dump: {len(written)} layer files under {base}", flush=True)
@@ -231,6 +296,14 @@ def _problems():
     problems = []
     if not RECORDS:
         problems.append("no DSA layer recorded; the instrumentation site never matched")
+    if KEYS_DIR is not None:
+        missing_keys = [token for token in KEY_TOKENS if not any(
+            token in entries for entries in KEY_RECORDS.values())]
+        if missing_keys:
+            problems.append(f"requested key tokens {missing_keys} were never reached")
+        missing_layers = sorted(LAYERS - set(KEY_RECORDS)) if LAYERS else []
+        if missing_layers:
+            problems.append(f"requested key layers {missing_layers} recorded no key rows")
     missing = sorted(LAYERS - set(RECORDS))
     if missing:
         problems.append(f"requested layers {missing} recorded nothing")

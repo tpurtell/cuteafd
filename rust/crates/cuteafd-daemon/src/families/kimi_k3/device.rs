@@ -618,6 +618,7 @@ pub(crate) struct LocalLane<'a> {
     pub(super) capture: Option<Rc<super::golden::Capture>>,
     pub(super) dsa_dump: Option<Rc<super::dsa_dump::DsaDump>>,
     pub(super) dsa_scores: Option<Rc<super::score_dump::ScoreDump>>,
+    pub(super) dsa_keys: Option<Rc<super::key_dump::KeyDump>>,
 }
 
 #[derive(Clone, Copy)]
@@ -675,7 +676,7 @@ impl<'a> LocalLane<'a> {
         let banks = lane.layout.metadata_banks();
         Ok(Self { lane, programs, cfg, layers, global, lane_index, rank, kda, mla, attention: None, graphs: None,
             replay_enabled: true, context: None, context_pages: vec![0; banks], context_units: vec![None; banks],
-            capture: None, dsa_dump: None, dsa_scores: None })
+            capture: None, dsa_dump: None, dsa_scores: None, dsa_keys: None })
     }
 
     pub(crate) fn bind_context(&mut self, owner: Rc<super::context::ContextOwner<'a>>,
@@ -1037,7 +1038,7 @@ impl<'a> LocalLane<'a> {
     /// A diagnostic readback adds host-visible host copies inside the step,
     /// so it excludes every recorded stream.
     fn diagnostics_active(&self) -> bool {
-        self.dsa_dump.is_some() || self.dsa_scores.is_some()
+        self.dsa_dump.is_some() || self.dsa_scores.is_some() || self.dsa_keys.is_some()
     }
 
     /// Run one step body through the bounded graph cache: replay a resident
@@ -1051,7 +1052,7 @@ impl<'a> LocalLane<'a> {
         let Some(mut graphs) = self.graphs.take() else { return body(self) };
         if self.diagnostics_active() {
             self.graphs = Some(graphs);
-            bail!("CUTEAFD_KIMI_DSA_DUMP/CUTEAFD_KIMI_DSA_SCORES refuse CUDA graph replay");
+            bail!("CUTEAFD_KIMI_DSA_DUMP/CUTEAFD_KIMI_DSA_SCORES/CUTEAFD_KIMI_DSA_KEYS refuse CUDA graph replay");
         }
         let stream = self.stream().clone();
         let key = super::graphs::Key { lane: self.lane_index, rank: self.rank, rows, op };
@@ -1532,7 +1533,21 @@ impl<'a> LocalLane<'a> {
                 }))
         } else {
             Ok(())
+        }?;
+        // Key readback: the producer wrote each token's E4M3 codes and FP32
+        // scale into this layer's index cache before the selector scored them,
+        // so the stored page is exactly what the served score dequantized. The
+        // lane stream is drained above; these are plain d2h copies of owners
+        // the lane retains, with no writer aliased.
+        if let Some(dump) = self.dsa_keys.as_deref().filter(|dump| !staging && dump.enabled(layer)) {
+            super::key_dump::record_keys(dump, self.rank, stream, layer, batch.rows, table_width,
+                batch.rows <= 64, self.mla.pages(), || Ok(super::key_dump::KeyBuffers {
+                    positions: self.lane.buffer("DSA positions")?,
+                    table: self.lane.buffer("DSA page table")?,
+                    cache,
+                }))?;
         }
+        Ok(())
     }
 
     fn mla_output(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
